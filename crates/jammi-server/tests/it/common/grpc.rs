@@ -317,7 +317,19 @@ async fn engine_chain_from_config(
     // production `OssServer` builds, and what the Flight SQL `annotate` test
     // exercises.
     let session = InferenceSession::open(cfg).await.expect("session");
+    chain_over_session(addr, tiers, session, admin_authorizer)
+}
 
+/// The chain-building half of [`engine_chain_from_config`] over an ALREADY
+/// OPEN engine session — so a test that opened its session itself (e.g. with
+/// [`InferenceSession::open_with_placement`]) serves the identical surface
+/// every other fixture serves. Returns the chain plus the shared engine handle.
+pub fn chain_over_session(
+    addr: SocketAddr,
+    tiers: jammi_server::tiers::TierSet,
+    session: Arc<InferenceSession>,
+    admin_authorizer: Option<Arc<dyn jammi_server::grpc::catalog::AdminAuthorizer>>,
+) -> (jammi_server::runtime::GrpcChain, Arc<InferenceSession>) {
     let store = SessionStore::new();
     let trigger = tiers
         .contains(jammi_server::tiers::ServiceTier::Event)
@@ -655,4 +667,103 @@ pub async fn start_engine_server_with_limits(
         engine,
         metrics,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The peer-listener fixture (`[server] peer_bind`)
+// ---------------------------------------------------------------------------
+
+/// Guards for an in-process server started through the PRODUCTION
+/// [`jammi_server::runtime::OssServer`] path — `new` → `bind` →
+/// `serve_with_shutdown` — with `[server] peer_bind` set, so the third
+/// (internal `PeerService`) listener is the real plumbing, not a fixture's
+/// re-implementation of it. All three listeners are ephemeral (`:0`).
+pub struct PeerEngineServer {
+    /// The public gRPC + Flight SQL listener.
+    pub public_addr: SocketAddr,
+    /// The internal `PeerService` listener (`[server] peer_bind`).
+    pub peer_addr: SocketAddr,
+    /// The HTTP side-channel (`/healthz`, `/readyz`, `/metrics`).
+    pub health_addr: SocketAddr,
+    /// The engine session the server drives — a test builds tables on it
+    /// directly (the owner's own result store).
+    pub engine: Arc<InferenceSession>,
+    /// The server's metrics registry — `jammi_peer_requests_total{rpc}` is the
+    /// observable that a peer call reached this owner.
+    pub metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
+    pub shutdown: oneshot::Sender<()>,
+    pub handle: AbortOnDropHandle<()>,
+    /// RAII root of the engine's artifact dir when this fixture owns it;
+    /// `None` when the caller supplied (and roots) a shared dir.
+    pub _dir: Option<TempDir>,
+}
+
+/// A `test_config` over `artifact_dir` with every listener at loopback `:0`
+/// and `peer_bind` set — the config a peer-bound fixture opens.
+pub fn peer_bind_config(artifact_dir: &std::path::Path) -> jammi_db::config::JammiConfig {
+    let mut cfg = test_config(artifact_dir);
+    cfg.server.health_listen = "127.0.0.1:0".into();
+    cfg.server.flight_listen = "127.0.0.1:0".into();
+    cfg.server.peer_bind = Some("127.0.0.1:0".into());
+    cfg
+}
+
+/// Start a server from `cfg` through the production `OssServer` path. `cfg`
+/// must set `peer_bind` (the fixture asserts the third listener bound).
+pub async fn start_engine_server_from_config(
+    cfg: jammi_db::config::JammiConfig,
+    dir: Option<TempDir>,
+) -> PeerEngineServer {
+    let server = jammi_server::runtime::OssServer::new(cfg)
+        .await
+        .expect("oss server");
+    let engine = server.session();
+    let metrics = server.metrics();
+    let bound = server.bind().await.expect("bind all listeners");
+    let public_addr = bound.flight_addr();
+    let health_addr = bound.health_addr();
+    let peer_addr = bound
+        .peer_addr()
+        .expect("peer_bind is set, so the third listener is bound");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        bound
+            .serve_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("oss server serve");
+    });
+    PeerEngineServer {
+        public_addr,
+        peer_addr,
+        health_addr,
+        engine,
+        metrics,
+        shutdown: shutdown_tx,
+        handle: AbortOnDropHandle(handle),
+        _dir: dir,
+    }
+}
+
+/// [`start_engine_server`]'s peer-bound twin: a fresh engine over its own
+/// temp artifact dir, every listener ephemeral, `PeerService` served on
+/// `peer_addr`.
+pub async fn start_engine_server_with_peer_bind() -> PeerEngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = peer_bind_config(dir.path());
+    start_engine_server_from_config(cfg, Some(dir)).await
+}
+
+/// Serve the engine chain (every tier except event) over an ALREADY OPEN
+/// engine session on a loopback ephemeral port — the public listener a test
+/// drives `Search` through against a session it opened itself. Returns the
+/// bound address, the shutdown trigger and the abort-on-drop serve handle.
+pub async fn start_engine_server_over_session(
+    session: Arc<InferenceSession>,
+) -> (SocketAddr, oneshot::Sender<()>, AbortOnDropHandle<()>) {
+    let (chain, _engine) = chain_over_session(ephemeral_addr(), non_event_tiers(), session, None);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+    (addr, shutdown_tx, AbortOnDropHandle(handle))
 }

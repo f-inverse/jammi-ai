@@ -302,7 +302,7 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
         .0;
 
     assert_eq!(table.row_count, 3);
-    assert_eq!(table.dimensions, Some(32));
+    assert_eq!(table.dimensions_raw(), Some(32));
     assert!(
         !common::segment_index_urls(&session, &table.table_name)
             .await

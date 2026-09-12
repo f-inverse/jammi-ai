@@ -175,6 +175,14 @@ impl SegmentIndexCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{validate_query, QuerySource, ValidatedQuery};
+
+    /// A test query: validated (finite) with no width in hand — the index or
+    /// scan it meets enforces the width.
+    fn vq(v: &[f32]) -> ValidatedQuery {
+        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+    }
+
     use crate::index::sidecar::SidecarIndex;
     use crate::index::VectorIndex;
     use crate::storage::sidecar_layout::save_sidecar;
@@ -251,7 +259,7 @@ mod tests {
             .load_segment(&url, &AnnIndexConfig::default(), StoragePrecision::F32)
             .await
             .unwrap();
-        let hits = second.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        let hits = second.search(&vq(&[1.0, 0.0, 0.0, 0.0]), 1).unwrap();
         assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("row-a"));
     }
 
@@ -282,7 +290,7 @@ mod tests {
             .load_segment(&url, &AnnIndexConfig::default(), StoragePrecision::F32)
             .await
             .unwrap();
-        let hits = reloaded.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
+        let hits = reloaded.search(&vq(&[0.0, 0.0, 0.0, 1.0]), 1).unwrap();
         assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("row-z"));
     }
 

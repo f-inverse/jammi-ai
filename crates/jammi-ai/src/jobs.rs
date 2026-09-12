@@ -287,6 +287,7 @@ pub(crate) async fn dispatch_partial_result(
     session: &Arc<InferenceSession>,
     catalog: &Catalog,
     tenant: Option<jammi_db::TenantId>,
+    job_id: &str,
     attempt: u32,
     partial_result: Option<&str>,
     instance_id: &str,
@@ -299,7 +300,9 @@ pub(crate) async fn dispatch_partial_result(
     };
     let Some(record) = catalog.get_result_table(table_name).await? else {
         // The row vanished (e.g. a prior fail+delete already reaped it) —
-        // nothing to adopt.
+        // nothing to adopt; the column still names it, so clear it or this
+        // attempt's own `create_result_table` CAS is superseded (esc-110).
+        clear_stale_partial_result(catalog, job_id, instance_id, attempt, table_name).await;
         return Ok(PartialResultDisposition::MaterializeAnew);
     };
     match record.status.as_str() {
@@ -329,9 +332,49 @@ pub(crate) async fn dispatch_partial_result(
             // changes nothing about THIS attempt's own next step, which is
             // to materialize its own fresh table either way.
             catalog.fail_building_table(&fail_cas).await.ok();
+            clear_stale_partial_result(catalog, job_id, instance_id, attempt, table_name).await;
             Ok(PartialResultDisposition::MaterializeAnew)
         }
-        _ => Ok(PartialResultDisposition::MaterializeAnew),
+        // `failed` (the predecessor's own abort, or its `BuildingTable::drop`
+        // after a RELEASE abort marked it), or any other terminal status:
+        // nothing to adopt, and the column must not poison this attempt's
+        // own CAS either.
+        _ => {
+            clear_stale_partial_result(catalog, job_id, instance_id, attempt, table_name).await;
+            Ok(PartialResultDisposition::MaterializeAnew)
+        }
+    }
+}
+
+/// Clear the predecessor's `partial_result` before THIS attempt
+/// materializes anew, so its own `create_result_table` CAS (`… AND
+/// partial_result IS NULL`) can land. Without this every attempt >= 2 that
+/// reached a `MaterializeAnew` arm was superseded by its own predecessor's
+/// stale pointer and the job landed `failed` (escape `esc-110`).
+/// Attempt-guarded like every jobs CAS (`Catalog::clear_partial_result`);
+/// 0 rows = a peer already cleared it or superseded this attempt, which the
+/// existing `JobAttemptSuperseded` path then reports. Best-effort: an error
+/// is logged and the attempt proceeds to the same CAS.
+async fn clear_stale_partial_result(
+    catalog: &Catalog,
+    job_id: &str,
+    instance_id: &str,
+    attempt: u32,
+    table_name: &str,
+) {
+    match catalog
+        .clear_partial_result(job_id, instance_id, attempt, table_name)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            job_id,
+            "partial_result already cleared or this attempt superseded; materializing anew regardless"
+        ),
+        Err(e) => tracing::warn!(
+            job_id, error = %e,
+            "clear_partial_result failed; this attempt's create_result_table may be superseded"
+        ),
     }
 }
 

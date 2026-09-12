@@ -6,6 +6,7 @@
 //! restore stale or omit entirely, never load-bearing for the catalog's
 //! own rows.
 
+use jammi_test_utils::vq;
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
@@ -138,10 +139,10 @@ async fn close_copy_reopen_preserves_rows() {
         .await
         .unwrap();
     let index = restored_store
-        .resolve_search_mode(&restored)
+        .resolve_search_mode_local(&restored)
         .await
         .unwrap()
         .expect("the ANN sidecar survived the copy too");
-    let hits = index.search(&[1.0, 2.0, 3.0, 4.0], 5).unwrap();
+    let hits = index.search(&vq(&[1.0, 2.0, 3.0, 4.0]), 5).unwrap();
     assert_eq!(hits.len(), 5, "every row is still searchable after restore");
 }

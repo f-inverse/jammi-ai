@@ -8,8 +8,10 @@
 //! - the Axum side-channel router (`/healthz`, `/readyz`, `/metrics`)
 //! - one Tonic server hosting `FlightSqlService + CatalogService +
 //!   TriggerService` on a single port
-//! - graceful shutdown wired to SIGINT/SIGTERM via a
-//!   [`tokio::sync::broadcast`] so every component drains in parallel
+//! - two-mode graceful shutdown (DRAIN on SIGTERM, RELEASE on SIGINT or a
+//!   second signal) wired through [`tokio::sync::watch`], so every listener
+//!   — HTTP side-channel, gRPC/Flight, and the internal peer listener when
+//!   bound — drains in parallel off the same signal
 //!
 //! The structure is intentionally flat: no `runtime/` directory, no
 //! per-component sub-modules. When a second binary materialises the same
@@ -18,11 +20,10 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
-use axum::routing::get;
 use axum::Router;
 use datafusion::execution::context::SessionContext;
 use datafusion_flight_sql_server::service::FlightSqlService;
@@ -31,13 +32,12 @@ use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigning
 use jammi_db::config::{JammiConfig, SigningKeyConfig};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::broadcast;
+use tokio::sync::{oneshot, watch};
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
 
-use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
 use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
@@ -45,6 +45,7 @@ use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::job::JobServer;
+use crate::grpc::peer::PeerServer;
 use crate::grpc::pipeline::PipelineServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
@@ -52,13 +53,14 @@ use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceSer
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::job::job_service_server::JobServiceServer;
+use crate::grpc::proto::peer::peer_service_server::PeerServiceServer;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver};
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::metrics_layer::MetricsLayer;
-use crate::routes::health::{self, MetricsRegistry};
+use crate::routes::health::MetricsRegistry;
 use crate::tenant_resolver_layer::TenantResolverLayer;
 use crate::tiers::{ServiceTier, TierSet};
 use crate::trace_context_layer::TraceContextLayer;
@@ -82,6 +84,12 @@ pub enum ServerError {
     AddrParse(#[from] std::net::AddrParseError),
     #[error("{0}")]
     AuditMasterKey(String),
+    /// A `[server] preload_models` entry could not be loaded at startup —
+    /// the model failed to load, a bare id has no `models` row to take its
+    /// task from, or the task could not be resolved. The server exits
+    /// non-zero instead of serving.
+    #[error("preload_models: `{id}`: {reason}")]
+    Preload { id: String, reason: String },
 }
 
 /// Fail-closed startup check for the audit signing key.
@@ -217,17 +225,80 @@ pub trait ReadinessCheck: Send + Sync {
 }
 
 /// Wrapper that holds the active [`ReadinessCheck`] behind an `Arc` so
-/// Axum can share it across handlers via `State`.
+/// Axum can share it across handlers via `State`, plus the process-level
+/// readiness phases a probe cannot know on its own: draining (a shutdown
+/// began — `/readyz` 503 `"draining"` so a balancer stops routing here while
+/// in-flight work finishes).
 pub struct ReadinessProbe {
     inner: Arc<dyn ReadinessCheck>,
+    draining: std::sync::atomic::AtomicBool,
+    /// Warm-before-ready: `false` until every `[server] preload_models`
+    /// entry is cached (`/readyz` 503 `"preloading i/n"` meanwhile).
+    warm: std::sync::atomic::AtomicBool,
+    preloaded: std::sync::atomic::AtomicUsize,
+    preload_total: std::sync::atomic::AtomicUsize,
 }
 
 impl ReadinessProbe {
     pub fn new(inner: Arc<dyn ReadinessCheck>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            warm: std::sync::atomic::AtomicBool::new(true),
+            preloaded: std::sync::atomic::AtomicUsize::new(0),
+            preload_total: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Enter the preloading phase: `/readyz` reports 503 `"preloading 0/n"`
+    /// until [`Self::set_warm`].
+    pub fn begin_preload(&self, total: usize) {
+        use std::sync::atomic::Ordering;
+        self.preload_total.store(total, Ordering::SeqCst);
+        self.preloaded.store(0, Ordering::SeqCst);
+        self.warm.store(false, Ordering::SeqCst);
+    }
+
+    /// One more entry cached.
+    pub fn note_preloaded(&self) {
+        self.preloaded
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every entry cached: `/readyz` may report ready.
+    pub fn set_warm(&self) {
+        self.warm.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the preload phase has completed (or never existed).
+    pub fn is_warm(&self) -> bool {
+        self.warm.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `/readyz` reports 503 `"draining"` from now on — set by the DRAIN and
+    /// RELEASE arms of [`BoundServer::serve_with_signals`].
+    pub fn begin_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a shutdown has begun.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn check(&self) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.is_draining() {
+            return Err("draining".to_string());
+        }
+        if !self.is_warm() {
+            return Err(format!(
+                "preloading {}/{}",
+                self.preloaded.load(Ordering::SeqCst),
+                self.preload_total.load(Ordering::SeqCst)
+            ));
+        }
         self.inner.check().await
     }
 }
@@ -257,6 +328,103 @@ impl ReadinessCheck for CatalogPingProbe {
     }
 }
 
+/// A liveness probe (`/healthz`): can this process keep its leases and its
+/// claim loop alive? Behind a trait so tests substitute a stub; the
+/// production implementation is [`EngineLiveness`].
+pub trait LivenessCheck: Send + Sync {
+    fn check(&self) -> LivenessReport;
+}
+
+/// What `/healthz` reports. Unhealthy (503) exactly when the lease keeper
+/// thread is dead (every lease this process holds is already lost) or the
+/// claim loop task panicked (`failed`); a loop that stopped, was aborted
+/// (a RELEASE) or never existed is not a fault, and neither is draining.
+/// No slow-step detection: the runtime owns "how long is too long".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessReport {
+    /// `LeaseKeeper::is_alive`.
+    pub lease_keeper: bool,
+    /// `running` / `stopped` / `aborted` / `failed`, or `none` on a process
+    /// with no claim loop.
+    pub claim_loop: &'static str,
+}
+
+impl LivenessReport {
+    pub fn healthy(&self) -> bool {
+        self.lease_keeper && self.claim_loop != "failed"
+    }
+}
+
+/// Wrapper that holds the active [`LivenessCheck`] behind an `Arc` so Axum
+/// can share it across handlers via `State`.
+pub struct LivenessProbe {
+    inner: Arc<dyn LivenessCheck>,
+}
+
+impl LivenessProbe {
+    pub fn new(inner: Arc<dyn LivenessCheck>) -> Self {
+        Self { inner }
+    }
+
+    /// A probe that always reports healthy with no claim loop — for a
+    /// router with no engine behind it (`crate::build_router`, fixtures).
+    pub fn always_healthy() -> Self {
+        struct AlwaysAlive;
+        impl LivenessCheck for AlwaysAlive {
+            fn check(&self) -> LivenessReport {
+                LivenessReport {
+                    lease_keeper: true,
+                    claim_loop: "none",
+                }
+            }
+        }
+        Self::new(Arc::new(AlwaysAlive))
+    }
+
+    pub fn check(&self) -> LivenessReport {
+        self.inner.check()
+    }
+}
+
+/// The production liveness: the session's lease keeper and, when this
+/// process runs a claim loop, the loop's shared state (a `Weak`, so the
+/// probe never keeps it alive; a gone state reads `stopped`).
+pub struct EngineLiveness {
+    keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
+    worker: Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>>,
+}
+
+impl EngineLiveness {
+    pub fn new(
+        keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
+        worker: Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>>,
+    ) -> Self {
+        Self { keeper, worker }
+    }
+}
+
+impl LivenessCheck for EngineLiveness {
+    fn check(&self) -> LivenessReport {
+        use jammi_ai::fine_tune::worker::LoopState;
+        let claim_loop = match &self.worker {
+            None => "none",
+            Some(weak) => match weak.upgrade() {
+                None => "stopped",
+                Some(shared) => match shared.loop_state() {
+                    LoopState::Running => "running",
+                    LoopState::Stopped => "stopped",
+                    LoopState::Aborted => "aborted",
+                    LoopState::Failed => "failed",
+                },
+            },
+        };
+        LivenessReport {
+            lease_keeper: self.keeper.is_alive(),
+            claim_loop,
+        }
+    }
+}
+
 /// The OSS server instance. Constructed via [`Self::new`] and consumed
 /// by [`Self::run`]. Holds every long-lived dependency the binary
 /// orchestrates — bind addresses, the engine session, the shared
@@ -264,6 +432,9 @@ impl ReadinessCheck for CatalogPingProbe {
 pub struct OssServer {
     flight_addr: SocketAddr,
     health_addr: SocketAddr,
+    /// `[server] peer_bind`: the internal peer listener's address, `Some`
+    /// iff this replica is a segment owner. `None` = no third listener.
+    peer_addr: Option<SocketAddr>,
     session: Arc<InferenceSession>,
     session_store: SessionStore,
     metrics: Arc<MetricsRegistry>,
@@ -298,6 +469,12 @@ impl OssServer {
 
         let flight_addr: SocketAddr = config.server.flight_listen.parse()?;
         let health_addr: SocketAddr = config.server.health_listen.parse()?;
+        let peer_addr: Option<SocketAddr> = config
+            .server
+            .peer_bind
+            .as_deref()
+            .map(str::parse)
+            .transpose()?;
 
         // Resolve the mounted tier set before constructing the engine: a config
         // that names an unknown tier or one whose feature is compiled out is a
@@ -308,8 +485,24 @@ impl OssServer {
         // DataFusion context — the Flight SQL surface needs it. It already returns
         // an `Arc<InferenceSession>`.
         let session = InferenceSession::open(config).await?;
+        // Warm-before-ready: with models to preload, the claim loop must not
+        // claim before they are cached — close the session's worker gate
+        // before the worker is spawned at bind; `serve_with_signals` opens
+        // it once warm. An empty list leaves the gate open (existing
+        // deployments unchanged).
+        if !session.inner_config().server.preload_models.is_empty() {
+            session.close_worker_gate();
+        }
         let session_store = SessionStore::new();
         let metrics = Arc::new(MetricsRegistry::new()?);
+        // Every process has a keeper: `jammi_lease_heartbeat_age_seconds` is
+        // present on every server.
+        metrics.attach_keeper(Arc::clone(session.lease_keeper()))?;
+        // The placed-search failure-ladder counters live in the engine's
+        // result store; the registry reads them at scrape as
+        // `jammi_peer_search_failures_total{reason}`. Registered here, once,
+        // additively — `MetricsRegistry::new` keeps its arity.
+        metrics.install_peer_failures(session.result_store().peer_failures())?;
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(
             Arc::clone(&session),
         ))));
@@ -317,6 +510,7 @@ impl OssServer {
         Ok(Self {
             flight_addr,
             health_addr,
+            peer_addr,
             session,
             session_store,
             metrics,
@@ -355,9 +549,30 @@ impl OssServer {
     /// ([`BoundServer::flight_addr`] / [`BoundServer::health_addr`]) while the
     /// listeners stay bound, with no observable release-then-rebind window.
     pub async fn bind(self) -> Result<BoundServer, ServerError> {
-        let health_router = self.build_health_router();
         let health_listener = TcpListener::bind(self.health_addr).await?;
         let health_addr = health_listener.local_addr()?;
+        // The THIRD listener: `PeerService` on `[server] peer_bind`, built
+        // OUTSIDE `assemble_grpc_chain` — never added to the public `Routes`,
+        // never wrapped by the `TenantResolverLayer`, never advertised by
+        // `GetServerInfo`. The public listener answers UNIMPLEMENTED for its
+        // paths. Its routes are a plain `tonic::service::Routes`, so a second
+        // internal service can be mounted beside `PeerService` here later. The
+        // registry is cloned now because `MetricsLayer::new(self.metrics)`
+        // moves the `Arc` into the public chain below.
+        let peer = match self.peer_addr {
+            Some(addr) => {
+                let listener = TcpListener::bind(addr).await?;
+                let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
+                    Arc::clone(&self.session),
+                )));
+                Some((listener, routes, Arc::clone(&self.metrics)))
+            }
+            None => None,
+        };
+        let peer_addr = match &peer {
+            Some((listener, _, _)) => Some(listener.local_addr()?),
+            None => None,
+        };
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
         // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
         // internally (captured by the mounted services), but neither type
@@ -365,25 +580,43 @@ impl OssServer {
         // handle `serve_with_shutdown` has to release the catalog through
         // once the serve loop drains.
         let session = Arc::clone(&self.session);
-        let grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
+        let readiness = Arc::clone(&self.readiness);
+        let mut grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
+        // Hoist the worker guard out of the chain (D3): ownership decides
+        // who can DRAIN or RELEASE, and the server's two-mode shutdown needs
+        // the guard alive past the gRPC serve future, which the chain would
+        // otherwise drop it with.
+        let worker = grpc.take_worker();
+        // The worker gauge families exist only where a claim loop does.
+        if let Some(w) = &worker {
+            self.metrics.attach_worker(w.shared())?;
+        }
+        // Liveness reads the keeper and (when present) the loop's state, so
+        // the side-channel router is built once the worker guard is known.
+        let liveness = Arc::new(LivenessProbe::new(Arc::new(EngineLiveness::new(
+            Arc::clone(session.lease_keeper()),
+            worker.as_ref().map(|w| w.shared()),
+        ))));
+        let health_router =
+            crate::build_health_router(Arc::clone(&readiness), Arc::clone(&self.metrics), liveness);
         Ok(BoundServer {
             grpc,
             health_listener,
             health_addr,
             health_router,
+            peer,
+            peer_addr,
             session,
+            worker,
+            readiness,
         })
     }
 
-    /// Drive the server until SIGINT / SIGTERM arrives. Both the HTTP
-    /// side-channel and the gRPC surface drain in parallel; the call
-    /// returns when both have stopped accepting new connections and
-    /// finished serving in-flight requests.
+    /// Drive the server until a shutdown signal arrives — SIGTERM = DRAIN,
+    /// SIGINT (or any signal while draining) = RELEASE; see
+    /// [`BoundServer::serve`].
     pub async fn run(self) -> Result<(), ServerError> {
-        self.bind()
-            .await?
-            .serve_with_shutdown(shutdown_signal())
-            .await
+        self.bind().await?.serve().await.map(|_| ())
     }
 
     /// Variant of [`Self::run`] that accepts a caller-provided
@@ -394,24 +627,6 @@ impl OssServer {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
         self.bind().await?.serve_with_shutdown(shutdown).await
-    }
-
-    fn build_health_router(&self) -> Router {
-        // Two sub-routers keep the State types separated — Axum requires
-        // every route in a Router to share the same State type, so the
-        // readiness handler and the metrics handler are merged here
-        // after each one's State is applied.
-        let readyz = Router::new()
-            .route("/readyz", get(health::readyz))
-            .with_state(Arc::clone(&self.readiness));
-        let metrics = Router::new()
-            .route("/metrics", get(health::metrics))
-            .with_state(Arc::clone(&self.metrics));
-        Router::new()
-            .route("/healthz", get(health::healthz))
-            .merge(readyz)
-            .merge(metrics)
-            .fallback(fallback_handler)
     }
 
     /// Assemble the engine's [`GrpcChain`] from this server's config and engine
@@ -470,14 +685,197 @@ pub struct BoundServer {
     health_listener: TcpListener,
     health_addr: SocketAddr,
     health_router: Router,
+    /// The bound internal peer listener with its layer-free routes and the
+    /// registry its own `MetricsLayer` is built from at serve time. `None`
+    /// when `[server] peer_bind` is unset.
+    peer: Option<(TcpListener, tonic::service::Routes, Arc<MetricsRegistry>)>,
+    /// The ACTUAL peer listener address (the real port for a `:0` request).
+    peer_addr: Option<SocketAddr>,
     /// The engine session, kept alive past [`OssServer::bind`] so
-    /// [`Self::serve_with_shutdown`] can release its catalog connections
+    /// [`Self::serve_with_signals`] can release its catalog connections
     /// (including the lease keeper's own, N3) once the serve loop has fully
     /// drained — the graceful-shutdown release point a `SIGTERM`'d
     /// `jammi-server` needs so a successor process can open the same
     /// SQLite catalog directory immediately, exactly as the embedded
     /// engine's `close()` does.
     session: Arc<InferenceSession>,
+    /// The embedded job worker guard, hoisted out of the chain at bind (D3)
+    /// so the two-mode shutdown owns it: `None` when `[worker] enabled =
+    /// false`.
+    worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    /// The readiness probe, so a shutdown can flip `/readyz` to 503.
+    readiness: Arc<ReadinessProbe>,
+}
+
+/// How [`BoundServer::serve_with_signals`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// DRAIN completed: the gRPC surface drained and the worker (if any)
+    /// finished its in-flight job and was joined.
+    Drained {
+        /// `true` when a worker loop was actually stopped and joined;
+        /// `false` on a worker-less process.
+        worker_joined: bool,
+    },
+    /// RELEASE completed and its evidence CONFIRMS every held lease was
+    /// handed back — P-RELEASE: the release call returned `Ok`, its
+    /// per-hold pass (P-2B, see `release_outcome`'s doc) was observed with
+    /// no per-hold failure, its loop (if any) is certainly no longer able to
+    /// claim (P-2F), and its authoritative sweep's `jobs`/`building` fields
+    /// both read `Some`. `main` exits the process at once (a detached
+    /// training thread may still be running).
+    Released,
+    /// RELEASE was attempted but its own evidence does NOT confirm every
+    /// held lease was handed back — ANY determinant of P-RELEASE was
+    /// unobserved or reported failure: the release call itself errored, its
+    /// per-hold pass could not be confirmed to run or found a hold it
+    /// attempted and failed to release, its loop's terminal state was
+    /// neither certainly resolved nor genuinely observed, or one of its
+    /// sweep statements failed (`jammi_ai::fine_tune::worker::
+    /// ReleaseSweep::jobs`/`building` read `None`, a swallowed statement
+    /// failure, never fabricated into a claim of success). Which lease, if
+    /// any, still gets handed back is CONDITIONAL on which determinant
+    /// degraded, and a degraded determinant is a state defined by MISSING
+    /// evidence — it gets a definite consequence only where the evidence
+    /// actually establishes one (contract `CONTRACT-OPS-fix7.md`, round 7,
+    /// correcting round 6's own conditional, whose second branch asserted a
+    /// confirmed lease state for an arm whose defining property is that the
+    /// lease state is not established):
+    ///
+    /// * the release call itself errored — nothing further is established;
+    ///   whether any lease this instance held was handed back is unknown.
+    /// * a sweep statement for a lease's own table read `None` (the one
+    ///   case with a definite, table-specific cost): that lease truly was
+    ///   not written by this release and falls to the expiry path. A `jobs`
+    ///   row costs one attempt (`attempts + 1`, `releases` untouched); the
+    ///   linked `building` row lives in `result_tables`, which carries no
+    ///   `attempts`/`releases` columns at all, so its cost is a one-time
+    ///   back-off, never an attempt.
+    /// * the per-hold pass is `Unobserved`, or reports a per-hold failure,
+    ///   while both sweep fields still read `Some`: every row the sweep
+    ///   itself matched — not under an active hold — IS released, since
+    ///   that is what its `UPDATE`'s own commit reports. Nothing is
+    ///   established about a row under an active hold at that moment; the
+    ///   sweep predicate never matches a held row, and the pass whose job
+    ///   it was to release that hold is exactly the one whose evidence is
+    ///   missing.
+    /// * `stop_witnessed == false` while both sweep fields still read
+    ///   `Some`: every row the sweep matched by the time it ran IS
+    ///   released. Nothing is established about a claim that commits AFTER
+    ///   the sweep runs — `stop_witnessed == false` means precisely that
+    ///   such a claim is not ruled out, and it is outside the sweep's
+    ///   predicate: a live lease with `releases` untouched, falling to the
+    ///   expiry path.
+    ///
+    /// `main` still exits the process at once (exit code 3, distinct from
+    /// [`Self::Released`]'s 0)
+    /// — R6: an `Err` here must never propagate through the normal return
+    /// path, which would hang on a detached trainer past its grace period
+    /// and turn a degraded release into a kill.
+    ReleaseDegraded,
+}
+
+/// Whether a [`jammi_ai::fine_tune::worker::ReleaseSweep`]'s own evidence
+/// supports believing its two RELEASE statements actually ran: `jobs` and
+/// `building` both `Some`, never a swallowed statement error read back as
+/// `None` (`release_sweep`'s own doc — a failed statement is logged and
+/// folded into `Ok(None)`, never an `Err`, so `None` is the only signal
+/// left that it failed).
+fn sweep_confirms_release(sweep: &jammi_ai::fine_tune::worker::ReleaseSweep) -> bool {
+    sweep.jobs.is_some() && sweep.building.is_some()
+}
+
+/// One RELEASE call's raw result, from either surface that can issue it —
+/// the input to [`release_outcome`].
+enum ReleaseAttempt {
+    /// `EmbeddedWorker::release_and_stop`: two sweeps (2c, 2g); the FINAL
+    /// one (2g, unconditional, idempotent, run after the loop has stopped)
+    /// is the authoritative word on what actually got released, so it is
+    /// what evidence is read from — sweep #1 can legitimately read `None`
+    /// on a transient race and still have the release land via #2.
+    Worker(Result<jammi_ai::fine_tune::worker::ReleaseReport, jammi_db::error::JammiError>),
+    /// `InferenceSession::release_job_leases`: the worker-less peer, one
+    /// sweep, no loop (so P-2F is vacuously satisfied — there is no further
+    /// claim any loop could make).
+    SessionOnly(
+        Result<
+            (
+                jammi_ai::fine_tune::worker::HoldReleaseOutcome,
+                jammi_ai::fine_tune::worker::ReleaseSweep,
+            ),
+            jammi_db::error::JammiError,
+        >,
+    ),
+}
+
+/// R6's ONE outcome-evidence helper: the preload-exit early return and the
+/// main RELEASE arm both call this rather than each constructing
+/// [`ShutdownOutcome::Released`] merely from "the RELEASE signal fired".
+///
+/// Implements **P-RELEASE** (contract `CONTRACT-OPS-fix3.md`):
+/// [`ShutdownOutcome::Released`] iff EVERY determinant of "this RELEASE
+/// handed back every lease this instance held" was both observed and
+/// reports success — [`ShutdownOutcome::ReleaseDegraded`] whenever ANY
+/// determinant is unobserved or reports failure. The determinants:
+///
+/// * **P-2B** — the call itself succeeded (`Ok`) AND its keeper pass
+///   [`jammi_ai::fine_tune::worker::HoldReleaseOutcome::confirms_release`]
+///   (observed, no per-hold failure).
+/// * **P-2F** (`Worker` only) — [`jammi_ai::fine_tune::worker::ReleaseReport::stop_witnessed`]:
+///   no further claim by this loop can land. Vacuously true on
+///   `SessionOnly` (no loop exists).
+/// * **P-EXCLUSION** — only the FINAL sweep (`sweep_two` / the `SessionOnly`
+///   sweep) is a determinant; [`sweep_confirms_release`] is never called on
+///   `sweep_one`, whose `None` is legitimate on a transient race superseded
+///   by the idempotent final sweep.
+///
+/// Never panics and never itself surfaces an `Err` — a degraded release is
+/// a value, not a propagated failure (see [`ShutdownOutcome::ReleaseDegraded`]'s
+/// doc).
+fn release_outcome(attempt: ReleaseAttempt) -> ShutdownOutcome {
+    match attempt {
+        ReleaseAttempt::Worker(Ok(report)) => {
+            tracing::info!(
+                ?report.loop_state,
+                ?report.holds,
+                stop_witnessed = report.stop_witnessed,
+                ?report.sweep_one,
+                ?report.sweep_two,
+                "RELEASE: leases handed back; the loop is stopped"
+            );
+            if report.holds.confirms_release()
+                && report.stop_witnessed
+                && sweep_confirms_release(&report.sweep_two)
+            {
+                ShutdownOutcome::Released
+            } else {
+                ShutdownOutcome::ReleaseDegraded
+            }
+        }
+        ReleaseAttempt::Worker(Err(e)) => {
+            tracing::error!(error = %e, "RELEASE: the worker release failed");
+            ShutdownOutcome::ReleaseDegraded
+        }
+        ReleaseAttempt::SessionOnly(Ok((holds, sweep))) => {
+            tracing::info!(
+                ?holds,
+                ?sweep,
+                "RELEASE on a worker-less process: nothing loop-claimed to release"
+            );
+            if holds.confirms_release() && sweep_confirms_release(&sweep) {
+                ShutdownOutcome::Released
+            } else {
+                ShutdownOutcome::ReleaseDegraded
+            }
+        }
+        ReleaseAttempt::SessionOnly(Err(e)) => {
+            tracing::error!(
+                error = %e,
+                "RELEASE on a worker-less process: releasing leases failed"
+            );
+            ShutdownOutcome::ReleaseDegraded
+        }
+    }
 }
 
 impl BoundServer {
@@ -495,66 +893,373 @@ impl BoundServer {
         self.health_addr
     }
 
+    /// Whether this server owns an embedded worker guard (`[worker]
+    /// enabled`).
+    pub fn has_worker(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// A weak handle on the embedded worker's shared state (`None` without a
+    /// worker) — what the gauges and liveness read; exposed for oracles.
+    pub fn worker_shared(&self) -> Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>> {
+        self.worker.as_ref().map(|w| w.shared())
+    }
+
+    /// The ACTUAL address the internal `PeerService` listener is bound to —
+    /// `Some` iff `[server] peer_bind` was set (the real port for a `:0`
+    /// request).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
     /// Serve both halves on the already-bound listeners until `shutdown`
-    /// resolves. The HTTP side-channel and the gRPC surface drain in parallel;
-    /// the call returns when both have stopped accepting new connections and
-    /// finished serving in-flight requests.
+    /// resolves, then DRAIN: the gRPC surface drains and — concurrently,
+    /// gated on the same signal so the worker is never stopped at t = 0 —
+    /// the embedded worker finishes its in-flight job and is joined. A
+    /// RELEASE is never requested on this entry; [`Self::serve_with_signals`]
+    /// is the two-signal form.
     pub async fn serve_with_shutdown(
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
-        // Fan out one shutdown signal to both servers. A `broadcast`
-        // channel gives every subscriber an independent receiver and
-        // does not require the futures to share lifetimes.
-        let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        let mut shutdown_health_rx = shutdown_tx.subscribe();
-        let mut shutdown_grpc_rx = shutdown_tx.subscribe();
-        let shutdown_tx_for_signal = shutdown_tx.clone();
+        let (drain_tx, drain_rx) = watch::channel(false);
+        // Dropped with the task: a closed release sender reads as "never".
+        let (_release_tx, release_rx) = watch::channel(false);
         tokio::spawn(async move {
             shutdown.await;
-            // Receivers may already be gone if the servers errored
-            // first; either way the broadcast send is best-effort.
-            let _ = shutdown_tx_for_signal.send(());
+            let _ = drain_tx.send(true);
         });
+        self.serve_with_signals(drain_rx, release_rx)
+            .await
+            .map(|_| ())
+    }
 
+    /// Serve both halves until a signal arrives on `drain_rx` (DRAIN) or
+    /// `release_rx` (RELEASE) — the two-mode shutdown, PostgreSQL's mapping
+    /// (SIGTERM smart, SIGINT fast). A closed sender on either watch reads as
+    /// "that signal never comes".
+    ///
+    /// **DRAIN** (`drain_rx` → `true`): `/readyz` flips to 503 `"draining"`;
+    /// tonic's graceful shutdown closes the listener and finishes in-flight
+    /// requests while every idle `WaitJob`/`Subscribe` stream is ended with a
+    /// typed `UNAVAILABLE` "server draining" trailer (counted under
+    /// `jammi_grpc_refused_total{reason="draining"}`); concurrently the
+    /// worker's `begin_drain` + `stop_and_join` lets the in-flight job finish
+    /// (keeper alive, every epoch bundle lands) and joins the loop. Then the
+    /// health task stops, the session closes, OTLP flushes, and this returns
+    /// [`ShutdownOutcome::Drained`]. No engine-side timeout: the runtime's
+    /// grace period (`terminationGracePeriodSeconds`, `stop_grace_period`)
+    /// bounds it. An in-flight UNARY (including an inline `run_now`) is
+    /// bounded only by that grace.
+    ///
+    /// **RELEASE** (`release_rx` → `true`, at any time — it races the whole
+    /// DRAIN sequence): the gRPC serve future is dropped (connections
+    /// severed; an inline `run_now` future dies here and its row is left to
+    /// the inline liveness reclaim), then `EmbeddedWorker::release_and_stop`
+    /// hands every lease back and stops the loop (or, with no worker,
+    /// `InferenceSession::release_job_leases`, a no-op by construction), then
+    /// the same health/session/OTLP tail, and this returns
+    /// [`ShutdownOutcome::Released`] — the binary exits the process at once.
+    pub async fn serve_with_signals(
+        self,
+        drain_rx: watch::Receiver<bool>,
+        release_rx: watch::Receiver<bool>,
+    ) -> Result<ShutdownOutcome, ServerError> {
         let BoundServer {
             grpc,
             health_listener,
             health_addr,
             health_router,
+            peer,
+            peer_addr,
             session,
+            worker,
+            readiness,
         } = self;
         tracing::info!(
             address = %health_addr,
             "HTTP side-channel listening (/healthz, /readyz, /metrics)"
         );
 
+        // The health side-channel stays up through a DRAIN (D13) — it is
+        // signalled only at the very end, on its own channel.
+        let (health_stop_tx, health_stop_rx) = oneshot::channel::<()>();
+        // The peer listener: its own tonic server over the pre-bound
+        // `TcpListener` (a `TcpListenerStream` — deliberately without the
+        // public chain's nodelay tuning: internal unary RPC), carrying only
+        // the `MetricsLayer` so `jammi_grpc_requests_total` /
+        // `jammi_peer_requests_total{rpc}` count peer calls like any
+        // `/jammi.v1.*` request. No tenant layer, no gRPC-web framing, no
+        // `[server.limits]` stack — its clients are coordinators (I-PEER).
+        // It stays up through a DRAIN exactly like the health side-channel
+        // (D13's analogue: a coordinator's fan-out to this owner is never cut
+        // early) and is signalled only at the very end, on its own oneshot.
+        let (peer_stop_tx, peer_stop_rx) = oneshot::channel::<()>();
+        let peer_task = peer.map(|(listener, routes, registry)| {
+            tokio::spawn(async move {
+                tracing::info!(
+                    address = ?peer_addr,
+                    "peer listener listening (jammi.v1.peer.PeerService)"
+                );
+                Server::builder()
+                    .layer(MetricsLayer::new(registry))
+                    .add_routes(routes)
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        async move {
+                            let _ = peer_stop_rx.await;
+                        },
+                    )
+                    .await
+                    .map_err(ServerError::from)
+            })
+        });
+
         let health_task = tokio::spawn(async move {
             axum::serve(health_listener, health_router)
                 .with_graceful_shutdown(async move {
-                    let _ = shutdown_health_rx.recv().await;
+                    let _ = health_stop_rx.await;
                 })
                 .await
                 .map_err(ServerError::from)
         });
 
-        // Run both halves to completion. If either errors out we still
-        // wait for the other to drain — abandoning a running server
-        // mid-shutdown corrupts in-flight connections.
-        let grpc_result = grpc
-            .serve_with_shutdown(async move {
-                let _ = shutdown_grpc_rx.recv().await;
-            })
-            .await;
-        if grpc_result.is_err() {
-            let _ = shutdown_tx.send(());
+        // Warm-before-ready: preload every listed model inline, `/readyz`
+        // 503 "preloading i/n" meanwhile and the claim loop parked at its
+        // gate (`workers.state = warming`), raced against both signals. A
+        // signal aborts the preload and the server never serves; a preload
+        // error is a startup error. On both exits the worker is stopped and
+        // joined (its row deleted) BEFORE the session closes.
+        let entries = session.inner_config().server.preload_models.clone();
+        if !entries.is_empty() {
+            readiness.begin_preload(entries.len());
+            let preload = preload_models(&session, &readiness, &entries);
+            let mut drain_wait = drain_rx.clone();
+            let mut release_wait = release_rx.clone();
+            let outcome = tokio::select! {
+                result = preload => Some(result),
+                _ = drain_wait.wait_for(|v| *v) => None,
+                _ = release_wait.wait_for(|v| *v) => None,
+            };
+            let preempted: Option<Result<(), ServerError>> = match outcome {
+                Some(Ok(())) => None,
+                Some(Err(e)) => Some(Err(e)),
+                None => Some(Ok(())),
+            };
+            if let Some(preempted) = preempted {
+                readiness.begin_drain();
+                // W2/R6: the outcome must reflect what THIS arm actually
+                // DID, never merely which signal fired. On EITHER exit — a
+                // signal preempting the preload, or the preload itself
+                // erroring — the worker is still stopped and joined (its
+                // row deleted) before the session closes; a preload `Err`
+                // is never a release (`is_release` is `false` on it), so
+                // that arm always joins, never releases. The computed
+                // `outcome` is discarded on the `Err` arm below — only the
+                // join's SIDE EFFECT (the row delete) matters there — and
+                // is constructed only from its own evidence
+                // ([`release_outcome`]) on the `Ok` arm.
+                let is_release = matches!(preempted, Ok(())) && *release_rx.borrow();
+                let outcome = if is_release {
+                    match worker.as_ref() {
+                        Some(w) => {
+                            release_outcome(ReleaseAttempt::Worker(w.release_and_stop().await))
+                        }
+                        None => release_outcome(ReleaseAttempt::SessionOnly(
+                            session.release_job_leases().await,
+                        )),
+                    }
+                } else {
+                    // The gate is closed, so the loop returns without a
+                    // claim; the join orders the row's delete after the
+                    // task's own upsert. `worker_joined` is the call's own
+                    // `StopOutcome` (F4b), never `worker.is_some()` — that
+                    // would read `true` even when the join itself errored
+                    // or found nothing left to join.
+                    let worker_joined = match worker.as_ref() {
+                        Some(w) => match w.stop_and_join().await {
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::Joined) => true,
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::NothingToJoin) => false,
+                            Err(e) => {
+                                tracing::error!(error = %e, "preload exit: the worker join failed");
+                                false
+                            }
+                        },
+                        None => false,
+                    };
+                    ShutdownOutcome::Drained { worker_joined }
+                };
+                let early: Result<ShutdownOutcome, ServerError> = match preempted {
+                    Err(e) => Err(e),
+                    Ok(()) => Ok(outcome),
+                };
+                // R6: the tail this early return shares with the main one —
+                // health side-channel, then the PEER listener (previously
+                // skipped here entirely: dropping the sender starts its
+                // graceful shutdown but nothing established it finished
+                // before the session closed — the same divergence class as
+                // the outcome itself), then the session and OTLP. FOLDED,
+                // never discarded (the main tail's own `result.and(health_
+                // result).and(peer_result)`): no hang risk in folding here —
+                // this exit precedes the worker gate opening, so no job is
+                // claimed and no detached trainer exists to wait on.
+                //
+                // UNREACHABLE AT THE PINNED VERSIONS, established by reading
+                // both crates rather than argued (contract
+                // `CONTRACT-OPS-fix6.md`, round 6, correcting round 5's
+                // `CONTRACT-OPS-fix5.md`): no test drives `health_task` or
+                // `peer_task` to `Err` on this exact preload-exit path
+                // because, at the pinned dependency versions, NEITHER serve
+                // future can return `Err` from a live socket at all — this
+                // is not a tooling gap, it is a fact about the pinned
+                // dependencies. `axum::serve(..).with_graceful_shutdown(..)`'s
+                // `IntoFuture` is literally `{ self.run().await; Ok(()) }`
+                // (`axum-0.8.8/src/serve/mod.rs:344-348`), and its
+                // `Listener::accept` loop for a `TcpListener` never returns
+                // on error — an EMFILE from descriptor exhaustion is logged
+                // and slept on for 1s, then retried
+                // (`axum-0.8.8/src/serve/listener.rs:30-36,140-158`).
+                // Tonic's `Server::serve_with_incoming_shutdown` loop does
+                // `Some(Err(e)) => { trace!(..); continue; }` on an accept
+                // error, and its only fallible call is `MakeSvc::call`,
+                // which is `future::ready(Ok(svc))`
+                // (`tonic-0.14.5/src/transport/server/mod.rs:841-845,1250`).
+                // Both futures return `Ok(())` on every path, so raw-fd
+                // manipulation or a lowered `RLIMIT_NOFILE` — the routes a
+                // prior round named and declined to build — would not have
+                // produced an `Err` either; the arm is unreachable by
+                // construction, not by a missing fault-injection technique.
+                // The arm itself IS still reached
+                // (`signal_during_preload_exits_without_serving`,
+                // `release_signal_during_preload_actually_releases`,
+                // `preload_of_an_unloadable_model_is_a_startup_error` all
+                // enter it) — this fold is dead only for `Err`, live for
+                // `Ok`, and never dead code — but the fold this comment
+                // defends is defence against a FUTURE change to the pinned
+                // `axum`/`tonic` versions that makes one of these serve
+                // futures fallible on accept-loop exhaustion, not against a
+                // producer that exists in the tree today. Whether either
+                // task's join-error (`Err(join_err)`) arm just below is
+                // covered by anything in this suite is UNMEASURED — a grep
+                // for a test that panics either task found none — and is
+                // left that way rather than asserted.
+                let _ = health_stop_tx.send(());
+                let health_result = match health_task.await {
+                    Ok(r) => r,
+                    Err(join_err) => {
+                        Err(ServerError::Io(std::io::Error::other(join_err.to_string())))
+                    }
+                };
+                let _ = peer_stop_tx.send(());
+                let peer_result = match peer_task {
+                    Some(task) => match task.await {
+                        Ok(r) => r,
+                        Err(join_err) => {
+                            Err(ServerError::Io(std::io::Error::other(join_err.to_string())))
+                        }
+                    },
+                    None => Ok(()),
+                };
+                session.close().await;
+                crate::telemetry::flush_otlp();
+                return early.and(health_result).and(peer_result).map(|()| outcome);
+            }
         }
+        readiness.set_warm();
+        session.open_worker_gate();
+
+        enum Arm {
+            Drained {
+                grpc: Result<(), ServerError>,
+                worker_joined: bool,
+            },
+            Release,
+        }
+
+        let arm = {
+            let grpc_serve = grpc.serve_with_drain(drain_rx.clone());
+            let mut drain_gate = drain_rx.clone();
+            let worker_ref = worker.as_ref();
+            let readiness_ref = Arc::clone(&readiness);
+            // The gated join half: nothing here runs until DRAIN is
+            // signalled, so the worker is never stopped at t = 0.
+            let gated_join = async move {
+                let _ = drain_gate.wait_for(|v| *v).await;
+                readiness_ref.begin_drain();
+                match worker_ref {
+                    Some(w) => {
+                        w.begin_drain().await;
+                        match w.stop_and_join().await {
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::Joined) => true,
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::NothingToJoin) => false,
+                            Err(e) => {
+                                tracing::error!(error = %e, "DRAIN: the worker join failed");
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            };
+            let drain_sequence = async { tokio::join!(grpc_serve, gated_join) };
+            let mut release_rx = release_rx;
+            let release_wait = async move {
+                if release_rx.wait_for(|v| *v).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                (grpc, worker_joined) = drain_sequence => Arm::Drained { grpc, worker_joined },
+                () = release_wait => Arm::Release,
+            }
+        };
+
+        let (result, outcome) = match arm {
+            Arm::Drained {
+                grpc,
+                worker_joined,
+            } => (grpc, ShutdownOutcome::Drained { worker_joined }),
+            Arm::Release => {
+                // Step 1 already happened: `select!` dropped the drain
+                // sequence, and with it the gRPC serve future — connections
+                // severed. Step 2: the one release mechanism, whose outcome
+                // is constructed only from its own evidence (R6:
+                // [`release_outcome`]) — never surfaced as an `Err` here: a
+                // degraded release still exits the process at once, exactly
+                // like a confirmed one (see [`ShutdownOutcome::
+                // ReleaseDegraded`]'s doc for why propagating it as an `Err`
+                // would instead hang on a detached trainer past the grace
+                // period).
+                readiness.begin_drain();
+                let outcome = match worker.as_ref() {
+                    Some(w) => release_outcome(ReleaseAttempt::Worker(w.release_and_stop().await)),
+                    None => release_outcome(ReleaseAttempt::SessionOnly(
+                        session.release_job_leases().await,
+                    )),
+                };
+                (Ok(()), outcome)
+            }
+        };
+
+        // The tail both arms share: stop the health side-channel, release
+        // the catalog (the keeper's own connection included, N3 — a
+        // successor process can open the same SQLite catalog directory at
+        // once), flush telemetry.
+        let _ = health_stop_tx.send(());
         let health_result = match health_task.await {
             Ok(r) => r,
             Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
         };
+        let _ = peer_stop_tx.send(());
+        let peer_result = match peer_task {
+            Some(task) => match task.await {
+                Ok(r) => r,
+                Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
+            },
+            None => Ok(()),
+        };
 
-        // Both halves have stopped accepting and finished draining
+        // Every listener has stopped accepting and finished draining
         // in-flight requests — the graceful-shutdown release point.
         // `InferenceSession::close` shuts the lease keeper (N3) down and
         // joins its dedicated thread (closing its own catalog connection)
@@ -564,15 +1269,22 @@ impl BoundServer {
         // catalog directory immediately rather than waiting out the process
         // exit.
         session.close().await;
+        crate::telemetry::flush_otlp();
 
-        grpc_result.and(health_result)
+        result.and(health_result).and(peer_result).map(|()| outcome)
     }
 
-    /// Serve both halves until SIGINT / SIGTERM arrives. The binary entry
-    /// point ([`OssServer::run`] and `main`) reaches graceful shutdown through
-    /// this.
-    pub async fn serve(self) -> Result<(), ServerError> {
-        self.serve_with_shutdown(shutdown_signal()).await
+    /// Serve both halves until an OS signal arrives — the binary entry
+    /// point. One task owns both signal streams from this point on (tokio
+    /// coalesces signals only before a stream's first poll): the first
+    /// SIGTERM is DRAIN; SIGINT at any time, or any later SIGTERM, is
+    /// RELEASE. Ctrl+C on a laptop therefore releases the running job and
+    /// exits promptly, exactly as `kill -INT` does in a container.
+    pub async fn serve(self) -> Result<ShutdownOutcome, ServerError> {
+        let (drain_tx, drain_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
+        tokio::spawn(signal_watcher(drain_tx, release_tx));
+        self.serve_with_signals(drain_rx, release_rx).await
     }
 }
 
@@ -1005,6 +1717,15 @@ impl BoundChain {
         &self.mounted
     }
 
+    /// Take the embedded worker guard out of the chain, so a caller that
+    /// needs it to outlive the gRPC serve future (the server's two-mode
+    /// shutdown) owns it. After this the chain's own serve paths hold no
+    /// worker and their `Drop` stops nothing. `None` when this process runs
+    /// no claim loop, or when it was already taken.
+    pub fn take_worker(&mut self) -> Option<jammi_ai::fine_tune::worker::EmbeddedWorker> {
+        self._worker.take()
+    }
+
     /// Serve the bound chain on its already-open listener until `shutdown`
     /// resolves. Consumes `self`, keeping the training-worker guard alive for
     /// the whole serve loop.
@@ -1031,6 +1752,25 @@ impl BoundChain {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
+        let (drain_tx, drain_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = drain_tx.send(true);
+        });
+        self.serve_with_drain(drain_rx).await
+    }
+
+    /// [`Self::serve_with_shutdown`] on a drain watch: tonic's graceful
+    /// shutdown (listener closed, in-flight requests finished) begins when
+    /// `drain_rx` reads `true`, and the same watch feeds
+    /// [`crate::limits::MethodClassLayer`]'s stream ender, so an idle
+    /// `WaitJob`/`Subscribe` stream is ended with `UNAVAILABLE` "server
+    /// draining" instead of holding the drain open forever. A closed sender
+    /// reads as "never drain".
+    pub async fn serve_with_drain(
+        self,
+        drain_rx: watch::Receiver<bool>,
+    ) -> Result<(), ServerError> {
         tracing::info!(
             "gRPC chain ({}) listening on {}",
             self.mounted.join(" + "),
@@ -1042,7 +1782,14 @@ impl BoundChain {
         // `add_routes` attaches it behind the stack at serve time, then serves
         // on the pre-bound listener via `serve_with_incoming_shutdown`.
         let refusal_metrics = Arc::clone(&self.metrics);
+        let drain_metrics = Arc::clone(&self.metrics);
         let limits = self.limits;
+        let mut shutdown_rx = drain_rx.clone();
+        let shutdown = async move {
+            if shutdown_rx.wait_for(|v| *v).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
         let mut server = Server::builder()
             .accept_http1(true)
             .layer(MetricsLayer::new(self.metrics))
@@ -1056,14 +1803,16 @@ impl BoundChain {
             .layer(crate::limits::PerConnectionLimitLayer::new(
                 limits.max_in_flight_per_connection,
             ))
-            .layer(crate::limits::MethodClassLayer::new(&limits));
+            .layer(
+                crate::limits::MethodClassLayer::new(&limits).with_drain(drain_rx, drain_metrics),
+            );
         server
             .add_routes(self.routes)
             .serve_with_incoming_shutdown(self.incoming, shutdown)
             .await
             .map_err(ServerError::from)
-        // `self._worker` is dropped here, after the serve future resolves — its
-        // RAII lifetime spans the whole serve loop.
+        // `self._worker` (if not taken) is dropped here, after the serve
+        // future resolves — its RAII lifetime spans the whole serve loop.
     }
 }
 
@@ -1319,39 +2068,125 @@ pub async fn serve_grpc_chain(
     assemble_grpc_chain(chain)?.serve(shutdown).await
 }
 
-/// Install OS shutdown handlers and resolve when SIGINT or SIGTERM
-/// arrives. Mirrors the existing `lib.rs` behaviour so the binary
-/// shuts down on Ctrl+C and on `docker stop` (which sends SIGTERM).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        match signal::ctrl_c().await {
-            Ok(()) => {}
-            Err(e) => tracing::error!("Failed to install Ctrl+C handler: {e}"),
-        }
-    };
+/// Preload every `[server] preload_models` entry into the session's model
+/// cache, in order: `ModelSource::parse(id)`; the task is the entry's
+/// explicit one, else the catalog's `models` row for the id, else a typed
+/// [`ServerError::Preload`] ("no models row; give { id, task }"); a load
+/// failure is the same typed error. Each cached entry advances `/readyz`'s
+/// "preloading i/n".
+async fn preload_models(
+    session: &Arc<InferenceSession>,
+    readiness: &ReadinessProbe,
+    entries: &[jammi_db::config::PreloadEntry],
+) -> Result<(), ServerError> {
+    for entry in entries {
+        let source = jammi_ai::model::ModelSource::parse(&entry.id);
+        let task = match entry.task {
+            Some(task) => task,
+            None => match session.catalog().get_model(&entry.id).await {
+                Ok(Some(record)) => record.task,
+                Ok(None) => {
+                    return Err(ServerError::Preload {
+                        id: entry.id.clone(),
+                        reason: "no models row; give { id, task }".to_string(),
+                    })
+                }
+                Err(e) => {
+                    return Err(ServerError::Preload {
+                        id: entry.id.clone(),
+                        reason: format!("models row lookup failed: {e}"),
+                    })
+                }
+            },
+        };
+        tracing::info!(model = %entry.id, ?task, "preloading model");
+        session
+            .model_cache()
+            .preload(&source, task, None)
+            .await
+            .map_err(|e| ServerError::Preload {
+                id: entry.id.clone(),
+                reason: e.to_string(),
+            })?;
+        readiness.note_preloaded();
+    }
+    Ok(())
+}
 
+/// The one task that owns both OS signal streams for the process's
+/// lifetime (tokio coalesces a signal only before its stream's first poll;
+/// after that every delivery is an item): the first SIGTERM sends DRAIN on
+/// `drain_tx`; SIGINT at any time, or any SIGTERM after the first, sends
+/// RELEASE on `release_tx` and the task ends. PostgreSQL's mapping — SIGTERM
+/// smart, SIGINT fast — and the reason RELEASE is reachable by a distinct
+/// signal: an orchestrator sends one stop signal then SIGKILL, so a second
+/// SIGTERM never arrives from it; `jammi-server release` (a preStop hook)
+/// and Ctrl+C send SIGINT.
+async fn signal_watcher(drain_tx: watch::Sender<bool>, release_tx: watch::Sender<bool>) {
     #[cfg(unix)]
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
+    {
+        let mut interrupt = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!("Failed to install SIGINT handler: {e}");
+                None
             }
+        };
+        let mut terminate = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(s) => Some(s),
             Err(e) => {
                 tracing::error!("Failed to install SIGTERM handler: {e}");
-                std::future::pending::<()>().await;
+                None
+            }
+        };
+        let mut draining = false;
+        loop {
+            let on_interrupt = async {
+                match interrupt.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let on_terminate = async {
+                match terminate.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = on_interrupt => {
+                    tracing::info!("SIGINT received: RELEASE — handing leases back and exiting");
+                    let _ = release_tx.send(true);
+                    return;
+                }
+                () = on_terminate => {
+                    if draining {
+                        tracing::info!("second SIGTERM while draining: RELEASE");
+                        let _ = release_tx.send(true);
+                        return;
+                    }
+                    draining = true;
+                    tracing::info!("SIGTERM received: DRAIN — finishing in-flight work");
+                    let _ = drain_tx.send(true);
+                }
             }
         }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
     }
-
-    tracing::info!("Shutdown signal received, draining connections...");
+    #[cfg(not(unix))]
+    {
+        let _ = &drain_tx;
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                tracing::info!("Ctrl+C received: RELEASE");
+                let _ = release_tx.send(true);
+            }
+            Err(e) => tracing::error!("Failed to install Ctrl+C handler: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1554,6 +2389,554 @@ mod audit_master_key_tests {
         assert!(
             msg.contains(path.to_str().unwrap()),
             "error must name the unreadable path, got: {msg}"
+        );
+    }
+}
+
+/// OPS round 3 (contract `CONTRACT-OPS-fix3.md`) — the non-negotiable test
+/// capacity over `release_outcome`'s predicate: round 2 shipped a predicate
+/// change (the parity-oracle deletion + evidence-based outcome) with ZERO
+/// observing oracle, and the round-3 audit proved it by mutation — forcing
+/// the predicate to `true` and reverting the paired change still left an
+/// 18-of-18 green suite. This module reaches the private `release_outcome`
+/// directly (an in-crate `#[cfg(test)]` table test — no server, no signals,
+/// no tokio runtime needed).
+///
+/// **What actually goes RED, measured, not asserted** (contract
+/// `CONTRACT-OPS-fix4.md` M3 — the round-3 audit found this doc previously
+/// overstated its own module's capacity: it claimed "every test below
+/// fails" against the round-2 revert, when the round-4 audit performed that
+/// exact revert and only a minority did). Reverting BOTH arms' predicates to
+/// "success iff the call returned `Ok`" (round 2's predicate) turns every
+/// test that pins a determinant *this* module folds in RED, and leaves every
+/// must-be-`Released` pin and every outer-`Err` pin GREEN — a weaker
+/// predicate can only ever be MORE permissive on the `Ok` arms than a
+/// stronger one, never less, so a "must be `Released`" or "must be
+/// `Degraded`-on-`Err`" pin cannot be falsified by weakening a conjunct on
+/// `Ok`. Only the determinant-pinning tests can, and do, go red under that
+/// revert; see each test's own doc for which determinant it pins. Measured
+/// at this module's current 15 tests: 7 go red, 8 stay green (re-run
+/// yourself before trusting this number — it is a property of the test
+/// count at the time this sentence was written, not a promise about a
+/// future edit to this module).
+///
+/// # M1 — the determinant enumeration (contract `CONTRACT-OPS-fix4.md`)
+///
+/// This table test's oracles construct every determinant as a LITERAL — it
+/// establishes the predicate reads each determinant correctly, never that
+/// any real producer ever emits a failing one. The round-4 audit proved by
+/// mutation that the producer half was entirely unobserved: applying all
+/// four producer-side collapses at once (forcing `stop_witnessed` constant
+/// `true`, re-collapsing the worker's and the session's per-hold `Err` back
+/// into `Observed(HoldRelease::default())`, and folding the keeper's
+/// per-hold `Err` back into `not_required`) left the WHOLE crate's suite
+/// green, counts identical to baseline. The round-5 audit then measured
+/// each of those four collapses SEPARATELY (never combined) and found the
+/// producer half was in fact 1 of 4 observed, and refuted two of this
+/// table's own "NOT producer-driven" claims by execution in ~2 seconds
+/// using a technique already in this test tree — closed below. Every
+/// determinant, enumerated, and where its producer-driven oracle lives or
+/// why one does not exist yet:
+///
+/// * **P-2B, `HoldReleaseOutcome::Unobserved` (`Worker` arm)** (the keeper's
+///   per-hold pass could not be confirmed to run at all): producer-driven in
+///   `jammi-server`'s `crates/jammi-server/tests/it/liveness.rs`
+///   (`healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies`)
+///   — the test kills the real keeper thread with
+///   `LeaseKeeper::kill_thread_for_test`, then drives a real DRAIN+RELEASE
+///   through `serve_with_signals`, and asserts the outcome the running
+///   system actually returns is `ReleaseDegraded`. No literal `HoldRelease`
+///   or `HoldReleaseOutcome` is constructed anywhere in that test.
+/// * **P-2B, `HoldReleaseOutcome::Unobserved` (`SessionOnly` arm)** — a
+///   SEPARATE producer from the bullet above, which drives the `Worker` arm
+///   only: producer-driven in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_is_unobserved_when_the_keeper_thread_is_dead`),
+///   the identical `LeaseKeeper::kill_thread_for_test` technique applied to
+///   `InferenceSession::release_job_leases`'s own collapse.
+/// * **P-2B, `HoldRelease.failed > 0`** (a per-hold release attempt itself
+///   returning `Err` from `Catalog::release_job_lease`): producer-driven in
+///   `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_reports_failed_from_a_real_backend_fault`). A prior
+///   round of this doc claimed this was uncoverable — "no fault-injecting
+///   `CatalogBackend` implementation and no reliable way to force one from
+///   outside" — which was FALSE: a schema-level fault (`ALTER TABLE jobs
+///   DROP COLUMN releases`, through the public `SqliteBackend::open` +
+///   `CatalogBackend::transaction`, exactly the pattern
+///   `crates/jammi-db/tests/it/migrations.rs` already uses) makes every
+///   `release_job_lease` `UPDATE` fail at prepare time on the keeper's own
+///   pooled connection, with no new test double. The claim was closed in
+///   prose while the code stayed unobserved; the fix is the test, not the
+///   sentence.
+/// * **P-2B, `HoldRelease.not_required`** (a hold that provably did not need
+///   releasing): producer-driven in
+///   `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_flips_lost_and_skips_inline_holds`) — a real
+///   inline-claimed row's hold produces a genuine `Ok(false)` from
+///   `Catalog::release_job_lease`.
+/// * **P-2B totality** (`released + not_required + failed == attempted`,
+///   `HoldRelease::attempted` — M5): whether the production pass's own
+///   `assert_eq!` (`crates/jammi-db/src/catalog/lease_keeper.rs`) can be
+///   bypassed from a test without corrupting the pass is UNCOVERED (R-A) —
+///   no test attempts it; the claim that it cannot is prose, not an
+///   executed falsification. The consumer-side check IS driven with a
+///   literal (`confirms_release_catches_an_undercounted_attempted` in
+///   `crates/jammi-ai/src/fine_tune/worker.rs`), which is what this bullet
+///   can actually stand behind: every iteration of
+///   `release_job_holds_on_thread` increments exactly one of
+///   `released`/`not_required`/`failed` against an `attempted` fixed before
+///   the loop starts, so a producer that reaches the consumer without
+///   panicking cannot emit an inconsistent value — but that is read from
+///   the pass's source, not measured by an attempt to break it.
+/// * **P-2F, `stop_witnessed == true`** via a genuine abort or join
+///   (`stop_resolved`): producer-driven throughout
+///   `crates/jammi-server/tests/it/serve_shutdown_modes.rs` (e.g. the
+///   sigint-while-draining and abort scenarios) and by the liveness test
+///   above (a `Stopped` loop after the keeper dies still resolves the task).
+/// * **P-2F, `stop_witnessed == false`** (2e found nothing to take AND 2f's
+///   own observation fell back to the last-known proxy read): producer-driven
+///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`a_release_racing_an_in_flight_drain_reads_stop_unwitnessed`) — exactly
+///   "any signal while draining is a RELEASE" (`deploy-server.md`): a DRAIN
+///   (`stop_and_join`, unbounded by design) takes the handle — deterministically,
+///   via a single hand-driven poll rather than a scheduler race — and waits
+///   on an in-flight job the test parks mid-materialization with a real hold
+///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock or
+///   the process-global `training_test_hooks::arm_pause_before_spawn_blocking`,
+///   which is not scoped per test and was measured to let a concurrently
+///   running fine-tune test steal the park), and a concurrent RELEASE loses
+///   the handle race (`stop_resolved == false`) and then times out at 2f
+///   within one heartbeat (`state_witnessed == false`) because the
+///   still-parked loop never transitions. A prior round of this doc claimed
+///   this arm was structurally unreachable; that argument is retracted in
+///   favour of the test — the reasoning was never wrong about the
+///   SINGLE-caller path, only about there being no second caller.
+/// * **Sweep confirmation, `ReleaseSweep.jobs == None`** (the jobs sweep
+///   statement itself returning `Err`): producer-driven in
+///   `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_reports_failed_from_a_real_backend_fault`, which
+///   also asserts `Catalog::release_jobs_claimed_by` errors under the same
+///   fault) and end-to-end through a real `EmbeddedWorker::release_and_stop`
+///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_real_fault`),
+///   which also confirms `ReleaseSweep.building` is UNAFFECTED by the same
+///   fault (a different table, a different column) — the asymmetric shape
+///   `sweep_confirms_release`'s two conjuncts read independently. Pinned at
+///   the predicate itself by the literal
+///   `a_jobs_only_unconfirmed_second_sweep_degrades` /
+///   `session_only_jobs_only_unconfirmed_sweep_degrades` below: every
+///   PRE-EXISTING unconfirmed-sweep pin in this table used `building ==
+///   None`, so dropping the `jobs` conjunct out of `sweep_confirms_release`
+///   went unnoticed by every test in this file until this round.
+/// * **Sweep confirmation, `ReleaseSweep.building == None`** (the linked
+///   building-table sweep statement itself returning `Err`): producer-driven
+///   ON THE `SessionOnly` ARM ONLY, in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_real_fault`
+///   — named `one_sweep`, round 7, because `InferenceSession::release_job_leases`
+///   runs `release_sweep` exactly once; there is no sweep #1 on that path for
+///   this to be "second" after). A round-5 version of this doc declared this
+///   arm "NOT producer-driven ... no OTHER injection point into this
+///   statement is established", reasoning only about the COLUMN
+///   `release_building_tables_of_claimant`'s `UPDATE` WRITES
+///   (`result_tables.lease_expires_at`); that argument is retracted — the
+///   statement also NAMES a second table it reads FROM, `result_tables`
+///   itself, and renaming that table out from under the statement (the same
+///   public `SqliteBackend::open` + `CatalogBackend::transaction` surface
+///   the `jobs`-fault test above uses) faults it while
+///   `release_jobs_claimed_by` — which never touches `result_tables` —
+///   still confirms: the mirror image of the asymmetric shape above.
+///   STILL UNDRIVEN: `EmbeddedWorker::release_and_stop`'s own sweep #2 (2g)
+///   reaching `building == None` from a real backend fault, through a real
+///   worker loop — no test in this tree does that; only the `SessionOnly`
+///   arm's single sweep is producer-driven for this determinant. Covered at
+///   the predicate itself by the literal `an_unconfirmed_second_sweep_degrades`
+///   / `session_only_unconfirmed_sweep_degrades` below.
+/// * **Outer `Err`** (`ReleaseAttempt::Worker(Err(_))` /
+///   `SessionOnly(Err(_))`): a single unconditional match arm with no
+///   conjunct to collapse — a mutation deleting either arm's body is caught
+///   by any test that exercises it at all, so this is lower-value to drive
+///   from a producer; covered by the literal `worker_err_is_degraded` /
+///   `session_only_err_is_degraded` below.
+#[cfg(test)]
+mod release_outcome_tests {
+    use jammi_ai::fine_tune::worker::{HoldReleaseOutcome, LoopState, ReleaseReport, ReleaseSweep};
+    use jammi_db::catalog::lease_keeper::HoldRelease;
+    use jammi_db::error::JammiError;
+
+    use super::{release_outcome, ReleaseAttempt, ShutdownOutcome};
+
+    fn sweep(jobs: Option<usize>, building: Option<usize>) -> ReleaseSweep {
+        ReleaseSweep { jobs, building }
+    }
+
+    /// A sweep whose own evidence confirms it ran (both fields `Some`).
+    fn confirmed_sweep() -> ReleaseSweep {
+        sweep(Some(0), Some(0))
+    }
+
+    fn report(
+        loop_state: LoopState,
+        holds: HoldReleaseOutcome,
+        stop_witnessed: bool,
+        sweep_one: ReleaseSweep,
+        sweep_two: ReleaseSweep,
+    ) -> ReleaseReport {
+        ReleaseReport {
+            loop_state,
+            holds,
+            stop_witnessed,
+            sweep_one,
+            sweep_two,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // The four arms of `ReleaseAttempt` / `release_outcome`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn worker_ok_fully_confirmed_is_released() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    #[test]
+    fn worker_err_is_degraded() {
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Err(JammiError::Catalog(
+                "lease keeper: cannot release job holds, its thread is dead".into()
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    #[test]
+    fn session_only_ok_fully_confirmed_is_released() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease::default());
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((holds, confirmed_sweep())))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    #[test]
+    fn session_only_err_is_degraded() {
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Err(JammiError::Catalog(
+                "boom".into()
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Contract `CONTRACT-OPS-fix4.md` M2: the `SessionOnly` arm's own P-2B
+    // conjunct (`holds.confirms_release() &&`, folded in this round exactly
+    // like the Worker arm's) had NO oracle — the round-4 audit found
+    // deleting it left `release_outcome_tests` 12/12 green AND the whole
+    // `jammi-server` crate 285/285 green. These pin it, mirroring the two
+    // cases already proven load-bearing on the Worker arm
+    // (`an_unobserved_hold_pass_degrades`, `a_failed_hold_degrades_even_with_
+    // confirmed_sweeps`) rather than adding only the single case the audit
+    // wrote out.
+    // -------------------------------------------------------------------
+
+    /// The keeper's per-hold pass itself unobserved (a dead keeper) must
+    /// degrade a `SessionOnly` release exactly as it does a `Worker` one,
+    /// even though the outer call and the sweep are both fine.
+    #[test]
+    fn session_only_unobserved_hold_pass_degrades() {
+        let holds = HoldReleaseOutcome::Unobserved;
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((holds, confirmed_sweep())))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// A per-hold failure degrades a `SessionOnly` release even though the
+    /// outer call succeeded and the sweep confirms.
+    #[test]
+    fn session_only_failed_hold_degrades() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 1,
+            attempted: 1,
+        });
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((holds, confirmed_sweep())))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// Sibling check on the OTHER conjunct of the same arm's predicate
+    /// (`sweep_confirms_release`, pre-existing but never pinned for
+    /// `SessionOnly` specifically): an unconfirmed sweep degrades a
+    /// `SessionOnly` release even with a fully confirmed hold pass.
+    #[test]
+    fn session_only_unconfirmed_sweep_degrades() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 0,
+            attempted: 0,
+        });
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((
+                holds,
+                sweep(Some(0), None)
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// The `SessionOnly` peer of `a_jobs_only_unconfirmed_second_sweep_
+    /// degrades`: the same asymmetric arm (`jobs == None`, `building ==
+    /// Some(_)`) no existing `SessionOnly` pin exercises either.
+    #[test]
+    fn session_only_jobs_only_unconfirmed_sweep_degrades() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 0,
+            attempted: 0,
+        });
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((
+                holds,
+                sweep(None, Some(0))
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The newly folded determinants (P-2B, P-2F, P-EXCLUSION) — each of
+    // these fails against the round-2 predicate ("success iff `Ok`").
+    // -------------------------------------------------------------------
+
+    /// P-2B: a per-hold failure degrades the outcome even though the OUTER
+    /// call succeeded and both sweeps confirm — the collapse this round's
+    /// contract closes at the producer (`lease_keeper.rs`), pinned here at
+    /// the predicate that reads it.
+    #[test]
+    fn a_failed_hold_degrades_even_with_confirmed_sweeps() {
+        let r = report(
+            LoopState::Aborted,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 0,
+                not_required: 0,
+                failed: 1,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// P-2B: the keeper's per-hold pass itself UNOBSERVED (a dead keeper or
+    /// a bound exceeded) is never treated as "zero holds released" —
+    /// degraded, never released, even though the outer call and both
+    /// sweeps are fine. This is the exact collapse a bare `usize` could not
+    /// represent.
+    #[test]
+    fn an_unobserved_hold_pass_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Unobserved,
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// P-2F: an unwitnessed stop (2e found nothing to take AND 2f fell back
+    /// to the last-known proxy read) degrades even with a confirmed hold
+    /// pass and confirmed sweeps.
+    #[test]
+    fn an_unwitnessed_stop_degrades() {
+        let r = report(
+            LoopState::Running,
+            HoldReleaseOutcome::Observed(HoldRelease::default()),
+            false,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// P-EXCLUSION: sweep #1 unconfirmed (`None`) must NEVER degrade the
+    /// outcome on its own — folding it in would manufacture a false
+    /// degraded on a transient race the idempotent sweep #2 already
+    /// superseded.
+    #[test]
+    fn an_unconfirmed_first_sweep_alone_never_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            sweep(None, None),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    /// Sweep #2 unconfirmed still degrades — the pre-existing behaviour,
+    /// pinned so this round's changes cannot regress it.
+    #[test]
+    fn an_unconfirmed_second_sweep_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            sweep(Some(0), None),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// `sweep_confirms_release`'s TWO conjuncts fail independently
+    /// (contract `CONTRACT-OPS-fix5.md`, round 5): every existing
+    /// unconfirmed-sweep pin above (and `session_only_unconfirmed_sweep_
+    /// degrades` below) drops `building` and leaves `jobs` `Some`, so
+    /// dropping the `jobs` conjunct out of `sweep_confirms_release`
+    /// entirely went unnoticed. Pinned here on the arm none of those
+    /// exercise: `jobs == None`, `building == Some(_)`.
+    #[test]
+    fn a_jobs_only_unconfirmed_second_sweep_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            sweep(None, Some(0)),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // False-positive pins: a normal cooperative release and a normal abort
+    // release must both still report `Released` — the contract's own
+    // stop-rule condition (a regression here that only a mutation test
+    // would catch is exactly what ends this unit's wave-1 participation).
+    // -------------------------------------------------------------------
+
+    /// A normal cooperative release: 2e joined the task after observing
+    /// its exit (`stop_witnessed = true`), `loop_state` `Stopped`, no
+    /// holds needed, both sweeps confirm.
+    #[test]
+    fn a_normal_cooperative_release_is_released() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease::default()),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    /// A normal abort release: 2e aborted the task directly
+    /// (`stop_witnessed = true` via 2e's own certain resolution), a held
+    /// lease released, both sweeps confirm — this is
+    /// `serve_shutdown_modes::sigint_while_draining_releases_and_returns_
+    /// released_within_two_heartbeats`'s (O1's) own scenario, pinned here
+    /// at the unit level so a predicate regression is caught without the
+    /// full server harness.
+    #[test]
+    fn a_normal_abort_release_is_released() {
+        let r = report(
+            LoopState::Aborted,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    /// The falsifier the design round handed forward, demonstrated
+    /// directly: an abort whose in-task guard has not published within one
+    /// heartbeat (`loop_state` reads a stale `Running`, the fallback proxy
+    /// read) must NOT spuriously degrade a release that 2e itself already
+    /// resolved with certainty.
+    #[test]
+    fn stop_witnessed_via_2e_survives_a_stale_running_read() {
+        let r = report(
+            LoopState::Running,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
         );
     }
 }

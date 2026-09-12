@@ -40,6 +40,10 @@ use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, Trig
 use jammi_db::{AuditError, ModelTask, PerQueryAudit, TenantId};
 
 use jammi_admin::CatalogClient;
+use jammi_wire::embedding_refresh::{
+    delete_policy_to_proto, expiry_report_from_proto, refresh_report_from_proto, ExpiryReport,
+    RefreshOptions, RefreshReport,
+};
 use jammi_wire::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
 use jammi_wire::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_wire::proto::audit::audit_service_client::AuditServiceClient;
@@ -49,8 +53,8 @@ use jammi_wire::proto::audit::{
 use jammi_wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use jammi_wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
-    EncodeQueryRequest, GenerateEmbeddingsRequest, QueryVector,
-    SearchRequest as ProtoSearchRequest, SearchResponse,
+    CompactEmbeddingsRequest, EncodeQueryRequest, ExpireVersionsRequest, GenerateEmbeddingsRequest,
+    QueryVector, RefreshEmbeddingsRequest, SearchRequest as ProtoSearchRequest, SearchResponse,
 };
 use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
@@ -248,6 +252,56 @@ impl DataClient {
             .map_err(|s| error_from_status(&s))?
             .into_inner();
         Ok(resp.embedding)
+    }
+
+    // --- incremental embedding ------------------------------------------
+
+    /// Re-embed only the source rows whose content changed since `table`'s
+    /// current version and publish the result as a new version.
+    pub async fn refresh_embeddings(
+        &self,
+        table: &str,
+        options: RefreshOptions,
+    ) -> Result<RefreshReport> {
+        let report = self
+            .embedding_client()
+            .refresh_embeddings(RefreshEmbeddingsRequest {
+                table: table.to_string(),
+                deletes: delete_policy_to_proto(options.deletes) as i32,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        refresh_report_from_proto(report).map_err(|s| error_from_status(&s))
+    }
+
+    /// Rewrite `table`'s live rows as one fragment + one segment and publish
+    /// it as a new version.
+    pub async fn compact_embeddings(&self, table: &str) -> Result<RefreshReport> {
+        let report = self
+            .embedding_client()
+            .compact_embeddings(CompactEmbeddingsRequest {
+                table: table.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        refresh_report_from_proto(report).map_err(|s| error_from_status(&s))
+    }
+
+    /// Delete every non-current version of `table` numbered below `before`
+    /// and reap its unreferenced artifacts.
+    pub async fn expire_versions(&self, table: &str, before: i64) -> Result<ExpiryReport> {
+        let report = self
+            .embedding_client()
+            .expire_versions(ExpireVersionsRequest {
+                table: table.to_string(),
+                before,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(expiry_report_from_proto(report))
     }
 
     // --- search ----------------------------------------------------------

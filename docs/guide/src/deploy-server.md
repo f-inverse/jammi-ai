@@ -76,13 +76,23 @@ format = "json"    # structured logging for production
 
 ### Preloading models
 
-Models listed in `preload_models` are downloaded and loaded into memory at startup. This ensures the session is warm before the server accepts connections.
+Models listed in `preload_models` are loaded into the cache at startup,
+BEFORE `/readyz` reports ready — it answers `503 {"status":"not_ready",
+"detail":"preloading i/n"}` meanwhile, `/healthz` stays `200` (no
+`startupProbe` needed), and this process's claim loop waits at its gate
+with its `workers.state` row reading `warming`, so no job is claimed by a
+cold process. An entry is a bare id, whose task comes from the catalog's
+`models` row, or `{ id, task }` naming the task explicitly — required for a
+`local:` path, which has no row. A listed model that cannot load, a bare id
+with no `models` row, or an unknown task token is a **startup error**: the
+server exits non-zero instead of serving. A shutdown signal during the
+preload exits 0 without ever serving.
 
 ```toml
 [server]
 preload_models = [
     "sentence-transformers/all-MiniLM-L6-v2",
-    "BAAI/bge-small-en-v1.5",
+    { id = "local:/models/bge-small", task = "text_embedding" },
 ]
 ```
 
@@ -235,14 +245,33 @@ curl http://localhost:8080/metrics
 # jammi_search_latency_seconds_bucket{...} 0
 ```
 
-`/healthz` is a liveness probe — a `200` means the process is running.
-`/readyz` is a readiness probe — `200` means the catalog backend
-responded; `503` means it didn't and traffic should be drained from
-this instance. Point your load balancer at `/readyz`.
+`/healthz` is a liveness probe — `200` while the process can keep its
+leases and its claim loop alive; `503 {"status":"unhealthy","lease_keeper":
+false|true,"claim_loop":"…"}` when the lease keeper thread is dead (every
+lease this process holds is lost) or the claim loop task panicked
+(`claim_loop: "failed"`). A stopped or aborted loop, a process with no loop,
+and a DRAIN in progress are all `200` — liveness decides restarts, never
+routing, and there is no slow-step detection (the runtime owns "how long is
+too long"). `/readyz` is a readiness probe — `200` means the catalog backend
+responded; `503` means it didn't, or the server is draining (`"detail":
+"draining"`), and traffic should be drained from this instance. Point your
+load balancer at `/readyz`.
 
 `/metrics` exposes a small, substrate-level set of Prometheus counters
-(gRPC requests, Flight SQL queries, eval invocations) plus a search-
-latency histogram.
+(gRPC requests, Flight SQL queries, eval invocations, refusals at the
+`[server.limits]` edge) plus a search-latency histogram, and five gauges:
+
+| Gauge | Present on | Source |
+|---|---|---|
+| `jammi_jobs_queued{kind}` | worker-enabled processes | the catalog, sampled every `[worker] metrics_sample_secs` (default 5) by a dedicated task — one `GROUP BY kind, status` per tick, never on a scrape; a held (`claimable = false`) row counts as queued |
+| `jammi_jobs_running{kind}` | worker-enabled processes | the same sample |
+| `jammi_worker_jobs_in_flight` | worker-enabled processes | loop-claimed jobs running under a live lease hold (0 or 1); an inline `run_now` is never counted |
+| `jammi_worker_claim_loop_up` | worker-enabled processes | 1 while the claim loop task runs, 0 once it stopped, aborted or failed |
+| `jammi_lease_heartbeat_age_seconds` | every process | seconds since the lease keeper last completed a renewal pass |
+
+A process without a claim loop omits the worker families (absent, never 0).
+No gauge carries a tenant label. `jammi_jobs_queued{kind}` is the
+autoscaling input for a compute tier; a scrape issues no catalog statement.
 
 ## What the server can and cannot do
 
@@ -262,9 +291,107 @@ The Flight SQL surface is a **query** interface (read path); the ML operations a
 
 The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client for Flight SQL's bidirectional streaming). `EmbeddingService` serves `AddSource`, `GenerateEmbeddings`, `EncodeQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web** — so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes). `JobService` (core, always mounted) serves all three training kinds over gRPC and `InferenceService.Predict` serves a trained context predictor — so a client can offload training and prediction to a GPU server with the same verb surface the embedded engine exposes.
 
-## Graceful shutdown
+## Shutdown: DRAIN and RELEASE
 
-The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flight queries complete; long-running operations started via the library are unaffected.
+The server has two shutdown modes, PostgreSQL's mapping: **SIGTERM = DRAIN**
+(smart) and **SIGINT = RELEASE** (fast); any signal received while draining
+is a RELEASE. There is no engine-side drain timeout — the runtime's grace
+period (`terminationGracePeriodSeconds`, `stop_grace_period`) bounds a
+DRAIN, then SIGKILL.
+
+**DRAIN** (`kill -TERM`, `docker stop`, a Kubernetes pod deletion):
+`/readyz` flips to `503 {"status":"not_ready","detail":"draining"}`; the
+listener closes and in-flight requests finish; every idle `WaitJob` /
+`Subscribe` stream is ended with `UNAVAILABLE` "server draining" (counted
+under `jammi_grpc_refused_total{reason="draining"}`); the embedded worker
+finishes the job it is running — its lease keeps renewing, every epoch
+bundle lands, the job reaches `completed` under the same attempt — and
+claims no more. Then the catalog is released and the process exits 0. An
+in-flight **unary** (an inline `run_now` such as `GenerateEmbeddings`) is
+bounded only by the grace period. A DRAIN that outlives the grace is
+SIGKILLed: the running job's lease then expires after one `[lease]
+duration_secs`, a successor requeues it (resuming from its last epoch
+bundle) and it consumes one attempt.
+
+**RELEASE** (`kill -INT`, Ctrl+C, `jammi-server release`, or a second
+SIGTERM): connections are severed at once; every job lease this process
+holds is handed back — the row stays `running` under this instance with
+`lease_expires_at = NULL` and `releases + 1`, and a compute job's linked
+building-table lease is NULLed with it — the loop is stopped (cooperatively
+while no job is under a hold, by abort while one is), the `workers` row is
+deleted, the catalog released, and the process exits **0 at once, or exit
+code 3 when its own evidence does not confirm every lease was handed
+back** (see below). A released row is claimable by any other worker within
+one `[worker] idle_poll_secs`, never one lease window; the reclaim cap
+counts `attempts - releases`, so a rollout storm of releases never burns the
+three attempts a genuine crash does. The abandoned training thread never
+finalizes: its lease is gone and its next epoch boundary bails without a
+bundle, so the `_resume` manifest epoch never advances past the last landed
+one **PROVIDED the RELEASE confirmed** (exit 0) — under a degraded RELEASE
+(exit 3) one further epoch bundle may still land before the affected hold's
+`lost` flag flips at its next renewal. Three named exceptions (§3.5 of the
+design): a claim caught between its COMMIT and its hold registration past
+one heartbeat keeps its live lease and is recovered by the expiry path (one
+lease window, `attempts + 1`, never `failed`); a compute job whose linked
+building sweep errored while the jobs sweep succeeded makes the successor
+back off once (one lease window) before it re-materializes; and a RELEASE
+whose own **sweep statement for a given lease's table** itself errored (that
+statement's own `Err`, read back as `None`) — that lease was never written
+and falls to the expiry path, so a successor reclaims it within one
+`[lease] duration_secs` rather than one idle poll.
+
+Exit code 3 (DEGRADED) does not by itself say which lease, if any, is still
+live — it means at least one determinant of a confirmed release is missing,
+and WHICH determinant is missing decides what is and is not established;
+there is no single consequence for "degraded":
+
+- The RELEASE call itself returned an error: nothing further is
+  established — whether any lease this instance held was handed back is
+  unknown.
+- A sweep statement for a given lease's own table itself failed (the
+  exception above): that is the one case with a definite, table-specific
+  cost. The `jobs` table costs one attempt (`attempts + 1`, `releases`
+  untouched) within one `[lease] duration_secs`; the linked `building` row
+  lives in `result_tables`, which carries no `attempts`/`releases` columns
+  at all, so its cost is the "backs off once" recovery documented above,
+  never an attempt.
+- The keeper's per-hold pass could not be confirmed to run (`Unobserved`),
+  or reported a per-hold failure, while both sweep statements still
+  confirm: every row the sweep itself matched — queued, not under an active
+  hold — is confirmed released, since that `UPDATE`'s own commit is what
+  the sweep's `Some` count reports. Nothing is established about a job
+  under an active hold at that moment: the sweep predicate never matches a
+  held row, and the pass whose job it was to release that hold is exactly
+  the one whose evidence is missing.
+- The loop's terminal state was not genuinely witnessed
+  (`stop_witnessed == false`) while both sweep statements still confirm:
+  every row the sweep matched by the time it ran is confirmed released.
+  Nothing is established about a claim that commits AFTER the sweep runs —
+  `stop_witnessed == false` means precisely that such a claim is not ruled
+  out, and a claim like that is outside the sweep's predicate, keeping a
+  live lease with `releases` untouched and falling to the expiry path, the
+  same shape as the exception above.
+
+The process still exits at once either way (exit code 3, never a hang).
+
+`jammi-server release [--pid N]` sends SIGINT to `N` (default 1, the
+container entrypoint) and exits 0 when the signal was sent — that is ALL its
+own exit code means; it signals a process that is not its child, so it
+cannot wait on the RELEASE it triggered and never reports that outcome. It
+is the uniform RELEASE actuator for a `preStop` hook, since the distroless
+images carry no shell for `kill`, and it knows nothing about jobs. The
+RELEASE outcome itself (confirmed or degraded) is read from the **serving**
+process's own exit code (0 or 3) via the supervisor
+(`lastState.terminated.exitCode`, `docker inspect --format='{{.State.ExitCode}}'`)
+— under `restartPolicy: Always` (or equivalent), exit code 3 restarts
+identically to 0. The library reaches the same mechanism through
+`EmbeddedWorker::release_and_stop` and Python's `close(release=True)`; there
+the process survives, so a thread that reaches finalize before a successor
+claims may still land `completed` — the one documented divergence from the
+server, which exits.
+
+`ListWorkers` / `jammi workers` show each claim loop's `state`: `warming`
+(the process is preloading; nothing claimed yet), `claiming`, or `draining`.
 
 ## The identity seam
 
@@ -333,6 +460,23 @@ VPC with the gRPC + health ports, `8081` / `8080`, closed to the public
 internet; network policy or a firewall; or an authenticating reverse proxy) —
 or wire an authenticating `TenantResolver` in front — before exposing it
 beyond a trusted caller.
+
+**The peer listener (I-PEER).** `[server] peer_bind` — unset by default —
+opens a THIRD listener that serves `jammi.v1.peer.PeerService` to other
+replicas of the same deployment (segment search for the segments this replica
+owns; see [Beyond one node](./reference-topologies.md#beyond-one-node-retrieval)).
+It is deliberately outside the identity seam: the peer routes are built
+outside `assemble_grpc_chain`, are never wrapped by the `TenantResolverLayer`,
+never advertised by `GetServerInfo`, and the public listener answers
+`UNIMPLEMENTED` for their paths. The owner binds no tenant — the request
+carries none — because tenant scope was already enforced by the coordinator
+(the replica that received the `Search`), which resolved the table through its
+own tenant-scoped catalog read before fanning out; the owner enforces only
+that every requested segment belongs to the named table. The invariant every
+deployment inherits: **every client of `peer_bind` is a jammi coordinator.**
+Bind it on a private interface behind network policy and, where the runtime
+provides it, mTLS; on a routable interface without them it exposes
+cross-tenant segment reads to anyone who can reach the port.
 
 ## Deploying as a container
 

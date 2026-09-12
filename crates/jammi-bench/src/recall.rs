@@ -156,6 +156,7 @@ use datafusion::prelude::SessionContext;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::{validate_query, QuerySource};
 use jammi_db::index::{SegmentId, SegmentedIndex, VectorIndex};
 use jammi_numerics::stats::{bootstrap_ci, Interval};
 
@@ -368,7 +369,8 @@ async fn recall_samples_at_k_rescored(
 
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
-        let exact = exact_vector_search(ctx, table_name, query, k).await?;
+        let query = &validate_query(query.to_vec(), None, QuerySource::Caller)?;
+        let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
         let ann = if precision.needs_rescore() {
             crate::operator_mirror::retrieve_then_rescore(&index, query, k, oversample.max(1))?
         } else {
@@ -419,7 +421,8 @@ async fn recall_samples_at_k_segmented(
 
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
-        let exact = exact_vector_search(ctx, table_name, query, k).await?;
+        let query = &validate_query(query.to_vec(), None, QuerySource::Caller)?;
+        let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
         let ann = merged.search_final(query, k, oversample.max(1))?;
         samples.push(recall_at_k_for_query(&ann, &exact, k));
     }
@@ -736,7 +739,10 @@ mod tests {
         // Query == row_005; its own cosine distance to itself is ~0, so it is
         // the unambiguous top-1 the oracle must return first.
         let query = rows[5].1.clone();
-        let top = exact_vector_search(&ctx, table, &query, 3).await.unwrap();
+        let query = validate_query(query.to_vec(), None, QuerySource::Caller).unwrap();
+        let top = exact_vector_search(&ctx, table, &query, 3, None)
+            .await
+            .unwrap();
         assert_eq!(top.len(), 3);
         assert_eq!(top[0].0, "row_005", "nearest neighbour of a row is itself");
         assert!(

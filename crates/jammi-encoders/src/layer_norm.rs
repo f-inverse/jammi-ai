@@ -1242,8 +1242,8 @@ mod tests {
         // 12.09` (this fixture's own deviations), giving `(8-1) * 1.1921e-7
         // * 12.09 ≈ 1.01e-5`. The variance error propagates through
         // `invvar = 1/sqrt(var+eps)` with local sensitivity `|d(invvar)/
-        // d(var)| = 0.5*(var+eps)^-1.5 ≈ 0.5 * 1.512^-1.5 ≈ 0.269` here,
-        // contributing `≈ 0.269 * 1.01e-5 ≈ 2.7e-6` to `invvar`'s own
+        // d(var)| = 0.5*(var+eps)^-1.5 ≈ 0.5 * 1.512^-1.5 ≈ 0.269` here (no-producer: closed-form derivative at this fixture's own `var`, not measured),
+        // contributing `≈ 0.269 * 1.01e-5 ≈ 2.7e-6` (no-producer: same hand-derived quantity above) to `invvar`'s own
         // error; that then scales `xhat * gamma` (`|xhat| ≤ 1.48`, `gamma =
         // 1.3` on this fixture) by roughly `1.48 * 1.3 * 2.7e-6 ≈ 5.2e-6`.
         // Summing every term (mean's own propagated contribution through

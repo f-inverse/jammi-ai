@@ -70,6 +70,39 @@ them supplies them above the engine.
   rotation, and cloud IAM are the consumer's runtime, not the engine's — the same
   line the [Design Philosophy](./philosophy.md) draws around load balancing,
   ingress, and orchestration.
+- **The peer listener authenticates nothing either (I-PEER).** `[server]
+  peer_bind` (unset by default) serves the engine-internal segment-search
+  seam to other replicas and trusts the channel — see
+  [The peer listener](#the-peer-listener-i-peer) below.
+
+## The peer listener (I-PEER)
+
+`[server] peer_bind` opens a separate internal listener serving
+`jammi.v1.peer.PeerService` — the seam a coordinator replica fans a search
+out through to the replicas that own a table's segments (see [Beyond one
+node](./reference-topologies.md#beyond-one-node-retrieval)). Its threat model
+is stated as one invariant, **I-PEER**:
+
+- **Every client of `peer_bind` is a jammi coordinator.** The owner handler
+  trusts the channel: the request carries no tenant, the owner binds none and
+  reads no `result_tables` row. It enforces exactly one thing at its input
+  edge — every requested segment id belongs to the named table (else the whole
+  request is refused) and the bundle's stamped precision matches.
+- **Tenant scope is enforced once, at the coordinator.** The coordinator's
+  `Search` resolved the table through its own tenant-scoped catalog read
+  (`tenant_id = $current OR tenant_id IS NULL`) before any fan-out, so a
+  coordinator bound to tenant B cannot name tenant A's table — it fails before
+  a single peer call. The owner is the second half of that one predicate, not a
+  second predicate.
+- **The public listener never reaches it.** The peer routes are built outside
+  `assemble_grpc_chain`, never wrapped by the tenant-binding layer, never
+  advertised by `GetServerInfo`; the public listener answers `UNIMPLEMENTED`
+  for `/jammi.v1.peer.PeerService/*` (proven by the tenant-isolation oracle).
+- **Binding `peer_bind` on a routable interface without network policy / mTLS
+  exposes cross-tenant segment reads** to anyone who can reach the port. The
+  listener speaks plaintext gRPC like every other engine port; encryption and
+  peer authentication are the runtime's (a mesh, a network policy, mTLS at a
+  sidecar), exactly as for the public listener. Default unset = no listener.
 
 ## Transport encryption is the deployer's runtime, not the engine's
 

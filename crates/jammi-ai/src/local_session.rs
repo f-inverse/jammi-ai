@@ -548,6 +548,37 @@ impl Session {
         self.engine.recompute(&record, cascade).await
     }
 
+    /// Re-embed only the source rows whose content changed since `table`'s
+    /// current version and publish the result as a new version. See
+    /// [`InferenceSession::refresh_embeddings`] for the full contract.
+    pub async fn refresh_embeddings(
+        &self,
+        table: &str,
+        options: crate::pipeline::embedding_refresh::RefreshOptions,
+    ) -> Result<crate::pipeline::embedding_refresh::RefreshReport> {
+        self.engine.refresh_embeddings(table, options).await
+    }
+
+    /// Rewrite `table`'s live rows as one fragment + one segment (no
+    /// inference). See [`InferenceSession::compact_embeddings`].
+    pub async fn compact_embeddings(
+        &self,
+        table: &str,
+    ) -> Result<crate::pipeline::embedding_refresh::RefreshReport> {
+        self.engine.compact_embeddings(table).await
+    }
+
+    /// Delete every non-current version of `table` numbered below `before`
+    /// and reap its unreferenced artifacts. See
+    /// [`InferenceSession::expire_versions`].
+    pub async fn expire_versions(
+        &self,
+        table: &str,
+        before: i64,
+    ) -> Result<crate::pipeline::embedding_refresh::ExpiryReport> {
+        self.engine.expire_versions(table, before).await
+    }
+
     // --- graph / temporal pipeline verbs ----------------------------------
 
     /// Build a neighbour-edge table over a source's embedding table. See

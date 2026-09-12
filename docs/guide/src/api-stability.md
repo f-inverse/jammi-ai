@@ -47,10 +47,12 @@ would carry elsewhere.
 
 ### 2. The wire contract — `package jammi.v1.*`
 
-The gRPC/Flight SQL wire surface is the eleven `jammi.v1.*` proto packages (ten
-served by the OSS engine; `jammi.v1.lifecycle` is a **contract-only** surface —
-defined in the wire descriptor so the candle-free client can call a platform
-server that implements it, but answered by no OSS handler):
+The gRPC/Flight SQL wire surface is the twelve `jammi.v1.*` proto packages (ten
+served on the public listener; one, `jammi.v1.peer`, served **only on the
+internal `[server] peer_bind` listener** — the public listener answers
+`UNIMPLEMENTED` for its rpcs; `jammi.v1.lifecycle` is a **contract-only**
+surface — defined in the wire descriptor so the candle-free client can call a
+platform server that implements it, but answered by no OSS handler):
 
 | Package | Surface |
 |---|---|
@@ -62,6 +64,7 @@ server that implements it, but answered by no OSS handler):
 | `jammi.v1.inference` | bulk inference + predict |
 | `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`) |
 | `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |
+| `jammi.v1.peer` | the engine-internal segment-search seam between replicas (`PeerService.SegmentSearch` / `ExactRescore`) — served **only on `peer_bind`**, never on the public listener; deliberately tenant-free (the coordinator enforces tenant scope; see [Security Posture](./security.md#the-peer-listener-i-peer)) |
 | `jammi.v1.pipeline` | graph / context / as-of / recompute / materialization rpcs |
 | `jammi.v1.training` | the training spec message vocabulary `JobService.SubmitJob`'s oneof carries (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/`FineTuneConfig`/…) — no rpcs of its own since `TrainingService` folded into `JobService` |
 | `jammi.v1.trigger` | topic publish + subscribe |
@@ -85,7 +88,7 @@ version with reject-newer (or strict) semantics — the full contract is on the
 | Materialization manifest (`.materialization.json`) | `MANIFEST_VERSION` | `3` |
 | ANN row map (`.rowmap`) | `ROWMAP_VERSION` | `1` |
 | ANN sidecar manifest (`.manifest.json`) | `ANN_MANIFEST_VERSION` | `3` |
-| Catalog schema | append-only migration ledger | through `023` |
+| Catalog schema | append-only migration ledger | see `crates/jammi-db/src/catalog/migrations.rs` |
 
 The catalog migration ledger is **append-only**: a migration is never edited or
 removed once shipped, only a new numbered migration is appended. The other three
@@ -139,6 +142,164 @@ provisional or experimental, and none ships behind an "unstable" flag. A surface
 that is not yet ready to freeze does not appear on the public client at all; it
 stays internal until it is ready to enter the frozen set. The freeze is total
 across the published surface, which is what the terminal-0.x bar requires.
+
+## Published-crate Rust APIs
+
+Eleven workspace crates lack `publish = false` and are therefore published
+Rust crates: `jammi-admin`, `jammi-ai`, `jammi-cli`, `jammi-client`,
+`jammi-db`, `jammi-encoders`, `jammi-kernels`, `jammi-lora`, `jammi-numerics`,
+`jammi-server`, and `jammi-wire`. Their public items (types, functions, trait
+signatures, struct field visibility) are a real compile-time surface for any
+consumer outside this workspace, distinct from the three CI-enforced surfaces
+above. This surface carries **no CI freeze guard** — there is no descriptor to
+decode or conformance set to pin a bare Rust signature against — so a breaking
+change here is caught only by review, and is recorded as a **BREAKING** entry
+in the CHANGELOG the same way every other breaking change in this workspace
+is, naming the item, what changed, and what the caller does instead.
+
+**Deriving this section.** Do not hand-maintain this list from memory — a
+prior round of this same section missed at least seven breaking changes,
+including a `pub fn` removed with no entry anywhere, and its own scope
+sentence named 2 of these 11 crates. Enumerate every public item whose
+signature, visibility, or existence changed across the range instead. **The
+range is a set of commits, not a contiguous `<base>..<head>` span**: this
+unit's commits are interleaved on the branch with other units' commits (a
+plain `git diff <base> <head>` between the oldest and newest of this unit's
+own commits also picks up whatever any OTHER unit changed in between — that
+is how a sibling unit's own unannounced removal was mistaken for this
+section's gap in a prior round). Derive the exact commit set from the
+commit-message tag every round of this unit's own history carries, and diff
+the UNION of those commits, never a span:
+
+```bash
+# Every commit belonging to THIS unit, oldest first. NOT a literal
+# '#482 DIST' substring match: this unit's own history also carries the tag
+# as 'DIST-1' and 'DELTA/DIST' (a hyphen or a slash immediately after
+# 'DIST', never a space) — a plain `--grep='#482 DIST'` silently drops those
+# and under-ranges the set (measured, DIST round 8: it returns 3 commits and
+# misses 3 more, including the one that introduced the sites a round-8 fix
+# corrected). `-E --grep='#482.*DIST'` matches all three spellings because
+# it does not require a space between the issue number and the tag:
+commits=$(git log --oneline --reverse -E --grep='#482.*DIST' | cut -d' ' -f1)
+for c in $commits; do
+  git diff --name-only "$c"^.."$c" | grep '^crates/.*/src/.*\.rs$'
+  # for each changed file, diff its `pub fn|struct|enum|trait|type|const|
+  # static|use` items between "$c"^ and "$c" — a struct/enum/trait's full
+  # brace-balanced body, a fn/const/static/type/use's signature up to its
+  # body or `;` — and treat a normalized-text change as added-old +
+  # added-new (catches a removal with no replacement, not just a same-line
+  # diff hunk).
+done
+# Cross-check the crate list above against every `crates/*/Cargo.toml`
+# lacking `publish = false`.
+```
+
+Nine commits are current state as of this release (the range this section
+has covered started as three, was five, was six, was seven, was eight as of
+DELTA round 6's own fold, and is nine as of DIST round 7's own fold — state
+the true count rather than repeating a stale one). The corrected recipe
+above resolves to SIX commits (`3a696a65`, `cbd427b4`, `320b73ee`,
+`f37cb743`, `b1665c14`, `a2dfcb1f`) — three more than the three the old,
+narrower grep found — but the three added (`320b73ee`'s re-apply, `cbd427b4`'s
+formatting-only fmt, `3a696a65`'s masked-load reuse with no new `pub` item)
+introduce no public-surface change beyond what the bullets below already
+list; checked by diffing each for an added/removed/changed `pub` item
+against the crate list above, not assumed.
+
+- **The vector-search API takes a validated query type, not a bare slice.**
+  `jammi_numerics::query::ValidatedQuery` is the only type
+  `jammi_numerics::distance::{cosine_distance, cosine_similarity}`,
+  `jammi_db::index::VectorIndex::search`,
+  `jammi_db::index::segment::{search_unit, rescore}`,
+  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`,
+  `jammi_db::index::exact::exact_vector_search`,
+  `jammi_db::index::placed::PlacedIndex::search_final_placed`,
+  `jammi_db::store::ResultStore::{search_vectors, search_vectors_local}`,
+  `jammi_ai::operator::ann_search_exec::AnnSearchExec::new` (and its
+  `query_vector` field), and `jammi_ai::pipeline::neighbor_graph::Node`'s
+  `vector` field accept for a query vector.
+  `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
+  **removed** with no replacement — its check is now
+  `ValidatedQuery::require_width`/`require_authority_width`, methods on the
+  type itself, not a function a caller could import.
+  Construct a `ValidatedQuery` with `jammi_db::index::validate_query(values,
+  expected_width, source)` (re-exported from `jammi_numerics::query`, along
+  with the new `jammi_numerics::query::QueryValidationError` error type),
+  where `source` is a `jammi_db::index::QuerySource::{Caller, Stored {
+  table }}`. Its inherent methods are `as_slice`, `into_inner`, `source`, and
+  the two width checks below.
+  `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
+  parameter (a cross-check against the scan's own width; `None` when there is
+  none on record). `jammi_db::index::peer::{SegmentSearchRequest,
+  ExactRescoreRequest}`'s `query` field is a `ValidatedQuery`, not a
+  `Vec<f32>`; `PeerFailureReason` gained the `CallerFault` variant,
+  `PeerError` gained a `message: String` field, and `PEER_FAILURE_LABELS` is
+  `[&str; 10]`.
+- **`jammi_db::catalog::result_repo::ResultTableRecord::dimensions` is a
+  method, not a field.** It returns `Option<std::num::NonZeroUsize>` — a
+  non-positive stored value and an absent one are both `None`.
+  `dimensions_raw() -> Option<i32>` returns the stored column verbatim, for a
+  caller that must round-trip it unfiltered. A caller that built a
+  `ResultTableRecord` field-by-field from outside this crate now goes through
+  `ResultTableRecord::from_wire_projection`, the crate's sole cross-crate
+  constructor.
+- **`jammi_wire::peer::{phase_from_proto, precision_from_proto}` return a
+  `ProtoEnumDecode<T>`, not an `Option<T>`.** The wire's explicit "not set"
+  (`ProtoEnumDecode::Unspecified`) and a raw value this build's generated
+  `enum` has no variant for (`ProtoEnumDecode::Unknown`) are no longer
+  collapsed into one `None` — a caller that only needs "did this decode"
+  calls the new `.known() -> Option<T>` to get the old behaviour back.
+- **Whose-fault a downstream width check assigns no longer depends on the
+  query's own provenance.** `ValidatedQuery::require_width` now takes an
+  `artifact: impl Into<String>` and returns a new error variant,
+  `QueryValidationError::ArtifactMismatch { artifact, expected, actual }`,
+  which carries no `QuerySource` at all — a mismatch it finds is always
+  attributed to the named artifact, never the caller, because by the time a
+  query reaches any consumer an entry has already checked it once against an
+  authority it had in hand. THREE call sites still attribute by the query's
+  own provenance (the placement entry's all-remote shape, the placement
+  entry's all-local shape against the set's own first segment, and
+  `exact_vector_search`'s no-catalog-width fallback — round 8 closed the
+  all-local gap, where the same deferral the other two already performed
+  had never run), each checking a query with no width in hand against the
+  only authority available to that call; all three use the new
+  `ValidatedQuery::require_authority_width` instead, which keeps the OLD
+  `require_width` behaviour under a name that says why it is different.
+  `QuerySource::source()` on `QueryValidationError` now returns
+  `Option<&QuerySource>` (`None` for `ArtifactMismatch`) rather than
+  `&QuerySource` unconditionally. (DIST round 6/7 shipped a third
+  `QuerySource` variant, `Artifact { name }`, to carry this same
+  information; round 8 removed it in favor of the dedicated
+  `ArtifactMismatch` error variant above, so `QuerySource` is back to
+  exactly two variants, `Caller` and `Stored` — the states a query's own
+  provenance can actually be. A round-6/7 caller matching on three
+  `QuerySource` variants needs the arm removed, not added.) `JammiError::Schema`
+  constructions in `jammi_db::index::exact::exact_vector_search`,
+  `jammi_db::index::placed::PlacedIndex::search_mixed`,
+  `jammi_db::store::vectors::{extend_with_fixed_size_list_f32,
+  extend_with_keyed_fixed_size_list_f32}`, and `jammi_db::store::deletes::
+  DeletionMask::read` that priced an ENGINE-owned artifact's own corruption
+  as the caller's fault are now `JammiError::IncompatibleFormat`; the two
+  `store::vectors` functions changed their error type to the new,
+  provenance-neutral `jammi_db::store::vectors::VectorColumnError` (`?`
+  converts it to `IncompatibleFormat` by default; `.into_caller_fault()` is
+  the explicit override the one caller-supplied read path, behind
+  `import_embeddings`, now uses).
+- **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
+  replacement.** It resolved a result table's current version and then
+  discarded the resolution, returning a bare `InputAnchor` a caller could
+  not get the matching content back from without a second, independent
+  resolve — a version publish landing between the two could straddle.
+  Call `ResultStore::pin_current_version(record).await?.input_anchor()`
+  instead; the versioned arm already delegated to exactly that internally,
+  so the returned value is unchanged. (This item predates the compute-tier
+  substrate epic — it shipped in an earlier release — so its removal here
+  is a genuine breaking change to an already-released surface, not internal
+  churn within this epic's own unreleased history; the two DELTA-round
+  functions that went `pub` → private/`pub(crate)` entirely within this
+  epic's own unreleased commits, `current_version_provider` and
+  `current_version_identity`, never shipped as `pub` in any release and so
+  carry no such entry.)
 
 ## Enforcement: the freeze-guard
 

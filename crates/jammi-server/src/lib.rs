@@ -38,7 +38,7 @@ use jammi_db::trigger::{Publisher, Subscriber};
 
 use crate::error::fallback_handler;
 use crate::routes::health::{self, MetricsRegistry};
-use crate::runtime::ReadinessProbe;
+use crate::runtime::{LivenessProbe, ReadinessProbe};
 
 /// Trigger-stream handles attached to the gRPC server. The caller
 /// constructs these once per deployment (sharing one broker, publisher,
@@ -60,16 +60,23 @@ pub struct TriggerHandles {
 pub fn build_router() -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
+        .with_state(Arc::new(LivenessProbe::always_healthy()))
         .fallback(fallback_handler)
 }
 
 /// Build the full side-channel router exposing `/healthz`, `/readyz`,
-/// and `/metrics`. The readiness probe and metrics registry are passed
-/// in as `Arc`s so test fixtures can substitute stubs.
+/// and `/metrics`. The readiness probe, metrics registry and liveness
+/// probe are passed in as `Arc`s so test fixtures can substitute stubs;
+/// the production server (`runtime::OssServer::bind`) builds its router
+/// through this same function.
 pub fn build_health_router(
     readiness: Arc<ReadinessProbe>,
     metrics: Arc<MetricsRegistry>,
+    liveness: Arc<LivenessProbe>,
 ) -> Router {
+    let healthz = Router::new()
+        .route("/healthz", get(health::healthz))
+        .with_state(liveness);
     let readyz = Router::new()
         .route("/readyz", get(health::readyz))
         .with_state(readiness);
@@ -77,7 +84,7 @@ pub fn build_health_router(
         .route("/metrics", get(health::metrics))
         .with_state(metrics);
     Router::new()
-        .route("/healthz", get(health::healthz))
+        .merge(healthz)
         .merge(readyz)
         .merge(metrics)
         .fallback(fallback_handler)

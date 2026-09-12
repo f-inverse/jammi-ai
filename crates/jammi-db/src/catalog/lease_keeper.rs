@@ -69,6 +69,16 @@ pub enum LeaseTarget {
     /// A `building` `result_tables` row — renewed via
     /// [`Catalog::renew_lease`] under [`ResultTableCas::writer_any_tenant`].
     ResultTable { table: String, writer_id: String },
+    /// A `building` `result_table_versions` row (an in-flight refresh or
+    /// compaction of a ready table) — renewed via
+    /// [`Catalog::renew_version_lease`] under the writer's own CAS with no
+    /// tenant arm, for the same reason `ResultTable` uses
+    /// `writer_any_tenant`.
+    ResultTableVersion {
+        table: String,
+        version: i64,
+        writer_id: String,
+    },
 }
 
 /// The keeper thread's liveness, shared by the keeper handle and every
@@ -169,6 +179,67 @@ struct HeldState {
     target: LeaseTarget,
     lost: Arc<AtomicBool>,
     last_renewed_ms: Arc<AtomicU64>,
+    /// Set by [`LeaseKeeper::release_job_holds`] once this hold's row was
+    /// RELEASED (`Catalog::release_job_lease` returned `Ok(true)`) — only
+    /// ever on a [`LeaseTarget::Job`] hold. `renew_all` skips a released
+    /// hold; an optimisation only — the SQL `lease_expires_at IS NOT NULL`
+    /// arm on `heartbeat_job` is the guarantee that a released lease is
+    /// never re-armed, and a hold registered AFTER the release (which has
+    /// no flag) misses through that same arm and flips `lost`.
+    released: bool,
+}
+
+/// The outcome of one RELEASE pass over every not-yet-released [`LeaseTarget::Job`]
+/// hold this keeper held when the pass began: every hold attempted lands in
+/// EXACTLY one of the three counts below — the totality invariant
+/// `released + not_required + failed == attempted`. `attempted` is the
+/// snapshot size taken BEFORE the loop runs (`release_job_holds_on_thread`,
+/// this module's private keeper-thread helper), carried on the value
+/// itself rather than kept as a function-local the loop checks against
+/// only its own bookkeeping — a consumer of [`HoldRelease`] (not just the
+/// pass that produced it) can now tell "every hold this pass started with
+/// is accounted for" from "some holds were silently dropped without being
+/// counted at all", which `released + not_required + failed` alone cannot
+/// distinguish from a smaller starting snapshot. `failed` is the
+/// determinant a bare `usize` return could never represent: a hold whose
+/// release attempt itself errored has exactly the operator-visible
+/// consequence a whole-pass error has (its `lost` flag never flips, so a
+/// doomed epoch can still land in the shared `_resume` prefix), and is not
+/// the same fact as "there was no such hold" (`not_required`) or "it was
+/// handed back" (`released`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoldRelease {
+    /// Rows released this pass (`Catalog::release_job_lease` returned
+    /// `Ok(true)`).
+    pub released: usize,
+    /// Rows that provably did not require releasing — an INLINE row
+    /// (`execution = 'inline'` never matches), a row a peer already took,
+    /// or a lease already released (`Ok(false)`).
+    pub not_required: usize,
+    /// Rows whose release attempt itself failed (`Err`) — logged and left
+    /// to the expiry path. Distinct from `not_required`: this hold WAS
+    /// attempted and did NOT succeed.
+    pub failed: usize,
+    /// The number of holds this pass started with (the snapshot taken
+    /// before any release call ran) — the independent quantity
+    /// `released + not_required + failed` is checked against. Carried so a
+    /// consumer can evaluate "no hold went unattempted" itself rather than
+    /// trusting the three counts alone, which a future early-exit inside
+    /// the pass could make sum to less than the true starting count with
+    /// no observable difference.
+    pub attempted: usize,
+}
+
+/// The one-shot handshake behind [`LeaseKeeper::release_job_holds`]: the
+/// caller sets `requested` and wakes the thread; the thread runs the release
+/// pass on its own connection, publishes the outcome under `outcome`'s
+/// `Mutex` (whose lock/unlock is what actually synchronises the publish with
+/// the awaiting caller's read — `Notify` itself carries no ordering
+/// guarantee over arbitrary data), and notifies `done`.
+struct ReleaseRequest {
+    requested: AtomicBool,
+    outcome: Mutex<HoldRelease>,
+    done: tokio::sync::Notify,
 }
 
 /// A future-returning catalog-connection factory: called from inside the
@@ -219,6 +290,7 @@ pub struct LeaseKeeper {
     /// 10 s for nothing).
     wake: Arc<tokio::sync::Notify>,
     liveness: Arc<Liveness>,
+    release: Arc<ReleaseRequest>,
     #[cfg(feature = "test-hooks")]
     kill: Arc<AtomicBool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -257,6 +329,11 @@ impl LeaseKeeper {
             last_pass_ms: AtomicU64::new(0),
             lease: intervals.lease(),
         });
+        let release = Arc::new(ReleaseRequest {
+            requested: AtomicBool::new(false),
+            outcome: Mutex::new(HoldRelease::default()),
+            done: tokio::sync::Notify::new(),
+        });
         #[cfg(feature = "test-hooks")]
         let kill = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
@@ -265,6 +342,7 @@ impl LeaseKeeper {
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_wake = Arc::clone(&wake);
         let thread_liveness = Arc::clone(&liveness);
+        let thread_release = Arc::clone(&release);
         #[cfg(feature = "test-hooks")]
         let thread_kill = Arc::clone(&kill);
         let thread = std::thread::Builder::new()
@@ -331,6 +409,19 @@ impl LeaseKeeper {
                         if thread_kill.load(Ordering::SeqCst) {
                             panic!("lease keeper: thread killed by test hook");
                         }
+                        // A RELEASE request runs here, on this thread and
+                        // this connection, serialised with the renewal pass
+                        // that follows it — so no renewal of a hold this
+                        // pass releases can be in flight beside it.
+                        if thread_release.requested.swap(false, Ordering::SeqCst) {
+                            let outcome =
+                                release_job_holds_on_thread(&catalog, &thread_holds).await;
+                            *thread_release
+                                .outcome
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) = outcome;
+                            thread_release.done.notify_waiters();
+                        }
                         renew_all(&catalog, &thread_holds, &thread_liveness, intervals).await;
                     }
                 });
@@ -355,6 +446,7 @@ impl LeaseKeeper {
             shutdown,
             wake,
             liveness,
+            release,
             #[cfg(feature = "test-hooks")]
             kill,
             thread: Mutex::new(Some(thread)),
@@ -381,6 +473,7 @@ impl LeaseKeeper {
                     target,
                     lost: Arc::clone(&lost),
                     last_renewed_ms: Arc::clone(&last_renewed_ms),
+                    released: false,
                 },
             );
         LeaseHold {
@@ -389,6 +482,72 @@ impl LeaseKeeper {
             lost,
             last_renewed_ms,
             liveness: Arc::clone(&self.liveness),
+        }
+    }
+
+    /// RELEASE every [`LeaseTarget::Job`] hold this keeper currently holds
+    /// — the per-hold half of a two-mode shutdown's RELEASE arm — and wait,
+    /// bounded by `bound` (one heartbeat), for the pass to complete.
+    /// Returns the [`HoldRelease`] counts on `Ok`; see its doc for the
+    /// totality invariant every caller's evidence predicate relies on.
+    ///
+    /// The pass runs ON THE KEEPER THREAD, on its own connection, serialised
+    /// with `renew_all`: for every registered `Job` hold not already
+    /// released it issues `Catalog::release_job_lease(job_id, instance_id,
+    /// attempts)`; `Ok(true)` flips the hold's `lost` flag (so a training
+    /// loop polling it bails at its next epoch boundary without writing a
+    /// bundle), marks the hold released, and counts it `released`;
+    /// `Ok(false)` — an INLINE row (`execution = 'inline'` never matches), a
+    /// row a peer already took, or a lease already released — leaves the
+    /// hold untouched and counts it `not_required`; an `Err` is logged (the
+    /// expiry path covers it) and counts it `failed` — NEVER folded into
+    /// `not_required`, since this hold WAS attempted and did not succeed.
+    /// Runs BEFORE any loop task is aborted, so every live hold's `lost`
+    /// flips while the hold still exists.
+    ///
+    /// ONLY the `Job` class. A [`LeaseTarget::ResultTable`] hold — the
+    /// second lease class a compute job holds — is never touched here:
+    /// every `BuildingTable` on a session is adopted under the store's one
+    /// `writer_id`, so from this map a loop-claimed materialization's table,
+    /// an inline `run_now`'s and a library materialization's are
+    /// indistinguishable, and a per-target release would NULL the wrong
+    /// lease. That class is released solely by the jobs-linked sweep
+    /// (`Catalog::release_building_tables_of_claimant`), after which the
+    /// loop's own `ResultTable` hold flips `lost` through the guarded
+    /// renewal (`Catalog::renew_lease`'s lease-present arm) within one
+    /// heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// [`JammiError::Catalog`] when the keeper thread is dead (nothing can
+    /// run the pass — every hold already reads lost) or when the pass has
+    /// not completed within `bound` — never a hang. This `Err` means the
+    /// per-hold pass is UNOBSERVED: a caller must never map it to a count
+    /// of zero (that would be indistinguishable from "there were no
+    /// holds"), which is exactly the collapse this type exists to close.
+    pub async fn release_job_holds(&self, bound: Duration) -> Result<HoldRelease> {
+        if !self.is_alive() {
+            return Err(JammiError::Catalog(
+                "lease keeper: cannot release job holds, its thread is dead".into(),
+            ));
+        }
+        // Register interest BEFORE requesting, so a `notify_waiters` that
+        // lands between the two cannot be missed (`Notify::notify_waiters`
+        // stores no permit).
+        let done = self.release.done.notified();
+        tokio::pin!(done);
+        done.as_mut().enable();
+        self.release.requested.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+        match tokio::time::timeout(bound, done).await {
+            Ok(()) => Ok(*self
+                .release
+                .outcome
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)),
+            Err(_elapsed) => Err(JammiError::Catalog(format!(
+                "lease keeper: release_job_holds did not complete within {bound:?}"
+            ))),
         }
     }
 
@@ -589,6 +748,9 @@ async fn renew_all(
     let snapshot: Vec<(LeaseTarget, Arc<AtomicBool>, Arc<AtomicU64>)> = {
         let regs = holds.lock().unwrap_or_else(PoisonError::into_inner);
         regs.values()
+            // A released Job hold is never renewed again (its row's lease is
+            // NULL and `heartbeat_job`'s `IS NOT NULL` arm would miss anyway).
+            .filter(|r| !r.released)
             .map(|r| {
                 (
                     r.target.clone(),
@@ -637,6 +799,28 @@ async fn renew_all(
                     }
                 }
             }
+            LeaseTarget::ResultTableVersion {
+                table,
+                version,
+                writer_id,
+            } => {
+                let cas = crate::catalog::version_repo::VersionCas::writer_any_tenant(
+                    table, *version, writer_id,
+                );
+                match catalog.renew_version_lease(&cas, intervals.lease()).await {
+                    Ok(()) => Some(true),
+                    Err(
+                        JammiError::RowGone { .. }
+                        | JammiError::TenantMismatch { .. }
+                        | JammiError::LeaseLost { .. }
+                        | JammiError::CasFailed { .. },
+                    ) => Some(false),
+                    Err(e) => {
+                        warn!(table, version, error = %e, "lease keeper: version heartbeat failed");
+                        None
+                    }
+                }
+            }
         };
         match renewed {
             Some(true) => liveness.stamp(&last_renewed_ms),
@@ -645,4 +829,84 @@ async fn renew_all(
         }
     }
     liveness.stamp(&liveness.last_pass_ms);
+}
+
+/// The RELEASE pass [`LeaseKeeper::release_job_holds`] runs on the keeper
+/// thread: release every not-yet-released [`LeaseTarget::Job`] hold's row
+/// through `Catalog::release_job_lease`, flipping `lost` and marking the
+/// hold released on `Ok(true)`. Returns the [`HoldRelease`] counts — every
+/// attempted hold lands in EXACTLY one of `released`/`not_required`/
+/// `failed` (checked below), which is what makes P-2B (this pass's
+/// determinant) decidable at the type level rather than collapsed into a
+/// single count a dead keeper or a per-hold failure could equally have
+/// produced. The snapshot is taken once; a hold dropped mid-pass simply has
+/// its row released to no observer.
+async fn release_job_holds_on_thread(
+    catalog: &Catalog,
+    holds: &Arc<Mutex<HashMap<u64, HeldState>>>,
+) -> HoldRelease {
+    let snapshot: Vec<(u64, String, String, u32, Arc<AtomicBool>)> = {
+        let regs = holds.lock().unwrap_or_else(PoisonError::into_inner);
+        regs.iter()
+            .filter(|(_, r)| !r.released)
+            .filter_map(|(id, r)| match &r.target {
+                LeaseTarget::Job {
+                    job_id,
+                    instance_id,
+                    attempts,
+                } => Some((
+                    *id,
+                    job_id.clone(),
+                    instance_id.clone(),
+                    *attempts,
+                    Arc::clone(&r.lost),
+                )),
+                LeaseTarget::Instance(_)
+                | LeaseTarget::ResultTable { .. }
+                | LeaseTarget::ResultTableVersion { .. } => None,
+            })
+            .collect()
+    };
+    let attempted = snapshot.len();
+    let mut outcome = HoldRelease {
+        attempted,
+        ..HoldRelease::default()
+    };
+    for (id, job_id, instance_id, attempts, lost) in snapshot {
+        match catalog
+            .release_job_lease(&job_id, &instance_id, attempts)
+            .await
+        {
+            Ok(true) => {
+                lost.store(true, Ordering::SeqCst);
+                if let Some(held) = holds
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_mut(&id)
+                {
+                    held.released = true;
+                }
+                outcome.released += 1;
+            }
+            Ok(false) => {
+                outcome.not_required += 1;
+            }
+            Err(e) => {
+                warn!(job_id, error = %e, "lease keeper: job lease release failed; left to expiry");
+                outcome.failed += 1;
+            }
+        }
+    }
+    // A real assert, not `debug_assert_eq!`: this pass runs at most once per
+    // RELEASE (never in a hot loop), and `HoldRelease::attempted` is now a
+    // value consumers evaluate `confirms_release()` against — a corrupted
+    // count must never reach a caller silently in a release build (contract
+    // `CONTRACT-OPS-fix4.md` M5: a check compiled out in release build is
+    // not a check).
+    assert_eq!(
+        outcome.released + outcome.not_required + outcome.failed,
+        outcome.attempted,
+        "every attempted hold must land in exactly one of released/not_required/failed"
+    );
+    outcome
 }

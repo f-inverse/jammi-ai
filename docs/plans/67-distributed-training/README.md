@@ -175,25 +175,47 @@ those still in force are restated here in their v4 form. Principle in parenthese
     whose `execute` runs the U5b coordinator; Ballista's job is to place that task on a
     device-bearing executor. No all-or-nothing rank binding in Ballista; a gang stage kind stays
     a future upstream option. (K4 parity: bytes == U5b.)
-42. **Executor liveness is membership, not an engine control loop.** `expire_dead_executors`
-    (started unconditionally in `SchedulerServer::init`) sweeps Ballista executor heartbeats —
-    the same class as `reclaim_expired_jobs` and `prune_instances` the fleet already runs each
-    tick. With retries off (r40) it never makes consumer work runnable. This disposes the
-    control-loop ground of 68 DIST D2 for jammi's compute plane (D2's numbered future-option
-    conditions are the accelerator dimension, pluggable cluster storage and object-store
-    shuffle); DIST's decision for the data plane is untouched.
+42. **Executor liveness is membership, and it resets tasks with no knob to stop it (S6 probe
+    5).** `expire_dead_executors` (started unconditionally in `SchedulerServer::init`) sweeps
+    Ballista executor heartbeats — the same class as `reclaim_expired_jobs` and `prune_instances`
+    the fleet already runs each tick — but the same loop also posts `ExecutorLost`
+    (`scheduler_server/mod.rs:395`) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
+    frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
+    `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
+    **without consulting `task_max_failures`**. With both retry knobs at 0, a `GangExec` on a
+    killed executor is re-launched by Ballista on a surviving executor and the job succeeds on
+    its own — in parallel with jammi's own reclaim. U8b needs an explicit bind-time guard in
+    `CatalogClusterState::bind_schedulable_tasks` / `DevicePlacement` that refuses to re-bind a
+    task whose `(job_id, stage_id, partition)` was already launched, keyed on jammi's own job row
+    (Ballista's `task_attempt` counter is not bumped by this reset, so the refusal cannot key on
+    it) — or an upstream "no reset on lost executor" option; there is no knob for this in 54.1.
+    This still disposes the control-loop ground of 68 DIST D2 for jammi's compute plane (D2's
+    numbered future-option conditions are the accelerator dimension, pluggable cluster storage
+    and object-store shuffle); DIST's decision for the data plane is untouched.
 43. **The seams and the one true gap.** Codecs (`override_{logical,physical}_codec`); the
     `ExecutionEngine` (`override_execution_engine`; receives each stage's plan, rewrites
     `ShuffleReaderExec` nodes and wraps the writer — the seam an object-store shuffle would use,
     **not adopted in v1**: shuffle stays Ballista's local `work_dir`, and D2's object-store-shuffle
     condition stands until a spike proves the cross-executor read); `BallistaCluster::new(Arc<dyn
-    ClusterState>, Arc<dyn JobState>)` + `start_server(cluster, …)` (persistent, multi-scheduler
-    state at the seam — Spice's HA without the fork); `TaskDistributionPolicy::Custom`;
-    `TaskLauncher`. `DevicePlacement` learns that a task is GPU-bound from the stage's physical
-    plan in `active_jobs`' execution graph, decoded through `JammiCodec` (a `GangExec` or an
-    `InferenceExec` whose descriptor names a CUDA device); S6 proves that read. The accelerator
-    dimension has no seam (`ExecutorSpecification { vcores }`); jammi carries it out of band in
-    `workers.devices`, and the upstream PR is the only one 67 owes.
+    ClusterState>, Arc<dyn JobState>)` + `start_server(cluster, …)` — executor registrations and
+    heartbeats survive a scheduler restart from a custom state (S6 probe 6); an in-flight job does
+    not (`ExecutionGraphBox` has no serialisation in 54.1, `JobState::try_acquire_job` is never
+    called by the scheduler), so recovery is a re-submit of the stored plan as a *new* Ballista job
+    id — jammi's own `attempts`/reclaim semantics (r36/r40), not Ballista-side job survival; two
+    schedulers over one store serve one cluster only for sequential jobs (S6 probe 7) — concurrent
+    jobs hang on whichever scheduler loses the slot race, with no public path to wake it
+    (`revive_offers` and `query_stage_event_loop` are `pub(crate)`, `job_resubmit_interval_ms` has
+    no readers, `cluster_state_events` is unconsumed): active/standby, not Spice's active/active
+    HA, until a second upstream contribution lands; `TaskDistributionPolicy::Custom` (a custom
+    `ClusterState` must bring its own binder — the built-in `bind_task_bias` / `bind_task_round_robin`
+    are `pub(crate)` — and in pull-staged mode `ClusterState::bind_schedulable_tasks` is bypassed
+    entirely and only the `Custom` policy is honoured, so the role knobs pin push-staged
+    scheduling); `TaskLauncher`. `DevicePlacement` learns that a task is GPU-bound from the stage's
+    physical plan in `active_jobs`' execution graph, decoded through `JammiCodec` (a `GangExec` or
+    an `InferenceExec` whose descriptor names a CUDA device); S6 proves that read. The accelerator
+    dimension has no seam (Rust `ExecutorSpecification { task_slots: u32 }`, not `vcores`; the
+    proto side's `oneof resource { TaskSlots(u32) }` is extensible); jammi carries it out of band
+    in `workers.devices`, and the upstream accelerator variant is the only PR 67 owes.
 44. **Device pinning does not move bytes.** The executor process runs on its configured
     `[gpu] devices`; device *kind* is already in `MaterializationEnv`; the ordinal is not
     output-affecting; the shuffle writer never reorders a partition-ordered sink. K4 and K7 hold
@@ -246,18 +268,34 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 
 Spikes (no PR; results in the ledger before the dependent unit is briefed): **S1** (→ U4a,
 U5b) `candle-core/nccl` under the `cuda` feature; `Comm::from_devices`; `all_gather` equal and
-unequal counts; two-process `from_rank`. **S3** (→ U1) throwaway DataFusion 54 workspace compile
-on top of PR-C, incl. `-p jammi-db --features postgres,mysql`. **S4** (→ U7) a `gpuCount: 2` pod +
-create-cluster probe — spends money, human-approved. **S5** (→ GPU byte oracles) CUDA
-bit-reproducibility pin. **S6** (→ U8a/U8b; supersedes S2) a scratch crate on Ballista 54.1 with
-`override_execution_engine`, a custom `ClusterState`/`JobState` passed to `start_server`, and the
-codec, running a custom `ExecutionPlan` on one scheduler + two executors; confirm
-`task_max_failures = 0` disables retry and that `expire_dead_executors` only removes executors;
-**kill and restart the scheduler** and assert registrations and an in-flight job survive from
-the custom state; **run two schedulers** over one state store; print the executor identity a
-`TaskDistributionPolicy::Custom` receives and confirm the stage plan is readable from
-`active_jobs`. U8b is gated on all of these. **S3** also records `cargo tree -d` for `tonic` and
-`prost` with the OpenTelemetry family #501 added.
+unequal counts; two-process `from_rank`. **Runtime result:** the NCCL host call itself never
+blocks — the hang is in `stream.synchronize()`, and NCCL does not detect a dead peer, so a
+watchdog `ncclCommAbort` from another thread is what unblocks it; the sync then returns `Ok` with
+a garbage buffer, so the abort flag (not the sync's return value) is the failure signal, and the
+`Nccl` arm needs an `Aborted` state and must never drop after an explicit abort (a drop after
+abort double-aborts and SIGSEGVs). Unequal-count `all_gather` via pad-to-max plus narrow is
+bitwise equal to a CPU concat for f32 and bf16. **S3** (→ U1) throwaway DataFusion 54 workspace
+compile on top of PR-C, incl. `-p jammi-db --features postgres,mysql`. **S4** (→ U7) a
+`gpuCount: 2` pod + create-cluster probe — spends money, human-approved. **Result:** a 2-GPU pod
+and a 2-pod × 2-GPU TRAINING cluster both provision from the repo's own payload shape; cluster
+members expose `actions: []`, so the reaper deletes the cluster (not a member pod), and
+`list-pods` needs `includeClusterPods=true` to see them; cluster GPUs bill at $1.908/GPU/h, so
+U7b's ceiling is $7.63/h (4 GPUs), not $6.4. **S5** (→ GPU byte oracles) CUDA
+bit-reproducibility pin. **Result:** candle 0.11 LoRA-shaped forward/backward/SGD is
+byte-identical across processes and across two A100s with no env pins; `CUBLAS_WORKSPACE_CONFIG`
+is a kernel-selection input that must merely be *consistent* across ranks (`:4096:8` reproduces
+the unset default, `:16:8` differs), so it belongs in the `MaterializationEnv` kernel profile,
+not a default setting; the `NCCL_ALGO`/`PROTO`/`NCHANNELS` pin set is untested — at world size 2
+the reduction is commutative, so it needs world size ≥ 3 on the cluster leg. **S6** (→ U8a/U8b;
+supersedes S2) a scratch crate on Ballista 54.1 with `override_execution_engine`, a custom
+`ClusterState`/`JobState` passed to `start_server`, and the codec, running a custom
+`ExecutionPlan` on one scheduler + two executors. **Result:** retries are off for jammi operators
+by error classification, not by the knob (README r43); `expire_dead_executors` removes executors
+but the same loop also resets and re-launches their tasks with no knob to stop it (README r42);
+executor registrations survive a scheduler restart, in-flight jobs do not (README r43); two
+schedulers over one store serve one cluster only for sequential jobs, not concurrent ones (README
+r43). U8b is gated on all of these. **S3** also records `cargo tree -d` for `tonic` and `prost`
+with the OpenTelemetry family #501 added.
 
 ## Hand-off: how a fresh lead kicks this off
 

@@ -843,7 +843,7 @@ fn f16_biased_fwd_bwd_bound_at_production_width() {
                 let b = bh[c].to_f32() as f64;
                 let expected = (xhat * g + b) as f32;
                 let got = out_v[r * hidden + c].to_f32();
-                let bound = ((xhat * g).abs() as f32 + b.abs() as f32) * 2.5e-3 + 1.25e-3;
+                let bound = ((xhat * g).abs() as f32 + b.abs() as f32) * 2.5e-3 + 1.25e-3; // no-producer: derived from bf16's own 2e-2/1e-2 coefficients scaled by the analytic F16/BF16 ULP ratio (1/8) -- see this fn's own doc comment for the arithmetic, not measured
                 assert!(
                     got.is_finite() && (got - expected).abs() < bound,
                     "hidden={hidden} row={r} col={c}: got {got} vs expected {expected} \

@@ -554,6 +554,55 @@ pub enum ProducingDescriptor {
         /// false match, so completeness is the producer's responsibility.
         params: BTreeMap<String, String>,
     },
+    /// An incremental refresh of an embedding table: the rows whose content
+    /// hash changed (or were added) since `parent_version`, re-embedded with
+    /// the same embedding parameters, plus the deletion-mask horizons for
+    /// superseded and deleted keys. Recorded only in a `.version.json`
+    /// (never in `.materialization.json`); replayed by a full
+    /// `EmbeddingPipeline::run` over the current source into a NEW table.
+    EmbeddingDelta {
+        model_id: String,
+        task: ModelTask,
+        source_id: String,
+        columns: Vec<String>,
+        key_column: String,
+        dimensions: usize,
+        /// The version refreshed from.
+        parent_version: i64,
+        /// The parent's identity (the chain link).
+        parent_identity: String,
+        /// What a key the source no longer has became.
+        deletes: DeletePolicy,
+    },
+    /// A compaction of a versioned embedding table: every live row of
+    /// `parent_version` rewritten as one fragment + one segment, no inference.
+    /// Recorded only in a `.version.json`; replayed like `EmbeddingDelta`.
+    EmbeddingCompaction {
+        model_id: String,
+        task: ModelTask,
+        source_id: String,
+        columns: Vec<String>,
+        key_column: String,
+        dimensions: usize,
+        /// The version compacted.
+        parent_version: i64,
+        /// The parent's identity (the chain link).
+        parent_identity: String,
+    },
+}
+
+/// What an incremental refresh does with a key the source no longer has.
+/// Recorded in the delta descriptor (K7: it is output-affecting).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletePolicy {
+    /// The key is masked out of every prior fragment and segment (the
+    /// default: a table keeping rows its source lost is not "D over S").
+    #[default]
+    Tombstone,
+    /// The key's current row is kept; a rolling-window table is the
+    /// consumer's knowledge.
+    Retain,
 }
 
 /// Match direction recorded in an [`ProducingDescriptor::AsofJoin`] — the
@@ -745,10 +794,24 @@ pub enum EdgeSourceBinding {
 }
 
 impl ProducingDescriptor {
+    /// The chain link of a version descriptor: the parent's identity for an
+    /// `EmbeddingDelta` / `EmbeddingCompaction`, `None` for a base descriptor.
+    pub fn parent_identity(&self) -> Option<&str> {
+        match self {
+            Self::EmbeddingDelta {
+                parent_identity, ..
+            }
+            | Self::EmbeddingCompaction {
+                parent_identity, ..
+            } => Some(parent_identity.as_str()),
+            _ => None,
+        }
+    }
+
     /// Canonical bytes for hashing: a JSON encoding with object keys sorted, so
     /// the byte stream is independent of struct field declaration order and
     /// stable across serde versions. Pure; no I/O.
-    fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
         let value = serde_json::to_value(self)
             .map_err(|e| ManifestError::UncanonicalDescriptor(e.to_string()))?;
         let canonical = canonicalize_json(&value);

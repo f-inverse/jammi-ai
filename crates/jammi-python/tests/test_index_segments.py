@@ -123,7 +123,8 @@ def test_list_index_segments_returns_the_engines_own_segment_zero(tmp_path: Path
         assert isinstance(segments, list)
         assert len(segments) == 1, segments
         entry = segments[0]
-        assert set(entry.keys()) == {"segment_id", "index_path", "row_count"}
+        assert set(entry.keys()) == {"segment_id", "index_path", "row_count", "version"}
+        assert entry["version"] is None, "a base segment carries no version"
         assert entry["segment_id"] == 0
         assert isinstance(entry["index_path"], str) and entry["index_path"]
         assert entry["row_count"] == N_CORPUS
@@ -167,8 +168,18 @@ def test_list_index_segments_orders_by_segment_id_not_insertion_order(
         assert [s["segment_id"] for s in segments] == [0, 1, 2], segments
         assert segments == [
             engine_segment,
-            {"segment_id": 1, "index_path": f"file:///idx/{table}-1", "row_count": 7},
-            {"segment_id": 2, "index_path": f"file:///idx/{table}-2", "row_count": 11},
+            {
+                "segment_id": 1,
+                "index_path": f"file:///idx/{table}-1",
+                "row_count": 7,
+                "version": None,
+            },
+            {
+                "segment_id": 2,
+                "index_path": f"file:///idx/{table}-2",
+                "row_count": 11,
+                "version": None,
+            },
         ]
     finally:
         db.close()

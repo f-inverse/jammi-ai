@@ -149,6 +149,13 @@ jobs:
       - name: Run the remote Shape B smoke script
         run: python3 tests/compose/shape_b_remote.py
 
+      # The two-mode shutdown's RELEASE arm on the shipped image: SIGINT
+      # hands the in-flight job's lease back (Postgres row: lease NULL,
+      # releases = 1), the process exits 0, `restart: unless-stopped` brings
+      # it back and its worker reclaims the row (attempts = 2).
+      - name: Run the Shape B release smoke script (RELEASE via SIGINT)
+        run: python3 tests/compose/shape_b_release.py
+
       - name: Assert the Postgres catalog and JetStream broker were exercised at runtime
         run: |
           set -euo pipefail

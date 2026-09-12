@@ -34,6 +34,27 @@ class InvalidArgument(JammiError, ValueError):
     """
 
 
+class InvalidKey(InvalidArgument):
+    """A ``NULL`` in the key column of a source scanned for embedding,
+    inference or an incremental refresh.
+
+    The engine refuses at the input edge, before any model call, naming the
+    column and the exact null count. Refines :class:`InvalidArgument` (the
+    class the remote transport raises for the same ``INVALID_ARGUMENT``
+    status), so ``except InvalidArgument`` holds on both transports.
+    """
+
+
+class NonUniqueKey(InvalidArgument):
+    """An incremental refresh found the same key more than once on a complete
+    scan of the source (or of the parent version's current state).
+
+    A delta over a non-unique key space is ambiguous, so the refresh is
+    refused before any version is allocated; ``recompute`` once yields a
+    table a refresh can proceed from. Refines :class:`InvalidArgument`.
+    """
+
+
 class NotSupportedOnBackend(JammiError):
     """A one-sided operation was invoked on a backend that does not carry it.
 
@@ -155,4 +176,32 @@ class BackendError(JammiError, RuntimeError):
     residual bucket for anything that is neither a bad argument, an unsupported
     capability, nor a failed training job. Refines :class:`RuntimeError` for the
     same reason :class:`InvalidArgument` refines :class:`ValueError`.
+    """
+
+
+class NotRefreshable(BackendError):
+    """A refresh or compaction was asked of a table it cannot serve
+    incrementally (not ready, not an embedding table, its current version
+    unavailable, or rows without a ``_content_hash``). ``recompute`` once.
+    Refines :class:`BackendError` (``FAILED_PRECONDITION`` on the remote
+    transport).
+    """
+
+
+class DefinitionDrift(BackendError):
+    """The definition a refresh would run under (the table's recorded
+    embedding parameters over the model as loaded now) no longer matches the
+    table's recorded definition hash — a model or environment change.
+    ``recompute`` the table. Refines :class:`BackendError`
+    (``FAILED_PRECONDITION`` on the remote transport).
+    """
+
+
+class VersionUnavailable(BackendError):
+    """A versioned result table's CURRENT version cannot be served.
+
+    Its version row is ``failed`` or its ``.version.json`` manifest is absent;
+    the table row itself is untouched and the remedy is ``recompute`` (a new
+    table). Refines :class:`BackendError` (the class the remote transport
+    raises for the same ``NOT_FOUND`` status).
     """

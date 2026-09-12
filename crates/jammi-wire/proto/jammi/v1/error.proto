@@ -90,6 +90,24 @@ message JammiErrorDetail {
     IncompatibleFormatError incompatible_format = 27;
     DependencyCycleError dependency_cycle = 28;
     NotRecomputableError not_recomputable = 29;
+    // `JammiError::Unavailable { resource, reason }` — a placed segment whose
+    // owner, retry candidate and local load all failed. Maps to gRPC
+    // `UNAVAILABLE`.
+    UnavailableError unavailable = 30;
+    InvalidKeyError invalid_key = 32;
+    VersionUnavailableError version_unavailable = 33;
+    NotRefreshableError not_refreshable = 34;
+    DefinitionDriftError definition_drift = 35;
+    NonUniqueKeyError non_unique_key = 36;
+    // `JammiError::ParentMoved { table, expected, found }` — a parent-pinned
+    // version CAS (allocation or publish) lost a race against a concurrent
+    // refresh/compaction that published first. Maps to `Aborted`, the same
+    // retryable-conflict code as `CasFailed`/`LeaseLost`.
+    //
+    // Tags 37 and 38 are intentionally vacant: they belonged to the job-graph
+    // unit, deferred to #515 and recoverable by cherry-pick. Leaving them
+    // reserved means that recovery cannot collide with this field.
+    ParentMovedError parent_moved = 39;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -132,6 +150,20 @@ message LeaseLostError {
 message CasFailedError {
   string table = 1;
   string status = 2;
+}
+
+// `JammiError::ParentMoved { table, expected, found }`. A parent-pinned
+// version CAS (the allocation UPDATE or the publish table-row swap) matched
+// no row because `current_version` no longer equals the parent the caller's
+// delta was derived from — a concurrent refresh/compaction published first.
+// The ONE classification for both the allocation miss and the publish
+// table-row miss. Maps to `Aborted` (the same retryable-conflict family as
+// `CasFailed`/`LeaseLost`). `expected`/`found` are absent only for the base
+// publish's `current_version IS NULL` CAS.
+message ParentMovedError {
+  string table = 1;
+  optional int64 expected = 2;
+  optional int64 found = 3;
 }
 
 // `JammiError::SourceBusy { source_id, table }`. A source delete was refused
@@ -185,6 +217,67 @@ message DependencyCycleError {
 // table with no recorded descriptor, or an `External`-producer table).
 message NotRecomputableError {
   string table = 1;
+}
+
+// `JammiError::Unavailable`: the resource that could not be served (`segment
+// {table}/{id}`) and why the last rung of the failure ladder failed.
+message UnavailableError {
+  string resource = 1;
+  string reason = 2;
+}
+
+// `JammiError::InvalidKey { column, null_count }`. A `NULL` in the key column
+// of a source scanned for embedding / inference / refresh — refused typed at
+// the input edge before any model call, with the exact null count. A
+// data-shape fault, so it maps to `InvalidArgument`.
+message InvalidKeyError {
+  string column = 1;
+  uint64 null_count = 2;
+}
+
+// `JammiError::VersionUnavailable { table, version }`. A versioned result
+// table whose CURRENT version cannot be served (its version row is `failed`
+// or its manifest is definitively absent). The absent-resource convention:
+// maps to `NotFound`.
+message VersionUnavailableError {
+  string table = 1;
+  int64 version = 2;
+}
+
+// `JammiError::NotRefreshable { table, reason }`. A refresh/compaction of a
+// table it cannot serve incrementally; `reason` is the engine's stable token
+// (`missing_content_hash` / `current_version_unavailable` / `not_ready` /
+// `not_embedding_table`). "Fix state, then retry" → `FailedPrecondition`.
+message NotRefreshableError {
+  string table = 1;
+  string reason = 2;
+}
+
+// `JammiError::DefinitionDrift { table, recorded, current }`. The definition
+// a refresh would run under no longer hashes to the table's recorded
+// `definition_hash` (a model or environment change). The environment, not the
+// argument, must change before a retry → `FailedPrecondition`.
+message DefinitionDriftError {
+  string table = 1;
+  string recorded = 2;
+  string current = 3;
+}
+
+// One duplicated key and its exact count.
+message KeyCount {
+  string key = 1;
+  uint64 count = 2;
+}
+
+// `JammiError::NonUniqueKey { table, scan, keys, total }`. A refresh found
+// the same key more than once on a complete scan (`scan` is `source` or
+// `parent`); `keys` carries at most ten. A data-shape fault →
+// `InvalidArgument`.
+message NonUniqueKeyError {
+  string table = 1;
+  string scan = 2;
+  repeated KeyCount keys = 3;
+  uint64 total = 4;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

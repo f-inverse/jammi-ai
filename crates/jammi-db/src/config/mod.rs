@@ -1035,6 +1035,7 @@ impl LeaseConfig {
 /// enabled = true
 /// kinds = "all"
 /// idle_poll_secs = 1
+/// metrics_sample_secs = 5
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1072,6 +1073,13 @@ pub struct WorkerConfig {
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
     pub idle_poll_secs: u64,
+    /// How often a worker-enabled process samples the queue gauges
+    /// (`jammi_jobs_queued{kind}` / `jammi_jobs_running{kind}`) from the
+    /// catalog — one `GROUP BY kind, status` statement per tick, on a
+    /// dedicated task, never on a `/metrics` scrape and never on the claim
+    /// loop (a scrape storm must not become a catalog storm). Must be
+    /// `>= 1`. Default: 5.
+    pub metrics_sample_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -1082,6 +1090,7 @@ impl Default for WorkerConfig {
             enabled: true,
             kinds: WorkerKinds::default(),
             idle_poll_secs: 1,
+            metrics_sample_secs: 5,
         }
     }
 }
@@ -1149,6 +1158,11 @@ impl WorkerConfig {
         if self.idle_poll_secs == 0 {
             return Err(JammiError::Config(
                 "worker.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
+            ));
+        }
+        if self.metrics_sample_secs == 0 {
+            return Err(JammiError::Config(
+                "worker.metrics_sample_secs must be >= 1 (a zero interval is a busy-loop)".into(),
             ));
         }
         Ok(WorkerIntervals {
@@ -1238,8 +1252,15 @@ pub struct ServerConfig {
     pub health_listen: String,
     /// Arrow Flight listen address. Default: `"0.0.0.0:8081"`.
     pub flight_listen: String,
-    /// Model IDs to preload into memory at server startup.
-    pub preload_models: Vec<String>,
+    /// Models to load into the cache at server startup, BEFORE `/readyz`
+    /// reports ready and before this process's claim loop claims anything
+    /// (warm-before-ready). Each entry is a bare model id string, whose
+    /// task is resolved from the catalog's `models` row at the server's
+    /// startup edge, or a `{ id, task }` table naming the task explicitly
+    /// (a `local:` path has no row). A listed model that cannot load, a
+    /// bare id with no `models` row, or an unknown task token is a startup
+    /// error: the server exits non-zero instead of serving. Default: `[]`.
+    pub preload_models: Vec<PreloadEntry>,
     /// Optional gRPC service tiers this deployment mounts, beyond the always-on
     /// core tier. Tokens are `"event"`, `"eval"` (the `jammi-server`
     /// service-tier mechanism owns their meaning and validation; this layer
@@ -1252,6 +1273,23 @@ pub struct ServerConfig {
     /// Request-bounds and refusal-policy limits for the combined gRPC +
     /// Flight SQL surface. See [`LimitsConfig`].
     pub limits: LimitsConfig,
+    /// The INTERNAL peer listener for beyond-one-node retrieval: the address
+    /// this replica serves `jammi.v1.peer.PeerService` on, to other replicas
+    /// of the same deployment. `None` (the default) = no third listener =
+    /// single node; a replica is a segment owner iff this is set. Validated
+    /// like `health_listen` / `flight_listen`: parseable, and distinct from
+    /// both at a fixed port (`:0` never collides). Served outside the tenant
+    /// layer (I-PEER): every client of it is a jammi coordinator.
+    pub peer_bind: Option<String>,
+    /// MARGINAL-LOAD ADMISSION per query, in bytes: the maximum estimated
+    /// bytes ONE query may load locally for segments it does not own, when
+    /// their owners are unreachable (the last rung of the placed-search
+    /// failure ladder). Unset (the default) = unbounded. NOT a memory cap: the
+    /// segment cache never evicts, earlier queries' loads are invisible to the
+    /// check, and concurrent queries admit independently, so peak heap is
+    /// concurrency × budget. Read by the result store; a library embedder sets
+    /// it through the same config. `Some(0)` is refused.
+    pub peer_local_load_bytes: Option<u64>,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
@@ -1509,6 +1547,92 @@ impl LimitsConfig {
     }
 }
 
+/// One `[server] preload_models` entry: `"id"` (task from the `models`
+/// row) or `{ id = "…", task = "text_embedding" }` (explicit task —
+/// required for a `local:` path, which has no row). Deserialized from either
+/// shape by hand so the layer's typed-error contract holds under
+/// `deny_unknown_fields`: an unknown key or task token is a load-time
+/// `JammiError::Config` naming it, never a silent default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadEntry {
+    /// The model id (`local:<path>`, an HF repo id, or a catalog model name).
+    pub id: String,
+    /// The task to load under; `None` = resolve from the `models` row.
+    pub task: Option<crate::model_task::ModelTask>,
+}
+
+impl<'de> Deserialize<'de> for PreloadEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct PreloadEntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PreloadEntryVisitor {
+            type Value = PreloadEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a model id string or { id, task }")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<PreloadEntry, E> {
+                if v.trim().is_empty() {
+                    return Err(E::custom("preload_models: a model id must not be empty"));
+                }
+                Ok(PreloadEntry {
+                    id: v.to_string(),
+                    task: None,
+                })
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<PreloadEntry, M::Error> {
+                let mut id: Option<String> = None;
+                let mut task: Option<crate::model_task::ModelTask> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            if id.is_some() {
+                                return Err(serde::de::Error::duplicate_field("id"));
+                            }
+                            id = Some(map.next_value()?);
+                        }
+                        "task" => {
+                            if task.is_some() {
+                                return Err(serde::de::Error::duplicate_field("task"));
+                            }
+                            let token: String = map.next_value()?;
+                            task = Some(
+                                crate::model_task::ModelTask::try_from_db_str(&token).map_err(
+                                    |e| {
+                                        serde::de::Error::custom(format!(
+                                            "preload_models: unknown task `{token}`: {e}"
+                                        ))
+                                    },
+                                )?,
+                            );
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(other, &["id", "task"]));
+                        }
+                    }
+                }
+                let id = id.ok_or_else(|| serde::de::Error::missing_field("id"))?;
+                if id.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "preload_models: a model id must not be empty",
+                    ));
+                }
+                Ok(PreloadEntry { id, task })
+            }
+        }
+
+        deserializer.deserialize_any(PreloadEntryVisitor)
+    }
+}
+
 impl ServerConfig {
     /// Validate server configuration.
     pub fn validate(&self) -> Result<()> {
@@ -1533,6 +1657,30 @@ impl ServerConfig {
         if health == flight && health.port() != 0 {
             return Err(crate::error::JammiError::Config(
                 "health_listen and flight_listen must be different addresses".into(),
+            ));
+        }
+        // The third listener, when set, joins the same fixed-address rule
+        // against BOTH of the others (a 3-way check).
+        if let Some(raw) = &self.peer_bind {
+            let peer: SocketAddr = raw.parse().map_err(|e| {
+                crate::error::JammiError::Config(format!("Invalid peer_bind address '{raw}': {e}"))
+            })?;
+            if peer.port() != 0 {
+                if peer == flight {
+                    return Err(crate::error::JammiError::Config(
+                        "peer_bind and flight_listen must be different addresses".into(),
+                    ));
+                }
+                if peer == health {
+                    return Err(crate::error::JammiError::Config(
+                        "peer_bind and health_listen must be different addresses".into(),
+                    ));
+                }
+            }
+        }
+        if self.peer_local_load_bytes == Some(0) {
+            return Err(crate::error::JammiError::Config(
+                "server.peer_local_load_bytes must be > 0 when set (unset = unbounded)".into(),
             ));
         }
         self.limits.validate()?;
@@ -1841,6 +1989,8 @@ impl Default for ServerConfig {
             preload_models: Vec::new(),
             services: ServiceSelection::default(),
             limits: LimitsConfig::default(),
+            peer_bind: None,
+            peer_local_load_bytes: None,
         }
     }
 }

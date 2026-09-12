@@ -24,6 +24,7 @@ mod freshness;
 mod index;
 mod jobs_queue;
 mod lease_keeper;
+mod masked_read;
 mod materialization;
 #[cfg(feature = "test-hooks")]
 mod materialization_crash_recovery;
@@ -37,6 +38,7 @@ mod read_vectors;
 mod reconcile;
 mod recovery;
 mod register_computed_embedding;
+mod result_tables;
 mod segment;
 mod serde_json_preserve_order;
 mod shipped_feature_exposure;
@@ -48,3 +50,4 @@ mod tenant_scope;
 mod trigger;
 #[cfg(feature = "live-broker-tests")]
 mod trigger_jetstream;
+mod whose_fault_gate;

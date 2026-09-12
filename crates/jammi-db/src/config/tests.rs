@@ -642,6 +642,7 @@ fn lease_and_worker_config_round_trip() {
             enabled: true,
             kinds: WorkerKinds::All(AllSentinel::All),
             idle_poll_secs: 1,
+            metrics_sample_secs: 5,
         }
     );
     let intervals = cfg
@@ -1074,6 +1075,114 @@ fn env_override_lease_violating_margin_is_a_typed_load_error() {
         matches!(&err, JammiError::Config(m) if m.contains("heartbeat_secs")),
         "got {err:?}"
     );
+}
+
+#[test]
+fn server_peer_local_load_bytes_parses_and_zero_is_refused() {
+    // Unset = unbounded (today's behaviour).
+    let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_local_load_bytes, None);
+    assert!(cfg.server.validate().is_ok());
+
+    // A plain integer byte count parses and validates.
+    let cfg = JammiConfig::parse_from("[server]\npeer_local_load_bytes = 1\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_local_load_bytes, Some(1));
+    assert!(cfg.server.validate().is_ok());
+
+    // The env layer spells it the same way.
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__PEER_LOCAL_LOAD_BYTES".to_string(),
+            "4096".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.peer_local_load_bytes, Some(4096));
+
+    // K2: `Some(0)` has no sane reading (a budget that admits nothing is not
+    // "unbounded") and is refused, naming the key.
+    let cfg = JammiConfig::parse_from("[server]\npeer_local_load_bytes = 0\n", vec![]).unwrap();
+    let err = cfg.server.validate().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("peer_local_load_bytes")),
+        "got {err:?}"
+    );
+}
+
+// Commit-2 oracle (a): `[server] peer_bind` parses (RED at base: `deny_unknown_fields`
+// refuses the key), and unset means no third listener.
+#[test]
+fn server_peer_bind_parses_and_defaults_unset() {
+    let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
+    assert_eq!(
+        cfg.server.peer_bind, None,
+        "unset = not mounted = single node"
+    );
+    let cfg = JammiConfig::parse_from("[server]\npeer_bind = \"127.0.0.1:0\"\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_bind.as_deref(), Some("127.0.0.1:0"));
+    assert!(cfg.server.validate().is_ok());
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__PEER_BIND".to_string(),
+            "10.0.0.1:8082".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.peer_bind.as_deref(), Some("10.0.0.1:8082"));
+}
+
+// Commit-2 oracle (b): the 3-way fixed-address collision check. `peer_bind ==
+// flight_listen` or `== health_listen` (fixed ports) is refused; identical `:0`
+// requests are allowed (the kernel assigns each bind a distinct port); an
+// unparseable address is refused naming the key.
+#[test]
+fn server_peer_bind_collisions_are_refused_and_ephemeral_is_allowed() {
+    let base = ServerConfig {
+        health_listen: "0.0.0.0:8080".into(),
+        flight_listen: "0.0.0.0:8081".into(),
+        ..Default::default()
+    };
+    let with_flight = ServerConfig {
+        peer_bind: Some("0.0.0.0:8081".into()),
+        ..base.clone()
+    };
+    let err = with_flight.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("peer_bind") && err.contains("flight_listen"),
+        "peer_bind == flight_listen must be refused naming both: {err}"
+    );
+    let with_health = ServerConfig {
+        peer_bind: Some("0.0.0.0:8080".into()),
+        ..base.clone()
+    };
+    let err = with_health.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("peer_bind") && err.contains("health_listen"),
+        "peer_bind == health_listen must be refused naming both: {err}"
+    );
+    let distinct = ServerConfig {
+        peer_bind: Some("0.0.0.0:8082".into()),
+        ..base.clone()
+    };
+    assert!(distinct.validate().is_ok());
+    let ephemeral = ServerConfig {
+        health_listen: "127.0.0.1:0".into(),
+        flight_listen: "127.0.0.1:0".into(),
+        peer_bind: Some("127.0.0.1:0".into()),
+        ..Default::default()
+    };
+    assert!(
+        ephemeral.validate().is_ok(),
+        "three identical :0 requests are allowed (distinct ports at bind)"
+    );
+    let bad = ServerConfig {
+        peer_bind: Some("not-an-address".into()),
+        ..base
+    };
+    let err = bad.validate().unwrap_err().to_string();
+    assert!(err.contains("peer_bind"), "must name the key: {err}");
 }
 
 #[test]
@@ -2570,4 +2679,80 @@ fn env_override_observability_lands_through_the_struct_derived_layer() {
         cfg.observability.sample_ratio,
         ObservabilityConfig::default().sample_ratio
     );
+}
+
+// ---------------------------------------------------------------------------
+// OPS (#482) — `[server] preload_models` entries: a bare id (task from the
+// `models` row) or `{ id, task }`; an unknown task token or key is a typed
+// load-time error naming it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preload_entries_parse_as_bare_ids_or_id_task_tables() {
+    let cfg = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    { id = "local:/models/tiny", task = "text_embedding" },
+]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.server.preload_models,
+        vec![
+            PreloadEntry {
+                id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+                task: None,
+            },
+            PreloadEntry {
+                id: "local:/models/tiny".into(),
+                task: Some(crate::model_task::ModelTask::TextEmbedding),
+            },
+        ]
+    );
+    assert!(
+        JammiConfig::parse_from("", std::collections::BTreeMap::new())
+            .unwrap()
+            .server
+            .preload_models
+            .is_empty()
+    );
+}
+
+#[test]
+fn preload_entry_rejects_an_unknown_task_token_with_a_typed_error() {
+    let err = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [{ id = "local:/models/tiny", task = "bogus_task" }]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .expect_err("an unknown task token must be refused at load");
+    let text = err.to_string();
+    assert!(
+        matches!(err, JammiError::Config(_)) && text.contains("bogus_task"),
+        "the error must be typed and name the token, got {text}"
+    );
+    let err = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [{ id = "x", tsk = "text_embedding" }]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .expect_err("an unknown key must be refused at load");
+    assert!(err.to_string().contains("tsk"), "{err}");
+    let err = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [{ task = "text_embedding" }]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .expect_err("a missing id must be refused at load");
+    assert!(err.to_string().contains("id"), "{err}");
 }

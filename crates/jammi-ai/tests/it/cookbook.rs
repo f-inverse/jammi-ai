@@ -175,7 +175,7 @@ async fn recipe_generate_embeddings() {
 
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
-    assert!(record.dimensions.is_some());
+    assert!(record.dimensions().is_some());
 
     // Parquet file exists
     assert!(common::url_to_path(&record.parquet_path).exists());
@@ -662,7 +662,7 @@ async fn recipe_modernbert_embeddings() {
 
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
-    assert!(record.dimensions.is_some());
+    assert!(record.dimensions().is_some());
 
     // encode_query with ModernBERT
     let query = session
@@ -1147,7 +1147,7 @@ async fn recipe_generate_image_embeddings() {
 
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 5);
-    assert!(record.dimensions.is_some());
+    assert!(record.dimensions().is_some());
 
     // Parquet file exists
     assert!(common::url_to_path(&record.parquet_path).exists());
@@ -1300,7 +1300,7 @@ async fn recipe_generate_audio_embeddings() {
 
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 3);
-    assert!(record.dimensions.is_some());
+    assert!(record.dimensions().is_some());
     assert!(common::url_to_path(&record.parquet_path).exists());
 
     // Sidecar index files exist (the audio path participates in ANN like the

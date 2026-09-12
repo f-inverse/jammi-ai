@@ -17,6 +17,7 @@
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
+use jammi_db::index::{validate_query, QuerySource};
 
 /// Retrieve→rescore over a quantized [`SidecarIndex`]: `search` an
 /// oversampled `k * oversample` candidate set off the (possibly lossy)
@@ -37,7 +38,8 @@ pub fn retrieve_then_rescore(
     oversample: usize,
 ) -> Result<Vec<(String, f32)>> {
     let candidate_k = k.saturating_mul(oversample).max(k);
-    let candidates = index.search(query, candidate_k)?;
+    let query = validate_query(query.to_vec(), None, QuerySource::Caller)?;
+    let candidates = index.search(&query, candidate_k)?;
 
     let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
     for (row_id, _quantized_distance) in candidates {
@@ -47,7 +49,13 @@ pub fn retrieve_then_rescore(
                  (corrupted or torn sidecar bundle)"
             ))
         })?;
-        let distance = jammi_numerics::distance::cosine_distance(query, &exact);
+        // Only safe today by the implicit ordering that `index.search` above
+        // already ran a width check against the SAME index `exact` was read
+        // from — not by any guard at this call. Checked explicitly so that
+        // ordering is never the only thing standing between this call and the
+        // kernel's own `assert!`.
+        query.require_width(exact.len(), format!("row '{row_id}'"))?;
+        let distance = jammi_numerics::distance::cosine_distance(&query, &exact);
         rescored.push((row_id, distance));
     }
 

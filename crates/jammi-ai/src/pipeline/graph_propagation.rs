@@ -342,12 +342,21 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
-        let dimensions = table.dimensions.ok_or_else(|| {
-            JammiError::Other(format!(
-                "propagate_embeddings: embedding table '{}' carries no dimensions",
-                table.table_name
-            ))
-        })? as usize;
+        // ONE resolution of the source table's current version (M1): its
+        // anchor (`inputs` below) and every row `load_initial_features`
+        // reads both derive from this single pin, so a version publish
+        // racing this materialization can never straddle the two.
+        let pin = self.result_store().pin_current_version(table).await?;
+        let table = pin.record();
+        let dimensions = table
+            .dimensions()
+            .ok_or_else(|| {
+                JammiError::Other(format!(
+                    "propagate_embeddings: embedding table '{}' carries no dimensions",
+                    table.table_name
+                ))
+            })?
+            .get();
 
         // Top-of-producer cache probe, before the expensive load+propagate. The
         // output width is knowable now (`Final` keeps one block, `JumpingKnowledge`
@@ -374,7 +383,7 @@ impl InferenceSession {
         let env =
             jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
         let inputs = vec![
-            self.result_store().result_digest_anchor(&table).await?,
+            pin.input_anchor(),
             self.edge_source_anchor(&request.edge_source).await?,
         ];
 
@@ -399,7 +408,7 @@ impl InferenceSession {
 
         // X⁽⁰⁾: the source vectors keyed by `_row_id`, in a stable total order so
         // the materialised output is reproducible.
-        let initial = self.load_initial_features(&table, dimensions).await?;
+        let initial = self.load_initial_features(&pin, dimensions).await?;
         if initial.is_empty() {
             return Err(JammiError::Other(format!(
                 "propagate_embeddings: embedding table '{}' has no rows",
@@ -425,13 +434,19 @@ impl InferenceSession {
         };
 
         let (rows, assembled_dim) = assemble_output(&initial, &history, request.output, dimensions);
-        // The output width was predicted at the top (the cache key keys on it);
-        // the assembled width must agree, or the prediction — and the probe key —
-        // would be wrong. A mismatch is a kernel bug, surfaced loudly.
-        debug_assert_eq!(
-            assembled_dim, out_dim,
-            "propagate_embeddings: predicted output width {out_dim} != assembled {assembled_dim}"
-        );
+        // Same class as the DELTA contract's M6: the output width was
+        // predicted at the top (the cache key and the materialized table's
+        // `dimensions` column both key on `out_dim`); the assembled width
+        // must agree, or the table gets materialized with rows narrower or
+        // wider than the schema it announces. A `debug_assert!` here
+        // vanishes in release and lets exactly that corrupt table land
+        // silently, so this is a typed refusal, not an assert.
+        if assembled_dim != out_dim {
+            return Err(JammiError::Other(format!(
+                "propagate_embeddings: predicted output width {out_dim} != assembled {assembled_dim} for table '{}' — refusing to materialize a mismatched-width table",
+                table.table_name
+            )));
+        }
 
         // Materialize with the contract built at the top (the same definition +
         // anchors the cache probe keyed on).
@@ -464,15 +479,24 @@ impl InferenceSession {
     /// keeps the materialised output byte-identical across runs and partitions.
     async fn load_initial_features(
         &self,
-        table: &ResultTableRecord,
+        pin: &jammi_db::store::PinnedSource,
         dimensions: usize,
     ) -> Result<Vec<NodeFeatures>> {
-        let batches = self
-            .sql(&format!(
-                "SELECT _row_id, vector FROM \"jammi.{}\"",
-                table.table_name
-            ))
-            .await?;
+        // Reads through `pinned_provider` — the SAME resolution the
+        // caller's `ResultDigest` anchor was computed from, never a second,
+        // independent read of `current_version` (see `PinnedSource`'s doc
+        // for why the two could otherwise disagree).
+        let table = pin.record();
+        let ctx = self.context();
+        let provider = self.result_store().pinned_provider(ctx, pin).await?;
+        let batches = ctx
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .select_columns(&["_row_id", "vector"])
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
 
         let mut nodes: Vec<NodeFeatures> = Vec::new();
         for batch in &batches {
@@ -787,6 +811,13 @@ impl InferenceSession {
     /// (`ResultDigest`); a `Registered` external source has no version surface in
     /// open-core, so it is anchored as `UnpinnedAtInstant` — honest about the
     /// reproducibility gap rather than fabricating a pin.
+    ///
+    /// Round 6 (M1): resolves through [`jammi_db::store::ResultStore::pin_current_version`]
+    /// rather than the now-removed `result_digest_anchor` — same value (a
+    /// `NeighborGraph` table is excluded from embedding refresh, so it can
+    /// never carry a `current_version`; both routes took the unversioned,
+    /// hash-the-Parquet arm), but the anchor no longer has a public shape a
+    /// caller could get without also being able to get the matching content.
     async fn edge_source_anchor(
         self: &Arc<Self>,
         edge_source: &EdgeSourceRef,
@@ -802,7 +833,11 @@ impl InferenceSession {
                             "propagate: edge relation '{table_name}' not found in the catalog"
                         ))
                     })?;
-                self.result_store().result_digest_anchor(&record).await
+                Ok(self
+                    .result_store()
+                    .pin_current_version(record)
+                    .await?
+                    .input_anchor())
             }
             EdgeSourceRef::Registered { source_id, .. } => {
                 Ok(jammi_db::store::manifest::InputAnchor::unpinned_at_instant(

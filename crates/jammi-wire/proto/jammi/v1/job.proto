@@ -268,6 +268,11 @@ message WorkerSummary {
   string kinds = 4;
   string started_at = 5;
   string last_seen_at = 6;
+  // The claim loop's lifecycle state, exactly as the `workers.state` row
+  // carries it: `warming` (the process is preloading; nothing claimed yet),
+  // `claiming` (the loop is live), `draining` (a DRAIN is finishing the
+  // in-flight job). The row is deleted once the loop has exited.
+  string state = 7;
 }
 
 message PruneJobsRequest {}

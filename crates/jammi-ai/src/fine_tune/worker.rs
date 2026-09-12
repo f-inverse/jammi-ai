@@ -80,12 +80,14 @@
 //! row (`jobs.cancel_requested` remains `true`) — the run completes and the
 //! row finishes `completed`, never retroactively `failed`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
+use jammi_db::catalog::jobs_repo::WorkerState;
+use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
@@ -93,6 +95,7 @@ use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::ArtifactStore;
 use jammi_db::tenant::TenantId;
+use tokio::sync::watch;
 
 use crate::fine_tune::data::TrainingDataLoader;
 use crate::fine_tune::graph_sampler::{
@@ -227,7 +230,433 @@ fn resolve_kinds(kinds: &jammi_db::config::WorkerKinds) -> Result<Vec<String>> {
 }
 
 /// A job worker bound to a session. Claims and runs durable jobs — training
-/// AND compute — from the shared catalog under a lease. Construct one per
+/// The claim loop's shutdown phase (§3.1 of the OPS design): `Running` until
+/// a DRAIN or RELEASE begins; `Draining` finishes the in-flight job and stops
+/// claiming; `Releasing` hands every lease back and stops at once. Stored in
+/// [`WorkerShared::phase`] as an `AtomicU8` — every store and load `SeqCst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkerPhase {
+    Running = 0,
+    Draining = 1,
+    Releasing = 2,
+}
+
+impl WorkerPhase {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => WorkerPhase::Draining,
+            2 => WorkerPhase::Releasing,
+            _ => WorkerPhase::Running,
+        }
+    }
+}
+
+/// What the loop task is doing, as observed through a `watch` the in-task
+/// `LoopExitGuard` writes on EVERY exit path — a writer placed after the
+/// loop's `.await` would never run when the task is aborted or panics, a
+/// `Drop` guard always does. `Stopped` is the cooperative return (the stop
+/// flag, the gate refusing, or the session dropping); `Aborted` is the task
+/// being dropped mid-poll (an `abort()`); `Failed` is a panic unwinding
+/// through the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopState {
+    Running,
+    Stopped,
+    Aborted,
+    Failed,
+}
+
+/// State shared between the loop task, the [`EmbeddedWorker`] guard that
+/// owns it, and the process's observers (`/healthz`, `/metrics`) — one
+/// `Arc`, held strongly by the loop task and the guard, handed out `Weak`
+/// through [`EmbeddedWorker::shared`].
+///
+/// * `stop` is a level-triggered `watch<bool>`: the loop's pre-claim check
+///   reads it and its idle sleep is `select!`ed against `wait_for(|v| *v)`,
+///   so a stop set during the sleep wakes the loop at once and a receiver
+///   subscribed after the send still resolves — a wakeup cannot be lost.
+/// * `in_flight` counts loop-claimed jobs running under a live hold
+///   (incremented by `register_job_hold_or_release` on its `Some` path,
+///   decremented by the `InFlightGuard` bound beside the hold). Invariant:
+///   `in_flight > 0` ⇒ the loop is inside a job, not inside `claim_next`.
+///   An inline `run_now` registers its own hold and never touches this.
+/// * `state` is the [`LoopState`] watch the exit guard writes.
+pub struct WorkerShared {
+    phase: AtomicU8,
+    stop: watch::Sender<bool>,
+    in_flight: AtomicUsize,
+    state_tx: watch::Sender<LoopState>,
+    instance_id: String,
+    /// The gauge sampler's last catalog snapshot (`/metrics` copies it on a
+    /// scrape; the sampler task writes it every `[worker]
+    /// metrics_sample_secs`).
+    sample: std::sync::RwLock<WorkerSample>,
+    /// How many catalog samples the sampler has taken — the oracle that a
+    /// scrape issues no catalog statement of its own.
+    samples_taken: AtomicU64,
+}
+
+/// The queue-depth snapshot the gauge sampler last read from the catalog:
+/// `(kind, count)` for `queued` and for `running` loop-claimable rows
+/// (`execution = 'queued'`; a held `claimable = false` row counts as
+/// queued). A kind present in the previous sample but absent now is carried
+/// at 0, so its gauge falls to zero instead of going stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerSample {
+    pub queued: Vec<(String, i64)>,
+    pub running: Vec<(String, i64)>,
+}
+
+impl WorkerShared {
+    /// Fresh shared state for one loop task: phase `Running`, stop unset,
+    /// nothing in flight, state `Running`.
+    pub fn new(instance_id: String) -> Arc<Self> {
+        let (stop, _) = watch::channel(false);
+        let (state_tx, _) = watch::channel(LoopState::Running);
+        Arc::new(Self {
+            phase: AtomicU8::new(WorkerPhase::Running as u8),
+            stop,
+            in_flight: AtomicUsize::new(0),
+            state_tx,
+            instance_id,
+            sample: std::sync::RwLock::new(WorkerSample::default()),
+            samples_taken: AtomicU64::new(0),
+        })
+    }
+
+    /// The sampler's last snapshot (a copy).
+    pub fn sample(&self) -> WorkerSample {
+        self.sample
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many catalog samples the sampler has taken so far.
+    pub fn samples_taken(&self) -> u64 {
+        self.samples_taken.load(Ordering::SeqCst)
+    }
+
+    /// Fold one `count_jobs_by_kind_status` result into the snapshot,
+    /// carrying every kind of the previous snapshot at 0 when absent now.
+    fn record_sample(&self, rows: Vec<(String, String, i64)>) {
+        let mut guard = self
+            .sample
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::take(&mut *guard);
+        let mut queued: std::collections::BTreeMap<String, i64> =
+            previous.queued.into_iter().map(|(k, _)| (k, 0)).collect();
+        let mut running: std::collections::BTreeMap<String, i64> =
+            previous.running.into_iter().map(|(k, _)| (k, 0)).collect();
+        for (kind, status, n) in rows {
+            match status.as_str() {
+                "queued" => {
+                    queued.insert(kind, n);
+                }
+                "running" => {
+                    running.insert(kind, n);
+                }
+                _ => {}
+            }
+        }
+        *guard = WorkerSample {
+            queued: queued.into_iter().collect(),
+            running: running.into_iter().collect(),
+        };
+        drop(guard);
+        self.samples_taken.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The `claimed_by` identity of the loop this state belongs to.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// The current shutdown phase (`SeqCst` load).
+    pub fn phase(&self) -> WorkerPhase {
+        WorkerPhase::from_u8(self.phase.load(Ordering::SeqCst))
+    }
+
+    fn set_phase(&self, phase: WorkerPhase) {
+        self.phase.store(phase as u8, Ordering::SeqCst);
+    }
+
+    /// Whether a stop has been requested (the level the loop's pre-claim
+    /// check reads).
+    pub fn stop_requested(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    fn request_stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    fn stop_receiver(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    /// Loop-claimed jobs currently running under a live hold (0 or 1).
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The loop task's current [`LoopState`].
+    pub fn loop_state(&self) -> LoopState {
+        *self.state_tx.borrow()
+    }
+
+    /// A receiver on the [`LoopState`] watch — `wait_for(|s| *s !=
+    /// LoopState::Running)` observes the loop's exit on every path.
+    pub fn state_receiver(&self) -> watch::Receiver<LoopState> {
+        self.state_tx.subscribe()
+    }
+}
+
+/// Reports the loop task's terminal [`LoopState`] from inside the task, on
+/// every exit path: `Stopped` when the loop returned (the guard was
+/// [`Self::complete`]d), `Failed` when a panic is unwinding through it,
+/// `Aborted` otherwise (the task was dropped mid-poll by an `abort()`).
+struct LoopExitGuard {
+    shared: Arc<WorkerShared>,
+    completed: bool,
+}
+
+impl LoopExitGuard {
+    fn new(shared: Arc<WorkerShared>) -> Self {
+        Self {
+            shared,
+            completed: false,
+        }
+    }
+
+    /// The loop returned cooperatively.
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for LoopExitGuard {
+    fn drop(&mut self) {
+        let state = if std::thread::panicking() {
+            LoopState::Failed
+        } else if self.completed {
+            LoopState::Stopped
+        } else {
+            LoopState::Aborted
+        };
+        self.shared.state_tx.send_replace(state);
+    }
+}
+
+/// Decrements [`WorkerShared::in_flight`] on drop — bound in the same scope
+/// as the job's [`LeaseHold`] by both loop hold sites, so the ordinary exit
+/// (an explicit `drop` paired with `drop(hold)`), a panic, and the loop
+/// future being dropped by an abort all release the count together with
+/// the hold.
+struct InFlightGuard(Arc<WorkerShared>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Register a claimed job's lease hold at a loop hold site — the ONE helper
+/// both sites ([`JobWorker::run_claimed_job`]'s fine-tune arm and its
+/// compute arm) call, so the RELEASE check exists in exactly one place.
+///
+/// Registers the hold with the session's keeper, then reads the phase
+/// (`SeqCst`): under [`WorkerPhase::Releasing`] the claim raced a RELEASE
+/// (it committed after the keeper's per-hold pass snapshotted, or after the
+/// first sweep), so this releases its OWN row through
+/// `Catalog::release_job_lease` (idempotent — 0 rows if a sweep already
+/// took it), drops the hold and returns `None`: the caller returns without
+/// dispatching, the row is left `running` with a NULL lease for the
+/// successor to claim within one idle poll, and the cap is untouched
+/// (`attempts - releases` is net 0). Otherwise `in_flight` is incremented and
+/// the hold returned; the caller binds an [`InFlightGuard`] beside it.
+///
+/// An inline `run_now` registers its hold directly (`crate::jobs`) and never
+/// calls this, so it never changes `in_flight` and is never released here.
+async fn register_job_hold_or_release(
+    session: &Arc<InferenceSession>,
+    catalog: &Arc<Catalog>,
+    shared: &WorkerShared,
+    job_id: &str,
+    attempts: u32,
+) -> Option<LeaseHold> {
+    #[cfg(feature = "test-hooks")]
+    loop_test_hooks::maybe_park(job_id, loop_test_hooks::ParkPoint::BeforeHold).await;
+    let hold = session.lease_keeper().hold(LeaseTarget::Job {
+        job_id: job_id.to_string(),
+        instance_id: shared.instance_id.clone(),
+        attempts,
+    });
+    if shared.phase() == WorkerPhase::Releasing {
+        match catalog
+            .release_job_lease(job_id, &shared.instance_id, attempts)
+            .await
+        {
+            Ok(true) => tracing::info!(
+                job_id,
+                "claim landed during RELEASE: lease handed back before dispatch"
+            ),
+            Ok(false) => tracing::debug!(
+                job_id,
+                "claim landed during RELEASE: lease already released by the sweep"
+            ),
+            Err(e) => tracing::warn!(
+                job_id, error = %e,
+                "claim landed during RELEASE but its release failed; left to expiry"
+            ),
+        }
+        drop(hold);
+        return None;
+    }
+    let previous = shared.in_flight.fetch_add(1, Ordering::SeqCst);
+    debug_assert!(
+        previous == 0,
+        "the loop runs one job at a time, so in_flight was {previous} before this hold"
+    );
+    Some(hold)
+}
+
+/// One RELEASE sweep over this instance's rows — the two statements of
+/// §3.4 2c/2g in their load-bearing order: the jobs sweep
+/// (`Catalog::release_jobs_claimed_by`) and then the jobs-linked building
+/// sweep (`Catalog::release_building_tables_of_claimant`). `None` in a field
+/// means that statement returned an error (logged; the row falls to the
+/// expiry path) — distinct from `Some(0)`, a sweep that matched nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseSweep {
+    /// Loop-claimed `jobs` rows whose lease this sweep NULLed.
+    pub jobs: Option<usize>,
+    /// Linked `building` `result_tables` rows whose lease this sweep NULLed.
+    pub building: Option<usize>,
+}
+
+pub(crate) async fn release_sweep(
+    catalog: &Catalog,
+    instance_id: &str,
+    writer_id: &str,
+) -> ReleaseSweep {
+    let jobs = match catalog.release_jobs_claimed_by(instance_id).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(error = %e, "RELEASE: the jobs sweep failed; leases left to expiry");
+            None
+        }
+    };
+    let building = match catalog
+        .release_building_tables_of_claimant(instance_id, writer_id)
+        .await
+    {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "RELEASE: the linked building-table sweep failed; the successor backs off once"
+            );
+            None
+        }
+    };
+    ReleaseSweep { jobs, building }
+}
+
+/// The gauge sampler: one `count_jobs_by_kind_status` per `every`, on its
+/// own task — never on a `/metrics` scrape (a scrape storm must not become a
+/// catalog storm) and never on the claim loop (which does not tick during a
+/// run). Ends when the loop's shared state is gone.
+async fn sample_loop(catalog: Arc<Catalog>, shared: Weak<WorkerShared>, every: Duration) {
+    loop {
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        match catalog.count_jobs_by_kind_status().await {
+            Ok(rows) => shared.record_sample(rows),
+            Err(e) => tracing::warn!(error = %e, "gauge sampler: count_jobs_by_kind_status failed"),
+        }
+        drop(shared);
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// What a graceful stop found to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The loop task was signalled, observed terminal, and joined; the
+    /// `workers` row is deleted.
+    Joined,
+    /// The task had already been taken (an earlier stop or release).
+    NothingToJoin,
+}
+
+/// P-2B's determinant (contract `CONTRACT-OPS-fix3.md`): the keeper's
+/// per-hold RELEASE pass (2b) either completed — carrying [`HoldRelease`]'s
+/// totality-checked counts — or could not be confirmed to run at all (the
+/// keeper thread was dead, or the pass did not complete within the bound).
+/// The latter is UNOBSERVED, never folded into a count of zero: "no hold
+/// failed" and "we don't know whether any hold failed" are different facts,
+/// and collapsing them is exactly the defect this type exists to close. The
+/// underlying error is logged at the call site ([`EmbeddedWorker::release_and_stop`]
+/// / [`crate::session::InferenceSession::release_job_leases`]); this report
+/// only needs to know the pass ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReleaseOutcome {
+    /// The pass completed; `Ok` from [`LeaseKeeper::release_job_holds`].
+    Observed(HoldRelease),
+    /// The pass could not be confirmed to run; `Err` from
+    /// [`LeaseKeeper::release_job_holds`].
+    Unobserved,
+}
+
+impl HoldReleaseOutcome {
+    /// P-2B: `true` iff the pass was observed, no hold's release attempt
+    /// itself failed, AND every hold the pass started with is accounted
+    /// for (`released + not_required + failed == attempted` — see
+    /// [`HoldRelease::attempted`]'s doc for why this is checked here, at
+    /// the consumer, rather than trusted from the pass's own internal
+    /// assert alone). `false` on `Unobserved` (unobserved is not success),
+    /// on `Observed` with `failed > 0`, and on an `Observed` value whose
+    /// three counts do not sum to `attempted` (a hold silently dropped
+    /// without being counted at all — the pass's own `assert_eq!` should
+    /// already have caught this before it ever reaches a caller, but a
+    /// consumer must not simply trust that).
+    pub fn confirms_release(&self) -> bool {
+        matches!(self, Self::Observed(hr) if hr.failed == 0
+            && hr.released + hr.not_required + hr.failed == hr.attempted)
+    }
+}
+
+/// What [`EmbeddedWorker::release_and_stop`] did, for the caller's log and
+/// for the oracles that pin each arm of §3.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseReport {
+    /// The loop's terminal state: `Stopped` on the cooperative arm,
+    /// `Aborted` on the in-flight and timeout arms, `Failed` on a panic.
+    /// May be a last-known/fallback read rather than a certain observation
+    /// — see `stop_witnessed`.
+    pub loop_state: LoopState,
+    /// `Job` holds the keeper released (2b) — P-2B's determinant.
+    pub holds: HoldReleaseOutcome,
+    /// P-2F's determinant: `true` iff no further claim by this loop can
+    /// land after sweep #2 — witnessed either by 2e having resolved the
+    /// task with certainty (joined, or aborted on any of its three abort
+    /// arms) or by `loop_state` itself being an OBSERVED terminal state
+    /// (the state-change watch fired within the bound), never the
+    /// fallback/proxy read alone. A bare `loop_state != Running` comparison
+    /// cannot make this distinction — see the contract's falsifier.
+    pub stop_witnessed: bool,
+    /// Sweep #1 (2c).
+    pub sweep_one: ReleaseSweep,
+    /// Sweep #2 (2g).
+    pub sweep_two: ReleaseSweep,
+}
+
+/// Runs jobs of every kind — the three training kinds via `run_spec` AND
+/// compute — from the shared catalog under a lease. Construct one per
 /// process (or N for a pool); [`Self::run`] is the long-lived loop the
 /// embedded engine and the server's worker tier both drive.
 pub struct JobWorker {
@@ -306,30 +735,82 @@ impl JobWorker {
 
     /// Run the claim→reconstruct→train loop until the session drops.
     ///
-    /// Equivalent to [`Self::run_until`] with a never-set stop flag — for callers
-    /// that rely solely on the session dropping (the `Weak` upgrade failing) to
-    /// stop the worker.
+    /// Equivalent to [`Self::run_until`] over fresh, never-stopped shared
+    /// state — for callers that rely solely on the session dropping (the
+    /// `Weak` upgrade failing) to stop the worker.
     pub async fn run(&self) {
-        self.run_until(Arc::new(AtomicBool::new(false))).await
+        self.run_until(WorkerShared::new(self.worker_id.clone()))
+            .await
     }
 
-    /// Run the claim→reconstruct→train loop until either `stop` is set or the
-    /// session drops.
+    /// Run the claim→reconstruct→train loop until `shared`'s stop is set or
+    /// the session drops.
     ///
-    /// Stack-safe: a bounded `loop`, never recursion. Each tick reclaims expired
-    /// leases then attempts one claim; on a claim it runs the job to a terminal
-    /// state inline (the next claim waits for it), on no claim it sleeps the
-    /// configured idle poll. The catalog used for reclaim/claim is unscoped — a worker
-    /// serves every tenant's queue.
-    pub async fn run_until(&self, stop: Arc<AtomicBool>) {
+    /// Stack-safe: a bounded `loop`, never recursion. The task's FIRST
+    /// statement upserts this process's `workers` row as `warming`; it then
+    /// waits on the session's worker gate (`InferenceSession::open_worker_gate`,
+    /// open by default — a server closes it while it preloads models)
+    /// selected against the stop, flips the row to `claiming` when the gate
+    /// opens, and only then claims — one sequential chain, so `claiming` can
+    /// never precede `warming` and a stop during the wait returns without a
+    /// claim. Each tick reclaims expired leases then attempts one claim; on a
+    /// claim it runs the job to a terminal state inline (the next claim waits
+    /// for it), on no claim it sleeps the configured idle poll `select!`ed
+    /// against the stop watch (level-triggered: no lost wakeup, no waiting
+    /// out the poll). The catalog used for reclaim/claim is unscoped — a
+    /// worker serves every tenant's queue. The terminal [`LoopState`] is
+    /// written on every exit path by an in-task guard.
+    pub async fn run_until(&self, shared: Arc<WorkerShared>) {
+        let exit = LoopExitGuard::new(Arc::clone(&shared));
+        let mut stop_rx = shared.stop_receiver();
+
+        // The `workers` row, first: another process's `ListWorkers` sees
+        // this loop from the moment it exists, and never `claiming` before.
+        let Some(session) = self.session.upgrade() else {
+            exit.complete();
+            return;
+        };
+        if let Err(e) = session
+            .catalog()
+            .upsert_worker(&self.worker_id, &self.kinds.join(","), WorkerState::Warming)
+            .await
+        {
+            tracing::error!(error = %e, "failed to upsert this process's `workers` row");
+        }
+        let mut gate_rx = session.worker_gate_receiver();
+        drop(session);
+
+        // Warm-before-claim: wait for the gate, or for a stop — whichever
+        // comes first. A closed gate whose sender is gone (the session
+        // dropped) can never open.
+        let gate_open = tokio::select! {
+            opened = gate_rx.wait_for(|open| *open) => opened.is_ok(),
+            _ = stop_rx.wait_for(|stop| *stop) => false,
+        };
+        if !gate_open {
+            exit.complete();
+            return;
+        }
+        if let Some(session) = self.session.upgrade() {
+            if let Err(e) = session
+                .catalog()
+                .set_worker_state(&self.worker_id, WorkerState::Claiming)
+                .await
+            {
+                tracing::error!(error = %e, "failed to flip this process's `workers.state` to claiming");
+            }
+        }
+
         loop {
-            if stop.load(Ordering::Relaxed) {
-                return;
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::maybe_panic(&self.worker_id);
+            if shared.stop_requested() {
+                break;
             }
             let session = match self.session.upgrade() {
                 Some(s) => s,
                 // The session dropped: nothing more to serve, exit the loop.
-                None => return,
+                None => break,
             };
             let catalog = session.catalog();
 
@@ -357,11 +838,20 @@ impl JobWorker {
                     // Drop the session strong ref before the (possibly long) run
                     // so the worker does not pin the session for the whole job —
                     // the run re-upgrades the Weak through the `Arc` it captures.
-                    self.run_claimed_job(&session, record).await;
+                    self.run_claimed_job_under(&session, record, &shared).await;
                 }
-                None => tokio::time::sleep(self.intervals.idle_poll).await,
+                None => {
+                    // Interruptible: a stop set mid-sleep wakes the loop now,
+                    // not up to `idle_poll` later; `wait_for` is level-
+                    // triggered so a stop sent before this poll resolves too.
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.intervals.idle_poll) => {}
+                        _ = stop_rx.wait_for(|stop| *stop) => {}
+                    }
+                }
             }
         }
+        exit.complete();
     }
 
     /// Run one already-claimed job to a terminal state. Deserialises the spec,
@@ -473,6 +963,21 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         record: jammi_db::catalog::jobs_repo::JobRecord,
     ) {
+        // A caller driving one claimed job outside a loop task runs it under
+        // fresh shared state: phase `Running`, so the hold sites dispatch.
+        let shared = WorkerShared::new(self.worker_id.clone());
+        self.run_claimed_job_under(session, record, &shared).await
+    }
+
+    /// [`Self::run_claimed_job`] under the loop's [`WorkerShared`]: the two
+    /// hold sites register through [`register_job_hold_or_release`] against
+    /// `shared`'s phase and account the job in `shared.in_flight`.
+    async fn run_claimed_job_under(
+        &self,
+        session: &Arc<InferenceSession>,
+        record: jammi_db::catalog::jobs_repo::JobRecord,
+        shared: &Arc<WorkerShared>,
+    ) {
         let job_id = record.job_id.clone();
         // The attempt counter makes the artifact prefix unique per (job, worker,
         // attempt): a reclaimed job re-runs under a higher `attempts`, so its
@@ -485,6 +990,7 @@ impl JobWorker {
             self.run_claimed_compute_job(
                 session,
                 &catalog,
+                shared,
                 &job_id,
                 &record.spec,
                 attempt,
@@ -536,14 +1042,15 @@ impl JobWorker {
         // keeper flips it directly on the next renewal that misses, and both
         // training paths' epoch-boundary checks read it exactly as they read
         // the old heartbeat-task-set flag. `hold` must outlive the
-        // run (held below) — dropping it early would stop renewal.
-        let hold = session
-            .lease_keeper()
-            .hold(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
-                job_id: job_id.clone(),
-                instance_id: self.worker_id.clone(),
-                attempts: attempt,
-            });
+        // run (held below) — dropping it early would stop renewal. Registered
+        // through the one RELEASE-aware helper: a claim that landed during a
+        // RELEASE hands its lease straight back and never dispatches.
+        let Some(hold) =
+            register_job_hold_or_release(session, &catalog, shared, &job_id, attempt).await
+        else {
+            return;
+        };
+        let in_flight = InFlightGuard(Arc::clone(shared));
         let cancel = hold.lost_flag();
 
         // #485: `cancel` (the lease-lost flag above) is not the ONLY source
@@ -620,6 +1127,7 @@ impl JobWorker {
         // it by a caller aborting the task — #485 BLOCK B1).
         drop(hold);
         drop(cancel_watcher);
+        drop(in_flight);
 
         match outcome {
             Ok(artifact) => {
@@ -1090,6 +1598,7 @@ impl JobWorker {
         &self,
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
+        shared: &Arc<WorkerShared>,
         job_id: &str,
         spec_json: &str,
         attempt: u32,
@@ -1123,6 +1632,7 @@ impl JobWorker {
             session,
             catalog,
             tenant_id,
+            job_id,
             attempt,
             partial_result,
             &self.worker_id,
@@ -1178,13 +1688,12 @@ impl JobWorker {
             }
         }
 
-        let hold = session
-            .lease_keeper()
-            .hold(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
-                job_id: job_id.to_string(),
-                instance_id: self.worker_id.clone(),
-                attempts: attempt,
-            });
+        let Some(hold) =
+            register_job_hold_or_release(session, catalog, shared, job_id, attempt).await
+        else {
+            return;
+        };
+        let in_flight = InFlightGuard(Arc::clone(shared));
         let job_attempt = jammi_db::catalog::result_repo::JobAttempt {
             job_id,
             instance_id: &self.worker_id,
@@ -1192,6 +1701,7 @@ impl JobWorker {
         };
         let outcome = crate::jobs::execute_compute(session, catalog, &spec, job_attempt).await;
         drop(hold);
+        drop(in_flight);
 
         match outcome {
             Ok(result) => match serde_json::to_string(&result) {
@@ -1515,9 +2025,16 @@ impl JobWorker {
         // crashing loop still resolves to a terminal classification rather than
         // a wedged `running` row.
         let result = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_fine_tune_blocking(params)
-            }))
+            }));
+            // Counted INSIDE the blocking closure: this thread keeps running
+            // after the owning future is aborted, and a test observing that
+            // the abandoned attempt never finalizes needs the exact moment the
+            // thread returned.
+            #[cfg(feature = "test-hooks")]
+            training_test_hooks::note_training_thread_finished();
+            outcome
         })
         .await;
 
@@ -1578,33 +2095,195 @@ impl JobWorker {
     }
 }
 
-/// An RAII guard owning an embedded [`JobWorker`]'s background task. On
-/// drop it sets the stop flag and aborts the task, so the worker stops claiming
-/// new jobs when its owner (the embedded `Session` or the Python
-/// `Database`) drops.
+/// The loop task's lifecycle as tracked by its owning [`EmbeddedWorker`].
 ///
-/// Drop stops the *loop*, not in-flight training: a job already running inside
-/// `spawn_blocking` cannot be force-aborted, so aborting the loop task only
-/// cancels it at the next `.await` point. A run already on the blocking pool
-/// proceeds to completion and writes its terminal status (the lease-guarded
-/// finalize) *after* this guard has dropped — detached from the guard's
-/// lifetime. The guard therefore bounds when the worker stops taking new work,
-/// not when the current job finishes.
+/// A bare `Mutex<Option<JoinHandle>>` collapses two different states into
+/// one `None`: "already gracefully joined, nothing to abort" and "taken by
+/// a `stop_and_join`/`release_and_stop` whose own future was then cancelled
+/// by ITS caller — e.g. `tokio::select!` dropping a `stop_and_join` future
+/// the instant a RELEASE signal races a DRAIN already in flight — the task
+/// is still running (or was, at the moment we lost track of it) and an
+/// abort is exactly what is owed. A bare `JoinHandle` drop DETACHES rather
+/// than aborts, so that collapse let the loop run on, undetected, past a
+/// DRAIN-then-RELEASE (SIGTERM-then-SIGINT): `release_and_stop`'s 2e found
+/// `None` (already taken, never restored) and skipped its abort arm
+/// entirely, and `Drop` found `None` too.
+///
+/// [`TakenHandle`] is the only way to read a `JoinHandle` out of this type:
+/// on ordinary completion (join or an explicit synchronous abort) it leaves
+/// the slot `Joined`; if the `TakenHandle`'s OWN holder is dropped before
+/// that — the caller's future was itself cancelled while suspended on it —
+/// its `Drop` puts the handle back as `Abandoned`, never losing it to a
+/// bare detach.
+enum LoopTask {
+    /// The task is (as far as this guard knows) still running, and nothing
+    /// has yet tried to stop it.
+    Running(tokio::task::JoinHandle<()>),
+    /// The handle was fully disposed of — cooperatively joined, or aborted
+    /// synchronously by whichever caller last held it. Nothing owed.
+    Joined,
+    /// A previous attempt to stop the task (`stop_and_join` or
+    /// `release_and_stop`) was itself cancelled while it held the handle,
+    /// before it could join or abort it. The task's exact state is now
+    /// unknown, so the next caller that observes this must abort
+    /// unconditionally rather than retry the cooperative dance — always
+    /// safe here (an abort can only land before a claim's `COMMIT`, which
+    /// always rolls back, or between `COMMIT` and hold registration, which
+    /// the reclaim path recovers with `attempts + 1`, never `failed`;
+    /// §3.4 2e / §3.5 outcome (iii)).
+    Abandoned(tokio::task::JoinHandle<()>),
+}
+
+/// Takes the current [`LoopTask`]'s handle out of `slot` for direct
+/// manipulation (join or abort), replacing the slot with `Joined`
+/// provisionally. Implements [`Future`](std::future::Future) so `.await`ing
+/// one directly resolves once the underlying task returns; if the future
+/// awaiting it is itself dropped first (a `tokio::select!` losing a race),
+/// [`Drop`] restores the handle into the slot as `LoopTask::Abandoned`
+/// rather than letting the bare `JoinHandle` drop DETACH the task. Calling
+/// [`Self::abort_now`] instead performs a synchronous abort with no `.await`
+/// in between the take and the abort, so no external cancellation can land
+/// in the gap.
+struct TakenHandle<'a> {
+    slot: &'a std::sync::Mutex<LoopTask>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this handle was reclaimed from a previously `Abandoned`
+    /// slot, as opposed to a fresh `Running` one — `release_and_stop`'s 2e
+    /// always aborts a reclaimed handle rather than re-attempting the
+    /// cooperative wait, since the task's state is unknown.
+    reclaimed: bool,
+}
+
+impl<'a> TakenHandle<'a> {
+    /// `None` when the slot is already `Joined` (nothing to take).
+    fn take(slot: &'a std::sync::Mutex<LoopTask>) -> Option<Self> {
+        let mut guard = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (handle, reclaimed) = match std::mem::replace(&mut *guard, LoopTask::Joined) {
+            LoopTask::Running(h) => (Some(h), false),
+            LoopTask::Abandoned(h) => (Some(h), true),
+            LoopTask::Joined => (None, false),
+        };
+        drop(guard);
+        handle.map(|handle| Self {
+            slot,
+            handle: Some(handle),
+            reclaimed,
+        })
+    }
+
+    /// Whether this handle came from a slot a previous caller abandoned
+    /// mid-stop.
+    fn reclaimed(&self) -> bool {
+        self.reclaimed
+    }
+
+    /// Abort the task now, synchronously — no `.await` between taking the
+    /// handle and issuing the abort, so this cannot itself be interrupted
+    /// by an external cancellation. Leaves the slot `Joined`.
+    fn abort_now(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<'a> std::future::Future for TakenHandle<'a> {
+    type Output = std::result::Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // `TakenHandle` is `Unpin` (every field is), so projecting through
+        // the pin is just a reborrow.
+        let this = self.get_mut();
+        let handle = this
+            .handle
+            .as_mut()
+            .expect("TakenHandle polled after its handle was already taken");
+        match std::pin::Pin::new(handle).poll(cx) {
+            std::task::Poll::Ready(result) => {
+                // Consumed to completion: `Drop` below finds `None` and
+                // leaves the slot `Joined` (already set at `take`).
+                this.handle = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<'a> Drop for TakenHandle<'a> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Still holding an un-joined, un-aborted handle: our OWN holder
+            // (the `stop_and_join`/`release_and_stop` future this lived
+            // inside) was cancelled before finishing with it. Restore it
+            // rather than letting it detach.
+            *self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = LoopTask::Abandoned(handle);
+        }
+    }
+}
+
+/// An RAII guard owning an embedded [`JobWorker`]'s background task, and
+/// the process's handle on its two shutdown modes.
+///
+/// * [`Self::stop_and_join`] — DRAIN: signal stop, let the in-flight job
+///   finish (keeper alive, heartbeats continue, every epoch bundle lands),
+///   observe the loop's terminal state, join the task, delete the `workers`
+///   row.
+/// * [`Self::release_and_stop`] — RELEASE: hand every lease this loop holds
+///   back to the catalog (both classes), stop the loop — cooperatively while
+///   nothing is in flight, by abort while a job is — and delete the row. The
+///   released job is claimable by a successor within one idle poll and costs
+///   no attempt.
+/// * `Drop` — the unattended halt: sets stop and aborts the task. Stops the
+///   *loop*, not in-flight training: a job already running inside
+///   `spawn_blocking` cannot be force-aborted, so aborting the loop task
+///   only cancels it at the next `.await` point; a run already on the
+///   blocking pool proceeds to completion and writes its terminal status
+///   (the lease-guarded finalize) *after* this guard has dropped — detached
+///   from the guard's lifetime. After either graceful path, or a reclaimed
+///   `Abandoned` handle, `Drop` aborts it (or finds `Joined` and no-ops).
 pub struct EmbeddedWorker {
-    /// `None` once [`Self::stop_and_join`] has taken it — the marker `Drop`
-    /// checks to skip its own abort (already gracefully joined, nothing left
-    /// to abort). Guarded by a `Mutex` rather than consuming `self` because
-    /// [`Self::stop_and_join`] takes `&self`: the owning `Database` binding
-    /// wants to signal-and-await without giving up the guard itself (its
-    /// `Drop` must still run at the connection's own end of life).
-    handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    stop: Arc<AtomicBool>,
+    /// [`LoopTask::Joined`] whenever nothing is available to take: either
+    /// [`Self::stop_and_join`] or [`Self::release_and_stop`] has fully
+    /// disposed of the handle, OR one of them is CURRENTLY holding it
+    /// inside a live [`TakenHandle`] — [`TakenHandle::take`] writes `Joined`
+    /// provisionally for the whole take window, before the handle is
+    /// joined, aborted, or (if the taker's own future is itself cancelled
+    /// first) restored as `Abandoned`. So `Joined` alone does not mean the
+    /// handle has been fully disposed of; it means this slot has nothing
+    /// left to hand out to a concurrent caller. `Drop` reads it to skip its
+    /// own abort. Guarded by a `Mutex` rather than consuming `self` because
+    /// both take `&self`: the owning `Database` binding wants to
+    /// signal-and-await without giving up the guard itself (its `Drop` must
+    /// still run at the connection's own end of life).
+    handle: std::sync::Mutex<LoopTask>,
+    /// The state shared with the loop task: phase, stop, in-flight count,
+    /// loop state.
+    shared: Arc<WorkerShared>,
     /// The catalog the `workers` row was upserted into, and the id it is
     /// keyed by — so stopping the loop (graceful or `Drop`) can delete the
     /// row rather than leave a claimant advertised until its `instances`
     /// row goes stale and cascades.
     catalog: Arc<Catalog>,
     instance_id: String,
+    /// The session's keeper (2b releases the `Job` holds it holds) and the
+    /// session's result-store writer id (the linked building sweep's
+    /// `writer_id` arm) — captured at spawn so RELEASE needs no session.
+    keeper: Arc<LeaseKeeper>,
+    writer_id: String,
+    /// The heartbeat interval: the bound on 2b's keeper pass and on 2e's
+    /// cooperative wait.
+    heartbeat: Duration,
+    /// The gauge sampler task; aborted with the loop on every stop path.
+    sampler: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EmbeddedWorker {
@@ -1618,9 +2297,9 @@ impl EmbeddedWorker {
     /// normal flow `JammiConfig::load` already validated the timing, so that
     /// half only surfaces for a hand-built config.
     ///
-    /// Upserts this process's `workers` row (item 5: "workers upsert before
-    /// serving when `[worker] enabled`") before the poll loop starts, so a
-    /// `ListWorkers` read observes this process from the moment it can claim.
+    /// The loop task's own first statement upserts this process's `workers`
+    /// row (`warming`, then `claiming` once the session's worker gate is
+    /// open — see [`JobWorker::run_until`]); nothing detached races it.
     pub fn spawn(session: &Arc<InferenceSession>) -> Result<Self> {
         let worker = JobWorker::new(session)?;
         Self::spawn_worker(session, worker)
@@ -1630,76 +2309,297 @@ impl EmbeddedWorker {
     /// harness that needs explicit timing/kinds via
     /// [`JobWorker::with_intervals_and_kinds`]).
     pub fn spawn_worker(session: &Arc<InferenceSession>, worker: JobWorker) -> Result<Self> {
-        let catalog = Arc::clone(session.catalog_arc());
-        let instance_id = session.instance_id().to_string();
-        let kinds = worker.kinds.join(",");
-        // Best-effort, synchronous-from-the-caller's-perspective upsert: a
-        // fresh `tokio::spawn`'d task issues it before the loop's first
-        // claim attempt, so the ordering "workers row exists before this
-        // process can appear to have claimed anything" holds without
-        // blocking `spawn` itself on catalog I/O.
-        tokio::spawn(async move {
-            if let Err(e) = catalog.upsert_worker(&instance_id, &kinds).await {
-                tracing::error!(error = %e, "failed to upsert this process's `workers` row");
-            }
-        });
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_task = Arc::clone(&stop);
-        let handle = tokio::spawn(async move { worker.run_until(stop_for_task).await });
+        let shared = WorkerShared::new(session.instance_id().to_string());
+        let heartbeat = worker.intervals.heartbeat;
+        let task_shared = Arc::clone(&shared);
+        let handle = tokio::spawn(async move { worker.run_until(task_shared).await });
+        let every = Duration::from_secs(session.inner_config().worker.metrics_sample_secs.max(1));
+        let sampler = tokio::spawn(sample_loop(
+            Arc::clone(session.catalog_arc()),
+            Arc::downgrade(&shared),
+            every,
+        ));
         Ok(Self {
-            handle: std::sync::Mutex::new(Some(handle)),
-            stop,
+            handle: std::sync::Mutex::new(LoopTask::Running(handle)),
+            shared,
             catalog: Arc::clone(session.catalog_arc()),
             instance_id: session.instance_id().to_string(),
+            keeper: Arc::clone(session.lease_keeper()),
+            writer_id: session.result_store().writer_id().to_string(),
+            heartbeat,
+            sampler: std::sync::Mutex::new(Some(sampler)),
         })
+    }
+
+    fn stop_sampler(&self) {
+        if let Some(sampler) = self
+            .sampler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            sampler.abort();
+        }
+    }
+
+    /// A weak handle on the loop's shared state, for observers (`/healthz`,
+    /// `/metrics`) that must never keep the loop's state alive past its
+    /// owner.
+    pub fn shared(&self) -> Weak<WorkerShared> {
+        Arc::downgrade(&self.shared)
+    }
+
+    /// Begin a DRAIN: phase `Draining` (a later RELEASE still wins), stop
+    /// requested — the loop finishes its in-flight job and claims no more —
+    /// and the `workers` row flipped to `draining` (best-effort). The join
+    /// is [`Self::stop_and_join`]'s.
+    pub async fn begin_drain(&self) {
+        let _ = self.shared.phase.compare_exchange(
+            WorkerPhase::Running as u8,
+            WorkerPhase::Draining as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        self.shared.request_stop();
+        if let Err(e) = self
+            .catalog
+            .set_worker_state(&self.instance_id, WorkerState::Draining)
+            .await
+        {
+            tracing::warn!(error = %e, "DRAIN: failed to flip this process's `workers.state` to draining");
+        }
     }
 
     /// Gracefully stop this worker and wait for its loop task to actually
     /// return, rather than `Drop`'s non-blocking signal-and-abort.
     ///
-    /// This is the primitive an explicit, deterministic teardown (a bound
-    /// `Database::close()`) needs, distinct from `Drop`'s best-effort halt for
-    /// an unattended process exit: it signals `stop` and then *awaits* the loop
-    /// task rather than aborting it, so a caller blocking on this observes the
-    /// worker's actual quiescence, not merely "the signal was sent".
+    /// This is the DRAIN primitive an explicit, deterministic teardown (a
+    /// bound `Database::close()`, a `SIGTERM`'d server) needs, distinct from
+    /// `Drop`'s best-effort halt for an unattended process exit: it signals
+    /// `stop`, then *awaits* the loop's terminal [`LoopState`] on the shared
+    /// watch (the in-flight job's own terminal write lands first: the keeper
+    /// stays alive, heartbeats continue, every epoch bundle lands), then
+    /// joins the task, so a caller blocking on this observes the worker's
+    /// actual quiescence, not merely "the signal was sent".
     ///
-    /// **Bound on how long this takes to return**, because [`JobWorker::
-    /// run_until`]'s loop only re-checks `stop` between claim attempts (see its
-    /// doc): immediate if the worker is between claim attempts (asleep for at
-    /// most `intervals.idle_poll`, default 1s), or the remaining duration of a
-    /// job already claimed and running when this is called — such a job runs to
-    /// its own terminal state (finalize included) before the loop task returns.
-    /// This never force-cancels an in-flight training run; it only stops the
-    /// worker from picking up further work and waits for it to notice.
+    /// **Bound on how long this takes to return**: immediate if the worker is
+    /// between claim attempts (its idle sleep is `select!`ed against the stop
+    /// watch, so it never waits out `intervals.idle_poll`), or the remaining
+    /// duration of a job already claimed and running when this is called —
+    /// such a job runs to its own terminal state (finalize included) before
+    /// the loop task returns. This never force-cancels an in-flight training
+    /// run; it only stops the worker from picking up further work and waits
+    /// for it to notice.
     ///
-    /// Idempotent: a second call (concurrent or sequential) finds no handle left
-    /// to take and returns `Ok(())` immediately. Takes `&self` rather than
-    /// consuming — the caller keeps the guard (and its `Drop`) alive; `Drop`
-    /// checks the same `Mutex` and no-ops the abort once this has already taken
-    /// the handle.
+    /// Idempotent: a second call (concurrent or sequential) finds no handle
+    /// left to take and returns [`StopOutcome::NothingToJoin`] at once. Takes
+    /// `&self` rather than consuming — the caller keeps the guard (and its
+    /// `Drop`) alive; `Drop` checks the same `Mutex` and no-ops the abort
+    /// once this has already taken the handle.
     ///
     /// Once the loop has returned, this process's `workers` row is deleted:
     /// a process that has stopped claiming must not show up in `ListWorkers`
-    /// as a claimant (the `instances` row stays — the process itself is alive).
-    pub async fn stop_and_join(&self) -> Result<()> {
-        self.stop.store(true, Ordering::Relaxed);
-        let taken = self
-            .handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(handle) = taken else {
-            return Ok(());
+    /// as a claimant (the `instances` row stays — the process itself is
+    /// alive). Ordered after the loop task's own `upsert_worker` by
+    /// construction: the task has exited before the delete runs.
+    ///
+    /// Cancel-safe: if THIS future is dropped before it returns (a caller's
+    /// `tokio::select!` losing a race — e.g. a RELEASE signal preempting a
+    /// DRAIN already awaiting this), the handle is never lost to a bare
+    /// detach. `TakenHandle` restores it as `LoopTask::Abandoned`, and the
+    /// next `release_and_stop` (2e) or `Drop` aborts it unconditionally.
+    pub async fn stop_and_join(&self) -> Result<StopOutcome> {
+        self.shared.request_stop();
+        let Some(taken) = TakenHandle::take(&self.handle) else {
+            return Ok(StopOutcome::NothingToJoin);
         };
+        let mut state_rx = self.shared.state_receiver();
+        // The sender lives in `self.shared`, so this cannot error.
+        let _ = state_rx.wait_for(|s| *s != LoopState::Running).await;
         // A join error here is a task panic inside `run_until` (every fallible
         // step inside its loop is already caught and logged, not propagated as
-        // a panic) or the task having been aborted by a concurrent `Drop` —
-        // either is a genuine defect worth surfacing, not swallowing.
-        handle
+        // a panic — the guard reports `Failed`) or the task having been
+        // aborted by a concurrent `Drop` — either is a genuine defect worth
+        // surfacing, not swallowing.
+        taken
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
+        self.stop_sampler();
         self.catalog.delete_worker(&self.instance_id).await?;
-        Ok(())
+        Ok(StopOutcome::Joined)
+    }
+
+    /// RELEASE — the one mechanism, identical on the library and the server
+    /// (§3.4 2a–2h): hand every lease this loop holds back to the catalog and
+    /// stop the loop at once, so a successor claims the in-flight job within
+    /// one idle poll (never one lease window) and the job costs no attempt
+    /// — WHEN every determinant of the returned [`ReleaseReport`] confirms.
+    /// When one does not, whether a given lease was in fact handed back
+    /// depends on which determinant degraded and is not universal; see
+    /// [`ReleaseReport`]'s own fields and, for the exit-code consumer, the
+    /// server's `ShutdownOutcome::ReleaseDegraded` doc.
+    ///
+    /// In order:
+    ///
+    /// * **2a** phase `Releasing` — from this instant a claim that lands runs
+    ///   into `register_job_hold_or_release`, which self-releases instead of
+    ///   dispatching.
+    /// * **2b** the keeper releases every `Job` hold it holds
+    ///   (`LeaseKeeper::release_job_holds`, bounded by one heartbeat): the
+    ///   row's lease goes NULL and the hold's `lost` flips while the hold
+    ///   still exists, so a training thread bails at its next epoch boundary
+    ///   WITHOUT writing a bundle — before any abort could drop the hold and
+    ///   let a detached trainer write a doomed epoch into the shared
+    ///   `_resume` prefix. `ResultTable` holds are never touched (2c). P-2B
+    ///   (the report's `holds` field): the pass either completed, in which
+    ///   case a per-hold failure is a genuine, separately-counted
+    ///   determinant, distinct from `not_required` (no such hold existed),
+    ///   or it could not be confirmed to run at all, which is UNOBSERVED
+    ///   rather than a count of zero.
+    /// * **2c** sweep #1: the jobs sweep, then the jobs-linked building-table
+    ///   sweep (`release_sweep`) — covering a claim or a building row that
+    ///   committed after 2b snapshotted. The loop's own `ResultTable` hold
+    ///   flips `lost` through the keeper's guarded renewal within one
+    ///   heartbeat.
+    /// * **2d** stop — the loop cannot enter a new `claim_next`; a claim
+    ///   already in flight began before this.
+    /// * **2e** total match on the loop task's state: a handle `Abandoned`
+    ///   by a previous stop attempt this process's own caller cancelled
+    ///   (F1 — e.g. a DRAIN's `stop_and_join` preempted by this RELEASE) is
+    ///   aborted unconditionally, since its true state is unknown and an
+    ///   abort is always safe here. A `Running` handle with `in_flight ==
+    ///   0` (the loop is idle, inside `reclaim_expired_jobs`/`claim_next`,
+    ///   or in the claim→hold prologue) is never aborted while a claim
+    ///   transaction can be in flight; wait one heartbeat for the
+    ///   cooperative exit, joining the task on it. On timeout, abort
+    ///   (outcome (iii): a claim between COMMIT and hold registration keeps
+    ///   its live lease and is recovered by the expiry path with `attempts
+    ///   + 1`, never `failed`). `in_flight > 0`: the loop is inside a job
+    ///   under a hold, not inside `claim_next` — abort now; the dropped
+    ///   future runs the hold's and the watcher's `Drop`. `Joined` is a
+    ///   no-op — nothing left to take; see `TakenHandle`'s own doc for why
+    ///   this alone does not witness P-2F (a concurrent `stop_and_join` may
+    ///     still be mid-flight holding the handle).
+    /// * **2f** observe the terminal [`LoopState`] (the in-task guard reports
+    ///   on every path). `stop_witnessed` (P-2F) is `true` when 2e itself
+    ///   resolved the task (joined or aborted, any arm) OR this observation
+    ///   is a genuine watch-fired transition — never when it fell back to
+    ///   the last-known proxy read on a timeout/closed channel, which alone
+    ///   can read `Running` on a genuine abort whose guard has not published
+    ///   yet.
+    /// * **2g** sweep #2, unconditionally — idempotent, catches a claim or a
+    ///   building row that committed after sweep #1.
+    /// * **2h** delete the `workers` row — AFTER sweep #2, so the row outlives
+    ///   this instance's last lease write.
+    ///
+    /// Bounded by 2 × heartbeat plus the keeper's pass, never a hang. A
+    /// catalog error inside any statement is logged and the arm continues
+    /// (the affected lease falls to the expiry path).
+    pub async fn release_and_stop(&self) -> Result<ReleaseReport> {
+        // 2a
+        self.shared.set_phase(WorkerPhase::Releasing);
+        // 2b
+        let holds = match self.keeper.release_job_holds(self.heartbeat).await {
+            Ok(hr) => HoldReleaseOutcome::Observed(hr),
+            Err(e) => {
+                tracing::warn!(error = %e, "RELEASE: the keeper's per-hold release pass failed");
+                HoldReleaseOutcome::Unobserved
+            }
+        };
+        // 2c
+        let sweep_one = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
+        // 2d
+        self.shared.request_stop();
+        // 2e
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::fire(&self.instance_id, loop_test_hooks::Rendezvous::ReleaseAt2e);
+        let in_flight = self.shared.in_flight();
+        debug_assert!(
+            in_flight <= 1,
+            "the loop runs one job at a time; in_flight = {in_flight}"
+        );
+        let mut state_rx = self.shared.state_receiver();
+        // P-2F's first disjunct: whether THIS call resolved the task with
+        // certainty (joined, or aborted on any arm). `NothingToTake` — the
+        // handle was already taken by a concurrent caller — is NOT itself a
+        // certain witness (see `TakenHandle`'s own doc: `Joined` alone does
+        // not mean the handle was fully disposed of, only that this slot had
+        // nothing left to hand out); P-2F then falls through to the second
+        // disjunct below (2f's OBSERVED terminal state, never its fallback).
+        let stop_resolved = if let Some(taken) = TakenHandle::take(&self.handle) {
+            if taken.reclaimed() {
+                // A previous stop attempt (this process's own caller
+                // cancelled it) left the task's fate unresolved rather than
+                // losing it to a bare `JoinHandle` drop. Abort it
+                // unconditionally — see `LoopTask::Abandoned`'s doc for why
+                // this is always safe.
+                tracing::warn!(
+                    "RELEASE: a previous stop attempt was itself cancelled before observing \
+                     the loop's terminal state; aborting the loop task now"
+                );
+                taken.abort_now();
+            } else if in_flight == 0 {
+                // The watch `Ref` is dropped before the join below: a guard
+                // held across an `.await` would make this future `!Send`.
+                let exited = tokio::time::timeout(
+                    self.heartbeat,
+                    state_rx.wait_for(|s| *s != LoopState::Running),
+                )
+                .await
+                .is_ok();
+                if exited {
+                    if let Err(e) = taken.await {
+                        tracing::error!(error = %e, "RELEASE: the loop task ended with a join error");
+                    }
+                } else {
+                    tracing::warn!(
+                        bound = ?self.heartbeat,
+                        "RELEASE: the loop did not exit within one heartbeat; aborting it"
+                    );
+                    taken.abort_now();
+                }
+            } else {
+                taken.abort_now();
+            }
+            true
+        } else {
+            false
+        };
+        // 2f
+        let observed = tokio::time::timeout(
+            self.heartbeat,
+            state_rx.wait_for(|s| *s != LoopState::Running),
+        )
+        .await
+        .map(|r| r.map(|state| *state));
+        let (loop_state, state_witnessed) = match observed {
+            Ok(Ok(state)) => (state, true),
+            Ok(Err(_)) | Err(_) => {
+                let observed = self.shared.loop_state();
+                tracing::warn!(
+                    ?observed,
+                    "RELEASE: the loop's terminal state was not observed within one heartbeat"
+                );
+                (observed, false)
+            }
+        };
+        // P-2F: resolved with certainty by 2e, OR the terminal state above
+        // was itself an OBSERVED transition (never the fallback proxy read
+        // alone — see the contract's falsifier on a bare `loop_state !=
+        // Running` comparison).
+        let stop_witnessed = stop_resolved || state_witnessed;
+        // 2g
+        let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
+        // 2h
+        self.stop_sampler();
+        self.catalog.delete_worker(&self.instance_id).await?;
+        Ok(ReleaseReport {
+            loop_state,
+            holds,
+            stop_witnessed,
+            sweep_one,
+            sweep_two,
+        })
     }
 }
 
@@ -1709,24 +2609,34 @@ impl Drop for EmbeddedWorker {
     /// it runs to completion and writes its terminal status post-drop (see the
     /// type doc).
     ///
-    /// No-ops the abort when [`Self::stop_and_join`] already took the handle —
-    /// there is nothing left to abort, and aborting a handle that already
-    /// returned would be a silent no-op anyway, but the explicit check keeps
-    /// the intent legible.
+    /// No-ops the abort when [`Self::stop_and_join`] or
+    /// [`Self::release_and_stop`] already fully joined the task (the slot
+    /// reads `LoopTask::Joined`) — there is nothing left to abort, and
+    /// aborting a handle that already returned would be a silent no-op
+    /// anyway, but the explicit check keeps the intent legible. A
+    /// `LoopTask::Abandoned` handle — left behind by a stop attempt this
+    /// process's own caller cancelled before it could join or abort it (F1)
+    /// — is aborted here too: total match, nothing is ever silently lost to
+    /// a bare `JoinHandle` drop (which would DETACH rather than abort).
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self
-            .handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+        self.shared.request_stop();
+        self.stop_sampler();
+        let task = std::mem::replace(
+            &mut *self
+                .handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            LoopTask::Joined,
+        );
+        if let LoopTask::Running(handle) | LoopTask::Abandoned(handle) = task {
             handle.abort();
             // The loop is gone, so the claimant row must go too. `Drop` is
             // synchronous: the delete rides a detached task on the current
             // runtime when there is one (the embedded engine's own runtime
             // is still up at this point); with no runtime to spawn onto the
-            // row is left to the `instances` staleness cascade.
+            // row is left to the `instances` staleness cascade. A `Drop` that
+            // lands while the task's own `upsert_worker` is still in flight
+            // can leave a phantom `warming` row — the same cascade covers it.
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 let catalog = Arc::clone(&self.catalog);
                 let instance_id = self.instance_id.clone();
@@ -1736,6 +2646,221 @@ impl Drop for EmbeddedWorker {
                     }
                 });
             }
+        }
+    }
+}
+
+/// Test-only rendezvous inside the claim loop (`feature = "test-hooks"`;
+/// mirrors `crate::jobs::compute_test_hooks`): a test parks the loop at a
+/// documented point between its claim and its hold, or observes the exact
+/// instant RELEASE reaches its 2e decision, so the shutdown arms are pinned
+/// against the mechanism rather than raced against a wall clock. No
+/// production path observes anything here beyond the `maybe_park` /
+/// `fire` calls, which return at once when nothing is armed.
+#[cfg(feature = "test-hooks")]
+pub mod loop_test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tokio::sync::Notify;
+
+    /// Where the loop parks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ParkPoint {
+        /// Inside `register_job_hold_or_release`, after the claim committed
+        /// and before the hold is registered — the claim→hold prologue, on
+        /// both the fine-tune and the compute path.
+        BeforeHold,
+    }
+
+    struct Armed {
+        job_id: String,
+        point: ParkPoint,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn armed() -> &'static Mutex<Vec<Armed>> {
+        static ARMED: OnceLock<Mutex<Vec<Armed>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of one armed park: wait for the loop to arrive, then
+    /// let it continue. Dropping the handle without releasing leaves the
+    /// loop parked — release it explicitly (or abort the task).
+    pub struct ParkHandle {
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    impl ParkHandle {
+        /// Resolve once the loop has reached the park point.
+        pub async fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                self.parked_notify.notified().await;
+            }
+        }
+
+        /// Whether the loop has reached the park point (non-blocking).
+        pub fn is_parked(&self) -> bool {
+            self.parked.load(Ordering::SeqCst)
+        }
+
+        /// Let the parked loop continue.
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_one();
+        }
+    }
+
+    /// Arm one park for the next hold registration of `job_id` at `point`.
+    /// One-shot: the park disarms as soon as the loop takes it.
+    pub fn arm(job_id: &str, point: ParkPoint) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Armed {
+                job_id: job_id.to_string(),
+                point,
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park(job_id: &str, point: ParkPoint) {
+        let taken = {
+            let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.job_id == job_id && a.point == point)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
+    }
+
+    fn panic_armed() -> &'static Mutex<Vec<String>> {
+        static ARMED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Make the loop task of `instance_id` panic at the top of its next tick
+    /// — the way a defect inside the loop would kill it — so a test can
+    /// prove the exit guard reports `LoopState::Failed` and `/healthz` reads
+    /// 503. One-shot.
+    pub fn arm_panic_at_next_tick(instance_id: &str) {
+        panic_armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(instance_id.to_string());
+    }
+
+    pub(super) fn maybe_panic(instance_id: &str) {
+        let armed = {
+            let mut list = panic_armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|i| i == instance_id)
+                .map(|i| list.remove(i))
+        };
+        if armed.is_some() {
+            panic!("claim loop: task killed by test hook");
+        }
+    }
+
+    /// A notify-only rendezvous: RELEASE fires it and never waits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Rendezvous {
+        /// The first statement of `EmbeddedWorker::release_and_stop`'s 2e —
+        /// the sweeps have returned and the `in_flight` decision is about to
+        /// be read. A test that parked the loop before COMMIT unparks it on
+        /// THIS signal, never on a wall clock measured from the sweeps.
+        ReleaseAt2e,
+    }
+
+    struct ArmedRendezvous {
+        instance_id: String,
+        which: Rendezvous,
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    fn rendezvous() -> &'static Mutex<Vec<ArmedRendezvous>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedRendezvous>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of an armed rendezvous.
+    pub struct RendezvousHandle {
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    impl RendezvousHandle {
+        /// Resolve once RELEASE has fired the rendezvous.
+        pub async fn wait_fired(&self) {
+            while !self.fired.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+        }
+
+        /// Whether the rendezvous has fired (non-blocking).
+        pub fn has_fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Arm `which` for the next RELEASE of the worker whose `claimed_by`
+    /// identity is `instance_id`. One-shot per handle; keyed so sibling tests
+    /// in one binary never fire each other's.
+    pub fn arm_rendezvous(instance_id: &str, which: Rendezvous) -> RendezvousHandle {
+        let fired = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        rendezvous()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedRendezvous {
+                instance_id: instance_id.to_string(),
+                which,
+                fired: Arc::clone(&fired),
+                notify: Arc::clone(&notify),
+            });
+        RendezvousHandle { fired, notify }
+    }
+
+    /// Fire every handle armed for (`instance_id`, `which`). Never parks.
+    pub(super) fn fire(instance_id: &str, which: Rendezvous) {
+        let taken: Vec<ArmedRendezvous> = {
+            let mut list = rendezvous().lock().unwrap_or_else(PoisonError::into_inner);
+            let (hit, rest): (Vec<_>, Vec<_>) = list
+                .drain(..)
+                .partition(|a| a.which == which && a.instance_id == instance_id);
+            *list = rest;
+            hit
+        };
+        for armed in taken {
+            armed.fired.store(true, Ordering::SeqCst);
+            armed.notify.notify_one();
         }
     }
 }
@@ -2672,10 +3797,26 @@ impl Drop for CancelWatcherGuard {
 /// here.
 #[cfg(feature = "test-hooks")]
 pub mod training_test_hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
     use jammi_db::catalog::Catalog;
     use tokio::sync::oneshot;
+
+    static THREADS_FINISHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many `spawn_blocking` training threads have returned in this
+    /// process — counted inside the blocking closure itself, so a thread
+    /// whose owning future was aborted (a RELEASE mid-epoch) is still counted
+    /// the moment it bails. A test that must prove "the abandoned attempt
+    /// never finalized" waits for this to advance, then reads the row.
+    pub fn training_threads_finished() -> usize {
+        THREADS_FINISHED.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn note_training_thread_finished() {
+        THREADS_FINISHED.fetch_add(1, Ordering::SeqCst);
+    }
 
     /// One-shot pause slot: `Some` once armed, taken (and thereby disarmed)
     /// the first time [`checkpoint_before_spawn_blocking`] runs after that.
@@ -5992,8 +7133,8 @@ mod tests {
         // arm directly (via the field it shares with `stop_and_join`) rather
         // than only trusting that dropping `worker` at scope-end never panics.
         assert!(
-            worker.handle.lock().unwrap().is_none(),
-            "stop_and_join must take the handle so a later Drop finds nothing to abort"
+            matches!(*worker.handle.lock().unwrap(), LoopTask::Joined),
+            "stop_and_join must leave the slot Joined so a later Drop finds nothing to abort"
         );
 
         // Idempotent: a second call finds no handle left and returns
@@ -6002,5 +7143,37 @@ mod tests {
             .await
             .expect("a second stop_and_join must not hang")
             .expect("a second stop_and_join on an already-joined worker is Ok");
+    }
+
+    /// Contract `CONTRACT-OPS-fix4.md` M5: `confirms_release()` checks
+    /// totality (`released + not_required + failed == attempted`), not just
+    /// `failed == 0` — a `HoldRelease` whose three counts undercount its own
+    /// `attempted` (a hold silently dropped without being counted at all)
+    /// must degrade the release even though `failed` reads zero. The
+    /// production pass's own `assert_eq!` should already refuse to hand out
+    /// such a value, but a consumer of the type must not simply trust that.
+    #[test]
+    fn confirms_release_catches_an_undercounted_attempted() {
+        let undercounted = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+            attempted: 2,
+        });
+        assert!(
+            !undercounted.confirms_release(),
+            "one of the two attempted holds is unaccounted for; this must not confirm release"
+        );
+
+        let consistent = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 1,
+            failed: 0,
+            attempted: 2,
+        });
+        assert!(
+            consistent.confirms_release(),
+            "every attempted hold is accounted for and none failed"
+        );
     }
 }

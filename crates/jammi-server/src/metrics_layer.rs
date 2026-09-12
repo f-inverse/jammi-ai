@@ -13,7 +13,10 @@
 //! * `/jammi.v1.eval.EvalService/*` increments `eval_invocations`;
 //! * `/jammi.v1.embedding.EmbeddingService/Search` additionally times the
 //!   request future and records the elapsed end-to-end latency on
-//!   `search_latency` when the response resolves.
+//!   `search_latency` when the response resolves;
+//! * `/jammi.v1.peer.PeerService/<Rpc>` increments `peer_requests{rpc}` — the
+//!   owner side of a placed search, seen only on the `peer_bind` listener
+//!   (which carries this same layer).
 //!
 //! Counting at the whole-server layer (rather than per service / per
 //! interceptor) keeps all four metrics live at one site with no threading into
@@ -42,6 +45,10 @@ const FLIGHT_DO_GET_PATH: &str = "/arrow.flight.protocol.FlightService/DoGet";
 const EVAL_PREFIX: &str = "/jammi.v1.eval.EvalService/";
 /// The single embedding-search method path whose latency is observed.
 const EMBEDDING_SEARCH_PATH: &str = "/jammi.v1.embedding.EmbeddingService/Search";
+/// `PeerService` method-path prefix — the owner side of a placed search,
+/// counted per rpc (`jammi_peer_requests_total{rpc}`). Reachable only on the
+/// `[server] peer_bind` listener, which carries this same layer.
+const PEER_PREFIX: &str = "/jammi.v1.peer.PeerService/";
 
 /// [`Layer`] that installs [`Metrics`]. Add it to the tonic `Server::builder()`
 /// chain so it observes every request to the combined Flight + gRPC surface.
@@ -98,6 +105,9 @@ where
         }
         if path.starts_with(EVAL_PREFIX) {
             self.registry.eval_invocations.inc();
+        }
+        if let Some(rpc) = path.strip_prefix(PEER_PREFIX) {
+            self.registry.peer_requests.with_label_values(&[rpc]).inc();
         }
 
         // Time the Search RPC end-to-end: start the clock here and observe on

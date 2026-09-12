@@ -33,6 +33,7 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
+use jammi_db::index::{validate_query, QuerySource};
 
 use crate::corpus;
 use crate::operator_mirror::retrieve_then_rescore;
@@ -120,7 +121,16 @@ pub async fn run(
     let max_k = RECALL_KS.iter().copied().max().unwrap_or(0);
     let mut exact: Vec<Vec<(String, f32)>> = Vec::with_capacity(queries.len());
     for q in &queries {
-        exact.push(exact_vector_search(&ctx, CORPUS_TABLE, q, max_k).await?);
+        exact.push(
+            exact_vector_search(
+                &ctx,
+                CORPUS_TABLE,
+                &validate_query(q.to_vec(), None, QuerySource::Caller)?,
+                max_k,
+                None,
+            )
+            .await?,
+        );
     }
 
     let tmp = tempfile::tempdir()?;
@@ -224,7 +234,7 @@ pub async fn run(
             if precision.needs_rescore() {
                 retrieve_then_rescore(&loaded, q, k, oversample.max(1))
             } else {
-                loaded.search(q, k)
+                loaded.search(&validate_query(q.to_vec(), None, QuerySource::Caller)?, k)
             }
         })?;
         precision_sweep.push(PrecisionSweepPoint {
@@ -261,7 +271,9 @@ fn recall_and_qps(
     queries: &[Vec<f32>],
     exact: &[Vec<(String, f32)>],
 ) -> Result<(BTreeMap<usize, Measurement>, f64), Box<dyn std::error::Error>> {
-    recall_and_qps_with(queries, exact, |q, k| index.search(q, k))
+    recall_and_qps_with(queries, exact, |q, k| {
+        index.search(&validate_query(q.to_vec(), None, QuerySource::Caller)?, k)
+    })
 }
 
 /// Recall@k for every k in [`RECALL_KS`] plus QPS at [`QPS_K`], retrieving each

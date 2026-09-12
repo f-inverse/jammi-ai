@@ -38,6 +38,53 @@ pub struct InferenceRunner {
     backend: Option<BackendType>,
     batch_size: usize,
     observer: Option<Arc<dyn InferenceObserver>>,
+    /// Input columns copied verbatim to the end of every emitted sub-batch
+    /// (see `schema::build_output_schema`'s `passthrough`).
+    passthrough: Vec<String>,
+}
+
+/// Test-only observability: a process-global count of `forward()` calls,
+/// keyed by the scanned `source_id`, so an oracle can prove a refusal happened
+/// BEFORE the model was ever invoked for ITS source (the
+/// `KeyCheckExec`-below-the-sort contract) while sibling tests in the same
+/// binary keep forwarding over their own sources in parallel — a single
+/// unkeyed total would be racy in a parallel test binary.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static FORWARD_CALLS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+    fn table() -> &'static Mutex<HashMap<String, u64>> {
+        FORWARD_CALLS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record_forward(source_id: &str) {
+        *table()
+            .lock()
+            .expect("forward-call table poisoned")
+            .entry(source_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// The number of `forward()` calls over `source_id` since the last reset.
+    pub fn forward_calls_for(source_id: &str) -> u64 {
+        table()
+            .lock()
+            .expect("forward-call table poisoned")
+            .get(source_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Reset `source_id`'s counter to zero.
+    pub fn reset_forward_calls_for(source_id: &str) {
+        table()
+            .lock()
+            .expect("forward-call table poisoned")
+            .insert(source_id.to_string(), 0);
+    }
 }
 
 /// Everything needed to shape a successful forward's raw output into a
@@ -51,6 +98,8 @@ struct OutputContext<'a> {
     source_id: &'a str,
     model_label: &'a str,
     observer: Option<&'a dyn InferenceObserver>,
+    /// The key column's name, for the defensive null-key refusal.
+    key_column: &'a str,
 }
 
 impl InferenceRunner {
@@ -77,7 +126,15 @@ impl InferenceRunner {
             backend,
             batch_size,
             observer,
+            passthrough: Vec::new(),
         }
+    }
+
+    /// Name input columns copied verbatim to the end of every emitted
+    /// sub-batch, in this order (after the task columns).
+    pub fn with_passthrough(mut self, passthrough: Vec<String>) -> Self {
+        self.passthrough = passthrough;
+        self
     }
 
     /// Consume the input stream, run inference in sub-batches, and send results to `tx`.
@@ -135,10 +192,14 @@ impl InferenceRunner {
 
         // Process input stream
         while let Some(input_batch) = input.next().await {
-            let input_batch = input_batch.map_err(|e| JammiError::Inference(e.to_string()))?;
+            // The structural classifier, never a stringification: a typed
+            // refusal raised below this runner (`KeyCheckExec`'s
+            // `InvalidKey`) must reach the caller as that variant.
+            let input_batch = input_batch.map_err(JammiError::from)?;
 
             let content = extract_columns(&input_batch, &self.content_columns)?;
             let keys = extract_column(&input_batch, &self.key_column)?;
+            let passthrough = extract_columns(&input_batch, &self.passthrough)?;
 
             let ctx = OutputContext {
                 output_schema,
@@ -146,11 +207,13 @@ impl InferenceRunner {
                 source_id: &self.source_id,
                 model_label: &model_label,
                 observer: self.observer.as_deref(),
+                key_column: &self.key_column,
             };
 
             Self::run_chunks(
                 &content,
                 &keys,
+                &passthrough,
                 &mut current_batch_size,
                 &mut next_ordinal,
                 &ctx,
@@ -180,9 +243,11 @@ impl InferenceRunner {
     /// annotated as a per-row `_status = error` batch (see the module doc
     /// comment). `forward` is injected so this control flow is unit-testable
     /// without a real model.
+    #[allow(clippy::too_many_arguments)]
     async fn run_chunks<F>(
         content: &[ArrayRef],
         keys: &ArrayRef,
+        passthrough: &[ArrayRef],
         current_batch_size: &mut usize,
         next_ordinal: &mut u64,
         ctx: &OutputContext<'_>,
@@ -199,14 +264,18 @@ impl InferenceRunner {
             let chunk_len = (*current_batch_size).min(row_count - chunk_start);
             let chunk_content = slice_columns(content, chunk_start, chunk_len);
             let chunk_keys = keys.slice(chunk_start, chunk_len);
+            let chunk_passthrough = slice_columns(passthrough, chunk_start, chunk_len);
 
             let start = Instant::now();
+            #[cfg(feature = "test-hooks")]
+            test_hooks::record_forward(ctx.source_id);
             match forward(&chunk_content) {
                 Ok(raw_output) => {
                     let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
                     let output_batch = Self::build_output_batch(
                         ctx,
                         &chunk_keys,
+                        &chunk_passthrough,
                         &raw_output,
                         chunk_len,
                         latency_ms,
@@ -270,6 +339,7 @@ impl InferenceRunner {
     fn build_output_batch(
         ctx: &OutputContext<'_>,
         keys: &ArrayRef,
+        passthrough: &[ArrayRef],
         raw_output: &BackendOutput,
         row_count: usize,
         latency_ms: f32,
@@ -285,10 +355,23 @@ impl InferenceRunner {
             row_count,
             ordinal_start,
         )?;
+        // Defensive only: `KeyCheckExec` below the blocking sort refuses a
+        // null key before any row reaches this runner, so this is unreachable
+        // on every planned path — but a hand-built plan that bypasses it must
+        // still get the typed refusal, never a stringly `RecordBatch::try_new`
+        // "non-nullable column contains nulls".
+        let null_keys = prefix[0].null_count();
+        if null_keys > 0 {
+            return Err(JammiError::InvalidKey {
+                column: ctx.key_column.to_string(),
+                null_count: null_keys as u64,
+            });
+        }
         let task_columns = ctx.adapter.adapt(raw_output, row_count)?;
 
         let mut all_columns = prefix;
         all_columns.extend(task_columns);
+        all_columns.extend(passthrough.iter().cloned());
 
         RecordBatch::try_new(Arc::clone(ctx.output_schema), all_columns)
             .map_err(|e| JammiError::Inference(format!("Failed to build output batch: {e}")))
@@ -348,6 +431,7 @@ mod tests {
             "id",
             Some(1),
             None,
+            &[],
         )
         .expect("schema builds")
     }
@@ -419,6 +503,7 @@ mod tests {
             source_id: "test-source",
             model_label: "test-model",
             observer: None,
+            key_column: "id",
         };
         let mut current_batch_size = 100;
         let mut next_ordinal = 0u64;
@@ -428,6 +513,7 @@ mod tests {
         InferenceRunner::run_chunks(
             &content,
             &keys,
+            &[],
             &mut current_batch_size,
             &mut next_ordinal,
             &ctx,
@@ -474,6 +560,7 @@ mod tests {
             source_id: "test-source",
             model_label: "test-model",
             observer: None,
+            key_column: "id",
         };
         let mut current_batch_size = 100;
         let mut next_ordinal = 0u64;
@@ -483,6 +570,7 @@ mod tests {
         InferenceRunner::run_chunks(
             &content,
             &keys,
+            &[],
             &mut current_batch_size,
             &mut next_ordinal,
             &ctx,
@@ -528,6 +616,7 @@ mod tests {
             source_id: "test-source",
             model_label: "test-model",
             observer: None,
+            key_column: "id",
         };
         let mut current_batch_size = 4;
         let mut next_ordinal = 0u64;
@@ -536,6 +625,7 @@ mod tests {
         let result = InferenceRunner::run_chunks(
             &content,
             &keys,
+            &[],
             &mut current_batch_size,
             &mut next_ordinal,
             &ctx,
@@ -570,6 +660,7 @@ mod tests {
             source_id: "test-source",
             model_label: "test-model",
             observer: None,
+            key_column: "id",
         };
         let mut current_batch_size = 4;
         let mut next_ordinal = 0u64;
@@ -578,6 +669,7 @@ mod tests {
         let result = InferenceRunner::run_chunks(
             &content,
             &keys,
+            &[],
             &mut current_batch_size,
             &mut next_ordinal,
             &ctx,

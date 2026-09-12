@@ -74,6 +74,7 @@
       "build_neighbor_graph",
       "cancel_job",
       "close",
+      "compact_embeddings",
       "conformalize",
       "conformalize_cqr",
       "conformalize_interval",
@@ -90,6 +91,7 @@
       "eval_embeddings",
       "eval_inference",
       "eval_per_query",
+      "expire_versions",
       "fine_tune",
       "fine_tune_graph",
       "generate_embeddings",
@@ -111,6 +113,7 @@
       "publish_topic",
       "recompute",
       "reconcile",
+      "refresh_embeddings",
       "register_channel",
       "register_topic",
       "rrf_fuse",
@@ -125,7 +128,7 @@
       "train_context_predictor",
       "verify_materialization"
     ],
-    "verb_count": 57
+    "verb_count": 60
   },
   "taxonomy": {
     "embedded_bad_arg": {

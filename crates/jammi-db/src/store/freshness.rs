@@ -438,19 +438,43 @@ impl ResultStore {
     ///   [`CurrentAnchor::Undecidable`]: there is no current-resolution surface
     ///   to read a live version from (see the module docs). This is honest, not
     ///   a fabricated read against a surface that does not exist.
+    ///
+    /// **Disclosed residual (round 7, not closed):** for a versioned parent,
+    /// [`CurrentAnchor::ResultDigest`] carries the SAME identity value
+    /// [`ResultStore::pin_current_version`]'s anchor would for that table —
+    /// a version-resolved digest with no paired content read. This function's
+    /// only in-tree callers ([`Self::staleness`], same file) compare it
+    /// against a *recorded* anchor and then discard it, never persist it as
+    /// new provenance, so nothing straddles today; but nothing in this
+    /// function's type stops a future caller from pairing the value with an
+    /// independently-resolved read and persisting the pair. Tracked as a
+    /// live, reviewed exception in `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
+    /// `ANCHOR_RETURN_ALLOWED` (the gate that mechanically enumerates, across
+    /// this crate and `jammi-ai`, every function whose return type carries
+    /// `InputAnchor`/`CurrentAnchor` verbatim — a strictly narrower, textual
+    /// predicate than "every such function" in the semantic sense above; see
+    /// that file's own module doc for the other three patterns it also
+    /// checks), not silently absorbed.
     pub async fn current_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
         match anchor.kind {
             AnchorKind::ResultDigest => {
                 let Some(parent) = self.catalog().get_result_table(&anchor.source).await? else {
                     return Ok(CurrentAnchor::Vanished);
                 };
+                // A versioned parent's current anchor is its current version's
+                // identity — a refresh that changed content advances it, one
+                // that did not leaves every dependent `Fresh`.
+                if let Some(identity) = self.current_version_identity(&parent).await? {
+                    return Ok(CurrentAnchor::ResultDigest(identity));
+                }
                 let parquet_url = StorageUrl::parse(&parent.parquet_path)?;
                 match self.read_materialization_manifest(&parquet_url).await? {
                     Some(manifest) => Ok(CurrentAnchor::ResultDigest(manifest.artifact.0)),
                     // A resolvable result table with no manifest is a pre-contract
                     // parent: its current digest is recomputed from its bytes, the
-                    // same fall-back `result_digest_anchor` uses, so the comparison
-                    // is against the parent's true present content.
+                    // same fall-back `pin_current_version`'s unversioned arm uses,
+                    // so the comparison is against the parent's true present
+                    // content.
                     None => {
                         let handle = self.open_parquet(&parquet_url)?;
                         let path = handle.data_path()?;
@@ -483,6 +507,21 @@ impl ResultStore {
         table: &ResultTableRecord,
     ) -> Result<ProducingDescriptor> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        // A versioned table's producer is its CURRENT version's delta
+        // descriptor (`Embedding` at the base, `EmbeddingDelta` after a
+        // refresh, `EmbeddingCompaction` after a compaction). When that
+        // manifest is unavailable (the `VersionUnavailable` state) the base
+        // manifest's descriptor stands in: `recompute` is the documented
+        // remedy for an unavailable version, and every embedding-family
+        // descriptor in the chain replays as the same full embed.
+        if let Some(version) = table.current_version {
+            if let Some(m) = self
+                .read_version_manifest(&table.table_name, &parquet_url, version)
+                .await?
+            {
+                return Ok(m.delta.descriptor.clone());
+            }
+        }
         match self.read_materialization_manifest(&parquet_url).await? {
             Some(manifest) => Ok(manifest.descriptor),
             None => Err(JammiError::NotRecomputable {

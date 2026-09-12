@@ -1,0 +1,283 @@
+---
+title: "Incremental refresh: versioned embedding tables over a deletion mask — edit, delete, compact, expire"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `refresh_embeddings(table, deletes=...)` → `compact_embeddings(table)` →
+`expire_versions(table, before=...)` over one versioned embedding table, each
+version published by compare-and-set · **Theory:** the log-structured store's own
+append-then-compact discipline — a delete is a tombstone over an immutable
+segment, never an in-place mutation, until a compaction reclaims what the
+tombstones shadow [@kleppmann2017ddia] · **Rail:** measurement (a real tiny
+corpus, edited twice and re-embedded live at render time; every report field and
+every segment listing asserted against what the same call just did — no cache
+read, no printed-only result).
+
+## A different model from full recompute
+
+[The recompute chapter](../20-recompute/recompute.qmd) re-derives a result table
+from scratch: `recompute(table, cascade=...)` re-invokes the table's recorded
+producer over its inputs' *current* state and returns a whole new table. That is
+the right action when the cost of a full re-derivation is acceptable and the
+producer is arbitrary. This chapter's three verbs are a **materially different**
+model, purpose-built for one producer — embedding — where re-inferring every row
+on every edit would be wasteful: a **versioned table** whose rows live across an
+immutable base plus zero or more immutable **deltas**, a **deletion mask** that
+tombstones a row without rewriting the segment that holds it, and a
+**compare-and-set** publish that admits exactly one writer per version number. Two
+housekeeping verbs close the loop: `compact_embeddings` rewrites the table's live
+rows into one fragment so a reader stops paying the cost of merging the mask
+against every delta, and `expire_versions` reaps what compaction leaves behind.
+Nothing here re-embeds a row whose content did not change, and nothing here ever
+mutates a segment in place — the two properties a deletion-mask design exists to
+buy.
+
+## Building the base table
+
+A twelve-row corpus, one lexically distinct sentence per key, embedded once with
+the same tiny local BERT fixture [the precision chapters](../22-precision/compute-precision.qmd)
+use — hidden size 32, CPU-only, fast enough to embed and re-embed several times in
+one render:
+
+```{python}
+import os
+import tempfile
+from pathlib import Path
+
+import jammi
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
+TINY_BERT = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_bert"
+assert TINY_BERT.exists(), f"missing engine fixture: {TINY_BERT}"
+
+WORDS = [
+    "apple", "river", "engine", "violet", "quartz", "harbor",
+    "meadow", "copper", "signal", "falcon", "marble", "thunder",
+]
+
+
+def write_corpus(path: str, rows: list[tuple[int, str]]) -> None:
+    """Atomically replace `path` with `rows` — a rename, never an in-place
+    edit, so a concurrent scan of a single-file source never observes a
+    partially-written file."""
+    table = pa.table({
+        "id": pa.array([r[0] for r in rows], type=pa.int64()),
+        "text": pa.array([r[1] for r in rows], type=pa.string()),
+    })
+    tmp = f"{path}.tmp"
+    pq.write_table(table, tmp)
+    os.replace(tmp, path)
+
+
+corpus_dir = tempfile.mkdtemp(prefix="incremental_refresh_src_")
+corpus_path = f"{corpus_dir}/corpus.parquet"
+rows = [(i, f"{WORDS[i]} sentence number {i}") for i in range(12)]
+write_corpus(corpus_path, rows)
+
+art_dir = tempfile.mkdtemp(prefix="incremental_refresh_art_")
+db = jammi.connect(f"file://{art_dir}")
+db.add_source("corpus", url=f"file://{corpus_path}", format="parquet")
+
+table = db.generate_embeddings(
+    source="corpus",
+    model=f"local:{TINY_BERT}",
+    columns=["text"],
+    key="id",
+    modality="text",
+)
+
+row_count = db.sql(f'SELECT count(*) AS c FROM "jammi.{table}"').to_pylist()[0]["c"]
+print(f"base embedding table {table!r}: {row_count} rows")
+assert row_count == 12
+```
+
+The table has no version yet: `refresh_embeddings`, `compact_embeddings`, and
+`expire_versions` all operate on a table that has **already** been published to
+at least version 0 — the very first call below both publishes that base version
+and, because the source already carries an edit by the time it runs, computes the
+first real delta in the same call.
+
+## Edit one row — the report's own counts, and one new segment
+
+Row `3`'s sentence changes; every other key is untouched. `refresh_embeddings`
+re-embeds **only** the row whose content moved, publishes the result as a new
+version, and returns a report naming exactly what it did — the assertion below
+reads that report, not a side channel:
+
+```{python}
+old_vector = db.sql(
+    f'SELECT vector FROM "jammi.{table}" WHERE _row_id = \'3\''
+).to_pylist()[0]["vector"]
+
+edited = list(rows)
+edited[3] = (3, "a completely different sentence about something else")
+write_corpus(corpus_path, edited)
+
+report = db.refresh_embeddings(table)
+print(f"outcome={report['outcome']}  version={report['version']}  "
+      f"parent_version={report['parent_version']}")
+print({k: report[k] for k in
+       ("inferred_rows", "added", "changed", "deleted", "unchanged", "dropped_rows")})
+
+assert report["outcome"] == "published"
+assert report["version"] == 1
+assert report["parent_version"] == 0
+assert (report["inferred_rows"], report["added"], report["changed"],
+        report["deleted"], report["dropped_rows"]) == (1, 0, 1, 0, 0)
+assert report["unchanged"] == 11, "every OTHER row is reported unchanged, not re-inferred"
+
+edit_version = report["version"]
+```
+
+Exactly one new segment carries the edit — the other eleven rows are served from
+whatever segment already held them; an edit of one row never touches a segment
+that holds a different row:
+
+```{python}
+segments = db.list_index_segments(table)
+new_segments = [s for s in segments if s["version"] == edit_version]
+print(f"segments stamped version={edit_version}: {new_segments}")
+assert len(new_segments) == 1, f"exactly one new segment for one changed row: {segments}"
+assert new_segments[0]["row_count"] == 1
+
+new_vector = db.sql(
+    f'SELECT vector FROM "jammi.{table}" WHERE _row_id = \'3\''
+).to_pylist()[0]["vector"]
+assert new_vector != old_vector, "row 3's vector moved"
+
+row_count = db.sql(f'SELECT count(*) AS c FROM "jammi.{table}"').to_pylist()[0]["c"]
+assert row_count == 12, "an edit changes a vector, never the row count"
+print("\none changed row -> one inferred row -> one new segment; nothing else moved")
+```
+
+## Delete one key — the mask grows, no new segment
+
+Key `7` is now absent from the source entirely. `refresh_embeddings`'s default
+`deletes="tombstone"` masks it out of the current version rather than discarding
+its history; because a pure delete infers nothing, it publishes a version with
+**no new segment at all** — the contrast with the edit above is the point:
+
+```{python}
+edited_no7 = [r for r in edited if r[0] != 7]
+write_corpus(corpus_path, edited_no7)
+
+report = db.refresh_embeddings(table, deletes="tombstone")
+print(f"outcome={report['outcome']}  version={report['version']}  "
+      f"parent_version={report['parent_version']}")
+print({k: report[k] for k in ("inferred_rows", "added", "changed", "deleted")})
+
+assert report["outcome"] == "published"
+assert report["version"] == edit_version + 1
+assert report["parent_version"] == edit_version
+assert (report["deleted"], report["inferred_rows"], report["added"], report["changed"]) == (1, 0, 0, 0)
+
+delete_version = report["version"]
+
+segments = db.list_index_segments(table)
+new_segments = [s for s in segments if s["version"] == delete_version]
+assert new_segments == [], (
+    f"a pure delete masks a key, it infers nothing — no new segment: {new_segments}"
+)
+
+gone = db.sql(f'SELECT count(*) AS c FROM "jammi.{table}" WHERE _row_id = \'7\'').to_pylist()[0]["c"]
+assert gone == 0, "key 7 is masked out of the current version"
+
+row_count = db.sql(f'SELECT count(*) AS c FROM "jammi.{table}"').to_pylist()[0]["c"]
+assert row_count == 11
+print("\none deleted key -> the mask grows by one entry -> zero new segments")
+```
+
+## Compaction — collapsing fragments and segments into one
+
+Two refreshes in, the table's **current** state is scattered across three
+physical pieces a reader has to reconcile: the original base, the one-row delta
+segment from the edit, and the deletion mask from the delete. `compact_embeddings`
+rewrites exactly the *live* rows — the ones the deletion mask does not shadow —
+as one fragment and one segment, and publishes that as a new version:
+
+```{python}
+report = db.compact_embeddings(table)
+print(f"outcome={report['outcome']}  version={report['version']}  "
+      f"parent_version={report['parent_version']}  live_rows={report['live_rows']}  "
+      f"masked_rows={report['masked_rows']}")
+
+assert report["outcome"] == "published"
+assert report["parent_version"] == delete_version
+assert report["masked_rows"] == 0, "compaction carries forward only what is LIVE"
+assert report["live_rows"] == 11
+
+compact_version = report["version"]
+
+segments = db.list_index_segments(table)
+compact_segments = [s for s in segments if s["version"] == compact_version]
+assert len(compact_segments) == 1, f"one fragment, one segment: {segments}"
+assert compact_segments[0]["row_count"] == 11, "the compacted segment alone covers every live row"
+```
+
+Compaction is a **logical** collapse of the read path, not yet a **physical**
+reclaim: the segment the earlier edit published (`edit_version`) still exists in
+the catalog after compaction — nothing has reaped it yet.
+
+```{python}
+old_segments = [s for s in db.list_index_segments(table) if s["version"] == edit_version]
+assert len(old_segments) == 1, (
+    "compaction supersedes the old delta for READS, but its artifact is still "
+    f"on disk until expiry reaps it: {old_segments}"
+)
+print(f"\nversion={compact_version} alone answers every read; "
+      f"version={edit_version}'s segment is still sitting on disk, unreaped")
+```
+
+## Expiry — collecting the versions compaction left behind
+
+`expire_versions(table, before=N)` deletes every non-current version numbered
+below `N` and reaps its now-unreferenced fragments, segments, deletion masks, and
+manifests. Compacting to `compact_version` made every version below it
+unreachable for reads; expiry is what actually frees their storage:
+
+```{python}
+expiry = db.expire_versions(table, before=compact_version)
+print(f"expired_versions={expiry['expired_versions']}  objects_deleted={expiry['objects_deleted']}")
+
+assert expiry["expired_versions"] == [0, edit_version, delete_version]
+assert expiry["objects_deleted"] > 0
+
+segments = db.list_index_segments(table)
+reaped = [s for s in segments if s["version"] in (0, edit_version, delete_version)]
+assert reaped == [], f"every expired version's segment is gone: {reaped}"
+
+surviving = [s for s in segments if s["version"] == compact_version]
+assert len(surviving) == 1 and surviving[0]["row_count"] == 11, (
+    "the compacted version is untouched by expiry"
+)
+
+row_count = db.sql(f'SELECT count(*) AS c FROM "jammi.{table}"').to_pylist()[0]["c"]
+assert row_count == 11, "expiry reaps old artifacts, it never changes what is currently served"
+print(f"\n{len(expiry['expired_versions'])} old version(s) reaped, "
+      "the compacted version keeps serving the same 11 rows")
+```
+
+## Bridge note
+
+> **Two models for two shapes of change.** [The recompute chapter](../20-recompute/recompute.qmd)
+> answers *"the inputs moved, re-derive the output"* with one bounded action —
+> `recompute` — over an arbitrary producer, and pays a full re-derivation every
+> time it fires. This chapter's three verbs answer a narrower, sharper question —
+> *"most of a large embedding table is unchanged; re-embed only what moved"* — with
+> a design purpose-built for exactly that: a versioned table published by
+> compare-and-set, a deletion mask that tombstones rather than rewrites
+> [@kleppmann2017ddia], and two housekeeping actions — `compact_embeddings`
+> collapsing the read path into one fragment, `expire_versions` reclaiming what
+> that collapse leaves behind — that a caller invokes explicitly, on its own
+> schedule, exactly like `recompute`'s own cascade dial. Measured here on one
+> table walking through all four operations in sequence: one edited row inferred
+> once and landing in one new segment, one deleted key masked with no inference at
+> all, a compaction that answers every read from a single fragment, and an expiry
+> that reaps the three versions compaction left behind while the eleven rows it
+> serves never move.

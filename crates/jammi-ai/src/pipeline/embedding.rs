@@ -12,6 +12,55 @@ use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
+/// The loaded model's identity for one embedding definition: the model
+/// source, its embedding width, and the output-affecting environment the
+/// definition hash folds (backend, precision, content digest, quantization,
+/// device). Loaded once per producer call — the base embed and every refresh
+/// build their descriptor + environment from this one place.
+pub(crate) struct EmbeddingDefinition {
+    pub(crate) model_source: ModelSource,
+    pub(crate) embedding_dim: usize,
+    pub(crate) env: jammi_db::store::manifest::MaterializationEnv,
+}
+
+/// Load `model_id` for `task` and build its [`EmbeddingDefinition`].
+pub(crate) async fn embedding_definition(
+    session: &InferenceSession,
+    model_id: &str,
+    task: ModelTask,
+) -> Result<EmbeddingDefinition> {
+    let model_source = ModelSource::parse(model_id);
+    let guard = session
+        .model_cache()
+        .get_or_load(&model_source, task, None)
+        .await?;
+    let embedding_dim = guard
+        .model
+        .embedding_dim()
+        .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
+    let backend_kind = guard.model.backend_kind();
+    let compute_precision = guard.model.compute_precision();
+    let content_digest = guard.model.content_digest()?;
+    let quantization = guard.model.quantization();
+    drop(guard);
+    let canonical_model_id = model_source.to_string();
+    let env = jammi_db::store::manifest::MaterializationEnv::new(
+        session.compute_device(),
+        vec![jammi_db::store::manifest::ModelIdentity {
+            model_id: canonical_model_id,
+            backend: backend_kind.to_string(),
+            compute_precision,
+            content_digest,
+            quantization,
+        }],
+    );
+    Ok(EmbeddingDefinition {
+        model_source,
+        embedding_dim,
+        env,
+    })
+}
+
 /// Orchestrates embedding generation: source scan → InferenceExec → ResultSink → index.
 ///
 /// Modality-agnostic — works for both text (`ModelTask::TextEmbedding`) and
@@ -53,23 +102,13 @@ impl<'a> EmbeddingPipeline<'a> {
         cache: CachePolicy,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
-        let model_source = ModelSource::parse(model_id);
-
-        // Pre-load model to get embedding dimensions
-        let guard = self
-            .session
-            .model_cache()
-            .get_or_load(&model_source, self.task, None)
-            .await?;
-        let embedding_dim = guard
-            .model
-            .embedding_dim()
-            .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
-        let backend_kind = guard.model.backend_kind();
-        let compute_precision = guard.model.compute_precision();
-        let content_digest = guard.model.content_digest()?;
-        let quantization = guard.model.quantization();
-        drop(guard);
+        // Pre-load the model: its embedding width and the output-affecting
+        // environment the definition hash folds.
+        let EmbeddingDefinition {
+            model_source,
+            embedding_dim,
+            env,
+        } = embedding_definition(self.session, model_id, self.task).await?;
 
         // The materialization contract is knowable here — the model is loaded
         // (so `embedding_dim` is fixed) and the source is named — so the cache
@@ -85,16 +124,6 @@ impl<'a> EmbeddingPipeline<'a> {
             key_column: key_column.to_string(),
             dimensions: embedding_dim,
         };
-        let env = jammi_db::store::manifest::MaterializationEnv::new(
-            self.session.compute_device(),
-            vec![jammi_db::store::manifest::ModelIdentity {
-                model_id: canonical_model_id.clone(),
-                backend: backend_kind.to_string(),
-                compute_precision,
-                content_digest,
-                quantization,
-            }],
-        );
         let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
             source_id,
             chrono::Utc::now().to_rfc3339(),
@@ -151,8 +180,12 @@ impl<'a> EmbeddingPipeline<'a> {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        // One plan shape at every model-facing site: coalesce → null-key
+        // check → the deterministic total order (see `operator::ordered_input`).
+        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
 
-        // Create InferenceExec
+        // Create InferenceExec — the source scan's `_content_hash` projection
+        // rides through to the sink as the table's fifth column.
         let inference_exec = InferenceExecBuilder::new(
             input_plan,
             model_source,
@@ -165,6 +198,9 @@ impl<'a> EmbeddingPipeline<'a> {
         .batch_size(self.session.inner_config().inference.batch_size)
         .observer(self.session.observer().clone())
         .embedding_dim(Some(embedding_dim))
+        .passthrough(vec![
+            jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
+        ])
         .build()?;
 
         // Create ResultSink
@@ -184,13 +220,17 @@ impl<'a> EmbeddingPipeline<'a> {
 
         // Execute and stream results through sink
         let task_ctx = self.session.context().task_ctx();
+        // Both through the structural classifier (`JammiError::from`): a typed
+        // refusal raised inside the plan (`InvalidKey` from `KeyCheckExec`, a
+        // rendering refusal from the hash UDF) reaches the caller as that
+        // variant, never stringified.
         let stream = inference_exec
             .execute(0, task_ctx)
-            .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
+            .map_err(JammiError::from)?;
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
-            .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
+            .map_err(JammiError::from)?;
 
         // Fail loud when there is nothing to embed. A systemic model failure (a
         // broken kernel / arch / dtype — #277/#319/#326, any non-OOM
@@ -245,7 +285,9 @@ impl<'a> EmbeddingPipeline<'a> {
                     Err(e) => e,
                 });
             }
-            sink.write_batch(batch).await?;
+            // The realized ids are the refresh path's concern (its
+            // `dropped_rows`); the base embed writes every ok row.
+            let _realized = sink.write_batch(batch).await?;
         }
 
         let (row_count, index) = sink.finalize().await?;

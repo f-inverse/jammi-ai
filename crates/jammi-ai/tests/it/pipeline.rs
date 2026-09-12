@@ -75,7 +75,7 @@ async fn generate_embeddings_produces_complete_result() {
     assert_eq!(from_catalog.status, "ready");
 
     // Dimensions match tiny_bert (hidden_size=32)
-    assert_eq!(record.dimensions, Some(32));
+    assert_eq!(record.dimensions_raw(), Some(32));
 
     // Metadata tracked
     assert_eq!(record.source_id, "patents");

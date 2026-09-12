@@ -329,12 +329,12 @@ def test_reconcile_verb_has_identical_signature_across_wheels():
 # boundary from the engine's `IndexSegment`; the remote builds it from the wire
 # `IndexSegment` — so the two agree key-for-key, and neither carries the row's
 # `tenant_id` / `created_at` bookkeeping.
-_INDEX_SEGMENT_DICT_KEYS = {"segment_id", "index_path", "row_count"}
+_INDEX_SEGMENT_DICT_KEYS = {"segment_id", "index_path", "row_count", "version"}
 
 
 def test_index_segment_projection_is_the_whole_row_and_nothing_more():
     """The wire `IndexSegment` message — the single source of the client-facing
-    segment shape — carries exactly the three projected fields. Pinned against
+    segment shape — carries exactly the four projected fields. Pinned against
     the proto descriptor, so adding a catalog-internal column (`tenant_id`,
     `created_at`) to the projection reds here.
 

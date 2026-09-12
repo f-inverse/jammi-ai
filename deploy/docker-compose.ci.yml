@@ -20,6 +20,11 @@ services:
     # the merged model.
     build: !reset null
     pull_policy: never
+    # The smoke's DRAIN never has to finish a real epoch: 30 s keeps a
+    # teardown short.
+    stop_grace_period: 30s
     volumes:
       - ../cookbook/fixtures/tiny_bert:/fixtures/tiny_bert:ro
       - ../tests/fixtures/patents.parquet:/fixtures/patents.parquet:ro
+      # `shape_b_release.py`'s long fine-tune runs over this corpus.
+      - ../tests/fixtures/training_pairs.csv:/fixtures/training_pairs.csv:ro

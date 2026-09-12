@@ -167,6 +167,7 @@ impl TableFunctionImpl for AnnotateTableFunction {
             &key_column,
             embedding_dim,
             regression_form.as_ref(),
+            &[],
         )
         .map_err(|e| DataFusionError::Plan(format!("annotate: output schema: {e}")))?;
 

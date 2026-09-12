@@ -310,6 +310,7 @@ impl CatalogClient {
                 kinds: w.kinds,
                 started_at: w.started_at,
                 last_seen_at: w.last_seen_at,
+                state: w.state,
             })
             .collect())
     }
@@ -817,6 +818,9 @@ pub struct WorkerSummary {
     /// The `[worker] kinds` configuration this process claims: `"all"` or a
     /// comma-joined kind list.
     pub kinds: String,
+    /// The claim loop's lifecycle state as the `workers.state` row carries
+    /// it: `warming`, `claiming` or `draining`.
+    pub state: String,
     pub started_at: String,
     pub last_seen_at: String,
 }

@@ -95,8 +95,17 @@ pub enum JammiError {
     Json(#[from] serde_json::Error),
 
     /// DataFusion query-engine error.
+    ///
+    /// `#[source]` (not `#[from]`): the conversion from a
+    /// [`DataFusionError`](datafusion::error::DataFusionError) is the manual
+    /// `impl From` at the bottom of this file — the structural classifier that
+    /// restores a typed engine error a plan node raised (`External(Box<JammiError>)`,
+    /// even nested under `Context`/`ArrowError`/`ParquetError`) and types a
+    /// mid-scan object-store not-found as [`Self::Storage`]. Every `?` that
+    /// converts a DataFusion error routes through it by construction. The
+    /// attribute keeps `source()` intact (thiserror's `#[from]` implied it).
     #[error("DataFusion error: {0}")]
-    DataFusion(#[from] datafusion::error::DataFusionError),
+    DataFusion(#[source] datafusion::error::DataFusionError),
 
     /// A channel-catalog operation (register a channel, append columns) failed
     /// with a caller-facing condition the gRPC surface must distinguish
@@ -239,6 +248,34 @@ pub enum JammiError {
         status: String,
     },
 
+    /// A parent-pinned version CAS — the allocation UPDATE or the publish
+    /// table-row swap — matched no row because `result_tables.current_version`
+    /// no longer equals the parent the caller's delta was derived from: a
+    /// concurrent refresh or compaction published between the caller's read
+    /// and this CAS. ONE classification for both misses (the allocation
+    /// miss and the publish table-row miss are the same lost race and must
+    /// not get two typed spellings): raised by `classify_ready_cas_miss`
+    /// ahead of its `CasFailed` fallback whenever the row IS `ready` but its
+    /// `current_version` disagrees with `expected`. `expected`/`found` are
+    /// both `None` only for the base publish's `current_version IS NULL`
+    /// CAS; a concurrent refresh's version row is left `building` (allocation
+    /// miss) or rolled back to `building` (publish miss) and neither
+    /// `next_version` nor `current_version` is touched by the loser. The
+    /// caller re-reads the table row and retries from the new parent, or
+    /// gives up; the previous version stays live either way.
+    #[error(
+        "result table `{table}`: parent moved (expected {expected:?}, found {found:?}); a \
+         concurrent refresh or compaction published first"
+    )]
+    ParentMoved {
+        /// The table whose parent-pinned CAS missed.
+        table: String,
+        /// The parent the caller's delta was derived from.
+        expected: Option<i64>,
+        /// The table's actual `current_version` at the CAS.
+        found: Option<i64>,
+    },
+
     /// A `create_result_table` call's `jobs.partial_result` compare-and-set
     /// matched zero rows: the job is either not `running` (a peer
     /// reclaimed it, the caller's attempt has been superseded) or another
@@ -277,10 +314,412 @@ pub enum JammiError {
         table: String,
     },
 
+    /// A `NULL` in the key column of a source scanned for embedding /
+    /// inference / refresh: refused typed at the input edge (K2), never
+    /// skipped and counted, never a stringly Arrow error after model calls.
+    /// Raised by the `KeyCheckExec` plan node below the blocking sort, so the
+    /// count is exact and the model is invoked zero times.
+    #[error("key column `{column}` has {null_count} null value(s); every row needs a key")]
+    InvalidKey {
+        /// The source key column the caller named.
+        column: String,
+        /// The exact number of null keys in the scanned source.
+        null_count: u64,
+    },
+
+    /// A versioned result table whose CURRENT version cannot be served: the
+    /// version row is `failed`, or its `.version.json` manifest is
+    /// definitively absent on an `exists()` probe. Raised by the ANN and SQL
+    /// read paths alike (the SQL path through the placeholder provider and
+    /// the structural error classifier). The table row itself is untouched;
+    /// the remedy is `recompute` (a new table).
+    #[error(
+        "result table `{table}` version {version} is unavailable (its manifest cannot be resolved)"
+    )]
+    VersionUnavailable {
+        /// The table whose current version is unavailable.
+        table: String,
+        /// The unavailable version.
+        version: i64,
+    },
+
+    /// A refresh or compaction was asked of a table it cannot serve
+    /// incrementally: not `ready`, not an embedding table, its current
+    /// version row not `ready`, or its rows carry no `_content_hash` (a table
+    /// produced before the hash column existed, or by a producer that writes
+    /// none). The remedy is `recompute` once (a fresh table carries hashes).
+    #[error("result table `{table}` is not refreshable: {reason}")]
+    NotRefreshable {
+        /// The table the verb targeted.
+        table: String,
+        /// Why.
+        reason: NotRefreshableReason,
+    },
+
+    /// The definition a refresh would run under (the table's recorded
+    /// embedding parameters over the model as loaded NOW, device included)
+    /// no longer hashes to the table's recorded `definition_hash` — a model or
+    /// environment change, which no per-row content hash can see. Refused
+    /// before any version is allocated; the consumer runs `recompute`.
+    #[error("result table `{table}`: definition drift (recorded {recorded}, current {current})")]
+    DefinitionDrift {
+        table: String,
+        /// The table's recorded `definition_hash`.
+        recorded: String,
+        /// The definition hash the refresh computed.
+        current: String,
+    },
+
+    /// A refresh found the same key more than once on a COMPLETE scan — of
+    /// the source (`Source`) or of the parent version's current state
+    /// (`Parent`, two physical rows under one `_row_id`). A delta over a
+    /// non-unique key space is ambiguous, so it is refused before any new
+    /// version is allocated; the initial embed still tolerates duplicates,
+    /// and `recompute` once yields a table a refresh can proceed from.
+    #[error(
+        "result table `{table}`: {total} non-unique key(s) in the {scan} scan (first {}: {keys:?})",
+        keys.len()
+    )]
+    NonUniqueKey {
+        table: String,
+        /// Which scan carried the duplicates.
+        scan: NonUniqueScan,
+        /// Up to ten offending keys with their exact counts.
+        keys: Vec<(String, u64)>,
+        /// The total number of non-unique keys.
+        total: u64,
+    },
+
+    /// A resource the request needs could not be reached after the bounded
+    /// failure ladder: a placed segment whose owner and retry candidate both
+    /// failed and whose local load was not admitted (or not attempted). Names
+    /// the resource (`segment {table}/{id}`) and the last failure's reason. A
+    /// peer outage is visible — never masked by a silent full scan of a
+    /// larger-than-memory table. Maps to gRPC `Unavailable`.
+    #[error("unavailable: {resource}: {reason}")]
+    Unavailable {
+        /// The resource that could not be served.
+        resource: String,
+        /// Why the last rung of the ladder failed.
+        reason: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),
 }
 
+/// Why a table is [`JammiError::NotRefreshable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRefreshableReason {
+    /// The rows carry no (or a NULL / malformed) `_content_hash`.
+    MissingContentHash,
+    /// The table's current version row is not `ready`.
+    CurrentVersionUnavailable,
+    /// The table row is not `ready`.
+    NotReady,
+    /// Not an embedding table produced by the embedding pipeline.
+    NotEmbeddingTable,
+}
+
+impl std::fmt::Display for NotRefreshableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl NotRefreshableReason {
+    /// The stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingContentHash => "missing_content_hash",
+            Self::CurrentVersionUnavailable => "current_version_unavailable",
+            Self::NotReady => "not_ready",
+            Self::NotEmbeddingTable => "not_embedding_table",
+        }
+    }
+
+    /// Parse the wire token; `None` for an unknown one.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "missing_content_hash" => Some(Self::MissingContentHash),
+            "current_version_unavailable" => Some(Self::CurrentVersionUnavailable),
+            "not_ready" => Some(Self::NotReady),
+            "not_embedding_table" => Some(Self::NotEmbeddingTable),
+            _ => None,
+        }
+    }
+}
+
+/// Which scan a [`JammiError::NonUniqueKey`] found its duplicates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonUniqueScan {
+    /// The source scan.
+    Source,
+    /// The parent version's current-state scan.
+    Parent,
+}
+
+impl std::fmt::Display for NonUniqueScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl NonUniqueScan {
+    /// The stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Parent => "parent",
+        }
+    }
+
+    /// Parse the wire token; `None` for an unknown one.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "source" => Some(Self::Source),
+            "parent" => Some(Self::Parent),
+            _ => None,
+        }
+    }
+}
+
+/// The structural classifier: how EVERY DataFusion error becomes a
+/// [`JammiError`].
+///
+/// Two shapes, in order. **(a) owned passthrough** — an
+/// `External(Box<JammiError>)` payload (a typed error a plan node, provider or
+/// UDF raised) is destructured BY VALUE back into the inner `JammiError`, also
+/// when nested under `Context`, `ArrowError(ExternalError)` or
+/// `ParquetError(External)`; a miss rebuilds the original unchanged. **(b) a
+/// borrowed `source()` walk** — an `object_store::Error::NotFound` found at any
+/// depth (the parquet reader wraps it under `ParquetError::External`, which
+/// neither a top-level `ObjectStore` arm nor DataFusion's `find_root` reaches)
+/// becomes [`JammiError::Storage`] with the existing `StorageError::Io { source:
+/// NotFound { .. } }` spelling every reader already matches. Everything else
+/// keeps the shape [`JammiError::DataFusion`] with `source()` intact.
+/// `Shared(Arc<_>)` cannot yield ownership and is a stated fidelity limit of
+/// shape (a); shape (b) still walks it.
+impl From<datafusion::error::DataFusionError> for JammiError {
+    fn from(e: datafusion::error::DataFusionError) -> Self {
+        match unwrap_jammi(e) {
+            Ok(inner) => inner,
+            Err(e) => match not_found_path(&e) {
+                Some((path, original)) => JammiError::Storage(crate::storage::StorageError::Io {
+                    path: path.clone(),
+                    source: object_store::Error::NotFound {
+                        path,
+                        source: Box::<dyn std::error::Error + Send + Sync>::from(original),
+                    },
+                }),
+                None => JammiError::DataFusion(e),
+            },
+        }
+    }
+}
+
+/// A refused query vector, classified by its provenance
+/// ([`jammi_numerics::query::QuerySource`]): a CALLER's vector is the caller's
+/// fault — the schema class every width mismatch already maps to (gRPC
+/// `InvalidArgument`); a vector read back from STORAGE, or a downstream
+/// ARTIFACT the query disagreed with after construction, is a corrupt
+/// artifact named by its table or index (the same class an unreadable
+/// sidecar maps to, gRPC `Internal`). `ArtifactMismatch` carries no
+/// `QuerySource` — it is never about the query's own provenance — so it is
+/// matched directly rather than through `.source()`.
+impl From<jammi_numerics::query::QueryValidationError> for JammiError {
+    fn from(e: jammi_numerics::query::QueryValidationError) -> Self {
+        use jammi_numerics::query::{QuerySource, QueryValidationError};
+        match e {
+            QueryValidationError::NonFinite {
+                index,
+                value,
+                source,
+            } => {
+                let expected = "finite f32 components".to_string();
+                let actual = format!("component {index} is {value:?}");
+                match source {
+                    QuerySource::Caller => JammiError::Schema {
+                        table: "query".into(),
+                        column: "query".into(),
+                        expected,
+                        actual,
+                    },
+                    QuerySource::Stored { table } => JammiError::IncompatibleFormat {
+                        artifact: format!("{table}.vector"),
+                        found: actual,
+                        supported: expected,
+                    },
+                }
+            }
+            QueryValidationError::Width {
+                expected,
+                actual,
+                source,
+            } => {
+                let expected_s = format!("{expected} dimensions");
+                let actual_s = format!("{actual} dimensions");
+                match source {
+                    QuerySource::Caller => JammiError::Schema {
+                        table: "query".into(),
+                        column: "query".into(),
+                        expected: expected_s,
+                        actual: actual_s,
+                    },
+                    QuerySource::Stored { table } => JammiError::IncompatibleFormat {
+                        artifact: format!("{table}.vector"),
+                        found: actual_s,
+                        supported: expected_s,
+                    },
+                }
+            }
+            // Carries no `QuerySource` at all — engine-fault by construction,
+            // never the query's own provenance, regardless of it.
+            QueryValidationError::ArtifactMismatch {
+                artifact,
+                expected,
+                actual,
+            } => JammiError::IncompatibleFormat {
+                artifact: format!("{artifact}.vector"),
+                found: format!("{actual} dimensions"),
+                supported: format!("{expected} dimensions"),
+            },
+        }
+    }
+}
+
+/// Shape (a): destructure `e` by value looking for an `External(Box<JammiError>)`
+/// payload, recursing through the three Box-carrying wrappers and rebuilding the
+/// original on a miss.
+fn unwrap_jammi(
+    e: datafusion::error::DataFusionError,
+) -> std::result::Result<JammiError, datafusion::error::DataFusionError> {
+    use datafusion::error::DataFusionError as DF;
+    match e {
+        DF::External(b) => match b.downcast::<JammiError>() {
+            Ok(j) => Ok(*j),
+            Err(b) => Err(DF::External(b)),
+        },
+        DF::Context(msg, inner) => match unwrap_jammi(*inner) {
+            Ok(j) => Ok(j),
+            Err(back) => Err(DF::Context(msg, Box::new(back))),
+        },
+        DF::ArrowError(b, bt) => match *b {
+            arrow::error::ArrowError::ExternalError(inner) => {
+                match inner.downcast::<JammiError>() {
+                    Ok(j) => Ok(*j),
+                    Err(inner) => Err(DF::ArrowError(
+                        Box::new(arrow::error::ArrowError::ExternalError(inner)),
+                        bt,
+                    )),
+                }
+            }
+            other => Err(DF::ArrowError(Box::new(other), bt)),
+        },
+        DF::ParquetError(b) => match *b {
+            parquet::errors::ParquetError::External(inner) => {
+                match inner.downcast::<JammiError>() {
+                    Ok(j) => Ok(*j),
+                    Err(inner) => Err(DF::ParquetError(Box::new(
+                        parquet::errors::ParquetError::External(inner),
+                    ))),
+                }
+            }
+            other => Err(DF::ParquetError(Box::new(other))),
+        },
+        other => Err(other),
+    }
+}
+
+/// Shape (b): walk `source()` from `e` and return the first
+/// `object_store::Error::NotFound` (its `path` and the original's `Display`).
+fn not_found_path(e: &datafusion::error::DataFusionError) -> Option<(String, String)> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(object_store::Error::NotFound { path, .. }) =
+            err.downcast_ref::<object_store::Error>()
+        {
+            return Some((path.clone(), err.to_string()));
+        }
+        cur = err.source();
+    }
+    None
+}
+
 /// Convenience alias for `std::result::Result<T, JammiError>`.
 pub type Result<T> = std::result::Result<T, JammiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::error::DataFusionError as DF;
+
+    fn not_found(path: &str) -> object_store::Error {
+        object_store::Error::NotFound {
+            path: path.to_string(),
+            source: Box::<dyn std::error::Error + Send + Sync>::from("gone"),
+        }
+    }
+
+    /// Shape (a): a typed engine error a plan node raised, wrapped by the
+    /// optimizer's `Context`, comes back as the exact variant.
+    #[test]
+    fn classifier_restores_a_nested_external_jammi_error() {
+        let e = DF::Context(
+            "opt".into(),
+            Box::new(DF::External(Box::new(JammiError::InvalidKey {
+                column: "id".into(),
+                null_count: 3,
+            }))),
+        );
+        match JammiError::from(e) {
+            JammiError::InvalidKey { column, null_count } => {
+                assert_eq!(column, "id");
+                assert_eq!(null_count, 3);
+            }
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    /// Shape (b): an object-store not-found nested under the parquet reader's
+    /// `External` (where no top-level arm reaches) becomes the typed `Storage`
+    /// not-found every reader already matches, naming the path.
+    #[test]
+    fn classifier_types_a_nested_object_store_not_found() {
+        let e = DF::ParquetError(Box::new(parquet::errors::ParquetError::External(Box::new(
+            not_found("t__v1.parquet"),
+        ))));
+        match JammiError::from(e) {
+            JammiError::Storage(crate::storage::StorageError::Io {
+                path,
+                source: object_store::Error::NotFound { path: inner, .. },
+            }) => {
+                assert_eq!(path, "t__v1.parquet");
+                assert_eq!(inner, "t__v1.parquet");
+            }
+            other => panic!("expected Storage(Io(NotFound)), got {other:?}"),
+        }
+    }
+
+    /// Everything else keeps the `DataFusion` shape with `source()` intact —
+    /// the `#[source]` attribute survived dropping `#[from]`.
+    #[test]
+    fn classifier_keeps_other_errors_as_datafusion_with_source() {
+        match JammiError::from(DF::Plan("x".into())) {
+            JammiError::DataFusion(DF::Plan(m)) => assert_eq!(m, "x"),
+            other => panic!("expected DataFusion(Plan), got {other:?}"),
+        }
+        let j = JammiError::from(DF::ArrowError(
+            Box::new(arrow::error::ArrowError::SchemaError("x".into())),
+            None,
+        ));
+        assert!(matches!(j, JammiError::DataFusion(_)), "got {j:?}");
+        assert!(
+            std::error::Error::source(&j).is_some(),
+            "`source()` must survive on the public type"
+        );
+    }
+}

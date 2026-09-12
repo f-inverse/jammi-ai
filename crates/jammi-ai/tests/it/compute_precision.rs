@@ -22,6 +22,7 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_numerics::distance::cosine_similarity;
 use jammi_numerics::ComputePrecision;
+use jammi_test_utils::vq;
 use tempfile::TempDir;
 
 const TEXT: &str = "the quick brown fox jumps over the lazy dog";
@@ -119,7 +120,7 @@ async fn f16_embedding_is_valid_and_active_but_close_to_f32() {
     );
     // ...yet the two precisions encode the same semantic content, so they
     // stay close by cosine similarity.
-    let cos = cosine_similarity(&vec_f32, &vec_f16);
+    let cos = cosine_similarity(&vq(&vec_f32), &vec_f16);
     assert!(
         cos > 0.99,
         "F16 and F32 embeddings of the same input should be nearly identical \

@@ -267,7 +267,8 @@ struct FinetuneRunArgs {
     #[arg(long)]
     work_dir: PathBuf,
     /// Unit 63 round-7 audit, finding 1: the mutant's own label (e.g.
-    /// `"eps-0.10"`) — OPTIONAL, and all-or-none with `--mutant-base-sha` /
+    /// `"eps-0.10"` — no-producer: an illustrative example label, not a
+    /// measurement) — OPTIONAL, and all-or-none with `--mutant-base-sha` /
     /// `--mutant-patch-sha256` (a partial mutant label is refused; see
     /// `finetune_run::run`'s own leading validation). Omitted entirely for
     /// an ordinary (non-mutant) leg — see

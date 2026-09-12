@@ -39,6 +39,7 @@ use crate::storage::StorageUrl;
 use crate::store::manifest::Materialization;
 use crate::store::ResultStore;
 use crate::tenant::TenantId;
+use crate::tenant_scope::TenantBinding;
 
 /// A `building` result table owned by this process under a leased row.
 ///
@@ -289,16 +290,19 @@ impl BuildingTable {
             }
             Err(e) => return Err(e),
         };
-        self.store
-            .register_table(ctx, &self.table_name, &self.parquet_url, owner)
-            .await?;
-        self.store
-            .catalog()
-            .get_result_table(&self.table_name)
-            .await?
-            .ok_or_else(|| JammiError::RowGone {
-                table: self.table_name.clone(),
-            })
+        // The row a fresh table just promoted is read back under admin scope
+        // (the owner may be a tenant other than the binding in force when
+        // recovery promoted it) and bound through the ONE registration path
+        // — always the `current_version = None` arm for a fresh table.
+        let _ = owner;
+        let record =
+            TenantBinding::admin_scope(self.store.catalog().get_result_table(&self.table_name))
+                .await?
+                .ok_or_else(|| JammiError::RowGone {
+                    table: self.table_name.clone(),
+                })?;
+        self.store.bind_result_table(ctx, &record).await?;
+        Ok(record)
     }
 
     /// Abort the table: the CAS `building -> failed` under this writer's

@@ -50,16 +50,21 @@ use jammi_db::store::manifest::{ArtifactDigest, ProducingDescriptor};
 
 use crate::common;
 
-/// Golden output Parquet artifact digest (SHA-256 hex), re-captured on the
-/// `parquet` 58 line; on the `parquet` 57 line these bytes hashed to
-/// `1093bebfee3cf0ac31368b4cc1c94de117e4bced8bebc481efbefadc00e883e8`. The
-/// rows the pipeline PRODUCES did not move across that bump:
-/// [`GOLDEN_CONTENT_DIGEST`] below — folded from the normalized `(key, vector)`
-/// rows as they are handed to the writer (`store/mod.rs`, `content_digest`),
-/// never from a decode of the written artifact — is unchanged, and this test
-/// asserts it on every run.
+/// Golden output Parquet artifact digest (SHA-256 hex). Re-captured on the
+/// merged tree: BOTH inputs to these bytes moved independently. This branch
+/// added a fifth column to the embedding schema (`_row_id, _source_id,
+/// _model_id, vector, _content_hash` — NULL on an imported table, which embeds
+/// no source row), and `main` moved the writer to the `parquet` 58 line. So
+/// neither side's constant is correct here and this value is measured on the
+/// merge, not carried from either parent.
+///
+/// What did NOT move, and is the reason an artifact-digest change is safe to
+/// accept: [`GOLDEN_CONTENT_DIGEST`] below is folded from the normalized
+/// `(key, vector)` rows as they are handed to the writer, never from a decode
+/// of the written artifact, so it is invariant to both the encoder line and
+/// the schema's null column. This test asserts it on every run.
 const GOLDEN_ARTIFACT_DIGEST: &str =
-    "e5b6f05d8b844e80e3aeef6b35724f90aedced0694eb198a4f7b427ce731b8de";
+    "57219fe5253e751d6627cb15c4688fe97f2099f99487cbf0e79c2aa2417dd222";
 
 /// Golden content digest (SHA-256 hex) of the fixture's normalized
 /// `(_row_id, vector)` rows, captured the same way as

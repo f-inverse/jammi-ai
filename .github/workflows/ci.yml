@@ -78,8 +78,16 @@ jobs:
       # a prospective gap, not a live one; if it needs closing, it needs a
       # macro-aware (or item-doc-scoped) checker, not a reinstated line-shape
       # scanner with the over/under-approximation problems above.
+      #
+      # jammi-server's `test-hooks` arm: its test targets (and the
+      # `CARGO_BIN_EXE_jammi-server` they spawn) are built with the engine's
+      # rendezvous hooks through the `jammi-ai = { features = ["test-hooks"] }`
+      # dev-dependency union (`crates/jammi-server/Cargo.toml`); the explicit
+      # feature here lints that closure by name, beside the jammi-ai line.
       - name: Clippy (gated test surfaces — compile-only feature closure)
-        run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+        run: |
+          cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+          cargo clippy -p jammi-server --tests --features test-hooks -- -D warnings
 
       # `openssl-sys` (pulled in transitively by `native-tls`, which
       # `datafusion-table-providers`'s `postgres`/`mysql` subcrates depend on
@@ -1072,6 +1080,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
+      # freshness step: a container `run:` step's `git` is a different UID
+      # than the checkout, so the safe.directory `actions/checkout` sets is
+      # not visible here. This job's own it-suite shells out to `git
+      # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
+      # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
+      # (exit 128) without this — measured against PR #521's CI run, where
+      # this job's whole `whose_fault_gate` suite failed at that one shared
+      # line with no other difference from the hermetic lane, which already
+      # carries this step.
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install and start nats-server (with JetStream)
         # GHA `services:` cannot override the upstream image's CMD to pass
         # `-js`, so the broker driver's JetStream API isn't available with
@@ -1161,6 +1182,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
+
+      # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
+      # freshness step: a container `run:` step's `git` is a different UID
+      # than the checkout, so the safe.directory `actions/checkout` sets is
+      # not visible here. This job's own it-suite shells out to `git
+      # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
+      # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
+      # (exit 128) without this — measured against PR #521's CI run, where
+      # this job's whole `whose_fault_gate` suite failed at that one shared
+      # line with no other difference from the hermetic lane, which already
+      # carries this step.
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Run Postgres-gated tests
         env:

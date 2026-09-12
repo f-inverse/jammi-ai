@@ -1068,3 +1068,74 @@ CREATE UNIQUE INDEX idx_jobs_tenant_idempotency_key
     ON jobs (COALESCE(tenant_id, ''), idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 "#;
+
+/// Migration 031 (OPS, #482): lease RELEASE bookkeeping and the worker's
+/// lifecycle state.
+///
+///   * `jobs.releases` — how many times a claimant handed this job's lease
+///     back on purpose (`Catalog::release_job_lease` /
+///     `release_jobs_claimed_by`: a two-mode shutdown's RELEASE arm, never
+///     an expiry). The reclaim cap compares `attempts - releases` against
+///     the attempts limit, so a rollout storm of releases never burns the
+///     cap a genuine crash does; `attempts` still bumps on every claim.
+///   * `idx_jobs_kind_status(status, execution, kind)` — the index the
+///     gauge sampler's `GROUP BY kind, status` over `execution = 'queued'`
+///     rows reads (`Catalog::count_jobs_by_kind_status`) so a metrics tick
+///     is an index-only aggregate, not a heap scan; `idx_jobs_claim` lacks
+///     `kind`.
+///   * `workers.state` — `warming` (the loop task's row exists but the
+///     process is not yet warm / its worker gate is closed), `claiming`
+///     (the claim loop is live), `draining` (a DRAIN is in progress). The
+///     CHECK pins the vocabulary at the SQL edge (K2). Every pre-existing
+///     row is a live claimant, hence the default.
+pub(super) const MIGRATION_031_JOBS_RELEASES_WORKERS_STATE: &str = r#"
+ALTER TABLE jobs ADD COLUMN releases INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_jobs_kind_status ON jobs(status, execution, kind);
+ALTER TABLE workers ADD COLUMN state TEXT NOT NULL DEFAULT 'claiming'
+    CHECK (state IN ('warming', 'claiming', 'draining'));
+"#;
+
+/// Migration 032 — versioned result tables: `result_table_versions`, the
+/// `current_version` / `next_version` columns on `result_tables`, and the
+/// producing-version stamp on `index_segments`.
+///
+/// One logical table keeps its `result_tables` row (the identity every
+/// predicate renders); its refreshed states live in `result_table_versions`,
+/// one row per version, immutable once `ready`. `result_tables.current_version`
+/// is the published version (`NULL` = never refreshed = today's table with
+/// zero behaviour change) and `next_version` the monotonic allocator: a
+/// number is allocated exactly once by `UPDATE ... SET next_version =
+/// next_version + 1` under the row lock, never reused — a failed or crashed
+/// version keeps its number and expiry never decrements it. A version row is
+/// lease-owned while `building` (`writer_id` / `lease_expires_at`, the same
+/// text form as migration 027) and terminal as `ready` / `failed`;
+/// `tenant_id` is inherited from the parent row in the same transaction;
+/// `created_at` is app-supplied. `index_segments.version` stamps the
+/// producing version on every segment appended by a refresh (`NULL` = a base
+/// segment, read as the base version through a manifest).
+///
+/// One `ADD COLUMN` per statement (SQLite); the composite index on
+/// `(status, lease_expires_at)` serves recovery's expired-lease scan exactly
+/// as `idx_result_tables_lease` does for tables.
+pub(super) const MIGRATION_032_RESULT_TABLE_VERSIONS: &str = r#"
+CREATE TABLE result_table_versions (
+    table_name       TEXT NOT NULL REFERENCES result_tables(table_name) ON DELETE CASCADE,
+    version          INTEGER NOT NULL,
+    parent_version   INTEGER,
+    status           TEXT NOT NULL DEFAULT 'building',
+    manifest_path    TEXT NOT NULL,
+    identity         TEXT,
+    live_rows        INTEGER,
+    masked_rows      INTEGER,
+    writer_id        TEXT,
+    lease_expires_at TEXT,
+    tenant_id        TEXT,
+    created_at       TEXT NOT NULL,
+    completed_at     TEXT,
+    PRIMARY KEY (table_name, version)
+);
+CREATE INDEX idx_result_table_versions_lease ON result_table_versions(status, lease_expires_at);
+ALTER TABLE result_tables ADD COLUMN current_version INTEGER;
+ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE index_segments ADD COLUMN version INTEGER;
+"#;

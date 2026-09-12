@@ -168,6 +168,17 @@ const NOT_SHIPPED: &[NotShipped] = &[
                   never packaged or published) -- not a shipped artifact",
     },
     NotShipped {
+        file: ".github/workflows/ci.yml",
+        literal: "test-hooks",
+        reason: "the gated-test-surfaces clippy step's compile-only feature closure (cargo \
+                  clippy -p jammi-server --tests --features test-hooks -- -D warnings) -- lints \
+                  that `jammi-server`'s test targets (and the `CARGO_BIN_EXE_jammi-server` they \
+                  spawn) still compile with the engine's rendezvous hooks the `jammi-ai = { \
+                  features = [\"test-hooks\"] }` dev-dependency union pulls in; `--tests` never \
+                  builds the shipped `jammi-server` binary, so nothing here reaches a release \
+                  artifact",
+    },
+    NotShipped {
         file: "Dockerfile",
         literal: "cuda,jetstream-broker,storage-cloud",
         reason: "the builder-cuda stage's `ARG CARGO_FEATURES` default, used only by a bare \

@@ -6,7 +6,168 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### BREAKING
+- **`[server] preload_models` is now honoured (#482).** It was documented and
+  dormant; a config that already lists it flips from starting to exiting
+  non-zero if a listed model cannot load, a bare id has no `models` row (its
+  task is resolved from that row at the startup edge), or a task token is
+  unknown. Entries are a bare id or `{ id, task }`
+  (`jammi_db::config::PreloadEntry`); `/readyz` reports 503 "preloading i/n"
+  and the claim loop waits at the session's worker gate (`workers.state =
+  warming`) until every entry is cached.
+- **The vector-search API takes a validated query type, not a bare slice
+  (#482).** `jammi_numerics::query::ValidatedQuery` is the only type
+  `jammi_numerics::distance::{cosine_distance, cosine_similarity}`,
+  `jammi_db::index::VectorIndex::search`,
+  `jammi_db::index::segment::{search_unit, rescore}`,
+  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`,
+  `jammi_db::index::exact::exact_vector_search`,
+  `jammi_db::index::placed::PlacedIndex::search_final_placed`,
+  `jammi_db::store::ResultStore::{search_vectors, search_vectors_local}`,
+  `jammi_ai::operator::ann_search_exec::AnnSearchExec::new` (and its
+  `query_vector` field), and `jammi_ai::pipeline::neighbor_graph::Node`'s
+  `vector` field accept for a query vector.
+  `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
+  **removed** with no replacement — its check is now
+  `ValidatedQuery::require_width` / `require_authority_width`, methods on
+  the type itself.
+  Construct one with `jammi_db::index::validate_query(values, expected_width,
+  source)` (re-exported from `jammi_numerics::query`, along with the new
+  `jammi_numerics::query::QueryValidationError` error type), where `source`
+  is a `jammi_db::index::QuerySource::{Caller, Stored { table }}`. Its
+  inherent methods are `as_slice`, `into_inner`, `source`, and the two width
+  checks below.
+  `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
+  parameter — a cross-check against the scan's own width; pass `None` when
+  there is none on record. `jammi_db::index::peer::{SegmentSearchRequest,
+  ExactRescoreRequest}`'s `query` field is a `ValidatedQuery`, not a
+  `Vec<f32>`; `PeerFailureReason` gained the `CallerFault` variant,
+  `PeerError` gained a `message: String` field, and `PEER_FAILURE_LABELS` is
+  now `[&str; 10]`.
+- **`jammi_db::catalog::result_repo::ResultTableRecord::dimensions` is a
+  method, not a field (#482).** It returns `Option<std::num::NonZeroUsize>`
+  — a non-positive stored value and an absent one are both `None`.
+  `dimensions_raw() -> Option<i32>` returns the stored column verbatim, for a
+  caller that must round-trip it unfiltered. A caller building a
+  `ResultTableRecord` field-by-field from outside this crate uses
+  `ResultTableRecord::from_wire_projection`, the crate's sole cross-crate
+  constructor.
+- **`jammi_wire::peer::{phase_from_proto, precision_from_proto}` return a
+  `ProtoEnumDecode<T>`, not an `Option<T>` (#482).** The wire's explicit
+  "not set" and a raw value this build's generated `enum` has no variant for
+  are no longer collapsed into one `None`; call the new `.known() ->
+  Option<T>` for the old behaviour.
+- **A downstream width check never attributes to the caller, regardless of
+  the query's own provenance (#482).** `ValidatedQuery::require_width` now
+  takes an `artifact: impl Into<String>` and does not read the query's
+  `QuerySource` at all — every call downstream of an entry an authority has
+  already checked (an index's declared dimensions, a scan's width, a stored
+  vector's own length) is engine-fault by construction. TWO entries still
+  attribute by the query's own provenance (the placement entry's all-remote
+  shape, and `exact_vector_search`'s no-catalog-width fallback) and use the
+  new `ValidatedQuery::require_authority_width`, the old `require_width`
+  behaviour under a name that says why it is different. `QuerySource`
+  gained a third variant, `Artifact { name }`, which `require_width` reports
+  instead of borrowing `Stored` for a query it did not read from that
+  table — an exhaustive match on `QuerySource` needs a new arm.
+- **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
+  replacement (#482).** It resolved a result table's current version and
+  then discarded the resolution, returning a bare `InputAnchor` a caller
+  could not get the matching content back from without a second,
+  independent resolve — the exact shape a version publish landing between
+  the two calls can straddle. Call
+  `ResultStore::pin_current_version(record).await?.input_anchor()` instead;
+  for a versioned table this method already delegated to exactly that
+  internally, so the returned value is unchanged.
+
 ### Added
+- **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
+  the Rust library and Python (#482).** A DRAIN finishes the in-flight job
+  (every epoch bundle lands, `completed` under the same attempt), ends idle
+  `WaitJob`/`Subscribe` streams with `UNAVAILABLE` "server draining"
+  (`jammi_grpc_refused_total{reason="draining"}`), flips `/readyz` to 503
+  "draining", and exits 0 — bounded only by the runtime's grace period. A
+  RELEASE (SIGINT, Ctrl+C, a second SIGTERM, or the new `jammi-server
+  release [--pid N]` subcommand) hands every job lease back at once — the
+  row stays `running` with a NULL lease and `releases + 1`, a compute job's
+  linked building-table lease with it — stops the loop and exits 0 when its
+  own evidence confirms every lease was handed back, or exit code 3 when it
+  does not; a successor claims a CONFIRMED release within one idle poll at
+  no attempt cost (`releases` offsets it in the `attempts - releases` cap).
+  Whether a DEGRADED release (exit 3) still hands a given lease back depends
+  on WHICH determinant degraded, and a degraded determinant is defined by
+  missing evidence — it gets a definite consequence only where the evidence
+  establishes one: when the sweep statement for that lease's own table
+  itself failed, the lease was never written and falls to the expiry path,
+  costing one attempt (`attempts + 1`, `releases` untouched) for `jobs`, or
+  a one-time back-off for the linked `result_tables` row (which carries no
+  `attempts`/`releases` columns to increment); but when the sweep confirms and only
+  the hold-observation or stop-witness evidence is missing, every row the
+  sweep itself matched was already handed back (`releases + 1`, lease
+  NULLed) and a successor claims it within one idle poll at no attempt
+  cost — nothing is established about a row still under an active hold, or
+  about a claim that commits after the sweep runs; either keeps a live
+  lease and falls to the expiry path instead.
+  `EmbeddedWorker::{begin_drain, stop_and_join -> StopOutcome,
+  release_and_stop -> ReleaseReport, shared}`, `WorkerShared`, `LoopState`,
+  `InferenceSession::{release_job_leases, close_worker_gate,
+  open_worker_gate, worker_gate_receiver}`, `BoundServer::{serve_with_signals,
+  has_worker}`, `ShutdownOutcome`, `BoundChain::{take_worker,
+  serve_with_drain}`, `MethodClassLayer::with_drain`, `RefusedBound::Draining`;
+  Python `close(release=False)` on `Session`/`EmbeddedBackend`/
+  `RemoteDatabase` (the remote arm accepts and ignores it); `WorkerSummary`
+  and `ListWorkers` carry `state` (`warming`/`claiming`/`draining`), written
+  by the loop task in that order. The loop's idle sleep is interruptible, so a
+  drain of an idle worker never waits out `idle_poll_secs`.
+- **`jammi_db::catalog::result_repo::ResultTableCas` gains the `pub` field
+  `lease_present: bool` (#482).** The struct is a re-exported pub struct
+  with pub fields, so every literal `ResultTableCas { .. }` construction in
+  downstream code must add the field (`false` reproduces the previous
+  predicate; the builders `writer` / `writer_any_tenant` / `expired` set it
+  `false`, `with_lease_present()` sets it). When set, the building-row CAS
+  additionally requires `lease_expires_at IS NOT NULL`; `Catalog::renew_lease`
+  always carries it, so a RELEASED building lease is never re-armed by any
+  holder's renewal. Migration `031_jobs_releases_workers_state` adds
+  `jobs.releases`, `workers.state` and the gauge index `idx_jobs_kind_status`;
+  `Catalog::{release_job_lease, release_jobs_claimed_by,
+  release_building_tables_of_claimant, clear_partial_result,
+  set_worker_state, count_jobs_by_kind_status}`, `WorkerState`,
+  `LeaseKeeper::release_job_holds` and `[worker] metrics_sample_secs`
+  (default 5) are the lease-release substrate; `Catalog::upsert_worker`
+  takes the row's initial `WorkerState`. The reclaim cap now compares
+  `attempts - releases`, and `heartbeat_job` carries `lease_expires_at IS
+  NOT NULL`.
+- **Incremental embedding refresh: `refresh_embeddings`, `compact_embeddings`,
+  `expire_versions` (#482).** An embedding table is now versioned in place:
+  `refresh_embeddings(table, deletes = tombstone | retain)` diffs the source
+  against the current version by the new nullable `_content_hash` column
+  (hex SHA-256 over the embedded columns as the model read them, the fifth
+  column of every embedding table), re-embeds only the added and changed
+  rows into one fragment + one ANN segment stamped with a monotonically
+  allocated version number, masks superseded and deleted keys through a
+  cumulative per-version deletion mask, and publishes with one
+  compare-and-set — a reader sees exactly one version, the previous one
+  stays live until the swap, and a never-refreshed table is byte-identical
+  to before. A refresh with nothing to do is `no_change` and leaves every
+  downstream anchor `Fresh`. Migration 032 adds `result_table_versions` and
+  `result_tables.current_version/next_version`; `index_segments.version`
+  stamps segments. `compact_embeddings` rewrites the live rows as one
+  fragment + one segment (no inference); `expire_versions(before)` reaps
+  old versions and never touches the allocator. The version identity is a
+  hash chain (parent identity, definition, delta descriptor, fragment and
+  mask digests) that `verify_materialization` recomputes and `staleness`
+  anchors on. The verbs are on `Session`, both Python bindings, and
+  `EmbeddingService.{RefreshEmbeddings, CompactEmbeddings, ExpireVersions}`.
+  Base embedding output is now written in key order (`CAST(key AS Utf8)`,
+  then `_content_hash`) so the artifact digest is identical across
+  `execution_threads`; a `NULL` key is the typed `InvalidKey { column,
+  null_count }` on `generate_embeddings`, refresh and `infer` before any
+  model call; new typed errors `NonUniqueKey`, `DefinitionDrift`,
+  `NotRefreshable`, `VersionUnavailable` (wire, Python leaf classes); a
+  storage object vanishing under a scan is the typed
+  `Storage(StorageError::Io { NotFound })` and every other DataFusion error
+  keeps its `source()` under `JammiError::DataFusion`. Guide:
+  `incremental-refresh.md`.
 - **`jobs`/`instances`/`workers`: a generalised, kind-agnostic durable-job
   queue replaces the training-only queue; a per-process lease keeper (#485).**
   Migration 029 drops `training_jobs` and adds `jobs` (training AND compute

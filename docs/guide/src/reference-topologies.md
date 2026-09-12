@@ -234,6 +234,21 @@ to claim only the training kinds) so only it runs the job worker's claim
 loop against the shared catalog. Its `[server] services` is whatever the
 compute node should also serve — `services = []` for a pure compute node.
 
+The compute tier's Deployment carries `terminationGracePeriodSeconds: 600`
+— SIGTERM drains (the in-flight training job finishes, every epoch bundle
+lands) and SIGKILL follows the grace; SIGINT, or `jammi-server release` from
+a `preStop` hook, RELEASES — on a CONFIRMED release (exit 0), the job's
+lease is handed back at once and any other replica claims it within one
+idle poll at no attempt cost; a DEGRADED release (exit 3) does not cost an
+attempt universally, and its per-lease outcome depends on which determinant
+degraded (see the RELEASE breakdown in `deploy/kubernetes/README.md` and
+`deploy-server.md` below — never assume the CONFIRMED cost here for a
+degraded exit). The grace must cover one epoch's wall time; on spot
+capacity use RELEASE. The operative rule, the rollout arithmetic and both
+`preStop` recipes are in `deploy/kubernetes/README.md` ("Shutdown: DRAIN
+and RELEASE"); the modes themselves are in
+[Shutdown](./deploy-server.md#shutdown-drain-and-release).
+
 The compute tier is a plain Deployment today and is **provisional**:
 [#500](https://github.com/f-inverse/jammi-ai/issues/500) decides the gang
 primitive for multi-GPU and multi-node training; once ranks need stable
@@ -257,6 +272,54 @@ tag for reproducible GPU-node deploys.
 Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)
 are the shapes this topology serves.
+
+### Beyond-one-node retrieval
+
+A query-tier replica answers `Search` over a table whose ANN index segments
+it does not all hold by fanning the query out to the replicas that own
+them: each owner searches its segments and returns `(row_id, distance)`
+hits — never vectors — and the coordinator merges them under the same total
+order a single node merges its own segments with (the distributed data
+plane; see [Security Posture](./security.md#the-peer-listener-i-peer) for
+the I-PEER invariant and [Operability](./operability.md#failure-mode-matrix)
+for the failure ladder). Three facts fix the shape:
+
+- **The default is `AllLocal`.** With `[server] peer_bind` unset — every
+  shape above — every segment is this replica's, there is no third listener,
+  and the search is exactly the single-node search (the same kernels, the
+  same bytes, the same exact-read count at every segment count). Nothing on
+  this page changes until a deployment opts in.
+- **`peer_bind` makes a replica an owner.** Setting `[server] peer_bind`
+  (`JAMMI_SERVER__PEER_BIND`) opens the internal `PeerService` listener on
+  that replica. Bind it on a private interface behind network policy / mTLS
+  from the runtime — its clients are other jammi coordinators and it
+  authenticates nothing itself.
+- **Precondition: a shared, replica-readable `result_root`.** A segment an
+  owner serves must be a bundle every replica can reach: `[storage]
+  result_root` on an object store every replica reads (a local
+  `artifact_dir` is one node's). Placement — which replica owns which
+  segment — is derived at query time from the live replica ring
+  (`[server] peer_advertise` + the catalog's `instances` rows, rendezvous-
+  hashed over `(table, segment)`), never declared; the membership half of
+  that ring is the compute-tier substrate's (`peer_advertise`,
+  `instances.peer_addr`), and until it lands a library process supplies an
+  explicit `StaticPlacement` through
+  `InferenceSession::open_with_placement`. Batch builders (the neighbor
+  graph, eval) never fan out: they load the whole table's segment set on the
+  building replica.
+
+**A REFRESHED table's `Mixed` arm is not version-aware.** The single-node
+(`AllLocal`, every segment this replica's own) search path always resolves a
+versioned table's CURRENT version before searching it. The multi-node
+`Mixed` arm — reached only when `peer_bind` is set and this table's segments
+span more than one replica — does not: it plans off `list_index_segments`'
+flat, unversioned segment set, the same limitation the single-node path
+carried before its own version-aware resolution was added. If a Shape D
+deployment places a table `refresh_embeddings` has since published a new
+version of across more than one owning replica, a `Search` served through
+peers can surface rows from a version older than the table's current one;
+keep a refreshed table's segments on a single owning replica (or force-local
+it) until this closes.
 
 ## The `jammi-server probe` subcommand
 

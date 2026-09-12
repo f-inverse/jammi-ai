@@ -47,6 +47,7 @@ use tempfile::tempdir;
 use tokio::process::Command;
 
 use jammi_db::index::exact::exact_vector_search;
+use jammi_db::index::{validate_query, QuerySource};
 use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 use jammi_numerics::distance::cosine_distance;
 
@@ -225,11 +226,16 @@ async fn naive_collect_all_search(
         extend_with_fixed_size_list_f32(&batch, table_name, "vector", &mut vectors)?;
     }
 
-    let mut scored: Vec<(String, f32)> = row_ids
-        .into_iter()
-        .zip(vectors.iter())
-        .map(|(id, v)| (id, cosine_distance(query, v)))
-        .collect();
+    let query = validate_query(query.to_vec(), None, QuerySource::Caller)?;
+    // The kernel's own `assert!` is not a guard a caller can rely on: this
+    // harness reaches `cosine_distance` directly, with nothing else in the
+    // path enforcing that the scanned width matches the query — checked here,
+    // typed, so a misconfigured bench run is a refusal, never a panic.
+    let mut scored: Vec<(String, f32)> = Vec::with_capacity(vectors.len());
+    for (id, v) in row_ids.into_iter().zip(vectors.iter()) {
+        query.require_width(v.len(), format!("{table_name}.vector"))?;
+        scored.push((id, cosine_distance(&query, v)));
+    }
     scored.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -283,7 +289,16 @@ pub async fn measure_once(
         }
         Variant::Streamed | Variant::Naive => {
             let result = match variant {
-                Variant::Streamed => exact_vector_search(&ctx, table, &query, K).await?,
+                Variant::Streamed => {
+                    exact_vector_search(
+                        &ctx,
+                        table,
+                        &validate_query(query.to_vec(), None, QuerySource::Caller)?,
+                        K,
+                        None,
+                    )
+                    .await?
+                }
                 Variant::Naive => naive_collect_all_search(&ctx, table, &query, K).await?,
                 Variant::ScanOnly => unreachable!("scan-only handled above"),
             };

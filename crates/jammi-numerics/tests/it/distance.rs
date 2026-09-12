@@ -1,31 +1,36 @@
+use jammi_numerics::query::{validate_query, QuerySource, ValidatedQuery};
+
+fn vq(v: &[f32]) -> ValidatedQuery {
+    validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+}
 use approx::assert_abs_diff_eq;
 use jammi_numerics::distance::{cosine_distance, cosine_similarity, vector_norm};
 
 #[test]
 fn cosine_distance_of_self_is_zero() {
     let v = vec![1.0_f32, 2.0, 3.0];
-    assert_abs_diff_eq!(cosine_distance(&v, &v), 0.0_f32, epsilon = 1e-6);
+    assert_abs_diff_eq!(cosine_distance(&vq(&v), &v), 0.0_f32, epsilon = 1e-6);
 }
 
 #[test]
 fn cosine_distance_anti_parallel_is_two() {
     let v = vec![1.0_f32, 2.0, 3.0];
     let neg: Vec<f32> = v.iter().map(|x| -x).collect();
-    assert_abs_diff_eq!(cosine_distance(&v, &neg), 2.0_f32, epsilon = 1e-6);
+    assert_abs_diff_eq!(cosine_distance(&vq(&v), &neg), 2.0_f32, epsilon = 1e-6);
 }
 
 #[test]
 fn cosine_distance_with_zero_vector_returns_one() {
     let v = vec![1.0_f32, 0.0, 0.0];
     let zero = vec![0.0_f32, 0.0, 0.0];
-    assert_eq!(cosine_distance(&v, &zero), 1.0);
+    assert_eq!(cosine_distance(&vq(&v), &zero), 1.0);
 }
 
 #[test]
 fn similarity_and_distance_sum_to_one_for_non_degenerate() {
     let a = vec![1.0_f32, 0.5, -0.3];
     let b = vec![0.8_f32, 1.2, 0.1];
-    let sum = cosine_similarity(&a, &b) + cosine_distance(&a, &b);
+    let sum = cosine_similarity(&vq(&a), &b) + cosine_distance(&vq(&a), &b);
     assert_abs_diff_eq!(sum, 1.0_f32, epsilon = 1e-6);
 }
 

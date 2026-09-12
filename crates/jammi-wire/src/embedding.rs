@@ -128,11 +128,12 @@ fn result_table_kind_from_proto(kind: i32) -> Result<ResultTableKind, Status> {
 /// modality threaded in out of band, never a guess.
 impl From<ResultTableRecord> for pb::ResultTable {
     fn from(record: ResultTableRecord) -> Self {
+        let dimensions = record.dimensions_raw().unwrap_or(0);
         pb::ResultTable {
             table_name: record.table_name,
             source_id: record.source_id,
             model_id: record.model_id,
-            dimensions: record.dimensions.unwrap_or(0),
+            dimensions,
             row_count: record.row_count as u64,
             status: record.status,
             task: super::model_task_to_proto(record.task) as i32,
@@ -177,40 +178,36 @@ pub fn result_table_with_outcome(record: ResultTableRecord, outcome: i32) -> pb:
 pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableRecord, Status> {
     let task = super::model_task_from_proto(table.task)?;
     let kind = result_table_kind_from_proto(table.kind)?;
-    Ok(ResultTableRecord {
-        table_name: table.table_name,
-        source_id: table.source_id,
-        model_id: table.model_id,
+    // `ResultTableRecord::from_wire_projection` is the sole authorized
+    // cross-crate constructor: `dimensions`'s privacy otherwise closes off
+    // building a record field-by-field from outside `jammi-db`. Every field
+    // the wire message does not carry (storage/index paths, timestamps,
+    // tenant, lease, version bookkeeping) is left at its "not carried"
+    // value inside that constructor — the same values this reconstruction
+    // used inline before `dimensions` was privatized:
+    //   - `parquet_path`, `distance_metric`, `created_at`: `String::new()`
+    //   - `text_columns`, `completed_at`: `None`
+    //   - `tenant_id`: server-side bookkeeping resolved from the session,
+    //     not carried on the result wire.
+    //   - `definition_hash`, `input_anchors_json`: server-side provenance;
+    //     a remote consumer that wants the attestation reaches it through
+    //     `verify_materialization`, not this reconstruction.
+    //   - `storage_precision`, `oversample`: server-side bookkeeping — a
+    //     remote consumer never builds/loads the index directly.
+    //   - `writer_id`, `lease_expires_at`: the writer lease is server-side
+    //     bookkeeping on a `building` row; a wire result is `ready`.
+    //   - `current_version`, `next_version`: versioned-table bookkeeping a
+    //     remote consumer never reads back through this projection.
+    Ok(ResultTableRecord::from_wire_projection(
+        table.table_name,
+        table.source_id,
+        table.model_id,
         task,
         kind,
-        derived_from: table.derived_from,
-        parquet_path: String::new(),
-        dimensions: (table.dimensions != 0).then_some(table.dimensions),
-        distance_metric: String::new(),
-        row_count: table.row_count as usize,
-        status: table.status,
-        key_column: (!table.key_column.is_empty()).then_some(table.key_column),
-        text_columns: None,
-        created_at: String::new(),
-        completed_at: None,
-        // Tenant identity is server-side bookkeeping resolved from the session,
-        // not carried on the result wire — the reconstruction leaves it absent.
-        tenant_id: None,
-        // The materialization-contract summary columns are server-side
-        // provenance, not carried on the `GenerateEmbeddings` result wire; a
-        // remote consumer that wants the attestation reaches it through
-        // `verify_materialization`, not this reconstruction.
-        definition_hash: None,
-        input_anchors_json: None,
-        // The sidecar-index storage precision / rescore oversample are
-        // server-side bookkeeping, not carried on the `GenerateEmbeddings`
-        // result wire — a remote consumer never builds/loads the index
-        // directly, so it has no use for these here.
-        storage_precision: None,
-        oversample: None,
-        // The writer lease is server-side bookkeeping on a `building` row;
-        // a wire result is a `ready` table, so neither field is carried.
-        writer_id: None,
-        lease_expires_at: None,
-    })
+        table.derived_from,
+        table.dimensions,
+        table.row_count as usize,
+        table.status,
+        (!table.key_column.is_empty()).then_some(table.key_column),
+    ))
 }

@@ -397,9 +397,11 @@ impl Fnv {
 /// floats into an FNV digest.
 ///
 /// The fold is over the full persisted `vector` column in result-table storage
-/// order, which is the embedding pipeline's deterministic source-scan write order
-/// — so the digest is reproducible on a machine (the tier's on-box determinism
-/// gate folds it twice and asserts equality). A length tag per vector makes the
+/// order — for a never-refreshed table (this bench never refreshes) the raw
+/// base bytes in the embedding pipeline's deterministic key-order write order;
+/// a versioned table would read through its masked provider in `_row_id`
+/// order — so the digest is reproducible on a machine (the tier's on-box
+/// determinism gate folds it twice and asserts equality). A length tag per vector makes the
 /// row boundaries explicit so a
 /// dimensionality change cannot be masked by a float collision.
 ///

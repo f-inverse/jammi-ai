@@ -219,10 +219,11 @@ const SOFTMAX_SCALE: f32 = 0.125; // 1/sqrt(64)
 ///
 /// There is consequently no significand-width argument for widening this
 /// crate's slack past the bf16 file's own `1.5` — and the LIVE measurement
-/// confirms it: the landing commit's own pod run
-/// (`o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound_f16`'s
-/// `eprintln!` ratios, campaign #443 `e98b4b46`) reports `ratio(max)`
-/// across every leg/tensor in `[0.71, 1.20]` — comfortably under `1.5`
+/// confirms it: see
+/// [`o_lse_dq_dk_dv_match_truth_within_the_torch_relative_bound_f16`],
+/// whose `eprintln!` ratios (on the landing commit's own pod run) report
+/// `ratio(max)` across every leg/tensor in `[0.71, 1.20]` (no-producer: produced by that same #[test]'s own eprintln!, one comment line separates its #[test] attribute from its fn line so this repo's own doc-number-producer scan cannot resolve the bracket link mechanically -- see that test directly) — comfortably
+/// under `1.5`
 /// (headroom `1.5 / 1.20 ≈ 1.25x` over the worst observed leg) and nowhere
 /// near needing `2.0`. `1.5` is the re-derivation clause's defensible
 /// choice: it matches the bf16 file's own value (no dtype-specific

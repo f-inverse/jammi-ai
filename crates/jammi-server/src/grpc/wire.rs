@@ -209,6 +209,20 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::Aborted,
             format!("result table `{table}` is already `{status}`"),
         ),
+        // A parent-pinned version CAS (allocation or publish) lost a race
+        // against a concurrent refresh/compaction that published first: the
+        // same "the caller's view was already stale" shape `LeaseLost` /
+        // `CasFailed` carry, so the same retryable `Aborted` code.
+        JammiError::ParentMoved {
+            table,
+            expected,
+            found,
+        } => (
+            Code::Aborted,
+            format!(
+                "result table `{table}`: parent moved (expected {expected:?}, found {found:?})"
+            ),
+        ),
         // A job-row attempt guard missed under the caller: a peer's reclaim
         // superseded this attempt mid-run. `Aborted` — the same "lost the
         // race, retry from a fresh claim" mapping `LeaseLost`/`CasFailed`
@@ -231,6 +245,48 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::FailedPrecondition,
             format!("source `{source_id}` is busy: result table `{table}` is being built"),
         ),
+        // A null key in the scanned source is a data-shape fault of the
+        // caller's input — the same `InvalidArgument` convention `Schema` and
+        // `Source` follow above.
+        JammiError::InvalidKey { column, null_count } => (
+            Code::InvalidArgument,
+            format!("key column `{column}` has {null_count} null value(s)"),
+        ),
+        // The current version of a versioned table cannot be served — the
+        // absent-resource convention `ModelNotFound` / `RowGone` follow.
+        JammiError::VersionUnavailable { table, version } => (
+            Code::NotFound,
+            format!("result table `{table}` version {version} is unavailable"),
+        ),
+        // "Fix state, then retry" — the `ModelReferenced` / `SourceBusy`
+        // convention: the table must be recomputed (or its version restored)
+        // before a refresh can proceed.
+        JammiError::NotRefreshable { table, reason } => (
+            Code::FailedPrecondition,
+            format!("result table `{table}` is not refreshable: {reason}"),
+        ),
+        // The environment (model / device), not the argument, must change
+        // before a retry.
+        JammiError::DefinitionDrift { table, .. } => (
+            Code::FailedPrecondition,
+            format!("result table `{table}`: definition drift; recompute it"),
+        ),
+        // A non-unique key space is a data-shape fault of the caller's
+        // input, like `InvalidKey`.
+        JammiError::NonUniqueKey {
+            table, scan, total, ..
+        } => (
+            Code::InvalidArgument,
+            format!("result table `{table}`: {total} non-unique key(s) in the {scan} scan"),
+        ),
+        // The placed-search failure ladder was exhausted for a segment another
+        // replica owns: the owner, its retry candidate and the local load all
+        // failed. `Unavailable` — gRPC's code for "the service is currently
+        // unavailable; retry with backoff" — naming the segment, so a peer
+        // outage is visible and never masked by a silent full scan.
+        JammiError::Unavailable { resource, reason } => {
+            (Code::Unavailable, format!("{resource}: {reason}"))
+        }
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)
@@ -358,6 +414,22 @@ mod tests {
         assert!(matches!(
             error_from_status(&source_busy),
             JammiError::SourceBusy { source_id, table } if source_id == "src1" && table == "t1"
+        ));
+
+        // A parent-pinned version CAS lost the race the same way `CasFailed`
+        // does — the same retryable `Aborted` code, but its own typed
+        // variant carrying `expected`/`found` rather than `CasFailed`'s
+        // `status`, which would misname the cause (the row IS `ready`).
+        let parent_moved = map_engine_error(JammiError::ParentMoved {
+            table: "t1".into(),
+            expected: Some(3),
+            found: Some(4),
+        });
+        assert_eq!(parent_moved.code(), Code::Aborted);
+        assert!(matches!(
+            error_from_status(&parent_moved),
+            JammiError::ParentMoved { table, expected, found }
+                if table == "t1" && expected == Some(3) && found == Some(4)
         ));
     }
 
@@ -563,5 +635,39 @@ mod tests {
             JammiError::ModelNotFound { model_id } => assert_eq!(model_id, "acme/embed-mini"),
             other => panic!("expected ModelNotFound to round-trip, got {other:?}"),
         }
+    }
+
+    /// W — the Caller finiteness refusal crosses the wire as
+    /// `INVALID_ARGUMENT`: the same code (and the same Python exception,
+    /// `InvalidArgument` / `ValueError`) as a width mismatch. Before the
+    /// query was typed, a non-finite query landed on `Other` → `Internal` → a
+    /// different exception class. The Stored twin is `Internal`, naming the
+    /// table: a corrupt artifact is never the caller's fault.
+    #[test]
+    fn query_finiteness_refusal_codes_follow_provenance() {
+        use jammi_db::index::{validate_query, QuerySource};
+        let caller: JammiError = validate_query(vec![f32::NAN], None, QuerySource::Caller)
+            .unwrap_err()
+            .into();
+        let status = map_engine_error(caller);
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        // …and it round-trips as the same schema-class variant a width
+        // mismatch would.
+        assert!(matches!(
+            error_from_status(&status),
+            JammiError::Schema { .. }
+        ));
+        let stored: JammiError = validate_query(
+            vec![f32::NAN],
+            None,
+            QuerySource::Stored {
+                table: "docs_embeddings".into(),
+            },
+        )
+        .unwrap_err()
+        .into();
+        let status = map_engine_error(stored);
+        assert_eq!(status.code(), Code::Internal, "{status:?}");
+        assert!(status.message().contains("docs_embeddings"), "{status:?}");
     }
 }

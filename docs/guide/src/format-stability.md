@@ -30,6 +30,9 @@ are pinned identically.)
 | USearch ANN graph | `.usearch` | `backend_version` stamped in the sidecar `.manifest.json` | **Strict** — any mismatch with the linked USearch → `JammiError::IncompatibleFormat { artifact: "usearch-index", .. }` |
 | Lexical (BM25) index | tantivy index dir | tantivy's own format tag | **Library-loud** — tantivy's `Index::open` fails with `IncompatibleIndex`, surfaced as `JammiError::Lexical` |
 | Result-table data | `.parquet` | *none embedded* — its format-of-record version **is** the `.materialization.json` `manifest_version` | Schema-shape checked at read via `JammiError::Schema`; byte integrity caught by `verify_materialization` |
+| Version manifest (a refreshed embedding table) | `{table}__v{N}.version.json` | `version_format` (`u32`) | **Reject-newer** — `found > VERSION_FORMAT` → `JammiError::IncompatibleFormat { artifact: "version-manifest", .. }` |
+| Deletion mask | `{table}__v{N}.deletes.parquet` | *none embedded* — its format-of-record version is the version manifest's `version_format` | Schema-shape checked at read (`_row_id Utf8 NOT NULL, _dead_through_version Int64 NOT NULL`) via `JammiError::Schema`; byte integrity caught by `verify_materialization` (its digest folds into the version identity) |
+| Version fragment | `{table}__v{N}.parquet` | *none embedded* — same rule as the base Parquet | Pinned to the base fragment's schema at bind; a divergent file is a typed `JammiError::Schema`; digest verified by `verify_materialization` |
 
 Two distinct kinds of stamp appear above, and the difference is deliberate:
 

@@ -202,8 +202,9 @@ pub const COND_AWARE_TOL: f64 = 4e-6;
 /// residual independent of how small the true answer is.
 ///
 /// Measured, with a LIVE producer (KO-4 — no bare, unverifiable number in
-/// prose): `tests/gelu_erf_oracles.rs`'s
+/// prose): see
 /// `backward_matches_candles_own_composition_within_the_condition_aware_bound`
+/// in `tests/gelu_erf_oracles.rs`, which
 /// computes, on EVERY run, the max ADDITIVE excess (`|fused - eager| -
 /// COND_AWARE_TOL*(|Phi(x)|+|x*phi(x)|)` — i.e. the residual the relative
 /// term ALONE cannot cover) over that test's own `[-8,8]` step-`0.02`

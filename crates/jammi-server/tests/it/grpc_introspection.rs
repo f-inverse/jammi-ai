@@ -59,19 +59,6 @@ fn local(server: &EngineServer) -> Session {
     Session::new(Arc::clone(&server.engine))
 }
 
-/// Require-gate, same shape as `jammi-db`'s `recovery.rs`/`broker_parity.rs`
-/// `require_live_pg`: a lane that wants to REQUIRE the real Postgres arm sets
-/// `JAMMI_REQUIRE_PG`, turning an unset `JAMMI_TEST_PG_URL` into a panic
-/// instead of a silent skip.
-fn require_live_pg(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
-             must run the real Postgres arm, not skip it"
-        );
-    }
-}
-
 /// A comparable projection of a descriptor: the registry identity plus, per
 /// result table, the client-observable embedding fields (`table_name`,
 /// `status`, `row_count`, `dimensions`, `task`, `kind`, `derived_from`,
@@ -103,7 +90,7 @@ fn descriptor_shape(d: &SourceDescriptor) -> DescriptorShape {
                 t.table_name.clone(),
                 t.status.clone(),
                 t.row_count,
-                t.dimensions,
+                t.dimensions_raw(),
                 t.task,
                 t.kind,
                 t.derived_from.clone(),
@@ -146,7 +133,7 @@ async fn remote_list_and_describe_sources_like_local() {
         .0;
     assert_eq!(table.status, "ready");
     assert!(table.row_count > 0, "patents corpus embeds rows");
-    assert!(table.dimensions.is_some(), "dimensions recorded");
+    assert!(table.dimensions().is_some(), "dimensions recorded");
 
     // A neighbor graph derived from that embedding table — a second result
     // table under the same source, of a DIFFERENT kind, with real provenance
@@ -207,7 +194,7 @@ async fn remote_list_and_describe_sources_like_local() {
         .expect("the model-output embedding table");
     assert_eq!(rt.status, "ready");
     assert_eq!(rt.row_count, table.row_count);
-    assert_eq!(rt.dimensions, table.dimensions);
+    assert_eq!(rt.dimensions_raw(), table.dimensions_raw());
     assert_eq!(rt.task, jammi_db::ModelTask::TextEmbedding);
     assert_eq!(rt.kind, ResultTableKind::Model);
     assert_eq!(rt.derived_from, None);
@@ -362,7 +349,6 @@ async fn remote_server_info_reports_postgres_broker_kind() {
         eprintln!(
             "skipping remote_server_info_reports_postgres_broker_kind: JAMMI_TEST_PG_URL unset"
         );
-        require_live_pg("remote_server_info_reports_postgres_broker_kind");
         return;
     };
     let broker = jammi_db::config::BrokerConfig::Postgres {

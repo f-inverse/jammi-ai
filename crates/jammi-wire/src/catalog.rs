@@ -477,7 +477,7 @@ pub fn derives_from_edge_from_proto(
 
 /// Map an engine [`IndexSegment`] onto its proto message — the send side of a
 /// `ListIndexSegments` response. Total: the wire message carries exactly the
-/// engine row's three fields, so nothing is dropped or synthesized.
+/// engine row's four fields, so nothing is dropped or synthesized.
 ///
 /// `row_count` widens `usize` → `uint64`, which is lossless on every target the
 /// engine builds for (`usize` is at most 64 bits).
@@ -486,6 +486,7 @@ pub fn index_segment_to_proto(segment: &IndexSegment) -> pb::IndexSegment {
         segment_id: segment.segment_id,
         index_path: segment.index_path.clone(),
         row_count: segment.row_count as u64,
+        version: segment.version,
     }
 }
 
@@ -506,6 +507,7 @@ pub fn index_segment_from_proto(segment: pb::IndexSegment) -> Result<IndexSegmen
         segment_id: segment.segment_id,
         index_path: segment.index_path,
         row_count,
+        version: segment.version,
     })
 }
 

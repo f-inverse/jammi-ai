@@ -686,7 +686,8 @@ pub struct FinetuneRunParams {
     // "Option::is_none")]` on [`crate::report::FinetuneRunTier`]'s mirror
     // fields), so a normal leg's report bytes are unchanged by this finding
     // (committed goldens unaffected).
-    /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — see
+    /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — no-producer:
+    /// an illustrative example label, not a measurement — see
     /// `docs/plans/63-how-well/mutants/README.md`'s dose-family naming).
     /// Trimmed and checked for non-emptiness by `run_impl`; the STAMPED
     /// value (in the returned tier) is the trimmed string.
@@ -2731,7 +2732,9 @@ mod tests {
     /// was_training = self.training_mode; let result = f(self);
     /// self.set_training(was_training); result`) and re-running
     /// `init_probe_does_not_perturb_the_training_trajectory_bitwise` at
-    /// this fix's now-live `lora_dropout: 0.05` made THAT test fail —
+    /// this fix's now-live `lora_dropout: 0.05` (no-producer: this crate's
+    /// own `--lora-dropout` CLI default, not a measured quantity) made
+    /// THAT test fail —
     /// `named_with != named_without` ("trained weights diverged bit-for-bit
     /// between WITH and WITHOUT the init probe") — because the extra init
     /// probe's now-live dropout draw perturbed the first epoch's own

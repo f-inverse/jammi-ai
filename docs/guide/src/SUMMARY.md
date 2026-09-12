@@ -46,6 +46,7 @@
 - [Scope a Session to a Tenant](./multi-tenant.md)
 - [Scope a Federated Source by Tenant](./scope-source-by-tenant.md)
 - [Verify a Result Table's Materialization Identity](./materialization-contract.md)
+- [Refresh an Embedding Table Incrementally](./incremental-refresh.md)
 
 # Operations
 

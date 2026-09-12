@@ -42,6 +42,36 @@ file/fn and why. Registering a new helper is a reviewed PR diff, exactly like
 adding a citation or a `no-producer:` opt-out; the registry may only grow by
 entries the shape check accepts.
 
+#513 amendment (human-reviewed, admin-merged — this gate script is
+human-amend-only): a require-gate FOLDED INTO the accessor it guards (so the
+accessor cannot be obtained ungated at all — see `jammi_test_utils::
+pg_url_for_tests`) leads its condition with the accessor's OWN not-already-
+satisfied check (`url.is_none() && ...`) rather than the bare env-read alone,
+and reads a NAMED CONSTANT (`REQUIRE_PG_ENV`) rather than repeating the
+`JAMMI_REQUIRE_*` literal at every call site. Both are now accepted: the `if`
+condition may carry additional `&&`-joined conjuncts in ANY position (never a
+`||`, and never a literal `true`/`false` conjunct — the exact `&&
+false`/`.is_none()` bypass this shape check has always refused stays refused),
+and the env-read's argument may be a bare identifier resolved, ONE level of
+SAME-FILE indirection, against a `const NAME: &str = "JAMMI_REQUIRE_...";`
+declaration (`_resolve_require_const`) instead of a literal. Neither widening
+touches the OTHER half of the contract: the taken-when-set branch must still be
+EXACTLY one `panic!`/`unreachable!` statement — an accessor that merely
+returns an `Option` without ever panicking is still a REGISTRY FAIL, folded
+gate or not. The registry also gained an explicit, opt-in cross-file mode
+(`shared:<file>::<fn_name>` — see `ci/kernel-oracle-helpers.txt`'s own header)
+for exactly this shape: a require-gate folded into ONE shared accessor is
+meant to gate every one of its (potentially many) callers without each of
+them re-registering a thin per-file wrapper — the twelve-copy duplication this
+gate exists to prevent in the first place. A `shared:` entry gates a BARE call
+to its name in any OTHER file that does not itself define a same-named local
+fn (the round-4 anti-decoy guard still applies to the bare form), and a
+CRATE-QUALIFIED call (`jammi_test_utils::pg_url_for_tests()`) whose qualifier
+is exactly the declaring file's own crate name — regardless of local decoys,
+since the qualifier itself disambiguates. Two different files may never both
+register the same name `shared:` — that is a REGISTRY FAIL naming the
+conflict, never a best-effort pick.
+
 "Dominated" is a TEXTUAL, PER-SKIP check (this is a lexical scanner, not a
 control-flow analyzer — it cannot prove REACHABILITY, so a registered helper's
 call sitting in a genuinely dead branch, e.g. `if false { cuda_device(); }`,
@@ -234,6 +264,8 @@ fixture names that are not real admission keys).
   - Any registry entry (`ci/kernel-oracle-helpers.txt`) whose file/fn does not
     resolve, or whose body does not have the canonical require-gate shape, is a
     non-zero exit naming the entry and why.
+  - Any `shared:` entry name registered from more than one declaring file is a
+    non-zero exit naming the conflicting files (#513 amendment, above).
   - Any per-line fn-keyword desync with no reviewed marker, or a marker
     covering no real desync, is a non-zero exit naming the file and line(s).
   - Any file whose `#[test]`-attribute-token count does not exactly match its
@@ -1119,15 +1151,32 @@ ENV_READ_CALL_ALTERNATION = r"(?:std::env::var_os|env::var_os|std::env::var|env:
 # condition text — `... .is_some() && false { panic!(..) }` (a conjunct
 # that makes the guard never actually fire) and `... .is_none() {
 # panic!(..) }` (an INVERTED gate — panics when the flag is NOT set) both
-# satisfied the old regex. The `if` condition must now be EXACTLY the
-# env-read call followed by `.is_some()` or `.is_ok()` — nothing before it
-# in the condition, nothing after it but the opening `{`.
-IF_ENV_READ_RE = re.compile(
-    rf'\bif\s+{ENV_READ_CALL_ALTERNATION}\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"\s*\)'
-    r"\s*\.\s*(?:is_some|is_ok)\s*\(\s*\)\s*\{"
-)
+# satisfied the old regex. Round-4's fix made the `if` condition EXACTLY the
+# env-read call followed by `.is_some()`/`.is_ok()` — nothing before or after
+# it — which is what closed both holes.
+#
+# #513 amendment: a require-gate FOLDED INTO its own accessor (the fix for
+# the twelve-copy-pasted-wrapper failure mode #513 documents) legitimately
+# leads its condition with the accessor's own not-already-satisfied check
+# (`url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some()`) — a REAL
+# extra conjunct, not a decoy. `_if_conjunct_gate_braces` (below)
+# re-generalizes round-4's fix as a PROPERTY rather than an exact-string
+# anchor: the condition may carry any number of `&&`-joined conjuncts, in
+# any position, PROVIDED (a) there is no top-level `||` (which would let an
+# unrelated branch reach the panic without the env-read ever being true —
+# the same class of hole round-4 closed), (b) no conjunct is the literal
+# `true`/`false` (the exact `&& false` bypass above — still refused, now by
+# an explicit check rather than by forbidding conjuncts altogether), and (c)
+# at least one conjunct IS the genuine env-read gate (`_atom_is_env_read_gate`
+# — literal `"JAMMI_REQUIRE_*"` OR a bare identifier resolved, same-file, to
+# a `const` whose value carries that prefix). `IF_ENV_READ_RE` itself is
+# retired in favor of that function; `MATCH_ENV_READ_RE` keeps its original
+# `[^{]*?` shape (a `match` subject is never a boolean AND-chain the same
+# bypass could hide in) but widens its captured argument the same way — see
+# `helper_shape_ok`.
 MATCH_ENV_READ_RE = re.compile(
-    rf'\bmatch\b[^{{]*?\b{ENV_READ_CALL_ALTERNATION}\s*\(\s*"(JAMMI_REQUIRE_[A-Z0-9_]*)"[^{{]*\{{'
+    rf'\bmatch\b[^{{]*?\b{ENV_READ_CALL_ALTERNATION}\s*\(\s*'
+    rf'(?:"(JAMMI_REQUIRE_[A-Z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))\s*\)[^{{]*\{{'
 )
 # `return;` / brace-tail `return}`, plus `return Ok(...)`/`return Err(...)`,
 # plus `process::exit(`/`std::process::exit(` (round-4 audit F15 — a
@@ -1294,17 +1343,171 @@ def _split_match_arms(match_body: str) -> list[tuple[str, str]]:
     return result
 
 
-def helper_shape_ok(fn_body_stripped: str) -> tuple[bool, str]:
+def _split_top_level(text: str, sep: str) -> list[str]:
+    """Split `text` on TOP-LEVEL occurrences of `sep` (depth-balanced over
+    `()[]{}`) — never inside a nested call/index/block. Used to break a
+    boolean `if` condition into its `&&`- or `||`-joined pieces without
+    mis-splitting inside e.g. a method call's own argument list. Always
+    returns at least one element (the whole `text` when `sep` never occurs
+    at top level).
+    """
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    n = len(text)
+    sep_len = len(sep)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and text[i : i + sep_len] == sep:
+            parts.append(text[start:i])
+            i += sep_len
+            start = i
+            continue
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+# #513 amendment: a folded gate's condition is an env-read `.is_some()`/
+# `.is_ok()` ATOM — exactly the old `IF_ENV_READ_RE` shape, but matched
+# against one already-split conjunct rather than the whole condition, so it
+# composes with `_split_top_level` instead of anchoring the entire `if`.
+_ENV_READ_ATOM_RE = re.compile(
+    rf'^{ENV_READ_CALL_ALTERNATION}\s*\(\s*'
+    rf'(?:"(JAMMI_REQUIRE_[A-Z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))\s*\)'
+    r"\s*\.\s*(?:is_some|is_ok)\s*\(\s*\)$"
+)
+_REQUIRE_CONST_PREFIX_RE = re.compile(r"^JAMMI_REQUIRE_[A-Z0-9_]*$")
+
+
+def _resolve_require_const(file_stripped: str, name: str) -> str | None:
+    """Resolve a bare identifier against a `const NAME: &str = "...";`
+    declaration ANYWHERE in `file_stripped` (one level of SAME-FILE
+    indirection — mirrors KO-2's same-file helper-fn indirection; never a
+    cross-file/qualified-path resolution). Fails closed — returns `None`,
+    never a best-effort pick — on zero or more than one such declaration:
+    an ambiguous or missing constant can never launder the shape check.
+    `file_stripped` is `_strip_rust` output, so a `JAMMI_REQUIRE_*` run
+    inside the constant's own string value survives verbatim (the one
+    exception that stripper keeps visible) while everything else — the
+    `const` keyword appearing in a comment, or any other string content —
+    is blanked, exactly as every other pass in this file reads it.
+    """
+    pattern = re.compile(
+        rf'\bconst\s+{re.escape(name)}\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"]*)"\s*;'
+    )
+    matches = pattern.findall(file_stripped)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _atom_is_env_read_gate(atom: str, file_stripped: str) -> bool:
+    """`atom` (one already-trimmed, top-level `&&`-split conjunct) IS a
+    runtime env-read of a `JAMMI_REQUIRE_*` name — either a literal string
+    matching that prefix directly, or a bare identifier resolved, same-file,
+    to a `const` whose value carries the prefix (#513 amendment — the
+    fold-the-gate-into-the-accessor shape reads a NAMED constant, e.g.
+    `REQUIRE_PG_ENV`, not a repeated literal).
+    """
+    m = _ENV_READ_ATOM_RE.match(atom.strip())
+    if not m:
+        return False
+    literal, ident = m.group(1), m.group(2)
+    if literal is not None:
+        return True
+    value = _resolve_require_const(file_stripped, ident)
+    return value is not None and bool(_REQUIRE_CONST_PREFIX_RE.match(value))
+
+
+def _if_conjunct_gate_braces(fn_body_stripped: str, file_stripped: str) -> list[int]:
+    """Every `if <cond> {`'s own opening-brace POSITION in `fn_body_stripped`
+    whose `<cond>` is an `&&`-ONLY conjunction (never `||`, which would let
+    an unrelated disjunct reach the panic without the env-read ever being
+    true — the same class of hole round-4 closed for the single-conjunct
+    case) of boolean atoms, none of them the bare literal `true`/`false`
+    (the round-4 `... && false { panic!(..) }` bypass — still refused: a
+    trivial constant conjunct can neutralize any real condition, so it is
+    rejected outright, never merely one non-matching atom among several), at
+    least one atom of which is a genuine env-read gate
+    (`_atom_is_env_read_gate`).
+
+    #513 amendment: round-4's rule required the condition to be EXACTLY the
+    env-read call and nothing else; a require-gate FOLDED INTO its own
+    accessor (`url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some()`)
+    legitimately carries an extra, real conjunct — the accessor's own
+    not-already-satisfied check. Additional conjuncts, in ANY position, are
+    now accepted verbatim. This is intentionally weaker than full boolean
+    evaluation — a lexical scanner cannot evaluate an arbitrary conjunct's
+    real truth value; `true`/`false` literals are the one syntactically
+    certain always-same-value case, so only those are refused. `if let` is
+    excluded outright (a pattern-match shape, not a boolean condition this
+    conjunct-splitter can parse).
+    """
+    braces: list[int] = []
+    n = len(fn_body_stripped)
+    for kw in re.finditer(r"\bif\s+", fn_body_stripped):
+        if re.match(r"\s*let\b", fn_body_stripped[kw.end() :]):
+            continue
+        depth = 0
+        j = kw.end()
+        brace_idx = None
+        while j < n:
+            c = fn_body_stripped[j]
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth -= 1
+            elif c == "{" and depth == 0:
+                brace_idx = j
+                break
+            elif c == ";" and depth == 0:
+                break
+            j += 1
+        if brace_idx is None:
+            continue
+        condition = fn_body_stripped[kw.end() : brace_idx]
+        if len(_split_top_level(condition, "||")) > 1:
+            continue
+        conjuncts = _split_top_level(condition, "&&")
+        if any(c.strip() in ("true", "false") for c in conjuncts):
+            continue
+        if not any(_atom_is_env_read_gate(c, file_stripped) for c in conjuncts):
+            continue
+        braces.append(brace_idx)
+    return braces
+
+
+def helper_shape_ok(fn_body_stripped: str, file_stripped: str | None = None) -> tuple[bool, str]:
     """The canonical require-gate shape (see module doc above): `if`-form
     or `match`-form, both accepted; whichever it is, the branch taken when
-    the env var is set is EXACTLY one panic!/unreachable! statement.
+    the env var is set is EXACTLY one panic!/unreachable! statement — a
+    folded gate's extra conjuncts (#513 amendment) never relax THAT half of
+    the contract: an accessor whose taken-when-set branch merely returns an
+    `Option`, or does anything other than panic, is still a REGISTRY FAIL.
+    `file_stripped` (the WHOLE FILE's `_strip_rust` output; defaults to
+    `fn_body_stripped` itself for a caller with no wider text — every real
+    call site always passes the whole file) is consulted ONLY to resolve a
+    same-file named `JAMMI_REQUIRE_*` constant (`_resolve_require_const`).
     Returns (ok, reason-if-not).
     """
-    for m in IF_ENV_READ_RE.finditer(fn_body_stripped):
-        block, _, _ = _extract_balanced_block(fn_body_stripped, m.end() - 1)
+    if file_stripped is None:
+        file_stripped = fn_body_stripped
+    for brace_idx in _if_conjunct_gate_braces(fn_body_stripped, file_stripped):
+        block, _, _ = _extract_balanced_block(fn_body_stripped, brace_idx)
         if _is_exactly_one_panic_stmt(block):
             return True, ""
     for m in MATCH_ENV_READ_RE.finditer(fn_body_stripped):
+        literal, ident = m.group(1), m.group(2)
+        if literal is None:
+            value = _resolve_require_const(file_stripped, ident)
+            if value is None or not _REQUIRE_CONST_PREFIX_RE.match(value):
+                continue
         block, _, _ = _extract_balanced_block(fn_body_stripped, m.end() - 1)
         inner = block[1:-1]
         for pattern, body in _split_match_arms(inner):
@@ -1321,11 +1524,16 @@ def helper_shape_ok(fn_body_stripped: str) -> tuple[bool, str]:
                 return True, ""
     return (
         False,
-        "no canonical if/match RUNTIME env-read (std::env::var_os/var of a JAMMI_REQUIRE_* name — "
-        "option_env! is a COMPILE-TIME read, never accepted) whose taken-when-set branch is "
-        "EXACTLY one panic!/unreachable! statement (no .expect(, no closures, no other "
-        "statements, no match-arm guard)",
+        "no canonical if/match RUNTIME env-read (std::env::var_os/var of a JAMMI_REQUIRE_* "
+        "literal, or a same-file resolved constant whose value carries that prefix — option_env! "
+        "is a COMPILE-TIME read, never accepted) whose taken-when-set branch is EXACTLY one "
+        "panic!/unreachable! statement (no .expect(, no closures, no other statements, no "
+        "match-arm guard, and — for the `if` form — no top-level `||` and no literal `true`/"
+        "`false` conjunct)",
     )
+
+
+SHARED_HELPER_PREFIX = "shared:"
 
 
 def load_helper_registry(path: Path = HELPERS_REGISTRY_PATH) -> list[tuple[str, str]]:
@@ -1335,7 +1543,14 @@ def load_helper_registry(path: Path = HELPERS_REGISTRY_PATH) -> list[tuple[str, 
     <fn_name>` entry (round-4 audit advisory — a repeated line is either a
     copy-paste mistake or dead weight nobody would notice is redundant;
     the registry is a reviewed list, and a duplicate was never itself
-    reviewed as a second, distinct fact).
+    reviewed as a second, distinct fact). `file_rel_path` may carry a
+    leading `SHARED_HELPER_PREFIX` (`shared:`) — that is a syntactic detail
+    of the ONE `<file>::<fn_name>` line shape (parsing here never changes;
+    `rsplit("::", 1)` still splits exactly the same way, the prefix just
+    rides along as part of what it calls `file_part`) — `verify_helper_
+    registry` is what interprets the prefix (#513 amendment: opts a helper
+    into cross-file gating; see that function and `ci/kernel-oracle-
+    helpers.txt`'s own header for the full contract).
     """
     if not path.is_file():
         raise OracleError(f"helper registry not found: {path}")
@@ -1361,6 +1576,88 @@ def load_helper_registry(path: Path = HELPERS_REGISTRY_PATH) -> list[tuple[str, 
     return entries
 
 
+# --------------------------------------------------------------------------- #
+# Delegation soundness (lead review, post-#513): a call to an already-
+# verified gate ANYWHERE in a candidate's body is not enough evidence that
+# the candidate itself is a genuine gate — a wrapper shaped "if some
+# condition, call the gate and use it; otherwise return the skip value"
+# would satisfy a bare "is it called somewhere" check while still skipping
+# silently on the untaken path. `verify_helper_registry`'s delegation pass
+# (below) additionally requires (a) the call to PROPAGATE the callee's
+# return value via `?` (`_call_propagates_via_question_mark`) and (b) the
+# candidate's body to carry NO independent skip-value return anywhere
+# (`_has_independent_skip_value_return`) — together, the ONLY path that can
+# produce the candidate's own skip value passes through the verified gate.
+# Deliberately lexical, never a dataflow prover (per the same "a
+# regex/lexical scanner cannot establish X as a syntactic fact" philosophy
+# this whole file already applies to KO-7's `verified` predicate) — each
+# check is a shape a real, sound wrapper always has and a bypassing wrapper
+# always lacks, on the six real registered delegation targets in this tree.
+# --------------------------------------------------------------------------- #
+_QUESTION_MARK_PROPAGATION_RE = re.compile(r"^\s*(?:\.\s*await\s*)?\?")
+
+
+def _call_propagates_via_question_mark(body: str, call_start: int) -> bool:
+    """`call_start` is the position of a call's own NAME (the start of a
+    `\\bname\\(` — or `\\bcrate::name\\(` — regex match). True iff the
+    `(...)` call immediately following it is itself immediately followed
+    — only whitespace, and at most one `.await` (the standard async-
+    fallible-forward idiom every registered delegation target in this tree
+    uses) — by the `?` operator: the ONE Rust shape that PROPAGATES a
+    callee's own return value (its OWN skip value included) out of the
+    caller, rather than merely invoking it for a side effect or an
+    unwrapped/discarded result. Paren-balanced via `_extract_call_and_
+    rest`, so a call with nested-paren arguments (`open_with_options(&url,
+    8, None)`) still finds the REAL end of the call, not its first `)`.
+    """
+    if "(" not in body[call_start:]:
+        return False
+    _call_text, rest = _extract_call_and_rest(body[call_start:])
+    return bool(_QUESTION_MARK_PROPAGATION_RE.match(rest))
+
+
+def _paren_depth_at(body: str, pos: int) -> int:
+    """Net `(`/`)` balance in `body[:pos]` — 0 iff `pos` sits OUTSIDE every
+    call's own argument list (a function-call ARGUMENT is always inside at
+    least one unclosed `(`)."""
+    depth = 0
+    for c in body[:pos]:
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+    return depth
+
+
+# `None` immediately followed (only whitespace) by a statement/tail/match-
+# arm boundary (`;`, `}`, `,` — the SAME terminator set `RETURN_SKIP_RE`
+# already recognizes for an explicit `return`), OR a bare `Err(` call
+# (generalizes beyond this tree's all-`Option` registrations to a future
+# `Result`-returning one). Matched at PAREN-DEPTH ZERO ONLY (`_paren_depth_
+# at`) — `open_with_options(&url, 8, None)` and `build_harness_with_broker
+# (backend, None, ..)` both have a literal `None` immediately followed by
+# `)`/`,`, but BOTH are function-call ARGUMENTS (paren-depth > 0 at that
+# position), never the wrapper's OWN return value; a match-arm pattern
+# (`None => TenantContext::Unscoped,`) is at paren-depth 0 but is followed
+# by `=>`, not a terminator, so it never matches either. All three are real
+# occurrences in this tree's own registered delegation targets — the
+# reason this check is paren-depth-scoped rather than a bare `\bNone\b`
+# grep.
+_BARE_SKIP_VALUE_RE = re.compile(r"\bNone\b\s*(?=[;,}])|\bErr\s*\(")
+
+
+def _has_independent_skip_value_return(body: str) -> bool:
+    """A bare, paren-depth-zero `None`/`Err(` — see `_BARE_SKIP_VALUE_RE`'s
+    own comment — ANYWHERE in `body`. `?` never itself writes the literal
+    token `None`/`Err` into the PROPAGATING fn's own source (the compiler
+    generates that branch, not the source text), so "zero occurrences"
+    means the ONLY textual source of this fn's own skip value is whatever
+    `?`-propagation exists elsewhere in the body — never a second,
+    independent, ungated skip path.
+    """
+    return any(_paren_depth_at(body, m.start()) == 0 for m in _BARE_SKIP_VALUE_RE.finditer(body))
+
+
 def verify_helper_registry(
     entries: list[tuple[str, str]], source_texts: dict[str, str]
 ) -> tuple[set[tuple[str, str]], list[str]]:
@@ -1382,15 +1679,91 @@ def verify_helper_registry(
     undecidable) is a REGISTRY FAIL, never a best-effort pick of whichever
     candidate happens to pass; and that one candidate's body must pass
     `helper_shape_ok` — else a REGISTRY FAIL naming the file:line and why.
+
+    #513 amendment: `file` may carry a leading `SHARED_HELPER_PREFIX`
+    (`shared:`) — a helper an author wants ANY calling file to gate against,
+    without each caller re-registering its own thin per-file wrapper (the
+    exact twelve-copy duplication #513 documents). A `shared:` entry is
+    verified against its real (prefix-stripped) declaring file exactly like
+    any other; on success, `verified` gains BOTH the ordinary `(real_file,
+    fn_name)` pair (so the declaring file's own tests, if it has any, keep
+    the normal per-file gate too) AND a SENTINEL member `(SHARED_HELPER_
+    PREFIX + real_file, fn_name)` — `check_ko7` reads that sentinel to know
+    which names may gate a skip in a DIFFERENT file. Two different files
+    registering the SAME name as `shared:` is ambiguous (which one does a
+    third file's call site actually reach? — a lexical scanner cannot know)
+    and is a REGISTRY FAIL naming the conflict, never a best-effort pick;
+    neither of the conflicting entries' sentinels is emitted (though each
+    still verifies, and still gates, its OWN declaring file normally).
+
+    #513 amendment (delegation, resolved to a FIXED POINT): a candidate
+    whose OWN body does NOT itself match the canonical shape may still
+    verify by DELEGATION — a call to another name that IS ALREADY verified
+    (direct-shape, or itself already delegated in an earlier pass), either
+    a BARE call (`_is_bare_call`; SAME-FILE targets always eligible, a
+    `shared:` target eligible only when `real_file` has no local decoy of
+    that name — the SAME anti-decoy guard `check_ko7` applies) or a
+    CRATE-QUALIFIED call to a `shared:` target (`_crate_name_from_path` —
+    accepted regardless of a local decoy, exactly like `check_ko7`). This
+    is the real shape of this codebase's own Postgres test harnesses: a
+    per-file `open_backend`/`build_backend` wrapper that forwards to the
+    shared `pg_url_for_tests` DIRECTLY (one hop), and a further wrapper
+    (`build_harness_with_in_memory_broker` -> `build_harness_with_broker`
+    -> `pg_url_for_tests`) that forwards to THAT wrapper (two hops) —
+    resolving only one hop per registry entry would leave the second
+    wrapper's own registration unresolvable no matter how many OTHER
+    entries exist. Passes repeat until a full pass verifies nothing new
+    (bounded by `len(entries)` passes, since each pass either verifies at
+    least one previously-unresolved entry or the loop stops) — this is a
+    plain, terminating FIXED-POINT computation, not an unbounded search:
+    every hop still requires a REAL textual call to a name that is ALREADY
+    independently verified, so the transitive closure of "genuinely calls
+    something genuinely gated" is itself genuinely gated — never a rubber
+    stamp, however many hops deep. Whatever remains unresolved after the
+    fixed point is a REGISTRY FAIL naming the file:line and the ORIGINAL
+    (direct-shape) reason.
+
+    Lead review (post-#513): a call to an already-verified name ANYWHERE in
+    a candidate's body is not, on its own, evidence the candidate is a
+    genuine gate — a wrapper shaped "if some condition, call the gate and
+    use it; otherwise return the skip value" satisfies a bare "is it called
+    somewhere" check while still skipping silently on the untaken path.
+    `_delegates` (below) additionally requires the call to PROPAGATE the
+    callee's return value via `?` (`_call_propagates_via_question_mark` —
+    tolerating one intervening `.await`, the async-fallible-forward idiom
+    every registered target here uses) and requires the candidate's body to
+    carry NO independent skip-value return anywhere else
+    (`_has_independent_skip_value_return`: a bare, paren-depth-zero `None`
+    or `Err(` — paren-depth-zero to distinguish a genuine return-position
+    value from a mere function-call ARGUMENT, e.g. `open_with_options(&url,
+    8, None)`'s own `None`). Together: the ONLY path that can produce the
+    candidate's own skip value passes through the verified gate — the same
+    property KO-7 exists to protect, re-established one hop out through a
+    wrapper. See `test_wrapper_with_a_skip_path_that_bypasses_the_gate_is_
+    rejected`/`...bypass_removed_verifies` in the test suite for the
+    positive/negative pair this predicate is pinned against.
     """
     verified: set[tuple[str, str]] = set()
     failures: list[str] = []
+    shared_owners: dict[str, set[str]] = {}
+    stripped_cache: dict[str, str] = {}
+    pending: list[tuple[str, str, str, bool, FnRecord, int, str]] = []
+
+    def _file_stripped(real_file: str) -> str:
+        cached = stripped_cache.get(real_file)
+        if cached is None:
+            cached = _strip_rust(source_texts[real_file])
+            stripped_cache[real_file] = cached
+        return cached
+
     for file_rel, fn_name in entries:
-        text = source_texts.get(file_rel)
+        is_shared = file_rel.startswith(SHARED_HELPER_PREFIX)
+        real_file = file_rel[len(SHARED_HELPER_PREFIX) :] if is_shared else file_rel
+        text = source_texts.get(real_file)
         if text is None:
             failures.append(f"{file_rel}::{fn_name}: file not found among scanned files")
             continue
-        candidates = [f for f in find_fns(text, file_rel) if f.name == fn_name]
+        candidates = [f for f in find_fns(text, real_file) if f.name == fn_name]
         if not candidates:
             failures.append(f"{file_rel}::{fn_name}: fn not found in file")
             continue
@@ -1404,11 +1777,108 @@ def verify_helper_registry(
             continue
         candidate = candidates[0]
         line_no = text.count("\n", 0, candidate.body_start_idx) + 1
-        shape_ok, reason = helper_shape_ok(candidate.body_stripped)
-        if not shape_ok:
-            failures.append(f"{file_rel}:{line_no}::{fn_name}: {reason}")
+        shape_ok, reason = helper_shape_ok(candidate.body_stripped, _file_stripped(real_file))
+        if shape_ok:
+            verified.add((real_file, fn_name))
+            if is_shared:
+                shared_owners.setdefault(fn_name, set()).add(real_file)
+        else:
+            pending.append((file_rel, fn_name, real_file, is_shared, candidate, line_no, reason))
+
+    def _delegates(real_file: str, candidate: FnRecord, fn_name: str) -> bool:
+        body = candidate.body_stripped
+        # Lead review (post-#513): a call to an already-verified gate
+        # ANYWHERE in the body is not enough — a wrapper shaped "if some
+        # condition, call the gate and use it; otherwise return the skip
+        # value" would satisfy that on its own while still skipping
+        # silently on the untaken path. Two additional, still-lexical
+        # (never a dataflow prover) requirements close this:
+        #   (a) the call itself must PROPAGATE the callee's return value
+        #       via `?` (`_call_propagates_via_question_mark`) — the one
+        #       Rust shape that makes the callee's own skip value become
+        #       THIS fn's skip value, rather than merely invoking it for a
+        #       side effect or an unwrapped/discarded result.
+        #   (b) the candidate's body must carry NO independent skip-value
+        #       return anywhere (`_has_independent_skip_value_return`) —
+        #       a bare `return None`, a tail-position `None`, or any
+        #       `Err(...)`. `?` itself never writes that literal text into
+        #       THIS fn's own source (the compiler generates it), so "zero
+        #       independent occurrences" means the `?`-propagation above
+        #       really is the ONLY way this fn can produce its skip value.
+        # Together: the ONLY path that returns the skip value passes
+        # through the verified gate — exactly the property KO-7 exists to
+        # protect, re-established one hop out through a wrapper.
+        if _has_independent_skip_value_return(body):
+            return False
+        same_file_targets = {n for (f, n) in verified if f == real_file and n != fn_name}
+        if any(
+            _is_bare_call(body, m.start()) and _call_propagates_via_question_mark(body, m.start())
+            for other_name in same_file_targets
+            for m in re.finditer(rf"\b{re.escape(other_name)}\s*\(", body)
+        ):
+            return True
+        # A `shared:` target from ANY declaring file (not just `real_file`)
+        # — the `open_backend`/`build_backend`-shaped case: a per-file-local
+        # wrapper (never itself `shared:`) that forwards to a shared
+        # accessor declared elsewhere, via either a BARE call (only when
+        # `real_file` has no local decoy of that name — the SAME anti-decoy
+        # guard `check_ko7` applies) or a crate-qualified call (accepted
+        # regardless of a local decoy). Mirrors `check_ko7`'s own
+        # shared-name acceptance.
+        local_defined = {f.name for f in find_fns(source_texts[real_file], real_file)}
+        for shared_name, owner_files in shared_owners.items():
+            if shared_name == fn_name or len(owner_files) != 1:
+                continue
+            (owner_file,) = owner_files
+            if shared_name not in local_defined:
+                cre = re.compile(rf"\b{re.escape(shared_name)}\s*\(")
+                if any(
+                    _is_bare_call(body, m.start()) and _call_propagates_via_question_mark(body, m.start())
+                    for m in cre.finditer(body)
+                ):
+                    return True
+            crate_name = _crate_name_from_path(owner_file)
+            if crate_name is not None:
+                qcre = re.compile(rf"\b{re.escape(crate_name)}\s*::\s*{re.escape(shared_name)}\s*\(")
+                for m in qcre.finditer(body):
+                    if _call_propagates_via_question_mark(body, m.start()):
+                        return True
+        return False
+
+    # Fixed point: repeat until a full pass verifies nothing new (bounded by
+    # `len(pending)` passes) — see the docstring's "delegation, resolved to
+    # a FIXED POINT" paragraph for why one hop is not enough on this real
+    # tree and why repeated passes stay sound (never a rubber stamp).
+    progressed = True
+    while pending and progressed:
+        progressed = False
+        still_pending: list[tuple[str, str, str, bool, FnRecord, int, str]] = []
+        for file_rel, fn_name, real_file, is_shared, candidate, line_no, direct_reason in pending:
+            if _delegates(real_file, candidate, fn_name):
+                verified.add((real_file, fn_name))
+                if is_shared:
+                    shared_owners.setdefault(fn_name, set()).add(real_file)
+                progressed = True
+            else:
+                still_pending.append(
+                    (file_rel, fn_name, real_file, is_shared, candidate, line_no, direct_reason)
+                )
+        pending = still_pending
+
+    for file_rel, fn_name, real_file, is_shared, candidate, line_no, direct_reason in pending:
+        failures.append(f"{file_rel}:{line_no}::{fn_name}: {direct_reason}")
+
+    for fn_name, owners in shared_owners.items():
+        if len(owners) > 1:
+            failures.append(
+                f"`{SHARED_HELPER_PREFIX}` name {fn_name!r} is registered from more than one "
+                f"file ({', '.join(sorted(owners))}) — a cross-file gate name must be "
+                "registry-globally unique; keep exactly one `shared:` registration for this name"
+            )
             continue
-        verified.add((file_rel, fn_name))
+        (owner_file,) = owners
+        verified.add((SHARED_HELPER_PREFIX + owner_file, fn_name))
+
     return verified, failures
 
 
@@ -1433,6 +1903,22 @@ def _is_bare_call(text: str, pos: int) -> bool:
     return not re.search(r"(?:\.\s*|::\s*|\bfn\s+)$", text[:pos])
 
 
+def _crate_name_from_path(file_rel: str) -> str | None:
+    """`crates/<crate-dir>/...` -> `<crate-dir>` with every `-` mangled to
+    `_` — the SAME mangling every `Cargo.toml` `name = "jammi-test-utils"`
+    undergoes at its own `::` path root. Used ONLY to accept a `shared:`
+    helper's fully-qualified call form (`jammi_test_utils::pg_url_for_
+    tests()`) in `check_ko7` — never to resolve an arbitrary re-export
+    path. `None` for any file not under `crates/<name>/...` — an
+    uncomputable crate name a qualified-call check can never accept (the
+    same fail-closed default as every other unresolvable shape here).
+    """
+    parts = Path(file_rel).parts
+    if len(parts) < 2 or parts[0] != "crates":
+        return None
+    return parts[1].replace("-", "_")
+
+
 def check_ko7(
     all_fns: list[FnRecord], verified: set[tuple[str, str]], source_texts: dict[str, str]
 ) -> list[UngatedSkip]:
@@ -1449,11 +1935,34 @@ def check_ko7(
     same fn unconditionally — a gated CUDA-device check followed by an
     UNRELATED, ungated `if !FLASH_COMPILED { return; }` further down the
     same fn still reds.
+
+    #513 amendment: `verified` may also carry `SHARED_HELPER_PREFIX`-
+    prefixed sentinel members (`verify_helper_registry`, above) — a name
+    registered `shared:`. Such a name gates a skip in ANY OTHER file, via
+    EITHER a BARE call (round-4's own anti-decoy guard still applies here:
+    only when the calling file does NOT itself define a local fn of that
+    name — a real local decoy must not "borrow" the shared review) OR a
+    CRATE-QUALIFIED call whose qualifier is exactly the declaring file's own
+    crate name (`_crate_name_from_path`) — accepted regardless of a local
+    decoy, since the qualifier itself disambiguates which fn is meant. This
+    is what lets ONE folded, reviewed accessor gate every one of its
+    (potentially many) callers without each of them registering a thin
+    per-file wrapper — the twelve-copy duplication this gate exists to
+    prevent.
     """
     verified_by_file: dict[str, set[str]] = {}
+    shared_owner_by_name: dict[str, str] = {}
     for file_rel, fn_name in verified:
-        verified_by_file.setdefault(file_rel, set()).add(fn_name)
-    call_res: dict[str, re.Pattern] = {}
+        if file_rel.startswith(SHARED_HELPER_PREFIX):
+            shared_owner_by_name[fn_name] = file_rel[len(SHARED_HELPER_PREFIX) :]
+        else:
+            verified_by_file.setdefault(file_rel, set()).add(fn_name)
+
+    fn_names_by_file: dict[str, set[str]] = {}
+    for fn in all_fns:
+        fn_names_by_file.setdefault(fn.file, set()).add(fn.name)
+
+    call_res: dict[tuple, re.Pattern] = {}
     findings: list[UngatedSkip] = []
     for fn in all_fns:
         if not fn.is_test:
@@ -1465,11 +1974,26 @@ def check_ko7(
         if not skip_matches:
             continue
         local_names = verified_by_file.get(fn.file, set())
+        local_defined = fn_names_by_file.get(fn.file, set())
         helper_positions = []
         for name in local_names:
-            cre = call_res.setdefault(name, re.compile(rf"\b{re.escape(name)}\s*\("))
+            cre = call_res.setdefault(("bare", name), re.compile(rf"\b{re.escape(name)}\s*\("))
             for m in cre.finditer(fn.body_stripped):
                 if _is_bare_call(fn.body_stripped, m.start()):
+                    helper_positions.append(m.start())
+        for name, owner_file in shared_owner_by_name.items():
+            if name not in local_defined:
+                cre = call_res.setdefault(("bare", name), re.compile(rf"\b{re.escape(name)}\s*\("))
+                for m in cre.finditer(fn.body_stripped):
+                    if _is_bare_call(fn.body_stripped, m.start()):
+                        helper_positions.append(m.start())
+            crate_name = _crate_name_from_path(owner_file)
+            if crate_name is not None:
+                qcre = call_res.setdefault(
+                    ("qual", name, crate_name),
+                    re.compile(rf"\b{re.escape(crate_name)}\s*::\s*{re.escape(name)}\s*\("),
+                )
+                for m in qcre.finditer(fn.body_stripped):
                     helper_positions.append(m.start())
         helper_positions.sort()
         window_start = 0

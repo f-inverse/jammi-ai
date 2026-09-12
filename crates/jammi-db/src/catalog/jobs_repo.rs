@@ -82,7 +82,19 @@ pub struct JobRecord {
     /// Id of the instance holding the lease, or `None` while queued/unclaimed.
     pub claimed_by: Option<String>,
     pub attempts: u32,
-    /// Lease deadline as a canonical UTC timestamp, or `None` when not leased.
+    /// How many times a claimant handed this job's lease back ON PURPOSE
+    /// ([`Catalog::release_job_lease`] / [`Catalog::release_jobs_claimed_by`]
+    /// — a two-mode shutdown's RELEASE arm), as opposed to letting it
+    /// expire. Offsets the reclaim cap: [`Catalog::reclaim_expired_jobs`]
+    /// compares `attempts - releases` against its limit, so a deploy storm
+    /// of releases never burns the attempts a genuine crash consumes.
+    /// Bumped at most once per attempt by construction (every release
+    /// statement carries `lease_expires_at IS NOT NULL`, so a second
+    /// release of the same lease matches zero rows).
+    pub releases: u32,
+    /// Lease deadline as a canonical UTC timestamp, or `None` when not leased
+    /// — including a `running` row whose holder RELEASED it (see
+    /// [`Self::releases`]): such a row is reclaimable at once.
     pub lease_expires_at: Option<String>,
     pub priority: i32,
     /// Migration 024's temporary operator hold: a `false` row is excluded
@@ -153,8 +165,8 @@ impl JobRecord {
 
 const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, partial_result, \
      result, error, progress_rows_done, progress_rows_total, progress_phase, cancel_requested, \
-     model_ref, output_model_id, model_source, claimed_by, attempts, lease_expires_at, \
-     priority, claimable, acceleration_report, created_at, updated_at";
+     model_ref, output_model_id, model_source, claimed_by, attempts, releases, \
+     lease_expires_at, priority, claimable, acceleration_report, created_at, updated_at";
 
 /// The explicit submission-time marker [`Catalog::submit_job`] writes into
 /// `acceleration_report`: the job exists but no claimant has yet computed an
@@ -252,6 +264,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
         model_source: row.try_get("model_source")?,
         claimed_by: row.try_get("claimed_by")?,
         attempts: row.get::<i32>("attempts")? as u32,
+        releases: row.get::<i32>("releases")? as u32,
         lease_expires_at: row.try_get("lease_expires_at")?,
         priority: row.get("priority")?,
         claimable: row.get("claimable")?,
@@ -371,6 +384,12 @@ pub struct WorkerRecord {
     pub label: Option<String>,
     pub host: Option<String>,
     pub kinds: String,
+    /// The claim loop's lifecycle state as the row carries it — one of
+    /// [`WorkerState`]'s spellings (`warming` / `claiming` / `draining`),
+    /// written by the loop task in that order (`upsert_worker` with
+    /// `warming` as its first statement, `set_worker_state` afterwards) so
+    /// no reader ever sees `claiming` before the row exists.
+    pub state: String,
     pub started_at: String,
     pub last_seen_at: String,
 }
@@ -383,9 +402,43 @@ fn parse_worker_row(
         label: row.try_get("label")?,
         host: row.try_get("host")?,
         kinds: row.get("kinds")?,
+        state: row.get("state")?,
         started_at: row.get("started_at")?,
         last_seen_at: row.get("last_seen_at")?,
     })
+}
+
+/// The `workers.state` vocabulary (migration 031, CHECK-constrained at the
+/// SQL edge): what THIS process's claim loop is doing right now, as another
+/// process can read it off the row (`ListWorkers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerState {
+    /// The loop task exists but is parked on its worker gate (the process is
+    /// still preloading models): it has claimed nothing and will not until
+    /// the gate opens.
+    Warming,
+    /// The claim loop is live.
+    Claiming,
+    /// A DRAIN is in progress: the loop finishes its in-flight job (if any)
+    /// and stops claiming; the row is deleted once the loop has exited.
+    Draining,
+}
+
+impl WorkerState {
+    /// The exact string the `workers.state` column carries.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            WorkerState::Warming => "warming",
+            WorkerState::Claiming => "claiming",
+            WorkerState::Draining => "draining",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_db_str())
+    }
 }
 
 /// The maximum byte length `submit_job_deduped`'s `idempotency_key` accepts
@@ -668,6 +721,8 @@ impl Catalog {
         let running = JobStatus::Running.to_string();
         let queued_execution = JobExecution::Queued.to_string();
         let instance_id = instance_id.to_string();
+        #[cfg(feature = "test-hooks")]
+        let instance_for_hook = instance_id.clone();
         let now = now_sortable();
         let kind = self.backend().backend_kind();
 
@@ -712,7 +767,22 @@ impl Catalog {
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move { tx.query_opt(&sql, &params, parse_row).await })
+                Box::pin(async move {
+                    let claimed = tx.query_opt(&sql, &params, parse_row).await?;
+                    // Test-only: hold a landed claim open before COMMIT (the
+                    // shutdown oracles' "claim in flight" window). A no-op
+                    // unless armed for this instance; never parks an empty
+                    // claim, so an idle loop's ticks cannot consume the arm.
+                    #[cfg(feature = "test-hooks")]
+                    if claimed.is_some() {
+                        super::claim_test_hooks::maybe_park(
+                            &instance_for_hook,
+                            super::claim_test_hooks::ParkPoint::ClaimBeforeCommit,
+                        )
+                        .await;
+                    }
+                    Ok(claimed)
+                })
             })
             .await
             .map_err(Into::into)
@@ -767,8 +837,15 @@ impl Catalog {
     }
 
     /// Renew the lease on a running job the caller still owns. `false` when
-    /// the guard misses: the lease was lost, the job is not running, or
-    /// `attempts` is stale (a successor already claimed this job).
+    /// the guard misses: the lease was lost, the job is not running,
+    /// `attempts` is stale (a successor already claimed this job), or the
+    /// lease was RELEASED (`lease_expires_at IS NULL` — [`Self::release_job_lease`]
+    /// / [`Self::release_jobs_claimed_by`]): the `IS NOT NULL` arm is what
+    /// makes a release final at the SQL edge, so no holder — this process's
+    /// own keeper included — can re-arm a lease its instance handed back.
+    /// Every `running` row this catalog's own claim path produces carries a
+    /// non-NULL lease ([`Self::claim_next`] / [`Self::claim_by_id`] both
+    /// stamp the deadline), so the arm changes nothing for a live holder.
     pub async fn heartbeat_job(
         &self,
         job_id: &str,
@@ -791,7 +868,8 @@ impl Catalog {
         params.push(SqlValue::Int(attempts));
         let sql = format!(
             "UPDATE jobs SET lease_expires_at = {deadline_expr}, updated_at = $2 \
-             WHERE job_id = $3 AND status = $4 AND claimed_by = $5 AND attempts = $6"
+             WHERE job_id = $3 AND status = $4 AND claimed_by = $5 AND attempts = $6 \
+               AND lease_expires_at IS NOT NULL"
         );
         let updated = self
             .backend()
@@ -1143,6 +1221,154 @@ impl Catalog {
         Ok(updated == 1)
     }
 
+    /// RELEASE this instance's lease on one running, loop-claimed job: the
+    /// heartbeat CAS (`job_id / status = 'running' / claimed_by / attempts`)
+    /// plus `execution = 'queued'`, setting `lease_expires_at = NULL` and
+    /// `releases = releases + 1`. The row stays `running` and `claimed_by`
+    /// this instance — no status is invented for shutdown — but with a NULL
+    /// lease it is immediately reclaimable ([`Self::reclaim_expired_jobs`]'s
+    /// arm 1a treats `IS NULL` as expired), so a successor claims it within
+    /// one idle poll instead of one lease window; the reclaim cap counts
+    /// `attempts - releases`, so the release costs the job no attempt.
+    ///
+    /// `Ok(false)` when the guard misses: not this instance's live lease
+    /// (a peer reclaimed it, it went terminal, `attempts` is stale), an
+    /// INLINE row (`execution = 'inline'` — an inline job has no requeue
+    /// arm and is never released; arm 2 fails it by instance staleness), or
+    /// the lease was ALREADY released — the `lease_expires_at IS NOT NULL`
+    /// arm makes every release statement idempotent, so `releases` is
+    /// bumped at most once per attempt by construction.
+    pub async fn release_job_lease(
+        &self,
+        job_id: &str,
+        instance_id: &str,
+        attempts: u32,
+    ) -> Result<bool> {
+        let running = JobStatus::Running.to_string();
+        let queued_execution = JobExecution::Queued.to_string();
+        let job_id = job_id.to_string();
+        let instance_id = instance_id.to_string();
+        let attempts = attempts as i64;
+        let now = now_sortable();
+        let sql = "UPDATE jobs SET lease_expires_at = NULL, releases = releases + 1, \
+                   updated_at = $1 \
+                   WHERE job_id = $2 AND status = $3 AND execution = $4 AND claimed_by = $5 \
+                     AND attempts = $6 AND lease_expires_at IS NOT NULL";
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        sql,
+                        &[
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(running),
+                            SqlValue::TextOwned(queued_execution),
+                            SqlValue::TextOwned(instance_id),
+                            SqlValue::Int(attempts),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// The sweep form of [`Self::release_job_lease`]: RELEASE every running,
+    /// loop-claimed (`execution = 'queued'`) job this instance still holds a
+    /// live lease on — the same `SET`, `WHERE claimed_by = $me AND status =
+    /// 'running' AND execution = 'queued' AND lease_expires_at IS NOT NULL`.
+    /// Returns the number of rows released. Idempotent by the `IS NOT NULL`
+    /// arm: a second sweep matches nothing; inline rows are never matched.
+    /// A shutdown's RELEASE arm runs it twice — once before the loop is
+    /// stopped (covering a claim that committed after the keeper's per-hold
+    /// pass snapshotted) and once after (covering a claim that committed
+    /// after the first sweep).
+    pub async fn release_jobs_claimed_by(&self, instance_id: &str) -> Result<usize> {
+        let running = JobStatus::Running.to_string();
+        let queued_execution = JobExecution::Queued.to_string();
+        let instance_id = instance_id.to_string();
+        let now = now_sortable();
+        let sql = "UPDATE jobs SET lease_expires_at = NULL, releases = releases + 1, \
+                   updated_at = $1 \
+                   WHERE claimed_by = $2 AND status = $3 AND execution = $4 \
+                     AND lease_expires_at IS NOT NULL";
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        sql,
+                        &[
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(instance_id),
+                            SqlValue::TextOwned(running),
+                            SqlValue::TextOwned(queued_execution),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated as usize)
+    }
+
+    /// Clear `partial_result` on a job the caller still owns — the
+    /// attempt-guarded inverse of [`Self::record_partial_result`] and of
+    /// `create_result_table`'s in-transaction CAS: `UPDATE jobs SET
+    /// partial_result = NULL WHERE job_id AND claimed_by AND status =
+    /// 'running' AND attempts AND partial_result = $table`. `false` when the
+    /// guard misses (a peer already cleared it, a successor superseded this
+    /// attempt, or the column names a different table) — idempotent.
+    ///
+    /// Called by the compute path's partial-result dispatch on its
+    /// claim-and-fail arm, BEFORE it materializes anew: `partial_result` is
+    /// otherwise written exactly once (`create_result_table`'s CAS carries
+    /// `partial_result IS NULL`) and never cleared, so every attempt >= 2
+    /// that failed its predecessor's table and then created its own would
+    /// find that CAS matching zero rows and land `JobAttemptSuperseded` —
+    /// a terminal `failed` for a job whose successor did everything right
+    /// (escape `esc-110`).
+    pub async fn clear_partial_result(
+        &self,
+        job_id: &str,
+        instance_id: &str,
+        attempts: u32,
+        table_name: &str,
+    ) -> Result<bool> {
+        let running = JobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let instance_id = instance_id.to_string();
+        let table_name = table_name.to_string();
+        let attempts = attempts as i64;
+        let now = now_sortable();
+        let sql = "UPDATE jobs SET partial_result = NULL, updated_at = $1 \
+                   WHERE job_id = $2 AND claimed_by = $3 AND status = $4 AND attempts = $5 \
+                     AND partial_result = $6";
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        sql,
+                        &[
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(instance_id),
+                            SqlValue::TextOwned(running),
+                            SqlValue::Int(attempts),
+                            SqlValue::TextOwned(table_name),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
     /// Record `partial_result` on a job the caller still owns, outside a
     /// `create_result_table` transaction (e.g. adopting a predecessor's
     /// already-`ready` table on a reclaimed attempt — N1). `false` when the
@@ -1292,7 +1518,9 @@ impl Catalog {
     ///   - **queued-execution, lease expired** (absent-or-expired
     ///     `lease_expires_at`, the same `lease_expired_clause` predicate
     ///     `training_repo::reclaim_expired_training_jobs` used): requeue when
-    ///     `attempts < max_attempts`, otherwise fail with
+    ///     `attempts - releases < max_attempts` (a lease the holder RELEASED
+    ///     on purpose — [`Self::release_job_lease`] — is reclaimable at once
+    ///     and costs the job no attempt), otherwise fail with
     ///     `"job lease expired after exhausting max attempts"`.
     ///   - **inline-execution, owning instance dead**: failed with
     ///     `"inline executor died"` when no `instances` row for `claimed_by`
@@ -1401,7 +1629,7 @@ impl Catalog {
                                  lease_expires_at = NULL, acceleration_report = ${pending_bind}, \
                                  updated_at = $2 \
                              WHERE status = ${running_bind} AND execution = ${execution_bind} \
-                               AND {expired} AND attempts < ${max_bind}{scope_sql} \
+                               AND {expired} AND attempts - releases < ${max_bind}{scope_sql} \
                              RETURNING {SELECT_COLS}"
                         );
                         out.extend(tx.query(&sql, &params, parse_row).await?);
@@ -1439,7 +1667,7 @@ impl Catalog {
                             "UPDATE jobs SET status = $1, error = $2, \
                                  lease_expires_at = NULL, {retire}, updated_at = ${now_bind} \
                              WHERE status = ${running_bind} AND execution = ${execution_bind} \
-                               AND {expired} AND attempts >= ${max_bind}{scope_sql} \
+                               AND {expired} AND attempts - releases >= ${max_bind}{scope_sql} \
                              RETURNING {SELECT_COLS}"
                         );
                         out.extend(tx.query(&sql, &params, parse_row).await?);
@@ -1552,23 +1780,106 @@ impl Catalog {
 
     /// Upsert this process's `workers` row — present only while the process
     /// runs the claim loop. `kinds` is the comma-joined (or otherwise
-    /// producer-encoded) kind set this worker claims.
-    pub async fn upsert_worker(&self, instance_id: &str, kinds: &str) -> Result<()> {
+    /// producer-encoded) kind set this worker claims; `state` is the loop's
+    /// lifecycle state at this instant (the loop task writes `warming` as
+    /// its FIRST statement and flips to `claiming` through
+    /// [`Self::set_worker_state`] once its gate opens). A re-upsert on an
+    /// existing row resets both.
+    pub async fn upsert_worker(
+        &self,
+        instance_id: &str,
+        kinds: &str,
+        state: WorkerState,
+    ) -> Result<()> {
         let instance_id = instance_id.to_string();
         let kinds = kinds.to_string();
+        let state = state.as_db_str();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "INSERT INTO workers (instance_id, kinds) VALUES ($1, $2) \
-                         ON CONFLICT(instance_id) DO UPDATE SET kinds = excluded.kinds",
-                        &[SqlValue::TextOwned(instance_id), SqlValue::TextOwned(kinds)],
+                        "INSERT INTO workers (instance_id, kinds, state) VALUES ($1, $2, $3) \
+                         ON CONFLICT(instance_id) DO UPDATE \
+                         SET kinds = excluded.kinds, state = excluded.state",
+                        &[
+                            SqlValue::TextOwned(instance_id),
+                            SqlValue::TextOwned(kinds),
+                            SqlValue::Text(state),
+                        ],
                     )
                     .await
                 })
             })
             .await?;
         Ok(())
+    }
+
+    /// Flip this process's `workers.state` (`claiming` when the worker gate
+    /// opens, `draining` when a DRAIN begins). `false` when no row exists —
+    /// the loop never ran, or the row was already deleted.
+    pub async fn set_worker_state(&self, instance_id: &str, state: WorkerState) -> Result<bool> {
+        let instance_id = instance_id.to_string();
+        let state = state.as_db_str();
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE workers SET state = $1 WHERE instance_id = $2",
+                        &[SqlValue::Text(state), SqlValue::TextOwned(instance_id)],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// The gauge sampler's one query: `(kind, status, count)` over every
+    /// loop-claimable row — `execution = 'queued'` and `status IN ('queued',
+    /// 'running')`, grouped by kind and status — an index-only aggregate on
+    /// `idx_jobs_kind_status` (migration 031). Inline rows and terminal rows
+    /// are excluded; a held (`claimable = false`) row is still counted as
+    /// queued. Tenant-unscoped by design (a queue depth is a process-level
+    /// signal, not a tenant dimension). Sorted in Rust — the backend's
+    /// `GROUP BY` order is never trusted.
+    pub async fn count_jobs_by_kind_status(&self) -> Result<Vec<(String, String, i64)>> {
+        let queued_execution = JobExecution::Queued.to_string();
+        let queued = JobStatus::Queued.to_string();
+        let running = JobStatus::Running.to_string();
+        let mut rows = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT kind, status, COUNT(*) AS n FROM jobs \
+                             WHERE execution = $1 AND status IN ($2, $3) \
+                             GROUP BY kind, status",
+                            &[
+                                SqlValue::TextOwned(queued_execution),
+                                SqlValue::TextOwned(queued),
+                                SqlValue::TextOwned(running),
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<String>("kind")?,
+                                    row.get::<String>("status")?,
+                                    row.get::<i64>("n")?,
+                                ))
+                            },
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        rows.sort();
+        Ok(rows)
     }
 
     /// Delete this process's `workers` row — the claim loop has stopped, so
@@ -1608,7 +1919,7 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query(
                             "SELECT w.instance_id AS instance_id, i.label AS label, \
-                                    i.host AS host, w.kinds AS kinds, \
+                                    i.host AS host, w.kinds AS kinds, w.state AS state, \
                                     i.started_at AS started_at, i.last_seen_at AS last_seen_at \
                              FROM workers w JOIN instances i ON w.instance_id = i.instance_id \
                              ORDER BY i.started_at",

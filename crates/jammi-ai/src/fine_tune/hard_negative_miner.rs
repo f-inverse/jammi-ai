@@ -36,6 +36,7 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
+use jammi_db::index::{validate_query, QuerySource};
 
 use super::HardNegativeConfig;
 
@@ -151,7 +152,16 @@ impl HardNegativeMiner {
         // anchor falls through to the drop path below — it is never given a wrong
         // (excluded) negative.
         let fetch = capped_fetch(self.config.k, excluded.len());
-        let neighbours = self.index.search(&anchor.embedding, fetch)?;
+        // The anchor is the caller's (the training example's current
+        // embedding): validated against the index's own width so a
+        // wrong-width or non-finite anchor is a typed refusal, never a
+        // backend error string or a panic.
+        let anchor_query = validate_query(
+            anchor.embedding.clone(),
+            Some(self.index.dimensions()),
+            QuerySource::Caller,
+        )?;
+        let neighbours = self.index.search(&anchor_query, fetch)?;
 
         let mut mined = Vec::with_capacity(self.config.k);
         for (id, _dist) in neighbours {
@@ -189,6 +199,14 @@ impl HardNegativeMiner {
                 };
                 // k + 1 to cover the self-hit, which is dropped by the excluded
                 // check below.
+                // Read back from the miner's own index: STORED provenance.
+                let vector = validate_query(
+                    vector,
+                    Some(self.index.dimensions()),
+                    QuerySource::Stored {
+                        table: "hard-negative candidates".into(),
+                    },
+                )?;
                 let neighbours = self.index.search(&vector, self.config.k + 1)?;
                 for (nid, _dist) in neighbours {
                     if excluded.insert(nid.clone()) {
@@ -403,5 +421,41 @@ mod tests {
         // `dup` is excluded (1-hop of `pos`); the hardest survivor is `near`,
         // ahead of `mid` and `far`.
         assert_eq!(mined, vec!["near".to_string()]);
+    }
+
+    /// A3 — a wrong-width or non-finite anchor is a TYPED refusal (the
+    /// schema class every caller-side query fault maps to), never a backend
+    /// error string and never a panic: the anchor is validated against the
+    /// index's own width before `search` runs.
+    #[test]
+    fn a_wrong_width_or_non_finite_anchor_is_a_typed_refusal() {
+        let candidates = vec![
+            cand("pos", vec![1.0, 0.0, 0.0]),
+            cand("near", vec![0.98, 0.02, 0.0]),
+            cand("far", vec![0.0, 0.0, 1.0]),
+        ];
+        let config = HardNegativeConfig {
+            mine: true,
+            k: 1,
+            exclude_hops: 0,
+            refresh_every: 1,
+        };
+        let miner = HardNegativeMiner::build(&candidates, config).unwrap();
+        for bad in [
+            vec![1.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![f32::NAN, 0.0, 0.0],
+        ] {
+            let err = miner
+                .mine(&AnchorQuery {
+                    embedding: bad.clone(),
+                    positive_id: "pos".into(),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err, JammiError::Schema { .. }),
+                "{bad:?}: expected the typed schema-class refusal, got {err:?}"
+            );
+        }
     }
 }

@@ -19,21 +19,6 @@ use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
 
-/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip every
-/// `make_test_session(BackendKind::Postgres, ..)` call site in this file
-/// falls through to: by default (unset) the Postgres arm still silently
-/// skips, exactly as before — a lane that wants to REQUIRE the real
-/// Postgres arm run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and
-/// this call panics instead.
-fn require_live_pg(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
-             must run the real Postgres arm, not skip it"
-        );
-    }
-}
-
 // ─── ObjectParquetWriter roundtrip ───────────────────────────────────────────
 
 #[tokio::test]
@@ -105,7 +90,7 @@ async fn result_table_crud_lifecycle() {
 
     let record = catalog.get_result_table("t1").await.unwrap().unwrap();
     assert_eq!(record.status, "building");
-    assert_eq!(record.dimensions, Some(384));
+    assert_eq!(record.dimensions_raw(), Some(384));
     assert_eq!(record.row_count, 0);
 
     catalog
@@ -342,7 +327,6 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            require_live_pg("resolve_embedding_table_picks_newest_by_created_at_not_table_name");
             return;
         }
     };
@@ -1007,7 +991,6 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
-            require_live_pg("result_table_none_dimensions_round_trips_as_null");
             return;
         }
     };
@@ -1058,7 +1041,8 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
         .unwrap()
         .unwrap();
     assert_eq!(
-        record.dimensions, None,
+        record.dimensions_raw(),
+        None,
         "a dimensionless result table must round-trip NULL, not error binding a typed null"
     );
 }

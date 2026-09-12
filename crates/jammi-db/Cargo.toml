@@ -10,6 +10,13 @@ readme = "README.md"
 
 [features]
 default = []
+# `postgres` and `mysql` pull `datafusion-table-providers`'s federation
+# drivers, which link a native TLS stack (`native-tls` -> OpenSSL) rather than
+# `rustls`. Building either feature therefore requires OpenSSL's development
+# headers on the build host (e.g. `libssl-dev`/`openssl-devel`, or `openssl`
+# + `pkg-config` on macOS via Homebrew) — a requirement this crate does not
+# vendor or otherwise satisfy for a consumer of the published crate.
+#
 # Each source feature turns on the matching `datafusion-table-providers`
 # backend (whose own `federation` default pushes the query down) plus the
 # driver crate `source/{postgres,mysql}.rs` uses directly for table discovery.

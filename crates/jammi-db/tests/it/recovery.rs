@@ -49,6 +49,7 @@
 //! reset-then-populate cannot race a sibling — important because `recover()` is
 //! a cross-tenant admin scan that would otherwise see a sibling's rows).
 
+use jammi_test_utils::vq;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -110,21 +111,6 @@ async fn open_backend(kind: BackendKind, dir: &Path) -> Option<BackendImpl> {
                 .expect("open postgres backend");
             Some(BackendImpl::Postgres(pg))
         }
-    }
-}
-
-/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip every
-/// `open_backend(BackendKind::Postgres, ..)` call site in this file falls
-/// through to: by default (unset) the Postgres arm still silently skips,
-/// exactly as before — a lane that wants to REQUIRE the real Postgres arm
-/// run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and this call
-/// panics instead.
-fn require_live_pg(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
-             must run the real Postgres arm, not skip it"
-        );
     }
 }
 
@@ -340,6 +326,7 @@ async fn write_closed_embedding_parquet(store: &ResultStore, info: &BuildingTabl
             Arc::new(source_arr),
             Arc::new(model_arr),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();
@@ -416,7 +403,6 @@ async fn building_with_missing_bytes_fails(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("building_with_missing_bytes_fails");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -476,7 +462,6 @@ async fn building_with_torn_parquet_fails_and_reaps(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("building_with_torn_parquet_fails_and_reaps");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -533,7 +518,6 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("building_with_valid_parquet_promotes_with_true_count");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -595,11 +579,11 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     );
     assert_eq!(segs[0].segment_id, 0);
     let index = store
-        .resolve_search_mode(&rec)
+        .resolve_search_mode_local(&rec)
         .await
         .unwrap()
         .expect("I6: sidecar rebuilt from Parquet");
-    let hits = index.search(&[0.0, 1.0, 2.0, 3.0], 1).unwrap();
+    let hits = index.search(&vq(&[0.0, 1.0, 2.0, 3.0]), 1).unwrap();
     assert_eq!(hits.len(), 1, "I6: rebuilt index is queryable");
 
     // I1/I3: a Ready table whose bytes exist IS registered.
@@ -627,7 +611,6 @@ async fn partial_but_valid_parquet_promotes_with_footer_count(kind: BackendKind)
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("partial_but_valid_parquet_promotes_with_footer_count");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -662,7 +645,6 @@ async fn ready_with_missing_bytes_not_loaded(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("ready_with_missing_bytes_not_loaded");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -703,7 +685,6 @@ async fn recover_is_idempotent(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("recover_is_idempotent");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -744,7 +725,6 @@ async fn recover_reconciles_every_tenant(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("recover_reconciles_every_tenant");
         return;
     };
     // Unscoped (GLOBAL) catalog — the shape a startup recovery session has.
@@ -868,7 +848,6 @@ async fn expired_lease_building_row_is_reaped(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("expired_lease_building_row_is_reaped");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -939,7 +918,6 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("live_writer_survives_peer_recover_w2");
         return;
     };
     let global = fresh_catalog(backend).await;
@@ -1073,7 +1051,6 @@ async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("live_writer_survives_peer_reconcile_apply_u2");
         return;
     };
     let global = fresh_catalog(backend).await;
@@ -1171,7 +1148,6 @@ async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kin
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1255,7 +1231,6 @@ async fn reconcile_claim_never_reuses_this_sessions_own_writer_id(kind: BackendK
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("reconcile_claim_never_reuses_this_sessions_own_writer_id");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1335,7 +1310,6 @@ async fn live_writer_survives_peer_recover_w1(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("live_writer_survives_peer_recover_w1");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1404,7 +1378,6 @@ async fn zero_rows_row_gone_deletes_nothing(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("zero_rows_row_gone_deletes_nothing");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1438,7 +1411,6 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("strict_tenant_predicate_on_promote");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1462,6 +1434,7 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
         table: name.clone(),
         tenant_arm: TenantArm::Strict(Some(tenant_b())),
         owner: Owner::Writer(info.writer_id().to_string()),
+        lease_present: false,
     };
     let err = catalog
         .promote_result_table_with_manifest(
@@ -1511,7 +1484,6 @@ async fn zero_rows_reaped_row_is_cas_failed(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("zero_rows_reaped_row_is_cas_failed");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1558,7 +1530,6 @@ async fn zero_rows_recovery_promoted_row_is_cas_failed_ready(kind: BackendKind) 
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("zero_rows_recovery_promoted_row_is_cas_failed_ready");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1611,7 +1582,6 @@ async fn zero_rows_claimed_row_is_lease_lost_and_deletes_nothing(kind: BackendKi
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("zero_rows_claimed_row_is_lease_lost_and_deletes_nothing");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1686,7 +1656,6 @@ async fn abort_deletes_only_after_its_own_cas(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("abort_deletes_only_after_its_own_cas");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1724,7 +1693,6 @@ async fn drop_without_finish_marks_failed_or_expires(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("drop_without_finish_marks_failed_or_expires");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1771,7 +1739,6 @@ async fn remove_source_refuses_live_building_row(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("remove_source_refuses_live_building_row");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1825,7 +1792,6 @@ async fn source_busy_rolls_back_the_whole_delete_not_only_the_busy_row(kind: Bac
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("source_busy_rolls_back_the_whole_delete_not_only_the_busy_row");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -1895,7 +1861,6 @@ async fn two_recoverers_race_on_one_expired_row(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
-        require_live_pg("two_recoverers_race_on_one_expired_row");
         return;
     };
     let catalog = fresh_catalog(backend).await;

@@ -154,7 +154,18 @@ pub struct ResultTableRecord {
     pub kind: ResultTableKind,
     pub derived_from: Option<String>,
     pub parquet_path: String,
-    pub dimensions: Option<i32>,
+    /// The catalog row's raw, unvalidated embedding width. PRIVATE: a
+    /// non-positive value here is a corrupt row, never a width to search,
+    /// estimate, or validate against, and every read used to re-derive that
+    /// filter at the call site (`.and_then(|d| usize::try_from(d).ok())
+    /// .filter(|d| *d > 0)`, copy-pasted at six sites) while six more read
+    /// the field raw — one of them (`unwrap_or(0) as usize`) let a
+    /// negative width sign-extend into `usize::MAX`, silently passing its
+    /// own zero-check. [`Self::dimensions`] is now the ONE site the
+    /// positivity predicate is applied; [`Self::dimensions_raw`] is the
+    /// escape hatch for the writer/serialization sites that must round-trip
+    /// the signed column verbatim.
+    dimensions: Option<i32>,
     pub distance_metric: String,
     pub row_count: usize,
     pub status: String,
@@ -206,6 +217,93 @@ pub struct ResultTableRecord {
     /// the row is terminal, and `None` on a pre-027 `building` row (recovery
     /// reads that as an absent lease and reconciles it as before).
     pub lease_expires_at: Option<String>,
+    /// The published version of a refreshed table (`result_table_versions`
+    /// row), or `None` for a never-refreshed table — today's table with zero
+    /// behaviour change (the base Parquet and base segment set are read
+    /// directly). Advanced only by the single publish compare-and-set.
+    pub current_version: Option<i64>,
+    /// The monotonic version allocator: the next number a refresh, a base
+    /// publish or a compaction will take. Allocated exactly once per number,
+    /// never reused, never decremented (a failed version keeps its number;
+    /// expiry deletes rows and artifacts and never touches this).
+    pub next_version: i64,
+}
+
+impl ResultTableRecord {
+    /// The catalog row's recorded embedding width, applying "a non-positive
+    /// `dimensions` is a corrupt row, never a width to search, estimate, or
+    /// validate against" exactly once. `None` covers a pre-column row, a
+    /// non-embedding table, AND a corrupt non-positive value — every caller
+    /// treats the three identically ("nothing to cross-check / no known
+    /// width"), which is the correct behaviour every guarded call site used
+    /// to hand-derive with `.and_then(|d| usize::try_from(d).ok())
+    /// .filter(|d| *d > 0)`.
+    pub fn dimensions(&self) -> Option<std::num::NonZeroUsize> {
+        self.dimensions
+            .and_then(|d| usize::try_from(d).ok())
+            .and_then(std::num::NonZeroUsize::new)
+    }
+
+    /// The raw signed catalog value, exactly as stored — never filtered.
+    /// For the writer (re-persisting a row's value verbatim) and
+    /// serialization sites that must round-trip the column's on-disk
+    /// representation bit-for-bit. Every OTHER caller wants
+    /// [`Self::dimensions`], the one site the positivity predicate is
+    /// applied.
+    pub fn dimensions_raw(&self) -> Option<i32> {
+        self.dimensions
+    }
+
+    /// Reconstruct a bare record from the fields a `GenerateEmbeddings` /
+    /// `DescribeSource` wire response carries — the sole authorized
+    /// cross-crate constructor: `dimensions`'s privacy otherwise closes off
+    /// building a record field-by-field from outside this module. Every
+    /// field the wire message does not carry (storage/index paths,
+    /// timestamps, tenant, lease, version bookkeeping) is left at its "not
+    /// carried" value, matching `jammi-wire`'s reconstruction exactly.
+    /// `dimensions_raw` is the wire `int32` verbatim; `0` collapses to
+    /// `None` here as it always has (never filtered on sign — that is
+    /// [`Self::dimensions`]'s job on every later read).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_wire_projection(
+        table_name: String,
+        source_id: String,
+        model_id: String,
+        task: ModelTask,
+        kind: ResultTableKind,
+        derived_from: Option<String>,
+        dimensions_raw: i32,
+        row_count: usize,
+        status: String,
+        key_column: Option<String>,
+    ) -> Self {
+        Self {
+            table_name,
+            source_id,
+            model_id,
+            task,
+            kind,
+            derived_from,
+            parquet_path: String::new(),
+            dimensions: (dimensions_raw != 0).then_some(dimensions_raw),
+            distance_metric: String::new(),
+            row_count,
+            status,
+            key_column,
+            text_columns: None,
+            created_at: String::new(),
+            completed_at: None,
+            tenant_id: None,
+            definition_hash: None,
+            input_anchors_json: None,
+            storage_precision: None,
+            oversample: None,
+            writer_id: None,
+            lease_expires_at: None,
+            current_version: None,
+            next_version: 0,
+        }
+    }
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
@@ -252,6 +350,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         oversample,
         writer_id: row.try_get("writer_id")?,
         lease_expires_at: row.try_get("lease_expires_at")?,
+        current_version: row.try_get::<i32>("current_version")?.map(i64::from),
+        next_version: i64::from(row.get::<i32>("next_version")?),
     })
 }
 
@@ -315,6 +415,19 @@ pub struct ResultTableCas {
     pub tenant_arm: TenantArm,
     /// The ownership predicate.
     pub owner: Owner,
+    /// The lease-present arm: when `true`, the predicate additionally
+    /// requires `lease_expires_at IS NOT NULL`, so a building row whose
+    /// lease was RELEASED (`Catalog::release_building_tables_of_claimant`
+    /// NULLs it) matches zero rows. `false` in every builder; set by
+    /// [`Self::with_lease_present`]. [`Catalog::renew_lease`] ALWAYS renders
+    /// it (on a copy of its argument), for every caller — the keeper's
+    /// renewal, the writer's pre-promote renewal, recovery's pre-purge
+    /// renewal — so no holder can re-arm a released building lease, exactly
+    /// as `heartbeat_job`'s `IS NOT NULL` arm guards the jobs class. Never
+    /// carried by [`Owner::ExpiredLease`]'s own builder: that arm's
+    /// predicate is `IS NULL OR < now`, and a released row must stay
+    /// claimable through it.
+    pub lease_present: bool,
 }
 
 impl ResultTableCas {
@@ -324,7 +437,15 @@ impl ResultTableCas {
             table: table.to_string(),
             tenant_arm: TenantArm::in_force(tenant),
             owner: Owner::Writer(writer_id.to_string()),
+            lease_present: false,
         }
+    }
+
+    /// The same CAS with the lease-present arm set — see
+    /// [`Self::lease_present`].
+    pub fn with_lease_present(mut self) -> Self {
+        self.lease_present = true;
+        self
     }
 
     /// The lease keeper's CAS on a live writer's row (N3,
@@ -343,6 +464,7 @@ impl ResultTableCas {
             table: table.to_string(),
             tenant_arm: TenantArm::Admin,
             owner: Owner::Writer(writer_id.to_string()),
+            lease_present: false,
         }
     }
 
@@ -355,6 +477,7 @@ impl ResultTableCas {
             table: table.to_string(),
             tenant_arm: TenantArm::in_force(tenant),
             owner: Owner::ExpiredLease,
+            lease_present: false,
         }
     }
 
@@ -397,6 +520,8 @@ impl ResultTableCas {
 
     /// Render the full building-row predicate, appending its binds to
     /// `params` (whose existing entries are the statement's earlier binds).
+    /// The lease-present arm (`AND lease_expires_at IS NOT NULL`) renders
+    /// only when [`Self::lease_present`] is set.
     fn render(&self, kind: BackendKind, params: &mut Vec<SqlValue<'static>>) -> String {
         params.push(SqlValue::TextOwned(self.table.clone()));
         let mut sql = format!(
@@ -404,6 +529,9 @@ impl ResultTableCas {
             params.len()
         );
         sql.push_str(&self.render_owner_and_tenant("", kind, params));
+        if self.lease_present {
+            sql.push_str(" AND lease_expires_at IS NOT NULL");
+        }
         sql
     }
 
@@ -429,12 +557,17 @@ impl ResultTableCas {
 }
 
 /// The row a zero-row CAS re-reads by primary key (no tenant predicate) to
-/// classify the miss.
+/// classify the miss. `current_version` lets `classify_ready_cas_miss`
+/// distinguish a genuinely superseded row (`CasFailed`) from one whose
+/// `current_version` moved out from under a parent-pinned allocation or
+/// publish CAS (`ParentMoved`) — the same field the allocation and publish
+/// predicates themselves compare against.
 #[derive(Debug, Clone)]
 pub(crate) struct CasTarget {
-    tenant_id: Option<String>,
-    status: String,
-    writer_id: Option<String>,
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) status: String,
+    pub(crate) writer_id: Option<String>,
+    pub(crate) current_version: Option<i64>,
 }
 
 /// Re-read the CAS target by primary key inside the same transaction.
@@ -443,13 +576,15 @@ pub(crate) async fn read_cas_target(
     table: &str,
 ) -> std::result::Result<Option<CasTarget>, BackendError> {
     tx.query_opt(
-        "SELECT tenant_id, status, writer_id FROM result_tables WHERE table_name = $1",
+        "SELECT tenant_id, status, writer_id, current_version FROM result_tables \
+         WHERE table_name = $1",
         &[SqlValue::TextOwned(table.to_string())],
         |row| {
             Ok(CasTarget {
                 tenant_id: row.try_get("tenant_id")?,
                 status: row.get("status")?,
                 writer_id: row.try_get("writer_id")?,
+                current_version: row.try_get::<i32>("current_version")?.map(i64::from),
             })
         },
     )
@@ -752,7 +887,16 @@ impl Catalog {
     /// 4. `status == 'building'` and the owner arm no longer holds (the row's
     ///    `writer_id` is not ours; or, for an expired-lease arm, the lease was
     ///    renewed) → [`JammiError::LeaseLost`]. The claimant now owns the row
-    ///    and its bytes: the loser deletes nothing.
+    ///    and its bytes: the loser deletes nothing;
+    /// 5. `status == 'building'`, the owner arm holds on re-read, and the
+    ///    statement carried the [`ResultTableCas::lease_present`] arm which
+    ///    missed (the lease was RELEASED — `lease_expires_at IS NULL`) →
+    ///    [`JammiError::CasFailed`] naming `building`: a status-named error
+    ///    whose status did not change. Every caller that matches `CasFailed`
+    ///    already treats it as a miss (the keeper flips `lost`; recovery's
+    ///    `is_cas_miss` skips the row and deletes nothing), which is exactly
+    ///    what a released lease requires. The same branch also reports the
+    ///    "every arm matched on re-read" straddle below.
     pub(crate) fn classify_cas_miss(cas: &ResultTableCas, target: Option<CasTarget>) -> JammiError {
         let table = cas.table.clone();
         let Some(row) = target else {
@@ -825,12 +969,89 @@ impl Catalog {
     /// (`catalog::lease`'s module docs); `lease` is the WINDOW, always the
     /// deployment's configured duration, not a computed deadline. The
     /// writer's heartbeat.
+    ///
+    /// ALWAYS carries the [`ResultTableCas::lease_present`] arm (set on a
+    /// copy of `cas`; the argument is untouched), whichever caller renews —
+    /// the keeper's `LeaseTarget::ResultTable` renewal, the writer's
+    /// pre-promote renewal in `BuildingTable::finish`, recovery's pre-purge
+    /// renewal — so a RELEASED building lease (`lease_expires_at IS NULL`,
+    /// [`Self::release_building_tables_of_claimant`]) renews zero rows and
+    /// surfaces as [`JammiError::CasFailed`] with `status = "building"`
+    /// (cause 5 of `Self::classify_cas_miss`): the keeper flips the hold's
+    /// `lost`, the writer's `finish` errors instead of promoting, and
+    /// recovery purges nothing.
     pub async fn renew_lease(&self, cas: &ResultTableCas, lease: Duration) -> Result<()> {
         let kind = self.backend().backend_kind();
         let mut params = Vec::new();
         let expr = lease_deadline_expr(kind, lease, &mut params);
-        self.building_row_cas(cas, &format!("lease_expires_at = {expr}"), params)
+        let guarded = cas.clone().with_lease_present();
+        self.building_row_cas(&guarded, &format!("lease_expires_at = {expr}"), params)
             .await
+    }
+
+    /// RELEASE the building-table leases of THIS instance's loop-claimed
+    /// compute jobs — the second lease class a compute job holds — as a
+    /// plain sweep beside `Catalog::release_jobs_claimed_by`, never a
+    /// per-target CAS: `UPDATE result_tables SET lease_expires_at = NULL
+    /// WHERE writer_id = $writer AND status = 'building' AND
+    /// lease_expires_at IS NOT NULL AND table_name IN (SELECT partial_result
+    /// FROM jobs WHERE claimed_by = $instance AND execution = 'queued' AND
+    /// status = 'running' AND partial_result IS NOT NULL)`. Returns the
+    /// number of rows released.
+    ///
+    /// Scoped through the JOBS linkage on purpose (D11): every
+    /// `BuildingTable` on a session is adopted under the store's one
+    /// `writer_id`, so from `result_tables` alone a loop-claimed
+    /// materialization's row, an inline `run_now`'s and a library
+    /// materialization's are indistinguishable — a writer-scoped sweep would
+    /// NULL the wrong lease. The only column that CAN tell them apart is
+    /// `jobs.execution`, reached through `jobs.partial_result`: inline rows
+    /// are excluded by `execution = 'queued'`, a library materialization has
+    /// no jobs row, and a row recovery re-adopted under
+    /// `"{writer_id}/claim-…"` matches neither arm. Run AFTER the jobs sweep:
+    /// that sweep only NULLs `lease_expires_at`, so the subquery's predicate
+    /// is untouched by it. An uncorrelated `IN (SELECT ..)`, portable on both
+    /// backends. A NULL building lease is claimable at once through
+    /// [`Self::claim_expired_building_table`] (`IS NULL OR < now`), so the
+    /// successor's partial-result dispatch materializes anew instead of
+    /// backing off for a lease window; the old holder's own renewal then
+    /// misses ([`Self::renew_lease`]'s lease-present arm) and never re-arms
+    /// it.
+    pub async fn release_building_tables_of_claimant(
+        &self,
+        instance_id: &str,
+        writer_id: &str,
+    ) -> Result<usize> {
+        let instance_id = instance_id.to_string();
+        let writer_id = writer_id.to_string();
+        let building = ResultTableStatus::Building.to_string();
+        let running = crate::catalog::status::JobStatus::Running.to_string();
+        let queued_execution = crate::catalog::status::JobExecution::Queued.to_string();
+        let sql = "UPDATE result_tables SET lease_expires_at = NULL \
+                   WHERE writer_id = $2 AND status = $3 AND lease_expires_at IS NOT NULL \
+                     AND table_name IN ( \
+                       SELECT partial_result FROM jobs \
+                       WHERE claimed_by = $1 AND execution = $4 AND status = $5 \
+                         AND partial_result IS NOT NULL)";
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        sql,
+                        &[
+                            SqlValue::TextOwned(instance_id),
+                            SqlValue::TextOwned(writer_id),
+                            SqlValue::TextOwned(building),
+                            SqlValue::TextOwned(queued_execution),
+                            SqlValue::TextOwned(running),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated as usize)
     }
 
     /// Persist a checkpoint (batch number) on the building row `cas` names.

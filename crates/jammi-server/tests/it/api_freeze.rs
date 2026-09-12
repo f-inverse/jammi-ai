@@ -1,8 +1,11 @@
 //! The API-stability freeze-guard.
 //!
-//! The terminal-0.x engineering bar freezes the public wire surface: the ten
+//! The terminal-0.x engineering bar freezes the public wire surface: the twelve
 //! `jammi.v1.*` proto packages and the `(Service, Method)` rpc paths they define
-//! (see `docs/guide/src/api-stability.md`). This guard makes that freeze
+//! (see `docs/guide/src/api-stability.md`) — ten on the public listener (two of
+//! them, `jammi.v1.error` and `jammi.v1.training`, rpc-free vocabularies), one
+//! (`jammi.v1.peer`) served only on the internal `peer_bind` listener, and
+//! `jammi.v1.lifecycle` contract-only. This guard makes that freeze
 //! enforceable rather than aspirational: it decodes the compiled
 //! [`FILE_DESCRIPTOR_SET`] — the authoritative machine-readable description of
 //! the compiled `jammi.v1` wire surface (the frozen contract, which may exceed

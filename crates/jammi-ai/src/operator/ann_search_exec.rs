@@ -14,6 +14,7 @@ use futures::stream;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::Result;
 use jammi_db::index::exact::exact_vector_search;
+use jammi_db::index::ValidatedQuery;
 use jammi_db::store::ResultStore;
 
 /// ANN vector search over an embedding table.
@@ -31,7 +32,7 @@ use jammi_db::store::ResultStore;
 /// (resolved against the table's stamped default) is threaded here.
 pub struct AnnSearchExec {
     table: ResultTableRecord,
-    query_vector: Vec<f32>,
+    query_vector: ValidatedQuery,
     k: usize,
     /// Per-request oversample override (`SearchRequest::oversample`). `None`
     /// defers to the table's own stamped default
@@ -48,7 +49,7 @@ pub struct AnnSearchExec {
 impl AnnSearchExec {
     pub fn new(
         table: ResultTableRecord,
-        query_vector: Vec<f32>,
+        query_vector: ValidatedQuery,
         k: usize,
         oversample_override: Option<usize>,
         result_store: Arc<ResultStore>,
@@ -145,12 +146,21 @@ impl ExecutionPlan for AnnSearchExec {
                         .ann_config()
                         .resolve_oversample(oversample_override, table.oversample);
                     index
-                        .search_final(&query, k, oversample)
+                        .search_final_placed(&query, k, oversample)
+                        .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
                 }
-                None => exact_vector_search(&ctx, &table.table_name, &query, k)
-                    .await
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+                None => exact_vector_search(
+                    &ctx,
+                    &table.table_name,
+                    &query,
+                    k,
+                    // The catalog width is a CROSS-CHECK against the scan's own
+                    // width inside; `None` means nothing to cross-check.
+                    table.dimensions().map(std::num::NonZeroUsize::get),
+                )
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
             };
 
             // Convert Vec<(row_id, cosine_distance)> to RecordBatch

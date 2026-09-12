@@ -52,7 +52,8 @@ async fn generate_embeddings_cpu_gpu_parity() {
     let gpu_vecs = harness::keyed_result_vectors(&gpu, &gpu_table).await;
 
     assert_eq!(
-        cpu_table.dimensions, gpu_table.dimensions,
+        cpu_table.dimensions(),
+        gpu_table.dimensions(),
         "CPU and GPU embedding tables must share a dimension"
     );
     assert!(

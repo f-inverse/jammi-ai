@@ -50,6 +50,7 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
             Arc::new(StringArray::from(source_ids)),
             Arc::new(StringArray::from(model_ids)),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();

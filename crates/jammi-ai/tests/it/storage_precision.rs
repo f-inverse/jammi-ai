@@ -17,6 +17,7 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_numerics::distance::cosine_distance;
+use jammi_test_utils::vq;
 use tempfile::TempDir;
 
 use crate::common;
@@ -118,7 +119,7 @@ async fn read_ground_truth(
 fn exact_top_k(ground_truth: &[(String, Vec<f32>)], query: &[f32], k: usize) -> Vec<(String, f32)> {
     let mut scored: Vec<(String, f32)> = ground_truth
         .iter()
-        .map(|(id, v)| (id.clone(), cosine_distance(query, v)))
+        .map(|(id, v)| (id.clone(), cosine_distance(&vq(query), v)))
         .collect();
     scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     scored.truncate(k);
@@ -324,11 +325,11 @@ async fn per_request_oversample_overrides_table_default() {
 
     let index = session
         .result_store()
-        .resolve_search_mode(&table)
+        .resolve_search_mode_local(&table)
         .await
         .unwrap()
         .expect("the Int8 sidecar index must load");
-    let raw_quantized_top_k = index.search(&query, k).unwrap();
+    let raw_quantized_top_k = index.search(&vq(&query), k).unwrap();
     let mut raw_ids: Vec<String> = raw_quantized_top_k
         .iter()
         .map(|(id, _)| id.clone())

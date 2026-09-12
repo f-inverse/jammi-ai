@@ -1,0 +1,68 @@
+# check_no_consumer_names.py waiver allowlist — mirrors the self-rotting-
+# waiver idiom of arch_validation_freshness_allowlist.txt.
+#
+# The governance-verb tripwire and the leak-smell scan are advisory: a
+# generic pattern match, not a proven violation. Their failure message used
+# to say "resolve or annotate" with no annotate path — a finding a human has
+# already ruled MECHANISM (not governance; no consumer name) had exactly two
+# exits, both worse than the finding: rename a correct identifier to dodge
+# the grep, or admin-merge past every gate in the job. This file is the
+# annotate path: a reviewed ruling lands in the tree, and a waived finding
+# still PRINTS (as an informational line naming this row and its ruling) so
+# it stays visible in every CI log — silence is how a waiver becomes
+# invisible.
+#
+# Format: one row per line, five TAB-delimited fields (a literal TAB
+# character between each — not spaces):
+#
+#   <identifier><TAB><declaring_path><TAB><ruling_sha><TAB><ruling_ref><TAB><reason>
+#
+#   - identifier      the exact public identifier the tripwire/leak-smell
+#                      scan flagged (e.g. `register_content_hash_udf`).
+#   - declaring_path  the repo-relative path where `identifier` is publicly
+#                      declared. Scoping is PER (identifier, declaring_path)
+#                      PAIR — a second site with the same identifier name
+#                      needs its OWN row; one row can never amnesty a class.
+#   - ruling_sha      a 40-hex commit sha, an ANCESTOR of HEAD, at which the
+#                      ruling below was made.
+#   - ruling_ref      a resolvable citation carrying the verdict: either a
+#                      `<doc-path>#<heading>` pair (the heading text must
+#                      appear in that doc, the same substring check
+#                      check_constitution_anchors.py's `doc_heading` anchor
+#                      kind uses) or a bare issue/PR number (`#123`).
+#   - reason          ONE sentence, in MECHANISM vocabulary, naming what
+#                      state the identifier changes. Must not itself lead
+#                      with a governance-verb stem as its main verb (that
+#                      would just restate the tripwire, not resolve it),
+#                      must not be a bare line-number citation, and must not
+#                      be trivially short.
+#
+# Rot, re-verified on EVERY run, every one a hard FAIL (never a soft skip):
+#
+#   1. `identifier` no longer matches a public declaration in
+#      `declaring_path` — a rename must re-earn its ruling.
+#   2. `declaring_path` is missing.
+#   3. `ruling_sha` is malformed, or is not an ancestor of HEAD.
+#   4. `ruling_ref` does not resolve.
+#   5. `identifier` appears nowhere in the crates tree at all — a DEAD
+#      waiver; delete the row.
+#   6. `reason` is trivially short, is itself phrased with a governance verb
+#      as its main verb, or carries a bare line-number citation instead of
+#      a mechanism sentence.
+#   7. A row waives `identifier` and `declaring_path` as a PAIR, never
+#      `identifier` alone — a second site with the same identifier needs
+#      its own row (enforced by construction: matching is always by the
+#      exact pair, and a duplicate pair is itself a hard fail at load time).
+#
+# This file is in `.github/workflows/swarm.yml`'s human-amend-only glob
+# (SWARM_GATE_TOUCHED) — adding a row costs an admin-merge once per
+# identifier, same discipline as every other reviewed waiver in this repo.
+#
+# `register_content_hash_udf` — a Datafusion UDF registration
+# (`SessionContext::register_udf`), the exact use `check_no_consumer_
+# names.py`'s own module doc names as legitimate ("source/UDF
+# *registration*"), and `philosophy.md` places source and function
+# registration in the engine column, not the governance column. Ruled
+# mechanism on three independent grounds by the discipline auditor; see
+# issue #508 for the full ruling.
+register_content_hash_udf	crates/jammi-ai/src/query/content_hash_udf.rs	c0e1faec00a3de0d59499801755e705579dbe202	#508	Installs a Datafusion scalar UDF into the query session's function catalog so SQL statements can invoke it by name.

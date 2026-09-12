@@ -2,6 +2,7 @@ pub mod asof;
 pub mod context_predictor;
 pub mod context_set;
 pub mod embedding;
+pub mod embedding_refresh;
 pub mod graph_neighbourhood;
 pub mod graph_propagation;
 pub mod import;

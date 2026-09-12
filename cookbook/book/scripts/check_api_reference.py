@@ -110,6 +110,12 @@ REQUIRED: dict[str, list[str]] = {
     "staleness": ["current_definition"],
     "derives_from": [],
     "recompute": ["cascade"],
+    # versioned embedding tables — incremental refresh over a deletion mask
+    # (DELTA, issue #482): re-embed only changed rows, compact live rows into
+    # one fragment, and reap old versions.
+    "refresh_embeddings": ["table"],
+    "compact_embeddings": ["table"],
+    "expire_versions": ["table", "before"],
     # tier 04
     "train_context_predictor": [
         "key_column",

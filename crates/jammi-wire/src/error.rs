@@ -34,7 +34,9 @@
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
-//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`) reconstructs exactly,
+//! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
+//! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
+//! `NonUniqueKey`, `Unavailable`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -54,7 +56,7 @@
 
 use jammi_db::catalog::backend::BackendError;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
 use jammi_db::{AuditError, TenantId};
@@ -148,6 +150,15 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 table: table.clone(),
                 status: status.clone(),
             }),
+            JammiError::ParentMoved {
+                table,
+                expected,
+                found,
+            } => Variant::ParentMoved(pb::ParentMovedError {
+                table: table.clone(),
+                expected: *expected,
+                found: *found,
+            }),
             JammiError::SourceBusy { source_id, table } => {
                 Variant::SourceBusy(pb::SourceBusyError {
                     source_id: source_id.clone(),
@@ -182,6 +193,56 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::NotRecomputable { table } => {
                 Variant::NotRecomputable(pb::NotRecomputableError {
                     table: table.clone(),
+                })
+            }
+            JammiError::InvalidKey { column, null_count } => {
+                Variant::InvalidKey(pb::InvalidKeyError {
+                    column: column.clone(),
+                    null_count: *null_count,
+                })
+            }
+            JammiError::VersionUnavailable { table, version } => {
+                Variant::VersionUnavailable(pb::VersionUnavailableError {
+                    table: table.clone(),
+                    version: *version,
+                })
+            }
+            JammiError::NotRefreshable { table, reason } => {
+                Variant::NotRefreshable(pb::NotRefreshableError {
+                    table: table.clone(),
+                    reason: reason.as_str().to_string(),
+                })
+            }
+            JammiError::DefinitionDrift {
+                table,
+                recorded,
+                current,
+            } => Variant::DefinitionDrift(pb::DefinitionDriftError {
+                table: table.clone(),
+                recorded: recorded.clone(),
+                current: current.clone(),
+            }),
+            JammiError::NonUniqueKey {
+                table,
+                scan,
+                keys,
+                total,
+            } => Variant::NonUniqueKey(pb::NonUniqueKeyError {
+                table: table.clone(),
+                scan: scan.as_str().to_string(),
+                keys: keys
+                    .iter()
+                    .map(|(key, count)| pb::KeyCount {
+                        key: key.clone(),
+                        count: *count,
+                    })
+                    .collect(),
+                total: *total,
+            }),
+            JammiError::Unavailable { resource, reason } => {
+                Variant::Unavailable(pb::UnavailableError {
+                    resource: resource.clone(),
+                    reason: reason.clone(),
                 })
             }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
@@ -256,6 +317,11 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             table: e.table,
             status: e.status,
         },
+        Some(Variant::ParentMoved(e)) => JammiError::ParentMoved {
+            table: e.table,
+            expected: e.expected,
+            found: e.found,
+        },
         Some(Variant::SourceBusy(e)) => JammiError::SourceBusy {
             source_id: e.source_id,
             table: e.table,
@@ -272,6 +338,42 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         },
         Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
         Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
+        Some(Variant::InvalidKey(e)) => JammiError::InvalidKey {
+            column: e.column,
+            null_count: e.null_count,
+        },
+        Some(Variant::VersionUnavailable(e)) => JammiError::VersionUnavailable {
+            table: e.table,
+            version: e.version,
+        },
+        // An unknown `reason` / `scan` token (a newer peer) reconstructs as
+        // `Other` carrying the Status message, the same total-decode stance
+        // as the unknown-oneof arm — never a fabricated token.
+        Some(Variant::NotRefreshable(e)) => match NotRefreshableReason::parse(&e.reason) {
+            Some(reason) => JammiError::NotRefreshable {
+                table: e.table,
+                reason,
+            },
+            None => JammiError::Other(message.to_string()),
+        },
+        Some(Variant::DefinitionDrift(e)) => JammiError::DefinitionDrift {
+            table: e.table,
+            recorded: e.recorded,
+            current: e.current,
+        },
+        Some(Variant::NonUniqueKey(e)) => match NonUniqueScan::parse(&e.scan) {
+            Some(scan) => JammiError::NonUniqueKey {
+                table: e.table,
+                scan,
+                keys: e.keys.into_iter().map(|k| (k.key, k.count)).collect(),
+                total: e.total,
+            },
+            None => JammiError::Other(message.to_string()),
+        },
+        Some(Variant::Unavailable(e)) => JammiError::Unavailable {
+            resource: e.resource,
+            reason: e.reason,
+        },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
         // own text, so the reconstructed error still carries the real fault
@@ -884,9 +986,16 @@ mod tests {
             | JammiError::TenantMismatch { .. }
             | JammiError::LeaseLost { .. }
             | JammiError::CasFailed { .. }
+            | JammiError::ParentMoved { .. }
             | JammiError::JobAttemptSuperseded { .. }
             | JammiError::JobCancelled { .. }
             | JammiError::SourceBusy { .. }
+            | JammiError::InvalidKey { .. }
+            | JammiError::VersionUnavailable { .. }
+            | JammiError::NotRefreshable { .. }
+            | JammiError::DefinitionDrift { .. }
+            | JammiError::NonUniqueKey { .. }
+            | JammiError::Unavailable { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -943,6 +1052,11 @@ mod tests {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
                 status: "ready".into(),
             },
+            JammiError::ParentMoved {
+                table: "patents__embedding__m".into(),
+                expected: Some(3),
+                found: Some(4),
+            },
             JammiError::SourceBusy {
                 source_id: "src1".into(),
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
@@ -964,6 +1078,33 @@ mod tests {
             },
             JammiError::NotRecomputable {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::InvalidKey {
+                column: "id".into(),
+                null_count: 3,
+            },
+            JammiError::VersionUnavailable {
+                table: "patents__embedding__m".into(),
+                version: 4,
+            },
+            JammiError::NotRefreshable {
+                table: "patents__embedding__m".into(),
+                reason: NotRefreshableReason::MissingContentHash,
+            },
+            JammiError::DefinitionDrift {
+                table: "patents__embedding__m".into(),
+                recorded: "abc".into(),
+                current: "def".into(),
+            },
+            JammiError::NonUniqueKey {
+                table: "patents__embedding__m".into(),
+                scan: NonUniqueScan::Source,
+                keys: vec![("k1".into(), 2), ("k2".into(), 3)],
+                total: 2,
+            },
+            JammiError::Unavailable {
+                resource: "segment src1__text_embedding__m__20260101T000000_deadbeef/1".into(),
+                reason: "unreachable".into(),
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

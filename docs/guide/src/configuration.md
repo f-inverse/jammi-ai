@@ -135,6 +135,11 @@ kinds = "all"
 # naming the former `lease_duration_secs` / `heartbeat_interval_secs`
 # keys is refused at load (no alias), never silently defaulted.
 idle_poll_secs = 1
+# How often a worker-enabled process samples the queue-depth gauges
+# (`jammi_jobs_queued{kind}` / `jammi_jobs_running{kind}`) from the catalog:
+# one grouped count per tick on a dedicated task, never on a `/metrics`
+# scrape and never on the claim loop. Must be >= 1. Default: 5.
+metrics_sample_secs = 5
 
 [jobs]
 # How many days a terminal (completed/failed) job row survives before the
@@ -158,8 +163,48 @@ embedding_cache_size = "1GB"
 health_listen = "0.0.0.0:8080"
 # Arrow Flight SQL listen address. Default: "0.0.0.0:8081".
 flight_listen = "0.0.0.0:8081"
-# Models to preload on server start. Default: [].
-preload_models = ["sentence-transformers/all-MiniLM-L6-v2"]
+# Models to load into the cache before /readyz reports ready and before this
+# process's claim loop claims anything. A bare id takes its task from the
+# catalog's `models` row; `{ id, task }` names it (required for a `local:`
+# path). A model that cannot load, a bare id with no row, or an unknown task
+# token is a startup error (the server exits non-zero). Default: [].
+preload_models = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    { id = "local:/models/bge-small", task = "text_embedding" },
+]
+# The INTERNAL peer listener for beyond-one-node retrieval: the address this
+# replica serves `jammi.v1.peer.PeerService` (segment search for the
+# segments it owns) on, to OTHER replicas of the same deployment. Unset (the
+# default) = no third listener = single node. A replica is a segment owner
+# iff this is set. Must differ from health_listen and flight_listen at a
+# fixed port (`:0` never collides). I-PEER: every client of this listener is
+# a jammi coordinator -- the owner trusts the channel, binds no tenant, and
+# enforces only that each requested segment belongs to the named table (the
+# coordinator resolved that table through its own tenant-scoped catalog
+# read before fanning out). Bind it on a private interface behind network
+# policy / mTLS from the runtime: on a routable interface without them it
+# exposes cross-tenant reads. See security.md "The peer listener".
+# peer_bind = "10.0.0.5:8082"
+# MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
+# estimated bytes ONE query may load locally for segments it does not own,
+# when their owners are unreachable -- the last rung of the placed-search
+# failure ladder (see "Beyond one node" in reference-topologies.md). Unset
+# (the default) = unbounded, today's behaviour. It is NOT a memory cap: the
+# segment cache never evicts, earlier queries' loads are invisible to the
+# check (each query loads afresh and frees on completion; the on-disk copy of
+# a remote bundle persists), distinct remote segments accumulate on disk, and
+# concurrent queries admit independently, so peak heap is
+# concurrency x budget. The estimate per segment is
+# row_count x (dimensions x bytes(precision) + 32 + 64) -- 4 (F32) / 2 (F16)
+# / 1 (Int8) / ceil(d/8)/d (Binary) bytes per component, 32 bytes of row-id
+# strings and 64 bytes of graph link overhead per row -- a LOWER bound for
+# the quantized precisions: the rawf32 companion is excluded (it is a
+# positioned read, never resident), but usearch's level-0 links and the
+# row-id HashMap are unmodelled, so the true resident size exceeds it.
+# Prescribe headroom: set the budget to at most half the memory you are
+# willing to give one query's fallback loads. 0 is refused. Read by the
+# result store; a library embedder sets it through the same config.
+# peer_local_load_bytes = 268435456
 
 [server.limits]
 # Request-bounds and refusal policy for the combined gRPC + Flight SQL

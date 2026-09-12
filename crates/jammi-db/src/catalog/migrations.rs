@@ -102,6 +102,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "030_jobs_idempotency_key",
         schema::MIGRATION_030_JOBS_IDEMPOTENCY_KEY,
     ),
+    (
+        "031_jobs_releases_workers_state",
+        schema::MIGRATION_031_JOBS_RELEASES_WORKERS_STATE,
+    ),
+    (
+        "032_result_table_versions",
+        schema::MIGRATION_032_RESULT_TABLE_VERSIONS,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

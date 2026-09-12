@@ -136,6 +136,7 @@ async fn child_workload() {
             Arc::new(sources),
             Arc::new(models),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(2),
         ],
     )
     .unwrap();

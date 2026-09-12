@@ -83,6 +83,15 @@ per-step `$?`. Naming per README ruling 23.
   (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
   (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
+- **precondition (S1)**: `jammi-ai`'s `cuda` feature adds `candle-core/nccl`, and cudarc's
+  `dynamic-linking` emits `cargo:rustc-link-lib=dylib=nccl` at link time; `.docker/ci-cuda.Dockerfile`
+  installs `cuda-toolkit-12-6` only, which does not carry NCCL, so the `builder-cuda` stage fails
+  to link as of this commit. The CI CUDA image must carry `libnccl-devel` (rhel8 packages
+  `libnccl`/`libnccl-devel` 2.23.4-1+cuda12.6 — the version the runtime image
+  `nvidia/cuda:12.6.3-runtime-ubi8` already ships, and the version S1's GPU leg ran against) and
+  be republished **before** this commit lands. A `jammi-ai --features cuda` clippy arm must also
+  exist in the nvcc lane (today only `jammi-encoders` and `jammi-kernels` are built with `cuda`
+  there), so the `Nccl` arm is compiled somewhere before the GPU leg runs.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
   `nccl` without CUDA, `world_size > 1` with `cached == true` or `hard_negatives.mine == true`
   refused with typed errors at the submit edge), K4 (remote parity suite unchanged), B6.

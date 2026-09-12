@@ -36,6 +36,7 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
+use jammi_test_utils::vq;
 
 use crate::common;
 
@@ -352,7 +353,7 @@ fn nn_same_class_rate(
             if other_id == id {
                 continue;
             }
-            let d = jammi_numerics::distance::cosine_distance(v, ov);
+            let d = jammi_numerics::distance::cosine_distance(&vq(v), ov);
             if best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((other_id, d));
             }
@@ -377,7 +378,8 @@ fn class_separation(vectors: &HashMap<String, Vec<f32>>, class_of: &HashMap<Stri
     let (mut inter_sum, mut inter_n) = (0.0f64, 0u64);
     for a in 0..entries.len() {
         for b in (a + 1)..entries.len() {
-            let d = jammi_numerics::distance::cosine_distance(entries[a].1, entries[b].1) as f64;
+            let d =
+                jammi_numerics::distance::cosine_distance(&vq(entries[a].1), entries[b].1) as f64;
             if class_of[entries[a].0] == class_of[entries[b].0] {
                 intra_sum += d;
                 intra_n += 1;
@@ -1019,7 +1021,7 @@ async fn jumping_knowledge_concats_every_hop_normalizes_blocks_and_is_searchable
         .unwrap()
         .0;
     assert_eq!(
-        table.dimensions,
+        table.dimensions_raw(),
         Some((DIM * blocks) as i32),
         "JK output dim = (K+1)·d — one block per hop plus X⁰"
     );
@@ -1046,7 +1048,7 @@ async fn jumping_knowledge_concats_every_hop_normalizes_blocks_and_is_searchable
     let probe = out[probe_key].clone();
     let hits = session
         .result_store()
-        .search_vectors(session.context(), &table, &probe, 1)
+        .search_vectors(session.context(), &table, &vq(&probe), 1)
         .await
         .unwrap();
     assert_eq!(
@@ -1132,7 +1134,7 @@ async fn evaluable_through_r1_eval_embeddings() {
         .await
         .unwrap();
     assert_eq!(resolved.key_column.as_deref(), Some("_row_id"));
-    assert_eq!(resolved.dimensions, Some(DIM as i32));
+    assert_eq!(resolved.dimensions_raw(), Some(DIM as i32));
 
     // The eval runner's per-query loop runs `search_vectors` over the resolved
     // table — exercise exactly that read path (the R1 hook) without a live
@@ -1140,7 +1142,7 @@ async fn evaluable_through_r1_eval_embeddings() {
     let probe = read_table_vectors(&session, &table).await["c0_0"].clone();
     let hits = session
         .result_store()
-        .search_vectors(session.context(), &resolved, &probe, 3)
+        .search_vectors(session.context(), &resolved, &vq(&probe), 3)
         .await
         .unwrap();
     assert!(

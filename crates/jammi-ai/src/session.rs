@@ -63,6 +63,12 @@ pub struct InferenceSession {
     /// This session's `instances` row hold — held for its `Drop` (releases
     /// the keeper renewal when the session drops), never read.
     _instance_hold: jammi_db::catalog::lease_keeper::LeaseHold,
+    /// The worker gate (warm-before-claim): a claim loop spawned over this
+    /// session waits for `true` before its first claim. Open by default —
+    /// fixtures and library callers never touch it; a server closes it
+    /// ([`Self::close_worker_gate`]) before binding while it preloads models
+    /// and opens it ([`Self::open_worker_gate`]) once warm.
+    worker_gate: tokio::sync::watch::Sender<bool>,
 }
 
 /// The model-side links a training kind's `jobs` row is submitted with —
@@ -89,6 +95,25 @@ impl InferenceSession {
     /// [`Self::new`].
     pub async fn open(config: JammiConfig) -> Result<Arc<Self>> {
         let session = Arc::new(Self::new(config).await?);
+        session.register_query_functions();
+        Ok(session)
+    }
+
+    /// [`Self::open`] with an explicit segment placement — which process owns
+    /// which ANN index segment, read by the result store at every online
+    /// search resolve. `open` passes [`jammi_db::index::AllLocal`] (every
+    /// segment is this process's — a single node); a library process that
+    /// knows its topology passes a [`jammi_db::index::StaticPlacement`] and
+    /// becomes a full coordinator over the gRPC peer transport
+    /// (`jammi_wire::peer::GrpcPeerTransport`, wired by the store builder).
+    /// Precondition for any non-local placement: `storage.result_root` (or a
+    /// shared local `artifact_dir`) is a root every replica can read.
+    pub async fn open_with_placement(
+        config: JammiConfig,
+        placement: Arc<dyn jammi_db::index::SegmentPlacement>,
+    ) -> Result<Arc<Self>> {
+        let inner = JammiSession::new(config).await?;
+        let session = Arc::new(Self::wrap_with(inner, None, placement).await?);
         session.register_query_functions();
         Ok(session)
     }
@@ -138,6 +163,14 @@ impl InferenceSession {
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
+        Self::wrap_with(inner, observer, Arc::new(jammi_db::index::AllLocal)).await
+    }
+
+    async fn wrap_with(
+        inner: JammiSession,
+        observer: Option<Arc<dyn InferenceObserver>>,
+        placement: Arc<dyn jammi_db::index::SegmentPlacement>,
+    ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
 
@@ -174,7 +207,7 @@ impl InferenceSession {
         // serves on another. It registers every `BuildingTable` it adopts
         // with the keeper above rather than spawning its own heartbeat task.
         let result_store = Arc::new(
-            build_result_store(&inner, Arc::clone(&catalog))?
+            build_result_store(&inner, Arc::clone(&catalog), placement)?
                 .with_lease_keeper(Arc::clone(&lease_keeper)),
         );
         let artifact_store = result_store.artifact_store();
@@ -200,6 +233,11 @@ impl InferenceSession {
         // resolutions honour the catalog owner on every read lane and source
         // removal can find the provider to clear.
         result_store.install_result_schema(inner.context())?;
+        // Every model-facing source scan projects `jammi_content_hash(...)`
+        // (`build_source_query`), so the UDF is part of the session's base
+        // context — not of the opt-in compound-query set
+        // (`register_query_functions`), which a plain `new` never installs.
+        crate::query::register_content_hash_udf(inner.context());
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
@@ -256,6 +294,8 @@ impl InferenceSession {
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
         let ann_cache = Arc::new(AnnCache::new(ann_cache_size));
 
+        let (worker_gate, _) = tokio::sync::watch::channel(true);
+
         Ok(Self {
             inner,
             model_cache,
@@ -269,7 +309,65 @@ impl InferenceSession {
             instance_id,
             lease_keeper,
             _instance_hold: instance_hold,
+            worker_gate,
         })
+    }
+
+    /// Close the worker gate: a claim loop over this session (spawned
+    /// before or after this call) parks before its first claim, with its
+    /// `workers` row reading `warming`, until [`Self::open_worker_gate`].
+    /// A server closes it while `preload_models` loads, so `/readyz` never
+    /// says "preloading" while this process is already claiming.
+    pub fn close_worker_gate(&self) {
+        self.worker_gate.send_replace(false);
+    }
+
+    /// Open the worker gate (the default state): a parked loop passes its
+    /// wait, flips its row to `claiming` and claims.
+    pub fn open_worker_gate(&self) {
+        self.worker_gate.send_replace(true);
+    }
+
+    /// A receiver on the worker gate — what a claim loop `wait_for(|open|
+    /// *open)`s before its first claim.
+    pub fn worker_gate_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.worker_gate.subscribe()
+    }
+
+    /// RELEASE this session's job leases without a loop to stop — the
+    /// library's `release_and_stop` when no worker was spawned, and the
+    /// server's when `[worker] enabled = false`: 2b (the keeper releases
+    /// every `LeaseTarget::Job` hold it holds — inline holds return
+    /// `Ok(false)` and are left alone) then 2c (the jobs sweep and the
+    /// jobs-linked building sweep). With no loop-claimed row on this
+    /// instance every statement matches nothing by construction, so on a
+    /// worker-less process this is a no-op that keeps the surface uniform.
+    /// Returns `(2b's outcome, sweep counts)` — see
+    /// [`crate::fine_tune::worker::HoldReleaseOutcome`] for why a bare count
+    /// cannot stand in for 2b's own result: `Unobserved` (the keeper's pass
+    /// itself could not be confirmed to run) is a different fact from "zero
+    /// holds were held".
+    pub async fn release_job_leases(
+        &self,
+    ) -> Result<(
+        crate::fine_tune::worker::HoldReleaseOutcome,
+        crate::fine_tune::worker::ReleaseSweep,
+    )> {
+        let heartbeat = self.worker_intervals()?.heartbeat;
+        let holds = match self.lease_keeper.release_job_holds(heartbeat).await {
+            Ok(hr) => crate::fine_tune::worker::HoldReleaseOutcome::Observed(hr),
+            Err(e) => {
+                tracing::warn!(error = %e, "release_job_leases: the keeper's per-hold pass failed");
+                crate::fine_tune::worker::HoldReleaseOutcome::Unobserved
+            }
+        };
+        let sweep = crate::fine_tune::worker::release_sweep(
+            self.catalog(),
+            &self.instance_id,
+            self.result_store.writer_id(),
+        )
+        .await;
+        Ok((holds, sweep))
     }
 
     /// This process's `instances`/`jobs.claimed_by` identity (N3): a UUID
@@ -649,22 +747,6 @@ impl InferenceSession {
         crate::model::backend::candle::effective_compute_device(&self.device_config)
     }
 
-    /// Resolve a single member row's stored `vector` from an embedding result
-    /// table by key, or `None` when no row matches — the per-member read the
-    /// episodic context sampler builds its tensors from, reusing the engine's
-    /// typed vector-by-key SQL path rather than a raw-vector verb.
-    pub(crate) async fn read_vector_by_key(
-        &self,
-        table: &ResultTableRecord,
-        row_key: &str,
-    ) -> Result<Option<Vec<f32>>> {
-        match self.inner.read_vector_by_key(table, row_key).await {
-            Ok(v) => Ok(Some(v)),
-            Err(JammiError::Catalog(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Access the DataFusion session context.
     pub fn context(&self) -> &datafusion::prelude::SessionContext {
         self.inner.context()
@@ -723,6 +805,7 @@ impl InferenceSession {
             k,
             embedding_table,
             oversample,
+            jammi_db::index::QuerySource::Caller,
         )
         .await
     }
@@ -751,8 +834,21 @@ impl InferenceSession {
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let query = self.inner.read_vector_by_key(&table, row_key).await?;
-        self.search(source_id, query, k, embedding_table, oversample)
-            .await
+        // The vector was READ BACK from the table: its provenance is
+        // `Stored`, so a non-finite component is a corrupt artifact named by
+        // the table (gRPC `Internal`), never the caller's fault.
+        QueryBuilder::new(
+            Arc::clone(self),
+            source_id,
+            query,
+            k,
+            embedding_table,
+            oversample,
+            jammi_db::index::QuerySource::Stored {
+                table: table.table_name.clone(),
+            },
+        )
+        .await
     }
 
     /// Run a model over `columns` of an arbitrary input plan, appending the
@@ -1220,6 +1316,11 @@ impl InferenceSession {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        // The same plan shape the embedding pipeline uses (coalesce →
+        // null-key check → total order), so `infer` refuses a null key typed
+        // before any model call and its output is deterministic across
+        // `execution_threads`.
+        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
 
         // Pre-load the model to get embedding dimensions for schema construction.
         // This also warms the cache so execute() hits a cache hit.
@@ -1303,15 +1404,17 @@ impl InferenceSession {
         .regression_form(regression_form)
         .build()?;
 
-        // Execute and collect results
+        // Execute and collect results — both through the structural
+        // classifier so a typed refusal raised inside the plan reaches the
+        // caller as that variant.
         let task_ctx = self.inner.context().task_ctx();
         let stream = inference_exec
             .execute(0, task_ctx)
-            .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
+            .map_err(JammiError::from)?;
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
-            .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
+            .map_err(JammiError::from)?;
 
         // An inference always creates its (possibly empty) result table — a
         // zero-row scan is a real, queryable artifact too, never a case the
@@ -1391,8 +1494,20 @@ impl InferenceSession {
             .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
+        // The per-row content hash over the RAW content columns, computed by
+        // the `jammi_content_hash` UDF with the runner's own rendering (never
+        // a SQL `CAST`), carried by every model-facing scan — the embedding
+        // pipeline persists it as the table's `_content_hash`, `infer`
+        // ignores it, and an incremental refresh classifies rows by it.
+        let hash_args = content_columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "SELECT {select_list} FROM {}",
+            "SELECT {select_list}, {}({hash_args}) AS {} FROM {}",
+            crate::query::CONTENT_HASH_UDF_NAME,
+            jammi_db::store::schema::CONTENT_HASH_COLUMN,
             source_relation(source_id, table_name)
         )
     }
@@ -2126,6 +2241,7 @@ fn extract_test_column(output: &BackendOutput, col_idx: usize) -> Result<Vec<f32
 fn build_result_store(
     inner: &JammiSession,
     catalog: Arc<jammi_db::catalog::Catalog>,
+    placement: Arc<dyn jammi_db::index::SegmentPlacement>,
 ) -> Result<ResultStore> {
     let ann = inner.config().embedding.ann;
     // The one lease timing every leased row shares: the store's building
@@ -2154,7 +2270,19 @@ fn build_result_store(
         }
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
     }?;
-    Ok(store.with_lease_intervals(lease))
+    Ok(store
+        .with_lease_intervals(lease)
+        // The placed-search seams: who owns which segment (`AllLocal` unless
+        // the session was opened with a placement), and the gRPC transport a
+        // remote segment is searched through — the same client whether this
+        // process is a server replica or a library coordinator.
+        .with_placement(placement)
+        .with_peer_transport(Arc::new(jammi_wire::peer::GrpcPeerTransport::new()))
+        // `[server] peer_local_load_bytes`: the marginal-load admission
+        // budget of the placed-search failure ladder. Read by the store
+        // (the only reader), from the same config a wire deployment and an
+        // in-process one share.
+        .with_peer_local_load_bytes(inner.config().server.peer_local_load_bytes))
 }
 
 #[cfg(test)]

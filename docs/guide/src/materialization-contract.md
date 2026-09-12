@@ -261,6 +261,32 @@ legitimately has no sidecar; recovery leaves it untouched, and
 This is the distinction the contract draws: a bug (post-contract, no sidecar) is
 reaped; a legitimate historical table is preserved.
 
+## Versioned tables: the identity chain
+
+An embedding table that has been refreshed (see
+[Refresh an Embedding Table Incrementally](./incremental-refresh.md)) carries a
+chain of versions beside its base manifest. The base version's identity **is**
+the `.materialization.json` artifact digest — publishing the base changes no
+anchor. Every later version `N` records, in `{table}__v{N}.version.json`, its
+parent, the definition hash, the delta descriptor (`EmbeddingDelta` or
+`EmbeddingCompaction`, which name the parent version and its identity), the
+digest of every fragment it serves and the digest of its deletion mask; its
+identity is a domain-separated SHA-256 over exactly those inputs. Counts, the
+ANN segments and `produced_by`/`produced_at` are outputs, not inputs.
+
+`verify_materialization` on a versioned table runs the base check unchanged,
+then recomputes every fragment digest and the mask digest from the bytes,
+recomputes the chain identity from the parent's recorded identity, and compares
+it with both the version manifest and the catalog row. A `Mismatch` names the
+artifact that diverged. The version's input anchors are the source at the
+instant of the refresh (unpinned), so the verdict is
+`MatchWithUnpinnedInputs` naming the source, exactly as for the base embed.
+
+`staleness` and every `derives_from` anchor use the current version's identity,
+so a refresh that changed content advances dependents to
+`Stale { InputAdvanced }` and a `no_change` refresh leaves them `Fresh`.
+`recompute` of a versioned table starts a new chain in a new table.
+
 ## Why this identity matters
 
 The materialization manifest gives every result table a content-addressed,

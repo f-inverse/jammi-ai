@@ -18,6 +18,13 @@ spec:
     metadata:
       labels: { app: jammi-server-compute }
     spec:
+      # DRAIN on SIGTERM finishes the in-flight job; RELEASE (SIGINT /
+      # `jammi-server release` via preStop) hands it to a successor at once.
+      # 600 s = cluster-autoscaler `--max-graceful-termination-sec` default; a
+      # larger value is honoured only by rollouts/`kubectl delete` — raise both
+      # together. The operative rule and the rollout arithmetic are in the
+      # README ("Shutdown: DRAIN and RELEASE").
+      terminationGracePeriodSeconds: 600
       nodeSelector:
         gpu-node-pool: "true" # your cluster's own GPU node label
       securityContext:

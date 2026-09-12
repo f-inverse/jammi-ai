@@ -353,10 +353,31 @@ fn launder() -> Option<u32> {
             ("crates/jammi-encoders/src/modernbert.rs", "growth_oracle_cuda_device"),
         }
         self.assertTrue(seed.issubset(set(entries)), f"seed entries missing from {entries}")
-        source_texts = {rel: (ko.REPO_ROOT / rel).read_text() for rel, _name in entries}
+        # #513: an entry's `file` half may carry a leading `shared:` (see
+        # `SHARED_HELPER_PREFIX`) — strip it to get the REAL on-disk path a
+        # source_texts map needs; `verify_helper_registry` does the same
+        # stripping internally.
+        real_paths = {
+            (rel[len(ko.SHARED_HELPER_PREFIX) :] if rel.startswith(ko.SHARED_HELPER_PREFIX) else rel)
+            for rel, _name in entries
+        }
+        source_texts = {rel: (ko.REPO_ROOT / rel).read_text() for rel in real_paths}
         names, failures = ko.verify_helper_registry(entries, source_texts)
         self.assertEqual(failures, [])
-        self.assertEqual(names, set(entries))
+        # `names` also carries the (real_file, fn_name) pair for every
+        # `shared:` entry (in addition to its sentinel), and may resolve
+        # DELEGATED entries that were never in `entries` themselves only
+        # via calling an entry that IS — so `names` is a superset of every
+        # entry's own (real_file, fn_name) pair, never merely equal to
+        # `set(entries)` once `shared:` prefixes are normalized away.
+        normalized_entries = {
+            (rel[len(ko.SHARED_HELPER_PREFIX) :] if rel.startswith(ko.SHARED_HELPER_PREFIX) else rel, name)
+            for rel, name in entries
+        }
+        self.assertTrue(
+            normalized_entries.issubset(names),
+            f"not every registry entry verified: {normalized_entries - names}",
+        )
 
 
 class TestKo7(unittest.TestCase):
@@ -2277,6 +2298,395 @@ class TestTokenizerCommentStringInvariant(unittest.TestCase):
         self.assertIn("// a real comment", out)
         self.assertIn("fn a() {}", out)
         self.assertNotIn("blank me", out)
+
+
+class TestFoldedAccessorAndSharedDelegation(unittest.TestCase):
+    """#513 amendment: a require-gate FOLDED INTO its own accessor (extra
+    `&&` conjuncts, a named `JAMMI_REQUIRE_*` constant instead of a
+    literal) and cross-file `shared:`/delegation gating. Every positive
+    case here has a matching negative case proving the SAME widening does
+    not turn into a rubber stamp — the line this issue draws is: a folded
+    gate satisfies KO-7 MORE strongly than a per-file wrapper because it
+    cannot be forgotten, but an accessor that merely returns an `Option`
+    without ever panicking does NOT satisfy it, folded shape or not.
+    """
+
+    DECL_SRC = """
+pub const PG_URL_ENV: &str = "JAMMI_TEST_PG_URL";
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+
+pub fn pg_url_for_tests() -> Option<String> {
+    let url = std::env::var(PG_URL_ENV).ok().filter(|s| !s.is_empty());
+    if url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some() {
+        panic!("{REQUIRE_PG_ENV} is set but {PG_URL_ENV} is unset");
+    }
+    url
+}
+"""
+
+    # --- direct shape: conjuncts + named constant (positive) ---------------
+
+    def test_folded_conjunct_with_named_constant_verifies(self) -> None:
+        names, failures = ko.verify_helper_registry(
+            [("f.rs", "pg_url_for_tests")], {"f.rs": self.DECL_SRC}
+        )
+        self.assertEqual(failures, [])
+        self.assertIn(("f.rs", "pg_url_for_tests"), names)
+
+    def test_conjunct_order_reversed_also_verifies(self) -> None:
+        src = """
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+pub fn h(url: Option<String>) -> Option<String> {
+    if std::env::var_os(REQUIRE_PG_ENV).is_some() && url.is_none() {
+        panic!("x");
+    }
+    url
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "h")], {"f.rs": src})
+        self.assertEqual(failures, [])
+        self.assertIn(("f.rs", "h"), names)
+
+    # --- direct shape: negative/regression guards ---------------------------
+
+    def test_or_conjunct_is_rejected(self) -> None:
+        # A `||` lets an unrelated disjunct reach the panic without the
+        # env-read ever being true — the same class of hole the `&&`-only
+        # rule (and round-4's original single-conjunct rule) closes.
+        src = """
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+pub fn h() -> Option<String> {
+    if std::env::var_os(REQUIRE_PG_ENV).is_some() || true { panic!("x"); }
+    None
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "h")], {"f.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+
+    def test_always_false_conjunct_still_rejected_with_named_constant(self) -> None:
+        # The round-4 `&& false` bypass, re-verified against the WIDENED
+        # (named-constant) form — widening the accepted CONJUNCTS must
+        # never widen the accepted CONSTANT VALUES of those conjuncts.
+        src = """
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+pub fn h() -> Option<String> {
+    if std::env::var_os(REQUIRE_PG_ENV).is_some() && false { panic!("x"); }
+    None
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "h")], {"f.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+
+    def test_named_constant_not_prefixed_jammi_require_is_rejected(self) -> None:
+        src = """
+pub const OTHER_ENV: &str = "SOME_OTHER_VAR";
+pub fn h() -> Option<String> {
+    if std::env::var_os(OTHER_ENV).is_some() { panic!("x"); }
+    None
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "h")], {"f.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+
+    def test_unresolvable_named_constant_is_rejected(self) -> None:
+        # `SOME_IDENT` is never declared as a `const` anywhere in the file
+        # — an identifier that cannot be resolved must fail closed, never
+        # a best-effort "assume it's fine".
+        src = """
+pub fn h() -> Option<String> {
+    if std::env::var_os(SOME_IDENT).is_some() { panic!("x"); }
+    None
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "h")], {"f.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+
+    def test_folded_conjunct_that_merely_returns_none_is_rejected(self) -> None:
+        # THE key distinction: the EXACT SAME folded conjunct condition as
+        # the accepted case above, but the taken-when-set branch merely
+        # returns `None` instead of panicking. Widening the CONDITION must
+        # never widen the required BRANCH SHAPE — an accessor that hands
+        # back "skip" instead of panicking is a rubber stamp and must
+        # still be a REGISTRY FAIL.
+        src = """
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+pub fn maybe_url(url: Option<String>) -> Option<String> {
+    if url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some() {
+        return None;
+    }
+    url
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "maybe_url")], {"f.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+        self.assertIn("maybe_url", failures[0])
+
+    # --- shared: cross-file gating (positive + anti-decoy negative) --------
+
+    def test_shared_entry_gates_a_bare_call_in_a_different_file(self) -> None:
+        caller = """
+use jammi_test_utils::pg_url_for_tests;
+#[test]
+fn t_bare() {
+    let Some(url) = pg_url_for_tests() else { return; };
+    let _ = url;
+}
+"""
+        sources = {
+            "crates/jammi-test-utils/src/lib.rs": self.DECL_SRC,
+            "crates/jammi-db/tests/it/a.rs": caller,
+        }
+        entries = [("shared:crates/jammi-test-utils/src/lib.rs", "pg_url_for_tests")]
+        verified, failures = ko.verify_helper_registry(entries, sources)
+        self.assertEqual(failures, [])
+        all_fns = [f for label, text in sources.items() for f in ko.find_fns(text, label)]
+        findings = ko.check_ko7(all_fns, verified, sources)
+        self.assertEqual(findings, [])
+
+    def test_shared_entry_gates_a_crate_qualified_call(self) -> None:
+        caller = """
+#[test]
+fn t_qual() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else { return; };
+    let _ = url;
+}
+"""
+        sources = {
+            "crates/jammi-test-utils/src/lib.rs": self.DECL_SRC,
+            "crates/jammi-db/tests/it/b.rs": caller,
+        }
+        entries = [("shared:crates/jammi-test-utils/src/lib.rs", "pg_url_for_tests")]
+        verified, failures = ko.verify_helper_registry(entries, sources)
+        self.assertEqual(failures, [])
+        all_fns = [f for label, text in sources.items() for f in ko.find_fns(text, label)]
+        findings = ko.check_ko7(all_fns, verified, sources)
+        self.assertEqual(findings, [])
+
+    def test_shared_entry_does_not_bare_gate_a_local_decoy_but_qualified_still_does(self) -> None:
+        decoy_bare = """
+fn pg_url_for_tests() -> Option<String> { None }
+#[test]
+fn t_decoy_bare() {
+    let Some(url) = pg_url_for_tests() else { return; };
+    let _ = url;
+}
+"""
+        decoy_qual = """
+fn pg_url_for_tests() -> Option<String> { None }
+#[test]
+fn t_decoy_qual() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else { return; };
+    let _ = url;
+}
+"""
+        sources = {
+            "crates/jammi-test-utils/src/lib.rs": self.DECL_SRC,
+            "crates/jammi-db/tests/it/c.rs": decoy_bare,
+            "crates/jammi-db/tests/it/d.rs": decoy_qual,
+        }
+        entries = [("shared:crates/jammi-test-utils/src/lib.rs", "pg_url_for_tests")]
+        verified, failures = ko.verify_helper_registry(entries, sources)
+        self.assertEqual(failures, [])
+        all_fns = [f for label, text in sources.items() for f in ko.find_fns(text, label)]
+        findings = ko.check_ko7(all_fns, verified, sources)
+        fn_names = {f.fn_name for f in findings}
+        self.assertIn("t_decoy_bare", fn_names)
+        self.assertNotIn("t_decoy_qual", fn_names)
+
+    def test_shared_name_registered_from_two_files_is_a_registry_fail(self) -> None:
+        decl_a = (
+            'pub fn shared_helper() -> Option<i32> { '
+            'if std::env::var_os("JAMMI_REQUIRE_X").is_some() { panic!("x"); } None }'
+        )
+        names, failures = ko.verify_helper_registry(
+            [("shared:a.rs", "shared_helper"), ("shared:b.rs", "shared_helper")],
+            {"a.rs": decl_a, "b.rs": decl_a},
+        )
+        # Each entry still verifies (and gates) its OWN declaring file...
+        self.assertIn(("a.rs", "shared_helper"), names)
+        self.assertIn(("b.rs", "shared_helper"), names)
+        # ...but neither gets the cross-file sentinel, and the conflict itself fails.
+        self.assertFalse(any(f.startswith(ko.SHARED_HELPER_PREFIX) for f, _n in names))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("shared_helper", failures[0])
+
+    # --- delegation: same-file and transitive-through-shared (positive) ----
+
+    def test_same_file_wrapper_delegates_to_a_direct_verified_helper(self) -> None:
+        src = self.DECL_SRC + """
+pub async fn make_test_session(kind: u8) -> Option<String> {
+    match kind {
+        0 => Some("sqlite".to_string()),
+        _ => {
+            let url = pg_url_for_tests()?;
+            Some(url)
+        }
+    }
+}
+"""
+        names, failures = ko.verify_helper_registry(
+            [("shared:f.rs", "pg_url_for_tests"), ("shared:f.rs", "make_test_session")],
+            {"f.rs": src},
+        )
+        self.assertEqual(failures, [])
+        self.assertIn(("f.rs", "make_test_session"), names)
+
+    def test_transitive_two_hop_delegation_through_a_shared_name(self) -> None:
+        # The real `open_backend`/`build_harness_with_in_memory_broker`
+        # shape: a PER-FILE-LOCAL wrapper with no direct env-read, that
+        # calls ANOTHER per-file-local wrapper, which itself calls the
+        # `shared:` accessor. One entry's own resolution can only complete
+        # once the OTHER entry (processed in the same pass) has already
+        # resolved — this is why delegation must reach a FIXED POINT, not
+        # stop after one hop.
+        caller_file_src = """
+async fn open_backend() -> Option<String> {
+    let url = jammi_test_utils::pg_url_for_tests()?;
+    Some(url)
+}
+async fn open_backend_wrapper() -> Option<String> {
+    let inner = open_backend().await?;
+    Some(inner)
+}
+"""
+        sources = {
+            "crates/jammi-test-utils/src/lib.rs": self.DECL_SRC,
+            "crates/jammi-db/tests/it/e.rs": caller_file_src,
+        }
+        entries = [
+            ("shared:crates/jammi-test-utils/src/lib.rs", "pg_url_for_tests"),
+            ("crates/jammi-db/tests/it/e.rs", "open_backend"),
+            ("crates/jammi-db/tests/it/e.rs", "open_backend_wrapper"),
+        ]
+        names, failures = ko.verify_helper_registry(entries, sources)
+        self.assertEqual(failures, [])
+        self.assertIn(("crates/jammi-db/tests/it/e.rs", "open_backend"), names)
+        self.assertIn(("crates/jammi-db/tests/it/e.rs", "open_backend_wrapper"), names)
+
+    def test_delegation_never_rescues_a_call_to_an_unverified_name(self) -> None:
+        # Calling some OTHER, never-registered/never-verified fn must NOT
+        # count as delegation — only a call to a name THIS registry has
+        # already verified counts. Otherwise any fn that calls any other
+        # fn would trivially "verify".
+        src = """
+fn unrelated_helper() -> Option<i32> { None }
+pub fn h() -> Option<i32> {
+    unrelated_helper()
+}
+"""
+        names, failures = ko.verify_helper_registry([("f.rs", "h")], {"f.rs": src})
+        self.assertEqual(names, set())
+        self.assertEqual(len(failures), 1)
+
+    # --- delegation soundness (lead review, post-#513) ----------------------
+
+    def test_wrapper_with_a_skip_path_that_bypasses_the_gate_is_rejected(self) -> None:
+        # "if some condition, call the gate and use it; otherwise return
+        # the skip value" — a call to the verified gate appears in the
+        # body, but ONE path (the `else` arm) returns `None` without ever
+        # reaching it. A bare "is the gate called somewhere" predicate
+        # would wrongly accept this; the tightened one must not.
+        src = self.DECL_SRC + """
+pub fn bypassing_wrapper(flag: bool) -> Option<String> {
+    if flag {
+        let url = pg_url_for_tests()?;
+        Some(url)
+    } else {
+        None
+    }
+}
+"""
+        names, failures = ko.verify_helper_registry(
+            [("shared:f.rs", "pg_url_for_tests"), ("f.rs", "bypassing_wrapper")], {"f.rs": src}
+        )
+        self.assertNotIn(("f.rs", "bypassing_wrapper"), names)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("bypassing_wrapper", failures[0])
+
+    def test_same_wrapper_with_the_bypass_removed_verifies(self) -> None:
+        # The exact same shape, minus the independent `None` path — the
+        # ONLY way this fn can return its skip value is the `?` on the
+        # verified gate.
+        src = self.DECL_SRC + """
+pub fn honest_wrapper(flag: bool) -> Option<String> {
+    if flag {
+        let url = pg_url_for_tests()?;
+        Some(url)
+    } else {
+        let url = pg_url_for_tests()?;
+        Some(url)
+    }
+}
+"""
+        names, failures = ko.verify_helper_registry(
+            [("shared:f.rs", "pg_url_for_tests"), ("f.rs", "honest_wrapper")], {"f.rs": src}
+        )
+        self.assertEqual(failures, [])
+        self.assertIn(("f.rs", "honest_wrapper"), names)
+
+    def test_delegation_call_not_followed_by_question_mark_is_rejected(self) -> None:
+        # The gate is called, but its `Option` is thrown away (`let _ =
+        # ..`) rather than propagated via `?` — the callee's own skip
+        # value can never become this fn's skip value this way, so no
+        # delegation should fire (this candidate's direct shape also
+        # fails, since it never reads the env itself).
+        src = self.DECL_SRC + """
+pub fn h() -> Option<String> {
+    let _ = pg_url_for_tests();
+    Some("ignored".to_string())
+}
+"""
+        names, failures = ko.verify_helper_registry(
+            [("shared:f.rs", "pg_url_for_tests"), ("f.rs", "h")], {"f.rs": src}
+        )
+        self.assertNotIn(("f.rs", "h"), names)
+        self.assertEqual(len(failures), 1)
+
+    def test_argument_position_none_never_counts_as_an_independent_skip(self) -> None:
+        # `open_with_options(&url, 8, None)`-shaped: a literal `None`
+        # PASSED AS AN ARGUMENT to some other call is not a return-position
+        # skip value at all — paren-depth > 0 at that `None`, so it must
+        # not block delegation.
+        src = self.DECL_SRC + """
+fn configure(a: &str, b: u8, c: Option<u8>) -> u8 { b }
+pub fn h() -> Option<String> {
+    let url = pg_url_for_tests()?;
+    let _ = configure(&url, 8, None);
+    Some(url)
+}
+"""
+        names, failures = ko.verify_helper_registry(
+            [("shared:f.rs", "pg_url_for_tests"), ("f.rs", "h")], {"f.rs": src}
+        )
+        self.assertEqual(failures, [])
+        self.assertIn(("f.rs", "h"), names)
+
+    def test_match_arm_none_pattern_never_counts_as_an_independent_skip(self) -> None:
+        # `None => ...`-shaped: a `None` MATCH-ARM PATTERN (matching on
+        # some unrelated `Option`, not producing this fn's own return
+        # value) is immediately followed by `=>`, not a terminator, so it
+        # must not block delegation either.
+        src = self.DECL_SRC + """
+pub fn h(x: Option<u8>) -> Option<String> {
+    let url = pg_url_for_tests()?;
+    let described = match x {
+        Some(v) => format!("{v}"),
+        None => "none".to_string(),
+    };
+    let _ = described;
+    Some(url)
+}
+"""
+        names, failures = ko.verify_helper_registry(
+            [("shared:f.rs", "pg_url_for_tests"), ("f.rs", "h")], {"f.rs": src}
+        )
+        self.assertEqual(failures, [])
+        self.assertIn(("f.rs", "h"), names)
 
 
 if __name__ == "__main__":

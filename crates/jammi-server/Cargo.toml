@@ -17,6 +17,8 @@ path = "src/main.rs"
 # stubs back this crate's service impls) and the candle-free proto↔domain
 # conversions the receive side consumes.
 jammi-wire.workspace = true
+# `jammi-server release`: `libc::kill(pid, SIGINT)` — the RELEASE actuator.
+libc.workspace = true
 # The embedded engine (default = `local`): the service impls run inference /
 # embeddings / fine-tune / eval in-process, and consume the engine-spec
 # converters in `jammi_ai::wire` (TrainingSpec / edge-gather / pipeline).
@@ -110,10 +112,28 @@ storage-gcs = ["jammi-db/storage-gcs"]
 storage-azure = ["jammi-db/storage-azure"]
 storage-r2 = ["jammi-db/storage-r2"]
 storage-cloud = ["jammi-db/storage-cloud"]
+# The engine's test-only rendezvous hooks (`jammi_ai::fine_tune::worker::
+# loop_test_hooks`, `jammi_ai::jobs::compute_test_hooks`, `jammi_db::catalog::
+# claim_test_hooks`, the store's materialization park), named here so CI's
+# gated-surface clippy arm can lint this crate's test closure by feature.
+# This crate's own test targets already carry it through the `[dev-
+# dependencies]` union below; the published binary never enables it, and an
+# enabled hook is inert unless a test arms it.
+test-hooks = ["jammi-ai/test-hooks"]
 
 [dev-dependencies]
 tokio.workspace = true
 jammi-test-utils.workspace = true
+# The shutdown oracles park the engine at documented rendezvous points
+# (`jammi_ai::fine_tune::worker::loop_test_hooks`, `jammi_ai::jobs::
+# compute_test_hooks`, `jammi_db::catalog::claim_test_hooks`, the mutable
+# store's materialization park). A dev-dependency with the feature unions
+# it into this crate's test builds (resolver 2 applies dev-dep features
+# whenever test targets are built), so `CARGO_BIN_EXE_jammi-server` under
+# `cargo test` is hook-enabled — inert unless armed — while the published
+# binary never carries the feature. CI lints this closure in the
+# `Clippy (gated test surfaces)` step.
+jammi-ai = { workspace = true, features = ["test-hooks"] }
 # The end-to-end client tests drive the in-process server through the real
 # client crates — `DataClient` (data verbs) and `CatalogClient` (control verbs)
 # — over a live HTTP/2 channel, proving the wire surface works against a real

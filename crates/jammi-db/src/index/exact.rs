@@ -145,10 +145,25 @@ pub async fn exact_vector_search(
         ))
         .await?;
     // The scan schema's `FixedSizeList` width is the width every row below
-    // has, by construction of the column type.
+    // has, by construction of the column type. A non-positive or
+    // unconvertible length is a corrupt column, never a width of `0` — a
+    // silent `0` would refuse every non-empty query with a confident wrong
+    // expectation ("expected 0 dimensions") instead of naming the corrupt
+    // column, and this is the one path with no index behind it, so nothing
+    // else catches it.
     let scan_width = match df.schema().field_with_unqualified_name("vector") {
         Ok(field) => match field.data_type() {
-            DataType::FixedSizeList(_, n) => usize::try_from(*n).unwrap_or(0),
+            DataType::FixedSizeList(_, n) => match usize::try_from(*n) {
+                Ok(width) if width > 0 => width,
+                _ => {
+                    return Err(JammiError::Schema {
+                        table: table_name.to_string(),
+                        column: "vector".into(),
+                        expected: "a positive FixedSizeList width".into(),
+                        actual: format!("{n}"),
+                    })
+                }
+            },
             other => {
                 return Err(JammiError::Schema {
                     table: table_name.to_string(),
@@ -167,16 +182,33 @@ pub async fn exact_vector_search(
             })
         }
     };
-    if let Some(catalog) = catalog_dimensions {
-        if catalog != scan_width {
-            return Err(JammiError::IncompatibleFormat {
-                artifact: format!("{table_name}.vector"),
-                found: format!("scan width {scan_width}"),
-                supported: format!("catalog width {catalog}"),
-            });
+    match catalog_dimensions {
+        Some(catalog) => {
+            if catalog != scan_width {
+                return Err(JammiError::IncompatibleFormat {
+                    artifact: format!("{table_name}.vector"),
+                    found: format!("scan width {scan_width}"),
+                    supported: format!("catalog width {catalog}"),
+                });
+            }
+            // The catalog record is the authority a Caller-provenance query
+            // was already checked against at construction (`QueryBuilder::
+            // new`'s `expected_width`), before this call was ever reached —
+            // downstream of that entry, so a disagreement against the scan's
+            // own width (just proven equal to the catalog's) is this table's
+            // data drifting from its schema, never the caller's.
+            query.require_width(scan_width, table_name.to_string())?;
+        }
+        None => {
+            // No catalog width is on record for this table, so nothing has
+            // checked this query before it reached here: the scan's own
+            // width is the ONLY authority this call has, exactly like the
+            // placement entry's `require_authority_width` when the catalog
+            // has no recorded width. A genuine caller mistake here is still
+            // the caller's fault.
+            query.require_authority_width(scan_width)?;
         }
     }
-    query.require_width(scan_width)?;
     // `execute_stream` yields a single merged stream over all partitions. The
     // `(dist, _row_id)` total order makes the partition layout irrelevant — the
     // retained set is identical regardless of how the scan is partitioned — so

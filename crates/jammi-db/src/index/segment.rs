@@ -148,8 +148,12 @@ pub fn search_unit(
     exact: &ExactLookup<'_>,
 ) -> Result<Vec<(String, f32)>> {
     // The index enforces the width itself inside `search`; checked here too
-    // so the `width == 0` early return cannot skip it.
-    query.require_width(index.dimensions())?;
+    // so the `width == 0` early return cannot skip it. Downstream of the
+    // entry (`validate_query`'s own check, or the placement entry's
+    // `require_authority_width`), so a mismatch against this segment's OWN
+    // declared width is that segment's drift, never the caller's —
+    // `require_width` cannot express otherwise.
+    query.require_width(index.dimensions(), format!("segment {}", segment.0))?;
     if width == 0 {
         return Ok(Vec::new());
     }
@@ -237,9 +241,12 @@ pub fn rescore(
                  companion (corrupted or torn sidecar bundle)"
             ))
         })?;
-        // The stored vector is the authority on width here (this kernel may
+        // The stored vector is the artifact on width here (this kernel may
         // be reached with no index in hand): typed, before `cosine_distance`.
-        query.require_width(vector.len())?;
+        // Downstream of the entry, same reasoning as `search_unit` above — a
+        // disagreement is this row's own exact-vector companion drifting,
+        // never the caller's.
+        query.require_width(vector.len(), format!("segment {}.exact", segment.0))?;
         let distance = cosine_distance(query, &vector);
         rescored.push((row_id, distance));
     }
@@ -1154,8 +1161,13 @@ mod tests {
                 )
                 .unwrap_err();
                 let text = err.to_string();
+                // `search_unit` is reached only downstream of an entry (its
+                // own doc comment, above): a width disagreement here is the
+                // SEGMENT's own drift, never the caller's, regardless of the
+                // query's `QuerySource` — so `IncompatibleFormat`, not
+                // `Schema`, even for this `Caller`-provenance unit query.
                 assert!(
-                    matches!(err, JammiError::Schema { .. })
+                    matches!(err, JammiError::IncompatibleFormat { .. })
                         && text.contains("8 dimensions")
                         && text.contains(&format!("{width} dimensions")),
                     "{precision:?} width {width}: {text}"

@@ -49,6 +49,12 @@ pub fn retrieve_then_rescore(
                  (corrupted or torn sidecar bundle)"
             ))
         })?;
+        // Only safe today by the implicit ordering that `index.search` above
+        // already ran a width check against the SAME index `exact` was read
+        // from — not by any guard at this call. Checked explicitly so that
+        // ordering is never the only thing standing between this call and the
+        // kernel's own `assert!`.
+        query.require_width(exact.len(), format!("row '{row_id}'"))?;
         let distance = jammi_numerics::distance::cosine_distance(&query, &exact);
         rescored.push((row_id, distance));
     }

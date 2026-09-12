@@ -1245,12 +1245,17 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
 // answers FAILED_PRECONDITION (own-data — a segment whose width has drifted
 // from the table's recorded `dimensions`), the ladder exhausts (one owner,
 // no retry candidate) and COMPLETES at rung 3 (a generous budget), where a
-// local load reproduces the SAME provenance-aware width refusal the
-// coordinator's local kernels apply everywhere else: `Stored` names the
-// table (`Internal`); `Caller` blames the query (`InvalidArgument`). Pins
-// both arms of F2's remedy with zero provenance threading through the
-// terminal `caller_fault` arm — the class arrives via the ladder, not the
-// terminal path.
+// local load meets the same drifted segment directly.
+//
+// Whose-fault a DOWNSTREAM artifact check assigns does not depend on the
+// query's own `QuerySource`: this query already matched an artifact of the
+// table (the local, undrifted segment 0) before the rung-3 local-load width
+// check meets the drifted segment 1, so the failure is provably segment 1's
+// own drift. `Stored` AND `Caller` both get `IncompatibleFormat` / `Internal`,
+// named by the drifted segment — never `InvalidArgument`, and never decided
+// by the query's provenance. Pins both arms of the whose-fault fix with zero
+// provenance threading through the terminal `caller_fault` arm — the class
+// arrives via the ladder, not the terminal path.
 // ---------------------------------------------------------------------------
 
 /// A one-segment [`SidecarIndex`] built at `width` dimensions — plants a
@@ -1333,7 +1338,9 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
 
     // --- Stored provenance: the query was READ BACK from storage (the same
     //     provenance `InferenceSession::search_by_id` builds), so a fault is
-    //     a corrupt artifact named by the table — `Internal`.
+    //     a corrupt artifact — `Internal`, named by the segment whose width
+    //     actually drifted (never the query's own table: the query already
+    //     matched a DIFFERENT artifact of this same table first).
     let served_before = served(&b, "SegmentSearch");
     let counters_before = snapshot(&store);
     let stored_query = validate_query(
@@ -1353,8 +1360,8 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     match &err {
         JammiError::IncompatibleFormat { artifact, .. } => {
             assert!(
-                artifact.contains(&record.table_name),
-                "names the table: {artifact}"
+                artifact.contains('1'),
+                "names the drifted segment: {artifact}"
             )
         }
         other => panic!("expected IncompatibleFormat (Stored provenance), got {other:?}"),
@@ -1378,12 +1385,18 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
         "never terminal"
     );
 
-    // --- Caller-provenance twin, the SAME drifted table: the SAME
-    //     mechanism (the local rung-3 width check) classifies a caller's
-    //     own query `InvalidArgument` — the class is decided by provenance
-    //     at the point of failure, with zero threading through the
-    //     terminal `caller_fault` arm.
+    // --- Caller-provenance twin, the SAME drifted table: whose-fault an
+    //     artifact-width check assigns is decided by WHERE it runs, never by
+    //     the query's own provenance. This query already matched the local
+    //     segment (segment 0, 4-wide) before the rung-3 local-load width
+    //     check meets the drifted segment 1 — so by the time that check
+    //     fails, the query has provably matched an artifact of this table
+    //     already, and the failure is segment 1's own drift, exactly like
+    //     the Stored-provenance case above. `require_width` does not read
+    //     `self.source()` at all, so a `Caller`-provenance query gets the
+    //     SAME `IncompatibleFormat` / `Internal` class, not `InvalidArgument`.
     let served_before = served(&b, "SegmentSearch");
+    let counters_before = snapshot(&store);
     let caller_query = vq(&[1.0, 0.0, 0.0, 0.0]);
     let err = placed
         .search_final_placed(&caller_query, 3, 4)
@@ -1391,12 +1404,28 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
         .expect_err(
             "a caller query fanned out to a width-drifted owner must ladder to a named refusal",
         );
-    assert!(
-        matches!(&err, JammiError::Schema { column, .. } if column == "query"),
-        "{err:?}"
-    );
-    assert_eq!(map_engine_error(err).code(), Code::InvalidArgument);
+    match &err {
+        JammiError::IncompatibleFormat { artifact, .. } => {
+            assert!(
+                artifact.contains('1'),
+                "names the drifted segment: {artifact}"
+            )
+        }
+        other => panic!("expected IncompatibleFormat (Caller provenance too), got {other:?}"),
+    }
+    assert_eq!(map_engine_error(err).code(), Code::Internal);
     assert!(served(&b, "SegmentSearch") > served_before);
+    let counters_after = snapshot(&store);
+    assert_eq!(
+        delta(&counters_before, &counters_after, "refused"),
+        1,
+        "the owner's FAILED_PRECONDITION ladders as Refused, not terminal"
+    );
+    assert_eq!(
+        delta(&counters_before, &counters_after, "caller_fault"),
+        0,
+        "never terminal — and never reached, since this is not the caller's fault"
+    );
 
     table.abort().await.unwrap();
     a.close().await;

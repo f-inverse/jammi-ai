@@ -854,9 +854,12 @@ impl VectorIndex for SidecarIndex {
     }
 
     fn search(&self, query: &ValidatedQuery, k: usize) -> Result<Vec<(String, f32)>> {
-        // The index is the authority on width: a `ValidatedQuery` validated
+        // The index is an artifact on width: a `ValidatedQuery` validated
         // with no width in hand meets it here, typed, before any kernel.
-        query.require_width(self.dimensions)?;
+        // Downstream of the entry (redundant with `search_unit`'s own check
+        // when reached through it, and still safe standalone), so a
+        // disagreement is this index's own drift, never the caller's.
+        query.require_width(self.dimensions, "sidecar index")?;
         let query: &[f32] = query;
         if self.row_map.is_empty() {
             return Ok(Vec::new());

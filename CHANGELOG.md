@@ -20,11 +20,23 @@ workspace ships every publishable crate at the same
   `jammi_numerics::distance::{cosine_distance, cosine_similarity}`,
   `jammi_db::index::VectorIndex::search`,
   `jammi_db::index::segment::{search_unit, rescore}`,
-  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`, and
-  `jammi_db::index::exact::exact_vector_search` accept for a query vector.
+  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`,
+  `jammi_db::index::exact::exact_vector_search`,
+  `jammi_db::index::placed::PlacedIndex::search_final_placed`,
+  `jammi_db::store::ResultStore::{search_vectors, search_vectors_local}`,
+  `jammi_ai::operator::ann_search_exec::AnnSearchExec::new` (and its
+  `query_vector` field), and `jammi_ai::pipeline::neighbor_graph::Node`'s
+  `vector` field accept for a query vector.
+  `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
+  **removed** with no replacement — its check is now
+  `ValidatedQuery::require_width` / `require_authority_width`, methods on
+  the type itself.
   Construct one with `jammi_db::index::validate_query(values, expected_width,
-  source)` (re-exported from `jammi_numerics::query`), where `source` is a
-  `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  source)` (re-exported from `jammi_numerics::query`, along with the new
+  `jammi_numerics::query::QueryValidationError` error type), where `source`
+  is a `jammi_db::index::QuerySource::{Caller, Stored { table }}`. Its
+  inherent methods are `as_slice`, `into_inner`, `source`, and the two width
+  checks below.
   `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
   parameter — a cross-check against the scan's own width; pass `None` when
   there is none on record. `jammi_db::index::peer::{SegmentSearchRequest,
@@ -40,6 +52,20 @@ workspace ships every publishable crate at the same
   `ResultTableRecord` field-by-field from outside this crate uses
   `ResultTableRecord::from_wire_projection`, the crate's sole cross-crate
   constructor.
+- **`jammi_wire::peer::{phase_from_proto, precision_from_proto}` return a
+  `ProtoEnumDecode<T>`, not an `Option<T>` (#482).** The wire's explicit
+  "not set" and a raw value this build's generated `enum` has no variant for
+  are no longer collapsed into one `None`; call the new `.known() ->
+  Option<T>` for the old behaviour.
+- **A downstream width check never attributes to the caller, regardless of
+  the query's own provenance (#482).** `ValidatedQuery::require_width` now
+  takes an `artifact: impl Into<String>` and does not read the query's
+  `QuerySource` at all — every call downstream of an entry (an index's
+  declared dimensions, a scan's width, a stored vector's own length) is
+  engine-fault by construction. The one entry that still attributes by the
+  query's own provenance (the placement entry's all-remote shape) uses the
+  new `ValidatedQuery::require_authority_width`, the old `require_width`
+  behaviour under a name that says why it is different.
 
 ### Added
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,

@@ -181,7 +181,8 @@ impl NeighborGraphStrategy for Exact {
             .nodes
             .iter()
             .map(|other| {
-                node.vector.require_width(other.vector.len())?;
+                node.vector
+                    .require_width(other.vector.len(), format!("node '{}'", other.row_id))?;
                 Ok::<_, JammiError>((
                     other.row_id.clone(),
                     jammi_numerics::distance::cosine_distance(&node.vector, &other.vector),

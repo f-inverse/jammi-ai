@@ -145,28 +145,61 @@ across the published surface, which is what the terminal-0.x bar requires.
 
 ## Published-crate Rust APIs
 
-`jammi-db` and `jammi-numerics` are published Rust crates: their public items
-(types, functions, trait signatures, struct field visibility) are a real
-compile-time surface for any consumer outside this workspace, distinct from
-the three CI-enforced surfaces above. This surface carries **no CI freeze
-guard** — there is no descriptor to decode or conformance set to pin a bare
-Rust signature against — so a breaking change here is caught only by review,
-and is recorded as a **BREAKING** entry in the CHANGELOG the same way every
-other breaking change in this workspace is, naming the item, what changed,
-and what the caller does instead.
+Eleven workspace crates lack `publish = false` and are therefore published
+Rust crates: `jammi-admin`, `jammi-ai`, `jammi-cli`, `jammi-client`,
+`jammi-db`, `jammi-encoders`, `jammi-kernels`, `jammi-lora`, `jammi-numerics`,
+`jammi-server`, and `jammi-wire`. Their public items (types, functions, trait
+signatures, struct field visibility) are a real compile-time surface for any
+consumer outside this workspace, distinct from the three CI-enforced surfaces
+above. This surface carries **no CI freeze guard** — there is no descriptor to
+decode or conformance set to pin a bare Rust signature against — so a breaking
+change here is caught only by review, and is recorded as a **BREAKING** entry
+in the CHANGELOG the same way every other breaking change in this workspace
+is, naming the item, what changed, and what the caller does instead.
 
-Two such changes are current state as of this release:
+**Deriving this section.** Do not hand-maintain this list from memory — a
+prior round of this same section missed at least seven breaking changes,
+including a `pub fn` removed with no entry anywhere, and its own scope
+sentence named 2 of these 11 crates. Enumerate every public item whose
+signature, visibility, or existence changed across the range instead:
+
+```
+git diff --name-only <base> <head> | grep '^crates/.*/src/.*\.rs$'
+# for each changed file, diff its `pub fn|struct|enum|trait|type|const|
+# static|use` items between <base> and <head> — a struct/enum/trait's full
+# brace-balanced body, a fn/const/static/type/use's signature up to its
+# body or `;` — and treat a normalized-text change as added-old +
+# added-new (catches a removal with no replacement, not just a same-line
+# diff hunk). Cross-check the crate list above against every
+# `crates/*/Cargo.toml` lacking `publish = false`.
+```
+
+Six commits are current state as of this release (the range this section has
+covered started as three, was five, and is six as of this round's own
+whose-fault fix — state the true count rather than repeating a stale one):
 
 - **The vector-search API takes a validated query type, not a bare slice.**
   `jammi_numerics::query::ValidatedQuery` is the only type
   `jammi_numerics::distance::{cosine_distance, cosine_similarity}`,
   `jammi_db::index::VectorIndex::search`,
   `jammi_db::index::segment::{search_unit, rescore}`,
-  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`, and
-  `jammi_db::index::exact::exact_vector_search` accept for a query vector.
-  Construct one with `jammi_db::index::validate_query(values, expected_width,
-  source)` (re-exported from `jammi_numerics::query`), where `source` is a
-  `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`,
+  `jammi_db::index::exact::exact_vector_search`,
+  `jammi_db::index::placed::PlacedIndex::search_final_placed`,
+  `jammi_db::store::ResultStore::{search_vectors, search_vectors_local}`,
+  `jammi_ai::operator::ann_search_exec::AnnSearchExec::new` (and its
+  `query_vector` field), and `jammi_ai::pipeline::neighbor_graph::Node`'s
+  `vector` field accept for a query vector.
+  `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is
+  **removed** with no replacement — its check is now
+  `ValidatedQuery::require_width`/`require_authority_width`, methods on the
+  type itself, not a function a caller could import.
+  Construct a `ValidatedQuery` with `jammi_db::index::validate_query(values,
+  expected_width, source)` (re-exported from `jammi_numerics::query`, along
+  with the new `jammi_numerics::query::QueryValidationError` error type),
+  where `source` is a `jammi_db::index::QuerySource::{Caller, Stored {
+  table }}`. Its inherent methods are `as_slice`, `into_inner`, `source`, and
+  the two width checks below.
   `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
   parameter (a cross-check against the scan's own width; `None` when there is
   none on record). `jammi_db::index::peer::{SegmentSearchRequest,
@@ -182,6 +215,23 @@ Two such changes are current state as of this release:
   `ResultTableRecord` field-by-field from outside this crate now goes through
   `ResultTableRecord::from_wire_projection`, the crate's sole cross-crate
   constructor.
+- **`jammi_wire::peer::{phase_from_proto, precision_from_proto}` return a
+  `ProtoEnumDecode<T>`, not an `Option<T>`.** The wire's explicit "not set"
+  (`ProtoEnumDecode::Unspecified`) and a raw value this build's generated
+  `enum` has no variant for (`ProtoEnumDecode::Unknown`) are no longer
+  collapsed into one `None` — a caller that only needs "did this decode"
+  calls the new `.known() -> Option<T>` to get the old behaviour back.
+- **Whose-fault a downstream width check assigns no longer depends on the
+  query's own provenance.** `ValidatedQuery::require_width` now takes an
+  `artifact: impl Into<String>` and never reads the query's own
+  `QuerySource` — a mismatch it finds is always attributed to the named
+  artifact, never the caller, because by the time a query reaches any
+  consumer an entry has already checked it once. The one call site that
+  still attributes by the query's own provenance (the placement entry's
+  all-remote shape, checking a query with no width in hand against the
+  catalog's recorded width) uses the new `ValidatedQuery::require_authority_width`
+  instead, which keeps the OLD `require_width` behaviour under a name that
+  says why it is different.
 
 ## Enforcement: the freeze-guard
 

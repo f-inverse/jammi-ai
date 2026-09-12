@@ -227,11 +227,15 @@ async fn naive_collect_all_search(
     }
 
     let query = validate_query(query.to_vec(), None, QuerySource::Caller)?;
-    let mut scored: Vec<(String, f32)> = row_ids
-        .into_iter()
-        .zip(vectors.iter())
-        .map(|(id, v)| (id, cosine_distance(&query, v)))
-        .collect();
+    // The kernel's own `assert!` is not a guard a caller can rely on: this
+    // harness reaches `cosine_distance` directly, with nothing else in the
+    // path enforcing that the scanned width matches the query — checked here,
+    // typed, so a misconfigured bench run is a refusal, never a panic.
+    let mut scored: Vec<(String, f32)> = Vec::with_capacity(vectors.len());
+    for (id, v) in row_ids.into_iter().zip(vectors.iter()) {
+        query.require_width(v.len(), format!("{table_name}.vector"))?;
+        scored.push((id, cosine_distance(&query, v)));
+    }
     scored.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
             .unwrap_or(std::cmp::Ordering::Equal)

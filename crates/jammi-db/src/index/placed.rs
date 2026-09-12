@@ -316,12 +316,14 @@ impl PlacedIndex {
         // below runs first), but an all-remote placement has no index in hand
         // and `index_segments` records no width — so the catalog's
         // `dimensions` is the only width on record. With it, the query is
-        // enforced against it here; without it, the search is refused rather
+        // enforced against it here — the ONE call site that still attributes
+        // by the query's own provenance, because nothing downstream of it
+        // has been consulted yet; without it, the search is refused rather
         // than fanned out unguarded (a caller fault must never reach an
         // owner, let alone the ladder).
         if local.is_empty() {
             match self.dimensions {
-                Some(width) => query.require_width(width.get())?,
+                Some(width) => query.require_authority_width(width.get())?,
                 None => {
                     return Err(JammiError::Schema {
                         table: self.table_name.clone(),

@@ -95,16 +95,21 @@
 //!    surface rather than one crate's `src/pipeline/` directory, and (round
 //!    8, D3) bound to its enclosing function rather than to the file as a
 //!    whole.
-//! 4. [`self_fetched_record_version_hits`] (round 8, D1) — a function that
-//!    does NOT take a [`jammi_db::catalog::result_repo::ResultTableRecord`]
-//!    as a parameter (pattern 2's precondition) but instead resolves one
-//!    itself in its own body via the catalog idiom `.get_result_table(` and
-//!    then reads the `.current_version` FIELD off the record it just
-//!    fetched — the parameter shape and the self-fetch shape partition the
-//!    surface between patterns 2 and 4 rather than overlapping it. This is
-//!    pattern 2's own precondition inverted, closing exactly the gap the
-//!    round-7 audit measured: all three of the original detectors return
-//!    empty on this shape.
+//! 4. [`self_fetched_record_version_hits`] (round 8, D1; widened round 9,
+//!    M4) — a function that does NOT take a
+//!    [`jammi_db::catalog::result_repo::ResultTableRecord`] as a parameter
+//!    (pattern 2's precondition) but reads the `.current_version` FIELD off
+//!    a record it holds by some OTHER means — the parameter shape and the
+//!    self-fetch shape partition the surface between patterns 2 and 4 rather
+//!    than overlapping it. This is pattern 2's own precondition inverted,
+//!    closing the gap the round-7 audit measured: all three of the original
+//!    detectors return empty on this shape. Round 8 additionally required
+//!    the literal `.get_result_table(` idiom in the same body; round 9
+//!    dropped that conjunct (measured cost: five more allowlist entries, not
+//!    hundreds — see [`self_fetched_record_version_hits`]'s own doc) because
+//!    it let three other named evasions through untouched. Destructuring a
+//!    `ResultTableRecord` into a bare `current_version` local remains
+//!    disclosed, not covered — see that same doc for why.
 //!
 //! **What this file does NOT claim.** It is source-text pattern matching
 //! over a hand-written (but string/char/comment-literal-aware — see
@@ -151,7 +156,35 @@
 //! longer produces that hit (the code was fixed or removed) is ALSO RED
 //! (`allowlists_match_current_hits_exactly`, below) — an allowance is never
 //! permanent slack a later, different site can spend.
+//!
+//! **Round 9 — the allowlist's own prose was the same failure, moved.**
+//! Deleting the hand-written sweep (round 7) did not eliminate unverified
+//! human claims; every allowlist entry below still clears its site with a
+//! hand-written justification, and three of those justifications named a
+//! CALLER SET in prose — an enumeration, not a dataflow property, and
+//! therefore exactly as derivable as everything else this file checks. Two
+//! were false: `producing_descriptor`'s declared set omitted a real caller
+//! (`compact_embeddings`), and `refreshable_record`'s omitted TWO — the
+//! destructive ones, `compact_embeddings` (publishes a new version) and
+//! `expire_versions` (permanently reaps old ones). Both are now DATA
+//! (`PRODUCING_DESCRIPTOR_CALLERS`, `REFRESHABLE_RECORD_CALLERS`, below —
+//! see [`callers_of`]'s doc), checked by `caller_set_claims_match_reality`
+//! against the real surface; a claim that cannot be expressed as a caller
+//! set (what a caller DOES with the value, rather than who the caller is)
+//! stays prose. One allowlisted entry's MECHANISM claim was also false, not
+//! just its caller set — `refreshable_record`'s entry cleared itself by
+//! asserting every later pairing comes from a fresh re-fetch, when the
+//! function it named (`ensure_base_version`) documents, in its OWN entry,
+//! that its dominant arm returns the same record unchanged; both entries are
+//! corrected together. One negative control asserted that the exact escape
+//! shape pattern 4 exists to catch (self-fetch, then resolve the version
+//! identity as a plain string) must never be flagged merely because it
+//! delegates to a named, reviewed helper — clearance by a callee's name is
+//! the same failure this file's own module doc disowns for a return TYPE's
+//! name; it is corrected to make the delegate's caller set the thing that is
+//! actually checked, rather than asserting the shape itself is safe.
 
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -666,18 +699,49 @@ fn reads_current_version_field(body: &str) -> bool {
     false
 }
 
-/// Pattern 4 (round 8, D1) — the escape the round-7 audit measured: a
-/// function that does NOT take a bare `ResultTableRecord` as a parameter
-/// (pattern 2's own precondition, excluded here via `!region.params.contains(
-/// "ResultTableRecord")` so patterns 2 and 4 partition the surface instead
-/// of double-flagging the same site under two different names) but instead
-/// resolves one itself, in its own body, via the catalog idiom
-/// `.get_result_table(` — the prevailing in-tree idiom, not this crate's
-/// only one, but the one every known instance of this shape uses — and then
-/// reads the resolved record's `.current_version` FIELD (see
-/// [`reads_current_version_field`]'s doc for why this must be a field match,
-/// not a substring one). See this file's module doc for why patterns 1–3
-/// alone cannot see this shape.
+/// Pattern 4 (round 8, D1; widened round 9, M4) — the escape the round-7
+/// audit measured: a function that does NOT take a bare `ResultTableRecord`
+/// as a parameter (pattern 2's own precondition, excluded here via
+/// `!region.params.contains("ResultTableRecord")` so patterns 2 and 4
+/// partition the surface instead of double-flagging the same site under two
+/// different names) but reads a self-obtained record's `.current_version`
+/// FIELD (see [`reads_current_version_field`]'s doc for why this must be a
+/// field match, not a substring one).
+///
+/// **Round 9, M4:** round 8 additionally required the literal idiom
+/// `.get_result_table(` to appear in the same function's body. The round-9
+/// audit measured that conjunct's cost directly (`p4_no_idiom` in its
+/// harness) rather than arguing it: dropping it raises the real-surface hit
+/// count from 1 to 6 — five more allowlist entries, not hundreds — and the
+/// conjunct was never load-bearing against false positives, only against
+/// coverage. It was a narrowing that let three of the module doc's own
+/// named evasions through: a record resolved through ANY OTHER catalog
+/// method (`probe_cache_record`, `exact_match_candidates`), the SAME method
+/// called in fully-qualified/UFCS form (`ResultRepo::get_result_table(...)`,
+/// which never spells `.get_result_table(`), and a parameter typed through a
+/// local alias of `ResultTableRecord` (which fails pattern 2's own
+/// parameter-text precondition and, before this fix, ALSO failed pattern 4's
+/// idiom precondition since such a function never self-fetches at all — it
+/// already holds the record, just not under the literal type name pattern 2
+/// looks for). All three are closed by dropping the conjunct: none of them
+/// require the self-fetch idiom, they only require a `.current_version`
+/// FIELD read outside a function whose parameter TEXT names
+/// `ResultTableRecord`. A fourth named evasion, destructuring
+/// (`let ResultTableRecord { current_version, .. } = record;`, binding the
+/// field to a bare local identifier with no `.current_version` text at all),
+/// remains genuinely uncovered by this or any other conjunct here — see the
+/// module doc's disclosure list; a text-only check cannot distinguish that
+/// shape from an ordinary struct-literal field-init shorthand
+/// (`ResultTableRecord { current_version, .. other }`) without becoming a
+/// parser, so per R-A it stays disclosed rather than "fixed" by a check that
+/// would also flag unrelated row-construction code (checked: relaxing the
+/// field match to a bare, both-sides-bounded `current_version` identifier —
+/// dropping the leading-dot requirement — pulls in
+/// `catalog/result_repo.rs`'s `from_wire_projection`/`parse_row`/
+/// `read_cas_target`, three row-PARSING functions that construct a
+/// `ResultTableRecord` rather than branch on an already-resolved one; that
+/// is the "hundreds" scale this same measurement warns against, not the
+/// "five" the idiom-conjunct removal costs).
 fn self_fetched_record_version_hits(surface: &[(String, String)]) -> Vec<Hit> {
     let mut hits = Vec::new();
     for (file, text) in surface {
@@ -687,7 +751,7 @@ fn self_fetched_record_version_hits(surface: &[(String, String)]) -> Vec<Hit> {
                 continue;
             }
             if let Some(body) = &region.body {
-                if body.contains(".get_result_table(") && reads_current_version_field(body) {
+                if reads_current_version_field(body) {
                     hits.push(Hit {
                         file: file.clone(),
                         name: region.name,
@@ -732,11 +796,21 @@ fn self_fetched_record_version_hits(surface: &[(String, String)]) -> Vec<Hit> {
 /// so a hit inside a nested function is never double-counted against its
 /// enclosing one too. A hit whose line falls inside no region at all (a
 /// module-level literal, which does not occur on today's surface) is bound
-/// to the sentinel site `"<module-scope>"`, which no `ALLOWED` entry ever
-/// names, so it fails loudly rather than being silently mis-attributed.
+/// to the sentinel site `"<module-scope>"` at line 0 (no real function
+/// starts at line 0), which no `ALLOWED` entry ever names, so it fails
+/// loudly rather than being silently mis-attributed.
+///
+/// **Round 9, M4:** the key is `(file, function name, function's own start
+/// LINE)`, not `(file, function name)` — a same-named sibling in the same
+/// file (a trait method and an inherent method both called `read_vectors`,
+/// say) used to collide under the two-element key and have their counts
+/// summed into one allowance, exactly the per-file fungibility round 8
+/// closed for this same check one granularity higher (the surface carries
+/// 109 colliding `(file, name)` pairs today). A declaration LINE is unique
+/// per function within a file, so this key cannot collide.
 fn session_registration_literal_sites(
     surface: &[(String, String)],
-) -> std::collections::HashMap<(String, String), usize> {
+) -> std::collections::HashMap<(String, String, usize), usize> {
     let mut counts = std::collections::HashMap::new();
     for (file, text) in surface {
         let masked = mask_non_code(text);
@@ -763,26 +837,206 @@ fn session_registration_literal_sites(
                     }
                 }
             }
-            let site = best
-                .map(|r| r.name.clone())
-                .unwrap_or_else(|| "<module-scope>".to_string());
-            *counts.entry((file.clone(), site)).or_insert(0) += hits;
+            let (site, site_line) = best
+                .map(|r| (r.name.clone(), r.line))
+                .unwrap_or_else(|| ("<module-scope>".to_string(), 0));
+            *counts.entry((file.clone(), site, site_line)).or_insert(0) += hits;
         }
     }
     counts
+}
+
+// ── Caller-set claims, machine-checked (round 9, M1). ───────────────────────
+//
+// Several allowlist entries below clear their site by naming who calls it —
+// "its one in-tree caller is", "its only in-tree callers are", "every
+// caller is" — and R-H holds that a caller SET is an enumeration over
+// source text, not a dataflow property, so it is derivable exactly the way
+// [`session_registration_literal_sites`] already derives a hit's enclosing
+// function: attribute every `.method(` call site to its innermost
+// containing region. What a caller DOES with the value it gets (whether it
+// persists it, discards it, or pairs it with something else) is NOT
+// enumerable this way and stays prose in the entry itself, per R-A.
+
+/// The `(file, enclosing function name)` sites whose masked body contains a
+/// call `.method(` — an ENUMERATION, not a dataflow analysis: it names every
+/// function that calls `method` this way, nothing about what that function
+/// does with the result. Deliberately does NOT exclude a hit whose
+/// enclosing function shares `method`'s own name: a forwarding wrapper
+/// (`JammiSession::read_vectors` calling `self.inner.read_vectors(...)`) is
+/// a REAL caller, and an early draft of this check that skipped "the
+/// enclosing function's name equals the callee's name" as a guard against
+/// spurious recursive self-matches hid exactly that forwarding call —
+/// checked directly: without the guard, `callers_of(surface,
+/// "read_vectors")` finds both `LocalSession::read_vectors` and
+/// `JammiSession::read_vectors`; a version of this function carrying that
+/// guard (the one the round-9 audit's own probe harness used) finds
+/// neither.
+fn callers_of(surface: &[(String, String)], method: &str) -> BTreeSet<(String, String)> {
+    let needle = format!(".{method}(");
+    let mut out = BTreeSet::new();
+    for (file, text) in surface {
+        let masked = mask_non_code(text);
+        let regions = find_fn_regions(&masked);
+        for (line_idx, line) in masked.lines().enumerate() {
+            let line_no = line_idx + 1;
+            if !line.contains(&needle) {
+                continue;
+            }
+            let mut best: Option<&FnRegion> = None;
+            for region in &regions {
+                if region.line <= line_no && line_no <= region.end_line {
+                    let is_smaller = match best {
+                        None => true,
+                        Some(b) => (region.end_line - region.line) < (b.end_line - b.line),
+                    };
+                    if is_smaller {
+                        best = Some(region);
+                    }
+                }
+            }
+            let site = best
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "<module-scope>".to_string());
+            out.insert((file.clone(), site));
+        }
+    }
+    out
+}
+
+/// `ANCHOR_RETURN_ALLOWED`'s `current_anchor` entry's caller-set claim, as
+/// DATA: re-derived at round 9 and found to still match (`staleness`, same
+/// file, is the only in-tree caller of `.current_anchor(`).
+const CURRENT_ANCHOR_CALLERS: &[(&str, &str)] =
+    &[("crates/jammi-db/src/store/freshness.rs", "staleness")];
+
+/// `RECORD_VERSION_BRANCH_ALLOWED`'s `producing_descriptor` entry's caller-
+/// set claim, as DATA. Round 9 correction: the round-8 entry named only
+/// `refresh_embeddings` and `recompute_one`; `compact_embeddings` calls
+/// `.producing_descriptor(` too (`embedding_refresh.rs:1024`) and was
+/// omitted.
+const PRODUCING_DESCRIPTOR_CALLERS: &[(&str, &str)] = &[
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "compact_embeddings",
+    ),
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "refresh_embeddings",
+    ),
+    ("crates/jammi-ai/src/pipeline/recompute.rs", "recompute_one"),
+];
+
+/// `SELF_FETCHED_RECORD_ALLOWED`'s `refreshable_record` entry's caller-set
+/// claim, as DATA. Round 9 correction: the round-8 entry named only
+/// `refresh_embeddings`, its "one in-tree caller". It has THREE:
+/// `compact_embeddings` and `expire_versions` were omitted — the destructive
+/// ones (see that entry's review for what each actually does with the
+/// value).
+const REFRESHABLE_RECORD_CALLERS: &[(&str, &str)] = &[
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "compact_embeddings",
+    ),
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "expire_versions",
+    ),
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "refresh_embeddings",
+    ),
+];
+
+/// `RECORD_VERSION_BRANCH_ALLOWED`'s `current_version_provider` entry's
+/// caller-set claim, as DATA: re-derived at round 9 and found to still
+/// match (`pinned_provider`'s unversioned arm is its only in-tree caller).
+const CURRENT_VERSION_PROVIDER_CALLERS: &[(&str, &str)] =
+    &[("crates/jammi-db/src/store/mod.rs", "pinned_provider")];
+
+/// `RECORD_VERSION_BRANCH_ALLOWED`'s `current_version_identity` entry's
+/// caller-set claim, as DATA (round 9, M3 — this entry previously pointed
+/// at `current_anchor`'s own prose residual rather than naming its own
+/// callers; it has TWO, both already-reviewed non-persisting reads):
+/// `current_anchor` (`ANCHOR_RETURN_ALLOWED`'s entry) and
+/// `verify_materialization` (`RECORD_VERSION_BRANCH_ALLOWED`'s own entry,
+/// "never persists a new anchor"). Pinning this set is what actually
+/// protects the delegation shape `falsification_self_fetched_record_version_ignores_reviewed_delegation_and_parameterized_shapes`
+/// exercises: a THIRD caller appearing here — such as a hypothetical
+/// producer that self-fetches a record and returns
+/// `current_version_identity`'s value as a plain string, pattern 4's own
+/// disclosed cross-function blind spot — turns `caller_set_claims_match_reality`
+/// red the moment it is added, even though pattern 4 itself cannot see it.
+const CURRENT_VERSION_IDENTITY_CALLERS: &[(&str, &str)] = &[
+    ("crates/jammi-db/src/store/freshness.rs", "current_anchor"),
+    ("crates/jammi-db/src/store/mod.rs", "verify_materialization"),
+];
+
+/// `RECORD_VERSION_BRANCH_ALLOWED`'s `read_vectors` entry's caller-set
+/// claim, as DATA: re-derived at round 9 and found to still match — its
+/// only two in-tree callers are the forwarding wrappers of the same name in
+/// `jammi-ai` (`LocalSession::read_vectors`, `JammiSession::read_vectors`),
+/// each a one-line delegate to this function, never a provenance-persisting
+/// producer.
+const READ_VECTORS_CALLERS: &[(&str, &str)] = &[
+    ("crates/jammi-ai/src/local_session.rs", "read_vectors"),
+    ("crates/jammi-ai/src/session.rs", "read_vectors"),
+];
+
+#[test]
+fn caller_set_claims_match_reality() {
+    let surface = scan_surface();
+    let checks: &[(&str, &[(&str, &str)])] = &[
+        ("current_anchor", CURRENT_ANCHOR_CALLERS),
+        ("producing_descriptor", PRODUCING_DESCRIPTOR_CALLERS),
+        ("refreshable_record", REFRESHABLE_RECORD_CALLERS),
+        ("current_version_provider", CURRENT_VERSION_PROVIDER_CALLERS),
+        ("current_version_identity", CURRENT_VERSION_IDENTITY_CALLERS),
+        ("read_vectors", READ_VECTORS_CALLERS),
+    ];
+    for (method, declared) in checks {
+        let real = callers_of(&surface, method);
+        let declared_set: BTreeSet<(String, String)> = declared
+            .iter()
+            .map(|(f, n)| (f.to_string(), n.to_string()))
+            .collect();
+        let omitted: Vec<_> = real.difference(&declared_set).collect();
+        assert!(
+            omitted.is_empty(),
+            "{method}: the allowlist's caller-set claim omits real in-tree caller(s) of \
+             `.{method}(` — {omitted:?}. R-H requires every caller-set claim to be machine-\
+             checked; add these to the declared `_CALLERS` list AND review what each does with \
+             the value in the allowlist entry's prose, or retract the caller-set claim entirely."
+        );
+        let stale: Vec<_> = declared_set.difference(&real).collect();
+        assert!(
+            stale.is_empty(),
+            "{method}: the declared caller-set lists {stale:?}, but the current scan finds no \
+             call to `.{method}(` inside them — the claim no longer matches reality (a caller was \
+             renamed, removed, or never called this way). Shrink the declared set to match, the \
+             same inverse-control discipline `allowlists_match_current_hits_exactly` applies to \
+             shape hits."
+        );
+    }
 }
 
 // ── Allowlists. Every entry is a hit this gate's scan finds TODAY (verified
 // by running each detector with an empty allowlist and transcribing every
 // hit), never a guess. Each carries its own review note — a bare list of
 // paths is not a review, it is the same failure mode this contract exists
-// to close for the sweep it replaces. ─────────────────────────────────────
+// to close for the sweep it replaces. Keyed on `(file, function name, the
+// function's own declaration LINE)`, not `(file, function name)` alone
+// (round 9, M4): a same-named sibling in the same file used to collide
+// under the two-element key and inherit an unrelated review — the surface
+// carries 109 colliding `(file, name)` pairs today, and a declaration line
+// is unique per function within a file so this key cannot collide. ─────────
 
-/// Pattern 1 — `(file, function name)`.
-const ANCHOR_RETURN_ALLOWED: &[(&str, &str)] = &[
+/// Pattern 1 — `(file, function name, declaration line)`.
+const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "input_anchor",
+        306,
         // `PinnedSource::input_anchor` — SAFE BY CONSTRUCTION: only reachable
         // through a `&PinnedSource`, which already carries the record and
         // (for a versioned table) the manifest `ResultStore::pinned_provider`
@@ -795,6 +1049,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/jammi-db/src/store/freshness.rs",
         "current_anchor",
+        458,
         // `ResultStore::current_anchor` — NOT CLOSED, disclosed rather than
         // hidden (round 6's audit, BLOCK finding 1). Its only in-tree
         // callers (`freshness.rs`'s own staleness comparison, same file) use
@@ -813,23 +1068,19 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str)] = &[
         // "Folds, small ... Nothing else"); this entry is the gate's record
         // that the residual is real, watched, and not silently absorbed.
         //
-        // **Round 8, D3 disclosure:** the "only in-tree callers" claim above
-        // is a POINT-IN-TIME grep result (re-verified at round 8:
-        // `grep -rn 'current_anchor(' crates/jammi-db/src crates/jammi-ai/src`
-        // still shows only `freshness.rs`'s own `staleness`), not a
-        // machine-checked invariant — nothing in this file re-runs that grep
-        // or otherwise re-derives it, so a future commit that adds a second
-        // caller would not turn any test here red. This allowlist entry
-        // clears the SHAPE (an anchor-shaped return), not the callers; the
-        // callers claim is carried in prose, in an artifact whose purpose is
-        // to replace prose claims with machine ones. Cheaply machine-
-        // checking "no OTHER caller persists this value" would require call-
-        // graph analysis this file's source-text matching does not attempt
-        // (see the module doc's "not a call-graph or dataflow analysis").
+        // **Round 9, M1:** the "only in-tree callers" claim is no longer
+        // carried in prose alone — `CURRENT_ANCHOR_CALLERS` above is
+        // machine-checked by `caller_set_claims_match_reality` against
+        // `callers_of(&surface, "current_anchor")` on every run, and a
+        // future second caller turns that test red the moment it lands,
+        // rather than waiting for the next round's grep. Re-derived (not
+        // merely re-asserted) at round 9: the set is unchanged from round 8
+        // (`staleness`, same file, only).
     ),
     (
         "crates/jammi-ai/src/pipeline/graph_propagation.rs",
         "edge_source_anchor",
+        821,
         // Delegates to `pin_current_version(record).await?.input_anchor()`
         // — the sanctioned pattern (the same one every `result_digest_anchor`
         // caller was migrated to in round 6), not an independent anchor-only
@@ -845,20 +1096,25 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Pattern 2 — `(file, function name)`.
-const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
+/// Pattern 2 — `(file, function name, declaration line)`.
+const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "current_version_identity",
-        // The anchor leg `current_anchor` calls (crate-private in name, not
-        // in the property this gate checks): same residual, see
-        // `ANCHOR_RETURN_ALLOWED`'s `current_anchor` entry — its only
-        // callers are same-crate freshness comparisons, never a persisted
-        // anchor.
+        1164,
+        // Round 9, M3 correction: this entry used to point at
+        // `current_anchor`'s own residual prose instead of naming its own
+        // callers. `CURRENT_VERSION_IDENTITY_CALLERS` above is now the
+        // machine-checked claim: its two in-tree callers are `current_anchor`
+        // (`ANCHOR_RETURN_ALLOWED`'s entry — discards the value after an
+        // equality check) and `verify_materialization` (this list's own
+        // entry below — never persists a new anchor). Neither pairs this
+        // value with an independent content read to persist as provenance.
     ),
     (
         "crates/jammi-db/src/store/mod.rs",
         "verify_materialization",
+        1301,
         // Read-only integrity check: compares a version's RECORDED identity
         // against a freshly recomputed one and reports a `MatchVerdict`. It
         // never persists a new anchor or a new artifact.
@@ -866,6 +1122,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "resolve_search_mode_local",
+        2280,
         // Disclosed, not closed (M4, carried from the deleted sweep):
         // candidate SELECTION (which rows a producer's pooled read gathers)
         // is out of this contract's scope. `pin_current_version`'s own doc
@@ -876,6 +1133,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "bind_result_table",
+        2516,
         // Documented "Read class" residual on its own doc comment: serves a
         // possibly-stale session-bound registration, never persists an
         // anchor. Every producer that DOES persist an anchor is required
@@ -885,16 +1143,18 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "current_version_provider",
-        // Private; its only caller is `pinned_provider`'s own unversioned
-        // arm (verified: `grep -n 'current_version_provider' crates/jammi-db/src`
-        // shows one call site, `store/mod.rs`'s `pinned_provider`). Reading
-        // `.current_version` off the SAME `pin.record` `pinned_provider` was
-        // itself called with cannot straddle anything — there is no second,
-        // independent resolution here.
+        2675,
+        // Private; `CURRENT_VERSION_PROVIDER_CALLERS` above is the machine-
+        // checked claim: its only in-tree caller is `pinned_provider`'s own
+        // unversioned arm. Reading `.current_version` off the SAME
+        // `pin.record` `pinned_provider` was itself called with cannot
+        // straddle anything — there is no second, independent resolution
+        // here.
     ),
     (
         "crates/jammi-db/src/store/mod.rs",
         "pin_current_version",
+        2756,
         // The seam itself: reads `record.current_version` once to decide
         // which arm to take, then returns a `PinnedSource` that carries the
         // record, the resolved version, and (for a versioned table) the
@@ -904,6 +1164,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "allocate_version",
+        2917,
         // Reads `table.current_version` only as the CAS's EXPECTED PARENT
         // (refuses with `ParentMoved` on mismatch); never reads content
         // under a version it resolves itself.
@@ -911,34 +1172,37 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/jammi-db/src/store/freshness.rs",
         "producing_descriptor",
+        505,
         // NOT CLOSED, disclosed (round 6's audit named this alongside
         // `current_anchor` and `read_vectors` as the plan's own reader
-        // class, `DELTA-INCREMENTAL-EMBEDDING.md:180`). Its callers
-        // (`embedding_refresh.rs`'s `refresh_embeddings`,
-        // `recompute.rs`'s `recompute_one`) use the returned
-        // `ProducingDescriptor` only to select WHICH producer verb/params to
-        // replay — never as content or as a persisted anchor — and each
-        // producer that then materializes a new artifact performs its own,
-        // independent `pin_current_version` resolution for that artifact's
-        // actual anchor and rows. A version drift between this read and that
-        // later pin could select a stale REPLAY TARGET, never corrupt a
-        // persisted anchor/content pairing. Closing the shape itself (this
-        // function still re-derives `table.current_version` from a bare
-        // record) is out of round 7's scope; recorded here rather than
-        // silently absorbed.
+        // class, `DELTA-INCREMENTAL-EMBEDDING.md:180`). Its callers use the
+        // returned `ProducingDescriptor` only to select WHICH producer
+        // verb/params to replay — never as content or as a persisted anchor
+        // — and each producer that then materializes a new artifact
+        // performs its own, independent `pin_current_version` resolution
+        // for that artifact's actual anchor and rows. A version drift
+        // between this read and that later pin could select a stale REPLAY
+        // TARGET, never corrupt a persisted anchor/content pairing. Closing
+        // the shape itself (this function still re-derives
+        // `table.current_version` from a bare record) is out of round 7's
+        // scope; recorded here rather than silently absorbed.
         //
-        // **Round 8, D3 disclosure:** the "callers use it only to select a
-        // replay target" claim is a POINT-IN-TIME grep result (re-verified
-        // at round 8: `grep -rn 'producing_descriptor(' crates/jammi-db/src
-        // crates/jammi-ai/src` shows exactly the two callers named above),
-        // not a machine-checked invariant this file re-derives on every run
-        // — see `current_anchor`'s entry above for the same disclosure and
-        // why closing it would need call-graph analysis this file does not
-        // attempt.
+        // **Round 9, M1 correction:** the round-8 "callers use it only to
+        // select a replay target" claim named two callers
+        // (`refresh_embeddings`, `recompute_one`) and was FALSE — a third,
+        // `compact_embeddings` (`embedding_refresh.rs:1024`), also calls
+        // `.producing_descriptor(` and was omitted. `PRODUCING_DESCRIPTOR_CALLERS`
+        // above now carries all three as DATA, machine-checked by
+        // `caller_set_claims_match_reality` rather than re-verified by grep
+        // each round; `compact_embeddings` uses the descriptor the same way
+        // the other two do (select the producer verb, here
+        // `ProducingDescriptor::EmbeddingCompaction`'s inputs), so the
+        // argument itself is unchanged, only the enumerated set.
     ),
     (
         "crates/jammi-db/src/session.rs",
         "read_vectors",
+        977,
         // NOT CLOSED, disclosed (round 6's audit, the third plan-listed
         // reader-class member: `DELTA-INCREMENTAL-EMBEDDING.md:180`). The
         // versioned arm reads content through this SESSION's own
@@ -947,72 +1211,190 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
         // same file) rather than through `pinned_provider` — an unpinned,
         // version-branched content read, re-exported publicly at
         // `jammi-ai/src/session.rs:1018` and
-        // `jammi-ai/src/local_session.rs:363`. No in-tree caller currently
-        // pairs this read with an independently-resolved anchor to persist
-        // as provenance (verified: `grep -rn '\.read_vectors(' crates/jammi-db/src
-        // crates/jammi-ai/src` — every caller is a plain vector read, not a
-        // provenance-persisting producer). Closing this (route the versioned
-        // arm through `pin_current_version`/`pinned_provider`, or require a
-        // caller-supplied `PinnedSource`) is out of round 7's scope; the
-        // straddle this function makes constructible is exactly the class
-        // this contract names as real and unclosed.
-        //
-        // **Round 8, D3 disclosure:** re-verified rather than re-argued
-        // (the grep above was re-run at round 8 with the same two-caller
-        // result), but still a POINT-IN-TIME claim, not a machine-checked
-        // one — nothing here re-runs it on a future commit; see
-        // `current_anchor`'s entry above for the general shape of this
-        // disclosure.
+        // `jammi-ai/src/local_session.rs:363`. `READ_VECTORS_CALLERS` above
+        // is the machine-checked claim (round 9, M1): its only two in-tree
+        // callers are those two forwarding wrappers, each a one-line
+        // delegate, never a provenance-persisting producer. Closing this
+        // (route the versioned arm through `pin_current_version`/
+        // `pinned_provider`, or require a caller-supplied `PinnedSource`) is
+        // out of round 7's scope; the straddle this function makes
+        // constructible is exactly the class this contract names as real
+        // and unclosed.
     ),
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
         "ensure_base_version",
-        // Guard clause only: `record.current_version.is_some()` short-
-        // circuits to "already versioned, return unchanged" — no content
-        // read branches on the value; the function that DOES read content
-        // for the base publish path is gated separately.
+        657,
+        // Guard clause only on its DOMINANT arm:
+        // `record.current_version.is_some()` short-circuits to "already
+        // versioned, return the SAME record UNCHANGED" — no re-fetch, no
+        // content read branches on the value. Only the non-dominant,
+        // never-based-before arm re-fetches (`embedding_refresh.rs:751`,
+        // after its own base-publish CAS) before returning. See
+        // `SELF_FETCHED_RECORD_ALLOWED`'s `refreshable_record` entry (round
+        // 9, M2) for why this dominant-arm behaviour is the fact that
+        // entry's PREVIOUS review got backwards.
     ),
 ];
 
-/// Pattern 4 (round 8, D1) — `(file, function name)`, same shape as
-/// `ANCHOR_RETURN_ALLOWED`/`RECORD_VERSION_BRANCH_ALLOWED`.
-const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str)] = &[(
-    "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
-    "refreshable_record",
-    // `InferenceSession::refreshable_record` — step 0's readiness GATE,
-    // and the round-8 audit's own escape shape found LIVE on this
-    // surface: it self-fetches the record from a bare table name via
-    // `self.catalog().get_result_table(table)`, then reads
-    // `record.current_version` to reject a table whose CURRENT version
-    // row is not `ready` (`NotRefreshableReason::CurrentVersionUnavailable`).
-    // That read is used ONLY for this readiness check — it is never
-    // returned, never becomes an anchor, and never pairs with a content
-    // read here. Its one in-tree caller (`refresh_embeddings`) performs
-    // every later anchor/content pairing from a SEPARATE, later
-    // resolution: `ensure_base_version` re-fetches the record itself
-    // (`RECORD_VERSION_BRANCH_ALLOWED`'s own entry for that function),
-    // and `refresh_embeddings` reads `parent_version` off THAT fresh
-    // record, not this one's. A version publish landing between this
-    // gate and that later resolution can only make this gate stale
-    // (reject a table that just became refreshable, or admit one whose
-    // checked version has since moved and gets re-validated downstream
-    // by `resolve_version_manifest`) — never mint a mismatched
-    // anchor/content pair. Same disclosed-residual shape as
-    // `bind_result_table`'s "Read class" note, not closed by this round.
-)];
+/// Pattern 4 (round 8, D1; widened round 9, M4) — `(file, function name,
+/// declaration line)`, same shape as
+/// `ANCHOR_RETURN_ALLOWED`/`RECORD_VERSION_BRANCH_ALLOWED`. Six entries, not
+/// one: dropping the `.get_result_table(` idiom conjunct
+/// (`self_fetched_record_version_hits`'s own doc) raised the real-surface
+/// hit count from 1 to 6, the measured "five more, not hundreds" this
+/// contract pays for wider coverage.
+const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str, usize)] = &[
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "refresh_embeddings",
+        340,
+        // NEW at round 9 (was invisible under the idiom-narrowed pattern 4:
+        // this function never itself calls `.get_result_table(`, it calls
+        // the wrapper `refreshable_record`). Reads `record.current_version`
+        // once (`parent_version`, line 357) off the record
+        // `refreshable_record` returned, then uses that SAME value to
+        // resolve the parent manifest (`store.resolve_version_manifest(
+        // &record, parent_version)`, line 366) — one fetch, one field, one
+        // value threaded through to both the version DECISION and the
+        // content READ. There is no second, independent resolution to
+        // straddle against.
+    ),
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "refreshable_record",
+        579,
+        // `InferenceSession::refreshable_record` — step 0's readiness GATE,
+        // and the round-8 audit's own escape shape found LIVE on this
+        // surface: it self-fetches the record from a bare table name via
+        // `self.catalog().get_result_table(table)`, then reads
+        // `record.current_version` to reject a table whose CURRENT version
+        // row is not `ready` (`NotRefreshableReason::CurrentVersionUnavailable`).
+        // That read is used ONLY for this readiness check — it is never
+        // returned, never becomes an anchor, and never pairs with a content
+        // read here.
+        //
+        // **Round 9, M1 correction:** the round-8 review named ONE in-tree
+        // caller, `refresh_embeddings`. `REFRESHABLE_RECORD_CALLERS` above,
+        // machine-checked, shows THREE: `compact_embeddings` and
+        // `expire_versions` were omitted — the destructive ones,
+        // `compact_embeddings` PUBLISHES a new version
+        // (`version.publish(...)`, `embedding_refresh.rs:1170`) and
+        // `expire_versions` PERMANENTLY REAPS old ones
+        // (`store.reap_expired_version(...)`, its own doc comment calls
+        // this "a PERMANENT delete"). Both are reviewed in their own entries
+        // below, alongside `refresh_embeddings`'s above.
+        //
+        // **Round 9, M2 correction:** the round-8 review also claimed the
+        // safety mechanism was that "`ensure_base_version` RE-FETCHES the
+        // record" before `refresh_embeddings`/`compact_embeddings` ever pair
+        // this value with content — FALSE on the DOMINANT arm.
+        // `RECORD_VERSION_BRANCH_ALLOWED`'s own `ensure_base_version` entry
+        // documents that when `record.current_version.is_some()` — true for
+        // every refresh/compaction after a table's first-ever base publish —
+        // it is a guard clause returning the SAME record UNCHANGED, no
+        // re-fetch at all. This file was contradicting itself across its own
+        // two entries.
+        //
+        // What actually protects `refresh_embeddings` and
+        // `compact_embeddings` is not a re-fetch on that arm; it is that
+        // there is only ONE resolution of the record/version in the whole
+        // call, threaded through unchanged: this function's single catalog
+        // read supplies both the readiness check's `current_version` AND
+        // (via the record it returns, carried forward unchanged by
+        // `ensure_base_version`'s guard clause on the dominant arm) the SAME
+        // field the caller later reads as `parent_version` to resolve the
+        // manifest. One fetch, one field, one value — never two independent
+        // resolutions to straddle. On the non-dominant, never-based arm,
+        // `ensure_base_version` DOES re-fetch once
+        // (`embedding_refresh.rs:751`, after its own base-publish CAS), and
+        // THAT fresh record is what flows forward instead — still a single
+        // resolution per call, just a different one depending on the arm.
+        // Either way the anchor and the content pairing this gate polices
+        // come from the SAME record object, never two.
+        //
+        // `expire_versions` never calls `ensure_base_version` at all: it
+        // reads `record.current_version` from this function's single fetch
+        // and uses that SAME value, once, to resolve the retention manifest
+        // (`store.resolve_version_manifest(&record, current)`) its deletion
+        // loop reaps against — again one resolution, not a pairing of two.
+        // It never constructs or persists an `InputAnchor`; the value read
+        // here never becomes a provenance artifact, only a retention-set
+        // selector for a destructive delete — the same "candidate SELECTION
+        // is out of this contract's scope" residual `resolve_search_mode_local`'s
+        // entry above discloses for a different function. A version publish
+        // landing between this read and the reap could pick a stale
+        // retention set (a garbage-collection race its own `M5` doc comment
+        // already tracks) — never mint a mismatched anchor/content pair,
+        // because no anchor is ever minted on this path.
+    ),
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "compact_embeddings",
+        1020,
+        // NEW at round 9 (same reason `refresh_embeddings` above is new: no
+        // direct `.get_result_table(` call in its own body). Same mechanism
+        // as `refresh_embeddings`: calls `refreshable_record` then
+        // `ensure_base_version`, reads `record.current_version` once as
+        // `parent_version` (line 1027), and uses that SAME value to resolve
+        // `store.resolve_version_manifest(&record, parent_version)` (line
+        // 1034) for the content it compacts. See `refreshable_record`'s
+        // entry above for the full mechanism review (round 9, M2).
+    ),
+    (
+        "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+        "expire_versions",
+        1202,
+        // NEW at round 9. Calls `refreshable_record` (never
+        // `ensure_base_version`), reads `record.current_version` once
+        // (`current`, line 1209) and uses that SAME value to resolve the
+        // retention manifest (`store.resolve_version_manifest(&record,
+        // current)`, line 1228) its deletion loop reaps every OTHER version
+        // against. See `refreshable_record`'s entry above for why this never
+        // mints an anchor.
+    ),
+    (
+        "crates/jammi-db/src/catalog/version_repo.rs",
+        "classify_ready_cas_miss",
+        245,
+        // NEW at round 9. Takes `target: Option<CasTarget>`, never a
+        // `ResultTableRecord` — `CasTarget` merely happens to name its own
+        // version field `current_version` too, which is what the widened
+        // check (correctly) matches on text alone. Reads `row.current_version`
+        // only to build a typed comparison error (`ParentMoved { expected,
+        // found: row.current_version }` vs. `CasFailed`); never persists an
+        // anchor or reads content.
+    ),
+    (
+        "crates/jammi-db/src/store/mod.rs",
+        "reconcile_ready_manifests",
+        1941,
+        // NEW at round 9. A read-only recovery sweep over already-`ready`
+        // tables: for each, checks whether the CURRENT version's manifest
+        // sidecar exists on disk and fails the row/version if it does not
+        // (corruption repair). Never constructs or persists an
+        // `InputAnchor`; no content is read here at all, only manifest
+        // EXISTENCE.
+    ),
+];
 
-/// Pattern 3 — `(file, function name, allowed occurrence count)`. Keyed on
-/// the (path, function) SITE (round 8, D3 — the round-7 audit's advisory: a
-/// per-file `usize` allowance let a NEW unpinned read inside an already-
-/// allowlisted file pass review-free whenever an existing one in a
-/// DIFFERENT function of that same file was deleted in the same commit),
-/// never a bare file name (round 6 advisory: a same-named file in a
-/// different subdirectory must not silently inherit an allowance reviewed
-/// for a wholly different file).
-const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
+/// Pattern 3 — `(file, function name, declaration line, allowed occurrence
+/// count)`. Keyed on the (path, function, LINE) SITE (round 8, D3 — the
+/// round-7 audit's advisory: a per-file `usize` allowance let a NEW unpinned
+/// read inside an already-allowlisted file pass review-free whenever an
+/// existing one in a DIFFERENT function of that same file was deleted in
+/// the same commit; round 6 advisory: a same-named file in a different
+/// subdirectory must not silently inherit an allowance reviewed for a
+/// wholly different file; round 9, M4: the declaration LINE closes the last
+/// gap — a same-named sibling FUNCTION in the same file used to collide
+/// under a two-element `(file, name)` key and have its count summed into
+/// this one, the same fungibility this pattern's own per-file-to-per-
+/// function narrowing closed one granularity higher at round 8).
+const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     (
         "crates/jammi-ai/src/pipeline/graph_propagation.rs",
         "edge_scan_sql",
+        854,
         1,
         // The S9 `neighbor_graph` edge scan — the EDGE relation, never the
         // pinned embedding table `PinnedSource` covers. Reviewed in the
@@ -1024,12 +1406,14 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-ai/src/pipeline/graph_neighbourhood.rs",
         "load_neighbor_graph_edges",
+        511,
         1,
         // Same class, the S9 edge relation.
     ),
     (
         "crates/jammi-db/src/index/exact.rs",
         "exact_vector_search",
+        135,
         1,
         // The exact-match ANN fallback, reading THIS session's own
         // registration. `pin_current_version`'s own doc names this exact
@@ -1041,6 +1425,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/session.rs",
         "read_vectors",
+        977,
         1,
         // See `RECORD_VERSION_BRANCH_ALLOWED`'s entry for this same
         // function — builds a `TableReference::bare(format!("jammi.{table}"))`
@@ -1050,6 +1435,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/session.rs",
         "read_vector_by_key",
+        1045,
         1,
         // Same shape as `read_vectors`, a different function in the same
         // file — kept as its own site so the two allowances cannot be
@@ -1058,6 +1444,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "register_table",
+        1073,
         1,
         // The registration write itself — defines what `jammi.{name}` maps
         // to, never a read.
@@ -1065,6 +1452,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/mod.rs",
         "bind_result_table",
+        2516,
         2,
         // Its two `add_result_table` calls (its documented "Read class"
         // residual — see `RECORD_VERSION_BRANCH_ALLOWED`'s entry). Both
@@ -1076,6 +1464,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-db/src/store/result_schema.rs",
         "deregister_result_tables",
+        198,
         1,
         // REMOVES a registration (`provider.remove`); not a read of any
         // kind.
@@ -1083,6 +1472,7 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-ai/src/session.rs",
         "infer_ordered_read_back_sql",
+        2114,
         1,
         // An INFERENCE task-result table's own read-back of what
         // `InferenceSession::infer` just wrote in the same call, immediately
@@ -1103,14 +1493,15 @@ fn no_new_anchor_shaped_return_without_review() {
     for hit in &hits {
         let allowed_name = ANCHOR_RETURN_ALLOWED
             .iter()
-            .find(|(f, n)| *f == hit.file && *n == hit.name);
+            .find(|(f, n, l)| *f == hit.file && *n == hit.name && *l == hit.line);
         assert!(
             allowed_name.is_some(),
             "{}:{} `fn {}` returns a type carrying `InputAnchor`/`CurrentAnchor` — a version-\
              resolved anchor value with no paired content. This is either a NEW straddle-shaped \
              site (route it through `ResultStore::pin_current_version`/`PinnedSource::input_anchor` \
              instead) or a reviewed exception that belongs in this test's `ANCHOR_RETURN_ALLOWED` \
-             list, keyed on (file, function name), with the same review its existing entries carry.",
+             list, keyed on (file, function name, declaration line), with the same review its \
+             existing entries carry.",
             hit.file, hit.line, hit.name
         );
     }
@@ -1123,14 +1514,14 @@ fn no_new_bare_record_version_branch_without_review() {
     for hit in &hits {
         let allowed_name = RECORD_VERSION_BRANCH_ALLOWED
             .iter()
-            .find(|(f, n)| *f == hit.file && *n == hit.name);
+            .find(|(f, n, l)| *f == hit.file && *n == hit.name && *l == hit.line);
         assert!(
             allowed_name.is_some(),
             "{}:{} `fn {}` takes a bare `ResultTableRecord` and re-derives `.current_version` \
              from it in its own body, rather than taking an already-resolved version/manifest/\
              `PinnedSource` as a parameter. This is either a NEW straddle-shaped site or a \
              reviewed exception that belongs in `RECORD_VERSION_BRANCH_ALLOWED`, keyed on (file, \
-             function name), with the same review its existing entries carry.",
+             function name, declaration line), with the same review its existing entries carry.",
             hit.file,
             hit.line,
             hit.name
@@ -1145,16 +1536,16 @@ fn no_new_self_fetched_record_version_without_review() {
     for hit in &hits {
         let allowed_name = SELF_FETCHED_RECORD_ALLOWED
             .iter()
-            .find(|(f, n)| *f == hit.file && *n == hit.name);
+            .find(|(f, n, l)| *f == hit.file && *n == hit.name && *l == hit.line);
         assert!(
             allowed_name.is_some(),
-            "{}:{} `fn {}` resolves a `ResultTableRecord` itself in its own body via \
-             `.get_result_table(` and reads the resolved record's `.current_version` field, \
-             rather than taking an already-resolved record/version/manifest/`PinnedSource` as a \
-             parameter (pattern 2's shape) or content read (pattern 3's shape). This is either a \
-             NEW straddle-shaped site (route it through `ResultStore::pin_current_version` \
-             instead) or a reviewed exception that belongs in `SELF_FETCHED_RECORD_ALLOWED`, \
-             keyed on (file, function name), with the same review its existing entry carries.",
+            "{}:{} `fn {}` reads a self-obtained record's `.current_version` field, rather than \
+             taking an already-resolved record/version/manifest/`PinnedSource` as a parameter \
+             (pattern 2's shape) or content read (pattern 3's shape). This is either a NEW \
+             straddle-shaped site (route it through `ResultStore::pin_current_version` instead) \
+             or a reviewed exception that belongs in `SELF_FETCHED_RECORD_ALLOWED`, keyed on \
+             (file, function name, declaration line), with the same review its existing entries \
+             carry.",
             hit.file,
             hit.line,
             hit.name
@@ -1166,21 +1557,22 @@ fn no_new_self_fetched_record_version_without_review() {
 fn no_new_unpinned_session_registration_literal() {
     let surface = scan_surface();
     let sites = session_registration_literal_sites(&surface);
-    for ((file, name), count) in &sites {
+    for ((file, name, line), count) in &sites {
         let allowed = SESSION_LITERAL_ALLOWED
             .iter()
-            .find(|(f, n, _)| f == file && n == name)
-            .map(|(_, _, c)| *c)
+            .find(|(f, n, l, _)| f == file && n == name && l == line)
+            .map(|(_, _, _, c)| *c)
             .unwrap_or(0);
         assert!(
             *count <= allowed,
-            "{file}: fn {name} has {count} occurrence(s) of the bare session-registration \
-             literal `\"jammi.{{`, {allowed} audited/allowed for THIS SITE (function) — an \
-             allowance in a DIFFERENT function of the same file never covers this one. A NEW \
-             site must read through `ResultStore::pin_current_version`/`pinned_provider`, never \
-             construct the session-registered `jammi.{{table}}` reference directly. If this IS \
-             an audited exception, add it to `SESSION_LITERAL_ALLOWED` — keyed on this same \
-             (path, function name) — with the same review its existing entries had."
+            "{file}: fn {name} (line {line}) has {count} occurrence(s) of the bare session-\
+             registration literal `\"jammi.{{`, {allowed} audited/allowed for THIS SITE (function \
+             at this exact declaration line) — an allowance in a DIFFERENT function of the same \
+             file, even one with the same NAME, never covers this one. A NEW site must read \
+             through `ResultStore::pin_current_version`/`pinned_provider`, never construct the \
+             session-registered `jammi.{{table}}` reference directly. If this IS an audited \
+             exception, add it to `SESSION_LITERAL_ALLOWED` — keyed on this same (path, function \
+             name, declaration line) — with the same review its existing entries had."
         );
     }
 }
@@ -1338,14 +1730,26 @@ fn falsification_self_fetched_record_version_is_detected() {
 #[test]
 fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_parameterized_shapes()
 {
-    // Negative control 1 (family F): self-fetches the record but delegates
-    // the version branch to a SEPARATELY REVIEWED helper
-    // (`current_version_identity`, `RECORD_VERSION_BRANCH_ALLOWED`'s own
-    // entry) rather than reading the `.current_version` field itself.
-    // Without `reads_current_version_field`'s exact field-boundary check,
+    // Round 9, M3 correction. This USED to be a "negative control" asserting
+    // that a producer taking a bare table name, self-fetching the record,
+    // and returning `current_version_identity`'s value as a plain `String`
+    // must NEVER be flagged — verbatim the round-7 escape shape pattern 4
+    // exists to catch, cleared here only because it delegates to a NAMED,
+    // reviewed helper rather than reading `.current_version` itself.
+    // Clearance by a callee's NAME is the same failure this file's own
+    // module doc disowns for a return TYPE's name (round 8, D1's own
+    // opening paragraph); asserting this shape can never be flagged was
+    // wrong in the same way, and the fix is the same: check the SET, not
+    // the shape.
+    //
+    // The field-boundary regression this control also exercises is real and
+    // stays: without `reads_current_version_field`'s exact-boundary check,
     // the substring `.current_version` inside `.current_version_identity(`
-    // would false-positive here — this is exactly `ResultStore::current_anchor`'s
-    // real shape on today's surface.
+    // would false-positive on this exact shape — `ResultStore::current_anchor`'s
+    // real body on today's surface. That assertion is kept below, but framed
+    // as what it is: pattern 4 has a disclosed, uncovered blind spot for
+    // ANY delegation to a differently-named helper (the module doc's own
+    // "cross-function" limit), not a proof this shape is safe.
     let src_delegates = r#"
         impl ResultStore {
             pub async fn wraps_identity(&self, table_name: &str) -> Result<Option<String>> {
@@ -1358,9 +1762,25 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
     let hits = self_fetched_record_version_hits(&surface);
     assert!(
         hits.is_empty(),
-        "a function that self-fetches a record and delegates its version branch to a \
-         separately-reviewed helper (never reading `.current_version` itself) must not be \
-         flagged: {hits:?}"
+        "UNCOVERED, per R-A, not a guarantee (round 9, M3): pattern 4 does not see this \
+         self-fetch-then-delegate shape — a real change here would mean the field-boundary check \
+         regressed to a bare substring match, not that the escape closed: {hits:?}"
+    );
+    // What actually protects today's real surface against this exact shape
+    // is NOT pattern 4 (which cannot see it) but `current_version_identity`'s
+    // own machine-checked caller set (`CURRENT_VERSION_IDENTITY_CALLERS`,
+    // checked by `caller_set_claims_match_reality`): a real `wraps_identity`
+    // calling `.current_version_identity(` would be a THIRD caller, and that
+    // check would go red the moment it landed, even though this detector
+    // never would. Demonstrated directly: this synthetic probe's own
+    // `(file, fn)` pair is not in the declared set, and IS what
+    // `callers_of` would report if this were real production code sharing
+    // this file's surface.
+    assert!(
+        !CURRENT_VERSION_IDENTITY_CALLERS
+            .iter()
+            .any(|(f, n)| *f == "__probe__.rs" && *n == "wraps_identity"),
+        "the pinned caller set must not already contain this synthetic probe's site"
     );
 
     // Negative control 2: takes the record as a PARAMETER (pattern 2's own
@@ -1457,7 +1877,7 @@ fn falsification_session_registration_literal_is_detected() {
     let sites =
         session_registration_literal_sites(&[("__probe__.rs".to_string(), src.to_string())]);
     assert_eq!(
-        sites.get(&("__probe__.rs".to_string(), "<module-scope>".to_string())),
+        sites.get(&("__probe__.rs".to_string(), "<module-scope>".to_string(), 0)),
         Some(&1),
         "the session-registration-literal detector did not fire on a synthetic \
          `TableReference::bare(format!(\"jammi.{{}}\", ..))` call at module scope"
@@ -1482,17 +1902,19 @@ fn falsification_session_registration_literal_binds_to_its_enclosing_function() 
     let sites =
         session_registration_literal_sites(&[("__probe__.rs".to_string(), src.to_string())]);
     assert_eq!(
-        sites.get(&("__probe__.rs".to_string(), "one".to_string())),
+        sites.get(&("__probe__.rs".to_string(), "one".to_string(), 1)),
         Some(&1),
         "fn `one`'s single occurrence must be bound to `one`, not to the file total: {sites:?}"
     );
     assert_eq!(
-        sites.get(&("__probe__.rs".to_string(), "two".to_string())),
+        sites.get(&("__probe__.rs".to_string(), "two".to_string(), 4)),
         Some(&2),
         "fn `two`'s two occurrences must be bound to `two`, and only `two`: {sites:?}"
     );
     assert!(
-        !sites.contains_key(&("__probe__.rs".to_string(), "<module-scope>".to_string())),
+        !sites
+            .keys()
+            .any(|(f, n, _)| f == "__probe__.rs" && n == "<module-scope>"),
         "no occurrence here is outside a function, so the module-scope sentinel must not appear: \
          {sites:?}"
     );
@@ -1559,53 +1981,110 @@ fn allowlists_match_current_hits_exactly() {
     // contract names for the sweep it replaces.
     let surface = scan_surface();
 
-    let anchor_hits: HashSet<(String, String)> = anchor_shaped_return_hits(&surface)
+    let anchor_hits: HashSet<(String, String, usize)> = anchor_shaped_return_hits(&surface)
         .into_iter()
-        .map(|h| (h.file, h.name))
+        .map(|h| (h.file, h.name, h.line))
         .collect();
-    for (file, name) in ANCHOR_RETURN_ALLOWED {
+    for (file, name, line) in ANCHOR_RETURN_ALLOWED {
         assert!(
-            anchor_hits.contains(&(file.to_string(), name.to_string())),
-            "ANCHOR_RETURN_ALLOWED lists {file}:{name}, but the current scan no longer finds an \
-             anchor-shaped return there — shrink this list to match (the fix landed, or the \
-             function moved/was removed)."
+            anchor_hits.contains(&(file.to_string(), name.to_string(), *line)),
+            "ANCHOR_RETURN_ALLOWED lists {file}:{line} fn {name}, but the current scan no longer \
+             finds an anchor-shaped return there — shrink this list to match (the fix landed, the \
+             function moved/was renamed, or its declaration line changed)."
         );
     }
 
-    let record_hits: HashSet<(String, String)> = bare_record_version_branch_hits(&surface)
+    let record_hits: HashSet<(String, String, usize)> = bare_record_version_branch_hits(&surface)
         .into_iter()
-        .map(|h| (h.file, h.name))
+        .map(|h| (h.file, h.name, h.line))
         .collect();
-    for (file, name) in RECORD_VERSION_BRANCH_ALLOWED {
+    for (file, name, line) in RECORD_VERSION_BRANCH_ALLOWED {
         assert!(
-            record_hits.contains(&(file.to_string(), name.to_string())),
-            "RECORD_VERSION_BRANCH_ALLOWED lists {file}:{name}, but the current scan no longer \
-             finds a bare-record version-branch there — shrink this list to match."
+            record_hits.contains(&(file.to_string(), name.to_string(), *line)),
+            "RECORD_VERSION_BRANCH_ALLOWED lists {file}:{line} fn {name}, but the current scan no \
+             longer finds a bare-record version-branch there — shrink this list to match."
         );
     }
 
-    let self_fetched_hits: HashSet<(String, String)> = self_fetched_record_version_hits(&surface)
-        .into_iter()
-        .map(|h| (h.file, h.name))
-        .collect();
-    for (file, name) in SELF_FETCHED_RECORD_ALLOWED {
+    let self_fetched_hits: HashSet<(String, String, usize)> =
+        self_fetched_record_version_hits(&surface)
+            .into_iter()
+            .map(|h| (h.file, h.name, h.line))
+            .collect();
+    for (file, name, line) in SELF_FETCHED_RECORD_ALLOWED {
         assert!(
-            self_fetched_hits.contains(&(file.to_string(), name.to_string())),
-            "SELF_FETCHED_RECORD_ALLOWED lists {file}:{name}, but the current scan no longer \
-             finds a self-fetched-record version read there — shrink this list to match."
+            self_fetched_hits.contains(&(file.to_string(), name.to_string(), *line)),
+            "SELF_FETCHED_RECORD_ALLOWED lists {file}:{line} fn {name}, but the current scan no \
+             longer finds a self-fetched-record version read there — shrink this list to match."
         );
     }
 
     let literal_sites = session_registration_literal_sites(&surface);
-    for (file, name, allowed) in SESSION_LITERAL_ALLOWED {
+    for (file, name, line, allowed) in SESSION_LITERAL_ALLOWED {
         let current = literal_sites
-            .get(&(file.to_string(), name.to_string()))
+            .get(&(file.to_string(), name.to_string(), *line))
             .copied()
             .unwrap_or(0);
         assert_eq!(
             current, *allowed,
-            "{file}: fn {name}: SESSION_LITERAL_ALLOWED expects exactly {allowed} occurrence(s) \
-             of `\"jammi.{{`, the current scan finds {current} — update this allowlist to match."
+            "{file}: fn {name} (line {line}): SESSION_LITERAL_ALLOWED expects exactly {allowed} \
+             occurrence(s) of `\"jammi.{{`, the current scan finds {current} — update this \
+             allowlist to match."
+        );
+    }
+
+    let anchor_callers = callers_of(&surface, "current_anchor");
+    let producing_callers = callers_of(&surface, "producing_descriptor");
+    let refreshable_callers = callers_of(&surface, "refreshable_record");
+    let provider_callers = callers_of(&surface, "current_version_provider");
+    let identity_callers = callers_of(&surface, "current_version_identity");
+    let vectors_callers = callers_of(&surface, "read_vectors");
+    // Inverse control for the caller-set consts themselves (round 9, M1): a
+    // declared caller that no longer calls `.method(` at all — renamed,
+    // removed, or refactored away — must shrink the const, the same
+    // discipline the four shape-hit allowlists above already carry.
+    // `caller_set_claims_match_reality` already asserts this per-check; this
+    // is the same assertion folded into the one test every entry's inverse
+    // control lives in, so a reviewer checking "does every allowlist here
+    // have a matching inverse control" finds all five without hunting.
+    for (f, n) in CURRENT_ANCHOR_CALLERS {
+        assert!(
+            anchor_callers.contains(&(f.to_string(), n.to_string())),
+            "CURRENT_ANCHOR_CALLERS lists {f}::{n}, but it no longer calls `.current_anchor(`"
+        );
+    }
+    for (f, n) in PRODUCING_DESCRIPTOR_CALLERS {
+        assert!(
+            producing_callers.contains(&(f.to_string(), n.to_string())),
+            "PRODUCING_DESCRIPTOR_CALLERS lists {f}::{n}, but it no longer calls \
+             `.producing_descriptor(`"
+        );
+    }
+    for (f, n) in REFRESHABLE_RECORD_CALLERS {
+        assert!(
+            refreshable_callers.contains(&(f.to_string(), n.to_string())),
+            "REFRESHABLE_RECORD_CALLERS lists {f}::{n}, but it no longer calls \
+             `.refreshable_record(`"
+        );
+    }
+    for (f, n) in CURRENT_VERSION_PROVIDER_CALLERS {
+        assert!(
+            provider_callers.contains(&(f.to_string(), n.to_string())),
+            "CURRENT_VERSION_PROVIDER_CALLERS lists {f}::{n}, but it no longer calls \
+             `.current_version_provider(`"
+        );
+    }
+    for (f, n) in CURRENT_VERSION_IDENTITY_CALLERS {
+        assert!(
+            identity_callers.contains(&(f.to_string(), n.to_string())),
+            "CURRENT_VERSION_IDENTITY_CALLERS lists {f}::{n}, but it no longer calls \
+             `.current_version_identity(`"
+        );
+    }
+    for (f, n) in READ_VECTORS_CALLERS {
+        assert!(
+            vectors_callers.contains(&(f.to_string(), n.to_string())),
+            "READ_VECTORS_CALLERS lists {f}::{n}, but it no longer calls `.read_vectors(`"
         );
     }
 }

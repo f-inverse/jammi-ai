@@ -1,0 +1,194 @@
+diff --git a/.claude/hooks/README.md b/.claude/hooks/README.md
+index 68fdc8c..d2b9253 100644
+--- a/.claude/hooks/README.md
++++ b/.claude/hooks/README.md
+@@ -65,6 +65,17 @@ only shrink the adjacent set) and is therefore NOT the acceptance-easing
+ normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
+ row is diagnostic only — no gate decision reads it; which requirement has content is
+ derived from the enumeration itself.
++**(2b) Open question — ALWAYS (esc-lead-gate-R10).** Alongside the ≥2 examined-clean
++sites (2) already requires, a non-empty `open_question` string must be present on
++every BLOCK relay of every gated verifier type: a site the lead examined and
++explicitly could NOT close, naming the attack for the next round to run. (2)'s own
++≥2-distinct-non-reactive count is UNCHANGED — this is a separate, ADDITIONAL field,
++never folded into the `probe` array or its counting. No subprocess, no regex, no
++match count, no cap: a plain non-empty-string presence check, nothing that scales
++with the size of a class. HONEST LIMIT, stated as one: this is a SCHEMA requirement
++over lead-authored text, a COST FLOOR, not proof of examination — the same limit (2)
++already carries. A lead can write a hollow open question; what it cannot do is write
++nothing and pass. What a human reads at merge is whether the open question was real.
+ **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
+ `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
+ (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE
+@@ -117,7 +128,8 @@ or parenthesis and trailing punctuation stripped, an optional trailing
+ probing the fix's own surface satisfies this even when that file is also a finding
+ location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
+ conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
+-though one entry can double as both when it qualifies for each). **One unit per
++though one entry can double as both when it qualifies for each) and with (2b)'s
++separate `open_question` field, conjunctive with all of R1-R3. **One unit per
+ dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
+ type, the dispatch is denied outright, naming every targeted unit — R3 never
+ silently skips the others; dispatch each named unit separately. **§C5 — the ONE
+diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
+index 049b952..2a6f9ac 100755
+--- a/.claude/hooks/lead-gate-lib.py
++++ b/.claude/hooks/lead-gate-lib.py
+@@ -25,7 +25,14 @@ why the remaining design still closes the expensive loop, F10):
+   relay's requirements are a CONJUNCTION (esc-064): coverage (`sites`) is
+   armed by a non-empty `class_enumeration` — the data, never the recorded
+   `enumeration_missing` flag — and adjacent probing (`probe`, >=2 distinct
+-  sites outside enumeration+findings) is armed ALWAYS.
++  sites outside enumeration+findings) is armed ALWAYS. esc-lead-gate-R10:
++  alongside those >=2 examined-clean sites, the relay must ALSO carry a
++  non-empty `open_question` — a site examined and explicitly NOT closed,
++  naming the attack for the next round to run. A one-line schema
++  requirement over lead-authored text: a COST FLOOR, not proof of
++  examination, the same limit `probe` itself already carries — it cannot
++  be satisfied by writing nothing, and a human reads at merge whether the
++  open question was real.
+ 
+ esc-097 (R3, "PROBE THE FIX"): the relay gains ONE further requirement,
+ `fix_head` (a full sha, `re.fullmatch(r"[0-9a-f]{7,40}")`) plus a `probe`
+@@ -96,7 +103,8 @@ operator-facing ALLOW reason (and the `hook.log` row it is written into),
+ so shadowing stays visible even when it did not change the outcome.
+ 
+ Arm order: artifact-exists -> schema -> R1 (coverage) -> R2 (proactivity,
+-always) -> CLAUDE_PROJECT_DIR is set -> `row.head_sha` ("block_sha")
++always) -> R10 (open question, always) -> CLAUDE_PROJECT_DIR is set ->
++`row.head_sha` ("block_sha")
+ matches the sha shape and resolves (STARTS WITH the given hex) -> `fix_head`
+ matches the sha shape, differs from block_sha, and resolves (STARTS WITH
+ the given hex) -> relay `unit_branch` slugifies to this BLOCK's own
+@@ -1074,6 +1082,18 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
+                 "is reactive acknowledgment, not adjacent probing; name >=2 sites you "
+                 "EXAMINED and found clean (esc-064)")
+ 
++    # esc-lead-gate-R10 — ARMED UNCONDITIONALLY, alongside R2 above. A ONE-LINE
++    # schema requirement over lead-authored text, never a count or a match: a
++    # cost floor, not proof of examination — the same limit the >=2-clean
++    # rule above already carries. Alongside the >=2 examined-CLEAN sites,
++    # the relay must ALSO name a site examined and explicitly NOT closed,
++    # carrying the attack the next round should run.
++    open_question = data.get("open_question")
++    if not isinstance(open_question, str) or not open_question.strip():
++        return ("relay carries no `open_question` — alongside the >=2 examined-clean "
++                "sites above, one further entry must be a site you examined and could "
++                "NOT close, naming the attack for the next round to run (esc-lead-gate-R10)")
++
+     # R3 PROBE-THE-FIX (esc-097) — the only git subprocess in this module;
+     # see its own module-doc paragraph for the arm order.
+     fix_changed, why, fix_warnings = _fix_window(row, unit_slug, data)
+diff --git a/ci/scripts/check_lead_gate.py b/ci/scripts/check_lead_gate.py
+index ee72098..56cc830 100644
+--- a/ci/scripts/check_lead_gate.py
++++ b/ci/scripts/check_lead_gate.py
+@@ -55,6 +55,14 @@ Required fixtures (RED when the corresponding hook arm is removed):
+   G19 the coverage arm is selected by the DATA: a row with a non-empty
+       class_enumeration but NO `enumeration_missing` key still requires
+       `sites` (the flag is diagnostic, never a discriminator)
++  OQ1/OQ2  esc-lead-gate-R10: alongside the >=2 examined-clean probe sites
++      R2 already requires, a relay must ALSO carry a non-empty
++      `open_question` — a site examined and explicitly NOT closed, naming
++      the attack for the next round. OQ1: an otherwise-fully-satisfying
++      relay (R1/R2/R3 all pass) with NO `open_question` is denied, naming
++      the missing field. OQ2: the SAME relay plus a non-empty
++      `open_question` is allowed. Armed unconditionally, alongside R2 —
++      never folded into `probe`'s own >=2 count.
+   L1  closed-world agent-type lattice: unrecognized type -> deny
+   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
+       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`
+@@ -376,13 +384,28 @@ def _relay_path_exact(root: Path, row: dict) -> Path:
+                                     row["agent_type"], row["ts"])
+ 
+ 
++# esc-lead-gate-R10: the fixture-only default `open_question` value every
++# pre-R10 fixture inherits automatically (below) — never asserted on, only
++# a valid non-empty placeholder so existing ALLOW fixtures stay ALLOW.
++_DEFAULT_OPEN_QUESTION = "fixture-default.py:1 — attack: none captured (fixture placeholder)"
++
++
+ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = None,
+                         probe: list[str] | None = None, fix_head: str | None = None,
++                        open_question: str | None = _DEFAULT_OPEN_QUESTION,
+                         override: dict | None = None) -> None:
+     """esc-097: `fix_head` (the fix commit's full sha) is written into the
+     relay artifact whenever the caller supplies one — the R3 arm's own
+     field, always OMITTED unless a caller passes it (so every pre-esc-097
+-    fixture's relay shape is byte-identical to before)."""
++    fixture's relay shape is byte-identical to before).
++
++    esc-lead-gate-R10: `open_question` defaults to a fixed, non-empty
++    placeholder string — so every EXISTING call site (none of which passes
++    this kwarg) keeps satisfying the new always-armed requirement without
++    editing dozens of unrelated fixtures — exactly the same backward-compat
++    shape `fix_head`'s own None-means-omitted default already established.
++    A fixture that means to test the R10 arm itself passes
++    `open_question=None` (omit) or an explicit string (present)."""
+     path = _relay_path_exact(root, row)
+     artifact = {"unit_branch": row["unit_branch"], "agent_type": row["agent_type"], "block_ts": row["ts"]}
+     if fix_head is not None:
+@@ -391,6 +414,8 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
+         artifact["sites"] = sites
+     if probe is not None:
+         artifact["probe"] = probe
++    if open_question is not None:
++        artifact["open_question"] = open_question
+     if override:
+         artifact.update(override)
+     path.parent.mkdir(parents=True, exist_ok=True)
+@@ -1261,6 +1286,45 @@ def fixture_g19_coverage_arm_selected_by_data_not_flag() -> None:
+             f"data-armed coverage must deny a probe-only relay, got {p.returncode}: {p.stderr}")
+ 
+ 
++# ==========================================================================
++# OQ1-OQ2 — esc-lead-gate-R10: alongside the >=2 examined-clean probe sites
++# R2 already requires, ONE further relay entry must be an OPEN QUESTION — a
++# site examined and explicitly NOT closed, naming the attack for the next
++# round. Armed ALWAYS, conjunctive with R1-R3, never folded into `probe`'s
++# own counting.
++# ==========================================================================
++
++def fixture_oq1_no_open_question_denies() -> None:
++    """A relay with >=2 clean, disjoint probe sites AND a valid fix_head
++    (satisfying R1/R2/R3 in full) but an explicitly ABSENT `open_question`
++    must still be denied — the new field is armed UNCONDITIONALLY, never
++    satisfied by `probe` alone."""
++    root = _temp_repo("feat/oq1")
++    row = _write_block_row(root, "feat/oq1", "a1", "adversarial-audit", None, ["foo.py:10"])
++    fix_head = _commit_fix(root, "baz.py")
++    _write_relay_exact(root, row, probe=["bar.py:5", "baz.py:9"], fix_head=fix_head,
++                        open_question=None)
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/oq1"}}, root)
++    _assert(p.returncode == 2, "OQ1", f"a relay with no open_question must deny, got {p.returncode}: {p.stderr}")
++    _assert("open_question" in p.stderr, "OQ1",
++            f"the deny reason must name the missing open_question: {p.stderr!r}")
++
++
++def fixture_oq2_open_question_present_allows() -> None:
++    """The SAME relay as OQ1, plus a non-empty `open_question`, must ALLOW —
++    proving the new field is satisfiable, not merely a permanent deny."""
++    root = _temp_repo("feat/oq2")
++    row = _write_block_row(root, "feat/oq2", "a1", "adversarial-audit", None, ["foo.py:10"])
++    fix_head = _commit_fix(root, "baz.py")
++    _write_relay_exact(
++        root, row, probe=["bar.py:5", "baz.py:9"], fix_head=fix_head,
++        open_question="qux.py:3 — examined, could not close: retry under a concurrent writer")
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/oq2"}}, root)
++    _assert(p.returncode == 0, "OQ2", f"a relay with an open_question present must allow, got {p.returncode}: {p.stderr}")
++
++
+ # ==========================================================================
+ # G20-G40 — esc-097 (R3, "probe the fix"; G32-G35 are the round-2, G36-G38
+ # the round-3, and G39-G40 the round-4 pressure-test reproducers). NOT
+@@ -2058,6 +2122,8 @@ FIXTURES = [
+     ("G17", fixture_g17_probed_relay_accepted_when_enumeration_present),
+     ("G18", fixture_g18_probe_boundary_cases),
+     ("G19", fixture_g19_coverage_arm_selected_by_data_not_flag),
++    ("OQ1", fixture_oq1_no_open_question_denies),
++    ("OQ2", fixture_oq2_open_question_present_allows),
+     ("T1", fixture_t1_card_schema_line_substituted_binds),
+     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
+     ("T3", fixture_t3_start_binds_unit_branch_colon_form),

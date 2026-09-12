@@ -1,19 +1,25 @@
-# PROPOSAL (human-merge): tighten(lead-gate) — a committed rigor record, armed by the diff's own shape (R7)
+# PROPOSAL (human-merge): tighten(lead-gate) — a committed rigor record, armed by the diff's own shape (R7); one relay probe entry must be an open question (R10)
 
-Status: PROPOSED. Third design on this problem — R4/R5 were KILLED, R6 was KILLED, R7 came back
-REFINE with binding corrections (v2, below the first `---`; where v1 and v2 differ, v2 wins — this
-doc states the v2 design directly and cites v1 only where the design history matters). Two patch
-files, proven applying and self-test-green against a pristine, independently-reconstructed copy of
-the real tree (see "Proven", below):
+Status: PROPOSED. Five designs have gone through this problem — R4/R5 were KILLED, R6 was KILLED, R7
+came back REFINE with binding corrections (v2, below the first `---`; where v1 and v2 differ, v2
+wins — this doc states the v2 design directly and cites v1 only where the design history matters),
+R9 was KILLED (see "R10 — the one thing in this corpus that worked ahead of time", below), and R10
+came back REFINE, the smallest surviving thing. Three patch files, proven applying and
+self-test-green against a pristine, independently-reconstructed copy of the real tree (see "Proven",
+below):
 
 - `docs/plans/53-agentic-swarm/proposals/R7-patch1-per-type-pass-vocabulary.patch` → `.claude/hooks/
   lead-gate-lib.py`, `.claude/hooks/README.md`, `ci/scripts/check_lead_gate.py`.
 - `docs/plans/53-agentic-swarm/proposals/R7-patch2-committed-rigor-record.patch` → `.claude/hooks/
   lead-gate-lib.py`, `.claude/agents/adversarial-audit.md`, `.github/workflows/swarm.yml`,
   `ci/scripts/check_rigor_record.py` (new), `ci/scripts/rigor_record_allowlist.txt` (new).
+- `docs/plans/53-agentic-swarm/proposals/R7-patch3-open-question-probe.patch` → `.claude/hooks/
+  lead-gate-lib.py`, `.claude/hooks/README.md`, `ci/scripts/check_lead_gate.py`. Applies AFTER patch 1
+  and patch 2, in that order (proven sequentially, below) — the smallest of the three, touching only
+  `_relay_rejection`'s R2 block, two docstring sentences, and the harness's own relay-fixture helper.
 
 `SWARM_GATE_TOUCHED` (`.claude/hooks/**`, `.claude/agents/*.md`, `ci/scripts/**/check_*.py`,
-`.github/workflows/swarm.yml`) → both patches, proposal only, human admin-merge — every file either
+`.github/workflows/swarm.yml`) → all three patches, proposal only, human admin-merge — every file any
 patch touches is human-amend-only or itself a swarm gate definition.
 
 ## Applying the patches (human step)
@@ -27,14 +33,21 @@ git apply --check docs/plans/53-agentic-swarm/proposals/R7-patch2-committed-rigo
   git apply docs/plans/53-agentic-swarm/proposals/R7-patch2-committed-rigor-record.patch
 python3 ci/scripts/check_lead_gate.py --self-test
 python3 ci/scripts/check_rigor_record.py --self-test
+
+git apply --check docs/plans/53-agentic-swarm/proposals/R7-patch3-open-question-probe.patch && \
+  git apply docs/plans/53-agentic-swarm/proposals/R7-patch3-open-question-probe.patch
+python3 ci/scripts/check_lead_gate.py --self-test
 ```
 
-Patches apply independently and in either order against each other's OWN file set (patch 1 never
-touches a file patch 2 also touches except `lead-gate-lib.py`, where the two edit disjoint regions —
-proven applying sequentially, patch 1 then patch 2, in that order, below); ship patch 1 now, patch 2
-next, per the binding sequencing below.
+Patches 1 and 2 apply independently and in either order against each other's OWN file set (patch 1
+never touches a file patch 2 also touches except `lead-gate-lib.py`, where the two edit disjoint
+regions — proven applying sequentially, patch 1 then patch 2, in that order, below). Patch 3 is
+ORDER-DEPENDENT on both: it is built against, and proven applying only against, the tree AFTER patch
+1 and patch 2 already landed (its own `_relay_rejection` edit sits between R2's block, which patch 1
+and patch 2 leave untouched, and R3's — proven sequentially, patch 1 then patch 2 then patch 3, in
+that order, below). Ship patch 1 now, patch 2 next, patch 3 last, per the binding sequencing below.
 
-## Design history — three rounds, cited by artifact, not narrated
+## Design history — five rounds, cited by artifact, not narrated
 
 **R4/R5 — KILLED.** A verifiable-sweep mechanism (re-executing a lead-authored shell command) and a
 round cap billed as enforceable against the lead were both killed on reproduced evidence, not argued
@@ -86,6 +99,47 @@ trailers) orphans every pre-amend `head_sha`, reproduced twice (`git merge-base 
 — so it becomes advisory; the carrier moves from a hand-typed markdown table to JSONL (the hook's
 own row schema, exported by a new `--export` subcommand); the commit trailer is dropped entirely
 (equally forgeable, less visible than a file in the diff, fragile under the amend-trailers workflow).
+
+**R9 — KILLED, including a case the round caught against the lead itself.** R9 proposed a
+re-executable, verifier-authored sweep predicate; the design round's own verdict killed it on three
+independent measurements, one of which corrected a claim this session had relayed as measured when it
+was fitted. The predicate credited with finding a site "one round early" was round 4's OWN sweep
+instrument, replayed at round 4's OWN audit head — the round that would actually have had to author it
+never mentions the term: its five real patterns yield 54, 45, 123, 20, and 444 matches at that same
+head and NONE reaches the site; the honest, non-hindsight construction hands the lead about 686
+dispositions and still misses. The showcase was also MISDIAGNOSED: the class was named prospectively —
+by the LEAD, in an earlier round's own relay, as the one site it could not close by reading, with an
+explicit "attack it" — and the next round attacked it and closed it, which is the hand-off chain
+working, not a proactivity failure the predicate caught. Three further measurements killed the
+mechanism independently: the jam is the MEDIAN (executing 101 real verifier-authored patterns at their
+own recorded fix heads gives a median of 25 matches whole-tree and 10 scoped, 31% over 25 even when
+scoped; 13 of 101 are FATAL under the extended-regex the design demanded and 5 more silently match
+nothing); and the theory of change is wrong (over 45 relay-carrying consecutive pairs, 67% of the next
+round's findings land in a file the relay ALREADY dispositioned and only 6% repeat a site — the gap is
+DEPTH per site, not breadth, and R9 multiplied breadth tenfold while leaving depth alone; median
+disposition length falls from 180 characters at eight sites or fewer to 45 at thirty-four sites, and
+14% of all live dispositions are under forty characters).
+
+**R10 — REFINE, the one thing in this corpus that worked ahead of time.** Every relay already carries,
+per R2, at least two probe sites "examined and found clean." The single best hand-off in the entire
+corpus was not one of those — it was a probe entry that said: here is a site I examined and could NOT
+close, here is the attack; the next round took it and closed it (the same hand-off R9's showcase
+misdiagnosed as a predicate's finding, above). **The rule:** alongside the two examined-clean sites R2
+already requires, at least ONE probe entry must be an OPEN QUESTION — a site examined and explicitly
+not closed, carrying the attack to run. The relay schema gains this distinction; R2's own count
+requirement is otherwise unchanged. This is PROSPECTIVE — checked when the relay is written, before
+the next verifier exists, changing what the lead must produce at the moment of re-dispatch (the user's
+own bar), rather than annotating the round after. It does not JAM: one line of relay text, no
+subprocess, no regex, no new field on the verifier's write path, no match count, no cap, no shadow
+period — nothing scales with the size of the class (patch 3, below, is the smallest of the three
+patches this proposal ships). It creates no bad incentive: it cannot be satisfied by narrowing the
+verifier's brief, because it is about the LEAD's own examination, never the verifier's scope — R9's
+worst residual (a narrower round-one audit becomes cheaper for the lead) does not arise here.
+
+**The residual, stated and never implied away.** This is a SCHEMA requirement over lead-authored
+text. It is a cost floor, not proof of examination — the same limit the hook already records for its
+existing probe rule. A lead can write a hollow open question. What it cannot do is write nothing and
+pass, and what the human reads at merge is whether the open questions were real.
 
 ## What R7 is, as bound by v2
 
@@ -173,6 +227,37 @@ against all seven verdict schemas).
 **The honest words, binding, used exactly once, as instructed, and nowhere else in this document:**
 ARMED BY THE DIFF, SATISFIED BY DISCLOSURE, JUDGED BY THE HUMAN. TAMPER-EVIDENT, NEVER TAMPER-PROOF.
 
+## What patch 3 (R10) is
+
+**The mechanism.** `_relay_rejection`'s R2 block (`.claude/hooks/lead-gate-lib.py`) already requires
+`probe` to name ≥2 distinct sites outside the enumeration/findings. Patch 3 adds, immediately after
+that block and immediately before R3, ONE further ARMED-ALWAYS check: `data.get("open_question")`
+must be a non-empty string. That is the entire mechanism — no adjacency check against `probe` or the
+enumeration, no format requirement beyond non-empty, no cap. R2's own ≥2-distinct-non-reactive
+counting is untouched, byte-for-byte, by this patch — a decision recorded in the diff itself: the new
+check reads a field R2 never looks at, so a regression in one cannot silently mask a regression in the
+other. The module docstring's "Arm order" sentence and its `esc-064` summary paragraph gain one
+clause each naming the new arm; `.claude/hooks/README.md` gains one new numbered sub-point, (2b),
+between (2) Proactivity and (3) Probe-the-fix, restating the exact same limit in the human-facing doc.
+
+**The harness.** `ci/scripts/check_lead_gate.py`'s `_write_relay_exact` test helper gains one new
+keyword parameter, `open_question`, defaulting to a fixed, non-empty placeholder string
+(`_DEFAULT_OPEN_QUESTION`) — so every one of the ~30 EXISTING call sites, none of which passes this
+kwarg, keeps satisfying the new always-armed requirement without a single one of them being edited.
+This is the identical backward-compatible shape `fix_head`'s own `None`-means-omitted default already
+established in this same helper. Two new fixtures exercise the arm directly: `OQ1` writes a relay that
+already satisfies R1+R2+R3 in full but passes `open_question=None` (explicitly suppressing the
+default) and asserts DENY, naming the missing field; `OQ2` is the identical relay with a real
+`open_question` string and asserts ALLOW. Both are non-vacuous — confirmed directly by temporarily
+removing the new check and observing `OQ1` turn RED (`check-lead-gate[OQ1]: FAIL — ... got 0`) while
+every other fixture stayed unaffected, then restoring it.
+
+**What this patch does NOT do**, stated as plainly as the mechanism itself: it does not check that the
+named open question is adjacent to anything, that it differs from any `probe` entry, that it names a
+real file, or that its prose is substantive — any non-empty string satisfies it, including a copied
+placeholder. This is not an oversight; it is the same limit (2)'s own ≥2-clean-sites rule already
+carries, restated rather than hidden. See "The residual, stated and never implied away," above.
+
 ## Proven
 
 Built and tested against a from-scratch, byte-for-byte pristine reconstruction of the real files
@@ -199,6 +284,15 @@ worktree's own live `.claude/hooks/**`, which tools are denied from editing:
    directory: exports the unit's own rows verbatim, including a `recurrence_of_round` value written
    by a real `SubagentStop` payload through `handle_stop` (verified by reading the resulting
    `.jammi/gate-state/<slug>.jsonl` row directly).
+5. Patch 1 THEN patch 2 THEN patch 3, applied sequentially to a THIRD, independently-reconstructed
+   pristine copy: all three `git apply --check`/`git apply` pairs clean, in that order (patch 3's own
+   `index` lines chain from patch 2's post-apply blob hashes, confirmed by hash, not merely by
+   re-running the check); `python3 -m py_compile` clean; `check_lead_gate.py --self-test` →
+   **68/68** (66 + `OQ1` + `OQ2`); `check_rigor_record.py --self-test` → **11/11**, unaffected (patch 3
+   touches no file that script imports or reads). `OQ1`/`OQ2` confirmed non-vacuous by temporarily
+   deleting patch 3's own check and re-running: `OQ1` alone turns RED, every other fixture (including
+   every pre-existing ALLOW fixture that never passes `open_question`) stays GREEN — proof the
+   backward-compatible default in `_write_relay_exact` does not also hide a vacuous new assertion.
 
 Every fixture in `check_rigor_record.py`'s own self-test builds a REAL `origin` + feature-branch
 clone pair (`git fetch origin <base>` really resolves `origin/<base>`, exactly as a CI checkout
@@ -285,15 +379,18 @@ it has caught anyone.
 
 ## Ledger lifecycle
 
-No escape id is assigned yet. `.jammi/escapes.jsonl` carries no `lead-gate-R7`/`esc-lead-gate-R7` row
-as of this doc; one is appended, following the `esc-097-relay-form-satisfied-without-probing-the-fix`
-precedent, once a human applies the patches and both self-tests go green on `main`.
+No escape id is assigned yet. `.jammi/escapes.jsonl` carries no `lead-gate-R7`/`esc-lead-gate-R7`/
+`esc-lead-gate-R10` row as of this doc; one is appended, following the
+`esc-097-relay-form-satisfied-without-probing-the-fix` precedent, once a human applies all three
+patches and every self-test goes green on `main`.
 
 ## Session-local evidence
 
 Every `scratchpad/…`/`{scratchpad}/tasks/…` path cited above is session-local working state — per
 this repo's own `.gitignore`, `scratchpad/` is never tracked and none of it is citable after the
 session ends; it is named here only to show how this doc's own numbers were produced. The durable
-evidence is: the two `.patch` files under this same directory; `ci/hook-acceptance/replay_relays.py`
+evidence is: the three `.patch` files under this same directory; `ci/hook-acceptance/replay_relays.py`
 and its two baseline logs; and the real `.jammi/gate-state/*`/`.jammi/ledger/*` rows this proposal's
-own design-history section cites by exact path and timestamp.
+own design-history section cites by exact path and timestamp. Patch 3 (R10) adds no new replay
+evidence of its own — it is a pure schema-presence check with no arming condition to replay against
+real merge history (unlike R7b/patch 2); its own evidence is exclusively "Proven" item 5, above.

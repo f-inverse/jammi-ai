@@ -362,6 +362,17 @@ impl SegmentedIndex {
         self.storage_precision
     }
 
+    /// The embedding width every segment in this set was built at — read off
+    /// the first segment. `new`/`new_masked` require at least one segment
+    /// (never an empty set), so this is always available once a
+    /// `SegmentedIndex` exists; it is the set's own authority for a query
+    /// whose `expected_width` was deferred at construction (no catalog width
+    /// on record), the all-local twin of `exact_vector_search`'s
+    /// no-catalog-width fallback one layer up.
+    pub(crate) fn dimensions(&self) -> usize {
+        self.segments[0].index.dimensions()
+    }
+
     /// Total number of rows across every segment (physical rows, masked
     /// included).
     pub fn len(&self) -> usize {

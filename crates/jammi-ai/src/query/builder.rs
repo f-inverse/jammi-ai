@@ -77,12 +77,6 @@ impl QueryBuilder {
         let width = match &source {
             QuerySource::Caller => table.dimensions().map(std::num::NonZeroUsize::get),
             QuerySource::Stored { .. } => None,
-            // `Artifact` is never a query's own provenance — it is only
-            // ever constructed inside `ValidatedQuery::require_width`'s
-            // error, never passed in as an incoming `source` here.
-            QuerySource::Artifact { .. } => {
-                unreachable!("QuerySource::Artifact is never a query's own provenance")
-            }
         };
         let query_vec = validate_query(query_vec, width, source)?;
 

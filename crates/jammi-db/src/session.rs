@@ -969,9 +969,11 @@ impl JammiSession {
     /// [`crate::storage::JammiObjectStore`] and streams the column through
     /// the engine's typed-vector reader.
     ///
-    /// Surfaces [`JammiError::Schema`] when the table's parquet does not
-    /// carry a `vector` column shaped `FixedSizeList<Float32>`, so callers
-    /// see a typed signal instead of a panic on the downcast.
+    /// Surfaces [`JammiError::IncompatibleFormat`] when the table's own
+    /// parquet does not carry a `vector` column shaped
+    /// `FixedSizeList<Float32>` — this table's own stored artifact, never
+    /// the caller's fault — so callers see a typed, engine-class signal
+    /// instead of a panic on the downcast.
     pub async fn read_vectors(
         &self,
         table: &crate::catalog::result_repo::ResultTableRecord,
@@ -1035,10 +1037,11 @@ impl JammiSession {
     /// a typed equality filter (no SQL string interpolation of the key, so an
     /// arbitrary key is not an injection vector) and extracts the one
     /// `FixedSizeList<Float32>` cell. Returns [`JammiError::Catalog`] when no
-    /// row matches the key, and [`JammiError::Schema`] when the `vector`
-    /// column is not shaped `FixedSizeList<Float32>` — the same typed signal
-    /// [`Self::read_vectors`] gives. The vector stays inside the engine; this
-    /// is the resolver behind `search_by_id`'s query-by-example path.
+    /// row matches the key, and [`JammiError::IncompatibleFormat`] when the
+    /// `vector` column is not shaped `FixedSizeList<Float32>` — this table's
+    /// own stored artifact, the same engine-class signal [`Self::
+    /// read_vectors`] gives. The vector stays inside the engine; this is the
+    /// resolver behind `search_by_id`'s query-by-example path.
     pub async fn read_vector_by_key(
         &self,
         table: &crate::catalog::result_repo::ResultTableRecord,

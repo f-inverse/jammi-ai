@@ -120,8 +120,10 @@ impl DeletionMask {
     }
 
     /// Read a mask back, schema-checked (K2): a file that is not exactly the
-    /// two-column mask shape is a typed [`JammiError::Schema`], never a
-    /// misread horizon.
+    /// two-column mask shape is a typed [`JammiError::IncompatibleFormat`] —
+    /// this ENGINE's own sidecar (only [`Self::write`], in this module,
+    /// ever produces one), so a corrupt mask is never the caller's fault —
+    /// never a misread horizon.
     pub async fn read(handle: &JammiObjectStore, table: &str) -> Result<Self> {
         let batches = storage::reader::read_all_record_batches(handle).await?;
         let mut mask = Self::default();
@@ -170,18 +172,21 @@ impl DeletionMask {
     }
 }
 
+/// The mask's own corruption is always the ENGINE's fault: this sidecar is
+/// never anything a caller supplies, only ever written by [`DeletionMask::write`]
+/// in this module and read back by [`DeletionMask::read`] above.
 fn schema_error(table: &str, column: &str, expected: &str, actual: &str) -> JammiError {
-    JammiError::Schema {
-        table: table.to_string(),
-        column: column.to_string(),
-        expected: expected.to_string(),
-        actual: actual.to_string(),
+    JammiError::IncompatibleFormat {
+        artifact: format!("{table}.{column}"),
+        found: actual.to_string(),
+        supported: expected.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{StorageRegistry, StorageUrl};
 
     #[test]
     fn horizons_mask_at_or_below_and_never_above() {
@@ -193,5 +198,44 @@ mod tests {
         assert!(!mask.is_masked("other", 0));
         assert!(mask.masks_version(1));
         assert!(!mask.masks_version(2));
+    }
+
+    /// (DIST round 8) The mask sidecar is ENGINE-owned: only [`DeletionMask::write`]
+    /// in this module ever produces one, so a corrupt on-disk mask is never
+    /// the caller's fault. `read` used to refuse it with `JammiError::Schema`
+    /// (the caller class, gRPC `InvalidArgument`) — this asserts the fixed
+    /// engine class, `IncompatibleFormat` (gRPC `Internal`).
+    #[tokio::test]
+    async fn a_corrupt_mask_file_is_the_engine_class_never_the_caller_s() {
+        let dir = tempfile::tempdir().unwrap();
+        // Wrong shape entirely: a single Utf8 column, not the two-column
+        // `(_row_id Utf8, _dead_through_version Int64)` mask schema.
+        let wrong_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "not_a_mask",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&wrong_schema),
+            vec![Arc::new(StringArray::from(vec!["x"])) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+        let url = StorageUrl::parse(dir.path().join("corrupt.deletes.parquet").to_str().unwrap())
+            .unwrap();
+        let registry = StorageRegistry::new();
+        let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url);
+        let mut writer = ObjectParquetWriter::open(&handle, wrong_schema)
+            .await
+            .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let err = DeletionMask::read(&handle, "docs")
+            .await
+            .expect_err("a mask file missing its own columns must be refused");
+        assert!(
+            matches!(&err, JammiError::IncompatibleFormat { artifact, .. } if artifact.contains("docs")),
+            "a corrupt ENGINE-owned sidecar must never be billed to the caller: {err:?}"
+        );
     }
 }

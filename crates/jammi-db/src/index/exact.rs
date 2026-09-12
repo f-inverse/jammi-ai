@@ -146,39 +146,40 @@ pub async fn exact_vector_search(
         .await?;
     // The scan schema's `FixedSizeList` width is the width every row below
     // has, by construction of the column type. A non-positive or
-    // unconvertible length is a corrupt column, never a width of `0` — a
-    // silent `0` would refuse every non-empty query with a confident wrong
-    // expectation ("expected 0 dimensions") instead of naming the corrupt
-    // column, and this is the one path with no index behind it, so nothing
-    // else catches it.
+    // unconvertible length, a wrong Arrow type, or a missing column is a
+    // CORRUPT scan schema — this table's own stored artifact, never anything
+    // the caller supplied — so every arm below is `IncompatibleFormat`
+    // (engine class), identically to the catalog-vs-scan disagreement four
+    // lines below and every corrupt-artifact refusal in `sidecar.rs`. A
+    // silent `0` would additionally refuse every non-empty query with a
+    // confident wrong expectation ("expected 0 dimensions") instead of
+    // naming the corrupt column, and this is the one path with no index
+    // behind it, so nothing else catches it.
     let scan_width = match df.schema().field_with_unqualified_name("vector") {
         Ok(field) => match field.data_type() {
             DataType::FixedSizeList(_, n) => match usize::try_from(*n) {
                 Ok(width) if width > 0 => width,
                 _ => {
-                    return Err(JammiError::Schema {
-                        table: table_name.to_string(),
-                        column: "vector".into(),
-                        expected: "a positive FixedSizeList width".into(),
-                        actual: format!("{n}"),
+                    return Err(JammiError::IncompatibleFormat {
+                        artifact: format!("{table_name}.vector"),
+                        found: format!("{n}"),
+                        supported: "a positive FixedSizeList width".into(),
                     })
                 }
             },
             other => {
-                return Err(JammiError::Schema {
-                    table: table_name.to_string(),
-                    column: "vector".into(),
-                    expected: "FixedSizeList<Float32>".into(),
-                    actual: format!("{other:?}"),
+                return Err(JammiError::IncompatibleFormat {
+                    artifact: format!("{table_name}.vector"),
+                    found: format!("{other:?}"),
+                    supported: "FixedSizeList<Float32>".into(),
                 })
             }
         },
         Err(_) => {
-            return Err(JammiError::Schema {
-                table: table_name.to_string(),
-                column: "vector".into(),
-                expected: "FixedSizeList<Float32>".into(),
-                actual: "missing".into(),
+            return Err(JammiError::IncompatibleFormat {
+                artifact: format!("{table_name}.vector"),
+                found: "missing".into(),
+                supported: "FixedSizeList<Float32>".into(),
             })
         }
     };

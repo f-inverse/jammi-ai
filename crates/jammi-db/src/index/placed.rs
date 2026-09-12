@@ -254,8 +254,10 @@ impl PlacedIndex {
     /// total order comparable across every segment, wherever it lives.
     ///
     /// All-local: literally [`SegmentedIndex::search_final`] — the same
-    /// kernels, the same bytes, today's exact-read count. Mixed: the
-    /// per-precision protocol over the transport plus the failure ladder.
+    /// kernels, the same bytes, today's exact-read count — after the same
+    /// deferred-authority check the all-remote branch of [`Self::
+    /// search_mixed`] applies (below). Mixed: the per-precision protocol
+    /// over the transport plus the failure ladder.
     pub async fn search_final_placed(
         &self,
         query: &ValidatedQuery,
@@ -263,7 +265,27 @@ impl PlacedIndex {
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
         match &self.inner {
-            Placed::AllLocal(index) => index.search_final(query, k, oversample),
+            Placed::AllLocal(index) => {
+                // The width rule for the all-local shape: nothing downstream
+                // of `QueryBuilder::new` has been consulted yet (no fan-out,
+                // no owner, no peer ladder — the sync path runs next), so
+                // this is the LAST point a deferred (`expected_width: None`)
+                // query can still be attributed to the caller before it
+                // meets `SegmentedIndex::search_final`'s own width check
+                // (`segment.rs`'s `require_width`, the downstream,
+                // artifact-only class by construction — never the caller's,
+                // regardless of provenance). With a catalog width on record,
+                // that is the authority; without one, the set's own first
+                // segment is — exactly `exact_vector_search`'s
+                // no-catalog-width fallback, one layer up (a segmented index
+                // rather than a bare scan).
+                let authority = match self.dimensions {
+                    Some(width) => width.get(),
+                    None => index.dimensions(),
+                };
+                query.require_authority_width(authority)?;
+                index.search_final(query, k, oversample)
+            }
             Placed::Mixed { local, remote } => {
                 self.search_mixed(local, remote, query, k, oversample).await
             }
@@ -316,23 +338,25 @@ impl PlacedIndex {
         // below runs first), but an all-remote placement has no index in hand
         // and `index_segments` records no width — so the catalog's
         // `dimensions` is the only width on record. With it, the query is
-        // enforced against it here — one of TWO call sites that still
-        // attribute by the query's own provenance (the other is
-        // `exact_vector_search`'s no-catalog-width fallback), because
-        // nothing downstream of it has been consulted yet; without it, the
-        // search is refused rather than fanned out unguarded (a caller
-        // fault must never reach an owner, let alone the ladder).
+        // enforced against it here — one of THREE call sites that still
+        // attribute by the query's own provenance (the others are
+        // `exact_vector_search`'s no-catalog-width fallback and this same
+        // method's all-local branch below), because nothing downstream of it
+        // has been consulted yet; without it, the search is refused rather
+        // than fanned out unguarded (a caller fault must never reach an
+        // owner, let alone the ladder) — but an ABSENT catalog width is the
+        // engine's own gap in the row it owns, never anything the caller
+        // supplied, so THIS refusal is the engine class, not the caller's.
         if local.is_empty() {
             match self.dimensions {
                 Some(width) => query.require_authority_width(width.get())?,
                 None => {
-                    return Err(JammiError::Schema {
-                        table: self.table_name.clone(),
-                        column: "dimensions".into(),
-                        expected: "a recorded width (every segment is remote, so the catalog \
-                                   row is the only width on record)"
+                    return Err(JammiError::IncompatibleFormat {
+                        artifact: format!("{}.dimensions", self.table_name),
+                        found: "none".into(),
+                        supported: "a recorded width (every segment is remote, so the catalog \
+                                    row is the only width on record)"
                             .into(),
-                        actual: "none".into(),
                     })
                 }
             }
@@ -953,6 +977,59 @@ mod tests {
         }
     }
 
+    // M4c (DIST round 8) — the deferred-authority promise on the ALL-LOCAL
+    // path. With no catalog width on record (`dimensions: None`) and every
+    // segment local, `search_final_placed` used to go straight to
+    // `SegmentedIndex::search_final` with nothing having checked the query
+    // against any authority — the first (and only) width check it then met
+    // was `segment.rs`'s `require_width`, the downstream, artifact-only
+    // class BY CONSTRUCTION, engine-fault regardless of provenance. So a
+    // genuine caller width mistake was billed to the engine — the reverse
+    // direction of the M2 defect (`exact.rs`/`placed.rs`'s absent-width
+    // arms billing the ENGINE's gap to the caller). Fixed by checking the
+    // set's own first segment's width here, exactly `exact_vector_search`'s
+    // no-catalog-width fallback, one layer up.
+    #[tokio::test]
+    async fn all_local_with_no_catalog_width_still_attributes_a_wrong_width_query_to_the_caller() {
+        let rows = corpus(); // every row is 8-wide
+        let dir = tempfile::tempdir().unwrap();
+        let loader = Arc::new(
+            SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
+        );
+        let placed = PlacedIndex::with_sources(
+            vec![SegmentSource::Local(
+                SegmentId(0),
+                segment(&rows, StoragePrecision::F32),
+            )],
+            "t",
+            StoragePrecision::F32,
+            Arc::new(NoPeers),
+            loader,
+            AnnIndexConfig::default(),
+            None,
+            None, // no catalog width on record — the failure precondition
+            Arc::new(PeerFailureCounters::default()),
+        )
+        .unwrap();
+        // A genuine caller mistake: the corpus is 8-wide, this query is 5.
+        let q = vq(&[1.0; 5]);
+        let err = placed
+            .search_final_placed(&q, 3, 1)
+            .await
+            .expect_err("a wrong-width query must be refused, not silently truncated or padded");
+        assert!(
+            matches!(&err, JammiError::Schema { .. }),
+            "a genuine caller width mistake with no catalog width on record must still be the \
+             CALLER class (JammiError::Schema), not the engine's — got {err:?}"
+        );
+        // The conforming query still serves — the authority check is not a
+        // blanket refusal of every deferred-width query, only a mismatched
+        // one.
+        let ok = vq(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]);
+        let hits = placed.search_final_placed(&ok, 1, 1).await.unwrap();
+        assert_eq!(hits[0].0, "a");
+    }
+
     #[test]
     fn empty_source_set_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1454,13 +1531,16 @@ mod tests {
             )
             .unwrap()
         };
-        // No width on record: refused, no fan-out.
+        // No width on record: refused, no fan-out. An ABSENT catalog width
+        // is the engine's own gap in the row it owns — never anything the
+        // caller supplied — so this is the engine class (IncompatibleFormat),
+        // never JammiError::Schema.
         let err = build(None)
             .search_final_placed(&vq(&[1.0; 8]), 3, 1)
             .await
             .expect_err("no width on record → refuse, never fan out");
         assert!(
-            matches!(&err, JammiError::Schema { column, .. } if column == "dimensions"),
+            matches!(&err, JammiError::IncompatibleFormat { artifact, .. } if artifact == "t.dimensions"),
             "{err:?}"
         );
         assert_eq!(owner.calls.lock().unwrap().0, 0, "no owner was dialled");

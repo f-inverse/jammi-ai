@@ -136,11 +136,15 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape(backend: BackendKind) {
+async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend: BackendKind) {
     // The parquet at the registered table's URL carries a `vector` column
-    // typed Utf8, not FixedSizeList<Float32>. `read_vectors` must surface a
-    // `JammiError::Schema` with the actual shape populated — proves callers
-    // see a typed signal instead of the panic-on-downcast the OSS path used
+    // typed Utf8, not FixedSizeList<Float32>. This is the TABLE's own stored
+    // artifact — the corruption is never the caller's fault, so
+    // `read_vectors` must surface `JammiError::IncompatibleFormat` (round-8
+    // DIST fix: a standing oracle used to pin the caller class,
+    // `JammiError::Schema`, for exactly this engine-owned defect) with the
+    // actual shape populated — proves callers see a typed, correctly-
+    // attributed signal instead of the panic-on-downcast the OSS path used
     // to emit when consumers reached straight at the parquet.
     let dir = tempdir().unwrap();
     let session = session_or_skip!(backend, dir);
@@ -207,20 +211,18 @@ async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape(backend:
         .unwrap();
     let err = session.read_vectors(&record).await.unwrap_err();
     match err {
-        JammiError::Schema {
-            table,
-            column,
-            expected,
-            actual,
+        JammiError::IncompatibleFormat {
+            artifact,
+            found,
+            supported,
         } => {
-            assert_eq!(table, table_name);
-            assert_eq!(column, "vector");
-            assert_eq!(expected, "FixedSizeList<Float32>");
+            assert!(artifact.contains(table_name) && artifact.contains("vector"));
+            assert_eq!(supported, "FixedSizeList<Float32>");
             assert!(
-                !actual.is_empty() && actual != "missing",
-                "actual should describe Utf8 column shape, got {actual:?}"
+                !found.is_empty() && found != "missing",
+                "found should describe Utf8 column shape, got {found:?}"
             );
         }
-        other => panic!("expected JammiError::Schema, got {other:?}"),
+        other => panic!("expected JammiError::IncompatibleFormat, got {other:?}"),
     }
 }

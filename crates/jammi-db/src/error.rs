@@ -524,43 +524,68 @@ impl From<datafusion::error::DataFusionError> for JammiError {
 /// A refused query vector, classified by its provenance
 /// ([`jammi_numerics::query::QuerySource`]): a CALLER's vector is the caller's
 /// fault — the schema class every width mismatch already maps to (gRPC
-/// `InvalidArgument`); a vector read back from STORAGE is a corrupt artifact
-/// named by its table (the same class an unreadable sidecar maps to, gRPC
-/// `Internal`).
+/// `InvalidArgument`); a vector read back from STORAGE, or a downstream
+/// ARTIFACT the query disagreed with after construction, is a corrupt
+/// artifact named by its table or index (the same class an unreadable
+/// sidecar maps to, gRPC `Internal`). `ArtifactMismatch` carries no
+/// `QuerySource` — it is never about the query's own provenance — so it is
+/// matched directly rather than through `.source()`.
 impl From<jammi_numerics::query::QueryValidationError> for JammiError {
     fn from(e: jammi_numerics::query::QueryValidationError) -> Self {
         use jammi_numerics::query::{QuerySource, QueryValidationError};
-        let (expected, actual) = match &e {
-            QueryValidationError::NonFinite { index, value, .. } => (
-                "finite f32 components".to_string(),
-                format!("component {index} is {value:?}"),
-            ),
+        match e {
+            QueryValidationError::NonFinite {
+                index,
+                value,
+                source,
+            } => {
+                let expected = "finite f32 components".to_string();
+                let actual = format!("component {index} is {value:?}");
+                match source {
+                    QuerySource::Caller => JammiError::Schema {
+                        table: "query".into(),
+                        column: "query".into(),
+                        expected,
+                        actual,
+                    },
+                    QuerySource::Stored { table } => JammiError::IncompatibleFormat {
+                        artifact: format!("{table}.vector"),
+                        found: actual,
+                        supported: expected,
+                    },
+                }
+            }
             QueryValidationError::Width {
-                expected, actual, ..
-            } => (
-                format!("{expected} dimensions"),
-                format!("{actual} dimensions"),
-            ),
-        };
-        match e.source() {
-            QuerySource::Caller => JammiError::Schema {
-                table: "query".into(),
-                column: "query".into(),
                 expected,
                 actual,
-            },
-            QuerySource::Stored { table } => JammiError::IncompatibleFormat {
-                artifact: format!("{table}.vector"),
-                found: actual,
-                supported: expected,
-            },
-            // A downstream artifact `require_width` disagreed with —
-            // engine-fault by construction, identically to `Stored`,
-            // regardless of the query's own provenance.
-            QuerySource::Artifact { name } => JammiError::IncompatibleFormat {
-                artifact: format!("{name}.vector"),
-                found: actual,
-                supported: expected,
+                source,
+            } => {
+                let expected_s = format!("{expected} dimensions");
+                let actual_s = format!("{actual} dimensions");
+                match source {
+                    QuerySource::Caller => JammiError::Schema {
+                        table: "query".into(),
+                        column: "query".into(),
+                        expected: expected_s,
+                        actual: actual_s,
+                    },
+                    QuerySource::Stored { table } => JammiError::IncompatibleFormat {
+                        artifact: format!("{table}.vector"),
+                        found: actual_s,
+                        supported: expected_s,
+                    },
+                }
+            }
+            // Carries no `QuerySource` at all — engine-fault by construction,
+            // never the query's own provenance, regardless of it.
+            QueryValidationError::ArtifactMismatch {
+                artifact,
+                expected,
+                actual,
+            } => JammiError::IncompatibleFormat {
+                artifact: format!("{artifact}.vector"),
+                found: format!("{actual} dimensions"),
+                supported: format!("{expected} dimensions"),
             },
         }
     }

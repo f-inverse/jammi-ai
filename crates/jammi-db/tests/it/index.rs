@@ -335,17 +335,21 @@ async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
 }
 
 // A1b — a ZERO-width `FixedSizeList` scan column (a corrupt schema, not a
-// user query) is refused with a typed error naming the COLUMN, never
-// silently treated as a width of `0` against the query. The query here is
-// deliberately NON-EMPTY: an empty query would trivially match a width-0
-// column under the old, buggy conversion too (0 == 0), so it would prove
-// nothing. A non-empty query against a 0-width column is exactly the case
-// the old `usize::try_from(*n).unwrap_or(0)` mishandled — it would refuse
-// the query as "expected 0 dimensions" (blaming the CALLER's width, column
-// "query"), when the true defect is the corrupt scan schema itself (column
-// "vector"). Those are different failures; only the second is the fix.
+// user query) is refused with a typed, engine-class error naming the
+// artifact, never silently treated as a width of `0` against the query and
+// never billed to the caller. The query here is deliberately NON-EMPTY: an
+// empty query would trivially match a width-0 column under the old, buggy
+// conversion too (0 == 0), so it would prove nothing. A non-empty query
+// against a 0-width column is exactly the case the old
+// `usize::try_from(*n).unwrap_or(0)` mishandled — it would refuse the query
+// as "expected 0 dimensions" (blaming the CALLER's width). The corrupt scan
+// schema is THIS table's own stored artifact (round-8 fix: `JammiError::
+// IncompatibleFormat`, gRPC `Internal`), never the caller's fault
+// (`JammiError::Schema`, gRPC `InvalidArgument`) — a standing oracle that
+// used to assert the caller class here while its own comment said "a
+// corrupt schema, not a user query".
 #[tokio::test]
-async fn exact_search_refuses_a_zero_width_scan_column_typed_not_a_width_of_zero() {
+async fn exact_search_refuses_a_zero_width_scan_column_typed_engine_fault() {
     let dir = tempdir().unwrap();
     let schema = embedding_table_schema(0);
     // Only the SCHEMA's `FixedSizeList` width matters to the check under
@@ -393,19 +397,23 @@ async fn exact_search_refuses_a_zero_width_scan_column_typed_not_a_width_of_zero
         .await
         .expect_err("a zero-width scan column must be refused, never treated as width 0");
     match &err {
-        jammi_db::error::JammiError::Schema {
-            column, expected, ..
+        jammi_db::error::JammiError::IncompatibleFormat {
+            artifact,
+            supported,
+            ..
         } => {
-            assert_eq!(
-                column, "vector",
-                "must name the corrupt SCAN column, not \"query\" (the old, wrong shape): {err:?}"
+            assert!(
+                artifact.contains("zero_width") && artifact.contains("vector"),
+                "must name the corrupt SCAN artifact, not \"query\" (the old, wrong shape): {err:?}"
             );
             assert!(
-                expected.contains("positive"),
-                "names the corrupt column's own defect, not a query width like \"0 dimensions\": {expected}"
+                supported.contains("positive"),
+                "names the corrupt column's own defect, not a query width like \"0 dimensions\": {supported}"
             );
         }
-        other => panic!("expected a typed Schema error naming the column: {other:?}"),
+        other => panic!(
+            "expected the engine-class IncompatibleFormat error naming the artifact, got {other:?}"
+        ),
     }
 }
 

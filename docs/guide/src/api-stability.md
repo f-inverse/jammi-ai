@@ -172,9 +172,15 @@ commit-message tag every round of this unit's own history carries, and diff
 the UNION of those commits, never a span:
 
 ```
-# Every commit belonging to THIS unit (adjust the grep to the unit's own
-# tag, e.g. '#482 DIST'), oldest first:
-commits=$(git log --oneline --reverse --grep='#482 DIST' | cut -d' ' -f1)
+# Every commit belonging to THIS unit, oldest first. NOT a literal
+# '#482 DIST' substring match: this unit's own history also carries the tag
+# as 'DIST-1' and 'DELTA/DIST' (a hyphen or a slash immediately after
+# 'DIST', never a space) — a plain `--grep='#482 DIST'` silently drops those
+# and under-ranges the set (measured, DIST round 8: it returns 3 commits and
+# misses 3 more, including the one that introduced the sites a round-8 fix
+# corrected). `-E --grep='#482.*DIST'` matches all three spellings because
+# it does not require a space between the issue number and the tag:
+commits=$(git log --oneline --reverse -E --grep='#482.*DIST' | cut -d' ' -f1)
 for c in $commits; do
   git diff --name-only "$c"^.."$c" | grep '^crates/.*/src/.*\.rs$'
   # for each changed file, diff its `pub fn|struct|enum|trait|type|const|
@@ -191,7 +197,14 @@ done
 Nine commits are current state as of this release (the range this section
 has covered started as three, was five, was six, was seven, was eight as of
 DELTA round 6's own fold, and is nine as of DIST round 7's own fold — state
-the true count rather than repeating a stale one):
+the true count rather than repeating a stale one). The corrected recipe
+above resolves to SIX commits (`3a696a65`, `cbd427b4`, `320b73ee`,
+`f37cb743`, `b1665c14`, `a2dfcb1f`) — three more than the three the old,
+narrower grep found — but the three added (`320b73ee`'s re-apply, `cbd427b4`'s
+formatting-only fmt, `3a696a65`'s masked-load reuse with no new `pub` item)
+introduce no public-surface change beyond what the bullets below already
+list; checked by diffing each for an added/removed/changed `pub` item
+against the crate list above, not assumed.
 
 - **The vector-search API takes a validated query type, not a bare slice.**
   `jammi_numerics::query::ValidatedQuery` is the only type
@@ -238,21 +251,40 @@ the true count rather than repeating a stale one):
   calls the new `.known() -> Option<T>` to get the old behaviour back.
 - **Whose-fault a downstream width check assigns no longer depends on the
   query's own provenance.** `ValidatedQuery::require_width` now takes an
-  `artifact: impl Into<String>` and never reads the query's own
-  `QuerySource` — a mismatch it finds is always attributed to the named
-  artifact, never the caller, because by the time a query reaches any
-  consumer an entry has already checked it once against an authority it had
-  in hand. TWO call sites still attribute by the query's own provenance
-  (the placement entry's all-remote shape, and `exact_vector_search`'s
-  no-catalog-width fallback), both checking a query with no width in hand
-  against the only authority available to that call; both use the new
+  `artifact: impl Into<String>` and returns a new error variant,
+  `QueryValidationError::ArtifactMismatch { artifact, expected, actual }`,
+  which carries no `QuerySource` at all — a mismatch it finds is always
+  attributed to the named artifact, never the caller, because by the time a
+  query reaches any consumer an entry has already checked it once against an
+  authority it had in hand. THREE call sites still attribute by the query's
+  own provenance (the placement entry's all-remote shape, the placement
+  entry's all-local shape against the set's own first segment, and
+  `exact_vector_search`'s no-catalog-width fallback — round 8 closed the
+  all-local gap, where the same deferral the other two already performed
+  had never run), each checking a query with no width in hand against the
+  only authority available to that call; all three use the new
   `ValidatedQuery::require_authority_width` instead, which keeps the OLD
   `require_width` behaviour under a name that says why it is different.
-  `QuerySource` gained a third variant, `Artifact { name }`: `require_width`
-  reports the artifact it disagreed with under this variant, never under
-  `Stored`, so `QueryValidationError::source()` and its `Display` text never
-  assert a caller's query was read from a table it never came from. Any
-  exhaustive match on `QuerySource` needs a new arm.
+  `QuerySource::source()` on `QueryValidationError` now returns
+  `Option<&QuerySource>` (`None` for `ArtifactMismatch`) rather than
+  `&QuerySource` unconditionally. (DIST round 6/7 shipped a third
+  `QuerySource` variant, `Artifact { name }`, to carry this same
+  information; round 8 removed it in favor of the dedicated
+  `ArtifactMismatch` error variant above, so `QuerySource` is back to
+  exactly two variants, `Caller` and `Stored` — the states a query's own
+  provenance can actually be. A round-6/7 caller matching on three
+  `QuerySource` variants needs the arm removed, not added.) `JammiError::Schema`
+  constructions in `jammi_db::index::exact::exact_vector_search`,
+  `jammi_db::index::placed::PlacedIndex::search_mixed`,
+  `jammi_db::store::vectors::{extend_with_fixed_size_list_f32,
+  extend_with_keyed_fixed_size_list_f32}`, and `jammi_db::store::deletes::
+  DeletionMask::read` that priced an ENGINE-owned artifact's own corruption
+  as the caller's fault are now `JammiError::IncompatibleFormat`; the two
+  `store::vectors` functions changed their error type to the new,
+  provenance-neutral `jammi_db::store::vectors::VectorColumnError` (`?`
+  converts it to `IncompatibleFormat` by default; `.into_caller_fault()` is
+  the explicit override the one caller-supplied read path, behind
+  `import_embeddings`, now uses).
 - **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
   replacement.** It resolved a result table's current version and then
   discarded the resolution, returning a bare `InputAnchor` a caller could

@@ -2,6 +2,22 @@
 //! Parquet object. Centralises the downcast-and-collect logic that both the
 //! brute-force search path and downstream callers (e.g. resilience checks
 //! that need the raw vectors) would otherwise duplicate.
+//!
+//! **Whose fault a shape mismatch is depends on who owns the object being
+//! read, and this module has no way to know that** — [`extend_with_fixed_size_list_f32`]
+//! and [`extend_with_keyed_fixed_size_list_f32`] take a bare `RecordBatch`,
+//! never a marker for "this is a caller-supplied file" vs. "this is an
+//! engine-owned result table". So their error, [`VectorColumnError`], is
+//! provenance-NEUTRAL: it names the shape defect but picks no
+//! [`crate::error::JammiError`] variant itself. `?` converts it to
+//! [`JammiError::IncompatibleFormat`] by default (an engine-owned artifact's
+//! corruption is never the caller's fault) — correct for every reader of a
+//! result table's OWN parquet (the brute-force scan, `read_vectors`,
+//! `read_vector_by_key`, the neighbor-graph and propagation node readers,
+//! embedding refresh). The ONE genuinely caller-supplied path
+//! ([`read_keyed_vectors_f32`], behind `import_embeddings`, reading a file
+//! the caller handed the engine) explicitly reclassifies via
+//! [`VectorColumnError::into_caller_fault`] instead of `?`.
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow::compute::cast;
@@ -10,12 +26,75 @@ use arrow_schema::DataType;
 use crate::error::{JammiError, Result};
 use crate::storage::{self, JammiObjectStore};
 
+/// A `FixedSizeList<Float32>` vector (or its paired key) column disagreed
+/// with what a reader expected — provenance-neutral (see the module doc):
+/// this type carries no opinion on whose fault the disagreement is, only
+/// what disagreed and how. [`From<VectorColumnError> for JammiError`]
+/// supplies the DEFAULT (engine-owned artifact); [`Self::into_caller_fault`]
+/// is the explicit override for the one path that needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorColumnError {
+    /// The table (or, for an import, the object) the column was read from.
+    pub table: String,
+    /// The column name.
+    pub column: String,
+    /// What was expected.
+    pub expected: String,
+    /// What was found.
+    pub actual: String,
+}
+
+impl std::fmt::Display for VectorColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{}: expected {}, found {}",
+            self.table, self.column, self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for VectorColumnError {}
+
+impl VectorColumnError {
+    /// Reclassify as the CALLER's fault — reserved for a reader whose
+    /// `RecordBatch` came directly from an object the caller supplied (an
+    /// import file), where a shape mismatch is genuinely a bad input, never
+    /// the engine's own corruption.
+    pub fn into_caller_fault(self) -> JammiError {
+        JammiError::Schema {
+            table: self.table,
+            column: self.column,
+            expected: self.expected,
+            actual: self.actual,
+        }
+    }
+}
+
+/// The DEFAULT conversion: an engine-owned artifact's own shape disagreeing
+/// with what a reader expected is never the caller's fault, mirroring
+/// [`jammi_numerics::query::ValidatedQuery::require_width`]'s default to the
+/// engine class. Every call site that reads a RESULT TABLE's own stored
+/// parquet (the overwhelming majority of this module's callers) gets this
+/// for free through `?`; only [`read_keyed_vectors_f32`] overrides it.
+impl From<VectorColumnError> for JammiError {
+    fn from(e: VectorColumnError) -> Self {
+        JammiError::IncompatibleFormat {
+            artifact: format!("{}.{}", e.table, e.column),
+            found: e.actual,
+            supported: e.expected,
+        }
+    }
+}
+
 /// Materialise a `FixedSizeList<Float32>` column from one `RecordBatch` into
 /// `Vec<f32>` rows, appending them to `out`.
 ///
-/// Returns a typed [`JammiError::Schema`] when the column is missing, has the
+/// Returns a typed [`VectorColumnError`] when the column is missing, has the
 /// wrong Arrow type, or has a non-`Float32` inner item. The `table` argument
-/// is folded into the error so the caller does not need to wrap.
+/// is folded into the error so the caller does not need to wrap. See the
+/// module doc for why this is provenance-neutral rather than a
+/// [`JammiError`] directly.
 ///
 /// Hidden invariant: this helper is the only place in the engine that should
 /// downcast a vector column to `FixedSizeListArray<Float32>`. The brute-force
@@ -26,10 +105,10 @@ pub fn extend_with_fixed_size_list_f32(
     table: &str,
     column: &str,
     out: &mut Vec<Vec<f32>>,
-) -> Result<()> {
+) -> std::result::Result<(), VectorColumnError> {
     let col = batch
         .column_by_name(column)
-        .ok_or_else(|| JammiError::Schema {
+        .ok_or_else(|| VectorColumnError {
             table: table.to_string(),
             column: column.to_string(),
             expected: "FixedSizeList<Float32>".to_string(),
@@ -38,14 +117,14 @@ pub fn extend_with_fixed_size_list_f32(
     let list = col
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| JammiError::Schema {
+        .ok_or_else(|| VectorColumnError {
             table: table.to_string(),
             column: column.to_string(),
             expected: "FixedSizeList<Float32>".to_string(),
             actual: format!("{:?}", col.data_type()),
         })?;
     if !matches!(list.value_type(), DataType::Float32) {
-        return Err(JammiError::Schema {
+        return Err(VectorColumnError {
             table: table.to_string(),
             column: column.to_string(),
             expected: "FixedSizeList<Float32>".to_string(),
@@ -58,7 +137,7 @@ pub fn extend_with_fixed_size_list_f32(
         let floats =
             v.as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| JammiError::Schema {
+                .ok_or_else(|| VectorColumnError {
                     table: table.to_string(),
                     column: column.to_string(),
                     expected: "FixedSizeList<Float32>".to_string(),
@@ -118,7 +197,7 @@ fn is_utf8_family(dt: &DataType) -> bool {
 /// alone. Equal logical string values therefore extract identically
 /// regardless of which admitted encoding produced them.
 ///
-/// Returns a typed [`JammiError::Schema`] when either column is missing, the
+/// Returns a typed [`VectorColumnError`] when either column is missing, the
 /// key column's `DataType` is not a member of the Utf8 family, or the vector
 /// column has the wrong Arrow type (a non-`Float32` vector), so a caller
 /// reading precomputed vectors sees a typed signal rather than a downcast
@@ -126,17 +205,18 @@ fn is_utf8_family(dt: &DataType) -> bool {
 /// stringified success). The vector leg delegates to
 /// [`extend_with_fixed_size_list_f32`] so the downcast rules stay defined in
 /// exactly one place; this pairs each resulting vector with its key by
-/// position.
+/// position. See the module doc for why this is provenance-neutral rather
+/// than a [`JammiError`] directly.
 pub fn extend_with_keyed_fixed_size_list_f32(
     batch: &RecordBatch,
     table: &str,
     key_column: &str,
     vector_column: &str,
     out: &mut Vec<(String, Vec<f32>)>,
-) -> Result<()> {
+) -> std::result::Result<(), VectorColumnError> {
     let key_col = batch
         .column_by_name(key_column)
-        .ok_or_else(|| JammiError::Schema {
+        .ok_or_else(|| VectorColumnError {
             table: table.to_string(),
             column: key_column.to_string(),
             expected: "Utf8".to_string(),
@@ -149,10 +229,10 @@ pub fn extend_with_keyed_fixed_size_list_f32(
     // Arrow can cast to `Utf8` would silently widen this column's accepted
     // domain past "logically a string". Only `Utf8`, `LargeUtf8`,
     // `Utf8View`, and Utf8-family dictionaries carry the same logical string
-    // value across encodings; everything else keeps the typed
-    // `JammiError::Schema` this function's contract promises.
+    // value across encodings; everything else keeps the typed error this
+    // function's contract promises.
     if !is_utf8_family(key_col.data_type()) {
-        return Err(JammiError::Schema {
+        return Err(VectorColumnError {
             table: table.to_string(),
             column: key_column.to_string(),
             expected: "Utf8".to_string(),
@@ -164,7 +244,7 @@ pub fn extend_with_keyed_fixed_size_list_f32(
     // of forcing every caller to know which one a given read path produces.
     // The DataType gate above has already ruled out every non-Utf8-family
     // input, so this cast only ever normalises within the admitted domain.
-    let keys_utf8 = cast(key_col, &DataType::Utf8).map_err(|_| JammiError::Schema {
+    let keys_utf8 = cast(key_col, &DataType::Utf8).map_err(|_| VectorColumnError {
         table: table.to_string(),
         column: key_column.to_string(),
         expected: "Utf8".to_string(),
@@ -173,7 +253,7 @@ pub fn extend_with_keyed_fixed_size_list_f32(
     let keys = keys_utf8
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| JammiError::Schema {
+        .ok_or_else(|| VectorColumnError {
             table: table.to_string(),
             column: key_column.to_string(),
             expected: "Utf8".to_string(),
@@ -183,7 +263,7 @@ pub fn extend_with_keyed_fixed_size_list_f32(
     let mut vectors = Vec::with_capacity(keys.len());
     extend_with_fixed_size_list_f32(batch, table, vector_column, &mut vectors)?;
     if vectors.len() != keys.len() {
-        return Err(JammiError::Schema {
+        return Err(VectorColumnError {
             table: table.to_string(),
             column: vector_column.to_string(),
             expected: format!("{} vectors (one per key)", keys.len()),
@@ -204,7 +284,12 @@ pub fn extend_with_keyed_fixed_size_list_f32(
 /// The read path behind importing precomputed vectors: streams batches through
 /// the engine's `storage::reader` and delegates each to
 /// [`extend_with_keyed_fixed_size_list_f32`]. Reads the whole object into
-/// memory.
+/// memory. This is the ONE call site in this module that reads an object the
+/// CALLER supplied directly (the file behind `import_embeddings`), so — unlike
+/// every other reader here, which reads back the engine's own stored parquet
+/// — a shape mismatch really is the caller's fault: explicitly reclassified
+/// via [`VectorColumnError::into_caller_fault`] rather than the `?`-conversion
+/// default every other caller in this module gets.
 pub async fn read_keyed_vectors_f32(
     handle: &JammiObjectStore,
     table: &str,
@@ -214,7 +299,8 @@ pub async fn read_keyed_vectors_f32(
     let batches = storage::reader::read_all_record_batches(handle).await?;
     let mut out = Vec::new();
     for batch in batches {
-        extend_with_keyed_fixed_size_list_f32(&batch, table, key_column, vector_column, &mut out)?;
+        extend_with_keyed_fixed_size_list_f32(&batch, table, key_column, vector_column, &mut out)
+            .map_err(VectorColumnError::into_caller_fault)?;
     }
     Ok(out)
 }
@@ -343,12 +429,12 @@ mod tests {
     /// `FixedSizeList<Float32>` — not `from_type.is_primitive()` under
     /// Arrow's cast-compatibility rules, unlike an integer or float column,
     /// which numeric-to-string casting *would* silently stringify) still
-    /// surfaces the typed [`JammiError::Schema`] signal rather than a
+    /// surfaces the typed [`VectorColumnError`] signal rather than a
     /// downcast panic — the cast-then-downcast normalisation widens which
     /// encodings succeed, it does not weaken the error path for genuinely
     /// wrong types.
     #[test]
-    fn non_string_key_column_still_surfaces_typed_schema_error() {
+    fn non_string_key_column_still_surfaces_typed_error() {
         let dim = 3_i32;
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -380,13 +466,8 @@ mod tests {
         let mut out = Vec::new();
         let err = extend_with_keyed_fixed_size_list_f32(&batch, "t", "key", "vector", &mut out)
             .unwrap_err();
-        match err {
-            JammiError::Schema { table, column, .. } => {
-                assert_eq!(table, "t");
-                assert_eq!(column, "key");
-            }
-            other => panic!("expected JammiError::Schema, got {other:?}"),
-        }
+        assert_eq!(err.table, "t");
+        assert_eq!(err.column, "key");
     }
 
     /// The hazard the previous `FixedSizeList` case (above) didn't actually
@@ -396,10 +477,10 @@ mod tests {
     /// fails the cast). A cast-then-downcast implementation that skips the
     /// pre-cast `DataType` gate would silently turn an `Int64` key column
     /// into plausible-looking decimal strings (`"1"`, `"2"`, `"3"`) instead
-    /// of raising the typed [`JammiError::Schema`] this function's contract
+    /// of raising the typed [`VectorColumnError`] this function's contract
     /// promises for a wrongly-typed key column. Asserts the typed error, not
     /// a stringified success — the numeric-key oracle the prior
-    /// `non_string_key_column_still_surfaces_typed_schema_error` test named
+    /// `non_string_key_column_still_surfaces_typed_error` test named
     /// as a hazard but did not cover.
     #[test]
     fn int64_key_column_is_rejected_not_stringified() {
@@ -433,23 +514,51 @@ mod tests {
         let mut out = Vec::new();
         let err = extend_with_keyed_fixed_size_list_f32(&batch, "t", "key", "vector", &mut out)
             .unwrap_err();
-        match err {
-            JammiError::Schema {
-                table,
-                column,
-                expected,
-                actual,
-            } => {
-                assert_eq!(table, "t");
-                assert_eq!(column, "key");
-                assert_eq!(expected, "Utf8");
-                assert_eq!(actual, "Int64");
-            }
-            other => panic!("expected JammiError::Schema, got {other:?}"),
-        }
+        assert_eq!(err.table, "t");
+        assert_eq!(err.column, "key");
+        assert_eq!(err.expected, "Utf8");
+        assert_eq!(err.actual, "Int64");
         assert!(
             out.is_empty(),
             "no rows should be extracted on a rejected key column"
         );
+    }
+
+    /// The provenance-neutral [`VectorColumnError`] converts to the ENGINE
+    /// class by default through `?` (an engine-owned artifact's own
+    /// corruption is never the caller's fault) — the same default
+    /// `ValidatedQuery::require_width` uses.
+    #[test]
+    fn default_conversion_is_the_engine_class() {
+        let e = VectorColumnError {
+            table: "docs".into(),
+            column: "vector".into(),
+            expected: "FixedSizeList<Float32>".into(),
+            actual: "Utf8".into(),
+        };
+        let engine: JammiError = e.into();
+        assert!(
+            matches!(
+                &engine,
+                JammiError::IncompatibleFormat { artifact, .. } if artifact == "docs.vector"
+            ),
+            "{engine:?}"
+        );
+    }
+
+    /// [`VectorColumnError::into_caller_fault`] is the explicit override
+    /// reserved for the one genuinely caller-supplied path (import).
+    #[test]
+    fn into_caller_fault_is_the_caller_class() {
+        let e = VectorColumnError {
+            table: "import".into(),
+            column: "_row_id".into(),
+            expected: "Utf8".into(),
+            actual: "Int64".into(),
+        };
+        assert!(matches!(
+            e.into_caller_fault(),
+            JammiError::Schema { table, column, .. } if table == "import" && column == "_row_id"
+        ));
     }
 }

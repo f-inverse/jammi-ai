@@ -545,8 +545,11 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
 
 /// The shape with no local segment: nothing at the coordinator holds an index,
 /// so every width and finiteness check must happen at the ENTRY, from the
-/// catalog. A NaN component through the public `Search` verb, a wrong-width
-/// query at the placed entry, and a table with NO width on record are each a
+/// catalog. A NaN component through the public `Search` verb and a
+/// wrong-width query at the placed entry (against a recorded width) are each
+/// a CALLER-class refusal; a table with NO width on record is the ENGINE's
+/// own gap in the row it owns (round-8 DIST fix — this arm used to assert
+/// the caller class here, misnamed by this test's own title). Every arm is a
 /// typed refusal with ZERO `SegmentSearch` served and every ladder counter at
 /// its previous value — `retry_ok`, `local_load`, `unavailable`, `torn`
 /// included.
@@ -585,8 +588,10 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
         .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 4)
         .await
         .expect_err("no width on record and no local segment → refuse, never fan out");
+    // An ABSENT catalog width is the engine's own gap in the row it owns —
+    // never anything the caller supplied — so this is the engine class.
     assert!(
-        matches!(&err, JammiError::Schema { column, .. } if column == "dimensions"),
+        matches!(&err, JammiError::IncompatibleFormat { artifact, .. } if artifact.contains("dimensions")),
         "{err:?}"
     );
 

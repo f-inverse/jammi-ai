@@ -1002,6 +1002,124 @@ mod rendezvous_state_tests {
     }
 }
 
+/// White-box oracles pinning `verb` at each per-verb descriptor CONSTRUCTOR
+/// directly, by reading back the [`Descriptor`] a parked rank deposited into
+/// [`Round::slots`] — rather than through a cross-verb rendezvous.
+///
+/// `tests.rs`'s `a_two_rank_*_and_barrier_verb_mismatch_*` tests attempt the
+/// cross-verb route (pair the verb under test against a real `barrier()`
+/// call) for `all_gather`, `all_reduce_sum` and `broadcast`. EXECUTING the
+/// `verb: "barrier"` mutation at each constructor (see that file's section
+/// comment) shows it is caught only for `all_reduce_sum`: `all_gather`'s
+/// descriptor always carries `counts: Some(_)` and `broadcast`'s always
+/// carries `root: Some(_)`, and `barrier`'s carries `None` for both, so those
+/// two fields ALREADY disagree with `barrier` regardless of `verb` — the
+/// round stays refused for that independent reason, and the cross-verb test
+/// cannot observe whether `verb` itself was ever compared. This is not a
+/// coverage gap to route around quietly: `counts` and `root` are the ONLY
+/// descriptor fields whose value is `Some` for exactly one verb each
+/// (`all_gather` and `broadcast` respectively), so no OTHER verb's
+/// descriptor can ever coincide with theirs on every field but `verb` — a
+/// black-box cross-verb rendezvous can never isolate `verb` for these two
+/// constructors, by construction, no matter which peer verb is chosen.
+///
+/// The three tests below instead peek at the round directly: park a rank
+/// mid-collective (a second rank that never arrives), read back the
+/// [`Descriptor`] it deposited, and assert `.verb` is the constructor's own
+/// [`Contribution::kind`] — this is sensitive to the exact
+/// `verb: "barrier"` mutation regardless of `counts`/`root`, because it
+/// never depends on a peer's descriptor agreeing or disagreeing at all.
+#[cfg(test)]
+mod constructor_verb_tests {
+    use super::*;
+
+    #[test]
+    fn all_gather_deposits_a_descriptor_whose_verb_is_all_gather() {
+        let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(200))
+            .expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        std::thread::scope(|scope| {
+            let local = Tensor::from_vec(vec![1.0f32, 2.0], (1, 2), &Device::Cpu).expect("tensor");
+            let parked = scope.spawn(move || rank0.all_gather(&local, &[1, 1]).map(|_| ()));
+            let verb = loop {
+                let round = gang.shared.round.lock().expect("round");
+                if let Some((_, descriptor, _)) = round.slots[0].as_ref() {
+                    break descriptor.verb;
+                }
+                drop(round);
+                std::thread::yield_now();
+            };
+            assert_eq!(
+                verb, "all_gather",
+                "the all_gather constructor must sign its own verb, never a hardcoded one"
+            );
+            parked
+                .join()
+                .expect("rank 0 thread")
+                .expect_err("rank 1 never arrives inside the short deadline");
+        });
+    }
+
+    #[test]
+    fn all_reduce_sum_deposits_a_descriptor_whose_verb_is_all_reduce_sum() {
+        let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(200))
+            .expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        std::thread::scope(|scope| {
+            let parked = scope.spawn(move || {
+                let mut tensors =
+                    vec![Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu).expect("tensor")];
+                rank0.all_reduce_sum(&mut tensors)
+            });
+            let verb = loop {
+                let round = gang.shared.round.lock().expect("round");
+                if let Some((_, descriptor, _)) = round.slots[0].as_ref() {
+                    break descriptor.verb;
+                }
+                drop(round);
+                std::thread::yield_now();
+            };
+            assert_eq!(
+                verb, "all_reduce_sum",
+                "the all_reduce_sum constructor must sign its own verb, never a hardcoded one"
+            );
+            parked
+                .join()
+                .expect("rank 0 thread")
+                .expect_err("rank 1 never arrives inside the short deadline");
+        });
+    }
+
+    #[test]
+    fn broadcast_deposits_a_descriptor_whose_verb_is_broadcast() {
+        let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(200))
+            .expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        std::thread::scope(|scope| {
+            let parked = scope.spawn(move || {
+                let mut t = Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu).expect("tensor");
+                rank0.broadcast(&mut t, 0)
+            });
+            let verb = loop {
+                let round = gang.shared.round.lock().expect("round");
+                if let Some((_, descriptor, _)) = round.slots[0].as_ref() {
+                    break descriptor.verb;
+                }
+                drop(round);
+                std::thread::yield_now();
+            };
+            assert_eq!(
+                verb, "broadcast",
+                "the broadcast constructor must sign its own verb, never a hardcoded one"
+            );
+            parked
+                .join()
+                .expect("rank 0 thread")
+                .expect_err("rank 1 never arrives inside the short deadline");
+        });
+    }
+}
+
 /// One test per [`Descriptor`] field, each proving that field is its own,
 /// independent determinant of agreement: dropping any one `if` inside
 /// [`Descriptor::agrees_with`] is a distinct way for two ranks to be handed

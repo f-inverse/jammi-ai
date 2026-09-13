@@ -1042,3 +1042,187 @@ fn a_two_rank_all_reduce_sum_with_a_per_tensor_shape_mismatch_faults_both_ranks_
         "unexpected message: {refused}"
     );
 }
+
+// ── Fix round 4 item 6: the verb field, pinned at EACH constructor ──────────
+//
+// `agrees_with`'s per-field mutation sweep proves the `verb` COMPARISON is
+// sound in isolation, but every `Descriptor` in that sweep is hand-built —
+// none of it runs through a real verb's constructor. The three tests below
+// close that gap: rank 0 calls the verb under test through its real
+// `Collective` method (so its descriptor is built by that constructor, not by
+// a test helper), rank 1 calls `barrier`, and the property is the same one
+// `local_refuses_a_round_whose_ranks_are_at_different_collectives` already
+// proves for `all_reduce_max_flags` and `barrier` themselves: a round whose
+// ranks are at different verbs is refused on BOTH ranks, symmetrically, and
+// the gang is left faulted for the next call on EITHER rank.
+//
+// The mutation for each is hardcoding `verb: contribution.kind()` to
+// `verb: "barrier"` at that ONE constructor. `all_gather`'s descriptor always
+// carries `counts: Some(_)` (never `None`) and `broadcast`'s always carries
+// `root: Some(_)` (never `None`), so — MEASURED below, not assumed — a
+// verb-only hardcode at either of those two constructors leaves a second,
+// independent field disagreement against `barrier`'s `{ counts: None, root:
+// None }` and the round stays refused for that reason instead: the mutation
+// does NOT kill the corresponding test on its own. `all_reduce_sum`'s
+// descriptor already carries `root: None` and `counts: None` like
+// `barrier`'s, so calling it with an EMPTY tensor slice makes its `tensors`
+// field `vec![]` too — the only constructor of the three where hardcoding
+// `verb` alone drives every other field into agreement with `barrier`,
+// publishing the round; the empty tensor slice then means
+// `Local::all_reduce_sum`'s own fold loop (which iterates the CALLING rank's
+// tensors, not the round) never runs, so instead of the fold hitting a
+// foreign `Contribution::Barrier`, both ranks are silently handed `Ok` — the
+// "refused, not published" property fails a different, and arguably worse,
+// way: no error, no panic, both ranks agree on nothing.
+
+/// `all_gather`'s constructor (local.rs `Collective::all_gather`): the
+/// mutation `verb: "barrier"` is executed and reported below rather than
+/// assumed to kill this test.
+#[test]
+fn a_two_rank_all_gather_and_barrier_verb_mismatch_faults_both_ranks_symmetrically() {
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    let results = std::thread::scope(|scope| {
+        let gather = scope.spawn(move || {
+            rank0
+                .all_gather(&matrix(1, 2, 0.0), &[1, 1])
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        let barrier = scope.spawn(move || {
+            rank1
+                .barrier()
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        [
+            gather.join().expect("rank 0 thread"),
+            barrier.join().expect("rank 1 thread"),
+        ]
+    });
+
+    for (rank, message) in results.iter().enumerate() {
+        assert!(
+            !message.is_empty(),
+            "rank {rank} returned Ok from a round rank {} was running a different collective in",
+            1 - rank
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {message}"
+        );
+    }
+
+    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+    let refused = after_fault
+        .barrier()
+        .expect_err("the gang must stay faulted after the verb mismatch");
+    assert!(
+        refused.to_string().contains("the gang has already failed"),
+        "unexpected message: {refused}"
+    );
+}
+
+/// `all_reduce_sum`'s constructor: the tensor slice is EMPTY, which is what
+/// makes the `verb: "barrier"` mutation actually publish the round (see the
+/// section comment above) rather than being caught by a second, independent
+/// field.
+#[test]
+fn a_two_rank_all_reduce_sum_and_barrier_verb_mismatch_faults_both_ranks_symmetrically() {
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    let results = std::thread::scope(|scope| {
+        let reduce = scope.spawn(move || {
+            let mut tensors: Vec<Tensor> = Vec::new();
+            rank0
+                .all_reduce_sum(&mut tensors)
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        let barrier = scope.spawn(move || {
+            rank1
+                .barrier()
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        [
+            reduce.join().expect("rank 0 thread"),
+            barrier.join().expect("rank 1 thread"),
+        ]
+    });
+
+    for (rank, message) in results.iter().enumerate() {
+        assert!(
+            !message.is_empty(),
+            "rank {rank} returned Ok from a round rank {} was running a different collective in",
+            1 - rank
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {message}"
+        );
+    }
+
+    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+    let refused = after_fault
+        .barrier()
+        .expect_err("the gang must stay faulted after the verb mismatch");
+    assert!(
+        refused.to_string().contains("the gang has already failed"),
+        "unexpected message: {refused}"
+    );
+}
+
+/// `broadcast`'s constructor: the mutation `verb: "barrier"` is executed and
+/// reported below rather than assumed to kill this test.
+#[test]
+fn a_two_rank_broadcast_and_barrier_verb_mismatch_faults_both_ranks_symmetrically() {
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    let results = std::thread::scope(|scope| {
+        let broadcast = scope.spawn(move || {
+            let mut t = matrix(1, 1, 0.0);
+            rank0
+                .broadcast(&mut t, 0)
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        let barrier = scope.spawn(move || {
+            rank1
+                .barrier()
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        [
+            broadcast.join().expect("rank 0 thread"),
+            barrier.join().expect("rank 1 thread"),
+        ]
+    });
+
+    for (rank, message) in results.iter().enumerate() {
+        assert!(
+            !message.is_empty(),
+            "rank {rank} returned Ok from a round rank {} was running a different collective in",
+            1 - rank
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {message}"
+        );
+    }
+
+    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+    let refused = after_fault
+        .barrier()
+        .expect_err("the gang must stay faulted after the verb mismatch");
+    assert!(
+        refused.to_string().contains("the gang has already failed"),
+        "unexpected message: {refused}"
+    );
+}

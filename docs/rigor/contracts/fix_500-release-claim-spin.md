@@ -85,7 +85,7 @@ blocks, the unit ships the oracle marked `#[ignore]` with the defect filed — n
 - **Two properties, not one per-determinant pair:** P1 (safety, phase-keyed): a `claim_next` is initiated only if
   `phase() == Running` was read at the top of that same iteration. P2 (wakeup/latency, stop-keyed): every phase setter
   requests the stop in the same statement pair, so exit latency after a flip is bounded by the in-flight job, not by
-  `idle_poll` — discharged by an enumerating check over the two setters (`:2357`, `:2500` — both at fe5ac560),
+  `idle_poll` — discharged by a check over the two setters that exist (`:2357`, `:2500` — both at fe5ac560),
   never by a RED mutation.
 - **Oracle for P1 (gate-direct, deterministic):** a `#[cfg(feature = "test-hooks")]` phase setter on `WorkerShared`
   (field and `set_phase` are private, `:286`/`:382` — at fe5ac560; the it-tests are external); set `Releasing` WITHOUT the stop, run
@@ -113,8 +113,8 @@ blocks, the unit ships the oracle marked `#[ignore]` with the defect filed — n
 - ai-core: `crates/jammi-ai/tests/it/jobs_shutdown.rs:833-834` — the doc comment on
   `every_phase_setter_pairs_the_stop_in_the_same_statement_group` cites `begin_drain (:2357)` and 2a
   `(:2500)` — both the fe5ac560 anchors from the design-pass fold above (at fe5ac560), stale by this
-  commit; re-anchor to the HEAD lines (`:2383-2390`, `:2547`) or cite by symbol without a line. Doc
-  comment only.
+  commit; re-anchor to the HEAD lines (`:2383-2390`, `:2547`, both at c75452b0) or cite by symbol
+  without a line. Doc comment only.
 - docs-ci: `docs/plans/68-compute-tier-substrate/units/OPS-COMPUTE-TIER-OPERABILITY.md` D6 row cites
   `crates/jammi-ai/src/fine_tune/worker.rs:620` (at fe5ac560) for "aborting first would drop the hold —
   runs on the dropped future"; find the real site at HEAD (the 2e cooperative-vs-abort decision / the
@@ -123,7 +123,7 @@ Serialized AFTER the running audit/acceptance/oracle report (doc-only; no re-run
 
 ## Fix round 1 — REVISED (audit BLOCK at c75452b0 + citation BLOCK at d471541a): one round, both owners
 **Ruling.** The audit executed the falsification: the gate is read at the loop top, then `reclaim_expired_jobs` is
-awaited (:842-844), then `claim_next` (:853) — a RELEASE that lands during the reclaim still lets THIS iteration
+awaited (`:842-844`, at c75452b0), then `claim_next` (`:853`, at c75452b0) — a RELEASE that lands during the reclaim still lets THIS iteration
 initiate one claim, self-released by the hold arm. The fold's wide property ("no `claim_next` INITIATED at or after
 2a … over ALL rows") was over-claimed; the narrow P1 holds. This is a LOCAL correction of where the existing predicate
 is read, not a new mechanism (no design round): the property becomes **P1'**: `claim_next` is called only after a
@@ -132,7 +132,7 @@ the residual — a claim whose catalog round trip is already in flight when 2a r
 as exactly that, and is what the hold arm's self-release (:509) exists for.
 
 ### ai-core — `worker.rs`, `tests/it/jobs_shutdown.rs`
-1. Re-read the same predicate immediately before `claim_next` (:853), after `reclaim_expired_jobs`; `break` on it.
+1. Re-read the same predicate immediately before `claim_next` (`:853`, at c75452b0), after `reclaim_expired_jobs`; `break` on it.
    No await between the read and the call (`record_claim_next` is sync and stays after the read). Both gate sites
    share ONE private fn (`fn admits_claim(&self) -> bool`) so the predicate cannot drift between them.
 2. Doc sentences: `crates/jammi-ai/src/fine_tune/worker.rs:2478-2480` ("a claim that nonetheless lands (it began before this instant)") → the
@@ -140,11 +140,15 @@ as exactly that, and is what the hold arm's self-release (:509) exists for.
 3. Oracle (RED at c75452b0 — the audit's probe): park the loop INSIDE `reclaim_expired_jobs` via the existing
    `loop_test_hooks` rendezvous (or a `test-hooks` park at that await), run 2a, release the park, assert
    `claim_next_calls` delta == 0 and the queued row untouched (`status`, `attempts`, `releases`, `claimed_by`).
-4. Counter positive control: at `jobs_shutdown.rs:~955` (the loop has claimed and parked) assert
-   `claim_next_calls(id) >= 1` before the release — so a dead counter (M4) dies.
+4. Counter positive control: at `jobs_shutdown.rs:~955` (at c75452b0; the loop has claimed and parked)
+   assert `claim_next_calls(id) >= 1` before the release — so a dead counter (M4) dies. Landed at HEAD
+   as `release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a`'s own positive control
+   (`crates/jammi-ai/tests/it/jobs_shutdown.rs:1025-1030`), not at the estimated line.
 5. `jobs_shutdown.rs:~838`: delete the false sentence ("cannot be made RED through observable behaviour") — M2
-   kills `release_before_the_loop_reaches_claim_next_leaves_the_row_untouched` (:671) as well; say that instead.
-6. Citations `:833-834` → `:2383-2390` / `:2547` (or cite by symbol); stale "2a–2h" labels at `:1079`, `:1112`.
+   kills `release_before_the_loop_reaches_claim_next_leaves_the_row_untouched` (`:671`, at c75452b0; `:660`
+   at cd807a5b) as well; say that instead.
+6. Citations `:833-834` → `:2383-2390` / `:2547` (or cite by symbol; all four at c75452b0); stale "2a–2h"
+   labels at `:1079`, `:1112` (at c75452b0).
 7. Gates: `cargo test -p jammi-ai --features test-hooks --test it -- jobs_shutdown` (all), the whole `--test it`
    once (name the load-sensitive `jobs_cancel` test if it fails and re-run it alone), clippy (workspace + gated
    lanes), fmt, rustdoc. Mutations: remove the second read → the new oracle dies (name it); M4 → the positive

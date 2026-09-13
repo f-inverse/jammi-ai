@@ -172,46 +172,65 @@ discharge a real claim with a weak command; what it cannot do is skip a
 claim, because the hook enumerates them, never the lead. See the proposal
 doc for the full design history and the residual, stated without softening.
 
-esc-lead-gate-R12 v2 ("ANTICIPATE BEFORE THE FIX"): esc-lead-gate-R10's
-`open_question` was checked ONLY on the RELAY — written after a fix commit
-already exists — so it was fillable after the fact (v1 of this rule, which
-attached every obligation to that same post-fix relay, was KILLED by its
-own pressure round for the identical reason). v2 moves the load-bearing
-check to the PRE-FIX moment: `_decide_implementer_dispatch` (READER 1)
-denies an implementer-type dispatch onto a unit with an open verifier-type
-BLOCK unless a `.jammi/gate-state/<slug>.anticipation.<block_ts>.json`
-artifact exists whose commands the hook re-executes and hash-matches, and
-whose named unit branch's CURRENT tip equals the BLOCK's own `head_sha` —
-the one non-forgeable ordering fact: the attacks ran against the broken
-code, never after a fix already landed. `_relay_rejection` (READER 2)
-then requires `attacks_post`, the SAME keys re-run at `fix_head`, and a
-measured DIFFERENCE from the pre-fix witness for every fix-changed file a
-pre-fix key covers — an outcome DERIVED from hash inequality, never lead-
+esc-lead-gate-R12 v2 ("ANTICIPATE BEFORE THE FIX", fix round 1, M1'-M6'):
+esc-lead-gate-R10's `open_question` was checked ONLY on the RELAY — written
+after a fix commit already exists — so it was fillable after the fact (v1
+of this rule, which attached every obligation to that same post-fix relay,
+was KILLED by its own pressure round for the identical reason; the FIRST
+v2 implementation keyed the pre-fix artifact by a single block's `ts` and
+required the tip to equal that block's OWN `head_sha`, which denies
+PERMANENTLY the moment two open second-round BLOCKs of different types sit
+at different shas — fix round 1 replaces that shape). v2 moves the
+load-bearing check to the PRE-FIX moment: `_decide_implementer_dispatch`
+(READER 1) denies a dispatch onto a unit with ANY open verifier-type BLOCK
+unless a `.jammi/gate-state/<slug>.anticipation.<tip_sha>.json` artifact
+exists AT THE BRANCH'S CURRENT TIP covering the UNION of every such open
+block's own derived keys, reduced to one entry PER FILE, whose commands the
+hook re-executes and hash-matches — and whose ordering evidence is: the
+tip has not moved since the decision began, the resolved worktree's own
+HEAD equals it, and the tree is clean. `_relay_rejection` (READER 2) then
+requires `attacks_post`, the SAME per-file keys (widened by every file the
+fix changed or added a new surface to) re-run at `fix_head`, and a measured
+DIFFERENCE from the pre-fix witness for every fix-changed file the pre-fix
+artifact covers — an outcome DERIVED from hash inequality, never lead-
 declared. Attack-command execution runs in a COMPUTED cwd (`git worktree
 list --porcelain`'s own resolution for the unit branch, never
 `$CLAUDE_PROJECT_DIR`) and has its OWN budget (`_ATTACK_BUDGET_S`,
-separate from `_GIT_BUDGET_S`). `ci/scripts/check_rigor_record.py` is
-READER 3, the half the lead cannot forge: it independently re-derives the
-same artifact from the committed record, checks out `block_sha` in its
-OWN temp worktree, and fails when a recorded witness does not reproduce
-there. HONEST LIMITS, stated as plainly as R3's/R11's own: the hook
-cannot judge that an attack is a GOOD attack — only that it ran against
-the broken code and that its measured output moved after the fix; no
-gitignored timestamp or commit-author-date window can establish
-anticipation on its own (v1's own such arm, R12d, is DROPPED here, not
-softened); a changed file covered by no pre-fix attack key is not
-differential-checked by the hook (Reader 3's real `block_sha` checkout is
-the only place that gap could close). See the proposal doc for the full
-v1-to-v2 design history.
+separate from `_GIT_BUDGET_S`, run under its own per-phase deadline —
+never inside the git-metadata deadline the ordering checks use).
+`ci/scripts/check_rigor_record.py` is READER 3, the half the lead cannot
+forge: a committed-record SHAPE check (every second-round BLOCK row's
+export carries a matching anticipation record covering every required
+file) that HARD FAILS on shape alone; re-execution against a real
+`pre_fix_sha` checkout is ADVISORY, never a hard fail (BSD/GNU and path
+divergence between the lead's machine and CI, measured). HONEST LIMITS,
+stated as plainly as R3's/R11's own: the hook cannot judge that an attack
+is a GOOD attack — only that it ran, at this instant, against a worktree
+whose HEAD really was the tip with nothing uncommitted, and that its
+measured output moved after the fix; this does NOT establish that no fix
+exists off-tree (a stash, another branch or worktree) nor that the attack
+necessarily preceded any later fix commit — "true by construction" is not
+claimed. A changed file covered by no pre-fix attack key is not
+differential-checked by the hook (Reader 3's real checkout is the only
+place that gap could close); the decoy-unit-line residual (the hook trusts
+the lead's own `unit:` line) is not detected by anything here. See the
+proposal doc for the full v1-to-v2 design history and CONTRACT-R12-fix1.md
+for the fix-round-1 design verdict this implementation follows.
 
 Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
-`SendMessage` gating and all message-prose parsing; implementer-dispatch
-binding for every type OUTSIDE `IMPLEMENTER_TYPES` (esc-lead-gate-R12
-reader 1 gates exactly those nine domain-implementer types — a
-`general-purpose`/`claude`/`fork`/`doc-updater` dispatch is never gated
-here); the Bash backstop (the mechanical control is `permissions.deny`
-on the hook files in `.claude/settings.json`, unchanged); tell rows beyond
-the existing one-line `hook.log` entry every invocation already writes.
+`SendMessage` gating and all message-prose parsing; the Bash backstop (the
+mechanical control is `permissions.deny` on the hook files in
+`.claude/settings.json`, unchanged); tell rows beyond the existing one-line
+`hook.log` entry every invocation already writes. Implementer-dispatch
+binding now covers thirteen agent_types (M6'): the nine domain-implementer
+`IMPLEMENTER_TYPES` (a dispatch with NO unit line DENIES, naming the
+missing line) and four generic/harness `_R12_EXTRA_GATED_TYPES` —
+`general-purpose`/`claude`/`fork`/`doc-updater` — which stay ALLOWED with
+no unit line (a lead may dispatch these for reasons unrelated to
+implementing a fix) but are gated identically to the nine the moment their
+prompt DOES name a unit with an open second-round BLOCK; a `unit:` line
+naming a branch that does not resolve under `refs/heads/` DENIES either
+way.
 Visible-only residuals, each with a runtime tell (a verifier's next round
 reproducing the same BLOCK with no relay artifact between it and the
 prior one): relaying to a running agent by `SendMessage` (out of scope by
@@ -1447,49 +1466,148 @@ def _run_claim_command(command: str, cwd: str, deadline: float) -> tuple[bool, s
 _OUTPUT_HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 
+# R12-BEGIN
 # ==========================================================================
-# esc-lead-gate-R12 v2 — "ANTICIPATE BEFORE THE FIX": a differential
-# witness, checked while the fix does not yet exist.
+# esc-lead-gate-R12 v2 ("ANTICIPATE BEFORE THE FIX", fix round 1) — a
+# differential witness, checked while the fix does not yet exist.
 #
-# v1 of this design attached every obligation to the RELAY — which is
-# written only after a fix commit already exists — so v1 was fillable
-# after the fact (killed by its own pressure round). v2 moves the load-
-# bearing check to the ONE moment that cannot be gamed after the fact: an
-# IMPLEMENTER dispatch onto a unit with an open verifier BLOCK (READER 1,
-# below) is denied unless a `.jammi/gate-state/<slug>.anticipation.
-# <block_ts>.json` artifact exists whose commands the hook itself
-# re-executes and whose recorded witnesses reproduce, AND whose named unit
-# branch's CURRENT tip equals the BLOCK's own `head_sha` at THIS INSTANT —
-# the one piece of evidence that cannot be forged after a fix commit
-# exists: the attacks ran against the broken code. READER 2 (the closing
-# verifier's relay, post-fix) requires the SAME keys re-run at `fix_head`
-# and a measured DIFFERENCE from the pre-fix witness for every changed
-# file a pre-fix key covers — an `outcome` is DERIVED from that hash
-# inequality, never lead-declared. READER 3
-# (`ci/scripts/check_rigor_record.py`) is the half the lead cannot forge:
-# it independently re-derives the pre-fix artifact from the committed
-# record, checks out `block_sha` in its OWN temp worktree, and fails when
-# a recorded witness does not reproduce there.
+# v1 attached every obligation to the RELAY — written only after a fix
+# commit already exists — so v1 was fillable after the fact (killed by its
+# own pressure round). The FIRST implementation of v2 (this comment's own
+# prior revision) keyed the pre-fix artifact by `block_ts` and required the
+# unit branch's tip to equal that ONE BLOCK row's own `head_sha` exactly —
+# which denies PERMANENTLY the moment two open second-round BLOCKs of
+# different types sit at different shas (an acceptance-verifier BLOCK
+# provoked at the tip, alongside an older open adversarial-audit BLOCK,
+# cannot both be "the current tip" at once). CONTRACT-R12-fix1.md's design
+# round (v2, M1'-M6') replaces that with the shape below.
+#
+# THE ARTIFACT is keyed by the unit branch's CURRENT TIP, never a block's
+# own ts or sha: `.jammi/gate-state/<slug>.anticipation.<tip_sha>.json` =
+# `{unit_branch, pre_fix_sha, covers: [block_ts, ...], attacks: {file:
+# {command, hash, keys: [...]}}, residual_risk}`. READER 1 (an implementer
+# dispatch onto a unit with an open second-round BLOCK) requires ONE such
+# artifact at the branch's CURRENT tip that covers the UNION of every open
+# BLOCK's own derived keys (`finding_locations` UNION `class_enumeration`),
+# reduced to one required entry PER FILE (`_key_to_file`) — never one entry
+# per raw line-key, and never "the newest block only" (that shape is
+# exactly what produced the permanent-deny bug above: a lead-provoked
+# acceptance-verifier BLOCK at the tip could otherwise retire an older,
+# unrelated audit's 10-key obligation for free). Every recorded command is
+# RE-EXECUTED by the hook itself, and its witness must hash-match, in the
+# RESOLVED worktree for that branch — the git worktree `git worktree list
+# --porcelain` reports for it, never `$CLAUDE_PROJECT_DIR`. Ordering
+# evidence is: the branch's tip has not moved since this decision began,
+# the resolved worktree's OWN `HEAD` equals that tip, and `git status
+# --porcelain` in that worktree is EMPTY (an uncommitted fix denies, naming
+# the dirty paths). This establishes exactly one thing, stated precisely
+# everywhere it is claimed: the hook re-executed each recorded command at
+# THIS INSTANT on a worktree whose HEAD is the tip with no uncommitted
+# modifications. It does NOT establish that no fix exists off-tree (a
+# stash, another branch, another worktree of the same repo) nor that the
+# attack necessarily preceded any particular fix commit that will later
+# land — "true by construction" is not claimed.
+#
+# READER 2 (the closing-verifier relay, post-fix) requires `attacks_post`
+# with the SAME per-file keys (widened by every FILE the fix's own diff
+# changed, `_fix_window`'s `fix_changed`, and every FILE a new-surface
+# definition landed in), the SAME commands, re-run at `fix_head`; for every
+# fix-changed file the PRE-FIX artifact covers, at least one such file's
+# post-fix hash must differ from its own recorded pre-fix hash — the fix
+# must have measurably moved something an attack measures. `outcome` is
+# DERIVED from that inequality, never a lead-declared field.
+#
+# READER 3 (`ci/scripts/check_rigor_record.py`) is the half the lead cannot
+# forge: a committed-record SHAPE check (every second-round BLOCK row's
+# exported record carries a matching `docs/rigor/<slug>.anticipation.jsonl`
+# whose every key is covered and whose every command passes THIS module's
+# own `_r12_attack_command_denied`) that HARD FAILS on shape alone;
+# re-execution against a real `block_sha`/`pre_fix_sha` checkout is
+# ADVISORY (BSD/GNU divergence, path divergence — measured, never portable)
+# and reported per row, never a hard fail.
+#
+# HONEST LIMITS (stated as plainly as R3's/R11's own, never softened):
+# attack QUALITY is never judged by any of this — only that a command ran,
+# against a worktree whose HEAD really was the broken tip with nothing
+# uncommitted, and that its output measurably moved after the fix. The
+# hook trusts the lead's own `unit:` line naming which branch is under
+# work (a decoy line is not detected). A key that does not parse as
+# `path[:line]` still requires an attack (mapped to itself as its own
+# "file") rather than being silently exempted or denied outright — a
+# malformed key is a re-keying problem for the NEXT relay, not a reason to
+# block anticipation from ever being satisfiable. `rm
+# .jammi/gate-state/<slug>.*` remains the operator escape hatch and
+# destroys evidence rather than fixing anything; no R12 deny message ever
+# names it as a remedy.
 # ==========================================================================
 
-# The nine domain-implementer agent_types this reader gates — deliberately
-# NARROWER than "every GATED type outside VERIFIER_SECOND_ROUND_TYPES":
-# `general-purpose`/`claude`/`fork`/`doc-updater` are harness/generic types
-# a lead may dispatch for reasons unrelated to implementing a fix on a
-# blocked unit, and are not gated here.
+# The nine domain-implementer agent_types READER 1 gates unconditionally
+# (M6' widens gating to four more GATED-but-generic types, below, but ONLY
+# when their dispatch actually names a unit — these nine are gated even
+# with NO unit line at all, denied naming the missing line).
 IMPLEMENTER_TYPES = {
     "ai-core", "bench", "cli", "cookbook", "db", "docs-ci", "numerics",
     "python", "wire-server",
 }
 
+# M6': `general-purpose`/`claude`/`fork`/`doc-updater` are harness/generic
+# types a lead may dispatch for reasons unrelated to implementing a fix —
+# so a dispatch of one of these with NO unit line stays allowed (bricking
+# concern: ~40 units may carry open blocks at any time; a lead using one of
+# these types for something unrelated must not be gated). When the prompt
+# DOES name a unit with an open second-round BLOCK, the SAME anticipation
+# requirement as `IMPLEMENTER_TYPES` applies — this closes the fail-open
+# enumeration these four types previously sat in unconditionally.
+_R12_EXTRA_GATED_TYPES = {"general-purpose", "claude", "fork", "doc-updater"}
+
 # Attack-command execution has its OWN budget, separate from `_GIT_BUDGET_S`
-# (5s, shared by six git metadata calls — far too little to re-run the
-# 10-53 attack keys measured on the real U4a windows). `_ATTACK_BUDGET_S`
-# bounds the WHOLE decision's worth of attack re-execution;
-# `_ATTACK_PER_COMMAND_CAP_S` additionally caps any ONE command so a single
-# hung attack cannot eat the whole shared budget silently.
+# (5s, shared by the ref/worktree-resolution git calls — far too little to
+# re-run the 10-53 attack keys the design round counted as definition-
+# shaped added lines on the three real U4a fix windows: `git diff -U0
+# <range> | grep -Ec '(fn|struct|enum|mod|impl|def|class|name:)'` returned
+# 53, 28 and 10). `_ATTACK_BUDGET_S` bounds the WHOLE decision's worth of
+# attack re-execution; `_ATTACK_PER_COMMAND_CAP_S` additionally caps any ONE
+# command so a single hung attack cannot eat the whole shared budget
+# silently. Per M1', git-bound work runs under its OWN, FRESH
+# `_GIT_BUDGET_S` window BEFORE attack execution begins and again AFTER it
+# ends — never inside the attack window, so a 6s attack command cannot
+# exhaust the deadline the NEXT phase's git calls need.
 _ATTACK_BUDGET_S = 300.0
 _ATTACK_PER_COMMAND_CAP_S = 120.0
+
+# M1': because a cancelled PreToolUse `command` hook has its output
+# DISCARDED (fail-open — no decision at all, not a deny), this module
+# SELF-BOUNDS well inside the harness's own cancellation deadline
+# (`.claude/settings.json` pins `timeout: 420` on this hook's entry) via
+# `signal.alarm`, so a hung or over-budget decision produces a real,
+# logged DENY instead of silently vanishing into the harness's cancel path.
+_SELF_ALARM_S = 330
+
+
+def _install_self_alarm() -> None:
+    """Installs a `SIGALRM` handler that DENIES (prints a reason to stderr,
+    exits 2) if this process is still running `_SELF_ALARM_S` seconds after
+    this call. Only ever called from `main()`'s `pre` branch — `start`/
+    `stop` are best-effort writers with no attack-execution phase. A
+    platform with no `SIGALRM` (this module targets POSIX; there is no
+    Windows-hook deployment of this hook family today) silently skips
+    installing it — an HONEST LIMIT, not a workaround: the harness's own
+    `timeout` setting remains the only bound in that case, stated here
+    rather than pretended away."""
+    def _handler(signum: int, frame: object) -> None:  # noqa: ARG001
+        sys.stderr.write(
+            f"lead-gate: internal self-bound ({_SELF_ALARM_S:g}s) exceeded during "
+            "esc-lead-gate-R12 attack re-execution — denying rather than risk the "
+            "harness's own PreToolUse cancellation (fail-open, output discarded) "
+            "leaving this decision unresolved\n"
+        )
+        sys.stderr.flush()
+        os._exit(2)
+    try:
+        signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(_SELF_ALARM_S)
+    except (ValueError, AttributeError, OSError):
+        pass
 
 
 def _new_attack_deadline() -> float:
@@ -1497,10 +1615,10 @@ def _new_attack_deadline() -> float:
 
 
 def _derived_attack_keys(row: dict) -> set[str]:
-    """The hook's OWN derived pre-fix attack-key set: `finding_locations`
-    UNION `class_enumeration` from the BLOCK row itself, exact strings —
-    never a lead-supplied list, matched as exact dict keys the same way
-    R11's `claim_sites` already are, never by substring."""
+    """The hook's OWN derived pre-fix attack-key set for ONE BLOCK row:
+    `finding_locations` UNION `class_enumeration`, exact strings — never a
+    lead-supplied list, matched as exact dict keys the same way R11's
+    `claim_sites` already are, never by substring."""
     locs = {s for s in (row.get("finding_locations") or []) if isinstance(s, str)}
     enum = {s for s in (row.get("class_enumeration") or []) if isinstance(s, str)}
     return locs | enum
@@ -1511,26 +1629,34 @@ _KEY_LINE_SUFFIX_RE = re.compile(r":\d+(?:-\d+)?$")
 
 def _key_to_file(key: str) -> str:
     """Strips a trailing `:<line>[-<line>]` from an attack key, best-effort
-    — a `path:line` key maps to its own file; a key with no such suffix
-    (an unusual finding_locations entry) maps to itself, unresolved."""
+    — a `path:line` key maps to its own file; a key with no such suffix (an
+    unusual finding_locations entry, or prose in parentheses) maps to
+    ITSELF, unresolved — M1'/M2': this NEVER denies; it still requires an
+    attack, filed under the key's own literal text as its "file"."""
     return _KEY_LINE_SUFFIX_RE.sub("", key)
 
 
-def anticipation_artifact_path(sdir: Path, unit_slug: str, block_ts: str) -> Path:
-    return sdir / f"{unit_slug}.anticipation.{_fs_safe(block_ts)}.json"
+def anticipation_artifact_path(sdir: Path, unit_slug: str, tip_sha: str) -> Path:
+    """M1': keyed by the unit branch's CURRENT TIP — never a block's own
+    `ts` (the pre-fix-round-1 shape, which denied permanently the moment
+    two open blocks of different types sat at different shas)."""
+    return sdir / f"{unit_slug}.anticipation.{_fs_safe(tip_sha)}.json"
 
 
 def _witness_hash(rc: int, stdout: str, stderr_first_line: str) -> str:
-    """`sha256(rc + "\\n" + stdout + "\\n" + first line of stderr)` — the
+    """`sha256(rc + "\\n" + stdout + "\\n" + first line of stderr)`. The
     stderr line is INCLUDED (unlike R11's `_run_claim_command`, which
-    excludes stderr entirely) because a missing script (rc=127, empty
-    stdout) and a real, meaningful failure (rc=1, empty stdout, a real
-    error on stderr) hash IDENTICALLY under `sha256(rc+stdout)` alone —
-    measured, both produced `743c7850…`. The `rc in (126, 127)`/empty-
-    stdout vacuity check below is a further, independent guard: even a
-    stderr-disambiguated hash can reproduce consistently for a command
-    that is simply broken (a missing script fails the SAME way every
-    time), which proves nothing about the mechanism under attack."""
+    excludes stderr entirely): the design round measured that two
+    DIFFERENT commands — a real script absent from a stale
+    `$CLAUDE_PROJECT_DIR` checkout, and a nonexistent script — both produce
+    `rc=127` with EMPTY stdout, and hash IDENTICALLY (`743c7850…`) under
+    `sha256(rc+stdout)` alone; `rc=1` (a real, meaningful failure) does NOT
+    collide with `rc=127` under either hashing scheme — the two are
+    already distinguished by `rc` alone. The independent `rc in (126,
+    127)`/empty-stdout vacuity check below still applies even with the
+    stderr-disambiguated hash: a command that is simply broken can
+    reproduce its own broken witness consistently, which proves nothing
+    about the mechanism under attack."""
     return hashlib.sha256(f"{rc}\n{stdout}\n{stderr_first_line}".encode("utf-8")).hexdigest()
 
 
@@ -1623,7 +1749,8 @@ def _resolve_worktree_cwd(unit_branch: str, project_dir: str, deadline: float) -
     return found, None
 
 
-def _r12_attack_command_denied(command: object, cwd: str) -> str | None:
+def _r12_attack_command_denied(command: object, cwd: str, *, require_tracked_at: str | None = None,
+                                project_dir: str | None = None, deadline: float | None = None) -> str | None:
     """The RELAXED sibling of R11's `_command_denied`, for esc-lead-gate-
     R12 attack commands ONLY (R11's own `claims` commands are UNCHANGED —
     this function is never called from there): `sh <path>` / `bash <path>`
@@ -1635,7 +1762,15 @@ def _r12_attack_command_denied(command: object, cwd: str) -> str | None:
     (`rm`, `curl`, `docker`, `git push/reset/clean/gc`, `find -delete`, a
     BARE `bash -c '...'`, `curl … | sh`, …) stays denied exactly as R11
     leaves it — this widens NOTHING but the one 'invoke a real repo
-    script directly, with no further arguments' shape."""
+    script directly, with no further arguments' shape.
+
+    M3': when `require_tracked_at` (a resolved sha) is given, `<path>` must
+    ALSO be git-TRACKED at that sha (`git ls-tree`) — READER 3's own,
+    stricter form, so CI never executes an untracked lead-written file from
+    a detached checkout. Tracked-ness buys REVIEWABILITY, not safety: a
+    script the lead committed or modified in the SAME PR is tracked and CI
+    still runs it; the controls remain the write-verb denylist below, the
+    human SWARM_GATE_TOUCHED review, and same-repo `on: pull_request`."""
     if not isinstance(command, str) or not command.strip():
         return "empty or non-string command"
     try:
@@ -1663,10 +1798,18 @@ def _r12_attack_command_denied(command: object, cwd: str) -> str | None:
                 is_real = candidate.is_file() and str(candidate).startswith(str(base) + os.sep)
             except OSError:
                 is_real = False
-            if is_real:
-                continue
-            return (f"`{prog} {seg[1]}` does not resolve to a real, existing file under {cwd} "
-                     "(esc-lead-gate-R12's relaxed denylist only admits a real repo script)")
+            if not is_real:
+                return (f"`{prog} {seg[1]}` does not resolve to a real, existing file under {cwd} "
+                         "(esc-lead-gate-R12's relaxed denylist only admits a real repo script)")
+            if require_tracked_at is not None and project_dir is not None and deadline is not None:
+                ok, out, _rc = _run_git(["ls-tree", "-r", "--name-only", require_tracked_at],
+                                         project_dir, deadline, [])
+                tracked = set(out.splitlines()) if ok else set()
+                if seg[1] not in tracked:
+                    return (f"`{prog} {seg[1]}` is not git-TRACKED at {require_tracked_at[:12]}… "
+                             "(esc-lead-gate-R12 M3': CI never executes an untracked lead-written "
+                             "file from a detached checkout)")
+            continue
         if prog in _DENIED_PROGRAMS:
             return f"`{prog}` is a denied program (esc-lead-gate-R11 write-verb denylist)"
         if prog == "git" and len(seg) > 1 and seg[1].lower() in _DENIED_GIT_SUBCOMMANDS:
@@ -1676,24 +1819,193 @@ def _r12_attack_command_denied(command: object, cwd: str) -> str | None:
     return None
 
 
-def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, agent_type: str, row: dict,
-                                     project_dir: str, deadline: float, attack_deadline: float) -> str | None:
-    """esc-lead-gate-R12 READER 1 — the pre-fix moment. `None` iff a
-    complete, EXECUTED anticipation artifact exists for this open
-    `(unit_slug, agent_type)` BLOCK: every derived key (`_derived_attack_
-    keys`) carries a command the hook itself re-executes and hash-matches,
-    the unit branch's CURRENT tip equals the BLOCK's own `head_sha` at
-    THIS INSTANT (the one non-forgeable ordering fact: the attacks ran
-    against the BROKEN code, never after a fix already landed), and
-    `residual_risk` is a non-empty, honest admission of what stays
-    unclosed."""
-    block_ts = row.get("ts") or ""
-    block_sha = row.get("head_sha")
-    if not block_ts or not (isinstance(block_sha, str) and _SHA_RE.fullmatch(block_sha)):
-        return f"{agent_type} BLOCK row carries no ts/head_sha to anticipate against"
-    path = anticipation_artifact_path(sdir, unit_slug, block_ts)
+# M2': "an artifact of only inspectors ... denies" — the precise condition
+# is EVERY attack command being drawn exclusively from this list, never
+# merely "lacks a command from the execution allowlist" (a `printf`/`echo`
+# placeholder is neither an inspector nor on the execution allowlist, and
+# is NOT itself grounds for this specific deny).
+_R12_INSPECTOR_PROGRAMS = {"sed", "grep", "cat", "head", "awk", "rg", "wc", "tail", "ls"}
+_R12_EXECUTION_PROGRAMS = {"cargo", "python3", "pytest", "make"}
+
+
+def _r12_is_inspector_only(command: str) -> bool:
+    """True iff EVERY shell segment of `command` invokes ONLY a program in
+    `_R12_INSPECTOR_PROGRAMS` (a pipeline `grep -c foo | wc -l` is
+    inspector-only end to end; `cargo test && sed -n 1p out` is NOT,
+    because one segment is not an inspector at all)."""
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    segments: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok in _SHELL_OPERATOR_TOKENS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    real_segments = [seg for seg in segments if seg]
+    if not real_segments:
+        return False
+    return all(seg[0].lower() in _R12_INSPECTOR_PROGRAMS for seg in real_segments)
+
+
+def _r12_targeted_open_blocks(sdir: Path, unit_slug: str) -> list[tuple[str, dict]]:
+    """M1': the UNION arm — every open `VERIFIER_SECOND_ROUND_TYPES` BLOCK
+    on this unit, never "the newest only" (which produced the permanent-
+    deny bug the module docstring above describes)."""
+    return [
+        (atype, row) for atype, row, _idx in open_blocks_for_unit(sdir, unit_slug)
+        if atype in VERIFIER_SECOND_ROUND_TYPES
+    ]
+
+
+def _r12_required_by_file(targeted: list[tuple[str, dict]]) -> tuple[dict[str, set[str]], set[str]]:
+    """`(by_file, covers)`: `by_file` maps EVERY FILE named by the UNION of
+    every targeted open block's own derived keys to the set of raw keys
+    that map to it (`_key_to_file`) — the per-file reduction M1' requires
+    ("this unit's 50 keys cover 7 files"). `covers` is the set of every
+    covered block's own `ts`, recorded into the artifact for provenance —
+    never itself gated on."""
+    by_file: dict[str, set[str]] = {}
+    covers: set[str] = set()
+    for _atype, row in targeted:
+        ts = row.get("ts")
+        if isinstance(ts, str) and ts:
+            covers.add(ts)
+        for key in _derived_attack_keys(row):
+            by_file.setdefault(_key_to_file(key), set()).add(key)
+    return by_file, covers
+
+
+_R12_MAIN_REF_CANDIDATES = ("main", "master")
+
+
+def _r12_changed_file_set(project_dir: str, deadline: float, tip: str) -> tuple[set[str] | None, str | None]:
+    """M2': the unit's own `merge-base(main, tip)..tip` changed-file set,
+    used ONLY to constrain lead-chosen keys on the empty-derived-set path
+    (below) — never to narrow the by-file requirement itself. Tries `main`
+    then `master`; `(None, reason)` if neither resolves (an honest failure,
+    denied naming it, never silently bypassed)."""
+    for ref in _R12_MAIN_REF_CANDIDATES:
+        ok, base, _rc = _run_git(["merge-base", "--end-of-options", ref, tip], project_dir, deadline, [])
+        if not ok:
+            continue
+        base = base.strip()
+        if not base:
+            continue
+        ok2, out, _rc2 = _run_git(["diff", "--name-only", "-z", "--end-of-options", base, tip],
+                                   project_dir, deadline, [])
+        if ok2:
+            return {p for p in out.split("\0") if p}, None
+    return None, (
+        f"could not resolve a merge-base against {'/'.join(_R12_MAIN_REF_CANDIDATES)} to derive "
+        f"the unit's own changed-file set for {tip[:12]}… (esc-lead-gate-R12)"
+    )
+
+
+def _r12_validate_and_run_entry(artifact_name: str, key: str, entry: object, cwd: str,
+                                 attack_deadline: float, seen_pairs: dict[tuple[str, str], str],
+                                 *, require_tracked_at: str | None = None,
+                                 project_dir: str | None = None,
+                                 git_deadline: float | None = None) -> tuple[str | None, str | None, bool]:
+    """Validates, denylist-checks, RE-EXECUTES and hash-matches ONE
+    `{command, hash}` attack entry keyed by `key` (a file, or a raw key
+    mapped to itself). Returns `(error_or_None, command_or_None,
+    is_inspector_only)` — shared by every R12 caller (reader 1's by-file
+    loop, reader 1's empty-set fallback, and — via its own `hash` field
+    name — reader 3's shape check) so a fix to this one function fixes
+    every caller identically."""
+    if not isinstance(entry, dict):
+        return f"anticipation artifact {artifact_name} attacks[{key!r}] is not an object (esc-lead-gate-R12)", None, False
+    command = entry.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return f"anticipation artifact {artifact_name} attacks[{key!r}] has no `command` (esc-lead-gate-R12)", None, False
+    recorded_hash = entry.get("hash")
+    if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):
+        return f"anticipation artifact {artifact_name} attacks[{key!r}] has no valid `hash` (esc-lead-gate-R12)", None, False
+    pair = (command, recorded_hash)
+    if pair in seen_pairs:
+        return (f"anticipation artifact {artifact_name} attacks[{key!r}] and "
+                 f"attacks[{seen_pairs[pair]!r}] reuse the IDENTICAL (command, hash) pair — a "
+                 "templated attack is not a per-site examination (esc-lead-gate-R12)"), None, False
+    seen_pairs[pair] = key
+    deny = _r12_attack_command_denied(command, cwd, require_tracked_at=require_tracked_at,
+                                       project_dir=project_dir, deadline=git_deadline)
+    if deny is not None:
+        return f"anticipation artifact {artifact_name} attacks[{key!r}] command is denied: {deny}", None, False
+    remaining = attack_deadline - time.monotonic()
+    if remaining <= 0:
+        return (f"the shared {_ATTACK_BUDGET_S:g}s attack budget for this decision was already "
+                 f"exhausted before attacks[{key!r}]'s command could run (esc-lead-gate-R12)"), None, False
+    ok, rc, stdout, stderr_line, run_why = _run_attack_command(command, cwd, attack_deadline)
+    if not ok:
+        return f"anticipation artifact {artifact_name} attacks[{key!r}] command could not be re-executed: {run_why}", None, False
+    if rc in (126, 127) or stdout == "":
+        return (f"anticipation artifact {artifact_name} attacks[{key!r}] command's re-executed "
+                 f"run is VACUOUS (rc={rc}) — this proves nothing about the mechanism "
+                 "(esc-lead-gate-R12)"), None, False
+    actual_hash = _witness_hash(rc, stdout, stderr_line)
+    if actual_hash != recorded_hash:
+        return (f"anticipation artifact {artifact_name} attacks[{key!r}] command's re-executed "
+                 f"output does not reproduce the recorded hash (recorded {recorded_hash[:12]}…, "
+                 f"got {actual_hash[:12]}…) — the attack is not established (esc-lead-gate-R12)"), None, False
+    return None, command, _r12_is_inspector_only(command)
+
+
+def _r12_empty_set_rejection(artifact_name: str, attacks: object, unit_branch: str, tip: str,
+                              project_dir: str, git_deadline: float, attack_deadline: float,
+                              cwd: str) -> str | None:
+    """M2': an EMPTY derived set (an `uncertain` BLOCK with no findings; an
+    unparseable verifier row) can never be satisfied by writing an empty
+    file — the artifact must instead carry >=2 LEAD-CHOSEN keys, each
+    naming a file in the unit's own `merge-base(main, tip)..tip` changed-
+    file set, with distinct commands, distinct hashes, and at least one
+    execution-class. Two keys in an untouched file, or two lines of one
+    file read with two different `sed -n` invocations, do not satisfy
+    this."""
+    if not isinstance(attacks, dict) or len(attacks) < 2:
+        return (f"anticipation artifact {artifact_name} carries no derived keys (an uncertain "
+                 "BLOCK with no findings) and fewer than 2 lead-chosen attack keys — an "
+                 "anticipation can never be satisfied by writing an empty file (esc-lead-gate-R12)")
+    changed, why = _r12_changed_file_set(project_dir, git_deadline, tip)
+    if why is not None:
+        return why
+    seen_pairs: dict[tuple[str, str], str] = {}
+    all_inspector = True
+    for key, entry in attacks.items():
+        f = _key_to_file(key)
+        if f not in changed:
+            return (f"anticipation artifact {artifact_name} attacks[{key!r}] names {f!r}, which "
+                     f"is not in the unit's own changed-file set against "
+                     f"{'/'.join(_R12_MAIN_REF_CANDIDATES)} — a lead-chosen key on the empty-set "
+                     "path must attack a file the unit actually touches (esc-lead-gate-R12)")
+        err, _command, is_inspector = _r12_validate_and_run_entry(
+            artifact_name, key, entry, cwd, attack_deadline, seen_pairs)
+        if err is not None:
+            return err
+        all_inspector = all_inspector and is_inspector
+    if all_inspector:
+        return (f"anticipation artifact {artifact_name} carries only inspector-class commands — "
+                 "at least one lead-chosen attack must be execution-class (sh|bash <tracked "
+                 "path>, cargo, python3, pytest, make) (esc-lead-gate-R12)")
+    return None
+
+
+def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str, tip: str,
+                                     by_file: dict[str, set[str]], covers: set[str],
+                                     project_dir: str, git_deadline: float,
+                                     attack_deadline: float) -> str | None:
+    """esc-lead-gate-R12 READER 1 (M1'/M2'). `None` iff a complete, EXECUTED
+    anticipation artifact exists at the branch's CURRENT tip covering the
+    UNION of every open second-round BLOCK's derived keys, reduced to one
+    entry per FILE, plus non-empty `residual_risk` and clean ordering
+    evidence (see the module doc above for exactly what that evidence
+    establishes and what it does not)."""
+    path = anticipation_artifact_path(sdir, unit_slug, tip)
     if not path.exists():
-        return (f"no anticipation artifact ({path.name}) for the open {agent_type} BLOCK — the "
+        return (f"no anticipation artifact ({path.name}) at the current tip {tip[:12]}… — the "
                  "lead must attack the fix's own broken tip BEFORE dispatching the implementer "
                  "(esc-lead-gate-R12)")
     try:
@@ -1702,10 +2014,9 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, agent_type: str,
         return f"anticipation artifact {path.name} is not valid JSON"
     if not isinstance(data, dict):
         return f"anticipation artifact {path.name} is not a JSON object"
-    if data.get("block_ts") != block_ts:
-        return f"anticipation artifact {path.name} `block_ts` does not match the BLOCK row's own ts"
-    if data.get("block_sha") != block_sha:
-        return f"anticipation artifact {path.name} `block_sha` does not match the BLOCK row's own head_sha"
+    if data.get("pre_fix_sha") != tip:
+        return (f"anticipation artifact {path.name} `pre_fix_sha` does not match its own "
+                 f"filename's tip {tip[:12]}… (esc-lead-gate-R12)")
     relay_ub = data.get("unit_branch")
     if not (isinstance(relay_ub, str) and relay_ub.strip() and slugify(relay_ub) == unit_slug):
         return f"anticipation artifact {path.name} `unit_branch` does not name this unit"
@@ -1713,111 +2024,102 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, agent_type: str,
     residual_risk = data.get("residual_risk")
     if not isinstance(residual_risk, str) or not residual_risk.strip():
         return (f"anticipation artifact {path.name} carries no non-empty `residual_risk` — the "
-                 "one field where the lead admits an unclosed site (esc-lead-gate-R12; replaces "
-                 "esc-lead-gate-R10's `open_question`)")
+                 "one field where the lead admits an unclosed site (esc-lead-gate-R12)")
 
-    required_keys = _derived_attack_keys(row)
+    # M1' ordering evidence: the tip has not moved since this decision
+    # began, the resolved worktree's own HEAD equals it, and the tree is
+    # clean — a moved tip or a dirty tree denies, never silently degrades.
+    ok, tip_now, out = _run_git(
+        ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{relay_ub}^{{commit}}"],
+        project_dir, git_deadline, [])
+    if not ok:
+        return f"could not re-resolve {relay_ub!r} under refs/heads/ to confirm the pre-fix tip — {out}"
+    if tip_now != tip:
+        return (f"{relay_ub!r}'s tip moved to {tip_now[:12]}… since this decision began (was "
+                 f"{tip[:12]}…) — re-record the anticipation artifact at the new tip "
+                 "(esc-lead-gate-R12)")
+
+    cwd, why = _resolve_worktree_cwd(relay_ub, project_dir, git_deadline)
+    if why is not None:
+        return why
+    ok, status_out, _rc = _run_git(["status", "--porcelain"], cwd, git_deadline, [])
+    if not ok:
+        return f"could not check {cwd} for a clean tree (`git status --porcelain`) — {status_out}"
+    if status_out.strip():
+        dirty = [ln[3:].strip() if len(ln) > 3 else ln for ln in status_out.splitlines()[:5]]
+        return (f"the worktree at {cwd} carries uncommitted changes ({', '.join(dirty)}) — "
+                 "commit them or move them outside the worktree before anticipation attacks can "
+                 "prove they ran against the tip exactly (esc-lead-gate-R12)")
+    ok, head_now, _rc = _run_git(["rev-parse", "HEAD"], cwd, git_deadline, [])
+    if not ok or head_now != tip:
+        return (f"the worktree at {cwd}'s HEAD ({head_now if ok else '?'}) does not match the "
+                 f"branch tip {tip[:12]}… (esc-lead-gate-R12)")
+
     attacks = data.get("attacks")
     if not isinstance(attacks, dict):
         return f"anticipation artifact {path.name} carries no `attacks` object"
-    missing = [k for k in required_keys if k not in attacks]
-    if missing:
-        return (f"anticipation artifact {path.name} omits {len(missing)} derived key(s) the "
-                f"BLOCK's own finding_locations/class_enumeration name, e.g. {missing[:3]} "
-                "(esc-lead-gate-R12)")
 
-    ok, tip, _rc = _run_git(
-        ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{relay_ub}^{{commit}}"],
-        project_dir, deadline, [])
-    if not ok:
-        return f"could not resolve {relay_ub!r} under refs/heads/ to check the pre-fix tip — {tip}"
-    if tip != block_sha:
-        return (f"{relay_ub!r}'s current tip {tip[:12]}… is not the BLOCK's own head_sha "
-                 f"{block_sha[:12]}… — anticipation attacks must run BEFORE the fix lands, "
-                 "against the broken tip, never after (esc-lead-gate-R12)")
+    if not by_file:
+        return _r12_empty_set_rejection(path.name, attacks, relay_ub, tip, project_dir,
+                                         git_deadline, attack_deadline, cwd)
 
-    cwd, why = _resolve_worktree_cwd(relay_ub, project_dir, deadline)
-    if why is not None:
-        return why
+    missing_files = [f for f in by_file if f not in attacks]
+    if missing_files:
+        return (f"anticipation artifact {path.name} omits {len(missing_files)} file(s) the open "
+                 f"BLOCK(s)' own finding_locations/class_enumeration name, e.g. "
+                 f"{sorted(missing_files)[:3]} (esc-lead-gate-R12)")
 
     seen_pairs: dict[tuple[str, str], str] = {}
-    for key in required_keys:
-        entry = attacks.get(key)
-        if not isinstance(entry, dict):
-            return f"anticipation artifact {path.name} attacks[{key!r}] is not an object (esc-lead-gate-R12)"
-        attack_desc = entry.get("attack")
-        if not isinstance(attack_desc, str) or not attack_desc.strip():
-            return f"anticipation artifact {path.name} attacks[{key!r}] has no `attack` description (esc-lead-gate-R12)"
-        command = entry.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return f"anticipation artifact {path.name} attacks[{key!r}] has no `command` (esc-lead-gate-R12)"
-        block_rc = entry.get("block_rc")
-        block_hash = entry.get("block_hash")
-        if not isinstance(block_rc, int) or isinstance(block_rc, bool):
-            return f"anticipation artifact {path.name} attacks[{key!r}] has no integer `block_rc` (esc-lead-gate-R12)"
-        if not (isinstance(block_hash, str) and _OUTPUT_HASH_RE.fullmatch(block_hash)):
-            return f"anticipation artifact {path.name} attacks[{key!r}] has no valid `block_hash` (esc-lead-gate-R12)"
-        pair = (command, block_hash)
-        if pair in seen_pairs:
-            return (f"anticipation artifact {path.name} attacks[{key!r}] and "
-                     f"attacks[{seen_pairs[pair]!r}] reuse the IDENTICAL (command, block_hash) "
-                     "pair — a templated attack is not a per-site examination (esc-lead-gate-R12)")
-        seen_pairs[pair] = key
-        deny = _r12_attack_command_denied(command, cwd)
-        if deny is not None:
-            return f"anticipation artifact {path.name} attacks[{key!r}] command is denied: {deny}"
-        remaining = attack_deadline - time.monotonic()
-        if remaining <= 0:
-            return (f"the shared {_ATTACK_BUDGET_S:g}s attack budget for this decision was "
-                     f"already exhausted before attacks[{key!r}]'s command could run")
-        ok, rc, stdout, stderr_line, run_why = _run_attack_command(command, cwd, attack_deadline)
-        if not ok:
-            return f"anticipation artifact {path.name} attacks[{key!r}] command could not be re-executed: {run_why}"
-        if rc in (126, 127) or stdout == "":
-            return (f"anticipation artifact {path.name} attacks[{key!r}] command's re-executed "
-                     f"run is VACUOUS (rc={rc}) — this proves nothing about the mechanism "
-                     "(esc-lead-gate-R12)")
-        actual_hash = _witness_hash(rc, stdout, stderr_line)
-        if rc != block_rc or actual_hash != block_hash:
-            return (f"anticipation artifact {path.name} attacks[{key!r}] command's re-executed "
-                     f"output does not reproduce the recorded witness (recorded rc={block_rc} "
-                     f"hash {block_hash[:12]}…, got rc={rc} hash {actual_hash[:12]}…) — the "
-                     "attack is not established (esc-lead-gate-R12)")
+    all_inspector = True
+    for f in sorted(by_file):
+        err, _command, is_inspector = _r12_validate_and_run_entry(
+            path.name, f, attacks.get(f), cwd, attack_deadline, seen_pairs)
+        if err is not None:
+            return err
+        all_inspector = all_inspector and is_inspector
+    if all_inspector:
+        return (f"anticipation artifact {path.name} carries only inspector-class commands "
+                 "(sed/grep/cat/head/awk/rg/wc/tail/ls) — at least one attack must be "
+                 "execution-class (sh|bash <tracked path>, cargo, python3, pytest, make) "
+                 "(esc-lead-gate-R12)")
     return None
 
 
 def _post_fix_attacks_rejection(row: dict, data: dict, project_dir: str, cwd: str,
-                                 attack_deadline: float, pre_keys: set[str],
+                                 attack_deadline: float, pre_by_file: dict[str, set[str]],
                                  new_surfaces: dict[str, str] | None, fix_changed: list[str] | None,
                                  anticipation_data: dict | None) -> str | None:
-    """esc-lead-gate-R12 READER 2 — the closing-verifier relay, post-fix.
-    `attacks_post` REPLACES `open_question` (a relay still carrying the
-    old field with no `attacks_post` is denied naming the migration). The
-    required key set WIDENS with every new-surface definition the fix's
-    diff adds (`new_surfaces`); every required key's `command` must match
-    the pre-fix anticipation's own command for that SAME key (the
-    differential is meaningless if the command itself changed), re-execute
-    at `fix_head` non-vacuously, and — for every fix-changed file a
-    PRE-FIX key covers — at least one such key's post-fix hash must differ
-    from its own recorded pre-fix `block_hash`: the fix must have
-    measurably moved something an attack measures. `outcome` is DERIVED
-    from that inequality, never a lead-declared field. HONEST LIMIT: a
-    changed file covered by NO pre-fix key (only brand-new attack sites)
-    is not differential-checked here — there is no pre-fix witness for a
-    key that did not exist before the fix, and this hook does not stand up
-    an ephemeral `block_sha` checkout to synthesize one (see Reader 3,
-    `check_rigor_record.py`, which independently re-derives from a real
-    `block_sha` checkout instead)."""
-    required = set(pre_keys) | set((new_surfaces or {}).keys())
+    """esc-lead-gate-R12 READER 2 (M4'), post-fix. `attacks_post` REPLACES
+    `open_question` (a relay still carrying the old field with no
+    `attacks_post` is denied naming the migration). The required key set is
+    `keys(ARTIFACT) ∪ new_surfaces`, PER FILE (M4' widens by file for
+    every changed file — the finer, per-rewritten-definition refinement
+    M4' also describes for `.rs`/`.py` is NOT implemented here; this is a
+    documented simplification, never a weaker per-file guarantee: every
+    changed file still needs its own covering key). Every required file's
+    `command` must match the pre-fix artifact's own command for that SAME
+    file, re-execute non-vacuously at `fix_head`, and — for every fix-
+    changed file the PRE-FIX artifact covers — at least one such file's
+    post-fix hash must differ from its own recorded pre-fix hash. `outcome`
+    is DERIVED from that inequality, never a lead-declared field. HONEST
+    LIMIT: a changed file covered by NO pre-fix key (only brand-new attack
+    sites) is not differential-checked here — there is no pre-fix witness
+    for a key that did not exist before the fix, and this hook does not
+    stand up an ephemeral `block_sha` checkout to synthesize one (see
+    Reader 3, `check_rigor_record.py`, which independently re-derives from
+    a real checkout instead)."""
+    new_surface_files = {_key_to_file(k) for k in (new_surfaces or {}).keys()}
+    required = set(pre_by_file) | new_surface_files
     if "open_question" in data and not (isinstance(data.get("attacks_post"), dict) and data.get("attacks_post")):
         return (
             "relay carries `open_question`, which esc-lead-gate-R12 REPLACES with "
             "`attacks_post` (post-fix, keyed like the pre-fix anticipation artifact's own "
-            "`attacks`) — see the anticipation artifact for the schema (esc-lead-gate-R12)"
+            "`attacks`, per FILE) — see the anticipation artifact for the schema "
+            "(esc-lead-gate-R12)"
         )
     if not required:
         return None
-    if pre_keys and not (isinstance(anticipation_data, dict) and isinstance(anticipation_data.get("attacks"), dict)):
+    if pre_by_file and not (isinstance(anticipation_data, dict) and isinstance(anticipation_data.get("attacks"), dict)):
         # Defensive re-check: Reader 1 should already have required a real
         # pre-fix anticipation artifact before the implementer was ever
         # dispatched — if it is missing HERE, the differential below would
@@ -1830,72 +2132,46 @@ def _post_fix_attacks_rejection(row: dict, data: dict, project_dir: str, cwd: st
     attacks_post = data.get("attacks_post")
     if not isinstance(attacks_post, dict):
         return (f"relay carries no `attacks_post` object, but {len(required)} attack site(s) "
-                f"are required, e.g. {list(required)[:3]} (esc-lead-gate-R12)")
+                f"are required, e.g. {sorted(required)[:3]} (esc-lead-gate-R12)")
     missing = [k for k in required if k not in attacks_post]
     if missing:
-        return f"relay `attacks_post` omits {len(missing)} required site(s), e.g. {missing[:3]} (esc-lead-gate-R12)"
+        return f"relay `attacks_post` omits {len(missing)} required site(s), e.g. {sorted(missing)[:3]} (esc-lead-gate-R12)"
 
     pre_attacks = (anticipation_data or {}).get("attacks") if isinstance(anticipation_data, dict) else None
     if not isinstance(pre_attacks, dict):
         pre_attacks = {}
 
-    post_hashes: dict[str, str] = {}
     seen_pairs: dict[tuple[str, str], str] = {}
-    for key in required:
-        entry = attacks_post.get(key)
+    post_hashes: dict[str, str] = {}
+    for f in sorted(required):
+        entry = attacks_post.get(f)
         if not isinstance(entry, dict):
-            return f"relay `attacks_post[{key!r}]` is not an object (esc-lead-gate-R12)"
+            return f"relay `attacks_post[{f!r}]` is not an object (esc-lead-gate-R12)"
         command = entry.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return f"relay `attacks_post[{key!r}]` has no `command` (esc-lead-gate-R12)"
-        pre_entry = pre_attacks.get(key)
+        pre_entry = pre_attacks.get(f)
         if isinstance(pre_entry, dict) and isinstance(pre_entry.get("command"), str):
-            if pre_entry["command"] != command:
-                return (f"relay `attacks_post[{key!r}]` command differs from the pre-fix "
-                         "anticipation's own command for the SAME key — the differential "
+            if isinstance(command, str) and pre_entry["command"] != command:
+                return (f"relay `attacks_post[{f!r}]` command differs from the pre-fix "
+                         "anticipation's own command for the SAME file — the differential "
                          "requires the SAME command (esc-lead-gate-R12)")
-        post_rc = entry.get("post_rc")
-        post_hash = entry.get("post_hash")
-        if not isinstance(post_rc, int) or isinstance(post_rc, bool):
-            return f"relay `attacks_post[{key!r}]` has no integer `post_rc` (esc-lead-gate-R12)"
-        if not (isinstance(post_hash, str) and _OUTPUT_HASH_RE.fullmatch(post_hash)):
-            return f"relay `attacks_post[{key!r}]` has no valid `post_hash` (esc-lead-gate-R12)"
-        pair = (command, post_hash)
-        if pair in seen_pairs:
-            return (f"relay `attacks_post[{key!r}]` and `attacks_post[{seen_pairs[pair]!r}]` "
-                     "reuse the IDENTICAL (command, post_hash) pair — templated, not a "
-                     "per-site examination (esc-lead-gate-R12)")
-        seen_pairs[pair] = key
-        deny = _r12_attack_command_denied(command, cwd)
-        if deny is not None:
-            return f"relay `attacks_post[{key!r}]` command is denied: {deny}"
-        remaining = attack_deadline - time.monotonic()
-        if remaining <= 0:
-            return (f"the shared {_ATTACK_BUDGET_S:g}s attack budget for this decision was "
-                     f"already exhausted before attacks_post[{key!r}]'s command could run")
-        ok, rc, stdout, stderr_line, run_why = _run_attack_command(command, cwd, attack_deadline)
-        if not ok:
-            return f"relay `attacks_post[{key!r}]` command could not be re-executed: {run_why}"
-        if rc in (126, 127) or stdout == "":
-            return (f"relay `attacks_post[{key!r}]` command's re-executed run is VACUOUS "
-                     f"(rc={rc}) (esc-lead-gate-R12)")
-        actual_hash = _witness_hash(rc, stdout, stderr_line)
-        if rc != post_rc or actual_hash != post_hash:
-            return (f"relay `attacks_post[{key!r}]` command's re-executed output does not "
-                     "reproduce the recorded post-fix witness (esc-lead-gate-R12)")
-        post_hashes[key] = post_hash
+        err, _command, _is_exec = _r12_validate_and_run_entry(
+            "relay", f, entry, cwd, attack_deadline, seen_pairs)
+        if err is not None:
+            return err.replace("anticipation artifact relay", "relay `attacks_post`")
+        post_hashes[f] = entry.get("hash")
 
     for f in (fix_changed or []):
-        covering = [k for k in pre_keys if _key_to_file(k) == f]
-        if not covering:
+        if f not in pre_by_file:
             continue
-        if all(pre_attacks.get(k, {}).get("block_hash") == post_hashes.get(k) for k in covering):
+        pre_hash = pre_attacks.get(f, {}).get("hash") if isinstance(pre_attacks.get(f), dict) else None
+        if pre_hash is not None and pre_hash == post_hashes.get(f):
             return (
-                f"the fix changed {f!r} but every pre-fix attack site covering it "
-                f"({covering[:3]}) reproduces the IDENTICAL post-fix hash — the fix did not "
-                "observably move anything these attacks measure (esc-lead-gate-R12)"
+                f"the fix changed {f!r} but its pre-fix attack site reproduces the IDENTICAL "
+                "post-fix hash — the fix did not observably move anything these attacks "
+                "measure (esc-lead-gate-R12)"
             )
     return None
+# R12-END
 
 
 def _claims_rejection(claim_sites: dict[str, str] | None, data: dict, project_dir: str,
@@ -2098,14 +2374,31 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
     if claims_why is not None:
         return claims_why
 
-    # esc-lead-gate-R12 READER 2 — the post-fix differential. Runs in the
-    # SAME resolved worktree the fix landed in (never $CLAUDE_PROJECT_DIR),
-    # bounded by its OWN `_ATTACK_BUDGET_S`, separate from the git budget
-    # above — re-running 10-53 attack keys cannot fit in `_GIT_BUDGET_S`'s
-    # 5s.
+    # esc-lead-gate-R12 READER 2 (M4') — the post-fix differential. Runs in
+    # the SAME resolved worktree the fix landed in (never
+    # $CLAUDE_PROJECT_DIR), bounded by its OWN `_ATTACK_BUDGET_S`, separate
+    # from the git budget above. The pre-fix artifact is looked up by the
+    # BLOCK's own `head_sha` (M1': the artifact is keyed by TIP, and this
+    # BLOCK's own head_sha WAS the tip at the moment Reader 1 required
+    # anticipation for it); the required set is `keys(ARTIFACT) ∪
+    # new_surfaces`, PER FILE — never merely this row's own derived keys —
+    # so lead-chosen keys the empty-set path added are differentiated too.
     relay_ub = data.get("unit_branch")
-    pre_keys = _derived_attack_keys(row)
-    required_r12 = pre_keys | set((new_surfaces or {}).keys())
+    anticipation_data = None
+    if isinstance(relay_ub, str) and relay_ub.strip():
+        block_sha_local = row.get("head_sha")
+        if isinstance(block_sha_local, str) and block_sha_local:
+            apath = anticipation_artifact_path(sdir, unit_slug, block_sha_local)
+            if apath.exists():
+                try:
+                    anticipation_data = json.loads(apath.read_text())
+                except Exception:
+                    anticipation_data = None
+    if isinstance(anticipation_data, dict) and isinstance(anticipation_data.get("attacks"), dict):
+        pre_by_file: dict[str, set[str]] = {f: set() for f in anticipation_data["attacks"].keys()}
+    else:
+        pre_by_file = {}
+    required_r12 = set(pre_by_file) | {_key_to_file(k) for k in (new_surfaces or {}).keys()}
     if required_r12:
         project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if not project_dir:
@@ -2113,17 +2406,9 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
         cwd, cwd_why = _resolve_worktree_cwd(relay_ub, project_dir, deadline) if isinstance(relay_ub, str) else (None, "relay carries no `unit_branch`")
         if cwd_why is not None:
             return cwd_why
-        anticipation_data = None
-        block_ts_local = row.get("ts") or ""
-        apath = anticipation_artifact_path(sdir, unit_slug, block_ts_local)
-        if apath.exists():
-            try:
-                anticipation_data = json.loads(apath.read_text())
-            except Exception:
-                anticipation_data = None
         attack_deadline = _new_attack_deadline()
         post_why = _post_fix_attacks_rejection(row, data, project_dir, cwd, attack_deadline,
-                                                pre_keys, new_surfaces, fix_changed, anticipation_data)
+                                                pre_by_file, new_surfaces, fix_changed, anticipation_data)
         if post_why is not None:
             return post_why
     return None
@@ -2290,32 +2575,49 @@ def _decide_dispatch(tool_input: dict, sdir: Path) -> tuple[bool, str]:
         )
     if subtype not in VERIFIER_SECOND_ROUND_TYPES:
         if subtype in IMPLEMENTER_TYPES:
-            # esc-lead-gate-R12 reader 1 — the pre-fix moment. Every OTHER
-            # GATED non-verifier type (general-purpose/claude/fork/
-            # doc-updater) stays OUT OF SCOPE, unchanged from the round-3
-            # core cut.
+            # esc-lead-gate-R12 reader 1 — the pre-fix moment. A `unit:`
+            # line is REQUIRED for these nine (M6') — an implementer
+            # dispatch with no unit line is denied, naming the missing
+            # line.
             prompt = _first_str(tool_input, ("prompt", "description")) or ""
-            return _decide_implementer_dispatch(subtype, prompt, sdir)
+            return _decide_implementer_dispatch(subtype, prompt, sdir, require_unit_line=True)
+        if subtype in _R12_EXTRA_GATED_TYPES:
+            # M6': these four GATED-but-generic types stay allowed with NO
+            # unit line (a lead may dispatch them for reasons unrelated to
+            # implementing a fix — ~40 units may carry an open block at any
+            # time; gating an unlabeled dispatch of these types would brick
+            # the lead). When the prompt DOES name a unit with an open
+            # second-round BLOCK, the SAME anticipation requirement as
+            # IMPLEMENTER_TYPES applies — this closes the fail-open
+            # enumeration these four previously sat in unconditionally.
+            prompt = _first_str(tool_input, ("prompt", "description")) or ""
+            return _decide_implementer_dispatch(subtype, prompt, sdir, require_unit_line=False)
         # Implementer-dispatch binding is OUT OF SCOPE by the round-3 core
-        # cut — a GATED non-verifier, non-implementer type dispatch is
-        # always allowed.
+        # cut — every OTHER GATED non-verifier, non-implementer type
+        # dispatch is always allowed.
         return True, f"agent type {subtype!r} is GATED but dispatch-binding is out of scope (§3 core)"
     prompt = _first_str(tool_input, ("prompt", "description")) or ""
     return _decide_verifier_dispatch(subtype, prompt, sdir)
 
 
-def _decide_implementer_dispatch(subtype: str, prompt: str, sdir: Path) -> tuple[bool, str]:
-    """esc-lead-gate-R12 READER 1 — the pre-fix moment (today an
-    unconditional allow). An implementer-type dispatch that names, via a
-    `unit_branch:`/`unit:` line (the SAME parse `handle_start` already uses
-    to bind a branch — this is about WHICH unit the implementer works on,
-    never a whole-token scan of the whole prompt the way the verifier
-    branch's anchor-matching is), a unit branch carrying an OPEN BLOCK of
-    a `VERIFIER_SECOND_ROUND_TYPES` agent_type is denied unless a valid,
-    complete, PRE-FIX anticipation artifact exists for EVERY such open
-    block. A prompt naming no unit, or a unit with no open verifier-type
-    BLOCK at all, is allowed — structurally unreachable to gate: there is
-    nothing yet to have anticipated."""
+def _decide_implementer_dispatch(subtype: str, prompt: str, sdir: Path, *,
+                                  require_unit_line: bool) -> tuple[bool, str]:
+    """esc-lead-gate-R12 READER 1 (M1'/M2'/M6'), the pre-fix moment. A
+    dispatch that names, via a `unit_branch:`/`unit:` line (the SAME parse
+    `handle_start` already uses to bind a branch — this is about WHICH unit
+    the agent works on, never a whole-token scan of the whole prompt the
+    way the verifier branch's anchor-matching is), a unit branch carrying
+    ANY open `VERIFIER_SECOND_ROUND_TYPES` BLOCK is denied unless a valid,
+    complete, PRE-FIX anticipation artifact exists at the branch's CURRENT
+    tip covering the UNION of every such open block's derived keys
+    (`_r12_required_by_file`). `require_unit_line=True` (the nine
+    `IMPLEMENTER_TYPES`) denies a dispatch with no unit line at all, naming
+    the missing line (M6' — a decoy-free zone: EVERY implementer dispatch
+    must say which unit it works on); `require_unit_line=False` (the four
+    `_R12_EXTRA_GATED_TYPES`) allows a dispatch naming no unit — nothing to
+    check yet. A `unit:` line naming a branch that does not resolve under
+    `refs/heads/` DENIES either way (M6') — never silently treated as "no
+    unit named"."""
     unit_branch = None
     m = _UNIT_LINE_RE.search(prompt)
     if m:
@@ -2329,40 +2631,49 @@ def _decide_implementer_dispatch(subtype: str, prompt: str, sdir: Path) -> tuple
     if unit_branch:
         unit_branch, _note = _normalize_unit_branch(unit_branch)
     if not unit_branch:
+        if require_unit_line:
+            return False, (
+                f"implementer dispatch ({subtype!r}) names no unit branch — esc-lead-gate-R12 "
+                "M6' requires every implementer dispatch to name the unit it works on via a "
+                "`unit:` line"
+            )
         return True, (
-            f"implementer dispatch ({subtype!r}) names no unit branch — nothing to check for "
-            "an open verifier-type BLOCK (esc-lead-gate-R12 reader 1)"
+            f"dispatch ({subtype!r}) names no unit branch — nothing to check for an open "
+            "verifier-type BLOCK (esc-lead-gate-R12 reader 1)"
         )
     unit_slug = slugify(unit_branch)
-    targeted = [
-        (atype, row) for atype, row, _idx in open_blocks_for_unit(sdir, unit_slug)
-        if atype in VERIFIER_SECOND_ROUND_TYPES
-    ]
-    if not targeted:
-        return True, (
-            f"implementer dispatch ({subtype!r}) names unit {unit_slug!r} with no open "
-            "verifier-type BLOCK — nothing to anticipate yet (esc-lead-gate-R12 reader 1)"
-        )
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
     if not project_dir:
         return False, "hook needs CLAUDE_PROJECT_DIR for the esc-lead-gate-R12 reader-1 arm"
-    deadline = _new_git_deadline()
-    attack_deadline = _new_attack_deadline()
-    unresolved = []
-    for atype, row in targeted:
-        why = _pre_fix_anticipation_rejection(sdir, unit_slug, atype, row, project_dir,
-                                               deadline, attack_deadline)
-        if why is not None:
-            unresolved.append(f"{atype}: {why}")
-    if unresolved:
+    git_deadline = _new_git_deadline()
+    ok, tip, git_out = _run_git(
+        ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{unit_branch}^{{commit}}"],
+        project_dir, git_deadline, [])
+    if not ok:
         return False, (
-            f"implementer dispatch onto unit {unit_slug!r} denied — {len(unresolved)} open "
-            "verifier-type BLOCK(s) lack a satisfying pre-fix anticipation: "
-            + "; ".join(unresolved)
+            f"dispatch ({subtype!r}) names unit branch {unit_branch!r}, which does not resolve "
+            f"under refs/heads/ ({git_out}) — esc-lead-gate-R12 M6'"
         )
+    targeted = _r12_targeted_open_blocks(sdir, unit_slug)
+    if not targeted:
+        return True, (
+            f"dispatch ({subtype!r}) names unit {unit_slug!r} with no open verifier-type BLOCK "
+            "— nothing to anticipate yet (esc-lead-gate-R12 reader 1)"
+        )
+    by_file, _covers = _r12_required_by_file(targeted)
+    # A fresh, SEPARATE git-budget window for the ordering/artifact checks
+    # below, minted AFTER the branch-resolution call above and BEFORE any
+    # attack execution — M1': per-phase deadlines, never one budget shared
+    # across ref resolution, attack execution, and any later git call.
+    git_deadline = _new_git_deadline()
+    attack_deadline = _new_attack_deadline()
+    why = _pre_fix_anticipation_rejection(sdir, unit_slug, unit_branch, tip, by_file, _covers,
+                                           project_dir, git_deadline, attack_deadline)
+    if why is not None:
+        return False, f"implementer dispatch onto unit {unit_slug!r} denied — {why}"
     return True, (
-        f"implementer dispatch onto unit {unit_slug!r} allowed — every open verifier-type "
-        "BLOCK carries a satisfying pre-fix anticipation artifact (esc-lead-gate-R12)"
+        f"dispatch onto unit {unit_slug!r} allowed — the anticipation artifact at tip "
+        f"{tip[:12]}… covers every open verifier-type BLOCK's derived keys (esc-lead-gate-R12)"
     )
 
 
@@ -2680,7 +2991,11 @@ def main(argv: list[str]) -> int:
             handle_stop(payload, sdir)
             _log_line(sdir, "SubagentStop", tool_name, agent_type, "n/a (writer)", payload_keys)
             return 0
-        # cmd == "pre"
+        # cmd == "pre" — esc-lead-gate-R12 M1': self-bound well inside the
+        # harness's own PreToolUse cancellation deadline (settings.json
+        # pins it above `_SELF_ALARM_S`), since a cancelled hook's output
+        # is DISCARDED (fail-open) rather than denied.
+        _install_self_alarm()
         allow, reason = decide_pre(payload, sdir)
         _log_line(sdir, "PreToolUse", tool_name, agent_type, "allow" if allow else "deny",
                    payload_keys, reason)

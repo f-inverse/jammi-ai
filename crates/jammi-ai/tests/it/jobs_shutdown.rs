@@ -463,6 +463,73 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
     );
 }
 
+/// Regression (compose smoke `shape_b_release.py`, wave 1): `release_and_stop`
+/// must request stop in the SAME step it flips phase `Releasing` — BEFORE any
+/// hold is released — never in a later step. A hold 2b releases flips a
+/// training thread's `lost` check, and for a fast-bailing attempt the thread
+/// can return control to the loop's own top-of-loop `claim_next` before 2b/2c
+/// resolve. If stop were requested only after 2b/2c (as it was before this
+/// fix), that reawakened iteration would find `stop_requested() == false`,
+/// reclaim its OWN just-released row (a released-but-still-`running` lease
+/// reads as expired, so it is unconditionally reclaimable) and re-claim it —
+/// a second attempt that self-releases through 2a's own phase check, leaving
+/// ONE operator RELEASE with `attempts` and `releases` both incremented an
+/// extra time (`running`/lease NULL/`2`/`2` instead of `1`/`1`). Pinned two
+/// ways: the ordering itself (`stop_requested()` already `true` at the 2a
+/// rendezvous, before any hold could have been touched) and the end-to-end
+/// row arithmetic on a real held hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_is_requested_before_any_hold_is_released() {
+    let (session, _dir) = session(FAST_TIMING).await;
+    let handle = session.enqueue(fine_tune(20_000), 0).await.unwrap();
+    let worker = spawn_worker(&session);
+    let shared = shared_of(&worker);
+    wait_in_flight(&shared, 1).await;
+    assert!(
+        !shared.stop_requested(),
+        "sanity: stop must not be requested before any RELEASE begins"
+    );
+
+    let at_2a = loop_test_hooks::arm_rendezvous(
+        session.instance_id(),
+        loop_test_hooks::Rendezvous::ReleaseAt2a,
+    );
+    let releasing = {
+        let worker = Arc::clone(&worker);
+        tokio::spawn(async move { worker.release_and_stop().await })
+    };
+    at_2a.wait_fired().await;
+    assert!(
+        shared.stop_requested(),
+        "stop must already be requested at 2a, strictly before 2b can release any hold -- \
+         otherwise a fast-bailing attempt can race the loop back into its own just-released row"
+    );
+
+    let report = tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("RELEASE is bounded by two heartbeats")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.holds,
+        HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+            attempted: 1,
+        }),
+        "{report:?}"
+    );
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert!(row.lease_expires_at.is_none(), "{row:?}");
+    assert_eq!(
+        (row.attempts, row.releases),
+        (1, 1),
+        "one operator RELEASE must cost the job exactly one release and no extra attempt: {row:?}"
+    );
+}
+
 /// RELEASE during a compute materialization (job hold + `ResultTable` hold
 /// registered, the writer parked inside `BuildingTable::finish`): both
 /// leases are NULL afterwards (the jobs sweep and the jobs-linked building

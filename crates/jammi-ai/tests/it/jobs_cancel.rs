@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
-use jammi_ai::fine_tune::worker::{training_test_hooks, EmbeddedWorker, JobWorker};
+use jammi_ai::fine_tune::worker::{
+    loop_test_hooks, training_test_hooks, EmbeddedWorker, JobWorker,
+};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::compute_test_hooks::{arm, ParkPoint};
 use jammi_ai::jobs::{ComputeSpec, JobSpec};
@@ -472,6 +474,11 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
          cancel -- raise `epochs` further so this genuinely races a live training run"
     );
 
+    // Armed BEFORE the request so the watcher's very next poll tick -- which
+    // can land before this task is even scheduled again on a busy runtime --
+    // can never fire the rendezvous before it is armed and lose the signal.
+    let observed = loop_test_hooks::arm_cancel_observed(&handle.job_id);
+
     assert!(
         session
             .catalog()
@@ -481,9 +488,29 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
         "a cancel on the running training job is recorded"
     );
 
+    // Wait on the ACTUAL event (the watcher's poll tick observing the
+    // request) rather than a fixed wall-clock bound on the whole run: a
+    // parallel test binary under load can delay the watcher's `sleep`
+    // arbitrarily past any fixed guess, which is exactly what made this
+    // bound flake. The bound here is a generous backstop against a genuine
+    // hang, not the mechanism itself.
+    tokio::time::timeout(Duration::from_secs(60), observed.wait_fired())
+        .await
+        .expect(
+            "the cancel-request watcher must observe the request within a generous backstop \
+             bound -- if this ever fires, the watcher itself is stuck, not merely slow",
+        );
+
+    // Cancellation has been observed at this point (`cancel` is already
+    // `true`), so the training thread's next epoch-boundary check bails at
+    // once -- this join is now bounded by real scheduling latency, never by
+    // the watcher's poll cadence.
     tokio::time::timeout(Duration::from_secs(15), run)
         .await
-        .expect("the cancel-request watcher's next poll tick observes the request promptly")
+        .expect(
+            "once the cancel-request watcher has observed the request, the training thread's \
+             next epoch-boundary check must bail promptly",
+        )
         .unwrap();
 
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();

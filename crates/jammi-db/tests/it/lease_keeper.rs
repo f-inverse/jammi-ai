@@ -790,3 +790,104 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
 
     keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
 }
+
+/// The catalog-level idempotency `EmbeddedWorker::release_and_stop`'s
+/// ordering fix relies on: its exact statement order — 2b
+/// (`LeaseKeeper::release_job_holds`, on the keeper's OWN connection) then
+/// 2c and 2g (`Catalog::release_jobs_claimed_by`, on the caller's pool
+/// connection) — against a REAL backend, with a real elapsed heartbeat
+/// between claim and release (never releasing in the same instant a job was
+/// claimed, which would hide a connection-visibility bug the in-process
+/// SQLite backend cannot exhibit). `jobs.releases` must land at exactly 1
+/// for one held hold released once, on both backends: every release
+/// statement's own `lease_expires_at IS NOT NULL` guard is what makes 2c and
+/// 2g no-ops once 2b has already released the row. (This does NOT, by
+/// itself, guard against the orchestration-level race the same commit fixes
+/// — a fast-bailing training thread racing the loop's own `claim_next` back
+/// into its just-released row before `stop` is requested; see
+/// `jammi-ai`'s `jobs_shutdown::stop_is_requested_before_any_hold_is_released`
+/// for that half.)
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backend(
+    backend: jammi_db::catalog::backend::BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+    let catalog = Arc::clone(session.catalog());
+    let job_id = format!("scratch-{}", jammi_test_utils::unique_suffix());
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: "embedding",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let instance = format!("inst-{}", jammi_test_utils::unique_suffix());
+    let intervals = fast_intervals();
+    let claimed = catalog
+        .claim_next(&instance, &["embedding"], intervals.lease())
+        .await
+        .unwrap()
+        .expect("job claimed");
+
+    let keeper =
+        crate::common::keeper_for_backend(backend, dir.path().to_path_buf(), intervals).await;
+    let hold = keeper.hold(LeaseTarget::Job {
+        job_id: job_id.clone(),
+        instance_id: instance.clone(),
+        attempts: claimed.attempts,
+    });
+    assert!(!hold.lost(), "the hold reads live before any release runs");
+
+    // Real elapsed time: let at least one heartbeat renewal land on this
+    // hold before release, matching a job that has been in flight a while
+    // (as opposed to releasing it in the same instant it was claimed).
+    tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(200)).await;
+
+    // 2b
+    let holds = keeper
+        .release_job_holds(intervals.heartbeat() * 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        holds,
+        jammi_db::catalog::lease_keeper::HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+            attempted: 1,
+        },
+        "{holds:?}"
+    );
+    assert!(hold.lost(), "the released hold reads lost at once");
+    // 2c
+    let sweep_one = catalog.release_jobs_claimed_by(&instance).await.unwrap();
+    assert_eq!(
+        sweep_one, 0,
+        "2b already released the row; the sweep is a no-op"
+    );
+    // 2g
+    let sweep_two = catalog.release_jobs_claimed_by(&instance).await.unwrap();
+    assert_eq!(sweep_two, 0, "the second sweep is a no-op too");
+
+    let row = catalog.get_job(&job_id).await.unwrap();
+    assert_eq!(
+        row.releases, 1,
+        "releases must be exactly 1 for one held hold released once: {row:?}"
+    );
+    assert_eq!(row.attempts, 1, "{row:?}");
+    assert!(row.lease_expires_at.is_none(), "{row:?}");
+    drop(hold);
+    keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
+}

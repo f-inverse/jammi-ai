@@ -2441,9 +2441,30 @@ impl EmbeddedWorker {
     ///
     /// In order:
     ///
-    /// * **2a** phase `Releasing` — from this instant a claim that lands runs
-    ///   into `register_job_hold_or_release`, which self-releases instead of
-    ///   dispatching.
+    /// * **2a** phase `Releasing` AND stop requested, together, BEFORE any
+    ///   hold is touched — from this instant a claim that lands runs into
+    ///   `register_job_hold_or_release`, which self-releases instead of
+    ///   dispatching, AND the loop cannot enter a new `claim_next` (a claim
+    ///   already in flight began before this). Stop was moved here from what
+    ///   used to be a separate 2d, AFTER 2b/2c: a hold 2b releases can flip a
+    ///   training thread's `lost` check and let it bail at its very next
+    ///   epoch boundary — for a fast attempt this can return control to the
+    ///   loop's own top-of-loop `claim_next` before 2b/2c's own `.await`
+    ///   points resolve. With stop requested only at the old 2d, that
+    ///   reawakened loop iteration would see `stop_requested() == false`,
+    ///   run `reclaim_expired_jobs` against its OWN just-released row (a
+    ///   released-but-still-`running` lease reads as expired by
+    ///   construction, so it is unconditionally reclaimable), and
+    ///   `claim_next` it right back — a second attempt that immediately
+    ///   self-releases through 2a's own phase check, so ONE operator RELEASE
+    ///   left `attempts` and `releases` both incremented an extra time
+    ///   (`running|<lease NULL>|2|2` instead of `…|1|1`) with no bundle ever
+    ///   at risk. Requesting stop in the SAME synchronous step that flips the
+    ///   phase closes the window by construction — no hold can be released
+    ///   before the loop is already forbidden from starting a new
+    ///   `claim_next` — rather than narrowing it to a smaller wall-clock
+    ///   gap. See `jobs_shutdown.rs`'s
+    ///   `a_fast_bailing_attempt_never_reclaims_its_own_just_released_row`.
     /// * **2b** the keeper releases every `Job` hold it holds
     ///   (`LeaseKeeper::release_job_holds`, bounded by one heartbeat): the
     ///   row's lease goes NULL and the hold's `lost` flips while the hold
@@ -2461,8 +2482,8 @@ impl EmbeddedWorker {
     ///   committed after 2b snapshotted. The loop's own `ResultTable` hold
     ///   flips `lost` through the keeper's guarded renewal within one
     ///   heartbeat.
-    /// * **2d** stop — the loop cannot enter a new `claim_next`; a claim
-    ///   already in flight began before this.
+    /// * **2d** (folded into 2a; kept as a numbered step only for the
+    ///   history above) — stop requested.
     /// * **2e** total match on the loop task's state: a handle `Abandoned`
     ///   by a previous stop attempt this process's own caller cancelled
     ///   (F1 — e.g. a DRAIN's `stop_and_join` preempted by this RELEASE) is
@@ -2496,8 +2517,13 @@ impl EmbeddedWorker {
     /// catalog error inside any statement is logged and the arm continues
     /// (the affected lease falls to the expiry path).
     pub async fn release_and_stop(&self) -> Result<ReleaseReport> {
-        // 2a
+        // 2a (folds the old 2d): phase AND stop, together, before any hold
+        // is touched — see this method's own doc for why the ordering
+        // itself is the fix, not merely an optimisation.
         self.shared.set_phase(WorkerPhase::Releasing);
+        self.shared.request_stop();
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::fire(&self.instance_id, loop_test_hooks::Rendezvous::ReleaseAt2a);
         // 2b
         let holds = match self.keeper.release_job_holds(self.heartbeat).await {
             Ok(hr) => HoldReleaseOutcome::Observed(hr),
@@ -2508,8 +2534,6 @@ impl EmbeddedWorker {
         };
         // 2c
         let sweep_one = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
-        // 2d
-        self.shared.request_stop();
         // 2e
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::fire(&self.instance_id, loop_test_hooks::Rendezvous::ReleaseAt2e);
@@ -2791,6 +2815,14 @@ pub mod loop_test_hooks {
     /// A notify-only rendezvous: RELEASE fires it and never waits.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Rendezvous {
+        /// `EmbeddedWorker::release_and_stop`'s 2a: phase `Releasing` AND
+        /// stop requested have both already landed, no hold has been
+        /// touched yet. A test observes `WorkerShared::stop_requested()` at
+        /// this exact instant — never after a wall-clock guess — to pin
+        /// that stop is requested strictly before any hold's release could
+        /// let a fast-bailing training thread race the loop back into
+        /// `claim_next`.
+        ReleaseAt2a,
         /// The first statement of `EmbeddedWorker::release_and_stop`'s 2e —
         /// the sweeps have returned and the `in_flight` decision is about to
         /// be read. A test that parked the loop before COMMIT unparks it on
@@ -2855,6 +2887,76 @@ pub mod loop_test_hooks {
             let (hit, rest): (Vec<_>, Vec<_>) = list
                 .drain(..)
                 .partition(|a| a.which == which && a.instance_id == instance_id);
+            *list = rest;
+            hit
+        };
+        for armed in taken {
+            armed.fired.store(true, Ordering::SeqCst);
+            armed.notify.notify_one();
+        }
+    }
+
+    /// One-shot fire, keyed by `job_id`: [`spawn_cancel_request_watcher`]
+    /// calls this the instant it OBSERVES `cancel_requested` on a poll tick
+    /// and flips `cancel_requested_seen` — never merely "a poll tick
+    /// happened" (a tick that reads `cancel_requested == false` does not
+    /// fire this). A test that must know the watcher has actually seen a
+    /// request awaits [`CancelObserved::wait_fired`] instead of bounding a
+    /// fixed wall-clock guess at `poll_interval` — the SAME cadence the
+    /// lease keeper renews at, so a busy test binary's scheduler delay can
+    /// push an observation past any fixed bound a parallel run happens to
+    /// pick, exactly the flake class a rendezvous on the real event closes.
+    struct ArmedCancelObserved {
+        job_id: String,
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    fn cancel_observed_arms() -> &'static Mutex<Vec<ArmedCancelObserved>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedCancelObserved>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of an armed cancel-observed rendezvous.
+    pub struct CancelObserved {
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    impl CancelObserved {
+        /// Resolve once the watcher for this `job_id` has observed the
+        /// cancel request (never on a wall-clock guess at its poll cadence).
+        pub async fn wait_fired(&self) {
+            while !self.fired.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    /// Arm the cancel-observed rendezvous for the next watcher spawned (or
+    /// already spawned) for `job_id`. One-shot; keyed so sibling tests in
+    /// one binary never fire each other's.
+    pub fn arm_cancel_observed(job_id: &str) -> CancelObserved {
+        let fired = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        cancel_observed_arms()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedCancelObserved {
+                job_id: job_id.to_string(),
+                fired: Arc::clone(&fired),
+                notify: Arc::clone(&notify),
+            });
+        CancelObserved { fired, notify }
+    }
+
+    /// Fire every handle armed for `job_id`. Never parks.
+    pub(super) fn fire_cancel_observed(job_id: &str) {
+        let taken: Vec<ArmedCancelObserved> = {
+            let mut list = cancel_observed_arms()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let (hit, rest): (Vec<_>, Vec<_>) = list.drain(..).partition(|a| a.job_id == job_id);
             *list = rest;
             hit
         };
@@ -3716,6 +3818,8 @@ fn spawn_cancel_request_watcher(
                 Ok(record) if record.cancel_requested => {
                     cancel_requested_seen.store(true, Ordering::SeqCst);
                     cancel.store(true, Ordering::SeqCst);
+                    #[cfg(feature = "test-hooks")]
+                    loop_test_hooks::fire_cancel_observed(&job_id);
                     return;
                 }
                 Ok(_) => {}

@@ -312,6 +312,40 @@ impl TextChunk {
     }
 }
 
+/// A [`TextChunk`] plus the residency reservation (M2, CONTRACT-U2b-fix1.md)
+/// its rows hold — held alive until the CALLER drops this value, which is
+/// what makes the residency bound cover rows the trainer is still encoding
+/// or scoring, not merely rows in flight between the reader task and the
+/// channel. `Deref`s to the chunk, so an ordinary caller (`chunk.row_count()`,
+/// `encode_chunk(&chunk)`, pattern-matching on `&*chunk`) never has to know
+/// the difference.
+///
+/// `_permit` is deliberately NOT a field on the public [`TextChunk`] itself:
+/// a `TextRows`/`Precomputed` chunk reserves nothing, and folding an
+/// almost-always-`None` field onto every chunk variant would make every
+/// existing constructor (`from_pairs`, `from_triplets`, …) responsible for a
+/// concept that only the `Stream` arm has.
+pub struct ChunkLease {
+    chunk: TextChunk,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for ChunkLease {
+    type Target = TextChunk;
+    fn deref(&self) -> &TextChunk {
+        &self.chunk
+    }
+}
+
+impl std::fmt::Debug for ChunkLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The permit carries no useful Debug content of its own (an internal
+        // semaphore handle) — report the chunk only, as if this were a plain
+        // `TextChunk`, which is what every caller actually wants to see.
+        self.chunk.fmt(f)
+    }
+}
+
 /// The flattened in-batch-negative view of a text loader: `(anchors,
 /// positives, optional explicit negatives)`. Consumed by GradCache and
 /// hard-negative mining, which treat the dataset as one in-batch-negative batch.
@@ -366,12 +400,25 @@ struct ResidencyBound {
 }
 
 impl ResidencyBound {
-    fn new(bound: usize) -> Self {
-        Self {
+    /// Refuses `bound == 0` (M2, defense in depth): a zero-permit semaphore
+    /// can never satisfy any reservation, so every stream built on it would
+    /// hang forever rather than fail loudly. The K2 edge this guards is
+    /// already refused upstream today (`StreamConfig`'s `prefetch < 2`
+    /// refusal and `batch >= 1` for any table with rows), so this leaf is a
+    /// second, independent line of defense rather than the primary one.
+    fn new(bound: usize) -> Result<Self> {
+        if bound == 0 {
+            return Err(JammiError::FineTune(
+                "a zero-row residency bound can never be satisfied — every reservation would \
+                 wait forever"
+                    .into(),
+            ));
+        }
+        Ok(Self {
             bound,
             semaphore: Arc::new(tokio::sync::Semaphore::new(bound)),
             high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
+        })
     }
 
     /// Reserve `n` rows' worth of residency, waiting (async) until enough is
@@ -447,6 +494,11 @@ enum StreamState {
         next_step: usize,
         rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
         residency: Arc<ResidencyBound>,
+        /// M2's INDEPENDENT residency instrumentation — see
+        /// [`TrainingDataLoader::stream_chunks_produced`]'s doc for why this
+        /// exists alongside (never in place of) [`ResidencyBound::
+        /// high_water_mark`].
+        chunks_produced: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
@@ -517,6 +569,7 @@ struct EpochStreamJob {
     range: Range<usize>,
     cfg: StreamConfig,
     residency: Arc<ResidencyBound>,
+    chunks_produced: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Re-chunks a per-epoch [`datafusion::physical_plan::SendableRecordBatchStream`]
@@ -538,13 +591,30 @@ struct BatchChunker {
     format: TrainingFormat,
     task: ModelTask,
     columns: Vec<String>,
+    /// M2 (CONTRACT-U2b-fix1.md): every polled `RecordBatch`'s rows are
+    /// reserved against this bound BEFORE they are decoded — the residency
+    /// accounting starts at the moment a batch is about to occupy memory,
+    /// never after the fact.
+    residency: Arc<ResidencyBound>,
     /// Decoded rows already pulled off the underlying stream but not yet
     /// handed to a caller of [`Self::next_n`] — the carry-over across a
     /// `RecordBatch`/row-group boundary.
     buffer: VecDeque<TrainingRow>,
+    /// The reservation backing `buffer`'s rows, in the SAME front-to-back
+    /// order: `spans.iter().map(|s| s.count).sum() == buffer.len()` always.
+    /// `Self::take_permit_for` is the only thing that drains this queue.
+    spans: VecDeque<ReservedSpan>,
     /// The underlying `RecordBatch` stream returned `None` — every row it
     /// will ever produce is already in `buffer` (or already drained).
     exhausted: bool,
+}
+
+/// One still-reserved, still-buffered span of decoded rows: `count` rows
+/// backed by `permit` (`permit.num_permits() == count`, always maintained by
+/// [`BatchChunker::take_permit_for`]).
+struct ReservedSpan {
+    count: usize,
+    permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl BatchChunker {
@@ -554,20 +624,90 @@ impl BatchChunker {
     /// final, trailing chunk). Never spans a caller-visible chunk shorter
     /// than `want` because of a row-group boundary: that boundary is fully
     /// absorbed into `buffer` before this returns.
-    async fn next_n(&mut self, want: usize) -> Result<Vec<TrainingRow>> {
+    ///
+    /// Returns the SINGLE permit covering exactly the returned rows'
+    /// residency (`None` only when `want == 0` or the stream was already
+    /// exhausted with nothing buffered) — assembled by [`Self::
+    /// take_permit_for`], which merges whole reserved spans and SPLITS the
+    /// last one needed so a carry-over remainder stays reserved (M2:
+    /// "carry-over rows stay reserved") for the NEXT call.
+    async fn next_n(
+        &mut self,
+        want: usize,
+    ) -> Result<(Vec<TrainingRow>, Option<tokio::sync::OwnedSemaphorePermit>)> {
         use futures::StreamExt;
         while self.buffer.len() < want && !self.exhausted {
             match self.stream.next().await {
                 Some(Ok(batch)) => {
+                    let n = batch.num_rows();
+                    // Reserve BEFORE decode (M2) — the residency this batch's
+                    // rows occupy is accounted for from this point on, not
+                    // from whenever decode happens to finish.
+                    let permit = self.residency.reserve(n).await;
                     let rows = decode_record_batch(self.format, self.task, &self.columns, &batch)?;
+                    // `decode_record_batch` is row-preserving (pinned by
+                    // `decode_record_batch_is_row_preserving` below): a
+                    // future skip-bad-rows decode that silently dropped rows
+                    // would otherwise leak this batch's permit forever (the
+                    // span's `count` would overstate what `buffer` actually
+                    // holds, permanently under-releasing the semaphore).
+                    assert_eq!(
+                        rows.len(),
+                        n,
+                        "decode_record_batch dropped or added rows: residency accounting for \
+                         this batch would leak or double-free permits"
+                    );
                     self.buffer.extend(rows);
+                    if n > 0 {
+                        self.spans.push_back(ReservedSpan { count: n, permit });
+                    }
                 }
                 Some(Err(e)) => return Err(JammiError::from(e)),
                 None => self.exhausted = true,
             }
         }
         let n = want.min(self.buffer.len());
-        Ok(self.buffer.drain(..n).collect())
+        let rows: Vec<TrainingRow> = self.buffer.drain(..n).collect();
+        let permit = self.take_permit_for(n);
+        Ok((rows, permit))
+    }
+
+    /// Assemble ONE permit covering exactly `n` rows' residency, draining
+    /// [`Self::spans`] from the front: a span smaller than or equal to the
+    /// remaining need is merged whole; the span that only partially covers
+    /// the remainder is SPLIT — the piece covering `n` merges into the
+    /// output, the rest (still reserved) is pushed back to the FRONT of
+    /// `spans`, backing the rows still at the front of `buffer`.
+    fn take_permit_for(&mut self, mut n: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let mut combined: Option<tokio::sync::OwnedSemaphorePermit> = None;
+        while n > 0 {
+            let mut span = self.spans.pop_front().unwrap_or_else(|| {
+                panic!(
+                    "residency spans desynced from buffered rows: needed {n} more but the span \
+                     queue is empty"
+                )
+            });
+            if span.count <= n {
+                n -= span.count;
+                match &mut combined {
+                    Some(c) => c.merge(span.permit),
+                    None => combined = Some(span.permit),
+                }
+            } else {
+                let for_output = span
+                    .permit
+                    .split(n)
+                    .expect("a span always holds at least its own `count` permits");
+                span.count -= n;
+                self.spans.push_front(span);
+                match &mut combined {
+                    Some(c) => c.merge(for_output),
+                    None => combined = Some(for_output),
+                }
+                n = 0;
+            }
+        }
+        combined
     }
 }
 
@@ -588,15 +728,19 @@ fn refuse_on_chunk_length_mismatch(step: usize, expected: usize, actual: usize) 
 
 /// Runs on [`StreamSource::runtime`]: opens [`open_row_range_stream`] and
 /// re-chunks it through a [`BatchChunker`] into fixed `job.cfg.batch`-sized
-/// row windows (M1 — see that type's doc), reserving each window's row count
-/// against `job.residency` (blocking this task, never the consumer, when the
-/// bound is full) before sending `(rows, permit)` into `tx`. The LAST window
-/// of `job.range` may be shorter than `job.cfg.batch`; every window before it
-/// is exactly `job.cfg.batch` rows — by construction, `BatchChunker` cannot
-/// yield a short chunk before the range is exhausted. Exits silently once
-/// `tx`'s receiver drops (the loader moved on without draining this epoch's
-/// stream to the end — never reached by the trainer's own sequential
-/// access, but a correct, non-panicking exit for any other caller).
+/// row windows (M1 — see that type's doc), sending `(rows, permit)` into
+/// `tx` once each window is assembled. M2 (CONTRACT-U2b-fix1.md): the
+/// residency reservation happens INSIDE the chunker, per polled
+/// `RecordBatch`, BEFORE that batch is decoded — never here, and never after
+/// a whole `job.cfg.batch`-sized window has already been assembled — so a
+/// background task can never hold decoded-but-unreserved rows. The LAST
+/// window of `job.range` may be shorter than `job.cfg.batch`; every window
+/// before it is exactly `job.cfg.batch` rows — by construction,
+/// `BatchChunker` cannot yield a short chunk before the range is exhausted.
+/// Exits silently once `tx`'s receiver drops (the loader moved on without
+/// draining this epoch's stream to the end — never reached by the trainer's
+/// own sequential access, but a correct, non-panicking exit for any other
+/// caller).
 async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedSender<StreamItem>) {
     let total = job.range.len();
     let batch = job.cfg.batch.max(1);
@@ -613,13 +757,15 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
         format: job.format,
         task: job.task,
         columns: job.columns,
+        residency: job.residency,
         buffer: VecDeque::new(),
+        spans: VecDeque::new(),
         exhausted: false,
     };
     let mut delivered = 0usize;
     while delivered < total {
         let want = batch.min(total - delivered);
-        let rows = match chunker.next_n(want).await {
+        let (rows, permit) = match chunker.next_n(want).await {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Err(e));
@@ -636,8 +782,17 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
             ))));
             return;
         }
-        let permit = job.residency.reserve(rows.len()).await;
+        let permit =
+            permit.expect("a non-empty chunk always carries the permit(s) reserved for its rows");
         delivered += rows.len();
+        // M2's INDEPENDENT residency instrumentation: counts every chunk the
+        // reader has FULLY produced, regardless of when (or whether) its
+        // permit is later released — never gated by `ResidencyBound` itself,
+        // which cannot by construction ever report past its own bound (a
+        // semaphore cannot be over-acquired). See `TrainingDataLoader::
+        // stream_chunks_produced`'s doc.
+        job.chunks_produced
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if tx.send(Ok((rows, permit))).is_err() {
             return; // The receiver (loader) was dropped mid-epoch.
         }
@@ -1210,6 +1365,24 @@ impl TrainingDataLoader {
         format: TrainingFormat,
         cfg: StreamConfig,
     ) -> Result<Self> {
+        // M2 (CONTRACT-U2b-fix1.md): `prefetch < 2` can never let the reader
+        // task run ahead of a consumer that is still holding the chunk it
+        // was just handed — with `prefetch == 1` the WHOLE residency bound is
+        // exactly one chunk's rows, so the reader cannot even START decoding
+        // the NEXT `RecordBatch` (which needs its own reservation) until the
+        // consumer drops the one it already has, i.e. until the trainer asks
+        // for the NEXT chunk — a genuine deadlock the moment the consumer's
+        // own request for chunk `k+1` is what would have to release chunk
+        // `k`'s permit. `prefetch >= 2` keeps the reader at least one whole
+        // chunk ahead of the consumer at all times.
+        if cfg.prefetch < 2 {
+            return Err(JammiError::FineTune(format!(
+                "StreamConfig::prefetch must be >= 2 (got {}): the reader task must be able to \
+                 decode at least one chunk ahead of whatever the consumer is still holding, or \
+                 the bound would deadlock the epoch stream",
+                cfg.prefetch
+            )));
+        }
         let range = 0..table.record.row_count;
         if matches!(format, TrainingFormat::Classification { .. }) {
             return build_classification_loader_eager(&session, &table, &columns, range).await;
@@ -1608,15 +1781,23 @@ impl TrainingDataLoader {
     /// partition; a `Stream` loader reads its own range directly rather than
     /// slicing an in-memory `Vec` — see `worker.rs`'s `run_spec` for that
     /// path, exercised only at `spec.world == 1` at this commit).
+    ///
+    /// Returns a [`ChunkLease`], not a bare [`TextChunk`] (M2): the `Stream`
+    /// arm's chunk carries a residency reservation that must stay alive for
+    /// as long as the CALLER holds the returned value — `Deref` makes this
+    /// invisible to every ordinary caller.
     pub fn text_chunk_for_rank(
         &self,
         spec: &super::partition::PartitionSpec,
         step: usize,
-    ) -> Result<TextChunk> {
+    ) -> Result<ChunkLease> {
         match &self.data {
             LoaderData::TextRows(rows) => {
                 let range = spec.rows_for_step(rows.len(), step);
-                Ok(self.rows_to_text_chunk(&rows[range]))
+                Ok(ChunkLease {
+                    chunk: self.rows_to_text_chunk(&rows[range]),
+                    _permit: None,
+                })
             }
             LoaderData::Precomputed(_) => Err(JammiError::FineTune(
                 "a precomputed loader has no row-level partition".into(),
@@ -1656,12 +1837,20 @@ impl TrainingDataLoader {
     /// the chunk is decoded into a [`TextChunk`], via
     /// [`refuse_on_chunk_length_mismatch`] — a typed refusal, never a
     /// silently short/long batch reaching the trainer.
+    ///
+    /// M2 (CONTRACT-U2b-fix1.md): the permit backing the RETURNED chunk's
+    /// residency is handed back INSIDE the [`ChunkLease`], not dropped here —
+    /// the true bound on "rows resident" includes rows the CALLER is still
+    /// holding (encoding, computing loss), which only ends when the caller
+    /// drops the lease. A chunk this call FAST-FORWARDS past (an out-of-order
+    /// ask behind an already-progressed stream) has its permit dropped
+    /// immediately here — nothing holds those rows once they are discarded.
     fn stream_next_chunk(
         &self,
         src: &StreamSource,
         spec: &super::partition::PartitionSpec,
         step: usize,
-    ) -> Result<TextChunk> {
+    ) -> Result<ChunkLease> {
         let batch = spec.batch;
         let expected_len = spec.rows_for_step(src.range.len(), step).len();
         let mut guard = src
@@ -1673,6 +1862,21 @@ impl TrainingDataLoader {
                 StreamState::Open { next_step, .. } => *next_step > step,
                 StreamState::Idle => true,
             };
+        // The epoch-restart transient double residency (M2, stated rather
+        // than fixed): a restart replaces `*guard` with a BRAND NEW
+        // `ResidencyBound` (its own semaphore, its own bound) and spawns a
+        // fresh reader task; it does not wait for the OLD reader task to
+        // wind down first. If the caller still holds a `ChunkLease` from the
+        // PREVIOUS epoch's stream at the exact moment it asks for the first
+        // chunk of a NEW one (never true of the trainer's own sequential
+        // loop, which drops each chunk before asking for the next — but true
+        // of an adversarial caller that holds one lease across a restart),
+        // the two epochs' bounds are independent and their reservations do
+        // not compose: total resident rows can transiently reach the sum of
+        // both bounds, not just one. Bounded and transient (it collapses back
+        // to one bound's worth the moment the old lease drops), and outside
+        // this unit's acceptance (a)/(m2), which measure a single, otherwise
+        // uninterrupted epoch stream.
         if needs_restart {
             let cfg = StreamConfig {
                 batch,
@@ -1680,7 +1884,8 @@ impl TrainingDataLoader {
             };
             let residency = Arc::new(ResidencyBound::new(
                 cfg.batch.saturating_mul(cfg.prefetch.max(1)),
-            ));
+            )?);
+            let chunks_produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let job = EpochStreamJob {
                 session: Arc::clone(&src.session),
@@ -1691,12 +1896,14 @@ impl TrainingDataLoader {
                 range: src.range.clone(),
                 cfg,
                 residency: Arc::clone(&residency),
+                chunks_produced: Arc::clone(&chunks_produced),
             };
             src.runtime.spawn(run_epoch_stream(job, tx));
             *guard = StreamState::Open {
                 next_step: 0,
                 rx,
                 residency,
+                chunks_produced,
             };
         }
         loop {
@@ -1720,20 +1927,29 @@ impl TrainingDataLoader {
                     if current_step == step {
                         refuse_on_chunk_length_mismatch(step, expected_len, 0)?;
                     }
-                    return Ok(self.rows_to_text_chunk(&[]));
+                    return Ok(ChunkLease {
+                        chunk: self.rows_to_text_chunk(&[]),
+                        _permit: None,
+                    });
                 }
                 Some(Err(e)) => return Err(e),
                 Some(Ok((rows, permit))) => {
-                    // Handed to the caller now — release the residency this
-                    // chunk reserved.
-                    drop(permit);
                     if current_step == step {
                         refuse_on_chunk_length_mismatch(step, expected_len, rows.len())?;
-                        return Ok(self.rows_to_text_chunk(&rows));
+                        // The permit travels WITH the chunk (M2) — released
+                        // only when the CALLER drops the returned lease,
+                        // never here.
+                        return Ok(ChunkLease {
+                            chunk: self.rows_to_text_chunk(&rows),
+                            _permit: Some(permit),
+                        });
                     }
                     // `current_step < step`: an out-of-order ask asked ahead
                     // of a stream that had already progressed less far;
-                    // discard and keep fast-forwarding.
+                    // discard and keep fast-forwarding — nothing holds these
+                    // rows once they are discarded, so their residency is
+                    // released immediately.
+                    drop(permit);
                 }
             }
         }
@@ -1896,7 +2112,46 @@ impl TrainingDataLoader {
                     StreamState::Idle => None,
                 }
             }
-            _ => None,
+            LoaderData::TextRows(_) | LoaderData::Precomputed(_) => None,
+        }
+    }
+
+    /// Test-only counting seam, INDEPENDENT of [`Self::
+    /// stream_residency_high_water_mark`]: the total number of chunks the
+    /// reader task has fully produced (decoded and sent) for the current (or
+    /// last-run) per-epoch stream — monotonically increasing, and NEVER
+    /// decremented by a permit release.
+    ///
+    /// **Why a second counting seam exists at all.** `ResidencyBound`'s own
+    /// `high_water_mark` is a semaphore's self-report, which cannot, BY
+    /// CONSTRUCTION, ever exceed the bound it enforces — `reserve` blocks
+    /// past it. That makes it structurally incapable of detecting M2's actual
+    /// failure mode: releasing a permit EARLIER than the row it backs is
+    /// truly gone from memory does not make the semaphore over-report; it
+    /// makes the semaphore UNDER-report relative to reality, invisibly. The
+    /// TRUE resident-row count a caller must reconstruct externally is
+    /// `(this method's value − chunks the CALLER has itself finished with) ×
+    /// batch`: the caller already knows how many chunks IT has finished
+    /// (its own step counter), so comparing the two series is what actually
+    /// exercises acceptance (m2), not `high_water_mark` alone. See
+    /// `streaming_loader::slow_consumer_residency_stays_within_bound_at_
+    /// prefetch_two_and_four` for the executed comparison.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn stream_chunks_produced(&self) -> Option<usize> {
+        match &self.data {
+            LoaderData::Stream(src) => {
+                let guard = src
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*guard {
+                    StreamState::Open {
+                        chunks_produced, ..
+                    } => Some(chunks_produced.load(std::sync::atomic::Ordering::SeqCst)),
+                    StreamState::Idle => None,
+                }
+            }
+            LoaderData::TextRows(_) | LoaderData::Precomputed(_) => None,
         }
     }
 }
@@ -1961,7 +2216,7 @@ mod tests {
         let prefetch = 2usize;
         let bound = batch * prefetch; // 8
 
-        let full = ResidencyBound::new(bound);
+        let full = ResidencyBound::new(bound).unwrap();
         let first = full.semaphore.try_acquire_many(batch as u32);
         assert!(first.is_ok(), "the first 4-row chunk must fit at bound 8");
         let second = full.semaphore.try_acquire_many(batch as u32);
@@ -1977,7 +2232,7 @@ mod tests {
 
         // R-A: the SAME batch/prefetch, but the residency bound is
         // constructed one row too small (7, not 8).
-        let shrunk = ResidencyBound::new(bound - 1);
+        let shrunk = ResidencyBound::new(bound - 1).unwrap();
         let first = shrunk.semaphore.try_acquire_many(batch as u32);
         assert!(first.is_ok(), "the first 4-row chunk still fits at bound 7");
         let second = shrunk.semaphore.try_acquire_many(batch as u32);
@@ -1985,6 +2240,56 @@ mod tests {
             second.is_err(),
             "at the shrunk bound (7), the SAME second 4-row chunk that fit at 8 must now be \
              refused — the bound is one row too small to hold two full chunks"
+        );
+    }
+
+    /// M2, defense in depth: a zero-row bound can never satisfy any
+    /// reservation (every `reserve` would wait forever), so `ResidencyBound::
+    /// new` refuses it outright rather than building a semaphore that can
+    /// only ever hang.
+    #[test]
+    fn residency_bound_of_zero_is_refused() {
+        assert!(ResidencyBound::new(0).is_err());
+        assert!(ResidencyBound::new(1).is_ok());
+    }
+
+    /// M2's decode-is-row-preserving pin: `decode_record_batch` must return
+    /// exactly as many rows as the batch it decoded — the residency
+    /// accounting in `BatchChunker::next_n` reserves `batch.num_rows()`
+    /// permits BEFORE decode and relies on decode producing exactly that
+    /// many `TrainingRow`s to keep `ReservedSpan::count` in sync with what
+    /// `buffer` actually holds. A future decode that silently DROPPED a
+    /// malformed row (a "skip bad rows" mode) would otherwise leak that
+    /// row's share of the permit forever — `BatchChunker::next_n`'s own
+    /// `assert_eq!` catches this LIVE; this test pins the invariant it relies
+    /// on directly, without needing a live stream.
+    #[test]
+    fn decode_record_batch_is_row_preserving() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Utf8, false),
+            Field::new("positive", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a0", "a1", "a2"])),
+                Arc::new(StringArray::from(vec!["p0", "p1", "p2"])),
+            ],
+        )
+        .unwrap();
+        let rows = decode_record_batch(
+            TrainingFormat::Pairs,
+            ModelTask::TextEmbedding,
+            &["anchor".to_string(), "positive".to_string()],
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            batch.num_rows(),
+            "decode_record_batch must return exactly one TrainingRow per input row"
         );
     }
 
@@ -2288,7 +2593,7 @@ mod tests {
                 // Step 10 is far past any row this 5-row fixture could ever
                 // reach at batch 3 for any tested world.
                 let chunk = loader.text_chunk_for_rank(&spec, 10).unwrap();
-                match chunk {
+                match &*chunk {
                     TextChunk::Pairs { anchors, positives } => {
                         assert!(anchors.is_empty() && positives.is_empty());
                     }

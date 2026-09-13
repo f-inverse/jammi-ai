@@ -161,6 +161,36 @@ async fn residency_bound_holds_on_a_fixture_larger_than_batch_times_prefetch() {
 // residency_bound_semaphore_refuses_one_row_past_a_shrunk_bound` in that
 // module's own `#[cfg(test)]` block.
 
+/// M2's deadlock-prevention refusal (dying test): `StreamConfig::prefetch < 2`
+/// is refused at loader construction, never silently accepted into a
+/// configuration that would deadlock the first time the reader tried to get
+/// one chunk ahead of the consumer.
+#[tokio::test(flavor = "multi_thread")]
+async fn prefetch_below_two_is_refused_at_construction() {
+    let dir = TempDir::new().unwrap();
+    let session = session_with_pairs_source(&dir).await;
+    let table = materialize_contrastive_table(&session).await;
+
+    let result = TrainingDataLoader::from_training_set_stream(
+        Arc::clone(&session),
+        table,
+        contrastive_columns(),
+        ModelTask::TextEmbedding,
+        TrainingFormat::Contrastive,
+        StreamConfig {
+            batch: 4,
+            prefetch: 1,
+        },
+    )
+    .await;
+    match result {
+        Err(e) => assert!(e.to_string().contains("prefetch")),
+        Ok(_) => panic!(
+            "prefetch=1 must be refused at construction, not accepted into a deadlocking config"
+        ),
+    }
+}
+
 /// Acceptance (e): the streamed row order equals the committed
 /// materialisation order, with no blocking sort — asserted at
 /// `target_partitions ∈ {1, N}` for the AMBIENT session (the loader's own
@@ -270,7 +300,7 @@ async fn streamed_order_matches_committed_order_at_target_partitions_one_and_n()
             let mut step = 0usize;
             loop {
                 let chunk = loader.text_chunk_for_rank(&spec, step).unwrap();
-                match &chunk {
+                match &*chunk {
                     jammi_ai::fine_tune::data::TextChunk::Contrastive { texts_a: a, .. } => {
                         if a.is_empty() {
                             break;
@@ -392,7 +422,7 @@ async fn streamed_chunks_stay_batch_sized_across_a_row_group_boundary() {
                 break;
             }
             sizes.push(chunk.row_count());
-            if let jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } = &chunk {
+            if let jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } = &*chunk {
                 seen.extend(anchors.iter().cloned());
             } else {
                 panic!("expected a Pairs chunk");
@@ -508,9 +538,9 @@ async fn streamed_chunk_sequence_matches_the_eager_reader_across_row_groups() {
             if chunk.row_count() == 0 {
                 break;
             }
-            match chunk {
+            match &*chunk {
                 jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } => {
-                    streamed.push(anchors)
+                    streamed.push(anchors.clone())
                 }
                 _ => panic!("expected a Pairs chunk"),
             }
@@ -888,4 +918,146 @@ async fn trainer_realised_step_count_matches_the_global_batch_formula_across_row
          row-group-boundary-driven count of a chunker that re-chunks at RecordBatch, not \
          partition-rule, boundaries"
     );
+}
+
+/// M2 (CONTRACT-U2b-fix1.md): with a consumer that holds each chunk for at
+/// least 50 ms (an adversarial stand-in for the production loop's actual
+/// model forward+backward, orders of magnitude slower than the reader), the
+/// TRUE resident-row count — measured INDEPENDENTLY of `ResidencyBound`'s own
+/// self-report via `TrainingDataLoader::stream_chunks_produced` (see that
+/// method's doc for why the self-report alone cannot detect this bug: a
+/// semaphore can never report past the bound it enforces, so it is
+/// structurally blind to permits released too EARLY relative to reality) —
+/// never exceeds `batch * prefetch`. Checked at `prefetch` in `{2, 4}`.
+///
+/// `true_resident = (chunks the reader has produced so far minus chunks THIS
+/// consumer has already finished with) * batch`, sampled while still holding
+/// the current chunk (after the sleep, before dropping it).
+///
+/// RED at 6482ea99 (observed, using this same instrumentation added at M2):
+/// true high-water 12 vs a configured bound of 8 (batch=4, prefetch=2) —
+/// `stream_next_chunk` dropped the permit the INSTANT it received a chunk off
+/// the channel, before the caller ever touched it, so the reader could
+/// reserve and decode a WHOLE EXTRA chunk's worth of rows beyond the bound
+/// while the consumer still held the previous one.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_consumer_residency_stays_within_bound_at_prefetch_two_and_four() {
+    for prefetch in [2usize, 4usize] {
+        let dir = TempDir::new().unwrap();
+        let session = session_with_pairs_source(&dir).await;
+        let table = materialize_contrastive_table(&session).await;
+
+        let cfg = StreamConfig { batch: 4, prefetch };
+        let bound = cfg.batch * cfg.prefetch;
+        let loader = TrainingDataLoader::from_training_set_stream(
+            Arc::clone(&session),
+            table,
+            contrastive_columns(),
+            ModelTask::TextEmbedding,
+            TrainingFormat::Contrastive,
+            cfg,
+        )
+        .await
+        .unwrap();
+
+        let spec = PartitionSpec {
+            rank: 0,
+            world: 1,
+            batch: cfg.batch,
+            rule: PartitionRule::BlockByGlobalBatch,
+        };
+        let true_high_water = tokio::task::spawn_blocking(move || {
+            let mut step = 0usize;
+            let mut true_high_water = 0usize;
+            loop {
+                let chunk = loader.text_chunk_for_rank(&spec, step).unwrap();
+                if chunk.row_count() == 0 {
+                    break;
+                }
+                // ADVERSARIAL: production's consumer runs a model
+                // forward+backward per chunk — orders of magnitude slower
+                // than the reader. Held for the sleep's whole duration
+                // (`chunk` is not dropped until the end of this iteration),
+                // exactly as the trainer's loop holds its own chunk across
+                // `encode_chunk` + `compute_loss` + the optimizer step.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let produced = loader
+                    .stream_chunks_produced()
+                    .expect("a live Stream loader reports its produced-chunk count");
+                // `step` chunks are already fully finished (dropped) before
+                // this one; this one (`chunk`, still held) and everything the
+                // reader produced beyond it are simultaneously resident.
+                let true_resident = produced.saturating_sub(step) * cfg.batch;
+                true_high_water = true_high_water.max(true_resident);
+                drop(chunk);
+                step += 1;
+            }
+            true_high_water
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            true_high_water <= bound,
+            "prefetch={prefetch}: TRUE resident-row high-water mark {true_high_water} exceeded \
+             the configured bound {bound}"
+        );
+        assert!(
+            true_high_water > 0,
+            "prefetch={prefetch}: the run must have held some rows"
+        );
+    }
+}
+
+/// M2's liveness half of the "bounded AND live" property: holding chunk `k`
+/// (never dropping it) while asking for chunk `k+1` must NOT hang. At
+/// `prefetch = 2` the bound (`batch * 2`) covers exactly one held chunk plus
+/// one more being assembled — `k+1`'s reservation fits without waiting on
+/// `k`'s release. Bounded by a wall-clock timeout so a real deadlock in this
+/// probe fails loudly (a hung `.await` with no timeout would instead hang the
+/// whole test binary).
+#[tokio::test(flavor = "multi_thread")]
+async fn holding_chunk_k_while_asking_for_k_plus_1_does_not_hang() {
+    for prefetch in [2usize, 4usize] {
+        let dir = TempDir::new().unwrap();
+        let session = session_with_pairs_source(&dir).await;
+        let table = materialize_contrastive_table(&session).await;
+
+        let cfg = StreamConfig { batch: 4, prefetch };
+        let loader = TrainingDataLoader::from_training_set_stream(
+            Arc::clone(&session),
+            table,
+            contrastive_columns(),
+            ModelTask::TextEmbedding,
+            TrainingFormat::Contrastive,
+            cfg,
+        )
+        .await
+        .unwrap();
+        let spec = PartitionSpec {
+            rank: 0,
+            world: 1,
+            batch: cfg.batch,
+            rule: PartitionRule::BlockByGlobalBatch,
+        };
+
+        let probe = tokio::task::spawn_blocking(move || {
+            let chunk_0 = loader.text_chunk_for_rank(&spec, 0).unwrap();
+            assert!(
+                chunk_0.row_count() > 0,
+                "test setup: step 0 must be non-empty"
+            );
+            // `chunk_0` stays alive (NOT dropped) across this next call —
+            // the adversarial hold.
+            let chunk_1 = loader.text_chunk_for_rank(&spec, 1).unwrap();
+            drop(chunk_0);
+            drop(chunk_1);
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), probe).await;
+        assert!(
+            result.is_ok(),
+            "prefetch={prefetch}: holding chunk k while asking for k+1 must not hang"
+        );
+        result.unwrap().unwrap();
+    }
 }

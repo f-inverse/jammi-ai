@@ -379,14 +379,18 @@ jobs:
   # libnvrtc-builtins out of the toolkit, plus libnccl, which `jammi-ai`'s
   # `cuda` feature pulls in through `candle-core/nccl`), and a `jammi-server`
   # launcher that prepends the bundled `lib/` to LD_LIBRARY_PATH then execs
-  # the binary. The candle/cudarc binary has hard DT_NEEDED entries for those
-  # libraries, so it will not exec without them on the loader path; bundling
-  # makes the tarball run on any host with only an NVIDIA driver. That set is
-  # a HAND LIST (seven names), not a derivation off the binary's own
-  # `DT_NEEDED` closure: a derivation arm existed and was EXCISED (#535)
-  # after it reported a green build with `libnccl` and `libnvrtc-builtins`
-  # missing from the stage directory; the hand list below fails the step by
-  # name instead. The driver's own libraries (`libcuda.so.1`, `libnvidia-*`)
+  # the binary. The candle/cudarc binary has hard DT_NEEDED entries for six
+  # of those seven libraries — every one but libnvrtc-builtins, which
+  # libnvrtc dlopens at runtime instead of linking — so it will not exec
+  # without the six on the loader path; bundling all seven still makes the
+  # tarball run on any host with only an NVIDIA driver. That set is a HAND
+  # LIST (seven names), not a derivation off the binary's own `DT_NEEDED`
+  # closure: a derivation arm existed and was EXCISED (#535) after the
+  # hermetic suite sourcing it — under its own `set +e`, not the script's
+  # fail-closed `set -euo pipefail`, which does not survive `source` —
+  # reported green with `libnccl` and `libnvrtc-builtins` missing from the
+  # stage directory; the hand list below fails the step by name instead.
+  # The driver's own libraries (`libcuda.so.1`, `libnvidia-*`)
   # are deliberately NOT bundled — they must match the host's driver. A
   # GPU-less runner is fine — nothing runs the binary here.
   gpu-proof:
@@ -512,12 +516,15 @@ jobs:
           # the six the toolkit itself carries, plus `libnccl`, the soname
           # `jammi-ai`'s `cuda` feature pulls in through `candle-core/nccl`.
           # A derivation that read this set off the binary's own `DT_NEEDED`
-          # closure existed and was EXCISED (#535, filed there): it
-          # discarded its own steps' exit codes under `set +e` and reported
-          # a green build with `libnccl` and `libnvrtc-builtins` missing
-          # from the stage directory — this hand list's whole reason to
-          # fail closed by name, below, is closing exactly that failure
-          # mode without re-taking on the derivation's own risk surface.
+          # closure existed and was EXCISED (#535, filed there): the script
+          # itself ran fail-closed (`set -euo pipefail`), but the hermetic
+          # suite that sourced it took `set +e` right after — needed to
+          # assert on exit codes without dying itself — and errexit does
+          # not survive `source`; under that `set +e` the suite reported
+          # green with `libnccl` and `libnvrtc-builtins` missing from the
+          # stage directory — this hand list's whole reason to fail closed
+          # by name, below, is closing exactly that failure mode without
+          # re-taking on the derivation's own risk surface.
           # `libnvrtc-builtins` carries no `DT_NEEDED` entry naming it at
           # all — MEASURED: `readelf -d` against the CUDA 12.6 toolkit's own
           # `libnvrtc.so.12` (run inside `nvidia/cuda:12.6.3-devel-ubi8`)

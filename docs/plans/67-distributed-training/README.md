@@ -81,13 +81,14 @@ those still in force are restated here in their v4 form. Principle in parenthese
     capability-scoping the ring is a 68 follow-on. (One membership mechanism; DIST D9.)
 29. **Knobs.** `[gpu] devices = [..]`; `[worker] world_size = 1`, `rank_timeout_secs = 120`,
     `collective = "auto"`; per-job `world_size` on `TrainingCommon` (`#[serde(default)]` = 1).
-    `[training]` no longer exists on the branch. On the wire (`wt-U4a: job.proto`, U4a's
-    unmerged commit), `SubmitJobRequest.world_size` is tag 9: tags 7 and 8 are `reserved` for the
-    job-dependency unit's `depends_on` and `parent_id`, deferred to #515 and recoverable by
-    cherry-pick without a tag collision. The field is implicit-presence `uint32` (`0` = unset),
-    so an explicit rank count of one encodes identically to "not chosen" in both clients: the
-    Rust `FineTuneRequest.world_size: Option<NonZeroU32>` (`wt-U4a: crates/jammi-wire/src/
-    request.rs:117-123`) and the Python `_wire_world_size` (`wt-U4a: clients/python/jammi/
+    `[training]` no longer exists on the branch. On the wire
+    (`crates/jammi-wire/proto/jammi/v1/job.proto:153`), `SubmitJobRequest.world_size` is tag 9:
+    tags 7 and 8 are `reserved` (`job.proto:157`) for the job-dependency unit's `depends_on` and
+    `parent_id`, deferred to #515 and recoverable by cherry-pick without a tag collision. The
+    field is implicit-presence `uint32` (`0` = unset), so an explicit rank count of one encodes
+    identically to "not chosen" in both clients: the
+    Rust `FineTuneRequest.world_size: Option<NonZeroU32>` (`crates/jammi-wire/src/
+    request.rs:126`) and the Python `_wire_world_size` (`clients/python/jammi/
     _assembly.py:502-512`) both write the field only above one, so `Some(1)`/`world_size=1` and
     the unset default are one wire value and the engine sees one encoding for a single-rank job
     regardless of caller or surface. On the job path, a typed `EmptyTrainingSet` (U2a's unmerged

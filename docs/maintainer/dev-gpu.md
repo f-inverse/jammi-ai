@@ -292,8 +292,8 @@ CUDA-shipping artifact answers for that soname its own way:
 
 | artifact | how `libnccl.so.2` gets there |
 | --- | --- |
-| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by a hand list of seven names in `release-binaries.yml`'s `server-cu12-build` step, each searched under the CUDA 12.6 toolkit then `/usr/lib64`, failing by name if a name resolves to no versioned object in either directory (a `DT_NEEDED`-closure derivation existed and was excised — #535 — after it reported success with libraries missing from the stage directory) |
-| `jammi-server-cu12` wheel | the `nvidia-nccl-cu12` dependency; the console script puts `nvidia/nccl/lib/` on `LD_LIBRARY_PATH`, and `verify_link_set.py` fails the build if a needed library is unclassified |
+| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by a hand list of seven names in `release-binaries.yml`'s `server-cu12-build` step, each searched under the CUDA 12.6 toolkit then `/usr/lib64`, failing by name if a name resolves to no versioned object in either directory (a `DT_NEEDED`-closure derivation existed and was excised — #535 — after the hermetic suite sourcing it, under its own `set +e` rather than the script's fail-closed `set -euo pipefail` (errexit does not survive `source`), reported green with libraries missing from the stage directory) |
+| `jammi-server-cu12` wheel | the `nvidia-nccl-cu12` dependency; the console script puts `nvidia/nccl/lib/` on `LD_LIBRARY_PATH`, and `verify_link_set.py` fails the build if a needed library is unclassified, or if it extracts no `DT_NEEDED` entries at all |
 | `jammi-ai-server` CUDA image | nothing to do: the `nvidia/cuda:12.6.3-runtime-ubi8` base installs `libnccl-2.23.4-1+cuda12.6` itself (its own image config's `NV_LIBNCCL_PACKAGE`) — the same build the CI image and the wheel pin |
 
 The host NVIDIA driver's own libraries (`libcuda.so.1`, `libnvidia-*`) are the

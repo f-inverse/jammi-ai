@@ -87,37 +87,37 @@ per-step `$?`. Naming per README ruling 23.
   (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
   (docs-ci) the six cu12 packaging sites that name the CUDA runtime library set, so it gains
-  `libnccl` (unmerged — U4a's own commit; cited as `wt-U4a:` below):
-  `wt-U4a: .github/workflows/release-binaries.yml:377-380` (the comment naming `libnccl`
+  `libnccl`:
+  `.github/workflows/release-binaries.yml:377-380` (the comment naming `libnccl`
   alongside the CUDA runtime's other hard `DT_NEEDED` entries) and its packaging step's soname
-  loop (a note recording that the prior six-name hand list missed the `DT_NEEDED
-  libnccl.so.2` `candle-core/nccl` adds — why the list gained a seventh, still hand-listed, name
-  rather than a `DT_NEEDED` closure walk, issue #535), `packaging/server-cu12/verify_link_set.py`,
-  `wt-U4a: packaging/server-cu12/jammi_server/_entry.py:23` (`_CUDA_COMPONENTS`),
-  `packaging/server-cu12/pyproject.toml` (the `nvidia-*-cu12` pins), `wt-U4a: packaging/
-  server-cu12/README.md:12`; and `.github/workflows/ci.yml`'s `flash-attn-compile` job, which
-  gains a preflight step (`wt-U4a`: `Preflight — the image carries NCCL`, `rpm -q libnccl
+  loop (`release-binaries.yml:539-556`; a note recording that the prior six-name hand list missed
+  the `DT_NEEDED libnccl.so.2` `candle-core/nccl` adds — why the list gained a seventh, still
+  hand-listed, name rather than a `DT_NEEDED` closure walk, issue #535), `packaging/server-cu12/
+  verify_link_set.py`, `packaging/server-cu12/jammi_server/_entry.py:28` (`_CUDA_COMPONENTS`),
+  `packaging/server-cu12/pyproject.toml` (the `nvidia-*-cu12` pins), `packaging/
+  server-cu12/README.md:12-13`; and `.github/workflows/ci.yml`'s `flash-attn-compile` job, which
+  gains a preflight step (`ci.yml:771-772`: `Preflight — the image carries NCCL`, `rpm -q libnccl
   libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so`) so a `:latest`
   published before B0's Dockerfile change reds this job before any `--features cuda` step tries
   to link.
 - **precondition (S1) — satisfied by B0** (`ci/500-cuda-image-nccl`, merged to `main`): the CI
   CUDA image carries NCCL (`.docker/ci-cuda.Dockerfile` pins `libnccl-2.23.4-1+cuda12.6` and
   `libnccl-devel-2.23.4-1+cuda12.6`, the version `nvidia/cuda:12.6.3-runtime-ubi8` already ships)
-  and the `flash-attn-compile` job's preflight step above (unmerged, `wt-U4a`) is meant to assert
+  and the `flash-attn-compile` job's preflight step above (`ci.yml:771-772`) asserts
   it before this unit's own `cargo clippy -p jammi-ai --features cuda --tests -- -D warnings`
-  step (`ci.yml:913`, already on `main`) compiles the `Nccl` arm. The CUDA-tarball soname set the
+  step (`ci.yml:943`) compiles the `Nccl` arm. The CUDA-tarball soname set the
   cu12 packaging above bundles is a fixed HAND LIST of seven stems (`libcudart libcublas
   libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl`), searched first in the CUDA 12.6
   toolkit's lib dir then in `/usr/lib64`, fail-closed per name — a name absent from both
-  locations fails the build rather than silently shipping a tarball missing it (`wt-U4a:
-  .github/workflows/release-binaries.yml`, the `server-cu12-build` job's packaging step). Deriving
-  the set from the binary's transitive `DT_NEEDED` closure was excised under this unit's stop
-  rule — a closure walk cannot be trusted to reach `libnvrtc-builtins` on its own, since it is
-  `dlopen`'d by `libnvrtc` rather than linked, a MEASURED fact (`readelf -d` against the toolkit's
-  `libnvrtc.so.12` names no such `NEEDED` entry) — and is filed as issue #535, not built by this
-  unit. The post-copy check is filesystem presence only, never the real runtime loader (`wt-U4a:
-  release-binaries.yml:392-393`); a runtime loader verification is filed as issue #534, not
-  established by this unit.
+  locations fails the build rather than silently shipping a tarball missing it
+  (`.github/workflows/release-binaries.yml:539-556`, the `server-cu12-build` job's packaging
+  step). Deriving the set from the binary's transitive `DT_NEEDED` closure was excised under
+  this unit's stop rule — a closure walk cannot be trusted to reach `libnvrtc-builtins` on its
+  own, since it is `dlopen`'d by `libnvrtc` rather than linked, a MEASURED fact (`readelf -d`
+  against the toolkit's `libnvrtc.so.12` names no such `NEEDED` entry) — and is filed as issue
+  #535, not built by this unit. The post-copy check is filesystem presence only, never the real
+  runtime loader (`release-binaries.yml:552-555`); a runtime loader verification is filed as
+  issue #534, not established by this unit.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
   `nccl` without CUDA, `world_size > 1` with `cached == true` or `hard_negatives.mine == true`
   refused with typed errors at the submit edge), K4 (remote parity suite unchanged), B6.
@@ -193,7 +193,7 @@ per-step `$?`. Naming per README ruling 23.
   completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden; (f) two real
   devices in one session hold two entries in the production model-cache map for one model id —
   U4a's own hermetic assertion pins the key-type fact against a mirror map, never the production
-  insert (`wt-U4a: model/cache.rs:885`, `do_load`'s `cache.entries.insert`); only one device
+  insert (`model/cache.rs:885`, `do_load`'s `cache.entries.insert`); only one device
   exists off the pod, so a device-collapse mutation at that insert site is hermetically
   UNCOVERED and this determinant is a pod-leg obligation, not a hermetic one. (pod leg,
   `Nccl`, 2×A100): (a) as a digest pair + per-step delta against the pre-registered ε, (c)

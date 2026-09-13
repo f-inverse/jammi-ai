@@ -2274,6 +2274,61 @@ def fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies() -> None:
     _assert("requires the SAME command" in p.stderr, "R12R2h", p.stderr)
 
 
+def fixture_r12witness_stderr_distinguishes_missing_from_real_failure() -> None:
+    """The design's own measured collision: `sha256(rc+stdout)` ALONE
+    cannot distinguish a missing script (rc=127, empty stdout) from a real
+    rc=1 failure with empty stdout; `_witness_hash` includes the first
+    stderr line specifically to fix this. Two IDENTICAL missing-script
+    runs still hash identically (by design — this is not a nonce)."""
+    mod = _r12_mod()
+    h_missing_1 = mod._witness_hash(127, "", "sh: 1: ./nope.sh: not found")
+    h_missing_2 = mod._witness_hash(127, "", "sh: 1: ./nope.sh: not found")
+    h_real_fail = mod._witness_hash(1, "", "")
+    _assert(h_missing_1 == h_missing_2, "R12witness", "two identical missing-script witnesses must hash identically")
+    _assert(h_missing_1 != h_real_fail, "R12witness", "rc=127 and rc=1 must never collide")
+
+
+def fixture_r12reduce_two_lines_same_file_one_required_entry() -> None:
+    """M1': two raw derived keys on the SAME file (`a.py:1`, `a.py:9`)
+    reduce to ONE required entry (`a.py`) — a complete artifact covering
+    just that ONE file ALLOWS, proving the per-file reduction actually
+    reduces (never one required entry per raw line-key)."""
+    unit = "feat/r12reduce"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1", "a.py:9"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 0, "R12reduce", f"one file entry must satisfy two same-file raw keys, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12unparse_prose_key_maps_to_itself_still_required() -> None:
+    """M1'/M2': a `class_enumeration` entry that is prose, not
+    `path:line`-shaped, maps to ITSELF as its own "file"
+    (`_key_to_file` returns it unchanged) — it is NEVER silently exempted;
+    missing, it still denies naming the omission; covered under its OWN
+    literal text, it allows."""
+    unit = "feat/r12unparse"
+    root = _temp_repo(unit)
+    prose_key = "the whole loader stage (nccl.rs)"
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", [prose_key], [prose_key])
+    # An artifact that EXISTS (at the right tip) but omits the prose key
+    # entirely -- must still deny, naming the omission (never silently
+    # exempted because the key does not parse as path:line).
+    other = _auto_r12_attack("unrelated.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"unrelated.py": {"command": other["command"], "hash": other["hash"]}})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12unparse", f"a missing attack for an unparseable key must still deny, got {p.returncode}")
+    _assert("omits" in p.stderr and prose_key in p.stderr, "R12unparse", p.stderr)
+    a = _auto_r12_attack(prose_key)
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "unrelated.py": {"command": other["command"], "hash": other["hash"]},
+        prose_key: {"command": a["command"], "hash": a["hash"]},
+    })
+    p2 = _r12_dispatch(root, unit)
+    _assert(p2.returncode == 0, "R12unparse", f"covering the prose key under its own literal text must allow, got {p2.returncode}: {p2.stderr}")
+
+
 def fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh() -> None:
     """The relaxed denylist admits ONLY `sh|bash <existing repo path>`
     (with no further arguments) — `bash -c '...'` and `curl ... | sh`
@@ -3418,6 +3473,9 @@ FIXTURES = [
     ("R12R2f", fixture_r12r2f_partial_attacks_post_coverage_denies),
     ("R12R2g", fixture_r12r2g_attacks_post_entry_not_object_denies),
     ("R12R2h", fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies),
+    ("R12witness", fixture_r12witness_stderr_distinguishes_missing_from_real_failure),
+    ("R12reduce", fixture_r12reduce_two_lines_same_file_one_required_entry),
+    ("R12unparse", fixture_r12unparse_prose_key_maps_to_itself_still_required),
     ("R12D1", fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh),
     ("R12R2a", fixture_r12r2a_missing_attacks_post_denies),
     ("R12R2b", fixture_r12r2b_no_differential_denies),

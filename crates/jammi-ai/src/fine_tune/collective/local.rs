@@ -925,6 +925,81 @@ mod rendezvous_state_tests {
             );
         });
     }
+
+    /// `mod.rs`'s asymmetry claim, proved deterministically: a round that
+    /// PUBLISHES and is then faulted — before the still-parked rank has taken
+    /// anything — wakes that rank into the refusal, never a stale `Ok`.
+    ///
+    /// **This exact sequence is not reachable through the public API** (a
+    /// round `Local::exchange` publishes is only ever faulted afterwards by a
+    /// LATER round's superseded-contribution check, never by the round that
+    /// just published itself), so this test manufactures it directly, the
+    /// same way `a_round_holding_a_superseded_contribution_is_refused_by_the_rank_completing_it`
+    /// manufactures its condition: rank 1 is parked in `exchange`, waiting on
+    /// `round.published` with only its own contribution deposited
+    /// (`arrived == 1` of a `world == 2` gang — rank 0 never calls in). Then,
+    /// under ONE acquisition of `round`'s lock — mirroring the shape a real
+    /// publish-then-fault race takes, where nothing rank 1 can observe splits
+    /// the two states apart — this test publishes the round, records a fault,
+    /// and abandons the round, in that order. `abandon` clears `published`
+    /// again before the lock is ever released, so rank 1 can only ever wake
+    /// into the world where the round is unpublished AND the gang is
+    /// faulted — proving the mechanism `mod.rs` describes: a rank that had
+    /// not yet taken a published result gets the gang's fault, never a wrong
+    /// or stale answer, even though a publish genuinely happened first.
+    #[test]
+    fn a_round_published_then_faulted_before_a_parked_rank_takes_it_wakes_that_rank_into_the_refusal(
+    ) {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+        let rank1 = gang.rank(1).expect("rank 1");
+
+        let outcome = std::thread::scope(|scope| {
+            let parked = scope.spawn(move || rank1.barrier());
+
+            // Spin until rank 1 has deposited into the round and is parked
+            // waiting for the round to publish — rank 0 never calls in, so
+            // `arrived` stops at 1 of a world of 2.
+            loop {
+                let round = gang.shared.round.lock().expect("round");
+                if round.arrived == 1 {
+                    break;
+                }
+                drop(round);
+                std::thread::yield_now();
+            }
+
+            // One critical section: publish, record the fault, abandon. Rank
+            // 1 — asleep outside this lock — cannot observe the intermediate
+            // published state; by the time it reacquires the lock, `abandon`
+            // has already cleared `published` and `record` has already set
+            // the fault.
+            {
+                let mut round = gang.shared.round.lock().expect("round");
+                let generation = round.generation;
+                round.published = Some((generation, Arc::new(Vec::new())));
+                gang.shared
+                    .record("a manufactured publish-then-fault race".to_string());
+                round.abandon();
+                gang.shared.signal.notify_all();
+            }
+
+            parked.join().expect("rank 1 thread")
+        });
+
+        let error =
+            outcome.expect_err("rank 1 must wake into the refusal, never a stale Ok or hang");
+        assert!(
+            error.to_string().contains("the gang has already failed"),
+            "unexpected message: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("a manufactured publish-then-fault race"),
+            "the refusal must quote the fault that actually happened: {error}"
+        );
+    }
 }
 
 /// One test per [`Descriptor`] field, each proving that field is its own,

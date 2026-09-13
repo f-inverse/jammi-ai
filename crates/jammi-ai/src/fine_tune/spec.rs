@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 
 use crate::fine_tune::graph_sampler::{GraphFineTuneSources, GraphSampleConfig};
@@ -111,6 +112,123 @@ pub const DEFAULT_WORLD_SIZE: u32 = 1;
 /// because `#[serde(default = ...)]` names a path, not a literal.
 fn default_world_size() -> u32 {
     DEFAULT_WORLD_SIZE
+}
+
+/// What a submitted [`TrainingSpec`] is admitted against: the deployment's
+/// devices, the collective it reduces over, and whether this build can reach
+/// that collective.
+///
+/// The submit edge is where a rank count the deployment cannot serve is
+/// caught, because it is the last point at which refusing costs nothing: past
+/// it the spec is a durable row that a worker will claim, fail, and retry
+/// until the attempt budget runs out. A count is never CLAMPED to what the
+/// deployment can serve — a silently lowered count trains a different model
+/// than the caller asked for and records it under the same identity.
+///
+/// The build flag is DATA rather than a `cfg!` inside the check so the rule
+/// is decidable for either build from either build: a host test can state
+/// what a CUDA build admits, and a CUDA build can state what a host build
+/// refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankAdmission {
+    devices: usize,
+    collective: jammi_db::config::CollectiveSelection,
+    cuda_build: bool,
+}
+
+impl RankAdmission {
+    /// The admission this deployment implies: one rank per configured
+    /// device, the configured collective, and THIS build's CUDA support.
+    pub fn from_config(config: &jammi_db::config::JammiConfig) -> Self {
+        Self {
+            devices: config.gpu.device_list().len(),
+            collective: config.worker.collective,
+            cuda_build: cfg!(feature = "cuda"),
+        }
+    }
+
+    /// An admission stated outright — for a test that needs a deployment
+    /// this host does not have.
+    pub fn new(
+        devices: usize,
+        collective: jammi_db::config::CollectiveSelection,
+        cuda_build: bool,
+    ) -> Self {
+        Self {
+            devices,
+            collective,
+            cuda_build,
+        }
+    }
+
+    /// Admit `spec`, or refuse with a typed [`JammiError::Config`] naming the
+    /// bound it crosses.
+    ///
+    /// The refusals, each of which would otherwise become a job that fails
+    /// on a worker rather than at the caller:
+    ///
+    /// - `world_size == 0` — no rank to run on. Unrepresentable at the
+    ///   request edge (`FineTuneRequest::world_size` is a `NonZeroU32`) but
+    ///   reachable through a hand-built or deserialized spec, so the durable
+    ///   edge checks it too.
+    /// - `world_size > devices` — there is no device for the last rank, and
+    ///   the alternative to refusing is two ranks silently sharing one.
+    /// - `collective = "nccl"` on a build without CUDA — the requested
+    ///   collective cannot be reached. Also refused at session OPEN
+    ///   (`refuse_unreachable_collective`), which is the edge a live session
+    ///   is stopped at; this arm is the same rule stated where the spec is
+    ///   admitted, so a caller holding an admission built by hand gets the
+    ///   same verdict.
+    /// - `world_size > 1` with GradCache (`config.cached`) or hard-negative
+    ///   mining (`config.hard_negatives.mine`) — both are single-rank
+    ///   mechanisms (a whole-batch second pass, and a miner over this
+    ///   process's own index), and running them per rank would change the
+    ///   negative pool each rank sees, so the gang would not compute the
+    ///   objective the caller asked for.
+    ///
+    /// The context-predictor kind carries no rank count at all: its variant
+    /// has no [`TrainingCommon`], so a multi-rank predictor job is
+    /// unrepresentable here and is refused at the wire decode, the last edge
+    /// that can still see a count a caller chose.
+    pub fn admit(&self, spec: &TrainingSpec) -> Result<()> {
+        let common = match spec {
+            TrainingSpec::FineTune { common, .. } | TrainingSpec::GraphFineTune { common, .. } => {
+                common
+            }
+            TrainingSpec::ContextPredictor { .. } => return Ok(()),
+        };
+        let world_size = common.world_size;
+
+        if world_size == 0 {
+            return Err(JammiError::Config(
+                "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)"
+                    .into(),
+            ));
+        }
+        if world_size as usize > self.devices {
+            return Err(JammiError::Config(format!(
+                "world_size = {world_size} exceeds the {} configured device(s): one rank per                  device, so list more in `[gpu] devices` or submit a smaller rank count",
+                self.devices
+            )));
+        }
+        if self.collective.requires_cuda() && !self.cuda_build {
+            return Err(JammiError::Config(format!(
+                "[worker] collective = \"{}\" needs a build with the `cuda` feature; this                  binary has none, so the requested collective cannot be reached",
+                self.collective
+            )));
+        }
+        if world_size > 1 && common.config.cached {
+            return Err(JammiError::Config(format!(
+                "world_size = {world_size} cannot be combined with GradCache (`cached`): the                  cached objective's second pass is over the WHOLE batch on one rank, so a                  gang would not compute the objective this config asks for"
+            )));
+        }
+        if world_size > 1 && common.config.hard_negatives.mine {
+            return Err(JammiError::Config(format!(
+                "world_size = {world_size} cannot be combined with hard-negative mining                  (`hard_negatives.mine`): the miner retrieves from this process's own index,                  so each rank would mine a different negative pool"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl TrainingSpec {

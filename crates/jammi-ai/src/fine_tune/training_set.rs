@@ -27,8 +27,8 @@
 //! A registered source exposes no version or digest surface, so its rows are
 //! anchored [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
 //! — the same honest anchor the embedding producer records for the same reason
-//! (`pipeline/embedding.rs`).
-//! The engine's reuse probe never matches an unpinned anchor, so a training set
+//! (`pipeline/embedding.rs`). The engine's reuse probe never matches an
+//! unpinned anchor, so a training set
 //! over a plain source is never reused across runs; the anchor still rides the
 //! manifest, so staleness reports the same honest `Undecidable` it reports for
 //! every unpinned input. The engine does own a resolver from a relation name to
@@ -90,17 +90,6 @@ pub fn read_back_sql(table: &TrainingSetTable, columns: &[String]) -> String {
     )
 }
 
-/// The anchor a fine-tune's source rows are recorded under.
-///
-/// Always [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant),
-/// exactly as the embedding producer anchors the same kind of input: a
-/// registered source has no version surface to pin, and fabricating a pin would
-/// claim a reproducibility the engine cannot deliver. See the module header for
-/// why the result-table arm is not reachable from here.
-fn source_anchor(source_id: &str) -> InputAnchor {
-    InputAnchor::unpinned_at_instant(source_id, chrono::Utc::now().to_rfc3339())
-}
-
 /// Materialise `columns` of a registered `source` as a training set, then read
 /// the committed rows back in order.
 ///
@@ -131,7 +120,15 @@ pub async fn materialize_projection(
             columns,
             task,
             format,
-            inputs: vec![source_anchor(source_id)],
+            // The source has no version surface to pin, so it is anchored at
+            // the instant it was read — the same honest anchor the embedding
+            // producer records for the same reason, constructed here rather
+            // than behind a helper so the anchor value never travels apart
+            // from the read it describes.
+            inputs: vec![InputAnchor::unpinned_at_instant(
+                source_id,
+                chrono::Utc::now().to_rfc3339(),
+            )],
             device: session.compute_device(),
         },
     )
@@ -285,7 +282,15 @@ pub(crate) async fn materialize_sampled_pairs(
                 }
             }
             .format_tag(),
-            inputs: vec![source_anchor(source_id)],
+            // The source has no version surface to pin, so it is anchored at
+            // the instant it was read — the same honest anchor the embedding
+            // producer records for the same reason, constructed here rather
+            // than behind a helper so the anchor value never travels apart
+            // from the read it describes.
+            inputs: vec![InputAnchor::unpinned_at_instant(
+                source_id,
+                chrono::Utc::now().to_rfc3339(),
+            )],
             device: session.compute_device(),
         },
     )

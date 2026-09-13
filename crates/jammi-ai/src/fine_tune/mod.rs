@@ -15,6 +15,8 @@ pub mod batch_bucket;
 #[cfg(feature = "local")]
 pub mod classifier;
 #[cfg(feature = "local")]
+pub mod collective;
+#[cfg(feature = "local")]
 pub mod data;
 #[cfg(feature = "local")]
 pub mod gradcache;

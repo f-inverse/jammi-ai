@@ -1217,13 +1217,6 @@ mod tests {
         )
     }
 
-    fn fine_tune_anchors() -> Vec<crate::store::manifest::InputAnchor> {
-        vec![crate::store::manifest::InputAnchor::result_digest(
-            "training-set",
-            &ArtifactDigest("c".repeat(64)),
-        )]
-    }
-
     /// RED at base: before this unit, `ArtifactStore` has no
     /// `write_model_materialization` at all — no `.materialization.json` is
     /// ever written into a model artifact prefix. This proves the mechanism
@@ -1253,7 +1246,17 @@ mod tests {
 
         let descriptor = fine_tune_descriptor();
         let env = fine_tune_env();
-        let anchors = fine_tune_anchors();
+        // Inlined rather than behind a helper: no function in this module
+        // may carry an `InputAnchor`-shaped return type (the straddle gate,
+        // `crates/jammi-ai/tests/it/pinned_source_gate.rs`, flags exactly
+        // that shape as an unreviewed anchor producer). This fixture never
+        // resolves a version -- it is a fixed digest handed straight to
+        // `Materialization::new`, never re-derived from a catalog record.
+        let anchors: Vec<crate::store::manifest::InputAnchor> =
+            vec![crate::store::manifest::InputAnchor::result_digest(
+                "training-set",
+                &ArtifactDigest("c".repeat(64)),
+            )];
         let written = store
             .write_model_materialization(
                 &prefix,
@@ -1299,11 +1302,12 @@ mod tests {
 
         let descriptor = fine_tune_descriptor();
         let env = fine_tune_env();
+        let anchors = vec![crate::store::manifest::InputAnchor::result_digest(
+            "training-set",
+            &ArtifactDigest("c".repeat(64)),
+        )];
         let err = store
-            .write_model_materialization(
-                &prefix,
-                Materialization::new(&descriptor, &env, fine_tune_anchors()),
-            )
+            .write_model_materialization(&prefix, Materialization::new(&descriptor, &env, anchors))
             .await
             .unwrap_err();
         assert!(
@@ -1333,11 +1337,12 @@ mod tests {
             .unwrap();
         let descriptor = fine_tune_descriptor();
         let env = fine_tune_env();
+        let anchors = vec![crate::store::manifest::InputAnchor::result_digest(
+            "training-set",
+            &ArtifactDigest("c".repeat(64)),
+        )];
         store
-            .write_model_materialization(
-                &prefix,
-                Materialization::new(&descriptor, &env, fine_tune_anchors()),
-            )
+            .write_model_materialization(&prefix, Materialization::new(&descriptor, &env, anchors))
             .await
             .unwrap();
 

@@ -373,13 +373,21 @@ jobs:
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
-  # self-sufficient: it bundles the CUDA-enabled binary, the CUDA runtime `.so`s
-  # the binary links dynamically (libcudart / libcublas / libcublasLt / libcurand
-  # / libnvrtc), and a `jammi-server` launcher that prepends the bundled `lib/`
-  # to LD_LIBRARY_PATH then execs the binary. The candle/cudarc binary has hard
-  # DT_NEEDED entries for those libraries, so it will not exec without them on the
-  # loader path; bundling makes the tarball run on any host with only an NVIDIA
-  # driver. A GPU-less runner is fine — nothing runs the binary here.
+  # self-sufficient: it bundles the CUDA-enabled binary, every shared library
+  # that binary's own `DT_NEEDED` closure names and the host does not provide
+  # (the CUDA runtime out of the toolkit — libcudart / libcublas / libcublasLt /
+  # libcurand / libnvrtc and nvrtc's builtins — plus libnccl out of
+  # `/usr/lib64`, which `jammi-ai`'s `cuda` feature pulls in through
+  # `candle-core/nccl`), and a `jammi-server` launcher that prepends the bundled
+  # `lib/` to LD_LIBRARY_PATH then execs the binary. The candle/cudarc binary
+  # has hard DT_NEEDED entries for those libraries, so it will not exec without
+  # them on the loader path; bundling makes the tarball run on any host with
+  # only an NVIDIA driver. That set is DERIVED from the binary rather than
+  # listed by hand (`ci/scripts/bundle_cuda_libs.sh`, whose own doc says why),
+  # and the staged tree is then checked against the real loader. The driver's
+  # own libraries (`libcuda.so.1`, `libnvidia-*`) are deliberately NOT bundled —
+  # they must match the host's driver. A GPU-less runner is fine — nothing runs
+  # the binary here.
   gpu-proof:
     name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
@@ -495,19 +503,29 @@ jobs:
           strip target/release/jammi-server
           cp target/release/jammi-server "${stage}/bin-jammi-server"
 
-          # Source the exact CUDA runtime `.so`s the binary links from the
-          # toolkit baked into the CUDA CI base (CUDA 12.6 lives at
-          # /usr/local/cuda-12.6/lib64). Copy the SONAME-versioned files so the
-          # binary's DT_NEEDED entries resolve. `cp -L` follows the dev symlinks
-          # to the real versioned object.
-          cuda_lib="/usr/local/cuda-12.6/lib64"
-          for soname in libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins; do
-            # Grab every matching versioned object (e.g. libcudart.so.12,
-            # libcudart.so.12.6.x) so the loader finds the SONAME it wants.
-            for so in "${cuda_lib}/${soname}.so".*; do
-              [ -e "$so" ] && cp -L "$so" "${stage}/lib/"
-            done
-          done
+          # Stage the libraries this tarball must carry, and check the result
+          # against the loader. Both halves live in
+          # `ci/scripts/bundle_cuda_libs.sh`: it walks the STAGED binary's own
+          # transitive `DT_NEEDED` closure, resolves each soname that is
+          # neither the platform's nor the driver's from its default search
+          # path (the CUDA 12.6 toolkit, then `/usr/lib64`), copies every
+          # versioned object with `cp -L`, and then asks `ldd` whether the
+          # staged tree actually satisfies the binary — failing on any
+          # unresolved entry other than the driver's own libraries, which no
+          # GPU-less build runner has.
+          #
+          # No soname list is passed: a list is a copy of a fact that lives in
+          # the binary, and this leg shipped six literal names right up until
+          # `jammi-ai`'s `cuda` feature took in `candle-core/nccl` and the
+          # binary grew a `DT_NEEDED libnccl.so.2` that none of them covered —
+          # a green build producing a tarball that cannot exec on a
+          # driver-only host. The search path's default is the script's own
+          # single site (`BUNDLE_DEFAULT_SEARCH_PATH`), pinned by
+          # `ci/scripts/test_bundle_cuda_libs.sh`, which is what exercises this
+          # derivation at all: this job's promote leg runs only on a `v*` tag,
+          # so without that hermetic suite the derivation's first real run
+          # would BE a release.
+          bash ci/scripts/bundle_cuda_libs.sh "${stage}/bin-jammi-server" "${stage}/lib"
 
           # The launcher: a host with only an NVIDIA driver has no system CUDA,
           # so put the bundled libs on the loader path before exec. `exec`

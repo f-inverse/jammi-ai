@@ -65,6 +65,17 @@ only shrink the adjacent set) and is therefore NOT the acceptance-easing
 normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
 row is diagnostic only — no gate decision reads it; which requirement has content is
 derived from the enumeration itself.
+**(2b) Open question — ALWAYS (esc-lead-gate-R10).** Alongside the ≥2 examined-clean
+sites (2) already requires, a non-empty `open_question` string must be present on
+every BLOCK relay of every gated verifier type: a site the lead examined and
+explicitly could NOT close, naming the attack for the next round to run. (2)'s own
+≥2-distinct-non-reactive count is UNCHANGED — this is a separate, ADDITIONAL field,
+never folded into the `probe` array or its counting. No subprocess, no regex, no
+match count, no cap: a plain non-empty-string presence check, nothing that scales
+with the size of a class. HONEST LIMIT, stated as one: this is a SCHEMA requirement
+over lead-authored text, a COST FLOOR, not proof of examination — the same limit (2)
+already carries. A lead can write a hollow open question; what it cannot do is write
+nothing and pass. What a human reads at merge is whether the open question was real.
 **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
 `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
 (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE
@@ -117,7 +128,9 @@ or parenthesis and trailing punctuation stripped, an optional trailing
 probing the fix's own surface satisfies this even when that file is also a finding
 location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
 conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
-though one entry can double as both when it qualifies for each). **One unit per
+though one entry can double as both when it qualifies for each), with (2b)'s
+separate `open_question` field, and with (4)'s `claims` object below — all
+conjunctive with R1-R3. **One unit per
 dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
 type, the dispatch is denied outright, naming every targeted unit — R3 never
 silently skips the others; dispatch each named unit separately. **§C5 — the ONE
@@ -125,12 +138,14 @@ amendment to "no git subprocess anywhere":** git runs ONLY from the repeat-dispa
 branch, NEVER on a first dispatch's hot path, and ONLY in `$CLAUDE_PROJECT_DIR` — the
 documented hook environment contract: the harness always sets this variable for
 every hook invocation, so `repo_root()`'s cwd fallback is never needed by this arm
-and is deliberately not reused here — with FIVE git calls per decision (`rev-parse
+and is deliberately not reused here — with SIX git calls per decision (`rev-parse
 --verify` block_sha, `rev-parse --verify` fix_head, `rev-parse --verify
 --end-of-options refs/heads/...` unit_branch, `merge-base --is-ancestor`, `diff
---name-only`), all sharing ONE per-decision monotonic deadline (`_GIT_BUDGET_S =
+--name-only`, and — esc-lead-gate-R11, (4) below — `diff -U0`), all sharing ONE
+per-decision monotonic deadline (`_GIT_BUDGET_S =
 5.0`, an absolute `time.monotonic()` value threaded through every call, never a
-fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s) (git >= 2.24
+fresh 5s per call — the whole arm, INCLUDING (4)'s own claim-command
+re-execution, is bounded by 5s total, not 6x5s) (git >= 2.24
 required: every invocation carries `--end-of-options` immediately before its
 revision arguments, so a value shaped like an option — e.g. `--output=/tmp/x` — can
 never be read as one; a pre-2.24 git fails that unrecognized-option check and
@@ -141,9 +156,54 @@ command AND its stderr (read back from the same `tempfile.TemporaryFile()` the
 command's output was captured to, after `wait()` returns — never left unread), and
 states that `rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the
 unit's evidence rather than fixing the underlying git problem.
+**(4) Untested claims — required alongside R3, on a REPEAT dispatch (esc-lead-gate-R11,
+"untested claims carry a test").** The relay may not be accepted while the fix's OWN
+diff still carries a claim-shaped line of a testable shape. The obligation is DERIVED
+BY THE HOOK from the diff's own shape — never declared by the lead: `_parse_claim_sites`
+(run from the SAME `_fix_window` call that computes R3's `fix_changed`, over `git diff
+-U0 block_sha fix_head`) is the hook's own enumeration of every line the fix ADDS that is
+BOTH a prose line (a comment, docstring, or whole-prose-file line — never bare code, the
+same WHERE-scoping technique `ci/scripts/check_doc_numbers_have_producers.py` already
+established for precision) and matches one of a finite, literal, multi-word phrase family
+drawn directly from this program's own retrospective: an impossibility/unreachability
+claim ("cannot be driven", "no injection point", "is unreachable", "no caller can", "not
+producer-driven", "no reliable way to force", "is not established", "structurally
+unreachable"), a mechanism claim ("is safe because", "routes through"), a caller-SET
+totality claim ("its only in-tree caller", "its one in-tree caller", "every caller is"),
+or a completed-re-verification claim ("re-verified"). A bare quantifier grep
+(`every`/`only`/`always` alone) was tried first and produces garbage — measured at 91 hits
+in this file alone and 1291 across `ci/scripts/*.py` — and is deliberately NOT shipped;
+this phrase family, unscoped, returns 26 hits across this repo's `ci/scripts` +
+`.claude/hooks` + `.claude/agents` combined, a tractable number. The relay's `claims`
+object must cover every key (`path:line`, EXACT-STRING, the hook's own derived set — the
+same superset-coverage posture R1 already takes toward `class_enumeration`) with either
+`{"status": "tested", "command": …, "output_hash": …}` (the hook RE-EXECUTES `command`
+itself — via the identical hardened `Popen`-into-its-own-process-group shape `_run_git`
+already uses, sharing the SAME per-decision deadline as R3's own git calls — and DENIES
+if the freshly-computed `sha256(f"{rc}\n{stdout}")` does not match `output_hash`) or
+`{"status": "uncovered", "reason": …}` (a non-empty reason; two or more IDENTICAL,
+normalized reasons in the same relay is denied as a templated, copy-pasted disposition,
+never a per-claim examination). Armed only when the hook's own derived set is non-empty —
+a fix that adds no claim-shaped line carries no obligation, the same "armed by the DATA"
+posture R1 already takes. Before executing any `tested` command, it is checked against a
+WHOLE-TOKEN (never substring) write-verb denylist covering both failure classes an
+earlier, killed design (`docs/plans/53-agentic-swarm/proposals/R7-committed-rigor-record.md`'s
+own R4a history) measured directly: a substring check wrongly denying `git grep -n
+'transform'`/`'confirm'` (the token `transform` is never confused with `rm` here), and
+`curl … | sh` / `git clean -fdx` / `git reset --hard` wrongly ALLOWED (all three are now
+denied outright, by inspecting every shell-operator-delimited segment's own first token,
+not only the command's first word). HONEST LIMIT, stated as plainly as R3's own: this
+cannot verify a `tested` claim's command is a GOOD test, only that it is a named one whose
+output hash reproduces; it cannot verify an `uncovered` reason is TRUE, only that it is
+present and not a copy-paste duplicate. **A lead can discharge a claim with a weak
+command. What it cannot do is skip a claim, because the hook enumerates them.** What a
+human reads at merge is whether the tested commands are meaningful and the uncovered
+reasons are honest — the same judgment (4)'s own two dispositions cannot make mechanically.
 **Migration.** A relay written to disk before this patch lands (no `fix_head`) stops
 being acceptable the moment the patch IS applied — an in-flight relay must be
-rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering.
+rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering. The
+same applies to (4): a relay written before esc-lead-gate-R11 lands has no `claims`
+object, and is denied the moment a re-dispatch's fix adds even one claim-shaped line.
 HONEST LIMIT (extended to R3): the hook enforces that adjacent probing AND fix-probing
 are each ASSERTED with a named, citation-checkable site that is ACTUALLY a member of
 the relevant set — never that either was semantically examined; a lead can satisfy R3
@@ -225,7 +285,21 @@ re-dispatch naming neither the recorded worktree, head_sha, nor unit_branch (DOD
 (3) `disableAllHooks` in local settings (a verifier verdict in the transcript with no
 hook-written state row is the tell); (4) a relay whose `probe` sites are
 asserted but never examined — mechanically indistinguishable here; the tell is a
-probe site the next round's citation-checker cannot corroborate.
+probe site the next round's citation-checker cannot corroborate; (5) a HAND-APPENDED
+verdict row in `.jammi/gate-state/<slug>.jsonl` itself — the directory carries no
+`permissions.deny` entry and the lead already writes into it by design (the relay
+artifact), so an appended row is indistinguishable, at the hook, from a real
+verifier's own `SubagentStop` write; the tell is that it has no matching `hook.log`
+`SubagentStop` entry and never lands in a committed, human-reviewed record (this
+residual is true today, independent of any of the above, and is the reason a
+COMMITTED rigor record — never the gitignored state directory alone — is what a
+human at merge can actually trust; see `docs/plans/53-agentic-swarm/proposals/`);
+(6) esc-lead-gate-R11's (4): a `tested` claim's command is a real, named, re-executed
+command whose output hash reproduces — but the hook cannot judge whether that command
+is a GOOD test of the claim, only that it ran and matched; nor can it judge whether an
+`uncovered` reason is TRUE, only that it is present and not a duplicate of another in
+the same relay — the tell is the same as (5): what a human reads in the committed
+record at merge, not anything this hook can enforce mechanically.
 
 ### `build-env-guard.sh` — `PreToolUse(Bash)`, opt-in, fail-open
 Warns (stderr only, **always exit 0**) when a Bash command carries a build-env hazard

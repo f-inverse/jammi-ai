@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""check_rigor_record.py — R7b (esc-lead-gate-R7, v2/REFINE): a required
+check that a lead cannot satisfy by under-reporting, because it never reads
+anything the lead authors to decide WHETHER it applies.
+
+Two design rounds killed the earlier shapes of this idea (see
+`docs/plans/53-agentic-swarm/proposals/R7-committed-rigor-record.md` for the
+full history, citations, and the measurements below). The one property that
+survived every round: **arm on the DIFF's own shape, never on a count or a
+flag the constrained party writes about itself.**
+
+THE RULE. If `base...HEAD` (a three-dot range, never two-dot — see "Known,
+undetectable residual" below) touches any path under `crates/**`, `ci/**`,
+or `.github/workflows/**`, this check is ARMED for the unit on this branch
+and requires, from COMMITTED files only:
+
+  1. A rigor record at `docs/rigor/<unit_slug>.jsonl` — the hook's own row
+     schema (`lead-gate-lib.py --export <slug>`), never hand-typed — exists
+     and parses.
+  2. That record carries at least one row with `agent_type ==
+     "pressure-tester"` — the design pass `.claude/agents/lead.md:41`
+     already requires before any non-local fix, now visible in a committed
+     diff a human reviews at merge, not merely asserted in a transcript.
+  3. This SAME diff (`base...HEAD`) adds or modifies at least one file
+     under `docs/plans/*/proposals/**` or `docs/rigor/contracts/**` — the
+     committed mechanism contract itself.
+  4. That contract passes the four ANTI-VACUITY cost-floor checks below.
+     Nothing mechanical judges a contract's QUALITY — this repo states
+     that plainly rather than implying otherwise.
+
+`unit_slug` is `slugify(<head branch name>)`, the SAME `slugify()`
+`lead-gate-lib.py` already uses (loaded dynamically from
+`.claude/hooks/lead-gate-lib.py` — never reimplemented, so the two never
+drift) — the PR's own head ref, read from `GITHUB_HEAD_REF` in Actions or
+`git rev-parse --abbrev-ref HEAD` otherwise. This is the SAME identity a
+verifier's `unit_branch` field already resolves to everywhere else in this
+system; a round of adversarial replay over 473 real hook decisions found
+gated verifier re-dispatches bind to it at ~98% (cited in the proposal
+doc), the most reliable identity this system has.
+
+ARMED BY THE DIFF, SATISFIED BY DISCLOSURE, JUDGED BY THE HUMAN.
+TAMPER-EVIDENT, NEVER TAMPER-PROOF — never described any other way.
+`.jammi/gate-state/` (the source the rigor record is exported FROM)
+carries no `permissions.deny` entry and the lead already writes into it by
+design — a hand-appended row is possible and undetectable at the hook
+layer (see `README.md`'s mechanical-vs-visible-only list, item 5). What
+this check adds is not tamper-PREVENTION: it is that the record becomes a
+COMMITTED file in a reviewed diff, so a human
+merging the PR can see "this unit touched a mechanism; here is its design
+pass; here is its round history" — or see that one of those three is
+silently missing, which a gitignored state directory could never show
+them at all.
+
+ANCESTRY IS ADVISORY, NEVER A FAILURE (check 3, historical numbering).
+Every recorded `head_sha` in the rigor record is checked for whether it
+resolves and is an ancestor of HEAD, using the exact git shape
+`_relay_rejection` already uses in `lead-gate-lib.py` — but ONLY reported,
+never failed on. Measured, twice, independently: this session's own
+documented workflow (amend an implementer's commit to add session
+trailers) orphans every head_sha a verifier recorded before the amend —
+`git merge-base --is-ancestor <pre-amend sha> HEAD` exits 1 on the
+honest path, and in a transport clone (what `actions/checkout` produces)
+the object is ABSENT entirely. `_relay_rejection`'s identical shape only
+works because it runs in a local repository whose object store still
+holds the orphan; a CI checkout has no such luxury.
+
+KNOWN, STRUCTURAL NO-OP SHAPES (never an author-declared marker/trailer/
+commit-message convention — every such predicate is a one-line opt-out):
+  - not a `pull_request` event (a push to `main` with no PR context) —
+    `GITHUB_EVENT_NAME` unset or not `pull_request`.
+  - the PR's base is not the default branch — `swarm.yml`'s own
+    `on: pull_request: branches: [main]` trigger already guarantees this
+    whenever the workflow runs at all; checked again here defensively.
+  - dependabot — `GITHUB_ACTOR == "dependabot[bot]"`.
+  - a docs-only/typo diff — implied structurally: a diff touching none of
+    `crates/**`/`ci/**`/`.github/workflows/**` never arms in the first
+    place; no special case is needed.
+  - a release-shaped diff — every changed file under `crates/**` is one of
+    `Cargo.toml`/`Cargo.lock` and no `ci/**`/`.github/workflows/**` file is
+    touched (a version-bump-only PR). Stated as a heuristic, not a proof:
+    a release PR that ALSO edits a gate script is not exempted by this
+    rule, and should not be.
+  - a purely human-authored PR — none of the commits in `base..HEAD`
+    carries this repo's own `Co-Authored-By: Claude` trailer convention.
+    A single swarm-touched commit in the range is enough to arm; the
+    swarm's own rigor process does not bind a human contributor who never
+    touched the branch.
+  - a revert — the PR's HEAD commit subject starts with `Revert "`, git's
+    own `git revert` convention.
+
+KNOWN, UNDETECTABLE RESIDUAL, STATED HONESTLY: a retargeted stacked branch
+whose three-dot range still carries a parent unit's own commits (the base
+this PR's history actually diverged from is stale relative to the PR's
+declared `base_ref`) is NOT detectable from the diff alone — three-dot
+ranges are the standard, correct GitHub PR semantics, and there is no
+mechanical way to distinguish "this diff correctly represents the PR's own
+work" from "this branch needs a rebase" without knowing the intended base.
+Pin three-dot ranges explicitly (done); do not pretend this residual is
+closed.
+
+Modes:
+  python3 ci/scripts/check_rigor_record.py                       # the check
+  python3 ci/scripts/check_rigor_record.py --check-allowlist-only-shrinks
+  python3 ci/scripts/check_rigor_record.py --self-test
+"""
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LEAD_GATE_LIB = REPO_ROOT / ".claude" / "hooks" / "lead-gate-lib.py"
+RIGOR_DIR = REPO_ROOT / "docs" / "rigor"
+ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_allowlist.txt"
+
+ARMING_GLOBS = ("crates/*", "crates/**", "ci/*", "ci/**", ".github/workflows/*", ".github/workflows/**")
+CONTRACT_GLOBS = ("docs/plans/*/proposals/*", "docs/plans/*/proposals/**", "docs/rigor/contracts/*", "docs/rigor/contracts/**")
+# A file-extension-bearing path token followed by `:<line>[-<line>]` — the
+# same grammar family `_probe_path`/`_PROBE_LINESPEC_RE` in lead-gate-lib.py
+# already uses for citation-checkable evidence, reused rather than
+# reinvented (never a length/word-count rule — Goodhart, and it is
+# prose-reading by another name).
+PATH_LINE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?`?")
+
+
+class Result:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+        self.warnings: list[str] = []
+
+    def fail(self, msg: str) -> None:
+        self.failures.append(msg)
+
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+    def ok(self) -> bool:
+        return not self.failures
+
+
+def _lib_module():
+    spec = importlib.util.spec_from_file_location("lead_gate_lib_rigor", LEAD_GATE_LIB)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def _git(cwd: Path, *args: str) -> tuple[bool, str]:
+    proc = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True)
+    return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr).strip()
+
+
+def _display_path(p: Path) -> str:
+    """`p` relative to REPO_ROOT when it is under it (the real invocation);
+    otherwise the path as-is (a self-test fixture's own throwaway tree,
+    which is never under REPO_ROOT)."""
+    try:
+        return str(p.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(p)
+
+
+def _matches_arming_glob(path: str) -> bool:
+    return any(fnmatch.fnmatch(path, g) for g in ARMING_GLOBS)
+
+
+def _matches_contract_glob(path: str) -> bool:
+    return any(fnmatch.fnmatch(path, g) for g in CONTRACT_GLOBS)
+
+
+def compute_diff_context(cwd: Path, base_ref: str, head_ref: str = "HEAD") -> tuple[bool, list[str], str]:
+    """Fetches `base_ref` from `origin` and returns `(ok, changed_paths,
+    range_spec)` for `origin/<base_ref>...<head_ref>` — a THREE-DOT range,
+    never two-dot (the range this whole mechanism is pinned to)."""
+    ok, _ = _git(cwd, "fetch", "--quiet", "origin", base_ref)
+    if not ok:
+        return False, [], ""
+    ok, _ = _git(cwd, "rev-parse", "--verify", f"origin/{base_ref}")
+    if not ok:
+        return False, [], ""
+    range_spec = f"origin/{base_ref}...{head_ref}"
+    ok, out = _git(cwd, "diff", "--name-only", range_spec)
+    if not ok:
+        return False, [], range_spec
+    return True, [p for p in out.splitlines() if p.strip()], range_spec
+
+
+def commits_in_range(cwd: Path, range_spec: str) -> list[str]:
+    ok, out = _git(cwd, "log", "--format=%H", range_spec.replace("...", ".."))
+    return [c for c in out.splitlines() if c.strip()] if ok else []
+
+
+def is_human_authored(cwd: Path, range_spec: str) -> bool:
+    """True iff NO commit in the range carries this repo's own swarm
+    co-authorship trailer — a single swarm-touched commit is enough to
+    arm; a purely human PR that never touched the branch is not bound by
+    the swarm's own rigor process."""
+    shas = commits_in_range(cwd, range_spec)
+    if not shas:
+        return True
+    for sha in shas:
+        ok, msg = _git(cwd, "log", "-1", "--format=%B", sha)
+        if ok and re.search(r"Co-Authored-By:\s*Claude", msg, re.IGNORECASE):
+            return False
+    return True
+
+
+def is_revert(cwd: Path, head_ref: str = "HEAD") -> bool:
+    ok, subject = _git(cwd, "log", "-1", "--format=%s", head_ref)
+    return ok and subject.startswith('Revert "')
+
+
+def is_release_shaped(changed: list[str]) -> bool:
+    crate_touches = [p for p in changed if _matches_arming_glob(p) and p.startswith("crates/")]
+    other_mechanism_touches = [
+        p for p in changed
+        if _matches_arming_glob(p) and not p.startswith("crates/")
+    ]
+    if other_mechanism_touches:
+        return False
+    if not crate_touches:
+        return False
+    return all(Path(p).name in ("Cargo.toml", "Cargo.lock") for p in crate_touches)
+
+
+def _no_op_reason(cwd: Path, changed: list[str], range_spec: str) -> str | None:
+    event = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event and event != "pull_request":
+        return f"not a pull_request event ({event!r})"
+    actor = os.environ.get("GITHUB_ACTOR", "")
+    if actor == "dependabot[bot]":
+        return "dependabot PR"
+    if is_revert(cwd):
+        return "revert PR (HEAD commit subject starts with Revert \")"
+    if is_release_shaped(changed):
+        return "release-shaped diff (only Cargo.toml/Cargo.lock under crates/**, no ci/**/.github/workflows/** touch)"
+    if is_human_authored(cwd, range_spec):
+        return "no commit in range carries the swarm's own Co-Authored-By: Claude trailer"
+    return None
+
+
+# --- Cost-floor (anti-vacuity) checks -----------------------------------
+
+def _path_lines_at_head(cwd: Path, path: str) -> int | None:
+    ok, out = _git(cwd, "show", f"HEAD:{path}")
+    if not ok:
+        return None
+    return len(out.splitlines())
+
+
+def check_path_line_citations(cwd: Path, contract_path: str, text: str, result: Result) -> None:
+    seen = set()
+    for m in PATH_LINE_RE.finditer(text):
+        cited_path, line1, line2 = m.group(1), int(m.group(2)), m.group(3)
+        key = (cited_path, line1, line2)
+        if key in seen:
+            continue
+        seen.add(key)
+        n = _path_lines_at_head(cwd, cited_path)
+        if n is None:
+            result.fail(f"{contract_path}: cites {cited_path}:{line1}"
+                        f"{'-' + line2 if line2 else ''} but {cited_path} does not exist at HEAD")
+            continue
+        top = int(line2) if line2 else line1
+        if top > n:
+            result.fail(f"{contract_path}: cites {cited_path}:{top} but {cited_path} has only {n} line(s) at HEAD")
+
+
+def check_introducing_commit_ancestor(cwd: Path, contract_path: str, result: Result) -> None:
+    ok, out = _git(cwd, "log", "--follow", "--diff-filter=A", "--format=%H", "--", contract_path)
+    if not ok or not out.strip():
+        result.warn(f"{contract_path}: could not find an introducing (add) commit via --follow")
+        return
+    introducing = out.strip().splitlines()[-1]
+    ok, _ = _git(cwd, "merge-base", "--is-ancestor", introducing, "HEAD")
+    if not ok:
+        result.fail(f"{contract_path}: introducing commit {introducing} is not an ancestor of HEAD")
+
+
+def _normalize_for_dedup(text: str) -> str:
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+
+def check_not_near_identical(cwd: Path, contract_path: str, text: str, all_contracts: list[str], result: Result) -> None:
+    my_hash = hashlib.sha256(_normalize_for_dedup(text).encode("utf-8")).hexdigest()
+    for other in all_contracts:
+        if other == contract_path:
+            continue
+        ok, other_text = _git(cwd, "show", f"HEAD:{other}")
+        if not ok:
+            continue
+        other_hash = hashlib.sha256(_normalize_for_dedup(other_text).encode("utf-8")).hexdigest()
+        if other_hash == my_hash:
+            result.fail(f"{contract_path}: near-identical (normalized-hash match) to {other}"
+                        " — a copy-paste contract is not a design pass")
+
+
+def _unit_allowlisted(unit_slug: str) -> bool:
+    if not ALLOWLIST_PATH.exists():
+        return False
+    for line in ALLOWLIST_PATH.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped == unit_slug:
+            return True
+    return False
+
+
+def run_check(cwd: Path = REPO_ROOT) -> Result:
+    result = Result()
+    base_ref = os.environ.get("GITHUB_BASE_REF", "main")
+    head_ref_env = os.environ.get("GITHUB_HEAD_REF")
+
+    ok, changed, range_spec = compute_diff_context(cwd, base_ref)
+    if not ok:
+        result.warn("could not resolve the base ref / three-dot diff — treating as a no-op (no PR context)")
+        return result
+
+    reason = _no_op_reason(cwd, changed, range_spec)
+    if reason is not None:
+        print(f"check-rigor-record: no-op — {reason}")
+        return result
+
+    armed_paths = [p for p in changed if _matches_arming_glob(p)]
+    if not armed_paths:
+        print("check-rigor-record: not armed — diff touches none of crates/**, ci/**, .github/workflows/**")
+        return result
+
+    mod = _lib_module()
+    if head_ref_env:
+        head_branch = head_ref_env
+    else:
+        ok, head_branch = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+        if not ok:
+            head_branch = "HEAD"
+    unit_slug = mod.slugify(head_branch)
+
+    if _unit_allowlisted(unit_slug):
+        print(f"check-rigor-record: armed but {unit_slug!r} is on the shrink-only allowlist "
+              f"({_display_path(ALLOWLIST_PATH)}) — no-op")
+        return result
+
+    print(f"check-rigor-record: ARMED — diff touches {len(armed_paths)} mechanism path(s), e.g. {armed_paths[:3]}")
+
+    record_path = RIGOR_DIR / f"{unit_slug}.jsonl"
+    ok, record_text = _git(cwd, "show", f"HEAD:docs/rigor/{unit_slug}.jsonl")
+    if not ok:
+        result.fail(f"no committed rigor record at docs/rigor/{unit_slug}.jsonl — export one with "
+                    f"`python3 .claude/hooks/lead-gate-lib.py --export {unit_slug} "
+                    f"> docs/rigor/{unit_slug}.jsonl` and commit it")
+    else:
+        rows = []
+        for i, line in enumerate(record_text.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                result.fail(f"docs/rigor/{unit_slug}.jsonl:{i + 1}: not valid JSON ({exc})")
+        pressure_rows = [r for r in rows if isinstance(r, dict) and r.get("agent_type") == "pressure-tester"]
+        if not pressure_rows:
+            result.fail(f"docs/rigor/{unit_slug}.jsonl carries no pressure-tester row — "
+                        "design-before-mechanism (.claude/agents/lead.md:41) requires one before "
+                        "a non-local fix; dispatch it and re-export the record")
+        # Check 3 (ancestry) — ADVISORY ONLY, never fails the check.
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sha = r.get("head_sha")
+            if not isinstance(sha, str) or not sha:
+                continue
+            ok_sha, _ = _git(cwd, "rev-parse", "--verify", f"{sha}^{{commit}}")
+            if not ok_sha:
+                result.warn(f"docs/rigor/{unit_slug}.jsonl: head_sha {sha} does not resolve in this "
+                            "checkout (advisory — an amend or a shallow clone can cause this)")
+                continue
+            ok_anc, _ = _git(cwd, "merge-base", "--is-ancestor", sha, "HEAD")
+            if not ok_anc:
+                result.warn(f"docs/rigor/{unit_slug}.jsonl: head_sha {sha} is not an ancestor of HEAD "
+                            "(advisory — the amend-after-verification workflow does this on the honest path)")
+
+    contract_paths = [p for p in changed if _matches_contract_glob(p)]
+    if not contract_paths:
+        result.fail("diff arms (touches crates/**/ci/**/.github/workflows/**) but adds/modifies no "
+                    "committed mechanism contract under docs/plans/*/proposals/** or docs/rigor/contracts/**")
+    else:
+        ok, all_contracts_out = _git(cwd, "ls-files", "docs/plans/*/proposals", "docs/rigor/contracts")
+        all_contracts = [p for p in all_contracts_out.splitlines() if p.strip()] if ok else contract_paths
+        for cp in contract_paths:
+            ok, text = _git(cwd, "show", f"HEAD:{cp}")
+            if not ok:
+                result.fail(f"{cp}: named in the diff but does not read at HEAD (deleted?)")
+                continue
+            check_path_line_citations(cwd, cp, text, result)
+            check_introducing_commit_ancestor(cwd, cp, result)
+            check_not_near_identical(cwd, cp, text, all_contracts, result)
+
+    return result
+
+
+def check_allowlist_only_shrinks(cwd: Path = REPO_ROOT) -> int:
+    ok, _ = _git(cwd, "fetch", "--quiet", "origin", "main")
+    if not ok:
+        print("rigor-record-allowlist-only-shrinks: FAIL — git fetch origin main failed", file=sys.stderr)
+        return 1
+    ok, _ = _git(cwd, "rev-parse", "--verify", "origin/main")
+    if not ok:
+        print("rigor-record-allowlist-only-shrinks: FAIL — origin/main does not resolve", file=sys.stderr)
+        return 1
+    current = set()
+    if ALLOWLIST_PATH.exists():
+        for line in ALLOWLIST_PATH.read_text().splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                current.add(s)
+    rel = ALLOWLIST_PATH.relative_to(cwd).as_posix()
+    ok, base_text = _git(cwd, "show", f"origin/main:{rel}")
+    if not ok:
+        print(f"rigor-record-allowlist-only-shrinks: OK (bootstrap) — origin/main has no {rel} yet; "
+              f"this branch's {len(current)} entries establish the baseline.")
+        return 0
+    base = {s.strip() for s in base_text.splitlines() if s.strip() and not s.strip().startswith("#")}
+    added = current - base
+    if added:
+        print("rigor-record-allowlist-only-shrinks: FAIL", file=sys.stderr)
+        for e in sorted(added):
+            print(f"  + {e}", file=sys.stderr)
+        print("\nrigor-record-allowlist-only-shrinks: this branch adds a NEW exemption. The "
+              "allowlist may only shrink — a genuinely new exemption is a human-reviewed decision, "
+              "made on main directly, never an autonomous addition on a swarm branch.", file=sys.stderr)
+        return 1
+    print(f"rigor-record-allowlist-only-shrinks: OK — {len(current)} entries "
+          f"({len(base) - len(current)} shrunk vs origin/main).")
+    return 0
+
+
+# ==========================================================================
+# --self-test — hermetic fixtures, the check_lead_gate.py harness pattern:
+# a real `origin` remote + a real feature-branch clone, run against the
+# REAL run_check()/check_allowlist_only_shrinks(), never a reimplementation.
+# ==========================================================================
+
+class Failure(Exception):
+    pass
+
+
+def _assert(cond: bool, label: str, detail: str = "") -> None:
+    if not cond:
+        raise Failure(f"{label}: {detail}")
+
+
+def _sh(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True)
+    _assert(proc.returncode == 0, "git fixture setup", f"git {' '.join(args)} failed: {proc.stderr}")
+    return proc.stdout.strip()
+
+
+_FIXTURE_ENV = {
+    "GIT_AUTHOR_NAME": "rigor-fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+    "GIT_COMMITTER_NAME": "rigor-fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+}
+
+
+def _pr_repo(tmp: Path) -> tuple[Path, Path]:
+    """A real `origin` repo (its own `main`, one seed commit) and a real
+    clone (`work`) with `origin` wired up — `git fetch origin main` in
+    `work` resolves `origin/main` exactly as a real CI checkout would.
+    Copies THIS run's own `.claude/hooks/lead-gate-lib.py` and
+    `ci/scripts/check_rigor_record.py` into `work` (never `.claude/hooks/`
+    from the real repo directly — a throwaway copy, per this file's own
+    module doc) so `_lib_module()`/self-invocation resolve inside the
+    fixture, not the real tree."""
+    origin = tmp / "origin"
+    work = tmp / "work"
+    origin.mkdir()
+    env = dict(os.environ)
+    env.update(_FIXTURE_ENV)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True, env=env)
+    subprocess.run(["git", "-C", str(origin), "config", "commit.gpgsign", "false"], check=True)
+    # Fixture-only: `origin` is a NON-bare repo so its own working tree can
+    # be read directly for setup; allow `work` to push updates to its
+    # currently-checked-out `main` (git denies this by default) — never a
+    # real-repo concern, since the real `origin` in CI is GitHub itself.
+    subprocess.run(["git", "-C", str(origin), "config", "receive.denyCurrentBranch", "updateInstead"], check=True)
+    (origin / "README.md").write_text("seed\n")
+    subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(origin), "commit", "-q", "-m", "seed"], check=True, env=env)
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    subprocess.run(["git", "-C", str(work), "config", "commit.gpgsign", "false"], check=True)
+    # Mirror the real tree's own module layout inside the fixture: this
+    # script and lead-gate-lib.py at their real relative paths, so
+    # REPO_ROOT/`_lib_module()` resolve inside `work`, never the real repo.
+    (work / ".claude" / "hooks").mkdir(parents=True)
+    (work / "ci" / "scripts").mkdir(parents=True)
+    (work / "docs" / "rigor" / "contracts").mkdir(parents=True)
+    (work / "docs" / "plans" / "99-fixture" / "proposals").mkdir(parents=True)
+    lib_text = LEAD_GATE_LIB.read_text() if LEAD_GATE_LIB.exists() else _MINIMAL_SLUGIFY_STUB
+    (work / ".claude" / "hooks" / "lead-gate-lib.py").write_text(lib_text)
+    (work / "ci" / "scripts" / "check_rigor_record.py").write_text(Path(__file__).read_text())
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "scaffold"], check=True, env=env)
+    subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"], check=True)
+    subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b", "feat/rr-fixture"], check=True)
+    return origin, work
+
+
+# A minimal, self-contained fallback if this fixture ever runs with no real
+# lead-gate-lib.py reachable (never used against the real tree — only a
+# defensive stub so the fixture harness itself cannot silently pass by
+# accident when the real file is missing).
+_MINIMAL_SLUGIFY_STUB = (
+    "import re\n"
+    "def slugify(branch):\n"
+    "    return re.sub(r'[^A-Za-z0-9._-]', '_', branch.strip()) or 'UNBOUND'\n"
+)
+
+
+def _commit(work: Path, message: str, files: dict[str, str], swarm: bool = True) -> str:
+    for rel, content in files.items():
+        p = work / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    full_msg = message + ("\n\nCo-Authored-By: Claude Fixture <noreply@anthropic.com>" if swarm else "")
+    env = dict(os.environ)
+    env.update(_FIXTURE_ENV)
+    subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", full_msg], check=True, env=env)
+    return _sh(work, "rev-parse", "HEAD")
+
+
+def _run_check_in(work: Path, env_overrides: dict | None = None) -> Result:
+    env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "main", "GITHUB_HEAD_REF": "feat/rr-fixture"}
+    if env_overrides:
+        env.update(env_overrides)
+    old = {}
+    for k, v in env.items():
+        old[k] = os.environ.get(k)
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    try:
+        global LEAD_GATE_LIB
+        real_lib = LEAD_GATE_LIB
+        LEAD_GATE_LIB = work / ".claude" / "hooks" / "lead-gate-lib.py"
+        try:
+            return run_check(work)
+        finally:
+            LEAD_GATE_LIB = real_lib
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+_VALID_CONTRACT = "# A mechanism contract\n\nCites `docs/README-fixture.md:1` which exists.\n"
+
+
+def fixture_rr1_not_armed_docs_only() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _commit(work, "docs: a docs-only change", {"docs/only.md": "hello\n"})
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR1", f"a docs-only diff must not arm: {r.failures}")
+
+
+def fixture_rr2_armed_no_record() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _commit(work, "ci: touch a gate script", {"ci/scripts/probe.py": "print('x')\n"})
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR2", "armed with no rigor record must FAIL")
+        _assert(any("no committed rigor record" in f for f in r.failures), "RR2",
+                f"reason must name the missing record: {r.failures}")
+
+
+def fixture_rr3_record_no_pressure_row() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "adversarial-audit", "verdict": "PASS"})
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR3", "a record with no pressure-tester row must FAIL")
+        _assert(any("no pressure-tester row" in f for f in r.failures), "RR3", f"{r.failures}")
+
+
+def fixture_rr4_no_contract_file() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR4", "armed with a record+pressure row but no contract file must FAIL")
+        _assert(any("no committed mechanism contract" in f for f in r.failures), "RR4", f"{r.failures}")
+
+
+def fixture_rr5_full_disclosure_allows() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR5", f"full disclosure must ALLOW: {r.failures}")
+
+
+def fixture_rr6_bad_citation_fails() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        bad_contract = "# Contract\n\nCites `docs/README-fixture.md:99` which does not have 99 lines.\n"
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": bad_contract,
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR6", "a citation past the file's own line count must FAIL")
+        _assert(any("has only" in f for f in r.failures), "RR6", f"{r.failures}")
+
+
+def fixture_rr7_near_identical_contract_fails() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        # Commit an EXISTING contract on main first (via a swarm commit on
+        # the feature branch itself, at the SAME path a second file will
+        # copy — near-identical after whitespace normalization).
+        _commit(work, "docs: an existing contract", {
+            "docs/rigor/contracts/other-unit.md": "# A mechanism contract\n\nCites `docs/README-fixture.md:1` which exists.\n",
+        })
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": "  # A mechanism contract  \n\n\nCites `docs/README-fixture.md:1` which exists.\n",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR7", "a whitespace-only variant of an existing contract must FAIL as near-identical")
+        _assert(any("near-identical" in f for f in r.failures), "RR7", f"{r.failures}")
+
+
+def fixture_rr8_noop_shapes() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _commit(work, "ci: touch a gate script, human-authored", {"ci/scripts/probe.py": "print('x')\n"}, swarm=False)
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR8a", f"a human-authored-only range must no-op: {r.failures}")
+
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _commit(work, "chore: bump crate version", {"crates/foo/Cargo.toml": "[package]\nversion=\"0.2.0\"\n"})
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR8b", f"a release-shaped (Cargo.toml-only) diff must no-op: {r.failures}")
+
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _commit(work, "ci: touch a gate script", {"ci/scripts/probe.py": "print('x')\n"})
+        r = _run_check_in(work, {"GITHUB_ACTOR": "dependabot[bot]"})
+        _assert(r.ok(), "RR8c", f"a dependabot actor must no-op: {r.failures}")
+
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _commit(work, "ci: touch a gate script", {"ci/scripts/probe.py": "print('x')\n"})
+        _commit(work, 'Revert "ci: touch a gate script"', {"ci/scripts/probe.py": "orig\n"})
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR8d", f"a revert HEAD commit must no-op: {r.failures}")
+
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        r = _run_check_in(work, {"GITHUB_EVENT_NAME": "push"})
+        _assert(r.ok(), "RR8e", f"a non-pull_request event must no-op: {r.failures}")
+
+
+def fixture_rr9_ancestry_advisory_only() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED",
+                           "head_sha": "cafef00d1234567890abcdef1234567890abcdef"})
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR9", f"an unresolvable head_sha must WARN, never FAIL: {r.failures}")
+        _assert(any("does not resolve" in w for w in r.warnings), "RR9",
+                f"the unresolvable sha must be reported as a warning: {r.warnings}")
+
+
+def fixture_rr10_allowlisted_unit_noop() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        (work / "ci" / "scripts" / "rigor_record_allowlist.txt").write_text("# fixture allowlist\nfeat_rr-fixture\n")
+        _commit(work, "ci: touch a gate script", {"ci/scripts/probe.py": "print('x')\n"})
+        global ALLOWLIST_PATH
+        real_allowlist = ALLOWLIST_PATH
+        ALLOWLIST_PATH = work / "ci" / "scripts" / "rigor_record_allowlist.txt"
+        try:
+            r = _run_check_in(work)
+        finally:
+            ALLOWLIST_PATH = real_allowlist
+        _assert(r.ok(), "RR10", f"an allowlisted unit must no-op even though armed: {r.failures}")
+
+
+def fixture_rr11_allowlist_only_shrinks() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        origin, work = _pr_repo(Path(td))
+        allow_rel = "ci/scripts/rigor_record_allowlist.txt"
+        _commit(work, "seed allowlist", {allow_rel: "unit-a\n"})
+        _sh(work, "push", "-q", "origin", "HEAD:main")
+        _sh(work, "fetch", "-q", "origin", "main")
+        global ALLOWLIST_PATH
+        real_allowlist = ALLOWLIST_PATH
+        ALLOWLIST_PATH = work / allow_rel
+        try:
+            rc = check_allowlist_only_shrinks(work)
+            _assert(rc == 0, "RR11a", "an unchanged allowlist must pass the shrink-only ratchet")
+            (work / allow_rel).write_text("unit-a\nunit-b\n")
+            rc = check_allowlist_only_shrinks(work)
+            _assert(rc != 0, "RR11b", "adding a NEW entry (not yet on origin/main) must FAIL the ratchet")
+        finally:
+            ALLOWLIST_PATH = real_allowlist
+
+
+RR_FIXTURES = [
+    ("RR1", fixture_rr1_not_armed_docs_only),
+    ("RR2", fixture_rr2_armed_no_record),
+    ("RR3", fixture_rr3_record_no_pressure_row),
+    ("RR4", fixture_rr4_no_contract_file),
+    ("RR5", fixture_rr5_full_disclosure_allows),
+    ("RR6", fixture_rr6_bad_citation_fails),
+    ("RR7", fixture_rr7_near_identical_contract_fails),
+    ("RR8", fixture_rr8_noop_shapes),
+    ("RR9", fixture_rr9_ancestry_advisory_only),
+    ("RR10", fixture_rr10_allowlisted_unit_noop),
+    ("RR11", fixture_rr11_allowlist_only_shrinks),
+]
+
+
+def self_test() -> int:
+    failures: list[str] = []
+    for name, fn in RR_FIXTURES:
+        try:
+            fn()
+            print(f"check-rigor-record[{name}]: OK")
+        except Failure as e:
+            failures.append(f"{name}: {e}")
+            print(f"check-rigor-record[{name}]: FAIL — {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{name}: unexpected exception: {e!r}")
+            print(f"check-rigor-record[{name}]: FAIL (unexpected exception) — {e!r}", file=sys.stderr)
+    if failures:
+        print("check-rigor-record: FAIL", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(f"check-rigor-record: all {len(RR_FIXTURES)} self-test fixture(s) passed.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if "--self-test" in argv:
+        return self_test()
+    if "--check-allowlist-only-shrinks" in argv:
+        return check_allowlist_only_shrinks()
+    result = run_check()
+    for w in result.warnings:
+        print(f"check-rigor-record: WARNING (advisory) — {w}")
+    if not result.ok():
+        print("check-rigor-record: FAIL", file=sys.stderr)
+        for f in result.failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print("check-rigor-record: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

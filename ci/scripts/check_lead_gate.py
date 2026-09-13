@@ -55,6 +55,14 @@ Required fixtures (RED when the corresponding hook arm is removed):
   G19 the coverage arm is selected by the DATA: a row with a non-empty
       class_enumeration but NO `enumeration_missing` key still requires
       `sites` (the flag is diagnostic, never a discriminator)
+  OQ1/OQ2  esc-lead-gate-R10: alongside the >=2 examined-clean probe sites
+      R2 already requires, a relay must ALSO carry a non-empty
+      `open_question` — a site examined and explicitly NOT closed, naming
+      the attack for the next round. OQ1: an otherwise-fully-satisfying
+      relay (R1/R2/R3 all pass) with NO `open_question` is denied, naming
+      the missing field. OQ2: the SAME relay plus a non-empty
+      `open_question` is allowed. Armed unconditionally, alongside R2 —
+      never folded into `probe`'s own >=2 count.
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`
@@ -67,7 +75,13 @@ Required fixtures (RED when the corresponding hook arm is removed):
       row IS written, never silently dropped
   V3  an unrecognized raw verdict value defaults to BLOCK and the deny
       reason names the raw value
-  V4/V5/V6  `_PASS_LIKE` pinned individually: "PASS", "verified", "PROCEED"
+  V4/V5/V6  the per-agent-type PASS vocabulary (esc-lead-gate-R7d) is pinned
+      individually: "PASS" (adversarial-audit), "verified" (fix-verifier),
+      "PROCEED" (pressure-tester) each clear THEIR OWN card's row; three
+      negatives pin the fix itself — adversarial-audit "verified",
+      adversarial-audit "PROCEED", and oracle "verified" must NOT clear,
+      because none is that card's own spelling (the pooled global set used
+      to let all three clear)
   V7  a `</verdict>` (or a stray `}`) inside the verdict's own `notes`
       STRING does not truncate/corrupt the region (round-2 finding 6)
   V8  an UNPARSEABLE verdict is filed under the agent's SubagentStart
@@ -129,6 +143,7 @@ Run: `python3 ci/scripts/check_lead_gate.py --self-test`
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -302,6 +317,26 @@ def _commit_fix(root: Path, *files: str) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def _commit_claim_fix(root: Path, path: str, lines: list[str]) -> str:
+    """esc-lead-gate-R11: like `_commit_fix`, but writes EXACT `lines`
+    content (never placeholder text) to `path`, on the current branch —
+    fixtures need a real, known claim-shaped line at a known 1-indexed line
+    number to exercise the hook's own `_parse_claim_sites` derivation."""
+    p = root / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", f"fix: {path}")
+    return _git(root, "rev-parse", "HEAD")
+
+
+def _claim_output_hash(rc: int, stdout: str) -> str:
+    """MUST match `_run_claim_command`'s own hashing convention in the
+    (proposed, patched) hook EXACTLY: `sha256(f"{rc}\\n{stdout}")` — stdout
+    and exit code only, stderr excluded."""
+    return hashlib.sha256(f"{rc}\n{stdout}".encode("utf-8")).hexdigest()
+
+
 def _assert(cond: bool, label: str, detail: str = "") -> None:
     if not cond:
         raise Failure(f"{label}: {detail}")
@@ -370,13 +405,36 @@ def _relay_path_exact(root: Path, row: dict) -> Path:
                                     row["agent_type"], row["ts"])
 
 
+# esc-lead-gate-R10: the fixture-only default `open_question` value every
+# pre-R10 fixture inherits automatically (below) — never asserted on, only
+# a valid non-empty placeholder so existing ALLOW fixtures stay ALLOW.
+_DEFAULT_OPEN_QUESTION = "fixture-default.py:1 — attack: none captured (fixture placeholder)"
+
+
 def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = None,
                         probe: list[str] | None = None, fix_head: str | None = None,
+                        open_question: str | None = _DEFAULT_OPEN_QUESTION,
+                        claims: dict[str, dict] | None = None,
                         override: dict | None = None) -> None:
     """esc-097: `fix_head` (the fix commit's full sha) is written into the
     relay artifact whenever the caller supplies one — the R3 arm's own
     field, always OMITTED unless a caller passes it (so every pre-esc-097
-    fixture's relay shape is byte-identical to before)."""
+    fixture's relay shape is byte-identical to before).
+
+    esc-lead-gate-R10: `open_question` defaults to a fixed, non-empty
+    placeholder string — so every EXISTING call site (none of which passes
+    this kwarg) keeps satisfying the new always-armed requirement without
+    editing dozens of unrelated fixtures — exactly the same backward-compat
+    shape `fix_head`'s own None-means-omitted default already established.
+    A fixture that means to test the R10 arm itself passes
+    `open_question=None` (omit) or an explicit string (present).
+
+    esc-lead-gate-R11: `claims` needs NO such backward-compat default —
+    the arm is armed by the DATA (a non-empty hook-derived `claim_sites`),
+    and no EXISTING fixture's placeholder fix content (`"fix content for
+    {name} ({marker})\\n"`, from `_commit_fix`) matches any claim phrase, so
+    every pre-R11 fixture's `claim_sites` is empty and the arm never fires
+    for them regardless of whether `claims` is present."""
     path = _relay_path_exact(root, row)
     artifact = {"unit_branch": row["unit_branch"], "agent_type": row["agent_type"], "block_ts": row["ts"]}
     if fix_head is not None:
@@ -385,6 +443,10 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
         artifact["sites"] = sites
     if probe is not None:
         artifact["probe"] = probe
+    if open_question is not None:
+        artifact["open_question"] = open_question
+    if claims is not None:
+        artifact["claims"] = claims
     if override:
         artifact.update(override)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -891,6 +953,19 @@ def fixture_v4_v5_v6_pass_like_pinned() -> None:
         msg = "```json\n" + json.dumps(v) + "\n```"
         row = _stop_and_read(root, msg, agent_type=agent_type)
         _assert(row["verdict"] == "PASS", f"V4-6[{raw}]", f"{raw!r} must normalize to PASS, got {row['verdict']!r}")
+    # esc-lead-gate-R7d: the vocabulary is PER AGENT TYPE, never pooled — a
+    # raw value that is PASS-like for ONE card must NOT clear a DIFFERENT
+    # card's row. All three reproduced true against the round-1/round-2
+    # pooled `_PASS_LIKE` set (KILL verdicts tasks/abe09018c16727106.output
+    # finding 7, tasks/a51ebcc1234dd552f.output premise "R6c").
+    for raw, agent_type in (("verified", "adversarial-audit"), ("PROCEED", "adversarial-audit"),
+                             ("verified", "oracle")):
+        root = _fresh_root()
+        v = {"kind": "verdict", "verdict": raw, "unit_branch": f"feat/neg-{raw}-{agent_type}", "findings": []}
+        msg = "```json\n" + json.dumps(v) + "\n```"
+        row = _stop_and_read(root, msg, agent_type=agent_type)
+        _assert(row["verdict"] == "BLOCK", f"V4-6neg[{agent_type}/{raw}]",
+                f"{raw!r} is not {agent_type}'s own PASS spelling and must NOT clear, got {row['verdict']!r}")
 
 
 def fixture_v7_tag_inside_notes_string_does_not_corrupt() -> None:
@@ -1240,6 +1315,189 @@ def fixture_g19_coverage_arm_selected_by_data_not_flag() -> None:
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g19"}}, root)
     _assert(p.returncode == 2, "G19",
             f"data-armed coverage must deny a probe-only relay, got {p.returncode}: {p.stderr}")
+
+
+# ==========================================================================
+# OQ1-OQ2 — esc-lead-gate-R10: alongside the >=2 examined-clean probe sites
+# R2 already requires, ONE further relay entry must be an OPEN QUESTION — a
+# site examined and explicitly NOT closed, naming the attack for the next
+# round. Armed ALWAYS, conjunctive with R1-R3, never folded into `probe`'s
+# own counting.
+# ==========================================================================
+
+def fixture_oq1_no_open_question_denies() -> None:
+    """A relay with >=2 clean, disjoint probe sites AND a valid fix_head
+    (satisfying R1/R2/R3 in full) but an explicitly ABSENT `open_question`
+    must still be denied — the new field is armed UNCONDITIONALLY, never
+    satisfied by `probe` alone."""
+    root = _temp_repo("feat/oq1")
+    row = _write_block_row(root, "feat/oq1", "a1", "adversarial-audit", None, ["foo.py:10"])
+    fix_head = _commit_fix(root, "baz.py")
+    _write_relay_exact(root, row, probe=["bar.py:5", "baz.py:9"], fix_head=fix_head,
+                        open_question=None)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/oq1"}}, root)
+    _assert(p.returncode == 2, "OQ1", f"a relay with no open_question must deny, got {p.returncode}: {p.stderr}")
+    _assert("open_question" in p.stderr, "OQ1",
+            f"the deny reason must name the missing open_question: {p.stderr!r}")
+
+
+def fixture_oq2_open_question_present_allows() -> None:
+    """The SAME relay as OQ1, plus a non-empty `open_question`, must ALLOW —
+    proving the new field is satisfiable, not merely a permanent deny."""
+    root = _temp_repo("feat/oq2")
+    row = _write_block_row(root, "feat/oq2", "a1", "adversarial-audit", None, ["foo.py:10"])
+    fix_head = _commit_fix(root, "baz.py")
+    _write_relay_exact(
+        root, row, probe=["bar.py:5", "baz.py:9"], fix_head=fix_head,
+        open_question="qux.py:3 — examined, could not close: retry under a concurrent writer")
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/oq2"}}, root)
+    _assert(p.returncode == 0, "OQ2", f"a relay with an open_question present must allow, got {p.returncode}: {p.stderr}")
+
+
+# ==========================================================================
+# UC1-UC7 — esc-lead-gate-R11 ("untested claims carry a test"): the relay may
+# not be accepted while the fix's OWN diff still carries a claim-shaped line
+# (the HOOK's own derived enumeration, `_parse_claim_sites`) with no
+# disposition in `claims`. Registered directly in FIXTURES below, the same
+# way OQ1/OQ2 (esc-lead-gate-R10) already are — this file and the mechanism
+# it exercises land in the SAME patch, so there is no unpatched state in
+# which these fixture functions exist at all.
+# ==========================================================================
+
+_UC_ENUM = ["foo.py:10"]
+_UC_FINDINGS = ["foo.py:10"]
+_UC_PROBE = ["bar.py:2", "qux.py:1"]
+_UC_SITES = {"foo.py:10": "checked and clean"}
+_UC_CLAIM_LINES = [
+    "import os",
+    "# this cannot be driven from a test",
+    "# no injection point here",
+    "def f():",
+    "    return os",
+]
+
+
+def _uc_setup(unit: str):
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", _UC_ENUM, _UC_FINDINGS)
+    fix_head = _commit_claim_fix(root, "bar.py", _UC_CLAIM_LINES)
+    return root, row, fix_head
+
+
+def fixture_uc1_missing_claim_denied() -> None:
+    """The fix adds a real claim-shaped line (`bar.py:2`, `# this cannot be
+    driven from a test`) but the relay carries no `claims` object at all —
+    denied naming the derived, uncovered claim-shaped line(s), even though
+    R1/R2/R3/R10 are all otherwise satisfied."""
+    root, row, fix_head = _uc_setup("feat/uc1")
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc1"}}, root)
+    _assert(p.returncode == 2, "UC1", f"a relay with no `claims` must deny, got {p.returncode}: {p.stderr}")
+    _assert("claim" in p.stderr.lower(), "UC1",
+            f"the deny reason must name the missing claims obligation: {p.stderr!r}")
+
+
+def fixture_uc2_tested_claim_with_matching_hash_allows() -> None:
+    """The SAME relay as UC1, with `bar.py:2` marked `tested` and a command
+    whose RE-EXECUTED output hash matches the recorded one, must ALLOW —
+    `bar.py:3` (`# no injection point here`) also needs a disposition since
+    the hook enumerates BOTH claim-shaped lines the fix adds."""
+    root, row, fix_head = _uc_setup("feat/uc2")
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
+        "bar.py:2": {"status": "tested", "command": "printf hello",
+                     "output_hash": _claim_output_hash(0, "hello")},
+        "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture; "
+                                                        "attack: drive it via the pattern in tests/it/probe.rs"},
+    })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc2"}}, root)
+    _assert(p.returncode == 0, "UC2", f"a fully-dispositioned relay must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_uc3_hash_mismatch_denied() -> None:
+    """The SAME `tested` claim as UC2, but the recorded `output_hash` does
+    NOT match what re-executing `command` actually produces — denied,
+    naming that the claim is not established."""
+    root, row, fix_head = _uc_setup("feat/uc3")
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
+        "bar.py:2": {"status": "tested", "command": "printf hello", "output_hash": "0" * 64},
+        "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture"},
+    })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc3"}}, root)
+    _assert(p.returncode == 2, "UC3", f"a non-reproducing hash must deny, got {p.returncode}: {p.stderr}")
+    _assert("not established" in p.stderr or "does not reproduce" in p.stderr, "UC3",
+            f"the deny reason must name the non-reproducing hash: {p.stderr!r}")
+
+
+def fixture_uc4_write_verb_denied() -> None:
+    """A `tested` claim whose command contains a denied write-verb program
+    is denied WITHOUT ever executing it — never reaches the hash-compare
+    step at all."""
+    root, row, fix_head = _uc_setup("feat/uc4")
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
+        "bar.py:2": {"status": "tested", "command": "rm -rf /tmp/should-never-run-uc4",
+                     "output_hash": "a" * 64},
+        "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture"},
+    })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc4"}}, root)
+    _assert(p.returncode == 2, "UC4", f"a write-verb command must deny, got {p.returncode}: {p.stderr}")
+    _assert("denied program" in p.stderr or "write-verb" in p.stderr, "UC4",
+            f"the deny reason must name the write-verb denylist: {p.stderr!r}")
+    _assert(not Path("/tmp/should-never-run-uc4").exists(), "UC4",
+            "the denied command must never have been executed")
+
+
+def fixture_uc5_uncovered_with_reason_allows() -> None:
+    """Both claim-shaped lines marked `uncovered`, each with its OWN
+    distinct, non-empty reason — must ALLOW; an honest disclosure costs
+    nothing."""
+    root, row, fix_head = _uc_setup("feat/uc5")
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
+        "bar.py:2": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture; "
+                                                        "attack: drive it via tests/it/probe.rs's own pattern"},
+        "bar.py:3": {"status": "uncovered", "reason": "the injection surface here is a private fn with "
+                                                        "no test harness yet; attack: add one exercising it directly"},
+    })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc5"}}, root)
+    _assert(p.returncode == 0, "UC5", f"two distinct honest uncovered reasons must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_uc6_duplicate_uncovered_reason_denied() -> None:
+    """Both claim-shaped lines marked `uncovered` with the IDENTICAL
+    (normalized) reason — a templated, copy-pasted disposition, denied as
+    the anti-vacuity check's own target."""
+    root, row, fix_head = _uc_setup("feat/uc6")
+    same_reason = "not established; attack: write a probe"
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
+        "bar.py:2": {"status": "uncovered", "reason": same_reason},
+        "bar.py:3": {"status": "uncovered", "reason": "  " + same_reason + "  "},
+    })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc6"}}, root)
+    _assert(p.returncode == 2, "UC6", f"a templated duplicate reason must deny, got {p.returncode}: {p.stderr}")
+    _assert("IDENTICAL" in p.stderr, "UC6",
+            f"the deny reason must name the duplicate uncovered reason: {p.stderr!r}")
+
+
+def fixture_uc7_no_claim_shaped_line_is_a_noop() -> None:
+    """A fix that adds NO claim-shaped line (ordinary `_commit_fix`
+    placeholder content) carries no R11 obligation at all — the relay needs
+    no `claims` object, the same "armed by the DATA" posture R1 already
+    takes toward `class_enumeration`."""
+    root = _temp_repo("feat/uc7")
+    row = _write_block_row(root, "feat/uc7", "a1", "adversarial-audit", _UC_ENUM, _UC_FINDINGS)
+    fix_head = _commit_fix(root, "bar.py")
+    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc7"}}, root)
+    _assert(p.returncode == 0, "UC7", f"a fix with no claim-shaped line must allow with no `claims`, "
+                                       f"got {p.returncode}: {p.stderr}")
 
 
 # ==========================================================================
@@ -2039,6 +2297,15 @@ FIXTURES = [
     ("G17", fixture_g17_probed_relay_accepted_when_enumeration_present),
     ("G18", fixture_g18_probe_boundary_cases),
     ("G19", fixture_g19_coverage_arm_selected_by_data_not_flag),
+    ("OQ1", fixture_oq1_no_open_question_denies),
+    ("OQ2", fixture_oq2_open_question_present_allows),
+    ("UC1", fixture_uc1_missing_claim_denied),
+    ("UC2", fixture_uc2_tested_claim_with_matching_hash_allows),
+    ("UC3", fixture_uc3_hash_mismatch_denied),
+    ("UC4", fixture_uc4_write_verb_denied),
+    ("UC5", fixture_uc5_uncovered_with_reason_allows),
+    ("UC6", fixture_uc6_duplicate_uncovered_reason_denied),
+    ("UC7", fixture_uc7_no_claim_shaped_line_is_a_noop),
     ("T1", fixture_t1_card_schema_line_substituted_binds),
     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
     ("T3", fixture_t3_start_binds_unit_branch_colon_form),

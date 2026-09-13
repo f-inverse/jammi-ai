@@ -25,7 +25,14 @@ why the remaining design still closes the expensive loop, F10):
   relay's requirements are a CONJUNCTION (esc-064): coverage (`sites`) is
   armed by a non-empty `class_enumeration` — the data, never the recorded
   `enumeration_missing` flag — and adjacent probing (`probe`, >=2 distinct
-  sites outside enumeration+findings) is armed ALWAYS.
+  sites outside enumeration+findings) is armed ALWAYS. esc-lead-gate-R10:
+  alongside those >=2 examined-clean sites, the relay must ALSO carry a
+  non-empty `open_question` — a site examined and explicitly NOT closed,
+  naming the attack for the next round to run. A one-line schema
+  requirement over lead-authored text: a COST FLOOR, not proof of
+  examination, the same limit `probe` itself already carries — it cannot
+  be satisfied by writing nothing, and a human reads at merge whether the
+  open question was real.
 
 esc-097 (R3, "PROBE THE FIX"): the relay gains ONE further requirement,
 `fix_head` (a full sha, `re.fullmatch(r"[0-9a-f]{7,40}")`) plus a `probe`
@@ -96,24 +103,31 @@ operator-facing ALLOW reason (and the `hook.log` row it is written into),
 so shadowing stays visible even when it did not change the outcome.
 
 Arm order: artifact-exists -> schema -> R1 (coverage) -> R2 (proactivity,
-always) -> CLAUDE_PROJECT_DIR is set -> `row.head_sha` ("block_sha")
+always) -> R10 (open question, always) -> CLAUDE_PROJECT_DIR is set ->
+`row.head_sha` ("block_sha")
 matches the sha shape and resolves (STARTS WITH the given hex) -> `fix_head`
 matches the sha shape, differs from block_sha, and resolves (STARTS WITH
 the given hex) -> relay `unit_branch` slugifies to this BLOCK's own
 `unit_slug` -> that `unit_branch` resolves under `refs/heads/` -> `fix_head`
 is an ancestor of `unit_branch`'s resolved tip -> R3 (>=1 probe path names
 a file the fix actually changed, per `git diff --name-only -z block_sha
-fix_head` — TRUSTED and COMPUTED, never lead-supplied). git runs ONLY
-here, ONLY in `$CLAUDE_PROJECT_DIR` (required explicitly), FIVE calls
-total per decision (`rev-parse --verify` block_sha, `rev-parse --verify`
-fix_head, `rev-parse --verify --end-of-options refs/heads/...`
-unit_branch, `merge-base --is-ancestor`, `diff --name-only`), every
-invocation carrying `--end-of-options` immediately before its revision
-arguments (git >= 2.24) so a value shaped like an option (e.g.
-`--output=/tmp/x`) can never be read as one, ALL FIVE sharing ONE
-per-decision monotonic deadline (`_GIT_BUDGET_S = 5.0`, an absolute
+fix_head` — TRUSTED and COMPUTED, never lead-supplied) -> R11 (esc-lead-
+gate-R11, "untested claims carry a test": every claim-shaped line the
+fix's OWN diff adds, per `git diff -U0 block_sha fix_head` — the hook's
+OWN derived enumeration, `_parse_claim_sites` — carries a `claims`
+disposition: TESTED, with a re-executed, hash-matching command, or
+explicitly UNCOVERED with a reason). git runs ONLY here, ONLY in
+`$CLAUDE_PROJECT_DIR` (required explicitly), SIX calls total per decision
+(`rev-parse --verify` block_sha, `rev-parse --verify` fix_head,
+`rev-parse --verify --end-of-options refs/heads/...` unit_branch,
+`merge-base --is-ancestor`, `diff --name-only`, and — esc-lead-gate-R11 —
+`diff -U0`), every invocation carrying `--end-of-options` immediately
+before its revision arguments (git >= 2.24) so a value shaped like an
+option (e.g. `--output=/tmp/x`) can never be read as one, ALL SIX sharing
+ONE per-decision monotonic deadline (`_GIT_BUDGET_S = 5.0`, an absolute
 `time.monotonic()` value threaded through every `_run_git` call, never a
-fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s)
+fresh 5s per call — the whole arm, INCLUDING R11's own claim-command
+re-execution below, is bounded by 5s total, not 6x5s)
 (`Popen` into its own process group, `Popen.wait(timeout=<time left on the
 shared deadline>)` — never `.communicate()`, never `with Popen(...)` —
 stdout/stderr captured to `tempfile.TemporaryFile()`s, BOTH read back only
@@ -131,12 +145,34 @@ underlying git problem. HONEST LIMIT: R3 cannot verify examination, only that a 
 path is a real member of the fix's own diff — a lead can still satisfy it
 by pasting a path out of its own change; the substantive rule
 (design-before-mechanism, one fix round per BLOCK) is a
-`.claude/agents/lead.md` discipline, not a hook. A further, PRE-EXISTING
-wrinkle, not introduced by this arm: `_PASS_LIKE` is checked globally when
-classifying a raw verdict value, so an adversarial-audit row whose OWN
-verdict text merely CONTAINS a pass-like token ("verified"/"PROCEED") also
-closes a BLOCK — independent of R3 entirely; out of scope for this
-proposal.
+`.claude/agents/lead.md` discipline, not a hook. A PRE-EXISTING wrinkle
+this arm never introduced is now CLOSED (esc-lead-gate-R7d): the PASS
+vocabulary used to be checked as one GLOBAL set (`_PASS_LIKE`), so an
+adversarial-audit row whose OWN verdict text was literally "verified" or
+"PROCEED" — words that clear a DIFFERENT card's row, never this one's —
+also closed a BLOCK, independent of R3 entirely. `_pass_word_for(agent_type)`
+(below) replaces the pooled set with a PER-AGENT-TYPE map, so a raw value
+only clears when it is that type's OWN card spelling.
+
+esc-lead-gate-R11 ("UNTESTED CLAIMS CARRY A TEST"): the retrospective this
+arm formalises (`{scratchpad}/CONTRACT-RULES.md`, session-local, cited only
+for provenance) named the SAME failure four times running — a caller-set
+claim that was false on its destructive callers, a "re-verified" claim that
+was wrong when written, an impossibility claim an auditor refuted in two
+seconds, and a universal about an uncertain outcome — none of them a wrong
+SITE; each a CLAIM the fix's own diff asserted and never tested. The
+obligation is DERIVED BY THE HOOK from the diff's own shape (`_parse_claim_
+sites`, run from `_fix_window`, sharing its git deadline), never declared by
+the lead — exactly the posture R1 already takes toward the auditor's own
+`class_enumeration`, here applied to the lead's OWN fix. HONEST LIMIT,
+stated as plainly as R3's own: this cannot verify that a `tested` claim's
+command is a GOOD test, only that it is a NAMED one whose recorded output
+hash REPRODUCES under fresh execution, and it cannot verify that an
+`uncovered` reason is TRUE, only that it is present and not a copy-paste
+duplicate of another uncovered reason in the same relay — a lead can still
+discharge a real claim with a weak command; what it cannot do is skip a
+claim, because the hook enumerates them, never the lead. See the proposal
+doc for the full design history and the residual, stated without softening.
 
 Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
 `SendMessage` gating and all message-prose parsing; implementer-dispatch
@@ -187,9 +223,11 @@ subprocess anywhere" doctrine to this narrower, explicit exception).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -235,10 +273,36 @@ HARNESS_BUILTIN_TYPES = {"general-purpose", "Explore", "Plan", "claude", "status
 # Verdict normalization — parse the JSON field, never substring-grep.
 # --------------------------------------------------------------------------
 
-# "_PASS_LIKE = exactly each card's PASS vocabulary" — "PASS" is every card
-# except fix-verifier ("verified") and pressure-tester ("PROCEED"). Any
-# other value defaults to BLOCK.
-_PASS_LIKE = {"PASS", "verified", "PROCEED"}
+# esc-lead-gate-R7d: the PASS vocabulary is PER AGENT TYPE, never pooled —
+# a global set let an adversarial-audit row whose raw verdict text was
+# literally "verified" (fix-verifier's own spelling) or "PROCEED"
+# (pressure-tester's own spelling) also clear an adversarial-audit BLOCK,
+# independent of anything R3 checks. `_PASS_LIKE_BY_AGENT_TYPE` maps a TYPE
+# to the ONE literal string its own card spells as PASS; every type not
+# listed (adversarial-audit, citation-checker, discipline-test-auditor,
+# oracle, and any type outside STOP_MATCH_TYPES) defaults to "PASS" — the
+# closed-world membership check that decides whether a type is gated AT ALL
+# happens elsewhere, at dispatch time (GATED_TYPES/NEVER_GATED_TYPES), never
+# here. Confirmed against all seven STOP_MATCH_TYPES cards' own verdict
+# vocabularies and a census of every live verdict row: every real clearing
+# already uses its own card's spelling, so no clearing depended on the
+# pooled set.
+_PASS_LIKE_BY_AGENT_TYPE: dict[str, str] = {
+    "fix-verifier": "verified",
+    "acceptance-verifier": "verified",
+    "pressure-tester": "PROCEED",
+}
+_DEFAULT_PASS_WORD = "PASS"
+
+
+def _pass_word_for(agent_type: str) -> str:
+    """The ONE literal string `agent_type`'s own card spells as its
+    PASS-equivalent verdict. Every STOP_MATCH_TYPES card not in
+    `_PASS_LIKE_BY_AGENT_TYPE` (adversarial-audit, citation-checker,
+    discipline-test-auditor, oracle) spells it "PASS"; an unrecognized
+    agent_type also defaults to "PASS" — never a KeyError, since the
+    closed-world membership check belongs to `_decide_dispatch`, not here."""
+    return _PASS_LIKE_BY_AGENT_TYPE.get(agent_type, _DEFAULT_PASS_WORD)
 _TEMPLATE_UNIT_BRANCH = "_branch_"
 
 # The verdict is the LAST fenced ```json block — or, for one release, the
@@ -405,9 +469,13 @@ def extract_verdict_json(last_assistant_message: str) -> tuple[dict | None, str 
     return None, "unparseable"
 
 
-def normalize_verdict(data: dict | None) -> tuple[str, str | None]:
+def normalize_verdict(data: dict | None, agent_type: str) -> tuple[str, str | None]:
     """Returns `(verdict, verdict_raw)`; `verdict` is one of "PASS" |
-    "BLOCK" | "UNPARSEABLE"."""
+    "BLOCK" | "UNPARSEABLE". `agent_type` is the CALLER's own trusted value
+    (`handle_stop`'s SubagentStop payload field, or a stored row's own
+    `agent_type` via `_diagnose_row`) — never read out of `data` itself,
+    which is verifier-authored prose the same way every other verdict field
+    is (esc-lead-gate-R7d: PASS-like is PER CARD, never pooled)."""
     if data is None:
         return "UNPARSEABLE", None
     raw = data.get("verdict")
@@ -417,7 +485,7 @@ def normalize_verdict(data: dict | None) -> tuple[str, str | None]:
         return "UNPARSEABLE", None
     if not isinstance(raw, str):
         return "BLOCK", repr(raw)
-    if raw in _PASS_LIKE:
+    if raw == _pass_word_for(agent_type):
         return "PASS", raw
     return "BLOCK", raw
 
@@ -450,6 +518,18 @@ def parse_verdict_fields(data: dict | None) -> dict:
                         loc = item.get("location")
                         if isinstance(loc, str):
                             finding_locations.append(loc)
+    # esc-lead-gate-R7 (v2): a VERIFIER-authored field, never a lead-computed
+    # counter key — the auditor's own judgement that THIS round is a
+    # recurrence of an earlier one on the SAME unit, carried verbatim into
+    # the committed rigor record (`--export`) for a human to read at merge.
+    # No gate decision reads this field: it FAILS OPEN when the auditor does
+    # not notice a recurrence, and it is forgeable by the same ledger-append
+    # path every other row field already is — DIAGNOSTIC/DISCLOSURE ONLY,
+    # the same trust boundary as `class_enumeration` itself. `bool` is
+    # excluded explicitly (`isinstance(True, int)` is true in Python).
+    recurrence_of_round = data.get("recurrence_of_round") if data else None
+    if isinstance(recurrence_of_round, bool) or not isinstance(recurrence_of_round, int):
+        recurrence_of_round = None
     return {
         "class_enumeration": class_enum,
         "sweep_method": sweep_method,
@@ -460,6 +540,7 @@ def parse_verdict_fields(data: dict | None) -> dict:
         "head_sha": head_sha if isinstance(head_sha, str) else None,
         "worktree": worktree if isinstance(worktree, str) else None,
         "finding_locations": finding_locations,
+        "recurrence_of_round": recurrence_of_round,
     }
 
 
@@ -825,14 +906,25 @@ def _resolve_sha_exact(hexstr: str, label: str, cwd: str, deadline: float,
     return resolved, None
 
 
-def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None, str | None, list[str]]:
-    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm.
-    `(fix_changed, None, warnings)` on success; `(None, deny_reason,
-    warnings)` otherwise — `warnings` carries any accept-side git stderr
-    text noticed along the way (round-4: surfaced by the caller even when
-    it did not change the outcome). Only ever called from
-    `_relay_rejection`'s own repeat-dispatch caller, once R1/R2 have
-    already passed.
+def _fix_window(row: dict, unit_slug: str, data: dict,
+                 deadline: float) -> tuple[list[str] | None, dict[str, str] | None, str | None, list[str]]:
+    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm,
+    AND (esc-lead-gate-R11) the trusted, COMPUTED `claim_sites` map — every
+    claim-shaped line the fix's OWN diff adds, keyed `path:line`, mapped to
+    its own verbatim text. `(fix_changed, claim_sites, None, warnings)` on
+    success; `(None, None, deny_reason, warnings)` otherwise — `warnings`
+    carries any accept-side git stderr text noticed along the way (round-4:
+    surfaced by the caller even when it did not change the outcome). Only
+    ever called from `_relay_rejection`'s own repeat-dispatch caller, once
+    R1/R2 have already passed.
+
+    esc-lead-gate-R11: `deadline` is now a PARAMETER, minted ONCE by the
+    caller (`_relay_rejection`) via `_new_git_deadline()`, rather than
+    minted internally here as before — R3's own git calls and R11's
+    claim-scan (the new SIXTH call, below) share the SAME one-decision
+    budget this way; the arm never grows `_GIT_BUDGET_S` per-caller. Every
+    internal use of `deadline` below is otherwise UNCHANGED from before
+    this parameter move.
 
     esc-097 V18 (round-3 closure) plus the round-4 closure below:
     reachability binds TWO things, not one. First, git-free: the relay's
@@ -873,56 +965,56 @@ def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None
     the original, possibly-abbreviated caller-supplied value — so a
     `fix_head` given as a short prefix that resolves to the SAME commit as
     `block_sha` is caught as a re-roll even when the two strings differed
-    before resolution. FIVE git calls total (`rev-parse --verify` for
+    before resolution. SIX git calls total (`rev-parse --verify` for
     block_sha, `rev-parse --verify` for fix_head, `rev-parse --verify
     --end-of-options refs/heads/...` for unit_branch, `merge-base
-    --is-ancestor`, `diff --name-only`), each sharing ONE per-decision
-    deadline (`_new_git_deadline()` — `_GIT_BUDGET_S` total, not `5 *
-    _GIT_BUDGET_S`)."""
+    --is-ancestor`, `diff --name-only`, and — esc-lead-gate-R11 — `diff
+    -U0` for the claim-scan), each sharing ONE per-decision deadline
+    (`_new_git_deadline()`, now minted by the CALLER and threaded in as a
+    parameter — `_GIT_BUDGET_S` total, not `6 * _GIT_BUDGET_S`)."""
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
     if not project_dir:
-        return None, "hook needs CLAUDE_PROJECT_DIR for the relay arm", []
+        return None, None, "hook needs CLAUDE_PROJECT_DIR for the relay arm", []
 
-    deadline = _new_git_deadline()
     warnings: list[str] = []
 
     block_sha = row.get("head_sha")
     if not (isinstance(block_sha, str) and _SHA_RE.fullmatch(block_sha)):
-        return None, "BLOCK row's head_sha is not a valid sha", warnings
+        return None, None, "BLOCK row's head_sha is not a valid sha", warnings
     block_sha, why = _resolve_sha_exact(
         block_sha, "BLOCK row's head_sha", project_dir, deadline, warnings)
     if why is not None:
-        return None, why, warnings
+        return None, None, why, warnings
 
     fix_head = data.get("fix_head")
     if not (isinstance(fix_head, str) and _SHA_RE.fullmatch(fix_head)):
-        return None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha", warnings
+        return None, None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha", warnings
 
     if fix_head == block_sha:
-        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
+        return None, None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
 
     fix_head, why = _resolve_sha_exact(fix_head, "relay `fix_head`", project_dir, deadline, warnings)
     if why is not None:
-        return None, why, warnings
+        return None, None, why, warnings
     if fix_head == block_sha:
         # Round-4: a fix_head given as a SHORT prefix can resolve to the
         # SAME full commit as block_sha even when the two caller-supplied
         # strings differed — still a re-roll, only visible after both are
         # resolved to their full form.
-        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
+        return None, None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
 
     relay_ub = data.get("unit_branch")
     if not (isinstance(relay_ub, str) and relay_ub.strip()):
-        return None, "relay carries no `unit_branch` naming the unit this fix landed on", warnings
+        return None, None, "relay carries no `unit_branch` naming the unit this fix landed on", warnings
     if unit_slug == "UNBOUND":
-        return None, (
+        return None, None, (
             "this BLOCK was recorded without a unit binding (the UNBOUND fallback bucket) — "
             "re-dispatch naming the unit so the verdict lands on the unit's own file, then "
             "hand-remove the stale row for this block from UNBOUND.jsonl (never `rm` the "
             "shared file — it holds every other unit's UNBOUND rows too)"
         ), warnings
     if slugify(relay_ub) != unit_slug:
-        return None, (
+        return None, None, (
             f"relay `unit_branch` {relay_ub!r} does not name this BLOCK's own unit "
             f"(recorded under slug {unit_slug!r}) — reachability is bound to the file this "
             "BLOCK is filed under, not an arbitrary branch the relay names"
@@ -937,7 +1029,7 @@ def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None
         ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{relay_ub}^{{commit}}"],
         project_dir, deadline, warnings)
     if not ok:
-        return None, (
+        return None, None, (
             f"relay `unit_branch` {relay_ub!r} slugifies to this BLOCK's own unit but does not "
             f"resolve under refs/heads/ — {tip} (a unit whose worktree is on a detached HEAD "
             "cannot be relayed this way — there is no refs/heads entry to bind to)"
@@ -946,18 +1038,355 @@ def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None
         ["merge-base", "--is-ancestor", "--end-of-options", fix_head, tip], project_dir, deadline, warnings)
     if not ok:
         if rc == 1:
-            return None, (
+            return None, None, (
                 f"fix_head {fix_head} is not on {relay_ub!r}; if the fix was amended, name "
                 "the amended sha; if it was committed on a child branch, commit or merge it "
                 f"onto {relay_ub!r}"
             ), warnings
-        return None, f"could not check whether fix_head is on {relay_ub!r} — {why}", warnings
+        return None, None, f"could not check whether fix_head is on {relay_ub!r} — {why}", warnings
 
     ok, out, _rc = _run_git(
         ["diff", "--name-only", "-z", "--end-of-options", block_sha, fix_head], project_dir, deadline, warnings)
     if not ok:
-        return None, f"could not compute the fix window: {out}", warnings
-    return [seg for seg in out.split("\0") if seg], None, warnings
+        return None, None, f"could not compute the fix window: {out}", warnings
+    fix_changed = [seg for seg in out.split("\0") if seg]
+
+    # esc-lead-gate-R11 — the SIXTH git call, sharing the SAME deadline as
+    # the five above: the fix's own added-line diff, zero context (`-U0`),
+    # from which `_parse_claim_sites` derives the hook's OWN, mechanically
+    # DERIVED claim enumeration — never lead-asserted, the same posture R1
+    # already takes toward the auditor's own `class_enumeration`, applied
+    # here to the fix's diff instead of a finding.
+    ok, diff_out, _rc = _run_git(
+        ["diff", "-U0", "--end-of-options", block_sha, fix_head], project_dir, deadline, warnings)
+    if not ok:
+        return None, None, f"could not compute the fix's added-line diff (esc-lead-gate-R11): {diff_out}", warnings
+    claim_sites = _parse_claim_sites(diff_out)
+    return fix_changed, claim_sites, None, warnings
+
+
+# --------------------------------------------------------------------------
+# esc-lead-gate-R11 — "UNTESTED CLAIMS CARRY A TEST". The obligation is
+# DERIVED BY THE HOOK from the fix's own diff, never declared by the lead:
+# `_parse_claim_sites` (above, run from `_fix_window`, sharing its git
+# deadline) is the hook's OWN enumeration of every claim-shaped line the fix
+# ADDS. A relay may not be accepted while any such line lacks a disposition
+# in `claims` — see `_claims_rejection`, the sole caller of everything below.
+#
+# THE PHRASE FAMILY is the exact, finite set of claim shapes this program's
+# own retrospective (`{scratchpad}/CONTRACT-RULES.md` R-A/R-F/R-H, plus the
+# diagnosis's own "re-verified" example) named as the shape that kept costing
+# a full audit round: an impossibility/unreachability claim, a "safe
+# because"/"routes through" mechanism claim, a caller-SET totality claim, and
+# a completed-re-verification claim. Measured, not asserted: scoping to
+# PROSE LINES (below) plus literal, space-delimited multi-word phrases —
+# never a bare word — is what keeps this precise. A bare quantifier grep
+# (`every`/`only`/`always`, R-I's own tell) was tried first and produces
+# garbage — `grep -ciE '\\b(every|only|always)\\b'` alone returns 91 hits in
+# this very file and 1291 across `ci/scripts/*.py` — and is DELIBERATELY NOT
+# shipped; R-I's shape is a known, stated residual (see the proposal doc's
+# "what this does NOT do"). The phrase family below, unscoped, returns 26
+# hits across this repo's `ci/scripts` + `.claude/hooks` + `.claude/agents`
+# combined — a tractable number, not a flood.
+_CLAIM_PHRASES = (
+    "cannot be driven", "no injection point", "is unreachable", "is safe because",
+    "no caller can", "not producer-driven", "no reliable way to force",
+    "is not established", "structurally unreachable", "its only in-tree caller",
+    "its one in-tree caller", "every caller is", "routes through", "re-verified",
+)
+_CLAIM_RE = re.compile("|".join(re.escape(p) for p in _CLAIM_PHRASES), re.IGNORECASE)
+
+# WHERE: reuses the exact WHERE-scoping TECHNIQUE
+# `ci/scripts/check_doc_numbers_have_producers.py` already established for
+# precision (doc comments / whole-prose files, never bare code) — the
+# concept, not the file, since this hook must stay dependency-free and must
+# never import a CI-only script. A "prose line" is a whole line in a
+# whole-prose file extension, or a line whose STRIPPED text starts with the
+# file extension's own single-line-comment marker; an unknown extension
+# tries both `#` and `//` (never neither — failing OPEN here would silently
+# exempt an entire language from the rule, which is the wrong direction to
+# fail for a DENY-arming enumeration).
+_LINE_COMMENT_MARKERS: dict[str, tuple[str, ...]] = {
+    ".rs": ("//",), ".py": ("#",), ".sh": ("#",), ".bash": ("#",), ".toml": ("#",),
+    ".yml": ("#",), ".yaml": ("#",), ".js": ("//",), ".ts": ("//",), ".go": ("//",),
+    ".c": ("//",), ".h": ("//",), ".cpp": ("//",), ".hpp": ("//",), ".java": ("//",),
+}
+_WHOLE_LINE_PROSE_EXTS = {".md", ".mdx", ".rst", ".txt"}
+_DEFAULT_COMMENT_MARKERS = ("#", "//")
+
+
+def _is_prose_line(path: str, stripped: str) -> bool:
+    ext = Path(path).suffix.lower()
+    if ext in _WHOLE_LINE_PROSE_EXTS:
+        return True
+    markers = _LINE_COMMENT_MARKERS.get(ext, _DEFAULT_COMMENT_MARKERS)
+    return any(stripped.startswith(m) for m in markers)
+
+
+_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _parse_claim_sites(diff_text: str) -> dict[str, str]:
+    """The hook's OWN derived claim enumeration from a `git diff -U0`
+    payload: every `path:line` the diff ADDS (never a removed or context
+    line — there are no context lines under `-U0`) whose text is BOTH a
+    prose line (`_is_prose_line`) and matches `_CLAIM_RE`. The value is the
+    line's own verbatim text (comment marker included, only the line's own
+    leading/trailing whitespace stripped).
+
+    A state machine, not a bare line-by-line grep: `+++`/`---` are only
+    read as FILE HEADERS between a `diff --git` line and this file's first
+    `@@` hunk — never afterward. Without this, a fix that adds a NEW
+    `.patch` file (this very repo's own convention — see
+    `docs/plans/*/proposals/*.patch`) would have its OWN embedded `+++ b/…`
+    text misread as a second file boundary the instant a content line
+    inside that patch starts with three literal `+` characters (the
+    patched file's own added line, prefixed by this diff's own `+`)."""
+    sites: dict[str, str] = {}
+    current_path: str | None = None
+    in_header = False
+    new_lineno = 0
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            current_path = None
+            in_header = True
+            continue
+        if in_header:
+            if line.startswith("+++ ") or line == "+++":
+                raw = line[4:] if line.startswith("+++ ") else ""
+                if raw == "/dev/null":
+                    current_path = None
+                elif raw[:2] in ("a/", "b/"):
+                    current_path = raw[2:]
+                else:
+                    current_path = raw or None
+                in_header = False
+            continue
+        if line.startswith("@@"):
+            m = _DIFF_HUNK_RE.match(line)
+            new_lineno = int(m.group(1)) if m else 0
+            continue
+        if current_path is None:
+            continue
+        if line.startswith("+"):
+            text = line[1:]
+            stripped = text.strip()
+            if stripped and _is_prose_line(current_path, stripped) and _CLAIM_RE.search(stripped):
+                sites[f"{current_path}:{new_lineno}"] = text.strip()
+            new_lineno += 1
+    return sites
+
+
+# WRITE-VERB DENYLIST, WHOLE-TOKEN matched (never substring — R4a's own
+# killed design measured `git grep -n 'transform'`/`'confirm'` wrongly
+# DENIED by a substring-`rm` check; this denylist is checked against
+# shell-tokenized argv, one token at a time, so `transform` is never
+# confused with `rm`), and it covers the THREE shapes that SAME killed
+# design measured as wrongly ALLOWED (`curl … | sh`, `git clean -fdx`,
+# `git reset --hard`) — by denying bare shell invocations and specific
+# destructive git subcommands outright, never by pattern-matching flags.
+_SHELL_OPERATOR_TOKENS = {"|", "||", "&&", ";", ">", ">>", "<", "&"}
+_DENIED_PROGRAMS = {
+    "rm", "mv", "dd", "shred", "mkfs", "truncate", "chmod", "chown", "chgrp",
+    "sudo", "su", "kill", "killall", "pkill", "reboot", "shutdown", "halt",
+    "curl", "wget", "ssh", "scp", "rsync", "nc", "ncat", "telnet",
+    "docker", "kubectl", "eval", "sh", "bash", "zsh", "dash", "ksh",
+    "xargs", "env",
+}
+_DENIED_GIT_SUBCOMMANDS = {"push", "reset", "clean", "gc"}
+
+
+def _command_denied(command: object) -> str | None:
+    """`None` iff `command` is safe to re-execute; otherwise the deny
+    reason. Splits on shell operators (`|`, `&&`, `;`, `>`, …) via
+    `shlex.shlex(..., punctuation_chars=True)`, which recognizes them as
+    their OWN tokens while still respecting quoting — so a denied program
+    hiding after a pipe (`curl … | sh`) or a redirect (`echo x > f`) is
+    caught by inspecting EVERY segment's own first token, never only the
+    command string's first word. `bash -c 'rm -rf /'` is denied on `bash`
+    itself, closing the nested-shell evasion without needing to parse
+    inside the quoted argument at all. An unbalanced quote (unparseable)
+    denies too — monotone toward DENY, the same posture `_probe_path`
+    already takes on an unparseable probe entry."""
+    if not isinstance(command, str) or not command.strip():
+        return "empty or non-string command"
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError as exc:
+        return f"command does not tokenize as a shell command ({exc})"
+    if not tokens:
+        return "empty command"
+    segments: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok in _SHELL_OPERATOR_TOKENS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    for seg in segments:
+        if not seg:
+            continue
+        prog = seg[0].lower()
+        if prog in _DENIED_PROGRAMS:
+            return f"`{prog}` is a denied program (esc-lead-gate-R11 write-verb denylist)"
+        if prog == "git" and len(seg) > 1 and seg[1].lower() in _DENIED_GIT_SUBCOMMANDS:
+            return f"`git {seg[1]}` is a denied git subcommand (esc-lead-gate-R11 write-verb denylist)"
+        if prog == "find" and any(t in ("-delete", "-exec", "-execdir") for t in seg[1:]):
+            return "`find` with -delete/-exec/-execdir is denied (esc-lead-gate-R11 write-verb denylist)"
+    return None
+
+
+def _run_claim_command(command: str, cwd: str, deadline: float) -> tuple[bool, str, str]:
+    """Re-executes `command` via `/bin/sh -c`, bounded by the TIME LEFT on
+    the SAME shared per-decision `deadline` R3's own git calls already
+    share (esc-lead-gate-R11 never grows the budget per-arm). The identical
+    hardened shape to `_run_git` (own process group, real
+    `tempfile.TemporaryFile()`s, never `subprocess.PIPE`/`.communicate()`,
+    `killpg` on timeout then a flat, un-budgeted 1s reap) for the exact
+    same escaped-grandchild reason `_run_git`'s own docstring measures —
+    duplicated rather than shared with `_run_git` itself, deliberately: R3
+    is an adversarially-hardened, heavily-reproduced code path (G20-G40),
+    and this arm does not touch it. Returns `(True, sha256_hex, "")` on a
+    completed run — `sha256(f"{returncode}\\n{stdout}")`, stdout and exit
+    code only; stderr is deliberately EXCLUDED from the hash, since
+    incidental warnings/progress text on stderr is frequently
+    non-deterministic and would break reproducibility for reasons unrelated
+    to the claim itself (an HONEST LIMIT, stated as one: a claim command
+    whose STDOUT itself is non-deterministic is not caught by this hash at
+    all) — or `(False, "", reason)` otherwise. Runs in `cwd` AS IT
+    CURRENTLY STANDS, never an ephemeral checkout of `fix_head` (a further
+    HONEST LIMIT: if the worktree has moved past `fix_head` since the relay
+    was written, the re-executed output may reflect a state the lead never
+    measured — the same trust boundary R3's own `probe` already carries)."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False, "", f"the shared decision budget was already exhausted — {_ESCAPE_HATCH_NOTE}"
+    try:
+        out_f = tempfile.TemporaryFile()
+        err_f = tempfile.TemporaryFile()
+    except OSError as exc:
+        return False, "", f"could not open temp files ({exc})"
+    try:
+        proc = subprocess.Popen(["/bin/sh", "-c", command], stdout=out_f, stderr=err_f,
+                                 cwd=cwd, start_new_session=True)
+    except OSError as exc:
+        out_f.close()
+        err_f.close()
+        return False, "", f"command failed to run ({exc})"
+    try:
+        rc = proc.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        out_f.close()
+        err_f.close()
+        return False, "", "command timed out (shared decision budget)"
+    try:
+        out_f.seek(0)
+        out = out_f.read().decode("utf-8", errors="replace")
+    finally:
+        out_f.close()
+        err_f.close()
+    digest = hashlib.sha256(f"{rc}\n{out}".encode("utf-8")).hexdigest()
+    return True, digest, ""
+
+
+_OUTPUT_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _claims_rejection(claim_sites: dict[str, str] | None, data: dict, project_dir: str,
+                       deadline: float) -> str | None:
+    """esc-lead-gate-R11: `None` iff every claim-shaped line the fix's own
+    diff adds (`claim_sites`, the HOOK's OWN derived enumeration — never
+    lead-supplied, the same posture R1 already takes toward the auditor's
+    own `class_enumeration`, applied here to the fix instead of a finding)
+    carries a disposition in the relay's `claims` object: either TESTED (a
+    command whose re-executed output hash matches the one recorded) or
+    explicitly marked UNCOVERED (a non-empty reason). Armed only when
+    `claim_sites` is non-empty — a fix that adds no claim-shaped line
+    carries no obligation, the same "armed by the DATA" posture R1 already
+    takes toward `class_enumeration`."""
+    if not claim_sites:
+        return None
+    claims = data.get("claims")
+    if not isinstance(claims, dict):
+        return (
+            f"relay carries no `claims` object, but the fix's own diff adds "
+            f"{len(claim_sites)} claim-shaped line(s), e.g. {list(claim_sites)[:3]} — every "
+            "one must be TESTED (a command + its output hash) or explicitly marked "
+            "UNCOVERED with a reason (esc-lead-gate-R11)"
+        )
+    missing = [k for k in claim_sites if k not in claims]
+    if missing:
+        return (
+            f"relay `claims` omits {len(missing)} claim-shaped line(s) the fix's own diff "
+            f"adds, e.g. {missing[:3]} — the obligation is DERIVED FROM THE DIFF, never "
+            "declared by the lead (esc-lead-gate-R11)"
+        )
+
+    uncovered_reasons: dict[str, str] = {}
+    for key in claim_sites:
+        entry = claims.get(key)
+        if not isinstance(entry, dict):
+            return f"relay `claims[{key!r}]` is not an object (esc-lead-gate-R11)"
+        status = entry.get("status")
+        if status == "uncovered":
+            reason = entry.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return f"relay `claims[{key!r}]` is marked uncovered with no `reason` (esc-lead-gate-R11)"
+            uncovered_reasons[key] = _probe_normalize(reason)
+        elif status == "tested":
+            command = entry.get("command")
+            output_hash = entry.get("output_hash")
+            if not isinstance(command, str) or not command.strip():
+                return f"relay `claims[{key!r}]` is marked tested with no `command` (esc-lead-gate-R11)"
+            if not (isinstance(output_hash, str) and _OUTPUT_HASH_RE.fullmatch(output_hash)):
+                return (f"relay `claims[{key!r}]` is marked tested with no valid "
+                        "`output_hash` (64 hex chars, sha256) (esc-lead-gate-R11)")
+            deny = _command_denied(command)
+            if deny is not None:
+                return f"relay `claims[{key!r}]` command is denied: {deny}"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return (f"the shared git/claim budget for this decision was already exhausted "
+                        f"before claims[{key!r}]'s command could run — {_ESCAPE_HATCH_NOTE}")
+            ok, actual_hash, run_why = _run_claim_command(command, project_dir, deadline)
+            if not ok:
+                return f"relay `claims[{key!r}]` command could not be re-executed: {run_why}"
+            if actual_hash != output_hash:
+                return (
+                    f"relay `claims[{key!r}]` command's re-executed output does not reproduce "
+                    f"the recorded hash (recorded {output_hash[:12]}…, got {actual_hash[:12]}…) "
+                    "— the claim is not established (esc-lead-gate-R11)"
+                )
+        else:
+            return (f"relay `claims[{key!r}]` has an unrecognized `status` {status!r} "
+                     "(must be `tested` or `uncovered`) (esc-lead-gate-R11)")
+
+    # Anti-vacuity: two or more IDENTICAL (normalized) uncovered reasons in
+    # the SAME relay is a templated, copy-pasted disposition, never a real
+    # per-claim examination — the honest-limit cousin of `check_rigor_
+    # record.py`'s own near-identical-CONTRACT check (the CONCEPT reused,
+    # not the code: a normalized-text collision, never a length/word-count
+    # rule). This CANNOT prove a reason is true; it can only prove two
+    # reasons are not two.
+    seen: dict[str, str] = {}
+    for key, norm in uncovered_reasons.items():
+        if norm in seen:
+            return (
+                f"relay `claims[{key!r}]` and `claims[{seen[norm]!r}]` carry the IDENTICAL "
+                "uncovered reason (normalized) — a templated reason is not a per-claim "
+                "examination (esc-lead-gate-R11)"
+            )
+        seen[norm] = key
+    return None
 
 
 def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
@@ -1029,9 +1458,24 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
                 "is reactive acknowledgment, not adjacent probing; name >=2 sites you "
                 "EXAMINED and found clean (esc-064)")
 
+    # esc-lead-gate-R10 — ARMED UNCONDITIONALLY, alongside R2 above. A ONE-LINE
+    # schema requirement over lead-authored text, never a count or a match: a
+    # cost floor, not proof of examination — the same limit the >=2-clean
+    # rule above already carries. Alongside the >=2 examined-CLEAN sites,
+    # the relay must ALSO name a site examined and explicitly NOT closed,
+    # carrying the attack the next round should run.
+    open_question = data.get("open_question")
+    if not isinstance(open_question, str) or not open_question.strip():
+        return ("relay carries no `open_question` — alongside the >=2 examined-clean "
+                "sites above, one further entry must be a site you examined and could "
+                "NOT close, naming the attack for the next round to run (esc-lead-gate-R10)")
+
     # R3 PROBE-THE-FIX (esc-097) — the only git subprocess in this module;
-    # see its own module-doc paragraph for the arm order.
-    fix_changed, why, fix_warnings = _fix_window(row, unit_slug, data)
+    # see its own module-doc paragraph for the arm order. esc-lead-gate-R11
+    # shares this SAME deadline (minted ONCE, here) for its own claim-scan —
+    # never a second, separate budget.
+    deadline = _new_git_deadline()
+    fix_changed, claim_sites, why, fix_warnings = _fix_window(row, unit_slug, data, deadline)
     if warnings is not None:
         warnings.extend(fix_warnings)
     if why is not None:
@@ -1053,6 +1497,16 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
             f"relay `probe` names none of the {n} files the fix changed "
             f"(block {block7}..fix {fix7}); probe the fix, not the neighbourhood{example}"
         )
+
+    # esc-lead-gate-R11 — "UNTESTED CLAIMS CARRY A TEST", required alongside
+    # R3: the relay may not be accepted while the fix's OWN diff still
+    # carries an untested claim of a testable shape. `claim_sites` is the
+    # HOOK's own derived enumeration (`_parse_claim_sites`, run inside
+    # `_fix_window`, sharing its git deadline) — never lead-asserted.
+    claims_why = _claims_rejection(claim_sites, data, project_dir=os.environ.get("CLAUDE_PROJECT_DIR"),
+                                    deadline=deadline)
+    if claims_why is not None:
+        return claims_why
     return None
 
 
@@ -1067,7 +1521,7 @@ def _diagnose_row(row: dict) -> str:
     # reported as "unrecognized ... defaulted to BLOCK"; that label is for
     # a raw value outside a card's own vocabulary, not the vocabulary's own
     # BLOCK spelling normalizing to the BLOCK verdict by construction.
-    if raw is not None and raw != "BLOCK" and raw not in _PASS_LIKE:
+    if raw is not None and raw != "BLOCK" and raw != _pass_word_for(row.get("agent_type") or ""):
         return f" [unrecognized verdict value {raw!r} defaulted to BLOCK]"
     if row.get("_corrupted"):
         return " [state row corrupted — treated as BLOCK]"
@@ -1345,7 +1799,7 @@ def handle_stop(payload: dict, sdir: Path) -> None:
 
     data, invalid_reason = extract_verdict_json(last_msg)
     fields = parse_verdict_fields(data)
-    verdict, verdict_raw = normalize_verdict(data)
+    verdict, verdict_raw = normalize_verdict(data, agent_type)
 
     # UNPARSEABLE rows are filed under the agent's SubagentStart binding,
     # never under a shared "UNBOUND" bucket, unless no binding exists
@@ -1371,6 +1825,7 @@ def handle_stop(payload: dict, sdir: Path) -> None:
         "enumeration_missing": fields["enumeration_missing"],
         "sweep_method": fields["sweep_method"], "exhaustive": fields["exhaustive"],
         "finding_locations": fields["finding_locations"],
+        "recurrence_of_round": fields["recurrence_of_round"],
     })
 
 
@@ -1394,9 +1849,74 @@ def _log_line(sdir: Path, event: str, tool_name: str, agent_type: str, decision:
         pass
 
 
+def cmd_export(argv: list[str]) -> int:
+    """esc-lead-gate-R7a (v2): `--export <unit_slug>` prints
+    `unit_file(sdir, unit_slug)`'s own rows, one JSON object per line, to
+    stdout — the hook's OWN row schema, verbatim, never hand-typed. A pure
+    READ: no stdin, no payload, never touches `decide_pre` or any gate
+    decision. The lead runs `python3 .claude/hooks/lead-gate-lib.py --export
+    <slug> > docs/rigor/<slug>.jsonl` and commits the result — the carrier
+    `ci/scripts/check_rigor_record.py` reads. Rows with no `verdict` key
+    (a corrupted line `read_rows` already flags via `_unparseable_raw`) are
+    skipped rather than exported malformed."""
+    if len(argv) < 3 or not argv[2].strip():
+        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export <unit_slug>\n")
+        return 2
+    slug = argv[2]
+    sdir = state_dir()
+    rows = read_rows(unit_file(sdir, slug))
+    n = 0
+    for row in rows:
+        if "verdict" not in row:
+            continue
+        sys.stdout.write(json.dumps(row, sort_keys=True))
+        sys.stdout.write("\n")
+        n += 1
+    sys.stderr.write(f"lead-gate-lib: exported {n} row(s) for {slug!r}\n")
+    return 0
+
+
+def cmd_export_oracle(argv: list[str]) -> int:
+    """esc-lead-invariants-2: `--export-oracle <unit_slug>` prints every
+    `agent_type == "oracle"` row from `unit_file(sdir, unit_slug)`'s own
+    rows, one JSON object per line, to stdout — the hook's OWN row schema,
+    verbatim, never hand-typed. A pure READ: no stdin, no payload, never
+    touches `decide_pre` or any gate decision.
+
+    The lead runs `python3 .claude/hooks/lead-gate-lib.py --export-oracle
+    <slug> > docs/rigor/<slug>.oracle.jsonl` and commits the result — the
+    carrier `ci/scripts/check_oracle_gate.py` reads. Deliberately narrower
+    than the general `--export` (it exports only oracle rows, to a distinct
+    `*.oracle.jsonl` path) so this addition never collides with
+    `cmd_export`'s own `--export` form — both coexist; a human may later
+    fold this into the general form, which is not required for this one
+    to work today."""
+    if len(argv) < 3 or not argv[2].strip():
+        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-oracle <unit_slug>\n")
+        return 2
+    slug = argv[2]
+    sdir = state_dir()
+    rows = read_rows(unit_file(sdir, slug))
+    n = 0
+    for row in rows:
+        if "verdict" not in row or row.get("agent_type") != "oracle":
+            continue
+        sys.stdout.write(json.dumps(row, sort_keys=True))
+        sys.stdout.write("\n")
+        n += 1
+    sys.stderr.write(f"lead-gate-lib: exported {n} oracle row(s) for {slug!r}\n")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[1] == "--export-oracle":
+        return cmd_export_oracle(argv)
+    if len(argv) >= 2 and argv[1] == "--export":
+        return cmd_export(argv)
     if len(argv) < 2 or argv[1] not in ("start", "stop", "pre"):
-        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json\n")
+        sys.stderr.write(
+            "lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json "
+            "| --export <unit_slug> | --export-oracle <unit_slug>\n")
         return 2
     cmd = argv[1]
 

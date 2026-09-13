@@ -1032,17 +1032,27 @@ def test_failed_job_wait_raises_training_error_on_both_raise_sites():
     assert client_errors.TrainingError is jammi.TrainingError
 
 
-def test_empty_training_set_refusal_is_invalid_argument_on_both_transports():
-    """Tier B (converter-level) — the K2 refusal of an EMPTY training set maps
-    to ONE class, `jammi.errors.InvalidArgument`, on both transports.
+def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_transports():
+    """Tier B (converter-level) — the K2 refusal of an EMPTY training set, WHEN
+    IT SURFACES OVER THE `Recompute` RPC (`grpc/pipeline.rs:139`,
+    `jammi_ai::pipeline::recompute`'s `TrainingSet` replay arm), maps to ONE
+    class, `jammi.errors.InvalidArgument`, on both transports.
 
-    A training set whose projection yields zero rows is refused by the producer
-    (`JammiError::EmptyTrainingSet`) rather than materialised as a 0-row table.
-    The server sends that refusal as `INVALID_ARGUMENT`
-    (`jammi_server::grpc::wire::map_engine_error`), so the remote client raises
-    `InvalidArgument` — and the embedded converter must not classify the same
-    engine error as a `BackendError`, or one `except InvalidArgument` would catch
-    the caller's own degenerate input remotely and miss it in-process.
+    This is deliberately scoped to the `Recompute` surface, not "the" K2
+    refusal generally: the SAME typed engine error
+    (`JammiError::EmptyTrainingSet`) reaches the caller as a DIFFERENT class,
+    `jammi.errors.TrainingError`, when it is instead raised on the fine-tune
+    JOB path (`worker.rs::run_spec`'s `materialize_projection` call) — see
+    `test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_transports`
+    below. A test named "the" refusal would misstate that as one universal
+    class; it is not — which surface carried the refusal determines the class.
+
+    On the `Recompute` RPC path: the server sends the refusal as
+    `INVALID_ARGUMENT` (`jammi_server::grpc::wire::map_engine_error`), so the
+    remote client raises `InvalidArgument` — and the embedded converter must
+    not classify the same engine error as a `BackendError`, or one
+    `except InvalidArgument` would catch the caller's own degenerate input
+    remotely and miss it in-process.
 
     Converter-level on the EMBEDDED arm BY NECESSITY, the same shape (and for the
     same reason) as the failed-job parity test above: driving a real refusal needs
@@ -1085,6 +1095,81 @@ def test_empty_training_set_refusal_is_invalid_argument_on_both_transports():
     assert client_errors.InvalidArgument is jammi.InvalidArgument
     assert issubclass(jammi.InvalidArgument, jammi.JammiError)
     assert issubclass(jammi.InvalidArgument, ValueError)
+
+
+def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_transports():
+    """Tier B (converter-level) — the SAME typed engine error
+    (`JammiError::EmptyTrainingSet`), WHEN IT SURFACES ON THE FINE-TUNE JOB
+    PATH instead of the `Recompute` RPC, does NOT reach the caller as
+    `InvalidArgument` on either transport: both `job.wait()` raise-sites
+    collapse it (and every other job-failure cause) to
+    `jammi.errors.TrainingError`. This is the class-equality check the
+    `Recompute`-scoped test above deliberately does not claim to cover.
+
+    On the JOB path, `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs`,
+    the `materialize_projection` call `.map_err(WorkerJobError::from)?`)
+    turns the typed `EmptyTrainingSet` into a plain string stored as the
+    job's `error_message` — the variant does not survive past that point.
+    Both raise-sites then rebuild the caller-facing error from that STORED
+    STRING alone, with NO branch on its content:
+      * the REMOTE raise-site, `RemoteJob.wait()`
+        (`clients/python/jammi/_database.py`), raises
+        `jammi.errors.TrainingError(resp.error)` for ANY `status == "failed"`
+        — driven directly here with the K2 message as the stubbed error;
+      * the EMBEDDED raise-site, `wait_for_result`
+        (`crates/jammi-python/src/job.rs:380-382`), raises
+        `JammiError::FineTune(record.error)` for ANY `JobStatus::Failed` —
+        the exact same unconditional wrap the generic
+        `test_failed_job_wait_raises_training_error_on_both_raise_sites`
+        above already pins with an unrelated message ("boom") — which
+        `jammi_error_class` (`crates/jammi-python/src/error.rs:54`) maps to
+        `TrainingError`. Neither raise-site inspects the failure's original
+        cause, so the class the two transports agree on for THIS failure is
+        the SAME class already pinned for every OTHER job failure — proven
+        by the shared code path, not restated as a separate coincidence.
+
+    Converter-level on the EMBEDDED arm for the same reason as the other
+    Tier B tests: driving a real `EmptyTrainingSet` job failure end-to-end
+    needs a real source and base model, which is not hermetic.
+    """
+    from jammi._generated.jammi.v1 import job_pb2
+
+    message = (
+        "training set over `SELECT text, label FROM reviews.public.rows` is "
+        "empty: the projection yielded zero rows"
+    )
+
+    class _EmptyTrainingSetJobStub:
+        def JobStatus(self, *_args, **_kwargs):
+            return job_pb2.JobStatusResponse(status="failed", error=message)
+
+    job = jammi.RemoteJob(
+        _EmptyTrainingSetJobStub(),
+        (),
+        job_id="job-empty-training-set",
+        kind="fine_tune",
+        output_model_id="model-empty-training-set",
+    )
+    with pytest.raises(jammi.TrainingError) as info:
+        job.wait()
+    assert type(info.value) is jammi.TrainingError
+    assert message in str(info.value)
+
+    # This is NOT the class the Recompute-RPC-scoped test above pins for the
+    # very same underlying refusal — the two surfaces genuinely disagree,
+    # which is exactly why neither test names itself as covering "the" K2
+    # refusal universally.
+    assert type(info.value) is not jammi.InvalidArgument
+
+    # The embedded raise-site binds to THIS class the same way the generic
+    # failed-job test binds it: by importing `jammi.errors.TrainingError`,
+    # the same module object asserted above, so a caller's single `except`
+    # holds on either transport for this failure too.
+    from jammi import errors as client_errors
+
+    assert client_errors.TrainingError is jammi.TrainingError
+    assert issubclass(jammi.TrainingError, jammi.JammiError)
+    assert issubclass(jammi.TrainingError, RuntimeError)
 
 
 def test_job_handle_protocol_is_satisfied_by_both_handles():

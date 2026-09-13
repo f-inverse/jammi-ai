@@ -801,13 +801,32 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
 #     scope), which is exactly the outcome an exemption list would have
 #     hidden.
 #
-# RESIDUAL, disclosed rather than assumed away: a workflow step that invokes
-# a driver through a variable path (`bash "$SCRIPT"`) is invisible to the
-# invocation scan below, exactly as it is to every other line-shaped rule in
-# this file. No such step exists in this tree today; the scan reports what
-# it can see, and a driver no visible step invokes is reported as a NOTE by
-# `_check_derived_driver_cannot_rent` — printed, never a failure and never a
-# clear.
+# RESIDUALS, disclosed rather than assumed away. Both are UNDER-approximations
+# — the direction that can miss a renter — so they are named, not argued away:
+#
+#   * VARIABLE INVOCATION PATH: a workflow step that invokes a driver through
+#     a variable path (`bash "$SCRIPT"`) is invisible to the invocation scan
+#     below, exactly as it is to every other line-shaped rule in this file.
+#     `git grep -nE 'bash +"?\$' -- .github/workflows` returns nothing on this
+#     tree, which covers that one spelling only; the scan reports what it can
+#     see, and a
+#     driver no visible step invokes is reported as a NOTE by
+#     `_check_derived_driver_cannot_rent` — printed, never a failure and never
+#     a clear.
+#   * COMPOSED CALL NAME: `_mentions` matches a closure member's name as a
+#     word in the driver's comment-stripped text, so a call whose FUNCTION
+#     NAME is assembled at run time — `p=rp_deploy_; s=arch; "${p}${s}" a100`
+#     — spells no member and the file is not derived as a driver at all. Bash
+#     name composition is not decidable by a static scan; the same limit
+#     applies to `derive_deploy_closure`'s own caller scan inside
+#     `runpod_lib.sh`. What was actually checked, and what it found:
+#     `git grep -nE '"\$\{[A-Za-z_][A-Za-z0-9_]*\}\$\{' -- ci/scripts` returns
+#     the composed-parameter form only in VALUE position — string
+#     accumulators in `pod_push_stamp.sh`/`pod_seed_target.sh`/
+#     `test_pod_substrate.sh` — and none in COMMAND position. That is an
+#     enumeration of one spelling on one day, not a proof: a driver written
+#     this way is missed, which is why the residual is written down here
+#     instead of a claim that the derivation is complete.
 # --------------------------------------------------------------------------- #
 SCRIPTS_ROOT = "ci/scripts/"
 RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"

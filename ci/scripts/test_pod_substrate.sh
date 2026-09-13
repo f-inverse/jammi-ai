@@ -4377,8 +4377,11 @@ COMMUNITY|NVIDIA A100 80GB PCIe"
 
   # ---- D5 (set-shaped): which TRACKED files mention RP_GPU_COUNT at all --
   # The reviewed set is exactly runpod_lib.sh (the parameter's own home),
-  # runpod_gpu_gang.sh (the ONE lane that asks for more than one GPU) and
-  # this suite. Anything else appearing here means some OTHER lane started
+  # runpod_gpu_gang.sh (the ONE lane that asks for more than one GPU), this
+  # suite, and test_gpu_gang_lane.sh — which READS the gang driver's count
+  # back and asserts 2, because the gang lane's dollar bound is priced at a
+  # rate measured for a 2-GPU pod. An ASSERTER of the value is not a lane
+  # setting one; anything else appearing here means some OTHER lane started
   # moving its own deploy payload off `gpuCount: 1`.
   ab_mentions="$(cd "$REPO_ROOT" && git ls-files ci/scripts .github/workflows | while IFS= read -r f; do
     if grep -q 'RP_GPU_COUNT' "$f"; then printf '%s\n' "$f"; fi
@@ -4386,9 +4389,10 @@ COMMUNITY|NVIDIA A100 80GB PCIe"
   ab_unexpected="$(printf '%s\n' "$ab_mentions" | grep -v '^$' \
     | grep -vx 'ci/scripts/runpod_lib.sh' \
     | grep -vx 'ci/scripts/runpod_gpu_gang.sh' \
+    | grep -vx 'ci/scripts/test_gpu_gang_lane.sh' \
     | grep -vx 'ci/scripts/test_pod_substrate.sh' || true)" # tripwire-ok: grep -v with no surviving line legitimately exits 1; the emptiness IS the pass condition, asserted on the next line.
   if printf '%s\n' "$ab_mentions" | grep -qx 'ci/scripts/runpod_lib.sh' && [ -z "$ab_unexpected" ]; then
-    ok "(ab/gpuCount D5) RP_GPU_COUNT is mentioned only by runpod_lib.sh, the gang driver and this suite across every tracked ci/scripts + .github/workflows file — gpu-prove, gpu-perf-ab, gpu-dev and howwell all inherit the default"
+    ok "(ab/gpuCount D5) RP_GPU_COUNT is mentioned only by runpod_lib.sh, the gang driver, the gang-lane suite that asserts its value and this suite across every tracked ci/scripts + .github/workflows file — gpu-prove, gpu-perf-ab, gpu-dev and howwell all inherit the default"
   else
     bad "(ab/gpuCount D5) unexpected RP_GPU_COUNT site(s) — a lane other than the gang driver is changing its own gpuCount: ${ab_unexpected:-<runpod_lib.sh itself never mentions it>}"
   fi

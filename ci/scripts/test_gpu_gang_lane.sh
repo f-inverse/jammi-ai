@@ -26,9 +26,12 @@
 #       printed in `gpu-gang.yml`, in the driver's own header and in
 #       `docs/maintainer/dev-gpu.md` is re-derived here from the `a100`
 #       candidate list in `runpod_lib.sh`, this lane's own
-#       RP_SSH_WAIT_SECS/RP_TTL_HOURS, the workflow's MAX_ATTEMPTS and the
-#       measured $3.18/h rate — a drifted pin or a silently raised term is
-#       a failure here, not a number nobody re-checks.
+#       RP_SSH_WAIT_SECS/RP_TTL_HOURS/RP_GPU_COUNT, the workflow's
+#       MAX_ATTEMPTS and the measured $3.18/h rate — a drifted pin or a
+#       silently raised term is a failure here, not a number nobody
+#       re-checks. The GPU count is a term of the RATE, not of the hours:
+#       $3.18/h prices a 2-GPU pod, so a lane that moved to 4 would keep
+#       printing a bound it no longer bills at.
 #
 # Run: bash ci/scripts/test_gpu_gang_lane.sh
 set -uo pipefail
@@ -308,6 +311,20 @@ if [ "$RP_TTL_HOURS" = "1" ]; then
   ok "G4: the driver pins RP_TTL_HOURS=1 (the pod's own entrypoint deadline)"
 else
   bad "G4: RP_TTL_HOURS is '${RP_TTL_HOURS}', not 1 — the TTL term of both bounds moved"
+fi
+
+# The rate is a PER-POD rate measured at a GPU COUNT: every figure below
+# multiplies hours by $3.18/h, and that price was read off a SECURE 2-GPU
+# A100-SXM4-80GB pod (S4). A lane that quietly rented 4 GPUs would keep
+# printing the same bound while billing something else, so the count is read
+# back OUT of the sourced driver — the same variable the shared deploy
+# payload reads — and pinned here. This suite ASSERTS the count; it does not
+# set one (test_pod_substrate.sh's `(ab/gpuCount D5)` closed set records why
+# this file is allowed to name the variable at all).
+if [ "$RP_GPU_COUNT" = "2" ]; then
+  ok "G4: the driver pins RP_GPU_COUNT=2 — the pod shape the \$${GANG_RATE_USD_PER_HOUR}/h rate was measured at"
+else
+  bad "G4: RP_GPU_COUNT is '${RP_GPU_COUNT}', not 2 — every bound here is priced at a rate measured for a 2-GPU pod, so the figures no longer price this lane"
 fi
 
 read -r bound_i bound_ii runner_minutes < <(python3 - \

@@ -824,6 +824,38 @@ jobs:
       - name: Clippy jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
         run: cargo clippy -p jammi-encoders --features cuda --tests -- -D warnings
 
+      # `jammi-ai`'s OWN `cuda` arm — every `#[cfg(feature = "cuda")]` item in
+      # this crate's `src/` and in its `it` test target (`required-features =
+      # ["local"]`, which `cuda` implies) — is compiled by no other merge-path
+      # lane. The enumeration behind that: `git grep -n -- '--features
+      # [^ ]*cuda' -- .github/workflows` returns cargo lines for
+      # `jammi-encoders` (the two steps above) and, in a comment, the GPU-host
+      # `jammi-ai` prove line — never a `-p jammi-ai --features cuda`
+      # invocation; `ci.yml`'s own `check` job lints this crate with
+      # `--features live-gpu-tests,live-distributed-tests` (no `cuda`), and
+      # `compile-check-gated` states in its own comment that it compiles the
+      # GPU-capability suite WITHOUT `cuda` deliberately, to stay on a CPU
+      # runner. So a break in the cuda arm would otherwise first surface on a
+      # GPU pod run (`ci/scripts/runpod_gpu_prove.sh`), behind
+      # `gpu-prove.yml`'s dispatch/label/schedule triggers — never on the
+      # merge path. `ci/scripts/check_lint_surface_closure.py` credits this
+      # step mechanically from `cargo metadata`; it keeps no registry of step
+      # names, so this comment is documentation, not the gate.
+      #
+      # Same image, job, and toolchain as the two steps above — `cuda` selects
+      # the feature chain (`candle-core/cuda`, `jammi-{encoders,lora,kernels}/
+      # cuda`, and `build_cuda`'s PTX build via `nvcc`), never a live device,
+      # so this needs the CUDA toolkit this job's image already ships and no
+      # GPU. `--tests` for the reason the steps above give: plain `cargo
+      # check`/`clippy` without it never compiles `#[cfg(test)] mod tests`
+      # content at all, feature-gated or not. `cuda` alone, never
+      # `cuda,flash-attn`: `flash-attn` must stay unreachable from `cuda`
+      # (`ci/scripts/check_flash_attn_closure.py`'s core invariant), and this
+      # crate's flash surface is already covered through `jammi-encoders`
+      # above.
+      - name: Clippy jammi-ai --features cuda (nvcc, no GPU)
+        run: cargo clippy -p jammi-ai --features cuda --tests -- -D warnings
+
   # esc-059's silicon-axis twin — CLOSED FOR COMPILE/LINT SURFACE ONLY, NOT
   # EXECUTION. `jammi-kernels`'s `metal_parity` test target
   # (`required-features = ["metal"]`), `jammi-ai`'s `metal_quantized_gpu`

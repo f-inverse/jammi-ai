@@ -38,9 +38,51 @@
 # `if:`/`continue-on-error:` honesty. A row satisfied only by `gpu-prove.yml`'s
 # label/dispatch/schedule-triggered lanes is NOT satisfied.
 #
+# A row is credited only by a lane whose HOSTING workflow runs on a PR that
+# touches the row's crate: some `pull_request`-to-main trigger of that
+# workflow must admit `crates/<crate>/**`. A push-to-main-only host
+# (`image-cuda.yml`) and a narrowly `paths:`-filtered one
+# (`pypi-server-cuda.yml`) satisfy nothing here, however merge-path their
+# triggers look.
+#
 # Adding a row is a promise the lane will keep existing; removing one is a
 # deliberate, reviewable narrowing of the lint surface this repo commits to.
 # An empty or missing registry is a FAIL, never a skip.
+#
+# WHAT THIS REGISTRY PROMISES, AND WHAT IT DOES NOT
+#
+# The merge-path corpus holds twelve `cargo clippy ... -D warnings` lanes.
+# Deleting each one in turn and re-running both halves of the gate (the
+# per-lane sweep in this file's own history, reproducible by removing a lane
+# from `lanes_from_workflows`' output and re-running `find_gaps` /
+# `find_missing_required_lanes`) splits them in two: five lanes are the only
+# cover for some `required-features` target, so the `cargo metadata` closure
+# half REDs on their loss all by itself and they need no row here; the other
+# seven are covered by nothing derived.
+#
+# The three rows below are three of those seven — the cuda-feature lanes.
+# They are here because a cuda lint regression is invisible until a GPU pod
+# run, off the merge path entirely, which makes their loss the most expensive
+# of the seven to discover.
+#
+# The remaining four are NOT rowed here, and that is a gap this file states
+# rather than hides: `.github/workflows/ci.yml:43` (`--workspace
+# --all-targets`), `:90` (`-p jammi-server --tests --features test-hooks`),
+# `:113` (`-p jammi-db --features postgres,mysql --all-targets`) and `:516`
+# (`-p jammi-wire -p jammi-admin -p jammi-client --all-targets`). Deleting any
+# of them reddens no gate that reads a clippy invocation at all: the candidate
+# detector set is `grep -rl clippy ci/scripts` (this gate,
+# `check_execution_surface_reachability.py`, and pod-side artifacts that never
+# read `ci.yml`'s merge lanes), and deleting each of the four lines in turn,
+# with both halves of this gate plus `check_execution_surface_reachability.py`
+# and `check_ci_guard_wiring.py` re-run, exits 0 every time. That is the
+# measured scope of the claim, not "no check anywhere".
+# Rowing them is a follow-up, recorded in
+# `docs/rigor/contracts/ci_500-cuda-image-nccl.md` § "Adjacent gap found,
+# deferred"; it is deliberately not done in passing here, because each row must state
+# WHICH surface it protects (the `feature-set`/`target-selection` fields are
+# a claim about a lint surface, not a copy of a command line), and that is
+# four separate readings of what those lanes uniquely compile.
 
 # `jammi-ai`'s `cuda` arm: `#[cfg(feature = "cuda")]` items in `src/` and the
 # `#[test] #[cfg(feature = "cuda")]` fns in its `cfg(test)` half (e.g.

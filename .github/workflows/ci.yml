@@ -859,8 +859,9 @@ jobs:
       # `cfg(test)` either — a `cargo build --bin jammi-server` never builds
       # `#[cfg(test)] mod tests` content — so e.g.
       # `crates/jammi-ai/src/fine_tune/adamw.rs:786`, `:800` and `:812`
-      # (`#[test] #[cfg(feature = "cuda")]` device-mismatch fns) are compiled
-      # by no merge-path lane today. The GPU pod prove run does compile them
+      # (`#[test] #[cfg(feature = "cuda")]` device-mismatch fns) are compiled,
+      # WITHOUT this step, by no merge-path lane at all — this step is what
+      # compiles them. The GPU pod prove run does compile them
       # (`ci/release-feature-manifest.json`'s `prove_lane` declares a
       # `jammi-ai` `test` pair), and that lane is not on the merge path.
       #

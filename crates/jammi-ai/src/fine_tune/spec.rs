@@ -207,24 +207,30 @@ impl RankAdmission {
         }
         if world_size as usize > self.devices {
             return Err(JammiError::Config(format!(
-                "world_size = {world_size} exceeds the {} configured device(s): one rank per                  device, so list more in `[gpu] devices` or submit a smaller rank count",
+                "world_size = {world_size} exceeds the {} configured device(s): one rank per \
+                 device, so list more in `[gpu] devices` or submit a smaller rank count",
                 self.devices
             )));
         }
         if self.collective.requires_cuda() && !self.cuda_build {
             return Err(JammiError::Config(format!(
-                "[worker] collective = \"{}\" needs a build with the `cuda` feature; this                  binary has none, so the requested collective cannot be reached",
+                "[worker] collective = \"{}\" needs a build with the `cuda` feature; this \
+                 binary has none, so the requested collective cannot be reached",
                 self.collective
             )));
         }
         if world_size > 1 && common.config.cached {
             return Err(JammiError::Config(format!(
-                "world_size = {world_size} cannot be combined with GradCache (`cached`): the                  cached objective's second pass is over the WHOLE batch on one rank, so a                  gang would not compute the objective this config asks for"
+                "world_size = {world_size} cannot be combined with GradCache (`cached`): the \
+                 cached objective's second pass is over the WHOLE batch on one rank, so a \
+                 gang would not compute the objective this config asks for"
             )));
         }
         if world_size > 1 && common.config.hard_negatives.mine {
             return Err(JammiError::Config(format!(
-                "world_size = {world_size} cannot be combined with hard-negative mining                  (`hard_negatives.mine`): the miner retrieves from this process's own index,                  so each rank would mine a different negative pool"
+                "world_size = {world_size} cannot be combined with hard-negative mining \
+                 (`hard_negatives.mine`): the miner retrieves from this process's own index, \
+                 so each rank would mine a different negative pool"
             )));
         }
         Ok(())

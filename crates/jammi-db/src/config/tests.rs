@@ -643,6 +643,9 @@ fn lease_and_worker_config_round_trip() {
             kinds: WorkerKinds::All(AllSentinel::All),
             idle_poll_secs: 1,
             metrics_sample_secs: 5,
+            world_size: 1,
+            collective: CollectiveSelection::Auto,
+            rank_timeout_secs: 120,
         }
     );
     let intervals = cfg
@@ -2755,4 +2758,390 @@ preload_models = [{ task = "text_embedding" }]
     )
     .expect_err("a missing id must be refused at load");
     assert!(err.to_string().contains("id"), "{err}");
+}
+
+// ── `[gpu] devices` and the `[worker]` rank knobs ────────────────────────
+//
+// The load path is the edge: `parse_from` only shapes the values, and every
+// refusal below is asserted through `load_from` (a real file), the one call
+// a deployment actually makes, plus at the validator that owns it.
+
+/// Load `src` as a whole config file through the production load path.
+fn load_src(src: &str) -> Result<JammiConfig> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, src).unwrap();
+    JammiConfig::load_from(Some(&path), std::iter::empty())
+}
+
+/// Every [`CollectiveSelection`] variant paired with the string it is spelled
+/// with in TOML. The `match` is the enumeration: a new variant fails to
+/// compile here, so no test below can range over a stale set.
+fn collective_token(selection: CollectiveSelection) -> &'static str {
+    match selection {
+        CollectiveSelection::Auto => "auto",
+        CollectiveSelection::Nccl => "nccl",
+        CollectiveSelection::Cpu => "cpu",
+    }
+}
+
+const ALL_COLLECTIVES: [CollectiveSelection; 3] = [
+    CollectiveSelection::Auto,
+    CollectiveSelection::Nccl,
+    CollectiveSelection::Cpu,
+];
+
+#[test]
+fn gpu_devices_default_is_the_absent_plural_resolving_to_the_primary() {
+    // Unset is not the empty list and not `[0]`: it is "no plural
+    // configured", and it resolves to the ONE device `device` names.
+    let gpu = GpuConfig::default();
+    assert_eq!(gpu.devices, None);
+    assert_eq!(gpu.device_list(), vec![0]);
+    assert!(gpu.validate().is_ok());
+
+    // The state the type must not be able to hold: a `GpuConfig` built in
+    // code that pins the CPU must resolve to the CPU, never to a stale
+    // default plural naming device 0. The set this ranges over is every
+    // in-tree struct literal of the type — `grep -rn "GpuConfig {" crates
+    // --include "*.rs"` minus this module: 10 sites (jammi-ai's
+    // `tests/{metal_quantized_gpu,gpu_capability/harness,distributed/harness}`,
+    // `jammi-python/tests/it`, `jammi-test-utils/src/lib`, and jammi-bench's
+    // `{context_predictor,propagate,model_inference,cache_slo,recompute_scale}`)
+    // and every one of them fills the rest from `..Default::default()`, so
+    // the `devices: None` default is what each of them holds.
+    let cpu = GpuConfig {
+        device: -1,
+        ..Default::default()
+    };
+    assert_eq!(cpu.device_list(), vec![-1]);
+    assert!(cpu.validate().is_ok());
+
+    // And a config file with no `[gpu]` section at all resolves the same.
+    let cfg = load_src("artifact_dir = \"/tmp/jammi\"\n").unwrap();
+    assert_eq!(cfg.gpu.devices, None);
+    assert_eq!(cfg.gpu.device_list(), vec![0]);
+}
+
+#[test]
+fn gpu_devices_parses_from_toml_and_from_env() {
+    let cfg = load_src("[gpu]\ndevice = 0\ndevices = [0, 1]\n").unwrap();
+    assert_eq!(cfg.gpu.devices, Some(vec![0, 1]));
+    assert_eq!(cfg.gpu.device_list(), vec![0, 1]);
+    // Order is the placement rule, so it is preserved verbatim.
+    let cfg = load_src("[gpu]\ndevice = 2\ndevices = [2, 0, 1]\n").unwrap();
+    assert_eq!(cfg.gpu.device_list(), vec![2, 0, 1]);
+
+    // The env layer carries the array as a TOML array (H14: it replaces the
+    // file's list wholly, never merges into it).
+    let cfg = JammiConfig::parse_from(
+        "[gpu]\ndevices = [0, 1, 2, 3]\n",
+        vec![("JAMMI_GPU__DEVICES".to_string(), "[0, 1]".to_string())],
+    )
+    .unwrap();
+    assert_eq!(cfg.gpu.devices, Some(vec![0, 1]));
+
+    // A single-entry plural and an absent plural describe the same
+    // deployment.
+    let explicit = load_src("[gpu]\ndevice = 3\ndevices = [3]\n").unwrap();
+    let implicit = load_src("[gpu]\ndevice = 3\n").unwrap();
+    assert_eq!(explicit.gpu.device_list(), implicit.gpu.device_list());
+}
+
+#[test]
+fn gpu_section_still_refuses_unknown_keys() {
+    // `deny_unknown_fields` stays: the plural is one named key, not an open
+    // section.
+    let err = JammiConfig::parse_from("[gpu]\ndevicez = [0, 1]\n", vec![]).unwrap_err();
+    assert!(
+        err.to_string().contains("devicez") && err.to_string().contains("devices"),
+        "the refusal must name the typo and offer the real key: {err}"
+    );
+}
+
+#[test]
+fn load_refuses_an_empty_gpu_devices_list() {
+    // The degenerate list: "run on nothing" is a statement, and a different
+    // one from omitting the key.
+    let err = load_src("[gpu]\ndevices = []\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("devices") && m.contains("empty")),
+        "expected a typed Config error naming the key, got {err:?}"
+    );
+    assert!(matches!(
+        GpuConfig {
+            devices: Some(vec![]),
+            ..Default::default()
+        }
+        .validate(),
+        Err(JammiError::Config(_))
+    ));
+}
+
+#[test]
+fn load_refuses_a_devices_list_that_disagrees_with_device() {
+    // Both keys set, first entry != `device`: the plural and the primary
+    // disagree about rank 0's device, and neither is guessed.
+    let err = load_src("[gpu]\ndevice = 1\ndevices = [0, 1]\n").unwrap_err();
+    let JammiError::Config(msg) = &err else {
+        panic!("expected a typed Config error, got {err:?}");
+    };
+    assert!(
+        msg.contains("devices") && msg.contains("device = 1"),
+        "the refusal must name both keys: {msg}"
+    );
+    // `device` left at its default is still `device`: a plural that does not
+    // start at the primary is refused whether the primary was spelled or not.
+    let err = load_src("[gpu]\ndevices = [1, 2]\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("devices")),
+        "{err:?}"
+    );
+    // Agreement is first-entry equality, so the documented pairing loads.
+    assert!(load_src("[gpu]\ndevice = 1\ndevices = [1, 0]\n").is_ok());
+}
+
+#[test]
+fn load_refuses_repeated_and_out_of_domain_device_ordinals() {
+    let err = load_src("[gpu]\ndevice = 0\ndevices = [0, 1, 0]\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("repeats")),
+        "two ranks on one device must be refused: {err:?}"
+    );
+    let err = load_src("[gpu]\ndevice = -2\ndevices = [-2]\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("not a device ordinal")),
+        "an ordinal below the CPU (-1) must be refused: {err:?}"
+    );
+    let err = load_src("[gpu]\ndevice = -1\ndevices = [-1, 0]\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("mixes the CPU")),
+        "a CPU/GPU mixed gang must be refused: {err:?}"
+    );
+    // The boundary itself is legal: the CPU alone is a one-device list.
+    let cfg = load_src("[gpu]\ndevice = -1\ndevices = [-1]\n").unwrap();
+    assert_eq!(cfg.gpu.device_list(), vec![GpuConfig::CPU_DEVICE]);
+}
+
+#[test]
+fn worker_rank_knobs_default_to_the_single_rank_deployment() {
+    let w = WorkerConfig::default();
+    assert_eq!(w.world_size, 1);
+    assert_eq!(w.collective, CollectiveSelection::Auto);
+    assert_eq!(w.rank_timeout_secs, 120);
+
+    // A config with no `[worker]` section parses to exactly that, and the
+    // topology it resolves to is the one-rank one on the primary device.
+    let cfg = load_src("artifact_dir = \"/tmp/jammi\"\n").unwrap();
+    assert_eq!(cfg.worker, WorkerConfig::default());
+    let topo = cfg.worker.topology(&cfg.gpu).unwrap();
+    assert_eq!(topo.world_size(), 1);
+    assert_eq!(topo.devices(), &[0]);
+    assert_eq!(topo.rank_devices(), &[0]);
+    assert_eq!(topo.collective(), CollectiveSelection::Auto);
+    assert_eq!(topo.rank_timeout(), std::time::Duration::from_secs(120));
+    assert!(!topo.is_distributed());
+}
+
+#[test]
+fn worker_rank_knobs_round_trip_from_toml() {
+    let cfg = load_src(
+        r#"
+            [gpu]
+            device = 0
+            devices = [0, 1]
+
+            [worker]
+            world_size = 2
+            collective = "cpu"
+            rank_timeout_secs = 45
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.worker.world_size, 2);
+    assert_eq!(cfg.worker.collective, CollectiveSelection::Cpu);
+    assert_eq!(cfg.worker.rank_timeout_secs, 45);
+    let topo = cfg.worker.topology(&cfg.gpu).unwrap();
+    assert!(topo.is_distributed());
+    assert_eq!(topo.rank_devices(), &[0, 1]);
+    assert_eq!(topo.rank_timeout(), std::time::Duration::from_secs(45));
+}
+
+#[test]
+fn worker_config_equality_sees_the_rank_knobs() {
+    // Without this, every `assert_eq!(cfg.worker, ..)` above would hold
+    // vacuously for a field the derived `PartialEq` ignored.
+    let base = WorkerConfig::default();
+    for other in [
+        WorkerConfig {
+            world_size: 2,
+            ..WorkerConfig::default()
+        },
+        WorkerConfig {
+            collective: CollectiveSelection::Nccl,
+            ..WorkerConfig::default()
+        },
+        WorkerConfig {
+            rank_timeout_secs: 7,
+            ..WorkerConfig::default()
+        },
+    ] {
+        assert_ne!(base, other, "the derived equality must see {other:?}");
+    }
+}
+
+#[test]
+fn collective_selection_toml_display_and_from_str_agree_on_every_variant() {
+    // Family M: the serde token, `Display` and `FromStr` are one vocabulary,
+    // ranged over the compiler-enumerated variant set.
+    assert_eq!(
+        ALL_COLLECTIVES.len(),
+        3,
+        "the variant array must match `collective_token`'s arms"
+    );
+    for selection in ALL_COLLECTIVES {
+        let token = collective_token(selection);
+        assert_eq!(selection.to_string(), token, "Display for {selection:?}");
+        assert_eq!(
+            CollectiveSelection::from_str(token).unwrap(),
+            selection,
+            "FromStr for {token}"
+        );
+        let cfg = JammiConfig::parse_from(&format!("[worker]\ncollective = \"{token}\"\n"), vec![])
+            .unwrap();
+        assert_eq!(cfg.worker.collective, selection, "TOML for {token}");
+        // And the env layer spells it the same way.
+        let cfg = JammiConfig::parse_from(
+            "",
+            vec![("JAMMI_WORKER__COLLECTIVE".to_string(), token.to_string())],
+        )
+        .unwrap();
+        assert_eq!(cfg.worker.collective, selection, "env for {token}");
+    }
+    assert_eq!(CollectiveSelection::default(), CollectiveSelection::Auto);
+}
+
+#[test]
+fn collective_selection_refuses_an_unknown_token() {
+    let err = JammiConfig::parse_from("[worker]\ncollective = \"mpi\"\n", vec![]).unwrap_err();
+    assert!(
+        err.to_string().contains("collective"),
+        "the refusal must name the key: {err}"
+    );
+    let err = CollectiveSelection::from_str("mpi").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("mpi") && m.contains("auto, nccl, cpu")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn collective_requires_cuda_is_the_nccl_arm_only() {
+    // The `#[cfg]`-free predicate the session applies at open. Asserted per
+    // variant over the compiler-enumerated set, so a new variant that needs
+    // CUDA cannot ride in on a default.
+    for selection in ALL_COLLECTIVES {
+        let expected = matches!(selection, CollectiveSelection::Nccl);
+        assert_eq!(
+            selection.requires_cuda(),
+            expected,
+            "requires_cuda for {selection:?}"
+        );
+    }
+}
+
+#[test]
+fn load_refuses_world_size_zero() {
+    let err = load_src("[worker]\nworld_size = 0\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("world_size")),
+        "expected a typed Config error naming the key, got {err:?}"
+    );
+    // At the validator that owns it, too.
+    let err = WorkerConfig {
+        world_size: 0,
+        ..Default::default()
+    }
+    .topology(&GpuConfig::default())
+    .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("world_size")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn load_refuses_world_size_wider_than_the_devices() {
+    let err = load_src("[worker]\nworld_size = 4\n").unwrap_err();
+    let JammiError::Config(msg) = &err else {
+        panic!("expected a typed Config error, got {err:?}");
+    };
+    assert!(
+        msg.contains("world_size = 4") && msg.contains("device"),
+        "the refusal must name the width and the devices: {msg}"
+    );
+
+    // The boundary: equal loads, one more does not — on a plural, too.
+    let equal = load_src("[gpu]\ndevices = [0, 1]\n\n[worker]\nworld_size = 2\n").unwrap();
+    assert_eq!(equal.worker.topology(&equal.gpu).unwrap().world_size(), 2);
+    let over = load_src("[gpu]\ndevices = [0, 1]\n\n[worker]\nworld_size = 3\n").unwrap_err();
+    assert!(
+        matches!(&over, JammiError::Config(m) if m.contains("world_size = 3")),
+        "{over:?}"
+    );
+}
+
+#[test]
+fn load_refuses_a_zero_rank_timeout() {
+    let err = load_src("[worker]\nrank_timeout_secs = 0\n").unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("rank_timeout_secs")),
+        "expected a typed Config error naming the key, got {err:?}"
+    );
+}
+
+#[test]
+fn topology_maps_exactly_the_ranks_it_has_to_devices() {
+    // A gang narrower than the device list: the extra device belongs to the
+    // process (a per-device cache), never to a rank.
+    let cfg = load_src("[gpu]\ndevices = [0, 1, 2]\n\n[worker]\nworld_size = 2\n").unwrap();
+    let topo = cfg.worker.topology(&cfg.gpu).unwrap();
+    assert_eq!(topo.devices(), &[0, 1, 2]);
+    assert_eq!(topo.rank_devices(), &[0, 1]);
+    assert_eq!(topo.device_for_rank(0), Some(0));
+    assert_eq!(topo.device_for_rank(1), Some(1));
+    // Out of range is `None` — never the primary, and never the third
+    // device, which no rank owns.
+    assert_eq!(topo.device_for_rank(2), None);
+    assert_eq!(topo.device_for_rank(u32::MAX), None);
+}
+
+#[test]
+fn load_of_a_pre_distributed_config_is_unchanged() {
+    // Every key that existed before the rank knobs still loads to the same
+    // values, and the new knobs sit at their defaults: an existing
+    // deployment's file is not re-validated into a refusal.
+    let cfg = load_src(
+        r#"
+            artifact_dir = "/tmp/jammi"
+
+            [gpu]
+            device = -1
+            require_gpu = false
+
+            [worker]
+            enabled = true
+            kinds = "fine_tune"
+            idle_poll_secs = 2
+            metrics_sample_secs = 5
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.gpu.device, -1);
+    assert_eq!(cfg.gpu.device_list(), vec![-1]);
+    assert_eq!(cfg.worker.idle_poll_secs, 2);
+    assert_eq!(cfg.worker.world_size, 1);
+    assert_eq!(cfg.worker.collective, CollectiveSelection::Auto);
+    assert_eq!(cfg.worker.rank_timeout_secs, 120);
+    assert!(!cfg.worker.topology(&cfg.gpu).unwrap().is_distributed());
 }

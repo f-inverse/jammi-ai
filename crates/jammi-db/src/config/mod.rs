@@ -60,6 +60,79 @@ impl FromStr for BackendSelection {
     }
 }
 
+/// Which collective a multi-rank worker reduces gradients over.
+///
+/// This is *configuration*, not a build feature: the same binary answers
+/// `auto`, `nccl` and `cpu`, and no variant selects a code path at compile
+/// time. The vocabulary is fixed here; the layer that owns communicators
+/// resolves `Auto` against what the process can actually reach (a CUDA
+/// build with visible devices, or the host reduction otherwise) and refuses
+/// [`Self::Nccl`] on a build without CUDA — that refusal is a runtime
+/// predicate at session open, never a `#[cfg]` in this crate, which cannot
+/// see another crate's features.
+///
+/// # TOML
+///
+/// ```toml
+/// [worker]
+/// collective = "auto"   # auto | nccl | cpu
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectiveSelection {
+    /// Pick the best collective this process can actually reach: NCCL on a
+    /// CUDA build with enough visible devices, the host reduction
+    /// otherwise. Degrades rather than refuses. Default.
+    #[default]
+    Auto,
+    /// Require NCCL. A build without CUDA refuses to open rather than
+    /// silently reducing on the host at a fraction of the throughput the
+    /// deployment asked for.
+    Nccl,
+    /// Require the host reduction, even where NCCL is available — the
+    /// deterministic, device-free path a hermetic run and a debugging
+    /// session want.
+    Cpu,
+}
+
+impl fmt::Display for CollectiveSelection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Nccl => write!(f, "nccl"),
+            Self::Cpu => write!(f, "cpu"),
+        }
+    }
+}
+
+impl FromStr for CollectiveSelection {
+    type Err = JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "nccl" => Ok(Self::Nccl),
+            "cpu" => Ok(Self::Cpu),
+            other => Err(JammiError::Config(format!(
+                "Unknown collective '{other}'. Expected: auto, nccl, cpu"
+            ))),
+        }
+    }
+}
+
+impl CollectiveSelection {
+    /// Whether this selection can only be honoured by a CUDA build.
+    ///
+    /// The `#[cfg]`-free half of the "`collective = \"nccl\"` on a build
+    /// without CUDA is refused" rule: this crate states the *predicate* over
+    /// the parsed value, and the layer that knows its own build features
+    /// (the session, at open) applies it and raises the typed refusal.
+    /// [`Self::Auto`] is `false` — it degrades to the host reduction — and
+    /// so is [`Self::Cpu`], which never wants a device.
+    pub fn requires_cuda(self) -> bool {
+        matches!(self, Self::Nccl)
+    }
+}
+
 /// Distance metric for ANN indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -643,11 +716,44 @@ pub struct EngineConfig {
 }
 
 /// GPU device and memory settings.
+///
+/// `device` is the deployment's PRIMARY device and stays the single answer to
+/// "which device does a one-device process run on". `devices` is the optional
+/// plural: the ordered list a multi-rank worker places rank `i` on. The two
+/// are one setting seen at two arities, so they are kept in agreement by
+/// [`GpuConfig::validate`] rather than left to drift — a list whose first
+/// entry is not `device` is a load error, never a silent second opinion about
+/// the primary.
+///
+/// # TOML
+///
+/// ```toml
+/// [gpu]
+/// device = 0
+/// devices = [0, 1]   # optional; unset = the one-device list `[device]`
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GpuConfig {
-    /// CUDA device ordinal. Default: 0.
+    /// CUDA device ordinal, and the PRIMARY of [`Self::devices`]. `-1` is the
+    /// CPU. Default: 0.
     pub device: i32,
+    /// The ordered device list a multi-rank worker places its ranks on: rank
+    /// `i` runs on `devices[i]`.
+    ///
+    /// `None` — the key is absent — is NOT the empty list: it means "no
+    /// plural was configured", and [`Self::device_list`] resolves it to the
+    /// one-device list `[device]`, which is exactly the single-device
+    /// deployment every reader of `device` already assumes. An explicit
+    /// `devices = []` is a different statement — "run on no device at all" —
+    /// and is refused at load, so the absent case can never be confused with
+    /// a configured-empty one.
+    ///
+    /// The list is stored raw (unresolved) so a `GpuConfig` built in code
+    /// with `..Default::default()` cannot hold a plural that contradicts the
+    /// `device` its author set; the resolution lives in
+    /// [`Self::device_list`], the one place both arities are reconciled.
+    pub devices: Option<Vec<i32>>,
     /// GPU memory limit (e.g., `"auto"` or `"8GB"`). Default: `"auto"`.
     pub memory_limit: String,
     /// Fraction of GPU memory to allocate (0.0 - 1.0). Default: 0.9.
@@ -663,6 +769,86 @@ pub struct GpuConfig {
     /// (Ampere+) and fails loud on a lower-capability or non-CUDA device.
     /// Default: `F32`.
     pub compute_precision: jammi_numerics::ComputePrecision,
+}
+
+impl GpuConfig {
+    /// The CPU device ordinal: `-1`, the value every backend already reads as
+    /// "no CUDA device, run on the host".
+    pub const CPU_DEVICE: i32 = -1;
+
+    /// The resolved device list: the configured plural when one was given,
+    /// and otherwise the one-device list `[device]`.
+    ///
+    /// This is the ONE reconciliation of the two arities — a caller never
+    /// reads [`Self::devices`] directly to decide where to place work, so an
+    /// absent plural and a one-device plural are indistinguishable downstream
+    /// (they mean the same deployment), while an absent plural and an
+    /// explicit empty one are not (the empty one does not load).
+    pub fn device_list(&self) -> Vec<i32> {
+        match &self.devices {
+            Some(devices) => devices.clone(),
+            None => vec![self.device],
+        }
+    }
+
+    /// Validate the device configuration at load, refusing every list that
+    /// names something no rank can be placed on. Returns a typed
+    /// [`JammiError::Config`] naming the offending key (R7).
+    ///
+    /// The refusals, each a boundary the resolved list must clear:
+    ///
+    /// - an explicit `devices = []` — a deployment with nowhere to run;
+    /// - a first entry that is not `device` — the plural and the primary
+    ///   disagree about which device is rank 0's, and guessing one of them is
+    ///   how a "CPU-pinned" session ends up on a GPU;
+    /// - a repeated ordinal — two ranks on one device is a placement mistake,
+    ///   and it makes the `world_size <= devices` bound meaningless;
+    /// - an ordinal below [`Self::CPU_DEVICE`] — not a device;
+    /// - the CPU (`-1`) listed alongside real ordinals — one gang runs on one
+    ///   kind of device, and a mixed list has no collective that spans it.
+    pub fn validate(&self) -> Result<()> {
+        let Some(devices) = &self.devices else {
+            // No plural configured: the resolved list is `[device]`, a
+            // single entry that satisfies every rule below by construction.
+            return Ok(());
+        };
+        if devices.is_empty() {
+            return Err(JammiError::Config(
+                "[gpu] devices must not be empty (omit the key for the single-device default)"
+                    .into(),
+            ));
+        }
+        if devices[0] != self.device {
+            return Err(JammiError::Config(format!(
+                "[gpu] devices = {:?} disagrees with device = {}: the first entry is rank 0's \
+                 device and must equal `device` (set `device = {}` or list it first)",
+                devices, self.device, devices[0]
+            )));
+        }
+        for (i, ordinal) in devices.iter().enumerate() {
+            if *ordinal < Self::CPU_DEVICE {
+                return Err(JammiError::Config(format!(
+                    "[gpu] devices[{i}] = {ordinal} is not a device ordinal (>= {} required, \
+                     {} is the CPU)",
+                    Self::CPU_DEVICE,
+                    Self::CPU_DEVICE
+                )));
+            }
+            if devices[..i].contains(ordinal) {
+                return Err(JammiError::Config(format!(
+                    "[gpu] devices = {devices:?} repeats device {ordinal}: one rank per device"
+                )));
+            }
+        }
+        if devices.len() > 1 && devices.contains(&Self::CPU_DEVICE) {
+            return Err(JammiError::Config(format!(
+                "[gpu] devices = {devices:?} mixes the CPU ({}) with device ordinals: a gang \
+                 runs on one kind of device",
+                Self::CPU_DEVICE
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Model inference defaults.
@@ -1080,6 +1266,24 @@ pub struct WorkerConfig {
     /// loop (a scrape storm must not become a catalog storm). Must be
     /// `>= 1`. Default: 5.
     pub metrics_sample_secs: u64,
+    /// How many ranks this deployment runs a distributed job over — one rank
+    /// per device, rank `i` on `[gpu] devices[i]`. Must be `>= 1`
+    /// (`1`, the default, is the single-rank deployment: no gang, no
+    /// collective) and never more than the configured device count, both
+    /// enforced by [`WorkerConfig::topology`] at load.
+    ///
+    /// This is the DEPLOYMENT's width. A submitted job carries its own
+    /// per-job width, which the submit edge checks against this one; the two
+    /// are separate numbers and neither defaults from the other.
+    pub world_size: u32,
+    /// Which collective a multi-rank worker reduces over. Default: `auto`.
+    /// Configuration, not a build feature — see [`CollectiveSelection`].
+    pub collective: CollectiveSelection,
+    /// How long a rank waits on its peers at a gang boundary before the wait
+    /// is a failure. Must be `> 0` — a zero deadline expires before any peer
+    /// can answer, turning every gang into an immediate failure. Default:
+    /// 120.
+    pub rank_timeout_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -1091,6 +1295,12 @@ impl Default for WorkerConfig {
             kinds: WorkerKinds::default(),
             idle_poll_secs: 1,
             metrics_sample_secs: 5,
+            // One rank on the primary device: an unconfigured deployment is
+            // the single-process one it has always been, with no gang and no
+            // collective to resolve.
+            world_size: 1,
+            collective: CollectiveSelection::Auto,
+            rank_timeout_secs: 120,
         }
     }
 }
@@ -1170,6 +1380,118 @@ impl WorkerConfig {
             heartbeat: lease.heartbeat(),
             idle_poll: Duration::from_secs(self.idle_poll_secs),
         })
+    }
+
+    /// Resolve the validated [`WorkerTopology`] this `[worker]` section
+    /// implies over `gpu`'s devices, refusing at load every width no
+    /// placement exists for.
+    ///
+    /// The refusals, each typed ([`JammiError::Config`]) and naming its key:
+    ///
+    /// - `world_size == 0` — a deployment with no rank cannot run anything,
+    ///   and `0` is not "unset" (the unset value is the default `1`);
+    /// - `world_size > devices` — there is no device for the last rank, and
+    ///   the alternative to refusing is two ranks silently sharing one;
+    /// - `rank_timeout_secs == 0` — a deadline that has already passed.
+    ///
+    /// `gpu`'s own domain rules ([`GpuConfig::validate`]) are checked first,
+    /// so the device count this bounds `world_size` against is a count of
+    /// distinct, placeable devices.
+    pub fn topology(&self, gpu: &GpuConfig) -> Result<WorkerTopology> {
+        gpu.validate()?;
+        let devices = gpu.device_list();
+        if self.world_size == 0 {
+            return Err(JammiError::Config(
+                "[worker] world_size must be >= 1 (1 is the single-rank deployment; 0 has no \
+                 rank to run on)"
+                    .into(),
+            ));
+        }
+        if self.world_size as usize > devices.len() {
+            return Err(JammiError::Config(format!(
+                "[worker] world_size = {} exceeds the {} configured device(s) {:?}: one rank \
+                 per device, so list more in `[gpu] devices` or lower `world_size`",
+                self.world_size,
+                devices.len(),
+                devices
+            )));
+        }
+        if self.rank_timeout_secs == 0 {
+            return Err(JammiError::Config(
+                "[worker] rank_timeout_secs must be > 0 (a zero deadline expires before any \
+                 peer can answer)"
+                    .into(),
+            ));
+        }
+        Ok(WorkerTopology {
+            world_size: self.world_size,
+            devices,
+            collective: self.collective,
+            rank_timeout: Duration::from_secs(self.rank_timeout_secs),
+        })
+    }
+}
+
+/// The validated rank topology a worker places work with: how many ranks this
+/// deployment runs, which device each of them gets, which collective they
+/// reduce over, and how long a rank waits at a gang boundary.
+///
+/// [`WorkerConfig::topology`] is the only constructor, so every instance has
+/// already cleared the bounds: `world_size >= 1`, `world_size <=
+/// devices.len()`, the devices distinct and placeable, and a non-zero
+/// timeout. The fields are private for the same reason — the bounds hold for
+/// the lifetime of the value, not just at the moment it was built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerTopology {
+    world_size: u32,
+    devices: Vec<i32>,
+    collective: CollectiveSelection,
+    rank_timeout: Duration,
+}
+
+impl WorkerTopology {
+    /// How many ranks this deployment runs. Always `>= 1`.
+    pub fn world_size(&self) -> u32 {
+        self.world_size
+    }
+
+    /// Every configured device, in order — the full set a process opens
+    /// per-device resources (a scheduler, a model cache) for, which may be
+    /// wider than the gang.
+    pub fn devices(&self) -> &[i32] {
+        &self.devices
+    }
+
+    /// The devices the ranks of a gang occupy: the first
+    /// [`Self::world_size`] entries of [`Self::devices`]. Never longer than
+    /// the gang, so a caller cannot spawn a rank onto a device no rank owns.
+    pub fn rank_devices(&self) -> &[i32] {
+        &self.devices[..self.world_size as usize]
+    }
+
+    /// The device rank `rank` runs on, or `None` when `rank` is not a rank of
+    /// this topology (`rank >= world_size`) — an out-of-range rank has no
+    /// device, and saying so is not the same as handing back the primary.
+    pub fn device_for_rank(&self, rank: u32) -> Option<i32> {
+        (rank < self.world_size).then(|| self.devices[rank as usize])
+    }
+
+    /// The configured collective. `Auto` is still unresolved here: this layer
+    /// records what was asked for, and the layer that owns communicators
+    /// decides what `Auto` becomes.
+    pub fn collective(&self) -> CollectiveSelection {
+        self.collective
+    }
+
+    /// How long a rank waits on its peers at a gang boundary. Always `> 0`.
+    pub fn rank_timeout(&self) -> Duration {
+        self.rank_timeout
+    }
+
+    /// Whether this topology has more than one rank — the one question that
+    /// decides whether a collective is needed at all.
+    pub fn is_distributed(&self) -> bool {
+        self.world_size > 1
     }
 }
 
@@ -1918,6 +2240,10 @@ impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             device: 0,
+            // Unset, NOT `[0]`: a `GpuConfig { device: -1, ..default() }`
+            // must resolve to the CPU, which it does only while the plural
+            // stays absent and `device_list()` derives it from `device`.
+            devices: None,
             memory_limit: "auto".into(),
             memory_fraction: 0.9,
             require_gpu: false,
@@ -2115,8 +2441,8 @@ impl JammiConfig {
     /// filesystem roots using `env` (never `std::env` directly — `env` is
     /// the single source both `JAMMI_CONFIG` resolution and every `JAMMI_*`
     /// override read from), read it if found, [`Self::parse_from`] it, then
-    /// run post-load validation (`storage.cloud.validate()`, the training
-    /// worker-interval invariants).
+    /// run post-load validation (`storage.cloud.validate()`, the worker
+    /// interval and rank-topology invariants, the section validators).
     pub fn load_from(
         file: Option<&Path>,
         env: impl IntoIterator<Item = (String, String)>,
@@ -2140,6 +2466,14 @@ impl JammiConfig {
         // worker spawn, deep in a server startup.
         let lease = config.lease.intervals()?;
         config.worker.worker_intervals(lease)?;
+        // Reject a device list nothing can be placed on (empty, repeated, a
+        // plural that disagrees with the primary — `GpuConfig::validate`,
+        // which `topology` runs first, so the device rules are checked here
+        // exactly once) and a rank width no placement exists for (zero,
+        // wider than the devices, a zero gang deadline) at load, naming the
+        // offending key — never at the first gang boundary, half-way into a
+        // training run.
+        config.worker.topology(&config.gpu)?;
         // Reject a retention window past the cap at load, not in the first
         // sweep's timestamp arithmetic.
         config.jobs.validate()?;

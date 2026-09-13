@@ -1579,6 +1579,17 @@ jobs:
           # list.
           - name: gpu prove lane suite
             cmd: bash ci/scripts/test_gpu_prove_lane.sh
+          # The gang-lane fixture suite (plan 67 U7a): drives the REAL
+          # `rp_gang_verdict` over every rc arm, the GANG_GROUPS closure, the
+          # two never-vacuous arms of the `gang-proof` group as the EXPANDED
+          # remote text the driver really sends, and the lane's cost bound —
+          # re-derived from runpod_lib.sh's own `a100` candidate list, the
+          # driver's RP_SSH_WAIT_SECS/RP_TTL_HOURS and the workflow's
+          # MAX_ATTEMPTS, so a raised term or a drifted figure reds here
+          # rather than showing up on an invoice. Mocks-only: no RunPod
+          # account, no GPU, no network. See that script's own header.
+          - name: gpu gang lane suite
+            cmd: bash ci/scripts/test_gpu_gang_lane.sh
           # esc-084/#454 (prove once per commit, share the verdict): P1-P4
           # static rules (exactly-one producer + the never-in-the-critical-
           # path doctrine, no renting reusable, every manifest CUDA lane's

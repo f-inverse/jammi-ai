@@ -130,6 +130,17 @@ string):
      itself. An unlisted match FAILS, naming the workflow and job — it can
      never again silently promote ungated.
 
+  P7 (EVERY paid pod lane, not only the prove one). P1's three sub-rules
+     — exactly one invoker, no `push:`/`workflow_call:` in that invoker's
+     own `on:` block, nothing `uses:` it — restated over the reviewed
+     `PAID_POD_LANE_TABLE` registry (driver script -> its one workflow):
+     the prove lane, the gang lane (1 pod x 2 GPU), the perf-A/B lane and
+     the how-well lane. The doctrine was never about one script's name; it
+     is about a leg that RENTS HARDWARE, and a lane added without this rule
+     would have reproduced P1's own escape shape one file over. A row's
+     workflow missing from the tree, an unreadable `on:` block, and zero
+     invokers are each a FAIL, never a silent skip.
+
 Mechanism: comment-stripped line scan plus a minimal indentation-based
 `jobs:` block splitter (no PyYAML, this repo's own gate convention). Every
 check function takes an explicit `workflows_dir`/`manifest_path` so
@@ -690,6 +701,107 @@ def check_p1_p2(workflow_texts: dict[str, str]) -> list[str]:
             if gate_variant in stripped:
                 findings.append(f"P2: {name} references the deleted renting reusable {gate_variant}")
 
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# P7 (every PAID POD LANE, not only the prove lane)
+# --------------------------------------------------------------------------- #
+# P1 states the doctrine for ONE script by name. The doctrine is not about
+# that script: it is about a leg that RENTS HARDWARE. Every such leg costs
+# money per run, depends on intermittent third-party capacity, and must
+# therefore be started deliberately — never by a push, never by another
+# workflow calling it, and never from more than one place (two invokers
+# means two rentals for one commit, and no single lane owning the verdict).
+#
+# `PAID_POD_LANE_TABLE` is the reviewed registry of those legs: driver
+# script -> the ONE workflow allowed to invoke it. Each row is held to
+# exactly P1's three sub-rules:
+#
+#   (1) exactly one workflow's comment-stripped body invokes the driver, and
+#       it is the row's workflow (zero invokers is a FAIL too — a paid lane
+#       wired nowhere is a lane that silently stopped running);
+#   (2) that workflow's own `on:` block carries neither `push:` nor
+#       `workflow_call:` (an unreadable — quoted or flow-style — `on:` block
+#       is itself a FAIL, never a silent skip);
+#   (3) no OTHER workflow `uses:` it, local or cross-repo form.
+#
+# The prove lane is a row here as well as P1's subject: P1 additionally
+# pins the exactly-once PRODUCER identity that the release verdict depends
+# on (and reports its own findings in its own words), while this rule is
+# the class the prove lane is one member of. A new paid lane lands as a
+# row, in the same commit as its driver and its workflow.
+PAID_POD_LANE_TABLE: dict[str, str] = {
+    # The release-gating proof lane (also P1's own subject).
+    "runpod_gpu_prove.sh": "gpu-prove.yml",
+    # The distributed-training gang leg: 1 pod x 2 GPU — the priciest row
+    # here per run, and the only one that rents more than one device.
+    "runpod_gpu_gang.sh": "gpu-gang.yml",
+    # The within-run GPU perf A/B (two resident clones on one pod).
+    "runpod_gpu_perf_ab.sh": "gpu-perf-ab.yml",
+    # The how-well A/B campaign driver.
+    "runpod_gpu_howwell.sh": "gpu-howwell.yml",
+}
+
+
+def check_p7_paid_pod_lanes(workflow_texts: dict[str, str]) -> list[str]:
+    findings: list[str] = []
+    for script, workflow in sorted(PAID_POD_LANE_TABLE.items()):
+        producers = sorted(
+            name for name, text in workflow_texts.items() if script in drop_comment_lines(text)
+        )
+        resolved_workflow = resolve_workflow(workflow_texts, workflow)
+
+        if not producers:
+            findings.append(
+                f"P7: zero workflows invoke {script} — the paid pod lane it drives is wired nowhere, "
+                "so nothing runs it and nothing can be proven by it"
+            )
+        else:
+            if resolved_workflow is None or resolved_workflow not in producers:
+                findings.append(
+                    f"P7: {script} is invoked by {producers}, none of which is {workflow} — a paid pod "
+                    "lane's driver belongs to exactly one workflow"
+                )
+            extra = [p for p in producers if p != resolved_workflow]
+            if extra:
+                findings.append(
+                    f"P7: {script} is invoked by more than one workflow ({producers}) — only {workflow} "
+                    f"may rent for this lane; extra site(s): {extra}"
+                )
+
+        if resolved_workflow is None:
+            findings.append(f"P7: {workflow} is missing from the workflow tree")
+            continue
+
+        keys, err = read_top_level_on_block(workflow_texts[resolved_workflow])
+        if err is not None:
+            findings.append(f"P7: {resolved_workflow}: {err}")
+        else:
+            bad_triggers = [k for k in (keys or []) if k in ("push", "workflow_call")]
+            if bad_triggers:
+                findings.append(
+                    f"P7: {resolved_workflow}'s on: block carries {bad_triggers} — a leg that RENTS "
+                    "hardware is never started by a push and is never callable by another workflow "
+                    "(it fires on a label, a schedule, or a manual dispatch only)"
+                )
+
+        workflow_variants = set(_workflow_name_variants(workflow))
+        for name, text in workflow_texts.items():
+            if name == resolved_workflow:
+                continue
+            stripped = drop_comment_lines(text)
+            for m in _USES_LOCAL_RE.finditer(stripped):
+                if m.group(1) in workflow_variants:
+                    findings.append(
+                        f"P7: {name} `uses:` {m.group(1)} — nothing may call a paid pod lane"
+                    )
+            for m in _USES_CROSS_REPO_RE.finditer(stripped):
+                if m.group(1) in workflow_variants:
+                    findings.append(
+                        f"P7: {name} `uses:` a cross-repo reference to {m.group(1)} — nothing may call "
+                        "a paid pod lane"
+                    )
     return findings
 
 
@@ -1491,6 +1603,7 @@ def run_gate(
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     findings: list[str] = []
     findings += check_p1_p2(workflow_texts)
+    findings += check_p7_paid_pod_lanes(workflow_texts)
     findings += check_gate_file_absent(workflows_dir)
     findings += check_promotion_table(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
@@ -1509,7 +1622,9 @@ def main() -> int:
     print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every release "
           "publisher's promotion gates on the shared verdict (all-or-nothing, not only the CUDA "
           "lanes), consumer/producer names agree, the reusable actually consults the verdict keyed "
-          "by the promoted commit, and no publishing job in the tree is unlisted.")
+          "by the promoted commit, no publishing job in the tree is unlisted, and every paid pod "
+          "lane in PAID_POD_LANE_TABLE has exactly one invoker whose on: block carries no "
+          "push:/workflow_call: trigger and which nothing uses:.")
     return 0
 
 

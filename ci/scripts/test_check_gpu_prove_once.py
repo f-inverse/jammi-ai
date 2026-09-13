@@ -98,6 +98,43 @@ jobs:
 """
 
 
+
+def _paid_lane_yml(name: str, job: str, script: str, label: str) -> str:
+    """A minimal, VALID paid-pod-lane workflow (P7): label/dispatch-only
+    triggers and exactly one step body invoking its own driver script."""
+    return f"""\
+name: {name}
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  {job}:
+    name: {name}
+    if: github.event_name != 'pull_request' || github.event.label.name == '{label}'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rent a pod and run this lane
+        run: |
+          bash ci/scripts/{script}
+"""
+
+
+GANG_YML_GOOD = _paid_lane_yml("GPU gang (RunPod)", "gpu-gang", "runpod_gpu_gang.sh", "run-gang")
+PERF_AB_YML_GOOD = _paid_lane_yml(
+    "GPU perf A/B (RunPod)", "gpu-perf-ab", "runpod_gpu_perf_ab.sh", "run-gpu-perf-ab"
+)
+HOWWELL_YML_GOOD = _paid_lane_yml(
+    "GPU how-well (RunPod)", "gpu-howwell", "runpod_gpu_howwell.sh", "run-howwell"
+)
+
+
 def _gate_job(gate_name: str = "gpu-proof", tag_family: str = "v") -> str:
     return f"""\
   {gate_name}:
@@ -313,6 +350,12 @@ def positive_workflows() -> dict[str, str]:
     positive."""
     return {
         "gpu-prove.yml": PROVE_YML_GOOD,
+        # P7's other PAID_POD_LANE_TABLE rows — the positive fixture must
+        # carry every row, or "no P7 findings" would be vacuous (the
+        # anti-vacuity leg in PaidPodLaneTest asserts exactly that).
+        "gpu-gang.yml": GANG_YML_GOOD,
+        "gpu-perf-ab.yml": PERF_AB_YML_GOOD,
+        "gpu-howwell.yml": HOWWELL_YML_GOOD,
         "_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD,
         "server-image.yml": _server_image_yml(),
         "release-binaries.yml": _release_binaries_yml(),
@@ -349,6 +392,95 @@ class RealTreeTest(unittest.TestCase):
     def test_real_tree_passes(self):
         findings = cgo.run_gate(cgo.WORKFLOWS_DIR, cgo.MANIFEST_PATH)
         self.assertEqual(findings, [])
+
+
+class PaidPodLaneTest(unittest.TestCase):
+    """P7: P1's doctrine over EVERY row of `PAID_POD_LANE_TABLE`, not only
+    the prove lane. Every case below is driven against the gang row (the
+    newest, priciest lane — 1 pod x 2 GPU), because a rule that only ever
+    bit on the row it was written for is the escape P7 exists to close."""
+
+    def _texts(self, **overrides: str) -> dict[str, str]:
+        texts = _positive_texts()
+        texts.update(overrides)
+        return texts
+
+    def test_positive_fixture_has_no_paid_lane_findings(self):
+        self.assertEqual(cgo.check_p7_paid_pod_lanes(_positive_texts()), [])
+
+    def test_every_table_row_is_exercised_by_the_positive_fixture(self):
+        # Anti-vacuity: the positive fixture must actually CONTAIN every row
+        # of the table, or "no findings" above would be free.
+        texts = _positive_texts()
+        for script, workflow in cgo.PAID_POD_LANE_TABLE.items():
+            self.assertIn(workflow, texts, f"{workflow} missing from the positive fixture")
+            self.assertIn(script, cgo.drop_comment_lines(texts[workflow]))
+
+    def test_push_trigger_on_the_gang_workflow_fails(self):
+        broken = GANG_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        joined = "\n".join(findings)
+        self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
+
+    def test_workflow_call_trigger_on_the_gang_workflow_fails(self):
+        broken = GANG_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:", "on:\n  workflow_call:\n  workflow_dispatch:"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        self.assertIn("workflow_call", "\n".join(findings))
+
+    def test_quoted_on_block_is_unreadable_not_a_pass(self):
+        broken = GANG_YML_GOOD.replace("\non:\n", '\n"on":\n')
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        self.assertIn("cannot read", "\n".join(findings))
+
+    def test_two_invokers_of_the_gang_driver_fail(self):
+        second = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: second-gang-renter")
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"second-gang-renter.yml": second}))
+        joined = "\n".join(findings)
+        self.assertIn("more than one workflow", joined)
+        self.assertIn("second-gang-renter.yml", joined)
+
+    def test_zero_invokers_fails(self):
+        broken = GANG_YML_GOOD.replace("bash ci/scripts/runpod_gpu_gang.sh", "echo nothing")
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        self.assertIn("zero workflows invoke runpod_gpu_gang.sh", "\n".join(findings))
+
+    def test_missing_workflow_file_fails(self):
+        texts = _positive_texts()
+        del texts["gpu-gang.yml"]
+        findings = cgo.check_p7_paid_pod_lanes(texts)
+        joined = "\n".join(findings)
+        self.assertIn("gpu-gang.yml is missing from the workflow tree", joined)
+
+    def test_a_publisher_that_uses_the_gang_lane_fails(self):
+        caller = (
+            "name: publisher\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  gang:\n    uses: ./.github/workflows/gpu-gang.yml\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
+        self.assertIn("nothing may call a paid pod lane", "\n".join(findings))
+
+    def test_cross_repo_uses_of_the_gang_lane_fails(self):
+        caller = (
+            "name: publisher\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  gang:\n    uses: f-inverse/jammi-ai/.github/workflows/gpu-gang.yml@main\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
+        self.assertIn("cross-repo reference", "\n".join(findings))
+
+    def test_the_rule_bites_on_every_row_not_only_the_gang_one(self):
+        # One `push:` trigger per row, each independently caught by name.
+        for script, workflow in cgo.PAID_POD_LANE_TABLE.items():
+            with self.subTest(lane=workflow):
+                texts = _positive_texts()
+                texts[workflow] = texts[workflow].replace(
+                    "on:\n  workflow_dispatch:", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:", 1
+                )
+                findings = cgo.check_p7_paid_pod_lanes(texts)
+                self.assertIn(f"{workflow}'s on: block carries ['push']", "\n".join(findings), script)
 
 
 class PreFixShapeFixtureTest(unittest.TestCase):

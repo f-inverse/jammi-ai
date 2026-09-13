@@ -44,12 +44,20 @@
 //!
 //! # What only the host arms guarantee
 //!
-//! A check on what a PEER passed needs the peer's arguments. The host arms
-//! ([`Noop`], [`Local`]) have them — the rendezvous carries each rank's whole
-//! contribution — so they refuse a peer whose row count contradicts the
-//! partition rule, whose tensor list is a different length, or who entered
-//! the round at a different collective or with a different root, and they
-//! record such a disagreement as the gang's permanent fault.
+//! A check on what a PEER passed needs the peer's arguments. [`Local`] has
+//! them — the rendezvous carries each rank's whole contribution — so a rank
+//! deposits a **descriptor** alongside it: the verb, and every argument other
+//! than the tensor bytes that determines the round's result (`root` for
+//! `broadcast`, the full `counts` vector for `all_gather`, how many tensors
+//! and each one's shape and dtype, and the world size). A round is published
+//! ONLY once every rank's descriptor for it is equal; on any disagreement no
+//! rank is ever handed a result — every rank gets a typed error naming both
+//! descriptors, and the gang is faulted before any of them returns. So on
+//! [`Local`], **no rank can ever return `Ok` from a round any other rank
+//! rejects**: two ranks each naming themselves root, or deriving different
+//! partition counts, are a symmetric typed error on both, never an `Ok` on
+//! one and a wrong answer (or a different error) on the other. [`Noop`] has
+//! no peer to disagree with (`world` is always 1), so this is vacuous there.
 //!
 //! The `Nccl` arm has none of that. NCCL exchanges the buffers a collective
 //! names and nothing else: there is no counts exchange (by design — see

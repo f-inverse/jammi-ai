@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use jammi_db::error::{JammiError, Result};
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 
 use super::{checked_gather_counts, checked_root, Collective};
 
@@ -48,10 +48,6 @@ use super::{checked_gather_counts, checked_root, Collective};
 pub const DEFAULT_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What one rank contributes to one round of one collective.
-///
-/// The kind is part of the contribution so a round in which the ranks are
-/// executing DIFFERENT collectives is a typed error rather than a
-/// nonsensical result: a mismatch means the gang has left lockstep.
 #[derive(Clone, Debug)]
 enum Contribution {
     /// [`Collective::all_gather`]: this rank's slice.
@@ -67,7 +63,10 @@ enum Contribution {
 }
 
 impl Contribution {
-    /// The operation name, for the error a kind mismatch raises.
+    /// The operation name — this is [`Descriptor::verb`], so a round in
+    /// which the ranks are executing DIFFERENT collectives is caught by the
+    /// same descriptor-agreement check as every other disagreement, rather
+    /// than by a check of its own.
     fn kind(&self) -> &'static str {
         match self {
             Self::Gather(_) => "all_gather",
@@ -76,6 +75,100 @@ impl Contribution {
             Self::Broadcast(_) => "broadcast",
             Self::Barrier => "barrier",
         }
+    }
+}
+
+/// One rank's declaration of what a round computes: the verb, and every
+/// per-call argument other than the tensor bytes that determines the round's
+/// result.
+///
+/// `Shared::exchange` publishes a round ONLY once every rank's descriptor for
+/// it is equal (checked by [`Descriptor::agrees_with`]); on any disagreement
+/// the round is never published, and every rank gets a typed error naming
+/// both descriptors instead. This is the ONE place a cross-rank agreement
+/// check lives — no verb's trait method runs its own peer-specific check
+/// outside it.
+#[derive(Clone, Debug, PartialEq)]
+struct Descriptor {
+    /// The operation name — see [`Contribution::kind`].
+    verb: &'static str,
+    /// [`Collective::world`] as this rank sees it.
+    world: usize,
+    /// [`Collective::broadcast`]'s `root`; `None` for every other verb.
+    root: Option<u32>,
+    /// [`Collective::all_gather`]'s full `counts` vector; `None` for every
+    /// other verb.
+    counts: Option<Vec<usize>>,
+    /// One entry per tensor this call carries, in the order the verb defines
+    /// it: `all_gather`'s single `local`, `all_reduce_sum`'s slice in
+    /// canonical order, or `broadcast`'s `t`. Empty for
+    /// `all_reduce_max_flags` and `barrier`, which carry no tensor.
+    tensors: Vec<TensorSignature>,
+}
+
+/// One tensor's shape and dtype, as far as a round's descriptor cares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TensorSignature {
+    dims: Vec<usize>,
+    dtype: DType,
+}
+
+impl TensorSignature {
+    /// The full shape and dtype of `t`.
+    fn of(t: &Tensor) -> Self {
+        Self {
+            dims: t.dims().to_vec(),
+            dtype: t.dtype(),
+        }
+    }
+
+    /// [`Self::of`] with dim 0 dropped: `all_gather`'s row count is already
+    /// the descriptor's [`Descriptor::counts`] and legitimately differs by
+    /// rank (a zero-row rank, an uneven partition), so only the TRAILING
+    /// shape is a determinant of agreement for a gathered tensor.
+    fn of_gather_slice(t: &Tensor) -> Self {
+        let dims = t.dims();
+        Self {
+            dims: dims.get(1..).map(<[usize]>::to_vec).unwrap_or_default(),
+            dtype: t.dtype(),
+        }
+    }
+}
+
+impl Descriptor {
+    /// `Ok(())` when every field this round's result depends on agrees with
+    /// `other`; `Err(())` on the first disagreement found.
+    ///
+    /// Each `if` below is an independent determinant of agreement: dropping
+    /// any single one of them is a distinct way for two ranks to be handed
+    /// `Ok` from a round they never actually agreed on (a different root, a
+    /// different partition, a different trainable-variable count, a
+    /// differently shaped or typed tensor, or a different world size).
+    fn agrees_with(&self, other: &Descriptor) -> std::result::Result<(), ()> {
+        if self.verb != other.verb {
+            return Err(());
+        }
+        if self.world != other.world {
+            return Err(());
+        }
+        if self.root != other.root {
+            return Err(());
+        }
+        if self.counts != other.counts {
+            return Err(());
+        }
+        if self.tensors.len() != other.tensors.len() {
+            return Err(());
+        }
+        for (mine, theirs) in self.tensors.iter().zip(other.tensors.iter()) {
+            if mine.dims != theirs.dims {
+                return Err(());
+            }
+            if mine.dtype != theirs.dtype {
+                return Err(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -94,8 +187,9 @@ struct Round {
     /// folded into a result.
     generation: u64,
     /// Rank-indexed contributions of the round being assembled, each tagged
-    /// with the [`Self::generation`] it was deposited at.
-    slots: Vec<Option<(u64, Contribution)>>,
+    /// with the [`Self::generation`] it was deposited at and the
+    /// [`Descriptor`] `Shared::exchange` compares before publishing.
+    slots: Vec<Option<(u64, Descriptor, Contribution)>>,
     /// How many ranks have deposited into `slots`.
     arrived: usize,
     /// The completed round, shared by every rank until all have taken it.
@@ -151,10 +245,19 @@ struct Shared {
 }
 
 impl Shared {
-    /// Deposit this rank's contribution and return every rank's, in rank
-    /// order, once the round completes.
-    fn exchange(&self, rank: usize, contribution: Contribution) -> Result<Arc<Vec<Contribution>>> {
-        let kind = contribution.kind();
+    /// Deposit this rank's contribution AND its round [`Descriptor`], and
+    /// return every rank's contribution, in rank order, once the round
+    /// completes — but only once every rank's descriptor for this round is
+    /// equal. On any disagreement no rank is ever handed a result: every
+    /// rank gets a typed error naming both descriptors, and the fault is
+    /// recorded before any rank returns.
+    fn exchange(
+        &self,
+        rank: usize,
+        descriptor: Descriptor,
+        contribution: Contribution,
+    ) -> Result<Arc<Vec<Contribution>>> {
+        let kind = descriptor.verb;
         let deadline = Instant::now() + self.timeout;
         let mut round = self.round.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -169,14 +272,16 @@ impl Shared {
         // is a whole collective ahead, so it waits here rather than
         // overwriting a slot the peer has not read.
         loop {
-            // The predicate is re-checked before every wait and never after
-            // the wait's own return: a wake that satisfied the predicate at
-            // the same instant the deadline passed proceeds, so a round the
-            // gang DID complete is never reported as a timeout on one rank
-            // and a success on another.
             if round.published.is_none() {
                 break;
             }
+            // The deadline itself is checked only just before parking, inside
+            // `wait`: a wake that already satisfies this predicate needs no
+            // fresh deadline check at all. This predicate, by contrast, IS
+            // re-checked every time `wait` returns (that is this loop
+            // repeating), so a round the gang DID complete inside the
+            // deadline reads as a success on every rank, never as a timeout
+            // on the one whose wake happened to land after the clock's edge.
             round = self.wait(round, deadline, kind, "the previous round to be consumed")?;
         }
 
@@ -187,7 +292,7 @@ impl Shared {
             return Err(self.fail(&mut round, reason));
         }
         let generation = round.generation;
-        round.slots[rank] = Some((generation, contribution));
+        round.slots[rank] = Some((generation, descriptor, contribution));
         round.arrived += 1;
 
         if round.arrived == self.world {
@@ -197,13 +302,15 @@ impl Shared {
             // assuming it, and it is what refuses the `Ok` a late peer would
             // otherwise be handed over a departed rank's stale contribution.
             let mut contributions = Vec::with_capacity(self.world);
+            let mut descriptors = Vec::with_capacity(self.world);
             let mut superseded: Option<(usize, u64)> = None;
             for (peer, slot) in round.slots.iter_mut().enumerate() {
-                let (deposited, contribution) =
+                let (deposited, descriptor, contribution) =
                     slot.take().expect("every rank deposited into this round");
                 if deposited != generation {
                     superseded = Some((peer, deposited));
                 }
+                descriptors.push(descriptor);
                 contributions.push(contribution);
             }
             if let Some((peer, deposited)) = superseded {
@@ -214,6 +321,26 @@ impl Shared {
                 );
                 return Err(self.fail(&mut round, reason));
             }
+
+            // Every rank's descriptor must agree before ANYTHING is
+            // published: this is the check that keeps a round no rank
+            // actually agreed to from ever being handed to any of them as
+            // `Ok`. No verb runs its own peer-specific check outside this
+            // one — a different root, a disagreeing partition, a different
+            // trainable-variable count or shape or dtype are all caught
+            // here, symmetrically, before the round exists for anyone.
+            for (peer, other) in descriptors.iter().enumerate().skip(1) {
+                if descriptors[0].agrees_with(other).is_err() {
+                    let reason = format!(
+                        "{kind}: rank 0's round descriptor is {:?} but rank {peer}'s is {:?} \
+                         — the ranks disagree about what this round computes, so no rank may \
+                         be handed a result",
+                        descriptors[0], other
+                    );
+                    return Err(self.fail(&mut round, reason));
+                }
+            }
+
             round.published = Some((generation, Arc::new(contributions)));
             round.generation += 1;
             round.arrived = 0;
@@ -248,19 +375,6 @@ impl Shared {
         }
         drop(round);
 
-        // Every rank ran the same collective, or the gang has left lockstep
-        // and any result computed from these contributions would be
-        // meaningless.
-        for (peer, contribution) in published.iter().enumerate() {
-            if contribution.kind() != kind {
-                let reason = format!(
-                    "{kind}: rank {peer} is at {} instead — the gang has left lockstep",
-                    contribution.kind()
-                );
-                self.fail_detached(reason.clone());
-                return Err(JammiError::FineTune(reason));
-            }
-        }
         Ok(published)
     }
 
@@ -497,26 +611,31 @@ impl Collective for Local {
     fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         self.guarded("all_gather", || {
             let total = checked_gather_counts(self.rank, self.world(), local, counts)?;
-            let contributions = self
-                .shared
-                .exchange(self.rank as usize, Contribution::Gather(local.clone()))?;
+            let contribution = Contribution::Gather(local.clone());
+            let descriptor = Descriptor {
+                verb: contribution.kind(),
+                world: self.shared.world,
+                root: None,
+                counts: Some(counts.to_vec()),
+                tensors: vec![TensorSignature::of_gather_slice(local)],
+            };
+            let contributions =
+                self.shared
+                    .exchange(self.rank as usize, descriptor, contribution)?;
 
             // Rank order, this rank's device, and only this rank's own slot
             // attached to the graph: the remote slots are values, not a path a
-            // gradient can take to a peer's parameters.
+            // gradient can take to a peer's parameters. Every peer's row count
+            // is already known to equal `counts[peer]` — the descriptor
+            // agreement `exchange` just proved makes every rank's `counts`
+            // vector identical, and each rank checked its OWN row count
+            // against its own `counts` entry before depositing.
             let mut slices: VecDeque<Tensor> = VecDeque::with_capacity(contributions.len());
             for (peer, contribution) in contributions.iter().enumerate() {
                 let Contribution::Gather(tensor) = contribution else {
                     unreachable!("exchange checked every contribution's kind");
                 };
                 let rows = tensor.dims().first().copied().unwrap_or(0);
-                if rows != counts[peer] {
-                    return Err(JammiError::FineTune(format!(
-                        "all_gather: rank {peer} contributed {rows} rows where the partition rule \
-                     says {} — the ranks disagree about the partition",
-                        counts[peer]
-                    )));
-                }
                 if rows == 0 {
                     continue;
                 }
@@ -556,26 +675,21 @@ impl Collective for Local {
 
     fn all_reduce_sum(&self, tensors: &mut [Tensor]) -> Result<()> {
         self.guarded("all_reduce_sum", || {
-            let contributions = self.shared.exchange(
-                self.rank as usize,
-                Contribution::ReduceSum(tensors.to_vec()),
-            )?;
+            let contribution = Contribution::ReduceSum(tensors.to_vec());
+            let descriptor = Descriptor {
+                verb: contribution.kind(),
+                world: self.shared.world,
+                root: None,
+                counts: None,
+                tensors: tensors.iter().map(TensorSignature::of).collect(),
+            };
+            let contributions =
+                self.shared
+                    .exchange(self.rank as usize, descriptor, contribution)?;
 
-            for (peer, contribution) in contributions.iter().enumerate() {
-                let Contribution::ReduceSum(peer_tensors) = contribution else {
-                    unreachable!("exchange checked every contribution's kind");
-                };
-                if peer_tensors.len() != tensors.len() {
-                    return Err(JammiError::FineTune(format!(
-                        "all_reduce_sum: rank {peer} reduced {} tensors where rank {} reduced {} \
-                     — the canonical trainable-variable order must be identical on every rank",
-                        peer_tensors.len(),
-                        self.rank,
-                        tensors.len()
-                    )));
-                }
-            }
-
+            // Every peer's tensor count and each tensor's shape and dtype are
+            // already known to match this rank's own — that agreement is what
+            // `exchange` just proved, symmetrically, before publishing.
             for (index, slot) in tensors.iter_mut().enumerate() {
                 // The fold runs on rank 0's device, in rank order, so the sum is
                 // one fixed sequence of additions rather than one per rank.
@@ -609,9 +723,17 @@ impl Collective for Local {
 
     fn all_reduce_max_flags(&self, flags: u32) -> Result<u32> {
         self.guarded("all_reduce_max_flags", || {
-            let contributions = self
-                .shared
-                .exchange(self.rank as usize, Contribution::MaxFlags(flags))?;
+            let contribution = Contribution::MaxFlags(flags);
+            let descriptor = Descriptor {
+                verb: contribution.kind(),
+                world: self.shared.world,
+                root: None,
+                counts: None,
+                tensors: Vec::new(),
+            };
+            let contributions =
+                self.shared
+                    .exchange(self.rank as usize, descriptor, contribution)?;
             let mut max = 0u32;
             for contribution in contributions.iter() {
                 let Contribution::MaxFlags(peer_flags) = contribution else {
@@ -626,19 +748,30 @@ impl Collective for Local {
     fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()> {
         self.guarded("broadcast", || {
             let root_index = checked_root(self.world(), root)?;
+            let descriptor_tensor = TensorSignature::of(t);
             let payload = (self.rank == root).then(|| t.clone());
-            let contributions = self
-                .shared
-                .exchange(self.rank as usize, Contribution::Broadcast(payload))?;
+            let contribution = Contribution::Broadcast(payload);
+            let descriptor = Descriptor {
+                verb: contribution.kind(),
+                world: self.shared.world,
+                root: Some(root),
+                counts: None,
+                tensors: vec![descriptor_tensor],
+            };
+            let contributions =
+                self.shared
+                    .exchange(self.rank as usize, descriptor, contribution)?;
             let Contribution::Broadcast(from_root) = &contributions[root_index] else {
                 unreachable!("exchange checked every contribution's kind");
             };
-            let from_root = from_root.as_ref().ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "broadcast: rank {root} entered the round as a non-root — the ranks disagree \
-                 about which of them is the root"
-                ))
-            })?;
+            // `exchange` only publishes once every rank's descriptor agrees,
+            // including `root`: the rank at `root_index` is the one every
+            // rank named as root, and it is the only one whose payload is
+            // `Some`, so this can never be the `None` a disagreeing root
+            // used to leave here.
+            let from_root = from_root
+                .as_ref()
+                .expect("the agreed root's slot in a published round always carries a payload");
             *t = from_root
                 .to_device(self.device())
                 .map_err(|e| JammiError::FineTune(format!("broadcast: to_device: {e}")))?
@@ -649,8 +782,16 @@ impl Collective for Local {
 
     fn barrier(&self) -> Result<()> {
         self.guarded("barrier", || {
+            let contribution = Contribution::Barrier;
+            let descriptor = Descriptor {
+                verb: contribution.kind(),
+                world: self.shared.world,
+                root: None,
+                counts: None,
+                tensors: Vec::new(),
+            };
             self.shared
-                .exchange(self.rank as usize, Contribution::Barrier)?;
+                .exchange(self.rank as usize, descriptor, contribution)?;
             Ok(())
         })
     }
@@ -770,5 +911,154 @@ mod rendezvous_state_tests {
                 "unexpected message: {stale}"
             );
         });
+    }
+}
+
+/// One test per [`Descriptor`] field, each proving that field is its own,
+/// independent determinant of agreement: dropping any one `if` inside
+/// [`Descriptor::agrees_with`] is a distinct way for two ranks to be handed
+/// `Ok` from a round they never actually agreed on, and this module's tests
+/// were each run against that exact mutation (comment out the one `if`, see
+/// exactly that test die, restore it).
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    fn gather_descriptor(counts: Vec<usize>) -> Descriptor {
+        Descriptor {
+            verb: "all_gather",
+            world: 2,
+            root: None,
+            counts: Some(counts),
+            tensors: vec![TensorSignature {
+                dims: vec![2],
+                dtype: DType::F32,
+            }],
+        }
+    }
+
+    fn reduce_descriptor(tensors: Vec<TensorSignature>) -> Descriptor {
+        Descriptor {
+            verb: "all_reduce_sum",
+            world: 2,
+            root: None,
+            counts: None,
+            tensors,
+        }
+    }
+
+    /// The control every mismatch test below rests on: two descriptors built
+    /// the same way agree, or the mismatch tests would be proving nothing.
+    #[test]
+    fn identical_descriptors_agree() {
+        let a = gather_descriptor(vec![1, 1]);
+        let b = gather_descriptor(vec![1, 1]);
+        assert!(
+            a.agrees_with(&b).is_ok(),
+            "identical descriptors must agree"
+        );
+    }
+
+    #[test]
+    fn a_verb_mismatch_disagrees() {
+        let a = gather_descriptor(vec![1, 1]);
+        let b = Descriptor {
+            verb: "barrier",
+            ..a.clone()
+        };
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks running different collectives must never agree"
+        );
+    }
+
+    #[test]
+    fn a_world_mismatch_disagrees() {
+        let a = gather_descriptor(vec![1, 1]);
+        let b = Descriptor {
+            world: a.world + 1,
+            ..a.clone()
+        };
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks reporting different world sizes must never agree"
+        );
+    }
+
+    #[test]
+    fn a_root_mismatch_disagrees() {
+        let a = Descriptor {
+            verb: "broadcast",
+            world: 2,
+            root: Some(0),
+            counts: None,
+            tensors: vec![TensorSignature {
+                dims: vec![1],
+                dtype: DType::F32,
+            }],
+        };
+        let b = Descriptor {
+            root: Some(1),
+            ..a.clone()
+        };
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks each naming themselves root must never agree — this is PROBE1's field"
+        );
+    }
+
+    #[test]
+    fn a_counts_mismatch_disagrees() {
+        let a = gather_descriptor(vec![1, 1]);
+        let b = gather_descriptor(vec![1, 2]);
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks with different partition vectors must never agree — this is PROBE2's field"
+        );
+    }
+
+    #[test]
+    fn a_tensor_count_mismatch_disagrees() {
+        let a = reduce_descriptor(vec![TensorSignature {
+            dims: vec![1],
+            dtype: DType::F32,
+        }]);
+        let b = reduce_descriptor(vec![]);
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks reducing a different number of trainable variables must never agree"
+        );
+    }
+
+    #[test]
+    fn a_tensor_shape_mismatch_disagrees() {
+        let a = reduce_descriptor(vec![TensorSignature {
+            dims: vec![2, 3],
+            dtype: DType::F32,
+        }]);
+        let b = reduce_descriptor(vec![TensorSignature {
+            dims: vec![2, 4],
+            dtype: DType::F32,
+        }]);
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks reducing a differently shaped tensor at the same index must never agree"
+        );
+    }
+
+    #[test]
+    fn a_tensor_dtype_mismatch_disagrees() {
+        let a = reduce_descriptor(vec![TensorSignature {
+            dims: vec![2],
+            dtype: DType::F32,
+        }]);
+        let b = reduce_descriptor(vec![TensorSignature {
+            dims: vec![2],
+            dtype: DType::F64,
+        }]);
+        assert!(
+            a.agrees_with(&b).is_err(),
+            "two ranks reducing a differently typed tensor at the same index must never agree"
+        );
     }
 }

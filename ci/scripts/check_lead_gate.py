@@ -2156,6 +2156,24 @@ def fixture_r12e5_empty_derived_set_unresolvable_main_denies() -> None:
     _assert("could not resolve a merge-base against main/master" in p.stderr, "R12E5", p.stderr)
 
 
+def fixture_r12e6_empty_derived_set_malformed_entry_denies() -> None:
+    """The empty-set path's own `err is not None: return err` propagation
+    (distinct from the by-file path's equivalent, R12P6-9) — a malformed
+    entry (bad hash) among otherwise-valid lead-chosen keys still denies,
+    naming the reproduction failure."""
+    unit = "feat/r12e6"
+    root = _r12_empty_set_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    b_hash = _r12_hash(0, "b = 1\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "cat a.py", "hash": "0" * 64},  # wrong hash
+        "b.py": {"command": "cat b.py", "hash": b_hash},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E6", f"a malformed empty-set entry must deny, got {p.returncode}")
+    _assert("does not reproduce the recorded hash" in p.stderr, "R12E6", p.stderr)
+
+
 def fixture_r12f1_pre_fix_sha_mismatch_denies() -> None:
     """The artifact is found at the CORRECT tip-keyed filename, but its OWN
     internal `pre_fix_sha` field (a forged or copy-pasted artifact) does
@@ -2294,6 +2312,25 @@ def fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies() -> None:
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2h"}}, root)
     _assert(p.returncode == 2, "R12R2h", f"a differing post-fix command must deny, got {p.returncode}")
     _assert("requires the SAME command" in p.stderr, "R12R2h", p.stderr)
+
+
+def fixture_r12r2i_attacks_post_hash_mismatch_denies() -> None:
+    """Reader 2's own `_r12_validate_and_run_entry` propagation (distinct
+    from R12R2b's "identical pre/post hash" differential check, which runs
+    AFTER this one) — a recorded `attacks_post` hash that does not
+    reproduce at all still denies here."""
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2i")
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": "0" * 64}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2i"}}, root)
+    _assert(p.returncode == 2, "R12R2i", f"a non-reproducing attacks_post hash must deny, got {p.returncode}")
+    _assert("does not reproduce" in p.stderr, "R12R2i", p.stderr)
 
 
 def fixture_r12witness_stderr_distinguishes_missing_from_real_failure() -> None:
@@ -3487,6 +3524,7 @@ FIXTURES = [
     ("R12E3", fixture_r12e3_empty_derived_set_all_inspector_denies),
     ("R12E4", fixture_r12e4_empty_derived_set_two_valid_execution_class_allows),
     ("R12E5", fixture_r12e5_empty_derived_set_unresolvable_main_denies),
+    ("R12E6", fixture_r12e6_empty_derived_set_malformed_entry_denies),
     ("R12F1", fixture_r12f1_pre_fix_sha_mismatch_denies),
     ("R12F2", fixture_r12f2_unit_branch_field_mismatch_denies),
     ("R12F3", fixture_r12f3_missing_residual_risk_denies),
@@ -3495,6 +3533,7 @@ FIXTURES = [
     ("R12R2f", fixture_r12r2f_partial_attacks_post_coverage_denies),
     ("R12R2g", fixture_r12r2g_attacks_post_entry_not_object_denies),
     ("R12R2h", fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies),
+    ("R12R2i", fixture_r12r2i_attacks_post_hash_mismatch_denies),
     ("R12witness", fixture_r12witness_stderr_distinguishes_missing_from_real_failure),
     ("R12reduce", fixture_r12reduce_two_lines_same_file_one_required_entry),
     ("R12unparse", fixture_r12unparse_prose_key_maps_to_itself_still_required),

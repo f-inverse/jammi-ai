@@ -471,3 +471,111 @@ fn local_reduces_a_non_f32_dtype() {
         assert_eq!(got, &vec![3, 21]);
     }
 }
+
+// ── The gang's fault state: a failed round is permanent ─────────────────────
+
+/// A round that expired cannot be completed by the peer that caused the
+/// expiry.
+///
+/// The timed-out rank has already been told it exchanged nothing; if the late
+/// peer were allowed to deposit into that same round it would fold the
+/// timed-out rank's STALE contribution and return `Ok` — two ranks with
+/// opposite verdicts about one round, which is the state the lockstep
+/// property exists to exclude. The late peer must instead be told the gang
+/// has failed, and told which collective it failed in.
+#[test]
+fn a_late_peer_cannot_complete_a_round_that_already_timed_out() {
+    let gang =
+        LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    // Rank 0 sets a control word its peer would see, and expires waiting.
+    let expired = rank0
+        .all_reduce_max_flags(0b1011)
+        .expect_err("rank 1 never arrives inside the deadline");
+    assert!(
+        expired.to_string().contains("timed out"),
+        "unexpected message: {expired}"
+    );
+
+    // Rank 1 arrives after the deadline. `Ok(0b1011)` here would be rank 0's
+    // stale flags — a decision rank 0 is not making.
+    let late = rank1
+        .all_reduce_max_flags(0)
+        .expect_err("the round rank 1 would complete has already failed");
+    let message = late.to_string();
+    assert!(
+        message.contains("the gang has already failed"),
+        "the late peer must be told the gang failed, not handed a result: {message}"
+    );
+    assert!(
+        message.contains("all_reduce_max_flags") && message.contains("timed out"),
+        "the fault names the round it failed in: {message}"
+    );
+}
+
+/// Once a gang has faulted, EVERY collective on EVERY rank refuses — promptly
+/// and with a typed error naming the fault, never `Ok` and never a park.
+///
+/// The elapsed bound is the "never a hang" half of that: the gang's deadline
+/// is two seconds, so a single collective that parked instead of refusing
+/// would put the sweep over the bound on its own.
+#[test]
+fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
+    let deadline = Duration::from_secs(2);
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], deadline).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    // Fault the gang through the lockstep check rather than the deadline, so
+    // the deadline below is free to be long enough for a park to be visible.
+    let mismatched = std::thread::scope(|scope| {
+        let zero = scope.spawn(|| rank0.all_reduce_max_flags(1).map(|_| ()));
+        let one = scope.spawn(|| rank1.barrier());
+        [
+            zero.join().expect("rank 0 thread"),
+            one.join().expect("rank 1 thread"),
+        ]
+    });
+    assert!(
+        mismatched.iter().any(|r| r
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.to_string().contains("left lockstep"))),
+        "the control: the gang must actually be faulted here, or the sweep below is vacuous"
+    );
+
+    let started = std::time::Instant::now();
+    for (who, rank) in [("rank 0", &rank0), ("rank 1", &rank1)] {
+        let mut sum = vec![matrix(1, 1, 0.0)];
+        let mut broadcast = matrix(1, 1, 0.0);
+        let attempts: [(&str, jammi_db::error::Result<()>); 5] = [
+            (
+                "all_gather",
+                rank.all_gather(&matrix(1, 2, 0.0), &[1, 1]).map(|_| ()),
+            ),
+            ("all_reduce_sum", rank.all_reduce_sum(&mut sum)),
+            (
+                "all_reduce_max_flags",
+                rank.all_reduce_max_flags(0).map(|_| ()),
+            ),
+            ("broadcast", rank.broadcast(&mut broadcast, 0)),
+            ("barrier", rank.barrier()),
+        ];
+        for (op, result) in attempts {
+            let error = result.expect_err(&format!(
+                "{who}'s {op} ran on a gang that has already failed"
+            ));
+            assert!(
+                error.to_string().contains("the gang has already failed"),
+                "{who}'s {op}: unexpected message: {error}"
+            );
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < deadline,
+        "the ten refusals took {elapsed:?}: at least one parked instead of refusing"
+    );
+}

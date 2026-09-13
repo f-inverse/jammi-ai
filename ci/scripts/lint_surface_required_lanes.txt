@@ -1,0 +1,60 @@
+# Required merge-path clippy lanes — read by `check_lint_surface_closure.py`.
+#
+# The closure half of that gate derives its obligations from `cargo metadata`:
+# a target with a non-empty `required-features` list must have SOME merge-path
+# `cargo clippy -D warnings` lane covering it. That derivation is silent about
+# a crate which declares no such target — `jammi-ai` declares none reaching
+# `cuda`, so deleting its `--features cuda` clippy step from
+# `.github/workflows/ci.yml` leaves the closure half, and every other gate in
+# this repo, green while a whole feature arm stops being linted on the merge
+# path. This registry is the second half: a lane named here MUST exist in the
+# merge-path corpus, whether or not any `required-features` target happens to
+# depend on it. Deleting the step reddens the gate, naming the row.
+#
+# Format, one lane per line, whitespace-separated:
+#
+#     <crate>  <feature-set>  <target-selection>
+#
+#   crate            a workspace package name; the lane must scope to it
+#                    (`-p <crate>`, or `--workspace` without `--exclude
+#                    <crate>`).
+#   feature-set      comma-separated feature names the lane must activate for
+#                    that crate, resolved through the crate's own `[features]`
+#                    implications (so a lane passing `flash-attn` satisfies a
+#                    `cuda` row when `flash-attn = ["cuda"]`); `-` for "no
+#                    features required". A `!name` entry FORBIDS a feature —
+#                    the lane must leave it off — which is how a narrower lane
+#                    that exists BECAUSE a feature is absent gets a row that
+#                    the wider lane cannot satisfy. `--all-features` is
+#                    expanded to the crate's whole feature set, so it satisfies
+#                    any positive row and fails every negated one.
+#   target-selection one of `all-targets`, `tests`, `bins`, `lib`, `examples`,
+#                    `benches` — the target kinds the lane must compile.
+#                    `--all-targets` on the lane satisfies every selection.
+#
+# Only a lane that denies warnings counts (`-- -D warnings` / `--deny
+# warnings`) and only one reachable from a genuinely merge-path-triggered
+# job/step, per `check_execution_surface_reachability.py`'s own trigger and
+# `if:`/`continue-on-error:` honesty. A row satisfied only by `gpu-prove.yml`'s
+# label/dispatch/schedule-triggered lanes is NOT satisfied.
+#
+# Adding a row is a promise the lane will keep existing; removing one is a
+# deliberate, reviewable narrowing of the lint surface this repo commits to.
+# An empty or missing registry is a FAIL, never a skip.
+
+# `jammi-ai`'s `cuda` arm: `#[cfg(feature = "cuda")]` items in `src/` and the
+# `#[test] #[cfg(feature = "cuda")]` fns in its `cfg(test)` half (e.g.
+# `crates/jammi-ai/src/fine_tune/adamw.rs`'s device-mismatch tests), which no
+# other merge-path lane compiles at all. Lives in `ci.yml`'s
+# `flash-attn-compile` job (the nvcc lane).
+jammi-ai        cuda             tests
+
+# `jammi-encoders`' two cuda arms. They differ by more than cost: the
+# `cuda`-only lane is the ONLY one that compiles the
+# `#[cfg(all(feature = "cuda", not(feature = "flash-attn")))]` meta-test, which
+# the `cuda,flash-attn` lane excludes by that test's own cfg. Hence the
+# negation: written as a bare `cuda` row it would be satisfied by the
+# `cuda,flash-attn` lane and would stay green on the very deletion it exists to
+# catch.
+jammi-encoders  cuda,!flash-attn  tests
+jammi-encoders  cuda,flash-attn   tests

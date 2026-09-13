@@ -876,9 +876,17 @@ jobs:
       # half, would otherwise first surface on a GPU pod run
       # (`ci/scripts/runpod_gpu_prove.sh`), behind `gpu-prove.yml`'s
       # dispatch/label/schedule triggers — never on the merge path.
-      # `ci/scripts/check_lint_surface_closure.py` credits this step
-      # mechanically from `cargo metadata`; it keeps no registry of step
-      # names, so this comment is documentation, not the gate.
+      # Deleting this step is caught, and by a gate rather than by review
+      # discipline: `ci/scripts/lint_surface_required_lanes.txt` carries the
+      # row `jammi-ai cuda tests`, and
+      # `ci/scripts/check_lint_surface_closure.py` FAILs naming that row when
+      # no merge-path lane matches it. The gate's OTHER half — the
+      # `cargo metadata` closure over `required-features` targets — credits
+      # this step for nothing at all (`jammi-ai` declares no target requiring
+      # `cuda`), which is precisely why the registry row exists. The registry
+      # matches parsed lanes, never step names, so renaming or moving this
+      # step is free; dropping `--tests`, dropping `-D warnings`, marking it
+      # `continue-on-error`, or deleting it is a FAIL.
       #
       # Same image, job, and toolchain as the two steps above — `cuda` selects
       # the feature chain (`candle-core/cuda`, `jammi-{encoders,lora,kernels}/

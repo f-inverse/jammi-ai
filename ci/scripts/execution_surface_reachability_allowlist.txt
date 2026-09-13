@@ -67,7 +67,7 @@ cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (p
 # three tuples newly REGISTERED. Same off-merge-path residual as the LIVE
 # suites section below — see the HONEST RESIDUAL note above. ---
 cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, now a literal tuple (esc-081) instead of a manifest-read shell variable.
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, now a literal tuple (esc-081).
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, now a literal tuple (esc-081) ci/scripts/runpod_gpu_gang.sh's own `gang-build` group carries the SAME tuple verbatim (it compiles the same test binary before running the gang filter over it) — one row, two origins, both off the merge path for the same reason.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture 2>&1)"	runpod_gpu_prove.sh's capability-surface-proof group — the RAGGED normalization of a `cap_out="$(JAMMI_KERNELS_STRICT=1 cargo test ... 2>&1)"` command-substitution line: the extractor's env-assignment stripper consumes `cap_out="$(JAMMI_KERNELS_STRICT=1 ` as its fallback (non-quoted) branch (the surrounding `"..."` never closes before end-of-line with trailing content, so the quoted branch cannot match) and the trailing `2>&1)"` is NOT stripped by anything else — this exact ragged string, not the "obvious" clean reading, is what the registry actually holds.
 
 # --- ci/scripts/runpod_gpu_prove.sh's own LIVE suites (distinct from the
@@ -160,3 +160,18 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn 2
 # #335's own exit criterion forbids enforcement before multi-pod/
 # both-device-model validation) -- see that script's own module doc. ---
 cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-clone build leg (`build_clone`, `CARGO_TARGET_DIR=\"$target\" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow (gpu-perf-ab.yml is dispatch/label-only); needs the CUDA toolchain. The SAME literal tuple covers BOTH the parent and comparison clone builds (`$clone` is a `build_clone` function parameter, called twice with different arguments -- one literal occurrence in the source).
+
+# --- ci/scripts/runpod_gpu_gang.sh — the gpu-gang POD leg (plan 67 U7a).
+# One pod, two A100s, the distributed fine-tune (gang) tests in jammi-ai's
+# `gpu_capability` target. Its `gang-build` compile-check tuple is
+# byte-identical to the prove lane's own and is covered by that row above
+# (one row, two origins); the LIVE run below is this script's only tuple of
+# its own. Same off-merge-path residual as every row above, on a narrower
+# fact: the tuple needs TWO real A100s in one box, which no hermetic runner
+# has and no single-GPU lane can stand in for. Its one invoker is
+# `.github/workflows/gpu-gang.yml` (the `run-gang` PR label, a nightly
+# schedule, manual dispatch — deliberately no `push:`/`workflow_call:`
+# trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s
+# paid-pod-lane rule pins that `on:` block by name, exactly as its P1 pins
+# the prove lane's). ---
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$gang_log"	runpod_gpu_gang.sh's `gang-proof` group — the live two-rank gang run on one 2-GPU pod (the RAGGED normalization of a `... | tee "$gang_log"` line inside the remote heredoc, so the registry holds the escaped `\$gang_log` spelling, not the "obvious" reading). Needs two real A100s in one box; the group refuses a zero-test filter match and a run that wrote no artifact, so this row never waives a vacuous pass.

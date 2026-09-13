@@ -103,6 +103,15 @@ PROVE_SCOPE = frozenset({"ci/scripts/runpod_gpu_prove.sh"})
 
 _PERF_PRODUCER_REASON = "perf producer, not a proof lane"
 EXEMPT_SCOPE: dict[str, str] = {
+    "ci/scripts/runpod_gpu_gang.sh": (
+        "gang pod leg (1 pod x 2 GPU): a DISTRIBUTED-TRAINING correctness surface, not the "
+        "release prove lane's shipped surface. PROVE_SCOPE membership means set-equality "
+        "against `ci/release-feature-manifest.json`'s `prove_lane.crates` declarations, and "
+        "this lane deliberately declares nothing there — it compiles and runs ONE target "
+        "(jammi-ai's `gpu_capability` under the gang name filter) on two devices, which no "
+        "release artifact is built from. Its tuples' off-merge-path residual is carried by "
+        "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own gang section"
+    ),
     "ci/scripts/pod_seed_target.sh": (
         "seed cache lane: T1 precedes CUTLASS provisioning, T1/T1b main-only "
         "split — a dedicated tuple-lockstep follow-up is tracked separately, "

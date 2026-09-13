@@ -1,0 +1,925 @@
+diff --git a/.claude/hooks/README.md b/.claude/hooks/README.md
+index d2b9253..ef14e00 100644
+--- a/.claude/hooks/README.md
++++ b/.claude/hooks/README.md
+@@ -128,8 +128,9 @@ or parenthesis and trailing punctuation stripped, an optional trailing
+ probing the fix's own surface satisfies this even when that file is also a finding
+ location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
+ conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
+-though one entry can double as both when it qualifies for each) and with (2b)'s
+-separate `open_question` field, conjunctive with all of R1-R3. **One unit per
++though one entry can double as both when it qualifies for each), with (2b)'s
++separate `open_question` field, and with (4)'s `claims` object below — all
++conjunctive with R1-R3. **One unit per
+ dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
+ type, the dispatch is denied outright, naming every targeted unit — R3 never
+ silently skips the others; dispatch each named unit separately. **§C5 — the ONE
+@@ -137,12 +138,14 @@ amendment to "no git subprocess anywhere":** git runs ONLY from the repeat-dispa
+ branch, NEVER on a first dispatch's hot path, and ONLY in `$CLAUDE_PROJECT_DIR` — the
+ documented hook environment contract: the harness always sets this variable for
+ every hook invocation, so `repo_root()`'s cwd fallback is never needed by this arm
+-and is deliberately not reused here — with FIVE git calls per decision (`rev-parse
++and is deliberately not reused here — with SIX git calls per decision (`rev-parse
+ --verify` block_sha, `rev-parse --verify` fix_head, `rev-parse --verify
+ --end-of-options refs/heads/...` unit_branch, `merge-base --is-ancestor`, `diff
+---name-only`), all sharing ONE per-decision monotonic deadline (`_GIT_BUDGET_S =
++--name-only`, and — esc-lead-gate-R11, (4) below — `diff -U0`), all sharing ONE
++per-decision monotonic deadline (`_GIT_BUDGET_S =
+ 5.0`, an absolute `time.monotonic()` value threaded through every call, never a
+-fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s) (git >= 2.24
++fresh 5s per call — the whole arm, INCLUDING (4)'s own claim-command
++re-execution, is bounded by 5s total, not 6x5s) (git >= 2.24
+ required: every invocation carries `--end-of-options` immediately before its
+ revision arguments, so a value shaped like an option — e.g. `--output=/tmp/x` — can
+ never be read as one; a pre-2.24 git fails that unrecognized-option check and
+@@ -153,9 +156,54 @@ command AND its stderr (read back from the same `tempfile.TemporaryFile()` the
+ command's output was captured to, after `wait()` returns — never left unread), and
+ states that `rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the
+ unit's evidence rather than fixing the underlying git problem.
++**(4) Untested claims — required alongside R3, on a REPEAT dispatch (esc-lead-gate-R11,
++"untested claims carry a test").** The relay may not be accepted while the fix's OWN
++diff still carries a claim-shaped line of a testable shape. The obligation is DERIVED
++BY THE HOOK from the diff's own shape — never declared by the lead: `_parse_claim_sites`
++(run from the SAME `_fix_window` call that computes R3's `fix_changed`, over `git diff
++-U0 block_sha fix_head`) is the hook's own enumeration of every line the fix ADDS that is
++BOTH a prose line (a comment, docstring, or whole-prose-file line — never bare code, the
++same WHERE-scoping technique `ci/scripts/check_doc_numbers_have_producers.py` already
++established for precision) and matches one of a finite, literal, multi-word phrase family
++drawn directly from this program's own retrospective: an impossibility/unreachability
++claim ("cannot be driven", "no injection point", "is unreachable", "no caller can", "not
++producer-driven", "no reliable way to force", "is not established", "structurally
++unreachable"), a mechanism claim ("is safe because", "routes through"), a caller-SET
++totality claim ("its only in-tree caller", "its one in-tree caller", "every caller is"),
++or a completed-re-verification claim ("re-verified"). A bare quantifier grep
++(`every`/`only`/`always` alone) was tried first and produces garbage — measured at 91 hits
++in this file alone and 1291 across `ci/scripts/*.py` — and is deliberately NOT shipped;
++this phrase family, unscoped, returns 26 hits across this repo's `ci/scripts` +
++`.claude/hooks` + `.claude/agents` combined, a tractable number. The relay's `claims`
++object must cover every key (`path:line`, EXACT-STRING, the hook's own derived set — the
++same superset-coverage posture R1 already takes toward `class_enumeration`) with either
++`{"status": "tested", "command": …, "output_hash": …}` (the hook RE-EXECUTES `command`
++itself — via the identical hardened `Popen`-into-its-own-process-group shape `_run_git`
++already uses, sharing the SAME per-decision deadline as R3's own git calls — and DENIES
++if the freshly-computed `sha256(f"{rc}\n{stdout}")` does not match `output_hash`) or
++`{"status": "uncovered", "reason": …}` (a non-empty reason; two or more IDENTICAL,
++normalized reasons in the same relay is denied as a templated, copy-pasted disposition,
++never a per-claim examination). Armed only when the hook's own derived set is non-empty —
++a fix that adds no claim-shaped line carries no obligation, the same "armed by the DATA"
++posture R1 already takes. Before executing any `tested` command, it is checked against a
++WHOLE-TOKEN (never substring) write-verb denylist covering both failure classes an
++earlier, killed design (`docs/plans/53-agentic-swarm/proposals/R7-committed-rigor-record.md`'s
++own R4a history) measured directly: a substring check wrongly denying `git grep -n
++'transform'`/`'confirm'` (the token `transform` is never confused with `rm` here), and
++`curl … | sh` / `git clean -fdx` / `git reset --hard` wrongly ALLOWED (all three are now
++denied outright, by inspecting every shell-operator-delimited segment's own first token,
++not only the command's first word). HONEST LIMIT, stated as plainly as R3's own: this
++cannot verify a `tested` claim's command is a GOOD test, only that it is a named one whose
++output hash reproduces; it cannot verify an `uncovered` reason is TRUE, only that it is
++present and not a copy-paste duplicate. **A lead can discharge a claim with a weak
++command. What it cannot do is skip a claim, because the hook enumerates them.** What a
++human reads at merge is whether the tested commands are meaningful and the uncovered
++reasons are honest — the same judgment (4)'s own two dispositions cannot make mechanically.
+ **Migration.** A relay written to disk before this patch lands (no `fix_head`) stops
+ being acceptable the moment the patch IS applied — an in-flight relay must be
+-rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering.
++rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering. The
++same applies to (4): a relay written before esc-lead-gate-R11 lands has no `claims`
++object, and is denied the moment a re-dispatch's fix adds even one claim-shaped line.
+ HONEST LIMIT (extended to R3): the hook enforces that adjacent probing AND fix-probing
+ are each ASSERTED with a named, citation-checkable site that is ACTUALLY a member of
+ the relevant set — never that either was semantically examined; a lead can satisfy R3
+@@ -245,7 +293,13 @@ verifier's own `SubagentStop` write; the tell is that it has no matching `hook.l
+ `SubagentStop` entry and never lands in a committed, human-reviewed record (this
+ residual is true today, independent of any of the above, and is the reason a
+ COMMITTED rigor record — never the gitignored state directory alone — is what a
+-human at merge can actually trust; see `docs/plans/53-agentic-swarm/proposals/`).
++human at merge can actually trust; see `docs/plans/53-agentic-swarm/proposals/`);
++(6) esc-lead-gate-R11's (4): a `tested` claim's command is a real, named, re-executed
++command whose output hash reproduces — but the hook cannot judge whether that command
++is a GOOD test of the claim, only that it ran and matched; nor can it judge whether an
++`uncovered` reason is TRUE, only that it is present and not a duplicate of another in
++the same relay — the tell is the same as (5): what a human reads in the committed
++record at merge, not anything this hook can enforce mechanically.
+ 
+ ### `build-env-guard.sh` — `PreToolUse(Bash)`, opt-in, fail-open
+ Warns (stderr only, **always exit 0**) when a Bash command carries a build-env hazard
+diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
+index 2a6f9ac..c575179 100755
+--- a/.claude/hooks/lead-gate-lib.py
++++ b/.claude/hooks/lead-gate-lib.py
+@@ -111,17 +111,23 @@ the given hex) -> relay `unit_branch` slugifies to this BLOCK's own
+ `unit_slug` -> that `unit_branch` resolves under `refs/heads/` -> `fix_head`
+ is an ancestor of `unit_branch`'s resolved tip -> R3 (>=1 probe path names
+ a file the fix actually changed, per `git diff --name-only -z block_sha
+-fix_head` — TRUSTED and COMPUTED, never lead-supplied). git runs ONLY
+-here, ONLY in `$CLAUDE_PROJECT_DIR` (required explicitly), FIVE calls
+-total per decision (`rev-parse --verify` block_sha, `rev-parse --verify`
+-fix_head, `rev-parse --verify --end-of-options refs/heads/...`
+-unit_branch, `merge-base --is-ancestor`, `diff --name-only`), every
+-invocation carrying `--end-of-options` immediately before its revision
+-arguments (git >= 2.24) so a value shaped like an option (e.g.
+-`--output=/tmp/x`) can never be read as one, ALL FIVE sharing ONE
+-per-decision monotonic deadline (`_GIT_BUDGET_S = 5.0`, an absolute
++fix_head` — TRUSTED and COMPUTED, never lead-supplied) -> R11 (esc-lead-
++gate-R11, "untested claims carry a test": every claim-shaped line the
++fix's OWN diff adds, per `git diff -U0 block_sha fix_head` — the hook's
++OWN derived enumeration, `_parse_claim_sites` — carries a `claims`
++disposition: TESTED, with a re-executed, hash-matching command, or
++explicitly UNCOVERED with a reason). git runs ONLY here, ONLY in
++`$CLAUDE_PROJECT_DIR` (required explicitly), SIX calls total per decision
++(`rev-parse --verify` block_sha, `rev-parse --verify` fix_head,
++`rev-parse --verify --end-of-options refs/heads/...` unit_branch,
++`merge-base --is-ancestor`, `diff --name-only`, and — esc-lead-gate-R11 —
++`diff -U0`), every invocation carrying `--end-of-options` immediately
++before its revision arguments (git >= 2.24) so a value shaped like an
++option (e.g. `--output=/tmp/x`) can never be read as one, ALL SIX sharing
++ONE per-decision monotonic deadline (`_GIT_BUDGET_S = 5.0`, an absolute
+ `time.monotonic()` value threaded through every `_run_git` call, never a
+-fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s)
++fresh 5s per call — the whole arm, INCLUDING R11's own claim-command
++re-execution below, is bounded by 5s total, not 6x5s)
+ (`Popen` into its own process group, `Popen.wait(timeout=<time left on the
+ shared deadline>)` — never `.communicate()`, never `with Popen(...)` —
+ stdout/stderr captured to `tempfile.TemporaryFile()`s, BOTH read back only
+@@ -148,6 +154,26 @@ also closed a BLOCK, independent of R3 entirely. `_pass_word_for(agent_type)`
+ (below) replaces the pooled set with a PER-AGENT-TYPE map, so a raw value
+ only clears when it is that type's OWN card spelling.
+ 
++esc-lead-gate-R11 ("UNTESTED CLAIMS CARRY A TEST"): the retrospective this
++arm formalises (`{scratchpad}/CONTRACT-RULES.md`, session-local, cited only
++for provenance) named the SAME failure four times running — a caller-set
++claim that was false on its destructive callers, a "re-verified" claim that
++was wrong when written, an impossibility claim an auditor refuted in two
++seconds, and a universal about an uncertain outcome — none of them a wrong
++SITE; each a CLAIM the fix's own diff asserted and never tested. The
++obligation is DERIVED BY THE HOOK from the diff's own shape (`_parse_claim_
++sites`, run from `_fix_window`, sharing its git deadline), never declared by
++the lead — exactly the posture R1 already takes toward the auditor's own
++`class_enumeration`, here applied to the lead's OWN fix. HONEST LIMIT,
++stated as plainly as R3's own: this cannot verify that a `tested` claim's
++command is a GOOD test, only that it is a NAMED one whose recorded output
++hash REPRODUCES under fresh execution, and it cannot verify that an
++`uncovered` reason is TRUE, only that it is present and not a copy-paste
++duplicate of another uncovered reason in the same relay — a lead can still
++discharge a real claim with a weak command; what it cannot do is skip a
++claim, because the hook enumerates them, never the lead. See the proposal
++doc for the full design history and the residual, stated without softening.
++
+ Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
+ `SendMessage` gating and all message-prose parsing; implementer-dispatch
+ binding; the Bash backstop (the mechanical control is `permissions.deny`
+@@ -197,9 +223,11 @@ subprocess anywhere" doctrine to this narrower, explicit exception).
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import re
++import shlex
+ import signal
+ import subprocess
+ import sys
+@@ -878,14 +906,25 @@ def _resolve_sha_exact(hexstr: str, label: str, cwd: str, deadline: float,
+     return resolved, None
+ 
+ 
+-def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None, str | None, list[str]]:
+-    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm.
+-    `(fix_changed, None, warnings)` on success; `(None, deny_reason,
+-    warnings)` otherwise — `warnings` carries any accept-side git stderr
+-    text noticed along the way (round-4: surfaced by the caller even when
+-    it did not change the outcome). Only ever called from
+-    `_relay_rejection`'s own repeat-dispatch caller, once R1/R2 have
+-    already passed.
++def _fix_window(row: dict, unit_slug: str, data: dict,
++                 deadline: float) -> tuple[list[str] | None, dict[str, str] | None, str | None, list[str]]:
++    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm,
++    AND (esc-lead-gate-R11) the trusted, COMPUTED `claim_sites` map — every
++    claim-shaped line the fix's OWN diff adds, keyed `path:line`, mapped to
++    its own verbatim text. `(fix_changed, claim_sites, None, warnings)` on
++    success; `(None, None, deny_reason, warnings)` otherwise — `warnings`
++    carries any accept-side git stderr text noticed along the way (round-4:
++    surfaced by the caller even when it did not change the outcome). Only
++    ever called from `_relay_rejection`'s own repeat-dispatch caller, once
++    R1/R2 have already passed.
++
++    esc-lead-gate-R11: `deadline` is now a PARAMETER, minted ONCE by the
++    caller (`_relay_rejection`) via `_new_git_deadline()`, rather than
++    minted internally here as before — R3's own git calls and R11's
++    claim-scan (the new SIXTH call, below) share the SAME one-decision
++    budget this way; the arm never grows `_GIT_BUDGET_S` per-caller. Every
++    internal use of `deadline` below is otherwise UNCHANGED from before
++    this parameter move.
+ 
+     esc-097 V18 (round-3 closure) plus the round-4 closure below:
+     reachability binds TWO things, not one. First, git-free: the relay's
+@@ -926,56 +965,56 @@ def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None
+     the original, possibly-abbreviated caller-supplied value — so a
+     `fix_head` given as a short prefix that resolves to the SAME commit as
+     `block_sha` is caught as a re-roll even when the two strings differed
+-    before resolution. FIVE git calls total (`rev-parse --verify` for
++    before resolution. SIX git calls total (`rev-parse --verify` for
+     block_sha, `rev-parse --verify` for fix_head, `rev-parse --verify
+     --end-of-options refs/heads/...` for unit_branch, `merge-base
+-    --is-ancestor`, `diff --name-only`), each sharing ONE per-decision
+-    deadline (`_new_git_deadline()` — `_GIT_BUDGET_S` total, not `5 *
+-    _GIT_BUDGET_S`)."""
++    --is-ancestor`, `diff --name-only`, and — esc-lead-gate-R11 — `diff
++    -U0` for the claim-scan), each sharing ONE per-decision deadline
++    (`_new_git_deadline()`, now minted by the CALLER and threaded in as a
++    parameter — `_GIT_BUDGET_S` total, not `6 * _GIT_BUDGET_S`)."""
+     project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+     if not project_dir:
+-        return None, "hook needs CLAUDE_PROJECT_DIR for the relay arm", []
++        return None, None, "hook needs CLAUDE_PROJECT_DIR for the relay arm", []
+ 
+-    deadline = _new_git_deadline()
+     warnings: list[str] = []
+ 
+     block_sha = row.get("head_sha")
+     if not (isinstance(block_sha, str) and _SHA_RE.fullmatch(block_sha)):
+-        return None, "BLOCK row's head_sha is not a valid sha", warnings
++        return None, None, "BLOCK row's head_sha is not a valid sha", warnings
+     block_sha, why = _resolve_sha_exact(
+         block_sha, "BLOCK row's head_sha", project_dir, deadline, warnings)
+     if why is not None:
+-        return None, why, warnings
++        return None, None, why, warnings
+ 
+     fix_head = data.get("fix_head")
+     if not (isinstance(fix_head, str) and _SHA_RE.fullmatch(fix_head)):
+-        return None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha", warnings
++        return None, None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha", warnings
+ 
+     if fix_head == block_sha:
+-        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
++        return None, None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
+ 
+     fix_head, why = _resolve_sha_exact(fix_head, "relay `fix_head`", project_dir, deadline, warnings)
+     if why is not None:
+-        return None, why, warnings
++        return None, None, why, warnings
+     if fix_head == block_sha:
+         # Round-4: a fix_head given as a SHORT prefix can resolve to the
+         # SAME full commit as block_sha even when the two caller-supplied
+         # strings differed — still a re-roll, only visible after both are
+         # resolved to their full form.
+-        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
++        return None, None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
+ 
+     relay_ub = data.get("unit_branch")
+     if not (isinstance(relay_ub, str) and relay_ub.strip()):
+-        return None, "relay carries no `unit_branch` naming the unit this fix landed on", warnings
++        return None, None, "relay carries no `unit_branch` naming the unit this fix landed on", warnings
+     if unit_slug == "UNBOUND":
+-        return None, (
++        return None, None, (
+             "this BLOCK was recorded without a unit binding (the UNBOUND fallback bucket) — "
+             "re-dispatch naming the unit so the verdict lands on the unit's own file, then "
+             "hand-remove the stale row for this block from UNBOUND.jsonl (never `rm` the "
+             "shared file — it holds every other unit's UNBOUND rows too)"
+         ), warnings
+     if slugify(relay_ub) != unit_slug:
+-        return None, (
++        return None, None, (
+             f"relay `unit_branch` {relay_ub!r} does not name this BLOCK's own unit "
+             f"(recorded under slug {unit_slug!r}) — reachability is bound to the file this "
+             "BLOCK is filed under, not an arbitrary branch the relay names"
+@@ -990,7 +1029,7 @@ def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None
+         ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{relay_ub}^{{commit}}"],
+         project_dir, deadline, warnings)
+     if not ok:
+-        return None, (
++        return None, None, (
+             f"relay `unit_branch` {relay_ub!r} slugifies to this BLOCK's own unit but does not "
+             f"resolve under refs/heads/ — {tip} (a unit whose worktree is on a detached HEAD "
+             "cannot be relayed this way — there is no refs/heads entry to bind to)"
+@@ -999,18 +1038,355 @@ def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None
+         ["merge-base", "--is-ancestor", "--end-of-options", fix_head, tip], project_dir, deadline, warnings)
+     if not ok:
+         if rc == 1:
+-            return None, (
++            return None, None, (
+                 f"fix_head {fix_head} is not on {relay_ub!r}; if the fix was amended, name "
+                 "the amended sha; if it was committed on a child branch, commit or merge it "
+                 f"onto {relay_ub!r}"
+             ), warnings
+-        return None, f"could not check whether fix_head is on {relay_ub!r} — {why}", warnings
++        return None, None, f"could not check whether fix_head is on {relay_ub!r} — {why}", warnings
+ 
+     ok, out, _rc = _run_git(
+         ["diff", "--name-only", "-z", "--end-of-options", block_sha, fix_head], project_dir, deadline, warnings)
+     if not ok:
+-        return None, f"could not compute the fix window: {out}", warnings
+-    return [seg for seg in out.split("\0") if seg], None, warnings
++        return None, None, f"could not compute the fix window: {out}", warnings
++    fix_changed = [seg for seg in out.split("\0") if seg]
++
++    # esc-lead-gate-R11 — the SIXTH git call, sharing the SAME deadline as
++    # the five above: the fix's own added-line diff, zero context (`-U0`),
++    # from which `_parse_claim_sites` derives the hook's OWN, mechanically
++    # DERIVED claim enumeration — never lead-asserted, the same posture R1
++    # already takes toward the auditor's own `class_enumeration`, applied
++    # here to the fix's diff instead of a finding.
++    ok, diff_out, _rc = _run_git(
++        ["diff", "-U0", "--end-of-options", block_sha, fix_head], project_dir, deadline, warnings)
++    if not ok:
++        return None, None, f"could not compute the fix's added-line diff (esc-lead-gate-R11): {diff_out}", warnings
++    claim_sites = _parse_claim_sites(diff_out)
++    return fix_changed, claim_sites, None, warnings
++
++
++# --------------------------------------------------------------------------
++# esc-lead-gate-R11 — "UNTESTED CLAIMS CARRY A TEST". The obligation is
++# DERIVED BY THE HOOK from the fix's own diff, never declared by the lead:
++# `_parse_claim_sites` (above, run from `_fix_window`, sharing its git
++# deadline) is the hook's OWN enumeration of every claim-shaped line the fix
++# ADDS. A relay may not be accepted while any such line lacks a disposition
++# in `claims` — see `_claims_rejection`, the sole caller of everything below.
++#
++# THE PHRASE FAMILY is the exact, finite set of claim shapes this program's
++# own retrospective (`{scratchpad}/CONTRACT-RULES.md` R-A/R-F/R-H, plus the
++# diagnosis's own "re-verified" example) named as the shape that kept costing
++# a full audit round: an impossibility/unreachability claim, a "safe
++# because"/"routes through" mechanism claim, a caller-SET totality claim, and
++# a completed-re-verification claim. Measured, not asserted: scoping to
++# PROSE LINES (below) plus literal, space-delimited multi-word phrases —
++# never a bare word — is what keeps this precise. A bare quantifier grep
++# (`every`/`only`/`always`, R-I's own tell) was tried first and produces
++# garbage — `grep -ciE '\\b(every|only|always)\\b'` alone returns 91 hits in
++# this very file and 1291 across `ci/scripts/*.py` — and is DELIBERATELY NOT
++# shipped; R-I's shape is a known, stated residual (see the proposal doc's
++# "what this does NOT do"). The phrase family below, unscoped, returns 26
++# hits across this repo's `ci/scripts` + `.claude/hooks` + `.claude/agents`
++# combined — a tractable number, not a flood.
++_CLAIM_PHRASES = (
++    "cannot be driven", "no injection point", "is unreachable", "is safe because",
++    "no caller can", "not producer-driven", "no reliable way to force",
++    "is not established", "structurally unreachable", "its only in-tree caller",
++    "its one in-tree caller", "every caller is", "routes through", "re-verified",
++)
++_CLAIM_RE = re.compile("|".join(re.escape(p) for p in _CLAIM_PHRASES), re.IGNORECASE)
++
++# WHERE: reuses the exact WHERE-scoping TECHNIQUE
++# `ci/scripts/check_doc_numbers_have_producers.py` already established for
++# precision (doc comments / whole-prose files, never bare code) — the
++# concept, not the file, since this hook must stay dependency-free and must
++# never import a CI-only script. A "prose line" is a whole line in a
++# whole-prose file extension, or a line whose STRIPPED text starts with the
++# file extension's own single-line-comment marker; an unknown extension
++# tries both `#` and `//` (never neither — failing OPEN here would silently
++# exempt an entire language from the rule, which is the wrong direction to
++# fail for a DENY-arming enumeration).
++_LINE_COMMENT_MARKERS: dict[str, tuple[str, ...]] = {
++    ".rs": ("//",), ".py": ("#",), ".sh": ("#",), ".bash": ("#",), ".toml": ("#",),
++    ".yml": ("#",), ".yaml": ("#",), ".js": ("//",), ".ts": ("//",), ".go": ("//",),
++    ".c": ("//",), ".h": ("//",), ".cpp": ("//",), ".hpp": ("//",), ".java": ("//",),
++}
++_WHOLE_LINE_PROSE_EXTS = {".md", ".mdx", ".rst", ".txt"}
++_DEFAULT_COMMENT_MARKERS = ("#", "//")
++
++
++def _is_prose_line(path: str, stripped: str) -> bool:
++    ext = Path(path).suffix.lower()
++    if ext in _WHOLE_LINE_PROSE_EXTS:
++        return True
++    markers = _LINE_COMMENT_MARKERS.get(ext, _DEFAULT_COMMENT_MARKERS)
++    return any(stripped.startswith(m) for m in markers)
++
++
++_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
++
++
++def _parse_claim_sites(diff_text: str) -> dict[str, str]:
++    """The hook's OWN derived claim enumeration from a `git diff -U0`
++    payload: every `path:line` the diff ADDS (never a removed or context
++    line — there are no context lines under `-U0`) whose text is BOTH a
++    prose line (`_is_prose_line`) and matches `_CLAIM_RE`. The value is the
++    line's own verbatim text (comment marker included, only the line's own
++    leading/trailing whitespace stripped).
++
++    A state machine, not a bare line-by-line grep: `+++`/`---` are only
++    read as FILE HEADERS between a `diff --git` line and this file's first
++    `@@` hunk — never afterward. Without this, a fix that adds a NEW
++    `.patch` file (this very repo's own convention — see
++    `docs/plans/*/proposals/*.patch`) would have its OWN embedded `+++ b/…`
++    text misread as a second file boundary the instant a content line
++    inside that patch starts with three literal `+` characters (the
++    patched file's own added line, prefixed by this diff's own `+`)."""
++    sites: dict[str, str] = {}
++    current_path: str | None = None
++    in_header = False
++    new_lineno = 0
++    for line in diff_text.splitlines():
++        if line.startswith("diff --git "):
++            current_path = None
++            in_header = True
++            continue
++        if in_header:
++            if line.startswith("+++ ") or line == "+++":
++                raw = line[4:] if line.startswith("+++ ") else ""
++                if raw == "/dev/null":
++                    current_path = None
++                elif raw[:2] in ("a/", "b/"):
++                    current_path = raw[2:]
++                else:
++                    current_path = raw or None
++                in_header = False
++            continue
++        if line.startswith("@@"):
++            m = _DIFF_HUNK_RE.match(line)
++            new_lineno = int(m.group(1)) if m else 0
++            continue
++        if current_path is None:
++            continue
++        if line.startswith("+"):
++            text = line[1:]
++            stripped = text.strip()
++            if stripped and _is_prose_line(current_path, stripped) and _CLAIM_RE.search(stripped):
++                sites[f"{current_path}:{new_lineno}"] = text.strip()
++            new_lineno += 1
++    return sites
++
++
++# WRITE-VERB DENYLIST, WHOLE-TOKEN matched (never substring — R4a's own
++# killed design measured `git grep -n 'transform'`/`'confirm'` wrongly
++# DENIED by a substring-`rm` check; this denylist is checked against
++# shell-tokenized argv, one token at a time, so `transform` is never
++# confused with `rm`), and it covers the THREE shapes that SAME killed
++# design measured as wrongly ALLOWED (`curl … | sh`, `git clean -fdx`,
++# `git reset --hard`) — by denying bare shell invocations and specific
++# destructive git subcommands outright, never by pattern-matching flags.
++_SHELL_OPERATOR_TOKENS = {"|", "||", "&&", ";", ">", ">>", "<", "&"}
++_DENIED_PROGRAMS = {
++    "rm", "mv", "dd", "shred", "mkfs", "truncate", "chmod", "chown", "chgrp",
++    "sudo", "su", "kill", "killall", "pkill", "reboot", "shutdown", "halt",
++    "curl", "wget", "ssh", "scp", "rsync", "nc", "ncat", "telnet",
++    "docker", "kubectl", "eval", "sh", "bash", "zsh", "dash", "ksh",
++    "xargs", "env",
++}
++_DENIED_GIT_SUBCOMMANDS = {"push", "reset", "clean", "gc"}
++
++
++def _command_denied(command: object) -> str | None:
++    """`None` iff `command` is safe to re-execute; otherwise the deny
++    reason. Splits on shell operators (`|`, `&&`, `;`, `>`, …) via
++    `shlex.shlex(..., punctuation_chars=True)`, which recognizes them as
++    their OWN tokens while still respecting quoting — so a denied program
++    hiding after a pipe (`curl … | sh`) or a redirect (`echo x > f`) is
++    caught by inspecting EVERY segment's own first token, never only the
++    command string's first word. `bash -c 'rm -rf /'` is denied on `bash`
++    itself, closing the nested-shell evasion without needing to parse
++    inside the quoted argument at all. An unbalanced quote (unparseable)
++    denies too — monotone toward DENY, the same posture `_probe_path`
++    already takes on an unparseable probe entry."""
++    if not isinstance(command, str) or not command.strip():
++        return "empty or non-string command"
++    try:
++        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
++        lex.whitespace_split = True
++        tokens = list(lex)
++    except ValueError as exc:
++        return f"command does not tokenize as a shell command ({exc})"
++    if not tokens:
++        return "empty command"
++    segments: list[list[str]] = [[]]
++    for tok in tokens:
++        if tok in _SHELL_OPERATOR_TOKENS:
++            segments.append([])
++        else:
++            segments[-1].append(tok)
++    for seg in segments:
++        if not seg:
++            continue
++        prog = seg[0].lower()
++        if prog in _DENIED_PROGRAMS:
++            return f"`{prog}` is a denied program (esc-lead-gate-R11 write-verb denylist)"
++        if prog == "git" and len(seg) > 1 and seg[1].lower() in _DENIED_GIT_SUBCOMMANDS:
++            return f"`git {seg[1]}` is a denied git subcommand (esc-lead-gate-R11 write-verb denylist)"
++        if prog == "find" and any(t in ("-delete", "-exec", "-execdir") for t in seg[1:]):
++            return "`find` with -delete/-exec/-execdir is denied (esc-lead-gate-R11 write-verb denylist)"
++    return None
++
++
++def _run_claim_command(command: str, cwd: str, deadline: float) -> tuple[bool, str, str]:
++    """Re-executes `command` via `/bin/sh -c`, bounded by the TIME LEFT on
++    the SAME shared per-decision `deadline` R3's own git calls already
++    share (esc-lead-gate-R11 never grows the budget per-arm). The identical
++    hardened shape to `_run_git` (own process group, real
++    `tempfile.TemporaryFile()`s, never `subprocess.PIPE`/`.communicate()`,
++    `killpg` on timeout then a flat, un-budgeted 1s reap) for the exact
++    same escaped-grandchild reason `_run_git`'s own docstring measures —
++    duplicated rather than shared with `_run_git` itself, deliberately: R3
++    is an adversarially-hardened, heavily-reproduced code path (G20-G40),
++    and this arm does not touch it. Returns `(True, sha256_hex, "")` on a
++    completed run — `sha256(f"{returncode}\\n{stdout}")`, stdout and exit
++    code only; stderr is deliberately EXCLUDED from the hash, since
++    incidental warnings/progress text on stderr is frequently
++    non-deterministic and would break reproducibility for reasons unrelated
++    to the claim itself (an HONEST LIMIT, stated as one: a claim command
++    whose STDOUT itself is non-deterministic is not caught by this hash at
++    all) — or `(False, "", reason)` otherwise. Runs in `cwd` AS IT
++    CURRENTLY STANDS, never an ephemeral checkout of `fix_head` (a further
++    HONEST LIMIT: if the worktree has moved past `fix_head` since the relay
++    was written, the re-executed output may reflect a state the lead never
++    measured — the same trust boundary R3's own `probe` already carries)."""
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        return False, "", f"the shared decision budget was already exhausted — {_ESCAPE_HATCH_NOTE}"
++    try:
++        out_f = tempfile.TemporaryFile()
++        err_f = tempfile.TemporaryFile()
++    except OSError as exc:
++        return False, "", f"could not open temp files ({exc})"
++    try:
++        proc = subprocess.Popen(["/bin/sh", "-c", command], stdout=out_f, stderr=err_f,
++                                 cwd=cwd, start_new_session=True)
++    except OSError as exc:
++        out_f.close()
++        err_f.close()
++        return False, "", f"command failed to run ({exc})"
++    try:
++        rc = proc.wait(timeout=remaining)
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        try:
++            proc.wait(timeout=1.0)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++        out_f.close()
++        err_f.close()
++        return False, "", "command timed out (shared decision budget)"
++    try:
++        out_f.seek(0)
++        out = out_f.read().decode("utf-8", errors="replace")
++    finally:
++        out_f.close()
++        err_f.close()
++    digest = hashlib.sha256(f"{rc}\n{out}".encode("utf-8")).hexdigest()
++    return True, digest, ""
++
++
++_OUTPUT_HASH_RE = re.compile(r"[0-9a-f]{64}")
++
++
++def _claims_rejection(claim_sites: dict[str, str] | None, data: dict, project_dir: str,
++                       deadline: float) -> str | None:
++    """esc-lead-gate-R11: `None` iff every claim-shaped line the fix's own
++    diff adds (`claim_sites`, the HOOK's OWN derived enumeration — never
++    lead-supplied, the same posture R1 already takes toward the auditor's
++    own `class_enumeration`, applied here to the fix instead of a finding)
++    carries a disposition in the relay's `claims` object: either TESTED (a
++    command whose re-executed output hash matches the one recorded) or
++    explicitly marked UNCOVERED (a non-empty reason). Armed only when
++    `claim_sites` is non-empty — a fix that adds no claim-shaped line
++    carries no obligation, the same "armed by the DATA" posture R1 already
++    takes toward `class_enumeration`."""
++    if not claim_sites:
++        return None
++    claims = data.get("claims")
++    if not isinstance(claims, dict):
++        return (
++            f"relay carries no `claims` object, but the fix's own diff adds "
++            f"{len(claim_sites)} claim-shaped line(s), e.g. {list(claim_sites)[:3]} — every "
++            "one must be TESTED (a command + its output hash) or explicitly marked "
++            "UNCOVERED with a reason (esc-lead-gate-R11)"
++        )
++    missing = [k for k in claim_sites if k not in claims]
++    if missing:
++        return (
++            f"relay `claims` omits {len(missing)} claim-shaped line(s) the fix's own diff "
++            f"adds, e.g. {missing[:3]} — the obligation is DERIVED FROM THE DIFF, never "
++            "declared by the lead (esc-lead-gate-R11)"
++        )
++
++    uncovered_reasons: dict[str, str] = {}
++    for key in claim_sites:
++        entry = claims.get(key)
++        if not isinstance(entry, dict):
++            return f"relay `claims[{key!r}]` is not an object (esc-lead-gate-R11)"
++        status = entry.get("status")
++        if status == "uncovered":
++            reason = entry.get("reason")
++            if not isinstance(reason, str) or not reason.strip():
++                return f"relay `claims[{key!r}]` is marked uncovered with no `reason` (esc-lead-gate-R11)"
++            uncovered_reasons[key] = _probe_normalize(reason)
++        elif status == "tested":
++            command = entry.get("command")
++            output_hash = entry.get("output_hash")
++            if not isinstance(command, str) or not command.strip():
++                return f"relay `claims[{key!r}]` is marked tested with no `command` (esc-lead-gate-R11)"
++            if not (isinstance(output_hash, str) and _OUTPUT_HASH_RE.fullmatch(output_hash)):
++                return (f"relay `claims[{key!r}]` is marked tested with no valid "
++                        "`output_hash` (64 hex chars, sha256) (esc-lead-gate-R11)")
++            deny = _command_denied(command)
++            if deny is not None:
++                return f"relay `claims[{key!r}]` command is denied: {deny}"
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                return (f"the shared git/claim budget for this decision was already exhausted "
++                        f"before claims[{key!r}]'s command could run — {_ESCAPE_HATCH_NOTE}")
++            ok, actual_hash, run_why = _run_claim_command(command, project_dir, deadline)
++            if not ok:
++                return f"relay `claims[{key!r}]` command could not be re-executed: {run_why}"
++            if actual_hash != output_hash:
++                return (
++                    f"relay `claims[{key!r}]` command's re-executed output does not reproduce "
++                    f"the recorded hash (recorded {output_hash[:12]}…, got {actual_hash[:12]}…) "
++                    "— the claim is not established (esc-lead-gate-R11)"
++                )
++        else:
++            return (f"relay `claims[{key!r}]` has an unrecognized `status` {status!r} "
++                     "(must be `tested` or `uncovered`) (esc-lead-gate-R11)")
++
++    # Anti-vacuity: two or more IDENTICAL (normalized) uncovered reasons in
++    # the SAME relay is a templated, copy-pasted disposition, never a real
++    # per-claim examination — the honest-limit cousin of `check_rigor_
++    # record.py`'s own near-identical-CONTRACT check (the CONCEPT reused,
++    # not the code: a normalized-text collision, never a length/word-count
++    # rule). This CANNOT prove a reason is true; it can only prove two
++    # reasons are not two.
++    seen: dict[str, str] = {}
++    for key, norm in uncovered_reasons.items():
++        if norm in seen:
++            return (
++                f"relay `claims[{key!r}]` and `claims[{seen[norm]!r}]` carry the IDENTICAL "
++                "uncovered reason (normalized) — a templated reason is not a per-claim "
++                "examination (esc-lead-gate-R11)"
++            )
++        seen[norm] = key
++    return None
+ 
+ 
+ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
+@@ -1095,8 +1471,11 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
+                 "NOT close, naming the attack for the next round to run (esc-lead-gate-R10)")
+ 
+     # R3 PROBE-THE-FIX (esc-097) — the only git subprocess in this module;
+-    # see its own module-doc paragraph for the arm order.
+-    fix_changed, why, fix_warnings = _fix_window(row, unit_slug, data)
++    # see its own module-doc paragraph for the arm order. esc-lead-gate-R11
++    # shares this SAME deadline (minted ONCE, here) for its own claim-scan —
++    # never a second, separate budget.
++    deadline = _new_git_deadline()
++    fix_changed, claim_sites, why, fix_warnings = _fix_window(row, unit_slug, data, deadline)
+     if warnings is not None:
+         warnings.extend(fix_warnings)
+     if why is not None:
+@@ -1118,6 +1497,16 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
+             f"relay `probe` names none of the {n} files the fix changed "
+             f"(block {block7}..fix {fix7}); probe the fix, not the neighbourhood{example}"
+         )
++
++    # esc-lead-gate-R11 — "UNTESTED CLAIMS CARRY A TEST", required alongside
++    # R3: the relay may not be accepted while the fix's OWN diff still
++    # carries an untested claim of a testable shape. `claim_sites` is the
++    # HOOK's own derived enumeration (`_parse_claim_sites`, run inside
++    # `_fix_window`, sharing its git deadline) — never lead-asserted.
++    claims_why = _claims_rejection(claim_sites, data, project_dir=os.environ.get("CLAUDE_PROJECT_DIR"),
++                                    deadline=deadline)
++    if claims_why is not None:
++        return claims_why
+     return None
+ 
+ 
+diff --git a/ci/scripts/check_lead_gate.py b/ci/scripts/check_lead_gate.py
+index 56cc830..a9673e4 100644
+--- a/ci/scripts/check_lead_gate.py
++++ b/ci/scripts/check_lead_gate.py
+@@ -143,6 +143,7 @@ Run: `python3 ci/scripts/check_lead_gate.py --self-test`
+ from __future__ import annotations
+ 
+ import atexit
++import hashlib
+ import json
+ import os
+ import re
+@@ -316,6 +317,26 @@ def _commit_fix(root: Path, *files: str) -> str:
+     return _git(root, "rev-parse", "HEAD")
+ 
+ 
++def _commit_claim_fix(root: Path, path: str, lines: list[str]) -> str:
++    """esc-lead-gate-R11: like `_commit_fix`, but writes EXACT `lines`
++    content (never placeholder text) to `path`, on the current branch —
++    fixtures need a real, known claim-shaped line at a known 1-indexed line
++    number to exercise the hook's own `_parse_claim_sites` derivation."""
++    p = root / path
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text("\n".join(lines) + "\n")
++    _git(root, "add", "-A")
++    _git(root, "commit", "-q", "-m", f"fix: {path}")
++    return _git(root, "rev-parse", "HEAD")
++
++
++def _claim_output_hash(rc: int, stdout: str) -> str:
++    """MUST match `_run_claim_command`'s own hashing convention in the
++    (proposed, patched) hook EXACTLY: `sha256(f"{rc}\\n{stdout}")` — stdout
++    and exit code only, stderr excluded."""
++    return hashlib.sha256(f"{rc}\n{stdout}".encode("utf-8")).hexdigest()
++
++
+ def _assert(cond: bool, label: str, detail: str = "") -> None:
+     if not cond:
+         raise Failure(f"{label}: {detail}")
+@@ -393,6 +414,7 @@ _DEFAULT_OPEN_QUESTION = "fixture-default.py:1 — attack: none captured (fixtur
+ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = None,
+                         probe: list[str] | None = None, fix_head: str | None = None,
+                         open_question: str | None = _DEFAULT_OPEN_QUESTION,
++                        claims: dict[str, dict] | None = None,
+                         override: dict | None = None) -> None:
+     """esc-097: `fix_head` (the fix commit's full sha) is written into the
+     relay artifact whenever the caller supplies one — the R3 arm's own
+@@ -405,7 +427,14 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
+     editing dozens of unrelated fixtures — exactly the same backward-compat
+     shape `fix_head`'s own None-means-omitted default already established.
+     A fixture that means to test the R10 arm itself passes
+-    `open_question=None` (omit) or an explicit string (present)."""
++    `open_question=None` (omit) or an explicit string (present).
++
++    esc-lead-gate-R11: `claims` needs NO such backward-compat default —
++    the arm is armed by the DATA (a non-empty hook-derived `claim_sites`),
++    and no EXISTING fixture's placeholder fix content (`"fix content for
++    {name} ({marker})\\n"`, from `_commit_fix`) matches any claim phrase, so
++    every pre-R11 fixture's `claim_sites` is empty and the arm never fires
++    for them regardless of whether `claims` is present."""
+     path = _relay_path_exact(root, row)
+     artifact = {"unit_branch": row["unit_branch"], "agent_type": row["agent_type"], "block_ts": row["ts"]}
+     if fix_head is not None:
+@@ -416,6 +445,8 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
+         artifact["probe"] = probe
+     if open_question is not None:
+         artifact["open_question"] = open_question
++    if claims is not None:
++        artifact["claims"] = claims
+     if override:
+         artifact.update(override)
+     path.parent.mkdir(parents=True, exist_ok=True)
+@@ -1325,6 +1356,150 @@ def fixture_oq2_open_question_present_allows() -> None:
+     _assert(p.returncode == 0, "OQ2", f"a relay with an open_question present must allow, got {p.returncode}: {p.stderr}")
+ 
+ 
++# ==========================================================================
++# UC1-UC7 — esc-lead-gate-R11 ("untested claims carry a test"): the relay may
++# not be accepted while the fix's OWN diff still carries a claim-shaped line
++# (the HOOK's own derived enumeration, `_parse_claim_sites`) with no
++# disposition in `claims`. Registered directly in FIXTURES below, the same
++# way OQ1/OQ2 (esc-lead-gate-R10) already are — this file and the mechanism
++# it exercises land in the SAME patch, so there is no unpatched state in
++# which these fixture functions exist at all.
++# ==========================================================================
++
++_UC_ENUM = ["foo.py:10"]
++_UC_FINDINGS = ["foo.py:10"]
++_UC_PROBE = ["bar.py:2", "qux.py:1"]
++_UC_SITES = {"foo.py:10": "checked and clean"}
++_UC_CLAIM_LINES = [
++    "import os",
++    "# this cannot be driven from a test",
++    "# no injection point here",
++    "def f():",
++    "    return os",
++]
++
++
++def _uc_setup(unit: str):
++    root = _temp_repo(unit)
++    row = _write_block_row(root, unit, "a1", "adversarial-audit", _UC_ENUM, _UC_FINDINGS)
++    fix_head = _commit_claim_fix(root, "bar.py", _UC_CLAIM_LINES)
++    return root, row, fix_head
++
++
++def fixture_uc1_missing_claim_denied() -> None:
++    """The fix adds a real claim-shaped line (`bar.py:2`, `# this cannot be
++    driven from a test`) but the relay carries no `claims` object at all —
++    denied naming the derived, uncovered claim-shaped line(s), even though
++    R1/R2/R3/R10 are all otherwise satisfied."""
++    root, row, fix_head = _uc_setup("feat/uc1")
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head)
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc1"}}, root)
++    _assert(p.returncode == 2, "UC1", f"a relay with no `claims` must deny, got {p.returncode}: {p.stderr}")
++    _assert("claim" in p.stderr.lower(), "UC1",
++            f"the deny reason must name the missing claims obligation: {p.stderr!r}")
++
++
++def fixture_uc2_tested_claim_with_matching_hash_allows() -> None:
++    """The SAME relay as UC1, with `bar.py:2` marked `tested` and a command
++    whose RE-EXECUTED output hash matches the recorded one, must ALLOW —
++    `bar.py:3` (`# no injection point here`) also needs a disposition since
++    the hook enumerates BOTH claim-shaped lines the fix adds."""
++    root, row, fix_head = _uc_setup("feat/uc2")
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
++        "bar.py:2": {"status": "tested", "command": "printf hello",
++                     "output_hash": _claim_output_hash(0, "hello")},
++        "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture; "
++                                                        "attack: drive it via the pattern in tests/it/probe.rs"},
++    })
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc2"}}, root)
++    _assert(p.returncode == 0, "UC2", f"a fully-dispositioned relay must allow, got {p.returncode}: {p.stderr}")
++
++
++def fixture_uc3_hash_mismatch_denied() -> None:
++    """The SAME `tested` claim as UC2, but the recorded `output_hash` does
++    NOT match what re-executing `command` actually produces — denied,
++    naming that the claim is not established."""
++    root, row, fix_head = _uc_setup("feat/uc3")
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
++        "bar.py:2": {"status": "tested", "command": "printf hello", "output_hash": "0" * 64},
++        "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture"},
++    })
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc3"}}, root)
++    _assert(p.returncode == 2, "UC3", f"a non-reproducing hash must deny, got {p.returncode}: {p.stderr}")
++    _assert("not established" in p.stderr or "does not reproduce" in p.stderr, "UC3",
++            f"the deny reason must name the non-reproducing hash: {p.stderr!r}")
++
++
++def fixture_uc4_write_verb_denied() -> None:
++    """A `tested` claim whose command contains a denied write-verb program
++    is denied WITHOUT ever executing it — never reaches the hash-compare
++    step at all."""
++    root, row, fix_head = _uc_setup("feat/uc4")
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
++        "bar.py:2": {"status": "tested", "command": "rm -rf /tmp/should-never-run-uc4",
++                     "output_hash": "a" * 64},
++        "bar.py:3": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture"},
++    })
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc4"}}, root)
++    _assert(p.returncode == 2, "UC4", f"a write-verb command must deny, got {p.returncode}: {p.stderr}")
++    _assert("denied program" in p.stderr or "write-verb" in p.stderr, "UC4",
++            f"the deny reason must name the write-verb denylist: {p.stderr!r}")
++    _assert(not Path("/tmp/should-never-run-uc4").exists(), "UC4",
++            "the denied command must never have been executed")
++
++
++def fixture_uc5_uncovered_with_reason_allows() -> None:
++    """Both claim-shaped lines marked `uncovered`, each with its OWN
++    distinct, non-empty reason — must ALLOW; an honest disclosure costs
++    nothing."""
++    root, row, fix_head = _uc_setup("feat/uc5")
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
++        "bar.py:2": {"status": "uncovered", "reason": "no fault-injecting backend in this fixture; "
++                                                        "attack: drive it via tests/it/probe.rs's own pattern"},
++        "bar.py:3": {"status": "uncovered", "reason": "the injection surface here is a private fn with "
++                                                        "no test harness yet; attack: add one exercising it directly"},
++    })
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc5"}}, root)
++    _assert(p.returncode == 0, "UC5", f"two distinct honest uncovered reasons must allow, got {p.returncode}: {p.stderr}")
++
++
++def fixture_uc6_duplicate_uncovered_reason_denied() -> None:
++    """Both claim-shaped lines marked `uncovered` with the IDENTICAL
++    (normalized) reason — a templated, copy-pasted disposition, denied as
++    the anti-vacuity check's own target."""
++    root, row, fix_head = _uc_setup("feat/uc6")
++    same_reason = "not established; attack: write a probe"
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head, claims={
++        "bar.py:2": {"status": "uncovered", "reason": same_reason},
++        "bar.py:3": {"status": "uncovered", "reason": "  " + same_reason + "  "},
++    })
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc6"}}, root)
++    _assert(p.returncode == 2, "UC6", f"a templated duplicate reason must deny, got {p.returncode}: {p.stderr}")
++    _assert("IDENTICAL" in p.stderr, "UC6",
++            f"the deny reason must name the duplicate uncovered reason: {p.stderr!r}")
++
++
++def fixture_uc7_no_claim_shaped_line_is_a_noop() -> None:
++    """A fix that adds NO claim-shaped line (ordinary `_commit_fix`
++    placeholder content) carries no R11 obligation at all — the relay needs
++    no `claims` object, the same "armed by the DATA" posture R1 already
++    takes toward `class_enumeration`."""
++    root = _temp_repo("feat/uc7")
++    row = _write_block_row(root, "feat/uc7", "a1", "adversarial-audit", _UC_ENUM, _UC_FINDINGS)
++    fix_head = _commit_fix(root, "bar.py")
++    _write_relay_exact(root, row, sites=_UC_SITES, probe=_UC_PROBE, fix_head=fix_head)
++    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
++        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/uc7"}}, root)
++    _assert(p.returncode == 0, "UC7", f"a fix with no claim-shaped line must allow with no `claims`, "
++                                       f"got {p.returncode}: {p.stderr}")
++
++
+ # ==========================================================================
+ # G20-G40 — esc-097 (R3, "probe the fix"; G32-G35 are the round-2, G36-G38
+ # the round-3, and G39-G40 the round-4 pressure-test reproducers). NOT
+@@ -2124,6 +2299,13 @@ FIXTURES = [
+     ("G19", fixture_g19_coverage_arm_selected_by_data_not_flag),
+     ("OQ1", fixture_oq1_no_open_question_denies),
+     ("OQ2", fixture_oq2_open_question_present_allows),
++    ("UC1", fixture_uc1_missing_claim_denied),
++    ("UC2", fixture_uc2_tested_claim_with_matching_hash_allows),
++    ("UC3", fixture_uc3_hash_mismatch_denied),
++    ("UC4", fixture_uc4_write_verb_denied),
++    ("UC5", fixture_uc5_uncovered_with_reason_allows),
++    ("UC6", fixture_uc6_duplicate_uncovered_reason_denied),
++    ("UC7", fixture_uc7_no_claim_shaped_line_is_a_noop),
+     ("T1", fixture_t1_card_schema_line_substituted_binds),
+     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
+     ("T3", fixture_t3_start_binds_unit_branch_colon_form),

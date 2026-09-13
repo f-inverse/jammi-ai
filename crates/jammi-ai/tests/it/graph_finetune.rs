@@ -697,6 +697,71 @@ async fn graph_training_set_anchors_both_node_and_edge_sources() {
     }
 }
 
+/// M2 — a graph training set's recorded source names a relation that lived
+/// only for the length of the original materialization
+/// (`jammi_sampled_pairs:...`, deregistered on drop). A `recompute` therefore
+/// fails at the planner, naming the missing relation — the honest consequence
+/// of sampling being a producer the engine cannot express as durable SQL, not
+/// a silently-reported no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_training_set_recompute_names_the_missing_sampled_pair_relation() {
+    use jammi_ai::pipeline::recompute::Cascade;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let sources = register_graph_fixture(dir.path(), &session).await;
+    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let sample = GraphSampleConfig {
+        walk_length: 2,
+        walks_per_node: 2,
+        hard_negatives: 0,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 3,
+        ..GraphSampleConfig::default()
+    };
+    let train = jammi_ai::fine_tune::FineTuneConfig {
+        epochs: 1,
+        batch_size: 4,
+        lora_rank: 4,
+        warmup_steps: 0,
+        validation_fraction: 0.0,
+        early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+        ..Default::default()
+    };
+    let job = session
+        .fine_tune_graph(&sources, &model, sample, Some(train))
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let tables = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let table = tables
+        .iter()
+        .find(|t| t.kind == ResultTableKind::TrainingSet)
+        .expect("the graph job materialises a training set");
+
+    let err = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(&table.table_name, Cascade::ReportOnly)
+        .await
+        .expect_err(
+            "a graph training set's sampled-pair relation does not survive its own materialization",
+        );
+    let message = format!("{err}");
+    assert!(
+        message.contains("jammi_sampled_pairs:"),
+        "the refusal must name the missing sampled-pair relation, got {message:?}"
+    );
+}
+
 /// A node source with no edge source (isolated graph) is a failure end to end —
 /// a graph with no structure carries no supervision. Submit no longer reads the
 /// graph (it persists the spec), so the failure surfaces when the worker

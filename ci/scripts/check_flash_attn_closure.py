@@ -103,6 +103,15 @@ PROVE_SCOPE = frozenset({"ci/scripts/runpod_gpu_prove.sh"})
 
 _PERF_PRODUCER_REASON = "perf producer, not a proof lane"
 EXEMPT_SCOPE: dict[str, str] = {
+    "ci/scripts/runpod_gpu_gang.sh": (
+        "gang pod leg (1 pod x 2 GPU): a DISTRIBUTED-TRAINING correctness surface, not the "
+        "release prove lane's shipped surface. PROVE_SCOPE membership means set-equality "
+        "against `ci/release-feature-manifest.json`'s `prove_lane.crates` declarations, and "
+        "this lane deliberately declares nothing there — it compiles and runs ONE target "
+        "(jammi-ai's `gpu_capability` under the gang name filter) on two devices, which no "
+        "release artifact is built from. Its tuples' off-merge-path residual is carried by "
+        "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own gang section"
+    ),
     "ci/scripts/pod_seed_target.sh": (
         "seed cache lane: T1 precedes CUTLASS provisioning, T1/T1b main-only "
         "split — a dedicated tuple-lockstep follow-up is tracked separately, "
@@ -1029,6 +1038,17 @@ def _write_prove_surface_fixture(root: Path, script_body: str, manifest: dict | 
     (root / "ci" / "scripts" / "pod_seed_target.sh").write_text(
         "#!/usr/bin/env bash\ncargo build --release -p jammi-bench --features cuda\n"
     )
+    # The gang pod leg's own two cuda-bearing tuples, shaped like the real
+    # driver's (its `gang-build` compile-check and its `gang-proof` live
+    # run, both inside a remote heredoc, hence the escaped `\$` spellings).
+    (root / "ci" / "scripts" / "runpod_gpu_gang.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
+        "--test gpu_capability --no-run || grc=\\$?\n"
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
+        "--test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 "
+        '2>&1 | tee "\\$gang_log"\n'
+    )
     for perf_name in (
         "finetune_ab.sh",
         "finetune_run_ab.sh",
@@ -1062,7 +1082,37 @@ def _run_prove_surface_fixture(script_body: str, manifest: dict | None = None) -
 
 
 def _self_test_prove_surface() -> None:
+    import tempfile
+
     good = _fixture_good_prove_script()
+
+    # --- Scope-map coverage, enumerated from the maps themselves (never a
+    # hand list): the fixture writer must materialise EVERY row of BOTH
+    # PROVE_SCOPE and EXEMPT_SCOPE, and every such row's fixture must carry a
+    # cuda-bearing tuple. A row added to either map without a matching fixture
+    # reds the GOOD fixture, which would otherwise surface only as the opaque
+    # "a well-formed fixture must be green" failure below — the sibling map
+    # needs this exactly as much as the exempt one does: a phantom PROVE_SCOPE
+    # row reds the self-test with no indication of which row is phantom.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_prove_surface_fixture(root, good, None)
+        gated_origin_paths = {
+            origin.rsplit(":", 1)[0]
+            for tuple_text, rec in discover_all_tuples(root).items()
+            if is_gated(tuple_text)
+            for origin in rec.origins
+        }
+        for map_name, scope in (("PROVE_SCOPE", PROVE_SCOPE), ("EXEMPT_SCOPE", EXEMPT_SCOPE)):
+            for scope_path in sorted(scope):
+                assert (root / scope_path).is_file(), (
+                    f"{map_name} row `{scope_path}` has no fixture — "
+                    f"_write_prove_surface_fixture must write every row of both scope maps"
+                )
+                assert scope_path in gated_origin_paths, (
+                    f"{map_name} row `{scope_path}`'s fixture carries no cuda-bearing tuple — "
+                    f"the row is phantom and reds the GOOD fixture"
+                )
 
     assert _run_prove_surface_fixture(good) == 0, "a well-formed fixture must be green"
 
@@ -1138,8 +1188,6 @@ def _self_test_prove_surface() -> None:
 
         return _augmented
 
-    import tempfile
-
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _with_extra_file("ci/scripts/foo.sh", "#!/usr/bin/env bash\ncargo test -p jammi-ai --features cuda\n")(
@@ -1156,14 +1204,48 @@ def _self_test_prove_surface() -> None:
         rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
         assert rc == 1, "a cuda tuple in an unlisted ci/scripts/perf/bar.sh must FAIL (never silently exempt)"
 
-    # Dead exempt entry: pod_seed_target.sh loses its own cuda tuple.
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        _write_prove_surface_fixture(root, good, None)
-        (root / "ci" / "scripts" / "pod_seed_target.sh").write_text("#!/usr/bin/env bash\necho hi\n")
-        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
-        rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
-        assert rc == 1, "a dead EXEMPT_SCOPE entry (no cuda tuple left) must FAIL"
+    # Dead exempt entry, over the WHOLE class: for EVERY row of EXEMPT_SCOPE
+    # (enumerated from the map, so a row added tomorrow is covered without
+    # editing this test), both shapes of "the row outlives its tuple" must
+    # FAIL — the script present but stripped of its cuda tuple, and the
+    # script ABSENT from the tree altogether (the shape a row added without a
+    # fixture takes).
+    for exempt_path in sorted(EXEMPT_SCOPE):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_prove_surface_fixture(root, good, None)
+            (root / exempt_path).write_text("#!/usr/bin/env bash\necho hi\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+            assert rc == 1, f"a dead EXEMPT_SCOPE entry (`{exempt_path}`, no cuda tuple left) must FAIL"
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_prove_surface_fixture(root, good, None)
+            (root / exempt_path).unlink()
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+            assert rc == 1, (
+                f"an EXEMPT_SCOPE row whose script is ABSENT from the tree (`{exempt_path}`) "
+                f"must FAIL as a dead exempt entry"
+            )
+
+    # The SIBLING map gets the same treatment, for the same reason: a
+    # PROVE_SCOPE row whose script is not in the tree is a phantom row, and
+    # `check_prove_surface`'s own "PROVE_SCOPE names `X`, which does not
+    # exist" arm is what must catch it — enumerated from the map, so a row
+    # added tomorrow is covered without editing this test.
+    for prove_path in sorted(PROVE_SCOPE):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_prove_surface_fixture(root, good, None)
+            (root / prove_path).unlink()
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+            assert rc == 1, (
+                f"a PROVE_SCOPE row whose script is ABSENT from the tree (`{prove_path}`) "
+                f"must FAIL as a phantom prove-scope entry"
+            )
 
 
 def load_manifest_lanes_rejects_empty() -> bool:

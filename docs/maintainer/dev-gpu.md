@@ -611,6 +611,130 @@ than rebuild) is **phase 2 of this unit, not in this PR**, and is blocked on
 a user action: creating the bucket (`jammi-seed-cache`) and a read-only
 access token. Nothing in this tooling reads or writes that bucket today.
 
+## The gang leg — two GPUs in one pod
+
+`gpu-gang.yml` rents ONE pod holding TWO A100s and runs the distributed
+fine-tune (gang) tests on it, through `ci/scripts/runpod_gpu_gang.sh` and the
+same shared primitive every other lane uses (`ci/scripts/runpod_lib.sh`). It is
+the only lane where a multi-device collective runs on real hardware; every
+other GPU lane rents a single device.
+
+**What makes the pod different.** `RP_GPU_COUNT` (default 1 for every other
+lane) is 2 here — the one caller that moves it. At a count above 1
+`rp_deploy_arch` tries the SXM4 candidates before the PCIe ones: a 2-GPU pod
+provisioned on `A100-SXM4-80GB` SECURE while the PCIe pool reported no 2-GPU
+capacity at all. Both pairs stay in the list, so a multi-GPU rental only
+reorders the capacity search, never narrows it.
+
+**What it proves.** The gang tests in `jammi-ai`'s `gpu_capability` target,
+selected by the `gang_` name filter the driver owns. A name filter that matches
+zero tests exits 0 with "running 0 tests" — the driver reads that as a
+FAILURE, by name, and equally refuses a run that wrote no artifact. A leg with
+no test is a leg with no proof.
+
+**Triggers.** The `run-gang` PR label, a nightly cron at 08:30 UTC, and manual
+dispatch — never a push, never `workflow_call`, and no workflow may `uses:` it.
+The cron sits after the only other renting cron in the repo: `gpu-prove.yml`
+fires at 03:47 UTC and its concurrent legs run under a 190-minute budget, so its
+rentals are done by 06:57, leaving a 93-minute margin. That margin is measured
+against a nominal start; GitHub delays scheduled runs under load, so it is a
+margin and not a guarantee of disjointness. The never-in-an-automated-path
+doctrine is `gpu-prove.yml`'s own, and
+`ci/scripts/check_gpu_prove_once.py`'s P7 rule pins it for every renting lane —
+over a driver set *derived* from `runpod_lib.sh`'s deploy closure, with
+`PAID_POD_LANE_TABLE` (driver script -> its one workflow) as the completeness
+assertion over that set. Nothing about a release depends on this lane; the
+release verdict is the prove lane's.
+
+**Cost bound (human-approved).** Two bounds, each with the mechanism that
+enforces it. The rented pod is not the only thing that bills: `rp_deploy_live`
+walks the `a100` candidate list (4 entries) and terminates a pod that is not
+SSH-reachable within `RP_SSH_WAIT_SECS` before trying the next, so the *search*
+bills too.
+
+- **Terminate-succeeds** — the ordinary path, every `rp_terminate` takes. The
+  driver pins `RP_SSH_WAIT_SECS=300` (half the library default) and the workflow
+  pins `MAX_ATTEMPTS: "1"`, so there is exactly one search; the winning pod then
+  bills to `RP_TTL_HOURS=1`, baked into the pod's own entrypoint so a SIGKILLed
+  runner cannot outlive it. `4 x 300 s x $3.18/h + 1 h x $3.18/h = $4.24` a run.
+- **Sweep-only** — every `rp_terminate` call fails, the case `runpod_lib.sh`'s
+  own header opens with. Nothing is torn down early, each pod bills to its
+  baked-in TTL, and the only remaining enforcers are that TTL and `gpu-reap.yml`'s
+  `rp_sweep`: `(4 + 1) x 1 h x $3.18/h = $15.90`.
+
+`$3.18/h` is the rate the SECURE 2-GPU `A100-SXM4-80GB` pod was rented at. The
+COMMUNITY 2-GPU rate is unmeasured — nothing has priced one — so neither figure
+covers a COMMUNITY landing. `ci/scripts/test_gpu_gang_lane.sh` re-derives the
+first bound from the candidate list, the driver's own two values and the
+workflow's `MAX_ATTEMPTS`, and fails if the printed figure and the mechanism
+disagree.
+
+Inside the TTL hour, the shared `RP_TIMEOUT` default (50m, owned by
+`runpod_lib.sh` — this lane declares no second one) is what cuts first, with the
+cut group named. Whether a cold `cuda,flash-attn` build plus the gang tests fits
+inside that hour is NOT established — nothing has measured it. A budget cut is
+therefore a cost decision for a human (raise the bound deliberately), never
+something the script raises on its own.
+
+**Exit codes** (the workflow annotates each one separately, so a capacity night
+never reads as a code regression):
+
+- `0` — every gating group passed.
+- `75` — no 2-GPU capacity. RED, with no retry: `MAX_ATTEMPTS` is `1`, because a
+  second attempt is a second walk of the candidate list and doubles the search
+  term of the first bound above. A leg with no capacity proved nothing.
+- `76` — the inactivity watchdog killed a hang with a gating group unresolved.
+  A hung collective is exactly what this lane exists to surface.
+- `77` — wrong tree: the pod's own `PROVE_SHA` disagreed with the commit the
+  run expected.
+- `97` — the rented pod is not the device the leg asked for (fewer GPUs than
+  requested, or the wrong compute capability). Refused before anything is
+  built.
+- `124` — budget cut with a gating group unresolved.
+
+**The artifact.** The gang tests write their evidence into
+`JAMMI_GANG_ARTIFACT_DIR` on the pod; the driver pulls that directory back
+before the EXIT trap tears the pod down (the pod is the only place it exists)
+and the workflow uploads it. A human reviews it and commits it under
+`crates/jammi-kernels/artifacts/cuda-runs/`, where
+`ci/scripts/check_cuda_run_artifacts.py`'s `gang` kind is its schema gate. That
+schema requires the topology the run actually had (`world`, the collective, and
+one device per rank), the same-seed digest pair, the measured per-step loss
+delta, and the epsilon it is read against — with epsilon's own derivation and
+the commit it was registered at. An epsilon chosen after seeing the delta it
+excuses is not a tolerance, and the gate refuses it by name.
+
+**A failing run is representable.** The artifact carries the leg's own
+`verdict`, exactly `pass` or `fail`. A `fail` is *admitted* with its deltas and
+digests as measured — that record is the whole value of a non-reproducible run —
+and owes a `reason` naming what failed plus a top-level `status` that is not
+`GREEN`. A `pass` is a claim, so on a `pass` the worst measured delta must be
+within epsilon, and the same-seed digest pair must be *equal* at `world` 2, the
+one regime a spike measured byte-identical (candle 0.11's LoRA-shaped
+forward/backward/SGD across A100s, no env pins). Above `world` 2 the pair is
+recorded and not asserted: nothing has established what byte-identity should
+mean for a reduction whose NCCL pin set is untested there.
+
+**Where epsilon has to sit in history.** The gate reads the registration commit
+against the artifact's *evidence anchor*: `git_sha` when that is an ancestor of
+`HEAD` — the tree the run actually measured — otherwise `merged_as` as the
+rescue, when the artifact carries one that is an ancestor of `HEAD` (a measured
+tip whose landing commit rewrote it). A `merged_as` stamped beside a `git_sha`
+that is still in this history changes nothing: it names a later commit, and
+ordering against it would admit an epsilon registered in the measured commit
+itself. When `merged_as` IS the anchor, epsilon is ordered against that
+**landing** commit, never against the (now-unreachable) commit where the
+measurement itself ran — the measured tip's own commit has no content left in
+this history to order anything against. The registration commit must be an
+ancestor of `HEAD` and a **strict** ancestor of that anchor; an artifact with
+neither anchor in this history fails, naming both. What that
+asks of whoever runs the leg: commit epsilon on its own, **before** the commit
+you measure with, on the same branch. Landing that branch by a merge commit —
+this repository's own merge style — keeps epsilon a strict ancestor afterwards.
+A squash, or a rebase performed *after* measuring, rewrites both commits and the
+artifact fails from the merge onwards, so do not rebase a measured branch:
+land it, or re-measure.
+
 ## Notes
 
 - **A100 capacity on RunPod is intermittent** — deployment fails over across

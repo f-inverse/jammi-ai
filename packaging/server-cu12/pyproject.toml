@@ -28,19 +28,34 @@ classifiers = [
 ]
 # candle-core 0.11 pins cudarc with `dynamic-linking`, so the binary carries
 # hard DT_NEEDED entries for libcudart / libcublas / libcublasLt / libcurand /
-# libnvrtc. These wheels deliver those libraries so no system CUDA install is
-# needed — only an NVIDIA driver. The four packages cover cudarc 0.19.8's
-# cuda_runtime / cublas+cublasLt / curand / nvrtc feature set.
+# libnvrtc, and — since `jammi-ai`'s `cuda` feature includes `candle-core/nccl`,
+# for which cudarc's build script emits `cargo:rustc-link-lib=dylib=nccl` —
+# libnccl. These wheels deliver those libraries so no system CUDA install is
+# needed — only an NVIDIA driver. The five packages cover cudarc 0.19.8's
+# cuda_runtime / cublas+cublasLt / curand / nvrtc feature set plus NCCL.
 #
 # Each pin tracks that library's OWN release lineage, not a single CUDA version
 # string. cuda-runtime / cublas / nvrtc follow the CUDA 12.6 line (==12.6.*), but
 # cuRAND ships on its own SONAME-10 versioning — the CUDA-12.6-generation cuRAND
 # is the 10.3.x line (10.3.7.77), so its pin is ==10.3.7.*, not 12.6.*.
+#
+# NCCL versions on its own 2.x lineage too, and PyPI's `nvidia-nccl-cu12`
+# releases are three-component (`2.22.3`, `2.23.4`, `2.24.3`, …) with an
+# occasional `.postN` (`2.25.1.post1`, `2.26.2.post1`) — there is no fourth
+# component to float, so `==2.23.4.*` admits that one release and its
+# post-releases and nothing else. Naming 2.23.4 exactly is deliberate rather
+# than conservative: it is the same NCCL build the CUDA CI image links against
+# (`.docker/ci-cuda.Dockerfile`'s `libnccl-2.23.4-1+cuda12.6`), so the library
+# this wheel puts on the loader path is the one the binary was built and
+# measured against. Its single object is `nvidia/nccl/lib/libnccl.so.2`, which
+# is why `_CUDA_COMPONENTS` gains the `nccl` directory and `COVERED` in
+# `verify_link_set.py` gains the `libnccl` stem.
 dependencies = [
     "nvidia-cuda-runtime-cu12==12.6.*",
     "nvidia-cublas-cu12==12.6.*",
     "nvidia-curand-cu12==10.3.7.*",
     "nvidia-cuda-nvrtc-cu12==12.6.*",
+    "nvidia-nccl-cu12==2.23.4.*",
 ]
 
 [project.scripts]

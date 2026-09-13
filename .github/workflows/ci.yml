@@ -2250,6 +2250,13 @@ jobs:
           # so it runs on this toolchain-free runner unchanged.
           - name: cu12 tarball library derivation suite
             cmd: bash ci/scripts/test_bundle_cuda_libs.sh
+          # The cu12 WHEEL's half of the same question: `verify_link_set.py`'s
+          # `COVERED`, `_entry.py`'s `_CUDA_COMPONENTS` and `pyproject.toml`'s
+          # `nvidia-*-cu12` pins state one contract three times, and the wheel
+          # lane that would notice them disagreeing runs only on a release.
+          # Three file reads, stdlib only — no wheel, no binary, no network.
+          - name: cu12 wheel component contract
+            cmd: python3 ci/scripts/test_cu12_component_contract.py
           # #482 item 2 (Kubernetes reference): the shared remote-smoke
           # oracle's own suite (`check_ci_guard_wiring.py` tracks every
           # tracked `tests/**/test_*.py`, so this suite must be wired in

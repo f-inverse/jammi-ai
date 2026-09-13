@@ -105,11 +105,51 @@ Required fixtures (RED when the corresponding hook arm is removed):
       R12timeout/R12alarm: settings.json's PreToolUse timeout pins above
       the hook's own self-alarm and below the harness default; the
       self-alarm itself denies once armed. `--r12-sweep` (its own
-      `swarm.yml` step): the M5' AST-based deny-coverage sweep over the
-      `# R12-BEGIN`/`# R12-END` sentinel region's four core mechanism
-      helpers — see its own docstring for the documented scope limit
-      (the dispatch-routing arms `_decide_implementer_dispatch` added for
-      M6' sit outside the sentinel region and are not swept).
+      `swarm.yml` step): the M5' AST-based deny-coverage sweep, now over
+      EVERY function in the `# R12-BEGIN`/`# R12-END` sentinel region (20
+      as of fix round 2, not merely the four core mechanism helpers fix
+      round 1 introduced) — see its own docstring for the documented scope
+      limit (the dispatch-routing arms `_decide_implementer_dispatch`
+      added for M6' sit outside the sentinel region and are not swept).
+  esc-lead-gate-R12 fix round 2 (closing audit findings F1-F6 at 5b9fa369,
+      plus acceptance folds): F1 (R12F1a/R12F1b) — reader 2 finds the
+      pre-fix artifact by scanning for the one whose OWN `covers` list
+      names the BLOCK's `ts` (`_r12_find_pre_fix_artifact`), never by
+      re-deriving the filename from the BLOCK row's own `head_sha` (which
+      only ever names ONE covering artifact when exactly one block was
+      open); a genuinely missing covering artifact still denies (`pre_by_
+      file` is independently derived from the row's own class_enumeration/
+      finding_locations, never forced empty by a missing file). F2
+      (R12P10c/R12E7) — `_R12_EXECUTION_PROGRAMS` is now an actual POSITIVE
+      membership test (`_r12_is_execution_class`): a `printf`/`echo`
+      placeholder is neither inspector-class nor execution-class and
+      denies on both the by-file and empty-set paths, where before it
+      silently allowed (it was declared but never checked). F3 (R12R2j) —
+      reader 2's required set widens by EVERY file `git diff --name-only
+      block_sha..fix_head` names, not merely `keys(artifact) ∪
+      new_surfaces`. F6 — the killed "tip equals the BLOCK's own head_sha"
+      wording is corrected everywhere it survived (SELF-FAILURE-MODES.md,
+      the escapes.jsonl row, and this file's own R12 section header).
+      Acceptance folds: R12witness is relabeled a STANDING PIN (never
+      retired); R12norm — no R12 deny-return literal ever spells the
+      standalone word "rm" (a STATIC AST check over the sentinel region,
+      not a sample of one runtime message); R12phase — a slow attack does
+      not exhaust the following git-call phase's own freshly-minted
+      budget; R12residual — the sweep's own `# R12-RESIDUAL: <reason>`
+      marker parsing; R12sweepmeta — a meta-test proving the sweep
+      mechanism itself flags a deliberately-injected, genuinely
+      unreachable canary arm as a SURVIVOR (run only from `--r12-sweep`,
+      never `--self-test` — like the real sweep, it drives the same slow
+      mutation/re-run pipeline). Item 9: `test_check_lead_gate.py`'s
+      subprocess timeout raised to a measured >=2x margin (150s) over the
+      64.8-72.7s the R12 fixture set now takes. Item 11:
+      `ci/scripts/derive_r12_grandfather.py` derives the grandfather list's
+      real content from `docs/rigor/*.jsonl` + `.jammi/gate-state/*.jsonl`
+      at merge time (never guessed by hand). Item 12: `_witness_hash` runs
+      `stdout` through `_r12_normalize_output` first (R12norm2) — an
+      execution-class command's own wall-clock timing text (a cargo/
+      libtest "finished in X.XXs" summary line) must never be the thing
+      that makes reader 2's pre/post differential "pass".
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`
@@ -586,6 +626,7 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
                    {s for s in (row.get("finding_locations") or []) if isinstance(s, str)}
         pre_files = {mod._key_to_file(k) for k in pre_keys}
         new_surface_files: set[str] = set()
+        fix_changed_files: set[str] = set()
         if fix_head is not None and isinstance(row.get("head_sha"), str):
             try:
                 # A fixture testing an ADVERSARIAL head_sha/fix_head (e.g.
@@ -597,9 +638,18 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
                 # never a fixture-setup crash.
                 diff_out = _git(root, "diff", "-U0", "--end-of-options", row["head_sha"], fix_head)
                 new_surface_files = {mod._key_to_file(k) for k in mod._parse_new_surfaces(diff_out).keys()}
+                # esc-lead-gate-R12 fix round 2 F3: the real hook widens
+                # `required` by EVERY file the fix's own diff changed, not
+                # merely new-surface definitions — mirror that here so the
+                # dozens of EXISTING fixtures using this "auto" mechanism
+                # keep auto-covering whatever the fix touches (including
+                # this harness's own marker/placeholder files).
+                names_out = _git(root, "diff", "--name-only", "--end-of-options", row["head_sha"], fix_head)
+                fix_changed_files = {line for line in names_out.splitlines() if line}
             except Failure:
                 new_surface_files = set()
-        required = pre_files | new_surface_files
+                fix_changed_files = set()
+        required = pre_files | new_surface_files | fix_changed_files
         if required:
             apath = _anticipation_path_exact(root, row["unit_branch"], row["head_sha"])
             pre_attacks = json.loads(apath.read_text()).get("attacks", {}) if apath.exists() else {}
@@ -1693,14 +1743,25 @@ def fixture_uc7_no_claim_shaped_line_is_a_noop() -> None:
 
 
 # ==========================================================================
-# R12P1-R12P11, R12D1, R12R2-*, R12M1 — esc-lead-gate-R12 v2 ("ANTICIPATE
-# BEFORE THE FIX"). Reader 1 (`_decide_implementer_dispatch`): an
-# implementer-type dispatch onto a unit with an open verifier BLOCK is
-# denied unless a complete, EXECUTED, pre-fix anticipation artifact exists
-# whose named branch's CURRENT tip equals the BLOCK's own head_sha. Reader
-# 2 (`_relay_rejection`'s own `attacks_post` arm): the closing-verifier
-# relay must re-run the SAME keys at `fix_head` and show a measured
-# difference for every changed file a pre-fix key covers.
+# R12P1-R12P15, R12E1-R12E7, R12F1-R12F5, R12D1, R12R2-*, R12M1, R12witness,
+# R12reduce, R12unparse — esc-lead-gate-R12 v2 ("ANTICIPATE BEFORE THE
+# FIX"), fix rounds 1-2. Reader 1 (`_pre_fix_anticipation_rejection`): an
+# implementer-type dispatch onto a unit with an open second-round-type
+# BLOCK is denied unless a complete, EXECUTED, pre-fix anticipation
+# artifact exists at `.jammi/gate-state/<slug>.anticipation.<pre_fix_sha>.
+# json` — keyed by the unit branch's CURRENT TIP (`pre_fix_sha`), NEVER by
+# any one BLOCK's own `head_sha` (M1': a second, older open BLOCK at a
+# DIFFERENT sha would otherwise leave the union's own covering artifact
+# unfindable under its own name) — covering the UNION of every open
+# second-round BLOCK's derived keys, reduced per file, with that SAME
+# `pre_fix_sha` equal to the branch's CURRENT tip and a clean worktree.
+# Reader 2 (`_post_fix_attacks_rejection`, the `attacks_post` arm): the
+# closing-verifier relay must re-run the SAME per-file keys at `fix_head`
+# and show a measured difference for every fix-changed file a pre-fix key
+# covers — the covering artifact is found by its OWN `covers` list (F1),
+# never by the relay's BLOCK row's own `head_sha`, and the required set
+# widens by every file the fix's diff actually changed (F3), not merely
+# new-surface definitions.
 # ==========================================================================
 
 def _r12_dispatch(root: Path, unit: str, subtype: str = "db") -> "subprocess.CompletedProcess":
@@ -1928,7 +1989,32 @@ def fixture_r12p10b_inspector_only_artifact_denies() -> None:
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P10b", f"an inspector-only artifact must deny, got {p.returncode}")
-    _assert("inspector-class" in p.stderr, "R12P10b", p.stderr)
+    # The EXACT "carries only inspector-class commands" phrase, never the
+    # bare substring "inspector-class" -- the F2 fallback message ALSO
+    # contains that substring ("...neither inspector-class nor execution-
+    # class..."), so a loose substring check here cannot distinguish the
+    # all-inspector arm from its own fallback and would never die under a
+    # mutation that neuters ONLY the all-inspector arm specifically.
+    _assert("carries only inspector-class commands" in p.stderr, "R12P10b", p.stderr)
+
+
+def fixture_r12p10c_printf_only_artifact_denies() -> None:
+    """esc-lead-gate-R12 fix round 2 F2: a `printf`-only artifact is
+    NEITHER inspector-class (it is not in `_R12_INSPECTOR_PROGRAMS`) NOR
+    execution-class (`_R12_EXECUTION_PROGRAMS` was declared but never
+    actually membership-tested) — before F2 this artifact ALLOWED (the
+    `all_inspector` check never fires for a non-inspector placeholder);
+    it must now DENY, naming the missing execution-class requirement."""
+    unit = "feat/r12p10c"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P10c", f"a printf-only artifact must deny, got {p.returncode}")
+    _assert("no execution-class attack" in p.stderr, "R12P10c", p.stderr)
 
 
 def fixture_r12p11_two_open_blocks_different_shas_still_satisfiable() -> None:
@@ -1941,12 +2027,19 @@ def fixture_r12p11_two_open_blocks_different_shas_still_satisfiable() -> None:
     covering the UNION of every open block's keys), this is satisfiable."""
     unit = "feat/r12p11"
     root = _temp_repo(unit)
+    # esc-lead-gate-R12 fix round 2 F2: at least one attack in the artifact
+    # must be execution-class, not merely a printf placeholder — a real
+    # tracked probe script, committed BEFORE either BLOCK row so it is
+    # already present at both blocks' own head_sha.
+    (root / "probe_r12p11.sh").write_text("#!/bin/sh\nprintf ok\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add probe_r12p11.sh")
     audit_row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
     _commit_fix(root, "unrelated.py")  # tip advances past the audit BLOCK's own head_sha
     accept_row = _write_block_row(root, unit, "a2", "acceptance-verifier", ["b.py:2"], ["b.py:2"])
     _assert(audit_row["head_sha"] != accept_row["head_sha"], "R12P11 setup",
             "the two BLOCKs must sit at DIFFERENT shas for this to test anything")
-    a = _auto_r12_attack("a.py")
+    a = {"command": "bash probe_r12p11.sh", "hash": _r12_hash(0, "ok", "")}
     b = _auto_r12_attack("b.py")
     _write_anticipation_exact(root, unit, accept_row["head_sha"], {
         "a.py": {"command": a["command"], "hash": a["hash"]},
@@ -2048,6 +2141,97 @@ def fixture_r12p15_find_delete_denied_via_dispatch() -> None:
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P15", f"find with -delete must deny, got {p.returncode}")
     _assert("-delete/-exec/-execdir is denied" in p.stderr, "R12P15", p.stderr)
+
+
+def fixture_r12p16_missing_command_field_denies() -> None:
+    """`_r12_validate_and_run_entry`'s own `has no \\`command\\`` determinant,
+    exercised through the real dispatch path — an attack entry with NO
+    `command` key at all (never merely an empty string, which is the same
+    arm but a different literal shape)."""
+    unit = "feat/r12p16"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"hash": "a" * 64},  # `command` deliberately omitted
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P16", f"a missing `command` field must deny, got {p.returncode}")
+    _assert("has no `command`" in p.stderr, "R12P16", p.stderr)
+
+
+def fixture_r12p17_invalid_hash_shape_denies() -> None:
+    """`_r12_validate_and_run_entry`'s own `has no valid \\`hash\\`` shape
+    determinant — a `hash` field that is not 64 hex characters (never the
+    SEPARATE "does not reproduce" arm, which requires a syntactically
+    valid but wrong hash; this is the field failing `_OUTPUT_HASH_RE`
+    outright)."""
+    unit = "feat/r12p17"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "printf hello", "hash": "not-a-valid-sha256-hash"},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P17", f"an invalid hash shape must deny, got {p.returncode}")
+    _assert("has no valid `hash`" in p.stderr, "R12P17", p.stderr)
+
+
+def fixture_r12p18_no_linked_worktree_denies() -> None:
+    """`_resolve_worktree_cwd`'s own "no linked worktree resolves" arm: the
+    dispatched unit branch DOES resolve under `refs/heads/` (a real ref,
+    at exactly the tip the anticipation artifact records) — but NO `git
+    worktree` entry (linked or the main one) is checked out on it, so an
+    attack command has no real files to run against. Built by creating the
+    ref to point at the BLOCK row's own `head_sha` AFTER that commit
+    exists (never before), so the tip-equality check earlier in the chain
+    is satisfied and this specific arm is what actually fires."""
+    unit = "feat/r12p18"
+    root = _temp_repo(unit)
+    orphan = "feat/r12p18-orphan-never-checked-out"
+    row = _write_block_row(root, orphan, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _git(root, "branch", orphan, row["head_sha"])
+    _write_anticipation_exact(root, orphan, row["head_sha"], {
+        "a.py": {"command": "printf ok", "hash": _r12_hash(0, "ok", "")},
+    })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "db", "prompt": f"unit: {orphan}\nimplement the fix"}}, root)
+    _assert(p.returncode == 2, "R12P18", f"a unit branch with no linked worktree must deny, got {p.returncode}: {p.stderr}")
+    _assert("no linked worktree resolves" in p.stderr, "R12P18", p.stderr)
+
+
+def fixture_r12p19_execution_class_direct_program_name_allows() -> None:
+    """`_r12_is_execution_class`'s own cargo/python3/pytest/make branch —
+    every OTHER execution-class fixture in this suite uses `bash <path>`;
+    this proves the direct program-name match is independently load-
+    bearing (an artifact whose ONLY execution-class command is `python3
+    -c ...`, never a bash/sh script, still allows)."""
+    unit = "feat/r12p19"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    cmd = "python3 -c \"print('r12p19-ok')\""
+    h = _r12_hash(0, "r12p19-ok\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": cmd, "hash": h},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 0, "R12P19", f"a python3-shaped execution-class command must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12p20_non_dict_attack_entry_denies() -> None:
+    """`_r12_validate_and_run_entry`'s own "is not an object" arm,
+    exercised through READER 1's by-file loop (never reader 2's relay
+    path, which pre-checks `isinstance(entry, dict)` itself before ever
+    delegating — see R12R2g) — an `attacks["a.py"]` value that is a plain
+    string, not a `{command, hash}` object."""
+    unit = "feat/r12p20"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": "not-an-object",
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P20", f"a non-object attacks[f] entry must deny, got {p.returncode}: {p.stderr}")
+    _assert("is not an object" in p.stderr, "R12P20", p.stderr)
 
 
 def _r12_empty_set_repo(unit: str) -> Path:
@@ -2172,6 +2356,25 @@ def fixture_r12e6_empty_derived_set_malformed_entry_denies() -> None:
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12E6", f"a malformed empty-set entry must deny, got {p.returncode}")
     _assert("does not reproduce the recorded hash" in p.stderr, "R12E6", p.stderr)
+
+
+def fixture_r12e7_empty_derived_set_printf_only_denies() -> None:
+    """esc-lead-gate-R12 fix round 2 F2, empty-set path: two lead-chosen
+    keys, both real changed files, both `printf` — neither inspector-class
+    nor execution-class. Before F2 this ALLOWED (the `all_inspector` check
+    never fires for a non-inspector placeholder); it must now DENY."""
+    unit = "feat/r12e7"
+    root = _r12_empty_set_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    a = _auto_r12_attack("a.py")
+    b = _auto_r12_attack("b.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        "b.py": {"command": b["command"], "hash": b["hash"]},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E7", f"a printf-only empty-set artifact must deny, got {p.returncode}")
+    _assert("no execution-class attack" in p.stderr, "R12E7", p.stderr)
 
 
 def fixture_r12f1_pre_fix_sha_mismatch_denies() -> None:
@@ -2333,12 +2536,41 @@ def fixture_r12r2i_attacks_post_hash_mismatch_denies() -> None:
     _assert("does not reproduce" in p.stderr, "R12R2i", p.stderr)
 
 
+def fixture_r12r2j_fix_changed_file_with_no_covering_key_denies() -> None:
+    """esc-lead-gate-R12 fix round 2 F3: `required` widens by EVERY file
+    the fix's own diff changed (`git diff --name-only block_sha..fix_head`),
+    not merely `keys(artifact) ∪ new_surfaces`. The fix here also touches
+    `config.toml` — a file no pre-fix key names and that introduces no
+    def/fn-shaped new surface at all — before F3 this file was invisible
+    to reader 2 entirely; it must now be required and denied when
+    uncovered."""
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2j")
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    (root / "config.toml").write_text("key = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED, plus config.toml")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2j"}}, root)
+    _assert(p.returncode == 2, "R12R2j",
+            f"a fix-changed file with no covering key must deny, got {p.returncode}: {p.stderr}")
+    _assert("config.toml" in p.stderr, "R12R2j", p.stderr)
+
+
 def fixture_r12witness_stderr_distinguishes_missing_from_real_failure() -> None:
-    """The design's own measured collision: `sha256(rc+stdout)` ALONE
-    cannot distinguish a missing script (rc=127, empty stdout) from a real
-    rc=1 failure with empty stdout; `_witness_hash` includes the first
-    stderr line specifically to fix this. Two IDENTICAL missing-script
-    runs still hash identically (by design — this is not a nonce)."""
+    """STANDING PIN — never a one-round acceptance check to retire once
+    this proposal merges; it stays in the suite for as long as
+    `_witness_hash` exists, the same way a regression test for a fixed bug
+    outlives the bug. The design's own measured collision: `sha256(rc+
+    stdout)` ALONE cannot distinguish a missing script (rc=127, empty
+    stdout) from a real rc=1 failure with empty stdout; `_witness_hash`
+    includes the first stderr line specifically to fix this. Two IDENTICAL
+    missing-script runs still hash identically (by design — this is not a
+    nonce)."""
     mod = _r12_mod()
     h_missing_1 = mod._witness_hash(127, "", "sh: 1: ./nope.sh: not found")
     h_missing_2 = mod._witness_hash(127, "", "sh: 1: ./nope.sh: not found")
@@ -2354,8 +2586,13 @@ def fixture_r12reduce_two_lines_same_file_one_required_entry() -> None:
     reduces (never one required entry per raw line-key)."""
     unit = "feat/r12reduce"
     root = _temp_repo(unit)
+    # esc-lead-gate-R12 fix round 2 F2: the sole required entry must carry
+    # an execution-class attack, not a printf placeholder.
+    (root / "probe_r12reduce.sh").write_text("#!/bin/sh\nprintf ok\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add probe_r12reduce.sh")
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1", "a.py:9"], ["a.py:1"])
-    a = _auto_r12_attack("a.py")
+    a = {"command": "bash probe_r12reduce.sh", "hash": _r12_hash(0, "ok", "")}
     _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}})
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 0, "R12reduce", f"one file entry must satisfy two same-file raw keys, got {p.returncode}: {p.stderr}")
@@ -2369,6 +2606,11 @@ def fixture_r12unparse_prose_key_maps_to_itself_still_required() -> None:
     literal text, it allows."""
     unit = "feat/r12unparse"
     root = _temp_repo(unit)
+    # esc-lead-gate-R12 fix round 2 F2: the prose key's own attack (the
+    # ONLY entry `by_file` actually requires here) must be execution-class.
+    (root / "probe_r12unparse.sh").write_text("#!/bin/sh\nprintf ok\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add probe_r12unparse.sh")
     prose_key = "the whole loader stage (nccl.rs)"
     row = _write_block_row(root, unit, "a1", "adversarial-audit", [prose_key], [prose_key])
     # An artifact that EXISTS (at the right tip) but omits the prose key
@@ -2379,7 +2621,7 @@ def fixture_r12unparse_prose_key_maps_to_itself_still_required() -> None:
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12unparse", f"a missing attack for an unparseable key must still deny, got {p.returncode}")
     _assert("omits" in p.stderr and prose_key in p.stderr, "R12unparse", p.stderr)
-    a = _auto_r12_attack(prose_key)
+    a = {"command": "bash probe_r12unparse.sh", "hash": _r12_hash(0, "ok", "")}
     _write_anticipation_exact(root, unit, row["head_sha"], {
         "unrelated.py": {"command": other["command"], "hash": other["hash"]},
         prose_key: {"command": a["command"], "hash": a["hash"]},
@@ -2436,6 +2678,102 @@ def _r12_post_setup(unit: str):
         "state.txt": {"command": cmd, "hash": pre_hash},
     })
     return root, row, cmd, pre_hash
+
+
+def _r12f1_two_block_setup(unit: str):
+    """esc-lead-gate-R12 fix round 2 F1 setup: TWO open BLOCKs of different
+    types at DIFFERENT shas on the same unit (an older adversarial-audit,
+    then a newer acceptance-verifier after a fix commit landed in between)
+    and ONE covering artifact recorded at the union's own (newer) tip with
+    an explicit `covers` list naming BOTH blocks' `ts` — the real shape
+    M1' produces once a second block opens. Returns `(root, audit_row,
+    accept_row, cmd, pre_hash)`."""
+    root = _temp_repo(unit)
+    (root / "state.txt").write_text("BROKEN\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed state.txt = BROKEN/v1")
+    audit_row = _write_block_row(root, unit, "a1", "adversarial-audit", ["state.txt:1"], ["state.txt:1"])
+    _commit_fix(root, "unrelated.py")  # tip advances past the audit BLOCK's own head_sha
+    accept_row = _write_block_row(root, unit, "a2", "acceptance-verifier", ["b.py:2"], ["b.py:2"])
+    cmd = "head -1 state.txt"
+    pre_hash = _r12_hash(0, "BROKEN\n", "")
+    b = _auto_r12_attack("b.py")
+    _write_anticipation_exact(root, unit, accept_row["head_sha"], {
+        "state.txt": {"command": cmd, "hash": pre_hash},
+        "b.py": {"command": b["command"], "hash": b["hash"]},
+    }, covers=[audit_row["ts"], accept_row["ts"]])
+    return root, audit_row, accept_row, cmd, pre_hash
+
+
+def fixture_r12f1a_reader2_finds_artifact_by_covers_not_block_head_sha() -> None:
+    """esc-lead-gate-R12 fix round 2 F1: the OLDER block's own `head_sha`
+    names NO artifact file on disk (the covering artifact sits at the
+    UNION's newer tip) — before F1, Reader 2 looked the artifact up by
+    `row["head_sha"]` directly, found nothing, and silently treated the
+    differential as vacuously satisfied (`required_r12` empty), ALLOWING
+    the older block's relay through with no check at all. After F1,
+    Reader 2 finds the SAME artifact by its `covers` list and still
+    catches an unmoved hash."""
+    unit = "feat/r12f1a"
+    root, audit_row, accept_row, cmd, pre_hash = _r12f1_two_block_setup(unit)
+    _assert(audit_row["head_sha"] != accept_row["head_sha"], "R12F1a setup",
+            "the two BLOCKs must sit at DIFFERENT shas for this to test anything")
+    (root / "state.txt").write_text("BROKEN\nv2\n")  # only line 2 changes; line 1 never moves
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 2 only, line 1 unchanged")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    b = _auto_r12_attack("b.py")
+    # F3 widens the OLDER block's own fix window by EVERY file changed
+    # since its head_sha, which here also sweeps up the setup commits that
+    # recorded the NEWER block (its marker file) and the tip-advancing
+    # `unrelated.py` commit — cover both with harmless auto attacks so the
+    # fixture actually reaches the state.txt differential it means to test.
+    marker = _auto_r12_attack(".block-acceptance-verifier-BLOCK.marker")
+    unrelated = _auto_r12_attack("unrelated.py")
+    _write_relay_exact(root, audit_row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={
+                            "state.txt": {"command": cmd, "hash": pre_hash},
+                            "b.py": {"command": b["command"], "hash": b["hash"]},
+                            ".block-acceptance-verifier-BLOCK.marker": {"command": marker["command"], "hash": marker["hash"]},
+                            "unrelated.py": {"command": unrelated["command"], "hash": unrelated["hash"]},
+                        })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12F1a",
+            f"the OLDER block's relay must still be checked against the covering artifact "
+            f"(found by `covers`, never by its own head_sha) and deny on an unmoved hash, "
+            f"got {p.returncode}: {p.stderr}")
+    _assert("did not observably move" in p.stderr, "R12F1a", p.stderr)
+
+
+def fixture_r12f1b_deleted_artifact_denies_not_allows() -> None:
+    """esc-lead-gate-R12 fix round 2 F1: R12R2b's own setup (a real
+    differential the fix DOES move), but the covering anticipation
+    artifact is DELETED from disk before the relay is checked. Before F1
+    this SILENTLY ALLOWED — a missing artifact forced `pre_by_file = {}`,
+    which emptied `required_r12` and skipped the whole reader-2 arm
+    instead of denying it. After F1, `pre_by_file` is independently
+    derived from the BLOCK row's own class_enumeration/finding_locations,
+    so a genuinely missing artifact still trips the "no pre-fix
+    anticipation artifact found" guard."""
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12f1b")
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}})
+    apath = _anticipation_path_exact(root, row["unit_branch"], row["head_sha"])
+    apath.unlink()
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12f1b"}}, root)
+    _assert(p.returncode == 2, "R12F1b",
+            f"a deleted pre-fix anticipation artifact must DENY, never silently allow, "
+            f"got {p.returncode}: {p.stderr}")
+    _assert("no pre-fix anticipation artifact found" in p.stderr, "R12F1b", p.stderr)
 
 
 def fixture_r12r2a_missing_attacks_post_denies() -> None:
@@ -2558,6 +2896,93 @@ def fixture_r12m1_open_question_without_attacks_post_denies() -> None:
     _assert(p.returncode == 2, "R12M1", f"open_question with no attacks_post must deny, got {p.returncode}")
     _assert("REPLACES" in p.stderr and "attacks_post" in p.stderr, "R12M1",
             f"reason must name the migration to attacks_post: {p.stderr!r}")
+
+
+_R12_RM_WORD_RE = re.compile(r"\brm\b", re.IGNORECASE)
+
+
+def _r12_return_string_literals(source: str, begin: int, end: int) -> list[tuple[int, str]]:
+    """`[(lineno, literal_text_chunk), ...]` for every literal STRING chunk
+    that could reach a caller from a `Return` inside the R12 sentinel line
+    range — f-string literal segments (never the interpolated `{...}`
+    expressions, which are not authored prose), plain string constants,
+    and `+`-concatenated/tuple/list-wrapped combinations of the above."""
+    tree = ast.parse(source)
+    out: list[tuple[int, str]] = []
+
+    def collect(node: ast.AST) -> None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            out.append((node.lineno, node.value))
+        elif isinstance(node, ast.JoinedStr):
+            for v in node.values:
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    out.append((v.lineno, v.value))
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                collect(elt)
+        elif isinstance(node, ast.BinOp):
+            collect(node.left)
+            collect(node.right)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return) and begin <= node.lineno <= end and node.value is not None:
+            collect(node.value)
+    return out
+
+
+def fixture_r12norm_no_rm_in_any_deny_text() -> None:
+    """esc-lead-gate-R12 fix round 2 acceptance fold: "no R12 deny message
+    ever names the `rm` hatch" is a STATIC property over every literal
+    string chunk a `Return` inside the `# R12-BEGIN`/`# R12-END` sentinel
+    region could ever emit — never a sample of one runtime message. Word-
+    bounded (`\\brm\\b`) so "alarm"/"confirm"/"warm"/"term" never false-
+    positive; a denylisted `rm` COMMAND legitimately appears in fixture
+    DATA elsewhere (R12P9) — this checks only what the HOOK ITSELF prints,
+    never what a lead-supplied command string might contain."""
+    source = LEAD_GATE_LIB.read_text()
+    begin, end = _r12_sentinel_line_range(source)
+    hits = [(ln, text) for ln, text in _r12_return_string_literals(source, begin, end)
+            if _R12_RM_WORD_RE.search(text)]
+    _assert(not hits, "R12norm",
+            f"an R12 deny-return literal spells the standalone word 'rm' — even a message that "
+            f"DISCLAIMS the rm hatch still names it: {hits}")
+
+
+def fixture_r12phase_slow_attack_does_not_exhaust_next_git_phase() -> None:
+    """M1'/fix round 2 acceptance fold: the per-phase deadline is minted
+    FRESH for each phase (ref/worktree resolution, then attacks, then any
+    LATER git call) — a slow attack command must not eat into the budget
+    of the git-call phase that follows it. A single ~1s attack (well under
+    `_ATTACK_BUDGET_S`, generous margin against timing jitter) followed by
+    the hook's OWN subsequent git calls (worktree HEAD re-check inside
+    Reader 1) must still complete well inside a single fresh
+    `_GIT_BUDGET_S` window — i.e. the whole dispatch still returns quickly,
+    never stalling for anywhere near the attack's own duration stacked
+    onto a git budget that should already have been spent and re-minted."""
+    unit = "feat/r12phase"
+    root = _temp_repo(unit)
+    (root / "slow_probe_r12phase.sh").write_text("#!/bin/sh\nsleep 1\nprintf ok\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add slow_probe_r12phase.sh")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    cmd = "bash slow_probe_r12phase.sh"
+    h = _r12_hash(0, "ok", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": cmd, "hash": h},
+    })
+    start = time.monotonic()
+    p = _r12_dispatch(root, unit)
+    elapsed = time.monotonic() - start
+    _assert(p.returncode == 0, "R12phase", f"a real ~1s attack must still allow, got {p.returncode}: {p.stderr}")
+    # Generous margin: the attack itself takes ~1s; the WHOLE dispatch
+    # (attack + every git phase around it) must not balloon anywhere near
+    # a shared/starved-budget shape — 10s is comfortably above the ~1s
+    # attack plus ordinary git-call overhead, comfortably below any
+    # budget that would indicate the NEXT phase inherited the attack's
+    # own exhausted clock.
+    _assert(elapsed < 10.0, "R12phase",
+            f"the dispatch took {elapsed:.2f}s — the attack phase must not exhaust the "
+            "following git-call phase's own freshly-minted budget")
 
 
 # ==========================================================================
@@ -3352,8 +3777,27 @@ def _g20_28_arm() -> tuple[list[str], int]:
 import ast  # noqa: E402  (kept local to this section, mirrors the module's own late imports)
 
 _R12_SWEEP_FUNCS = {
-    "_r12_attack_command_denied", "_pre_fix_anticipation_rejection",
-    "_r12_empty_set_rejection", "_post_fix_attacks_rejection",
+    # esc-lead-gate-R12 fix round 2 item 10: every function in the
+    # `# R12-BEGIN`/`# R12-END` sentinel region (20 total as of fix round
+    # 2 — the 17 fix round 1 introduced, plus `_r12_is_execution_class`
+    # (F2), `_r12_find_pre_fix_artifact` (F1) and `_r12_normalize_output`
+    # (item 12)), not merely the four `str | None`-returning core
+    # mechanism helpers fix round 1 introduced. A function with no
+    # CONDITIONAL non-`None`/non-fallthrough return (`_new_attack_deadline`,
+    # `_derived_attack_keys`, `_key_to_file`, `anticipation_artifact_path`,
+    # `_witness_hash`, `_r12_normalize_output`, `_r12_is_inspector_only`,
+    # `_r12_is_execution_class`, `_r12_targeted_open_blocks`,
+    # `_r12_required_by_file`) contributes ZERO positions automatically —
+    # `_r12_deny_if_positions` only counts a `Return` inside an `If`, so
+    # listing them here is harmless and keeps this set a straightforward,
+    # auditable ENUMERATION of the region rather than a hand-picked subset.
+    "_install_self_alarm", "_new_attack_deadline", "_derived_attack_keys",
+    "_key_to_file", "anticipation_artifact_path", "_r12_normalize_output", "_witness_hash",
+    "_run_attack_command", "_resolve_worktree_cwd", "_r12_attack_command_denied",
+    "_r12_is_inspector_only", "_r12_is_execution_class", "_r12_targeted_open_blocks",
+    "_r12_required_by_file", "_r12_changed_file_set", "_r12_validate_and_run_entry",
+    "_r12_empty_set_rejection", "_pre_fix_anticipation_rejection",
+    "_post_fix_attacks_rejection", "_r12_find_pre_fix_artifact",
 }
 
 
@@ -3458,17 +3902,173 @@ def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, o
     return died
 
 
-def run_r12_deny_coverage_sweep(fixtures: list[tuple[str, object]]) -> tuple[list[tuple[int, int]], dict[tuple[int, int], list[str]]]:
-    source = LEAD_GATE_LIB.read_text()
+def run_r12_deny_coverage_sweep(fixtures: list[tuple[str, object]],
+                                 source: str | None = None) -> tuple[list[tuple[int, int]], dict[tuple[int, int], list[str]]]:
+    """`source` defaults to the REAL `lead-gate-lib.py` — overridable so the
+    sweep meta-fixture (`R12sweepmeta`) can run this exact mechanism
+    against a deliberately mutated COPY carrying one genuinely silent arm,
+    proving the sweep's OWN detection logic fires, never merely that every
+    arm CURRENTLY has a fixture."""
+    if source is None:
+        source = LEAD_GATE_LIB.read_text()
     begin, end = _r12_sentinel_line_range(source)
     positions = _r12_deny_if_positions(source, begin, end)
-    r12_fixtures = [(n, f) for n, f in fixtures if n.startswith("R12")]
+    # esc-lead-gate-R12 fix round 2 F4: R12D1 (`_r12_mod()`'s CACHED module
+    # reference), R12alarm, R12timeout and R12alarmkill (all three load
+    # `LEAD_GATE_LIB` — the real, un-mutated path constant — directly, by
+    # construction, never `HOOKS_DIR`) can NEVER observe a mutant's
+    # `HOOKS_DIR` monkey-patch; including them wastes every arm's budget
+    # (R12alarmkill alone costs ~7s of real sleeps PER ARM) on fixtures
+    # that can by definition never die, and would misleadingly VALIDATE a
+    # mutant hooks dir that the rest of the subset never actually
+    # exercised.
+    _R12_MUTATION_BLIND = {"R12D1", "R12alarm", "R12timeout", "R12alarmkill"}
+    r12_fixtures = [(n, f) for n, f in fixtures if n.startswith("R12") and n not in _R12_MUTATION_BLIND]
     per_arm: dict[tuple[int, int], list[str]] = {}
     for pos in positions:
         mutated = _r12_mutate_at(source, pos)
         hooks_dir = _r12_mutant_hooks_dir(mutated)
         per_arm[pos] = _r12_run_fixture_subset_against(hooks_dir, r12_fixtures)
     return positions, per_arm
+
+
+def fixture_r12alarmkill_self_alarm_kills_inflight_attack_process_group() -> None:
+    """esc-lead-gate-R12 fix round 2 advisory: the self-alarm's SIGALRM
+    handler `killpg`s the CURRENTLY in-flight attack subprocess's own
+    process group before `os._exit(2)` — without this, `os._exit` skips
+    normal cleanup and the attack's own child (started in its own process
+    group via `start_new_session=True`) is orphaned and keeps running
+    after the hook process is gone. Spawns a throwaway subprocess that
+    arms a 1s self-alarm then calls `_run_attack_command` on `sleep 3 &&
+    touch <marker>` with a generous deadline (the ALARM fires first, never
+    the command's own budget); after the subprocess dies, THIS fixture
+    waits past the sleep's own 3s duration before checking — decisive: if
+    the child had merely been orphaned rather than killed, it would have
+    finished and created the marker well within that wait."""
+    with tempfile.TemporaryDirectory(prefix="r12alarmkill-") as d:
+        marker = str(Path(d) / "marker")
+        proc = subprocess.run(
+            ["python3", "-c",
+             "import importlib.util, time, sys\n"
+             f"spec = importlib.util.spec_from_file_location('m', {str(LEAD_GATE_LIB)!r})\n"
+             "mod = importlib.util.module_from_spec(spec)\n"
+             "spec.loader.exec_module(mod)\n"
+             "mod._SELF_ALARM_S = 1\n"
+             "mod._install_self_alarm()\n"
+             f"mod._run_attack_command('sleep 3 && touch {marker}', {d!r}, time.monotonic() + 60)\n"],
+            capture_output=True, text=True, timeout=10,
+        )
+        _assert(proc.returncode == 2, "R12alarmkill",
+                f"the self-alarm must still fire and exit 2, got {proc.returncode}: {proc.stderr!r}")
+        time.sleep(4.0)  # past the sleep's own 3s -- decisive, not a race
+        _assert(not Path(marker).exists(), "R12alarmkill",
+                "the marker file exists after waiting past the sleep's own duration -- the "
+                "attack subprocess was orphaned and kept running instead of being killed")
+
+
+def fixture_r12residual_marker_parsing() -> None:
+    """esc-lead-gate-R12 fix round 2 F4: `_r12_residual_reason` recognizes
+    a trailing `# R12-RESIDUAL: <reason>` comment on the EXACT line, and
+    returns `None` (unmarked) for an ordinary line with no such comment —
+    parsed precisely, never by a loose substring match that could
+    accidentally swallow prose that merely mentions "residual". Cheap and
+    pure (no subprocess, no mutation) — safe inside `--self-test`, unlike
+    `R12sweepmeta` (which drives the real, slow mutation pipeline and
+    belongs only in `--r12-sweep`)."""
+    lines = [
+        "    if some_condition:  # R12-RESIDUAL: dead code, unreachable by construction",
+        "    if other_condition:",
+        "    if third:  # a comment that mentions RESIDUAL but not the marker shape",
+    ]
+    _assert(_r12_residual_reason(lines, 1) == "dead code, unreachable by construction", "R12residual", lines[0])
+    _assert(_r12_residual_reason(lines, 2) is None, "R12residual", "an unmarked line must return None")
+    _assert(_r12_residual_reason(lines, 3) is None, "R12residual",
+            "prose mentioning residual without the exact `# R12-RESIDUAL:` marker must not match")
+
+
+def fixture_r12norm2_cargo_timing_normalized() -> None:
+    """esc-lead-gate-R12 fix round 2 item 12: an UNMUTATED, execution-class
+    command's own cargo/libtest-shaped summary line varies ONLY in its
+    wall-clock timing between two runs — `_witness_hash` must still hash
+    them IDENTICALLY (the property the differential's "post_hash !=
+    pre_hash" check depends on: a hash inequality must mean something
+    REALLY changed, never that cargo simply took a different number of
+    milliseconds this run). A GENUINE behavioural change (a different pass
+    count) still changes the hash — normalization strips ONLY the timing
+    text, nothing else."""
+    mod = _r12_mod()
+    run1 = ("running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.42s\n")
+    run2 = ("running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 1.07s\n")
+    run3_real_change = ("running 3 tests\n...\ntest result: ok. 2 passed; 1 failed; 0 ignored; "
+                         "0 measured; 0 filtered out; finished in 0.42s\n")
+    h1 = mod._witness_hash(0, run1, "")
+    h2 = mod._witness_hash(0, run2, "")
+    h3 = mod._witness_hash(0, run3_real_change, "")
+    _assert(h1 == h2, "R12norm2",
+            "two unmutated cargo-shaped runs differing ONLY in timing must hash identically")
+    _assert(h1 != h3, "R12norm2",
+            "a REAL behavioural change (a different pass/fail count) must still change the hash")
+
+
+_R12_SWEEP_META_ANCHOR = 'human SWARM_GATE_TOUCHED review, and same-repo `on: pull_request`."""\n'
+_R12_SWEEP_META_CANARY = (
+    '    if command == "__r12_sweep_meta_canary__":\n'
+    '        return "unreachable canary arm (R12sweepmeta)"  # noqa: R12-BEGIN sweep meta-fixture canary\n'
+)
+
+
+def fixture_r12sweepmeta_sweep_flags_a_genuinely_silent_arm() -> None:
+    """esc-lead-gate-R12 fix round 2 acceptance fold: a meta-test on the
+    SWEEP MECHANISM ITSELF, not on the current arm set — inserts ONE
+    deliberately unreachable deny arm (`command ==
+    "__r12_sweep_meta_canary__"`, a literal no fixture ever passes) into a
+    throwaway COPY of the real lib's source, right inside
+    `_r12_attack_command_denied` (already in `_R12_SWEEP_FUNCS`), and runs
+    the REAL `run_r12_deny_coverage_sweep` against that copy. Proves the
+    sweep correctly reports this canary as a SURVIVOR (no dying fixture)
+    — never that every arm CURRENTLY in the tree happens to have one,
+    which a bug in the sweep's own detection/mutation/re-run logic could
+    satisfy vacuously (e.g. a mutation that silently no-ops, or a fixture
+    subset that never actually runs)."""
+    source = LEAD_GATE_LIB.read_text()
+    _assert(source.count(_R12_SWEEP_META_ANCHOR) == 1, "R12sweepmeta",
+            "the sweep meta-fixture's anchor text no longer appears exactly once in the real "
+            "lib — update the anchor to match the current source")
+    mutated = source.replace(_R12_SWEEP_META_ANCHOR, _R12_SWEEP_META_ANCHOR + _R12_SWEEP_META_CANARY, 1)
+    _assert(mutated != source, "R12sweepmeta", "the canary insertion did not change the source")
+    canary_line = None
+    for i, line in enumerate(mutated.splitlines(), start=1):
+        if '"__r12_sweep_meta_canary__"' in line:
+            canary_line = i
+            break
+    _assert(canary_line is not None, "R12sweepmeta", "could not locate the injected canary line")
+    # A cheap, representative subset (never the full ~50+ R12* fixture
+    # list — this meta-fixture is about the MECHANISM, not re-proving
+    # every real arm; using a handful keeps this fast). Never R12D1/
+    # R12alarm/R12timeout — mutation-blind by construction (F4), which
+    # `run_r12_deny_coverage_sweep` already excludes from ITS OWN subset,
+    # but listing a mutation-blind name here would prove nothing anyway.
+    subset = [(n, f) for n, f in FIXTURES if n in ("R12P9", "R12P13")]
+    _assert(len(subset) == 2, "R12sweepmeta setup", f"expected 2 fixtures in the subset, got {len(subset)}")
+    positions, per_arm = run_r12_deny_coverage_sweep(subset, source=mutated)
+    canary_positions = [pos for pos in positions if pos[0] == canary_line]
+    _assert(len(canary_positions) == 1, "R12sweepmeta",
+            f"the injected canary arm was not detected as a distinct position: {positions}")
+    canary_died = per_arm[canary_positions[0]]
+    _assert(canary_died == [], "R12sweepmeta",
+            f"the sweep must report the genuinely unreachable canary arm as a SURVIVOR "
+            f"(no dying fixture), but it reported: {canary_died}")
+    # Robustness: a broken mutation/re-run pipeline (a mutant hooks dir
+    # that never actually gets exercised, say) would ALSO make the canary
+    # look like a survivor -- for the WRONG reason. Confirm at least one
+    # NON-canary, real arm DOES die under this same subset, proving the
+    # pipeline actually distinguishes mutants at all.
+    non_canary_deaths = [died for pos, died in per_arm.items() if pos[0] != canary_line and died]
+    _assert(non_canary_deaths, "R12sweepmeta",
+            "no non-canary arm died under this subset -- the mutation/re-run pipeline itself "
+            "may be broken (everything would look like a survivor for the wrong reason)")
 
 
 FIXTURES = [
@@ -3513,18 +4113,25 @@ FIXTURES = [
     ("R12P9", fixture_r12p9_denylisted_command_denies),
     ("R12P10", fixture_r12p10_complete_artifact_allows),
     ("R12P10b", fixture_r12p10b_inspector_only_artifact_denies),
+    ("R12P10c", fixture_r12p10c_printf_only_artifact_denies),
     ("R12P11", fixture_r12p11_two_open_blocks_different_shas_still_satisfiable),
     ("R12P11b", fixture_r12p11b_union_still_requires_the_older_blocks_own_keys),
     ("R12P12", fixture_r12p12_computed_cwd_not_project_dir),
     ("R12P13", fixture_r12p13_bash_nonexistent_path_denies_via_dispatch),
     ("R12P14", fixture_r12p14_git_subcommand_denied_via_dispatch),
     ("R12P15", fixture_r12p15_find_delete_denied_via_dispatch),
+    ("R12P16", fixture_r12p16_missing_command_field_denies),
+    ("R12P17", fixture_r12p17_invalid_hash_shape_denies),
+    ("R12P18", fixture_r12p18_no_linked_worktree_denies),
+    ("R12P19", fixture_r12p19_execution_class_direct_program_name_allows),
+    ("R12P20", fixture_r12p20_non_dict_attack_entry_denies),
     ("R12E1", fixture_r12e1_empty_derived_set_fewer_than_two_keys_denies),
     ("R12E2", fixture_r12e2_empty_derived_set_key_outside_changed_files_denies),
     ("R12E3", fixture_r12e3_empty_derived_set_all_inspector_denies),
     ("R12E4", fixture_r12e4_empty_derived_set_two_valid_execution_class_allows),
     ("R12E5", fixture_r12e5_empty_derived_set_unresolvable_main_denies),
     ("R12E6", fixture_r12e6_empty_derived_set_malformed_entry_denies),
+    ("R12E7", fixture_r12e7_empty_derived_set_printf_only_denies),
     ("R12F1", fixture_r12f1_pre_fix_sha_mismatch_denies),
     ("R12F2", fixture_r12f2_unit_branch_field_mismatch_denies),
     ("R12F3", fixture_r12f3_missing_residual_risk_denies),
@@ -3534,16 +4141,29 @@ FIXTURES = [
     ("R12R2g", fixture_r12r2g_attacks_post_entry_not_object_denies),
     ("R12R2h", fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies),
     ("R12R2i", fixture_r12r2i_attacks_post_hash_mismatch_denies),
+    ("R12R2j", fixture_r12r2j_fix_changed_file_with_no_covering_key_denies),
     ("R12witness", fixture_r12witness_stderr_distinguishes_missing_from_real_failure),
     ("R12reduce", fixture_r12reduce_two_lines_same_file_one_required_entry),
     ("R12unparse", fixture_r12unparse_prose_key_maps_to_itself_still_required),
     ("R12D1", fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh),
+    ("R12F1a", fixture_r12f1a_reader2_finds_artifact_by_covers_not_block_head_sha),
+    ("R12F1b", fixture_r12f1b_deleted_artifact_denies_not_allows),
     ("R12R2a", fixture_r12r2a_missing_attacks_post_denies),
     ("R12R2b", fixture_r12r2b_no_differential_denies),
     ("R12R2c", fixture_r12r2c_real_differential_allows),
     ("R12R2d", fixture_r12r2d_sh_hunk_widens_by_file),
     ("R12R2e", fixture_r12r2e_yml_hunk_widens_by_file),
     ("R12M1", fixture_r12m1_open_question_without_attacks_post_denies),
+    ("R12norm", fixture_r12norm_no_rm_in_any_deny_text),
+    ("R12phase", fixture_r12phase_slow_attack_does_not_exhaust_next_git_phase),
+    ("R12residual", fixture_r12residual_marker_parsing),
+    ("R12norm2", fixture_r12norm2_cargo_timing_normalized),
+    ("R12alarmkill", fixture_r12alarmkill_self_alarm_kills_inflight_attack_process_group),
+    # R12sweepmeta is deliberately NOT here — like the sweep itself (see
+    # `r12_sweep_main`'s own docstring), it re-runs the mutation/re-run
+    # pipeline (measured ~60s) and belongs in `--r12-sweep`, never in the
+    # per-invocation `--self-test` every unit's pressure-tester/oracle
+    # round already re-runs.
     ("T1", fixture_t1_card_schema_line_substituted_binds),
     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
     ("T3", fixture_t3_start_binds_unit_branch_colon_form),
@@ -3618,25 +4238,72 @@ def self_test() -> int:
     return 0
 
 
+_R12_RESIDUAL_RE = re.compile(r"#\s*R12-RESIDUAL:\s*(.+?)\s*$")
+
+
+def _r12_residual_reason(source_lines: list[str], lineno: int) -> str | None:
+    """esc-lead-gate-R12 fix round 2 F4: a survivor arm carrying a
+    committed `# R12-RESIDUAL: <reason>` trailing comment on its OWN `if`
+    line is REPORTED, never FAILED — the sweep's honest-residual escape
+    hatch for an arm this harness genuinely cannot exercise (a git-failure
+    branch, dead code, an out-of-scope arm), distinct from a silently
+    unmarked gap."""
+    if not (1 <= lineno <= len(source_lines)):
+        return None
+    m = _R12_RESIDUAL_RE.search(source_lines[lineno - 1])
+    return m.group(1) if m else None
+
+
 def r12_sweep_main() -> int:
     """esc-lead-gate-R12 M5' — its OWN `swarm.yml` step, separate from
-    `--self-test` (mutating and re-running ~24 R12 fixtures per deny arm is
-    too slow to fold into the per-invocation self-test every unit's
-    pressure-tester/oracle round already re-runs)."""
+    `--self-test` (mutating and re-running R12 fixtures per deny arm is too
+    slow to fold into the per-invocation self-test every unit's pressure-
+    tester/oracle round already re-runs). Also runs `R12sweepmeta` (a
+    meta-test on the sweep mechanism itself — same reason it is excluded
+    from `--self-test`) BEFORE trusting the real sweep's own result."""
+    print("check-lead-gate[R12-SWEEP]: running R12sweepmeta (mechanism self-check) first...")
+    try:
+        fixture_r12sweepmeta_sweep_flags_a_genuinely_silent_arm()
+    except Failure as e:
+        print(f"check-lead-gate[R12-SWEEP]: FAIL — R12sweepmeta itself failed: {e}", file=sys.stderr)
+        return 1
+    print("check-lead-gate[R12-SWEEP]: R12sweepmeta OK — the mechanism correctly flags a "
+          "genuinely silent arm; proceeding to the real sweep.")
+
+    source = LEAD_GATE_LIB.read_text()
+    source_lines = source.splitlines()
     start = time.monotonic()
-    positions, per_arm = run_r12_deny_coverage_sweep(FIXTURES)
+    positions, per_arm = run_r12_deny_coverage_sweep(FIXTURES, source=source)
     elapsed = time.monotonic() - start
-    survivors = [pos for pos, died in per_arm.items() if not died]
+    all_survivors = [pos for pos, died in per_arm.items() if not died]
+    residual: dict[tuple[int, int], str] = {}
+    unmarked_survivors: list[tuple[int, int]] = []
+    for pos in all_survivors:
+        reason = _r12_residual_reason(source_lines, pos[0])
+        if reason:
+            residual[pos] = reason
+        else:
+            unmarked_survivors.append(pos)
+    killed = len(positions) - len(all_survivors)
     print(f"check-lead-gate[R12-SWEEP]: {len(positions)} deny arm(s) swept in {elapsed:.2f}s "
-          f"({len(positions) - len(survivors)} killed by >=1 fixture, {len(survivors)} survivor(s))")
+          f"({killed} killed by >=1 fixture, {len(residual)} marked residual, "
+          f"{len(unmarked_survivors)} unmarked survivor(s))")
     for pos in sorted(per_arm):
         died = per_arm[pos]
-        print(f"  arm@line{pos[0]}: {'dies via ' + ', '.join(died) if died else 'SURVIVES (no dying fixture)'}")
-    if survivors:
-        print(f"check-lead-gate[R12-SWEEP]: FAIL — {len(survivors)} silent arm(s)", file=sys.stderr)
+        if died:
+            status = f"dies via {', '.join(died)}"
+        elif pos in residual:
+            status = f"R12-RESIDUAL: {residual[pos]}"
+        else:
+            status = "SURVIVES (no dying fixture, UNMARKED)"
+        print(f"  arm@line{pos[0]}: {status}")
+    if unmarked_survivors:
+        print(f"check-lead-gate[R12-SWEEP]: FAIL — {len(unmarked_survivors)} unmarked silent "
+              "arm(s) (mark a genuine residual with a trailing `# R12-RESIDUAL: <reason>` "
+              "comment on its own `if` line, or add a fixture that kills it)", file=sys.stderr)
         return 1
-    print(f"check-lead-gate[R12-SWEEP]: OK — every one of {len(positions)} deny arm(s) has a "
-          f"dying fixture ({elapsed:.2f}s)")
+    print(f"check-lead-gate[R12-SWEEP]: OK — every one of {len(positions)} deny arm(s) either has "
+          f"a dying fixture or a committed `# R12-RESIDUAL` marker ({elapsed:.2f}s)")
     return 0
 
 

@@ -12,17 +12,39 @@
 # candidate before any PCIe one — spike S4 rented a 2-GPU A100-SXM4-80GB
 # SECURE pod at $3.18/h while the PCIe pool returned zero 2-GPU capacity.
 #
-# COST CEILING (human-approved, plan 67 U7a): <= 1 h x 2 GPU x $1.59/GPU/h
-# ~= $3.2 per run. The ceiling is not prose here: RP_TTL_HOURS=1 bakes a
-# one-hour deadline into the pod's OWN entrypoint (runpod_lib.sh's
-# `_rp_deploy_payload` watchdog), so the pod self-terminates at the
-# ceiling even if this runner is SIGKILLed, and the shared RP_TIMEOUT
-# default (runpod_lib.sh's own 3000s) sits inside that hour so the driver's
-# own budget cut lands first with a legible group name. NOT ESTABLISHED on
-# this base: whether a cold `cuda,flash-attn` build of the gang target
-# plus the gang tests fits inside that hour — no run has measured it. A 124 (budget cut) or a pod
+# COST BOUND (human-approved, plan 67 U7a). Two bounds, each stated with
+# the mechanism that enforces it — none of this is prose:
+#
+#   (i) TERMINATE-SUCCEEDS (the ordinary path). rp_deploy_live walks the
+#       `a100` candidate list (4 entries) and terminates a pod that is not
+#       SSH-reachable within RP_SSH_WAIT_SECS before trying the next, so the
+#       search itself can bill up to `candidates x RP_SSH_WAIT_SECS`. This
+#       lane pins that wait to 300s below (the library default is 600s), and
+#       gpu-gang.yml pins MAX_ATTEMPTS to "1" so there is exactly one such
+#       search per run. Then the winning pod bills to RP_TTL_HOURS=1, baked
+#       into the pod's OWN entrypoint (runpod_lib.sh's `_rp_deploy_payload`
+#       watchdog), so it self-terminates even if this runner is SIGKILLed:
+#         4 x 300 s x $3.18/h + 1 h x $3.18/h = $1.06 + $3.18 = $4.24.
+#   (ii) SWEEP-ONLY (the worst path). If EVERY rp_terminate call fails — the
+#       case runpod_lib.sh's own header opens with — nothing is torn down
+#       early and each pod bills to its baked-in TTL. The remaining
+#       enforcers are that TTL and gpu-reap.yml's rp_sweep:
+#         (4 + 1) x 1 h x $3.18/h = $15.90.
+#
+# $3.18/h is what spike S4 measured for a SECURE 2-GPU A100-SXM4-80GB pod.
+# The COMMUNITY 2-GPU rate is UNMEASURED — nothing has priced one — so
+# neither figure is stated for a COMMUNITY landing.
+# ci/scripts/test_gpu_gang_lane.sh re-derives (i) from the candidate list,
+# the two values below and the workflow's MAX_ATTEMPTS, and fails if this
+# figure and the mechanism disagree.
+#
+# The shared RP_TIMEOUT default (runpod_lib.sh's own 3000s = 50m) sits
+# inside the TTL hour so the driver's own budget cut lands first with a
+# legible group name. NOT ESTABLISHED on this base: whether a cold
+# `cuda,flash-attn` build of the gang target plus the gang tests fits
+# inside that hour — no run has measured it. A 124 (budget cut) or a pod
 # that vanishes mid-run is therefore a COST DECISION for a human (raise
-# RP_TTL_HOURS/RP_TIMEOUT deliberately, re-approving the ceiling), never
+# RP_TTL_HOURS/RP_TIMEOUT deliberately, re-approving the bound), never
 # something this script raises on its own.
 #
 # WHAT IT PROVES: the gang tests U4b adds to `jammi-ai`'s `gpu_capability`
@@ -72,6 +94,17 @@ RP_TTL_HOURS="${RP_TTL_HOURS:-1}"
 # derives that set by scanning every tracked ci/scripts + .github/workflows
 # file), so no other lane's deploy payload changes.
 export RP_GPU_COUNT="${RP_GPU_COUNT:-2}"
+# The deploy search's own cost term (bound (i) in the header): every
+# candidate this lane tries and abandons bills for up to this long at the
+# 2-GPU rate, so 300s here instead of runpod_lib.sh's 600s default halves
+# that term. NOT ESTABLISHED: whether a 2-GPU SXM4 pod routinely reaches
+# sshd inside 300s — S4 rented one but did not record the time to first
+# SSH. A pod slower than this is terminated and the next candidate tried,
+# which costs a candidate rather than money; if the lane starts exhausting
+# its list on healthy capacity, this value is the first thing to look at.
+# Exported BEFORE the source below because runpod_lib.sh validates it at
+# source time.
+export RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-300}"
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 

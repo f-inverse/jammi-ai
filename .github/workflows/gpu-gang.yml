@@ -6,18 +6,40 @@ name: GPU gang (RunPod)
 # `ci/scripts/runpod_gpu_gang.sh` (see that script's own header for the
 # group/rc contract and for the artifact it pulls back).
 #
-# COST CEILING (human-approved): <= 1 h x 2 GPU x $1.59/GPU/h ~= $3.2 per
-# run, at the rate spike S4 measured for a 2-GPU A100-SXM4-80GB SECURE pod
-# ($3.18/h). The ceiling is enforced where a SIGKILLed runner cannot bypass
-# it: the driver sets RP_TTL_HOURS=1, which bakes a one-hour deadline into
-# the pod's own entrypoint, with runpod_lib.sh's shared RP_TIMEOUT default
-# (3000s) sitting inside that hour so a budget cut is reported with its
-# group named. Whether the cold
-# `cuda,flash-attn` build plus the gang tests FIT inside that hour is not
-# established — no run has measured it; a 124 is a cost decision for a human
-# (raise the ceiling deliberately), never a silent raise. A 2-GPU pod is
-# also scarcer than a 1-GPU one: S4 found the A100 PCIe pool with zero
-# 2-GPU capacity, so the driver tries SXM4 candidates first.
+# COST BOUND (human-approved). Each term names the mechanism that enforces
+# it — the number is what the mechanism produces, not a wish. Derivation
+# shape borrowed from gpu-howwell.yml's own timeout comment.
+#
+#   candidates x RP_SSH_WAIT_SECS — the deploy search. rp_deploy_live walks
+#     runpod_lib.sh's `a100` candidate list (4 entries) and TERMINATES a pod
+#     that is not SSH-reachable within RP_SSH_WAIT_SECS before trying the
+#     next, so an unlucky search bills up to 4 short rentals. This lane pins
+#     that wait to 300s in its own driver, not the 600s library default.
+#   MAX_ATTEMPTS: "1" (below) — exactly ONE deploy search per run. A retry
+#     doubles the search term; the bound below is stated for one.
+#   RP_TTL_HOURS=1 — the pod's own entrypoint deadline, baked in at deploy,
+#     which a SIGKILLed runner cannot bypass.
+#
+#   (i) terminate-succeeds (the ordinary path — every rp_terminate takes):
+#       4 x 300 s x $3.18/h + 1 h x $3.18/h = $1.06 + $3.18 = $4.24 per run.
+#   (ii) sweep-only (the worst path — EVERY rp_terminate call fails, the
+#       case runpod_lib.sh's own header opens with): nothing is torn down
+#       early, each pod bills to its baked-in TTL, and the only remaining
+#       enforcers are that TTL and gpu-reap.yml's rp_sweep:
+#       (4 + 1) x 1 h x $3.18/h = $15.90.
+#
+# $3.18/h is the rate spike S4 measured for a SECURE 2-GPU
+# A100-SXM4-80GB pod. The COMMUNITY 2-GPU rate is UNMEASURED — nothing has
+# priced one — so neither figure is stated for a COMMUNITY landing.
+# `ci/scripts/test_gpu_gang_lane.sh` re-derives (i) from the candidate list,
+# the driver's own RP_SSH_WAIT_SECS/RP_TTL_HOURS and this MAX_ATTEMPTS, and
+# fails if the printed figure and the mechanism disagree.
+#
+# Whether the cold `cuda,flash-attn` build plus the gang tests FIT inside
+# the TTL hour is not established — no run has measured it; a 124 is a cost
+# decision for a human (raise the bound deliberately), never a silent raise.
+# A 2-GPU pod is also scarcer than a 1-GPU one: S4 found the A100 PCIe pool
+# with zero 2-GPU capacity, so the driver tries SXM4 candidates first.
 #
 # Off the merge path, and NEVER in the critical path of an automated
 # workflow — the same operator direction gpu-prove.yml's own header records
@@ -42,9 +64,16 @@ on:
   pull_request:
     types: [labeled]
   schedule:
-    # Nightly at 04:31 UTC — off-peak, offset from every other cron in this
-    # repo (gpu-prove.yml takes 03:47) so two paid lanes never rent at once.
-    - cron: "31 4 * * *"
+    # Nightly at 08:30 UTC. The ONE other cron in this repo that rents is
+    # gpu-prove.yml's `47 3 * * *`: its legs run concurrently under a
+    # 190-minute job budget, so its rentals are done by 06:57 UTC. 08:30
+    # leaves a 93-minute margin. (gpu-perf-ab.yml and gpu-howwell.yml have
+    # no cron at all; gpu-reap.yml's hourly sweep only terminates.) The
+    # margin is against gpu-prove's NOMINAL start: GitHub delays scheduled
+    # runs under load, sometimes by tens of minutes, and a delay on the
+    # gpu-prove side moves its window later — 93 minutes is a margin, not a
+    # guarantee of disjointness.
+    - cron: "30 8 * * *"
 
 # Least privilege: this lane only reads the checkout; the RunPod side is
 # driven by the RUNPOD_API_KEY secret, not the GitHub token.
@@ -74,11 +103,13 @@ jobs:
       group: gpu-gang-${{ github.ref }}
       cancel-in-progress: false
     # A job-timeout kill is another trap bypass, so this budget sits ABOVE
-    # the remote job's own: RP_TIMEOUT (50m) + the deploy worst case (8
-    # candidates x 600s RP_SSH_WAIT_SECS = 80m) + 10m overhead = 140m. The
-    # pod's own 1h entrypoint deadline is what actually bounds the spend;
-    # this only bounds the runner.
-    timeout-minutes: 140
+    # the remote job's own, derived from the SAME terms as the cost bound in
+    # the header: RP_TIMEOUT (50m, runpod_lib.sh's library default — this
+    # lane declares no second one) + the deploy worst case (4 `a100`
+    # candidates x this lane's 300s RP_SSH_WAIT_SECS = 20m) + 10m runner
+    # overhead = 80m. The pod's own 1h entrypoint deadline is what actually
+    # bounds the spend; this only bounds the runner.
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
 
@@ -94,11 +125,16 @@ jobs:
       # name which condition it was, so a capacity night is never mistaken
       # for a code regression at a glance.
       #
-      # Bounded retry on capacity (75), and ONLY on capacity: 2-GPU pools
-      # run dry more often than 1-GPU ones, so a scheduled/dispatched run
-      # gets one retry after 300s. `echo "rc=$rc" >> "$GITHUB_OUTPUT"` runs
-      # on EVERY exit path (never only the terminal one) so the annotation
-      # steps below always see a real value.
+      # The retry loop is capacity-only (rc 75) and BOUNDED BY
+      # MAX_ATTEMPTS, which is "1" here: exactly one deploy search per run.
+      # That is the cost decision, not a shape decision — a second attempt
+      # is a second walk of the candidate list, which doubles the search
+      # term of bound (i) in the header. 2-GPU pools do run dry more often
+      # than 1-GPU ones, so raising this is a reasonable thing for a human
+      # to do deliberately; it is not something this lane does by default.
+      # `echo "rc=$rc" >> "$GITHUB_OUTPUT"` runs on EVERY exit path (never
+      # only the terminal one) so the annotation steps below always see a
+      # real value.
       - name: Run the gang suite on a real 2-GPU A100 pod (retry on capacity, fail closed)
         id: gang
         env:
@@ -111,7 +147,7 @@ jobs:
           # the wrong commit. Unset on a hand run of the script (never
           # checked then).
           PROVE_EXPECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          MAX_ATTEMPTS: "2"
+          MAX_ATTEMPTS: "1"
         run: |
           set +e
           attempt=1
@@ -150,7 +186,7 @@ jobs:
 
       - name: Annotate a budget cut
         if: always() && steps.gang.outputs.rc == '124'
-        run: echo "::error::GPU gang was CUT by its own RP_TIMEOUT with a gating group unresolved — the build plus the gang tests did not fit inside this lane's approved 1h/\$3.2 ceiling. Raising RP_TTL_HOURS/RP_TIMEOUT is a deliberate cost decision (see the workflow header), never an automatic one."
+        run: echo "::error::GPU gang was CUT by its own RP_TIMEOUT with a gating group unresolved — the build plus the gang tests did not fit inside this lane's approved 1h TTL, the term that carries \$3.18 of bound (i)'s \$4.24 (see the workflow header). Raising RP_TTL_HOURS/RP_TIMEOUT raises that bound and is a deliberate cost decision, never an automatic one."
 
       - name: Upload the pulled gang artifact
         if: always()

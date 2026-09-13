@@ -632,31 +632,57 @@ zero tests exits 0 with "running 0 tests" — the driver reads that as a
 FAILURE, by name, and equally refuses a run that wrote no artifact. A leg with
 no test is a leg with no proof.
 
-**Triggers.** The `run-gang` PR label, a nightly cron, and manual dispatch —
-never a push, never `workflow_call`, and no workflow may `uses:` it. That is
-the same doctrine `gpu-prove.yml` carries, and it is pinned for every
-hardware-renting lane by `ci/scripts/check_gpu_prove_once.py`'s P7 rule
-(`PAID_POD_LANE_TABLE`: the driver script and the one workflow allowed to
-invoke it). Nothing about a release depends on this lane; the release verdict
-is the prove lane's.
+**Triggers.** The `run-gang` PR label, a nightly cron at 08:30 UTC, and manual
+dispatch — never a push, never `workflow_call`, and no workflow may `uses:` it.
+The cron sits after the only other renting cron in the repo: `gpu-prove.yml`
+fires at 03:47 UTC and its concurrent legs run under a 190-minute budget, so its
+rentals are done by 06:57, leaving a 93-minute margin. That margin is measured
+against a nominal start; GitHub delays scheduled runs under load, so it is a
+margin and not a guarantee of disjointness. The never-in-an-automated-path
+doctrine is `gpu-prove.yml`'s own, and
+`ci/scripts/check_gpu_prove_once.py`'s P7 rule pins it for every renting lane —
+over a driver set *derived* from `runpod_lib.sh`'s deploy closure, with
+`PAID_POD_LANE_TABLE` (driver script -> its one workflow) as the completeness
+assertion over that set. Nothing about a release depends on this lane; the
+release verdict is the prove lane's.
 
-**Cost ceiling (human-approved).** One hour x 2 GPU at the rate the 2-GPU SXM4
-pod was rented at — about $3.2 a run. The ceiling is not prose: the driver sets
-`RP_TTL_HOURS=1`, which bakes the deadline into the pod's own entrypoint, so a
-SIGKILLed runner cannot outlive it, and the shared `RP_TIMEOUT` default (50m,
-owned by `runpod_lib.sh` — this lane declares no second one) sits inside that
-hour so the budget cut lands first with the cut group named. Whether a
-cold `cuda,flash-attn` build plus the gang tests fits inside the hour is NOT
-established — nothing has measured it. A budget cut is therefore a cost
-decision for a human (raise the ceiling deliberately), never something the
-script raises on its own.
+**Cost bound (human-approved).** Two bounds, each with the mechanism that
+enforces it. The rented pod is not the only thing that bills: `rp_deploy_live`
+walks the `a100` candidate list (4 entries) and terminates a pod that is not
+SSH-reachable within `RP_SSH_WAIT_SECS` before trying the next, so the *search*
+bills too.
+
+- **Terminate-succeeds** — the ordinary path, every `rp_terminate` takes. The
+  driver pins `RP_SSH_WAIT_SECS=300` (half the library default) and the workflow
+  pins `MAX_ATTEMPTS: "1"`, so there is exactly one search; the winning pod then
+  bills to `RP_TTL_HOURS=1`, baked into the pod's own entrypoint so a SIGKILLed
+  runner cannot outlive it. `4 x 300 s x $3.18/h + 1 h x $3.18/h = $4.24` a run.
+- **Sweep-only** — every `rp_terminate` call fails, the case `runpod_lib.sh`'s
+  own header opens with. Nothing is torn down early, each pod bills to its
+  baked-in TTL, and the only remaining enforcers are that TTL and `gpu-reap.yml`'s
+  `rp_sweep`: `(4 + 1) x 1 h x $3.18/h = $15.90`.
+
+`$3.18/h` is the rate the SECURE 2-GPU `A100-SXM4-80GB` pod was rented at. The
+COMMUNITY 2-GPU rate is unmeasured — nothing has priced one — so neither figure
+covers a COMMUNITY landing. `ci/scripts/test_gpu_gang_lane.sh` re-derives the
+first bound from the candidate list, the driver's own two values and the
+workflow's `MAX_ATTEMPTS`, and fails if the printed figure and the mechanism
+disagree.
+
+Inside the TTL hour, the shared `RP_TIMEOUT` default (50m, owned by
+`runpod_lib.sh` — this lane declares no second one) is what cuts first, with the
+cut group named. Whether a cold `cuda,flash-attn` build plus the gang tests fits
+inside that hour is NOT established — nothing has measured it. A budget cut is
+therefore a cost decision for a human (raise the bound deliberately), never
+something the script raises on its own.
 
 **Exit codes** (the workflow annotates each one separately, so a capacity night
 never reads as a code regression):
 
 - `0` — every gating group passed.
-- `75` — no 2-GPU capacity. Retried once, then RED: a leg with no capacity
-  proved nothing.
+- `75` — no 2-GPU capacity. RED, with no retry: `MAX_ATTEMPTS` is `1`, because a
+  second attempt is a second walk of the candidate list and doubles the search
+  term of the first bound above. A leg with no capacity proved nothing.
 - `76` — the inactivity watchdog killed a hang with a gating group unresolved.
   A hung collective is exactly what this lane exists to surface.
 - `77` — wrong tree: the pod's own `PROVE_SHA` disagreed with the commit the

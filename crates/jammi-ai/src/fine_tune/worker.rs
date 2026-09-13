@@ -1808,11 +1808,9 @@ impl JobWorker {
                 common,
             } => {
                 // Re-read node/edge sources and re-sample the graph (seeded →
-                // deterministic), commit the pairs through the SAME training-set
-                // producer the tabular path uses, and train on the rows that
-                // table holds.
+                // deterministic), then train on the text-embedding head.
                 let loader = self
-                    .reconstruct_graph_loader(session, job_id, &sources, sample_config)
+                    .reconstruct_graph_loader(session, &sources, sample_config)
                     .await
                     .map_err(WorkerJobError::from)?;
                 let run = FineTuneRun {
@@ -1858,13 +1856,11 @@ impl JobWorker {
         }
     }
 
-    /// Re-read the node/edge sources, rebuild the deterministic graph sampler,
-    /// commit its pairs as a training set, and load the contrastive rows back
-    /// out of that table.
+    /// Re-read the node/edge sources and rebuild the deterministic graph sampler,
+    /// then derive the contrastive-pair training loader from it.
     async fn reconstruct_graph_loader(
         &self,
         session: &Arc<InferenceSession>,
-        job_id: &str,
         sources: &GraphFineTuneSources,
         sample_config: GraphSampleConfig,
     ) -> Result<TrainingDataLoader> {
@@ -1939,86 +1935,7 @@ impl JobWorker {
         }
 
         let sampler = GraphSampler::build(nodes, edges, sample_config)?;
-        let pairs = sampler.sample()?;
-        // The sampler emits one uniform shape (`hard_negatives` is a single
-        // config knob), so the first pair decides whether a `negative` column
-        // is projected at all — the same derivation
-        // `TrainingDataLoader::from_graph` makes, taken here because the
-        // COLUMN SET has to be known before the table can be named.
-        let has_negatives = pairs.first().is_some_and(|p| !p.hard_negatives.is_empty());
-        let (_table, batches) = training_set::materialize_sampled_pairs(
-            session,
-            &sources.node_source,
-            &sources.edge_source,
-            &Self::graph_spec_identity(sources, &sample_config)?,
-            job_id,
-            &pairs,
-            has_negatives,
-        )
-        .await?;
-        drop(pairs);
-
-        let mut rows = Vec::new();
-        for batch in &batches {
-            let anchors = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune("graph training set: 'anchor' is not text".into())
-                })?;
-            let positives = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune("graph training set: 'positive' is not text".into())
-                })?;
-            let negatives = if has_negatives {
-                Some(
-                    batch
-                        .column_by_name("negative")
-                        .and_then(|c| extract_string_column(c.as_ref()))
-                        .ok_or_else(|| {
-                            JammiError::FineTune(
-                                "graph training set: 'negative' is not text".into(),
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
-            for i in 0..batch.num_rows() {
-                rows.push((
-                    anchors[i].clone(),
-                    positives[i].clone(),
-                    negatives.as_ref().map(|n| n[i].clone()),
-                ));
-            }
-        }
-        TrainingDataLoader::from_graph_rows(rows, has_negatives)
-    }
-
-    /// The canonical identity of a graph fine-tune SPEC (never a run): the
-    /// JSON of the node/edge sources and the sample config, in field order.
-    ///
-    /// [`training_set::materialize_sampled_pairs`] combines this with the
-    /// claiming job's id to name the session-scoped relation the sampled rows
-    /// are actually bound under (`training_set::pairs_relation_name`'s doc
-    /// says why the job id has to be there); that combined name is embedded
-    /// in the `source` SQL the training set's definition hash folds, so two
-    /// otherwise-identical graph fine-tunes now record two different
-    /// definition hashes — the honest consequence of two jobs never sharing
-    /// one relation. This function itself stays spec-only: omitting a config
-    /// field here would make two different samplings collide on one spec
-    /// identity, which is a distinct failure from the per-job uniqueness the
-    /// caller adds on top. Serialising the two spec structs whole is what
-    /// keeps a field added to either from silently escaping the identity.
-    fn graph_spec_identity(
-        sources: &GraphFineTuneSources,
-        sample_config: &GraphSampleConfig,
-    ) -> Result<String> {
-        serde_json::to_string(&(sources, sample_config)).map_err(|e| {
-            JammiError::FineTune(format!("graph fine-tune spec is not serialisable: {e}"))
-        })
+        TrainingDataLoader::from_graph(&sampler)
     }
 
     /// Load the base model, build the training target, and drive the blocking

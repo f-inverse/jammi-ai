@@ -468,11 +468,18 @@ impl InferenceSession {
     ///   here exactly as it would have refused there.
     /// - A recorded `source` query that no longer resolves in this session
     ///   (its relation was deregistered, or it never was a durable relation)
-    ///   fails at the planner inside the verb, naming the missing relation.
-    ///   That is the failure mode of a training set whose rows were projected
-    ///   from a session-scoped relation — a graph fine-tune's sampled pairs are
-    ///   registered for the length of the materialization and dropped after it,
-    ///   so their table is not replayable in a later session.
+    ///   fails at the planner inside the verb, naming the missing relation —
+    ///   the failure mode of a training set whose rows were projected from a
+    ///   session-scoped relation rather than a durable registered source. No
+    ///   producer in this tree names one today: `materialize_projection` (the
+    ///   only [`ProducingDescriptor::TrainingSet`] producer) always reads a
+    ///   durable registered source, and the graph arm samples in memory and
+    ///   never writes a `TrainingSet` table at all (a per-call session
+    ///   registration for it was tried and excised —
+    ///   <https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it a
+    ///   table of its own). This refusal stays because the planner error is
+    ///   the honest response to ANY table whose recorded source is not
+    ///   durable, not because one is expected today.
     async fn recompute_training_set(
         self: &Arc<Self>,
         table: &ResultTableRecord,

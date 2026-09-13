@@ -157,15 +157,18 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 ///
 /// **What this pin does NOT cover.** Only the TABULAR arm
 /// (`training_set::materialize_projection`) is fingerprinted here. The graph
-/// arm's adapter bytes (`training_set::materialize_sampled_pairs`, driven
-/// through `fine_tune_graph`) are a deliberate, intended change from base —
-/// base built the loader straight from the sampler's in-memory pairs, this
-/// branch routes them through the same materialize-and-read-back producer the
-/// tabular arm uses — and no parity pin covers that arm at all: it has no
-/// base-equivalent byte fixture to compare against (base's graph path never
-/// wrote Parquet rows to read back). The `NULLS FIRST` order key is likewise
-/// stated as intended in `training_set`'s module docs, not pinned by (c),
-/// which carries no NULLs to exercise it.
+/// arm never went through `training_set` at all in this unit's shipped shape:
+/// an earlier round routed its sampled pairs through the same
+/// materialize-and-read-back producer the tabular arm uses, but that guard
+/// could not be made safe under a reclaimed lease (see
+/// `pinned_source_gate::no_session_table_registration_under_fine_tune`'s doc)
+/// and was excised — the graph arm is `origin/main`'s code again, sampling in
+/// memory and training directly, with its own byte-identity pin at
+/// `graph_finetune::fine_tune_graph_end_to_end_completes`
+/// (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it a
+/// table of its own). The `NULLS FIRST` order key is likewise stated as
+/// intended in `training_set`'s module docs, not pinned by (c), which carries
+/// no NULLs to exercise it.
 ///
 /// The per-step `checkpoint_N` files are pinned alongside the final adapter on
 /// purpose: they fingerprint the *trajectory*, so a row-order change that a
@@ -771,13 +774,14 @@ async fn a_training_set_replays_from_its_recorded_descriptor() {
 /// manifest's recorded relation names, not from the recomputed table's single
 /// `source_id` lineage column.
 ///
-/// The graph arm anchors two relations (M1); nothing about `TrainingSetSpec`
-/// restricts `inputs` to one entry for the tabular arm either — this fixture
-/// exercises that directly, without a graph, by materialising a spec whose
-/// `inputs` name two distinct relations. A replay that instead re-derived a
-/// single anchor from `table.source_id` would silently collapse the recorded
-/// set to one relation; asserting the replay's OWN manifest is the executed
-/// check.
+/// Nothing about `TrainingSetSpec` restricts `inputs` to one entry — the
+/// tabular arm records exactly one today, but the shape is general the same
+/// way `pipeline/asof/verb.rs` anchors its spine and facts relations
+/// separately, and this fixture exercises it directly by materialising a spec
+/// whose `inputs` name two distinct relations. A replay that instead
+/// re-derived a single anchor from `table.source_id` would silently collapse
+/// the recorded set to one relation; asserting the replay's OWN manifest is
+/// the executed check.
 #[tokio::test(flavor = "multi_thread")]
 async fn recompute_re_anchors_every_recorded_relation() {
     use jammi_ai::pipeline::recompute::Cascade;

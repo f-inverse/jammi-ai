@@ -46,8 +46,11 @@ table of kind `TrainingSet` (`crates/jammi-db/src/catalog/result_repo.rs:27`) wi
 attestation (`MaterializationManifest`, `manifest.rs:874`). The descriptor carries **no
 topology and no split**: the table is shared by every job over the same source, columns, task
 and format, whatever their world size, batch or validation fraction. Input anchors are the
-source anchors. `GraphFineTune` materializes its seeded, deterministic sampled pairs
-(`graph_sampler.rs:374`) the same way. Media blob columns are stored as today.
+source anchors. `GraphFineTune` does not go through this table: its seeded, deterministic
+sampled pairs (`graph_sampler.rs:374`) are sampled in memory and trained on directly, as
+today — a per-call registration of the pairs on the shared session was tried and excised
+(no name is unique per call under a lease reclaim), so a graph training set's own table is
+https://github.com/f-inverse/jammi-ai/issues/538. Media blob columns are stored as today.
 
 **Split.** The job's `validation_fraction` defines the train prefix exactly as today
 (`data.rs:477-481`): `val_count = round(rows × fraction)`, train rows `[0, rows − val_count)`,

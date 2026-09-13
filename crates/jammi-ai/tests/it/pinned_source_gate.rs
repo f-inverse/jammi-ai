@@ -2449,3 +2449,125 @@ fn allowlists_match_current_hits_exactly() {
         );
     }
 }
+
+// ── #500 U2a fix round 4, P2 — the graph arm's excised registration guard ──
+//
+// The stop rule fired on the graph arm's per-call sampled-pairs relation
+// (`register_table`/`deregister_table` on the shared `SessionContext`,
+// keyed by spec identity + job id): two overlapping materializations of ONE
+// job id (the reclaim shape — a lease lost mid-sampling, then reclaimed by a
+// second worker) still collide, because the resource the guard named is
+// scoped to one CALL while the name was unique only per JOB. Per the
+// pre-committed stop rule the guard is deleted outright, not narrowed: the
+// graph arm went back to `origin/main`'s shape (sample in memory, train
+// directly, no table) and the follow-on unit that gives it a table of its
+// own is <https://github.com/f-inverse/jammi-ai/issues/538>.
+//
+// This is the standing oracle for that: NOTHING under
+// `crates/jammi-ai/src/fine_tune/**` may claim (or release) a name on the
+// shared session at all, ever, because the session is not a per-call
+// namespace — any token that is not unique per CALL (not per job, not per
+// spec) collides under reclaim. Unlike every allowlist above, there is no
+// allowance list here: the target count is zero, unconditionally, so a
+// future re-introduction of session-scoped registration under `fine_tune/`
+// fails this test rather than needing a reviewed entry.
+
+/// Every literal `register_table(`/`deregister_table(` call site under
+/// `crates/jammi-ai/src/fine_tune/**`, on the masked surface (so a doc
+/// comment or a string literal that merely NAMES the method, e.g. this
+/// file's own module doc, is never mistaken for a call).
+///
+/// `deregister_table(` is checked BEFORE `register_table(`, and as an
+/// `else if`: the string `"register_table("` is itself a substring of
+/// `"deregister_table("` (`de` + `register_table(`), so a line-by-line `if`/
+/// `if` would double-count every `deregister_table(` call as a
+/// `register_table(` hit too. This only under-counts a line that genuinely
+/// calls both methods side by side, which does not change the property this
+/// gate checks: the target is exactly zero, and any real hit already fails
+/// it regardless of how many are on one line.
+fn fine_tune_session_registration_hits(
+    surface: &[(String, String)],
+) -> Vec<(String, usize, &'static str)> {
+    let mut hits = Vec::new();
+    for (file, text) in surface {
+        if !file.starts_with("crates/jammi-ai/src/fine_tune/") {
+            continue;
+        }
+        let masked = mask_non_code(text);
+        for (line_idx, line) in masked.lines().enumerate() {
+            if line.contains("deregister_table(") {
+                hits.push((file.clone(), line_idx + 1, "deregister_table("));
+            } else if line.contains("register_table(") {
+                hits.push((file.clone(), line_idx + 1, "register_table("));
+            }
+        }
+    }
+    hits
+}
+
+/// RED at `fe96bf39` (the excised commit's parent): `training_set.rs` had a
+/// `ctx.register_table(relation.as_str(), ...)` call and `DeregisterOnDrop`'s
+/// `self.ctx.deregister_table(...)` — two hits. GREEN once the guard and its
+/// `MemTable` machinery are removed and the graph arm reverts to sampling in
+/// memory: zero hits, unconditionally, no allowlist.
+#[test]
+fn no_session_table_registration_under_fine_tune() {
+    let surface = scan_surface();
+    let hits = fine_tune_session_registration_hits(&surface);
+    assert!(
+        hits.is_empty(),
+        "everything under crates/jammi-ai/src/fine_tune (recursively) must claim nothing on the \
+         shared session — the `SessionContext` is not a per-call namespace, and any name that is \
+         not unique per CALL collides under reclaim (see \
+         https://github.com/f-inverse/jammi-ai/issues/538). Found: {hits:?}"
+    );
+}
+
+/// Falsification (R-A): the detector above must actually fire on the exact
+/// shape it is supposed to catch, in a synthetic file scoped as if it lived
+/// under `fine_tune/`, and must NOT fire on a file outside that directory or
+/// on a comment merely mentioning the method names.
+#[test]
+fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
+    let hit_src = concat!(
+        "\n",
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_session_registration_hits` — synthetic producer text fed to that detector, not real code in this file
+        "async fn materialize_something(ctx: &SessionContext) {\n",
+        "    ctx.register_table(\"jammi_sampled_pairs:x:y\", provider).unwrap();\n",
+        "    ctx.deregister_table(\"jammi_sampled_pairs:x:y\").unwrap();\n",
+        "}\n",
+    );
+    let hits = fine_tune_session_registration_hits(&[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+        hit_src.to_string(),
+    )]);
+    assert_eq!(
+        hits.len(),
+        2,
+        "the detector must find both the register and the deregister call, got {hits:?}"
+    );
+
+    // Same text, a file OUTSIDE fine_tune/ — must not count (this gate's
+    // property is scoped to the excised arm's own module tree, not the
+    // whole crate).
+    let outside_hits = fine_tune_session_registration_hits(&[(
+        "crates/jammi-ai/src/pipeline/embedding.rs".to_string(),
+        hit_src.to_string(),
+    )]);
+    assert!(
+        outside_hits.is_empty(),
+        "a hit outside the fine_tune tree must not be counted, got {outside_hits:?}"
+    );
+
+    // A comment naming the methods, never calling them — must not count
+    // (masked out, same discipline `session_registration_literal_sites` uses).
+    let comment_src = "// see ctx.register_table( and ctx.deregister_table( for context\n";
+    let comment_hits = fine_tune_session_registration_hits(&[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+        comment_src.to_string(),
+    )]);
+    assert!(
+        comment_hits.is_empty(),
+        "a comment naming the methods must not count as a call site, got {comment_hits:?}"
+    );
+}

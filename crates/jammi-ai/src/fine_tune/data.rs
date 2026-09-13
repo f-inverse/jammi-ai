@@ -487,52 +487,6 @@ impl TrainingDataLoader {
         })
     }
 
-    /// Create a graph loader from rows that have ALREADY been sampled and
-    /// committed — the read-back of a `TrainingSet` table a graph fine-tune
-    /// materialised its pairs into.
-    ///
-    /// [`Self::from_graph`] samples and loads in one step, which is what a
-    /// caller holding a live [`super::graph_sampler::GraphSampler`] wants; this
-    /// is the same shape rebuilt from the committed rows, so a run trains on the
-    /// table's bytes rather than on a second, in-memory sampling of them. The
-    /// reported format is [`TrainingFormat::Graph`] either way: the provenance
-    /// is the graph, whatever storage the rows travelled through.
-    ///
-    /// `has_negatives` is not re-derived from the rows here — it is the shape
-    /// the pairs were COMMITTED under (a third projected column), so the caller
-    /// that named the columns owns it. A row whose negative is missing under
-    /// `has_negatives` is a typed error, never an empty-string negative: the
-    /// model would learn to push its anchor away from `""`.
-    pub fn from_graph_rows(
-        rows: Vec<(String, String, Option<String>)>,
-        has_negatives: bool,
-    ) -> Result<Self> {
-        let rows = rows
-            .into_iter()
-            .map(|(anchor, positive, negative)| {
-                if has_negatives {
-                    let negative = negative.ok_or_else(|| {
-                        JammiError::FineTune(
-                            "graph training set declares a negative column but a row supplied none"
-                                .into(),
-                        )
-                    })?;
-                    Ok(TrainingRow::Triplet {
-                        anchor,
-                        positive,
-                        negative,
-                    })
-                } else {
-                    Ok(TrainingRow::Pairs { anchor, positive })
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            format: TrainingFormat::Graph { has_negatives },
-            data: LoaderData::TextRows(rows),
-        })
-    }
-
     /// Create a loader from MEDIA triplet rows. Each element is
     /// `(anchor_bytes, positive_bytes, negative_bytes)` where every field is
     /// one encoded blob — an audio clip or an image, per the job's task (see

@@ -54,8 +54,12 @@ per-step `$?`. Naming per README ruling 23.
   `ResultTableKind` mirrors). (ai-core) `fine_tune/worker.rs::run_spec` (materialize-or-reuse,
   then read the table back through `session.sql` over the registered `jammi.{name}` result
   table — `store/mod.rs:855`, `session.rs:944` precedent — with the canonical `ORDER BY`
-  re-applied, into today's loader: a compiling intermediate), `fine_tune/graph_sampler.rs`
-  (pairs → table), `pipeline/recompute.rs` (arm = re-materialize). (docs-ci) the
+  re-applied, into today's loader: a compiling intermediate). The `GraphFineTune` arm does
+  not route through this producer — a per-call registration of its sampled pairs on the
+  shared session was tried and excised (no name it could hold was unique per call under a
+  lease reclaim), so `fine_tune/graph_sampler.rs`'s pairs stay in-memory as before and a
+  graph training set's own table is https://github.com/f-inverse/jammi-ai/issues/538.
+  `pipeline/recompute.rs` (arm = re-materialize). (docs-ci) the
   `PRODUCING-DESCRIPTOR-VARIANTS` block of `docs/maintainer/MAINTAINER-GUIDE.md`
   (`check_doc_parity.py` runs on every PR with no path filter; co-owned with U3, U9). The
   cookbook fixture golden.

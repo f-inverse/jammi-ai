@@ -11,12 +11,31 @@ nowhere and the binary would fail to `exec` on a user's machine, long after CI i
 green. cudarc links `dynamic-linking`, so the set is fixed at build time and
 knowable here.
 
-This check reads the binary's `DT_NEEDED` entries (`readelf -d`), and for every
-CUDA library among them (SONAME beginning `libcu` or `libnv`) requires that it be
-either driver-provided (the host NVIDIA driver, never bundled) or delivered by a
-declared wheel component. A newly-required library (e.g. a candle bump that pulls
-in cuSPARSE) fails the build with the exact `nvidia-*-cu12` dependency and
-`_CUDA_COMPONENTS` entry to add — never a runtime surprise.
+This check reads the binary's `DT_NEEDED` entries (`readelf -d`) and classifies
+EVERY one of them. A soname is acceptable only if it is on the `PLATFORM`
+allowlist (a base-image library the manylinux platform tag already promises), in
+`DRIVER_PROVIDED` (the host NVIDIA driver, never bundled), or in `COVERED` (a
+declared `nvidia-*-cu12` wheel component). Anything else FAILS the build, naming
+the soname.
+
+The classification is an allowlist rather than a `libcu`/`libnv` prefix test
+because the prefix test fails OPEN on exactly the libraries this file exists to
+catch. `libnccl.so.2` — the soname a `candle-core/nccl` build adds — begins with
+neither prefix, so under the prefix test the wheel would print "link-set check
+OK" while shipping a binary that cannot `exec` anywhere NCCL is absent. Every
+future library is in the same position: a new dependency is unclassified until a
+human classifies it, and unclassified is a FAIL. That FAIL is the whole point,
+including when the new library turns out to be a harmless platform one — adding
+it to `PLATFORM` is a one-line, reviewed decision, whereas a silent skip is
+nobody's decision at all.
+
+`PLATFORM` is not a guess: it is the non-CUDA half of the actual `DT_NEEDED`
+list of the binary this check runs on (`target/release/jammi-server`, built by
+`_pypi-server.yml`'s `build-binary` job in the manylinux_2_28 CUDA image and
+verified at `_pypi-server.yml:144`), read off the `server-cu12-binary` artifact
+of run 34717957779. Note `libmvec.so.1`, glibc's vector-math library: it is on
+that list, and a hand-written "libc, libm, libstdc++, libgcc_s, …" allowlist
+would have reddened the lane on it.
 
 Usage: verify_link_set.py <path-to-jammi-server-binary>
 """
@@ -43,6 +62,29 @@ COVERED = {
 # installed with the driver the user already runs; bundling them would be wrong.
 DRIVER_PROVIDED = {"libcuda", "libnvidia-ptxjitcompiler", "libnvidia-nvvm"}
 
+# Base-image libraries the `manylinux_2_28_x86_64` platform tag itself
+# promises — the wheel neither ships nor declares them. This is the measured
+# non-CUDA `DT_NEEDED` set of the binary this check runs on (see the module
+# doc), not a general list of "system libraries": a soname that is not here is
+# unclassified, and unclassified is a FAIL that a human resolves by adding it
+# here, to `COVERED`, or to `DRIVER_PROVIDED`.
+PLATFORM = {
+    "libc",
+    "libdl",
+    "libgcc_s",
+    "libm",
+    "libmvec",  # glibc's vector math library; linked by the release build
+    "libpthread",
+    "librt",
+    "libstdc++",
+}
+
+# The dynamic loader itself. Its soname carries the architecture
+# (`ld-linux-x86-64.so.2` on x86-64, `ld-linux-aarch64.so.1` on arm64), so it is
+# matched by prefix rather than by exact stem — the one prefix rule here, and it
+# admits no library that is not the loader.
+PLATFORM_PREFIXES = ("ld-linux",)
+
 
 def needed_libs(binary: str) -> list:
     """The binary's `DT_NEEDED` SONAMEs, in link order."""
@@ -58,37 +100,51 @@ def soname_stem(soname: str) -> str:
     return soname.split(".so", 1)[0]
 
 
-def check(binary: str) -> int:
-    covered_stems = {stem for stems in COVERED.values() for stem in stems}
-    uncovered = []
-    for soname in needed_libs(binary):
-        stem = soname_stem(soname)
-        # Only CUDA/NVIDIA libraries are the wheel's responsibility; system libs
-        # (libc, libm, libstdc++, libgcc_s, ld-linux, …) are the platform's.
-        if not (stem.startswith("libcu") or stem.startswith("libnv")):
-            continue
-        if stem in DRIVER_PROVIDED or stem in covered_stems:
-            continue
-        uncovered.append(soname)
+def is_platform(stem: str) -> bool:
+    """Base-image library the platform tag promises — never the wheel's."""
+    return stem in PLATFORM or any(stem.startswith(p) for p in PLATFORM_PREFIXES)
 
-    if uncovered:
+
+def classify(soname: str) -> str:
+    """`platform` | `driver` | `covered` | `unclassified` for one DT_NEEDED
+    soname. Every entry lands in exactly one bucket, and `unclassified` is the
+    fail bucket: nothing is skipped for looking unlike a CUDA library."""
+    stem = soname_stem(soname)
+    if is_platform(stem):
+        return "platform"
+    if stem in DRIVER_PROVIDED:
+        return "driver"
+    if stem in {s for stems in COVERED.values() for s in stems}:
+        return "covered"
+    return "unclassified"
+
+
+def check(binary: str) -> int:
+    unclassified = [s for s in needed_libs(binary) if classify(s) == "unclassified"]
+
+    if unclassified:
         print(
-            "cu12 link-set check FAILED — the binary needs CUDA libraries the "
-            "wheel does not deliver:",
+            "cu12 link-set check FAILED — the binary needs libraries the wheel "
+            "neither delivers nor classifies:",
             file=sys.stderr,
         )
-        for soname in uncovered:
+        for soname in unclassified:
             print(f"  - {soname}", file=sys.stderr)
         print(
-            "\nAdd the owning `nvidia-*-cu12` wheel to `pyproject.toml`, its "
-            "component dir to `_CUDA_COMPONENTS` in `jammi_server/_entry.py`, and "
-            "its SONAME stem(s) to `COVERED` here. If it is genuinely "
-            "driver-provided, add it to `DRIVER_PROVIDED` instead.",
+            "\nClassify each one. If a wheel component delivers it: add the "
+            "owning `nvidia-*-cu12` wheel to `pyproject.toml`, its component dir "
+            "to `_CUDA_COMPONENTS` in `jammi_server/_entry.py`, and its SONAME "
+            "stem(s) to `COVERED` here. If the host NVIDIA driver provides it, "
+            "add it to `DRIVER_PROVIDED`. If it is a base-image library the "
+            "manylinux platform tag already promises, add it to `PLATFORM`. "
+            "Leaving it unclassified is the one thing that is not an option: an "
+            "unresolvable `DT_NEEDED` entry fails at `execve` on a user's "
+            "machine, with no CI signal at all.",
             file=sys.stderr,
         )
         return 1
 
-    print("cu12 link-set check OK — every CUDA DT_NEEDED library is covered.")
+    print("cu12 link-set check OK — every DT_NEEDED library is classified and covered.")
     return 0
 
 

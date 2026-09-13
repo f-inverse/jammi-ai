@@ -1693,6 +1693,18 @@ jobs:
           # state machine, driven with a fake fetch/clock — no network.
           - name: gpu prove verdict suite
             cmd: python3 ci/scripts/test_gpu_prove_verdict.py
+          # `packaging/server-cu12/verify_link_set.py`'s own suite. That
+          # script runs only inside the cu12 wheel lane
+          # (`_pypi-server.yml:144`), against a binary that exists only
+          # there; this leg is the hermetic half — a fixture `DT_NEEDED` list
+          # (the measured link set of the shipped binary) driven through the
+          # real `check()`, no readelf and no binary. It pins the
+          # fail-CLOSED property: a soname that is neither a platform
+          # library, nor driver-provided, nor delivered by a declared wheel
+          # component FAILS, so a future `libnccl.so.2` cannot print "OK" on
+          # a wheel that bundles no NCCL.
+          - name: cu12 link-set classification suite
+            cmd: python3 ci/scripts/test_verify_link_set.py
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

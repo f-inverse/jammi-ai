@@ -887,7 +887,7 @@ impl JobWorker {
     /// |---|---|---|
     /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
     /// | 2 | undeserialisable `training_spec` | same as 1 |
-    /// | 3 | source SQL / loader reconstruction error (`read_source_columns`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
     /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
     /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
     /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |

@@ -31,9 +31,11 @@ above): the taint tracker is INTRA-procedural — it does not follow a
 ``tempfile.mkdtemp(dir=that_parameter)`` several calls deep (this is exactly the
 shape ``build_recompute_cache.py`` had: `emit`'s ``work_root`` flows through
 `run_cache`/`_fresh_chain` as `catalog_root` before the `mkdtemp` call that
-actually derives the catalog directory). That file's four connect sites were
-found by hand, not by this gate, and are fixed directly (each `db.close()`d
-before its enclosing `TemporaryDirectory` can unwind) rather than papered over
+actually derives the catalog directory). That file's two `jammi.connect(...)`
+call sites are each exercised through several callers — `_fresh_chain` (five
+callers) and `run_cache` (one) — for six connect-opening call sites in total,
+found by hand, not by this gate, and fixed directly (each `db.close()`d before
+its enclosing `TemporaryDirectory` can unwind) rather than papered over
 by widening the regex into a real dataflow analysis, which is disproportionate
 for a line-based shape gate. A reviewer adding a NEW multi-hop
 `TemporaryDirectory` -> `mkdtemp(dir=...)` -> `jammi.connect` chain should not

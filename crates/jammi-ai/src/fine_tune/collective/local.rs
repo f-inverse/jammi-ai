@@ -150,38 +150,25 @@ impl TensorSignature {
 
 impl Descriptor {
     /// `Ok(())` when every field this round's result depends on agrees with
-    /// `other`; `Err(())` on the first disagreement found.
+    /// `other`; `Err(())` on any disagreement.
     ///
-    /// Each `if` below is an independent determinant of agreement: dropping
-    /// any single one of them is a distinct way for two ranks to be handed
-    /// `Ok` from a round they never actually agreed on (a different root, a
-    /// different partition, a different trainable-variable count, a
-    /// differently shaped or typed tensor, or a different world size).
+    /// Delegates to the derived [`PartialEq`] rather than repeating a
+    /// hand-written per-field comparison: [`Descriptor`] carries no field
+    /// that is not itself a determinant of a round's result (a different
+    /// root, a different partition, a different trainable-variable count, a
+    /// differently shaped or typed tensor, or a different world size — see
+    /// the struct's own field docs), so the derive already computes exactly
+    /// the comparison this round needs. A hand-written comparison is exactly
+    /// what a NEW field could be added without — silently exempting it from
+    /// agreement; `agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep`
+    /// destructures [`Descriptor`] field-by-field with no `..`, so a field
+    /// added to the struct without a matching arm there fails to COMPILE.
     fn agrees_with(&self, other: &Descriptor) -> std::result::Result<(), ()> {
-        if self.verb != other.verb {
-            return Err(());
+        if self == other {
+            Ok(())
+        } else {
+            Err(())
         }
-        if self.world != other.world {
-            return Err(());
-        }
-        if self.root != other.root {
-            return Err(());
-        }
-        if self.counts != other.counts {
-            return Err(());
-        }
-        if self.tensors.len() != other.tensors.len() {
-            return Err(());
-        }
-        for (mine, theirs) in self.tensors.iter().zip(other.tensors.iter()) {
-            if mine.dims != theirs.dims {
-                return Err(());
-            }
-            if mine.dtype != theirs.dtype {
-                return Err(());
-            }
-        }
-        Ok(())
     }
 }
 
@@ -930,10 +917,26 @@ mod rendezvous_state_tests {
     /// PUBLISHES and is then faulted — before the still-parked rank has taken
     /// anything — wakes that rank into the refusal, never a stale `Ok`.
     ///
-    /// **This exact sequence is not reachable through the public API** (a
-    /// round `Local::exchange` publishes is only ever faulted afterwards by a
-    /// LATER round's superseded-contribution check, never by the round that
-    /// just published itself), so this test manufactures it directly, the
+    /// **This exact sequence is not reachable through the public API on a
+    /// CPU-device gang** (every device in `LocalGang::new`'s `devices` is
+    /// [`Device::Cpu`], as it is in this test and in every other test this
+    /// module runs): a `Cpu`-to-`Cpu` [`Tensor::to_device`] is a no-op that
+    /// cannot fail, and the descriptor agreement `exchange` already proved
+    /// (equal `counts`, equal per-tensor shape and dtype) already makes
+    /// `all_gather`'s `Tensor::cat` and its rows-vs-`total` check infallible
+    /// too — so on this gang, a round `exchange` publishes is only ever
+    /// faulted afterwards by a LATER round's superseded-contribution check,
+    /// never by the round that just published itself, and this test has to
+    /// manufacture the sequence directly rather than reach it through a real
+    /// gang. A MULTI-device gang has a real route here that this module does
+    /// not exercise: the post-publish `to_device` calls at `all_gather`'s
+    /// peer-slice conversion, `all_reduce_sum`'s per-peer accumulation, and
+    /// its final per-slot store CAN fail on real hardware (an OOM, a
+    /// transfer error), which faults the gang for the round that just
+    /// published itself — exactly the asymmetry this test manufactures, but
+    /// reached for real. That route is UNCOVERED here; U4b's pod leg is
+    /// where a real multi-device `LocalGang` exists to exercise it (filed to
+    /// `CONTRACT-U4b.md`). So this test manufactures it directly, the
     /// same way `a_round_holding_a_superseded_contribution_is_refused_by_the_rank_completing_it`
     /// manufactures its condition: rank 1 is parked in `exchange`, waiting on
     /// `round.published` with only its own contribution deposited
@@ -1121,11 +1124,15 @@ mod constructor_verb_tests {
 }
 
 /// One test per [`Descriptor`] field, each proving that field is its own,
-/// independent determinant of agreement: dropping any one `if` inside
-/// [`Descriptor::agrees_with`] is a distinct way for two ranks to be handed
-/// `Ok` from a round they never actually agreed on, and this module's tests
-/// were each run against that exact mutation (comment out the one `if`, see
-/// exactly that test die, restore it).
+/// independent determinant of agreement: [`Descriptor::agrees_with`]
+/// delegates to the derived [`PartialEq`], so a mismatch on any one field —
+/// a different root, a different partition, a different trainable-variable
+/// count, a differently shaped or typed tensor, or a different world size —
+/// is a distinct way for two ranks to be handed `Ok` from a round they never
+/// actually agreed on. The sweep test at the end of this module additionally
+/// destructures [`Descriptor`] with no `..`, so a field the struct gains
+/// later without a matching entry there fails to COMPILE rather than
+/// silently going unchecked.
 #[cfg(test)]
 mod descriptor_tests {
     use super::*;
@@ -1252,16 +1259,18 @@ mod descriptor_tests {
         );
     }
 
-    /// `agrees_with(a, b).is_ok()` must equal `a == b` (the derived
-    /// [`PartialEq`]) over a sweep that mutates ONE field of a base
-    /// descriptor at a time. `agrees_with` is hand-written, field by field,
-    /// rather than delegating to the derived equality it is meant to match —
-    /// so a NEW field added to [`Descriptor`] without a matching `if` in
-    /// `agrees_with` would make the two diverge exactly on a mutation of that
-    /// field: `agrees_with` would still say `Ok` (it never looked at the new
-    /// field) while `==` says `false` (the derive compares every field). This
-    /// sweep is what would catch that divergence on every field the struct
-    /// has today.
+    /// `agrees_with(a, b).is_ok()` must equal `a == b` — trivially true now
+    /// that [`Descriptor::agrees_with`] delegates to the derived
+    /// [`PartialEq`] — over a sweep that mutates ONE field of a base
+    /// descriptor at a time.
+    ///
+    /// The exhaustive destructure below, naming every one of
+    /// [`Descriptor`]'s fields with no `..`, is what keeps this sweep
+    /// honest: it pins the test to the struct's ACTUAL field set rather
+    /// than to whichever fields whoever last edited the sweep remembered to
+    /// mutate. A field added to [`Descriptor`] without a matching arm here
+    /// fails to COMPILE (`E0027`, "pattern does not mention field"), rather
+    /// than silently leaving a field the sweep never exercises.
     #[test]
     fn agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep() {
         let base = Descriptor {
@@ -1274,6 +1283,15 @@ mod descriptor_tests {
                 dtype: DType::F32,
             }],
         };
+        // A field `Descriptor` gains later, and is not named here, fails
+        // THIS destructure to compile — see the test's own doc comment.
+        let Descriptor {
+            verb: _,
+            world: _,
+            root: _,
+            counts: _,
+            tensors: _,
+        } = &base;
 
         let mutations: Vec<Descriptor> = vec![
             base.clone(),
@@ -1323,8 +1341,8 @@ mod descriptor_tests {
             assert_eq!(
                 agrees, derived_equal,
                 "mutation {index} ({other:?}): agrees_with says {agrees} but derived equality \
-                 (==) says {derived_equal} — a field agrees_with does not check would show up \
-                 exactly as this divergence"
+                 (==) says {derived_equal} — agrees_with delegates to == directly, so these can \
+                 only diverge if that delegation itself regresses"
             );
         }
     }

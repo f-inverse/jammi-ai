@@ -55,14 +55,39 @@ Required fixtures (RED when the corresponding hook arm is removed):
   G19 the coverage arm is selected by the DATA: a row with a non-empty
       class_enumeration but NO `enumeration_missing` key still requires
       `sites` (the flag is diagnostic, never a discriminator)
-  OQ1/OQ2  esc-lead-gate-R10: alongside the >=2 examined-clean probe sites
-      R2 already requires, a relay must ALSO carry a non-empty
-      `open_question` — a site examined and explicitly NOT closed, naming
-      the attack for the next round. OQ1: an otherwise-fully-satisfying
-      relay (R1/R2/R3 all pass) with NO `open_question` is denied, naming
-      the missing field. OQ2: the SAME relay plus a non-empty
-      `open_question` is allowed. Armed unconditionally, alongside R2 —
-      never folded into `probe`'s own >=2 count.
+  OQ1/OQ2 (esc-lead-gate-R10, "open_question") are RETIRED — see R12P*/R12D1/
+      R12R2*/R12M1 below, esc-lead-gate-R12's replacement.
+  R12P1-R12P12(b), R12D1, R12R2a-d, R12M1  esc-lead-gate-R12 fix round 1
+      ("ANTICIPATE BEFORE THE FIX", M1'-M6'): an implementer-type dispatch
+      (or a `general-purpose`/`claude`/`fork`/`doc-updater` dispatch that
+      DOES name a unit) onto a unit branch with ANY open second-round
+      BLOCK is denied unless a `.jammi/gate-state/<slug>.anticipation.
+      <tip_sha>.json` artifact exists AT THE BRANCH'S CURRENT TIP, covering
+      the UNION of every such open block's own derived keys reduced to one
+      entry PER FILE, whose commands the hook re-executes and hash-matches
+      in a CLEAN, tip-matching worktree, with at least one execution-class
+      command. R12P1/R12P1b/R12P1c: the nine IMPLEMENTER_TYPES require a
+      `unit:` line (denied if absent); the four extra GATED types
+      (`general-purpose`/`claude`/`fork`/`doc-updater`) do not, but are
+      gated identically once a unit IS named. R12P2/R12P2b: no open block
+      allows; an unresolvable branch denies. R12P3-R12P10b: missing
+      artifact / missing per-file key / stale (pre-tip-move) artifact /
+      dirty worktree / hash mismatch / vacuous rc / templated (command,
+      hash) reuse / denylisted command / a complete artifact allows / an
+      inspector-only artifact denies. R12P11/R12P11b: THE CORE FIX-ROUND-1
+      FIX — two open second-round BLOCKs of different types at DIFFERENT
+      shas are satisfiable by ONE artifact at the current tip covering
+      their UNION (never "newest block only", which would let a
+      lead-provoked BLOCK retire an older, unrelated one's obligation for
+      free). R12P12: attack commands run in the branch's OWN
+      `git worktree list`-resolved worktree, unconfused by a decoy linked
+      worktree on another branch. R12D1: the relaxed denylist admits ONLY
+      `sh|bash <real path>`, still denies `bash -c`/`curl|sh`/every other
+      R11 entry. R12R2a-d: reader 2's `attacks_post` differential — missing
+      / no measured difference / a real differential allows / a `.sh`
+      new-surface hunk widens the required set by FILE. R12M1: a relay
+      still carrying the retired `open_question` with no `attacks_post` is
+      denied, naming the migration.
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`

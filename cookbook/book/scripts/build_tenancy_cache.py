@@ -254,7 +254,13 @@ def main() -> None:
     args = ap.parse_args()
     with tempfile.TemporaryDirectory() as catalog, tempfile.TemporaryDirectory() as work:
         db = jammi.connect(args.target or f"file://{catalog}")
-        emit(db, Path(work))
+        # closed BEFORE `catalog` is removed: a live embedded engine keeps
+        # writing its catalog, so a cleanup racing it fails with ENOTEMPTY
+        # (Errno 39 on Linux). Drop is not a release here.
+        try:
+            emit(db, Path(work))
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

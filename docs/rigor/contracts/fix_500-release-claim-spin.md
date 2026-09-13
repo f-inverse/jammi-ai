@@ -168,8 +168,10 @@ sentences state the reclaim-window residual verbatim; no further gate reads are 
   `fix/release-stop-ordering` (`git diff main...fix/release-stop-ordering -- crates/jammi-db/tests/it/lease_keeper.rs`):
   the three RELEASE statements in production order (2b `LeaseKeeper::release_job_holds` on the keeper's own
   connection, then 2c/2g `Catalog::release_jobs_claimed_by` on the pool connection) against a REAL backend with a real
-  elapsed heartbeat between claim and release; `jobs.releases` lands at exactly 1. Both backends (sqlite and a real
-  Postgres instance on 127.0.0.1, port 55432, database `rs_db`). Re-anchor its doc citations to THIS branch's
+  elapsed heartbeat between claim and release; `jobs.releases` lands at exactly 1. Both backends (sqlite and the
+  `::postgres` arm, which runs in CI under `--features live-postgres-tests` with `JAMMI_REQUIRE_PG: "1"`
+  (`.github/workflows/ci.yml:1296-1300`) and locally under `JAMMI_TEST_PG_URL`; the lead's executed runs are recorded
+  in the session ledger, not here). Re-anchor its doc citations to THIS branch's
   worker.rs (2a at :2547 → after the fix round, re-read) — the branch's own numbers are stale here. RED: revert to
   the pre-#524 shape is not required (an oracle over an invariant main already satisfies is a PIN — say so); mutate
   the test's release path once (drop the second statement) to show it bites.

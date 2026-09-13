@@ -186,18 +186,25 @@ pub enum JammiError {
     },
 
     /// A `recompute` was asked to re-produce a table the engine has no faithful
-    /// replay for. Two tables land here, and both are a loud typed refusal rather
+    /// replay for. Three tables land here, and each is a loud typed refusal rather
     /// than a silent best-effort:
     ///
     /// - a **pre-contract** table whose catalog `definition_hash IS NULL` — created
     ///   before the materialization contract landed, so there is no recorded
     ///   [`ProducingDescriptor`](crate::store::manifest::ProducingDescriptor) to
-    ///   dispatch a replay on at all; and
+    ///   dispatch a replay on at all;
     /// - a table produced by an [`External`](crate::store::manifest::ProducingDescriptor::External)
     ///   producer — a verb the engine does not own — which the engine cannot
-    ///   reconstruct even though a descriptor is recorded.
+    ///   reconstruct even though a descriptor is recorded; and
+    /// - a [`TrainingSet`](crate::store::manifest::ProducingDescriptor::TrainingSet)
+    ///   table whose recorded `order_rule` is one this build does not implement.
+    ///   The producer commits exactly one rule
+    ///   ([`TRAINING_SET_ORDER_RULE_V1`](crate::store::manifest::TRAINING_SET_ORDER_RULE_V1)),
+    ///   and re-materializing under a rule it does not implement would write rows
+    ///   in an order the recorded descriptor does not claim, so the replay is
+    ///   refused rather than run under a guessed order.
     ///
-    /// In either case guessing a producer call would be a fabricated re-run, so
+    /// In each case guessing a producer call would be a fabricated re-run, so
     /// the engine refuses loudly. Carries the table named.
     #[error("table `{table}` has no engine-recomputable producer and cannot be recomputed")]
     NotRecomputable {

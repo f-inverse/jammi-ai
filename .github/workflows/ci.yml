@@ -703,8 +703,15 @@ jobs:
   # nvcc-driven) and the job is realistically a few minutes end to end — real
   # but bounded, and it runs on every PR here (no `paths:` filter, matching
   # every other job in this file and the swarm's own no-paths-filter
-  # discipline: a filtered-out required check hangs unrelated PRs). If that
-  # per-PR cost is judged too high, the alternative is scoping it to changes
+  # discipline: a filtered-out required check hangs unrelated PRs). The
+  # `jammi-ai --features cuda` step adds THAT crate's full dependency graph
+  # (datafusion, arrow and tantivy on top of the candle stack) to this same
+  # job, under a feature resolution none of the other three steps select —
+  # they build `jammi-kernels` and `jammi-encoders`, never `jammi-ai` — so
+  # that compile is additive rather than shared. `sccache` (wired by
+  # `setup-rust-ci`) amortises it on warm runs, and the first PR run on this
+  # lane measures what it actually costs. If that per-PR cost is judged too
+  # high, the alternative is scoping it to changes
   # under `crates/jammi-kernels/build.rs`, `crates/jammi-kernels/src/flash/**`,
   # `crates/jammi-kernels/third_party/**`, `crates/jammi-kernels/Cargo.toml`,
   # and `.gitmodules` — EVERY one of those five paths, since missing any is
@@ -823,6 +830,69 @@ jobs:
       # esc-059: same swap, same reasoning as the two steps above.
       - name: Clippy jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
         run: cargo clippy -p jammi-encoders --features cuda --tests -- -D warnings
+
+      # `jammi-ai`'s OWN `cuda` arm — every `#[cfg(feature = "cuda")]` item in
+      # this crate's `src/` and in its `it` test target (`required-features =
+      # ["local"]`, which `cuda` implies). Two things are true of it without
+      # this step, and they are NOT the same claim: no merge-path lane LINTS
+      # this arm under `-D warnings`, and no merge-path lane compiles its
+      # `cfg(test)` half at all.
+      #
+      # Its `src/` half IS compiled elsewhere on the merge path, so the
+      # narrower claim is the true one. `pypi-server-cuda.yml` (pull_request
+      # on `crates/jammi-server/**`) and `server-image.yml` (pull_request on
+      # `Dockerfile`) both build `jammi-server` with the CUDA feature list
+      # `ci/release-feature-manifest.json` declares
+      # (`cuda,flash-attn,jetstream-broker,storage-cloud`), and
+      # `crates/jammi-server/Cargo.toml:85` is `cuda = ["jammi-ai/cuda"]` — so
+      # both compile this crate's cuda `src/`. Neither LINTS it: the wheel leg
+      # runs `cargo build --release -p jammi-server` with `setup-rust-ci`'s
+      # `deny-warnings` input left at its `"false"` default
+      # (`_pypi-server.yml:55`, `:126`), and the image leg's `cargo build`
+      # happens inside `Dockerfile`'s `builder-cuda` stage (`:116-121`), which
+      # exports no `-D warnings` at all. Neither compiles it under
+      # `cfg(test)` either — a `cargo build --bin jammi-server` never builds
+      # `#[cfg(test)] mod tests` content — so e.g.
+      # `crates/jammi-ai/src/fine_tune/adamw.rs:786`, `:800` and `:812`
+      # (`#[test] #[cfg(feature = "cuda")]` device-mismatch fns) are compiled
+      # by no merge-path lane today. The GPU pod prove run does compile them
+      # (`ci/release-feature-manifest.json`'s `prove_lane` declares a
+      # `jammi-ai` `test` pair), and that lane is not on the merge path.
+      #
+      # The workflow-side enumeration: `git grep -n -- '--features [^ ]*cuda'
+      # -- .github/workflows` returns cargo lines for `jammi-encoders` (the two
+      # steps above) and this step, plus comment lines (the GPU-host `jammi-ai`
+      # prove line in this file, `server-image.yml`'s CUDA-lane note) — no
+      # other `-p jammi-ai --features cuda` invocation. That grep's scope is
+      # narrow, and stating it honestly matters: it sees `.github/workflows`
+      # ONLY. It cannot see the two builds above, which carry no literal `cuda`
+      # next to `--features` — their feature list arrives through a
+      # reusable-workflow input (`_pypi-server.yml:126`) or a Dockerfile
+      # build-arg (`Dockerfile:102`, expanded at `:118-121`). Within this file, `check` lints this crate
+      # with `--features live-gpu-tests,live-distributed-tests` (no `cuda`),
+      # and `compile-check-gated` states in its own comment that it compiles
+      # the GPU-capability suite WITHOUT `cuda` deliberately, to stay on a CPU
+      # runner. So a lint regression in the cuda arm, or any break in its test
+      # half, would otherwise first surface on a GPU pod run
+      # (`ci/scripts/runpod_gpu_prove.sh`), behind `gpu-prove.yml`'s
+      # dispatch/label/schedule triggers — never on the merge path.
+      # `ci/scripts/check_lint_surface_closure.py` credits this step
+      # mechanically from `cargo metadata`; it keeps no registry of step
+      # names, so this comment is documentation, not the gate.
+      #
+      # Same image, job, and toolchain as the two steps above — `cuda` selects
+      # the feature chain (`candle-core/cuda`, `jammi-{encoders,lora,kernels}/
+      # cuda`, and `build_cuda`'s PTX build via `nvcc`), never a live device,
+      # so this needs the CUDA toolkit this job's image already ships and no
+      # GPU. `--tests` for the reason the steps above give: plain `cargo
+      # check`/`clippy` without it never compiles `#[cfg(test)] mod tests`
+      # content at all, feature-gated or not. `cuda` alone, never
+      # `cuda,flash-attn`: `flash-attn` must stay unreachable from `cuda`
+      # (`ci/scripts/check_flash_attn_closure.py`'s core invariant), and this
+      # crate's flash surface is already covered through `jammi-encoders`
+      # above.
+      - name: Clippy jammi-ai --features cuda (nvcc, no GPU)
+        run: cargo clippy -p jammi-ai --features cuda --tests -- -D warnings
 
   # esc-059's silicon-axis twin — CLOSED FOR COMPILE/LINT SURFACE ONLY, NOT
   # EXECUTION. `jammi-kernels`'s `metal_parity` test target

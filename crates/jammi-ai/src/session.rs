@@ -1825,6 +1825,7 @@ impl InferenceSession {
             task,
             config,
             world_size,
+            cache,
         } = request;
         let config = config.unwrap_or_default();
         config.validate()?;
@@ -1839,10 +1840,7 @@ impl InferenceSession {
                 config,
                 world_size: world_size
                     .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
-                // `FineTuneRequest` carries no cache field yet (wiring `Use`
-                // through the wire surface is a follow-up); matches the
-                // pre-`cache` behaviour byte-for-byte.
-                cache: jammi_db::store::CachePolicy::Bypass,
+                cache,
             },
         };
         self.submit_fine_tune_spec(spec).await

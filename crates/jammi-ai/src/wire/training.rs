@@ -59,11 +59,12 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
         config,
         idempotency_key: _,
         world_size,
+        cache,
     } = req;
     let spec = spec.ok_or_else(|| Status::invalid_argument("SubmitJob request carries no spec"))?;
     match spec {
         pb::submit_job_request::Spec::FineTune(ft) => {
-            let common = lora_common_from_proto(base_model, config, world_size)?;
+            let common = lora_common_from_proto(base_model, config, world_size, cache)?;
             if ft.source.is_empty() {
                 return Err(Status::invalid_argument("source is required"));
             }
@@ -82,7 +83,7 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
             })
         }
         pb::submit_job_request::Spec::GraphFineTune(g) => {
-            let common = lora_common_from_proto(base_model, config, world_size)?;
+            let common = lora_common_from_proto(base_model, config, world_size, cache)?;
             let sources = g.sources.ok_or_else(|| {
                 Status::invalid_argument("graph_fine_tune spec carries no sources")
             })?;
@@ -153,6 +154,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
             world_size: common.world_size,
+            cache: super::cache::cache_policy_to_proto(common.cache) as i32,
         },
         TrainingSpec::GraphFineTune {
             sources,
@@ -169,6 +171,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
             world_size: common.world_size,
+            cache: super::cache::cache_policy_to_proto(common.cache) as i32,
         },
         TrainingSpec::ContextPredictor {
             source,
@@ -187,17 +190,23 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             // wire's unset value, and the decode above refuses anything
             // greater than one rank for this spec.
             world_size: 0,
+            // The predictor kind has no `TrainingCommon`, so it has nothing
+            // to probe a cache hit by; `UNSPECIFIED` decodes to the engine's
+            // `Bypass` default the same way an unset `world_size` decodes to
+            // one rank.
+            cache: 0,
         },
     }
 }
 
-/// Fold the request's common `base_model` + optional `config` into a
+/// Fold the request's common `base_model` + optional `config` + `cache` into a
 /// [`TrainingCommon`] for the two LoRA fine-tune kinds. An empty base model is a
 /// client error (the worker has nothing to adapt).
 fn lora_common_from_proto(
     base_model: String,
     config: Option<training_pb::FineTuneConfig>,
     world_size: u32,
+    cache: i32,
 ) -> Result<TrainingCommon, Status> {
     if base_model.is_empty() {
         return Err(Status::invalid_argument("base_model is required"));
@@ -210,10 +219,7 @@ fn lora_common_from_proto(
         base_model,
         config,
         world_size: world_size_from_proto(world_size),
-        // `pb::SubmitJobRequest` carries no cache field yet (wiring `Use`
-        // through the wire proto is a follow-up); `Bypass` matches the
-        // pre-`cache` behaviour byte-for-byte for every remote submitter.
-        cache: jammi_db::store::CachePolicy::Bypass,
+        cache: super::cache_policy_from_proto(cache)?,
     })
 }
 
@@ -657,6 +663,7 @@ mod tests {
             config: None,
             idempotency_key: String::new(),
             world_size,
+            cache: 0,
         }
     }
 
@@ -693,6 +700,115 @@ mod tests {
     fn the_rank_count_round_trips_back_onto_the_request() {
         let spec = training_spec_from_proto(fine_tune_request(2)).expect("decode");
         assert_eq!(training_spec_to_proto(&spec).world_size, 2);
+    }
+
+    /// [`fine_tune_request`], but with the `cache` field the only thing that
+    /// varies — so `lora_common_from_proto`'s cache mapping is the only
+    /// determinant under test.
+    fn fine_tune_request_with_cache(cache: i32) -> pb::SubmitJobRequest {
+        pb::SubmitJobRequest {
+            cache,
+            ..fine_tune_request(0)
+        }
+    }
+
+    /// UNSPECIFIED (the wire's unset value) and the explicit `BYPASS` both
+    /// decode to the engine's `CachePolicy::Bypass` — the documented mapping
+    /// every other `*_UNSPECIFIED` arm in this crate follows, so an unset
+    /// field costs a pre-existing remote caller nothing.
+    #[test]
+    fn unspecified_and_bypass_cache_both_decode_to_bypass() {
+        use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
+
+        assert_eq!(
+            decoded_common(fine_tune_request_with_cache(
+                ProtoCachePolicy::Unspecified as i32
+            ))
+            .cache,
+            jammi_db::store::CachePolicy::Bypass
+        );
+        assert_eq!(
+            decoded_common(fine_tune_request_with_cache(
+                ProtoCachePolicy::Bypass as i32
+            ))
+            .cache,
+            jammi_db::store::CachePolicy::Bypass
+        );
+    }
+
+    /// `CACHE_POLICY_USE` decodes to the engine's `CachePolicy::Use` — the
+    /// opt-in model-level cache reuse this field exists to reach.
+    #[test]
+    fn cache_use_decodes_to_the_engine_use_policy() {
+        use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
+
+        assert_eq!(
+            decoded_common(fine_tune_request_with_cache(ProtoCachePolicy::Use as i32)).cache,
+            jammi_db::store::CachePolicy::Use
+        );
+    }
+
+    /// An out-of-range `cache` value is a loud client error, never a silent
+    /// fall-through to the default — matching every other enum decode in this
+    /// module.
+    #[test]
+    fn an_out_of_range_cache_value_is_a_loud_error() {
+        let status = training_spec_from_proto(fine_tune_request_with_cache(99))
+            .expect_err("an out-of-range cache value must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// The cache choice makes the round trip back onto the request, exactly
+    /// like the rank count: a spec re-encoded for a remote send carries the
+    /// cache policy it was submitted with rather than reverting to the
+    /// default.
+    #[test]
+    fn the_cache_policy_round_trips_back_onto_the_request() {
+        use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
+
+        let spec =
+            training_spec_from_proto(fine_tune_request_with_cache(ProtoCachePolicy::Use as i32))
+                .expect("decode");
+        assert_eq!(
+            training_spec_to_proto(&spec).cache,
+            ProtoCachePolicy::Use as i32
+        );
+    }
+
+    /// The cache field rides on the request like `world_size`, not the kind,
+    /// so the SAME field serves a graph fine-tune: the two LoRA kinds cannot
+    /// diverge on it, because there is only one place to put it.
+    #[test]
+    fn the_same_cache_field_serves_the_graph_fine_tune_kind() {
+        use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
+
+        let request = pb::SubmitJobRequest {
+            spec: Some(pb::submit_job_request::Spec::GraphFineTune(
+                training_pb::GraphFineTuneSpec {
+                    sources: Some(training_pb::GraphFineTuneSources {
+                        node_source: "nodes".into(),
+                        id_column: "id".into(),
+                        text_column: "text".into(),
+                        edge_source: "edges".into(),
+                        src_column: "src".into(),
+                        dst_column: "dst".into(),
+                        provenance: training_pb::EdgeProvenance::Declared as i32,
+                    }),
+                    sample_config: Some(training_pb::GraphSampleConfig::default()),
+                },
+            )),
+            base_model: "local:tiny".into(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size: 0,
+            cache: ProtoCachePolicy::Use as i32,
+        };
+
+        let spec = training_spec_from_proto(request).expect("decode");
+        let TrainingSpec::GraphFineTune { common, .. } = spec else {
+            panic!("expected the graph_fine_tune variant");
+        };
+        assert_eq!(common.cache, jammi_db::store::CachePolicy::Use);
     }
 
     /// r26: a context-predictor job is refused above one rank at the LAST

@@ -116,9 +116,15 @@ before any implementer built the permanently-broken shape:
   simplification, never a weaker per-file guarantee (every changed file still needs its own
   covering key).
 - **M5' — the deny-coverage sweep is committed.** `# R12-BEGIN`/`# R12-END` sentinels bound
-  the mechanism in `lead-gate-lib.py` for a future committed AST-based mutation sweep (every
-  deny-return in the region gets its own fixture) — the sweep itself is tracked as open work
-  on this branch (see the hand-off report).
+  the four core `str | None`-returning mechanism helpers in `lead-gate-lib.py`;
+  `ci/scripts/check_lead_gate.py --r12-sweep` (its own `swarm.yml` step, separate from
+  `--self-test` — mutating and re-running ~24 R12 fixtures per deny arm is too slow to fold
+  into the per-invocation self-test) enumerates every deny-`Return` inside that region by
+  AST, neuters each arm's nearest enclosing `if` test to `False` ALONE, and fails when a
+  neutered arm kills no R12 fixture. Scope note: the dispatch-routing arms M6' added
+  (`_decide_implementer_dispatch`) sit outside the sentinel region and are not swept by this
+  mechanism — they are independently covered by named, RED-verified fixtures instead
+  (R12P1/R12P1b/R12P1c/R12P2/R12P2b).
 - **M6' — close the fail-open enumerations.** `general-purpose`/`claude`/`fork`/
   `doc-updater` dispatches are now gated identically to the nine domain-implementer types the
   moment their prompt names a unit with an open second-round BLOCK (previously unconditionally

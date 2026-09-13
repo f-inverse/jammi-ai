@@ -101,6 +101,7 @@ closed.
 Modes:
   python3 ci/scripts/check_rigor_record.py                       # the check
   python3 ci/scripts/check_rigor_record.py --check-allowlist-only-shrinks
+  python3 ci/scripts/check_rigor_record.py --check-r12-grandfather-only-shrinks
   python3 ci/scripts/check_rigor_record.py --self-test
 """
 from __future__ import annotations

@@ -70,6 +70,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/test_check_lead_gate.py
 
+      # esc-lead-gate-R12 M5': a SEPARATE step from --self-test above --
+      # mutating and re-running ~24 R12 fixtures per deny arm (~30+ arms)
+      # is too slow to fold into the per-invocation self-test.
+      - name: Assert every esc-lead-gate-R12 deny arm has a dying fixture (deny-coverage sweep)
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_lead_gate.py --r12-sweep
+
       # esc-lead-gate-R7 (v2): the committed-rigor-record check's own
       # hermetic self-test — real scratch git repos (a real `origin` +
       # a real feature-branch clone), never against this checkout's own

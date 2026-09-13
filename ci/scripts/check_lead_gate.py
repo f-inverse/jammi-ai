@@ -1374,6 +1374,54 @@ def fixture_r10_wiring() -> None:
     _assert(".claude/settings.json" in deny_text, "R10", f"permissions.deny must cover .claude/settings.json: {deny}")
 
 
+def fixture_r12timeout_settings_pins_above_self_bound() -> None:
+    """esc-lead-gate-R12 M1': `.claude/settings.json`'s `lead-gate-pre.sh`
+    PreToolUse entry pins an explicit `timeout` ABOVE the hook's own
+    in-process self-alarm (`_SELF_ALARM_S`, so the harness never cancels
+    the hook — fail-open, output discarded — before the self-alarm has a
+    chance to produce a real, logged DENY) and BELOW the documented
+    harness default of 600s (a sanity ceiling — a pin far above the
+    default provides no protection); `async` is never set (a cancel
+    deadline, never a fire-and-forget dispatch)."""
+    settings = json.loads(SETTINGS_PATH.read_text())
+    pre_entries = settings.get("hooks", {}).get("PreToolUse", [])
+    lead_gate_entry = None
+    for entry in pre_entries:
+        for h in entry.get("hooks", []):
+            if Path(h.get("command", "")).name == "lead-gate-pre.sh" or h.get("command", "").endswith("lead-gate-pre.sh"):
+                lead_gate_entry = h
+    _assert(lead_gate_entry is not None, "R12timeout", "no PreToolUse entry names lead-gate-pre.sh")
+    timeout = lead_gate_entry.get("timeout")
+    _assert(isinstance(timeout, (int, float)), "R12timeout", f"lead-gate-pre.sh's PreToolUse entry carries no numeric `timeout`: {lead_gate_entry}")
+    self_alarm_s = _r12_mod()._SELF_ALARM_S
+    _assert(timeout > self_alarm_s, "R12timeout",
+            f"settings.json timeout ({timeout}) must exceed the hook's own self-alarm ({self_alarm_s})")
+    _assert(timeout < 600, "R12timeout", f"settings.json timeout ({timeout}) must stay below the documented harness default of 600s")
+    _assert("async" not in lead_gate_entry, "R12timeout", f"lead-gate-pre.sh's PreToolUse entry must never set `async`: {lead_gate_entry}")
+
+
+def fixture_r12alarm_self_bound_denies() -> None:
+    """esc-lead-gate-R12 M1': `_install_self_alarm`'s `SIGALRM` handler
+    denies (exits 2, names the self-bound) if the process is still running
+    past `_SELF_ALARM_S` — installs a handler with a near-zero alarm (never
+    the real 330s bound, which this fixture cannot afford to wait out) and
+    confirms the handler itself fires the documented remedy text, in a
+    throwaway subprocess so the real test process is never at risk of the
+    alarm firing into it."""
+    proc = subprocess.run(
+        ["python3", "-c",
+         "import importlib.util, signal, time, sys\n"
+         f"spec = importlib.util.spec_from_file_location('m', {str(LEAD_GATE_LIB)!r})\n"
+         "mod = importlib.util.module_from_spec(spec)\n"
+         "spec.loader.exec_module(mod)\n"
+         "mod._SELF_ALARM_S = 1\n"
+         "mod._install_self_alarm()\n"
+         "time.sleep(3)\n"],
+        capture_output=True, text=True, timeout=10)
+    _assert(proc.returncode == 2, "R12alarm", f"the self-alarm must exit 2 once it fires, got {proc.returncode}: {proc.stderr!r}")
+    _assert("self-bound" in proc.stderr, "R12alarm", f"the self-alarm's reason must name the self-bound: {proc.stderr!r}")
+
+
 def fixture_g16_reactive_relay_rejected_when_enumeration_present() -> None:
     """esc-064 RED case: a BLOCK with a NON-EMPTY class_enumeration whose
     relay restates it as `sites` with NO `probe` array is NOT accepted.
@@ -2866,6 +2914,140 @@ def _g20_28_arm() -> tuple[list[str], int]:
     return failures, len(_G20_28_FIXTURES)
 
 
+# ==========================================================================
+# esc-lead-gate-R12 M5' — the deny-coverage sweep is COMMITTED. Enumerates
+# every deny-Return inside the `# R12-BEGIN`/`# R12-END` sentinel region of
+# `lead-gate-lib.py` (the four `str | None`-returning core mechanism
+# helpers R12 fix round 1 introduced) by AST, neuters each arm ALONE
+# (its nearest enclosing `if` test forced to `ast.Constant(False)`, so the
+# guard never fires and that specific deny becomes unreachable), imports
+# the mutated source into a throwaway hooks directory, and re-runs every
+# registered "R12*"-named fixture against it — FAILING when an arm's
+# neutering kills NO fixture (the arm has no oracle proving it fires).
+# ==========================================================================
+
+import ast  # noqa: E402  (kept local to this section, mirrors the module's own late imports)
+
+_R12_SWEEP_FUNCS = {
+    "_r12_attack_command_denied", "_pre_fix_anticipation_rejection",
+    "_r12_empty_set_rejection", "_post_fix_attacks_rejection",
+}
+
+
+def _r12_sentinel_line_range(source: str) -> tuple[int, int]:
+    lines = source.splitlines()
+    begin = next(i + 1 for i, l in enumerate(lines) if l.strip() == "# R12-BEGIN")
+    end = next(i + 1 for i, l in enumerate(lines) if l.strip() == "# R12-END")
+    return begin, end
+
+
+def _r12_deny_if_positions(source: str, begin: int, end: int) -> list[tuple[int, int]]:
+    """`[(lineno, col_offset), ...]` of every distinct `If` node whose body
+    contains a deny-shaped `Return` (a `Return` whose value is NOT the bare
+    `None` constant) inside one of `_R12_SWEEP_FUNCS`, within the sentinel
+    line range — de-duplicated, order-preserving. Deliberately does not
+    walk into a NESTED FunctionDef (there are none inside these four)."""
+    tree = ast.parse(source)
+    parent_of: dict[ast.AST, ast.AST] = {}
+    positions: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name in _R12_SWEEP_FUNCS):
+            continue
+        for parent in ast.walk(node):
+            for child in ast.iter_child_nodes(parent):
+                parent_of[child] = parent
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Return):
+                continue
+            if not (begin <= sub.lineno <= end):
+                continue
+            val = sub.value
+            if isinstance(val, ast.Constant) and val.value is None:
+                continue  # the plain "accepted" return, never a deny
+            cur: ast.AST | None = parent_of.get(sub)
+            while cur is not None and not isinstance(cur, ast.If):
+                cur = parent_of.get(cur)
+            if isinstance(cur, ast.If):
+                pos = (cur.lineno, cur.col_offset)
+                if pos not in seen:
+                    seen.add(pos)
+                    positions.append(pos)
+    return positions
+
+
+class _R12NeuterIf(ast.NodeTransformer):
+    def __init__(self, target: tuple[int, int]) -> None:
+        self.target = target
+        self.hit = False
+
+    def visit_If(self, node: ast.If) -> ast.AST:
+        self.generic_visit(node)
+        if (node.lineno, node.col_offset) == self.target:
+            node.test = ast.copy_location(ast.Constant(value=False), node.test)
+            self.hit = True
+        return node
+
+
+def _r12_mutate_at(source: str, target: tuple[int, int]) -> str:
+    tree = ast.parse(source)
+    transformer = _R12NeuterIf(target)
+    mutated = transformer.visit(tree)
+    ast.fix_missing_locations(mutated)
+    _assert(transformer.hit, "R12-SWEEP setup", f"target If at {target} not found in a fresh parse")
+    return ast.unparse(mutated)
+
+
+def _r12_mutant_hooks_dir(mutated_source: str) -> Path:
+    """A fresh temp dir carrying an unmodified copy of every real
+    `.claude/hooks/*.sh` wrapper plus the ONE mutated `lead-gate-lib.py` —
+    `lead-gate-pre.sh` resolves its sibling lib via its OWN dirname, so
+    pointing `HOOKS_DIR` (module-global, monkey-patched for the duration of
+    one mutant's fixture subset) at this directory is enough to exercise
+    the mutated mechanism through the REAL wrapper scripts, unmodified."""
+    d = tempfile.TemporaryDirectory(prefix="r12-mutant-hooks-")
+    _TEMP_DIRS.append(d)
+    p = Path(d.name)
+    for sh in HOOKS_DIR.glob("*.sh"):
+        (p / sh.name).write_text(sh.read_text())
+        (p / sh.name).chmod(0o755)
+    (p / "lead-gate-lib.py").write_text(mutated_source)
+    return p
+
+
+def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, object]]) -> list[str]:
+    """Runs `fixtures` with `HOOKS_DIR` monkey-patched to `hooks_dir`,
+    returning the names that raised (died) under this mutant — a fixture
+    that no longer observes its expected ALLOW/DENY (or crashes outright)
+    both count as a death; only a clean pass survives."""
+    global HOOKS_DIR
+    real_hooks_dir = HOOKS_DIR
+    HOOKS_DIR = hooks_dir
+    died: list[str] = []
+    try:
+        for name, fn in fixtures:
+            try:
+                fn()
+            except Exception:
+                died.append(name)
+    finally:
+        HOOKS_DIR = real_hooks_dir
+    return died
+
+
+def run_r12_deny_coverage_sweep(fixtures: list[tuple[str, object]]) -> tuple[list[tuple[int, int]], dict[tuple[int, int], list[str]]]:
+    source = LEAD_GATE_LIB.read_text()
+    begin, end = _r12_sentinel_line_range(source)
+    positions = _r12_deny_if_positions(source, begin, end)
+    r12_fixtures = [(n, f) for n, f in fixtures if n.startswith("R12")]
+    per_arm: dict[tuple[int, int], list[str]] = {}
+    for pos in positions:
+        mutated = _r12_mutate_at(source, pos)
+        hooks_dir = _r12_mutant_hooks_dir(mutated)
+        per_arm[pos] = _r12_run_fixture_subset_against(hooks_dir, r12_fixtures)
+    return positions, per_arm
+
+
 FIXTURES = [
     ("G1", fixture_g1_first_round_never_gated),
     ("G2", fixture_g2_second_round_denied_worktree),
@@ -2942,6 +3124,8 @@ FIXTURES = [
     ("D1", fixture_d1_recognized_block_not_mislabeled_unrecognized),
     ("N6", fixture_n6_nothing_gated_when_no_block_anywhere),
     ("R10", fixture_r10_wiring),
+    ("R12timeout", fixture_r12timeout_settings_pins_above_self_bound),
+    ("R12alarm", fixture_r12alarm_self_bound_denies),
 ]
 
 
@@ -2989,10 +3173,34 @@ def self_test() -> int:
     return 0
 
 
+def r12_sweep_main() -> int:
+    """esc-lead-gate-R12 M5' — its OWN `swarm.yml` step, separate from
+    `--self-test` (mutating and re-running ~24 R12 fixtures per deny arm is
+    too slow to fold into the per-invocation self-test every unit's
+    pressure-tester/oracle round already re-runs)."""
+    start = time.monotonic()
+    positions, per_arm = run_r12_deny_coverage_sweep(FIXTURES)
+    elapsed = time.monotonic() - start
+    survivors = [pos for pos, died in per_arm.items() if not died]
+    print(f"check-lead-gate[R12-SWEEP]: {len(positions)} deny arm(s) swept in {elapsed:.2f}s "
+          f"({len(positions) - len(survivors)} killed by >=1 fixture, {len(survivors)} survivor(s))")
+    for pos in sorted(per_arm):
+        died = per_arm[pos]
+        print(f"  arm@line{pos[0]}: {'dies via ' + ', '.join(died) if died else 'SURVIVES (no dying fixture)'}")
+    if survivors:
+        print(f"check-lead-gate[R12-SWEEP]: FAIL — {len(survivors)} silent arm(s)", file=sys.stderr)
+        return 1
+    print(f"check-lead-gate[R12-SWEEP]: OK — every one of {len(positions)} deny arm(s) has a "
+          f"dying fixture ({elapsed:.2f}s)")
+    return 0
+
+
 def main() -> int:
+    if "--r12-sweep" in sys.argv[1:]:
+        return r12_sweep_main()
     if "--self-test" in sys.argv[1:]:
         return self_test()
-    print("check_lead_gate.py: usage: --self-test", file=sys.stderr)
+    print("check_lead_gate.py: usage: --self-test | --r12-sweep", file=sys.stderr)
     return 2
 
 

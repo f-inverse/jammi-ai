@@ -136,6 +136,21 @@ message SubmitJobRequest {
   // key can exceed (SQLite has none, so the two backends would otherwise
   // silently diverge on the exact same input).
   string idempotency_key = 6;
+  // Data-parallel rank count for the two LoRA fine-tune kinds: the wire form of
+  // the engine's `TrainingCommon.world_size`, which is why it sits beside
+  // `base_model`/`config` rather than inside a per-kind spec — both LoRA kinds
+  // fold the same common block, so one field serves both and the two kinds
+  // cannot diverge on it. Unused by the context-predictor kind (it carries no
+  // common block).
+  //
+  // `0` means UNSET and resolves to the engine's default of `1` (a single
+  // rank), so a caller that never sets it submits exactly the single-rank job
+  // it always did and a request encoded without the field decodes identically
+  // to one encoded with `0`. Identity-relevant, not a scheduling hint: the rank
+  // count fixes the batch layout and the summation order, so it is part of the
+  // trained model's producing identity. A count the deployment cannot serve is
+  // refused at submit with a typed error rather than silently clamped.
+  uint32 world_size = 7;
 }
 
 message SubmitJobResponse {

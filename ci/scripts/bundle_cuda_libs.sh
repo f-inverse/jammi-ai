@@ -133,12 +133,20 @@ bundle_resolve_soname() {
 # one per line. Arguments: the colon-separated search path, then the sonames to
 # start from (the binary's own `DT_NEEDED` list).
 #
-# For each soname that is not host-provided, EVERY versioned object of that
-# stem in the resolving directory is emitted — `libcudart.so.12` (the SONAME
-# the loader asks for) and `libcudart.so.12.6.77` (the real object the first is
-# a symlink to) alike — because `cp -L` of the SONAME alone would land a file
-# named for the SONAME whose own internal soname matches, but a sibling library
-# linked against the fully-versioned name would then find nothing. The closure
+# For each resolved, non-host soname, the exact resolved file (`$dir/$soname`)
+# is staged UNCONDITIONALLY — closing the unversioned-soname hole: a
+# `DT_NEEDED` entry that IS its own final object (`libfoo.so`, no trailing
+# version) can never match the stem glob below (`"$dir/$stem.so".*` demands a
+# LITERAL `.` immediately after `.so`, which `libfoo.so` itself, with nothing
+# after it, does not have), so relying on the glob alone would resolve the
+# soname (`-e "$dir/$soname"` passes) yet stage nothing and report nothing for
+# it — silence on a real `DT_NEEDED` entry the tarball genuinely cannot `exec`
+# without. EVERY versioned SIBLING object of that stem in the resolving
+# directory is ALSO emitted — `libcudart.so.12` (the SONAME the loader asks
+# for) and `libcudart.so.12.6.77` (the real object the first is a symlink to)
+# alike — because `cp -L` of the SONAME alone would land a file named for the
+# SONAME whose own internal soname matches, but a sibling library linked
+# against the fully-versioned name would then find nothing. The closure
 # continues through each resolved object's own `DT_NEEDED`.
 #
 # Fails (exit 1), naming every soname, if any non-host soname resolves nowhere
@@ -170,6 +178,10 @@ bundle_copy_sources() {
       continue
     fi
     resolved="$dir/$soname"
+    case "$sources" in
+      *"$resolved"$'\n'*) : ;;
+      *) sources="$sources$resolved"$'\n' ;;
+    esac
     stem="${soname%%.so*}"
     for so in "$dir/$stem.so".*; do
       [ -e "$so" ] || continue

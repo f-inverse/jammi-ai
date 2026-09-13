@@ -278,7 +278,24 @@ assert_contains "the unresolvable transitive soname is named" "$transitive_out" 
 install_fixture_needed
 
 # ---------------------------------------------------------------------------
-# 6. `bundle_main` end to end — the entry point the workflow calls. Nothing is
+# 6. The unversioned-soname hole (executed attack A1): a `DT_NEEDED` entry
+#    that IS its own final object (`libfoo.so`, no trailing version) present
+#    in the search dir. RED before this fix: the copy loop's stem glob
+#    (`"$dir/$stem.so".*`) demands a LITERAL `.` immediately after `.so`,
+#    which a bare `libfakeunversioned.so` — nothing after it — can never
+#    satisfy, so the soname resolved (`-e "$dir/$soname"` passed) yet was
+#    staged nowhere and reported nowhere: a silent omission on a real
+#    `DT_NEEDED` entry the tarball genuinely cannot `exec` without.
+# ---------------------------------------------------------------------------
+: >"${TOOLKIT}/libfakeunversioned.so"
+unver_sources="$(bundle_copy_sources "$SEARCH" libfakeunversioned.so)"
+unver_rc=$?
+assert_eq "an unversioned soname's derivation still succeeds" "$unver_rc" "0"
+assert_contains "an unversioned soname is copied by its exact resolved name" \
+  "$unver_sources" "${TOOLKIT}/libfakeunversioned.so"
+
+# ---------------------------------------------------------------------------
+# 7. `bundle_main` end to end — the entry point the workflow calls. Nothing is
 #    stubbed: the derivation and its copy step are pure filesystem operations
 #    over the fake tree, which is what makes them hermetic and exercisable
 #    through the real entry point rather than only in isolation.
@@ -301,6 +318,37 @@ empty_out="$(bundle_main "$BINARY" "${ROOT}/stage-empty" "$SEARCH" 2>&1)"
 empty_rc=$?
 assert_eq "a link set with nothing to bundle is refused" "$empty_rc" "1"
 assert_contains "the empty-set refusal explains itself" "$empty_out" "names no bundle-able DT_NEEDED library"
+install_fixture_needed
+
+# ---------------------------------------------------------------------------
+# 8. The "lead's own anticipation" run: `bundle_main` over a SYNTHETIC tree
+#    whose derived closure includes BOTH an unversioned soname AND the
+#    ordinary versioned objects, together, through the real entry point —
+#    not `bundle_copy_sources` in isolation. Reuses the same fixture tree
+#    plus the one extra unversioned file from step 6, injected as a genuine
+#    `DT_NEEDED` entry of the binary rather than only resolved directly.
+# ---------------------------------------------------------------------------
+UNVER_BINARY="${ROOT}/fake-jammi-server-unver"
+: >"$UNVER_BINARY"
+UNVER_STAGE="${ROOT}/stage-unver/lib"
+bundle_needed_sonames() {
+  case "$(basename "$1")" in
+    fake-jammi-server-unver) printf '%s\n' "$BINARY_NEEDED" "libfakeunversioned.so" ;;
+    libnvrtc.so.12) printf '%s\n' "libnvrtc-builtins.so.12.6" "libc.so.6" ;;
+    libnccl.so.2) printf '%s\n' "libc.so.6" ;;
+    *) : ;;
+  esac
+}
+main_unver_out="$(bundle_main "$UNVER_BINARY" "$UNVER_STAGE" "$SEARCH" 2>&1)"
+main_unver_rc=$?
+assert_eq "bundle_main succeeds over a tree with an unversioned soname AND ordinary versioned objects" \
+  "$main_unver_rc" "0"
+assert_eq "the unversioned soname is staged by its exact name" \
+  "$([ -f "${UNVER_STAGE}/libfakeunversioned.so" ] && echo yes || echo no)" "yes"
+assert_eq "an ordinary versioned-only object (cudart) is staged alongside it" \
+  "$([ -f "${UNVER_STAGE}/libcudart.so.12" ] && echo yes || echo no)" "yes"
+assert_eq "an ordinary versioned-only object (cudart's real object) is staged alongside it" \
+  "$([ -f "${UNVER_STAGE}/libcudart.so.12.6.77" ] && echo yes || echo no)" "yes"
 install_fixture_needed
 
 # ---------------------------------------------------------------------------

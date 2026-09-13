@@ -150,7 +150,11 @@ message SubmitJobRequest {
   // count fixes the batch layout and the summation order, so it is part of the
   // trained model's producing identity. A count the deployment cannot serve is
   // refused at submit with a typed error rather than silently clamped.
-  uint32 world_size = 7;
+  uint32 world_size = 9;
+  // Tags 7 and 8 belonged to the job-dependency unit (`depends_on = 7`,
+  // `parent_id = 8`), deferred to #515 and recoverable by cherry-pick; holding
+  // them means that recovery cannot collide with an appended field.
+  reserved 7, 8;
 }
 
 message SubmitJobResponse {

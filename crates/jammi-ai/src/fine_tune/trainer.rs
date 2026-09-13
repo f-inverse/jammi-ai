@@ -363,6 +363,16 @@ pub struct TrainingLoop {
     /// regression loss into a z-space the zero-initialised head can reach, while
     /// the head itself stays in raw space — so serving needs no de-standardisation.
     target_scaler: Option<TargetScaler>,
+    /// The data-parallel world this run's step formula indexes by
+    /// (DESIGN.md §2: `batches_per_epoch = ceil(train_count / (W·B))`, every
+    /// step quantity indexed by the GLOBAL batch). Defaults to `1` — every
+    /// existing call site that never calls [`TrainingLoopBuilder::world_size`]
+    /// keeps today's per-rank-only formula byte-for-byte (the W=1 parity
+    /// oracle: [`super::partition::batches_per_epoch`] at `world = 1` equals
+    /// [`TrainingDataLoader::num_batches`] for every batch size). U2b lands
+    /// the formula at this fixed `1`; U4b is what would ever set it above 1,
+    /// once the worker actually spawns more than one rank.
+    world_size: usize,
     /// The task this run trains for. It is the DISCRIMINATOR for the media
     /// paths: a `MediaTriplet` chunk carries three binary columns whose
     /// modality the columns themselves cannot express (an encoded WAV and an
@@ -454,6 +464,8 @@ pub struct TrainingLoopBuilder {
     resume: Option<RestoredCheckpoint>,
     /// See [`TrainingLoop::tenant`]. Defaults to `None`.
     tenant: Option<TenantId>,
+    /// See [`TrainingLoop::world_size`]. Defaults to `1`.
+    world_size: usize,
 }
 
 impl TrainingLoopBuilder {
@@ -479,7 +491,16 @@ impl TrainingLoopBuilder {
             artifact_store: None,
             resume: None,
             tenant: None,
+            world_size: 1,
         }
+    }
+
+    /// Set the data-parallel world this run's global-batch step formula
+    /// indexes by. Omit it for a single-rank run (defaults to `1`, today's
+    /// only reachable value — see [`TrainingLoop::world_size`]).
+    pub fn world_size(mut self, world_size: usize) -> Self {
+        self.world_size = world_size;
+        self
     }
 
     /// Set the job's tenant — the first prefix segment every checkpoint this
@@ -619,6 +640,7 @@ impl TrainingLoopBuilder {
             training_mode: false,
             divergence_count: 0,
             target_scaler: None,
+            world_size: self.world_size.max(1),
             task: self.task,
             device: self.device,
             cancel: self.cancel,
@@ -846,7 +868,29 @@ impl TrainingLoop {
         // step the loop takes, and makes the reported `result.total_steps` equal
         // this horizon. Computed after the train/validation split, since
         // `validation_fraction` changes `train_batches_per_epoch`.
-        let train_batches_per_epoch = train_loader.num_batches(self.config.batch_size);
+        // DESIGN.md §2: `batches_per_epoch = ceil(train_count / (W·B))`, every
+        // step quantity (this, the LR horizon via `total_steps` below, and the
+        // trailing-window scale via `EpochContext::batches_per_epoch`) indexed
+        // by the GLOBAL batch. At `self.world_size == 1` (every reachable
+        // value today) this is byte-identical to `train_loader.num_batches
+        // (self.config.batch_size)` — the W=1 parity oracle
+        // `partition::batches_per_epoch_at_world_one_matches_div_ceil` pins.
+        //
+        // The `Precomputed` test arm is split BY BATCH COUNT, not by row
+        // count (`TrainingDataLoader::num_batches` returns `batches.len()`
+        // directly there, ignoring `batch_size` — each precomputed entry IS
+        // already one batch), so the row-count-based formula does not apply
+        // to it; it stays on `num_batches` unchanged (DESIGN.md §2, PRESSURE
+        // round-2 design finding 7).
+        let train_batches_per_epoch = if train_loader.is_precomputed() {
+            train_loader.num_batches(self.config.batch_size)
+        } else {
+            super::partition::batches_per_epoch(
+                train_loader.len(),
+                self.world_size,
+                self.config.batch_size,
+            )
+        };
         let total_steps = train_batches_per_epoch
             .div_ceil(self.config.gradient_accumulation_steps.max(1))
             * self.config.epochs;

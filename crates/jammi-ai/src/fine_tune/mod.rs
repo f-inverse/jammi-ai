@@ -29,6 +29,8 @@ pub mod lora;
 #[cfg(feature = "local")]
 pub mod optimizer;
 #[cfg(feature = "local")]
+pub mod partition;
+#[cfg(feature = "local")]
 pub(crate) mod regression_loss;
 #[cfg(feature = "local")]
 pub mod resume;

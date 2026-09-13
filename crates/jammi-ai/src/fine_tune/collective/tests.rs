@@ -790,6 +790,44 @@ fn probe_a1_a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
     }
 }
 
+/// A second missing end-to-end oracle found while re-aiming the per-field
+/// sweep at the descriptor constructors (fix round 4, item 6): `all_gather`'s
+/// TRAILING shape is a descriptor determinant (`TensorSignature::of_gather_slice`
+/// drops only dim 0, which `counts` already governs) but, before this test,
+/// no end-to-end case exercised it — a mutation that replaced the
+/// constructor's `tensors` field with an empty vector left every other test
+/// in this file passing. Two ranks pass the SAME `counts` (so neither rank's
+/// own row-count check catches anything) but a DIFFERENT trailing shape —
+/// rank 0 a `[1, 2]` tensor, rank 1 a `[1, 3]` tensor — so only the
+/// descriptor's `tensors` field can catch the disagreement, symmetrically,
+/// before either rank is folded into a concatenation the other never agreed
+/// to the shape of.
+#[test]
+fn a_two_rank_all_gather_with_a_trailing_shape_mismatch_at_equal_counts_faults_both_ranks_symmetrically(
+) {
+    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
+        let cols = if local.rank() == 0 { 2 } else { 3 };
+        local
+            .all_gather(&matrix(1, cols, 0.0), &[1, 1])
+            .map(|t| t.dims().to_vec())
+            .map_err(|e| e.to_string())
+    });
+    for (rank, result) in results.iter().enumerate() {
+        let error = match result {
+            Err(error) => error,
+            Ok(dims) => panic!(
+                "rank {rank} returned Ok(dims = {dims:?}) from a gather the peer's trailing \
+                 shape disagreed with — equal counts must not excuse a differently shaped \
+                 tensor at each rank"
+            ),
+        };
+        assert!(
+            error.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {error}"
+        );
+    }
+}
+
 /// A reachability probe (not one of the auditor's numbered probes): three
 /// ranks name an ASYMMETRIC set of roots for `broadcast` — two agree with
 /// each other, one disagrees — so more than one rank's `Contribution` carries
@@ -944,4 +982,63 @@ fn a_third_attempt_two_ranks_agree_a_third_disagrees_on_dtype_still_faults_every
             "rank {rank}: unexpected message: {error}"
         );
     }
+}
+
+/// The missing end-to-end oracle for `all_reduce_sum`'s SHAPE determinant
+/// (fix round 4, item 6): a two-rank gang where rank 0 reduces a `[2, 2]`
+/// tensor and rank 1 a `[2, 3]` tensor at the same trainable-variable index.
+/// Neither rank's own tensor is internally inconsistent — each is a valid
+/// shape for a reduce on its own — so only the round descriptor's per-tensor
+/// `TensorSignature` catches the disagreement, symmetrically, before either
+/// rank is folded into the other's sum (which `Tensor::add` would refuse
+/// with a backend error anyway, but only for the rank unlucky enough to
+/// reach the fold — the descriptor check refuses BOTH, before the fold ever
+/// runs, and leaves the gang faulted for every collective after this one).
+#[test]
+fn a_two_rank_all_reduce_sum_with_a_per_tensor_shape_mismatch_faults_both_ranks_symmetrically() {
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    let results = std::thread::scope(|scope| {
+        let a = scope.spawn(move || {
+            let mut tensors = vec![matrix(2, 2, 0.0)];
+            rank0
+                .all_reduce_sum(&mut tensors)
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        let b = scope.spawn(move || {
+            let mut tensors = vec![matrix(2, 3, 0.0)];
+            rank1
+                .all_reduce_sum(&mut tensors)
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        [
+            a.join().expect("rank 0 thread"),
+            b.join().expect("rank 1 thread"),
+        ]
+    });
+
+    for (rank, message) in results.iter().enumerate() {
+        assert!(
+            !message.is_empty(),
+            "rank {rank} returned Ok from a reduce the peer's shape disagreed with"
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {message}"
+        );
+    }
+
+    // The gang is left faulted: a fresh handle's next collective refuses.
+    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+    let refused = after_fault
+        .barrier()
+        .expect_err("the gang must stay faulted after the shape mismatch");
+    assert!(
+        refused.to_string().contains("the gang has already failed"),
+        "unexpected message: {refused}"
+    );
 }

@@ -1988,6 +1988,292 @@ def fixture_r12p12_computed_cwd_not_project_dir() -> None:
             f"linked worktree on another branch, got {p.returncode}: {p.stderr}")
 
 
+def fixture_r12p13_bash_nonexistent_path_denies_via_dispatch() -> None:
+    """The `_r12_attack_command_denied` "does not resolve to a real,
+    existing file" arm, exercised through the REAL subprocess dispatch
+    path (never merely the direct in-process call R12D1 makes, which loads
+    a cached module reference and cannot observe an AST-mutated copy)."""
+    unit = "feat/r12p13"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "bash this-does-not-exist-r12p13.sh", "hash": "a" * 64},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P13", f"a bash command naming a nonexistent script must deny, got {p.returncode}")
+    _assert("does not resolve to a real, existing file" in p.stderr, "R12P13", p.stderr)
+
+
+def fixture_r12p14_git_subcommand_denied_via_dispatch() -> None:
+    unit = "feat/r12p14"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "git reset --hard", "hash": "a" * 64},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P14", f"a denied git subcommand must deny, got {p.returncode}")
+    _assert("denied git subcommand" in p.stderr, "R12P14", p.stderr)
+
+
+def fixture_r12p15_find_delete_denied_via_dispatch() -> None:
+    unit = "feat/r12p15"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "find . -delete", "hash": "a" * 64},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P15", f"find with -delete must deny, got {p.returncode}")
+    _assert("-delete/-exec/-execdir is denied" in p.stderr, "R12P15", p.stderr)
+
+
+def _r12_empty_set_repo(unit: str) -> Path:
+    """A real repo whose unit branch has committed TWO real changes over
+    `main` (`a.py`, `b.py`) — the changed-file set an empty-derived-set
+    lead-chosen key must name a member of."""
+    root = _temp_repo(unit)
+    (root / "a.py").write_text("a = 1\n")
+    (root / "b.py").write_text("b = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "the unit's own changes: a.py, b.py")
+    return root
+
+
+def fixture_r12e1_empty_derived_set_fewer_than_two_keys_denies() -> None:
+    """M2': an `uncertain` BLOCK with NO `finding_locations`/
+    `class_enumeration` at all reaches `_r12_empty_set_rejection` — a
+    single lead-chosen key is not enough (needs >=2)."""
+    unit = "feat/r12e1"
+    root = _r12_empty_set_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E1", f"fewer than 2 lead-chosen keys must deny, got {p.returncode}")
+    _assert("fewer than 2 lead-chosen" in p.stderr, "R12E1", p.stderr)
+
+
+def fixture_r12e2_empty_derived_set_key_outside_changed_files_denies() -> None:
+    """M2': a lead-chosen key naming a file the unit did NOT actually
+    change (against `main`) denies, even with >=2 keys total."""
+    unit = "feat/r12e2"
+    root = _r12_empty_set_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    a = _auto_r12_attack("a.py")
+    z = _auto_r12_attack("z.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        "z.py": {"command": z["command"], "hash": z["hash"]},  # z.py was never touched
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E2", f"a key outside the changed-file set must deny, got {p.returncode}")
+    _assert("is not in the unit's own changed-file set" in p.stderr, "R12E2", p.stderr)
+
+
+def fixture_r12e3_empty_derived_set_all_inspector_denies() -> None:
+    """M2': >=2 lead-chosen keys, both naming real changed files, both
+    inspector-class (`cat`) — denies naming inspector-only."""
+    unit = "feat/r12e3"
+    root = _r12_empty_set_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    a_hash = _r12_hash(0, "a = 1\n", "")
+    b_hash = _r12_hash(0, "b = 1\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "cat a.py", "hash": a_hash},
+        "b.py": {"command": "cat b.py", "hash": b_hash},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E3", f"an all-inspector empty-set artifact must deny, got {p.returncode}")
+    _assert("carries only inspector-class commands" in p.stderr, "R12E3", p.stderr)
+
+
+def fixture_r12e4_empty_derived_set_two_valid_execution_class_allows() -> None:
+    """M2': the satisfiable case — >=2 lead-chosen keys, both real changed
+    files, at least one execution-class (a real script), distinct
+    commands/hashes — ALLOWS."""
+    unit = "feat/r12e4"
+    root = _r12_empty_set_repo(unit)
+    (root / "probe.sh").write_text("#!/bin/sh\nprintf ok\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add probe.sh")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    h_ok = _r12_hash(0, "ok", "")
+    b_hash = _r12_hash(0, "b = 1\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "bash probe.sh", "hash": h_ok},
+        "b.py": {"command": "cat b.py", "hash": b_hash},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 0, "R12E4", f"two valid, changed-file, execution-class-including keys must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12e5_empty_derived_set_unresolvable_main_denies() -> None:
+    """M2': when neither `main` nor `master` resolves at all (a repo whose
+    default branch has neither name), the changed-file set cannot be
+    derived — denies naming it, never silently bypassed."""
+    unit = "feat/r12e5"
+    root = _fresh_root()
+    _git(root, "init", "-q", "-b", "trunk")
+    _git(root, "config", "commit.gpgsign", "false")
+    (root / ".gitignore").write_text(".jammi/\n")
+    (root / "a.py").write_text("a = 1\n")
+    (root / "b.py").write_text("b = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed on trunk")
+    _git(root, "checkout", "-q", "-b", unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    a = _auto_r12_attack("a.py")
+    b = _auto_r12_attack("b.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        "b.py": {"command": b["command"], "hash": b["hash"]},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E5", f"an unresolvable main/master must deny, got {p.returncode}")
+    _assert("could not resolve a merge-base against main/master" in p.stderr, "R12E5", p.stderr)
+
+
+def fixture_r12f1_pre_fix_sha_mismatch_denies() -> None:
+    """The artifact is found at the CORRECT tip-keyed filename, but its OWN
+    internal `pre_fix_sha` field (a forged or copy-pasted artifact) does
+    not match — denies, distinct from the "no artifact" / "tip moved"
+    arms."""
+    unit = "feat/r12f1"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    path = _anticipation_path_exact(root, unit, row["head_sha"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "unit_branch": unit, "pre_fix_sha": "0" * 40,  # forged, does not match the filename's own tip
+        "attacks": {"a.py": {"command": a["command"], "hash": a["hash"]}},
+        "residual_risk": "fixture residual",
+    }))
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12F1", f"a pre_fix_sha mismatch must deny, got {p.returncode}")
+    _assert("does not match its own filename's tip" in p.stderr, "R12F1", p.stderr)
+
+
+def fixture_r12f2_unit_branch_field_mismatch_denies() -> None:
+    unit = "feat/r12f2"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    path = _anticipation_path_exact(root, unit, row["head_sha"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "unit_branch": "feat/some-other-unit", "pre_fix_sha": row["head_sha"],
+        "attacks": {"a.py": {"command": a["command"], "hash": a["hash"]}},
+        "residual_risk": "fixture residual",
+    }))
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12F2", f"a mismatched unit_branch field must deny, got {p.returncode}")
+    _assert("`unit_branch` does not name this unit" in p.stderr, "R12F2", p.stderr)
+
+
+def fixture_r12f3_missing_residual_risk_denies() -> None:
+    unit = "feat/r12f3"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"],
+                               {"a.py": {"command": a["command"], "hash": a["hash"]}},
+                               residual_risk=None)
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12F3", f"a missing residual_risk must deny, got {p.returncode}")
+    _assert("carries no non-empty `residual_risk`" in p.stderr, "R12F3", p.stderr)
+
+
+def fixture_r12f4_non_dict_json_artifact_denies() -> None:
+    unit = "feat/r12f4"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    path = _anticipation_path_exact(root, unit, row["head_sha"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(["not", "an", "object"]))
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12F4", f"a non-object JSON artifact must deny, got {p.returncode}")
+    _assert("is not a JSON object" in p.stderr, "R12F4", p.stderr)
+
+
+def fixture_r12f5_attacks_field_missing_denies() -> None:
+    unit = "feat/r12f5"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    path = _anticipation_path_exact(root, unit, row["head_sha"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "unit_branch": unit, "pre_fix_sha": row["head_sha"], "residual_risk": "fixture",
+        # `attacks` deliberately omitted.
+    }))
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12F5", f"a missing `attacks` object must deny, got {p.returncode}")
+    _assert("carries no `attacks` object" in p.stderr, "R12F5", p.stderr)
+
+
+def fixture_r12r2f_partial_attacks_post_coverage_denies() -> None:
+    """Reader 2: an artifact covering TWO required files, but the relay's
+    `attacks_post` covers only ONE — denied, naming the omission (never
+    satisfied by partial coverage)."""
+    unit = "feat/r12r2f"
+    root = _temp_repo(unit)
+    (root / "a.py").write_text("a = 1\n")
+    (root / "b.py").write_text("b = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed a.py, b.py")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1", "b.py:2"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    b = _auto_r12_attack("b.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        "b.py": {"command": b["command"], "hash": b["hash"]},
+    })
+    (root / "a.py").write_text("a = 2\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: change a.py only")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    a_post_hash = _r12_hash(0, "a = 2\n", "")
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "n/a"}, probe=["c.py:9", "a.py"],
+                        fix_head=fix_head,
+                        attacks_post={"a.py": {"command": "cat a.py", "hash": a_post_hash}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2f"}}, root)
+    _assert(p.returncode == 2, "R12R2f", f"partial attacks_post coverage must deny, got {p.returncode}")
+    _assert("omits" in p.stderr and "required site" in p.stderr, "R12R2f", p.stderr)
+
+
+def fixture_r12r2g_attacks_post_entry_not_object_denies() -> None:
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2g")
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head, attacks_post={"state.txt": "not-an-object"})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2g"}}, root)
+    _assert(p.returncode == 2, "R12R2g", f"a non-object attacks_post entry must deny, got {p.returncode}")
+    _assert("is not an object" in p.stderr, "R12R2g", p.stderr)
+
+
+def fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies() -> None:
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2h")
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    different_cmd = "head -c4 state.txt"
+    post_hash = _r12_hash(0, "FIXE", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": different_cmd, "hash": post_hash}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2h"}}, root)
+    _assert(p.returncode == 2, "R12R2h", f"a differing post-fix command must deny, got {p.returncode}")
+    _assert("requires the SAME command" in p.stderr, "R12R2h", p.stderr)
+
+
 def fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh() -> None:
     """The relaxed denylist admits ONLY `sh|bash <existing repo path>`
     (with no further arguments) — `bash -c '...'` and `curl ... | sh`
@@ -3116,6 +3402,22 @@ FIXTURES = [
     ("R12P11", fixture_r12p11_two_open_blocks_different_shas_still_satisfiable),
     ("R12P11b", fixture_r12p11b_union_still_requires_the_older_blocks_own_keys),
     ("R12P12", fixture_r12p12_computed_cwd_not_project_dir),
+    ("R12P13", fixture_r12p13_bash_nonexistent_path_denies_via_dispatch),
+    ("R12P14", fixture_r12p14_git_subcommand_denied_via_dispatch),
+    ("R12P15", fixture_r12p15_find_delete_denied_via_dispatch),
+    ("R12E1", fixture_r12e1_empty_derived_set_fewer_than_two_keys_denies),
+    ("R12E2", fixture_r12e2_empty_derived_set_key_outside_changed_files_denies),
+    ("R12E3", fixture_r12e3_empty_derived_set_all_inspector_denies),
+    ("R12E4", fixture_r12e4_empty_derived_set_two_valid_execution_class_allows),
+    ("R12E5", fixture_r12e5_empty_derived_set_unresolvable_main_denies),
+    ("R12F1", fixture_r12f1_pre_fix_sha_mismatch_denies),
+    ("R12F2", fixture_r12f2_unit_branch_field_mismatch_denies),
+    ("R12F3", fixture_r12f3_missing_residual_risk_denies),
+    ("R12F4", fixture_r12f4_non_dict_json_artifact_denies),
+    ("R12F5", fixture_r12f5_attacks_field_missing_denies),
+    ("R12R2f", fixture_r12r2f_partial_attacks_post_coverage_denies),
+    ("R12R2g", fixture_r12r2g_attacks_post_entry_not_object_denies),
+    ("R12R2h", fixture_r12r2h_attacks_post_command_differs_from_pre_fix_denies),
     ("R12D1", fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh),
     ("R12R2a", fixture_r12r2a_missing_attacks_post_denies),
     ("R12R2b", fixture_r12r2b_no_differential_denies),

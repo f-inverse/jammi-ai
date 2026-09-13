@@ -2471,23 +2471,168 @@ fn allowlists_match_current_hits_exactly() {
 // allowance list here: the target count is zero, unconditionally, so a
 // future re-introduction of session-scoped registration under `fine_tune/`
 // fails this test rather than needing a reviewed entry.
+//
+// **Round 5 (this fix) — the escape.** The original two-literal detector
+// (`register_table(`/`deregister_table(`) went GREEN with
+// `ctx.register_batch("lead_probe", b)` appended to `fine_tune/data.rs`,
+// because `SessionContext::register_batch` (DataFusion 54.1.0,
+// `execution/context/mod.rs:537`) is a one-line wrapper —
+// `MemTable::try_new(..)` then `self.register_table(table_ref, Arc::new(table))`
+// at `mod.rs:543` — that binds the exact same shared-session table name, one
+// call deeper than the literal string the old detector searched for. The
+// class this oracle exists to enforce was never "the two literal spellings
+// `register_table`/`deregister_table`"; it is, per the audit's own words, "a
+// per-call resource bound to the shared SessionContext under a token that is
+// not unique per call" — and `SessionContext` exposes many more verbs shaped
+// exactly like that.
+//
+// **The whole verb surface, enumerated from the pinned source
+// (`datafusion = "54.1"`, locked at `54.1.0` in `Cargo.lock`;
+// `~/.cargo/registry/.../datafusion-54.1.0/src/execution/context/`), not
+// hand-guessed** — every `pub fn`/`pub async fn` on `SessionContext` whose
+// name starts `register_`/`deregister_`:
+//
+// IN — binds a resource under an explicit, caller-chosen token (a
+// `TableReference`/`String`/`Url`/`&str`, distinct from the value being
+// registered) into the shared session (or its shared `RuntimeEnv`), so two
+// overlapping calls under the same token collide the same way
+// `register_table` does under reclaim:
+//   - `register_table`/`deregister_table` (`mod.rs:1925,1941`) — the
+//     original pair; keyed by `table_ref: impl Into<TableReference>`.
+//   - `register_batch` (`mod.rs:537`) — a one-line wrapper that calls
+//     `self.register_table(table_ref, ..)` at `mod.rs:543`; same
+//     `table_ref` token, one call removed. The escape this fix closes.
+//   - `register_listing_table` (`mod.rs:1823`) — also calls
+//     `self.register_table(table_ref, Arc::new(table))?` directly
+//     (`mod.rs:1844`); same token.
+//   - `register_arrow` (`mod.rs:1873`), `register_csv`
+//     (`execution/context/csv.rs:63`), `register_json`
+//     (`execution/context/json.rs:42`), `register_parquet`
+//     (`execution/context/parquet.rs:66`), `register_avro`
+//     (`execution/context/avro.rs:40`) — each is a thin format-specific
+//     wrapper that builds `ListingOptions` and calls
+//     `self.register_listing_table(table_ref, ..)`; same `table_ref` token,
+//     two calls removed.
+//   - `register_catalog` (`mod.rs:1898`) — binds `name: impl Into<String>`
+//     into the shared `catalog_list()`; a second call with the same name
+//     silently replaces the first ("Returns the CatalogProvider previously
+//     registered for this name, if any"), so a caller that discards the
+//     return value has no signal a collision even happened.
+//   - `register_object_store`/`deregister_object_store` (`mod.rs:521,532`)
+//     — bind `url: &Url` into the shared `RuntimeEnv`, itself shared across
+//     every `SessionContext` built from it.
+//   - `register_udtf`/`deregister_udtf` (`mod.rs:1603,1693`) —
+//     `register_udtf(&self, name: &str, ..)` takes an explicit `name`
+//     token, the identical shape to `register_table`.
+//   - `register_udf`/`deregister_udf` (`mod.rs:1616,1670`),
+//     `register_udaf`/`deregister_udaf` (`mod.rs:1642,1683`),
+//     `register_udwf`/`deregister_udwf` (`mod.rs:1653,1688`) — the token is
+//     the function's own `.name()` rather than a separate parameter, but it
+//     is still a caller-determined string bound into the shared session's
+//     function registry, and `register_udf`'s own doc states the collision
+//     outcome directly (`mod.rs:1614`): "Any functions registered with the
+//     udf name or its aliases will be OVERWRITTEN with this new function" —
+//     the same silent-overwrite failure `register_catalog` has, not merely
+//     an analogy.
+//   - `register_higher_order_function`/`deregister_higher_order_function`
+//     (`mod.rs:1630,1675`) — same shape as `register_udf`, one indirection
+//     further (`HigherOrderUDF`'s own name).
+//
+// OUT — no caller-chosen per-resource token exists at all, so there is no
+// name a `fine_tune/` arm could pick non-uniquely and no reclaim-shaped
+// collision is possible regardless of call count; each is checked directly
+// by `falsification_fine_tune_session_registration_is_detected_and_scoped`'s
+// negative control, not merely omitted:
+//   - `register_variable` (`mod.rs:1591`) — keyed by `VarType`, a two-value
+//     enum (`System`/`UserDefined`), never a caller string; a fixed,
+//     session-wide config slot, not a per-job/per-spec resource namespace.
+//   - `register_relation_planner` (`mod.rs:1662`) — appends to an ordered
+//     `Vec` of planners ("Planners are invoked in reverse registration
+//     order"); there is no name to collide on and no way for a second
+//     registration to replace or interfere with the first.
+//   - `register_catalog_list` (`mod.rs:2053`) — replaces the WHOLE
+//     `CatalogProviderList` in one call; a single global slot, not a
+//     per-resource token — the same shape as `add_analyzer_rule`, session
+//     configuration rather than a named per-call resource.
+//   - `register_table_options_extension::<T>` (`mod.rs:2059`) — keyed by
+//     the extension type's own `TypeId` (a generic parameter), never a
+//     caller-supplied string; nothing under `fine_tune/` picks the Rust
+//     TYPE it instantiates per job or per spec.
 
-/// Every literal `register_table(`/`deregister_table(` call site under
-/// `crates/jammi-ai/src/fine_tune/**`, on the masked surface (so a doc
-/// comment or a string literal that merely NAMES the method, e.g. this
-/// file's own module doc, is never mistaken for a call).
-///
-/// `deregister_table(` is checked BEFORE `register_table(`, and as an
-/// `else if`: the string `"register_table("` is itself a substring of
-/// `"deregister_table("` (`de` + `register_table(`), so a line-by-line `if`/
-/// `if` would double-count every `deregister_table(` call as a
-/// `register_table(` hit too. This only under-counts a line that genuinely
-/// calls both methods side by side, which does not change the property this
-/// gate checks: the target is exactly zero, and any real hit already fails
-/// it regardless of how many are on one line.
+/// DataFusion `SessionContext` verbs (54.1.0) with BOTH a `register_`/
+/// `deregister_` form, both binding the shared session under the SAME
+/// caller-chosen token — see the module-level comment above this section for
+/// why each of these seven is IN scope.
+const PAIRED_REGISTRATION_VERBS: &[&str] = &[
+    "table",
+    "object_store",
+    "udtf",
+    "udf",
+    "udaf",
+    "udwf",
+    "higher_order_function",
+];
+
+/// DataFusion `SessionContext` verbs (54.1.0) with only a `register_` form
+/// (no matching `deregister_`), each binding the shared session under a
+/// caller-chosen token — see the module-level comment above for why each of
+/// these eight is IN scope.
+const UNPAIRED_REGISTRATION_VERBS: &[&str] = &[
+    "batch",
+    "csv",
+    "json",
+    "parquet",
+    "avro",
+    "listing_table",
+    "arrow",
+    "catalog",
+];
+
+/// The four DataFusion `SessionContext` verbs (54.1.0) this gate deliberately
+/// does NOT flag — see the module-level comment above for why each has no
+/// caller-chosen per-call token to collide on.
+const EXCLUDED_REGISTRATION_VERB_LITERALS: &[&str] = &[
+    "register_variable(",
+    "register_relation_planner(",
+    "register_catalog_list(",
+    "register_table_options_extension(",
+];
+
+/// Every literal call-site pattern [`fine_tune_session_registration_hits`]
+/// treats as in-scope, derived from [`PAIRED_REGISTRATION_VERBS`] and
+/// [`UNPAIRED_REGISTRATION_VERBS`] — the SAME two arrays the detector reads,
+/// so the falsification test's expected set can never drift from what the
+/// detector actually checks (the caller-set-claim drift this file's own
+/// round 9 note names for `callers_of`, applied here to a literal set
+/// instead of a caller set).
+fn included_registration_literals() -> Vec<String> {
+    let mut out = Vec::new();
+    for verb in PAIRED_REGISTRATION_VERBS {
+        out.push(format!("register_{verb}("));
+        out.push(format!("deregister_{verb}("));
+    }
+    for verb in UNPAIRED_REGISTRATION_VERBS {
+        out.push(format!("register_{verb}("));
+    }
+    out
+}
+
+/// Every hit of the class above under `crates/jammi-ai/src/fine_tune/**`, on
+/// the masked surface (so a doc comment or a string literal that merely
+/// NAMES a method, e.g. this file's own module comment, is never mistaken
+/// for a call). For each [`PAIRED_REGISTRATION_VERBS`] entry, the
+/// `deregister_` form is checked BEFORE the `register_` form on the same
+/// line: `"register_X("` is itself a substring of `"deregister_X("` (`de` +
+/// `register_X(`), so checking both unconditionally would double-count every
+/// `deregister_X(` call as a `register_X(` hit too — the SAME reasoning the
+/// original two-verb version used for `table`, now applied per paired verb.
+/// Checked exhaustively rather than assumed: no other pair among the full
+/// 22-literal surface is a substring of another (see
+/// [`falsification_no_included_literal_is_a_substring_of_another_unless_the_declared_pair`],
+/// below), so no other verb needs this ordering.
 fn fine_tune_session_registration_hits(
     surface: &[(String, String)],
-) -> Vec<(String, usize, &'static str)> {
+) -> Vec<(String, usize, String)> {
     let mut hits = Vec::new();
     for (file, text) in surface {
         if !file.starts_with("crates/jammi-ai/src/fine_tune/") {
@@ -2495,10 +2640,21 @@ fn fine_tune_session_registration_hits(
         }
         let masked = mask_non_code(text);
         for (line_idx, line) in masked.lines().enumerate() {
-            if line.contains("deregister_table(") {
-                hits.push((file.clone(), line_idx + 1, "deregister_table("));
-            } else if line.contains("register_table(") {
-                hits.push((file.clone(), line_idx + 1, "register_table("));
+            let line_no = line_idx + 1;
+            for verb in PAIRED_REGISTRATION_VERBS {
+                let de_pat = format!("deregister_{verb}(");
+                let re_pat = format!("register_{verb}(");
+                if line.contains(de_pat.as_str()) {
+                    hits.push((file.clone(), line_no, de_pat));
+                } else if line.contains(re_pat.as_str()) {
+                    hits.push((file.clone(), line_no, re_pat));
+                }
+            }
+            for verb in UNPAIRED_REGISTRATION_VERBS {
+                let re_pat = format!("register_{verb}(");
+                if line.contains(re_pat.as_str()) {
+                    hits.push((file.clone(), line_no, re_pat));
+                }
             }
         }
     }
@@ -2507,11 +2663,13 @@ fn fine_tune_session_registration_hits(
 
 /// RED at `fe96bf39` (the excised commit's parent): `training_set.rs` had a
 /// `ctx.register_table(relation.as_str(), ...)` call and `DeregisterOnDrop`'s
-/// `self.ctx.deregister_table(...)` — two hits. GREEN once the guard and its
-/// `MemTable` machinery are removed and the graph arm reverts to sampling in
-/// memory: zero hits, unconditionally, no allowlist.
+/// `self.ctx.deregister_table(...)` — two hits under the original two-verb
+/// detector. GREEN once the guard and its `MemTable` machinery are removed
+/// and the graph arm reverts to sampling in memory: zero hits,
+/// unconditionally, no allowlist — now checked against the full 22-literal
+/// verb surface above, not only `register_table`/`deregister_table`.
 #[test]
-fn no_session_table_registration_under_fine_tune() {
+fn no_session_registration_under_fine_tune() {
     let surface = scan_surface();
     let hits = fine_tune_session_registration_hits(&surface);
     assert!(
@@ -2523,28 +2681,48 @@ fn no_session_table_registration_under_fine_tune() {
     );
 }
 
-/// Falsification (R-A): the detector above must actually fire on the exact
-/// shape it is supposed to catch, in a synthetic file scoped as if it lived
-/// under `fine_tune/`, and must NOT fire on a file outside that directory or
-/// on a comment merely mentioning the method names.
+/// Falsification (R-A): every INCLUDED verb literal must fire the detector
+/// on its own line, scoped to `fine_tune/`, and masked out of a comment; and
+/// every EXCLUDED verb literal (a real `SessionContext` registration method
+/// this gate deliberately does not police) must NOT fire even when called
+/// from inside `fine_tune/` — proving the OUT decision by running the exact
+/// call shape through the detector, not merely by omitting it from the
+/// include list.
 #[test]
 fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
-    let hit_src = concat!(
-        "\n",
-        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_session_registration_hits` — synthetic producer text fed to that detector, not real code in this file
-        "async fn materialize_something(ctx: &SessionContext) {\n",
-        "    ctx.register_table(\"jammi_sampled_pairs:x:y\", provider).unwrap();\n",
-        "    ctx.deregister_table(\"jammi_sampled_pairs:x:y\").unwrap();\n",
-        "}\n",
+    let included = included_registration_literals();
+    assert_eq!(
+        included.len(),
+        22,
+        "expected 7 paired verbs * 2 forms + 8 unpaired verbs = 22 literals; the module-level \
+         doc's IN enumeration and PAIRED_REGISTRATION_VERBS/UNPAIRED_REGISTRATION_VERBS have \
+         drifted apart if this count changes without both being updated together"
     );
-    let hits = fine_tune_session_registration_hits(&[(
+
+    // One call per included literal, each on its own line inside its own
+    // synthetic function, scoped as if it lived under `fine_tune/`.
+    let mut hit_src = String::from("\n");
+    for lit in &included {
+        hit_src.push_str(&format!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_session_registration_hits` — synthetic producer text fed to that detector, not real code in this file
+            "async fn synthetic(ctx: &SessionContext) {{\n    ctx.{lit}ARG).unwrap();\n}}\n"
+        ));
+    }
+    let surface = [(
         "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
-        hit_src.to_string(),
-    )]);
+        hit_src.clone(),
+    )];
+    let hits = fine_tune_session_registration_hits(&surface);
     assert_eq!(
         hits.len(),
-        2,
-        "the detector must find both the register and the deregister call, got {hits:?}"
+        included.len(),
+        "expected exactly one hit per included verb literal, got {hits:?}"
+    );
+    let found: BTreeSet<String> = hits.iter().map(|(_, _, lit)| lit.clone()).collect();
+    let expected: BTreeSet<String> = included.iter().cloned().collect();
+    assert_eq!(
+        found, expected,
+        "every included verb literal must fire the detector on its own falsification line"
     );
 
     // Same text, a file OUTSIDE fine_tune/ — must not count (this gate's
@@ -2552,22 +2730,83 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     // whole crate).
     let outside_hits = fine_tune_session_registration_hits(&[(
         "crates/jammi-ai/src/pipeline/embedding.rs".to_string(),
-        hit_src.to_string(),
+        hit_src.clone(),
     )]);
     assert!(
         outside_hits.is_empty(),
         "a hit outside the fine_tune tree must not be counted, got {outside_hits:?}"
     );
 
-    // A comment naming the methods, never calling them — must not count
-    // (masked out, same discipline `session_registration_literal_sites` uses).
-    let comment_src = "// see ctx.register_table( and ctx.deregister_table( for context\n";
+    // A comment naming every included method, never calling it — must not
+    // count (masked out, same discipline `session_registration_literal_sites`
+    // uses).
+    let mut comment_src = String::new();
+    for lit in &included {
+        comment_src.push_str(&format!("// see ctx.{lit} for context\n"));
+    }
     let comment_hits = fine_tune_session_registration_hits(&[(
         "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
-        comment_src.to_string(),
+        comment_src,
     )]);
     assert!(
         comment_hits.is_empty(),
         "a comment naming the methods must not count as a call site, got {comment_hits:?}"
     );
+
+    // Negative control: the OUT verbs — real DataFusion `SessionContext`
+    // registration methods this gate deliberately does NOT flag, because
+    // none binds a caller-chosen per-call token (see the module-level
+    // comment above for why each is excluded). Run inside `fine_tune/`
+    // itself so the control proves the OUT decision, not merely the
+    // directory scoping already proven above.
+    let mut excluded_src = String::from("\n");
+    for lit in EXCLUDED_REGISTRATION_VERB_LITERALS {
+        excluded_src.push_str(&format!(
+            // kernel-oracles: fn-in-literal reviewed: negative-control fixture for the excluded `SessionContext` verbs — synthetic producer text fed to `fine_tune_session_registration_hits`, not real code in this file
+            "async fn synthetic_excluded(ctx: &SessionContext) {{\n    ctx.{lit}ARG);\n}}\n"
+        ));
+    }
+    let excluded_hits = fine_tune_session_registration_hits(&[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+        excluded_src,
+    )]);
+    assert!(
+        excluded_hits.is_empty(),
+        "a SessionContext verb with no caller-chosen per-call token must never be flagged, got \
+         {excluded_hits:?}"
+    );
+}
+
+/// Round 5's own falsification (R-H, applied to a literal set rather than a
+/// caller set — see [`included_registration_literals`]'s doc): the ONE
+/// ordering hazard `fine_tune_session_registration_hits` corrects for
+/// (`"register_X("` is a substring of `"deregister_X("`) is the ONLY such
+/// hazard among the full 22-literal surface, checked exhaustively rather
+/// than assumed — a future addition to either verb array that silently
+/// introduces a SECOND hazard (e.g. two unpaired verbs where one's literal
+/// is a substring of the other's) would go undetected by the per-verb
+/// `if`/`else if` structure above, exactly the way `register_batch` went
+/// undetected by the original two-literal version.
+#[test]
+fn falsification_no_included_literal_is_a_substring_of_another_unless_the_declared_pair() {
+    let included = included_registration_literals();
+    for a in &included {
+        for b in &included {
+            if a == b {
+                continue;
+            }
+            if b.contains(a.as_str()) {
+                let is_declared_pair = PAIRED_REGISTRATION_VERBS.iter().any(|verb| {
+                    *a == format!("register_{verb}(") && *b == format!("deregister_{verb}(")
+                });
+                assert!(
+                    is_declared_pair,
+                    "{a:?} is a substring of {b:?}, an UNDECLARED collision — \
+                     `fine_tune_session_registration_hits`'s if/else-if ordering only accounts \
+                     for the declared register_X/deregister_X pairs, so this pair would silently \
+                     under-count one of the two calls on a shared line"
+                );
+            }
+        }
+    }
 }

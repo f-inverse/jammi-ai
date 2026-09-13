@@ -734,6 +734,36 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
+      # Image-ordering gate for the NCCL link surface, and the reason it is a
+      # step rather than a note in a PR description. `jammi-ai`'s `cuda`
+      # feature includes `candle-core/nccl`, so cudarc's build script emits
+      # `cargo:rustc-link-lib=dylib=nccl` and every `--features cuda` step in
+      # this job links against NCCL: it needs `nccl.h` at compile time and
+      # `libnccl.so` (the development symlink, not just the versioned object)
+      # at link time. `.docker/ci-cuda.Dockerfile` installs `libnccl` and
+      # `libnccl-devel` for exactly that; this step asserts that THE IMAGE
+      # THIS RUN PULLED actually carries them, before the first step that
+      # would otherwise die a few minutes in with a bare `cannot find -lnccl`
+      # or a missing-header error out of a build script.
+      #
+      # It fails closed in both directions and needs no bookkeeping: a run on
+      # a `:latest` published before that Dockerfile change reds here, and so
+      # does any later rebuild that loses the package. `rpm -q` (this image is
+      # RPM-based — manylinux_2_28 on AlmaLinux 8) names the exact package and
+      # version in the log, which is what a "why did the link fail" question
+      # needs; the two `test -e` legs are the file-level facts the compiler and
+      # the linker actually consume, since a package can be present with its
+      # devel half absent.
+      #
+      # Nothing registers this step anywhere: `check_lint_surface_closure.py`'s
+      # required-lane registry enumerates CLIPPY lanes (crate + feature +
+      # target-kind tuples), not job steps, so a preflight has no row there,
+      # and `check_ci_guard_wiring.py` tracks `check_*`/`test_*` SCRIPTS, of
+      # which this step invokes none. The lane as a whole is already required
+      # through `ci-summary`'s `needs:` list.
+      - name: Preflight — the image carries NCCL (header + link library)
+        run: rpm -q libnccl libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so
+
       - uses: ./.github/actions/setup-rust-ci
 
       # `JAMMI_FLASH_MEASURE_RSS=1` is deliberately NOT set on this step

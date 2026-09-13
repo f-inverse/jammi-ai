@@ -60,7 +60,7 @@ use jammi_wire::proto::embedding::{
 use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_wire::proto::inference::inference_service_client::InferenceServiceClient;
-use jammi_wire::proto::inference::InferRequest;
+use jammi_wire::proto::inference::{CachePolicy as ProtoCachePolicy, InferRequest};
 use jammi_wire::proto::job::job_service_client::JobServiceClient;
 use jammi_wire::proto::job::{
     submit_job_request::Spec as ProtoTrainingSpec, CancelJobRequest as JobCancelJobRequest,
@@ -404,6 +404,7 @@ impl DataClient {
             task,
             config,
             world_size: None,
+            cache: CachePolicy::Bypass,
         })
         .await
     }
@@ -427,6 +428,7 @@ impl DataClient {
             task,
             config,
             world_size,
+            cache,
         } = request;
         // The column-source fine-tune is the `FineTuneSpec` arm of the
         // `SubmitJob` spec oneof; built inline from the transport-neutral
@@ -455,6 +457,14 @@ impl DataClient {
                     .map(NonZeroU32::get)
                     .filter(|&ranks| ranks > 1)
                     .unwrap_or(0),
+                // Every concrete engine `CachePolicy` maps to a concrete wire
+                // value — never `UNSPECIFIED`; that variant exists only so a
+                // server-side decode of an absent field gets the engine
+                // default, which this always-set encode never needs.
+                cache: match cache {
+                    CachePolicy::Use => ProtoCachePolicy::Use as i32,
+                    CachePolicy::Bypass => ProtoCachePolicy::Bypass as i32,
+                },
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -1279,6 +1289,7 @@ mod world_size_tests {
     use tonic::transport::{Endpoint, Server};
     use tonic::{Request, Response, Status};
 
+    use jammi_db::store::CachePolicy;
     use jammi_db::ModelTask;
     use jammi_wire::fine_tune::FineTuneMethod;
     use jammi_wire::proto::job::job_service_server::{JobService, JobServiceServer};
@@ -1421,6 +1432,16 @@ mod world_size_tests {
             task: ModelTask::TextEmbedding,
             config: None,
             world_size,
+            cache: CachePolicy::Bypass,
+        }
+    }
+
+    /// [`request`], but the cache policy is the only determinant chosen —
+    /// used by the tests below that pin the `cache` field's encode.
+    fn cache_request(cache: CachePolicy) -> FineTuneRequest {
+        FineTuneRequest {
+            cache,
+            ..request(None)
         }
     }
 
@@ -1520,5 +1541,43 @@ mod world_size_tests {
 
         assert_eq!(via_verb.world_size, 0);
         assert_eq!(via_verb, via_request);
+    }
+
+    /// SET. `CachePolicy::Use` reaches the server as the wire's concrete
+    /// `CACHE_POLICY_USE` — the client does not drop or default it.
+    #[tokio::test]
+    async fn a_chosen_cache_policy_reaches_the_server_as_use() {
+        let (client, submitted) = connected_client().await;
+
+        client
+            .submit_fine_tune(cache_request(CachePolicy::Use))
+            .await
+            .expect("submit returns the double's handle");
+
+        let received = submitted.lock().unwrap().take().expect("handler ran");
+        assert_eq!(
+            received.cache,
+            jammi_wire::proto::inference::CachePolicy::Use as i32
+        );
+    }
+
+    /// UNSET (the default). `CachePolicy::Bypass` reaches the server as the
+    /// wire's `CACHE_POLICY_BYPASS`, matching how every caller that predates
+    /// this field is served: the request's default cache field decodes to
+    /// the engine's `Bypass`.
+    #[tokio::test]
+    async fn the_default_cache_policy_reaches_the_server_as_bypass() {
+        let (client, submitted) = connected_client().await;
+
+        client
+            .submit_fine_tune(cache_request(CachePolicy::Bypass))
+            .await
+            .expect("submit returns the double's handle");
+
+        let received = submitted.lock().unwrap().take().expect("handler ran");
+        assert_eq!(
+            received.cache,
+            jammi_wire::proto::inference::CachePolicy::Bypass as i32
+        );
     }
 }

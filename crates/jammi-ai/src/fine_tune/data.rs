@@ -889,17 +889,22 @@ fn decode_record_batch(
 /// label set before any row's class index is built), just reading `range`
 /// off the committed table directly rather than off an already-materialised
 /// `Vec<RecordBatch>`.
+///
+/// M3 (CONTRACT-U2b-fix1.md): reads through
+/// [`super::training_set::read_back_range_sql`] — the committed order via
+/// `ORDER BY`, never the ambient session's unordered partition-by-partition
+/// scan `open_row_range_stream`'s NO-`ORDER BY` mechanism relies on a
+/// `target_partitions = 1` pin for. Correct at ANY `target_partitions`: the
+/// reader-class allow-list oracle (`training_set::reader_class_allow_list`)
+/// pins this call as reading through that helper rather than a raw
+/// `sql_relation()` scan.
 async fn build_classification_loader_eager(
     session: &InferenceSession,
     table: &TrainingSetTable,
+    columns: &[String],
     range: Range<usize>,
 ) -> Result<TrainingDataLoader> {
-    let sql = format!(
-        "SELECT * FROM {} LIMIT {} OFFSET {}",
-        table.sql_relation(),
-        range.len(),
-        range.start
-    );
+    let sql = super::training_set::read_back_range_sql(table, columns, range);
     let batches = session.sql(&sql).await?;
     let mut label_set = std::collections::BTreeSet::new();
     let mut rows: Vec<(String, String)> = Vec::new();
@@ -1207,7 +1212,7 @@ impl TrainingDataLoader {
     ) -> Result<Self> {
         let range = 0..table.record.row_count;
         if matches!(format, TrainingFormat::Classification { .. }) {
-            return build_classification_loader_eager(&session, &table, range).await;
+            return build_classification_loader_eager(&session, &table, &columns, range).await;
         }
         let runtime = tokio::runtime::Handle::current();
         Ok(Self {

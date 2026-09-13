@@ -79,6 +79,42 @@ pub fn read_back_sql(table: &TrainingSetTable, columns: &[String]) -> String {
     )
 }
 
+/// [`read_back_sql`]'s RANGE-scoped sibling (CONTRACT-U2b-fix1.md M3): the
+/// same committed-order `ORDER BY` re-applied via [`training_set_order_by`],
+/// with a `LIMIT`/`OFFSET` pair carved from `range` rather than reading the
+/// whole table. **No `target_partitions` pin** — unlike
+/// `data::open_row_range_stream`'s scoped, `ORDER BY`-free scan
+/// (which relies on a single-partition sequential plan visiting row groups in
+/// committed order because there is no sort to get wrong), this query asks
+/// DataFusion to sort explicitly, so the ambient session's own partitioning
+/// is free to plan however it likes — a `SortExec` (or a sort-preserving
+/// merge over several partitions) makes the result correct regardless of how
+/// many partitions read it.
+///
+/// The one caller today (`data::build_classification_loader_eager`)
+/// needs exactly this: a bounded, but still fully-ordered, read of a range
+/// that cannot be decoded one `RecordBatch` at a time (a chunk-at-a-time
+/// classification decode is refused — see `decode_record_batch`'s doc — so
+/// this reader stays an eager, whole-range-at-once query, unlike the
+/// streaming scan).
+///
+/// `range.start`/`range.len()` become `OFFSET`/`LIMIT` by plain
+/// interpolation, never a bound parameter (this crate's own convention —
+/// `LIMIT` is not bindable in DataFusion's SQL front end).
+pub fn read_back_range_sql(
+    table: &TrainingSetTable,
+    columns: &[String],
+    range: std::ops::Range<usize>,
+) -> String {
+    format!(
+        "SELECT * FROM {} {} LIMIT {} OFFSET {}",
+        table.sql_relation(),
+        training_set_order_by(columns),
+        range.len(),
+        range.start,
+    )
+}
+
 /// Materialise `columns` of a registered `source` as a training set, then read
 /// the committed rows back in order.
 ///
@@ -143,3 +179,189 @@ async fn materialize_and_read(
     let batches = session.sql(&read_back_sql(&table, &columns)).await?;
     Ok((table, batches))
 }
+/// The reader-class allow-list (CONTRACT-U2b-fix1.md M3): every production
+/// (non-test) call site of [`TrainingSetTable::sql_relation`] in this crate,
+/// keyed by `path:function` rather than `path:line` — a line number drifts
+/// under an unrelated edit, a function name does not — with the ONE property
+/// each entry must hold: it either applies [`training_set_order_by`] itself,
+/// or pins `target_partitions = 1` on a scan with no `ORDER BY` at all (the
+/// only way an un-ordered read is still correct — see
+/// [`super::data::open_row_range_stream`]'s doc). A caller that reads a
+/// relation by name without doing one of the two loses the committed order
+/// silently on a multi-row-group table scanned by more than one partition —
+/// exactly the class M3 fixed (the base tree's classification fallback read
+/// the relation with no order applied at all).
+///
+/// | `path:function`                                  | mechanism                          | behavioural order assertion |
+/// |---------------------------------------------------|-------------------------------------|------------------------------|
+/// | `fine_tune/training_set.rs:read_back_sql`          | `ORDER BY` via `training_set_order_by` | `training_set::read_back_re_applies_the_committed_order_across_row_groups` (`tests/it/training_set.rs`) |
+/// | `fine_tune/training_set.rs:read_back_range_sql`    | `ORDER BY` via `training_set_order_by`, `LIMIT`/`OFFSET` from the range | `streaming_loader::classification_eager_fallback_preserves_committed_order_across_row_groups` (`tests/it/streaming_loader.rs`) |
+/// | `fine_tune/data.rs:open_row_range_stream`          | NO `ORDER BY`; `target_partitions = 1` pinned | `streaming_loader::streamed_order_matches_committed_order_at_target_partitions_one_and_n` + `streaming_loader::removing_the_target_partitions_pin_breaks_order_on_a_multi_row_group_table` (`tests/it/streaming_loader.rs`) |
+///
+/// This test finds every call site itself (never hand-transcribes the count)
+/// by walking every `crates/*/src/**/*.rs` file from the workspace root and
+/// grepping for the reader method's invocation syntax on a receiver — so a
+/// NEW caller anywhere in the workspace, not just this crate, fails it, and a
+/// call site that moves to a different function name (rename) requires a
+/// conscious edit to this allow-list rather than silently staying "covered".
+/// The needle is assembled at runtime (never spelled as one contiguous
+/// literal in this module's own source) so this scan does not match its own
+/// doc comments, messages, or the `const` below.
+#[cfg(test)]
+mod reader_class_allow_list {
+    /// `(workspace-relative path, enclosing function name)` for every
+    /// production call site this fold has audited and accepted.
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/jammi-ai/src/fine_tune/training_set.rs",
+            "read_back_sql",
+        ),
+        (
+            "crates/jammi-ai/src/fine_tune/training_set.rs",
+            "read_back_range_sql",
+        ),
+        (
+            "crates/jammi-ai/src/fine_tune/data.rs",
+            "open_row_range_stream",
+        ),
+    ];
+
+    /// The invocation this scan looks for, assembled from two literal parts
+    /// so the exact contiguous text never appears once in this file (which
+    /// would otherwise match itself, its own doc comments, and its own
+    /// messages).
+    fn needle() -> String {
+        format!(".{}{}", "sql_relation", "()")
+    }
+
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("crates/jammi-ai/../.. must be the workspace root")
+    }
+
+    /// Every `crates/*/src/**/*.rs` file under the workspace root — `src/`
+    /// only, so a test fixture calling the reader method (there are several,
+    /// deliberately, to build committed-order oracles) never enters this
+    /// production-code sweep.
+    fn all_workspace_src_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let crates_dir = root.join("crates");
+        for crate_entry in std::fs::read_dir(&crates_dir)
+            .unwrap_or_else(|e| panic!("read_dir({}): {e}", crates_dir.display()))
+        {
+            let crate_entry = crate_entry.unwrap();
+            if !crate_entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let src_dir = crate_entry.path().join("src");
+            if src_dir.is_dir() {
+                walk_rs_files(&src_dir, &mut out);
+            }
+        }
+        out
+    }
+
+    fn walk_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir({}): {e}", dir.display()))
+        {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The name of the nearest `fn`/`async fn` declaration at or before
+    /// `line_idx` (0-based) in `lines` — a plain textual scan, adequate for
+    /// this codebase's style of one function body per reader-method call
+    /// site (never a closure or a nested `fn`).
+    fn enclosing_fn_name(lines: &[&str], line_idx: usize) -> Option<String> {
+        let fn_line = regex_lite_find_fn(lines, line_idx)?;
+        let after_fn = fn_line.split("fn ").nth(1)?;
+        let name: String = after_fn
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Walk backward from `line_idx` for a line containing `"fn "` — no
+    /// external regex dependency needed for this narrow a scan.
+    fn regex_lite_find_fn<'a>(lines: &[&'a str], line_idx: usize) -> Option<&'a str> {
+        (0..=line_idx).rev().map(|i| lines[i]).find(|l| {
+            l.trim_start().starts_with("fn ")
+                || l.trim_start().starts_with("pub fn ")
+                || l.trim_start().starts_with("pub(crate) fn ")
+                || l.trim_start().starts_with("async fn ")
+                || l.trim_start().starts_with("pub async fn ")
+                || l.trim_start().starts_with("pub(crate) async fn ")
+        })
+    }
+
+    #[test]
+    fn every_production_sql_relation_call_site_is_on_the_allow_list() {
+        let root = workspace_root();
+        let needle = needle();
+        let mut found: Vec<(String, String)> = Vec::new();
+        for path in all_workspace_src_files(&root) {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                // Skip comment/doc lines outright — a mention of the reader
+                // method in prose is not an invocation of it.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&needle) {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let func = enclosing_fn_name(&lines, i).unwrap_or_else(|| {
+                        panic!(
+                            "{rel}:{}: reader-method call with no enclosing `fn` found by this \
+                             scan — widen `regex_lite_find_fn`'s prefix list",
+                            i + 1
+                        )
+                    });
+                    found.push((rel, func));
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        let mut allowed: Vec<(String, String)> = ALLOWED
+            .iter()
+            .map(|(p, f)| (p.to_string(), f.to_string()))
+            .collect();
+        allowed.sort();
+
+        let extra: Vec<_> = found.iter().filter(|e| !allowed.contains(e)).collect();
+        assert!(
+            extra.is_empty(),
+            "new caller(s) of `TrainingSetTable::sql_relation()` not on the reader-class \
+             allow-list — each one must either apply `training_set_order_by` or pin \
+             `target_partitions = 1` on an `ORDER BY`-free scan, then be added here with its \
+             own behavioural order assertion: {extra:?}"
+        );
+        let missing: Vec<_> = allowed.iter().filter(|e| !found.contains(e)).collect();
+        assert!(
+            missing.is_empty(),
+            "allow-listed call site(s) no longer found — the allow-list is stale, narrow it: \
+             {missing:?}"
+        );
+    }
+}
+

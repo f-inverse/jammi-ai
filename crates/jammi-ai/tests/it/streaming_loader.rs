@@ -582,6 +582,107 @@ async fn removing_the_target_partitions_pin_breaks_order_on_a_multi_row_group_ta
     );
 }
 
+/// M3 (CONTRACT-U2b-fix1.md): `build_classification_loader_eager` reads
+/// through `training_set::read_back_range_sql` (`ORDER BY` re-applied), so
+/// classification rows on a multi-row-group, multi-thread fixture arrive in
+/// the committed order — never the ambient session's unordered
+/// partition-by-partition scan the base `SELECT * ... LIMIT ... OFFSET ...`
+/// (no `ORDER BY`) fell back to.
+///
+/// RED at 6482ea99 (observed): first divergence at index 0 — the base arm's
+/// SQL carried no `ORDER BY` at all, so a 4-thread scan over more than one
+/// row group came back interleaved from the first row.
+#[tokio::test(flavor = "multi_thread")]
+async fn classification_eager_fallback_preserves_committed_order_across_row_groups() {
+    const ROWS: usize = 70_000;
+    let dir = TempDir::new().unwrap();
+    let mut lines = String::from("text,label\n");
+    for i in 0..ROWS {
+        let n = (i * 37) % ROWS;
+        lines.push_str(&format!("t{n:05},l{}\n", n % 3));
+    }
+    let csv = dir.path().join("cls.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    let mut config = common::test_config(dir.path());
+    config.engine.execution_threads = 4;
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "cls",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+        .await
+        .unwrap();
+
+    let columns = vec!["text".to_string(), "label".to_string()];
+    let (table, _eager) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "cls",
+        &columns,
+        ModelTask::TextEmbedding,
+        "classification",
+    )
+    .await
+    .unwrap();
+    assert_eq!(table.record.row_count, ROWS);
+
+    // The committed order, exactly as `training_set::read_back_sql` defines
+    // it — the oracle the classification arm's rows must match.
+    let expected_sql = format!(
+        "SELECT * FROM {} {}",
+        table.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let expected: Vec<String> = session
+        .sql(&expected_sql)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|b| text_column_values(b.column_by_name("text").unwrap().as_ref()))
+        .collect();
+
+    let loader = TrainingDataLoader::from_training_set_stream(
+        Arc::clone(&session),
+        table,
+        columns,
+        ModelTask::TextEmbedding,
+        TrainingFormat::Classification { num_classes: 0 },
+        StreamConfig {
+            batch: 8,
+            prefetch: 4,
+        },
+    )
+    .await
+    .unwrap();
+    let chunks = loader.text_chunks(4096).unwrap();
+    let mut actual = Vec::with_capacity(ROWS);
+    for chunk in &chunks {
+        match chunk {
+            jammi_ai::fine_tune::data::TextChunk::Classification { texts, .. } => {
+                actual.extend(texts.iter().cloned())
+            }
+            _ => panic!("expected a Classification chunk"),
+        }
+    }
+    assert_eq!(actual.len(), ROWS, "row count");
+    let first_divergence = expected.iter().zip(actual.iter()).position(|(e, a)| e != a);
+    assert_eq!(
+        first_divergence, None,
+        "the classification loader's row order diverges from the committed order at {:?}",
+        first_divergence
+    );
+}
+
 /// Acceptance (d), the mechanism proof: hard-negative mining and GradCache
 /// are W=1-only whole-set consumers that "stream the table in and hold what
 /// they need" (`TrainingDataLoader::in_batch_negative_texts`'s `Stream` arm

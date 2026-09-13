@@ -19,6 +19,8 @@ Run directly: `python3 ci/scripts/test_check_gpu_prove_once.py`
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -356,6 +358,9 @@ def positive_workflows() -> dict[str, str]:
         "gpu-gang.yml": GANG_YML_GOOD,
         "gpu-perf-ab.yml": PERF_AB_YML_GOOD,
         "gpu-howwell.yml": HOWWELL_YML_GOOD,
+        # gpu-dev.sh's own row (whole-file scope gave it one: gpu-reap.yml
+        # is its only invoker and carries RUNPOD_API_KEY at step scope).
+        "gpu-reap.yml": REAP_YML,
         "_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD,
         "server-image.yml": _server_image_yml(),
         "release-binaries.yml": _release_binaries_yml(),
@@ -392,6 +397,18 @@ class RealTreeTest(unittest.TestCase):
     def test_real_tree_passes(self):
         findings = cgo.run_gate(cgo.WORKFLOWS_DIR, cgo.MANIFEST_PATH)
         self.assertEqual(findings, [])
+
+    def test_main_exits_zero_on_the_real_tree(self):
+        """`load_script_texts()` -- P7's own real-filesystem `git ls-files`
+        read -- is exercised exactly once through the actual entry point
+        `main()` calls (`run_gate()` with no `script_texts` override), never
+        only through a fixture-injected map. Every other P7 test in this
+        suite drives `check_p7_paid_pod_lanes` with an explicit
+        `script_texts`, which never touches this function at all."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cgo.main()
+        self.assertEqual(rc, 0, buf.getvalue())
 
 
 class PaidPodLaneTest(unittest.TestCase):
@@ -442,6 +459,11 @@ class PaidPodLaneTest(unittest.TestCase):
         joined = "\n".join(findings)
         self.assertIn("more than one workflow", joined)
         self.assertIn("second-gang-renter.yml", joined)
+        # The `extra site(s):` list's CONTENT, not just that the extra
+        # workflow's name appears somewhere in the joined findings: it names
+        # exactly the non-row invoker, never the row's own workflow.
+        self.assertIn("extra site(s): ['second-gang-renter.yml']", joined)
+        self.assertNotIn("extra site(s): ['gpu-gang.yml'", joined)
 
     def test_one_WRONG_invoker_is_a_failure_that_says_so(self):
         """Still a FAIL — but the finding describes the state it found. The
@@ -460,7 +482,7 @@ class PaidPodLaneTest(unittest.TestCase):
     def test_zero_invokers_fails(self):
         broken = GANG_YML_GOOD.replace("bash ci/scripts/runpod_gpu_gang.sh", "echo nothing")
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
-        self.assertIn("zero workflows invoke runpod_gpu_gang.sh", "\n".join(findings))
+        self.assertIn("zero workflows invoke ci/scripts/runpod_gpu_gang.sh", "\n".join(findings))
 
     def test_missing_workflow_file_fails(self):
         texts = _positive_texts()
@@ -484,6 +506,18 @@ class PaidPodLaneTest(unittest.TestCase):
         )
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
         self.assertIn("cross-repo reference", "\n".join(findings))
+
+    def test_cross_repo_uses_of_an_unrelated_workflow_is_clean(self):
+        """Negative fixture: a cross-repo `uses:` naming a DIFFERENT
+        workflow entirely must not trip the gang row's own `uses:` scan --
+        the pattern match is on the row's own workflow name, not on any
+        cross-repo reference at all."""
+        caller = (
+            "name: publisher\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  other:\n    uses: some-org/some-repo/.github/workflows/totally-unrelated.yml@main\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
+        self.assertFalse(any("cross-repo reference" in f for f in findings), findings)
 
     def test_the_rule_bites_on_every_row_not_only_the_gang_one(self):
         # One `push:` trigger per row, each independently caught by name.
@@ -681,7 +715,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
         )
         joined = "\n".join(findings)
         self.assertIn("ci/scripts/runpod_gpu_new.sh", joined)
-        self.assertIn("that step can RENT", joined)
+        self.assertIn("that workflow can RENT", joined)
         self.assertIn("new-lane.yml", joined)
         self.assertIn("new-lane-2.yml", joined)
 
@@ -707,37 +741,153 @@ class DerivedRentingDriverTest(unittest.TestCase):
         scripts["ci/scripts/runpod_gpu_gang.sh"] = "#!/usr/bin/env bash\necho 'no longer rents'\n"
         findings = cgo.check_p7_paid_pod_lanes(_derived_texts(), scripts)
         joined = "\n".join(findings)
-        self.assertIn("PAID_POD_LANE_TABLE row `runpod_gpu_gang.sh`", joined)
+        self.assertIn("PAID_POD_LANE_TABLE row `ci/scripts/runpod_gpu_gang.sh`", joined)
         self.assertIn("does NOT call", joined)
 
-    def test_a_literal_non_renting_verb_is_credited(self):
-        # gpu-dev.sh IS deploy-capable and IS invoked by a workflow holding
-        # the secret — the literal `reap` verb is the whole reason that is
-        # not a paid lane.
-        findings = cgo.check_p7_paid_pod_lanes(_derived_texts(), fixture_scripts())
-        self.assertFalse(any("gpu-dev.sh" in f for f in findings), findings)
-
-    def test_an_expression_verb_fails_closed(self):
-        broken = REAP_YML.replace(
-            "bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}",
-            "bash ci/scripts/gpu-dev.sh ${{ inputs.verb }}",
+    def test_verb_parsing_is_gone_the_mention_and_the_secret_are_all_that_matter(self):
+        """Round-3 fallback: an earlier revision credited a literal
+        `NON_RENTING_VERBS` verb (`reap`) and read the secret at JOB scope.
+        Both are gone. A fresh, non-table derived driver invoked with the
+        exact verb that used to clear gpu-dev.sh still gets a finding the
+        moment its workflow carries the secret anywhere — no invocation-site
+        parsing decides clearance any more."""
+        scripts = fixture_scripts()
+        scripts["ci/scripts/runpod_gpu_new.sh"] = _driver("rp_deploy_arch a100")
+        lane = (
+            "name: new-reap-verb-lane\n\non:\n  workflow_dispatch:\n\njobs:\n  reap:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - name: Reap\n        env:\n"
+            "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "        run: bash ci/scripts/runpod_gpu_new.sh reap\n"
         )
         findings = cgo.check_p7_paid_pod_lanes(
-            _derived_texts(**{"gpu-reap.yml": broken}), fixture_scripts()
+            _derived_texts(**{"new-reap-verb-lane.yml": lane}), scripts
         )
         joined = "\n".join(findings)
-        self.assertIn("ci/scripts/gpu-dev.sh", joined)
-        self.assertIn("<no literal verb>", joined)
+        self.assertIn("ci/scripts/runpod_gpu_new.sh", joined)
+        self.assertIn("that workflow can RENT", joined)
 
-    def test_a_renting_verb_on_a_secret_holding_job_fails(self):
-        broken = REAP_YML.replace(
-            "bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}",
-            "bash ci/scripts/gpu-dev.sh up --arch a100",
+    def test_a_paths_only_mention_in_a_secret_free_workflow_is_neither_finding_nor_note(self):
+        """The NOTE channel fires on ABSENCE, never on "not invoked". A
+        derived driver named only by a `paths:` filter entry, in a workflow
+        that carries no RUNPOD_API_KEY anywhere, is mentioned somewhere (so
+        the absence NOTE does not fire) and that workflow cannot make it
+        rent either (so there is nothing to condemn): the module doc and
+        `_check_derived_driver_cannot_rent`'s own docstring state this
+        silence as the rule's own outcome for this shape, not a gap."""
+        scripts = fixture_scripts()
+        scripts["ci/scripts/runpod_gpu_pathsonly.sh"] = _driver("rp_deploy_arch a100")
+        paths_only = (
+            "name: paths-only\n\non:\n  push:\n    paths:\n"
+            "      - ci/scripts/runpod_gpu_pathsonly.sh\n\njobs:\n  g:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        )
+        notes: list[str] = []
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"paths-only.yml": paths_only}), scripts, notes=notes
+        )
+        self.assertFalse(any("pathsonly" in f for f in findings), findings)
+        self.assertFalse(any("pathsonly" in n for n in notes), notes)
+
+    def test_a_same_basename_driver_in_a_different_directory_is_not_dropped(self):
+        """Identity is the repo-relative PATH, never a basename. A prior
+        revision keyed the completeness loop's own bookkeeping dict on
+        `rel.rsplit("/", 1)[-1]`, so two distinct DERIVED drivers sharing one
+        basename in different directories collapsed into a single dict
+        entry and one of them was silently never checked at all — a renting
+        `ci/scripts/perf/runpod_gpu_evil.sh` beside a renting flat
+        `ci/scripts/runpod_gpu_evil.sh`, each invoked from its OWN
+        secret-holding workflow, produced only ONE finding instead of two.
+        Both must be caught independently."""
+        scripts = fixture_scripts()
+        scripts["ci/scripts/runpod_gpu_evil.sh"] = _driver("rp_deploy_arch a100")
+        scripts["ci/scripts/perf/runpod_gpu_evil.sh"] = _driver("rp_deploy_arch a100")
+        flat_lane = (
+            "name: flat evil\n\non:\n  workflow_dispatch:\n\njobs:\n  rent:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - name: Rent\n        env:\n"
+            "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "        run: bash ci/scripts/runpod_gpu_evil.sh\n"
+        )
+        perf_lane = (
+            "name: perf evil\n\non:\n  workflow_dispatch:\n\njobs:\n  rent:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - name: Rent\n        env:\n"
+            "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "        run: bash ci/scripts/perf/runpod_gpu_evil.sh\n"
         )
         findings = cgo.check_p7_paid_pod_lanes(
-            _derived_texts(**{"gpu-reap.yml": broken}), fixture_scripts()
+            _derived_texts(**{"flat-evil.yml": flat_lane, "perf-evil.yml": perf_lane}), scripts
         )
-        self.assertIn("first verb 'up'", "\n".join(findings))
+        joined = "\n".join(findings)
+        self.assertIn("ci/scripts/runpod_gpu_evil.sh", joined)
+        self.assertIn("ci/scripts/perf/runpod_gpu_evil.sh", joined)
+        # Both are independent findings, not one message doing double duty.
+        self.assertEqual(
+            sum(1 for f in findings if "runpod_gpu_evil.sh" in f), 2, findings
+        )
+
+    def test_no_rsplit_anywhere_in_the_module(self):
+        """The identity discipline this file's P7 section commits to
+        (`ci/scripts/check_gpu_prove_once.py`'s own module doc): keying or
+        re-keying any of this rule's identity comparisons on a basename via
+        `.rsplit("/", ...)` is exactly the bug class `perf/`-collision
+        fixture above reproduces. Checked on the actual AST, never a plain
+        substring search, so this file's own PROSE describing the discipline
+        (which necessarily spells `rsplit("/")` out to explain what must
+        never appear) cannot trip its own assertion."""
+        import ast
+
+        src = Path(cgo.__file__).read_text()
+        tree = ast.parse(src)
+        rsplit_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "rsplit"
+        ]
+        self.assertEqual(rsplit_calls, [], [ast.dump(n) for n in rsplit_calls])
+
+    def test_prove_script_identity_is_a_repo_relative_path(self):
+        self.assertTrue(cgo.PROVE_SCRIPT.startswith("ci/scripts/"), cgo.PROVE_SCRIPT)
+        for key in cgo.PAID_POD_LANE_TABLE:
+            self.assertTrue(key.startswith("ci/scripts/"), key)
+
+    def test_unresolved_row_with_another_invoker_names_the_row_not_resolving(self):
+        """`:1100`'s `resolved_workflow is None` arm INSIDE the `producers`
+        branch: a row's own workflow file is absent from the tree, but a
+        DIFFERENT workflow's comment-stripped text still names the driver.
+        `test_missing_workflow_file_fails` deletes the row's only invoker
+        too, so it only ever reaches the `not producers` arm and the OUTER
+        `resolved_workflow is None` arm (`gpu-gang.yml is missing`) -- never
+        this one."""
+        texts = _positive_texts()
+        other = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: other-gang-invoker")
+        del texts["gpu-gang.yml"]
+        texts["other-gang-invoker.yml"] = other
+        findings = cgo.check_p7_paid_pod_lanes(texts)
+        joined = "\n".join(findings)
+        self.assertIn(
+            "invoked by ['other-gang-invoker.yml'], but its PAID_POD_LANE_TABLE row names "
+            "gpu-gang.yml, which does not resolve",
+            joined,
+        )
+        self.assertIn("gpu-gang.yml is missing from the workflow tree", joined)
+        self.assertNotIn("zero workflows invoke", joined)
+
+    def test_the_seed_loss_fail_propagates_through_the_gate_entry_point(self):
+        """`:1061`'s `findings += closure_findings`: renaming
+        `_rp_deploy_payload` in `runpod_lib.sh` is asserted at
+        `derive_deploy_closure`'s own unit level elsewhere in this suite
+        (`test_a_library_with_no_payload_builder_fails_closed`) but never
+        through `check_p7_paid_pod_lanes` itself -- the actual gate entry
+        point every other P7 fixture in this class drives through."""
+        scripts = fixture_scripts()
+        scripts[cgo.RUNPOD_LIB_REL] = FIXTURE_LIB.replace(
+            "_rp_deploy_payload()", "_rp_deploy_payload_RENAMED()"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(_derived_texts(), scripts)
+        self.assertTrue(
+            any("cannot derive the deploy closure" in f for f in findings), findings
+        )
 
     def test_the_secret_is_the_capability(self):
         # test_pod_substrate.sh is deploy-capable and IS invoked by the
@@ -775,18 +925,28 @@ class DerivedRentingDriverTest(unittest.TestCase):
         )
         joined = "\n".join(findings)
         self.assertIn("ci/scripts/test_pod_substrate.sh", joined)
-        self.assertIn("that step can RENT", joined)
+        self.assertIn("that workflow can RENT", joined)
 
     def test_a_with_block_secret_reaches_the_step(self):
         """Same capability, a different spelling site: a reusable-workflow
-        `with:`/`secrets:` mapping is not a job `env:` block either."""
+        `with:`/`secrets:` mapping is not a job `env:` block either. The
+        `with:` mapping sits in a SEPARATE job from the one invoking the
+        driver -- under whole-file scope there is no job attribution left to
+        read at all (a prior revision scoped the secret per-job/per-step;
+        that scoping is gone), so this fixture is the one that reds if a
+        future revision ever reintroduces job-level attribution by mistake."""
         via_with = GUARD_YML.replace(
-            "      - run: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh\n",
+            "\njobs:\n  guard:\n",
+            "\njobs:\n  other-job:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
             "      - uses: ./.github/workflows/_x.yml\n"
             "        with:\n"
             "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
-            "      - run: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh\n",
+            "  guard:\n",
         )
+        self.assertIn("other-job", via_with)
+        self.assertNotIn("with:", GUARD_YML)  # the fixture really added a new job, not edited in place
         findings = cgo.check_p7_paid_pod_lanes(
             _derived_texts(**{"ci.yml": via_with}), fixture_scripts()
         )
@@ -805,10 +965,11 @@ class DerivedRentingDriverTest(unittest.TestCase):
         )
         self.assertFalse(any("test_pod_substrate.sh" in f for f in findings), findings)
 
-    def test_an_uninvoked_derived_driver_is_reported_as_a_note(self):
-        """The prose promises a driver no visible step invokes is REPORTED,
-        never silently credited. It is a NOTE, not a finding: nothing in the
-        committed text says it can rent, and nothing says it cannot."""
+    def test_a_driver_mentioned_in_no_workflow_at_all_is_reported_as_a_note(self):
+        """The NOTE channel fires on ABSENCE: a derived driver whose path is
+        mentioned in NO workflow file at all is REPORTED, never silently
+        credited. It is a NOTE, not a finding: nothing in the committed text
+        says it can rent, and nothing says it cannot."""
         scripts = fixture_scripts()
         scripts["ci/scripts/runpod_gpu_orphan.sh"] = _driver("rp_deploy_arch a100")
         notes: list[str] = []
@@ -818,8 +979,10 @@ class DerivedRentingDriverTest(unittest.TestCase):
         self.assertFalse(any("runpod_gpu_orphan.sh" in f for f in findings), findings)
         joined = "\n".join(notes)
         self.assertIn("ci/scripts/runpod_gpu_orphan.sh", joined)
-        self.assertIn("no workflow in this tree invokes", joined)
-        # An INVOKED derived driver produces no note.
+        self.assertIn("mentioned in no workflow file in this tree", joined)
+        self.assertNotIn("invoked", joined)
+        # A driver MENTIONED somewhere (even if never truly invoked) produces
+        # no note -- see the paths:-only fixture above for that shape.
         self.assertFalse(any("test_pod_substrate.sh" in n for n in notes), notes)
 
     def test_the_real_tree_derives_the_set_this_suite_claims(self):

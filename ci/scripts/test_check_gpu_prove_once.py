@@ -494,8 +494,15 @@ class PaidPodLaneTest(unittest.TestCase):
 FIXTURE_LIB = """\
 #!/usr/bin/env bash
 rp_init() { : "${RUNPOD_API_KEY:?}"; }
+# Deliberately payload-free. `test_pod_substrate.sh`'s own `(ab/gpuCount D5)`
+# leg asserts a CLOSED set of tracked files naming the per-pod GPU-count
+# variable (the library, the gang driver and that suite) with a plain grep
+# that does not strip comments, so neither the fixture below NOR this comment
+# may spell that variable out — either would read as "a second lane started
+# moving its own gpuCount". Nothing here needs the real payload text: the
+# closure derivation reads CALL structure, not payload contents.
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
-  echo "{\\"gpuCount\\": ${RP_GPU_COUNT}}"
+  echo "{}"
 }
 rp_deploy_live() {
   local body

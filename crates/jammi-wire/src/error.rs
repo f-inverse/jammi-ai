@@ -36,7 +36,7 @@
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
-//! `NonUniqueKey`, `Unavailable`) reconstructs exactly,
+//! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -245,6 +245,11 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     reason: reason.clone(),
                 })
             }
+            JammiError::EmptyTrainingSet { source_query } => {
+                Variant::EmptyTrainingSet(pb::EmptyTrainingSetError {
+                    source_query: source_query.clone(),
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -373,6 +378,9 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::Unavailable(e)) => JammiError::Unavailable {
             resource: e.resource,
             reason: e.reason,
+        },
+        Some(Variant::EmptyTrainingSet(e)) => JammiError::EmptyTrainingSet {
+            source_query: e.source_query,
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
@@ -996,6 +1004,7 @@ mod tests {
             | JammiError::DefinitionDrift { .. }
             | JammiError::NonUniqueKey { .. }
             | JammiError::Unavailable { .. }
+            | JammiError::EmptyTrainingSet { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -1105,6 +1114,9 @@ mod tests {
             JammiError::Unavailable {
                 resource: "segment src1__text_embedding__m__20260101T000000_deadbeef/1".into(),
                 reason: "unreachable".into(),
+            },
+            JammiError::EmptyTrainingSet {
+                source_query: "SELECT \"abstract\", \"label\" FROM patents WHERE 1 = 0".into(),
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

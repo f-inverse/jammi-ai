@@ -1,0 +1,589 @@
+//! The training set as a producer output (#500 U2a) — the `jammi-ai` half.
+//!
+//! A tabular fine-tune no longer re-runs its source query into memory: it
+//! materialises the projected rows into an immutable `TrainingSet` result table
+//! through `ResultStore::materialize_training_set`, then reads that table back
+//! with the producer's own canonical `ORDER BY` re-applied. These tests pin the
+//! four properties that change hands at that seam.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
+use jammi_ai::model::ModelTask;
+use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use tempfile::TempDir;
+
+use crate::common;
+
+/// FNV-1a over a byte slice, as `{len}:{hash:016x}`.
+///
+/// A self-contained fingerprint: `sha2` is an optional *library* dependency of
+/// this crate (behind `local`) and not a dev-dependency, so a test target
+/// cannot name it, and `DefaultHasher` is explicitly not stable across
+/// toolchains — neither can back a constant pinned in source. FNV-1a is fully
+/// specified, so the pinned constants below mean the same thing on every host
+/// and every toolchain, and the length is carried alongside the hash so a
+/// truncation cannot hide behind a collision.
+fn fingerprint(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{}:{:016x}", bytes.len(), hash)
+}
+
+fn tiny_bert_model() -> String {
+    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+}
+
+/// The parity fixture's config — the smallest deterministic job-path
+/// fine-tune: one epoch over the 30-row `training_pairs.csv` contrastive
+/// source, rank-4 LoRA, no warm-up, the default (constant) seed.
+fn parity_config() -> FineTuneConfig {
+    FineTuneConfig {
+        epochs: 1,
+        batch_size: 8,
+        lora_rank: 4,
+        warmup_steps: 0,
+        ..Default::default()
+    }
+}
+
+fn parity_columns() -> Vec<String> {
+    vec![
+        "text_a".to_string(),
+        "text_b".to_string(),
+        "score".to_string(),
+    ]
+}
+
+async fn session_over(dir: &TempDir, csv_fixture: &str) -> Arc<InferenceSession> {
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(csv_fixture.to_string()),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+}
+
+/// Run the parity fixture to completion and return every published adapter
+/// file's fingerprint, keyed by file name (so a file appearing or disappearing
+/// moves the oracle as loudly as a byte change does).
+async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String, String> {
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session)
+        .expect("default worker intervals are valid");
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_model(),
+            &parity_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(parity_config()),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let models = session.catalog().list_models().await.unwrap();
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the fine-tune registers its output model");
+    let prefix =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix)
+        .await
+        .expect("the published adapter fetches and verifies");
+
+    let mut prints = BTreeMap::new();
+    for entry in std::fs::read_dir(local.dir()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
+        }
+    }
+    prints
+}
+
+/// (c) Refactor parity — a PINNED oracle, not a RED-at-base one.
+///
+/// Every file the smallest deterministic job-path fine-tune publishes,
+/// fingerprinted at base `9db8d395` (`crates/jammi-ai/src/fine_tune/**`
+/// untouched) with:
+///
+/// ```text
+/// git checkout 9db8d395 -- crates/jammi-ai/src
+/// cargo test -p jammi-ai --test it -- \
+///     training_set::refactor_parity --exact --nocapture
+/// ```
+///
+/// Routing the rows through an immutable Parquet table instead of straight out
+/// of the source query changes *where* the trainer's rows come from; it must
+/// not change *which* rows, in *what* order, so it must not change one adapter
+/// byte. This fixture carries no NULLs, so the producer's `NULLS FIRST` order
+/// key and the base read's default NULL placement agree on it — the parity
+/// claim is over row order and row content, not over NULL placement.
+///
+/// The per-step `checkpoint_N` files are pinned alongside the final adapter on
+/// purpose: they fingerprint the *trajectory*, so a row-order change that a
+/// converged final adapter might wash out still moves `checkpoint_1`. All eight
+/// files were byte-stable across repeated base runs before being pinned — a
+/// fingerprint that drifts run-to-run would make this oracle noise, not a pin.
+const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
+    ("adapter.safetensors", "1184:1495533e3a6c48bd"),
+    ("adapter_config.json", "143:1feeeb6239c3fd30"),
+    ("checkpoint_1.safetensors", "1184:b110a0c2b3ae4689"),
+    ("checkpoint_2.safetensors", "1184:62c25310eb04a178"),
+    ("checkpoint_3.safetensors", "1184:41a298dab26b51eb"),
+    ("checkpoint_4.safetensors", "1184:1495533e3a6c48bd"),
+    ("checkpoint_best.safetensors", "1184:1495533e3a6c48bd"),
+    ("manifest.json", "788:e0aeaf8353fd12ff"),
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refactor_parity() {
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let prints = run_parity_fixture(&session).await;
+    println!("PARITY_ADAPTER_PRINTS = {prints:#?}");
+
+    let expected: BTreeMap<String, String> = PARITY_ADAPTER_PRINTS
+        .iter()
+        .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        prints, expected,
+        "the adapter bytes moved: routing the training rows through the \
+         TrainingSet producer must not change which rows the trainer sees, in \
+         which order"
+    );
+}
+
+/// (a) A fine-tune job creates a `ready` `TrainingSet` result table carrying a
+/// definition hash and a manifest attestation, and trains from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let prints = run_parity_fixture(&session).await;
+    assert!(
+        !prints.is_empty(),
+        "the job trained and published an adapter"
+    );
+
+    let tables = session
+        .catalog()
+        .list_result_tables_by_status(ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let training_sets: Vec<_> = tables
+        .iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        1,
+        "the job materialises exactly one training set, got {:?}",
+        tables
+            .iter()
+            .map(|t| (&t.table_name, &t.kind))
+            .collect::<Vec<_>>()
+    );
+    let table = training_sets[0];
+    assert_eq!(table.row_count, 30, "every source row is committed");
+    assert!(
+        table.definition_hash.is_some(),
+        "a producer output is content-addressed by its definition hash"
+    );
+
+    let descriptor = session
+        .result_store()
+        .producing_descriptor(table)
+        .await
+        .expect("the attestation records the producing descriptor verbatim");
+    match descriptor {
+        jammi_db::store::manifest::ProducingDescriptor::TrainingSet {
+            source,
+            columns,
+            task,
+            format,
+            order_rule,
+        } => {
+            // The recorded source is the query the producer actually ran, with
+            // the columns in DECLARED order: the declared order is also the
+            // order key, so a descriptor that recorded some other projection
+            // order would name a table it does not describe.
+            assert_eq!(
+                source,
+                r#"SELECT "text_a", "text_b", "score" FROM "training".public."training_pairs""#
+            );
+            assert_eq!(columns, parity_columns());
+            assert_eq!(task, ModelTask::TextEmbedding);
+            assert_eq!(format, "contrastive");
+            assert_eq!(
+                order_rule,
+                jammi_db::store::manifest::TRAINING_SET_ORDER_RULE_V1
+            );
+        }
+        other => panic!("expected a TrainingSet descriptor, got {other:?}"),
+    }
+}
+
+/// (e) K2 — a projection that yields zero rows is refused with the typed
+/// `EmptyTrainingSet` before any training set exists, through the JOB path.
+///
+/// A zero-row training set is the shape that trains silently on nothing: the
+/// loop runs, an adapter is published, and every metric is a fold over an empty
+/// set. The refusal has to reach the JOB's terminal error, not merely the
+/// producer's return value, which is why this drives `fine_tune` end to end
+/// rather than calling the verb.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_projection_is_refused_through_the_job_path() {
+    let dir = TempDir::new().unwrap();
+    // A header-only CSV: the schema resolves and the projection is valid, so
+    // no column-shape check can catch this — only the row count can.
+    let csv = dir.path().join("empty_pairs.csv");
+    std::fs::write(&csv, "text_a,text_b,score\n").unwrap();
+    let session = session_over(&dir, &format!("file://{}", csv.display())).await;
+
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_model(),
+            &parity_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            // `train_loss` early stopping so the ONLY thing wrong with this
+            // job is that its projection is empty: the `val_loss` default has
+            // its own guard against an empty validation split, which would
+            // fail the job for an incidental reason and make this oracle
+            // vacuous about the emptiness itself.
+            Some(FineTuneConfig {
+                early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+                ..parity_config()
+            }),
+        )
+        .await
+        .unwrap();
+    let outcome = job.wait().await;
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    println!("K2 job outcome = {outcome:?}");
+    println!(
+        "K2 job status = {:?} error = {:?}",
+        record.status, record.error
+    );
+
+    assert_eq!(
+        record.status, "failed",
+        "a zero-row projection must fail the job, never train on nothing"
+    );
+    let error = record.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("the projection yielded zero rows"),
+        "the failure must be the typed EmptyTrainingSet refusal, got {error:?}"
+    );
+
+    for status in [ResultTableStatus::Ready, ResultTableStatus::Building] {
+        let tables = session
+            .catalog()
+            .list_result_tables_by_status(status)
+            .await
+            .unwrap();
+        assert!(
+            !tables
+                .iter()
+                .any(|t| t.kind == ResultTableKind::TrainingSet),
+            "the refusal leaves no {status:?} training-set row behind"
+        );
+    }
+}
+
+/// The order key `full_tuple_v1` commits for a two-column projection: every
+/// projected column, declared order, ascending, NULLs first. The fixture below
+/// carries no NULLs (the producer's NULL placement is the db half's oracle), so
+/// a plain tuple sort is the whole key.
+fn canonical_order(rows: &[(String, String)]) -> Vec<(String, String)> {
+    let mut sorted = rows.to_vec();
+    sorted.sort();
+    sorted
+}
+
+fn rows_of(batches: &[arrow::array::RecordBatch]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let anchor = string_column(batch, "anchor");
+        let positive = string_column(batch, "positive");
+        for i in 0..batch.num_rows() {
+            out.push((anchor[i].clone(), positive[i].clone()));
+        }
+    }
+    out
+}
+
+/// A string column read without assuming which Arrow string type the reader
+/// hands back — the parquet reader yields `Utf8View` in some configurations and
+/// `Utf8` in others, and a downcast that assumed one would silently read
+/// nothing under the other.
+fn string_column(batch: &arrow::array::RecordBatch, name: &str) -> Vec<String> {
+    use arrow::array::AsArray;
+    let column = batch.column_by_name(name).expect("column present");
+    match column.data_type() {
+        arrow::datatypes::DataType::Utf8View => column
+            .as_string_view()
+            .iter()
+            .map(|v| v.unwrap_or_default().to_string())
+            .collect(),
+        arrow::datatypes::DataType::LargeUtf8 => column
+            .as_string::<i64>()
+            .iter()
+            .map(|v| v.unwrap_or_default().to_string())
+            .collect(),
+        _ => column
+            .as_string::<i32>()
+            .iter()
+            .map(|v| v.unwrap_or_default().to_string())
+            .collect(),
+    }
+}
+
+/// (d) The read-back re-applies the canonical `ORDER BY` and matches the
+/// committed order on a table with MORE THAN ONE row group, read at
+/// `execution_threads > 1` over a scan that is genuinely split across
+/// partitions.
+///
+/// Each of those three conditions is MEASURED in the test, not assumed: the
+/// row-group count comes off the Parquet footer, the partition count off the
+/// session config, and the file-group count off the physical plan. A fixture
+/// that fitted in one row group, a session that planned one partition, or a
+/// scan DataFusion kept in one file group would each make this pass while
+/// proving nothing.
+///
+/// The negative control is the mechanism trace: the SAME read with the
+/// `ORDER BY` removed comes back in a DIFFERENT order, so the clause is what is
+/// doing the work — not an accident of how the file happened to be scanned.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_back_re_applies_the_committed_order_across_row_groups() {
+    use jammi_ai::fine_tune::training_set::read_back_sql;
+
+    let dir = TempDir::new().unwrap();
+
+    // 70_000 rows: the writer flushes a row group every 65_536, so the file
+    // has more than one. The rows are scrambled by a permutation with no fixed
+    // point in the sort order, and every `anchor` value appears twice, so
+    // `positive` is the separator — a key-column-only sort would not be total.
+    const ROWS: usize = 70_000;
+    let mut lines = String::from("anchor,positive\n");
+    let mut written = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        let n = (i * 37) % ROWS;
+        let anchor = format!("a{:05}", n / 2);
+        let positive = format!("p{n:05}");
+        lines.push_str(&format!("{anchor},{positive}\n"));
+        written.push((anchor, positive));
+    }
+    let csv = dir.path().join("pairs.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    let mut config = common::test_config(dir.path());
+    config.engine.execution_threads = 4;
+    let partitions = config.engine.execution_threads;
+    assert!(
+        partitions > 1,
+        "a scan cannot interleave at one partition, so the control below would \
+         be vacuous"
+    );
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "pairs",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // DataFusion only splits ONE file across partitions when the file exceeds
+    // `repartition_file_min_size` (10 MB by default). A 70k-row ZSTD training
+    // set is far under that, so without this the reader gets a single file
+    // group and the committed order survives an unordered scan by accident —
+    // the regime in which this oracle proves nothing. Lowering the threshold
+    // puts the reader in the regime the ORDER BY exists for, which a
+    // production-scale training set reaches on size alone.
+    session
+        .sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+        .await
+        .unwrap();
+
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+    let (table, batches) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "pairs",
+        &columns,
+        ModelTask::TextEmbedding,
+        "pairs",
+    )
+    .await
+    .unwrap();
+
+    // The committed file, read straight off the Parquet object in FILE order —
+    // never back through a scan, whose partitioning is exactly what this oracle
+    // must not be at the mercy of.
+    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let handle = session.result_store().open_parquet(&url).unwrap();
+    let bytes = handle
+        .get_bytes(&handle.data_path().unwrap())
+        .await
+        .unwrap();
+    let builder =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let row_groups = builder.metadata().num_row_groups();
+    assert!(
+        row_groups > 1,
+        "the order oracle is vacuous on a single row group; the fixture produced {row_groups}"
+    );
+    let committed: Vec<(String, String)> = rows_of(
+        &builder
+            .build()
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    assert_eq!(committed.len(), ROWS);
+    assert_eq!(committed, canonical_order(&written));
+
+    // The read-back the worker performs, through the production reader.
+    assert_eq!(
+        rows_of(&batches),
+        committed,
+        "the read-back must reproduce the committed order exactly"
+    );
+
+    let ordered_sql = read_back_sql(&table, &columns);
+    // The clause names the WHOLE committed key, rendered by the producer's own
+    // single source of truth. A prefix of the key re-sorts an already-sorted
+    // file into (almost always) the same order, so the row comparison above
+    // cannot see that determinant — the SQL text is where it is visible.
+    assert_eq!(
+        ordered_sql,
+        format!(
+            "SELECT * FROM {} {}",
+            table.sql_relation(),
+            jammi_db::store::training_set_order_by(&columns)
+        )
+    );
+    for column in &columns {
+        assert!(
+            ordered_sql.contains(&format!(r#""{column}" ASC NULLS FIRST"#)),
+            "the read-back key must carry every projected column: {ordered_sql}"
+        );
+    }
+    let unordered_sql = ordered_sql
+        .split(" ORDER BY ")
+        .next()
+        .expect("read_back_sql carries an ORDER BY")
+        .to_string();
+    assert_ne!(
+        ordered_sql, unordered_sql,
+        "read_back_sql must actually append an ORDER BY, or the control is vacuous"
+    );
+
+    // The scan really is split: read it off the physical plan rather than
+    // trusting the knob above to have taken effect.
+    let plan = explain(&session, &unordered_sql).await;
+    assert!(
+        plan.contains("file_groups={4 groups"),
+        "the read-back must be planned over {partitions} file groups for the \
+         control to mean anything; the plan is:\n{plan}"
+    );
+
+    // Negative control — remove the claimed cause and confirm the result moves.
+    let unordered = rows_of(&session.sql(&unordered_sql).await.unwrap());
+    assert_eq!(unordered.len(), committed.len());
+    assert_ne!(
+        unordered, committed,
+        "an unordered scan over {partitions} file groups returned committed \
+         order anyway, so this oracle cannot distinguish a reader that \
+         re-applies the order from one that does not"
+    );
+}
+
+/// The rendered physical plan of `query`, for assertions about HOW it is read.
+async fn explain(session: &Arc<InferenceSession>, query: &str) -> String {
+    let batches = session.sql(&format!("EXPLAIN {query}")).await.unwrap();
+    arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string()
+}
+
+/// The executed probe behind the module header's claim that a fine-tune source
+/// can never name a result table (and so can never be anchored by content
+/// digest): resolving a source goes through
+/// `SessionContext::catalog(source_id)`, and a result table is registered as a
+/// BARE table in the default catalog, never as a catalog of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_table_cannot_be_a_fine_tune_source() {
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let columns = parity_columns();
+    let (table, _) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "training",
+        &columns,
+        ModelTask::TextEmbedding,
+        "contrastive",
+    )
+    .await
+    .unwrap();
+
+    // The table is real and readable under its registered name.
+    let bound = session
+        .sql(&format!("SELECT * FROM {}", table.sql_relation()))
+        .await
+        .unwrap();
+    assert_eq!(bound.iter().map(|b| b.num_rows()).sum::<usize>(), 30);
+
+    // ... and yet neither its catalog name nor its registered name resolves as
+    // a fine-tune SOURCE, on either the submit or the materialize path.
+    for name in [table.table_name().to_string(), table.registered_name()] {
+        let err = jammi_ai::fine_tune::training_set::materialize_projection(
+            &session,
+            &name,
+            &columns,
+            ModelTask::TextEmbedding,
+            "contrastive",
+        )
+        .await
+        .expect_err("a result table must not resolve as a fine-tune source");
+        assert!(
+            format!("{err}").contains("not found"),
+            "expected a source-resolution failure for {name:?}, got {err}"
+        );
+    }
+}

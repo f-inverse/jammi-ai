@@ -65,17 +65,43 @@ only shrink the adjacent set) and is therefore NOT the acceptance-easing
 normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
 row is diagnostic only — no gate decision reads it; which requirement has content is
 derived from the enumeration itself.
-**(2b) Open question — ALWAYS (esc-lead-gate-R10).** Alongside the ≥2 examined-clean
-sites (2) already requires, a non-empty `open_question` string must be present on
-every BLOCK relay of every gated verifier type: a site the lead examined and
-explicitly could NOT close, naming the attack for the next round to run. (2)'s own
-≥2-distinct-non-reactive count is UNCHANGED — this is a separate, ADDITIONAL field,
-never folded into the `probe` array or its counting. No subprocess, no regex, no
-match count, no cap: a plain non-empty-string presence check, nothing that scales
-with the size of a class. HONEST LIMIT, stated as one: this is a SCHEMA requirement
-over lead-authored text, a COST FLOOR, not proof of examination — the same limit (2)
-already carries. A lead can write a hollow open question; what it cannot do is write
-nothing and pass. What a human reads at merge is whether the open question was real.
+**(2b) Anticipate before the fix, not after (esc-lead-gate-R12, fix round 1 —
+REPLACES esc-lead-gate-R10's `open_question`).** `open_question` required only that
+the lead NAME a site examined and not closed, "the attack for the NEXT ROUND to
+run" — a schema requirement over lead-authored prose, never an executed check, which
+institutionalised exactly the deferral it was meant to catch (three closing audits in
+a row BLOCKed on a mechanism the PREVIOUS fix introduced, each discoverable by
+running it once before re-dispatching; see `docs/swarm/SELF-FAILURE-MODES.md` F10's
+third incident). R12 moves the load-bearing check to the PRE-FIX moment, before the
+implementer is ever dispatched: `_decide_implementer_dispatch` denies a dispatch onto
+a unit branch carrying ANY open `VERIFIER_SECOND_ROUND_TYPES` BLOCK unless a
+`.jammi/gate-state/<slug>.anticipation.<tip_sha>.json` artifact exists — KEYED BY THE
+BRANCH'S CURRENT TIP, never a single block's own sha (two open blocks of different
+types at different shas must both be satisfiable by ONE artifact, never a permanent
+deny) — `{unit_branch, pre_fix_sha, covers, attacks: {"<file>": {command, hash}},
+residual_risk}`, one entry PER FILE covering the UNION of every open block's own
+`finding_locations` ∪ `class_enumeration`, whose every command the hook RE-EXECUTES
+and hash-matches, whose ordering evidence is a tip that has not moved and a CLEAN
+tree (`git status --porcelain` empty — a dirty worktree denies, naming the paths),
+and at least one of whose commands is execution-class (never only inspectors —
+`sed`/`grep`/`cat`/`head`/`awk`/`rg`/`wc`/`tail`/`ls`). `residual_risk` is the one
+field where the lead admits what stays unclosed — honest, never a hand-off. The
+CLOSING relay then requires `attacks_post` — the SAME per-file keys (widened by every
+file the fix changed or added a new surface to), re-run at `fix_head`; for every file
+the fix changed that a pre-fix key covers, its hash must have MOVED, an `outcome`
+DERIVED from the inequality, never lead-declared. `ci/scripts/check_rigor_record.py`
+independently HARD-FAILS on the committed record's SHAPE (every union key covered,
+every command passing the hook's own denylist) and, separately, ADVISORY-re-executes
+what it can from a real `pre_fix_sha` checkout — never a hard fail there (BSD/GNU and
+path divergence between the lead's machine and CI, measured). HONEST LIMITS: the hook
+cannot judge that an attack is a GOOD attack, only that it ran, at this instant,
+against a worktree whose HEAD really was the tip with nothing uncommitted, and that
+its output moved after the fix — this does not establish that no fix exists off-tree,
+nor that the attack necessarily preceded a later fix commit; the hook trusts the
+lead's own `unit:` line (a decoy is not detected); a fix that REWRITES a function's
+body inside an already-covered file is not separately re-armed beyond that file's own
+required key. A lead can still write a weak attack; what it cannot do is write
+nothing, or write it AFTER a fix already landed, and pass.
 **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
 `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
 (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE
@@ -129,7 +155,8 @@ probing the fix's own surface satisfies this even when that file is also a findi
 location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
 conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
 though one entry can double as both when it qualifies for each), with (2b)'s
-separate `open_question` field, and with (4)'s `claims` object below — all
+`attacks_post` differential (armed pre-fix, at implementer-dispatch time, not merely
+at this relay), and with (4)'s `claims` object below — all
 conjunctive with R1-R3. **One unit per
 dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
 type, the dispatch is denied outright, naming every targeted unit — R3 never

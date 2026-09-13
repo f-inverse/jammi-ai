@@ -640,6 +640,173 @@ async fn a_training_set_replays_from_its_recorded_descriptor() {
     );
 }
 
+/// M2 — `recompute`'s `TrainingSet` replay re-anchors from the ORIGINAL
+/// manifest's recorded relation names, not from the recomputed table's single
+/// `source_id` lineage column.
+///
+/// The graph arm anchors two relations (M1); nothing about `TrainingSetSpec`
+/// restricts `inputs` to one entry for the tabular arm either — this fixture
+/// exercises that directly, without a graph, by materialising a spec whose
+/// `inputs` name two distinct relations. A replay that instead re-derived a
+/// single anchor from `table.source_id` would silently collapse the recorded
+/// set to one relation; asserting the replay's OWN manifest is the executed
+/// check.
+#[tokio::test(flavor = "multi_thread")]
+async fn recompute_re_anchors_every_recorded_relation() {
+    use jammi_ai::pipeline::recompute::Cascade;
+    use jammi_db::store::manifest::{AnchorKind, InputAnchor};
+    use jammi_db::store::TrainingSetSpec;
+
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    // A second, distinctly-named source — its content is irrelevant here,
+    // only its NAME matters, as a second relation `inputs` will carry.
+    session
+        .add_source(
+            "training_secondary",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let columns = parity_columns();
+    let source_sql =
+        r#"SELECT "text_a", "text_b", "score" FROM "training".public."training_pairs""#.to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let spec = TrainingSetSpec {
+        source_id: "training",
+        source_sql: &source_sql,
+        columns: &columns,
+        task: ModelTask::TextEmbedding,
+        format: "contrastive",
+        inputs: vec![
+            InputAnchor::unpinned_at_instant("training", now.clone()),
+            InputAnchor::unpinned_at_instant("training_secondary", now),
+        ],
+        device: session.compute_device(),
+    };
+    let table = session
+        .result_store()
+        .materialize_training_set(session.context(), spec)
+        .await
+        .unwrap();
+
+    let report = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(table.table_name(), Cascade::ReportOnly)
+        .await
+        .unwrap();
+    assert_eq!(report.recomputed.len(), 1);
+    let replay = &report.recomputed[0];
+
+    let replayed_record = session
+        .catalog()
+        .get_result_table(&replay.recomputed)
+        .await
+        .unwrap()
+        .expect("the replay promoted a new ready table");
+    let anchors: Vec<InputAnchor> = serde_json::from_str(
+        replayed_record
+            .input_anchors_json
+            .as_deref()
+            .expect("the replay's manifest carries recorded anchors"),
+    )
+    .unwrap();
+    let names: std::collections::BTreeSet<&str> =
+        anchors.iter().map(|a| a.source.as_str()).collect();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["training", "training_secondary"]),
+        "the replay must re-anchor every relation the ORIGINAL manifest recorded, \
+         not just the recomputed table's source_id, got {anchors:?}"
+    );
+    assert_eq!(
+        anchors.len(),
+        2,
+        "no relation may be duplicated or dropped, got {anchors:?}"
+    );
+    for anchor in &anchors {
+        assert_eq!(anchor.kind, AnchorKind::UnpinnedAtInstant);
+    }
+    assert_eq!(
+        anchors[0].anchor, anchors[1].anchor,
+        "the replay's re-anchor must share ONE fresh instant across every relation, \
+         got {anchors:?}"
+    );
+}
+
+/// M2's first unwitnessed refusal — a `TrainingSet` descriptor recorded under
+/// an `order_rule` this build does not implement is `NotRecomputable`, never a
+/// replay guessed under a rule the recorded descriptor does not claim.
+///
+/// No producer in this build ever WRITES an unimplemented rule, so the only
+/// way to exercise the refusal honestly is to corrupt a real manifest's
+/// `order_rule` in place (same bytes, same artifact, same anchors — the ONE
+/// field this test changes) and drive `recompute` at it.
+#[tokio::test(flavor = "multi_thread")]
+async fn recompute_refuses_a_training_set_with_an_unknown_order_rule() {
+    use jammi_ai::pipeline::recompute::Cascade;
+    use jammi_db::error::JammiError;
+    use jammi_db::store::manifest::{MaterializationManifest, ProducingDescriptor};
+
+    const UNKNOWN_ORDER_RULE: &str = "full_tuple_v2";
+
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let columns = parity_columns();
+    let (table, _) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "training",
+        &columns,
+        ModelTask::TextEmbedding,
+        "contrastive",
+    )
+    .await
+    .unwrap();
+
+    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let mut manifest: MaterializationManifest = session
+        .result_store()
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("the producer wrote a manifest sidecar");
+    let ProducingDescriptor::TrainingSet { order_rule, .. } = &mut manifest.descriptor else {
+        panic!(
+            "expected a TrainingSet descriptor, got {:?}",
+            manifest.descriptor
+        );
+    };
+    assert_ne!(
+        order_rule.as_str(),
+        UNKNOWN_ORDER_RULE,
+        "the corruption below is vacuous unless it actually changes the rule"
+    );
+    *order_rule = UNKNOWN_ORDER_RULE.to_string();
+
+    let handle = session.result_store().open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, manifest.to_json_bytes().unwrap().into())
+        .await
+        .unwrap();
+
+    let err = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(table.table_name(), Cascade::ReportOnly)
+        .await
+        .expect_err("an unimplemented order_rule must refuse, never replay under a guess");
+    match err {
+        JammiError::NotRecomputable { table: named } => {
+            assert_eq!(named, table.table_name());
+        }
+        other => panic!("expected NotRecomputable, got {other:?}"),
+    }
+}
+
 /// The artifact digest a table's manifest attests — the byte-identity witness.
 async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
     let record = session

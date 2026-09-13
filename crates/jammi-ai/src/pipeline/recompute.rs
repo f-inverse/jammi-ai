@@ -425,6 +425,16 @@ impl InferenceSession {
     /// lineage column, which is the recomputed table's own catalog row — the
     /// same shape the `NeighborGraph` arm uses.
     ///
+    /// # Anchors re-derive from the RECORDED anchor set, not from `source_id`
+    ///
+    /// The original materialization may have anchored more than one relation
+    /// (the graph arm anchors both its node and its edge source); `source_id`
+    /// is one lineage column and can name only one of them. The replay instead
+    /// reads the table's own `.materialization.json` sidecar for its recorded
+    /// `input_anchors` and re-anchors every one of THOSE relation names — at a
+    /// fresh, shared instant — so a replay's manifest never reports a narrower
+    /// anchor set than the original materialization actually read.
+    ///
     /// # Why this always recomputes
     ///
     /// The verb carries no cache dial: it owns its own reuse probe, which
@@ -467,6 +477,25 @@ impl InferenceSession {
                 table: table.table_name.clone(),
             });
         }
+        // Re-anchor from the RECORDED anchor set's relation names, never from
+        // `table.source_id` alone: a graph training set's original
+        // materialization anchored BOTH the node and the edge relation, and a
+        // replay that only re-derived one would silently drop the other from
+        // the new manifest's lineage. `table.source_id` names one relation by
+        // construction (the catalog row's single lineage column); the
+        // manifest's own `input_anchors` is the only record of the full set.
+        let parquet_url = jammi_db::storage::StorageUrl::parse(&table.parquet_path)?;
+        let recorded_anchors = self
+            .result_store()
+            .read_materialization_manifest(&parquet_url)
+            .await?
+            .map(|manifest| manifest.input_anchors)
+            .unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        let inputs: Vec<InputAnchor> = recorded_anchors
+            .iter()
+            .map(|anchor| InputAnchor::unpinned_at_instant(anchor.source.clone(), now.clone()))
+            .collect();
         let materialized = self
             .result_store()
             .materialize_training_set(
@@ -477,10 +506,7 @@ impl InferenceSession {
                     columns: &columns,
                     task,
                     format: &format,
-                    inputs: vec![InputAnchor::unpinned_at_instant(
-                        &table.source_id,
-                        chrono::Utc::now().to_rfc3339(),
-                    )],
+                    inputs,
                     device: self.compute_device(),
                 },
             )

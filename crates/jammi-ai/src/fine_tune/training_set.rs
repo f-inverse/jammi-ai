@@ -3,7 +3,7 @@
 //!
 //! A training run no longer re-runs its source query into memory. It
 //! materialises the projected rows once, through
-//! [`ResultStore::materialize_training_set`], into an immutable Parquet result
+//! [`ResultStore::materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set), into an immutable Parquet result
 //! table of kind `TrainingSet` carrying a definition hash and the standard
 //! manifest attestation, and then reads that table back. Two runs over the same
 //! source query, columns, task and format name the same table — whatever their
@@ -13,7 +13,7 @@
 //! # The order contract has two halves, and this module owns the reader's
 //!
 //! The producer commits the rows sorted by the **full projected tuple**
-//! ([`TRAINING_SET_ORDER_RULE_V1`]). A Parquet scan gives no row-order
+//! ([`TRAINING_SET_ORDER_RULE_V1`](jammi_db::store::manifest::TRAINING_SET_ORDER_RULE_V1)). A Parquet scan gives no row-order
 //! guarantee: the table is written with 64K row groups and the session plans at
 //! `[engine] execution_threads` partitions, so a table larger than one row group
 //! comes back interleaved unless the reader asks for the order. [`read_back_sql`]
@@ -25,8 +25,9 @@
 //! # Anchors
 //!
 //! A registered source exposes no version or digest surface, so its rows are
-//! anchored [`AnchorKind::UnpinnedAtInstant`] — the same honest anchor the
-//! embedding producer records for the same reason (`pipeline/embedding.rs`).
+//! anchored [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
+//! — the same honest anchor the embedding producer records for the same reason
+//! (`pipeline/embedding.rs`).
 //! The engine's reuse probe never matches an unpinned anchor, so a training set
 //! over a plain source is never reused across runs; the anchor still rides the
 //! manifest, so staleness reports the same honest `Undecidable` it reports for

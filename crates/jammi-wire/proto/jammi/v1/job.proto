@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package jammi.v1.job;
 
+import "jammi/v1/inference.proto";
 import "jammi/v1/training.proto";
 
 // JobService — the wire surface over the engine's durable job queue
@@ -151,6 +152,20 @@ message SubmitJobRequest {
   // trained model's producing identity. A count the deployment cannot serve is
   // refused at submit with a typed error rather than silently clamped.
   uint32 world_size = 9;
+  // Opt-in model-level cache reuse for the two LoRA fine-tune kinds: probe
+  // the base model + training-set definition for an exact prior
+  // materialisation and register the caller's own name against the reused
+  // artifact prefix instead of retraining. Mirrors the engine's
+  // `TrainingCommon.cache` field for field, the same shared `CachePolicy`
+  // enum every other result-table producer verb carries
+  // (`jammi.v1.inference.CachePolicy` — imported rather than redeclared, so
+  // this and every other producer's cache dial share one wire vocabulary).
+  // UNSPECIFIED maps to the engine default (`Bypass`, always train), matching
+  // how every other `*_UNSPECIFIED` arm resolves to its engine default; an
+  // absent field and an explicit `CACHE_POLICY_BYPASS` are the identical
+  // engine outcome. Unused by the context-predictor kind (it carries no
+  // `TrainingCommon`, so it has nothing to probe by).
+  jammi.v1.inference.CachePolicy cache = 10;
   // Tags 7 and 8 belonged to the job-dependency unit (`depends_on = 7`,
   // `parent_id = 8`), deferred to #515 and recoverable by cherry-pick; holding
   // them means that recovery cannot collide with an appended field.

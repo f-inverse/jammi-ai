@@ -41,6 +41,7 @@ mod parallel_train;
 mod pinned_source_gate;
 mod pipeline;
 mod pooling_config;
+mod rank_admission;
 mod read_vectors;
 mod recompute;
 mod refresh;

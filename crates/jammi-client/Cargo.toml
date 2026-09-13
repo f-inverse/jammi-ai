@@ -29,3 +29,8 @@ uuid.workspace = true
 # those functions, so this needs a genuine server-side handler, not a
 # hand-built `tonic::Request` inspected without ever sending it.
 tokio.workspace = true
+# Test-only: `world_size_tests` compares two submissions as ENCODED BYTES
+# (`prost::Message::encode_to_vec`), not field-by-field -- an explicit rank
+# count of one must put on the wire exactly what an unchosen count puts there,
+# and bytes are what a server and another client's encoder actually agree on.
+prost.workspace = true

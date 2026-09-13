@@ -11212,6 +11212,7 @@ mod media_front_end_wall_tests {
             .expect("htsat_clap_tiny fixture must resolve");
         let device_config = DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,

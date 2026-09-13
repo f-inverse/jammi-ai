@@ -741,6 +741,36 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
+      # Image-ordering gate for the NCCL link surface, and the reason it is a
+      # step rather than a note in a PR description. `jammi-ai`'s `cuda`
+      # feature includes `candle-core/nccl`, so cudarc's build script emits
+      # `cargo:rustc-link-lib=dylib=nccl` and every `--features cuda` step in
+      # this job links against NCCL: it needs `nccl.h` at compile time and
+      # `libnccl.so` (the development symlink, not just the versioned object)
+      # at link time. `.docker/ci-cuda.Dockerfile` installs `libnccl` and
+      # `libnccl-devel` for exactly that; this step asserts that THE IMAGE
+      # THIS RUN PULLED actually carries them, before the first step that
+      # would otherwise die a few minutes in with a bare `cannot find -lnccl`
+      # or a missing-header error out of a build script.
+      #
+      # It fails closed in both directions and needs no bookkeeping: a run on
+      # a `:latest` published before that Dockerfile change reds here, and so
+      # does any later rebuild that loses the package. `rpm -q` (this image is
+      # RPM-based — manylinux_2_28 on AlmaLinux 8) names the exact package and
+      # version in the log, which is what a "why did the link fail" question
+      # needs; the two `test -e` legs are the file-level facts the compiler and
+      # the linker actually consume, since a package can be present with its
+      # devel half absent.
+      #
+      # Nothing registers this step anywhere: `check_lint_surface_closure.py`'s
+      # required-lane registry enumerates CLIPPY lanes (crate + feature +
+      # target-kind tuples), not job steps, so a preflight has no row there,
+      # and `check_ci_guard_wiring.py` tracks `check_*`/`test_*` SCRIPTS, of
+      # which this step invokes none. The lane as a whole is already required
+      # through `ci-summary`'s `needs:` list.
+      - name: Preflight — the image carries NCCL (header + link library)
+        run: rpm -q libnccl libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so
+
       - uses: ./.github/actions/setup-rust-ci
 
       # `JAMMI_FLASH_MEASURE_RSS=1` is deliberately NOT set on this step
@@ -2318,6 +2348,26 @@ jobs:
             cmd: bash ci/scripts/assert_glibc_floor.sh --self-test
           - name: assert_image_attestations.sh self-test
             cmd: bash ci/scripts/assert_image_attestations.sh --self-test
+          # The cu12 release tarball's library-bundling derivation
+          # (`ci/scripts/bundle_cuda_libs.sh`, called from
+          # `release-binaries.yml`'s `server-cu12-build` step). Its only
+          # caller's promote leg runs on a `v*` TAG, so nothing on the merge
+          # path executes it — this leg is the hermetic half, and without it
+          # the derivation's first real run would be a release. The suite
+          # sources the actual script, replaces its one ELF-reading function
+          # with the MEASURED `DT_NEEDED` list of the shipped binary, and
+          # drives the real resolution/closure/refusal/staging over a fake
+          # library tree: no readelf, no ldd, no ELF file, no CUDA install,
+          # so it runs on this toolchain-free runner unchanged.
+          - name: cu12 tarball library derivation suite
+            cmd: bash ci/scripts/test_bundle_cuda_libs.sh
+          # The cu12 WHEEL's half of the same question: `verify_link_set.py`'s
+          # `COVERED`, `_entry.py`'s `_CUDA_COMPONENTS` and `pyproject.toml`'s
+          # `nvidia-*-cu12` pins state one contract three times, and the wheel
+          # lane that would notice them disagreeing runs only on a release.
+          # Three file reads, stdlib only — no wheel, no binary, no network.
+          - name: cu12 wheel component contract
+            cmd: python3 ci/scripts/test_cu12_component_contract.py
           # #482 item 2 (Kubernetes reference): the shared remote-smoke
           # oracle's own suite (`check_ci_guard_wiring.py` tracks every
           # tracked `tests/**/test_*.py`, so this suite must be wired in

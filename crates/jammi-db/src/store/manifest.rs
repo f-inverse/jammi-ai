@@ -559,8 +559,10 @@ pub enum ProducingDescriptor {
     /// the validation split, not the topology: those partition and slice a
     /// table that is already fixed, so folding them in would fragment one
     /// shared artifact into a per-run copy while changing not one committed
-    /// byte. That omission is what makes the table reusable by definition
-    /// hash across runs of different shapes.
+    /// byte. That omission is what lets runs of different shapes share one
+    /// table — the definition half of the reuse key; the recorded input
+    /// anchors must match too, and be pinned
+    /// ([`ResultStore::materialize_training_set`](crate::store::ResultStore::materialize_training_set)).
     ///
     /// `format` is a **canonical string tag**, not the consuming crate's
     /// format type: `jammi-db` depends on no jammi crate but `jammi-numerics`,

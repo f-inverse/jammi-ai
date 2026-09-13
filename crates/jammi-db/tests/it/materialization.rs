@@ -27,11 +27,11 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
-    AnchorKind, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, MatchVerdict,
-    MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
+    AnchorKind, ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor,
+    MatchVerdict, MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, CacheOutcome, ResultStore, TrainingSetSpec};
+use jammi_db::store::{BuildingTable, CacheOutcome, PinnedSource, ResultStore, TrainingSetSpec};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -518,10 +518,12 @@ async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backe
 
 // --- the training-set producer ---------------------------------------------
 //
-// A training set is a producer output shared by definition hash, not a run's
-// scratch space (r31). These tests pin the db half of that contract: the kind
-// and the manifest, reuse by definition hash, the K2 refusal of an empty
-// projection, the committed full-tuple order under a partitioned plan, the
+// A training set is a producer output shared across runs, not a run's scratch
+// space (r31) — shared on the engine's standing reuse key, the definition hash
+// AND the recorded input anchors, so an unpinned source is never reused.
+// These tests pin the db half of that contract: the kind and the manifest,
+// reuse over a pinned source, the two ways a reuse is refused (an unpinned
+// anchor, an advanced one), the K2 refusal of an empty projection, the committed full-tuple order under a partitioned plan, the
 // exclusion from embedding resolution, and the promise that materializing
 // never touches a `building` row this call does not own.
 
@@ -569,12 +571,64 @@ fn ts_spec<'a>(source_id: &'a str, columns: &'a [String], format: &'a str) -> Tr
         task: ModelTask::TextEmbedding,
         format,
         // A registered relation exposes no version surface, so the honest
-        // anchor is the read instant — the shape a real caller passes, and the
-        // one an exact-inputs probe would (correctly) never match on.
+        // anchor is the read instant — the shape a real caller passes over an
+        // unpinned source, and the one the reuse probe never matches on.
         inputs: vec![InputAnchor::unpinned_at_instant(
             source_id,
             "2026-09-13T00:00:00Z",
         )],
+        device: ComputeDevice::Cpu,
+    }
+}
+
+/// The SQL a pinned spec projects: the parent result table, registered on the
+/// run's own session under the bare name `parent` by [`pinned_session`].
+const PINNED_SOURCE_SQL: &str = "SELECT \"q\", \"a\" FROM parent";
+
+/// A pinned training source: a `ready` result table (itself materialised from
+/// the in-memory fixture) resolved ONCE into a [`PinnedSource`], so the anchor
+/// a spec carries and the rows a run reads come from the same resolution. Its
+/// anchor is an `AnchorKind::ResultDigest` — the only anchor kind the reuse
+/// probe can honestly match, because a digest that still holds proves the rows
+/// did not move.
+async fn pinned_training_source(
+    store: &ResultStore,
+    dir: &tempfile::TempDir,
+    rows: Vec<RecordBatch>,
+) -> PinnedSource {
+    let columns = ts_columns();
+    let source = unique_source(dir, "pinned-parent");
+    let parent = store
+        .materialize_training_set(&ts_session(1, rows), ts_spec(&source, &columns, "parent"))
+        .await
+        .unwrap();
+    store.pin_current_version(parent.record).await.unwrap()
+}
+
+/// A fresh session reading `pin` under the bare name `parent`, through the
+/// provider of the pin's own resolution.
+async fn pinned_session(store: &ResultStore, pin: &PinnedSource) -> SessionContext {
+    let ctx = SessionContext::new();
+    let provider = store.pinned_provider(&ctx, pin).await.unwrap();
+    ctx.register_table("parent", provider).unwrap();
+    ctx
+}
+
+/// [`ts_spec`] over the pinned parent: the same definition determinants, with
+/// `anchor` as the single recorded input.
+fn pinned_spec<'a>(
+    source_id: &'a str,
+    columns: &'a [String],
+    format: &'a str,
+    anchor: InputAnchor,
+) -> TrainingSetSpec<'a> {
+    TrainingSetSpec {
+        source_id,
+        source_sql: PINNED_SOURCE_SQL,
+        columns,
+        task: ModelTask::TextEmbedding,
+        format,
+        inputs: vec![anchor],
         device: ComputeDevice::Cpu,
     }
 }
@@ -710,7 +764,7 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn two_runs_over_one_definition_share_one_training_set(backend: BackendKind) {
+async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
@@ -720,20 +774,30 @@ async fn two_runs_over_one_definition_share_one_training_set(backend: BackendKin
         (Some("q1"), Some("a1")),
         (Some("q2"), Some("a2")),
     ])];
+    // Sharing is only ever offered over a PINNED source: the parent is a
+    // result table resolved once, and both runs anchor on that resolution's
+    // digest.
+    let pin = pinned_training_source(&store, &dir, rows).await;
+    let anchor = pin.input_anchor();
+    assert_eq!(
+        anchor.kind,
+        AnchorKind::ResultDigest,
+        "the fixture must pin the source, or this oracle proves nothing about reuse"
+    );
 
     // Two runs, each on its OWN session — the second must find the table
     // through the catalog, not through a registration the first left behind.
     let first = store
         .materialize_training_set(
-            &ts_session(1, rows.clone()),
-            ts_spec(&source, &columns, "pairs"),
+            &pinned_session(&store, &pin).await,
+            pinned_spec(&source, &columns, "pairs", anchor.clone()),
         )
         .await
         .unwrap();
     let second = store
         .materialize_training_set(
-            &ts_session(1, rows.clone()),
-            ts_spec(&source, &columns, "pairs"),
+            &pinned_session(&store, &pin).await,
+            pinned_spec(&source, &columns, "pairs", anchor.clone()),
         )
         .await
         .unwrap();
@@ -767,11 +831,150 @@ async fn two_runs_over_one_definition_share_one_training_set(backend: BackendKin
     // …and the sharing is not "reuse whatever exists": one determinant moved
     // (the format) is a different training set.
     let other_format = store
-        .materialize_training_set(&ts_session(1, rows), ts_spec(&source, &columns, "triplets"))
+        .materialize_training_set(
+            &pinned_session(&store, &pin).await,
+            pinned_spec(&source, &columns, "triplets", anchor),
+        )
         .await
         .unwrap();
     assert!(matches!(other_format.outcome, CacheOutcome::Computed));
     assert_ne!(other_format.table_name(), first.table_name());
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn an_unpinned_source_is_never_reused(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let rows = vec![ts_batch(&[
+        (Some("q1"), Some("a1")),
+        (Some("q2"), Some("a2")),
+    ])];
+
+    // The registered relation exposes no version surface, so both runs anchor
+    // on a read INSTANT. An instant does not prove the rows are the ones the
+    // first run read: between the two runs the relation may have gained,
+    // lost, or rewritten every row, and the engine has no way to tell. So the
+    // second run recomputes — a training set over changed data is never
+    // served as the old one.
+    let first = store
+        .materialize_training_set(
+            &ts_session(1, rows.clone()),
+            ts_spec(&source, &columns, "pairs"),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .materialize_training_set(&ts_session(1, rows), ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+
+    // Non-vacuity: the two requests are the SAME definition — only the
+    // unpinned anchors keep them apart, so a definition-only probe would have
+    // reused here.
+    assert_eq!(first.definition_hash, second.definition_hash);
+    assert_eq!(
+        ts_spec(&source, &columns, "pairs").inputs[0].kind,
+        AnchorKind::UnpinnedAtInstant,
+        "the fixture must anchor unpinned, or this oracle proves nothing"
+    );
+    assert!(matches!(first.outcome, CacheOutcome::Computed));
+    assert!(
+        matches!(second.outcome, CacheOutcome::Computed),
+        "an unpinned source must never be reused, got {:?}",
+        second.outcome
+    );
+    assert_ne!(second.table_name(), first.table_name());
+
+    let training_sets: Vec<String> = catalog
+        .find_result_tables(&source, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .map(|t| t.table_name)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        2,
+        "two unpinned runs must leave two tables, found {training_sets:?}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let rows = vec![ts_batch(&[
+        (Some("q1"), Some("a1")),
+        (Some("q2"), Some("a2")),
+    ])];
+    let pin = pinned_training_source(&store, &dir, rows).await;
+    let anchor = pin.input_anchor();
+
+    let first = store
+        .materialize_training_set(
+            &pinned_session(&store, &pin).await,
+            pinned_spec(&source, &columns, "pairs", anchor.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first.outcome, CacheOutcome::Computed));
+
+    // The same parent table, at a DIFFERENT digest — what a recompute of the
+    // parent leaves a second run holding. The definition is untouched, so the
+    // anchor is the only thing that says these are two different training
+    // sets.
+    let advanced = InputAnchor::result_digest(
+        pin.table_name(),
+        &ArtifactDigest(format!("{:0>64}", "deadbeef")),
+    );
+    assert_ne!(advanced, anchor);
+    let second = store
+        .materialize_training_set(
+            &pinned_session(&store, &pin).await,
+            pinned_spec(&source, &columns, "pairs", advanced),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first.definition_hash, second.definition_hash,
+        "the two requests must share a definition, or the anchor is not what \
+         this oracle is measuring"
+    );
+    assert!(
+        matches!(second.outcome, CacheOutcome::Computed),
+        "a different input anchor is a different training set, got {:?}",
+        second.outcome
+    );
+    assert_ne!(second.table_name(), first.table_name());
+
+    // …and the pinned reuse itself still works: the ORIGINAL anchor hits the
+    // first table, so this test's `Computed` is the anchor's doing and not a
+    // probe that never matches anything.
+    let third = store
+        .materialize_training_set(
+            &pinned_session(&store, &pin).await,
+            pinned_spec(&source, &columns, "pairs", anchor),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        third.outcome,
+        CacheOutcome::Reused {
+            table: first.table_name().to_string()
+        }
+    );
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]

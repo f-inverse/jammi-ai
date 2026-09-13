@@ -167,9 +167,11 @@ pub const TRAINING_SET_MODEL_ID: &str = "training-set";
 ///
 /// Every field here except `device` and `inputs` is a **determinant of the
 /// table's identity** and folds into [`ProducingDescriptor::TrainingSet`];
-/// `device` folds into the [`MaterializationEnv`] the hash also covers, and
-/// `inputs` is provenance the manifest records (not part of the hash — the
-/// definition is *how* a table is produced, the anchors are *over what*).
+/// `device` folds into the [`MaterializationEnv`] the hash also covers.
+/// `inputs` is not part of the hash — the definition is *how* a table is
+/// produced, the anchors are *over what* — but it IS the other half of the
+/// reuse key: [`ResultStore::materialize_training_set`] reuses a table only
+/// when its recorded anchors equal these and every one of them is pinned.
 ///
 /// Deliberately absent: world size, per-rank batch, validation fraction,
 /// topology. They slice a table that is already fixed, so a spec that carried
@@ -196,9 +198,11 @@ pub struct TrainingSetSpec<'a> {
     /// mapping's completeness is what keeps two formats off one hash.
     pub format: &'a str,
     /// The as-of anchors of every input the source query reads, in the
-    /// caller's order. Recorded in the manifest; see
-    /// [`ResultStore::materialize_training_set`] for why they are provenance
-    /// here rather than part of the reuse key.
+    /// caller's order. Recorded in the manifest and matched exactly by the
+    /// reuse probe: an [`AnchorKind::UnpinnedAtInstant`] anchor here means
+    /// this materialization is never served from an existing table, and never
+    /// serves a later one (see
+    /// [`ResultStore::materialize_training_set`]).
     pub inputs: Vec<InputAnchor>,
     /// The device the projection ran on — part of the environment the
     /// definition hash folds.
@@ -282,8 +286,9 @@ pub struct TrainingSetTable {
     /// The promoted catalog record. `record.table_name` is the table's
     /// identity; see [`Self::registered_name`] for the name SQL reaches it by.
     pub record: ResultTableRecord,
-    /// The definition hash the table is content-addressed by — the key a
-    /// second run reuses it through, and the value a downstream producer folds
+    /// The definition hash the table is content-addressed by — the descriptor
+    /// half of the key a second run reuses it through (the recorded input
+    /// anchors are the other half), and the value a downstream producer folds
     /// into its own descriptor.
     pub definition_hash: DefinitionHash,
     /// Whether this call materialised the table
@@ -3787,8 +3792,9 @@ impl ResultStore {
     /// training run reads its rows from, and return the `ready` table.
     ///
     /// The training set is a **producer output**, not a run's scratch space:
-    /// two runs over the same source query, columns, task and format share ONE
-    /// table, found by [`DefinitionHash`]. Nothing about how a run *consumes*
+    /// two runs over the same source query, columns, task and format — read
+    /// over the same *pinned* input anchors — share ONE table, keyed by
+    /// ([`DefinitionHash`], input anchors). Nothing about how a run *consumes*
     /// the rows (world size, per-rank batch, validation split, topology) enters
     /// the identity, so runs of different shapes reuse the same artifact — see
     /// [`ProducingDescriptor::TrainingSet`] for the full determinant set.
@@ -3807,24 +3813,26 @@ impl ResultStore {
     /// # Reuse
     ///
     /// Before planning anything, this probes for a `ready`
-    /// [`ResultTableKind::TrainingSet`] row carrying this definition hash whose
-    /// Parquet artifact is still extant, and short-circuits to it. Reuse is
+    /// [`ResultTableKind::TrainingSet`] row carrying this definition hash
+    /// **and** exactly `spec.inputs` as its recorded anchors, whose Parquet
+    /// artifact is still extant, and short-circuits to it. Reuse is
     /// **reported**, never inferred: the returned
     /// [`TrainingSetTable::outcome`] says which path ran.
     ///
-    /// The probe key is the definition hash **alone** — deliberately not the
-    /// `(definition, input anchors)` pair [`Self::probe_cache_record`] matches
-    /// on. A training set is projected from a registered source relation, which
-    /// exposes no version or digest surface to pin, so its only honest anchor
-    /// is [`AnchorKind::UnpinnedAtInstant`] — an anchor the exact-inputs probe
-    /// (correctly) never treats as a match, which would make a training set
-    /// unshareable in every real deployment. What that costs is stated plainly
-    /// rather than hidden: reuse asserts that the source query names the same
-    /// rows it named before, and the engine cannot verify that for an unpinned
-    /// source. The recorded anchors still ride the manifest, so
-    /// [`Self::staleness`] reports the same honest `Undecidable` it reports for
-    /// every unpinned input, and a caller that wants a fresh table changes the
-    /// definition (its query) rather than asking for a second copy of one.
+    /// The rule is the engine's standing reuse semantics, with no local
+    /// exception: the key is the `(definition, input anchors)` pair
+    /// [`Self::probe_cache_record`] matches on, so **reuse happens only when
+    /// every recorded anchor is pinned ([`AnchorKind::ResultDigest`]) and equal
+    /// to the requested one**. A `spec.inputs` containing an
+    /// [`AnchorKind::UnpinnedAtInstant`] anchor is therefore never a hit and
+    /// always yields [`CacheOutcome::Computed`]: an instant is not a
+    /// reproducible id, so equal anchors would not prove equal rows, and a
+    /// training set built over changed data must never be served as the old
+    /// one. That is the same predicate [`Self::staleness`] applies (an
+    /// unpinned input is `Undecidable`, never `Fresh`); a caller that wants
+    /// its training sets shared pins its source (a result table read through
+    /// [`Self::pin_current_version`]) rather than asking the probe to assume
+    /// an unpinned relation did not move.
     ///
     /// # What it never does to a `building` row
     ///
@@ -3841,8 +3849,9 @@ impl ResultStore {
     /// # `job_attempt` is `None`, always
     ///
     /// The row is created with no job attempt, so it is never recorded as some
-    /// attempt's `jobs.partial_result`. A table shared by definition hash
-    /// across jobs is not any one attempt's partial output; recording it as one
+    /// attempt's `jobs.partial_result`. A table shared across jobs by its
+    /// `(definition, anchors)` key is not any one attempt's partial output;
+    /// recording it as one
     /// would tie a shared artifact's lifetime to a single attempt's failure.
     ///
     /// # Refusals
@@ -3866,7 +3875,10 @@ impl ResultStore {
         let definition =
             MaterializationManifest::definition_of(&descriptor, &env).map_err(manifest_to_jammi)?;
 
-        if let Some(record) = self.probe_ready_training_set(&definition).await? {
+        if let Some(record) = self
+            .probe_ready_training_set(&definition, &spec.inputs)
+            .await?
+        {
             // A reused table was registered on whichever session built it,
             // which is not this one; bind it here so the caller can read it
             // back under `jammi.{name}` exactly as it would a fresh one.
@@ -3955,13 +3967,25 @@ impl ResultStore {
         })
     }
 
-    /// The `ready` training-set table carrying `definition`, newest first,
-    /// whose Parquet artifact still exists — or `None`.
+    /// The `ready` training-set table produced by `definition` over exactly
+    /// `inputs`, newest first, whose Parquet artifact still exists — or
+    /// `None`.
     ///
-    /// The candidate set is narrowed to [`ResultTableKind::TrainingSet`]: a
-    /// definition hash folds the producing descriptor, so another kind can only
-    /// share one through a hash collision, and reusing a differently-shaped
-    /// table on that basis is not a risk this probe takes.
+    /// The candidate set is [`Self::exact_match_candidates`]', so this probe
+    /// carries the engine's standing reuse predicate verbatim: the recorded
+    /// anchor set must equal `inputs`, and a requested set holding any
+    /// [`AnchorKind::UnpinnedAtInstant`] anchor yields no candidate at all
+    /// (an instant does not prove the source's rows did not move). It is
+    /// [`Self::probe_cache_record`] plus ONE extra predicate — the kind — not
+    /// a second reuse policy.
+    ///
+    /// The kind filter is why this is not a bare call to
+    /// [`Self::probe_cache_record`]: that verb returns the newest extant
+    /// candidate of ANY kind, so a non-training-set row sharing the key
+    /// (only a hash collision can produce one) would both be handed back as a
+    /// training set and shadow a sound training-set reuse behind it. Filtering
+    /// before the extant check keeps the fall-through ranging over
+    /// training-set rows.
     ///
     /// The catalog's own `ORDER BY` is not trusted as the tie-break of record
     /// (r32): the candidates are re-sorted in Rust on the total key
@@ -3972,11 +3996,9 @@ impl ResultStore {
     async fn probe_ready_training_set(
         &self,
         definition: &DefinitionHash,
+        inputs: &[InputAnchor],
     ) -> Result<Option<ResultTableRecord>> {
-        let mut candidates = self
-            .catalog()
-            .find_ready_result_tables_by_definition(definition.as_str())
-            .await?;
+        let mut candidates = self.exact_match_candidates(definition, inputs).await?;
         candidates.retain(|c| c.kind == ResultTableKind::TrainingSet);
         candidates.sort_by(|a, b| {
             b.created_at

@@ -356,6 +356,25 @@ async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
             "every source row is committed, per table"
         );
     }
+
+    // K7: the definition hash folds source/columns/task/format/order_rule —
+    // NOT the anchor, the table id, or anything about which job ran it. Two
+    // tables that are never reused (because their anchors are unpinned and so
+    // never compare equal) still name the SAME definition: it is the anchor
+    // that differs between them, not the descriptor.
+    let hashes: Vec<Option<String>> = training_sets
+        .iter()
+        .map(|t| t.definition_hash.clone())
+        .collect();
+    assert!(
+        hashes.iter().all(Option::is_some),
+        "a producer output is content-addressed by its definition hash, got {hashes:?}"
+    );
+    assert_eq!(
+        hashes[0], hashes[1],
+        "two jobs over the identical source/columns/task/format must record ONE \
+         definition_hash between their two tables, got {hashes:?}"
+    );
 }
 
 /// (e) K2 — a projection that yields zero rows is refused with the typed

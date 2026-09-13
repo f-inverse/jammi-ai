@@ -258,3 +258,84 @@ async fn streamed_order_matches_committed_order_at_target_partitions_one_and_n()
         );
     }
 }
+
+/// Acceptance (d), the mechanism proof: hard-negative mining and GradCache
+/// are W=1-only whole-set consumers that "stream the table in and hold what
+/// they need" (`TrainingDataLoader::in_batch_negative_texts`'s `Stream` arm
+/// — `stream_drain_all`, exempt from the residency bound). Both run through
+/// the SAME `run_spec` → `from_source_stream` path
+/// [`residency_bound_holds_on_a_fixture_larger_than_batch_times_prefetch`]
+/// exercises for the ordinary per-step path, so this closes the ONE call
+/// these two mechanisms make that the rest of this file's tests never drive:
+/// a WHOLE-loader drain on a live `Stream` loader.
+///
+/// **What this does NOT claim.** This is a functional (job completes,
+/// publishes an adapter) proof, not a byte-parity pin like (c)'s — no
+/// hermetic fixture exercising mining/GradCache was pinned at U2b's base
+/// (`4e27156a`) before this unit started, so a byte-identical-to-base claim
+/// for this specific arm is UNCOVERED, not established; see this unit's
+/// report.
+#[tokio::test(flavor = "multi_thread")]
+async fn hard_negative_mining_completes_through_the_streaming_loader_at_w1() {
+    use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, HardNegativeConfig};
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_triplets.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let job = session
+        .fine_tune(
+            "training",
+            &("local:".to_string() + &common::cookbook_fixture("tiny_bert").display().to_string()),
+            &[
+                "anchor".to_string(),
+                "positive".to_string(),
+                "negative".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 4,
+                lora_rank: 4,
+                warmup_steps: 0,
+                hard_negatives: HardNegativeConfig {
+                    mine: true,
+                    k: 1,
+                    exclude_hops: 1,
+                    refresh_every: 1,
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("a world=1 mining run over the streamed loader must complete");
+
+    let models = session.catalog().list_models().await.unwrap();
+    assert!(
+        models
+            .iter()
+            .any(|m| m.model_id.starts_with("jammi:fine-tuned:")),
+        "the mining run must publish a fine-tuned model like any other W=1 run"
+    );
+}

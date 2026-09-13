@@ -676,9 +676,18 @@ schema requires the topology the run actually had (`world`, the collective, and
 one device per rank), the same-seed digest pair, the measured per-step loss
 delta, and the epsilon it is read against — with epsilon's own derivation and
 the commit it was registered at. An epsilon chosen after seeing the delta it
-excuses is not a tolerance, and the gate refuses it by name. Whether the two
-digests match is the leg's own verdict, recorded in the artifact's `status`; the
-schema does not decide it.
+excuses is not a tolerance, and the gate refuses it by name.
+
+**A failing run is representable.** The artifact carries the leg's own
+`verdict`, exactly `pass` or `fail`. A `fail` is *admitted* with its deltas and
+digests as measured — that record is the whole value of a non-reproducible run —
+and owes a `reason` naming what failed plus a top-level `status` that is not
+`GREEN`. A `pass` is a claim, so on a `pass` the worst measured delta must be
+within epsilon, and the same-seed digest pair must be *equal* at `world` 2, the
+one regime a spike measured byte-identical (candle 0.11's LoRA-shaped
+forward/backward/SGD across A100s, no env pins). Above `world` 2 the pair is
+recorded and not asserted: nothing has established what byte-identity should
+mean for a reduction whose NCCL pin set is untested there.
 
 **Where epsilon has to sit in history.** The gate reads the registration commit
 against the artifact's *evidence anchor*: `merged_as` when the artifact carries

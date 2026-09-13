@@ -156,7 +156,8 @@ must carry:
       filename matching `GANG_ARTIFACT_FILENAME_RE` — must carry every row
       of `GANG_FIELD_REGISTRY`: `world` (>= 2), `collective`, one per-rank
       `device` for each of `world` ranks, the same-seed `digests` PAIR
-      (exactly two), the measured `per_step_loss_delta`, and `epsilon`
+      (exactly two), the measured `per_step_loss_delta`, the leg's own
+      `verdict` (exactly `pass` or `fail`), and `epsilon`
       with its `value`, its `derivation`, and the `registered_sha` it was
       PRE-registered at — a commit that must be an ancestor of HEAD and a
       STRICT ancestor of the artifact's own EVIDENCE ANCHOR (an ε landing
@@ -166,15 +167,20 @@ must carry:
       else the artifact FAILS naming both — the same order rule (d) itself
       applies, so a measured tip whose landing commit REWROTE it is still
       ordered against something real instead of skipping the ε check
-      entirely (`_gang_evidence_anchor` carries the full reasoning). The
-      measured delta is read against that ε here, so an artifact cannot
-      record a run that failed its own tolerance as if it passed. Digest
-      EQUALITY is deliberately not asserted: that is the leg's verdict,
-      carried in `status`. A new required field lands as a registry row
-      (the same discipline `_TIER_SOURCE_REGISTRY` follows), never an
-      inline literal in a
-      checker. No artifact committed before this kind existed carries any
-      anchor, so none reddens.
+      entirely (`_gang_evidence_anchor` carries the full reasoning).
+
+      A FAILING gang run is REPRESENTABLE: a `fail` is admitted with its deltas and digests as
+      measured, and owes a non-empty `gang.reason` plus a top-level
+      `status` that is not `GREEN`. A `pass` is a CLAIM, so on a `pass` the
+      measured delta must be within ε (an artifact cannot record a run that
+      blew its own tolerance as if it passed) and the same-seed digest PAIR
+      must be EQUAL at `world == 2` — the one regime a spike measured
+      byte-identical. Above that world the pair is recorded, not asserted:
+      the NCCL pin set is untested at world >= 3, and a state defined by
+      missing evidence gets no definite consequence. A new required field
+      lands as a registry row (the same discipline `_TIER_SOURCE_REGISTRY`
+      follows), never an inline literal in a checker. No artifact committed
+      before this kind existed carries any anchor, so none reddens.
 
       WHAT THE ANCHOR RULE ASKS OF A PRODUCER: register ε in its OWN
       commit, BEFORE the commit that measures with it, on the same branch.
@@ -929,12 +935,23 @@ def check_oracle_separation(data: dict) -> list[str]:
 # reader can enumerate — and the next required field is a row, never another
 # `if` buried in a checker.
 #
-# WHAT THIS RULE DELIBERATELY DOES NOT ASSERT: that the two digests are
-# EQUAL. Equality is the LEG's verdict (recorded in the artifact's own
-# `status`), and the plan's own oracle table records the GPU digest pair
-# without failing on it until a spike promotes it; a schema gate that
-# refused an unequal pair would refuse to record exactly the evidence a
-# non-reproducible run needs to leave behind.
+# A FAILING GANG RUN IS REPRESENTABLE. `gang.verdict` (`pass`/`fail`) is the
+# leg's own call, and it is what every consequence in this rule is
+# conditioned on: a `fail` is ADMITTED with its deltas and digests exactly
+# as measured (with a `gang.reason` naming what failed, and a top-level
+# `status` that is not GREEN), because a non-reproducible run's own numbers
+# are precisely the evidence that has to survive into the repository. The
+# tolerance and reproducibility assertions bind on `pass` only — and there
+# they bind hard, because a `pass` is a CLAIM.
+#
+# WHAT THIS RULE ASSERTS ONLY CONDITIONALLY: digest EQUALITY. On a `pass`
+# it is required at `world == 2` — the regime spike S5 measured
+# byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD across
+# A100s, with no env pins — and merely RECORDED above that, because nothing
+# has established byte-identity for a reduction whose NCCL pin set is
+# untested at world >= 3 (README r16/§Spikes). A state defined by missing
+# evidence gets no definite consequence: the gate does not decide the
+# higher-world case in either direction.
 # --------------------------------------------------------------------------- #
 GANG_ARTIFACT_KIND = "gang"
 ARTIFACT_KIND_KEY = "artifact_kind"
@@ -945,6 +962,26 @@ GANG_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 # artifact whose FILENAME declares the family cannot escape this rule by
 # dropping its own `artifact_kind` key.
 GANG_ARTIFACT_FILENAME_RE = re.compile(r"(?:^|[-_])gang(?:[-_.]|$)")
+
+# The leg's own call. EXACT strings, closed set: a verdict spelled anything
+# else (`PASS`, `ok`, `failed`) is a FAIL, never coerced — every conditional
+# consequence below reads this field, so a value the gate does not
+# understand must never silently take the lenient branch.
+GANG_VERDICT_PASS = "pass"
+GANG_VERDICT_FAIL = "fail"
+GANG_VERDICTS = (GANG_VERDICT_PASS, GANG_VERDICT_FAIL)
+
+# The one top-level `status` spelling a `fail` verdict may not carry. The
+# corpus vocabulary is GREEN/RED/RECORD/SUPERSEDED, but `status` itself is
+# free text repo-wide (several pre-schema artifacts carry their own
+# phrasing) — so this rule refuses exactly the one contradiction it can
+# state without inventing a vocabulary: a leg that says it failed cannot
+# also be filed GREEN.
+GANG_GREEN_STATUS = "GREEN"
+
+# The world size at which a `pass` must show an EQUAL same-seed digest pair.
+# Above it the pair is recorded, not asserted — see the section comment.
+GANG_DIGEST_EQUALITY_WORLD = 2
 
 
 def _is_real_number(value) -> bool:
@@ -1020,6 +1057,7 @@ def _gang_check_digests(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
         ]
     failures: list[str] = []
     seeds: list = []
+    values: list[str] = []
     for i, entry in enumerate(digests):
         if not isinstance(entry, dict):
             failures.append(f"`gang.digests[{i}]` must be an object with `seed` and `digest`, got {entry!r}")
@@ -1034,10 +1072,34 @@ def _gang_check_digests(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
             failures.append(
                 f"`gang.digests[{i}].digest` must be a 64-lowercase-hex digest, got {digest!r}"
             )
+        else:
+            values.append(digest)
     if len(seeds) == 2 and seeds[0] != seeds[1]:
         failures.append(
             f"`gang.digests` records two DIFFERENT seeds ({seeds[0]} and {seeds[1]}) — the pair is two "
             "runs of the SAME seed; two seeds prove nothing about reproducibility"
+        )
+    # Equality, asserted CONDITIONALLY (see the section comment above): only
+    # on a `pass` verdict, and only in the world size a spike actually
+    # measured byte-identical. A `fail` records its pair as measured — that
+    # is the whole point of admitting a failing run — and a `pass` at a
+    # larger world records it too, because nothing here establishes what
+    # byte-identity should mean for an untested NCCL pin set.
+    world = gang.get("world")
+    if (
+        gang.get("verdict") == GANG_VERDICT_PASS
+        and not isinstance(world, bool)
+        and world == GANG_DIGEST_EQUALITY_WORLD
+        and len(seeds) == 2
+        and seeds[0] == seeds[1]
+        and len(values) == 2
+        and values[0] != values[1]
+    ):
+        failures.append(
+            f"`gang.digests` records a `pass` at `gang.world` {GANG_DIGEST_EQUALITY_WORLD} whose two "
+            f"same-seed runs produced DIFFERENT digests ({values[0]} vs {values[1]}) — spike S5 "
+            "measured this regime byte-identical, so an unequal pair is a failed run: record it as "
+            f"`gang.verdict` {GANG_VERDICT_FAIL!r} with its own `gang.reason`, never as a pass"
         )
     return failures
 
@@ -1054,6 +1116,39 @@ def _gang_check_delta_series(gang: dict, _data: dict, _repo_root: Path) -> list[
         i, v = bad[0]
         return [f"`gang.per_step_loss_delta[{i}]` must be a finite number, got {v!r}"]
     return []
+
+
+def _gang_check_verdict(gang: dict, data: dict, _repo_root: Path) -> list[str]:
+    """The leg's own pass/fail call, and the two things a `fail` owes a
+    reader. Every other conditional consequence in this rule (the ε
+    tolerance read, the conditional digest-equality assertion) is gated on
+    this field, so an unrecognised value is refused here rather than
+    quietly routed down the lenient branch."""
+    verdict = gang.get("verdict")
+    if verdict not in GANG_VERDICTS:
+        return [
+            f"`gang.verdict` must be exactly one of {list(GANG_VERDICTS)} — the leg's own call about "
+            "the run this artifact records; a run that failed is recorded AS failed, with its "
+            f"numbers as measured, never omitted or filed as a pass, got {verdict!r}"
+        ]
+    if verdict != GANG_VERDICT_FAIL:
+        return []
+    failures: list[str] = []
+    reason = gang.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        failures.append(
+            f"`gang.verdict` is {GANG_VERDICT_FAIL!r} but `gang.reason` is missing or blank — a "
+            "recorded failure states WHAT failed (which rank, which collective, which step), or it "
+            f"is an unactionable number, got {reason!r}"
+        )
+    status = data.get("status")
+    if isinstance(status, str) and status.strip().upper() == GANG_GREEN_STATUS:
+        failures.append(
+            f"`gang.verdict` is {GANG_VERDICT_FAIL!r} but the artifact's top-level `status` is "
+            f"{status!r} — a leg that reports its own failure cannot also be filed "
+            f"{GANG_GREEN_STATUS}; the two fields would contradict each other in the corpus"
+        )
+    return failures
 
 
 def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str | None, list[str]]:
@@ -1195,8 +1290,12 @@ GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
     (
         "digests",
         _gang_check_digests,
-        "the same-seed digest PAIR the equal-topology reproducibility oracle produces (equality itself "
-        "is the leg's verdict, carried in `status`)",
+        "the same-seed digest PAIR the equal-topology reproducibility oracle produces. Equality is "
+        f"ASSERTED on a {GANG_VERDICT_PASS!r} verdict at `world` {GANG_DIGEST_EQUALITY_WORLD} (the "
+        "regime spike S5 measured byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD "
+        "on A100s with no env pins) and merely RECORDED above that world — the NCCL pin set is "
+        "untested at world >= 3 (README r16), and a state defined by missing evidence gets no "
+        f"definite consequence. A {GANG_VERDICT_FAIL!r} verdict records its pair as measured",
     ),
     (
         "per_step_loss_delta",
@@ -1210,6 +1309,14 @@ GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
         "the pre-registered tolerance, its derivation, and the commit it was registered at — a STRICT "
         "ancestor of this artifact's evidence anchor (`merged_as` when that is in this history, else "
         "`git_sha`; neither in this history is a FAIL, never a skip — see `_gang_evidence_anchor`)",
+    ),
+    (
+        "verdict",
+        _gang_check_verdict,
+        f"the leg's own call, exactly {list(GANG_VERDICTS)}. Without it a FAILING gang run is not "
+        "representable at all: the tolerance and digest-equality assertions would refuse to record "
+        f"the very numbers a non-reproducible run must leave behind. A {GANG_VERDICT_FAIL!r} carries "
+        f"a non-empty `gang.reason` and a top-level `status` that is not {GANG_GREEN_STATUS}",
     ),
 )
 
@@ -1254,13 +1361,17 @@ def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
             failures.append(f"`{GANG_BLOCK_KEY}.{key}` is missing — {why}")
             continue
         failures.extend(validator(gang, data, repo_root))
-    # Cross-field: the recorded delta is read against the recorded ε. A
-    # committed artifact whose own numbers contradict each other is a
-    # finding here, not a thing a later reader has to notice by hand.
+    # Cross-field: on a `pass`, the recorded delta is read against the
+    # recorded ε. A committed artifact whose own numbers contradict its own
+    # verdict is a finding here, not a thing a later reader has to notice by
+    # hand. On a `fail` the deltas are admitted exactly as measured — a run
+    # that blew its tolerance is what a `fail` IS, and refusing to record it
+    # would leave the corpus with only the runs that went well.
     deltas = gang.get("per_step_loss_delta")
     epsilon = gang.get("epsilon")
     if (
-        isinstance(deltas, list)
+        gang.get("verdict") == GANG_VERDICT_PASS
+        and isinstance(deltas, list)
         and deltas
         and all(_is_real_number(v) for v in deltas)
         and isinstance(epsilon, dict)
@@ -1272,7 +1383,8 @@ def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
             failures.append(
                 f"`{GANG_BLOCK_KEY}.per_step_loss_delta`'s worst step ({worst}) exceeds "
                 f"`{GANG_BLOCK_KEY}.epsilon.value` ({epsilon['value']}) — this artifact records a run "
-                "that failed its own pre-registered tolerance"
+                f"that failed its own pre-registered tolerance as a {GANG_VERDICT_PASS!r}; record it "
+                f"as {GANG_VERDICT_FAIL!r} with its own `{GANG_BLOCK_KEY}.reason`"
             )
     return failures
 
@@ -2661,6 +2773,7 @@ def self_test() -> int:
                     ),
                     "registered_sha": root_sha,
                 },
+                "verdict": "pass",
             }
             return d
 
@@ -2672,7 +2785,7 @@ def self_test() -> int:
             baseline(), "control-single-device.json", "rule (k): non-gang artifact is not gang-checked"
         )
 
-        for field in ("world", "collective", "ranks", "digests", "per_step_loss_delta", "epsilon"):
+        for field in ("world", "collective", "ranks", "digests", "per_step_loss_delta", "epsilon", "verdict"):
             bad = gang_baseline()
             del bad["gang"][field]
             expect_hit(bad, "x.json", f"`gang.{field}` is missing", f"rule (k): missing gang.{field}")
@@ -2828,6 +2941,80 @@ def self_test() -> int:
         bad = gang_baseline()
         bad["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
         expect_hit(bad, "x.json", "exceeds", "rule (k): a delta outside the pre-registered ε")
+
+        # M2 — `gang.verdict`. One mutation per DETERMINANT: the value
+        # itself, each thing a `fail` owes, and each consequence that binds
+        # on `pass` ONLY (so the same payload that FAILS as a pass must be
+        # ADMITTED as a fail — the property is "a failing run is
+        # representable", which an assertion-only gate silently refused).
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "PASS"
+        expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict in the wrong case")
+
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "unknown"
+        expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict outside the closed set")
+
+        # A `pass` at world 2 with an unequal same-seed pair: S5's measured
+        # regime, so this is a failed run recorded as a pass.
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 7, "digest": "c" * 64},
+        ]
+        expect_hit(
+            bad,
+            "x.json",
+            "same-seed runs produced DIFFERENT digests",
+            "rule (k): a pass at world 2 whose digest pair disagrees",
+        )
+
+        # The SAME unequal pair above world 2 is RECORDED, not asserted —
+        # nothing has measured byte-identity for an untested NCCL pin set.
+        ok = gang_baseline()
+        ok["gang"]["world"] = 4
+        ok["gang"]["ranks"] = [
+            {"rank": i, "device": f"cuda:{i} NVIDIA A100-SXM4-80GB"} for i in range(4)
+        ]
+        ok["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 7, "digest": "c" * 64},
+        ]
+        expect_clean(ok, "control-gang-world4.json", "rule (k): an unequal pair above world 2 is recorded, not asserted")
+
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "fail"
+        bad["status"] = "RED"
+        expect_hit(bad, "x.json", "`gang.reason` is missing or blank", "rule (k): a fail with no reason")
+
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "fail"
+        bad["gang"]["reason"] = "rank 1's all-reduce diverged at global step 3"
+        expect_hit(
+            bad,
+            "x.json",
+            "cannot also be filed GREEN",
+            "rule (k): a fail filed as a GREEN artifact",
+        )
+
+        # The two admissions: the exact payloads that FAIL as a `pass` are
+        # ADMITTED as a `fail`, deltas and digests as measured.
+        ok = gang_baseline()
+        ok["gang"]["verdict"] = "fail"
+        ok["gang"]["reason"] = "worst per-step delta 1e-5 exceeded the pre-registered 1e-6"
+        ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
+        ok["status"] = "RED"
+        expect_clean(ok, "control-gang-fail-delta.json", "rule (k): a fail records a delta outside ε as measured")
+
+        ok = gang_baseline()
+        ok["gang"]["verdict"] = "fail"
+        ok["gang"]["reason"] = "the same-seed pair did not reproduce"
+        ok["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 7, "digest": "c" * 64},
+        ]
+        ok["status"] = "RED"
+        expect_clean(ok, "control-gang-fail-digests.json", "rule (k): a fail records an unequal digest pair as measured")
 
         # Anchors: dropping the `artifact_kind` key does NOT return a gang
         # artifact to the unchecked state — the `gang` block itself, and the
@@ -3500,7 +3687,11 @@ def self_test() -> int:
         "when ε precedes it, caught when ε IS it, caught when ε is the rewritten tip), an ε "
         "registered at a commit that is an ancestor of HEAD but AFTER the measured tree is caught, "
         "and an artifact with neither anchor in this history — `git_sha_unresolved` included — is "
-        "caught by a finding naming BOTH candidates, never skipped."
+        "caught by a finding naming BOTH candidates, never skipped. `gang.verdict` closes the same "
+        "loop from the other side: the wrong case and an unknown string are refused, a `fail` with "
+        "no reason and a `fail` filed GREEN are caught, a `pass` at world 2 whose same-seed pair "
+        "disagrees is caught while the same pair above world 2 is recorded rather than asserted, "
+        "and the exact delta/digest payloads that FAIL as a pass are ADMITTED as a fail."
     )
     return 0
 

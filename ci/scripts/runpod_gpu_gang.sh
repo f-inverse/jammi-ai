@@ -37,7 +37,9 @@
 #
 # THE ARTIFACT: the gang tests write their evidence JSON (world, collective,
 # per-rank device, the same-seed digest pair, the measured per-step loss
-# delta, and the PRE-REGISTERED epsilon with its derivation) into
+# delta, the leg's own verdict -- exactly `pass` or `fail`, a `fail`
+# carrying its own `reason` and its numbers AS MEASURED -- and the
+# PRE-REGISTERED epsilon with its derivation) into
 # `$JAMMI_GANG_ARTIFACT_DIR` on the pod. This driver pulls that directory
 # back before the EXIT trap tears the pod down — the pod is the only place
 # it exists, and it is unrecoverable afterwards. The committed form of that

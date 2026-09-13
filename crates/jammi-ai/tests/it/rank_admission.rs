@@ -116,16 +116,20 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
     // The two bounds a ONE-device deployment can state. The two
     // single-rank-only mechanisms need a deployment where the device bound
     // does not bite first, so they are checked on the wide session below.
+    // The expectation is the WHOLE sentence, not a fragment of it: a message
+    // is what the operator acts on, and a fragment-only assertion cannot see
+    // a sentence that arrives with its second half detached.
     let cases: [(&str, TrainingSpec, &str); 2] = [
         (
             "a zero-rank count",
             spec_with_world_size(0),
-            "world_size must be >= 1",
+            "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)",
         ),
         (
             "a count beyond the deployment's devices",
             spec_with_world_size(2),
-            "exceeds the 1 configured device(s)",
+            "world_size = 2 exceeds the 1 configured device(s): one rank per device, so list \
+             more in `[gpu] devices` or submit a smaller rank count",
         ),
     ];
 
@@ -181,12 +185,16 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         (
             "a multi-rank GradCache run",
             spec_with(2, cached),
-            "cannot be combined with GradCache",
+            "world_size = 2 cannot be combined with GradCache (`cached`): the cached \
+             objective's second pass is over the WHOLE batch on one rank, so a gang would \
+             not compute the objective this config asks for",
         ),
         (
             "a multi-rank mining run",
             spec_with(2, mining),
-            "cannot be combined with hard-negative mining",
+            "world_size = 2 cannot be combined with hard-negative mining \
+             (`hard_negatives.mine`): the miner retrieves from this process's own index, so \
+             each rank would mine a different negative pool",
         ),
     ] {
         let error = wide.run_training_spec(spec.clone()).await.expect_err(name);
@@ -329,6 +337,13 @@ fn the_admission_rule_reads_the_build_as_data() {
         .admit(&spec)
         .expect_err("a build without CUDA cannot reach NCCL");
     assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert!(
+        error.to_string().contains(
+            "[worker] collective = \"nccl\" needs a build with the `cuda` feature; this \
+             binary has none, so the requested collective cannot be reached"
+        ),
+        "the refusal must state the whole reason: {error}"
+    );
 
     let cuda_build = RankAdmission::new(1, CollectiveSelection::Nccl, true);
     cuda_build
@@ -339,6 +354,74 @@ fn the_admission_rule_reads_the_build_as_data() {
         RankAdmission::new(1, collective, false)
             .admit(&spec)
             .unwrap_or_else(|e| panic!("{collective} needs no CUDA: {e}"));
+    }
+}
+
+/// Every refusal the rule can raise reads as one sentence.
+///
+/// A multi-line Rust string literal joins its lines only through a trailing
+/// `\`; without it the source's own indentation is part of the message, and
+/// the operator is handed a sentence with a gap in the middle of it. The
+/// oracle is the gap, not any one wording: no refusal message contains a run
+/// of two spaces.
+///
+/// The set ranged over is every `return Err` of
+/// `RankAdmission::admit` — the five conditions the method tests, in the
+/// order it tests them; each case below is constructed so that its own
+/// condition is the first one to bite. A sixth branch added later without a
+/// case here would not be covered, which is why each case names the
+/// condition it fires.
+#[test]
+fn every_admission_refusal_reads_as_one_sentence() {
+    let cached = FineTuneConfig {
+        cached: true,
+        ..FineTuneConfig::default()
+    };
+    let mining = FineTuneConfig {
+        hard_negatives: HardNegativeConfig {
+            mine: true,
+            ..HardNegativeConfig::default()
+        },
+        ..FineTuneConfig::default()
+    };
+
+    let cases: [(&str, RankAdmission, TrainingSpec); 5] = [
+        (
+            "world_size == 0",
+            RankAdmission::new(1, CollectiveSelection::Auto, false),
+            spec_with_world_size(0),
+        ),
+        (
+            "world_size > devices",
+            RankAdmission::new(1, CollectiveSelection::Auto, false),
+            spec_with_world_size(2),
+        ),
+        (
+            "nccl without a cuda build",
+            RankAdmission::new(1, CollectiveSelection::Nccl, false),
+            spec_with_world_size(1),
+        ),
+        (
+            "world_size > 1 with GradCache",
+            RankAdmission::new(2, CollectiveSelection::Auto, false),
+            spec_with(2, cached),
+        ),
+        (
+            "world_size > 1 with hard-negative mining",
+            RankAdmission::new(2, CollectiveSelection::Auto, false),
+            spec_with(2, mining),
+        ),
+    ];
+
+    for (condition, admission, spec) in cases {
+        let message = admission
+            .admit(&spec)
+            .expect_err(condition)
+            .to_string();
+        assert!(
+            !message.contains("  "),
+            "{condition}: the refusal arrives with its source indentation in it: {message:?}"
+        );
     }
 }
 

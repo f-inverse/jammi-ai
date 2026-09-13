@@ -67,6 +67,19 @@
 //! hold for this one. [`Noop`] has no peer to disagree with (`world` is
 //! always 1), so this is vacuous there.
 //!
+//! **NOTE for U5b-1.** Publish-then-fault is a real state, not a
+//! theoretical one: a round can publish (every rank's descriptor agreed)
+//! and then fault before every rank has taken its result — a rank that
+//! already took the published value keeps its `Ok`, a rank that had not
+//! gets the gang's fault instead, and no rank is ever handed a wrong
+//! result. [`Local`] can afford to let that asymmetry stand because every
+//! rank is a thread of one process sharing one `Round`. The `Peer`
+//! collective U5b-1 rebuilds over the wire does not get that for free: a
+//! publish a peer has already ACKed and a fault raised immediately after
+//! is a real wire state (a message in flight, a peer that ACKed and then
+//! disconnected) that the wire protocol must decide explicitly, not
+//! inherit by writing the same shared-memory code over a socket.
+//!
 //! The `Nccl` arm has none of that. NCCL exchanges the buffers a collective
 //! names and nothing else: there is no counts exchange (by design — see
 //! above), so a peer's counts, its tensor-list length and its idea of the

@@ -383,10 +383,35 @@ impl WorkerShared {
         self.phase.store(phase as u8, Ordering::SeqCst);
     }
 
+    /// Test-only: set the phase WITHOUT requesting a stop (`set_phase` and
+    /// `request_stop` are both private, and the `it` tests are an external
+    /// crate, so this is the only way to construct the P1 gate-direct
+    /// scenario — a phase flip with `stop` deliberately left unset — to
+    /// prove the loop-top gate refuses a new claim on the phase read alone,
+    /// never relying on a real `release_and_stop` call, which always pairs
+    /// the two).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_phase_for_test(&self, phase: WorkerPhase) {
+        self.set_phase(phase);
+    }
+
     /// Whether a stop has been requested (the level the loop's pre-claim
     /// check reads).
     pub fn stop_requested(&self) -> bool {
         *self.stop.borrow()
+    }
+
+    /// Whether the loop may initiate a new `claim_next`: no stop has been
+    /// requested AND the phase is still `Running`. `EmbeddedWorker::run_until`
+    /// reads this ONE predicate at two sites — the loop's top-of-iteration
+    /// gate and again, with no `.await` between that second read and the
+    /// `claim_next` call itself, immediately after `reclaim_expired_jobs`
+    /// returns — so the two reads can never drift apart (P1',
+    /// `CONTRACT-RELEASE-SPIN.md`): a RELEASE landing anywhere in the
+    /// reclaim round trip is caught by the second read even when the first,
+    /// now-stale read had already admitted the iteration.
+    fn admits_claim(&self) -> bool {
+        !self.stop_requested() && self.phase() == WorkerPhase::Running
     }
 
     fn request_stop(&self) {
@@ -743,8 +768,9 @@ impl JobWorker {
             .await
     }
 
-    /// Run the claim→reconstruct→train loop until `shared`'s stop is set or
-    /// the session drops.
+    /// Run the claim→reconstruct→train loop until `shared`'s stop is set,
+    /// `shared`'s phase leaves [`WorkerPhase::Running`], or the session
+    /// drops.
     ///
     /// Stack-safe: a bounded `loop`, never recursion. The task's FIRST
     /// statement upserts this process's `workers` row as `warming`; it then
@@ -753,13 +779,26 @@ impl JobWorker {
     /// selected against the stop, flips the row to `claiming` when the gate
     /// opens, and only then claims — one sequential chain, so `claiming` can
     /// never precede `warming` and a stop during the wait returns without a
-    /// claim. Each tick reclaims expired leases then attempts one claim; on a
-    /// claim it runs the job to a terminal state inline (the next claim waits
-    /// for it), on no claim it sleeps the configured idle poll `select!`ed
-    /// against the stop watch (level-triggered: no lost wakeup, no waiting
-    /// out the poll). The catalog used for reclaim/claim is unscoped — a
-    /// worker serves every tenant's queue. The terminal [`LoopState`] is
-    /// written on every exit path by an in-task guard.
+    /// claim. `WorkerShared::admits_claim` (one private predicate, two
+    /// independent signals — `stop_requested()`, the wakeup that also
+    /// interrupts an idle sleep, and `phase() == Running`) is read at TWO
+    /// sites before any `claim_next`: the top of the iteration, and again,
+    /// with no `.await` between that second read and `claim_next` itself,
+    /// immediately after `reclaim_expired_jobs` returns — so a `Releasing`
+    /// (or `Draining`) phase that lands during the reclaim round trip is
+    /// caught by the second read even though the first, now-stale read had
+    /// already admitted the iteration (P1', `CONTRACT-RELEASE-SPIN.md`); a
+    /// loop already at either read point never starts a `claim_next`
+    /// regardless of which of the two signals it observes first. The one
+    /// residual — a claim whose own catalog round trip is already in flight
+    /// when the phase flips — the arm at `:522` tests `== Releasing` only, so
+    /// under `Releasing` it self-releases via `register_job_hold_or_release`; under `Draining` no arm matches and it dispatches normally. On a claim it runs the
+    /// job to a terminal state inline (the next claim waits for it), on no
+    /// claim it sleeps the configured idle poll `select!`ed against the stop
+    /// watch (level-triggered: no lost wakeup, no waiting out the poll). The
+    /// catalog used for reclaim/claim is unscoped — a worker serves every
+    /// tenant's queue. The terminal [`LoopState`] is written on every exit
+    /// path by an in-task guard.
     pub async fn run_until(&self, shared: Arc<WorkerShared>) {
         let exit = LoopExitGuard::new(Arc::clone(&shared));
         let mut stop_rx = shared.stop_receiver();
@@ -804,7 +843,16 @@ impl JobWorker {
         loop {
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::maybe_panic(&self.worker_id);
-            if shared.stop_requested() {
+            // `admits_claim()` bundles two independent signals:
+            // `stop_requested()` is the wakeup (it also interrupts an idle
+            // sleep, see the `None` arm's `select!` below); `phase() !=
+            // Running` refuses a new claim the instant RELEASE (or DRAIN)
+            // flips the phase, even in the window before the stop watch is
+            // next polled — see `EmbeddedWorker::release_and_stop`'s 2a. Read
+            // again below, after `reclaim_expired_jobs`, so a RELEASE landing
+            // during that round trip cannot ride this now-stale read into a
+            // claim (P1', `CONTRACT-RELEASE-SPIN.md`).
+            if !shared.admits_claim() {
                 break;
             }
             let session = match self.session.upgrade() {
@@ -821,7 +869,20 @@ impl JobWorker {
                 tracing::error!(worker = %self.worker_id, error = %e, "reclaim_expired_jobs failed");
             }
 
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::maybe_park_after_reclaim(&self.worker_id).await;
+
+            // The second read: no `.await` between this and `claim_next`
+            // itself (`record_claim_next` is sync). A claim whose own
+            // catalog round trip is already in flight when 2a runs is the
+            // one residual neither read catches — under `Releasing` (`:522`)
+            // `register_job_hold_or_release` self-releases it; under `Draining` it dispatches and runs to completion.
+            if !shared.admits_claim() {
+                break;
+            }
             let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::record_claim_next(&self.worker_id);
             let claimed = match catalog
                 .claim_next(&self.worker_id, &kind_refs, self.intervals.lease)
                 .await
@@ -2430,7 +2491,8 @@ impl EmbeddedWorker {
     }
 
     /// RELEASE — the one mechanism, identical on the library and the server
-    /// (§3.4 2a–2h): hand every lease this loop holds back to the catalog and
+    /// (§3.4 2a–2c, 2e–2h — 2d folded into 2a, see below): hand every lease
+    /// this loop holds back to the catalog and
     /// stop the loop at once, so a successor claims the in-flight job within
     /// one idle poll (never one lease window) and the job costs no attempt
     /// — WHEN every determinant of the returned [`ReleaseReport`] confirms.
@@ -2441,9 +2503,24 @@ impl EmbeddedWorker {
     ///
     /// In order:
     ///
-    /// * **2a** phase `Releasing` — from this instant a claim that lands runs
-    ///   into `register_job_hold_or_release`, which self-releases instead of
-    ///   dispatching.
+    /// * **2a** phase `Releasing` AND stop requested, together, as
+    ///   `begin_drain` does for its own phase — from this instant `claim_next`
+    ///   is initiated only after a read of `WorkerShared::admits_claim` that
+    ///   returned `true` with no `.await` between that read and the call
+    ///   (P1', `CONTRACT-RELEASE-SPIN.md`): the loop reads it at the top of
+    ///   the iteration AND again, immediately after `reclaim_expired_jobs`
+    ///   returns, so a phase/stop flip that lands during that reclaim round
+    ///   trip is still caught by the second read even though the first,
+    ///   now-stale read had already admitted the iteration. The one
+    ///   residual — a claim whose own catalog round trip is already in
+    ///   flight when 2a runs, so no later read of this loop's own state can
+    ///   observe it — runs into `register_job_hold_or_release`, which
+    ///   self-releases instead of dispatching. Folds what was once a separate
+    ///   later `stop` step: deferring it past 2b/2c left a window in which
+    ///   the loop could reclaim and re-claim the same row under `Releasing`
+    ///   without ever tripping the attempts cap (`attempts − releases` nets
+    ///   to 0 on every self-release), spinning for up to one keeper pass plus
+    ///   one sweep.
     /// * **2b** the keeper releases every `Job` hold it holds
     ///   (`LeaseKeeper::release_job_holds`, bounded by one heartbeat): the
     ///   row's lease goes NULL and the hold's `lost` flips while the hold
@@ -2461,8 +2538,6 @@ impl EmbeddedWorker {
     ///   committed after 2b snapshotted. The loop's own `ResultTable` hold
     ///   flips `lost` through the keeper's guarded renewal within one
     ///   heartbeat.
-    /// * **2d** stop — the loop cannot enter a new `claim_next`; a claim
-    ///   already in flight began before this.
     /// * **2e** total match on the loop task's state: a handle `Abandoned`
     ///   by a previous stop attempt this process's own caller cancelled
     ///   (F1 — e.g. a DRAIN's `stop_and_join` preempted by this RELEASE) is
@@ -2486,7 +2561,12 @@ impl EmbeddedWorker {
     ///   is a genuine watch-fired transition — never when it fell back to
     ///   the last-known proxy read on a timeout/closed channel, which alone
     ///   can read `Running` on a genuine abort whose guard has not published
-    ///   yet.
+    ///   yet. Since 2a's gate now stops an idle or between-claims loop at
+    ///   once, this `wait_for` usually finds the watch ALREADY at its
+    ///   terminal value by the time it is polled (an idle loop exits before
+    ///   2b/2c even run) rather than observing a live transition; `wait_for`
+    ///   treats an already-satisfied value as witnessed, same as a live one,
+    ///   so `stop_witnessed` is unaffected.
     /// * **2g** sweep #2, unconditionally — idempotent, catches a claim or a
     ///   building row that committed after sweep #1.
     /// * **2h** delete the `workers` row — AFTER sweep #2, so the row outlives
@@ -2496,8 +2576,14 @@ impl EmbeddedWorker {
     /// catalog error inside any statement is logged and the arm continues
     /// (the affected lease falls to the expiry path).
     pub async fn release_and_stop(&self) -> Result<ReleaseReport> {
-        // 2a
+        // 2a — phase and stop together, in the same synchronous statement
+        // pair (no `.await` between them), mirroring `begin_drain`'s own
+        // shape (P2, `CONTRACT-RELEASE-SPIN.md`'s design-pass fold): a
+        // poll-once test proves both setters resolve this pair before their
+        // first yield, so exit latency after either flip is bounded by the
+        // in-flight job, never by `idle_poll`.
         self.shared.set_phase(WorkerPhase::Releasing);
+        self.shared.request_stop();
         // 2b
         let holds = match self.keeper.release_job_holds(self.heartbeat).await {
             Ok(hr) => HoldReleaseOutcome::Observed(hr),
@@ -2508,8 +2594,6 @@ impl EmbeddedWorker {
         };
         // 2c
         let sweep_one = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
-        // 2d
-        self.shared.request_stop();
         // 2e
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::fire(&self.instance_id, loop_test_hooks::Rendezvous::ReleaseAt2e);
@@ -2654,11 +2738,16 @@ impl Drop for EmbeddedWorker {
 /// mirrors `crate::jobs::compute_test_hooks`): a test parks the loop at a
 /// documented point between its claim and its hold, or observes the exact
 /// instant RELEASE reaches its 2e decision, so the shutdown arms are pinned
-/// against the mechanism rather than raced against a wall clock. No
-/// production path observes anything here beyond the `maybe_park` /
-/// `fire` calls, which return at once when nothing is armed.
+/// against the mechanism rather than raced against a wall clock. A
+/// per-instance counter records every `claim_next` call the loop makes, so a
+/// test can snapshot it beside a rendezvous and assert a delta of zero
+/// across a window it controls. No production path observes anything here
+/// beyond the `maybe_park` / `fire` / `record_claim_next` calls, which
+/// return at once (or add one to a counter nothing reads) when nothing is
+/// armed.
 #[cfg(feature = "test-hooks")]
 pub mod loop_test_hooks {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -2758,6 +2847,97 @@ pub mod loop_test_hooks {
         while !armed.released.load(Ordering::SeqCst) {
             armed.release_notify.notified().await;
         }
+    }
+
+    struct ArmedInstance {
+        instance_id: String,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn instance_armed() -> &'static Mutex<Vec<ArmedInstance>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedInstance>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Arm a one-shot park for the next time the loop of `instance_id`
+    /// reaches the post-reclaim, pre-claim gate re-read — immediately after
+    /// `reclaim_expired_jobs` returns and before `WorkerShared::admits_claim`'s
+    /// second read, the reclaim-window instant the audit's falsification
+    /// names (`CONTRACT-RELEASE-SPIN.md`'s P1'). Keyed by `instance_id`
+    /// (unlike [`arm`], there is no claimed job yet at this point).
+    pub fn arm_after_reclaim(instance_id: &str) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        instance_armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedInstance {
+                instance_id: instance_id.to_string(),
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park_after_reclaim(instance_id: &str) {
+        let taken = {
+            let mut list = instance_armed()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.instance_id == instance_id)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
+    }
+
+    fn claim_next_counts() -> &'static Mutex<HashMap<String, u64>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Record one `claim_next` call by the loop of `instance_id` — called
+    /// from `run_until`'s loop body, immediately before it awaits
+    /// `Catalog::claim_next`. Keyed per instance so sibling tests in one
+    /// binary never read each other's counts.
+    pub(super) fn record_claim_next(instance_id: &str) {
+        *claim_next_counts()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(instance_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// How many times the loop of `instance_id` has called `claim_next`
+    /// since the process started (0 if it never has). A test snapshots this
+    /// beside a rendezvous it controls and compares the delta across a
+    /// window it also controls — never against a wall clock.
+    pub fn claim_next_calls(instance_id: &str) -> u64 {
+        claim_next_counts()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn panic_armed() -> &'static Mutex<Vec<String>> {

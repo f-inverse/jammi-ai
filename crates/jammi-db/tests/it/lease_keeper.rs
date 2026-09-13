@@ -790,3 +790,159 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
 
     keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
 }
+
+/// Open a raw `Catalog` on `backend` for a test that drives the pool
+/// directly (not through a `JammiSession`) — mirrors
+/// `jammi_test_utils::make_test_session`'s backend switch and skip
+/// contract, but hands back the `Catalog` this file's tests already work
+/// with. `None` when `backend == Postgres` and `JAMMI_TEST_PG_URL` is
+/// unset, so the caller skips without `#[ignore]`.
+async fn catalog_for_backend(
+    backend: jammi_db::catalog::backend::BackendKind,
+    dir: &std::path::Path,
+) -> Option<Catalog> {
+    use jammi_db::catalog::backend::{BackendImpl, BackendKind};
+    use jammi_db::catalog::backend_postgres::PostgresBackend;
+
+    match backend {
+        BackendKind::Sqlite => Some(Catalog::open(dir).await.unwrap()),
+        BackendKind::Postgres => {
+            let url = jammi_test_utils::pg_url_for_tests()?;
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            let backend_impl = BackendImpl::Postgres(pg);
+            backend_impl.migrate().await.unwrap();
+            Some(Catalog::from_backend(backend_impl))
+        }
+    }
+}
+
+/// Catalog-level idempotency of the three release statements a shutdown's
+/// RELEASE arm issues, in their production order — 2b
+/// (`LeaseKeeper::release_job_holds`, on the keeper's OWN connection) then
+/// 2c and 2g (`Catalog::release_jobs_claimed_by`, on the caller's pool
+/// connection) — against a REAL backend, with a real elapsed heartbeat
+/// between claim and release (never releasing in the same instant a job was
+/// claimed, which would hide a connection-visibility bug the in-process
+/// SQLite backend cannot exhibit). `jobs.releases` must land at exactly 1
+/// for one held hold released once, on both backends: every release
+/// statement's own `lease_expires_at IS NOT NULL` guard is what makes 2c and
+/// 2g no-ops once 2b has already released the row.
+///
+/// Scope, stated so this is not mistaken for coverage it does not provide:
+/// this is an ADJACENT property, not a guard on the `release_and_stop`
+/// ordering defect (a fast-bailing training thread racing the claim loop
+/// back into its own just-released row before `stop` is requested). It
+/// cannot be one: this crate does not depend on `jammi-ai` (nothing in
+/// `crates/jammi-db/Cargo.toml` names it — the dependency runs the other
+/// way), so no edit to `EmbeddedWorker::release_and_stop` changes this test
+/// binary at all, and measured it passes identically with that ordering
+/// reverted. The guards for that defect are `jammi-ai`'s
+/// `jobs_shutdown::release_gate_refuses_every_claim_when_phase_flips_without_a_stop`
+/// (the gate-direct P1 oracle), `jobs_shutdown::release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_read`
+/// (the P1' residual, the reclaim-window read), and
+/// `jobs_shutdown::every_phase_setter_pairs_the_stop_in_the_same_statement_group`
+/// (P2, every phase setter pairs the stop in the same statement group).
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backend(
+    backend: jammi_db::catalog::backend::BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    // Require-gated directly here (not only inside `catalog_for_backend`):
+    // `jammi_test_utils::pg_url_for_tests` folds in the `JAMMI_REQUIRE_PG`
+    // panic, so a lane that must run the real Postgres arm cannot silently
+    // skip it — this call has to sit in THIS fn's own body, ahead of the
+    // `return` below, for the skip to be a genuine require-gated skip
+    // rather than a bare one.
+    if backend == jammi_db::catalog::backend::BackendKind::Postgres
+        && jammi_test_utils::pg_url_for_tests().is_none()
+    {
+        eprintln!(
+            "skipping release_and_stop_statement_order_releases_exactly_once_on_a_real_backend: \
+             JAMMI_TEST_PG_URL unset"
+        );
+        return;
+    }
+    let catalog = Arc::new(
+        catalog_for_backend(backend, dir.path())
+            .await
+            .expect("JAMMI_TEST_PG_URL confirmed set above when backend == Postgres"),
+    );
+    let job_id = format!("scratch-{}", jammi_test_utils::unique_suffix());
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: "embedding",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let instance = format!("inst-{}", jammi_test_utils::unique_suffix());
+    let intervals = fast_intervals();
+    let claimed = catalog
+        .claim_next(&instance, &["embedding"], intervals.lease())
+        .await
+        .unwrap()
+        .expect("job claimed");
+
+    let keeper =
+        crate::common::keeper_for_backend(backend, dir.path().to_path_buf(), intervals).await;
+    let hold = keeper.hold(LeaseTarget::Job {
+        job_id: job_id.clone(),
+        instance_id: instance.clone(),
+        attempts: claimed.attempts,
+    });
+    assert!(!hold.lost(), "the hold reads live before any release runs");
+
+    // Real elapsed time: let at least one heartbeat renewal land on this
+    // hold before release, matching a job that has been in flight a while
+    // (as opposed to releasing it in the same instant it was claimed).
+    tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(200)).await;
+
+    // 2b
+    let holds = keeper
+        .release_job_holds(intervals.heartbeat() * 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        holds,
+        jammi_db::catalog::lease_keeper::HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+            attempted: 1,
+        },
+        "{holds:?}"
+    );
+    assert!(hold.lost(), "the released hold reads lost at once");
+    // 2c
+    let sweep_one = catalog.release_jobs_claimed_by(&instance).await.unwrap();
+    assert_eq!(
+        sweep_one, 0,
+        "2b already released the row; the sweep is a no-op"
+    );
+    // 2g
+    let sweep_two = catalog.release_jobs_claimed_by(&instance).await.unwrap();
+    assert_eq!(sweep_two, 0, "the second sweep is a no-op too");
+
+    let row = catalog.get_job(&job_id).await.unwrap();
+    assert_eq!(
+        row.releases, 1,
+        "releases must be exactly 1 for one held hold released once: {row:?}"
+    );
+    assert_eq!(row.attempts, 1, "{row:?}");
+    assert!(row.lease_expires_at.is_none(), "{row:?}");
+    drop(hold);
+    keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
+}

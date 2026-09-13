@@ -854,16 +854,26 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
     backend: jammi_db::catalog::backend::BackendKind,
 ) {
     let dir = tempdir().unwrap();
-    let catalog = match catalog_for_backend(backend, dir.path()).await {
-        Some(c) => Arc::new(c),
-        None => {
-            eprintln!(
-                "skipping release_and_stop_statement_order_releases_exactly_once_on_a_real_backend: \
-                 JAMMI_TEST_PG_URL unset"
-            );
-            return;
-        }
-    };
+    // Require-gated directly here (not only inside `catalog_for_backend`):
+    // `jammi_test_utils::pg_url_for_tests` folds in the `JAMMI_REQUIRE_PG`
+    // panic, so a lane that must run the real Postgres arm cannot silently
+    // skip it — this call has to sit in THIS fn's own body, ahead of the
+    // `return` below, for the skip to be a genuine require-gated skip
+    // rather than a bare one.
+    if backend == jammi_db::catalog::backend::BackendKind::Postgres
+        && jammi_test_utils::pg_url_for_tests().is_none()
+    {
+        eprintln!(
+            "skipping release_and_stop_statement_order_releases_exactly_once_on_a_real_backend: \
+             JAMMI_TEST_PG_URL unset"
+        );
+        return;
+    }
+    let catalog = Arc::new(
+        catalog_for_backend(backend, dir.path())
+            .await
+            .expect("JAMMI_TEST_PG_URL confirmed set above when backend == Postgres"),
+    );
     let job_id = format!("scratch-{}", jammi_test_utils::unique_suffix());
     catalog
         .submit_job(SubmitJobParams {

@@ -432,15 +432,26 @@ def _r12_hash(rc: int, stdout: str, stderr_line: str = "") -> str:
     return _r12_mod()._witness_hash(rc, stdout, stderr_line)
 
 
-def _anticipation_path_exact(root: Path, unit_branch: str, block_ts: str) -> Path:
+def _anticipation_path_exact(root: Path, unit_branch: str, tip_sha: str) -> Path:
+    """M1' (fix round 1): the artifact is keyed by the branch's CURRENT
+    TIP, never a block's own `ts` — `tip_sha` here is normally the value
+    `_write_block_row` returned as `row["head_sha"]` at the moment it was
+    written (the branch's tip has not moved since, in every fixture that
+    does not deliberately advance it afterward)."""
     mod = _r12_mod()
-    return mod.anticipation_artifact_path(root / ".jammi" / "gate-state", _slug(unit_branch), block_ts)
+    return mod.anticipation_artifact_path(root / ".jammi" / "gate-state", _slug(unit_branch), tip_sha)
 
 
-def _write_anticipation_exact(root: Path, unit_branch: str, block_ts: str, block_sha: str,
-                               attacks: dict, residual_risk: str | None = "fixture residual risk placeholder") -> Path:
-    path = _anticipation_path_exact(root, unit_branch, block_ts)
-    artifact = {"unit_branch": unit_branch, "block_ts": block_ts, "block_sha": block_sha, "attacks": attacks}
+def _write_anticipation_exact(root: Path, unit_branch: str, tip_sha: str, attacks: dict,
+                               residual_risk: str | None = "fixture residual risk placeholder",
+                               covers: list[str] | None = None) -> Path:
+    """M1' schema: `{unit_branch, pre_fix_sha, covers, attacks, residual_risk}`
+    — `attacks` is keyed PER FILE (`{file: {command, hash}}`), never per
+    raw `path:line` finding key."""
+    path = _anticipation_path_exact(root, unit_branch, tip_sha)
+    artifact = {"unit_branch": unit_branch, "pre_fix_sha": tip_sha, "attacks": attacks}
+    if covers is not None:
+        artifact["covers"] = covers
     if residual_risk is not None:
         artifact["residual_risk"] = residual_risk
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,22 +461,22 @@ def _write_anticipation_exact(root: Path, unit_branch: str, block_ts: str, block
 
 def _auto_r12_attack(key: str) -> dict:
     """A cheap, deterministic, denylist-safe command for a synthetic R12
-    key — `printf` a fixed, key-derived string; no shell metacharacters in
-    `key` in this fixture harness (every real key is `path:line`-shaped)."""
+    file key — `printf` a fixed, key-derived string; no shell
+    metacharacters in `key` in this fixture harness."""
     out = f"auto-ok-{key}"
-    return {"command": f"printf 'auto-ok-{key}'", "rc": 0, "hash": _r12_hash(0, out, "")}
+    return {"command": f"printf 'auto-ok-{key}'", "hash": _r12_hash(0, out, "")}
 
 
 def _auto_r12_baseline_hash(key: str) -> str:
-    """A DISTINCT, never-re-executed placeholder `block_hash` for the
+    """A DISTINCT, never-re-executed placeholder pre-fix `hash` for the
     auto-default's pre-fix side — `_post_fix_attacks_rejection` never
-    re-runs a pre-fix command (only compares its STORED `block_hash`
-    against the freshly re-executed `post_hash`), so this can be any
-    valid-shaped value that reliably DIFFERS from `_auto_r12_attack`'s own
-    `hash` — guaranteeing the differential always finds a difference for
-    an auto-generated key, regardless of whether that key's file happens
-    to coincide with one the fix actually changed (G24/G28's own real
-    shape: a class_enumeration key naming the SAME file the fix touches)."""
+    re-runs a pre-fix command (only compares its STORED `hash` against the
+    freshly re-executed post-fix `hash`), so this can be any valid-shaped
+    value that reliably DIFFERS from `_auto_r12_attack`'s own `hash` —
+    guaranteeing the differential always finds a difference for an
+    auto-generated key, regardless of whether that key's file happens to
+    coincide with one the fix actually changed (G24/G28's own real shape:
+    a class_enumeration key naming the SAME file the fix touches)."""
     return _r12_hash(0, f"auto-baseline-{key}", "")
 
 
@@ -484,31 +495,32 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
     is armed by the DATA (a non-empty hook-derived `claim_sites`), and no
     EXISTING fixture's placeholder fix content matches any claim phrase.
 
-    esc-lead-gate-R12 reader 2: `attacks_post` DEFAULTS to the sentinel
-    `"auto"` — every EXISTING call site (none of which anticipated R12 at
-    all) keeps satisfying the new, always-armed-by-the-DATA `attacks_post`
-    requirement without editing dozens of unrelated fixtures, the exact
-    backward-compat shape `fix_head`'s own None-means-omitted default
-    already established. `"auto"` derives the required key set from BOTH
-    `row`'s own `class_enumeration`/`finding_locations` (the SAME
-    derivation `_derived_attack_keys` performs) AND, when `fix_head` is
+    esc-lead-gate-R12 reader 2 (M4', per FILE): `attacks_post` DEFAULTS to
+    the sentinel `"auto"` — every EXISTING call site (none of which
+    anticipated R12 at all) keeps satisfying the new, always-armed-by-the-
+    DATA `attacks_post` requirement without editing dozens of unrelated
+    fixtures, the exact backward-compat shape `fix_head`'s own
+    None-means-omitted default already established. `"auto"` derives the
+    required FILE set from BOTH `row`'s own `class_enumeration`/
+    `finding_locations` (reduced to files via `_key_to_file`, the SAME
+    derivation `_r12_required_by_file` performs) AND, when `fix_head` is
     given, every new-surface definition the fix's own `-U0` diff adds
-    (`_parse_new_surfaces` — the UC1-7 fixtures' claim-fix content adds a
-    real `def f():` line, which is ALSO a new surface under R12b's
-    reader-2 widening); auto-writes a MATCHING pre-fix anticipation
-    artifact (if one is not already on disk for this block — a fixture
-    that wrote its own via `_write_anticipation_exact` is never clobbered)
-    with a cheap, reproducible `printf` command per key, and mirrors the
-    SAME command into `attacks_post` with a DELIBERATELY DIFFERENT
-    recorded hash (`_auto_r12_baseline_hash` vs `_auto_r12_attack`'s own
-    hash — `_post_fix_attacks_rejection` never re-executes the PRE-fix
-    command, only compares its stored `block_hash` against the freshly
-    re-executed `post_hash`, so these two literals differing is enough to
-    satisfy the differential UNCONDITIONALLY, regardless of whether an
-    auto key's own file happens to coincide with one the fix actually
-    changed — G24/G28's own real shape). A fixture that means to test R12
-    itself passes an explicit `attacks_post` dict (or `None` to omit it
-    deliberately)."""
+    (`_parse_new_surfaces`, also reduced to files — the UC1-7 fixtures'
+    claim-fix content adds a real `def f():` line, which is ALSO a new
+    surface under R12's reader-2 widening); auto-writes a MATCHING pre-fix
+    anticipation artifact at THIS BLOCK's own `head_sha` (its tip at the
+    moment it was written — a fixture that wrote its own via
+    `_write_anticipation_exact` is never clobbered) with a cheap,
+    reproducible `printf` command per file, and mirrors the SAME command
+    into `attacks_post` with a DELIBERATELY DIFFERENT recorded hash
+    (`_auto_r12_baseline_hash` vs `_auto_r12_attack`'s own hash —
+    `_post_fix_attacks_rejection` never re-executes the PRE-fix command,
+    only compares its stored `hash` against the freshly re-executed
+    post-fix `hash`, so these two literals differing is enough to satisfy
+    the differential UNCONDITIONALLY, regardless of whether an auto file
+    happens to coincide with one the fix actually changed — G24/G28's own
+    real shape). A fixture that means to test R12 itself passes an
+    explicit `attacks_post` dict (or `None` to omit it deliberately)."""
     path = _relay_path_exact(root, row)
     artifact = {"unit_branch": row["unit_branch"], "agent_type": row["agent_type"], "block_ts": row["ts"]}
     if fix_head is not None:
@@ -522,9 +534,11 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
     if claims is not None:
         artifact["claims"] = claims
     if attacks_post == "auto":
+        mod = _r12_mod()
         pre_keys = {s for s in (row.get("class_enumeration") or []) if isinstance(s, str)} | \
                    {s for s in (row.get("finding_locations") or []) if isinstance(s, str)}
-        new_surface_keys: set[str] = set()
+        pre_files = {mod._key_to_file(k) for k in pre_keys}
+        new_surface_files: set[str] = set()
         if fix_head is not None and isinstance(row.get("head_sha"), str):
             try:
                 # A fixture testing an ADVERSARIAL head_sha/fix_head (e.g.
@@ -535,28 +549,26 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
                 # here just means "no new-surface widening to auto-cover",
                 # never a fixture-setup crash.
                 diff_out = _git(root, "diff", "-U0", "--end-of-options", row["head_sha"], fix_head)
-                new_surface_keys = set(_r12_mod()._parse_new_surfaces(diff_out).keys())
+                new_surface_files = {mod._key_to_file(k) for k in mod._parse_new_surfaces(diff_out).keys()}
             except Failure:
-                new_surface_keys = set()
-        required = pre_keys | new_surface_keys
+                new_surface_files = set()
+        required = pre_files | new_surface_files
         if required:
-            apath = _anticipation_path_exact(root, row["unit_branch"], row["ts"])
+            apath = _anticipation_path_exact(root, row["unit_branch"], row["head_sha"])
             pre_attacks = json.loads(apath.read_text()).get("attacks", {}) if apath.exists() else {}
             wrote_new = False
-            for key in sorted(required):
-                if key not in pre_attacks:
-                    a = _auto_r12_attack(key)
-                    pre_attacks[key] = {"attack": f"fixture auto-attack on {key}",
-                                         "command": a["command"], "block_rc": a["rc"],
-                                         "block_hash": _auto_r12_baseline_hash(key)}
+            for f in sorted(required):
+                if f not in pre_attacks:
+                    a = _auto_r12_attack(f)
+                    pre_attacks[f] = {"command": a["command"], "hash": _auto_r12_baseline_hash(f)}
                     wrote_new = True
             if wrote_new or not apath.exists():
-                _write_anticipation_exact(root, row["unit_branch"], row["ts"], row["head_sha"], pre_attacks)
+                _write_anticipation_exact(root, row["unit_branch"], row["head_sha"], pre_attacks)
             post = {}
-            for key in sorted(required):
-                a = _auto_r12_attack(key)
-                cmd = pre_attacks.get(key, {}).get("command") or a["command"]
-                post[key] = {"command": cmd, "post_rc": a["rc"], "post_hash": a["hash"]}
+            for f in sorted(required):
+                a = _auto_r12_attack(f)
+                cmd = pre_attacks.get(f, {}).get("command") or a["command"]
+                post[f] = {"command": cmd, "hash": a["hash"]}
             artifact["attacks_post"] = post
     elif isinstance(attacks_post, dict):
         artifact["attacks_post"] = attacks_post
@@ -1601,21 +1613,62 @@ def _r12_dispatch(root: Path, unit: str, subtype: str = "db") -> "subprocess.Com
         "subagent_type": subtype, "prompt": f"unit: {unit}\nimplement the fix"}}, root)
 
 
-def fixture_r12p1_reader1_not_armed_no_unit_named() -> None:
-    """An implementer dispatch naming NO unit branch at all is allowed —
-    there is nothing yet to check for an open BLOCK."""
+def fixture_r12p1_no_unit_line_denies_for_implementer_types() -> None:
+    """M6': an IMPLEMENTER_TYPES dispatch (e.g. `db`) naming NO unit branch
+    at all is now DENIED — every implementer dispatch must say which unit
+    it works on. This REPLACES the pre-fix-round-1 "no unit named must
+    allow" fixture, which M6' deliberately closes (the fail-open
+    enumeration it belonged to)."""
     root = _fresh_root()
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "db", "prompt": "go fix the thing we discussed"}}, root)
-    _assert(p.returncode == 0, "R12P1", f"no unit named must allow, got {p.returncode}: {p.stderr}")
+    _assert(p.returncode == 2, "R12P1", f"no unit named must now deny (M6'), got {p.returncode}")
+    _assert("requires every implementer dispatch to name the unit" in p.stderr, "R12P1", p.stderr)
+
+
+def fixture_r12p1b_no_unit_line_allows_for_extra_gated_types() -> None:
+    """M6': a `general-purpose`/`claude`/`fork`/`doc-updater` dispatch
+    naming NO unit branch stays ALLOWED — these four are generic/harness
+    types a lead may dispatch for reasons unrelated to implementing a fix;
+    gating an unlabeled dispatch of these would brick the lead."""
+    root = _fresh_root()
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "general-purpose", "prompt": "go look something up"}}, root)
+    _assert(p.returncode == 0, "R12P1b", f"no unit named must allow for an extra-gated type, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12p1c_extra_gated_type_armed_when_unit_named() -> None:
+    """M6': a `general-purpose` dispatch that DOES name a unit with an open
+    verifier-type BLOCK is gated exactly like an IMPLEMENTER_TYPES
+    dispatch — closing the fail-open enumeration these four types
+    previously sat in unconditionally."""
+    unit = "feat/r12p1c"
+    root = _temp_repo(unit)
+    _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    p = _r12_dispatch(root, unit, subtype="general-purpose")
+    _assert(p.returncode == 2, "R12P1c", f"a named unit with an open BLOCK must deny for an extra-gated type too, got {p.returncode}")
+    _assert("no anticipation artifact" in p.stderr, "R12P1c", p.stderr)
 
 
 def fixture_r12p2_reader1_not_armed_no_open_block() -> None:
-    """An implementer dispatch naming a real unit with NO open verifier-
-    type BLOCK on it is allowed — structurally nothing to anticipate yet."""
-    root = _fresh_root()
-    p = _r12_dispatch(root, "feat/r12p2")
+    """An implementer dispatch naming a real, RESOLVABLE unit branch with
+    NO open verifier-type BLOCK on it is allowed — structurally nothing to
+    anticipate yet. Uses a real repo (M6' resolves the branch under
+    refs/heads/ before checking for an open block)."""
+    unit = "feat/r12p2"
+    root = _temp_repo(unit)
+    p = _r12_dispatch(root, unit)
     _assert(p.returncode == 0, "R12P2", f"no open BLOCK must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12p2b_unresolvable_branch_denies() -> None:
+    """M6': a `unit:` line naming a branch that does not resolve under
+    refs/heads/ DENIES outright — never silently treated as "no unit
+    named"."""
+    root = _temp_repo("feat/r12p2b-seed")
+    p = _r12_dispatch(root, "this-branch-does-not-exist-anywhere")
+    _assert(p.returncode == 2, "R12P2b", f"an unresolvable branch must deny, got {p.returncode}")
+    _assert("does not resolve under refs/heads/" in p.stderr, "R12P2b", p.stderr)
 
 
 def fixture_r12p3_missing_artifact_denies() -> None:
@@ -1628,48 +1681,71 @@ def fixture_r12p3_missing_artifact_denies() -> None:
 
 
 def fixture_r12p4_missing_key_denies() -> None:
+    """`a.py:1`/`b.py:2` reduce to two REQUIRED FILES, `a.py`/`b.py` — the
+    artifact carries `a.py` but omits `b.py` entirely."""
     unit = "feat/r12p4"
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1", "b.py:2"], ["a.py:1"])
-    a = _auto_r12_attack("a.py:1")
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "x", "command": a["command"], "block_rc": a["rc"], "block_hash": a["hash"]},
-        # b.py:2 (also a required derived key, from class_enumeration) is
-        # MISSING entirely.
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        # b.py (also required, from class_enumeration's b.py:2) is MISSING.
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P4", f"a missing derived key must deny, got {p.returncode}")
     _assert("omits" in p.stderr, "R12P4", f"reason must name the omitted key(s): {p.stderr!r}")
 
 
-def fixture_r12p5_tip_moved_past_block_sha_denies() -> None:
+def fixture_r12p5_tip_moved_since_artifact_recorded_denies() -> None:
     """The anticipation artifact is otherwise complete, but the unit
-    branch's CURRENT tip has ALREADY advanced past the BLOCK's own
-    head_sha (a fix commit landed) — the non-forgeable ordering check
-    (the attacks must run against the BROKEN code) must deny."""
+    branch's CURRENT tip has ALREADY advanced past the artifact's own
+    `pre_fix_sha` (a fix commit landed since it was recorded) — M1' keys
+    the artifact BY tip, so a stale, pre-move artifact is simply no longer
+    found at the CURRENT tip's path at all (never silently reused): the
+    non-forgeable ordering claim ("the attacks ran against the tip that is
+    now current") cannot be made from a file recorded under a sha that is
+    no longer the tip."""
     unit = "feat/r12p5"
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
-    a = _auto_r12_attack("a.py:1")
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "x", "command": a["command"], "block_rc": a["rc"], "block_hash": a["hash"]},
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
     })
-    _commit_fix(root, "later.py")  # the branch tip has now moved past block_sha
+    _commit_fix(root, "later.py")  # the branch tip has now moved past pre_fix_sha
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P5", f"a moved tip must deny, got {p.returncode}")
-    _assert("is not the BLOCK's own head_sha" in p.stderr, "R12P5", f"reason must name the ordering failure: {p.stderr!r}")
+    _assert("no anticipation artifact" in p.stderr, "R12P5",
+            f"a stale, pre-move artifact must not be found at the new tip: {p.stderr!r}")
+
+
+def fixture_r12p5b_dirty_worktree_denies_naming_paths() -> None:
+    """M1': ordering evidence ALSO requires the resolved worktree's `git
+    status --porcelain` to be EMPTY — an uncommitted, untracked change
+    denies, naming the dirty path (never merely "the tip moved")."""
+    unit = "feat/r12p5b"
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+    })
+    (root / "uncommitted-scratch.txt").write_text("not committed\n")
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P5b", f"a dirty worktree must deny, got {p.returncode}")
+    _assert("uncommitted changes" in p.stderr and "uncommitted-scratch.txt" in p.stderr, "R12P5b", p.stderr)
 
 
 def fixture_r12p6_hash_mismatch_denies() -> None:
     unit = "feat/r12p6"
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "x", "command": "printf hello", "block_rc": 0, "block_hash": "0" * 64},
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "printf hello", "hash": "0" * 64},
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P6", f"a non-reproducing hash must deny, got {p.returncode}")
-    _assert("does not reproduce the recorded witness" in p.stderr, "R12P6", f"{p.stderr!r}")
+    _assert("does not reproduce the recorded hash" in p.stderr, "R12P6", f"{p.stderr!r}")
 
 
 def fixture_r12p7_vacuous_missing_script_denies() -> None:
@@ -1679,9 +1755,8 @@ def fixture_r12p7_vacuous_missing_script_denies() -> None:
     unit = "feat/r12p7"
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "x", "command": "./this-script-does-not-exist-r12p7.sh",
-                   "block_rc": 127, "block_hash": "a" * 64},
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "./this-script-does-not-exist-r12p7.sh", "hash": "a" * 64},
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P7", f"a vacuous (missing-script) run must deny, got {p.returncode}")
@@ -1693,34 +1768,39 @@ def fixture_r12p8_templated_reused_pair_denies() -> None:
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1", "b.py:2"], ["a.py:1"])
     a = _auto_r12_attack("shared")
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "x", "command": a["command"], "block_rc": a["rc"], "block_hash": a["hash"]},
-        "b.py:2": {"attack": "y", "command": a["command"], "block_rc": a["rc"], "block_hash": a["hash"]},
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        "b.py": {"command": a["command"], "hash": a["hash"]},
     })
     p = _r12_dispatch(root, unit)
-    _assert(p.returncode == 2, "R12P8", f"a reused (command, block_hash) pair must deny, got {p.returncode}")
+    _assert(p.returncode == 2, "R12P8", f"a reused (command, hash) pair must deny, got {p.returncode}")
     _assert("IDENTICAL" in p.stderr, "R12P8", f"reason must name the templated pair: {p.stderr!r}")
 
 
 def fixture_r12p9_denylisted_command_denies() -> None:
+    """A REAL denylist hit — asserted against the SPECIFIC deny text
+    (`is denied:`), never merely the wrapper's own "denied —" prefix (which
+    would also appear for an unrelated deny, e.g. a missing artifact, and
+    make this fixture pass vacuously without ever exercising the denylist)."""
     unit = "feat/r12p9"
     root = _temp_repo(unit)
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "x", "command": "rm -rf /tmp/should-never-run-r12p9",
-                   "block_rc": 0, "block_hash": "b" * 64},
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "rm -rf /tmp/should-never-run-r12p9", "hash": "b" * 64},
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12P9", f"a denylisted command must deny, got {p.returncode}")
-    _assert("denied" in p.stderr, "R12P9", f"{p.stderr!r}")
+    _assert("command is denied:" in p.stderr, "R12P9",
+            f"the SPECIFIC denylist arm must fire, not merely the wrapper's own text: {p.stderr!r}")
     _assert(not Path("/tmp/should-never-run-r12p9").exists(), "R12P9", "the denied command must never have run")
 
 
 def fixture_r12p10_complete_artifact_allows() -> None:
-    """A complete, EXECUTED anticipation artifact whose branch tip equals
-    `block_sha` right now ALLOWS the implementer dispatch — proving the
+    """A complete, EXECUTED anticipation artifact at the branch's CURRENT
+    tip, in a CLEAN worktree, ALLOWS the implementer dispatch — proving the
     arm is satisfiable, not a permanent deny. Also proves the RELAXED
-    denylist admits `bash <real repo-relative path>`."""
+    denylist admits `bash <real repo-relative path>` and that a real
+    execution-class command (never merely an inspector) satisfies M2'."""
     unit = "feat/r12p10"
     root = _temp_repo(unit)
     (root / "ci").mkdir(parents=True, exist_ok=True)
@@ -1730,43 +1810,109 @@ def fixture_r12p10_complete_artifact_allows() -> None:
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
     cmd = "bash ci/probe_r12p10.sh"
     h = _r12_hash(0, "ok", "")
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "run the real probe script directly", "command": cmd,
-                   "block_rc": 0, "block_hash": h},
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": cmd, "hash": h},
     })
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 0, "R12P10", f"a complete artifact must allow, got {p.returncode}: {p.stderr}")
 
 
-def fixture_r12p11_computed_cwd_not_project_dir() -> None:
-    """Attack commands run in the `git worktree list`-resolved worktree for
-    the unit branch, NEVER `$CLAUDE_PROJECT_DIR` — a file that exists ONLY
-    in the unit's own worktree, read by the attack command, proves this:
-    dispatching with `CLAUDE_PROJECT_DIR` pointed at a SEPARATE, stale
-    linked worktree (checked out before that file existed) must still
-    ALLOW, because the command actually ran in the resolved worktree."""
+def fixture_r12p10b_inspector_only_artifact_denies() -> None:
+    """M2': an artifact whose EVERY attack is inspector-class (`cat` here)
+    denies — reading a file is not attacking a mechanism; at least one
+    attack must be execution-class."""
+    unit = "feat/r12p10b"
+    root = _temp_repo(unit)
+    (root / "a.py").write_text("x = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add a.py")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    h = _r12_hash(0, "x = 1\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": "cat a.py", "hash": h},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P10b", f"an inspector-only artifact must deny, got {p.returncode}")
+    _assert("inspector-class" in p.stderr, "R12P10b", p.stderr)
+
+
+def fixture_r12p11_two_open_blocks_different_shas_still_satisfiable() -> None:
+    """THE CORE FIX-ROUND-1 BUG: two open second-round BLOCKs of DIFFERENT
+    types, at DIFFERENT shas (an older adversarial-audit, then a NEWER
+    acceptance-verifier after a fix commit landed in between) — under the
+    fix-round-1 shape (tip must equal EACH block's own head_sha
+    individually) this is a PERMANENT deny (the tip cannot equal two
+    different shas at once). Under M1' (one artifact at the CURRENT tip,
+    covering the UNION of every open block's keys), this is satisfiable."""
     unit = "feat/r12p11"
     root = _temp_repo(unit)
-    (root / "only-here.txt").write_text("present")
-    _git(root, "add", "-A")
-    _git(root, "commit", "-q", "-m", "add only-here.txt")
-    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
-    cmd = "cat only-here.txt"
-    h = _r12_hash(0, "present", "")
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "a.py:1": {"attack": "read the file only this worktree carries", "command": cmd,
-                   "block_rc": 0, "block_hash": h},
+    audit_row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _commit_fix(root, "unrelated.py")  # tip advances past the audit BLOCK's own head_sha
+    accept_row = _write_block_row(root, unit, "a2", "acceptance-verifier", ["b.py:2"], ["b.py:2"])
+    _assert(audit_row["head_sha"] != accept_row["head_sha"], "R12P11 setup",
+            "the two BLOCKs must sit at DIFFERENT shas for this to test anything")
+    a = _auto_r12_attack("a.py")
+    b = _auto_r12_attack("b.py")
+    _write_anticipation_exact(root, unit, accept_row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+        "b.py": {"command": b["command"], "hash": b["hash"]},
     })
-    # A fresh, uniquely-named tempdir (cleaned up by the harness's own
-    # atexit sweep) — never a fixed name under the shared system tempdir,
-    # which a prior run's `git worktree add` (never cleaned up itself)
-    # could collide with.
-    stale_dir = _fresh_root() / "wt"
-    _git(root, "worktree", "add", "-q", "-b", f"r12p11-stale-branch-{id(root)}", str(stale_dir), "HEAD~2")
-    p = _r12_dispatch(stale_dir, unit)
+    p = _r12_dispatch(root, unit)
     _assert(p.returncode == 0, "R12P11",
-            f"the attack must run in the RESOLVED worktree (root), not the stale "
-            f"CLAUDE_PROJECT_DIR, got {p.returncode}: {p.stderr}")
+            f"a single artifact at the CURRENT tip covering the union of both blocks' keys "
+            f"must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12p11b_union_still_requires_the_older_blocks_own_keys() -> None:
+    """The SAME two-different-shas setup, but the artifact covers only the
+    NEWER block's own key (`b.py`) — proving this is the UNION arm, never
+    "the newest block only" (which would let a lead-provoked
+    acceptance-verifier BLOCK retire an older, unrelated audit's
+    obligation for free)."""
+    unit = "feat/r12p11b"
+    root = _temp_repo(unit)
+    _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _commit_fix(root, "unrelated.py")
+    accept_row = _write_block_row(root, unit, "a2", "acceptance-verifier", ["b.py:2"], ["b.py:2"])
+    b = _auto_r12_attack("b.py")
+    _write_anticipation_exact(root, unit, accept_row["head_sha"], {
+        "b.py": {"command": b["command"], "hash": b["hash"]},
+        # a.py (the OLDER, still-open adversarial-audit's own key) is
+        # deliberately MISSING.
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12P11b",
+            f"covering only the newest block must still deny — the older block's own key is "
+            f"required too, got {p.returncode}")
+    _assert("omits" in p.stderr and "a.py" in p.stderr, "R12P11b", p.stderr)
+
+
+def fixture_r12p12_computed_cwd_not_project_dir() -> None:
+    """Attack commands run in the `git worktree list`-resolved worktree for
+    the unit branch. `root` (checked out on `unit_branch`, where the BLOCK
+    row and the anticipation artifact both live, and where
+    `CLAUDE_PROJECT_DIR` points for this dispatch) carries a file a SECOND,
+    decoy linked worktree (checked out on an unrelated branch, added
+    AFTER) does not — proving the resolution is BY BRANCH NAME via `git
+    worktree list --porcelain`, never "whichever worktree happens to sit
+    at a fixed relative path", and never confused by the decoy's presence."""
+    unit = "feat/r12p12"
+    root = _temp_repo(unit)
+    (root / "only-here.sh").write_text("#!/bin/sh\nprintf present\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add only-here.sh")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    cmd = "bash only-here.sh"
+    h = _r12_hash(0, "present", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": cmd, "hash": h},
+    })
+    decoy_dir = _fresh_root() / "wt"
+    _git(root, "worktree", "add", "-q", "-b", f"r12p12-decoy-branch-{id(root)}", str(decoy_dir), "HEAD~2")
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 0, "R12P12",
+            f"the attack must run in the branch's OWN resolved worktree, unconfused by a decoy "
+            f"linked worktree on another branch, got {p.returncode}: {p.stderr}")
 
 
 def fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh() -> None:
@@ -1797,14 +1943,15 @@ def fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh() -> None:
 def _r12_post_setup(unit: str):
     """A real repo whose `state.txt` is TWO lines (`BROKEN`/`v1`) at the
     BLOCK's own head_sha — the pre-fix anticipation artifact's `head -1
-    state.txt` witness (line 1 only) is recorded against that content.
-    Returns `(root, row, cmd, pre_hash)`. Reading only line 1 (never the
-    whole file) is deliberate: it lets a fixture change line 2 (a REAL,
-    non-empty commit `git commit` will accept) while keeping line 1's own
-    observable output identical, for the "no differential" DENY case
-    below — a commit that changes NOTHING in `state.txt` at all would
-    never even appear in `git diff --name-only`, which would vacuously
-    SKIP the differential check entirely rather than exercise it."""
+    state.txt` witness (line 1 only) is recorded against that content,
+    keyed by FILE (`state.txt`, per M4'). Returns `(root, row, cmd,
+    pre_hash)`. Reading only line 1 (never the whole file) is deliberate:
+    it lets a fixture change line 2 (a REAL, non-empty commit `git commit`
+    will accept) while keeping line 1's own observable output identical,
+    for the "no differential" DENY case below — a commit that changes
+    NOTHING in `state.txt` at all would never even appear in `git diff
+    --name-only`, which would vacuously SKIP the differential check
+    entirely rather than exercise it."""
     root = _temp_repo(unit)
     (root / "state.txt").write_text("BROKEN\nv1\n")
     _git(root, "add", "-A")
@@ -1812,8 +1959,8 @@ def _r12_post_setup(unit: str):
     row = _write_block_row(root, unit, "a1", "adversarial-audit", ["state.txt:1"], ["state.txt:1"])
     cmd = "head -1 state.txt"
     pre_hash = _r12_hash(0, "BROKEN\n", "")
-    _write_anticipation_exact(root, unit, row["ts"], row["head_sha"], {
-        "state.txt:1": {"attack": "read state.txt's line 1", "command": cmd, "block_rc": 0, "block_hash": pre_hash},
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "state.txt": {"command": cmd, "hash": pre_hash},
     })
     return root, row, cmd, pre_hash
 
@@ -1833,11 +1980,11 @@ def fixture_r12r2a_missing_attacks_post_denies() -> None:
 
 
 def fixture_r12r2b_no_differential_denies() -> None:
-    """`attacks_post` reproduces perfectly, but its hash for the ONE key
+    """`attacks_post` reproduces perfectly, but its hash for the ONE FILE
     covering the changed file (`state.txt`) is IDENTICAL to the pre-fix
-    `block_hash` — the fix changed state.txt's SECOND line (a real,
-    non-empty commit, so state.txt genuinely appears in `fix_changed`),
-    but the attack only reads LINE 1, which never moved — the fix did not
+    `hash` — the fix changed state.txt's SECOND line (a real, non-empty
+    commit, so state.txt genuinely appears in `fix_changed`), but the
+    attack only reads LINE 1, which never moved — the fix did not
     observably move anything this attack measures."""
     root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2b")
     (root / "state.txt").write_text("BROKEN\nv2\n")  # only line 2 changes
@@ -1846,7 +1993,7 @@ def fixture_r12r2b_no_differential_denies() -> None:
     fix_head = _git(root, "rev-parse", "HEAD")
     _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
                         fix_head=fix_head,
-                        attacks_post={"state.txt:1": {"command": cmd, "post_rc": 0, "post_hash": pre_hash}})
+                        attacks_post={"state.txt": {"command": cmd, "hash": pre_hash}})
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2b"}}, root)
     _assert(p.returncode == 2, "R12R2b", f"an identical pre/post hash must deny, got {p.returncode}")
@@ -1865,10 +2012,37 @@ def fixture_r12r2c_real_differential_allows() -> None:
     post_hash = _r12_hash(0, "FIXED\n", "")
     _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
                         fix_head=fix_head,
-                        attacks_post={"state.txt:1": {"command": cmd, "post_rc": 0, "post_hash": post_hash}})
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}})
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2c"}}, root)
     _assert(p.returncode == 0, "R12R2c", f"a real differential must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12r2d_sh_hunk_widens_by_file() -> None:
+    """M4': a `.sh` hunk widens the required set by FILE only (never by a
+    finer definition-level granularity — a shell function has no `def`/
+    `fn` shape `_new_surface_def` recognizes anyway, so this also proves
+    the file-level fallback actually fires for a real new-surface diff).
+    `run.sh` is entirely NEW (no pre-fix key covers it, so no "same
+    command as pre-fix" constraint applies); `state.txt` is UNCHANGED by
+    this fix and its `attacks_post` entry re-runs the SAME pre-fix
+    command, reproducing the SAME hash — no differential violation, since
+    `state.txt` never appears in `fix_changed` here."""
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2d")
+    (root / "run.sh").write_text("#!/bin/sh\nfoo() {\n  echo hi\n}\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: add run.sh, state.txt unchanged")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    run_sh_hash = _r12_hash(0, (root / "run.sh").read_text(), "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "run.sh"],
+                        fix_head=fix_head,
+                        attacks_post={
+                            "state.txt": {"command": cmd, "hash": pre_hash},
+                            "run.sh": {"command": "cat run.sh", "hash": run_sh_hash},
+                        })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2d"}}, root)
+    _assert(p.returncode == 0, "R12R2d", f"a new .sh surface widened by file must allow once covered, got {p.returncode}: {p.stderr}")
 
 
 def fixture_r12m1_open_question_without_attacks_post_denies() -> None:
@@ -2694,21 +2868,29 @@ FIXTURES = [
     ("UC5", fixture_uc5_uncovered_with_reason_allows),
     ("UC6", fixture_uc6_duplicate_uncovered_reason_denied),
     ("UC7", fixture_uc7_no_claim_shaped_line_is_a_noop),
-    ("R12P1", fixture_r12p1_reader1_not_armed_no_unit_named),
+    ("R12P1", fixture_r12p1_no_unit_line_denies_for_implementer_types),
+    ("R12P1b", fixture_r12p1b_no_unit_line_allows_for_extra_gated_types),
+    ("R12P1c", fixture_r12p1c_extra_gated_type_armed_when_unit_named),
     ("R12P2", fixture_r12p2_reader1_not_armed_no_open_block),
+    ("R12P2b", fixture_r12p2b_unresolvable_branch_denies),
     ("R12P3", fixture_r12p3_missing_artifact_denies),
     ("R12P4", fixture_r12p4_missing_key_denies),
-    ("R12P5", fixture_r12p5_tip_moved_past_block_sha_denies),
+    ("R12P5", fixture_r12p5_tip_moved_since_artifact_recorded_denies),
+    ("R12P5b", fixture_r12p5b_dirty_worktree_denies_naming_paths),
     ("R12P6", fixture_r12p6_hash_mismatch_denies),
     ("R12P7", fixture_r12p7_vacuous_missing_script_denies),
     ("R12P8", fixture_r12p8_templated_reused_pair_denies),
     ("R12P9", fixture_r12p9_denylisted_command_denies),
     ("R12P10", fixture_r12p10_complete_artifact_allows),
-    ("R12P11", fixture_r12p11_computed_cwd_not_project_dir),
+    ("R12P10b", fixture_r12p10b_inspector_only_artifact_denies),
+    ("R12P11", fixture_r12p11_two_open_blocks_different_shas_still_satisfiable),
+    ("R12P11b", fixture_r12p11b_union_still_requires_the_older_blocks_own_keys),
+    ("R12P12", fixture_r12p12_computed_cwd_not_project_dir),
     ("R12D1", fixture_r12d1_relaxed_denylist_still_denies_bashc_and_pipe_sh),
     ("R12R2a", fixture_r12r2a_missing_attacks_post_denies),
     ("R12R2b", fixture_r12r2b_no_differential_denies),
     ("R12R2c", fixture_r12r2c_real_differential_allows),
+    ("R12R2d", fixture_r12r2d_sh_hunk_widens_by_file),
     ("R12M1", fixture_r12m1_open_question_without_attacks_post_denies),
     ("T1", fixture_t1_card_schema_line_substituted_binds),
     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),

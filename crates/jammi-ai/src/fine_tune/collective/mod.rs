@@ -3,9 +3,11 @@
 //! One trait, one implementation per transport, selected by CONFIGURATION —
 //! `[worker] collective` and `[worker] world_size`, never a cargo feature. The
 //! trainer holds a `&dyn Collective` and is never `cfg`-forked: a single-rank
-//! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`] or
-//! (on a CUDA build) an [`nccl::Nccl`], and the trainer's own code is the same
-//! code in every case.
+//! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`] or —
+//! on a CUDA build, where the `nccl` submodule exists — an `nccl::Nccl`, and
+//! the trainer's own code is the same code in every case. (A link rather than
+//! a code span would resolve only on a CUDA build, and fail the docs lane on
+//! every other.)
 //!
 //! # The five operations
 //!

@@ -675,11 +675,23 @@ and the workflow uploads it. A human reviews it and commits it under
 schema requires the topology the run actually had (`world`, the collective, and
 one device per rank), the same-seed digest pair, the measured per-step loss
 delta, and the epsilon it is read against — with epsilon's own derivation and
-the commit it was registered at, which must already be an ancestor of the
-commit the run measured. An epsilon chosen after seeing the delta it excuses is
-not a tolerance, and the gate refuses it by name. Whether the two digests match
-is the leg's own verdict, recorded in the artifact's `status`; the schema does
-not decide it.
+the commit it was registered at. An epsilon chosen after seeing the delta it
+excuses is not a tolerance, and the gate refuses it by name. Whether the two
+digests match is the leg's own verdict, recorded in the artifact's `status`; the
+schema does not decide it.
+
+**Where epsilon has to sit in history.** The gate reads the registration commit
+against the artifact's *evidence anchor*: `merged_as` when the artifact carries
+one that is an ancestor of `HEAD` (a measured tip whose landing commit rewrote
+it), otherwise `git_sha` when that is an ancestor of `HEAD`. The registration
+commit must be an ancestor of `HEAD` and a **strict** ancestor of that anchor;
+an artifact with neither anchor in this history fails, naming both. What that
+asks of whoever runs the leg: commit epsilon on its own, **before** the commit
+you measure with, on the same branch. Landing that branch by a merge commit —
+this repository's own merge style — keeps epsilon a strict ancestor afterwards.
+A squash, or a rebase performed *after* measuring, rewrites both commits and the
+artifact fails from the merge onwards, so do not rebase a measured branch:
+land it, or re-measure.
 
 ## Notes
 

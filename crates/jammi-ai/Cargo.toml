@@ -39,6 +39,13 @@ candle-nn = { workspace = true, optional = true }
 # Optional/`local`-gated for the same reason `candle-core` is: it is only reachable through
 # the embedded engine's candle-backed fine-tune path.
 jammi-kernels = { workspace = true, optional = true }
+# `half::{f16,bf16}` is the `NcclType` this crate's own collective arm
+# (`fine_tune::collective::nccl`) names directly to dispatch its CUDA kernels
+# by dtype — the same crate candle-core itself depends on, but candle-core
+# does not re-export it. Gated on `cuda` alone (not `local`): the only
+# caller is the `#[cfg(feature = "cuda")]` `Nccl` arm, so an unconditional
+# dependency would widen the default build for nothing.
+half = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 # `HubSource`'s cache-root fallback (`model/hub.rs`, esc-096): when neither
 # `[models] hub_cache_dir` nor `HF_HOME` is set, the platform home directory
@@ -293,6 +300,7 @@ cuda = [
     "jammi-encoders/cuda",
     "jammi-lora/cuda",
     "jammi-kernels/cuda",
+    "dep:half",
 ]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
 # Forwards to `jammi-encoders`'s and `jammi-kernels`'s own `flash-attn`

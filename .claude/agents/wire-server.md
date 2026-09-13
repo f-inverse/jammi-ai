@@ -30,8 +30,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
 
 ## Pre-flight
 
-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-wire-server-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-wire-server-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
 2. Load the constitution invariants the contract crosses.
+3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
+4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
+5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
 
 ## Acceptance
 

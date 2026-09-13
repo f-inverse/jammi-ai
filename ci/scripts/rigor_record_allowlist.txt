@@ -1,0 +1,16 @@
+# Committed exceptions for ci/scripts/check_rigor_record.py.
+#
+# One unit_slug per line (the SAME slugify() `lead-gate-lib.py` uses on a
+# branch name) — a line here means THAT unit is exempt from R7b's arming
+# requirement (a committed rigor record + a pressure-tester row + a
+# mechanism contract) even when its diff touches crates/**, ci/**, or
+# .github/workflows/**. Add a short reason as a `#` comment on the line
+# above so a reviewer can tell "deliberate exemption" from "forgotten".
+#
+# `--check-allowlist-only-shrinks` enforces that this file may only SHRINK
+# relative to `origin/main` — a genuinely new exemption is a human decision
+# made directly on `main`, never an autonomous addition on a swarm branch
+# (the same ratchet `ci/scripts/check_perf_claims.py
+# --check-allowlist-only-shrinks` already uses for a different allowlist).
+#
+# Empty by default: no unit is exempt right now.

@@ -1,0 +1,16 @@
+# Committed exceptions for ci/scripts/check_oracle_gate.py.
+#
+# One unit_slug per line (the SAME slugify() `lead-gate-lib.py` uses on a
+# branch name) — a line here means THAT unit is exempt from the phase-5
+# oracle-freshness requirement even when its diff touches crates/**/
+# cookbook/**. Add a short reason as a `#` comment on the line above so a
+# reviewer can tell "deliberate exemption" from "forgotten".
+#
+# `--check-allowlist-only-shrinks` enforces that this file may only SHRINK
+# relative to `origin/main` — a genuinely new exemption is a human decision
+# made directly on `main`, never an autonomous addition on a swarm branch
+# (the same ratchet `ci/scripts/check_rigor_record.py
+# --check-allowlist-only-shrinks` and `ci/scripts/check_perf_claims.py
+# --check-allowlist-only-shrinks` already use for their own allowlists).
+#
+# Empty by default: no unit is exempt right now.

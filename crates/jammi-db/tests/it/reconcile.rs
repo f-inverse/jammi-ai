@@ -2393,3 +2393,139 @@ async fn models_row_prefix_with_no_manifest_is_damaged_never_reclaimed() {
         "damaged bytes are never reclaimed, even past grace under apply=true"
     );
 }
+
+// ─── U3 (#500): a cache-reuse prefix shared by TWO model rows (own name →
+//     reused prefix, "two rows, one prefix") is attribution-counted, not
+//     row-counted — the predicate every acceptance (a) run depends on. Under
+//     BASE (no `probe_model_by_definition`/reuse mechanism), a `models` row
+//     always names its OWN unique per-attempt prefix, so this N:1 shape never
+//     naturally arises; this test constructs it directly against the
+//     EXISTING attribution predicate (`artifact_prefixes: BTreeSet<String>`
+//     over every live model's `artifact_path`, `src/store/reconcile.rs:698`)
+//     to prove it is already reference-counted by set membership rather than
+//     by a single row's identity — no production change was needed once the
+//     shape can occur; ai-core's finalize sequence is what makes it occur. ──
+
+#[tokio::test]
+async fn a_prefix_referenced_by_two_model_rows_survives_until_both_are_gone() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let job_id = Uuid::new_v4().to_string();
+    let bundle = vec![(
+        "adapter.safetensors".to_string(),
+        bytes::Bytes::from_static(b"weights"),
+    )];
+    let prefix_url = store
+        .artifact_store()
+        .put_artifact(None, &[&job_id], &bundle)
+        .await
+        .unwrap();
+
+    // Two DISTINCT model rows point at the SAME prefix — the shape a cache
+    // hit produces (the winning attempt's own row, plus a second job's
+    // own-named row pointing at the reused prefix).
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "fine-tuned-a",
+            version: 1,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(prefix_url.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "fine-tuned-b",
+            version: 1,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(prefix_url.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let prefix_dir = dir
+        .path()
+        .join("jammi_db")
+        .join("models")
+        .join("_global")
+        .join(&job_id);
+    backdate_dir(&prefix_dir, Duration::from_secs(3600));
+
+    // Both rows alive: the shared prefix survives.
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report
+            .orphans
+            .iter()
+            .all(|o| !o.ends_with("adapter.safetensors")),
+        "a prefix referenced by two live rows must survive: {report:?}"
+    );
+    assert!(prefix_dir.join("adapter.safetensors").exists());
+
+    // ONE row deleted: the OTHER row still references the prefix by SET
+    // membership — it must still survive (this is the predicate under test).
+    catalog
+        .delete_model("fine-tuned-a", Some(1), false, 0)
+        .await
+        .unwrap();
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report
+            .orphans
+            .iter()
+            .all(|o| !o.ends_with("adapter.safetensors")),
+        "one live row must still protect the shared prefix: {report:?}"
+    );
+    assert!(
+        prefix_dir.join("adapter.safetensors").exists(),
+        "deleting one of two rows sharing a prefix must not reclaim it"
+    );
+
+    // BOTH rows gone: the prefix is now genuinely unreferenced and reclaimable.
+    catalog
+        .delete_model("fine-tuned-b", Some(1), false, 0)
+        .await
+        .unwrap();
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report
+            .orphans
+            .iter()
+            .any(|o| o.ends_with("adapter.safetensors")),
+        "an unreferenced prefix must be reclaimable once no row names it: {report:?}"
+    );
+    assert!(
+        !prefix_dir.join("adapter.safetensors").exists(),
+        "the prefix must actually be reaped once both referencing rows are gone"
+    );
+}

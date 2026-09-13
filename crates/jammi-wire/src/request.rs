@@ -6,6 +6,12 @@
 //! live on the wire substrate: the embedded session and the data-plane client
 //! both build verbs from them, and the gRPC converters map them on/off the wire.
 
+use std::num::NonZeroU32;
+
+use jammi_db::ModelTask;
+
+use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+
 /// Which embedding tower an embeddings / encode-query call targets. Unifies the
 /// three per-modality engine verbs (`text`/`image`/`audio`) into one parameter
 /// so the consumer surface carries one embedding verb, not three.
@@ -69,6 +75,47 @@ pub struct SearchRequest {
     /// a pre-migration table with no stamped column. Irrelevant for a `F32`
     /// table (single-stage, no rescore).
     pub oversample: Option<usize>,
+}
+
+/// A flattened column-source fine-tune submission. Every knob the submit
+/// carries — the spec's own fields, the hyperparameter block, and the
+/// data-parallel rank count — is a field here, the same way [`SearchRequest`]
+/// flattens a search: a transport serialises the whole request, and the
+/// embedded session and the data-plane client build the identical
+/// submission from one shape rather than from two parameter lists that can
+/// drift apart.
+///
+/// The count sits beside `config` rather than inside it because that is where
+/// it sits in both of the shapes this maps onto: the engine's
+/// `TrainingCommon { base_model, config, world_size }` and
+/// `jammi.v1.job.SubmitJobRequest`'s tag 9. Folding it into
+/// [`FineTuneConfig`] would represent one value in two places.
+pub struct FineTuneRequest {
+    /// Source whose rows supply the training pairs.
+    pub source: String,
+    /// Base encoder to adapt (`local:<path>`, an HF repo id, or a fine-tuned
+    /// id).
+    pub base_model: String,
+    /// Content columns the pairs are read from.
+    pub columns: Vec<String>,
+    /// Fine-tuning method.
+    pub method: FineTuneMethod,
+    /// Which task head the adapted model serves.
+    pub task: ModelTask,
+    /// Hyperparameters. `None` applies the engine's defaults.
+    pub config: Option<FineTuneConfig>,
+    /// Data-parallel rank count. `None` is UNSET and leaves the engine's
+    /// default of a single rank; `Some(n)` requests `n` ranks.
+    ///
+    /// `Option<NonZeroU32>` rather than a bare `u32` so the two meanings a `0`
+    /// would carry — "I did not choose" and "I chose zero ranks" — cannot be
+    /// confused, and a zero-rank job is unrepresentable at this edge rather
+    /// than refused after it is built. On the wire the count is an
+    /// implicit-presence `uint32` where `0` IS the unset value, so `None`
+    /// encodes as `0` and a request that never sets the count is byte-for-byte
+    /// what a caller sent before the field existed. A count the deployment
+    /// cannot serve is refused at submit with a typed error, never clamped.
+    pub world_size: Option<NonZeroU32>,
 }
 
 /// Identifier of a fine-tune job. Returned in place of an in-process job handle

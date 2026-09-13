@@ -116,6 +116,7 @@ fn start_request() -> SubmitJobRequest {
         // Unset (`0`) rank count: the single-rank job every one of these
         // fixtures has always submitted.
         world_size: 0,
+        cache: 0,
     }
 }
 
@@ -510,6 +511,7 @@ fn predictor_start_request() -> SubmitJobRequest {
         config: None,
         idempotency_key: String::new(),
         world_size: 0,
+        cache: 0,
     }
 }
 
@@ -691,6 +693,7 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
         config: None,
         idempotency_key: String::new(),
         world_size: 0,
+        cache: 0,
     };
 
     let start = client
@@ -728,6 +731,7 @@ async fn start_training_rejects_unspecified_method() {
             config: None,
             idempotency_key: String::new(),
             world_size: 0,
+            cache: 0,
         })
         .await
         .expect_err("unspecified method must be rejected");
@@ -754,6 +758,7 @@ async fn start_training_rejects_missing_columns() {
             config: None,
             idempotency_key: String::new(),
             world_size: 0,
+            cache: 0,
         })
         .await
         .expect_err("missing columns must be rejected");

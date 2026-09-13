@@ -42,6 +42,7 @@ fn never_runs_job_request() -> SubmitJobRequest {
         idempotency_key: String::new(),
         // Unset (`0`) rank count -- single-rank, as this fixture always was.
         world_size: 0,
+        cache: 0,
     }
 }
 

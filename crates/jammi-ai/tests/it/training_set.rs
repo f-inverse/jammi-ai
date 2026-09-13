@@ -587,3 +587,74 @@ async fn a_result_table_cannot_be_a_fine_tune_source() {
         );
     }
 }
+
+/// K1 — a `TrainingSet` table's recorded producer replays, byte-identically
+/// when the source has not moved, and the replay genuinely RECOMPUTES rather
+/// than resolving back to the table it was asked to replay.
+///
+/// The second half is the load-bearing one: the verb owns its own reuse probe
+/// (there is no `CachePolicy` to pass it), so a replay that the probe answered
+/// from the catalog would report a recompute that never ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_training_set_replays_from_its_recorded_descriptor() {
+    use jammi_ai::pipeline::recompute::Cascade;
+
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let columns = parity_columns();
+    let (table, _) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "training",
+        &columns,
+        ModelTask::TextEmbedding,
+        "contrastive",
+    )
+    .await
+    .unwrap();
+
+    let before = artifact_digest(&session, table.table_name()).await;
+    let report = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(table.table_name(), Cascade::ReportOnly)
+        .await
+        .unwrap();
+
+    assert_eq!(report.recomputed.len(), 1);
+    let replay = &report.recomputed[0];
+    assert_eq!(replay.original, table.table_name());
+    assert_ne!(
+        replay.recomputed,
+        table.table_name(),
+        "the replay must write a NEW table, not hand back the one it replayed"
+    );
+    assert_eq!(
+        replay.outcome,
+        jammi_db::store::CacheOutcome::Computed,
+        "an unpinned source anchor never matches the verb's reuse probe, so a \
+         replay always recomputes"
+    );
+    assert_eq!(
+        before,
+        artifact_digest(&session, &replay.recomputed).await,
+        "the descriptor records every determinant, so a replay over unmoved \
+         inputs is byte-identical"
+    );
+}
+
+/// The artifact digest a table's manifest attests — the byte-identity witness.
+async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
+    let record = session
+        .catalog()
+        .get_result_table(table)
+        .await
+        .unwrap()
+        .expect("table present");
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    session
+        .result_store()
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("manifest sidecar present")
+        .artifact
+        .0
+}

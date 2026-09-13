@@ -1948,6 +1948,7 @@ impl JobWorker {
         let (_table, batches) = training_set::materialize_sampled_pairs(
             session,
             &sources.node_source,
+            &sources.edge_source,
             &Self::graph_spec_identity(sources, &sample_config)?,
             &pairs,
             has_negatives,

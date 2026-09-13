@@ -27,7 +27,12 @@
 //! A registered source exposes no version or digest surface, so its rows are
 //! anchored [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
 //! — the same honest anchor the embedding producer records for the same reason
-//! (`pipeline/embedding.rs`). The engine's reuse probe never matches an
+//! (`pipeline/embedding.rs`). The tabular arm reads one such source and records
+//! one anchor; the graph arm's sampled pairs are a function of BOTH the node
+//! source and the edge source, so it records BOTH as separate anchors sharing
+//! ONE read instant (see `materialize_sampled_pairs`'s own "Anchors" section)
+//! — the two-anchor, one-instant shape `pipeline/asof/verb.rs` uses for its
+//! spine and facts relations. The engine's reuse probe never matches an
 //! unpinned anchor, so a training set
 //! over a plain source is never reused across runs; the anchor still rides the
 //! manifest, so staleness reports the same honest `Undecidable` it reports for
@@ -166,19 +171,60 @@ async fn materialize_and_read(
 struct RegisteredPairs {
     ctx: SessionContext,
     relation: String,
+    /// Whatever `register_table` displaced when this guard's relation was
+    /// bound — `None` on the ordinary path (nothing occupied the
+    /// content-addressed name before us; this is what a sequential
+    /// registration under an occupied name actually returns too, since
+    /// DataFusion's default schema provider REFUSES a sequential duplicate
+    /// with `Err` rather than displacing it). `Some` means an overlapping
+    /// materialization (the SAME `spec_identity` racing this one, or a
+    /// coincidental name collision) won a genuine check-then-insert race and
+    /// displaced an existing binding; `Drop` restores exactly that occupant
+    /// rather than deregistering outright, so this guard undoes only what ITS
+    /// OWN registration did.
+    displaced: Option<Arc<dyn datafusion::datasource::TableProvider>>,
 }
 
 impl Drop for RegisteredPairs {
     fn drop(&mut self) {
-        // Deregistration failing is not actionable here (the table is gone
-        // either way, and this runs on an unwind path too), but a silent
-        // leak of a resident copy is worth a line in the log.
-        if let Err(e) = self.ctx.deregister_table(self.relation.as_str()) {
-            tracing::warn!(
-                relation = %self.relation,
-                error = %e,
-                "sampled-pair relation could not be deregistered; its rows stay resident"
-            );
+        if let Some(provider) = self.displaced.take() {
+            // An overlap: restore the prior occupant so the concurrent
+            // materialization that is still reading it does not lose its
+            // relation out from under it.
+            if let Err(e) = self.ctx.register_table(self.relation.as_str(), provider) {
+                tracing::warn!(
+                    relation = %self.relation,
+                    error = %e,
+                    "could not restore the sampled-pair relation this materialization displaced"
+                );
+            }
+            return;
+        }
+        // The ordinary path: nothing occupied this name before us, so our own
+        // registration is the only thing to remove.
+        match self.ctx.deregister_table(self.relation.as_str()) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // Nothing was bound here at drop time even though nothing
+                // occupied the name when WE registered: some other
+                // registration under this identical name displaced ours
+                // in between (an overlap this guard did not observe because
+                // it only knows what it itself displaced). Not actionable
+                // here, but distinct from a clean deregister — worth its own
+                // line so the overlap is visible in the log.
+                tracing::warn!(
+                    relation = %self.relation,
+                    "sampled-pair relation was already unbound at drop time \
+                     (displaced by another registration under the same name)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    relation = %self.relation,
+                    error = %e,
+                    "sampled-pair relation could not be deregistered; its rows stay resident"
+                );
+            }
         }
     }
 }
@@ -200,9 +246,21 @@ impl Drop for RegisteredPairs {
 /// `recompute` of it fails at the planner naming the missing relation. That is
 /// the honest consequence of sampling being a producer the engine cannot express
 /// as SQL; nothing here reports a replay that did not happen.
+///
+/// # Anchors
+///
+/// The pairs are a function of BOTH the node source and the edge source (the
+/// sampler walks the edges to pick positives, and every anchor/positive text
+/// is read off the nodes), so both are recorded as inputs — never just the
+/// one this call happens to use for the catalog row's `source_id` lineage
+/// column. Neither exposes a version surface, so each is honestly anchored
+/// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
+/// at ONE shared read instant — the same two-anchor, one-instant shape
+/// `pipeline/asof/verb.rs` records for its spine and facts relations.
 pub(crate) async fn materialize_sampled_pairs(
     session: &InferenceSession,
-    source_id: &str,
+    node_source: &str,
+    edge_source: &str,
     spec_identity: &str,
     pairs: &[SampledPair],
     has_negatives: bool,
@@ -252,11 +310,13 @@ pub(crate) async fn materialize_sampled_pairs(
 
     let relation = format!("jammi_sampled_pairs:{spec_identity}");
     let ctx = session.context();
-    ctx.register_table(relation.as_str(), Arc::new(provider))
+    let displaced = ctx
+        .register_table(relation.as_str(), Arc::new(provider))
         .map_err(JammiError::from)?;
     let _registered = RegisteredPairs {
         ctx: ctx.clone(),
         relation: relation.clone(),
+        displaced,
     };
 
     let projection = columns
@@ -265,10 +325,17 @@ pub(crate) async fn materialize_sampled_pairs(
         .collect::<Vec<_>>()
         .join(", ");
     let source_sql = format!("SELECT {projection} FROM {}", quote_ident(&relation));
+    // Both inputs the sampled pairs are a function of, anchored at the SAME
+    // read instant — see the "Anchors" section above.
+    let now = chrono::Utc::now().to_rfc3339();
+    let inputs = vec![
+        InputAnchor::unpinned_at_instant(node_source, now.clone()),
+        InputAnchor::unpinned_at_instant(edge_source, now),
+    ];
     materialize_and_read(
         session,
         TrainingSetSpec {
-            source_id,
+            source_id: node_source,
             source_sql: &source_sql,
             columns: &columns,
             task: ModelTask::TextEmbedding,
@@ -282,17 +349,135 @@ pub(crate) async fn materialize_sampled_pairs(
                 }
             }
             .format_tag(),
-            // The source has no version surface to pin, so it is anchored at
-            // the instant it was read — the same honest anchor the embedding
-            // producer records for the same reason, constructed here rather
-            // than behind a helper so the anchor value never travels apart
-            // from the read it describes.
-            inputs: vec![InputAnchor::unpinned_at_instant(
-                source_id,
-                chrono::Utc::now().to_rfc3339(),
-            )],
+            inputs,
             device: session.compute_device(),
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_table(value: &str) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![value.to_string()])) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    /// The fold's overlap probe, job-level: a mechanism to force two
+    /// `materialize_sampled_pairs` calls to interleave their register/drop on
+    /// the SAME relation name (e.g. a `run_job_now` that dispatches a claimed
+    /// job synchronously) does not exist anywhere in this codebase — `grep
+    /// -rn run_job_now` across the whole workspace has no hits. The two-worker
+    /// concurrency infrastructure in `jobs_cancel.rs`/`jobs_shutdown.rs`
+    /// targets job-CLAIM races (two workers racing `claim_next`), not this
+    /// in-process table-registration race, and this contract does not
+    /// authorize adding a new test-hook seam to build one. **UNCOVERED** at
+    /// the job level, for that reason.
+    ///
+    /// What IS constructible, and exercised below instead: [`RegisteredPairs`]'s
+    /// drop semantics, driven directly and deterministically — no timing
+    /// window to hit, and no test hook to add. Two guards over the SAME
+    /// relation name (the overlap the type exists to survive) must restore
+    /// the first occupant when the second one drops, and the first guard
+    /// (which displaced nothing) must fully remove the binding when it drops
+    /// last.
+    ///
+    /// The state a genuine overlap leaves behind (B's provider bound, A's
+    /// provider the value `register_table` handed back as `displaced`) is
+    /// constructed directly rather than produced by calling `register_table`
+    /// twice in sequence: DataFusion's own `MemorySchemaProvider` checks
+    /// `table_exist` before inserting and REFUSES a sequential duplicate with
+    /// `Err("... already exists")` — confirmed below — so the `Ok(Some(_))`
+    /// displacement arm this guard defends against is reachable only through
+    /// a genuine check-then-insert TOCTOU race between two REAL concurrent
+    /// threads, which a single-threaded test cannot reproduce by calling the
+    /// same function twice.
+    #[tokio::test]
+    async fn registered_pairs_drop_restores_a_displaced_overlap_and_fully_removes_the_last() {
+        let ctx = SessionContext::new();
+        let relation = "jammi_sampled_pairs:overlap-probe";
+
+        let a_provider = tiny_table("first");
+        let first_displaced = ctx
+            .register_table(relation, Arc::clone(&a_provider))
+            .unwrap();
+        assert!(
+            first_displaced.is_none(),
+            "nothing should occupy the name before A's registration"
+        );
+
+        // A sequential second registration under the SAME name is refused,
+        // never a silent displacement — the executed refutation of "this
+        // guard's `Some` arm is reachable by calling `register_table` twice".
+        let sequential_duplicate = ctx.register_table(relation, tiny_table("second"));
+        assert!(
+            sequential_duplicate.is_err(),
+            "a sequential duplicate registration must be refused, not silently \
+             displace — got {sequential_duplicate:?}"
+        );
+
+        // Construct the state the genuine (thread-race) overlap would leave:
+        // B's provider now bound in the ctx, A's provider recorded as what
+        // B's registration displaced.
+        ctx.deregister_table(relation).unwrap();
+        ctx.register_table(relation, tiny_table("second")).unwrap();
+        let a = RegisteredPairs {
+            ctx: ctx.clone(),
+            relation: relation.to_string(),
+            displaced: None,
+        };
+        let b = RegisteredPairs {
+            ctx: ctx.clone(),
+            relation: relation.to_string(),
+            displaced: Some(a_provider),
+        };
+
+        // B finishes first: its drop must RESTORE A's provider, not remove
+        // the binding outright — A may still be reading it.
+        drop(b);
+        assert!(
+            ctx.table_exist(relation).unwrap(),
+            "B's drop must restore the displaced provider, not remove the binding"
+        );
+
+        // A finishes last: nothing occupied the name when A registered
+        // (`displaced: None`), so A's drop is the ordinary path and fully
+        // removes the binding.
+        drop(a);
+        assert!(
+            !ctx.table_exist(relation).unwrap(),
+            "the last guard's drop must fully remove the relation"
+        );
+    }
+
+    /// The ordinary, non-overlapping path: a single guard's drop removes
+    /// exactly the relation it registered, and `deregister_table`'s `Ok(None)`
+    /// arm (nothing bound at drop time) is reachable without a panic when a
+    /// THIRD party removed the binding first — the distinct log line this
+    /// fold added, exercised for compile/run correctness rather than log
+    /// content (no test harness here captures `tracing` output).
+    #[tokio::test]
+    async fn registered_pairs_drop_tolerates_a_binding_already_removed() {
+        let ctx = SessionContext::new();
+        let relation = "jammi_sampled_pairs:already-gone-probe";
+        let displaced = ctx.register_table(relation, tiny_table("only")).unwrap();
+        assert!(displaced.is_none());
+        let guard = RegisteredPairs {
+            ctx: ctx.clone(),
+            relation: relation.to_string(),
+            displaced,
+        };
+        // Something else removes the binding before the guard drops.
+        ctx.deregister_table(relation).unwrap();
+        assert!(!ctx.table_exist(relation).unwrap());
+        drop(guard); // Must not panic on `Ok(None)`.
+        assert!(!ctx.table_exist(relation).unwrap());
+    }
 }

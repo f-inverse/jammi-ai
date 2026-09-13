@@ -1216,10 +1216,41 @@ impl TrainingLoop {
                     self.save_checkpoint(&checkpoint_dir, global_step)?;
                 }
             } else {
-                // Production path: encode text through the target, then compute loss.
-                let text_chunks = epoch_loader.text_chunks(self.config.batch_size);
-                for chunk in &text_chunks {
-                    let batch = self.encode_chunk(chunk)?;
+                // Production path: encode text through the target, then
+                // compute loss. Walks `epoch_loader` by PartitionSpec-selected
+                // GLOBAL step (DESIGN.md §2) rather than a pre-collected
+                // `Vec<TextChunk>` — a per-epoch stream reads a chunk at a
+                // time, never the whole epoch's chunks at once. At
+                // `self.world_size == 1` (every reachable value today,
+                // `rank = 0`) `rows_for_step` walks exactly the same `[s*B,
+                // (s+1)*B)` row slices `epoch_loader.chunks(batch_size)` would
+                // have collected, terminating at the same boundary — the
+                // first empty chunk, which falls exactly at
+                // `epoch_loader.len().div_ceil(batch_size)` steps — so this is
+                // a control-flow change only; the W=1 parity oracle is the
+                // whole existing trainer suite passing byte-for-byte.
+                //
+                // Bound by `epoch_loader`'s OWN row count via the
+                // empty-chunk terminator, never by `train_batches_per_epoch`
+                // (computed once from `train_loader`, before the loop): a
+                // hard-negative-mined `epoch_loader` can hold a different row
+                // count than `train_loader` on a refresh epoch (see the
+                // `total_optimizer_steps` doc above), and this loop must keep
+                // iterating exactly as many chunks as THIS epoch's loader
+                // actually holds, as `text_chunks` always did.
+                let partition_spec = super::partition::PartitionSpec {
+                    rank: 0,
+                    world: self.world_size,
+                    batch: self.config.batch_size,
+                    rule: super::partition::PartitionRule::BlockByGlobalBatch,
+                };
+                let mut step = 0usize;
+                loop {
+                    let chunk = epoch_loader.text_chunk_for_rank(&partition_spec, step)?;
+                    if chunk.row_count() == 0 {
+                        break;
+                    }
+                    let batch = self.encode_chunk(&chunk)?;
                     let loss = self.compute_loss(&batch)?;
                     Self::accumulate_sim_stats(&batch, &mut sim_stats);
                     self.process_batch_loss(
@@ -1241,6 +1272,7 @@ impl TrainingLoop {
                             batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
+                    step += 1;
                 }
             }
 

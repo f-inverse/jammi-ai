@@ -294,6 +294,294 @@ async fn streamed_order_matches_committed_order_at_target_partitions_one_and_n()
     }
 }
 
+/// A 70 000-row `(anchor, positive)` pairs fixture — more than one 65 536-row
+/// Parquet row group — committed as a training set and returned as its
+/// handle. `anchor`/`positive` values are `a{i:05}`/`p{i:05}` in row order, so
+/// the committed order is directly recoverable from a streamed anchor's own
+/// text (`format!("a{i:05}", i)`), with no separate oracle query needed.
+async fn materialize_multi_row_group_pairs_table(
+    session: &InferenceSession,
+    scratch_dir: &std::path::Path,
+) -> jammi_db::store::TrainingSetTable {
+    const ROWS: usize = 70_000;
+    // A caller-supplied, per-test `TempDir` — NEVER the shared OS temp
+    // directory keyed by process id: several of this file's `#[tokio::test]`
+    // functions run concurrently as tasks in the SAME process, so a
+    // process-id-keyed path collides between them (one test's fixture write
+    // racing another's read/removal of the identically-named file).
+    let path = scratch_dir.join("pairs70k.csv");
+    let mut lines = String::from("anchor,positive\n");
+    for i in 0..ROWS {
+        lines.push_str(&format!("a{i:05},p{i:05}\n"));
+    }
+    std::fs::write(&path, lines).unwrap();
+    session
+        .add_source(
+            "pairs70k",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", path.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+    let (table, _eager) = jammi_ai::fine_tune::training_set::materialize_projection(
+        session,
+        "pairs70k",
+        &columns,
+        ModelTask::TextEmbedding,
+        "pairs",
+    )
+    .await
+    .unwrap();
+    assert_eq!(table.record.row_count, ROWS);
+    table
+}
+
+/// M1 (CONTRACT-U2b-fix1.md): on a fixture LARGER than one Parquet row group
+/// (70 000 rows > 65 536), at a batch size that does NOT divide the row-group
+/// boundary (`100`; `65_536 % 100 == 36`), the streamed epoch takes exactly
+/// `ceil(70000 / 100) = 700` steps and every non-final chunk is exactly 100
+/// rows — never a short chunk at the row-group boundary.
+///
+/// RED at 6482ea99 (observed): 701 steps, with a 36-row short chunk at step
+/// 655 (the tail of the first row group) — see this unit's report.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_chunks_stay_batch_sized_across_a_row_group_boundary() {
+    const ROWS: usize = 70_000;
+    const BATCH: usize = 100;
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let table = materialize_multi_row_group_pairs_table(&session, dir.path()).await;
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+
+    let loader = TrainingDataLoader::from_training_set_stream(
+        Arc::clone(&session),
+        table,
+        columns,
+        ModelTask::TextEmbedding,
+        TrainingFormat::Pairs,
+        StreamConfig {
+            batch: BATCH,
+            prefetch: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let expected_steps = ROWS.div_ceil(BATCH);
+    let spec = PartitionSpec {
+        rank: 0,
+        world: 1,
+        batch: BATCH,
+        rule: PartitionRule::BlockByGlobalBatch,
+    };
+    let (sizes, order_ok) = tokio::task::spawn_blocking(move || {
+        let mut sizes = Vec::with_capacity(expected_steps);
+        let mut seen = Vec::with_capacity(ROWS);
+        let mut step = 0usize;
+        loop {
+            let chunk = loader.text_chunk_for_rank(&spec, step).unwrap();
+            if chunk.row_count() == 0 {
+                break;
+            }
+            sizes.push(chunk.row_count());
+            if let jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } = &chunk {
+                seen.extend(anchors.iter().cloned());
+            } else {
+                panic!("expected a Pairs chunk");
+            }
+            step += 1;
+        }
+        let order_ok = seen
+            .iter()
+            .enumerate()
+            .all(|(i, a)| *a == format!("a{i:05}"));
+        (sizes, order_ok)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sizes.len(),
+        expected_steps,
+        "the streamed epoch must take exactly ceil(train_count / batch) steps"
+    );
+    let non_final_short: Vec<(usize, usize)> = sizes
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| **n != BATCH && *i + 1 != sizes.len())
+        .map(|(i, n)| (i, *n))
+        .collect();
+    assert!(
+        non_final_short.is_empty(),
+        "every non-final chunk must be exactly {BATCH} rows; short chunks at {non_final_short:?}"
+    );
+    assert_eq!(
+        *sizes.last().unwrap(),
+        ROWS - BATCH * (expected_steps - 1),
+        "the trailing chunk must hold exactly the remainder"
+    );
+    assert!(
+        order_ok,
+        "the streamed order must equal the committed order"
+    );
+}
+
+/// M1's chunk-sequence identity: the `Stream` arm's `(chunk_index → rows)`
+/// equals the eager `TrainingDataLoader::text_chunks(B)` reader's — same
+/// sizes, same contents, row for row — on the SAME multi-row-group fixture, a
+/// batch size (`997`; `65_536 % 997 == 728`) that does not divide the
+/// row-group boundary either. The eager reader (`stream_drain_all` +
+/// `text_chunks`) is a whole-table read, so it is unaffected by a row-group
+/// boundary by construction — it is the oracle the per-step `Stream` arm
+/// must match exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_chunk_sequence_matches_the_eager_reader_across_row_groups() {
+    const BATCH: usize = 997;
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let table = materialize_multi_row_group_pairs_table(&session, dir.path()).await;
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+
+    let eager_loader = TrainingDataLoader::from_training_set_stream(
+        Arc::clone(&session),
+        table.clone(),
+        columns.clone(),
+        ModelTask::TextEmbedding,
+        TrainingFormat::Pairs,
+        StreamConfig {
+            batch: BATCH,
+            prefetch: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let stream_loader = TrainingDataLoader::from_training_set_stream(
+        Arc::clone(&session),
+        table,
+        columns,
+        ModelTask::TextEmbedding,
+        TrainingFormat::Pairs,
+        StreamConfig {
+            batch: BATCH,
+            prefetch: 2,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (eager_chunks, streamed_chunks) = tokio::task::spawn_blocking(move || {
+        // `text_chunks` is the whole-set exemption (`stream_drain_all`), so it
+        // is a legitimate oracle independent of the per-step Stream arm this
+        // test is checking.
+        let eager: Vec<Vec<String>> = eager_loader
+            .text_chunks(BATCH)
+            .unwrap()
+            .into_iter()
+            .map(|c| match c {
+                jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } => anchors,
+                _ => panic!("expected a Pairs chunk"),
+            })
+            .collect();
+
+        let spec = PartitionSpec {
+            rank: 0,
+            world: 1,
+            batch: BATCH,
+            rule: PartitionRule::BlockByGlobalBatch,
+        };
+        let mut streamed: Vec<Vec<String>> = Vec::new();
+        let mut step = 0usize;
+        loop {
+            let chunk = stream_loader.text_chunk_for_rank(&spec, step).unwrap();
+            if chunk.row_count() == 0 {
+                break;
+            }
+            match chunk {
+                jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } => {
+                    streamed.push(anchors)
+                }
+                _ => panic!("expected a Pairs chunk"),
+            }
+            step += 1;
+        }
+        (eager, streamed)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        streamed_chunks.len(),
+        eager_chunks.len(),
+        "the Stream arm must yield the same NUMBER of chunks as the eager reader"
+    );
+    for (i, (streamed, eager)) in streamed_chunks.iter().zip(eager_chunks.iter()).enumerate() {
+        assert_eq!(
+            streamed.len(),
+            eager.len(),
+            "chunk {i}: the Stream arm's chunk size must match the eager reader's"
+        );
+        assert_eq!(
+            streamed, eager,
+            "chunk {i}: the Stream arm's rows must match the eager reader's, row for row"
+        );
+    }
+}
+
+/// The executed refutation behind M1's ordering mechanism: `open_row_range_
+/// stream`'s scoped `target_partitions = 1` override is load-bearing, not
+/// incidental. Run the SAME `LIMIT ... OFFSET ...` scan `open_row_range_
+/// stream` builds but on the AMBIENT session at `execution_threads = 4` (no
+/// scoped override, no `ORDER BY`) against the SAME multi-row-group table,
+/// and observe the row order NO LONGER matches the committed order — proving
+/// the pin, not mere luck, is what keeps the real streamed reader correct.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_target_partitions_pin_breaks_order_on_a_multi_row_group_table() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.engine.execution_threads = 4;
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let table = materialize_multi_row_group_pairs_table(&session, dir.path()).await;
+    session
+        .sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+        .await
+        .unwrap();
+
+    // The ambient, UN-scoped scan: no `target_partitions` override, no
+    // `ORDER BY` — exactly what `open_row_range_stream` would read if its
+    // `with_target_partitions(1)` override were removed.
+    let sql = format!(
+        "SELECT * FROM {} LIMIT 70000 OFFSET 0",
+        table.sql_relation()
+    );
+    let batches = session.sql(&sql).await.unwrap();
+    let unscoped: Vec<String> = batches
+        .iter()
+        .flat_map(|b| text_column_values(b.column_by_name("anchor").unwrap().as_ref()))
+        .collect();
+    assert_eq!(unscoped.len(), 70_000);
+    let in_order = unscoped
+        .iter()
+        .enumerate()
+        .all(|(i, a)| *a == format!("a{i:05}"));
+    assert!(
+        !in_order,
+        "the un-scoped, multi-partition read was expected to SCRAMBLE the committed order — \
+         if it did not, the pin this mechanism relies on is not actually load-bearing here"
+    );
+}
+
 /// Acceptance (d), the mechanism proof: hard-negative mining and GradCache
 /// are W=1-only whole-set consumers that "stream the table in and hold what
 /// they need" (`TrainingDataLoader::in_batch_negative_texts`'s `Stream` arm
@@ -372,5 +660,131 @@ async fn hard_negative_mining_completes_through_the_streaming_loader_at_w1() {
             .iter()
             .any(|m| m.model_id.starts_with("jammi:fine-tuned:")),
         "the mining run must publish a fine-tuned model like any other W=1 run"
+    );
+}
+
+/// The M1 oracle fold's trainer-level check: a REAL `TrainingLoop::run`, over
+/// the job path (`session.fine_tune`), takes exactly `batches_per_epoch(train,
+/// 1, batch)` optimizer steps on a table forced across several small row
+/// groups by `test-hooks`' `JAMMI_TEST_ROW_GROUP_ROWS` override — never the
+/// row-group-boundary-driven count a broken chunker would take.
+///
+/// 200 rows, a row-group size of 30 (7 groups: six of 30, one of 20) and a
+/// batch of 13 (`30 % 13 == 4`, `20 % 13 == 7` — the row-group boundary does
+/// not land on a batch boundary at either group size). `gradient_
+/// accumulation_steps: 1` and `validation_fraction: 0.0` make `total_steps`
+/// (the run's own reported optimizer-step count) exactly the number of
+/// per-step chunks the epoch loop drove — `ceil(200 / 13) = 16`.
+///
+/// RED at 6482ea99 (observed, by direct construction rather than re-run: the
+/// base tree dispatches one `TextChunk` per POLLED `RecordBatch`, and a
+/// DataFusion scan never spans a row-group boundary within one polled batch —
+/// within one 30-row group at `batch_size = 13` that is 13, 13, 4; six such
+/// groups plus the trailing 20-row group's 13, 7 give `6*3 + 2 = 20` steps,
+/// not 16).
+#[tokio::test(flavor = "multi_thread")]
+async fn trainer_realised_step_count_matches_the_global_batch_formula_across_row_groups() {
+    const ROWS: usize = 200;
+    const ROW_GROUP_ROWS: usize = 30;
+    const BATCH: usize = 13;
+    let expected_steps = jammi_ai::fine_tune::partition::batches_per_epoch(ROWS, 1, BATCH);
+    assert_eq!(
+        expected_steps, 16,
+        "test setup: the arithmetic this test pins moved"
+    );
+
+    // `JAMMI_TEST_ROW_GROUP_ROWS` is process-global (db fold,
+    // `jammi_db::storage::writer`); scope it to this test's own write with a
+    // guard that always restores the prior value, even on panic — a
+    // concurrently-running unrelated test only ever sees a SMALLER row
+    // group, which changes no correctness property of its own assertions.
+    struct RowGroupOverrideGuard(Option<String>);
+    impl Drop for RowGroupOverrideGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var(jammi_db::storage::writer::ROW_GROUP_ROWS_ENV, v),
+                None => std::env::remove_var(jammi_db::storage::writer::ROW_GROUP_ROWS_ENV),
+            }
+        }
+    }
+    let prior = std::env::var(jammi_db::storage::writer::ROW_GROUP_ROWS_ENV).ok();
+    std::env::set_var(
+        jammi_db::storage::writer::ROW_GROUP_ROWS_ENV,
+        ROW_GROUP_ROWS.to_string(),
+    );
+    let _restore = RowGroupOverrideGuard(prior);
+
+    let dir = TempDir::new().unwrap();
+    let mut lines = String::from("anchor,positive\n");
+    for i in 0..ROWS {
+        lines.push_str(&format!("a{i:03},p{i:03}\n"));
+    }
+    let csv = dir.path().join("pairs200.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "pairs200",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let job = session
+        .fine_tune(
+            "pairs200",
+            &("local:".to_string() + &common::cookbook_fixture("tiny_bert").display().to_string()),
+            &["anchor".to_string(), "positive".to_string()],
+            jammi_ai::fine_tune::FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(jammi_ai::fine_tune::FineTuneConfig {
+                epochs: 1,
+                batch_size: BATCH,
+                lora_rank: 4,
+                warmup_steps: 0,
+                gradient_accumulation_steps: 1,
+                validation_fraction: 0.0,
+                early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("the row-group-boundary-crossing run must complete");
+
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    let result_json = record
+        .result
+        .expect("a completed fine-tune job records its terminal JobResult");
+    let job_result: jammi_ai::jobs::JobResult = serde_json::from_str(&result_json).unwrap();
+    let metrics = match job_result {
+        jammi_ai::jobs::JobResult::Model { metrics, .. } => {
+            metrics.expect("a fine-tune run records metrics")
+        }
+        other => panic!("expected JobResult::Model, got {other:?}"),
+    };
+    let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+    let total_steps = metrics["total_steps"]
+        .as_u64()
+        .expect("metrics JSON must carry total_steps") as usize;
+    assert_eq!(
+        total_steps, expected_steps,
+        "the realised optimizer-step count must equal ceil(train_count / batch), not the \
+         row-group-boundary-driven count of a chunker that re-chunks at RecordBatch, not \
+         partition-rule, boundaries"
     );
 }

@@ -11,6 +11,7 @@
 //! - **Precomputed** (`from_precomputed`): stores pre-built tensor batches.
 //!   `batches()` returns them as-is. Used in tests.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -518,19 +519,88 @@ struct EpochStreamJob {
     residency: Arc<ResidencyBound>,
 }
 
-/// Runs on [`StreamSource::runtime`]: opens
-/// [`open_row_range_stream`] and, for each polled `RecordBatch`, decodes it
-/// into [`TrainingRow`]s under `job.format`/`job.columns`
-/// ([`decode_record_batch`]), reserves that many rows against
-/// `job.residency` (blocking this task, never the consumer, when the bound
-/// is full), and sends `(rows, permit)` into `tx`. Exits silently once
+/// Re-chunks a per-epoch [`datafusion::physical_plan::SendableRecordBatchStream`]
+/// into fixed-size row windows — the mechanism behind M1 (CONTRACT-U2b-fix1.md):
+/// **chunks are the partition rule's slices, never row-group boundaries.**
+///
+/// DataFusion's scoped scan ([`open_row_range_stream`]) is pinned to
+/// `batch_size = cfg.batch`, but a polled `RecordBatch` never spans a Parquet
+/// row-group boundary — a table written with 65 536-row groups yields a SHORT
+/// batch at every multiple of 65 536 regardless of `batch_size`, and a fresh,
+/// full-sized batch resumes at the next row group. Left alone, that means the
+/// STREAM's chunk boundaries drift from the partition rule's `[s·B, (s+1)·B)`
+/// slices the instant a table crosses one row group. `BatchChunker` buffers
+/// every polled batch's decoded rows across that boundary and only ever hands
+/// out exactly the row count asked for (`next_n`'s `want`) — short only once
+/// the underlying stream is truly exhausted.
+struct BatchChunker {
+    stream: datafusion::physical_plan::SendableRecordBatchStream,
+    format: TrainingFormat,
+    task: ModelTask,
+    columns: Vec<String>,
+    /// Decoded rows already pulled off the underlying stream but not yet
+    /// handed to a caller of [`Self::next_n`] — the carry-over across a
+    /// `RecordBatch`/row-group boundary.
+    buffer: VecDeque<TrainingRow>,
+    /// The underlying `RecordBatch` stream returned `None` — every row it
+    /// will ever produce is already in `buffer` (or already drained).
+    exhausted: bool,
+}
+
+impl BatchChunker {
+    /// Pull exactly `want` rows, polling and decoding as many underlying
+    /// `RecordBatch`es as it takes to fill the request — fewer than `want`
+    /// ONLY when the underlying stream is exhausted first (the epoch's true
+    /// final, trailing chunk). Never spans a caller-visible chunk shorter
+    /// than `want` because of a row-group boundary: that boundary is fully
+    /// absorbed into `buffer` before this returns.
+    async fn next_n(&mut self, want: usize) -> Result<Vec<TrainingRow>> {
+        use futures::StreamExt;
+        while self.buffer.len() < want && !self.exhausted {
+            match self.stream.next().await {
+                Some(Ok(batch)) => {
+                    let rows = decode_record_batch(self.format, self.task, &self.columns, &batch)?;
+                    self.buffer.extend(rows);
+                }
+                Some(Err(e)) => return Err(JammiError::from(e)),
+                None => self.exhausted = true,
+            }
+        }
+        let n = want.min(self.buffer.len());
+        Ok(self.buffer.drain(..n).collect())
+    }
+}
+
+/// The step's expected row count for a `PartitionSpec::rows_for_step`-shaped
+/// producer, checked against what a chunk-shaped mechanism actually yielded —
+/// the "typed refusal on mismatch" M1's step-oracle folds ask for. Split out
+/// as its own function (rather than inlined at the one call site) so the
+/// invariant is directly unit-testable without needing a live stream.
+fn refuse_on_chunk_length_mismatch(step: usize, expected: usize, actual: usize) -> Result<()> {
+    if actual != expected {
+        return Err(JammiError::FineTune(format!(
+            "streamed chunk at step {step} yielded {actual} row(s), expected {expected}: the \
+             partition rule's step slice and the chunker's yield have drifted apart"
+        )));
+    }
+    Ok(())
+}
+
+/// Runs on [`StreamSource::runtime`]: opens [`open_row_range_stream`] and
+/// re-chunks it through a [`BatchChunker`] into fixed `job.cfg.batch`-sized
+/// row windows (M1 — see that type's doc), reserving each window's row count
+/// against `job.residency` (blocking this task, never the consumer, when the
+/// bound is full) before sending `(rows, permit)` into `tx`. The LAST window
+/// of `job.range` may be shorter than `job.cfg.batch`; every window before it
+/// is exactly `job.cfg.batch` rows — by construction, `BatchChunker` cannot
+/// yield a short chunk before the range is exhausted. Exits silently once
 /// `tx`'s receiver drops (the loader moved on without draining this epoch's
 /// stream to the end — never reached by the trainer's own sequential
 /// access, but a correct, non-panicking exit for any other caller).
 async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedSender<StreamItem>) {
-    use futures::StreamExt;
-
-    let mut stream =
+    let total = job.range.len();
+    let batch = job.cfg.batch.max(1);
+    let stream =
         match open_row_range_stream(&job.session, &job.table, job.range, job.cfg.batch).await {
             Ok(s) => s,
             Err(e) => {
@@ -538,15 +608,18 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
                 return;
             }
         };
-    while let Some(batch) = stream.next().await {
-        let batch = match batch {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = tx.send(Err(JammiError::from(e)));
-                return;
-            }
-        };
-        let rows = match decode_record_batch(job.format, job.task, &job.columns, &batch) {
+    let mut chunker = BatchChunker {
+        stream,
+        format: job.format,
+        task: job.task,
+        columns: job.columns,
+        buffer: VecDeque::new(),
+        exhausted: false,
+    };
+    let mut delivered = 0usize;
+    while delivered < total {
+        let want = batch.min(total - delivered);
+        let rows = match chunker.next_n(want).await {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Err(e));
@@ -554,9 +627,17 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
             }
         };
         if rows.is_empty() {
-            continue;
+            // The committed table held fewer rows than `job.range` claimed —
+            // an inconsistent read, not a valid trailing state (a genuine
+            // trailing chunk is `1..want` rows, never zero, since `delivered
+            // < total` here). Report rather than looping forever.
+            let _ = tx.send(Err(JammiError::FineTune(format!(
+                "streamed range ended after {delivered} of {total} expected row(s)"
+            ))));
+            return;
         }
         let permit = job.residency.reserve(rows.len()).await;
+        delivered += rows.len();
         if tx.send(Ok((rows, permit))).is_err() {
             return; // The receiver (loader) was dropped mid-epoch.
         }
@@ -1547,7 +1628,7 @@ impl TrainingDataLoader {
                         spec.rank, spec.world
                     )));
                 }
-                self.stream_next_chunk(src, spec.batch, step)
+                self.stream_next_chunk(src, spec, step)
             }
         }
     }
@@ -1562,12 +1643,22 @@ impl TrainingDataLoader {
     /// 1, 2, ...`, once per epoch): an out-of-order ask still returns the
     /// CORRECT chunk (by restarting and fast-forwarding, discarding the
     /// skipped chunks), never a wrong one, but pays the discarded I/O.
+    ///
+    /// M1's step oracle: `spec.rows_for_step(src.range.len(), step)` is the
+    /// authority on how many rows THIS step holds (rank 0 of world 1, the
+    /// only spec [`Self::text_chunk_for_rank`] ever forwards here); the row
+    /// count [`BatchChunker`] actually yielded is checked against it before
+    /// the chunk is decoded into a [`TextChunk`], via
+    /// [`refuse_on_chunk_length_mismatch`] — a typed refusal, never a
+    /// silently short/long batch reaching the trainer.
     fn stream_next_chunk(
         &self,
         src: &StreamSource,
-        batch: usize,
+        spec: &super::partition::PartitionSpec,
         step: usize,
     ) -> Result<TextChunk> {
+        let batch = spec.batch;
+        let expected_len = spec.rows_for_step(src.range.len(), step).len();
         let mut guard = src
             .state
             .lock()
@@ -1616,7 +1707,14 @@ impl TrainingDataLoader {
             match item {
                 None => {
                     // The stream is exhausted: every step from here on is a
-                    // zero-row state (K2), not an error.
+                    // zero-row state (K2), not an error — UNLESS the request
+                    // was for the step the stream is currently ON and the
+                    // partition rule itself expected a non-empty slice there,
+                    // which would mean the committed table held fewer rows
+                    // than its own row count claims.
+                    if current_step == step {
+                        refuse_on_chunk_length_mismatch(step, expected_len, 0)?;
+                    }
                     return Ok(self.rows_to_text_chunk(&[]));
                 }
                 Some(Err(e)) => return Err(e),
@@ -1625,6 +1723,7 @@ impl TrainingDataLoader {
                     // chunk reserved.
                     drop(permit);
                     if current_step == step {
+                        refuse_on_chunk_length_mismatch(step, expected_len, rows.len())?;
                         return Ok(self.rows_to_text_chunk(&rows));
                     }
                     // `current_step < step`: an out-of-order ask asked ahead
@@ -1881,6 +1980,25 @@ mod tests {
             second.is_err(),
             "at the shrunk bound (7), the SAME second 4-row chunk that fit at 8 must now be \
              refused — the bound is one row too small to hold two full chunks"
+        );
+    }
+
+    /// M1's step-oracle refusal, driven directly (the ONE call site,
+    /// `stream_next_chunk`, needs a live tokio runtime and a committed table
+    /// to reach — this function does not): a matching length is accepted, and
+    /// a chunk that yielded fewer OR more rows than `rows_for_step` expected
+    /// is refused rather than silently handed to the trainer as a
+    /// wrong-sized batch.
+    #[test]
+    fn chunk_length_mismatch_is_a_typed_refusal() {
+        assert!(refuse_on_chunk_length_mismatch(5, 100, 100).is_ok());
+        let short = refuse_on_chunk_length_mismatch(5, 100, 36);
+        assert!(short.is_err(), "a short chunk mid-stream must be refused");
+        assert!(short.unwrap_err().to_string().contains("36"));
+        let long = refuse_on_chunk_length_mismatch(5, 100, 101);
+        assert!(
+            long.is_err(),
+            "a chunk larger than the step's slice must be refused too"
         );
     }
 

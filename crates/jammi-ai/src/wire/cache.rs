@@ -32,6 +32,17 @@ pub fn cache_outcome_to_proto(outcome: &CacheOutcome) -> i32 {
     }
 }
 
+/// Encode the engine [`CachePolicy`] into the wire enum. Total — the engine
+/// type has no unspecified variant — so a send-side caller always emits a
+/// concrete `USE`/`BYPASS`, never `UNSPECIFIED` (that value exists only so a
+/// caller that omits the field gets the engine default on decode).
+pub fn cache_policy_to_proto(policy: CachePolicy) -> pb::CachePolicy {
+    match policy {
+        CachePolicy::Use => pb::CachePolicy::Use,
+        CachePolicy::Bypass => pb::CachePolicy::Bypass,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +83,13 @@ mod tests {
             cache_outcome_to_proto(&CacheOutcome::Reused { table: "t".into() }),
             pb::CacheOutcome::Reused as i32
         );
+    }
+
+    #[test]
+    fn cache_policy_encode_decode_round_trips_both_variants() {
+        for policy in [CachePolicy::Use, CachePolicy::Bypass] {
+            let encoded = cache_policy_to_proto(policy) as i32;
+            assert_eq!(cache_policy_from_proto(encoded).unwrap(), policy);
+        }
     }
 }

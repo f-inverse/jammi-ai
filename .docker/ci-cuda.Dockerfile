@@ -28,9 +28,9 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 #
 # Those link surfaces, exactly — only ONE of the three is a docker build:
 #   * `server-image.yml` builds through the top-level `Dockerfile`'s
-#     `builder-cuda` stage with `docker buildx` (build-args at `:747-749` on
-#     the `v*`-tag leg and `:815-817` on the build-only `pull_request` leg);
-#     that stage's own `FROM` is this image.
+#     `builder-cuda` stage with `docker buildx` (build-args at
+#     `server-image.yml:747-749` on the `v*`-tag leg and at `:815-817` on the
+#     build-only `pull_request` leg); that stage's own `FROM` is this image.
 #   * `pypi-server-cuda.yml` -> `_pypi-server.yml` takes this image as the job
 #     `container:` (`_pypi-server.yml:100`) and links DIRECTLY inside it with
 #     `cargo build --release -p jammi-server` (`:126`) — no docker build at all.
@@ -41,25 +41,33 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # `ghcr.io/f-inverse/jammi-ai-ci-cuda:latest`), so the pod-side link surface is
 # covered by this same rebuild.
 #
-# The version is a fully-qualified NVR rather than a bare package name, for two
-# measured reasons. A bare `libnccl-devel` resolves to the newest build the
-# cuda-rhel8 repo holds — 2.31.2-1+cuda13.4, a CUDA 13 NCCL against this
-# image's CUDA 12.6 toolkit — and dnf's glob forms (`libnccl-*+cuda12.6`,
-# `libnccl-devel-*cuda12.6`) do not resolve at all ("No match for argument"),
-# so a CUDA-minor pin has to be spelled out in full. 2.23.4-1+cuda12.6 is the
-# exact build `nvidia/cuda:12.6.3-runtime-ubi8` already ships, and that is the
-# GPU runtime stage these binaries are copied INTO (`Dockerfile`'s
-# `runtime-cuda`), so the soname the builder links against and the one the
-# runtime resolves are the same library.
+# The constraint the version expresses is CUDA-MINOR AGREEMENT, and it is local
+# to this file: the NCCL build installed here must be a `+cuda12.6` build,
+# because `cuda-toolkit-12-6` on the line below is what it is compiled and
+# linked against. It is not a soname constraint — NCCL's soname is
+# `libnccl.so.2` for every 2.x release, so the runtime would resolve the
+# library either way; what a CUDA-13 NCCL breaks is the toolkit pairing, not
+# the name.
 #
-# That makes this pin one half of a TWIN. The other half is the runtime base
-# `nvidia/cuda:12.6.3-runtime-ubi8` at `Dockerfile:258`, whose own
-# `NV_LIBNCCL_PACKAGE` is the same 2.23.4-1+cuda12.6. The two move together: a
-# CUDA-minor bump of THIS image moves the NCCL pin here in the same change, and
-# the runtime base it is matched against with it. Neither side can be left to
-# resolve on its own — the cuda-rhel8 repo carries more than one NCCL build for
-# `+cuda12.6` (2.23.4 and 2.24.3), and a bare name resolves to a cuda13 build,
-# as measured above.
+# Spelling the full NVR is forced, for two measured reasons. A bare
+# `libnccl-devel` resolves to the newest build the cuda-rhel8 repo holds —
+# 2.31.2-1+cuda13.4, a CUDA 13 NCCL against this image's CUDA 12.6 toolkit —
+# and dnf's glob forms (`libnccl-*+cuda12.6`, `libnccl-devel-*cuda12.6`) do not
+# resolve at all ("No match for argument"). The repo carries three `+cuda12.6`
+# NCCL builds (2.22.3, 2.23.4, 2.24.3), so "the cuda12.6 one" is not a unique
+# specification either; 2.23.4-1+cuda12.6 is the same build the runtime base
+# `nvidia/cuda:12.6.3-runtime-ubi8` ships (`Dockerfile:258`), which makes it the
+# natural choice of the three, not an obligation binding the two files.
+#
+# The alternative of floating the version (a bare name plus an `exclude=` for
+# the cuda13 builds) is rejected on reproducibility, not on correctness: this
+# image is rebuilt and republished as a mutable `:latest`, so a float would
+# silently re-resolve to a different NCCL on some later rebuild, and the build
+# that produced a given binary would no longer be recoverable from this file.
+# Copying the library out of the runtime image (`COPY --from=nvidia/cuda:
+# 12.6.3-runtime-ubi8`) is rejected too: that image ships the runtime package
+# only — no `nccl.h` and no `libnccl.so` development symlink — and link time
+# needs both.
 RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ \
                    'dnf-command(config-manager)' \
     && dnf config-manager --add-repo \

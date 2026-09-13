@@ -700,18 +700,18 @@ jobs:
   # wrapper ~5 s, so the `nvcc` stage alone is ~80 s. Add checkout, a shallow
   # CUTLASS submodule clone, the CUDA-image pull, and the rest of the crate's
   # own `cuda`-feature PTX build (`build_cuda`, 7 kernel files, also
-  # nvcc-driven) and the job is realistically a few minutes end to end — real
-  # but bounded, and it runs on every PR here (no `paths:` filter, matching
-  # every other job in this file and the swarm's own no-paths-filter
-  # discipline: a filtered-out required check hangs unrelated PRs). The
-  # `jammi-ai --features cuda` step adds THAT crate's full dependency graph
-  # (datafusion, arrow and tantivy on top of the candle stack) to this same
-  # job, under a feature resolution none of the other three steps select —
-  # they build `jammi-kernels` and `jammi-encoders`, never `jammi-ai` — so
-  # that compile is additive rather than shared. `sccache` (wired by
-  # `setup-rust-ci`) amortises it on warm runs, and the first PR run on this
-  # lane measures what it actually costs. If that per-PR cost is judged too
-  # high, the alternative is scoping it to changes
+  # nvcc-driven). Measured on job 103688700438: steps 1-8 (checkout through
+  # the two `jammi-encoders` clippy arms) take 13m26s, the `jammi-ai
+  # --features cuda` step 5m50s, and the job 19m20s in total. It runs on every
+  # PR here (no `paths:` filter, matching every other job in this file and the
+  # swarm's own no-paths-filter discipline: a filtered-out required check
+  # hangs unrelated PRs). The `jammi-ai --features cuda` step's share is
+  # additive rather than shared: it pulls THAT crate's full dependency graph
+  # (datafusion, arrow and tantivy on top of the candle stack) under a feature
+  # resolution none of the other three steps select — they build
+  # `jammi-kernels` and `jammi-encoders`, never `jammi-ai`. `sccache` (wired
+  # by `setup-rust-ci`) amortises it on warm runs. If that per-PR cost is
+  # judged too high, the alternative is scoping it to changes
   # under `crates/jammi-kernels/build.rs`, `crates/jammi-kernels/src/flash/**`,
   # `crates/jammi-kernels/third_party/**`, `crates/jammi-kernels/Cargo.toml`,
   # and `.gitmodules` — EVERY one of those five paths, since missing any is
@@ -838,10 +838,15 @@ jobs:
       # this arm under `-D warnings`, and no merge-path lane compiles its
       # `cfg(test)` half at all.
       #
-      # Its `src/` half IS compiled elsewhere on the merge path, so the
-      # narrower claim is the true one. `pypi-server-cuda.yml` (pull_request
-      # on `crates/jammi-server/**`) and `server-image.yml` (pull_request on
-      # `Dockerfile`) both build `jammi-server` with the CUDA feature list
+      # Its `src/` half is compiled by two other lanes, but only when their
+      # own path filters fire — `pypi-server-cuda.yml:22-27` (`packaging/
+      # server-cu12/**`, `crates/jammi-server/**`, the two wheel workflows,
+      # the release manifest) and `server-image.yml:33-37` (`Dockerfile`, its
+      # own file, the release manifest). Neither list contains
+      # `crates/jammi-ai/**`, so a PR touching only this crate runs neither,
+      # and without this step such a PR compiles the cuda `src/` arm nowhere
+      # at all. When they DO fire, both build `jammi-server` with the CUDA
+      # feature list
       # `ci/release-feature-manifest.json` declares
       # (`cuda,flash-attn,jetstream-broker,storage-cloud`), and
       # `crates/jammi-server/Cargo.toml:85` is `cuda = ["jammi-ai/cuda"]` — so
@@ -859,11 +864,11 @@ jobs:
       # (`ci/release-feature-manifest.json`'s `prove_lane` declares a
       # `jammi-ai` `test` pair), and that lane is not on the merge path.
       #
-      # The workflow-side enumeration: `git grep -n -- '--features [^ ]*cuda'
-      # -- .github/workflows` returns cargo lines for `jammi-encoders` (the two
-      # steps above) and this step, plus comment lines (the GPU-host `jammi-ai`
-      # prove line in this file, `server-image.yml`'s CUDA-lane note) — no
-      # other `-p jammi-ai --features cuda` invocation. That grep's scope is
+      # The workflow-side enumeration: of everything `git grep -n --
+      # '--features [^ ]*cuda' -- .github/workflows` returns, the only CARGO
+      # lines are the two `jammi-encoders` steps above and this step; every
+      # other hit is a comment or a step `name:` — so there is no other
+      # `-p jammi-ai --features cuda` invocation. That grep's scope is
       # narrow, and stating it honestly matters: it sees `.github/workflows`
       # ONLY. It cannot see the two builds above, which carry no literal `cuda`
       # next to `--features` — their feature list arrives through a

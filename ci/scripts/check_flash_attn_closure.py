@@ -1086,12 +1086,14 @@ def _self_test_prove_surface() -> None:
 
     good = _fixture_good_prove_script()
 
-    # --- EXEMPT_SCOPE coverage, enumerated from the map itself (never a hand
-    # list): the fixture writer must materialise EVERY exempt row, and every
-    # such row's fixture must carry a cuda-bearing tuple. A row added to
-    # EXEMPT_SCOPE without a matching fixture makes the dead-exempt-entry rule
-    # fire on the GOOD fixture, which would otherwise surface only as the
-    # opaque "a well-formed fixture must be green" failure below.
+    # --- Scope-map coverage, enumerated from the maps themselves (never a
+    # hand list): the fixture writer must materialise EVERY row of BOTH
+    # PROVE_SCOPE and EXEMPT_SCOPE, and every such row's fixture must carry a
+    # cuda-bearing tuple. A row added to either map without a matching fixture
+    # reds the GOOD fixture, which would otherwise surface only as the opaque
+    # "a well-formed fixture must be green" failure below — the sibling map
+    # needs this exactly as much as the exempt one does: a phantom PROVE_SCOPE
+    # row reds the self-test with no indication of which row is phantom.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _write_prove_surface_fixture(root, good, None)
@@ -1101,15 +1103,16 @@ def _self_test_prove_surface() -> None:
             if is_gated(tuple_text)
             for origin in rec.origins
         }
-        for exempt_path in sorted(EXEMPT_SCOPE):
-            assert (root / exempt_path).is_file(), (
-                f"EXEMPT_SCOPE row `{exempt_path}` has no fixture — "
-                f"_write_prove_surface_fixture must write every exempt row"
-            )
-            assert exempt_path in gated_origin_paths, (
-                f"EXEMPT_SCOPE row `{exempt_path}`'s fixture carries no cuda-bearing tuple — "
-                f"the dead-exempt-entry rule fires on the GOOD fixture"
-            )
+        for map_name, scope in (("PROVE_SCOPE", PROVE_SCOPE), ("EXEMPT_SCOPE", EXEMPT_SCOPE)):
+            for scope_path in sorted(scope):
+                assert (root / scope_path).is_file(), (
+                    f"{map_name} row `{scope_path}` has no fixture — "
+                    f"_write_prove_surface_fixture must write every row of both scope maps"
+                )
+                assert scope_path in gated_origin_paths, (
+                    f"{map_name} row `{scope_path}`'s fixture carries no cuda-bearing tuple — "
+                    f"the row is phantom and reds the GOOD fixture"
+                )
 
     assert _run_prove_surface_fixture(good) == 0, "a well-formed fixture must be green"
 
@@ -1225,6 +1228,23 @@ def _self_test_prove_surface() -> None:
             assert rc == 1, (
                 f"an EXEMPT_SCOPE row whose script is ABSENT from the tree (`{exempt_path}`) "
                 f"must FAIL as a dead exempt entry"
+            )
+
+    # The SIBLING map gets the same treatment, for the same reason: a
+    # PROVE_SCOPE row whose script is not in the tree is a phantom row, and
+    # `check_prove_surface`'s own "PROVE_SCOPE names `X`, which does not
+    # exist" arm is what must catch it — enumerated from the map, so a row
+    # added tomorrow is covered without editing this test.
+    for prove_path in sorted(PROVE_SCOPE):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_prove_surface_fixture(root, good, None)
+            (root / prove_path).unlink()
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+            assert rc == 1, (
+                f"a PROVE_SCOPE row whose script is ABSENT from the tree (`{prove_path}`) "
+                f"must FAIL as a phantom prove-scope entry"
             )
 
 

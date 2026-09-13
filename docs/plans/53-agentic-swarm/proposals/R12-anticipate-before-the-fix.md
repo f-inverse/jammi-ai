@@ -137,10 +137,39 @@ before any implementer built the permanently-broken shape:
 The decoy-unit-line risk (the hook trusts the lead's own `unit:` line); the in-function-
 rewrite residual (M4'); the `rm .jammi/gate-state/<slug>.*` escape hatch, which removes the
 antecedent for every check above it and is never named as a remedy in any deny message;
-`check_rigor_record.py`'s own re-execution being advisory, not a hard guarantee; the
-`_pre_fix_anticipation_rejection`'s internal tip-moved re-check (a defense against a race
-WITHIN one decision) has no practical, non-mocked fixture — stated as `uncovered` rather than
-asserted tested.
+`check_rigor_record.py`'s own re-execution being advisory, not a hard guarantee.
+
+**The M5' sweep's own honest result, not rounded up.** The committed `--r12-sweep` found 36
+deny-shaped `if` arms across the four core mechanism helpers; the FIRST run (before this
+round's own fixtures) found 27 with no dying fixture, and — after adding the fixtures this
+round documents (R12P13-15, R12E1-6, R12F1-5, R12R2f-i, plus `check_rigor_record.py`'s
+RR12g/RR12h) — a second run found 11 remaining, a third (with two more fixtures added, not
+yet re-verified by a fourth full run at the time of hand-off) targets two of those 11. The
+STATED, un-closed remainder, by cause:
+- Two arms in `_r12_attack_command_denied` (empty/non-string `command`; zero shlex tokens)
+  are DEAD CODE from every current caller — `_r12_validate_and_run_entry` already filters
+  both shapes out before ever calling this function. Not fixed here (removing dead code was
+  out of this round's scope) — named so a future reader does not waste a round trying to
+  cover them.
+- One arm (the M3' git-tracked-at-sha check) is invoked ONLY from `check_rigor_record.py`'s
+  Reader 3, which the `--r12-sweep` tool does not exercise (it only re-runs
+  `check_lead_gate.py`'s own "R12"-named fixtures) — a stated SCOPE LIMIT of the sweep tool
+  itself, not a missing property (the property IS fixture-tested, in `check_rigor_record.py`'s
+  own self-test, as RR12g/RR12h — just not swept by this AST tool).
+- One arm (reader 2's "defensive re-check" for a missing pre-fix artifact) is now DEAD CODE
+  after this round's own rewiring: `pre_by_file` is derived FROM the artifact lookup, so it is
+  always empty exactly when the artifact is missing, making the guard's own condition
+  unreachable by construction. Named, not removed, in this round.
+- Five arms (a git command itself failing — `rev-parse`, `git status --porcelain`; a
+  worktree resolving to a branch whose ref and checked-out `HEAD` have diverged) require
+  constructing a git-internal failure or a race that this fixture harness cannot cleanly
+  produce without mocking `_run_git` — `uncovered`, not asserted tested.
+- `_pre_fix_anticipation_rejection`'s internal tip-moved-mid-decision re-check (a defense
+  against a race WITHIN one decision, between the caller's tip resolution and this function's
+  own re-check) has no practical, non-mocked fixture for the same reason — `uncovered`.
+
+No claim in this proposal or in `lead.md`/`hooks/README.md` states these arms are covered;
+each is named exactly where it is, per the discipline this program itself imposes.
 
 See `.claude/agents/lead.md`'s "Anticipate before the fix, not after" paragraph and
 `.claude/hooks/README.md`'s "(2b)" paragraph for the operator-facing statement of the same

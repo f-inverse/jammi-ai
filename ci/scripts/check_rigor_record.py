@@ -1166,6 +1166,67 @@ def fixture_rr12f_grandfathered_unit_no_file_allows() -> None:
         _assert(r.ok(), "RR12f", f"a grandfathered unit must ALLOW despite no anticipation file: {r.failures}")
 
 
+def fixture_rr12g_tracked_bash_path_allows() -> None:
+    """M3': `bash <path>` is admitted only for paths git-TRACKED AT
+    `pre_fix_sha` — a script added IN that same commit is tracked there,
+    and the shape check (plus a real, matching re-execution) ALLOWS."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        origin, work = _pr_repo(Path(td))
+        _commit(work, "add probe.sh, tracked here", {"probe.sh": "#!/bin/sh\nprintf ok\n"})
+        pre_fix_sha = _sh(work, "rev-parse", "HEAD")
+        mod = _lib_module()
+        witness = mod._witness_hash(0, "ok", "")
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        anticipation_row = json.dumps({
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "attacks": {"a.py": {"command": "bash probe.sh", "hash": witness}},
+            "residual_risk": "fixture residual",
+        })
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR12g", f"a bash path tracked at pre_fix_sha must ALLOW: {r.failures}")
+
+
+def fixture_rr12h_untracked_bash_path_fails_shape() -> None:
+    """M3': the SAME `bash probe.sh` command, but `pre_fix_sha` names a
+    commit BEFORE `probe.sh` was ever added — untracked there — HARD
+    FAILS the shape check, naming it; tracked-ness buys reviewability, not
+    safety, but CI must never execute an untracked lead-written file from
+    a detached checkout."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        origin, work = _pr_repo(Path(td))
+        pre_fix_sha = _sh(work, "rev-parse", "HEAD")  # BEFORE probe.sh exists
+        _commit(work, "add probe.sh AFTER pre_fix_sha", {"probe.sh": "#!/bin/sh\nprintf ok\n"})
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        anticipation_row = json.dumps({
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "attacks": {"a.py": {"command": "bash probe.sh", "hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR12h", "a bash path NOT tracked at pre_fix_sha must FAIL the shape check")
+        _assert(any("is not git-TRACKED" in f for f in r.failures), "RR12h", f"{r.failures}")
+
+
 def fixture_rr13_r12_grandfather_only_shrinks() -> None:
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         origin, work = _pr_repo(Path(td))
@@ -1204,6 +1265,8 @@ RR_FIXTURES = [
     ("RR12d", fixture_rr12d_real_reproducing_witness_allows),
     ("RR12e", fixture_rr12e_real_nonreproducing_witness_warns_never_fails),
     ("RR12f", fixture_rr12f_grandfathered_unit_no_file_allows),
+    ("RR12g", fixture_rr12g_tracked_bash_path_allows),
+    ("RR12h", fixture_rr12h_untracked_bash_path_fails_shape),
     ("RR13", fixture_rr13_r12_grandfather_only_shrinks),
 ]
 

@@ -11,6 +11,7 @@
 //! submitted in-process. Validation stays in the engine (the submit verbs call
 //! `validate`); this is a pure shape map.
 
+use jammi_db::error::JammiError;
 use prost::Message;
 use tonic::Status;
 
@@ -57,11 +58,12 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
         base_model,
         config,
         idempotency_key: _,
+        world_size,
     } = req;
     let spec = spec.ok_or_else(|| Status::invalid_argument("SubmitJob request carries no spec"))?;
     match spec {
         pb::submit_job_request::Spec::FineTune(ft) => {
-            let common = lora_common_from_proto(base_model, config)?;
+            let common = lora_common_from_proto(base_model, config, world_size)?;
             if ft.source.is_empty() {
                 return Err(Status::invalid_argument("source is required"));
             }
@@ -80,7 +82,7 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
             })
         }
         pb::submit_job_request::Spec::GraphFineTune(g) => {
-            let common = lora_common_from_proto(base_model, config)?;
+            let common = lora_common_from_proto(base_model, config, world_size)?;
             let sources = g.sources.ok_or_else(|| {
                 Status::invalid_argument("graph_fine_tune spec carries no sources")
             })?;
@@ -94,6 +96,26 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
             })
         }
         pb::submit_job_request::Spec::ContextPredictor(cp) => {
+            // The context-predictor kind carries no `TrainingCommon`, so the
+            // engine spec has nowhere to put a rank count and a multi-rank
+            // predictor job is unrepresentable past this point. That makes
+            // this decode the LAST edge that can still see the count a caller
+            // chose: refuse here, typed, rather than silently drop it and run
+            // the single-rank job the caller did not ask for. The wire's `0`
+            // (unset) and `1` are both the single rank and pass.
+            if world_size > 1 {
+                let message = format!(
+                    "world_size = {world_size} is not supported for a context_predictor job \
+                     (the episodic meta-training loop runs on a single rank); submit it \
+                     without a rank count or with world_size = 1"
+                );
+                let engine_err = JammiError::Config(message.clone());
+                return Err(jammi_wire::attach_error_detail(
+                    tonic::Code::InvalidArgument,
+                    message,
+                    &engine_err,
+                ));
+            }
             let predictor_spec = cp.predictor_spec.ok_or_else(|| {
                 Status::invalid_argument("context_predictor spec carries no predictor_spec")
             })?;
@@ -130,6 +152,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             base_model: common.base_model.clone(),
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
+            world_size: common.world_size,
         },
         TrainingSpec::GraphFineTune {
             sources,
@@ -145,6 +168,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             base_model: common.base_model.clone(),
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
+            world_size: common.world_size,
         },
         TrainingSpec::ContextPredictor {
             source,
@@ -159,6 +183,10 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             base_model: String::new(),
             config: None,
             idempotency_key: String::new(),
+            // The predictor kind has no rank count to carry: `0` is the
+            // wire's unset value, and the decode above refuses anything
+            // greater than one rank for this spec.
+            world_size: 0,
         },
     }
 }
@@ -169,6 +197,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
 fn lora_common_from_proto(
     base_model: String,
     config: Option<training_pb::FineTuneConfig>,
+    world_size: u32,
 ) -> Result<TrainingCommon, Status> {
     if base_model.is_empty() {
         return Err(Status::invalid_argument("base_model is required"));
@@ -177,7 +206,30 @@ fn lora_common_from_proto(
         .map(FineTuneConfig::try_from)
         .transpose()?
         .unwrap_or_default();
-    Ok(TrainingCommon { base_model, config })
+    Ok(TrainingCommon {
+        base_model,
+        config,
+        world_size: world_size_from_proto(world_size),
+    })
+}
+
+/// Resolve the wire's rank count into the engine's.
+///
+/// `world_size` is an implicit-presence `uint32`, so `0` is what a request
+/// that never set the field carries — indistinguishable from one encoded
+/// without the field at all. It resolves to
+/// [`crate::fine_tune::spec::DEFAULT_WORLD_SIZE`] HERE, at the decode, so the
+/// wire's unset value never reaches a persisted spec: a `0` written into
+/// `jobs.spec` would be a zero-rank job on disk, which no worker can place.
+/// Every other count passes through unchanged and is bounded at the submit
+/// edge against what the deployment can serve — this seam resolves, it never
+/// refuses a count for being too large.
+fn world_size_from_proto(world_size: u32) -> u32 {
+    if world_size == 0 {
+        crate::fine_tune::spec::DEFAULT_WORLD_SIZE
+    } else {
+        world_size
+    }
 }
 
 fn graph_sources_from_proto(
@@ -419,6 +471,7 @@ mod tests {
                     lora_rank: 32,
                     ..FineTuneConfig::default()
                 },
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
         };
 
@@ -581,5 +634,126 @@ mod tests {
                 (want, got) => panic!("head mismatch: wanted {want:?}, got {got:?}"),
             }
         }
+    }
+
+    /// A minimal column-source request carrying `world_size`, so the count is
+    /// the only thing these three tests vary.
+    fn fine_tune_request(world_size: u32) -> pb::SubmitJobRequest {
+        pb::SubmitJobRequest {
+            spec: Some(pb::submit_job_request::Spec::FineTune(
+                training_pb::FineTuneSpec {
+                    source: "patents".into(),
+                    columns: vec!["abstract".into()],
+                    method: method_to_proto(crate::fine_tune::FineTuneMethod::Lora) as i32,
+                    task: model_task_to_proto(jammi_db::ModelTask::TextEmbedding) as i32,
+                },
+            )),
+            base_model: "local:tiny".into(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size,
+        }
+    }
+
+    fn decoded_common(req: pb::SubmitJobRequest) -> TrainingCommon {
+        match training_spec_from_proto(req).expect("decode") {
+            TrainingSpec::FineTune { common, .. } => common,
+            other => panic!("expected the fine_tune variant, got {other:?}"),
+        }
+    }
+
+    /// The wire's unset count (`0`) resolves to the engine's single rank AT
+    /// THE DECODE, before the spec can be persisted: a `0` reaching
+    /// `jobs.spec` would be a zero-rank job on disk that no worker can place.
+    /// A chosen count passes through unchanged.
+    #[test]
+    fn the_wire_unset_count_resolves_to_one_rank_and_a_chosen_count_survives() {
+        assert_eq!(
+            decoded_common(fine_tune_request(0)).world_size,
+            1,
+            "0 is the wire's UNSET value and must decode to one rank"
+        );
+        assert_eq!(decoded_common(fine_tune_request(1)).world_size, 1);
+        assert_eq!(
+            decoded_common(fine_tune_request(3)).world_size,
+            3,
+            "a chosen count is carried into the spec, never defaulted away"
+        );
+    }
+
+    /// The count makes the round trip back onto the request, so a spec
+    /// re-encoded for a remote send carries the rank count it was submitted
+    /// with rather than silently reverting to one rank.
+    #[test]
+    fn the_rank_count_round_trips_back_onto_the_request() {
+        let spec = training_spec_from_proto(fine_tune_request(2)).expect("decode");
+        assert_eq!(training_spec_to_proto(&spec).world_size, 2);
+    }
+
+    /// r26: a context-predictor job is refused above one rank at the LAST
+    /// edge that can still see the count — the engine's
+    /// `TrainingSpec::ContextPredictor` has no `TrainingCommon` and therefore
+    /// no field to carry it, so a count that got past this decode would be
+    /// silently dropped and the caller would get a single-rank job it never
+    /// asked for. The unset and single-rank values still pass, and the
+    /// re-encode leaves the wire's unset `0`.
+    #[test]
+    fn a_multi_rank_context_predictor_is_refused_at_the_decode() {
+        // Encoded from a real engine spec, so the request under test is the
+        // one the client sends rather than a hand-built shape that could
+        // drift from it; only the count varies.
+        let predictor_request = |world_size: u32| pb::SubmitJobRequest {
+            world_size,
+            ..training_spec_to_proto(&TrainingSpec::ContextPredictor {
+                source: "episodes_src".into(),
+                predictor_spec: ContextPredictorTrainConfig {
+                    model_id: "ctx-pred-ranks".into(),
+                    architecture: ContextArchitecture::Tnp,
+                    key_column: "row_key".into(),
+                    task_column: "cohort".into(),
+                    value_column: "outcome".into(),
+                    context_k: 4,
+                    hidden_dim: 32,
+                    num_heads: 2,
+                    num_layers: 1,
+                    head: PredictiveHead::Gaussian {
+                        objective: GaussianObjective::Nll { beta: 0.5 },
+                    },
+                    epochs: 1,
+                    learning_rate: 3e-4,
+                    grad_clip: 1.0,
+                    test_task_fraction: 0.3,
+                    min_task_count: 2,
+                    seed: 7,
+                },
+            })
+        };
+
+        for unset_or_single in [0, 1] {
+            training_spec_from_proto(predictor_request(unset_or_single))
+                .expect("a single-rank context predictor is the job this kind has always been");
+        }
+
+        let status = training_spec_from_proto(predictor_request(2))
+            .expect_err("a two-rank context predictor must be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("context_predictor"),
+            "the refusal must name the kind it refuses: {}",
+            status.message()
+        );
+        let engine_err = jammi_wire::error_from_status(&status);
+        assert!(
+            matches!(engine_err, JammiError::Config(_)),
+            "the refusal must reconstruct as the typed engine error, not the lossy \
+             fallback: {engine_err:?}"
+        );
+
+        let spec = training_spec_from_proto(predictor_request(0)).expect("decode");
+        assert_eq!(
+            training_spec_to_proto(&spec).world_size,
+            0,
+            "the predictor kind carries no count, so the re-encode leaves the wire's unset value"
+        );
     }
 }

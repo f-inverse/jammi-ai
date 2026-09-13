@@ -86,6 +86,8 @@ crates/jammi-db/tests/it/mutable_crash_recovery.rs::crash_recovery_child_dispatc
 crates/jammi-db/tests/it/storage_cloud.rs::require_live_storage
 crates/jammi-ai/src/fine_tune/optimizer.rs::cuda_device
 crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs::device_memory_used_bytes_or_require
+crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::serial_cuda_device_or_require
+crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::second_cuda_device_or_require
 crates/jammi-ai/tests/it/channel_contract.rs::regenerate_goldens_requested
 crates/jammi-ai/tests/it/fine_tune.rs::chmod_bypassed
 crates/jammi-ai/tests/it/models.rs::chmod_bypassed

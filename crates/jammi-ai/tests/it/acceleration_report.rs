@@ -529,6 +529,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         common: TrainingCommon {
             base_model: tiny_modernbert_model(),
             config: config.clone(),
+            world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
     };
     let spec_json = serde_json::to_string(&spec).unwrap();
@@ -1461,6 +1462,7 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
             common: TrainingCommon {
                 base_model: base_model.to_string(),
                 config: encoder_adapters_config(ComputePrecision::F32),
+                world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
         })
         .unwrap()
@@ -1631,6 +1633,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
         common: TrainingCommon {
             base_model: tiny_modernbert_model(),
             config: encoder_adapters_config(ComputePrecision::F32),
+            world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
     })
     .unwrap();

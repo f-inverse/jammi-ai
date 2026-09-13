@@ -118,13 +118,17 @@ before any implementer built the permanently-broken shape:
 - **M5' — the deny-coverage sweep is committed.** `# R12-BEGIN`/`# R12-END` sentinels bound
   the four core `str | None`-returning mechanism helpers in `lead-gate-lib.py`;
   `ci/scripts/check_lead_gate.py --r12-sweep` (its own `swarm.yml` step, separate from
-  `--self-test` — mutating and re-running ~24 R12 fixtures per deny arm is too slow to fold
-  into the per-invocation self-test) enumerates every deny-`Return` inside that region by
+  `--self-test` — mutating and re-running the R12 fixture subset per deny arm is too slow to
+  fold into the per-invocation self-test) enumerates every deny-`Return` inside that region by
   AST, neuters each arm's nearest enclosing `if` test to `False` ALONE, and fails when a
   neutered arm kills no R12 fixture. Scope note: the dispatch-routing arms M6' added
   (`_decide_implementer_dispatch`) sit outside the sentinel region and are not swept by this
   mechanism — they are independently covered by named, RED-verified fixtures instead
-  (R12P1/R12P1b/R12P1c/R12P2/R12P2b).
+  (R12P1/R12P1b/R12P1c/R12P2/R12P2b). **Measured** (this round, on this machine): the
+  hook's own unarmed hot path stays at 0.08-0.13s over repeated 5-invocation samples (well
+  under the 0.2s budget); `--r12-sweep` itself — 36 arms, re-running every "R12"-named fixture
+  per arm — took 541.66s at 24 fixtures/arm and 885.24s at 41 fixtures/arm (both real,
+  observed wall-clock runs; a third run at 48 fixtures/arm was still in progress at hand-off).
 - **M6' — close the fail-open enumerations.** `general-purpose`/`claude`/`fork`/
   `doc-updater` dispatches are now gated identically to the nine domain-implementer types the
   moment their prompt names a unit with an open second-round BLOCK (previously unconditionally

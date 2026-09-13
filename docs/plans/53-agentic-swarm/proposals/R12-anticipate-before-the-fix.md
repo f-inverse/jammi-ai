@@ -70,6 +70,14 @@ from the git-metadata budget. The witness is `sha256(rc + "\n" + stdout + "\n" +
 of stderr)`; `rc ∈ {126, 127}` or empty captured output DENIES as VACUOUS; the SAME
 `(command, hash)` pair reused across two keys DENIES as templated.
 
+The stderr-inclusion in the witness closes a MEASURED collision: two different commands (a
+real script absent from a stale checkout, and a nonexistent script) both produce `rc=127`
+with empty stdout and hash identically under `sha256(rc+stdout)` alone, while `rc=1` never
+collides with `rc=127` under either scheme. `ci/scripts/check_lead_gate.py`'s `R12witness`
+fixture is a STANDING PIN on this exact non-collision property — never a one-round acceptance
+check to be deleted once this proposal merges; it stays in the suite for as long as
+`_witness_hash` exists, the same way a regression test for a fixed bug outlives the bug.
+
 ## Honest limits (stated as R3/R11 state theirs)
 
 The hook cannot judge that an attack is a GOOD attack. What the pre-fix tip check and the

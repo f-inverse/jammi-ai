@@ -225,13 +225,18 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
   the lead to proactively anticipate and act even before the next audit round's finding." The fix
   (esc-lead-gate-R12) moves the check to the one moment that cannot be gamed after the fact: an
   implementer dispatch onto a unit with an open verifier BLOCK is denied unless a pre-fix
-  anticipation artifact already exists whose commands the hook itself re-executes and hash-matches,
-  and whose named branch's CURRENT tip equals the BLOCK's own `head_sha` — proof the attack ran
-  against the BROKEN code, never after a fix already landed; the closing relay then must show the
-  fix measurably moved at least one such witness. `open_question`/`residual_risk`'s own text is
-  never trusted as a substitute for having run something — a field that only ADMITS an unclosed
-  site cannot, by its own schema, defer the CLOSING of it to a future round that the mechanism
-  never actually requires to happen.
+  anticipation artifact already exists (keyed by the unit branch's CURRENT TIP, `pre_fix_sha`,
+  never by any one BLOCK's own `head_sha` — a second, older open BLOCK at a different sha would
+  otherwise leave the union's own covering artifact unfindable under its own name) whose commands
+  the hook itself re-executes and hash-matches, and whose recorded `pre_fix_sha` equals that SAME
+  branch's CURRENT tip at this instant with a clean worktree — proof the attack ran against the
+  BROKEN code at THIS tip, never after a fix already landed, and never that no fix exists off-tree
+  (a stash, another branch, another worktree) or that the attack strictly preceded the fix in wall-
+  clock time. The closing relay then must show the fix measurably moved at least one such witness,
+  found the SAME way — by the covering artifact's own `covers` list, never by the relay's own BLOCK
+  row's `head_sha`. `open_question`/`residual_risk`'s own text is never trusted as a substitute for
+  having run something — a field that only ADMITS an unclosed site cannot, by its own schema, defer
+  the CLOSING of it to a future round that the mechanism never actually requires to happen.
 
 ---
 

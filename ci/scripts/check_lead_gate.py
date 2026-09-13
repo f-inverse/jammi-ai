@@ -83,11 +83,33 @@ Required fixtures (RED when the corresponding hook arm is removed):
       `git worktree list`-resolved worktree, unconfused by a decoy linked
       worktree on another branch. R12D1: the relaxed denylist admits ONLY
       `sh|bash <real path>`, still denies `bash -c`/`curl|sh`/every other
-      R11 entry. R12R2a-d: reader 2's `attacks_post` differential — missing
-      / no measured difference / a real differential allows / a `.sh`
-      new-surface hunk widens the required set by FILE. R12M1: a relay
-      still carrying the retired `open_question` with no `attacks_post` is
-      denied, naming the migration.
+      R11 entry. R12R2a-h: reader 2's `attacks_post` differential — missing
+      / no measured difference / a real differential allows / a `.sh` /
+      `.yml` new-surface hunk widens the required set by FILE / partial
+      coverage denies / a non-object entry denies / a differing post-fix
+      command denies. R12M1: a relay still carrying the retired
+      `open_question` with no `attacks_post` is denied, naming the
+      migration. R12E1-E5: the empty-derived-set path
+      (`_r12_empty_set_rejection`) — fewer than 2 lead-chosen keys / a key
+      outside the changed-file set / all-inspector / two valid
+      execution-class keys allows / an unresolvable main-or-master denies.
+      R12F1-F5: a forged `pre_fix_sha` / a mismatched `unit_branch` field /
+      a missing `residual_risk` / a non-object JSON artifact / a missing
+      `attacks` object, each denies. R12P13-P15: the relaxed denylist's
+      remaining arms (a nonexistent bash path, a denied git subcommand, `find
+      -delete`), exercised through the REAL dispatch path (never merely
+      R12D1's direct, uncached-module-blind call). R12witness/R12reduce/
+      R12unparse: the stderr-distinct witness collision, per-file key
+      reduction (two raw keys on one file need one entry), and an
+      unparseable key mapping to itself while still being required.
+      R12timeout/R12alarm: settings.json's PreToolUse timeout pins above
+      the hook's own self-alarm and below the harness default; the
+      self-alarm itself denies once armed. `--r12-sweep` (its own
+      `swarm.yml` step): the M5' AST-based deny-coverage sweep over the
+      `# R12-BEGIN`/`# R12-END` sentinel region's four core mechanism
+      helpers — see its own docstring for the documented scope limit
+      (the dispatch-routing arms `_decide_implementer_dispatch` added for
+      M6' sit outside the sentinel region and are not swept).
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`

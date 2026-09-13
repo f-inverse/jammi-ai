@@ -743,6 +743,71 @@ class DerivedRentingDriverTest(unittest.TestCase):
         )
         self.assertIn("ci/scripts/test_pod_substrate.sh", "\n".join(findings))
 
+    def test_a_workflow_level_env_secret_reaches_the_step(self):
+        """The secret is read at EVERY scope of the invoking workflow. A
+        top-level `env:` block is inherited by every job and every step in
+        the file, so a deploy-capable driver invoked from any job in it can
+        rent — reading only the job body (this rule's first revision) let
+        that whole shape through, and 10+ workflows in this tree declare
+        their env at the top level."""
+        top_level_env = GUARD_YML.replace(
+            "\njobs:\n",
+            "\nenv:\n  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n\njobs:\n",
+        )
+        self.assertIn("env:\n  RUNPOD_API_KEY", top_level_env)  # the fixture really moved it out
+        self.assertNotIn("RUNPOD_API_KEY", top_level_env.split("jobs:", 1)[1])
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"ci.yml": top_level_env}), fixture_scripts()
+        )
+        joined = "\n".join(findings)
+        self.assertIn("ci/scripts/test_pod_substrate.sh", joined)
+        self.assertIn("that step can RENT", joined)
+
+    def test_a_with_block_secret_reaches_the_step(self):
+        """Same capability, a different spelling site: a reusable-workflow
+        `with:`/`secrets:` mapping is not a job `env:` block either."""
+        via_with = GUARD_YML.replace(
+            "      - run: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh\n",
+            "      - uses: ./.github/workflows/_x.yml\n"
+            "        with:\n"
+            "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "      - run: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh\n",
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"ci.yml": via_with}), fixture_scripts()
+        )
+        self.assertIn("ci/scripts/test_pod_substrate.sh", "\n".join(findings))
+
+    def test_a_commented_out_secret_is_not_the_capability(self):
+        """Whole-FILE scope, still comment-stripped: a commented secret is
+        text, not a capability, so the widened scope does not turn every
+        workflow that documents the variable into a paid lane."""
+        commented = GUARD_YML.replace(
+            "\njobs:\n",
+            "\n# env:\n#   RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n\njobs:\n",
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"ci.yml": commented}), fixture_scripts()
+        )
+        self.assertFalse(any("test_pod_substrate.sh" in f for f in findings), findings)
+
+    def test_an_uninvoked_derived_driver_is_reported_as_a_note(self):
+        """The prose promises a driver no visible step invokes is REPORTED,
+        never silently credited. It is a NOTE, not a finding: nothing in the
+        committed text says it can rent, and nothing says it cannot."""
+        scripts = fixture_scripts()
+        scripts["ci/scripts/runpod_gpu_orphan.sh"] = _driver("rp_deploy_arch a100")
+        notes: list[str] = []
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(), scripts, notes=notes
+        )
+        self.assertFalse(any("runpod_gpu_orphan.sh" in f for f in findings), findings)
+        joined = "\n".join(notes)
+        self.assertIn("ci/scripts/runpod_gpu_orphan.sh", joined)
+        self.assertIn("no workflow in this tree invokes", joined)
+        # An INVOKED derived driver produces no note.
+        self.assertFalse(any("test_pod_substrate.sh" in n for n in notes), notes)
+
     def test_the_real_tree_derives_the_set_this_suite_claims(self):
         """Anti-vacuity, stated as the SET the property ranged over: the
         real `runpod_lib.sh` closure and the real derived-driver set, so a

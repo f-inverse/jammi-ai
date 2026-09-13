@@ -148,10 +148,12 @@ string):
      `ci/scripts/**` file whose comment-stripped text calls one of them.
      Each derived driver is either a table row (held to the three
      sub-rules) or must satisfy a machine predicate: every workflow step
-     invoking it hands it a literal non-renting verb, or sits in a job that
-     never passes `RUNPOD_API_KEY`. A derived driver in neither state, and
-     a table row whose driver has left the derived set, are both FAILs by
-     name. `check_p7_paid_pod_lanes` takes the script map and the library
+     invoking it hands it a literal non-renting verb, or sits in a workflow
+     that never carries `RUNPOD_API_KEY` at ANY scope (top-level `env:`,
+     job `env:`, step `env:`, `with:` — the capability, not its spelling
+     site). A derived driver in neither state, and a table row whose driver
+     has left the derived set, are both FAILs by name; a derived driver no
+     visible workflow step invokes is a printed NOTE, neither. `check_p7_paid_pod_lanes` takes the script map and the library
      text as parameters (the same shape `load_workflow_texts` gives the
      workflow scan), so its own suite injects a fifth renting driver, or a
      new deploy wrapper, without touching this tree.
@@ -795,23 +797,26 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
 #     spells the members out in its own fixture strings and is therefore
 #     derived as a driver itself. Nothing is exempted for being ours — such
 #     a file is cleared by the same machine predicate as any other (the
-#     guard job that runs it passes no `RUNPOD_API_KEY`), which is exactly
-#     the outcome an exemption list would have hidden.
+#     workflow whose guard job runs it carries no `RUNPOD_API_KEY` at any
+#     scope), which is exactly the outcome an exemption list would have
+#     hidden.
 #
 # RESIDUAL, disclosed rather than assumed away: a workflow step that invokes
 # a driver through a variable path (`bash "$SCRIPT"`) is invisible to the
 # invocation scan below, exactly as it is to every other line-shaped rule in
 # this file. No such step exists in this tree today; the scan reports what
-# it can see, and a driver no visible step invokes is reported as such
-# rather than credited or condemned.
+# it can see, and a driver no visible step invokes is reported as a NOTE by
+# `_check_derived_driver_cannot_rent` — printed, never a failure and never a
+# clear.
 # --------------------------------------------------------------------------- #
 SCRIPTS_ROOT = "ci/scripts/"
 RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
 DEPLOY_PAYLOAD_FN = "_rp_deploy_payload"
 
 # The secret that turns a script that CAN deploy into a step that WILL: with
-# no `RUNPOD_API_KEY` in the invoking job, `rp_init` refuses before any pod
-# is created. The secret's presence is the capability.
+# no `RUNPOD_API_KEY` anywhere in the invoking WORKFLOW, `rp_init` refuses
+# before any pod is created. The secret's presence is the capability — its
+# scope in the file (top-level env, job env, step env, with:) is not.
 RUNPOD_SECRET = "RUNPOD_API_KEY"
 
 # First-argument verbs a deploy-capable driver may be handed from a workflow
@@ -936,19 +941,48 @@ def _invocation_verbs(job_body: str, script_rel: str) -> list[str | None]:
 
 
 def _check_derived_driver_cannot_rent(
-    script_rel: str, workflow_texts: dict[str, str]
+    script_rel: str, workflow_texts: dict[str, str], notes: list[str] | None = None
 ) -> list[str]:
     """The machine predicate a derived driver that is NOT a
     `PAID_POD_LANE_TABLE` row must satisfy: EVERY workflow step that invokes
-    it either hands it a literal `NON_RENTING_VERBS` verb, or sits in a job
-    that never passes `RUNPOD_SECRET` (so `rp_init` refuses before a pod
-    exists). Quantified over every visible invocation — one bad site is a
-    finding naming the driver, the workflow and the job."""
+    it either hands it a literal `NON_RENTING_VERBS` verb, or sits in an
+    invoking workflow that never carries `RUNPOD_SECRET` at all (so
+    `rp_init` refuses before a pod exists). Quantified over every visible
+    invocation — one bad site is a finding naming the driver, the workflow
+    and the job.
+
+    THE SECRET IS READ AT WORKFLOW SCOPE, not job scope. GitHub resolves a
+    top-level `env:` block for every job and every step in the file, so the
+    variable a step actually sees is spelled at any of four places —
+    top-level `env:`, job `env:`, step `env:`, a `with:`/`secrets:` mapping
+    — and which one a maintainer picked says nothing about the capability.
+    Reading the job body only (this rule's first revision) cleared a
+    deploy-capable driver invoked from a workflow whose secret sat at the
+    top level, which is how 10+ workflows in this tree declare env.
+
+    That scope over-approximates in the FAIL-CLOSED direction: a secret
+    declared for an unrelated job in the same file counts for this driver
+    too. The remedy is the same one the rule already asks for — a
+    PAID_POD_LANE_TABLE row, a literal non-renting verb, or the secret out
+    of that workflow — never a narrower read. The text is still
+    comment-stripped, so a commented-out or documented secret is text, not a
+    capability.
+
+    A derived driver that NO visible step invokes is neither credited nor
+    condemned: it lands in `notes` (printed, never a failure). Nothing in
+    the committed text establishes that it can rent, and nothing
+    establishes that it cannot — a state defined by missing evidence gets no
+    definite consequence, and a silent clear would have made this file's own
+    prose false."""
     findings: list[str] = []
+    invoked_anywhere = False
     for name in sorted(workflow_texts):
         stripped = drop_comment_lines(workflow_texts[name])
         if script_rel not in stripped:
             continue
+        invoked_anywhere = True
+        # WORKFLOW scope: every step in this file sees a top-level `env:`.
+        secret_present = RUNPOD_SECRET in stripped
         job_bodies = _workflow_job_bodies(workflow_texts[name])
         # A reference outside any `jobs:` block (a top-level comment is
         # already stripped; anything else is unusual) is judged against the
@@ -957,7 +991,6 @@ def _check_derived_driver_cannot_rent(
         if not scopes:
             scopes = {"<outside any job body>": stripped}
         for job, body in sorted(scopes.items()):
-            secret_present = RUNPOD_SECRET in body
             for verb in _invocation_verbs(body, script_rel):
                 if verb in NON_RENTING_VERBS:
                     continue
@@ -966,13 +999,21 @@ def _check_derived_driver_cannot_rent(
                 shown = "<no literal verb>" if verb is None else repr(verb)
                 findings.append(
                     f"P7: {script_rel} calls runpod_lib.sh's deploy closure and is invoked by "
-                    f"{name} (job `{job}`) with {RUNPOD_SECRET} in scope and first verb {shown} — "
+                    f"{name} (job `{job}`) with {RUNPOD_SECRET} somewhere in that workflow "
+                    f"(top-level env, job env, step env or with:) and first verb {shown} — "
                     f"that step can RENT. A deploy-capable driver reachable from a workflow with "
                     f"the secret is a paid pod lane: give it a PAID_POD_LANE_TABLE row (one "
                     f"workflow, no push:/workflow_call: trigger, nothing uses: it), hand it a "
                     f"literal non-renting verb ({sorted(NON_RENTING_VERBS)}), or drop the secret "
-                    f"from that job"
+                    f"from that workflow"
                 )
+    if not invoked_anywhere and notes is not None:
+        notes.append(
+            f"P7 NOTE: {script_rel} calls runpod_lib.sh's deploy closure, but no workflow in this "
+            "tree invokes it by a path this scan can read — so nothing here establishes that it "
+            "can rent, and nothing establishes that it cannot. Reported, not judged: it is not a "
+            "failure, and it is not cleared either"
+        )
     return findings
 
 
@@ -980,6 +1021,7 @@ def check_p7_paid_pod_lanes(
     workflow_texts: dict[str, str],
     script_texts: dict[str, str] | None = None,
     lib_text: str | None = None,
+    notes: list[str] | None = None,
 ) -> list[str]:
     findings: list[str] = []
 
@@ -1017,7 +1059,7 @@ def check_p7_paid_pod_lanes(
         for base, rel in sorted(derived_basenames.items()):
             if base in table_basenames:
                 continue
-            findings += _check_derived_driver_cannot_rent(rel, workflow_texts)
+            findings += _check_derived_driver_cannot_rent(rel, workflow_texts, notes)
 
     for script, workflow in sorted(PAID_POD_LANE_TABLE.items()):
         producers = sorted(
@@ -1870,14 +1912,19 @@ def run_gate(
     workflows_dir: Path = WORKFLOWS_DIR,
     manifest_path: Path = MANIFEST_PATH,
     script_texts: dict[str, str] | None = None,
+    notes: list[str] | None = None,
 ) -> list[str]:
+    """`notes` collects the OBSERVATIONS this gate makes that are not
+    verdicts (today: a derived renting driver no visible workflow step
+    invokes). They are printed by `main`; they never change the exit code,
+    so a note can never be read as a pass or as a failure."""
     workflow_texts = load_workflow_texts(workflows_dir)
     if not workflow_texts:
         return ["no workflow files found -- cannot verify the gpu-prove-once property"]
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     findings: list[str] = []
     findings += check_p1_p2(workflow_texts)
-    findings += check_p7_paid_pod_lanes(workflow_texts, script_texts)
+    findings += check_p7_paid_pod_lanes(workflow_texts, script_texts, notes=notes)
     findings += check_gate_file_absent(workflows_dir)
     findings += check_promotion_table(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
@@ -1887,7 +1934,10 @@ def run_gate(
 
 
 def main() -> int:
-    findings = run_gate()
+    notes: list[str] = []
+    findings = run_gate(notes=notes)
+    for n in notes:
+        print(f"  * {n}")
     if findings:
         print("gpu-prove-once: FAIL", file=sys.stderr)
         for f in findings:
@@ -1900,7 +1950,8 @@ def main() -> int:
           "lane in PAID_POD_LANE_TABLE has exactly one invoker whose on: block carries no "
           "push:/workflow_call: trigger and which nothing uses:, and every renting driver DERIVED "
           "from runpod_lib.sh's own deploy closure is either such a row or cannot rent from any "
-          "workflow that invokes it.")
+          "workflow that invokes it -- the secret read at every scope of that workflow, and a "
+          "driver no visible step invokes reported above as a NOTE rather than cleared.")
     return 0
 
 

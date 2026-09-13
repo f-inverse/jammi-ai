@@ -352,6 +352,78 @@ assert_eq "an ordinary versioned-only object (cudart's real object) is staged al
 install_fixture_needed
 
 # ---------------------------------------------------------------------------
+# 9. The floor (`bundle_stage_floor`), driven directly — resolves and stages
+#    the seven fixed stems from the search path, independent of any binary's
+#    `DT_NEEDED` graph.
+# ---------------------------------------------------------------------------
+FLOOR_STAGE="${ROOT}/stage-floor/lib"
+mkdir -p "$FLOOR_STAGE"
+floor_out="$(bundle_stage_floor "$SEARCH" "$FLOOR_STAGE" 2>&1)"
+floor_rc=$?
+assert_eq "the floor succeeds over a tree that holds all seven stems" "$floor_rc" "0"
+for f in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcurand.so.10 \
+  libnvrtc.so.12 libnvrtc-builtins.so.12.6 libnccl.so.2; do
+  checks=$((checks + 1))
+  if [ -f "${FLOOR_STAGE}/${f}" ]; then
+    ok "the floor stages ${f}"
+  else
+    fail "the floor stages ${f}" "expected a regular file at ${FLOOR_STAGE}/${f}"
+  fi
+done
+
+# Mutation-shaped check: a search path missing the ONE directory that carries
+# NCCL (`/usr/lib64`) still holds every other floor stem in the toolkit dir —
+# the floor's refusal must name exactly the stem it could not resolve, not
+# fail vacuously or fail the whole set silently.
+FLOOR_STAGE_PARTIAL="${ROOT}/stage-floor-partial/lib"
+mkdir -p "$FLOOR_STAGE_PARTIAL"
+floor_partial_out="$(bundle_stage_floor "$TOOLKIT" "$FLOOR_STAGE_PARTIAL" 2>&1)"
+floor_partial_rc=$?
+assert_eq "the floor fails when a stem is not in any search directory" "$floor_partial_rc" "1"
+assert_contains "the floor names the exact missing stem" "$floor_partial_out" "libnccl"
+assert_not_contains "the floor does not spuriously name a stem it DID resolve" \
+  "$floor_partial_out" "libcudart missing"
+
+# ---------------------------------------------------------------------------
+# 10. The stage-set assertion (`bundle_assert_staged`), driven directly: a
+#     regular file of exactly the required SONAME must exist under `lib_dir`.
+#     This is deliberately NOT the same claim `bundle_copy_sources` makes by
+#     exiting 0 (see the module doc) — mutation-shaped: remove a file after a
+#     successful derivation and the assertion, not the derivation, is what
+#     catches it.
+# ---------------------------------------------------------------------------
+ASSERT_STAGE="${ROOT}/stage-assert/lib"
+mkdir -p "$ASSERT_STAGE"
+: >"${ASSERT_STAGE}/libcudart.so.12"
+: >"${ASSERT_STAGE}/libnccl.so.2"
+assert_out="$(bundle_assert_staged "$ASSERT_STAGE" libcudart.so.12 libnccl.so.2 2>&1)"
+assert_rc=$?
+assert_eq "the stage-set assertion passes when every required file is present" "$assert_rc" "0"
+
+rm -f "${ASSERT_STAGE}/libnccl.so.2"
+assert_out2="$(bundle_assert_staged "$ASSERT_STAGE" libcudart.so.12 libnccl.so.2 2>&1)"
+assert_rc2=$?
+assert_eq "the stage-set assertion fails when a required file is gone" "$assert_rc2" "1"
+assert_contains "the stage-set assertion names the missing file" "$assert_out2" "libnccl.so.2"
+assert_not_contains "the stage-set assertion does not name a file that IS present" \
+  "$assert_out2" "libcudart.so.12 => "
+
+# A symlink whose target does not exist is not a "regular file" either — `[ -f
+# ]` follows the link and reports false for a broken one, which is the
+# correct outcome for a soname that LOOKS staged but resolves to nothing.
+ln -s "${ASSERT_STAGE}/does-not-exist.so.1" "${ASSERT_STAGE}/libbroken.so.1"
+assert_broken_out="$(bundle_assert_staged "$ASSERT_STAGE" libbroken.so.1 2>&1)"
+assert_broken_rc=$?
+assert_eq "the stage-set assertion fails on a broken symlink" "$assert_broken_rc" "1"
+assert_contains "the stage-set assertion names the broken symlink's soname" "$assert_broken_out" "libbroken.so.1"
+
+# `bundle_main` itself now runs the stage-set assertion (and the floor) after
+# the copy step — driven end to end, over the same fixture tree used above,
+# rather than only in isolation.
+assert_contains "bundle_main's own stage-set assertion reports success" "$main_out" \
+  "every non-host-provided soname of the DT_NEEDED closure, plus the floor, is staged"
+
+# ---------------------------------------------------------------------------
 if [ "$failures" -ne 0 ]; then
   echo "test_bundle_cuda_libs.sh: ${failures} of ${checks} check(s) FAILED" >&2
   exit 1

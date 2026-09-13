@@ -947,7 +947,6 @@ impl CacheInner {
     /// `device` can be released", which is the answer that makes the
     /// admission loop wait rather than spin.
     ///
-
     /// Audit round 62, F-A: `ref_count == 0` alone is NOT sufficient to
     /// promise a caller (`do_load`'s admission loop) that removing this
     /// entry frees GPU budget. A `ModelGuard`'s `Drop` releases its permit

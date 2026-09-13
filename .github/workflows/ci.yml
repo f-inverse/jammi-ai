@@ -2237,19 +2237,6 @@ jobs:
             cmd: bash ci/scripts/assert_glibc_floor.sh --self-test
           - name: assert_image_attestations.sh self-test
             cmd: bash ci/scripts/assert_image_attestations.sh --self-test
-          # The cu12 release tarball's library-bundling derivation
-          # (`ci/scripts/bundle_cuda_libs.sh`, called from
-          # `release-binaries.yml`'s `server-cu12-build` step). Its only
-          # caller's promote leg runs on a `v*` TAG, so nothing on the merge
-          # path executes it — this leg is the hermetic half, and without it
-          # the derivation's first real run would be a release. The suite
-          # sources the actual script, replaces its one ELF-reading function
-          # with the MEASURED `DT_NEEDED` list of the shipped binary, and
-          # drives the real resolution/closure/refusal/staging over a fake
-          # library tree: no readelf, no ldd, no ELF file, no CUDA install,
-          # so it runs on this toolchain-free runner unchanged.
-          - name: cu12 tarball library derivation suite
-            cmd: bash ci/scripts/test_bundle_cuda_libs.sh
           # The cu12 WHEEL's half of the same question: `verify_link_set.py`'s
           # `COVERED`, `_entry.py`'s `_CUDA_COMPONENTS` and `pyproject.toml`'s
           # `nvidia-*-cu12` pins state one contract three times, and the wheel

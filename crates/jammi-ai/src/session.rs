@@ -10,7 +10,6 @@ use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, ResultStore};
 
-use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
@@ -223,11 +222,20 @@ impl InferenceSession {
         let resolver =
             ModelResolver::new(catalog.clone(), Arc::clone(&artifact_store), hub.clone())?;
         let device_config = DeviceConfig::from_config(inner.config());
-        let scheduler = Arc::new(GpuScheduler::for_device(
-            device_config.gpu_device,
+        // One admission budget PER DEVICE, over the resolved `[gpu] devices`
+        // list. A budget is a property of a card: a single counter shared by
+        // two devices would either over-admit on one or starve the other.
+        // A single-device deployment resolves to one entry and is exactly
+        // what it was before the list existed.
+        let schedulers = crate::concurrency::DeviceSchedulers::for_devices(
+            &device_config.devices,
             device_config.memory_fraction,
+        )?;
+        let model_cache = Arc::new(ModelCache::with_device_schedulers(
+            resolver,
+            device_config.clone(),
+            schedulers,
         ));
-        let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         // Install the tenant-gating result-table schema as the context's
         // default schema before any table is loaded, so bare `jammi.{name}`
         // resolutions honour the catalog owner on every read lane and source

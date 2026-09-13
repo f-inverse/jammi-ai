@@ -11,7 +11,7 @@ use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
 use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask, ResolvedModel};
-use crate::concurrency::{GpuPermit, GpuScheduler};
+use crate::concurrency::{DeviceSchedulers, GpuPermit, GpuScheduler};
 
 /// Where a cached model currently resides.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,10 +39,56 @@ struct CacheEntry {
     gpu_permit: Arc<GpuPermit>,
 }
 
+/// What identifies one cached model.
+///
+/// A model id alone is not an identity: the same weights loaded on two
+/// devices are two resident copies with two budgets, and the same
+/// checkpoint loaded for two tasks or through two backends is two different
+/// loaded objects. Keying on the id alone made the second load a warm HIT on
+/// the first — a model served from the wrong device, or with the wrong head.
+///
+/// `None` is a DISTINCT KEY VALUE, never a wildcard: a load that named no
+/// backend hint is its own entry, and it neither matches nor is matched by a
+/// load that named one. A wildcard would reintroduce exactly the collision
+/// this key exists to remove.
+///
+/// The same shape both maps are keyed by — the entries and the single-flight
+/// `in_flight` — because a single-flight that keyed more coarsely than the
+/// entries would make one loader stand in for a load of a different thing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    /// The resolved model id.
+    pub model_id: ModelId,
+    /// The device ordinal this copy is resident on (-1 for the host).
+    pub device: i32,
+    /// The task the model was loaded for, when the caller named one.
+    pub task: Option<ModelTask>,
+    /// The backend the caller asked for, when it named one — not the backend
+    /// that was ultimately selected, which is a consequence of the load
+    /// rather than an input to it.
+    pub backend: Option<BackendType>,
+}
+
+#[cfg(test)]
+impl CacheKey {
+    /// A key for an inner-state test: one model id on one device, with no
+    /// task or backend named. `None` here is the DISTINCT "named none" value
+    /// the production keys also carry when a caller named none, never a
+    /// wildcard.
+    pub(crate) fn for_test(model_id: &str, device: i32) -> Self {
+        Self {
+            model_id: ModelId(model_id.to_string()),
+            device,
+            task: None,
+            backend: None,
+        }
+    }
+}
+
 struct CacheInner {
-    entries: HashMap<ModelId, CacheEntry>,
-    lru_order: VecDeque<ModelId>,
-    in_flight: HashMap<ModelId, Arc<tokio::sync::Notify>>,
+    entries: HashMap<CacheKey, CacheEntry>,
+    lru_order: VecDeque<CacheKey>,
+    in_flight: HashMap<CacheKey, Arc<tokio::sync::Notify>>,
 }
 
 struct Backends {
@@ -78,7 +124,8 @@ pub struct ModelCache {
     resolver: ModelResolver,
     backends: Backends,
     device_config: DeviceConfig,
-    gpu_scheduler: Arc<GpuScheduler>,
+    /// One admission budget per configured device — see [`DeviceSchedulers`].
+    gpu_schedulers: DeviceSchedulers,
     /// Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole): the
     /// cache-level admission wake source. See [`ModelGuard`]'s
     /// `admission_notify` field doc for why `GpuScheduler`'s own release
@@ -99,11 +146,36 @@ pub struct ModelCache {
 }
 
 impl ModelCache {
-    /// Create a cache backed by the given resolver, device config, and GPU scheduler.
+    /// Create a cache over the device config's PRIMARY device, backed by the
+    /// given resolver and that device's scheduler.
+    ///
+    /// The single-device shape. A deployment that declares several devices
+    /// builds the cache with [`Self::with_device_schedulers`] instead, so
+    /// every declared device gets its own budget.
     pub fn new(
         resolver: ModelResolver,
         device_config: DeviceConfig,
         gpu_scheduler: Arc<GpuScheduler>,
+    ) -> Self {
+        let primary = device_config.gpu_device;
+        Self::with_device_schedulers(
+            resolver,
+            device_config,
+            DeviceSchedulers::single(primary, gpu_scheduler),
+        )
+    }
+
+    /// Create a cache over EVERY device the deployment declared, each with
+    /// its own admission budget.
+    ///
+    /// The cache is one map keyed by [`CacheKey`] rather than one cache per
+    /// device: a model resident on two devices is two entries of one LRU, so
+    /// eviction still reasons over the whole process's residency, while
+    /// admission is charged to the device the copy actually occupies.
+    pub fn with_device_schedulers(
+        resolver: ModelResolver,
+        device_config: DeviceConfig,
+        gpu_schedulers: DeviceSchedulers,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(CacheInner {
@@ -117,13 +189,18 @@ impl ModelCache {
                 ort: OrtBackend,
             },
             device_config,
-            gpu_scheduler,
+            gpu_schedulers,
             admission_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             probe_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             single_flight_pause: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The per-device admission budgets this cache admits loads against.
+    pub fn schedulers(&self) -> &DeviceSchedulers {
+        &self.gpu_schedulers
     }
 
     /// Audit round 62, F-3' test seam: install a fresh [`ProbePauseHandle`]
@@ -184,7 +261,7 @@ impl ModelCache {
     /// discipline applies to both: serving stale bytes, or re-probing a
     /// permanently dead entry forever, are both correctness bugs the
     /// idle-only `evict_one` (memory-pressure eviction) does not address.
-    async fn evict_if_current(&self, id: &ModelId, model: &Arc<LoadedModel>) {
+    async fn evict_if_current(&self, id: &CacheKey, model: &Arc<LoadedModel>) {
         let mut cache = self.inner.write().await;
         if cache
             .entries
@@ -219,7 +296,41 @@ impl ModelCache {
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
-        let id = ModelId::from(source);
+        self.get_or_load_on(self.gpu_schedulers.primary(), source, task, backend_hint)
+            .await
+    }
+
+    /// [`Self::get_or_load`] on a NAMED device of this deployment.
+    ///
+    /// The device-plural entry point: rank `r` of a gang asks for its own
+    /// device, and gets a copy resident there rather than the primary's.
+    /// Two devices therefore hold two entries for one model id — they are
+    /// two resident copies, charged to two budgets.
+    ///
+    /// A device the deployment never declared is refused with a typed error:
+    /// there is no budget for it, and loading onto it anyway would put a
+    /// model somewhere the operator did not place this process.
+    pub async fn get_or_load_on(
+        &self,
+        device: i32,
+        source: &ModelSource,
+        task: ModelTask,
+        backend_hint: Option<BackendType>,
+    ) -> Result<ModelGuard> {
+        let device_config = self.device_config.for_device(device)?;
+        let scheduler = Arc::clone(self.gpu_schedulers.get(device).ok_or_else(|| {
+            JammiError::Config(format!(
+                "device {device} has no admission budget in this session: it is not one of \
+                 the configured [gpu] devices {:?}",
+                self.device_config.devices
+            ))
+        })?);
+        let id = CacheKey {
+            model_id: ModelId::from(source),
+            device,
+            task: Some(task),
+            backend: backend_hint,
+        };
 
         loop {
             // Fast-path snapshot: clone the currently cached entry's shared
@@ -441,7 +552,9 @@ impl ModelCache {
             cache.in_flight.insert(id.clone(), Arc::clone(&notify));
             drop(cache);
 
-            let result = self.do_load(&id, source, task, backend_hint).await;
+            let result = self
+                .do_load(&id, &device_config, &scheduler, source, task, backend_hint)
+                .await;
 
             let mut cache = self.inner.write().await;
             cache.in_flight.remove(&id);
@@ -617,7 +730,9 @@ impl ModelCache {
 
     async fn do_load(
         &self,
-        id: &ModelId,
+        id: &CacheKey,
+        device_config: &DeviceConfig,
+        gpu_scheduler: &Arc<GpuScheduler>,
         source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
@@ -709,14 +824,14 @@ impl ModelCache {
         // for every way this loop's admission state can change, so an
         // unbounded wait is the honest contract, not a masked liveness bug.
         let gpu_permit = loop {
-            let permit_released = self.gpu_scheduler.notify.notified();
+            let permit_released = gpu_scheduler.notify.notified();
             tokio::pin!(permit_released);
             permit_released.as_mut().enable();
             let entry_became_idle = self.admission_notify.notified();
             tokio::pin!(entry_became_idle);
             entry_became_idle.as_mut().enable();
 
-            if let Some(permit) = self.gpu_scheduler.try_acquire(memory_bytes) {
+            if let Some(permit) = gpu_scheduler.try_acquire(memory_bytes) {
                 break permit;
             }
             let evicted = {
@@ -726,14 +841,14 @@ impl ModelCache {
             if evicted {
                 continue;
             }
-            if memory_bytes > self.gpu_scheduler.usable_capacity() {
+            if memory_bytes > gpu_scheduler.usable_capacity() {
                 return Err(JammiError::Model {
                     model_id: source_str,
                     message: format!(
                         "Cannot acquire GPU memory: {memory_bytes} bytes requested exceeds \
                          the total usable GPU budget of {} bytes — no amount of eviction or \
                          waiting could ever satisfy this request",
-                        self.gpu_scheduler.usable_capacity()
+                        gpu_scheduler.usable_capacity()
                     ),
                 });
             }
@@ -743,7 +858,7 @@ impl ModelCache {
             }
         };
 
-        let loaded = backend.load(&resolved, &self.device_config)?;
+        let loaded = backend.load(&resolved, device_config)?;
 
         // Register model in catalog (idempotent — ignores if already registered).
         // See `Self::complete_generic_registration`'s own doc for the full
@@ -800,7 +915,7 @@ impl ModelCache {
 }
 
 impl CacheInner {
-    fn touch_lru(&mut self, id: &ModelId) {
+    fn touch_lru(&mut self, id: &CacheKey) {
         if let Some(pos) = self.lru_order.iter().position(|x| x == id) {
             self.lru_order.remove(pos);
         }
@@ -852,7 +967,8 @@ impl CacheInner {
                      the GpuScheduler reservation"
                 );
                 tracing::info!(
-                    model_id = %id.0,
+                    model_id = %id.model_id.0,
+                    device = id.device,
                     bytes = entry.memory_bytes,
                     "Evicted model from cache"
                 );
@@ -861,6 +977,154 @@ impl CacheInner {
         } else {
             false
         }
+    }
+}
+
+// ── The cache key: two devices are two resident copies, not one ────────────
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+
+    /// Two devices hold TWO entries for one model id — in both maps.
+    ///
+    /// Hermetic mechanism: two CPU "devices" are indistinguishable at
+    /// execution, so the oracle drives the `device` COMPONENT of the key
+    /// with two distinct values, which is exactly the quantity a two-card
+    /// deployment varies. Keyed by the id alone, the second insert would
+    /// overwrite the first and both maps would hold one entry — a rank
+    /// served a copy resident on another rank's card.
+    ///
+    /// The two maps are two determinants and are asserted separately: an
+    /// `in_flight` keyed more coarsely than `entries` would make one loader
+    /// stand in for a load of a different thing, which is a distinct defect
+    /// from a colliding entry.
+    #[test]
+    fn two_devices_hold_two_entries_and_two_single_flight_slots_for_one_model_id() {
+        let first = CacheKey::for_test("tiny-bert", 0);
+        let second = CacheKey::for_test("tiny-bert", 1);
+        assert_eq!(
+            first.model_id, second.model_id,
+            "the control: it is ONE model id, so an id-keyed map would hold one entry"
+        );
+        assert_ne!(first, second);
+
+        // The PRODUCTION maps, not mirrors of them: `CacheInner` is what
+        // `get_or_load` reads and writes.
+        let mut inner = CacheInner {
+            entries: HashMap::new(),
+            lru_order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        };
+
+        // Determinant 1 — the single-flight map. A load in flight for device
+        // 0 is not a load in flight for device 1: keyed by the id alone, the
+        // second caller would wait on the first's load and then be handed a
+        // copy resident on the wrong card.
+        inner
+            .in_flight
+            .insert(first.clone(), Arc::new(tokio::sync::Notify::new()));
+        inner
+            .in_flight
+            .insert(second.clone(), Arc::new(tokio::sync::Notify::new()));
+        assert_eq!(
+            inner.in_flight.len(),
+            2,
+            "the single-flight map holds one slot per device, not one per model id"
+        );
+        assert!(inner.in_flight.contains_key(&first));
+        assert!(inner.in_flight.contains_key(&second));
+
+        // Determinant 2 — the entries map and its LRU order. A `CacheEntry`
+        // needs a really-loaded model, which this hermetic oracle does not
+        // build; what it pins here is that BOTH are keyed by the same
+        // [`CacheKey`] (these calls do not type-check against an
+        // id-keyed map) and that the two devices occupy two distinct slots
+        // of the LRU rather than one.
+        assert!(!inner.entries.contains_key(&first));
+        inner.lru_order.push_back(first.clone());
+        inner.lru_order.push_back(second.clone());
+        inner.touch_lru(&first);
+        assert_eq!(
+            inner.lru_order.len(),
+            2,
+            "two devices are two resident copies of one model id, and the LRU tracks both"
+        );
+        assert_eq!(
+            inner.lru_order.back(),
+            Some(&first),
+            "touching device 0's copy must not move device 1's"
+        );
+
+        let mut entries: HashMap<CacheKey, &str> = HashMap::new();
+        entries.insert(first.clone(), "device 0's copy");
+        entries.insert(second.clone(), "device 1's copy");
+        assert_eq!(
+            entries.len(),
+            2,
+            "two devices are two resident copies of one model id"
+        );
+        assert_eq!(entries.get(&first), Some(&"device 0's copy"));
+        assert_eq!(entries.get(&second), Some(&"device 1's copy"));
+    }
+
+    /// `None` is a distinct key VALUE, never a wildcard: a load that named
+    /// no task or backend hint neither matches nor is matched by one that
+    /// did. Each of the two optional components is mutated on its own, so
+    /// one of them silently collapsing to a wildcard cannot hide behind the
+    /// other.
+    #[test]
+    fn an_unnamed_task_or_backend_is_its_own_key_never_a_wildcard() {
+        let unnamed = CacheKey::for_test("tiny-bert", 0);
+
+        let with_task = CacheKey {
+            task: Some(ModelTask::TextEmbedding),
+            ..unnamed.clone()
+        };
+        let with_backend = CacheKey {
+            backend: Some(BackendType::Candle),
+            ..unnamed.clone()
+        };
+        let other_task = CacheKey {
+            task: Some(ModelTask::Classification),
+            ..unnamed.clone()
+        };
+
+        let mut map: HashMap<CacheKey, &str> = HashMap::new();
+        for (key, label) in [
+            (unnamed.clone(), "named neither"),
+            (with_task.clone(), "named a task"),
+            (with_backend.clone(), "named a backend"),
+            (other_task.clone(), "named another task"),
+        ] {
+            map.insert(key, label);
+        }
+        assert_eq!(map.len(), 4, "four distinct keys, four entries");
+        assert_eq!(map.get(&unnamed), Some(&"named neither"));
+        assert_eq!(map.get(&with_task), Some(&"named a task"));
+        assert_eq!(map.get(&with_backend), Some(&"named a backend"));
+        assert_eq!(map.get(&other_task), Some(&"named another task"));
+    }
+
+    /// A device the deployment never declared has no budget and no cache
+    /// slot: naming it is a typed refusal, not a load onto the primary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_this_deployment_never_declared_is_refused() {
+        let config = DeviceConfig {
+            gpu_device: -1,
+            devices: vec![-1],
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        assert!(config.for_device(-1).is_ok());
+        let error = config
+            .for_device(3)
+            .expect_err("device 3 was never declared by this deployment");
+        assert!(
+            error.to_string().contains("not one of the configured"),
+            "unexpected message: {error}"
+        );
     }
 }
 
@@ -882,6 +1146,7 @@ mod f3_prime_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -1027,7 +1292,11 @@ mod f3_prime_tests {
         // B is genuinely resident and the sole occupant of the 1-model
         // budget — no room left.
         assert_eq!(
-            cache.gpu_scheduler.available(),
+            cache
+                .schedulers()
+                .get(cache.device_config.gpu_device)
+                .expect("the primary device has a budget")
+                .available(),
             0,
             "B occupies the entire 1-model budget after evicting idle A"
         );
@@ -1122,12 +1391,12 @@ mod f3_prime_tests {
         // progress.
         let permit_x = Arc::new(scheduler.try_acquire(1).unwrap());
         let outstanding_clone = Arc::clone(&permit_x);
-        let id_x = ModelId("model_x".into());
+        let id_x = CacheKey::for_test("model_x", -1);
 
         // Entry Y: genuinely idle — `ref_count == 0` AND its permit's only
         // clone is this entry's own.
         let permit_y = Arc::new(scheduler.try_acquire(1).unwrap());
-        let id_y = ModelId("model_y".into());
+        let id_y = CacheKey::for_test("model_y", -1);
 
         let mut inner = CacheInner {
             entries: HashMap::new(),
@@ -1247,6 +1516,7 @@ mod single_flight_advisory_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -1315,7 +1585,12 @@ mod single_flight_advisory_tests {
         let cache = Arc::new(ModelCache::new(resolver, device_config(), scheduler));
 
         let source = tiny_bert_source(tmp.path(), "single_flight_model");
-        let id = ModelId::from(&source);
+        let id = CacheKey {
+            model_id: ModelId::from(&source),
+            device: cache.device_config.gpu_device,
+            task: Some(ModelTask::TextEmbedding),
+            backend: None,
+        };
 
         // Simulate "another task is already loading this id" directly,
         // bypassing `do_load` entirely — the ONLY state `get_or_load`'s
@@ -1383,6 +1658,7 @@ mod r5_f1_tokenizer_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -1658,6 +1934,7 @@ mod admission_wake_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -1843,7 +2120,11 @@ mod admission_wake_tests {
         // was actually evicted (real progress), not merely "unblocked" by
         // some accounting fluke.
         assert_eq!(
-            cache.gpu_scheduler.available(),
+            cache
+                .schedulers()
+                .get(cache.device_config.gpu_device)
+                .expect("the primary device has a budget")
+                .available(),
             0,
             "B occupies the entire 1-model budget after evicting the now-idle M1"
         );
@@ -1868,6 +2149,7 @@ mod esc_089_bookkeeping_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,

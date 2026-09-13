@@ -4794,6 +4794,7 @@ mod digest_fingerprint_audit62_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -5922,6 +5923,7 @@ mod r5_f2_classification_pooling_tests {
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
+            devices: vec![-1],
             memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,

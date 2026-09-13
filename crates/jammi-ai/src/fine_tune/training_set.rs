@@ -160,28 +160,41 @@ async fn materialize_and_read(
     Ok((table, batches))
 }
 
-/// A [`MemTable`] registered on a session for the length of one
-/// materialization, deregistered on drop.
+/// The per-job-unique relation a graph fine-tune's sampled pairs are bound to
+/// for the length of one materialization: the spec identity (source + sample
+/// config) plus the claiming job's id.
 ///
-/// The sampled pairs are already resident as `Vec<SampledPair>`; the MemTable is
-/// a second resident copy of the same rows, and it exists only so the producer
-/// — whose input is a SQL relation — can plan over them. Holding it past the
-/// write would leave one such copy per distinct graph spec resident for the
-/// life of the session, so the registration is scoped to the call that needs it.
-///
-/// There is no "displaced occupant" to restore on drop: DataFusion 54.1's
-/// [`MemorySchemaProvider::register_table`](https://docs.rs/datafusion-catalog/54.1.0/datafusion_catalog/memory/struct.MemorySchemaProvider.html#method.register_table)
-/// checks `table_exist` and refuses (`Err`) rather than displacing whenever the
-/// name is already bound, so `register_table` never returns `Ok(Some(_))` for
-/// an occupied relation — see [`register_pairs_relation`], which turns that
-/// refusal into a typed error before this guard is ever constructed. This
-/// guard only ever removes the ONE binding it created.
-struct RegisteredPairs {
+/// Per-job — never spec-only — because a real session's
+/// [`ResultTableSchemaProvider`](jammi_db::store::ResultTableSchemaProvider)'s
+/// `register_table` inserts UNCONDITIONALLY and hands back whatever it displaced; it never
+/// refuses an occupied name the way DataFusion's in-memory
+/// `MemorySchemaProvider::register_table` (the provider behind
+/// `SessionContext::new()`, confirmed by reading
+/// `datafusion-catalog-54.1.0/src/memory/schema.rs:63-72`) does. Two
+/// concurrent materializations of the SAME graph spec — two jobs sharing one
+/// definition — therefore cannot be kept from contending by any occupancy
+/// check on a real session: the second call's registration would silently
+/// take over the first's relation, and whichever call finishes (and
+/// deregisters) first would tear the name out from under the other. Naming
+/// each job's relation uniquely removes the contention instead of trying to
+/// detect it after the fact.
+fn pairs_relation_name(spec_identity: &str, job_id: &str) -> String {
+    format!("jammi_sampled_pairs:{spec_identity}:{job_id}")
+}
+
+/// A relation registered on a session for the length of one materialization,
+/// deregistered by [`Drop`] on every exit — success, an error propagated
+/// through `?`, or the owning task being cancelled while parked mid-`.await`
+/// (Rust drops a future's live locals on cancellation exactly as it does on a
+/// normal return). This guard owns nothing but the ONE name it registered;
+/// with relations named per-job ([`pairs_relation_name`]) there is no
+/// "occupied name" case left to refuse, so cleanup is its only job.
+struct DeregisterOnDrop {
     ctx: SessionContext,
     relation: String,
 }
 
-impl Drop for RegisteredPairs {
+impl Drop for DeregisterOnDrop {
     fn drop(&mut self) {
         match self.ctx.deregister_table(self.relation.as_str()) {
             Ok(Some(_)) => {}
@@ -206,32 +219,100 @@ impl Drop for RegisteredPairs {
     }
 }
 
-/// Register `provider` under `relation` on `ctx`, guarded so the binding is
-/// released when the returned [`RegisteredPairs`] drops.
-///
-/// A relation name is the spec's identity (source + sample config), so two
-/// concurrent materializations of the identical graph spec on the SAME session
-/// contend for the SAME name. DataFusion's schema provider refuses the second
-/// registration outright (see [`RegisteredPairs`]'s doc) rather than displacing
-/// the first — this call turns that refusal into a typed [`JammiError::FineTune`]
-/// naming the relation, raised here before any row is written, rather than
-/// treating the overlap as a race to survive.
-fn register_pairs_relation(
-    ctx: &SessionContext,
-    relation: String,
-    provider: Arc<dyn datafusion::datasource::TableProvider>,
-) -> Result<RegisteredPairs> {
-    ctx.register_table(relation.as_str(), provider)
-        .map_err(|e| {
-            JammiError::FineTune(format!(
-                "a graph training set is already materializing sampled pairs under \
-                 relation {relation} on this session: {e}"
-            ))
-        })?;
-    Ok(RegisteredPairs {
-        ctx: ctx.clone(),
-        relation,
-    })
+/// Test-only pause inside [`materialize_sampled_pairs`], between registering
+/// the sampled-pair relation and running the materialization plan over it —
+/// exactly the window a same-named registration from a concurrent call could
+/// once step on, before per-job naming made that structurally impossible. No
+/// production path observes anything here beyond the `maybe_park` call, which
+/// returns at once when nothing is armed for the relation. One-shot per
+/// relation, mirroring `fine_tune::worker::loop_test_hooks`'s park/release
+/// shape.
+#[cfg(feature = "test-hooks")]
+pub mod graph_materialize_test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tokio::sync::Notify;
+
+    struct Armed {
+        relation: String,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn armed() -> &'static Mutex<Vec<Armed>> {
+        static ARMED: OnceLock<Mutex<Vec<Armed>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of one armed park: wait for the call to arrive, then
+    /// let it continue. Dropping the handle without releasing leaves the call
+    /// parked forever — release it explicitly.
+    pub struct ParkHandle {
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    impl ParkHandle {
+        /// Resolve once the call has reached the park point.
+        pub async fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                self.parked_notify.notified().await;
+            }
+        }
+
+        /// Let the parked call continue.
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_one();
+        }
+    }
+
+    /// Arm one park for the next materialization that registers `relation`.
+    /// One-shot: the park disarms as soon as it is taken.
+    pub fn arm(relation: &str) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Armed {
+                relation: relation.to_string(),
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park(relation: &str) {
+        let taken = {
+            let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.relation == relation)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
+    }
 }
 
 /// Materialise a graph fine-tune's seeded sampled pairs as a training set,
@@ -241,10 +322,18 @@ fn register_pairs_relation(
 /// The pairs are the output of a deterministic biased walk, not of a query, so
 /// they are bound to the session as an in-memory relation for the length of the
 /// materialization and the producer plans over that. The relation's NAME is the
-/// canonical JSON of the graph sources and the sample config — not a per-run
-/// id — because the relation name is the `source` the definition hash folds: a
-/// per-run id would make two identical graph fine-tunes two different tables
-/// while a config the name omitted would make two different ones collide.
+/// canonical JSON of the graph sources and the sample config PLUS `job_id`
+/// ([`pairs_relation_name`]) — never spec-only, so two jobs racing the
+/// identical graph spec cannot contend for one name (see that function's
+/// doc). That name is embedded in the recorded `source` SQL this call passes
+/// to the producer, and `source` is what the definition hash folds — so,
+/// honestly, two otherwise-identical graph fine-tunes now record two
+/// different definition hashes. This is not a regression to paper over: a
+/// graph training set was already per-job in every way that matters (its
+/// anchors are [`AnchorKind::UnpinnedAtInstant`], never reused, never served
+/// to a later run), and the executed SQL must equal the recorded SQL — a
+/// canonical name substituted into the recording but not into execution (or
+/// vice versa) would make the manifest a lie about what actually ran.
 ///
 /// **This table is not replayable in a later session.** Its recorded source
 /// names a relation that lives only while the materialization runs, so a
@@ -267,6 +356,7 @@ pub(crate) async fn materialize_sampled_pairs(
     node_source: &str,
     edge_source: &str,
     spec_identity: &str,
+    job_id: &str,
     pairs: &[SampledPair],
     has_negatives: bool,
 ) -> Result<(TrainingSetTable, Vec<RecordBatch>)> {
@@ -313,9 +403,16 @@ pub(crate) async fn materialize_sampled_pairs(
     let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(arrow_err)?;
     let provider = MemTable::try_new(schema, vec![vec![batch]]).map_err(JammiError::from)?;
 
-    let relation = format!("jammi_sampled_pairs:{spec_identity}");
+    let relation = pairs_relation_name(spec_identity, job_id);
     let ctx = session.context();
-    let _registered = register_pairs_relation(ctx, relation.clone(), Arc::new(provider))?;
+    ctx.register_table(relation.as_str(), Arc::new(provider))
+        .map_err(JammiError::from)?;
+    let _guard = DeregisterOnDrop {
+        ctx: ctx.clone(),
+        relation: relation.clone(),
+    };
+    #[cfg(feature = "test-hooks")]
+    graph_materialize_test_hooks::maybe_park(&relation).await;
 
     let projection = columns
         .iter()
@@ -357,78 +454,217 @@ pub(crate) async fn materialize_sampled_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
 
-    fn tiny_table(value: &str) -> Arc<dyn datafusion::datasource::TableProvider> {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec![value.to_string()])) as arrow::array::ArrayRef],
+    /// A real [`InferenceSession`] — the fixture a production job actually
+    /// runs on, whose default schema is [`jammi_db::store::ResultTableSchemaProvider`]
+    /// (`session.rs`'s `wrap_with` installs it before any table is loaded),
+    /// never DataFusion's `MemorySchemaProvider` behind a bare
+    /// `SessionContext::new()`. The two providers disagree on exactly the
+    /// property this module's naming scheme depends on (see
+    /// [`pairs_relation_name`]'s doc), so a test standing in for production
+    /// behaviour has to be built on this one.
+    async fn real_session(dir: &tempfile::TempDir) -> Arc<InferenceSession> {
+        Arc::new(
+            InferenceSession::new(jammi_test_utils::test_config(dir.path()))
+                .await
+                .unwrap(),
         )
-        .unwrap();
-        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
     }
 
-    /// Two overlapping registrations of one spec identity in one session: the
-    /// second is a typed refusal naming the relation, raised by
-    /// [`register_pairs_relation`] before any row is written — never a silent
-    /// displace-and-restore. DataFusion's `MemorySchemaProvider::register_table`
-    /// (54.1.0, confirmed by reading
-    /// `datafusion-catalog-54.1.0/src/memory/schema.rs:63-72`) checks
-    /// `table_exist` and returns `exec_err!` for an occupied name rather than
-    /// ever returning `Ok(Some(previous))`, so there is no "displaced occupant"
-    /// state to construct or restore; the first guard's own registration is the
-    /// only thing standing in the second call's way.
-    #[tokio::test]
-    async fn registering_sampled_pairs_over_an_occupied_relation_is_a_typed_refusal() {
-        let ctx = SessionContext::new();
-        let relation = "jammi_sampled_pairs:overlap-probe".to_string();
-
-        let _first = register_pairs_relation(&ctx, relation.clone(), tiny_table("first"))
-            .expect("the first registration over an unoccupied name succeeds");
-
-        let second = register_pairs_relation(&ctx, relation.clone(), tiny_table("second"));
-        match second {
-            Err(JammiError::FineTune(message)) => {
-                assert!(
-                    message.contains(&relation),
-                    "the refusal must name the occupied relation: {message}"
-                );
-            }
-            Err(other) => panic!(
-                "expected a typed FineTune refusal naming {relation}, got a different error variant: {other:?}"
-            ),
-            Ok(_) => panic!(
-                "expected the second registration over {relation} to be refused, but it succeeded"
-            ),
+    fn pair(anchor: &str, positive: &str) -> SampledPair {
+        SampledPair {
+            anchor: anchor.to_string(),
+            positive: positive.to_string(),
+            hard_negatives: Vec::new(),
         }
     }
 
-    /// A single guard's drop removes exactly the ONE binding it created — the
-    /// binding bound under `ctx` before the drop is this guard's own provider
-    /// (`Arc::ptr_eq`, not just "something is bound"), and the relation is gone
-    /// after.
-    #[tokio::test]
-    async fn registered_pairs_drop_removes_exactly_its_own_binding() {
-        let ctx = SessionContext::new();
-        let relation = "jammi_sampled_pairs:drop-probe".to_string();
-        let provider = tiny_table("only");
+    /// The distinct text values a batch set's `column` column carries, in
+    /// batch/row order — used to tell "these are call A's rows" from "these
+    /// are call B's rows" without trusting row count alone.
+    fn column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
+        use arrow::array::{LargeStringArray, StringViewArray};
 
-        let guard = register_pairs_relation(&ctx, relation.clone(), Arc::clone(&provider))
-            .expect("registering over an unoccupied name succeeds");
+        let mut values = Vec::new();
+        for batch in batches {
+            let array = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("column {column} is present"));
+            if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                values.extend((0..a.len()).map(|i| a.value(i).to_string()));
+            } else if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+                values.extend((0..a.len()).map(|i| a.value(i).to_string()));
+            } else if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+                values.extend((0..a.len()).map(|i| a.value(i).to_string()));
+            } else {
+                panic!(
+                    "column {column} is none of Utf8/Utf8View/LargeUtf8, got {:?}",
+                    array.data_type()
+                );
+            }
+        }
+        values
+    }
 
-        let bound_before = ctx
-            .table_provider(relation.as_str())
+    /// Oracle (1): two overlapping graph materializations of ONE spec
+    /// identity (two jobs racing the identical graph fine-tune), sequenced by
+    /// the test-hooks park so call A is parked between registering its
+    /// relation and running its materialization plan while call B runs to
+    /// completion. Each call must read back only its OWN rows, and neither
+    /// call's relation must exist once both have returned.
+    ///
+    /// Before per-job naming (this module's predecessor, `RegisteredPairs` /
+    /// `register_pairs_relation`), both calls shared ONE relation name (spec
+    /// identity only) and a real session's `ResultTableSchemaProvider`
+    /// (unlike the `MemorySchemaProvider` the deleted type's own tests used)
+    /// never refuses the second registration — it silently displaces the
+    /// first, so B's completion (which deregisters "the" relation) tears the
+    /// name out from under A while A is still parked on it. Reproduced as a
+    /// one-line revert of [`pairs_relation_name`] to `spec_identity` alone;
+    /// see the fix round 3 report for the transcript.
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overlapping_graph_materializations_of_one_spec_read_back_their_own_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = real_session(&dir).await;
+
+        let spec_identity = "shared-graph-spec";
+        let relation_a = pairs_relation_name(spec_identity, "job-a");
+        let relation_b = pairs_relation_name(spec_identity, "job-b");
+
+        let pairs_a = vec![pair("a-anchor", "a-positive")];
+        let pairs_b = vec![pair("b-anchor", "b-positive")];
+
+        let park = graph_materialize_test_hooks::arm(&relation_a);
+
+        let session_a = Arc::clone(&session);
+        let handle_a = tokio::spawn(async move {
+            materialize_sampled_pairs(
+                &session_a,
+                "nodes",
+                "edges",
+                spec_identity,
+                "job-a",
+                &pairs_a,
+                false,
+            )
             .await
-            .expect("the relation is bound before the drop");
-        assert!(
-            Arc::ptr_eq(&bound_before, &provider),
-            "the bound provider must be this guard's own, by identity"
+        });
+
+        park.wait_parked().await;
+
+        let result_b = materialize_sampled_pairs(
+            &session,
+            "nodes",
+            "edges",
+            spec_identity,
+            "job-b",
+            &pairs_b,
+            false,
+        )
+        .await;
+        let (_table_b, batches_b) =
+            result_b.expect("B's own materialization must succeed while A is parked");
+
+        park.release();
+        let (_table_a, batches_a) = handle_a.await.expect("A's task must not panic").expect(
+            "A's own materialization must succeed once resumed, even though B raced it \
+                 under the SAME spec identity",
         );
 
-        drop(guard);
+        assert_eq!(
+            column_values(&batches_a, "anchor"),
+            vec!["a-anchor".to_string()],
+            "A must read back only its OWN rows, not B's"
+        );
+        assert_eq!(
+            column_values(&batches_b, "anchor"),
+            vec!["b-anchor".to_string()],
+            "B must read back only its OWN rows, not A's"
+        );
+
         assert!(
-            !ctx.table_exist(&relation).unwrap(),
-            "the guard's drop must remove the relation it registered"
+            !session.context().table_exist(&relation_a).unwrap(),
+            "A's relation must not survive its own materialization"
+        );
+        assert!(
+            !session.context().table_exist(&relation_b).unwrap(),
+            "B's relation must not survive its own materialization"
+        );
+    }
+
+    /// Oracle (2a): a materialization that registers its relation and then
+    /// fails (K2's empty-training-set refusal, reached only after the
+    /// relation is registered — `pairs` is empty, so the write side sees zero
+    /// rows) still deregisters on the way out, via [`DeregisterOnDrop`]'s
+    /// normal `?`-propagated drop. Already true of the deleted
+    /// `RegisteredPairs` guard too (its `Drop` ran on any unwind); this
+    /// re-pins the same property on the excised mechanism, on a real session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relation_is_gone_after_an_empty_training_set_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = real_session(&dir).await;
+
+        let relation = pairs_relation_name("empty-spec", "job-empty");
+        let err = materialize_sampled_pairs(
+            &session,
+            "nodes",
+            "edges",
+            "empty-spec",
+            "job-empty",
+            &[],
+            false,
+        )
+        .await
+        .expect_err("zero sampled pairs must refuse as an empty training set, never a 0-row table");
+        assert!(
+            matches!(err, JammiError::EmptyTrainingSet { .. }),
+            "expected the typed K2 refusal, got {err:?}"
+        );
+        assert!(
+            !session.context().table_exist(&relation).unwrap(),
+            "the relation registered before the refusal must not survive it"
+        );
+    }
+
+    /// Oracle (2b): a materialization whose owning task is cancelled while
+    /// parked mid-`.await` (a `run_claimed_job` future dropped, or its task
+    /// aborted, the same action a job cancellation or a worker shutdown
+    /// takes) still deregisters its relation — [`DeregisterOnDrop`]'s `Drop`
+    /// runs on a future's live locals exactly as it does on a normal return.
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relation_is_gone_after_the_materialization_task_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = real_session(&dir).await;
+
+        let spec_identity = "cancel-spec";
+        let relation = pairs_relation_name(spec_identity, "job-cancel");
+        let pairs = vec![pair("anchor", "positive")];
+
+        let park = graph_materialize_test_hooks::arm(&relation);
+        let session_c = Arc::clone(&session);
+        let handle = tokio::spawn(async move {
+            materialize_sampled_pairs(
+                &session_c,
+                "nodes",
+                "edges",
+                spec_identity,
+                "job-cancel",
+                &pairs,
+                false,
+            )
+            .await
+        });
+
+        park.wait_parked().await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !session.context().table_exist(&relation).unwrap(),
+            "the relation must not survive its owning task being cancelled while it was live"
         );
     }
 }

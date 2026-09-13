@@ -1812,7 +1812,7 @@ impl JobWorker {
                 // producer the tabular path uses, and train on the rows that
                 // table holds.
                 let loader = self
-                    .reconstruct_graph_loader(session, &sources, sample_config)
+                    .reconstruct_graph_loader(session, job_id, &sources, sample_config)
                     .await
                     .map_err(WorkerJobError::from)?;
                 let run = FineTuneRun {
@@ -1864,6 +1864,7 @@ impl JobWorker {
     async fn reconstruct_graph_loader(
         &self,
         session: &Arc<InferenceSession>,
+        job_id: &str,
         sources: &GraphFineTuneSources,
         sample_config: GraphSampleConfig,
     ) -> Result<TrainingDataLoader> {
@@ -1950,6 +1951,7 @@ impl JobWorker {
             &sources.node_source,
             &sources.edge_source,
             &Self::graph_spec_identity(sources, &sample_config)?,
+            job_id,
             &pairs,
             has_negatives,
         )
@@ -1995,15 +1997,21 @@ impl JobWorker {
         TrainingDataLoader::from_graph_rows(rows, has_negatives)
     }
 
-    /// The canonical identity of a graph fine-tune's sampled-pair relation: the
+    /// The canonical identity of a graph fine-tune SPEC (never a run): the
     /// JSON of the node/edge sources and the sample config, in field order.
     ///
-    /// This string is the `source` the training set's definition hash folds, so
-    /// it must name everything the sampled rows depend on and nothing else. A
-    /// per-run id would make two identical graph fine-tunes two different
-    /// tables; omitting a config field would make two different samplings
-    /// collide on one hash. Serialising the two spec structs whole is what keeps
-    /// a field added to either from silently escaping the identity.
+    /// [`training_set::materialize_sampled_pairs`] combines this with the
+    /// claiming job's id to name the session-scoped relation the sampled rows
+    /// are actually bound under (`training_set::pairs_relation_name`'s doc
+    /// says why the job id has to be there); that combined name is embedded
+    /// in the `source` SQL the training set's definition hash folds, so two
+    /// otherwise-identical graph fine-tunes now record two different
+    /// definition hashes — the honest consequence of two jobs never sharing
+    /// one relation. This function itself stays spec-only: omitting a config
+    /// field here would make two different samplings collide on one spec
+    /// identity, which is a distinct failure from the per-job uniqueness the
+    /// caller adds on top. Serialising the two spec structs whole is what
+    /// keeps a field added to either from silently escaping the identity.
     fn graph_spec_identity(
         sources: &GraphFineTuneSources,
         sample_config: &GraphSampleConfig,

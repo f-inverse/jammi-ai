@@ -2895,6 +2895,76 @@ pub mod loop_test_hooks {
             armed.notify.notify_one();
         }
     }
+
+    /// One-shot fire, keyed by `job_id`: [`spawn_cancel_request_watcher`]
+    /// calls this the instant it OBSERVES `cancel_requested` on a poll tick
+    /// and flips `cancel_requested_seen` — never merely "a poll tick
+    /// happened" (a tick that reads `cancel_requested == false` does not
+    /// fire this). A test that must know the watcher has actually seen a
+    /// request awaits [`CancelObserved::wait_fired`] instead of bounding a
+    /// fixed wall-clock guess at `poll_interval` — the SAME cadence the
+    /// lease keeper renews at, so a busy test binary's scheduler delay can
+    /// push an observation past any fixed bound a parallel run happens to
+    /// pick, exactly the flake class a rendezvous on the real event closes.
+    struct ArmedCancelObserved {
+        job_id: String,
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    fn cancel_observed_arms() -> &'static Mutex<Vec<ArmedCancelObserved>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedCancelObserved>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of an armed cancel-observed rendezvous.
+    pub struct CancelObserved {
+        fired: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    }
+
+    impl CancelObserved {
+        /// Resolve once the watcher for this `job_id` has observed the
+        /// cancel request (never on a wall-clock guess at its poll cadence).
+        pub async fn wait_fired(&self) {
+            while !self.fired.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    /// Arm the cancel-observed rendezvous for the next watcher spawned (or
+    /// already spawned) for `job_id`. One-shot; keyed so sibling tests in
+    /// one binary never fire each other's.
+    pub fn arm_cancel_observed(job_id: &str) -> CancelObserved {
+        let fired = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        cancel_observed_arms()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedCancelObserved {
+                job_id: job_id.to_string(),
+                fired: Arc::clone(&fired),
+                notify: Arc::clone(&notify),
+            });
+        CancelObserved { fired, notify }
+    }
+
+    /// Fire every handle armed for `job_id`. Never parks.
+    pub(super) fn fire_cancel_observed(job_id: &str) {
+        let taken: Vec<ArmedCancelObserved> = {
+            let mut list = cancel_observed_arms()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let (hit, rest): (Vec<_>, Vec<_>) = list.drain(..).partition(|a| a.job_id == job_id);
+            *list = rest;
+            hit
+        };
+        for armed in taken {
+            armed.fired.store(true, Ordering::SeqCst);
+            armed.notify.notify_one();
+        }
+    }
 }
 
 /// The reconstructed inputs for a LoRA fine-tune run — the per-kind data
@@ -3748,6 +3818,8 @@ fn spawn_cancel_request_watcher(
                 Ok(record) if record.cancel_requested => {
                     cancel_requested_seen.store(true, Ordering::SeqCst);
                     cancel.store(true, Ordering::SeqCst);
+                    #[cfg(feature = "test-hooks")]
+                    loop_test_hooks::fire_cancel_observed(&job_id);
                     return;
                 }
                 Ok(_) => {}

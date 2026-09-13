@@ -35,11 +35,35 @@
 //!   takes the counts every rank derives locally from the partition rule; no
 //!   implementation performs a counts exchange, so no implementation can
 //!   deadlock on one.
-//! - **Domain checks at the edge.** A count vector that is not
-//!   `world`-long, a local tensor whose row count contradicts its own entry,
-//!   a root outside the gang, a tensor list of a different length on a peer:
-//!   each is a typed [`JammiError::FineTune`] at the seam, never a panic and
-//!   never a silently wrong reduction.
+//! - **Every implementation checks its own caller's arguments.** A count
+//!   vector that is not `world`-long, a local tensor whose row count
+//!   contradicts its own entry, a root outside the gang: each is a typed
+//!   error at the seam, never a panic and never a silently wrong reduction.
+//!   These are decided from what THIS rank passed, so every arm decides them
+//!   the same way, through the same two helpers.
+//!
+//! # What only the host arms guarantee
+//!
+//! A check on what a PEER passed needs the peer's arguments. The host arms
+//! ([`Noop`], [`Local`]) have them — the rendezvous carries each rank's whole
+//! contribution — so they refuse a peer whose row count contradicts the
+//! partition rule, whose tensor list is a different length, or who entered
+//! the round at a different collective or with a different root, and they
+//! record such a disagreement as the gang's permanent fault.
+//!
+//! The `Nccl` arm has none of that. NCCL exchanges the buffers a collective
+//! names and nothing else: there is no counts exchange (by design — see
+//! above), so a peer's counts, its tensor-list length and its idea of the
+//! root are not observable to this rank, and a gang whose ranks disagree
+//! about any of them produces a wrong result or a hang rather than a typed
+//! error. The failure signal for that arm is the watchdog abort — a peer
+//! that never answers leaves this rank in `synchronize`, another thread
+//! calls `nccl::Nccl::abort`, and the abort FLAG (never the collective's
+//! return value, which is `Ok` over a garbage buffer) is what says the
+//! attempt failed. A gang is kept in agreement upstream of the collective,
+//! by every rank deriving its counts from the same partition rule and
+//! walking the same canonical trainable-variable order, and not by this
+//! seam.
 
 use jammi_db::error::{JammiError, Result};
 

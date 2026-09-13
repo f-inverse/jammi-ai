@@ -414,10 +414,7 @@ fn every_admission_refusal_reads_as_one_sentence() {
     ];
 
     for (condition, admission, spec) in cases {
-        let message = admission
-            .admit(&spec)
-            .expect_err(condition)
-            .to_string();
+        let message = admission.admit(&spec).expect_err(condition).to_string();
         assert!(
             !message.contains("  "),
             "{condition}: the refusal arrives with its source indentation in it: {message:?}"

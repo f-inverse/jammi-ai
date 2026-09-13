@@ -704,6 +704,11 @@ mod world_size_tests {
                 ("config".to_string(), 5),
                 ("idempotency_key".to_string(), 6),
                 ("world_size".to_string(), 9),
+                // `cache` (below, [`cache_tests`]) took the next free tag
+                // after this test was written; listed here too so this
+                // exhaustive tag inventory stays the single source of truth
+                // for the message's WHOLE field set, not merely the count.
+                ("cache".to_string(), 10),
             ],
         );
     }
@@ -767,6 +772,7 @@ mod world_size_tests {
             config: None,
             idempotency_key: "dedupe-1".to_string(),
             world_size: 0,
+            cache: 0,
         };
 
         assert_eq!(current.encode_to_vec(), legacy.encode_to_vec());
@@ -801,6 +807,7 @@ mod world_size_tests {
             config: None,
             idempotency_key: "dedupe-1".to_string(),
             world_size: 4,
+            cache: 0,
         };
 
         let decoded = LegacySubmitJobRequest::decode(current.encode_to_vec().as_slice())
@@ -830,6 +837,7 @@ mod world_size_tests {
             }),
             idempotency_key: "dedupe-1".to_string(),
             world_size: 4,
+            cache: 0,
         };
 
         let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
@@ -855,12 +863,215 @@ mod world_size_tests {
             config: None,
             idempotency_key: String::new(),
             world_size: 2,
+            cache: 0,
         };
 
         let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
             .expect("a graph fine-tune carrying the count round-trips");
 
         assert_eq!(decoded.world_size, 2);
+        assert_eq!(decoded, original);
+    }
+}
+
+/// The per-job `cache` on `jammi.v1.job.SubmitJobRequest`.
+///
+/// Opt-in model-level cache reuse for the two LoRA fine-tune kinds, appended
+/// the same way [`world_size_tests`] appended the rank count: the next free
+/// tag, an implicit-presence field whose zero value IS the unset/default
+/// state, and the SAME `jammi.v1.inference.CachePolicy` enum every other
+/// result-table producer verb carries — imported rather than redeclared, so
+/// this field can never drift onto a second, differently-numbered cache
+/// vocabulary.
+#[cfg(test)]
+mod cache_tests {
+    use prost::Message;
+    use prost_types::{field_descriptor_proto::Type, FileDescriptorSet};
+
+    use crate::proto::{job as job_pb, training as pb};
+    use crate::FILE_DESCRIPTOR_SET;
+
+    /// `SubmitJobRequest` before `cache` was appended, carrying every scalar a
+    /// submit sends unconditionally (`base_model`, `idempotency_key`,
+    /// `world_size`) so encoding through this gives genuine pre-field bytes
+    /// rather than re-encoding the current type and comparing it with itself.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct PreCacheSubmitJobRequest {
+        #[prost(string, tag = "4")]
+        base_model: String,
+        #[prost(string, tag = "6")]
+        idempotency_key: String,
+        #[prost(uint32, tag = "9")]
+        world_size: u32,
+    }
+
+    fn submit_job_request_field(name: &str) -> prost_types::FieldDescriptorProto {
+        let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+            .expect("the compiled jammi.v1 descriptor must decode");
+        set.file
+            .iter()
+            .filter(|f| f.package() == "jammi.v1.job")
+            .flat_map(|f| f.message_type.iter())
+            .find(|m| m.name() == "SubmitJobRequest")
+            .expect("jammi.v1.job.SubmitJobRequest is in the descriptor")
+            .field
+            .iter()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("SubmitJobRequest carries a `{name}` field"))
+            .clone()
+    }
+
+    /// APPEND-ONLY. `cache` takes the next free tag after `world_size` (9) —
+    /// 10, since 7 and 8 stay reserved for the deferred job-dependency unit
+    /// (#515) — and every pre-existing field keeps its number. A renumbering,
+    /// or taking a held tag, would decode a payload built against either
+    /// contract into the wrong field.
+    #[test]
+    fn cache_takes_the_next_free_tag() {
+        assert_eq!(submit_job_request_field("cache").number(), 10);
+    }
+
+    /// `cache` is a proto3 enum, implicit presence: `0` (`UNSPECIFIED`) is
+    /// what a request that never set the field carries, matching how
+    /// `world_size`'s `0` is its unset value. It resolves to the engine's
+    /// `CachePolicy::Bypass` default at the decode
+    /// (`jammi_ai::wire::cache::cache_policy_from_proto`), never on the wire.
+    #[test]
+    fn cache_is_an_implicit_presence_enum_of_the_shared_cache_policy_type() {
+        let field = submit_job_request_field("cache");
+        assert_eq!(field.r#type(), Type::Enum);
+        assert_eq!(field.type_name(), ".jammi.v1.inference.CachePolicy");
+        assert_ne!(
+            field.proto3_optional,
+            Some(true),
+            "cache must not have explicit presence: UNSPECIFIED (0) IS the unset value"
+        );
+    }
+
+    /// UNSET. A request that leaves `cache` at `UNSPECIFIED` (`0`) encodes to
+    /// exactly the bytes a caller built before the field existed — the
+    /// appended field costs a pre-existing client nothing.
+    #[test]
+    fn unset_cache_encodes_byte_for_byte_as_the_pre_field_request() {
+        let legacy = PreCacheSubmitJobRequest {
+            base_model: "local:tiny-bert".to_string(),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+        };
+        let current = job_pb::SubmitJobRequest {
+            spec: None,
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+            cache: 0,
+        };
+
+        assert_eq!(current.encode_to_vec(), legacy.encode_to_vec());
+    }
+
+    /// BACKWARD. Bytes produced before `cache` existed decode into the current
+    /// type with the policy `UNSPECIFIED` and lose nothing else.
+    #[test]
+    fn pre_field_bytes_decode_with_cache_unspecified() {
+        let legacy = PreCacheSubmitJobRequest {
+            base_model: "local:tiny-bert".to_string(),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(legacy.encode_to_vec().as_slice())
+            .expect("pre-field bytes decode into the current request");
+
+        assert_eq!(decoded.cache, 0);
+        assert_eq!(decoded.base_model, "local:tiny-bert");
+        assert_eq!(decoded.idempotency_key, "dedupe-1");
+        assert_eq!(decoded.world_size, 2);
+    }
+
+    /// FORWARD. A peer that predates `cache` decodes a request carrying it
+    /// without error — the appended tag is unknown to it, skipped, and every
+    /// field it does know survives.
+    #[test]
+    fn a_pre_field_decoder_skips_a_set_cache() {
+        let current = job_pb::SubmitJobRequest {
+            spec: None,
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+            cache: crate::proto::inference::CachePolicy::Use as i32,
+        };
+
+        let decoded = PreCacheSubmitJobRequest::decode(current.encode_to_vec().as_slice())
+            .expect("a pre-field decoder skips the appended tag");
+
+        assert_eq!(decoded.base_model, "local:tiny-bert");
+        assert_eq!(decoded.idempotency_key, "dedupe-1");
+        assert_eq!(decoded.world_size, 2);
+    }
+
+    /// SET. A full fine-tune submit carrying `CACHE_POLICY_USE` round-trips
+    /// unchanged, alongside a non-default `world_size` — the two independent
+    /// scalars do not clobber each other.
+    #[test]
+    fn a_set_cache_round_trips_on_a_full_request() {
+        let original = job_pb::SubmitJobRequest {
+            spec: Some(job_pb::submit_job_request::Spec::FineTune(
+                pb::FineTuneSpec {
+                    source: "training".to_string(),
+                    columns: vec!["text_a".to_string(), "text_b".to_string()],
+                    method: pb::FineTuneMethod::Lora as i32,
+                    task: crate::proto::inference::ModelTask::TextEmbedding as i32,
+                },
+            )),
+            base_model: "local:tiny-bert".to_string(),
+            config: Some(pb::FineTuneConfig {
+                epochs: Some(2),
+                ..Default::default()
+            }),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 4,
+            cache: crate::proto::inference::CachePolicy::Use as i32,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
+            .expect("a request carrying the policy round-trips");
+
+        assert_eq!(
+            decoded.cache,
+            crate::proto::inference::CachePolicy::Use as i32
+        );
+        assert_eq!(decoded.world_size, 4);
+        assert_eq!(decoded, original);
+    }
+
+    /// The policy rides on the request, not the kind, so the SAME field
+    /// serves a graph fine-tune: the two LoRA kinds cannot diverge on it,
+    /// because there is only one place to put it.
+    #[test]
+    fn the_same_cache_field_serves_the_graph_fine_tune_kind() {
+        let original = job_pb::SubmitJobRequest {
+            spec: Some(job_pb::submit_job_request::Spec::GraphFineTune(
+                pb::GraphFineTuneSpec {
+                    sources: None,
+                    sample_config: None,
+                },
+            )),
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size: 0,
+            cache: crate::proto::inference::CachePolicy::Use as i32,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
+            .expect("a graph fine-tune carrying the policy round-trips");
+
+        assert_eq!(
+            decoded.cache,
+            crate::proto::inference::CachePolicy::Use as i32
+        );
         assert_eq!(decoded, original);
     }
 }

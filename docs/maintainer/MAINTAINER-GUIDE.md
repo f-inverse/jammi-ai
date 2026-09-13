@@ -3146,8 +3146,18 @@ then `publish_and_finalize`. A `CancelJob`/`JobHandle::cancel` request folds int
 SAME `cancel` flag a lease loss trips, via a watcher that polls `jobs.cancel_requested`
 at the keeper's own heartbeat cadence.
 
-**Train:** `JobWorker::run_spec` → FineTune arm → `read_source_columns` (`SELECT …
-ORDER BY <full tuple>` for deterministic order) → `build_training_data_loader` →
+**Train:** `JobWorker::run_spec` → FineTune arm → `training_set::materialize_projection`
+(`crates/jammi-ai/src/fine_tune/training_set.rs`): the projected columns are committed
+through `ResultStore::materialize_training_set` as an immutable `TrainingSet` result table
+— or an extant `ready` one is bound instead, on the engine's standing reuse key
+(definition hash AND every input anchor equal, no unpinned-at-an-instant anchor among
+them; a registered source is anchored unpinned, so the tabular path materialises its own
+table) — and read back on the SAME `SessionContext` through `read_back_sql`,
+`SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
+reader's half of the full-tuple order contract. The `GraphFineTune` arm reaches the same
+producer: `reconstruct_graph_loader` re-samples the seeded pairs and commits them with
+`training_set::materialize_sampled_pairs`, reading them back under the same order rule.
+Then `build_training_data_loader` →
 `train_fine_tune` → `run_fine_tune_blocking` (on the blocking pool, `catch_unwind`-wrapped):
 builds the `TrainingTarget` (empty `target_modules` → projection head; non-empty →
 `build_encoder_adapters`, which resolves the backbone through `model::arch` (§2.7) and

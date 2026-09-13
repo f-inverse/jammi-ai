@@ -12,7 +12,9 @@ green. cudarc links `dynamic-linking`, so the set is fixed at build time and
 knowable here.
 
 This check reads the binary's `DT_NEEDED` entries (`readelf -d`) and classifies
-EVERY one of them. A soname is acceptable only if it is on the `PLATFORM`
+EVERY one of them. Extracting NONE of them is itself a failure — an empty list
+is not "everything is classified", it is "nothing was read", and the two must
+never print the same line. A soname is acceptable only if it is on the `PLATFORM`
 allowlist (a base-image library the manylinux platform tag already promises), in
 `DRIVER_PROVIDED` (the host NVIDIA driver, never bundled), or in `COVERED` (a
 declared `nvidia-*-cu12` wheel component). Anything else FAILS the build, naming
@@ -120,7 +122,32 @@ def classify(soname: str) -> str:
 
 
 def check(binary: str) -> int:
-    unclassified = [s for s in needed_libs(binary) if classify(s) == "unclassified"]
+    needed = needed_libs(binary)
+
+    # Empty extraction is a FAILURE, not a pass. Classifying zero sonames
+    # says nothing about what the wheel must deliver, but the old code
+    # printed the same "OK" it prints for a fully classified binary. The cu12
+    # `jammi-server` links `libcudart` at minimum (cudarc's `dynamic-linking`),
+    # so an empty list means the file is not the dynamically-linked ELF this
+    # check expects, or `readelf -d`'s output no longer matches the
+    # `(NEEDED) ... [soname]` shape `needed_libs` parses -- and the second
+    # case is exactly the one that would hide an `libnccl.so.2` this check
+    # exists to catch. The sibling guard `ci/scripts/assert_glibc_floor.sh`
+    # fails closed on the same shape, naming both the binary and the tool.
+    if not needed:
+        print(
+            f"cu12 link-set check FAILED -- readelf -d extracted no DT_NEEDED entries from "
+            f"{binary}: there is no link set to classify, so this check can assert nothing "
+            "about what the wheel must deliver. A cu12 jammi-server binary always needs at "
+            "least libcudart, so either that path is not the dynamically-linked ELF this "
+            "check expects (wrong artifact, or a build with no dynamic section) or readelf's "
+            "output no longer matches the '(NEEDED) Shared library: [soname]' shape "
+            "needed_libs parses. Re-run 'readelf -d' on that path by hand and compare.",
+            file=sys.stderr,
+        )
+        return 1
+
+    unclassified = [s for s in needed if classify(s) == "unclassified"]
 
     if unclassified:
         print(

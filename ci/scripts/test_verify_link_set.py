@@ -27,7 +27,9 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -140,6 +142,14 @@ class LinkSetCheck(unittest.TestCase):
         self.assertFalse(covered & self.mod.PLATFORM)
         self.assertFalse(self.mod.DRIVER_PROVIDED & self.mod.PLATFORM)
 
+    def test_an_empty_link_set_fails(self):
+        """Zero classified entries is not "everything is classified". The
+        `needed_libs` fixture is bypassed the same way the tests above do
+        it; the suite below drives the REAL parser."""
+        rc, out, err = self.run_check([])
+        self.assertEqual(rc, 1, f"an empty DT_NEEDED list must FAIL; stdout={out}")
+        self.assertNotIn("OK", out)
+
     def test_covered_keys_match_the_entry_point_components(self):
         """`COVERED`'s keys, `_CUDA_COMPONENTS` and the `nvidia-*-cu12` pins
         are one contract stated three times; the first two are checkable
@@ -147,6 +157,89 @@ class LinkSetCheck(unittest.TestCase):
         entry = (MODULE_PATH.parent / "jammi_server" / "_entry.py").read_text()
         for component in self.mod.COVERED:
             self.assertIn(f'"{component}"', entry)
+
+
+class ExtractionThroughTheRealParser(unittest.TestCase):
+    """The suite above replaces `needed_libs` wholesale, so it can never see
+    a failure of `needed_libs` ITSELF. These cases patch one level lower —
+    the module's own `subprocess`, so the REAL `needed_libs` runs its real
+    regex over a real (fixture) `readelf -d` dump — which is the only way
+    the "the tool produced something this parser does not match" case is
+    reachable at all. Still hermetic: no readelf, no binary."""
+
+    BINARY = "/nonexistent/target/release/jammi-server"
+
+    #: A real `readelf -d` line, as the parser expects it.
+    WELL_FORMED_DUMP = "\n".join(
+        f" 0x0000000000000001 (NEEDED)             Shared library: [{soname}]"
+        for soname in MEASURED_LINK_SET
+    )
+    #: The same information in a shape the parser does NOT match — the
+    #: bracket-less spelling. Not a hypothetical taste in fixtures: this is
+    #: what an output-format change or a different binutils build looks like
+    #: from inside `needed_libs`, and `libnccl.so.2` is here so the case is
+    #: unmistakably "the one soname this check exists to catch, extracted by
+    #: nothing".
+    UNPARSEABLE_DUMP = "\n".join(
+        [
+            "Dynamic section at offset 0x1234 contains 30 entries:",
+            "  Tag        Type                         Name/Value",
+            " 0x0000000000000001 (NEEDED) Shared library: libnccl.so.2",
+            " 0x0000000000000001 (NEEDED) Shared library: libcudart.so.12",
+        ]
+    )
+    EMPTY_DUMP = ""
+
+    def setUp(self):
+        self.mod = load_module()
+
+    def run_with_dump(self, dump: str) -> tuple[int, str, str, list]:
+        """`check()` driven through the REAL `needed_libs`, with only the
+        subprocess call replaced. The module's own `subprocess` attribute is
+        rebound (never `subprocess.run` on the shared module object), so no
+        other test — in this file or any other — sees the patch."""
+        calls: list = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout=dump, stderr="")
+
+        self.mod.subprocess = types.SimpleNamespace(
+            run=fake_run, CalledProcessError=subprocess.CalledProcessError
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.mod.check(self.BINARY)
+        return rc, out.getvalue(), err.getvalue(), calls
+
+    def test_well_formed_dump_is_parsed_and_passes(self):
+        """The control: the same plumbing, a dump the parser DOES match,
+        must extract the measured link set and pass — so a FAIL below is the
+        extraction's, not the fixture harness's."""
+        rc, out, err, calls = self.run_with_dump(self.WELL_FORMED_DUMP)
+        self.assertEqual(calls, [["readelf", "-d", self.BINARY]])
+        self.assertEqual(
+            self.mod.needed_libs(self.BINARY), MEASURED_LINK_SET, "the real parser must read the dump"
+        )
+        self.assertEqual(rc, 0, f"stderr={err}")
+        self.assertIn("OK", out)
+
+    def test_unparseable_dump_fails_naming_the_binary_and_the_tool(self):
+        rc, out, err, _calls = self.run_with_dump(self.UNPARSEABLE_DUMP)
+        self.assertEqual(
+            self.mod.needed_libs(self.BINARY), [], "fixture premise: this dump must not parse"
+        )
+        self.assertEqual(rc, 1, f"an unparseable readelf dump must FAIL; stdout={out}")
+        self.assertNotIn("OK", out)
+        self.assertIn(self.BINARY, err)
+        self.assertIn("readelf", err)
+
+    def test_empty_dump_fails_naming_the_binary_and_the_tool(self):
+        rc, out, err, _calls = self.run_with_dump(self.EMPTY_DUMP)
+        self.assertEqual(rc, 1, f"an empty readelf dump must FAIL; stdout={out}")
+        self.assertNotIn("OK", out)
+        self.assertIn(self.BINARY, err)
+        self.assertIn("readelf", err)
 
 
 if __name__ == "__main__":

@@ -791,8 +791,8 @@ impl JobWorker {
     /// loop already at either read point never starts a `claim_next`
     /// regardless of which of the two signals it observes first. The one
     /// residual — a claim whose own catalog round trip is already in flight
-    /// when the phase flips — runs into `register_job_hold_or_release`,
-    /// which self-releases it instead of dispatching. On a claim it runs the
+    /// when the phase flips — the arm at `:522` tests `== Releasing` only, so
+    /// under `Releasing` it self-releases via `register_job_hold_or_release`; under `Draining` no arm matches and it dispatches normally. On a claim it runs the
     /// job to a terminal state inline (the next claim waits for it), on no
     /// claim it sleeps the configured idle poll `select!`ed against the stop
     /// watch (level-triggered: no lost wakeup, no waiting out the poll). The
@@ -875,8 +875,8 @@ impl JobWorker {
             // The second read: no `.await` between this and `claim_next`
             // itself (`record_claim_next` is sync). A claim whose own
             // catalog round trip is already in flight when 2a runs is the
-            // one residual neither read catches — `register_job_hold_or_release`'s
-            // self-release arm exists for exactly that case.
+            // one residual neither read catches — under `Releasing` (`:522`)
+            // `register_job_hold_or_release` self-releases it; under `Draining` it dispatches and runs to completion.
             if !shared.admits_claim() {
                 break;
             }

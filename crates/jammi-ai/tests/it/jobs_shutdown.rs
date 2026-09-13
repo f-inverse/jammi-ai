@@ -832,8 +832,8 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
 /// wakeup/latency): every phase setter requests the stop in the SAME
 /// statement pair as the phase flip — `begin_drain` (`:2417-2424`) and
 /// `release_and_stop`'s 2a (`:2585`) — so exit latency after a flip is
-/// bounded by the in-flight job, never by `idle_poll`. An ENUMERATING check
-/// over the two setters, PLUS one pre-existing oracle that already reddens
+/// bounded by the in-flight job, never by `idle_poll`. A check over the
+/// two setters that exist, PLUS one pre-existing oracle that already reddens
 /// on `release_and_stop`'s unpaired shape (reverting a setter's pairing CAN
 /// be observable, unlike this doc once claimed): reverting the 2a stop
 /// alone (keeping the phase flip) leaves an idle-sleeping loop unwoken, so

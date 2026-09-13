@@ -13,6 +13,10 @@
 //!   descriptor through either transport: same registry identity and the same
 //!   embedding `status` / `row_count` / `dimensions` read off the result table,
 //!   the source-of-truth a `generate_embeddings` response also returns.
+//! * **Kind parity** — a result table crosses the wire as the kind its catalog
+//!   row carries, on every value of the frozen `ResultTableKind` enum
+//!   including its newest (`TrainingSet`), never a fabricated `MODEL` and
+//!   never a rejected message.
 //! * **Absent-source parity** — `describe_source` of an unregistered id returns
 //!   `None` on both transports (the remote arm maps the server's `NotFound`
 //!   back to `None`), never a faked empty descriptor.
@@ -28,7 +32,7 @@ use std::sync::Arc;
 use jammi_admin::CatalogClient;
 use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 use jammi_test_utils::{cookbook_fixture, fixture, pg_url_for_tests};
@@ -243,6 +247,85 @@ async fn remote_list_and_describe_sources_like_local() {
         .expect("local describe_source of an absent id is not an error");
     assert!(remote_absent.is_none(), "remote: absent source → None");
     assert!(local_absent.is_none(), "local: absent source → None");
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Kind parity on the newest value of the frozen `ResultTableKind` enum: a
+/// `TrainingSet` result table reads as a training set through either
+/// transport.
+///
+/// This is the divergence-prone case for that enum's wire mirror. A remote
+/// surface that has not mirrored the value either rejects the message
+/// (`result table kind must be specified`) or fabricates a kind for it, while
+/// the embedded surface reads the kind straight off the catalog row — so the
+/// two disagree on exactly the row the newest producer writes, invisible to a
+/// parity case that only ever carries `MODEL`. The row is seeded on the
+/// catalog directly: the producer that writes one is the same unit's engine
+/// half, and the property under test belongs to the transport, not to the
+/// producer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_describe_source_carries_a_training_set_kind_like_local() {
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+
+    local
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect("add_source");
+
+    server
+        .engine
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
+            table_name: "patents_training_set",
+            source_id: "patents",
+            model_id: "trainer",
+            task: jammi_db::ModelTask::TextEmbedding,
+            kind: ResultTableKind::TrainingSet,
+            derived_from: None,
+            parquet_path: "file:///tmp/patents_training_set.parquet",
+            dimensions: None,
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
+        })
+        .await
+        .expect("seed the training-set result table");
+
+    let remote_one = remote
+        .describe_source("patents")
+        .await
+        .expect("remote describe_source")
+        .expect("patents is registered");
+    let local_one = local
+        .describe_source("patents")
+        .await
+        .expect("local describe_source")
+        .expect("patents is registered");
+    assert_eq!(
+        descriptor_shape(&remote_one),
+        descriptor_shape(&local_one),
+        "a training-set row describes identically through either transport"
+    );
+
+    let remote_rt = remote_one
+        .result_tables
+        .iter()
+        .find(|t| t.table_name == "patents_training_set")
+        .expect("the remote descriptor carries the training-set table");
+    assert_eq!(
+        remote_rt.kind,
+        ResultTableKind::TrainingSet,
+        "the remote descriptor must carry the training set's own kind, not a fabricated one"
+    );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

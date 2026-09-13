@@ -40,8 +40,11 @@ use jammi_ai::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use jammi_ai::fine_tune::graph_sampler::{
     EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
+use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::manifest::{AnchorKind, InputAnchor, ProducingDescriptor};
 use tempfile::TempDir;
 
 use crate::common;
@@ -466,6 +469,296 @@ async fn fine_tune_graph_end_to_end_completes() {
     assert!(
         adapter.exists(),
         "graph fine-tune should publish an adapter, missing at {adapter:?}"
+    );
+}
+
+/// Build the standard two-community node/edge fixture (the same shape
+/// [`fine_tune_graph_end_to_end_completes`] uses) under `dir`, register both
+/// sources on `session`, and return the [`GraphFineTuneSources`] naming them.
+async fn register_graph_fixture(
+    dir: &std::path::Path,
+    session: &InferenceSession,
+) -> GraphFineTuneSources {
+    let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
+        .iter()
+        .map(|id| (id.to_string(), format!("document about topic {id}")))
+        .collect();
+    let node_url = write_csv(dir, "nodes.csv", "id,text", &node_rows);
+
+    let edge_pairs = [
+        ("a0", "a1"),
+        ("a1", "a0"),
+        ("a1", "a2"),
+        ("a2", "a1"),
+        ("a0", "a2"),
+        ("a2", "a0"),
+        ("b0", "b1"),
+        ("b1", "b0"),
+        ("b1", "b2"),
+        ("b2", "b1"),
+        ("b0", "b2"),
+        ("b2", "b0"),
+        ("a0", "b0"),
+    ];
+    let edge_rows: Vec<(String, String)> = edge_pairs
+        .iter()
+        .map(|(s, d)| (s.to_string(), d.to_string()))
+        .collect();
+    let edge_url = write_csv(dir, "edges.csv", "src,dst", &edge_rows);
+
+    session
+        .add_source(
+            "nodes",
+            SourceType::File,
+            SourceConnection {
+                url: Some(node_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .add_source(
+            "edges",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    }
+}
+
+/// M1 — the graph arm's training set anchors BOTH the node source and the edge
+/// source, at one shared instant, and the lineage view agrees.
+///
+/// The sampled pairs are a function of both relations (the sampler walks the
+/// edges to pick positives; every anchor/positive text comes off the nodes),
+/// so a manifest recording only one of them would silently under-report what
+/// this table actually depends on — the same honest-anchoring contract
+/// `pipeline/asof/verb.rs` keeps for its own two input relations.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_training_set_anchors_both_node_and_edge_sources() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let sources = register_graph_fixture(dir.path(), &session).await;
+
+    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let sample = GraphSampleConfig {
+        walk_length: 3,
+        walks_per_node: 2,
+        hard_negatives: 1,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 11,
+        ..GraphSampleConfig::default()
+    };
+    let train = jammi_ai::fine_tune::FineTuneConfig {
+        epochs: 1,
+        batch_size: 4,
+        lora_rank: 4,
+        warmup_steps: 0,
+        validation_fraction: 0.0,
+        early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+        embedding_loss: Some(
+            jammi_ai::fine_tune::EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 },
+        ),
+        ..Default::default()
+    };
+
+    let job = session
+        .fine_tune_graph(&sources, &model, sample, Some(train))
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let tables = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let training_sets: Vec<_> = tables
+        .iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        1,
+        "the graph job materialises exactly one training set, got {:?}",
+        tables
+            .iter()
+            .map(|t| (&t.table_name, &t.kind))
+            .collect::<Vec<_>>()
+    );
+    let table = training_sets[0];
+
+    // The descriptor and column set: the sampled-pair relation, projected
+    // under the anchor/positive/negative columns declared order.
+    let descriptor = session
+        .result_store()
+        .producing_descriptor(table)
+        .await
+        .expect("the attestation records the producing descriptor verbatim");
+    let columns = match descriptor {
+        ProducingDescriptor::TrainingSet {
+            source,
+            columns,
+            task,
+            order_rule,
+            ..
+        } => {
+            assert!(
+                source.contains("jammi_sampled_pairs:"),
+                "the recorded source must name the sampled-pair relation, got {source:?}"
+            );
+            assert_eq!(task, ModelTask::TextEmbedding);
+            assert_eq!(
+                order_rule,
+                jammi_db::store::manifest::TRAINING_SET_ORDER_RULE_V1
+            );
+            columns
+        }
+        other => panic!("expected a TrainingSet descriptor, got {other:?}"),
+    };
+    assert_eq!(
+        columns,
+        vec![
+            "anchor".to_string(),
+            "positive".to_string(),
+            "negative".to_string()
+        ],
+        "hard_negatives: 1 must commit a negative column, in declared order"
+    );
+
+    // The anchor SET: exactly the two relations the sampled pairs depend on,
+    // sharing ONE read instant — never one anchor synthesised from whichever
+    // relation happened to be the catalog row's `source_id`.
+    let anchors: Vec<InputAnchor> = serde_json::from_str(
+        table
+            .input_anchors_json
+            .as_deref()
+            .expect("a ready table carries its recorded anchors"),
+    )
+    .unwrap();
+    assert_eq!(
+        anchors.len(),
+        2,
+        "exactly two anchors — node and edge, no more, no fewer, got {anchors:?}"
+    );
+    let names: std::collections::BTreeSet<&str> =
+        anchors.iter().map(|a| a.source.as_str()).collect();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["nodes", "edges"]),
+        "the graph arm must anchor BOTH the node and the edge source, got {anchors:?}"
+    );
+    for anchor in &anchors {
+        assert_eq!(
+            anchor.kind,
+            AnchorKind::UnpinnedAtInstant,
+            "neither relation exposes a version surface to pin, got {anchor:?}"
+        );
+    }
+    assert_eq!(
+        anchors[0].anchor, anchors[1].anchor,
+        "both anchors must share ONE read instant, got {anchors:?}"
+    );
+
+    // The lineage view (a view over the same `input_anchors_json`) agrees:
+    // both relations derive-from-edge to this table.
+    for source_name in ["nodes", "edges"] {
+        let edges = session
+            .result_store()
+            .derives_from(source_name)
+            .await
+            .unwrap();
+        assert!(
+            edges.iter().any(|e| e.derived == table.table_name),
+            "{source_name} must lineage-derive the graph training set table {}, got {edges:?}",
+            table.table_name
+        );
+    }
+}
+
+/// M2 — a graph training set's recorded source names a relation that lived
+/// only for the length of the original materialization
+/// (`jammi_sampled_pairs:...`, deregistered on drop). A `recompute` therefore
+/// fails at the planner, naming the missing relation — the honest consequence
+/// of sampling being a producer the engine cannot express as durable SQL, not
+/// a silently-reported no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_training_set_recompute_names_the_missing_sampled_pair_relation() {
+    use jammi_ai::pipeline::recompute::Cascade;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let sources = register_graph_fixture(dir.path(), &session).await;
+    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let sample = GraphSampleConfig {
+        walk_length: 2,
+        walks_per_node: 2,
+        hard_negatives: 0,
+        exclude_hops: 1,
+        min_negatives: 1,
+        seed: 3,
+        ..GraphSampleConfig::default()
+    };
+    let train = jammi_ai::fine_tune::FineTuneConfig {
+        epochs: 1,
+        batch_size: 4,
+        lora_rank: 4,
+        warmup_steps: 0,
+        validation_fraction: 0.0,
+        early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+        ..Default::default()
+    };
+    let job = session
+        .fine_tune_graph(&sources, &model, sample, Some(train))
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let tables = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let table = tables
+        .iter()
+        .find(|t| t.kind == ResultTableKind::TrainingSet)
+        .expect("the graph job materialises a training set");
+
+    let err = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(&table.table_name, Cascade::ReportOnly)
+        .await
+        .expect_err(
+            "a graph training set's sampled-pair relation does not survive its own materialization",
+        );
+    let message = format!("{err}");
+    assert!(
+        message.contains("jammi_sampled_pairs:"),
+        "the refusal must name the missing sampled-pair relation, got {message:?}"
     );
 }
 

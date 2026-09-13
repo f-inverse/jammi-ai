@@ -120,6 +120,96 @@ enum UnderlyingFormat {
     Regression,
 }
 
+/// Every canonical training-format tag, in declaration order — the CLOSED set
+/// [`TrainingFormat::format_tag`] maps onto.
+///
+/// The set is closed by the round-trip test below rather than by convention:
+/// the tag of every variant must appear here, the entries must be pairwise
+/// distinct, and [`TrainingFormat::from_format_tag`] must recover a value with
+/// the same tag for each. A tag that changes is a *different* training set, so
+/// a rename is a breaking change to every recorded definition hash, not a
+/// cosmetic edit.
+pub const TRAINING_FORMAT_TAGS: &[&str] = &[
+    "contrastive",
+    "pairs",
+    "triplet",
+    "media_triplet",
+    "classification",
+    "ner",
+    "regression",
+    "graph_pairs",
+    "graph_triplet",
+];
+
+impl TrainingFormat {
+    /// The canonical string tag a materialised training set records this format
+    /// under — the ONE mapping from a [`TrainingFormat`] to the `format` field
+    /// of
+    /// [`ProducingDescriptor::TrainingSet`](jammi_db::store::manifest::ProducingDescriptor::TrainingSet).
+    ///
+    /// `jammi-db` depends on no jammi crate but `jammi-numerics`, so the
+    /// descriptor folds a string rather than this enum, and the completeness
+    /// burden lands here: **a format distinction this mapping does not spell is
+    /// two different training sets colliding on one definition hash.** The match
+    /// is exhaustive with no `_` arm, so a new variant cannot reach the
+    /// descriptor without being given a tag.
+    ///
+    /// The two parameterised variants deliberately drop their parameter.
+    /// `Classification`'s `num_classes` and `Ner`'s `num_labels` are *functions
+    /// of the rows* — the count of distinct labels the loader observed — not
+    /// independent choices a caller makes, so they cannot distinguish two
+    /// training sets built from the same source, columns and task, and folding
+    /// them would require reading the rows before naming the table that holds
+    /// them. `Graph`'s `has_negatives` is not in that class: it changes the
+    /// projected column set (a mined negative is a third column) and therefore
+    /// the committed bytes, so it takes two distinct tags.
+    pub fn format_tag(self) -> &'static str {
+        match self {
+            TrainingFormat::Contrastive => "contrastive",
+            TrainingFormat::Pairs => "pairs",
+            TrainingFormat::Triplet => "triplet",
+            TrainingFormat::MediaTriplet => "media_triplet",
+            TrainingFormat::Classification { .. } => "classification",
+            TrainingFormat::Ner { .. } => "ner",
+            TrainingFormat::Regression => "regression",
+            TrainingFormat::Graph {
+                has_negatives: false,
+            } => "graph_pairs",
+            TrainingFormat::Graph {
+                has_negatives: true,
+            } => "graph_triplet",
+        }
+    }
+
+    /// The inverse of [`Self::format_tag`] over [`TRAINING_FORMAT_TAGS`]: the
+    /// representative format a recorded tag names, with the two data-derived
+    /// parameters at zero (the tag never carried them — see
+    /// [`Self::format_tag`] — so no value of theirs is recoverable and zero is
+    /// the neutral stand-in, never a claim about the rows).
+    ///
+    /// `None` for a tag this build does not know, which is how a table
+    /// committed by a newer build is refused rather than read as some
+    /// near-miss format.
+    pub fn from_format_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "contrastive" => Some(TrainingFormat::Contrastive),
+            "pairs" => Some(TrainingFormat::Pairs),
+            "triplet" => Some(TrainingFormat::Triplet),
+            "media_triplet" => Some(TrainingFormat::MediaTriplet),
+            "classification" => Some(TrainingFormat::Classification { num_classes: 0 }),
+            "ner" => Some(TrainingFormat::Ner { num_labels: 0 }),
+            "regression" => Some(TrainingFormat::Regression),
+            "graph_pairs" => Some(TrainingFormat::Graph {
+                has_negatives: false,
+            }),
+            "graph_triplet" => Some(TrainingFormat::Graph {
+                has_negatives: true,
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl TrainingFormat {
     /// The concrete shape a format trains as: a graph with mined hard negatives
     /// is a `Triplet`, one without is `Pairs`; every other format is itself.
@@ -391,6 +481,52 @@ impl TrainingDataLoader {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        Ok(Self {
+            format: TrainingFormat::Graph { has_negatives },
+            data: LoaderData::TextRows(rows),
+        })
+    }
+
+    /// Create a graph loader from rows that have ALREADY been sampled and
+    /// committed — the read-back of a `TrainingSet` table a graph fine-tune
+    /// materialised its pairs into.
+    ///
+    /// [`Self::from_graph`] samples and loads in one step, which is what a
+    /// caller holding a live [`super::graph_sampler::GraphSampler`] wants; this
+    /// is the same shape rebuilt from the committed rows, so a run trains on the
+    /// table's bytes rather than on a second, in-memory sampling of them. The
+    /// reported format is [`TrainingFormat::Graph`] either way: the provenance
+    /// is the graph, whatever storage the rows travelled through.
+    ///
+    /// `has_negatives` is not re-derived from the rows here — it is the shape
+    /// the pairs were COMMITTED under (a third projected column), so the caller
+    /// that named the columns owns it. A row whose negative is missing under
+    /// `has_negatives` is a typed error, never an empty-string negative: the
+    /// model would learn to push its anchor away from `""`.
+    pub fn from_graph_rows(
+        rows: Vec<(String, String, Option<String>)>,
+        has_negatives: bool,
+    ) -> Result<Self> {
+        let rows = rows
+            .into_iter()
+            .map(|(anchor, positive, negative)| {
+                if has_negatives {
+                    let negative = negative.ok_or_else(|| {
+                        JammiError::FineTune(
+                            "graph training set declares a negative column but a row supplied none"
+                                .into(),
+                        )
+                    })?;
+                    Ok(TrainingRow::Triplet {
+                        anchor,
+                        positive,
+                        negative,
+                    })
+                } else {
+                    Ok(TrainingRow::Pairs { anchor, positive })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             format: TrainingFormat::Graph { has_negatives },
             data: LoaderData::TextRows(rows),
@@ -768,6 +904,139 @@ impl TrainingDataLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every [`TrainingFormat`] value the tag mapping must cover, in
+    /// [`TRAINING_FORMAT_TAGS`] order. Hand-written, and ANCHORED to the
+    /// compiler by [`enumeration_index`] below — a new variant fails to
+    /// compile there until it is added here too, so the round-trip tests can
+    /// never range over a stale subset.
+    fn every_training_format() -> Vec<TrainingFormat> {
+        vec![
+            TrainingFormat::Contrastive,
+            TrainingFormat::Pairs,
+            TrainingFormat::Triplet,
+            TrainingFormat::MediaTriplet,
+            TrainingFormat::Classification { num_classes: 7 },
+            TrainingFormat::Ner { num_labels: 5 },
+            TrainingFormat::Regression,
+            TrainingFormat::Graph {
+                has_negatives: false,
+            },
+            TrainingFormat::Graph {
+                has_negatives: true,
+            },
+        ]
+    }
+
+    /// The compiler anchor for [`every_training_format`]: an exhaustive match
+    /// with no `_` arm mapping each variant to its position in that list.
+    fn enumeration_index(format: TrainingFormat) -> usize {
+        match format {
+            TrainingFormat::Contrastive => 0,
+            TrainingFormat::Pairs => 1,
+            TrainingFormat::Triplet => 2,
+            TrainingFormat::MediaTriplet => 3,
+            TrainingFormat::Classification { .. } => 4,
+            TrainingFormat::Ner { .. } => 5,
+            TrainingFormat::Regression => 6,
+            TrainingFormat::Graph {
+                has_negatives: false,
+            } => 7,
+            TrainingFormat::Graph {
+                has_negatives: true,
+            } => 8,
+        }
+    }
+
+    #[test]
+    fn the_format_enumeration_is_the_whole_enum() {
+        let all = every_training_format();
+        for (i, format) in all.iter().enumerate() {
+            assert_eq!(
+                enumeration_index(*format),
+                i,
+                "{format:?} is out of position in every_training_format()"
+            );
+        }
+        // Every index the anchor can return is occupied, so the list has no
+        // hole a variant could hide in.
+        let mut occupied: Vec<usize> = all.iter().map(|f| enumeration_index(*f)).collect();
+        occupied.sort_unstable();
+        assert_eq!(occupied, (0..all.len()).collect::<Vec<_>>());
+    }
+
+    /// The tag mapping is a bijection between the variants and
+    /// [`TRAINING_FORMAT_TAGS`], and it round-trips through
+    /// [`TrainingFormat::from_format_tag`].
+    ///
+    /// Injectivity is the load-bearing half: two variants sharing a tag are two
+    /// different training sets colliding on one definition hash, which is
+    /// exactly the failure the string-tag indirection risks.
+    #[test]
+    fn format_tags_are_a_bijection_and_round_trip() {
+        let all = every_training_format();
+
+        let tags: Vec<&str> = all.iter().map(|f| f.format_tag()).collect();
+        assert_eq!(
+            tags, TRAINING_FORMAT_TAGS,
+            "the declared tag set and the variants' own tags must agree, in order"
+        );
+
+        let mut distinct = tags.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            tags.len(),
+            "two formats share a tag, so two different training sets would              collide on one definition hash: {tags:?}"
+        );
+
+        for format in &all {
+            let tag = format.format_tag();
+            let recovered = TrainingFormat::from_format_tag(tag)
+                .unwrap_or_else(|| panic!("tag {tag:?} is not decodable"));
+            assert_eq!(recovered.format_tag(), tag);
+        }
+        for tag in TRAINING_FORMAT_TAGS {
+            let recovered = TrainingFormat::from_format_tag(tag)
+                .unwrap_or_else(|| panic!("declared tag {tag:?} is not decodable"));
+            assert_eq!(&recovered.format_tag(), tag);
+        }
+    }
+
+    /// The two data-derived parameters are dropped by design, and the one
+    /// byte-affecting parameter is not.
+    #[test]
+    fn the_tag_drops_row_derived_parameters_and_keeps_the_shape_one() {
+        assert_eq!(
+            TrainingFormat::Classification { num_classes: 3 }.format_tag(),
+            TrainingFormat::Classification { num_classes: 900 }.format_tag(),
+            "num_classes is a function of the rows, not of the table's identity"
+        );
+        assert_eq!(
+            TrainingFormat::Ner { num_labels: 3 }.format_tag(),
+            TrainingFormat::Ner { num_labels: 900 }.format_tag(),
+            "num_labels is a function of the rows, not of the table's identity"
+        );
+        assert_ne!(
+            TrainingFormat::Graph {
+                has_negatives: false
+            }
+            .format_tag(),
+            TrainingFormat::Graph {
+                has_negatives: true
+            }
+            .format_tag(),
+            "a mined negative is a third projected column, so it is a different table"
+        );
+    }
+
+    #[test]
+    fn an_unknown_tag_is_refused_rather_than_approximated() {
+        assert!(TrainingFormat::from_format_tag("graph").is_none());
+        assert!(TrainingFormat::from_format_tag("Contrastive").is_none());
+        assert!(TrainingFormat::from_format_tag("").is_none());
+    }
 
     /// A regression loader carries `TrainingFormat::Regression` and chunks its
     /// rows into `TextChunk::Regression { texts, targets }` — the shape the

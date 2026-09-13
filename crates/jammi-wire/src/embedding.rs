@@ -97,6 +97,7 @@ fn result_table_kind_to_proto(kind: ResultTableKind) -> pb::ResultTableKind {
         ResultTableKind::Model => pb::ResultTableKind::Model,
         ResultTableKind::NeighborGraph => pb::ResultTableKind::NeighborGraph,
         ResultTableKind::AsofJoin => pb::ResultTableKind::AsofJoin,
+        ResultTableKind::TrainingSet => pb::ResultTableKind::TrainingSet,
     }
 }
 
@@ -109,6 +110,7 @@ fn result_table_kind_from_proto(kind: i32) -> Result<ResultTableKind, Status> {
         Ok(pb::ResultTableKind::Model) => Ok(ResultTableKind::Model),
         Ok(pb::ResultTableKind::NeighborGraph) => Ok(ResultTableKind::NeighborGraph),
         Ok(pb::ResultTableKind::AsofJoin) => Ok(ResultTableKind::AsofJoin),
+        Ok(pb::ResultTableKind::TrainingSet) => Ok(ResultTableKind::TrainingSet),
         Ok(pb::ResultTableKind::Unspecified) | Err(_) => Err(Status::invalid_argument(
             "result table kind must be specified",
         )),
@@ -210,4 +212,173 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         table.status,
         (!table.key_column.is_empty()).then_some(table.key_column),
     ))
+}
+
+#[cfg(test)]
+mod result_table_kind_tests {
+    use super::{
+        result_table_from_proto, result_table_kind_from_proto, result_table_kind_to_proto,
+    };
+    use crate::proto::embedding as pb;
+    use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+    use jammi_db::ModelTask;
+
+    /// Discriminants scanned when deriving the wire enum's value set. Well
+    /// above the served range, so the scan below is a genuine enumeration of
+    /// the generated `pb::ResultTableKind` rather than a restatement of the
+    /// list under test.
+    const SCAN_LIMIT: i32 = 64;
+
+    /// Every engine [`ResultTableKind`], hand-enumerated and then checked
+    /// complete two ways: [`kind_is_enumerated`] below has no `_` arm (a
+    /// variant added to the engine enum fails to compile until it is listed
+    /// here), and
+    /// `engine_kinds_and_wire_kinds_are_the_same_size` pins this array's
+    /// length against the discriminant scan.
+    const ALL_ENGINE_KINDS: [ResultTableKind; 4] = [
+        ResultTableKind::Model,
+        ResultTableKind::NeighborGraph,
+        ResultTableKind::AsofJoin,
+        ResultTableKind::TrainingSet,
+    ];
+
+    /// Compile-time completeness witness for [`ALL_ENGINE_KINDS`]: no `_` arm,
+    /// so a new engine variant reds this function, and each arm names the
+    /// array slot the variant occupies.
+    fn kind_is_enumerated(kind: ResultTableKind) -> bool {
+        let slot = match kind {
+            ResultTableKind::Model => 0,
+            ResultTableKind::NeighborGraph => 1,
+            ResultTableKind::AsofJoin => 2,
+            ResultTableKind::TrainingSet => 3,
+        };
+        ALL_ENGINE_KINDS[slot] == kind
+    }
+
+    /// The wire enum's value set, derived by scanning discriminants rather
+    /// than restating the list: `try_from` accepts exactly the values the
+    /// generated enum declares.
+    fn wire_kind_values() -> Vec<i32> {
+        (0..SCAN_LIMIT)
+            .filter(|v| pb::ResultTableKind::try_from(*v).is_ok())
+            .collect()
+    }
+
+    /// The frozen wire numbering. `ResultTableKind` is append-only (H4): a
+    /// renumbered or dropped value is a breaking change to a served enum, and
+    /// an added one is appended here in the same change that adds it to the
+    /// proto.
+    #[test]
+    fn wire_kind_values_are_frozen_and_append_only() {
+        assert_eq!(pb::ResultTableKind::Unspecified as i32, 0);
+        assert_eq!(pb::ResultTableKind::Model as i32, 1);
+        assert_eq!(pb::ResultTableKind::NeighborGraph as i32, 2);
+        assert_eq!(pb::ResultTableKind::AsofJoin as i32, 3);
+        assert_eq!(pb::ResultTableKind::TrainingSet as i32, 4);
+        assert_eq!(
+            wire_kind_values(),
+            vec![0, 1, 2, 3, 4],
+            "the served ResultTableKind values are frozen; adding one is an \
+             append to this list, renumbering or removing one is breaking"
+        );
+    }
+
+    /// The engine→wire half of the mirror is exhaustive and injective, and the
+    /// wire→engine half inverts it: every engine kind survives a round trip as
+    /// itself, and no two engine kinds share a wire value (an alias would make
+    /// one of them undecodable).
+    #[test]
+    fn every_engine_kind_round_trips_through_the_wire_mirror() {
+        let mut seen: Vec<i32> = Vec::new();
+        for kind in ALL_ENGINE_KINDS {
+            assert!(kind_is_enumerated(kind), "{kind:?} is not enumerated");
+            let wire = result_table_kind_to_proto(kind) as i32;
+            assert_ne!(
+                wire,
+                pb::ResultTableKind::Unspecified as i32,
+                "{kind:?} must map to a concrete wire value"
+            );
+            assert!(
+                !seen.contains(&wire),
+                "{kind:?} aliases wire value {wire}, already used by another kind"
+            );
+            seen.push(wire);
+            assert_eq!(
+                result_table_kind_from_proto(wire).expect("a served kind decodes"),
+                kind,
+                "{kind:?} must survive the wire round trip as itself"
+            );
+        }
+    }
+
+    /// The wire→engine half is total over the served values: every value the
+    /// generated enum declares except `UNSPECIFIED` decodes to an engine kind
+    /// that re-encodes to the same value. A proto value added without a mirror
+    /// arm cannot reach this test — `result_table_kind_from_proto` has no `_`
+    /// arm, so it fails to compile first — but a value mirrored onto the WRONG
+    /// engine kind reds here.
+    #[test]
+    fn every_served_wire_kind_decodes_to_the_engine_kind_it_encodes_from() {
+        for value in wire_kind_values() {
+            if value == pb::ResultTableKind::Unspecified as i32 {
+                continue;
+            }
+            let kind = result_table_kind_from_proto(value)
+                .unwrap_or_else(|e| panic!("served wire kind {value} must decode: {e}"));
+            assert_eq!(
+                result_table_kind_to_proto(kind) as i32,
+                value,
+                "wire kind {value} decoded to {kind:?}, which re-encodes elsewhere"
+            );
+        }
+    }
+
+    /// The two sides have the same cardinality, so the hand-written
+    /// [`ALL_ENGINE_KINDS`] cannot silently lag a proto that grew a value.
+    #[test]
+    fn engine_kinds_and_wire_kinds_are_the_same_size() {
+        let served = wire_kind_values().len() - 1; // less UNSPECIFIED
+        assert_eq!(
+            ALL_ENGINE_KINDS.len(),
+            served,
+            "every served wire kind mirrors exactly one engine kind"
+        );
+    }
+
+    /// An unspecified or out-of-range kind is a malformed message, not a
+    /// silent `Model` guess.
+    #[test]
+    fn unspecified_and_unknown_wire_kinds_are_rejected() {
+        for value in [pb::ResultTableKind::Unspecified as i32, SCAN_LIMIT, -1] {
+            let err = result_table_kind_from_proto(value)
+                .expect_err("an unspecified/unknown kind must be rejected");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(err.message(), "result table kind must be specified");
+        }
+    }
+
+    /// The record projection carries the kind faithfully in both directions —
+    /// the path a `DescribeSource` / producer response actually takes — so a
+    /// remote consumer reads the same kind an embedded one does rather than a
+    /// fabricated `MODEL`.
+    #[test]
+    fn a_training_set_record_keeps_its_kind_across_the_projection() {
+        let record = ResultTableRecord::from_wire_projection(
+            "jammi_train_set_1".to_string(),
+            "src-1".to_string(),
+            "model-1".to_string(),
+            ModelTask::TextEmbedding,
+            ResultTableKind::TrainingSet,
+            None,
+            0,
+            7,
+            "ready".to_string(),
+            None,
+        );
+        let wire = pb::ResultTable::from(record);
+        assert_eq!(wire.kind, pb::ResultTableKind::TrainingSet as i32);
+        let back = result_table_from_proto(wire).expect("the projection reconstructs");
+        assert_eq!(back.kind, ResultTableKind::TrainingSet);
+        assert_eq!(back.row_count, 7);
+    }
 }

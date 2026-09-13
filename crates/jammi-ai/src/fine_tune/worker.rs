@@ -97,11 +97,12 @@ use jammi_db::store::ArtifactStore;
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
-use crate::fine_tune::data::TrainingDataLoader;
+use crate::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
+use crate::fine_tune::training_set;
 use crate::fine_tune::FineTuneConfig;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
@@ -886,7 +887,7 @@ impl JobWorker {
     /// |---|---|---|
     /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
     /// | 2 | undeserialisable `training_spec` | same as 1 |
-    /// | 3 | source SQL / loader reconstruction error (`read_source_columns`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
     /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
     /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
     /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |
@@ -1763,15 +1764,36 @@ impl JobWorker {
                 common,
                 ..
             } => {
-                // Re-run the source SQL and rebuild the loader from the persisted
-                // columns — the same loader the submitting `fine_tune` built, but
-                // reconstructed on this worker with no carryover.
-                let batches = self
-                    .read_source_columns(session, &source, &columns)
-                    .await
-                    .map_err(WorkerJobError::from)?;
+                // Materialise the projected rows into an immutable
+                // `TrainingSet` result table (or reuse the one that already
+                // carries this definition), then read that table back in its
+                // committed order. The rows a run trains on are a durable,
+                // attested artifact, not this worker's private scan.
+                let detected =
+                    detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
+                let (_table, batches) = training_set::materialize_projection(
+                    session,
+                    &source,
+                    &columns,
+                    task,
+                    detected.format_tag(),
+                )
+                .await
+                .map_err(WorkerJobError::from)?;
                 let loader = build_training_data_loader(&batches, &columns, task)
                     .map_err(WorkerJobError::from)?;
+                // The tag the table was WRITTEN under and the shape its loader
+                // reports come from one classifier, so a mismatch is a broken
+                // engine invariant rather than a caller error — and it must be
+                // loud: it would mean two formats sharing one definition hash.
+                if loader.format().format_tag() != detected.format_tag() {
+                    return Err(WorkerJobError::from(JammiError::Other(format!(
+                        "training set was committed as format '{}' but its loader reports \
+                         '{}': the column classifier and the loader disagree",
+                        detected.format_tag(),
+                        loader.format().format_tag()
+                    ))));
+                }
                 let run = FineTuneRun {
                     task,
                     common,
@@ -1786,7 +1808,9 @@ impl JobWorker {
                 common,
             } => {
                 // Re-read node/edge sources and re-sample the graph (seeded →
-                // deterministic), then train on the text-embedding head.
+                // deterministic), commit the pairs through the SAME training-set
+                // producer the tabular path uses, and train on the rows that
+                // table holds.
                 let loader = self
                     .reconstruct_graph_loader(session, &sources, sample_config)
                     .await
@@ -1834,40 +1858,9 @@ impl JobWorker {
         }
     }
 
-    /// Re-run `SELECT columns FROM source` for a tabular fine-tune.
-    ///
-    /// A deterministic `ORDER BY` over the **full projected column tuple** pins
-    /// the row order. Without it, DataFusion gives no row-order guarantee
-    /// (multi-file / multi-partition scans reorder run-to-run), which would
-    /// perturb both the batching and the `TargetScaler` μ/σ reduction — breaking
-    /// bit-reproducibility. The projected columns are exactly the columns that
-    /// feed training, so the order is a *total* function of the trainable data:
-    /// the only rows that can tie are byte-identical on every selected column,
-    /// and such rows are interchangeable for both batching and the (commutative)
-    /// mean/std reduction. DataFusion may permute a tie group arbitrarily, but
-    /// that permutation cannot change any training output, so the result is a
-    /// pure function of the row multiset. (No engine-wide stable row-identity
-    /// column exists on an arbitrary registered source table, so ordering by the
-    /// projected tuple is the strongest total key available here.)
-    async fn read_source_columns(
-        &self,
-        session: &Arc<InferenceSession>,
-        source: &str,
-        columns: &[String],
-    ) -> Result<Vec<RecordBatch>> {
-        let table_name = session.find_table_name(source)?;
-        let quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
-        let select = quoted.join(", ");
-        let order_by = quoted.join(", ");
-        let query = format!(
-            "SELECT {select} FROM {} ORDER BY {order_by}",
-            source_relation(source, &table_name)
-        );
-        session.sql(&query).await
-    }
-
-    /// Re-read the node/edge sources and rebuild the deterministic graph sampler,
-    /// then derive the contrastive-pair training loader from it.
+    /// Re-read the node/edge sources, rebuild the deterministic graph sampler,
+    /// commit its pairs as a training set, and load the contrastive rows back
+    /// out of that table.
     async fn reconstruct_graph_loader(
         &self,
         session: &Arc<InferenceSession>,
@@ -1945,7 +1938,79 @@ impl JobWorker {
         }
 
         let sampler = GraphSampler::build(nodes, edges, sample_config)?;
-        TrainingDataLoader::from_graph(&sampler)
+        let pairs = sampler.sample()?;
+        // The sampler emits one uniform shape (`hard_negatives` is a single
+        // config knob), so the first pair decides whether a `negative` column
+        // is projected at all — the same derivation
+        // `TrainingDataLoader::from_graph` makes, taken here because the
+        // COLUMN SET has to be known before the table can be named.
+        let has_negatives = pairs.first().is_some_and(|p| !p.hard_negatives.is_empty());
+        let (_table, batches) = training_set::materialize_sampled_pairs(
+            session,
+            &sources.node_source,
+            &sources.edge_source,
+            &Self::graph_spec_identity(sources, &sample_config)?,
+            &pairs,
+            has_negatives,
+        )
+        .await?;
+        drop(pairs);
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let anchors = batch
+                .column_by_name("anchor")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune("graph training set: 'anchor' is not text".into())
+                })?;
+            let positives = batch
+                .column_by_name("positive")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune("graph training set: 'positive' is not text".into())
+                })?;
+            let negatives = if has_negatives {
+                Some(
+                    batch
+                        .column_by_name("negative")
+                        .and_then(|c| extract_string_column(c.as_ref()))
+                        .ok_or_else(|| {
+                            JammiError::FineTune(
+                                "graph training set: 'negative' is not text".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    anchors[i].clone(),
+                    positives[i].clone(),
+                    negatives.as_ref().map(|n| n[i].clone()),
+                ));
+            }
+        }
+        TrainingDataLoader::from_graph_rows(rows, has_negatives)
+    }
+
+    /// The canonical identity of a graph fine-tune's sampled-pair relation: the
+    /// JSON of the node/edge sources and the sample config, in field order.
+    ///
+    /// This string is the `source` the training set's definition hash folds, so
+    /// it must name everything the sampled rows depend on and nothing else. A
+    /// per-run id would make two identical graph fine-tunes two different
+    /// tables; omitting a config field would make two different samplings
+    /// collide on one hash. Serialising the two spec structs whole is what keeps
+    /// a field added to either from silently escaping the identity.
+    fn graph_spec_identity(
+        sources: &GraphFineTuneSources,
+        sample_config: &GraphSampleConfig,
+    ) -> Result<String> {
+        serde_json::to_string(&(sources, sample_config)).map_err(|e| {
+            JammiError::FineTune(format!("graph fine-tune spec is not serialisable: {e}"))
+        })
     }
 
     /// Load the base model, build the training target, and drive the blocking
@@ -3322,11 +3387,58 @@ fn extract_numeric_column(
 /// differs, so the caller's chosen task is the discriminator, not a parallel
 /// set of column names, and not a byte-header sniff (an encoded WAV and an
 /// encoded PNG are both binary blobs).
-fn build_training_data_loader(
-    batches: &[RecordBatch],
-    columns: &[String],
-    task: ModelTask,
-) -> Result<TrainingDataLoader> {
+/// The training format a projection's COLUMN NAMES and the job's task fix,
+/// before a single row is read — everything the training-set producer must know
+/// to name the table it is about to write.
+///
+/// The data-derived parameters of [`TrainingFormat`] (`Classification`'s
+/// `num_classes`, `Ner`'s `num_labels`) are absent by construction: they are
+/// counts of what the rows turned out to contain, which is not knowable at the
+/// point the table is named, and which the canonical tag drops for exactly that
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedFormat {
+    Contrastive,
+    Pairs,
+    Triplet,
+    MediaTriplet,
+    Classification,
+    Regression,
+}
+
+impl DetectedFormat {
+    /// The canonical tag this shape records. Every arm names the
+    /// [`TrainingFormat`] variant the loader will build and reads the tag off
+    /// [`TrainingFormat::format_tag`] — the mapping lives in exactly one place,
+    /// so the tag a table is written under and the tag its loader reports can
+    /// never be spelled differently.
+    fn format_tag(self) -> &'static str {
+        match self {
+            Self::Contrastive => TrainingFormat::Contrastive.format_tag(),
+            Self::Pairs => TrainingFormat::Pairs.format_tag(),
+            Self::Triplet => TrainingFormat::Triplet.format_tag(),
+            Self::MediaTriplet => TrainingFormat::MediaTriplet.format_tag(),
+            // `num_classes` is a function of the rows and the tag discards it
+            // (see `format_tag`), so every value names the same tag; the zero
+            // is a neutral placeholder that never leaves this expression.
+            Self::Classification => TrainingFormat::Classification { num_classes: 0 }.format_tag(),
+            Self::Regression => TrainingFormat::Regression.format_tag(),
+        }
+    }
+}
+
+/// Detect the training format from the projected column names and the job's
+/// task — the SINGLE classifier, shared by the producer (which needs the format
+/// tag before it writes the table) and by [`build_training_data_loader`] (which
+/// needs the shape to read it back). Two copies of these predicates would let a
+/// table be written under one format and read under another.
+///
+/// The arm ORDER is part of the contract: media triplets are recognised before
+/// text ones (the columns are identical; only `task` distinguishes an encoded
+/// blob from a string), and regression is tested before classification and
+/// gated on `task == Regression`, so a numeric outcome can never fall into the
+/// classification path and be gathered as a class index.
+fn detect_training_format(columns: &[String], task: ModelTask) -> Result<DetectedFormat> {
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
 
     let has_contrastive = col_names.contains(&"text_a")
@@ -3341,23 +3453,53 @@ fn build_training_data_loader(
         && col_names.contains(&"positive")
         && !col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
-    // Regression shares the `text` anchor with classification but reads a
-    // numeric `target` column instead of a string `label`. The two text-outcome
-    // formats are disambiguated by `task`, not by column names, exactly as the
-    // audio-triplet path is task-gated below: the regression arm is gated on
-    // `task == Regression` and ordered before classification, and classification
-    // is gated on `task != Regression`. So `task=regression` is authoritative —
-    // it can never fall into the classification path (which would gather a
-    // numeric outcome as a class index and CUDA-assert), and a `label`-only
-    // source under `task=regression` produces a typed "needs a numeric target"
-    // error rather than a device-side assert.
     let has_regression = col_names.contains(&"text") && col_names.contains(&"target");
 
     if has_triplet && matches!(task, ModelTask::AudioEmbedding | ModelTask::ImageEmbedding) {
+        Ok(DetectedFormat::MediaTriplet)
+    } else if has_contrastive {
+        Ok(DetectedFormat::Contrastive)
+    } else if has_triplet {
+        Ok(DetectedFormat::Triplet)
+    } else if has_pairs {
+        Ok(DetectedFormat::Pairs)
+    } else if task == ModelTask::Regression {
+        // A `task=regression` request with no usable `target` column is a typed
+        // error here, never a fall-through to classification.
+        if !has_regression {
+            return Err(JammiError::FineTune(format!(
+                "task=regression needs a string 'text' column and a numeric 'target' column, \
+                 but the projected columns are {col_names:?}. (Classification's string 'label' \
+                 is distinct: name the numeric outcome column 'target'.)"
+            )));
+        }
+        Ok(DetectedFormat::Regression)
+    } else if has_classification {
+        Ok(DetectedFormat::Classification)
+    } else {
+        Err(JammiError::FineTune(format!(
+            "Cannot detect training format from columns: {col_names:?}. \
+             Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
+             pairs (anchor, positive), classification (text, label), or regression \
+             (text, target) with task=regression. For image/audio triplets, use the \
+             same (anchor, positive, negative) columns with binary cells and \
+             task=image_embedding/audio_embedding."
+        )))
+    }
+}
+
+fn build_training_data_loader(
+    batches: &[RecordBatch],
+    columns: &[String],
+    task: ModelTask,
+) -> Result<TrainingDataLoader> {
+    let detected = detect_training_format(columns, task)?;
+
+    if detected == DetectedFormat::MediaTriplet {
         return build_media_triplet_loader(batches, task);
     }
 
-    if has_contrastive {
+    if detected == DetectedFormat::Contrastive {
         let mut rows = Vec::new();
         for batch in batches {
             let a_col = batch
@@ -3395,7 +3537,7 @@ fn build_training_data_loader(
             }
         }
         Ok(TrainingDataLoader::from_contrastive(rows))
-    } else if has_triplet {
+    } else if detected == DetectedFormat::Triplet {
         let mut rows = Vec::new();
         for batch in batches {
             let schema_info = || {
@@ -3450,7 +3592,7 @@ fn build_training_data_loader(
             }
         }
         Ok(TrainingDataLoader::from_triplets(rows))
-    } else if has_pairs {
+    } else if detected == DetectedFormat::Pairs {
         let mut rows = Vec::new();
         for batch in batches {
             let schema_info = || {
@@ -3495,20 +3637,12 @@ fn build_training_data_loader(
             }
         }
         Ok(TrainingDataLoader::from_pairs(rows))
-    } else if task == ModelTask::Regression {
+    } else if detected == DetectedFormat::Regression {
         // Regression: a string `text` column and a numeric `target` column. The
         // target is read into `f32` (handling int64/float64/float32/… via
         // `extract_numeric_column`); nulls and NaNs are rejected citing the row
         // rather than coerced, since a coerced `0.0` would silently corrupt the
-        // scaler's μ/σ. A `task=regression` request with no usable `target`
-        // column is a typed error here, never a fall-through to classification.
-        if !has_regression {
-            return Err(JammiError::FineTune(format!(
-                "task=regression needs a string 'text' column and a numeric 'target' column, \
-                 but the projected columns are {col_names:?}. (Classification's string 'label' \
-                 is distinct: name the numeric outcome column 'target'.)"
-            )));
-        }
+        // scaler's μ/σ.
         let mut rows = Vec::new();
         for batch in batches {
             let text_vals = batch
@@ -3539,7 +3673,8 @@ fn build_training_data_loader(
             }
         }
         Ok(TrainingDataLoader::from_regression(rows))
-    } else if has_classification {
+    } else {
+        debug_assert_eq!(detected, DetectedFormat::Classification);
         let mut label_set = std::collections::BTreeSet::new();
         let mut rows = Vec::new();
         for batch in batches {
@@ -3573,15 +3708,6 @@ fn build_training_data_loader(
             indexed_rows,
             num_classes,
         ))
-    } else {
-        Err(JammiError::FineTune(format!(
-            "Cannot detect training format from columns: {col_names:?}. \
-             Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             pairs (anchor, positive), classification (text, label), or regression \
-             (text, target) with task=regression. For image/audio triplets, use the \
-             same (anchor, positive, negative) columns with binary cells and \
-             task=image_embedding/audio_embedding."
-        )))
     }
 }
 

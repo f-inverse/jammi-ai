@@ -34,9 +34,27 @@ pub enum ResultTableKind {
     /// carries no ANN sidecar and is excluded from embedding-table resolution —
     /// it is data of record, not a search structure.
     AsofJoin,
+    /// An immutable, canonically-ordered relational table a training run reads
+    /// its rows from, produced by
+    /// [`ResultStore::materialize_training_set`](crate::store::ResultStore::materialize_training_set).
+    /// Like [`AsofJoin`](Self::AsofJoin) it is data of record: no ANN sidecar,
+    /// and excluded from embedding-table resolution even though its `task`
+    /// column names a genuine model task (the task the rows train, not a task
+    /// this table is the model output of).
+    TrainingSet,
 }
 
 impl ResultTableKind {
+    /// Every kind, in declaration order — the single set the string codec's
+    /// round-trip oracle and its "expected" error text both range over, so a
+    /// kind added to the enum cannot be silently missing from either.
+    pub const ALL: [Self; 4] = [
+        Self::Model,
+        Self::NeighborGraph,
+        Self::AsofJoin,
+        Self::TrainingSet,
+    ];
+
     /// Canonical string stored in the `result_tables.kind` column. The single
     /// source of truth — [`try_from_db_str`](Self::try_from_db_str) decodes it.
     pub fn as_db_str(&self) -> &'static str {
@@ -44,20 +62,26 @@ impl ResultTableKind {
             Self::Model => "model",
             Self::NeighborGraph => "neighbor_graph",
             Self::AsofJoin => "asof_join",
+            Self::TrainingSet => "training_set",
         }
     }
 
     /// Decode the canonical string back into a [`ResultTableKind`]. Unknown
-    /// spellings raise [`JammiError::Catalog`] naming the offending value.
+    /// spellings raise [`JammiError::Catalog`] naming the offending value and
+    /// listing the accepted spellings, derived from [`Self::ALL`] rather than
+    /// hand-written: the two can never drift apart.
     pub fn try_from_db_str(s: &str) -> Result<Self> {
-        match s {
-            "model" => Ok(Self::Model),
-            "neighbor_graph" => Ok(Self::NeighborGraph),
-            "asof_join" => Ok(Self::AsofJoin),
-            other => Err(JammiError::Catalog(format!(
-                "Unknown result-table kind '{other}'. Expected: model, neighbor_graph, asof_join"
-            ))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_db_str() == s)
+            .ok_or_else(|| {
+                let expected: Vec<&'static str> =
+                    Self::ALL.iter().map(|kind| kind.as_db_str()).collect();
+                JammiError::Catalog(format!(
+                    "Unknown result-table kind '{s}'. Expected: {}",
+                    expected.join(", ")
+                ))
+            })
     }
 }
 
@@ -1803,5 +1827,51 @@ impl Catalog {
             )
             .await?;
         Ok(found.flatten().map(|c| c as usize))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Family M: `as_db_str` and `try_from_db_str` are inverse over the WHOLE
+    /// enum. The set ranged over is [`ResultTableKind::ALL`], which the
+    /// `as_db_str` match is exhaustive against — so a kind added to the enum
+    /// without a spelling fails to compile, and one added without being listed
+    /// in `ALL` fails the injectivity assertion below.
+    #[test]
+    fn every_result_table_kind_round_trips_through_its_db_string() {
+        for kind in ResultTableKind::ALL {
+            assert_eq!(
+                ResultTableKind::try_from_db_str(kind.as_db_str()).unwrap(),
+                kind,
+                "{kind:?} must decode from its own canonical spelling"
+            );
+        }
+        let spellings: std::collections::BTreeSet<&'static str> =
+            ResultTableKind::ALL.iter().map(|k| k.as_db_str()).collect();
+        assert_eq!(
+            spellings.len(),
+            ResultTableKind::ALL.len(),
+            "two kinds share one canonical spelling, so the codec is not injective"
+        );
+    }
+
+    /// The refusal names the offending value AND every accepted spelling, so a
+    /// kind that exists in the enum can never be missing from the message a
+    /// reader is handed.
+    #[test]
+    fn an_unknown_result_table_kind_is_refused_naming_every_accepted_spelling() {
+        let err = ResultTableKind::try_from_db_str("embedding_index")
+            .expect_err("an unknown kind must be refused, never defaulted");
+        let text = err.to_string();
+        assert!(text.contains("embedding_index"), "{text}");
+        for kind in ResultTableKind::ALL {
+            assert!(
+                text.contains(kind.as_db_str()),
+                "the refusal must list '{}': {text}",
+                kind.as_db_str()
+            );
+        }
     }
 }

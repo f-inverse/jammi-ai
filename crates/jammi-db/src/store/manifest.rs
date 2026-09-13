@@ -72,6 +72,26 @@ pub use jammi_numerics::ComputePrecision;
 /// version-mismatched or shape-mismatched manifest.
 pub const MANIFEST_VERSION: u32 = 3;
 
+/// The row-order rule version 1 of the training-set producer commits and
+/// records in [`ProducingDescriptor::TrainingSet::order_rule`]: the rows are
+/// ordered by the **full projected tuple** — every projected column, in
+/// declared order, ascending, NULLs first.
+///
+/// Ordering by the full tuple rather than by a key column is what makes the
+/// order a total function of the trainable data: the only rows that can tie
+/// are byte-identical on every projected column, and such rows are
+/// interchangeable for any consumer of the table (the reader cannot tell one
+/// from the other), so the committed order is a pure function of the row
+/// multiset even though a tie group's internal permutation is not pinned. No
+/// engine-wide stable row identity exists on an arbitrary registered source,
+/// so the projected tuple is the strongest total key available.
+///
+/// A versioned tag, not a bare `true`: a later rule (a different direction, a
+/// different NULL placement, an added tie-break column) is a *different*
+/// definition and must take a new tag, so a table committed under v1 is never
+/// silently read as if it carried the newer order.
+pub const TRAINING_SET_ORDER_RULE_V1: &str = "full_tuple_v1";
+
 /// Content hash of *how* a table was produced: a canonical encoding of the
 /// [`ProducingDescriptor`] plus the [`MaterializationEnv`] that affects its
 /// output. SHA-256, hex-encoded.
@@ -523,6 +543,60 @@ pub enum ProducingDescriptor {
         /// Right-side projection columns, in output order. Empty = all non-key
         /// columns.
         project: Vec<String>,
+    },
+    /// Training-set output: the rows a training run reads, projected from a
+    /// source relation and committed in one canonical order as an immutable
+    /// Parquet table of kind
+    /// [`ResultTableKind::TrainingSet`](crate::catalog::result_repo::ResultTableKind::TrainingSet).
+    /// ([`ResultStore::materialize_training_set`](crate::store::ResultStore::materialize_training_set).)
+    ///
+    /// The determinant set is exactly what changes the committed BYTES and
+    /// their order: the source relation the rows were projected from, the
+    /// projected columns in declared order, the model task those columns are
+    /// read as, the training format the consumer parses them under, and the
+    /// order rule the write committed. Nothing about *how a run consumes the
+    /// table* is recorded — not the world size, not the per-rank batch, not
+    /// the validation split, not the topology: those partition and slice a
+    /// table that is already fixed, so folding them in would fragment one
+    /// shared artifact into a per-run copy while changing not one committed
+    /// byte. That omission is what lets runs of different shapes share one
+    /// table — the definition half of the reuse key; the recorded input
+    /// anchors must match too, and be pinned
+    /// ([`ResultStore::materialize_training_set`](crate::store::ResultStore::materialize_training_set)).
+    ///
+    /// `format` is a **canonical string tag**, not the consuming crate's
+    /// format type: `jammi-db` depends on no jammi crate but `jammi-numerics`,
+    /// so the owning crate maps its own enum to a stable tag and this
+    /// descriptor folds the tag. The completeness burden moves with it: a
+    /// format distinction the tag does not spell is two different tables
+    /// colliding on one hash, which is the mapping's contract to keep (the
+    /// same burden [`Self::External`]'s `params` carries).
+    TrainingSet {
+        /// The source relation the rows were projected from, as the canonical
+        /// text the producer actually ran — the query, never merely a source
+        /// id. Two different projections, filters or joins over one registered
+        /// source are two different training sets, and recording only the id
+        /// would collide them on a single hash.
+        source: String,
+        /// The projected columns, in declared order. Also the order key (see
+        /// `order_rule`), so their declared order is itself output-affecting:
+        /// the same column set declared differently commits a different row
+        /// order.
+        columns: Vec<String>,
+        /// The model task the projected columns are read as — the task decides
+        /// which columns are inputs and which are targets, so it changes what
+        /// the same bytes mean to a consumer.
+        task: ModelTask,
+        /// The training format the consumer parses the rows under, as its
+        /// canonical string tag: the same columns under two formats are two
+        /// different training sets.
+        format: String,
+        /// The row-order rule the write committed, as a versioned tag —
+        /// [`TRAINING_SET_ORDER_RULE_V1`] today. A change to how the producer
+        /// orders rows changes the committed byte order, so the rule is part
+        /// of the definition and takes a NEW tag rather than silently
+        /// re-ordering the rows an existing hash already names.
+        order_rule: String,
     },
     /// A table produced by a verb the engine does not own: a consumer built the
     /// rows through its own producer and asked the engine only to publish them
@@ -2174,6 +2248,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.unpinned_inputs(), vec!["federated".to_string()]);
+    }
+
+    /// Every field of [`ProducingDescriptor::TrainingSet`], carried as a
+    /// fixture whose shape the completeness test below destructures WITHOUT
+    /// `..`, so a field added to the variant fails to compile here instead of
+    /// silently escaping the definition hash (K7).
+    #[derive(Clone)]
+    struct TrainingSetFields {
+        source: String,
+        columns: Vec<String>,
+        task: ModelTask,
+        format: String,
+        order_rule: String,
+    }
+
+    fn training_set_descriptor(f: &TrainingSetFields) -> ProducingDescriptor {
+        // Exhaustive construction: no `..`, so the fixture and the variant
+        // stay in lock-step.
+        let TrainingSetFields {
+            source,
+            columns,
+            task,
+            format,
+            order_rule,
+        } = f.clone();
+        ProducingDescriptor::TrainingSet {
+            source,
+            columns,
+            task,
+            format,
+            order_rule,
+        }
+    }
+
+    /// A base fixture whose every field is a NON-default, distinguishable
+    /// value: a mutation test over a fixture of defaults passes vacuously
+    /// exactly where the identity is lossy.
+    fn training_set_fields() -> TrainingSetFields {
+        TrainingSetFields {
+            source: "SELECT \"q\", \"a\" FROM jammi.support_tickets WHERE \"lang\" = 'en'".into(),
+            columns: vec!["q".into(), "a".into()],
+            task: ModelTask::TextEmbedding,
+            format: "pairs".into(),
+            order_rule: TRAINING_SET_ORDER_RULE_V1.to_string(),
+        }
+    }
+
+    #[test]
+    fn training_set_hash_is_deterministic() {
+        let env = no_model_env();
+        let f = training_set_fields();
+        assert_eq!(
+            definition_hash(&training_set_descriptor(&f), &env).unwrap(),
+            definition_hash(&training_set_descriptor(&f), &env).unwrap(),
+            "the same training-set definition must hash identically"
+        );
+    }
+
+    /// K7 completeness: the field set the assertions below range over is the
+    /// variant's own, taken by exhaustive destructuring (no `..`) — a new
+    /// field breaks this test's compilation, which is the point.
+    #[test]
+    fn training_set_every_field_moves_the_hash() {
+        // The `let` below is the enumeration of record: adding a field to the
+        // variant fails to compile here until it is bound and mutated.
+        let TrainingSetFields {
+            source: _,
+            columns: _,
+            task: _,
+            format: _,
+            order_rule: _,
+        } = training_set_fields();
+
+        assert_each_change_moves_hash(
+            &training_set_fields(),
+            &no_model_env(),
+            training_set_descriptor,
+            &[
+                ("source", |f| {
+                    f.source = "SELECT \"q\", \"a\" FROM jammi.support_tickets".into()
+                }),
+                // A different column SET.
+                ("columns", |f| f.columns.push("lang".into())),
+                // …and the same set in a different ORDER: the columns are the
+                // order key, so their declared order is output-affecting on
+                // its own.
+                ("columns order", |f| f.columns.reverse()),
+                ("task", |f| f.task = ModelTask::Classification),
+                ("format", |f| f.format = "triplets".into()),
+                ("order_rule", |f| f.order_rule = "full_tuple_v2".into()),
+            ],
+        );
+    }
+
+    /// The device is part of the environment the hash folds, so the same
+    /// training-set definition materialised on two devices is two identities —
+    /// the environment leg of K7 for this variant, which the descriptor-only
+    /// mutations above cannot show.
+    #[test]
+    fn training_set_hash_moves_with_the_device() {
+        let d = training_set_descriptor(&training_set_fields());
+        assert_ne!(
+            definition_hash(&d, &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())).unwrap(),
+            definition_hash(
+                &d,
+                &MaterializationEnv::new(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
+            )
+            .unwrap(),
+        );
     }
 
     #[test]

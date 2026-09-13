@@ -73,6 +73,16 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         JammiError::ChannelCatalog(
             ChannelCatalogError::InvalidId(_) | ChannelCatalogError::InvalidColumnType(_),
         ) => "InvalidArgument",
+        // A training set whose projection yields no rows is a degenerate input
+        // the caller must change. The server maps it to `Code::InvalidArgument`
+        // (`jammi_server::grpc::wire::map_engine_error`), which the remote
+        // client raises as `jammi.errors.InvalidArgument`
+        // (`clients/python/jammi/_database.py::_rpc_to_jammi`) — so the
+        // embedded engine raises THAT class, not the `BackendError` the
+        // fall-through below would give it. No leaf class: the remote client
+        // decodes no status detail, so a refinement here would be catchable on
+        // one transport only.
+        JammiError::EmptyTrainingSet { .. } => "InvalidArgument",
         // The leaf classes `jammi.errors` refines from `InvalidArgument` /
         // `BackendError` for the typed refusals the embedded engine raises
         // (each subclasses the class the remote mapper produces for its gRPC
@@ -112,9 +122,61 @@ pub fn to_pyerr<E: Into<JammiError>>(e: E) -> PyErr {
 /// in-process validators raise. Any other code is a genuine fault and surfaces
 /// as `BackendError`.
 pub fn status_to_pyerr(status: Status) -> PyErr {
-    let class = match status.code() {
+    client_error(status_class(status.code()), status.message().to_string())
+}
+
+/// The `jammi.errors` class a gRPC [`Code`] maps to.
+///
+/// The same partition the pure-Python remote client applies to a live status
+/// (`clients/python/jammi/_database.py::_rpc_to_jammi`): `INVALID_ARGUMENT` is a
+/// caller error, everything else is a backend fault. Named as its own function
+/// so [`jammi_error_class`] can be checked AGAINST it — an engine variant the
+/// server surfaces under a given code must land on the class the remote client
+/// raises for that code, rather than on a class chosen independently here.
+fn status_class(code: Code) -> &'static str {
+    match code {
         Code::InvalidArgument => "InvalidArgument",
         _ => "BackendError",
-    };
-    client_error(class, status.message().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// K4 (embedded ⇄ remote parity): the class the embedded engine raises for
+    /// `EmptyTrainingSet` is the class the remote transport raises for the same
+    /// failure.
+    ///
+    /// The remote side of the equality is derived, not restated: the server maps
+    /// this variant to `Code::InvalidArgument`
+    /// (`jammi_server::grpc::wire::map_engine_error`, pinned by that crate's
+    /// `empty_training_set_round_trips_as_its_typed_variant_not_other`), and
+    /// [`status_class`] is this crate's copy of the remote client's
+    /// code → class partition. Before this arm existed the variant fell through
+    /// to `BackendError`, so a caller catching `InvalidArgument` saw the K2
+    /// refusal remotely and missed it embedded.
+    #[test]
+    fn empty_training_set_raises_the_class_the_remote_transport_raises() {
+        let err = JammiError::EmptyTrainingSet {
+            source_query: "SELECT text, label FROM reviews.public.rows".to_string(),
+        };
+        assert_eq!(
+            jammi_error_class(&err),
+            status_class(Code::InvalidArgument),
+            "the embedded class for an empty training set must equal the class \
+             the remote client raises for the INVALID_ARGUMENT the server sends",
+        );
+    }
+
+    /// The residual bucket is still the residual bucket: a fault that is not a
+    /// caller error keeps mapping to `BackendError`, so the arm above narrowed
+    /// exactly one variant rather than widening the caller-error class.
+    #[test]
+    fn a_non_caller_fault_still_classifies_as_a_backend_error() {
+        assert_eq!(
+            jammi_error_class(&JammiError::Other("disk on fire".to_string())),
+            status_class(Code::Internal),
+        );
+    }
 }

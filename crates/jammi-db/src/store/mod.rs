@@ -27,7 +27,7 @@ pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, DeletePolicy,
     InputAnchor, ManifestError, MatchVerdict, Materialization, MaterializationEnv,
     MaterializationManifest, ModelContentDigest, ModelContentDigestUnavailableReason,
-    ModelIdentity, ProducingDescriptor,
+    ModelIdentity, ProducingDescriptor, TRAINING_SET_ORDER_RULE_V1,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
@@ -39,11 +39,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::Array;
+use arrow::compute::SortOptions;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_expr::{expressions::col as physical_col, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
+use futures::StreamExt;
 use tracing::warn;
 
 use crate::catalog::lease::LeaseIntervals;
@@ -148,6 +154,198 @@ pub struct ComputedEmbeddingProvenance {
     /// The as-of state of every input the caller's producer read, in producer
     /// order.
     pub inputs: Vec<InputAnchor>,
+}
+
+/// The `model_id` a training-set result table's catalog row carries. Producing
+/// a training set invokes no model — the column is NOT NULL, so a stable
+/// sentinel rides it, the same shape the neighbor-graph and as-of derivations
+/// use.
+pub const TRAINING_SET_MODEL_ID: &str = "training-set";
+
+/// Everything [`ResultStore::materialize_training_set`] needs to identify and
+/// build one training set.
+///
+/// Every field here except `device` and `inputs` is a **determinant of the
+/// table's identity** and folds into [`ProducingDescriptor::TrainingSet`];
+/// `device` folds into the [`MaterializationEnv`] the hash also covers.
+/// `inputs` is not part of the hash — the definition is *how* a table is
+/// produced, the anchors are *over what* — but it IS the other half of the
+/// reuse key: [`ResultStore::materialize_training_set`] reuses a table only
+/// when its recorded anchors equal these and every one of them is pinned.
+///
+/// Deliberately absent: world size, per-rank batch, validation fraction,
+/// topology. They slice a table that is already fixed, so a spec that carried
+/// them would fragment one shareable artifact into a per-run copy.
+#[derive(Debug)]
+pub struct TrainingSetSpec<'a> {
+    /// The registered source the rows belong to — the catalog row's
+    /// `source_id` lineage column, and the name a refusal reports against.
+    pub source_id: &'a str,
+    /// The query the rows are projected from, as the producer will run it.
+    /// This is the identity of the *source* in the definition hash: two
+    /// different projections, filters, or joins over one registered source are
+    /// two different training sets and must not share a table.
+    pub source_sql: &'a str,
+    /// The columns to project, in declared order. Also the full-tuple order
+    /// key ([`TRAINING_SET_ORDER_RULE_V1`]), so the declared order is
+    /// output-affecting.
+    pub columns: &'a [String],
+    /// The model task the projected columns are read as.
+    pub task: ModelTask,
+    /// The training format the consumer parses the rows under, as its
+    /// canonical string tag. The consuming crate owns the enum and the mapping
+    /// (`jammi-db` depends on no jammi crate but `jammi-numerics`); the
+    /// mapping's completeness is what keeps two formats off one hash.
+    pub format: &'a str,
+    /// The as-of anchors of every input the source query reads, in the
+    /// caller's order. Recorded in the manifest and matched exactly by the
+    /// reuse probe: an [`AnchorKind::UnpinnedAtInstant`] anchor here means
+    /// this materialization is never served from an existing table, and never
+    /// serves a later one (see
+    /// [`ResultStore::materialize_training_set`]).
+    pub inputs: Vec<InputAnchor>,
+    /// The device the projection ran on — part of the environment the
+    /// definition hash folds.
+    pub device: ComputeDevice,
+}
+
+impl TrainingSetSpec<'_> {
+    /// The typed [`ProducingDescriptor::TrainingSet`] this spec names.
+    pub fn descriptor(&self) -> ProducingDescriptor {
+        ProducingDescriptor::TrainingSet {
+            source: self.source_sql.to_string(),
+            columns: self.columns.to_vec(),
+            task: self.task,
+            format: self.format.to_string(),
+            order_rule: manifest::TRAINING_SET_ORDER_RULE_V1.to_string(),
+        }
+    }
+
+    /// The output-affecting environment this spec's materialization runs under
+    /// — the device, and no invoked model (projecting rows runs none).
+    pub fn env(&self) -> MaterializationEnv {
+        MaterializationEnv::new(self.device.clone(), Vec::new())
+    }
+
+    /// The [`DefinitionHash`] this spec's table is content-addressed by — the
+    /// same value the funnel records at finalize, exposed so a caller can name
+    /// a training set (e.g. fold it into a downstream producer's own
+    /// descriptor) without materialising it.
+    pub fn definition_hash(&self) -> Result<DefinitionHash> {
+        MaterializationManifest::definition_of(&self.descriptor(), &self.env())
+            .map_err(manifest_to_jammi)
+    }
+
+    /// Reject a projection that cannot carry a total order (family D:
+    /// validate at the edge, before anything is planned).
+    ///
+    /// An empty projection has no order key at all; a blank name resolves to
+    /// nothing; a repeated name projects two identically-named fields, which
+    /// makes the order key ambiguous rather than total — and, silently, makes
+    /// two different specs hash differently while committing the same bytes.
+    fn validate_columns(&self) -> Result<()> {
+        let schema_error = |column: &str, expected: &str, actual: String| JammiError::Schema {
+            table: self.source_id.to_string(),
+            column: column.to_string(),
+            expected: expected.to_string(),
+            actual,
+        };
+        if self.columns.is_empty() {
+            return Err(schema_error(
+                "<projection>",
+                "at least one projected column",
+                "an empty projection".to_string(),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for column in self.columns {
+            if column.trim().is_empty() {
+                return Err(schema_error(
+                    "<projection>",
+                    "a non-blank column name",
+                    format!("a blank column name at position {}", seen.len()),
+                ));
+            }
+            if !seen.insert(column.as_str()) {
+                return Err(schema_error(
+                    column,
+                    "each projected column named once",
+                    format!("column '{column}' projected more than once"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `ready` training-set table
+/// [`ResultStore::materialize_training_set`] returns: the catalog record, the
+/// definition hash it is addressed by, and which path produced it.
+#[derive(Debug, Clone)]
+pub struct TrainingSetTable {
+    /// The promoted catalog record. `record.table_name` is the table's
+    /// identity; see [`Self::registered_name`] for the name SQL reaches it by.
+    pub record: ResultTableRecord,
+    /// The definition hash the table is content-addressed by — the descriptor
+    /// half of the key a second run reuses it through (the recorded input
+    /// anchors are the other half), and the value a downstream producer folds
+    /// into its own descriptor.
+    pub definition_hash: DefinitionHash,
+    /// Whether this call materialised the table
+    /// ([`CacheOutcome::Computed`]) or reused an existing one
+    /// ([`CacheOutcome::Reused`]). Reuse is reported, never inferred.
+    pub outcome: CacheOutcome,
+}
+
+impl TrainingSetTable {
+    /// The table's identity — its catalog `table_name`.
+    pub fn table_name(&self) -> &str {
+        &self.record.table_name
+    }
+
+    /// The key the table is registered under on the session it was bound to:
+    /// the single bare identifier `jammi.{table_name}` — what
+    /// `TableReference::bare` takes. NOT safe to interpolate into SQL as-is;
+    /// use [`Self::sql_relation`] for that.
+    pub fn registered_name(&self) -> String {
+        format!("jammi.{}", self.record.table_name)
+    }
+
+    /// [`Self::registered_name`] quoted for interpolation into generated SQL:
+    /// `"jammi.{table_name}"`, one identifier carrying a literal dot.
+    ///
+    /// A result-table name carries hyphens (a sanitized model id) and dots (a
+    /// nanosecond timestamp), so the unquoted form re-parses as arithmetic and
+    /// as a multi-part relation reference — never the table. Quoting the WHOLE
+    /// key (not each dot-separated part) is what matches the provider's key.
+    pub fn sql_relation(&self) -> String {
+        crate::sql::quote_ident(&self.registered_name())
+    }
+}
+
+/// The `ORDER BY` clause that re-applies the training-set producer's committed
+/// row order ([`TRAINING_SET_ORDER_RULE_V1`]) to a read of the materialised
+/// table: every projected column, in declared order, ascending, NULLs first.
+///
+/// The single source of truth for the reader's half of the order contract — a
+/// reader that hand-writes the clause and gets the direction, the NULL
+/// placement, or the column order wrong reads rows in an order the table's
+/// descriptor does not claim, and no error is raised.
+///
+/// Identifiers are quoted and internal quotes doubled, so a column name is
+/// never a fragment of SQL the parser re-interprets. Returns the full clause
+/// including the `ORDER BY` keyword; an empty column list yields an empty
+/// string (there is nothing to order by), which is a caller error
+/// [`TrainingSetSpec`] refuses at materialization time.
+pub fn training_set_order_by(columns: &[String]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let keys: Vec<String> = columns
+        .iter()
+        .map(|c| format!("{} ASC NULLS FIRST", crate::sql::quote_ident(c)))
+        .collect();
+    format!("ORDER BY {}", keys.join(", "))
 }
 
 /// Coordinates Parquet storage, ANN indexes, DataFusion registration,
@@ -3589,6 +3787,310 @@ impl ResultStore {
         )
         .await
     }
+
+    /// Materialise — or reuse — the immutable, canonically-ordered table a
+    /// training run reads its rows from, and return the `ready` table.
+    ///
+    /// The training set is a **producer output**, not a run's scratch space:
+    /// two runs over the same source query, columns, task and format — read
+    /// over the same *pinned* input anchors — share ONE table, keyed by
+    /// ([`DefinitionHash`], input anchors). Nothing about how a run *consumes*
+    /// the rows (world size, per-rank batch, validation split, topology) enters
+    /// the identity, so runs of different shapes reuse the same artifact — see
+    /// [`ProducingDescriptor::TrainingSet`] for the full determinant set.
+    ///
+    /// # The order it commits
+    ///
+    /// The rows are ordered by the **full projected tuple**
+    /// ([`TRAINING_SET_ORDER_RULE_V1`]) and written in that order. The sort is
+    /// planned explicitly and the plan is collapsed to a single partition
+    /// through a [`SortPreservingMergeExec`] when the session's
+    /// `target_partitions` left it partitioned — never left to whatever
+    /// partition count a default hands back, whose merge would silently
+    /// interleave the sorted runs. A reader re-applies the same order with
+    /// [`training_set_order_by`] over the registered `jammi.{name}` table.
+    ///
+    /// # Reuse
+    ///
+    /// Before planning anything, this probes for a `ready`
+    /// [`ResultTableKind::TrainingSet`] row carrying this definition hash
+    /// **and** exactly `spec.inputs` as its recorded anchors, whose Parquet
+    /// artifact is still extant, and short-circuits to it. Reuse is
+    /// **reported**, never inferred: the returned
+    /// [`TrainingSetTable::outcome`] says which path ran.
+    ///
+    /// The rule is the engine's standing reuse semantics, with no local
+    /// exception: the key is the `(definition, input anchors)` pair
+    /// [`Self::probe_cache_record`] matches on, so **reuse happens only when
+    /// every recorded anchor is pinned ([`AnchorKind::ResultDigest`]) and equal
+    /// to the requested one**. A `spec.inputs` containing an
+    /// [`AnchorKind::UnpinnedAtInstant`] anchor is therefore never a hit and
+    /// always yields [`CacheOutcome::Computed`]: an instant is not a
+    /// reproducible id, so equal anchors would not prove equal rows, and a
+    /// training set built over changed data must never be served as the old
+    /// one. That is the same predicate [`Self::staleness`] applies (an
+    /// unpinned input is `Undecidable`, never `Fresh`); a caller that wants
+    /// its training sets shared pins its source (a result table read through
+    /// [`Self::pin_current_version`]) rather than asking the probe to assume
+    /// an unpinned relation did not move.
+    ///
+    /// # What it never does to a `building` row
+    ///
+    /// A crashed producer can leave a live `building` training-set row behind.
+    /// This verb never deletes one, never overwrites one, and never promotes
+    /// one: it creates its own row through the single
+    /// [`Self::create_table`] funnel and leaves every other row exactly as it
+    /// found it. Reclaiming an abandoned row is the lease's job
+    /// ([`Catalog::claim_expired_building_table`] after expiry), and a caller
+    /// that wants to wait for a live one rather than build a second copy backs
+    /// off — both remain possible precisely because nothing here forces a
+    /// write onto a row this call does not own.
+    ///
+    /// # `job_attempt` is `None`, always
+    ///
+    /// The row is created with no job attempt, so it is never recorded as some
+    /// attempt's `jobs.partial_result`. A table shared across jobs by its
+    /// `(definition, anchors)` key is not any one attempt's partial output;
+    /// recording it as one
+    /// would tie a shared artifact's lifetime to a single attempt's failure.
+    ///
+    /// # Refusals
+    ///
+    /// - zero projected columns, a blank column name, or a repeated column:
+    ///   [`JammiError::Schema`], before anything is planned. A repeated column
+    ///   projects two identically-named fields, which makes the order key
+    ///   ambiguous rather than total.
+    /// - a projection that yields **zero rows**:
+    ///   [`JammiError::EmptyTrainingSet`], raised before the catalog row is
+    ///   created, so an empty training set leaves no `building` row and no
+    ///   bytes — never a 0-row table a run trains on in silence.
+    pub async fn materialize_training_set(
+        &self,
+        ctx: &SessionContext,
+        spec: TrainingSetSpec<'_>,
+    ) -> Result<TrainingSetTable> {
+        spec.validate_columns()?;
+        let descriptor = spec.descriptor();
+        let env = spec.env();
+        let definition =
+            MaterializationManifest::definition_of(&descriptor, &env).map_err(manifest_to_jammi)?;
+
+        if let Some(record) = self
+            .probe_ready_training_set(&definition, &spec.inputs)
+            .await?
+        {
+            // A reused table was registered on whichever session built it,
+            // which is not this one; bind it here so the caller can read it
+            // back under `jammi.{name}` exactly as it would a fresh one.
+            self.bind_result_table(ctx, &record).await?;
+            let outcome = CacheOutcome::Reused {
+                table: record.table_name.clone(),
+            };
+            return Ok(TrainingSetTable {
+                record,
+                definition_hash: definition,
+                outcome,
+            });
+        }
+
+        let (plan, mut stream) = self.plan_training_set_rows(ctx, &spec).await?;
+
+        // K2: the refusal has to land BEFORE the catalog row exists, so the
+        // stream is pulled until it yields a row (or ends). Only the leading
+        // empty batches are held — never the whole set.
+        let mut buffered: Vec<arrow::array::RecordBatch> = Vec::new();
+        let mut rows_seen = 0usize;
+        while rows_seen == 0 {
+            match stream.next().await {
+                Some(batch) => {
+                    let batch = batch?;
+                    rows_seen += batch.num_rows();
+                    buffered.push(batch);
+                }
+                None => break,
+            }
+        }
+        if rows_seen == 0 {
+            return Err(JammiError::EmptyTrainingSet {
+                source_query: spec.source_sql.to_string(),
+            });
+        }
+
+        let building = self
+            .create_table(
+                spec.source_id,
+                spec.task,
+                ResultTableKind::TrainingSet,
+                // The rows are projected from a registered relation, not
+                // derived from a result table, so there is no FK-lineage
+                // parent; the reproducibility lineage rides the manifest's
+                // input anchors instead (the same shape `asof_join` uses).
+                None,
+                TRAINING_SET_MODEL_ID,
+                None,
+                None,
+                None,
+                // r31: a shared producer output, never this attempt's
+                // partial result.
+                None,
+            )
+            .await?;
+
+        let mut writer = self
+            .open_writer(building.parquet_url(), plan.schema())
+            .await?;
+        for batch in &buffered {
+            writer.write_batch(batch).await?;
+        }
+        drop(buffered);
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            writer.write_batch(&batch).await?;
+        }
+        let row_count = writer.close().await?;
+
+        // Every `?` above unwinds through the handle's Drop (a best-effort
+        // `building -> failed` CAS, no byte deletion); `finish` is the single
+        // `building -> ready` funnel and returns the promoted record.
+        let record = building
+            .finish(
+                ctx,
+                row_count,
+                Materialization::new(&descriptor, &env, spec.inputs.clone()),
+            )
+            .await?;
+
+        Ok(TrainingSetTable {
+            record,
+            definition_hash: definition,
+            outcome: CacheOutcome::Computed,
+        })
+    }
+
+    /// The `ready` training-set table produced by `definition` over exactly
+    /// `inputs`, newest first, whose Parquet artifact still exists — or
+    /// `None`.
+    ///
+    /// The candidate set is [`Self::exact_match_candidates`]', so this probe
+    /// carries the engine's standing reuse predicate verbatim: the recorded
+    /// anchor set must equal `inputs`, and a requested set holding any
+    /// [`AnchorKind::UnpinnedAtInstant`] anchor yields no candidate at all
+    /// (an instant does not prove the source's rows did not move). It is
+    /// [`Self::probe_cache_record`] plus ONE extra predicate — the kind — not
+    /// a second reuse policy.
+    ///
+    /// The kind filter is why this is not a bare call to
+    /// [`Self::probe_cache_record`]: that verb returns the newest extant
+    /// candidate of ANY kind, so a non-training-set row sharing the key
+    /// (only a hash collision can produce one) would both be handed back as a
+    /// training set and shadow a sound training-set reuse behind it. Filtering
+    /// before the extant check keeps the fall-through ranging over
+    /// training-set rows.
+    ///
+    /// The catalog's own `ORDER BY` is not trusted as the tie-break of record
+    /// (r32): the candidates are re-sorted in Rust on the total key
+    /// `(created_at DESC, table_name DESC)`, so two rows created in the same
+    /// nanosecond still resolve to one deterministic winner. A reaped artifact
+    /// falls through to the next candidate rather than failing the whole probe
+    /// — the same soundness rule [`Self::probe_cache_record`] applies.
+    async fn probe_ready_training_set(
+        &self,
+        definition: &DefinitionHash,
+        inputs: &[InputAnchor],
+    ) -> Result<Option<ResultTableRecord>> {
+        let mut candidates = self.exact_match_candidates(definition, inputs).await?;
+        candidates.retain(|c| c.kind == ResultTableKind::TrainingSet);
+        candidates.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.table_name.cmp(&a.table_name))
+        });
+        for candidate in candidates {
+            let url = StorageUrl::parse(&candidate.parquet_path)?;
+            let handle = self.open_parquet(&url)?;
+            let path = handle.data_path()?;
+            if handle.exists(&path).await? {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Plan the projection + full-tuple sort over `spec.source_sql` and start
+    /// it, returning the plan (for its output schema) and a single-partition
+    /// stream of its rows in committed order.
+    ///
+    /// The single-partition guarantee is asserted, not assumed: a global sort
+    /// plans to one output partition today, but a partitioned plan reaching
+    /// [`ExecutionPlan::execute`] would have its sorted runs concatenated in
+    /// arrival order, silently committing rows out of the order the descriptor
+    /// claims. A partitioned plan is therefore merged order-preservingly here.
+    async fn plan_training_set_rows(
+        &self,
+        ctx: &SessionContext,
+        spec: &TrainingSetSpec<'_>,
+    ) -> Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::Expr;
+
+        let projection: Vec<Expr> = spec
+            .columns
+            .iter()
+            // `Column::new_unqualified` rather than the `col(..)` helper: the
+            // helper PARSES its argument as a possibly-qualified identifier, so
+            // a column whose name contains a dot would resolve as
+            // `table.column` and miss. A projected column name is data, never
+            // a fragment of SQL to re-parse.
+            .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
+            .collect();
+        let sorted = ctx
+            .sql(spec.source_sql)
+            .await?
+            .select(projection.clone())?
+            // `full_tuple_v1`: every projected column, declared order,
+            // ascending, NULLs first — the same key
+            // [`training_set_order_by`] renders for the reader.
+            .sort(
+                projection
+                    .into_iter()
+                    .map(|e| e.sort(true, true))
+                    .collect::<Vec<_>>(),
+            )?;
+
+        let plan = sorted.create_physical_plan().await?;
+        let schema = plan.schema();
+        let mut sort_exprs = Vec::with_capacity(spec.columns.len());
+        for column in spec.columns {
+            sort_exprs.push(PhysicalSortExpr {
+                expr: physical_col(column, schema.as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            });
+        }
+        // `LexOrdering::new` is `None` only for an empty key, which
+        // `TrainingSetSpec::validate_columns` already refused at the entry —
+        // so this is an ENGINE-invariant breach (the two guards drifted
+        // apart), not the caller-fault class the entry check raises. Reported
+        // rather than `expect`ed: a broken invariant is an error to surface,
+        // never a panic in a producer.
+        let ordering = LexOrdering::new(sort_exprs).ok_or_else(|| {
+            JammiError::Other(format!(
+                "training set over '{}': an empty order key reached the planner, \
+                 which the projection check should have refused at the entry",
+                spec.source_id
+            ))
+        })?;
+        let plan: Arc<dyn ExecutionPlan> = if plan.output_partitioning().partition_count() > 1 {
+            Arc::new(SortPreservingMergeExec::new(ordering, plan))
+        } else {
+            plan
+        };
+
+        let stream = plan.execute(0, ctx.task_ctx())?;
+        Ok((plan, stream))
+    }
 }
 
 /// Build the `(_row_id, _source_id, _model_id, vector, _content_hash)` batch
@@ -3738,4 +4240,118 @@ async fn build_result_table_provider(
         .with_listing_options(listing_options)
         .with_schema(resolved_schema);
     Ok(Arc::new(ListingTable::try_new(table_config)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn spec<'a>(source_id: &'a str, columns: &'a [String]) -> TrainingSetSpec<'a> {
+        TrainingSetSpec {
+            source_id,
+            source_sql: "SELECT \"q\", \"a\" FROM t",
+            columns,
+            task: ModelTask::TextEmbedding,
+            format: "pairs",
+            inputs: Vec::new(),
+            device: ComputeDevice::Cpu,
+        }
+    }
+
+    /// The reader's half of the order contract renders every column, in
+    /// declared order, with the direction and NULL placement the producer
+    /// committed — the properties the clause must carry, asserted one by one
+    /// rather than against one golden string.
+    #[test]
+    fn the_training_set_order_clause_pins_direction_nulls_and_column_order() {
+        let clause = training_set_order_by(&cols(&["q", "a"]));
+        assert_eq!(
+            clause,
+            "ORDER BY \"q\" ASC NULLS FIRST, \"a\" ASC NULLS FIRST"
+        );
+        // Declared order, not sorted order: reversing the columns reverses the
+        // clause.
+        assert_eq!(
+            training_set_order_by(&cols(&["a", "q"])),
+            "ORDER BY \"a\" ASC NULLS FIRST, \"q\" ASC NULLS FIRST"
+        );
+    }
+
+    /// A column name is data, never SQL: an embedded double quote is doubled,
+    /// so it cannot close the identifier and start a new clause.
+    #[test]
+    fn the_training_set_order_clause_quotes_a_hostile_column_name() {
+        let clause = training_set_order_by(&cols(&["a\" ASC, (SELECT 1) --"]));
+        assert_eq!(
+            clause,
+            "ORDER BY \"a\"\" ASC, (SELECT 1) --\" ASC NULLS FIRST"
+        );
+    }
+
+    /// Degenerate input: no columns is no clause, never a dangling
+    /// `ORDER BY`, which would be a syntax error at the reader.
+    #[test]
+    fn the_training_set_order_clause_is_empty_for_no_columns() {
+        assert_eq!(training_set_order_by(&[]), "");
+    }
+
+    /// Family D at the spec's edge: each degenerate projection is refused with
+    /// a typed error, before anything is planned or created.
+    #[test]
+    fn a_degenerate_projection_is_refused_at_the_spec_edge() {
+        let empty: Vec<String> = Vec::new();
+        assert!(matches!(
+            spec("docs", &empty).validate_columns(),
+            Err(JammiError::Schema { .. })
+        ));
+
+        let blank = cols(&["q", "  "]);
+        assert!(matches!(
+            spec("docs", &blank).validate_columns(),
+            Err(JammiError::Schema { .. })
+        ));
+
+        let duplicated = cols(&["q", "a", "q"]);
+        let err = spec("docs", &duplicated)
+            .validate_columns()
+            .expect_err("a repeated projected column must be refused");
+        assert!(err.to_string().contains('q'), "{err}");
+
+        let ok = cols(&["q", "a"]);
+        assert!(spec("docs", &ok).validate_columns().is_ok());
+    }
+
+    /// The definition hash a caller can name a training set by, before any
+    /// table exists, is the same value for the same spec — and moves with the
+    /// spec's determinants.
+    #[test]
+    fn the_spec_names_a_stable_definition_hash() {
+        let columns = cols(&["q", "a"]);
+        let a = spec("docs", &columns).definition_hash().unwrap();
+        let b = spec("docs", &columns).definition_hash().unwrap();
+        assert_eq!(a, b);
+
+        let mut other = spec("docs", &columns);
+        other.format = "triplets";
+        assert_ne!(a, other.definition_hash().unwrap());
+    }
+
+    /// The order rule the spec records is the one the reader's clause renders:
+    /// a rule bump that forgot the clause (or vice versa) would leave the two
+    /// halves of the contract disagreeing in silence.
+    #[test]
+    fn the_spec_records_the_order_rule_the_reader_clause_implements() {
+        let columns = cols(&["q", "a"]);
+        let ProducingDescriptor::TrainingSet { order_rule, .. } =
+            spec("docs", &columns).descriptor()
+        else {
+            panic!("a training-set spec must build a TrainingSet descriptor");
+        };
+        assert_eq!(order_rule, TRAINING_SET_ORDER_RULE_V1);
+        assert_eq!(order_rule, "full_tuple_v1");
+    }
 }

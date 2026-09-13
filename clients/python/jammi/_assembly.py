@@ -58,11 +58,15 @@ _SOURCE_KIND_NAME = {
 # identically whether it crossed the gRPC wire or came back from the
 # in-process engine. `RESULT_TABLE_KIND_UNSPECIFIED` is deliberately absent —
 # a live `ResultTable` always carries a concrete kind, so seeing it on the
-# wire is a proto-version skew, not a value to default.
+# wire is a proto-version skew, not a value to default. Every OTHER served
+# value of the enum must appear here: a missing kind reads `"Unspecified"`
+# remotely and its real name embedded, which is the disagreement
+# `tests/test_result_table_kind_parity.py` pins this map TOTAL against.
 _RESULT_TABLE_KIND_NAME = {
     embedding_pb2.ResultTableKind.MODEL: "Model",
     embedding_pb2.ResultTableKind.NEIGHBOR_GRAPH: "NeighborGraph",
     embedding_pb2.ResultTableKind.ASOF_JOIN: "AsofJoin",
+    embedding_pb2.ResultTableKind.TRAINING_SET: "TrainingSet",
 }
 
 # File-format string → wire `FileFormat` enum. Mirrors the engine's `FileFormat`

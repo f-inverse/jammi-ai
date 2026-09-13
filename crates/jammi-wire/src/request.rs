@@ -115,6 +115,14 @@ pub struct FineTuneRequest {
     /// encodes as `0` and a request that never sets the count is byte-for-byte
     /// what a caller sent before the field existed. A count the deployment
     /// cannot serve is refused at submit with a typed error, never clamped.
+    ///
+    /// `Some(1)` and `None` are the SAME wire value — both encode as `0` — and
+    /// the engine treats both as one rank: a single-rank job has one encoding,
+    /// whichever client and whichever surface submits it (the embedded session
+    /// resolves both to the engine default, and the Python client's
+    /// `_wire_world_size` likewise writes the field only above one). The
+    /// distinction survives in this struct for the caller that wants to say
+    /// "one rank" out loud; it does not reach the wire.
     pub world_size: Option<NonZeroU32>,
 }
 

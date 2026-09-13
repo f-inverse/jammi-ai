@@ -4487,6 +4487,7 @@ dependencies = [
  "jammi-admin",
  "jammi-db",
  "jammi-wire",
+ "prost",
  "tokio",
  "tokio-stream",
  "tonic",

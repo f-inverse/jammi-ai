@@ -414,6 +414,10 @@ impl DataClient {
     /// count). One request shape rather than a growing parameter list, the
     /// same way [`Self::search`] takes a whole
     /// [`jammi_wire::request::SearchRequest`].
+    ///
+    /// A rank count of `Some(1)` submits the single-rank job [`Self::fine_tune`]
+    /// submits, on the identical bytes — see
+    /// [`FineTuneRequest::world_size`](jammi_wire::request::FineTuneRequest::world_size).
     pub async fn submit_fine_tune(&self, request: FineTuneRequest) -> Result<FineTuneJobId> {
         let FineTuneRequest {
             source,
@@ -443,8 +447,14 @@ impl DataClient {
                 // `0` IS the unset value of the wire's implicit-presence
                 // `uint32`, so an unchosen count sends the same bytes a caller
                 // sent before the field existed and the engine resolves it to
-                // one rank.
-                world_size: world_size.map_or(0, NonZeroU32::get),
+                // one rank. An explicit `1` denotes that same single-rank job,
+                // so it takes that same encoding: one wire value per intent,
+                // matching what the Python client puts on the wire
+                // (`_wire_world_size`). Only a count above one is written.
+                world_size: world_size
+                    .map(NonZeroU32::get)
+                    .filter(|&ranks| ranks > 1)
+                    .unwrap_or(0),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -1244,8 +1254,13 @@ mod grpc_timeout_header_tests {
 ///
 /// The count is the one submit knob whose default is a *silent* value — `0`,
 /// the implicit-presence `uint32`'s unset — so "the caller did not choose" and
-/// "the caller chose" have to be distinguishable at the server, not merely at
-/// the call site. These tests read the field a genuine handler received over a
+/// "the caller chose more than one rank" have to be distinguishable at the
+/// server, not merely at the call site. The third case, an explicit `1`, is
+/// the SAME job as unset and therefore owes the same bytes: one wire encoding
+/// per intent across clients, the encoding the Python client's
+/// `_wire_world_size` already writes.
+///
+/// These tests read the field a genuine handler received over a
 /// loopback connection, the same fixture shape
 /// [`grpc_timeout_header_tests`](self::grpc_timeout_header_tests) uses:
 /// `DataClient::submit_fine_tune` builds and sends the request in one async
@@ -1259,6 +1274,7 @@ mod world_size_tests {
     use std::sync::{Arc, Mutex};
 
     use futures::Stream;
+    use prost::Message;
     use tokio::net::{TcpListener, TcpStream};
     use tonic::transport::{Endpoint, Server};
     use tonic::{Request, Response, Status};
@@ -1438,6 +1454,40 @@ mod world_size_tests {
 
         let received = submitted.lock().unwrap().take().expect("handler ran");
         assert_eq!(received.world_size, 0);
+    }
+
+    /// SET TO ONE. An explicit single rank is the same job as an unchosen
+    /// count, so it is the same REQUEST: the two submissions are compared as
+    /// encoded bytes, not as a field read, because bytes are what a server (or
+    /// another client's request built for the same intent) actually sees. The
+    /// Python client already encodes an explicit `1` as unset
+    /// (`clients/python/jammi/_assembly.py`, `_wire_world_size`), so this is
+    /// also the cross-client agreement: one wire encoding per intent.
+    #[tokio::test]
+    async fn an_explicit_single_rank_encodes_as_the_unset_request() {
+        let (client, submitted) = connected_client().await;
+
+        client
+            .submit_fine_tune(request(NonZeroU32::new(1)))
+            .await
+            .expect("submit returns the double's handle");
+        let via_one = submitted.lock().unwrap().take().expect("handler ran");
+
+        client
+            .submit_fine_tune(request(None))
+            .await
+            .expect("submit returns the double's handle");
+        let via_unset = submitted.lock().unwrap().take().expect("handler ran");
+
+        assert_eq!(
+            via_one.encode_to_vec(),
+            via_unset.encode_to_vec(),
+            "an explicit rank count of one must put the SAME bytes on the wire as an \
+             unchosen count: both denote the single-rank job, and `0` is the wire's \
+             unset (got world_size = {} vs {})",
+            via_one.world_size,
+            via_unset.world_size,
+        );
     }
 
     /// The six-parameter [`DataClient::fine_tune`] is exactly

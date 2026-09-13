@@ -934,17 +934,25 @@ async fn recompute_refuses_a_training_set_with_an_unknown_order_rule() {
     }
 }
 
-/// M2's second unwitnessed refusal — a `TrainingSet` table whose
-/// `.materialization.json` sidecar has gone missing between the catalog's
-/// descriptor read and `recompute`'s anchor read is `NotRecomputable` naming
-/// the table, never a silent "zero recorded anchors" that would replay the
-/// table with none of its original lineage.
+/// This test pins the OUTER `producing_descriptor` guard, not the
+/// between-the-two-reads fold: it deletes the sidecar BEFORE calling
+/// `recompute` at all, so the refusal it drives is `recompute`'s outer
+/// dispatch reading the descriptor through `ResultStore::producing_descriptor`
+/// and finding no sidecar there — the same first read every other kind's
+/// recompute refuses on. The narrower race M2 also names — a sidecar that
+/// vanishes strictly BETWEEN that descriptor read and
+/// `recompute_training_set`'s own anchor read — cannot be constructed by
+/// driving this public entry point end to end (the outer guard above already
+/// refuses first); that fold is pinned at the function level by
+/// `recompute_training_set_refuses_when_its_own_manifest_read_finds_no_sidecar`
+/// (`pipeline/recompute.rs`), which calls `recompute_training_set` directly
+/// with the sidecar removed in the window this test cannot reach.
 ///
 /// No producer or verb in this build ever tears the sidecar off a `ready`
-/// table on its own, so the only way to exercise the refusal honestly is to
-/// delete a real manifest sidecar out from under a real table (same Parquet
-/// object, same catalog row — the sidecar is the ONE thing this test removes)
-/// and drive `recompute` at it.
+/// table on its own, so the only way to exercise even the outer refusal
+/// honestly is to delete a real manifest sidecar out from under a real table
+/// (same Parquet object, same catalog row — the sidecar is the ONE thing this
+/// test removes) and drive `recompute` at it.
 #[tokio::test(flavor = "multi_thread")]
 async fn recompute_refuses_a_training_set_with_a_missing_sidecar() {
     use jammi_ai::pipeline::recompute::Cascade;

@@ -968,6 +968,7 @@ mod tests {
             common: crate::fine_tune::spec::TrainingCommon {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
         }));
         let json = serde_json::to_string(&spec).unwrap();

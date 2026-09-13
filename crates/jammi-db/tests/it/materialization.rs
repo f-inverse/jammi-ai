@@ -1805,3 +1805,206 @@ async fn delete_sidecar(store: &ResultStore, record: &ResultTableRecord) {
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     handle.delete_if_exists(&sidecar).await.unwrap();
 }
+
+// ─── model_materialization (U3, #500): `probe_model_by_definition` ────────
+//
+// `FineTune`'s reuse key is the same one `TrainingSet` uses (definition hash
+// AND pinned equal anchors), restated over `models` because a fine-tuned
+// model is not a `result_tables` row. These tests exercise the db-level
+// primitive directly (register a bare model, then record its materialization
+// summary through `Catalog::record_model_materialization`) — the ai-core
+// finalize sequence this backs is a different unit's scope.
+
+fn unique_model_name(dir: &tempfile::TempDir, stem: &str) -> String {
+    let suffix = dir
+        .path()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("a temp dir has a UTF-8 final component");
+    format!("{stem}-{suffix}")
+}
+
+async fn register_bare_model(catalog: &Catalog, name: &str, version: i32) {
+    catalog
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+            model_id: name,
+            version,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// RED at base: a row created before migration 033 (or a model that never
+/// carries a fine-tune materialization, e.g. `ContextPredictor`) has
+/// `definition_hash IS NULL`. `NULL = $1` is never true, so such a row is
+/// never a probe hit — no separate guard, the equality predicate alone
+/// excludes it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_null_definition_hash_row_is_never_matched_by_probe(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let name = unique_model_name(&dir, "no-materialization");
+    register_bare_model(&catalog, &name, 1).await;
+
+    let anchors = vec![InputAnchor::result_digest(
+        "training-set",
+        &ArtifactDigest::of_bytes(b"rows"),
+    )];
+    let found = catalog
+        .probe_model_by_definition("deadbeef", &anchors)
+        .await
+        .unwrap();
+    assert!(
+        found.is_none(),
+        "a row with NULL definition_hash must never be a probe hit, even matching anchors"
+    );
+}
+
+/// A model row carrying `definition_hash` + exactly matching pinned anchors
+/// is a hit; a different anchor set, or the SAME set but with an
+/// `UnpinnedAtInstant` member, is never a hit (the K7 reuse rule this
+/// mirrors from `ResultStore::exact_match_candidates`).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let name = unique_model_name(&dir, "fine-tuned-x");
+    register_bare_model(&catalog, &name, 1).await;
+
+    let anchors = vec![InputAnchor::result_digest(
+        "training-set",
+        &ArtifactDigest::of_bytes(b"rows"),
+    )];
+    let anchors_json = serde_json::to_string(&anchors).unwrap();
+    catalog
+        .record_model_materialization(
+            &name,
+            1,
+            "hash-a",
+            &anchors_json,
+            "models/x/materialization.json",
+        )
+        .await
+        .unwrap();
+
+    let found = catalog
+        .probe_model_by_definition("hash-a", &anchors)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|r| r.model_id), Some(name.clone()));
+
+    // A different anchor set over the SAME definition hash is never a hit.
+    let different_anchors = vec![InputAnchor::result_digest(
+        "training-set",
+        &ArtifactDigest::of_bytes(b"different-rows"),
+    )];
+    assert!(catalog
+        .probe_model_by_definition("hash-a", &different_anchors)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The same source unpinned is never a hit either — an instant proves
+    // nothing about what the training set actually was.
+    let unpinned = vec![InputAnchor::unpinned_at_instant(
+        "training-set",
+        "2026-01-01T00:00:00Z",
+    )];
+    assert!(catalog
+        .probe_model_by_definition("hash-a", &unpinned)
+        .await
+        .unwrap()
+        .is_none());
+
+    // A different definition hash over the SAME anchors is never a hit.
+    assert!(catalog
+        .probe_model_by_definition("hash-b", &anchors)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// The cache-hit shape U3 builds toward: two DISTINCT model rows share one
+/// definition (a reuse chain), and the probe's tie-break is a deterministic
+/// TOTAL order in Rust (r32), never the catalog's raw `ORDER BY` — ties on
+/// `created_at` (a real possibility at whatever timestamp resolution a
+/// backend renders) break on `catalog_pk` DESCENDING. `second`'s name is
+/// chosen lexicographically greater than `first`'s so the same row wins
+/// whether or not the two registrations tie on `created_at`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn two_models_can_share_one_definition_and_the_probe_is_deterministic(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let anchors = vec![InputAnchor::result_digest(
+        "training-set",
+        &ArtifactDigest::of_bytes(b"rows"),
+    )];
+    let anchors_json = serde_json::to_string(&anchors).unwrap();
+
+    let first = unique_model_name(&dir, "fine-tuned-a");
+    register_bare_model(&catalog, &first, 1).await;
+    catalog
+        .record_model_materialization(
+            &first,
+            1,
+            "hash-shared",
+            &anchors_json,
+            "models/a/materialization.json",
+        )
+        .await
+        .unwrap();
+
+    let second = unique_model_name(&dir, "fine-tuned-b");
+    register_bare_model(&catalog, &second, 1).await;
+    catalog
+        .record_model_materialization(
+            &second,
+            1,
+            "hash-shared",
+            &anchors_json,
+            "models/b/materialization.json",
+        )
+        .await
+        .unwrap();
+
+    let found = catalog
+        .probe_model_by_definition("hash-shared", &anchors)
+        .await
+        .unwrap()
+        .expect("two rows sharing a definition must still be a hit");
+    assert_eq!(
+        found.model_id, second,
+        "the deterministic tie-break must pick the same row every time"
+    );
+}
+
+/// `record_model_materialization` refuses a row that does not exist —
+/// distinct from the register/upsert path, which creates one.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn record_model_materialization_refuses_a_missing_row(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let name = unique_model_name(&dir, "never-registered");
+    let err = catalog
+        .record_model_materialization(&name, 1, "hash", "[]", "models/x/materialization.json")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
+        "expected ModelNotFound, got {err:?}"
+    );
+}

@@ -62,6 +62,24 @@ pub struct ModelRecord {
     pub status: String,
     /// ISO-8601 timestamp of initial registration.
     pub created_at: String,
+    /// The materialization-contract definition hash (migration
+    /// `model_materialization`) — the indexable summary of this model's
+    /// `.materialization.json` sidecar, mirroring
+    /// `result_tables.definition_hash`. `None` for a model with no
+    /// materialization (a directly-registered base model, a
+    /// `ContextPredictor`) or a pre-migration row.
+    pub definition_hash: Option<String>,
+    /// The materialization-contract input anchors as canonical JSON — the
+    /// indexable summary [`Catalog::probe_model_by_definition`] matches
+    /// against, mirroring `result_tables.input_anchors_json`. `None`
+    /// alongside [`Self::definition_hash`].
+    pub input_anchors_json: Option<String>,
+    /// Path to this model's `.materialization.json` sidecar inside its
+    /// artifact prefix (written LAST, after the bundle's own
+    /// `manifest.json`, by
+    /// [`crate::store::ArtifactStore::write_model_materialization`]). `None`
+    /// alongside [`Self::definition_hash`].
+    pub manifest_path: Option<String>,
 }
 
 /// Registry introspection for one registered model — the client-facing
@@ -120,7 +138,7 @@ pub struct RegisterModelParams<'a> {
 
 const SELECT_COLS: &str =
     "model_id, name, model_type, task, backend, version, status, metadata, artifact_path, \
-     created_at";
+     created_at, definition_hash, input_anchors_json, manifest_path";
 
 impl Catalog {
     /// Register or refresh a model in the catalog. The session's bound
@@ -432,6 +450,177 @@ impl Catalog {
             )
             .await?)
     }
+
+    /// Every `models` row carrying exactly `definition_hash`, newest first —
+    /// the raw candidate set [`Self::probe_model_by_definition`] narrows with
+    /// the exact anchor match. Mirrors
+    /// [`Catalog::find_ready_result_tables_by_definition`]'s shape for
+    /// `result_tables`. Tenant-scoped like every other catalog read.
+    ///
+    /// `definition_hash = $1` can never match a `NULL` column (SQL's
+    /// three-valued equality), so a pre-migration or non-materialized row
+    /// (`ContextPredictor`, a directly-registered base model) is excluded by
+    /// the predicate alone — this function adds no separate `IS NOT NULL`
+    /// guard because none is load-bearing.
+    pub async fn find_models_by_definition(
+        &self,
+        definition_hash: &str,
+    ) -> Result<Vec<ModelRecord>> {
+        let hash = definition_hash.to_string();
+        let tenant = self.current_tenant();
+        let sql =
+            format!("SELECT {SELECT_COLS} FROM models WHERE definition_hash = $1 AND (tenant_id = $2 OR tenant_id IS NULL) ORDER BY created_at DESC");
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            &sql,
+                            &[
+                                SqlValue::TextOwned(hash),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            parse_model_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// Find a model row already materialised by the EXACT same definition
+    /// over the EXACT same input anchors — the model peer of
+    /// [`crate::store::ResultStore::probe_cache_record`]'s `result_tables`
+    /// probe, restated over `models` because a fine-tuned model is not a
+    /// `result_tables` row (K7 reuse rule: definition hash AND pinned equal
+    /// anchors; a plain/unpinned source is never reused).
+    ///
+    /// `NULL` never matches: [`Self::find_models_by_definition`]'s own
+    /// predicate already excludes every row with no recorded
+    /// `definition_hash`, so a model with no materialization can never be a
+    /// cache-hit candidate. An anchor set containing an
+    /// [`crate::store::manifest::AnchorKind::UnpinnedAtInstant`] anchor is
+    /// likewise never a hit — an unpinned input's current instant proves
+    /// nothing about what the training set actually was, so no recorded
+    /// model can be a sound reuse of it (the same rule
+    /// `ResultStore::exact_match_candidates` applies).
+    ///
+    /// When several rows share the exact key (a reuse chain: job C reused
+    /// job B's prefix, which reused job A's), the newest one wins, by a
+    /// deterministic TOTAL order this function imposes in Rust rather than
+    /// trusting the catalog's `ORDER BY` (r32: `RETURNING`/`ORDER BY` order
+    /// is never trusted as the tie-break of record) — `created_at` alone can
+    /// tie at whatever timestamp resolution a backend renders, so ties break
+    /// on `catalog_pk` DESCENDING, the same shape
+    /// `ResultStore::probe_ready_training_set` uses for `table_name`. This is
+    /// a pure sensor over the catalog's `definition_hash` index; it does not
+    /// check whether the row's artifact prefix still exists on disk (that
+    /// check, if the caller needs it, composes on top through
+    /// [`crate::store::ArtifactStore::read_model_materialization`]).
+    pub async fn probe_model_by_definition(
+        &self,
+        definition_hash: &str,
+        anchors: &[crate::store::manifest::InputAnchor],
+    ) -> Result<Option<ModelRecord>> {
+        use crate::store::manifest::AnchorKind;
+
+        if anchors
+            .iter()
+            .any(|a| a.kind == AnchorKind::UnpinnedAtInstant)
+        {
+            return Ok(None);
+        }
+        let mut exact = Vec::new();
+        for candidate in self.find_models_by_definition(definition_hash).await? {
+            let Some(ref anchors_json) = candidate.input_anchors_json else {
+                continue;
+            };
+            let recorded: Vec<crate::store::manifest::InputAnchor> =
+                serde_json::from_str(anchors_json)?;
+            if anchor_sets_equal(&recorded, anchors) {
+                exact.push(candidate);
+            }
+        }
+        exact.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.catalog_pk.cmp(&a.catalog_pk))
+        });
+        Ok(exact.into_iter().next())
+    }
+
+    /// Record a fine-tuned model's materialization-contract summary (the
+    /// `model_materialization` migration's three columns) — called after the
+    /// model's artifact prefix's `.materialization.json` sidecar has been
+    /// written ([`crate::store::ArtifactStore::write_model_materialization`],
+    /// itself written LAST, after the bundle's own `manifest.json`).
+    /// Tenant-scoped with the same STRICT predicate [`Self::delete_model`]
+    /// uses (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`).
+    ///
+    /// Unconditional `SET` (never a `COALESCE`), unlike `artifact_path`'s
+    /// re-registration guard: a model's materialization summary is written
+    /// exactly once, by the same finalize sequence that sets its
+    /// `artifact_path`, so there is no "leave unchanged on re-registration"
+    /// case to protect here.
+    ///
+    /// Refuses [`JammiError::ModelNotFound`] when no row matches `model_id`
+    /// (this name), `version`, and the caller's tenant — the row must already
+    /// exist (created by [`Self::register_model`] or the finalize path) for
+    /// this to have anything to update.
+    pub async fn record_model_materialization(
+        &self,
+        model_id: &str,
+        version: i32,
+        definition_hash: &str,
+        input_anchors_json: &str,
+        manifest_path: &str,
+    ) -> Result<()> {
+        let tenant = self.current_tenant();
+        let model_id_for_tx = model_id.to_string();
+        let version_i64 = version as i64;
+        let definition_hash = definition_hash.to_string();
+        let input_anchors_json = input_anchors_json.to_string();
+        let manifest_path = manifest_path.to_string();
+
+        let affected = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
+                    tx.execute(
+                        "UPDATE models SET definition_hash = $1, input_anchors_json = $2, \
+                         manifest_path = $3, updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
+                         WHERE name = $4 AND version = $5 \
+                           AND (tenant_id = $6 OR (tenant_id IS NULL AND $6 IS NULL))",
+                        &[
+                            SqlValue::TextOwned(definition_hash),
+                            SqlValue::TextOwned(input_anchors_json),
+                            SqlValue::TextOwned(manifest_path),
+                            SqlValue::TextOwned(model_id_for_tx),
+                            SqlValue::Int(version_i64),
+                            tenant_val,
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+
+        if affected == 0 {
+            return Err(JammiError::ModelNotFound {
+                model_id: model_id.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// In-transaction outcome of [`Catalog::delete_model`]'s scan-then-delete: the
@@ -545,7 +734,7 @@ async fn scan_model_references(
 }
 
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata,
-/// artifact_path, created_at
+/// artifact_path, created_at, definition_hash, input_anchors_json, manifest_path
 fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
     let catalog_pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
@@ -575,6 +764,14 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         })
         .unwrap_or((None, None));
 
+    // Migration `model_materialization` (033): absent on a pre-migration row
+    // or a model with no materialization at all — `try_get` reads a genuinely
+    // absent column the same way as a present `NULL`, so a query that omits
+    // these columns entirely (an older wire projection) still parses.
+    let definition_hash: Option<String> = row.try_get("definition_hash")?;
+    let input_anchors_json: Option<String> = row.try_get("input_anchors_json")?;
+    let manifest_path: Option<String> = row.try_get("manifest_path")?;
+
     Ok(ModelRecord {
         model_id: name,
         catalog_pk,
@@ -587,5 +784,24 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         config_json,
         status,
         created_at,
+        definition_hash,
+        input_anchors_json,
+        manifest_path,
     })
+}
+
+/// Two `InputAnchor` sets are the SAME reuse key iff they are equal as SETS
+/// (order-independent — a producer's `Vec<InputAnchor>` is built in producer
+/// order, which is not itself a determinant of the reuse key). Duplicated
+/// from `crate::store::freshness`'s private helper of the same shape rather
+/// than exposed across the `catalog`/`store` boundary this file does not
+/// otherwise cross: [`Catalog::probe_model_by_definition`] is the ONE
+/// catalog-layer caller that needs it, and the module boundary between
+/// catalog primitives and the store's sensing layer is worth keeping even at
+/// the cost of this five-line duplication.
+fn anchor_sets_equal(
+    a: &[crate::store::manifest::InputAnchor],
+    b: &[crate::store::manifest::InputAnchor],
+) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x)) && b.iter().all(|y| a.contains(y))
 }

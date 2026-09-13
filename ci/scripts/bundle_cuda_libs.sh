@@ -27,11 +27,23 @@
 #      `libnvrtc-builtins.so.12` is what `libnvrtc.so.12` itself names, and the
 #      loader needs both. A soname that resolves nowhere fails this script.
 #   2. VERIFICATION (`bundle_verify_stage`): after the copies, the real loader
-#      is asked whether the staged tree satisfies the staged binary
-#      (`LD_LIBRARY_PATH=<lib> ldd <binary>`), and any `not found` other than
-#      the host driver's own libraries fails. This arm depends on none of the
-#      derivation's reasoning — it is what catches a closure this script walked
-#      wrongly, including a `dlopen`-shaped dependency no `DT_NEEDED` names.
+#      is asked to resolve the staged binary's own dependencies
+#      (`LD_LIBRARY_PATH=<lib> ldd <binary>`) — and PREPENDS, never RESTRICTS,
+#      the loader's search, so `not found` is not the property to check: a
+#      soname the tarball never staged still resolves `Ok` here if the build
+#      HOST happens to carry it too (a `libnccl` the builder's own
+#      `/usr/lib64` ships, say), and that "clean" report ships a tarball that
+#      cannot `exec` on a driver-only host with no such copy. What this arm
+#      establishes instead: for every `DT_NEEDED` entry that is neither
+#      platform- nor driver-provided, the PATH the loader actually resolved it
+#      to (not merely whether it resolved) is under `$lib_dir`
+#      (`realpath`-normalised, so a symlinked stage dir still compares equal);
+#      anything else — resolved from elsewhere, or plainly `not found` — is a
+#      named FAIL. This arm depends on none of the derivation's reasoning, so
+#      it also catches a closure this script walked wrongly. What it can NOT
+#      catch: a `dlopen`-loaded dependency never appears in `ldd`'s output at
+#      all — `DT_NEEDED` says nothing about it, and neither does this check;
+#      that failure mode is UNCOVERED by this script.
 #
 # Usage:
 #   bundle_cuda_libs.sh <binary> <stage-lib-dir> [search-path]
@@ -72,7 +84,14 @@ BUNDLE_DEFAULT_SEARCH_PATH="${BUNDLE_DEFAULT_SEARCH_PATH:-/usr/local/cuda-12.6/l
 # tarball's responsibility, and if it cannot be resolved this script fails
 # rather than skipping it — an unknown soname is a decision for a human, never
 # a silent omission.
-bundle_is_host_provided() {
+#
+# Split into the two kinds separately (rather than one combined predicate)
+# because `bundle_verify_stage`'s loader arm treats them differently: BOTH may
+# resolve from anywhere the loader finds them (neither is required to be under
+# `$lib_dir`), but only the driver half may also come back `not found` — a
+# platform library that failed to resolve at all would be a broken host, not a
+# tolerated gap.
+bundle_is_platform_soname() {
   case "$1" in
     libc.so.* | libm.so.* | libmvec.so.* | libdl.so.* | librt.so.* | libpthread.so.* | libgcc_s.so.* | libstdc++.so.*)
       return 0
@@ -80,6 +99,14 @@ bundle_is_host_provided() {
     ld-linux-*)
       return 0
       ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bundle_is_driver_soname() {
+  case "$1" in
     libcuda.so.* | libnvidia-*)
       return 0
       ;;
@@ -87,6 +114,10 @@ bundle_is_host_provided() {
       return 1
       ;;
   esac
+}
+
+bundle_is_host_provided() {
+  bundle_is_platform_soname "$1" || bundle_is_driver_soname "$1"
 }
 
 # The one function that reads an ELF file, and therefore the one the hermetic
@@ -178,17 +209,96 @@ bundle_copy_sources() {
   printf '%s' "$sources"
 }
 
-# The `not found` lines of a loader report that are DEFECTS, given on stdin's
-# place as a single argument. Any `not found` counts, EXCEPT the host driver's
-# own libraries: the release job runs on a GPU-less runner with no NVIDIA
-# driver installed, so `libcuda.so.1` and `libnvidia-*` legitimately resolve
-# nowhere there and are deliberately not bundled (see
-# `bundle_is_host_provided`). Split out from `bundle_verify_stage` so the rule
-# — which entries are tolerated — is exercised by the hermetic suite over
-# fixture loader output, on a host that has neither `ldd` nor an ELF binary to
-# point it at. Prints nothing when the report is clean.
+# `realpath`-normalise a directory: the OS's own answer
+# (`cd <dir> && pwd -P`) when `dir` exists on THIS filesystem — which resolves
+# any symlink in the path, so a symlinked stage dir (a runner whose temp root
+# is itself a symlink, e.g. macOS's `/tmp` -> `/private/tmp`) compares equal
+# to its target — and the literal string, unchanged, when it does not: the
+# hermetic suite's fixture paths (`/usr/lib64/…`, `/stage/lib/…`) are never
+# created on disk, and a literal fixture string has no symlink to resolve in
+# the first place, so leaving it as given is the correct answer, not a
+# fallback that happens to work.
+bundle_realpath_dir() {
+  local dir="$1" resolved
+  if resolved="$(cd -- "$dir" 2>/dev/null && pwd -P)"; then
+    printf '%s\n' "$resolved"
+  else
+    printf '%s\n' "$dir"
+  fi
+}
+
+# The lines of a loader report that are DEFECTS, given the report and the
+# stage `lib_dir` it was generated against. For each `DT_NEEDED` entry the
+# report names:
+#   * a driver soname (`libcuda.so.*`, `libnvidia-*`) is never a defect,
+#     `not found` included — the release job runs on a GPU-less runner with
+#     no driver installed, and the driver is deliberately not bundled (see
+#     `bundle_is_driver_soname`).
+#   * a platform soname (glibc, libstdc++/libgcc, the dynamic loader itself)
+#     is never a defect for WHERE it resolved (the host's own copy, wherever
+#     that is, is correct), but IS a defect if it comes back `not found` — a
+#     platform library missing from the loader's search is a broken host, not
+#     a tolerated gap.
+#   * everything else — the tarball's own responsibility, the exact set
+#     `bundle_copy_sources` stages — is a defect both when `not found` (an
+#     `LD_LIBRARY_PATH` prefix cannot invent a file that was never staged) AND
+#     when it resolves from anywhere other than under `lib_dir`: `LD_LIBRARY_
+#     PATH` PREPENDS to the loader's search, it does not RESTRICT it, so a
+#     soname the tarball never staged can still come back resolved — from the
+#     builder's own system copy, say — and a rule that only greps for `not
+#     found` calls that report clean while shipping a tarball that cannot
+#     `exec` on a driver-only host lacking that copy.
+# Split out from `bundle_verify_stage` so the rule is exercised by the
+# hermetic suite over fixture loader output, on a host that has neither `ldd`
+# nor an ELF binary to point it at. Prints nothing when the report is clean;
+# otherwise prints one `soname => defect` line per problem, naming both the
+# soname and the path (or `not found`) it defects on.
 bundle_unresolved_from_loader_output() {
-  printf '%s\n' "$1" | grep 'not found' | grep -v -E 'libcuda\.so|libnvidia-' || true
+  local loader_output="$1"
+  local lib_dir="$2"
+  local real_lib_dir line soname rest resolved_path resolved_dir real_resolved_dir
+  local defect=""
+  real_lib_dir="$(bundle_realpath_dir "$lib_dir")"
+  real_lib_dir="${real_lib_dir%/}"
+
+  while IFS= read -r line; do
+    case "$line" in
+      *'=>'*) : ;;
+      # No `=>` at all: the vdso pseudo-entry, or the loader naming itself by
+      # full path. Neither is a staged dependency; nothing to check.
+      *) continue ;;
+    esac
+    soname="$(printf '%s' "${line%%=>*}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    rest="$(printf '%s' "${line#*=>}" | sed -e 's/^[[:space:]]*//')"
+
+    if [ "$rest" = "not found" ]; then
+      if bundle_is_driver_soname "$soname"; then
+        continue
+      fi
+      defect="${defect}${soname} => not found
+"
+      continue
+    fi
+
+    if bundle_is_driver_soname "$soname" || bundle_is_platform_soname "$soname"; then
+      continue
+    fi
+
+    # Strip the trailing ` (0xADDRESS)` the loader appends, leaving the path.
+    resolved_path="${rest% (*}"
+    resolved_dir="$(dirname -- "$resolved_path")"
+    real_resolved_dir="$(bundle_realpath_dir "$resolved_dir")"
+    real_resolved_dir="${real_resolved_dir%/}"
+    case "$real_resolved_dir" in
+      "$real_lib_dir" | "$real_lib_dir"/*) continue ;;
+    esac
+    defect="${defect}${soname} => ${resolved_path} (resolved outside ${lib_dir})
+"
+  done <<EOF
+$loader_output
+EOF
+
+  printf '%s' "$defect"
 }
 
 # Ask the real loader whether the staged tree satisfies the staged binary, and
@@ -198,16 +308,16 @@ bundle_verify_stage() {
   local lib_dir="$2"
   local loader_output unresolved
   loader_output="$(LD_LIBRARY_PATH="$lib_dir" ldd "$binary" 2>&1 || true)"
-  unresolved="$(bundle_unresolved_from_loader_output "$loader_output")"
+  unresolved="$(bundle_unresolved_from_loader_output "$loader_output" "$lib_dir")"
   if [ -n "$unresolved" ]; then
-    echo "::error::bundle_cuda_libs.sh: the staged tarball does not satisfy its own binary:" >&2
+    echo "::error::bundle_cuda_libs.sh: the staged tarball does not satisfy its own binary — a bundled dependency did not resolve, or resolved from somewhere other than ${lib_dir}:" >&2
     printf '%s\n' "$unresolved" >&2
     echo "Full loader output:" >&2
     printf '%s\n' "$loader_output" >&2
     return 1
   fi
   printf '%s\n' "$loader_output"
-  echo "bundle_cuda_libs.sh: every DT_NEEDED entry resolves under ${lib_dir} (driver libraries excepted)."
+  echo "bundle_cuda_libs.sh: every non-platform, non-driver DT_NEEDED entry resolved under ${lib_dir} (checked by path, not merely by presence; driver and platform libraries excepted)."
 }
 
 bundle_main() {

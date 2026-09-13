@@ -309,28 +309,67 @@ assert_contains "the empty-set refusal explains itself" "$empty_out" "names no b
 install_fixture_needed
 
 # ---------------------------------------------------------------------------
-# 7. The second, independent arm: the loader-report rule. The driver's own
-#    libraries read `not found` on a GPU-less build runner and are tolerated;
-#    anything else is a defect. Fixture text, no `ldd`.
+# 7. The second, independent arm: the loader-report rule. It checks not only
+#    THAT a bundled soname resolved, but WHERE: `LD_LIBRARY_PATH` PREPENDS to
+#    the loader's search, it does not RESTRICT it, so a soname the tarball
+#    never staged can still come back resolved if the build host happens to
+#    carry it too — a system `libnccl` at `/usr/lib64`, say — and a rule that
+#    only greps for `not found` calls that report clean. `$STAGE` already
+#    holds the real files `bundle_main` staged in step 6, and `$SYSLIB`
+#    already exists from the setup fixture, so these reports point at real
+#    directories rather than invented strings, which is what makes the
+#    symlink case below meaningful.
 # ---------------------------------------------------------------------------
 clean_report="	linux-vdso.so.1 (0x00007ffd8c9f2000)
-	libcudart.so.12 => /stage/lib/libcudart.so.12 (0x00007f1c00000000)
-	libnccl.so.2 => /stage/lib/libnccl.so.2 (0x00007f1bf0000000)
+	libcudart.so.12 => ${STAGE}/libcudart.so.12 (0x00007f1c00000000)
+	libnccl.so.2 => ${STAGE}/libnccl.so.2 (0x00007f1bf0000000)
 	libcuda.so.1 => not found
 	libnvidia-ptxjitcompiler.so.1 => not found
-	libc.so.6 => /lib64/libc.so.6 (0x00007f1be0000000)"
-assert_eq "a driver-only 'not found' report is clean" \
-  "$(bundle_unresolved_from_loader_output "$clean_report")" ""
+	libc.so.6 => ${SYSLIB}/libc.so.6 (0x00007f1be0000000)"
+assert_eq "a driver 'not found' and a platform soname resolved outside the stage dir both stay clean" \
+  "$(bundle_unresolved_from_loader_output "$clean_report" "$STAGE")" ""
 
-dirty_report="${clean_report}
-	libnccl.so.2 => not found"
-assert_contains "an unresolved bundled library is a defect" \
-  "$(bundle_unresolved_from_loader_output "$dirty_report")" "libnccl.so.2 => not found"
+# This unit's own regression: `libnccl.so.2` resolved from `/usr/lib64` — the
+# builder's own system copy — rather than the stage dir. The retired rule
+# called this clean, because it names no 'not found' line at all; RED at
+# f74943b5 (see the report's `red_observed`): the same fixture text, run
+# against the pre-fix `bundle_unresolved_from_loader_output`, returns empty.
+nccl_outside_report="	linux-vdso.so.1 (0x00007ffd8c9f2000)
+	libcudart.so.12 => ${STAGE}/libcudart.so.12 (0x00007f1c00000000)
+	libnccl.so.2 => ${SYSLIB}/libnccl.so.2 (0x00007f1bf0000000)
+	libcuda.so.1 => not found
+	libc.so.6 => ${SYSLIB}/libc.so.6 (0x00007f1be0000000)"
+assert_contains "a bundled soname resolved from outside the stage dir is a defect" \
+  "$(bundle_unresolved_from_loader_output "$nccl_outside_report" "$STAGE")" \
+  "libnccl.so.2 => ${SYSLIB}/libnccl.so.2 (resolved outside ${STAGE})"
 
-other_report="${clean_report}
+# Every bundled soname resolved UNDER the stage dir: clean.
+all_under_report="	libcudart.so.12 => ${STAGE}/libcudart.so.12 (0x1)
+	libnccl.so.2 => ${STAGE}/libnccl.so.2 (0x2)
+	libnvrtc-builtins.so.12.6 => ${STAGE}/libnvrtc-builtins.so.12.6 (0x3)
+	libcuda.so.1 => not found
+	libc.so.6 => ${SYSLIB}/libc.so.6 (0x4)"
+assert_eq "every bundled soname resolved under the stage dir passes" \
+  "$(bundle_unresolved_from_loader_output "$all_under_report" "$STAGE")" ""
+
+dirty_report="${all_under_report}
 	libcusparse.so.12 => not found"
-assert_contains "an unresolved library of any name is a defect too" \
-  "$(bundle_unresolved_from_loader_output "$other_report")" "libcusparse.so.12 => not found"
+assert_contains "an unresolved bundled library is a defect" \
+  "$(bundle_unresolved_from_loader_output "$dirty_report" "$STAGE")" "libcusparse.so.12 => not found"
+
+# A SYMLINKED stage dir: the workflow's own runner can put its temp root
+# behind a symlink (macOS's `/tmp` -> `/private/tmp` is exactly this shape;
+# a Linux CI runner's `$RUNNER_TEMP` is not guaranteed not to be one either),
+# so the loader's report and the `lib_dir` argument this script was called
+# with can name the SAME directory by two different literal strings.
+# `realpath`-normalising the comparison (`bundle_realpath_dir`), not the
+# literal strings, is what makes this equal; a literal-string comparison
+# would wrongly flag every entry as "resolved outside".
+STAGE_LINK="${ROOT}/stage/lib-link"
+ln -s "$STAGE" "$STAGE_LINK"
+symlink_report="	libcudart.so.12 => ${STAGE_LINK}/libcudart.so.12 (0x5)"
+assert_eq "a symlinked stage dir still normalises to a pass" \
+  "$(bundle_unresolved_from_loader_output "$symlink_report" "$STAGE")" ""
 
 # ---------------------------------------------------------------------------
 if [ "$failures" -ne 0 ]; then

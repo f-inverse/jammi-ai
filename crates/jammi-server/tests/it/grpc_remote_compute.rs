@@ -1027,6 +1027,7 @@ fn two_rank_request(model: &str) -> jammi_wire::request::FineTuneRequest {
             ..FineTuneConfig::default()
         }),
         world_size: std::num::NonZeroU32::new(2),
+        cache: jammi_db::store::CachePolicy::Bypass,
     }
 }
 
@@ -1138,6 +1139,122 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
     assert_eq!(
         remote_spec, local_spec,
         "an unset count must persist byte-identically through both surfaces"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// U3 wire-server follow-up: `SubmitJobRequest.cache` across the two submit
+// surfaces.
+// ---------------------------------------------------------------------------
+
+/// PARITY. `CachePolicy::Use` submitted over the wire persists the
+/// BYTE-IDENTICAL `jobs.spec` a `CachePolicy::Use` submitted through the
+/// embedded session persists — the stored `TrainingCommon.cache`, not merely
+/// two `Ok` responses. `cache` is excluded from the fine-tune definition hash
+/// (a call-time dial, not identity), so nothing about a persisted-spec
+/// comparison depends on the model-level reuse probe ever firing; this test
+/// only proves the wire carries the caller's choice through to the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_use_cache_policy_persists_the_identical_spec_on_both_paths() {
+    let server = start_engine_server_with_devices(2).await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    add_patents(&local).await;
+    let model = tiny_bert_model_id();
+
+    let request = || jammi_wire::request::FineTuneRequest {
+        cache: jammi_db::store::CachePolicy::Use,
+        ..two_rank_request(&model)
+    };
+
+    let remote_job = remote
+        .submit_fine_tune(request())
+        .await
+        .expect("remote submit with cache = use returns a handle");
+    let local_job = local
+        .submit_fine_tune(request())
+        .await
+        .expect("embedded submit with cache = use returns a handle");
+
+    let catalog = server.engine.catalog();
+    let remote_spec = catalog
+        .get_job(&remote_job.0)
+        .await
+        .expect("remote get_job")
+        .spec;
+    let local_spec = catalog
+        .get_job(&local_job.0)
+        .await
+        .expect("local get_job")
+        .spec;
+
+    assert!(
+        remote_spec.contains("\"cache\":\"use\""),
+        "the persisted spec must carry the policy the caller chose, so this \
+         oracle cannot pass with both surfaces dropping it: {remote_spec}"
+    );
+    assert_eq!(
+        remote_spec, local_spec,
+        "a job submitted over the wire and the same job submitted in-process \
+         must persist byte-identical specs"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// PARITY, the unset boundary. A submission that chooses no cache policy
+/// persists the same spec through both surfaces too, and that spec carries
+/// the engine's `Bypass` default — the wire's `UNSPECIFIED` (`0`) and the
+/// explicit `BYPASS` (`2`) are two different byte strings on the wire but the
+/// SAME decoded engine value, so this is the case a naive "assert the field is
+/// present" check would pass vacuously while still shipping the wrong policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_cache_policy_persists_the_identical_bypass_spec_on_both_paths() {
+    let server = start_engine_server_with_devices(2).await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    add_patents(&local).await;
+    let model = tiny_bert_model_id();
+
+    let request = two_rank_request(&model);
+    assert_eq!(
+        request.cache,
+        jammi_db::store::CachePolicy::Bypass,
+        "the fixture's default must be the unset case this test means to cover"
+    );
+
+    let remote_job = remote
+        .submit_fine_tune(two_rank_request(&model))
+        .await
+        .expect("remote submit with no chosen cache policy returns a handle");
+    let local_job = local
+        .submit_fine_tune(two_rank_request(&model))
+        .await
+        .expect("embedded submit with no chosen cache policy returns a handle");
+
+    let catalog = server.engine.catalog();
+    let remote_spec = catalog
+        .get_job(&remote_job.0)
+        .await
+        .expect("remote get_job")
+        .spec;
+    let local_spec = catalog
+        .get_job(&local_job.0)
+        .await
+        .expect("local get_job")
+        .spec;
+
+    assert!(
+        remote_spec.contains("\"cache\":\"bypass\""),
+        "an unset cache policy must resolve to the engine's Bypass default: {remote_spec}"
+    );
+    assert_eq!(
+        remote_spec, local_spec,
+        "an unset cache policy must persist byte-identically through both surfaces"
     );
 
     let _ = server.shutdown.send(());

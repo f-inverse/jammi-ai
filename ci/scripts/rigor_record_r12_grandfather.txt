@@ -1,0 +1,23 @@
+# Committed exceptions for esc-lead-gate-R12's Reader 3
+# (ci/scripts/check_rigor_record.py's check_anticipation_witnesses), fix
+# round 1 (M3').
+#
+# One unit_slug per line (the SAME slugify() `lead-gate-lib.py` uses on a
+# branch name) — a line here means THAT unit's exported rigor record may
+# carry an open second-round BLOCK row (adversarial-audit / fix-verifier /
+# acceptance-verifier) with NO accompanying
+# docs/rigor/<unit_slug>.anticipation.jsonl record, because that BLOCK
+# predates fix round 1's anticipation mechanism landing (an in-flight unit
+# at the moment this PR merges). Add a short reason as a `#` comment on the
+# line above so a reviewer can tell "deliberate, time-boxed exemption" from
+# "forgotten".
+#
+# `--check-r12-grandfather-only-shrinks` enforces that this file may only
+# SHRINK relative to `origin/main` — a genuinely new exemption is a
+# human-reviewed decision made directly on `main`, never an autonomous
+# addition on a swarm branch (the SAME ratchet shape
+# `rigor_record_allowlist.txt` / `--check-allowlist-only-shrinks` already
+# uses for a different exemption).
+#
+# Empty by default: no unit is grandfathered at the moment this file was
+# introduced.

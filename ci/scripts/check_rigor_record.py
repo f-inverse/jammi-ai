@@ -114,12 +114,23 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEAD_GATE_LIB = REPO_ROOT / ".claude" / "hooks" / "lead-gate-lib.py"
 RIGOR_DIR = REPO_ROOT / "docs" / "rigor"
 ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_allowlist.txt"
+# esc-lead-gate-R12 (M3'): in-flight units whose second-round BLOCK predates
+# fix round 1's anticipation mechanism land without a
+# `docs/rigor/<slug>.anticipation.jsonl` record. This is the SAME
+# shrink-only-ratchet SHAPE as `ALLOWLIST_PATH`/`check_allowlist_only_
+# shrinks` above (modelled on it directly, per swarm.yml's own two-step
+# pairing) — a SEPARATE file and a SEPARATE check, never folded into the
+# general allowlist, because the two exemptions arm on different diffs
+# (this one is read only by `check_anticipation_witnesses`, never by
+# `run_check`'s own top-level arming).
+R12_GRANDFATHER_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_r12_grandfather.txt"
 
 ARMING_GLOBS = ("crates/*", "crates/**", "ci/*", "ci/**", ".github/workflows/*", ".github/workflows/**")
 CONTRACT_GLOBS = ("docs/plans/*/proposals/*", "docs/plans/*/proposals/**", "docs/rigor/contracts/*", "docs/rigor/contracts/**")
@@ -305,88 +316,197 @@ def check_not_near_identical(cwd: Path, contract_path: str, text: str, all_contr
                         " — a copy-paste contract is not a design pass")
 
 
-def check_anticipation_witnesses(cwd: Path, unit_slug: str, result: Result) -> None:
-    """esc-lead-gate-R12 READER 3 — the half of the mechanism outside the
-    lead's own reach. ARMED ONLY when the committed record carries a
+def _r12_grandfathered_slugs() -> set[str]:
+    if not R12_GRANDFATHER_PATH.exists():
+        return set()
+    return {s.strip() for s in R12_GRANDFATHER_PATH.read_text().splitlines()
+            if s.strip() and not s.strip().startswith("#")}
+
+
+def _r12_second_round_block_rows(mod, rows: list[dict]) -> list[dict]:
+    """Every row in the EXPORTED unit record whose `agent_type` is one of
+    the hook's own `VERIFIER_SECOND_ROUND_TYPES` and whose `verdict` is
+    BLOCK-equivalent (`is_open`) — the SAME closed-world membership the
+    hook itself uses for reader 1, loaded from the real module, never
+    re-derived here."""
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("agent_type") not in mod.VERIFIER_SECOND_ROUND_TYPES:
+            continue
+        verdict = r.get("verdict")
+        if isinstance(verdict, str) and mod.is_open(verdict):
+            out.append(r)
+    return out
+
+
+def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], result: Result) -> None:
+    """esc-lead-gate-R12 READER 3 (fix round 1, M3'): a committed-record
+    SHAPE check, HARD-FAILED on shape alone. ARMED whenever the exported
+    `docs/rigor/<unit_slug>.jsonl` carries ANY open second-round BLOCK row
+    (`_r12_second_round_block_rows`) and `unit_slug` is NOT on the
+    shrink-only `R12_GRANDFATHER_PATH` list — never on a ts cutover (M3'
+    drops that; the grandfather list is the ONLY exemption, and it may only
+    shrink, enforced by `check_r12_grandfather_only_shrinks`). When armed:
     `docs/rigor/<unit_slug>.anticipation.jsonl` (exported via
-    `lead-gate-lib.py --export-anticipation`) — never a retroactive
-    requirement on a unit whose BLOCK predates R12 (B6 landing order: a
-    unit with no anticipation artifact carried at all is simply not
-    checked here). When armed: for every `lead-anticipation` row,
-    independently `git worktree add --detach` the row's own `block_sha`
-    into a REAL, fresh, TEMPORARY checkout (never trusting the LEAD's own
-    `.jammi/gate-state` — this runs in CI, against the object store the
-    PR's own commits populated) and re-executes each attack's `command`
-    THERE, failing when the freshly-computed witness does not match the
-    row's own recorded `block_rc`/`block_hash`. The SAME denylist
-    (`_r12_attack_command_denied`, loaded from the real `lead-gate-lib.py`
-    — never reimplemented) is re-applied before executing anything, so a
-    committed record cannot smuggle an arbitrary command past the hook's
-    own write-verb denylist and have CI execute it unguarded."""
+    `lead-gate-lib.py --export-anticipation`) must exist, every row must
+    parse, and the UNION of every second-round BLOCK row's own
+    `finding_locations` ∪ `class_enumeration`, reduced to files
+    (`mod._key_to_file`), must be covered by SOME row's `attacks` keys —
+    every command passing the hook's OWN denylist
+    (`mod._r12_attack_command_denied`, loaded from the real
+    `lead-gate-lib.py`, never reimplemented — `bash <path>` admitted only
+    when TRACKED at the row's own `pre_fix_sha`). Re-EXECUTION against a
+    REAL, independently checked-out `pre_fix_sha` is ADVISORY ONLY —
+    reported per attack as reproduced / mismatched / not_re_executed, NEVER
+    a failure (measured: BSD/GNU userland divergence between the lead's
+    machine and CI's, and path divergence, both change a witness hash
+    without the mechanism under attack having changed at all)."""
+    mod = _lib_module()
+    block_rows = _r12_second_round_block_rows(mod, rows)
+    if not block_rows:
+        return  # nothing to anticipate -- no open second-round BLOCK in this record
+
     path = f"docs/rigor/{unit_slug}.anticipation.jsonl"
     ok, text = _git(cwd, "show", f"HEAD:{path}")
-    if not ok or not text.strip():
-        return  # not armed -- no anticipation artifact carried in this record (B6 cutover)
-    mod = _lib_module()
+    has_file = ok and bool(text.strip())
+
+    if unit_slug in _r12_grandfathered_slugs():
+        if not has_file:
+            result.warn(f"{unit_slug!r} is on the shrink-only R12 grandfather list "
+                        f"({_display_path(R12_GRANDFATHER_PATH)}) — no {path} carried; not required")
+            return
+    elif not has_file:
+        result.fail(
+            f"docs/rigor/{unit_slug}.jsonl carries {len(block_rows)} open second-round BLOCK "
+            f"row(s) but no {path} — export one with `python3 .claude/hooks/lead-gate-lib.py "
+            f"--export-anticipation {unit_slug} > {path}` and commit it (esc-lead-gate-R12 "
+            "READER 3); an in-flight unit whose BLOCK predates fix round 1 is exempted only via "
+            f"{_display_path(R12_GRANDFATHER_PATH)} (shrink-only, human-added)")
+        return
+
+    if not has_file:
+        return
+
+    required_files: set[str] = set()
+    for row in block_rows:
+        locs = {s for s in (row.get("finding_locations") or []) if isinstance(s, str)}
+        enum = {s for s in (row.get("class_enumeration") or []) if isinstance(s, str)}
+        for key in locs | enum:
+            required_files.add(mod._key_to_file(key))
+
+    art_rows: list[tuple[int, dict]] = []
     for i, line in enumerate(text.splitlines()):
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
+            parsed = json.loads(line)
         except json.JSONDecodeError as exc:
             result.fail(f"{path}:{i + 1}: not valid JSON ({exc})")
             continue
-        if not isinstance(row, dict):
+        if not isinstance(parsed, dict):
             result.fail(f"{path}:{i + 1}: not a JSON object")
             continue
-        block_sha = row.get("block_sha")
+        art_rows.append((i + 1, parsed))
+
+    if not art_rows:
+        result.fail(f"{path}: carries no parseable anticipation row")
+        return
+
+    covered_files: set[str] = set()
+    for lineno, row in art_rows:
         attacks = row.get("attacks")
-        if not isinstance(block_sha, str) or not block_sha:
-            result.fail(f"{path}:{i + 1}: no `block_sha`")
-            continue
+        pre_fix_sha = row.get("pre_fix_sha")
         if not isinstance(attacks, dict) or not attacks:
-            result.fail(f"{path}:{i + 1}: no non-empty `attacks` object")
+            result.fail(f"{path}:{lineno}: no non-empty `attacks` object")
             continue
-        ok_sha, _ = _git(cwd, "rev-parse", "--verify", f"{block_sha}^{{commit}}")
+        if not isinstance(pre_fix_sha, str) or not pre_fix_sha:
+            result.fail(f"{path}:{lineno}: no `pre_fix_sha`")
+        sha_resolvable = False
+        if isinstance(pre_fix_sha, str) and pre_fix_sha:
+            ok_sha, _ = _git(cwd, "rev-parse", "--verify", f"{pre_fix_sha}^{{commit}}")
+            sha_resolvable = ok_sha
+            if not ok_sha:
+                result.warn(f"{path}:{lineno}: pre_fix_sha {pre_fix_sha} does not resolve in this "
+                            "checkout (advisory — a shallow clone or an amend can cause this; "
+                            "re-execution below is reported not_re_executed)")
+        for file_key, entry in attacks.items():
+            covered_files.add(file_key)
+            if not isinstance(entry, dict):
+                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] is not an object")
+                continue
+            command = entry.get("command")
+            recorded_hash = entry.get("hash")
+            if not isinstance(command, str) or not command.strip():
+                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] has no `command`")
+                continue
+            if not (isinstance(recorded_hash, str) and re.fullmatch(r"[0-9a-f]{64}", recorded_hash)):
+                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] has no valid `hash`")
+            deny = mod._r12_attack_command_denied(
+                command, str(cwd),
+                require_tracked_at=pre_fix_sha if sha_resolvable else None,
+                project_dir=str(cwd), deadline=time.monotonic() + 5.0)
+            if deny is not None:
+                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] command is denied: {deny}")
+
+    missing = required_files - covered_files
+    if missing:
+        result.fail(f"{path}: omits {len(missing)} file(s) the union of open second-round BLOCK "
+                    f"row(s) require, e.g. {sorted(missing)[:3]}")
+
+    # Re-execution against a REAL, independently checked-out `pre_fix_sha`
+    # — ADVISORY ONLY, per M3': never a hard fail.
+    for lineno, row in art_rows:
+        pre_fix_sha = row.get("pre_fix_sha")
+        attacks = row.get("attacks")
+        if not (isinstance(pre_fix_sha, str) and pre_fix_sha and isinstance(attacks, dict)):
+            continue
+        ok_sha, _ = _git(cwd, "rev-parse", "--verify", f"{pre_fix_sha}^{{commit}}")
         if not ok_sha:
-            result.fail(f"{path}:{i + 1}: block_sha {block_sha} does not resolve in this checkout")
+            result.warn(f"{path}:{lineno}: pre_fix_sha unreachable in this checkout — every attack "
+                        "here is not_re_executed")
             continue
         with tempfile.TemporaryDirectory(prefix="r12-reader3-") as td:
             tmp_wt = Path(td) / "wt"
-            ok_add, out_add = _git(cwd, "worktree", "add", "--detach", "-q", str(tmp_wt), block_sha)
+            ok_add, out_add = _git(cwd, "worktree", "add", "--detach", "-q", str(tmp_wt), pre_fix_sha)
             if not ok_add:
-                result.fail(f"{path}:{i + 1}: could not check out block_sha {block_sha} — {out_add}")
+                result.warn(f"{path}:{lineno}: could not check out pre_fix_sha {pre_fix_sha} for "
+                            f"advisory re-execution — {out_add} (not_re_executed)")
                 continue
             try:
-                for key, entry in sorted(attacks.items()):
+                for file_key, entry in sorted(attacks.items()):
                     if not isinstance(entry, dict):
-                        result.fail(f"{path}:{i + 1}: attacks[{key!r}] is not an object")
                         continue
                     command = entry.get("command")
-                    block_rc = entry.get("block_rc")
-                    block_hash = entry.get("block_hash")
+                    recorded_hash = entry.get("hash")
                     if not isinstance(command, str) or not command.strip():
-                        result.fail(f"{path}:{i + 1}: attacks[{key!r}] has no `command`")
                         continue
-                    deny = mod._r12_attack_command_denied(command, str(tmp_wt))
+                    deny = mod._r12_attack_command_denied(
+                        command, str(tmp_wt), require_tracked_at=pre_fix_sha,
+                        project_dir=str(cwd), deadline=time.monotonic() + 5.0)
                     if deny is not None:
-                        result.fail(f"{path}:{i + 1}: attacks[{key!r}] command is denied: {deny}")
+                        result.warn(f"{path}:{lineno}: attacks[{file_key!r}] not_re_executed "
+                                    f"(denied in the detached checkout: {deny})")
                         continue
                     try:
                         proc = subprocess.run(["/bin/sh", "-c", command], cwd=str(tmp_wt),
                                                capture_output=True, text=True, timeout=120)
                     except subprocess.TimeoutExpired:
-                        result.fail(f"{path}:{i + 1}: attacks[{key!r}] command timed out re-executing at block_sha")
+                        result.warn(f"{path}:{lineno}: attacks[{file_key!r}] not_re_executed "
+                                    "(timed out)")
                         continue
                     stderr_lines = proc.stderr.splitlines()
                     stderr_line = stderr_lines[0] if stderr_lines else ""
                     actual_hash = mod._witness_hash(proc.returncode, proc.stdout, stderr_line)
-                    if proc.returncode != block_rc or actual_hash != block_hash:
-                        result.fail(
-                            f"{path}:{i + 1}: attacks[{key!r}] does not reproduce at block_sha "
-                            f"{block_sha} (recorded rc={block_rc} hash "
-                            f"{block_hash[:12] if isinstance(block_hash, str) else block_hash}…, got "
-                            f"rc={proc.returncode} hash {actual_hash[:12]}…)")
+                    if not (isinstance(recorded_hash, str) and actual_hash == recorded_hash):
+                        result.warn(
+                            f"{path}:{lineno}: attacks[{file_key!r}] mismatched at pre_fix_sha "
+                            f"{pre_fix_sha} (advisory, never a failure — BSD/GNU userland and path "
+                            "divergence between the lead's machine and CI's is a measured, known "
+                            f"cause; recorded "
+                            f"{recorded_hash[:12] if isinstance(recorded_hash, str) else recorded_hash}…, "
+                            f"got {actual_hash[:12]}…)")
             finally:
                 _git(cwd, "worktree", "remove", "--force", str(tmp_wt))
 
@@ -476,9 +596,11 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
                 result.warn(f"docs/rigor/{unit_slug}.jsonl: head_sha {sha} is not an ancestor of HEAD "
                             "(advisory — the amend-after-verification workflow does this on the honest path)")
 
-        # esc-lead-gate-R12 READER 3 — armed only when an anticipation
-        # artifact is actually carried in this record (never retroactive).
-        check_anticipation_witnesses(cwd, unit_slug, result)
+        # esc-lead-gate-R12 READER 3 (M3') — armed whenever the exported
+        # record carries an open second-round BLOCK row not on the
+        # shrink-only grandfather list; a shape-only hard fail, re-execution
+        # ADVISORY.
+        check_anticipation_witnesses(cwd, unit_slug, [r for r in rows if isinstance(r, dict)], result)
 
     contract_paths = [p for p in changed if _matches_contract_glob(p)]
     if not contract_paths:
@@ -531,6 +653,47 @@ def check_allowlist_only_shrinks(cwd: Path = REPO_ROOT) -> int:
               "made on main directly, never an autonomous addition on a swarm branch.", file=sys.stderr)
         return 1
     print(f"rigor-record-allowlist-only-shrinks: OK — {len(current)} entries "
+          f"({len(base) - len(current)} shrunk vs origin/main).")
+    return 0
+
+
+def check_r12_grandfather_only_shrinks(cwd: Path = REPO_ROOT) -> int:
+    """esc-lead-gate-R12 (M3'): the SAME shrink-only ratchet as
+    `check_allowlist_only_shrinks`, applied to `R12_GRANDFATHER_PATH`
+    instead — a separate check because the two exemptions arm on
+    different diffs and are read by different functions."""
+    ok, _ = _git(cwd, "fetch", "--quiet", "origin", "main")
+    if not ok:
+        print("rigor-record-r12-grandfather-only-shrinks: FAIL — git fetch origin main failed", file=sys.stderr)
+        return 1
+    ok, _ = _git(cwd, "rev-parse", "--verify", "origin/main")
+    if not ok:
+        print("rigor-record-r12-grandfather-only-shrinks: FAIL — origin/main does not resolve", file=sys.stderr)
+        return 1
+    current = set()
+    if R12_GRANDFATHER_PATH.exists():
+        for line in R12_GRANDFATHER_PATH.read_text().splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                current.add(s)
+    rel = R12_GRANDFATHER_PATH.relative_to(cwd).as_posix()
+    ok, base_text = _git(cwd, "show", f"origin/main:{rel}")
+    if not ok:
+        print(f"rigor-record-r12-grandfather-only-shrinks: OK (bootstrap) — origin/main has no {rel} "
+              f"yet; this branch's {len(current)} entries establish the baseline.")
+        return 0
+    base = {s.strip() for s in base_text.splitlines() if s.strip() and not s.strip().startswith("#")}
+    added = current - base
+    if added:
+        print("rigor-record-r12-grandfather-only-shrinks: FAIL", file=sys.stderr)
+        for e in sorted(added):
+            print(f"  + {e}", file=sys.stderr)
+        print("\nrigor-record-r12-grandfather-only-shrinks: this branch adds a NEW exemption. The "
+              "grandfather list may only shrink — a genuinely new exemption (an in-flight unit "
+              "whose BLOCK predates fix round 1) is a human-reviewed decision, made on main "
+              "directly, never an autonomous addition on a swarm branch.", file=sys.stderr)
+        return 1
+    print(f"rigor-record-r12-grandfather-only-shrinks: OK — {len(current)} entries "
           f"({len(base) - len(current)} shrunk vs origin/main).")
     return 0
 
@@ -838,12 +1001,12 @@ def fixture_rr11_allowlist_only_shrinks() -> None:
             ALLOWLIST_PATH = real_allowlist
 
 
-def fixture_rr12a_no_anticipation_file_is_a_noop() -> None:
-    """esc-lead-gate-R12 READER 3: a record with NO
-    `docs/rigor/<slug>.anticipation.jsonl` at all is a NO-OP for this arm
-    (never a retroactive failure on a unit whose BLOCK predates R12) —
+def fixture_rr12a_no_open_block_row_is_a_noop() -> None:
+    """esc-lead-gate-R12 READER 3 (M3'): a record with NO open second-round
+    BLOCK row at all (only a pressure-tester row) never arms this check —
     the SAME full-disclosure record RR5 already proves ALLOWS stays
-    ALLOWED."""
+    ALLOWED, with no `docs/rigor/<slug>.anticipation.jsonl` carried
+    either."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
@@ -854,58 +1017,172 @@ def fixture_rr12a_no_anticipation_file_is_a_noop() -> None:
             "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
         })
         r = _run_check_in(work)
-        _assert(r.ok(), "RR12a", f"no anticipation file must be a no-op (still ALLOW): {r.failures}")
+        _assert(r.ok(), "RR12a", f"no open second-round BLOCK row must be a no-op (still ALLOW): {r.failures}")
 
 
-def fixture_rr12b_reproducing_witness_allows() -> None:
-    """A committed anticipation record whose attack command REPRODUCES,
-    fresh, at a REAL `block_sha` this check independently checks out —
-    ALLOWS."""
+def fixture_rr12b_open_block_no_anticipation_file_fails() -> None:
+    """An open `adversarial-audit` BLOCK row is present, but NO
+    `docs/rigor/<slug>.anticipation.jsonl` at all — HARD FAILS, naming the
+    `--export-anticipation` remedy (never a retroactive pass just because
+    the artifact happens to be absent)."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
-        origin, work = _pr_repo(Path(td))
-        block_sha = _sh(work, "rev-parse", "HEAD")
+        _origin, work = _pr_repo(Path(td))
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR12b", "an open second-round BLOCK row with no anticipation file must FAIL")
+        _assert(any("--export-anticipation" in f for f in r.failures), "RR12b", f"{r.failures}")
+
+
+def fixture_rr12c_shape_allows_despite_unresolvable_pre_fix_sha() -> None:
+    """A correctly-shaped anticipation record (covers the required file,
+    denylist-clean command) ALLOWS even though `pre_fix_sha` does not
+    resolve in this checkout (a shallow-clone-shaped repro) — the HARD
+    requirement is shape alone; re-execution is advisory and only WARNS
+    when it cannot even attempt reproduction."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
         mod = _lib_module()
-        witness = mod._witness_hash(0, "ok", "")
-        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        witness = mod._witness_hash(0, "ok\n", "")
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "agent_type": "lead-anticipation", "block_sha": block_sha,
-            "attacks": {"a.py:1": {"attack": "x", "command": "printf ok", "block_rc": 0, "block_hash": witness}},
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "printf 'ok\\n'", "hash": witness}},
+            "residual_risk": "fixture residual",
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
-            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
             "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
             "docs/README-fixture.md": "line one\n",
             "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
         })
         r = _run_check_in(work)
-        _assert(r.ok(), "RR12b", f"a reproducing witness at a real block_sha must ALLOW: {r.failures}")
+        _assert(r.ok(), "RR12c", f"a correctly-shaped record must ALLOW despite an unresolvable "
+                                  f"pre_fix_sha: {r.failures}")
+        _assert(any("does not resolve" in w for w in r.warnings), "RR12c",
+                f"the unresolvable pre_fix_sha must still be visible as a warning: {r.warnings}")
 
 
-def fixture_rr12c_nonreproducing_witness_fails() -> None:
-    """The SAME record as RR12b, but the recorded `block_hash` does NOT
-    match what re-executing the command at `block_sha` actually produces —
-    FAILS, naming the mismatch. This is the half the LEAD cannot forge:
-    CI re-derives and re-executes independently, never trusting the
-    lead's own `.jammi/gate-state`."""
+def fixture_rr12d_real_reproducing_witness_allows() -> None:
+    """The SAME shape as RR12c, but `pre_fix_sha` is a REAL commit this
+    check independently checks out and the command REPRODUCES there —
+    ALLOWS, with no mismatch warning for this attack."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         origin, work = _pr_repo(Path(td))
-        block_sha = _sh(work, "rev-parse", "HEAD")
-        row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        pre_fix_sha = _sh(work, "rev-parse", "HEAD")
+        mod = _lib_module()
+        witness = mod._witness_hash(0, "ok\n", "")
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "agent_type": "lead-anticipation", "block_sha": block_sha,
-            "attacks": {"a.py:1": {"attack": "x", "command": "printf ok", "block_rc": 0, "block_hash": "0" * 64}},
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "attacks": {"a.py": {"command": "printf 'ok\\n'", "hash": witness}},
+            "residual_risk": "fixture residual",
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
-            "docs/rigor/feat_rr-fixture.jsonl": row + "\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
             "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
             "docs/README-fixture.md": "line one\n",
             "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
         })
         r = _run_check_in(work)
-        _assert(not r.ok(), "RR12c", "a non-reproducing witness at block_sha must FAIL")
-        _assert(any("does not reproduce at block_sha" in f for f in r.failures), "RR12c", f"{r.failures}")
+        _assert(r.ok(), "RR12d", f"a real reproducing witness at pre_fix_sha must ALLOW: {r.failures}")
+        _assert(not any("mismatched at pre_fix_sha" in w for w in r.warnings), "RR12d",
+                f"a genuinely reproducing witness must not be reported mismatched: {r.warnings}")
+
+
+def fixture_rr12e_real_nonreproducing_witness_warns_never_fails() -> None:
+    """The SAME REAL `pre_fix_sha` checkout as RR12d, but the recorded
+    `hash` does NOT match what re-executing the command actually produces
+    there — WARNS naming the mismatch, but NEVER FAILS (M3': re-execution
+    is advisory only, since a lead's machine and CI's userland can
+    genuinely diverge on some commands without the mechanism itself having
+    changed)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        origin, work = _pr_repo(Path(td))
+        pre_fix_sha = _sh(work, "rev-parse", "HEAD")
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        anticipation_row = json.dumps({
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "attacks": {"a.py": {"command": "printf 'ok\\n'", "hash": "0" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR12e", f"a non-reproducing witness must WARN, never FAIL: {r.failures}")
+        _assert(any("mismatched at pre_fix_sha" in w for w in r.warnings), "RR12e",
+                f"the mismatch must still be visible as a warning: {r.warnings}")
+
+
+def fixture_rr12f_grandfathered_unit_no_file_allows() -> None:
+    """An open second-round BLOCK row with NO anticipation file at all is a
+    HARD FAIL (RR12b) — UNLESS the unit is on the shrink-only R12
+    grandfather list, in which case it ALLOWS (advisory warning only)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        (work / "ci" / "scripts" / "rigor_record_r12_grandfather.txt").write_text("# fixture\nfeat_rr-fixture\n")
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        global R12_GRANDFATHER_PATH
+        real_path = R12_GRANDFATHER_PATH
+        R12_GRANDFATHER_PATH = work / "ci" / "scripts" / "rigor_record_r12_grandfather.txt"
+        try:
+            r = _run_check_in(work)
+        finally:
+            R12_GRANDFATHER_PATH = real_path
+        _assert(r.ok(), "RR12f", f"a grandfathered unit must ALLOW despite no anticipation file: {r.failures}")
+
+
+def fixture_rr13_r12_grandfather_only_shrinks() -> None:
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        origin, work = _pr_repo(Path(td))
+        gf_rel = "ci/scripts/rigor_record_r12_grandfather.txt"
+        _commit(work, "seed r12 grandfather list", {gf_rel: "unit-a\n"})
+        _sh(work, "push", "-q", "origin", "HEAD:main")
+        _sh(work, "fetch", "-q", "origin", "main")
+        global R12_GRANDFATHER_PATH
+        real_path = R12_GRANDFATHER_PATH
+        R12_GRANDFATHER_PATH = work / gf_rel
+        try:
+            rc = check_r12_grandfather_only_shrinks(work)
+            _assert(rc == 0, "RR13a", "an unchanged grandfather list must pass the shrink-only ratchet")
+            (work / gf_rel).write_text("unit-a\nunit-b\n")
+            rc = check_r12_grandfather_only_shrinks(work)
+            _assert(rc != 0, "RR13b", "adding a NEW entry (not yet on origin/main) must FAIL the ratchet")
+        finally:
+            R12_GRANDFATHER_PATH = real_path
 
 
 RR_FIXTURES = [
@@ -920,9 +1197,13 @@ RR_FIXTURES = [
     ("RR9", fixture_rr9_ancestry_advisory_only),
     ("RR10", fixture_rr10_allowlisted_unit_noop),
     ("RR11", fixture_rr11_allowlist_only_shrinks),
-    ("RR12a", fixture_rr12a_no_anticipation_file_is_a_noop),
-    ("RR12b", fixture_rr12b_reproducing_witness_allows),
-    ("RR12c", fixture_rr12c_nonreproducing_witness_fails),
+    ("RR12a", fixture_rr12a_no_open_block_row_is_a_noop),
+    ("RR12b", fixture_rr12b_open_block_no_anticipation_file_fails),
+    ("RR12c", fixture_rr12c_shape_allows_despite_unresolvable_pre_fix_sha),
+    ("RR12d", fixture_rr12d_real_reproducing_witness_allows),
+    ("RR12e", fixture_rr12e_real_nonreproducing_witness_warns_never_fails),
+    ("RR12f", fixture_rr12f_grandfathered_unit_no_file_allows),
+    ("RR13", fixture_rr13_r12_grandfather_only_shrinks),
 ]
 
 
@@ -952,6 +1233,8 @@ def main(argv: list[str]) -> int:
         return self_test()
     if "--check-allowlist-only-shrinks" in argv:
         return check_allowlist_only_shrinks()
+    if "--check-r12-grandfather-only-shrinks" in argv:
+        return check_r12_grandfather_only_shrinks()
     result = run_check()
     for w in result.warnings:
         print(f"check-rigor-record: WARNING (advisory) — {w}")

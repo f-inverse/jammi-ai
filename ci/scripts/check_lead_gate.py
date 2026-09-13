@@ -2118,6 +2118,29 @@ def fixture_r12r2d_sh_hunk_widens_by_file() -> None:
     _assert(p.returncode == 0, "R12R2d", f"a new .sh surface widened by file must allow once covered, got {p.returncode}: {p.stderr}")
 
 
+def fixture_r12r2e_yml_hunk_widens_by_file() -> None:
+    """M4': the SAME property as R12R2d, for a `.yml` hunk (`_WORKFLOW_STEP_RE`
+    recognizes a new `- name: ...` step) — a SECOND, independent
+    extension, never assumed identical-by-inference from the `.sh` case."""
+    root, row, cmd, pre_hash = _r12_post_setup("feat/r12r2e")
+    (root / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    yml_path = root / ".github" / "workflows" / "new.yml"
+    yml_path.write_text("jobs:\n  x:\n    steps:\n      - name: a new step\n        run: echo hi\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: add .github/workflows/new.yml, state.txt unchanged")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    yml_hash = _r12_hash(0, yml_path.read_text(), "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", ".github/workflows/new.yml"],
+                        fix_head=fix_head,
+                        attacks_post={
+                            "state.txt": {"command": cmd, "hash": pre_hash},
+                            ".github/workflows/new.yml": {"command": "cat .github/workflows/new.yml", "hash": yml_hash},
+                        })
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12r2e"}}, root)
+    _assert(p.returncode == 0, "R12R2e", f"a new .yml surface widened by file must allow once covered, got {p.returncode}: {p.stderr}")
+
+
 def fixture_r12m1_open_question_without_attacks_post_denies() -> None:
     """A relay still carrying the RETIRED `open_question` field, with no
     `attacks_post`, is denied with a message naming the replacement —
@@ -3098,6 +3121,7 @@ FIXTURES = [
     ("R12R2b", fixture_r12r2b_no_differential_denies),
     ("R12R2c", fixture_r12r2c_real_differential_allows),
     ("R12R2d", fixture_r12r2d_sh_hunk_widens_by_file),
+    ("R12R2e", fixture_r12r2e_yml_hunk_widens_by_file),
     ("R12M1", fixture_r12m1_open_question_without_attacks_post_denies),
     ("T1", fixture_t1_card_schema_line_substituted_binds),
     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),

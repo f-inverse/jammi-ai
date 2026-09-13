@@ -830,14 +830,22 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
 
 /// Fix round companion (`CONTRACT-RELEASE-SPIN.md`, design-pass fold, P2 —
 /// wakeup/latency): every phase setter requests the stop in the SAME
-/// statement pair as the phase flip — `begin_drain` (`:2357`) and
-/// `release_and_stop`'s 2a (`:2500`) — so exit latency after a flip is
+/// statement pair as the phase flip — `begin_drain` (`:2417-2424`) and
+/// `release_and_stop`'s 2a (`:2585`) — so exit latency after a flip is
 /// bounded by the in-flight job, never by `idle_poll`. An ENUMERATING check
-/// over the two setters, never a RED mutation (reverting either setter's
-/// pairing alone cannot be made RED through observable behaviour: P1's gate
-/// already refuses a claim on the phase read alone, so an unpaired stop is
-/// unobservable from outside without the SAME gate-direct construction P1
-/// already uses).
+/// over the two setters, PLUS one pre-existing oracle that already reddens
+/// on `release_and_stop`'s unpaired shape (reverting a setter's pairing CAN
+/// be observable, unlike this doc once claimed): reverting the 2a stop
+/// alone (keeping the phase flip) leaves an idle-sleeping loop unwoken, so
+/// `release_before_the_loop_reaches_claim_next_leaves_the_row_untouched`
+/// (`:660`) waits out the idle poll instead of being interrupted and its
+/// `elapsed() < 3 s` bound fails. `begin_drain`'s OWN pairing has no such
+/// witness in this suite — `stop_and_join`, the only DRAIN entry point under
+/// test, requests its own stop directly (`:2472-2473`) and never calls
+/// `begin_drain`, so reverting `begin_drain`'s stop alone stays unobservable
+/// from outside without the SAME gate-direct construction P1 already uses
+/// (measured: `stop_and_join_returns_within_idle_poll_when_idle`, `:271`,
+/// stays green under that mutation).
 ///
 /// Each setter's future is polled EXACTLY ONCE, by hand, off the runtime
 /// with a no-op waker — the same technique
@@ -928,6 +936,65 @@ async fn every_phase_setter_pairs_the_stop_in_the_same_statement_group() {
     }
 }
 
+/// Fix round 1 REVISED (audit BLOCK at `c75452b0`; `CONTRACT-RELEASE-SPIN.md`
+/// P1'): the audit's own falsification of the fold's wide property — the
+/// loop's top-of-iteration gate is read ONCE, then `reclaim_expired_jobs` is
+/// awaited, then `claim_next` runs, so a RELEASE that lands during that
+/// reclaim round trip still finds the now-stale top-of-iteration read
+/// `Running` and would initiate one claim if nothing re-read the gate
+/// afterward. `WorkerShared::admits_claim` is now re-read, with no `.await`
+/// between that second read and `claim_next` itself, immediately after
+/// `reclaim_expired_jobs` returns — this test parks the loop at exactly
+/// that instant (`loop_test_hooks::arm_after_reclaim`, keyed by
+/// `instance_id` since no job is claimed yet), runs a real RELEASE (2a's
+/// phase-and-stop pair) to completion while the loop is parked there, then
+/// releases the park.
+///
+/// RED at `c75452b0` (before the second read existed): the parked
+/// iteration, once released, falls straight through to `claim_next` with no
+/// gate check in between — `claim_next_calls` grows by one and the row is
+/// claimed-and-self-released by `register_job_hold_or_release`'s `Releasing`
+/// arm (`(attempts, releases) == (1, 1)`, `running`) — the SAME numeric
+/// signature as the genuine, tolerated race, but reached through the
+/// reclaim window the fold's property claimed was already closed, not
+/// through a claim whose COMMIT preceded 2a.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_read() {
+    let (session, _dir) = session(DEFAULT_TIMING).await;
+    let handle = session.enqueue(fine_tune(1), 0).await.unwrap();
+
+    let park = loop_test_hooks::arm_after_reclaim(session.instance_id());
+    let worker = spawn_worker(&session);
+    park.wait_parked().await;
+    let claim_next_before_release = loop_test_hooks::claim_next_calls(session.instance_id());
+
+    let at_2e = loop_test_hooks::arm_rendezvous(
+        session.instance_id(),
+        loop_test_hooks::Rendezvous::ReleaseAt2e,
+    );
+    let releasing = {
+        let worker = Arc::clone(&worker);
+        tokio::spawn(async move { worker.release_and_stop().await })
+    };
+    at_2e.wait_fired().await;
+    park.release();
+    let report = tokio::time::timeout(Duration::from_secs(30), releasing)
+        .await
+        .expect("RELEASE completes once the parked iteration resolves")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.loop_state, LoopState::Stopped, "{report:?}");
+    assert_eq!(
+        loop_test_hooks::claim_next_calls(session.instance_id()),
+        claim_next_before_release,
+        "no claim_next may be initiated once phase/stop flip during the reclaim window"
+    );
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(row.status, JobStatus::Queued.to_string(), "{row:?}");
+    assert_eq!((row.attempts, row.releases), (0, 0), "{row:?}");
+    assert!(row.claimed_by.is_none(), "{row:?}");
+}
+
 /// R5(c): the prologue park is held PAST the heartbeat bound, so 2e's wait
 /// times out and RELEASE takes its abort arm — the ONLY path where the loop
 /// is aborted with `in_flight == 0`. The loop reports `Aborted`; no hold was
@@ -954,6 +1021,15 @@ async fn release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a() {
     let worker = spawn_worker(&session);
     park.wait_parked().await;
     let claim_next_before_release = loop_test_hooks::claim_next_calls(session.instance_id());
+    // Positive control for the counter itself: the loop has already claimed
+    // this row and parked in the claim→hold prologue, so `claim_next` must
+    // already have been recorded at least once here — a dead counter (never
+    // incremented) would make the reclaim-window oracle's `delta == 0`
+    // assertion pass vacuously.
+    assert!(
+        claim_next_before_release >= 1,
+        "the claim_next counter must be live before RELEASE runs: {claim_next_before_release}"
+    );
 
     let started = tokio::time::Instant::now();
     let report = worker.release_and_stop().await.unwrap();
@@ -1076,7 +1152,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
 /// two calls that funnel into the SAME function (`release_and_stop` on both
 /// arms) and so had zero true-positive capacity. The doc's own claim
 /// (`OPS-COMPUTE-TIER-OPERABILITY.md`, "Library") is STATEMENT identity
-/// between `EmbeddedWorker::release_and_stop` (2a-2h) and
+/// between `EmbeddedWorker::release_and_stop` (2a-2c, 2e-2h -- 2d folded into 2a) and
 /// `InferenceSession::release_job_leases` (2b+2c) -- the pair that
 /// genuinely differs, since one drives a real loop task through 2a/2d-2h
 /// around the shared 2b/2c core and the other is bare 2b+2c with no loop
@@ -1109,7 +1185,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
 /// instance's rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_actually_differs() {
-    // ----- worker-owning arm: release_and_stop's 2a-2h -----
+    // ----- worker-owning arm: release_and_stop's 2a-2c, 2e-2h (2d folded into 2a) -----
     let (owning_session, _owning_dir) = session(FAST_TIMING).await;
     let owning_handle = owning_session.enqueue(fine_tune(20_000), 0).await.unwrap();
     let worker = spawn_worker(&owning_session);

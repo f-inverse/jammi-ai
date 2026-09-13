@@ -1735,6 +1735,56 @@ impl InferenceSession {
             common: TrainingCommon {
                 base_model: base_model.to_string(),
                 config: config.clone(),
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            },
+        };
+        self.submit_fine_tune_spec(spec).await
+    }
+
+    /// Submit a column-source fine-tune from the flattened request shape the
+    /// data-plane client also submits
+    /// ([`jammi_wire::request::FineTuneRequest`]).
+    ///
+    /// [`Self::fine_tune`]'s loose parameter list cannot carry the rank count
+    /// without growing an argument every caller that does not choose one must
+    /// still pass, so the count arrives on a request struct — the same one
+    /// `jammi_client::DataClient::submit_fine_tune` takes. One request shape
+    /// on both surfaces is what makes the remote-equals-embedded parity
+    /// oracle a comparison of the two paths rather than of two request
+    /// vocabularies.
+    ///
+    /// `world_size: None` is UNSET and submits the single-rank job
+    /// [`Self::fine_tune`] submits;
+    /// [`jammi_wire::request::FineTuneRequest::world_size`]'s `NonZeroU32`
+    /// keeps a zero-rank request unrepresentable at this edge. A count this
+    /// deployment cannot serve is refused with a typed error and enqueues
+    /// nothing.
+    pub async fn submit_fine_tune(
+        &self,
+        request: jammi_wire::request::FineTuneRequest,
+    ) -> Result<TrainingJob> {
+        let jammi_wire::request::FineTuneRequest {
+            source,
+            base_model,
+            columns,
+            method,
+            task,
+            config,
+            world_size,
+        } = request;
+        let config = config.unwrap_or_default();
+        config.validate()?;
+
+        let spec = TrainingSpec::FineTune {
+            source,
+            columns,
+            method,
+            task,
+            common: TrainingCommon {
+                base_model,
+                config,
+                world_size: world_size
+                    .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
             },
         };
         self.submit_fine_tune_spec(spec).await
@@ -1929,6 +1979,7 @@ impl InferenceSession {
             common: TrainingCommon {
                 base_model: base_model.to_string(),
                 config: config.clone(),
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
         };
         self.submit_fine_tune_spec(spec).await

@@ -40,6 +40,8 @@ fn never_runs_job_request() -> SubmitJobRequest {
         base_model: "local:does-not-exist".into(),
         config: None,
         idempotency_key: String::new(),
+        // Unset (`0`) rank count -- single-rank, as this fixture always was.
+        world_size: 0,
     }
 }
 

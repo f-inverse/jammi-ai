@@ -462,6 +462,37 @@ pub fn with_session(
     }
 }
 
+/// Spin up the SAME engine-backed server [`start_engine_server`] does, over a
+/// deployment that declares `devices` CPU devices in `[gpu] devices`.
+///
+/// The rank count a submit may ask for is bounded by how many devices the
+/// deployment declares, so a test of that bound has to be able to move it.
+/// Only the config key varies: the chain, the tier set, and the eager bind are
+/// the ones every other fixture here serves, so a test built on this proves the
+/// KNOB rather than a construction seam. CPU entries (`-1`) are
+/// indistinguishable at execution — the COUNT is what the submit edge reads,
+/// and that is what these tests are about, so this stays hermetic.
+pub async fn start_engine_server_with_devices(devices: usize) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = jammi_test_utils::test_config(dir.path());
+    cfg.gpu.devices = vec![-1; devices];
+
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+        metrics,
+    }
+}
+
 /// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
 /// tier set, identical chain, identical eager bind), with `[worker] enabled`
 /// set to `enabled` **through a real `jammi.toml` loaded by

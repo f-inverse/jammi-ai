@@ -651,9 +651,9 @@ mod world_size_tests {
         idempotency_key: String,
     }
 
-    /// The `SubmitJobRequest` field names and numbers, read off the compiled
-    /// descriptor — the authoritative description of the emitted wire surface.
-    fn submit_job_request_tags() -> Vec<(String, i32)> {
+    /// The compiled `jammi.v1.job.SubmitJobRequest` descriptor — the
+    /// authoritative description of the emitted wire surface.
+    fn submit_job_request() -> prost_types::DescriptorProto {
         let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
             .expect("the compiled jammi.v1 descriptor must decode");
         set.file
@@ -662,15 +662,36 @@ mod world_size_tests {
             .flat_map(|f| f.message_type.iter())
             .find(|m| m.name() == "SubmitJobRequest")
             .expect("jammi.v1.job.SubmitJobRequest is in the descriptor")
+            .clone()
+    }
+
+    /// The `SubmitJobRequest` field names and numbers.
+    fn submit_job_request_tags() -> Vec<(String, i32)> {
+        submit_job_request()
             .field
             .iter()
             .map(|f| (f.name().to_string(), f.number()))
             .collect()
     }
 
+    /// Every field number the message holds RESERVED, flattened from the
+    /// descriptor's half-open ranges.
+    fn submit_job_request_reserved_tags() -> Vec<i32> {
+        let mut reserved: Vec<i32> = submit_job_request()
+            .reserved_range
+            .iter()
+            .flat_map(|r| r.start()..r.end())
+            .collect();
+        reserved.sort_unstable();
+        reserved.dedup();
+        reserved
+    }
+
     /// APPEND-ONLY. Every pre-existing `SubmitJobRequest` tag keeps its number
-    /// and `world_size` takes the next free one (7) — a renumbering, or reusing
-    /// a retired tag, would decode an old payload into the wrong field.
+    /// and `world_size` takes the next free one that is not HELD — 9, because 7
+    /// and 8 are reserved for the deferred job-dependency unit (#515). A
+    /// renumbering, or taking a held tag, would decode a payload built against
+    /// either contract into the wrong field.
     #[test]
     fn world_size_takes_the_next_free_tag_and_moves_no_existing_one() {
         assert_eq!(
@@ -682,8 +703,24 @@ mod world_size_tests {
                 ("base_model".to_string(), 4),
                 ("config".to_string(), 5),
                 ("idempotency_key".to_string(), 6),
-                ("world_size".to_string(), 7),
+                ("world_size".to_string(), 9),
             ],
+        );
+    }
+
+    /// HELD. Tags 7 and 8 belong to the deferred job-dependency unit
+    /// (`depends_on = 7`, `parent_id = 8`, #515): the message reserves them, so
+    /// `protoc` refuses any later field that tries to take one and the
+    /// cherry-pick reviving that unit cannot collide with a field appended in
+    /// the meantime. Same policy as `jammi.v1.error`'s vacant 37/38.
+    #[test]
+    fn tags_seven_and_eight_are_held_for_the_deferred_dependency_unit() {
+        assert_eq!(submit_job_request_reserved_tags(), vec![7, 8]);
+        assert!(
+            !submit_job_request_tags()
+                .iter()
+                .any(|(_, number)| *number == 7 || *number == 8),
+            "no live field may occupy a reserved tag"
         );
     }
 

@@ -60,6 +60,9 @@ fn training_probe_request() -> SubmitJobRequest {
         idempotency_key: String::new(),
         // Unset (`0`) rank count -- single-rank, as this fixture always was.
         world_size: 0,
+        // Unset (`0` = UNSPECIFIED) cache policy -- resolves to the engine's
+        // Bypass default, as this fixture always did.
+        cache: 0,
     }
 }
 

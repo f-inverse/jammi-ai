@@ -126,10 +126,23 @@ impl TensorSignature {
     /// the descriptor's [`Descriptor::counts`] and legitimately differs by
     /// rank (a zero-row rank, an uneven partition), so only the TRAILING
     /// shape is a determinant of agreement for a gathered tensor.
+    ///
+    /// Every caller reaches this only after
+    /// [`checked_gather_counts`](super::checked_gather_counts) has already
+    /// refused a 0-dim tensor for this exact call, so `dims` always has at
+    /// least one entry here. This does not fall back to signing an empty
+    /// trailing shape for a shape it cannot honestly sign — a 0-dim tensor
+    /// used to reach this via `unwrap_or_default()` and be signed exactly
+    /// like a 1-D tensor of the same (empty) trailing shape, which is the
+    /// PROBE-A1 defect.
     fn of_gather_slice(t: &Tensor) -> Self {
         let dims = t.dims();
+        let trailing = dims.get(1..).expect(
+            "checked_gather_counts already refused a 0-dim tensor before this call reaches \
+             of_gather_slice",
+        );
         Self {
-            dims: dims.get(1..).map(<[usize]>::to_vec).unwrap_or_default(),
+            dims: trailing.to_vec(),
             dtype: t.dtype(),
         }
     }
@@ -1044,6 +1057,83 @@ mod descriptor_tests {
             a.agrees_with(&b).is_err(),
             "two ranks reducing a differently shaped tensor at the same index must never agree"
         );
+    }
+
+    /// `agrees_with(a, b).is_ok()` must equal `a == b` (the derived
+    /// [`PartialEq`]) over a sweep that mutates ONE field of a base
+    /// descriptor at a time. `agrees_with` is hand-written, field by field,
+    /// rather than delegating to the derived equality it is meant to match —
+    /// so a NEW field added to [`Descriptor`] without a matching `if` in
+    /// `agrees_with` would make the two diverge exactly on a mutation of that
+    /// field: `agrees_with` would still say `Ok` (it never looked at the new
+    /// field) while `==` says `false` (the derive compares every field). This
+    /// sweep is what would catch that divergence on every field the struct
+    /// has today.
+    #[test]
+    fn agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep() {
+        let base = Descriptor {
+            verb: "all_gather",
+            world: 2,
+            root: None,
+            counts: Some(vec![1, 1]),
+            tensors: vec![TensorSignature {
+                dims: vec![2],
+                dtype: DType::F32,
+            }],
+        };
+
+        let mutations: Vec<Descriptor> = vec![
+            base.clone(),
+            Descriptor {
+                verb: "barrier",
+                ..base.clone()
+            },
+            Descriptor {
+                world: base.world + 1,
+                ..base.clone()
+            },
+            Descriptor {
+                root: Some(0),
+                ..base.clone()
+            },
+            Descriptor {
+                counts: Some(vec![1, 2]),
+                ..base.clone()
+            },
+            Descriptor {
+                counts: None,
+                ..base.clone()
+            },
+            Descriptor {
+                tensors: vec![],
+                ..base.clone()
+            },
+            Descriptor {
+                tensors: vec![TensorSignature {
+                    dims: vec![3],
+                    dtype: DType::F32,
+                }],
+                ..base.clone()
+            },
+            Descriptor {
+                tensors: vec![TensorSignature {
+                    dims: vec![2],
+                    dtype: DType::F64,
+                }],
+                ..base.clone()
+            },
+        ];
+
+        for (index, other) in mutations.iter().enumerate() {
+            let derived_equal = base == *other;
+            let agrees = base.agrees_with(other).is_ok();
+            assert_eq!(
+                agrees, derived_equal,
+                "mutation {index} ({other:?}): agrees_with says {agrees} but derived equality \
+                 (==) says {derived_equal} — a field agrees_with does not check would show up \
+                 exactly as this divergence"
+            );
+        }
     }
 
     #[test]

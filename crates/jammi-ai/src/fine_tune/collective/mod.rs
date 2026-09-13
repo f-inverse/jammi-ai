@@ -48,16 +48,24 @@
 //! them — the rendezvous carries each rank's whole contribution — so a rank
 //! deposits a **descriptor** alongside it: the verb, and every argument other
 //! than the tensor bytes that determines the round's result (`root` for
-//! `broadcast`, the full `counts` vector for `all_gather`, how many tensors
-//! and each one's shape and dtype, and the world size). A round is published
-//! ONLY once every rank's descriptor for it is equal; on any disagreement no
-//! rank is ever handed a result — every rank gets a typed error naming both
-//! descriptors, and the gang is faulted before any of them returns. So on
-//! [`Local`], **no rank can ever return `Ok` from a round any other rank
-//! rejects**: two ranks each naming themselves root, or deriving different
-//! partition counts, are a symmetric typed error on both, never an `Ok` on
-//! one and a wrong answer (or a different error) on the other. [`Noop`] has
-//! no peer to disagree with (`world` is always 1), so this is vacuous there.
+//! `broadcast`, the full `counts` vector for `all_gather`, one signature per
+//! tensor the verb carries — for `all_gather` the TRAILING shape only, since
+//! dim 0 is already the `counts` vector and legitimately differs by rank —
+//! and the world size). A round is published ONLY once every rank's
+//! descriptor for it is equal; on any disagreement BEFORE the round
+//! publishes, no rank is ever handed a result — every rank gets a typed error
+//! naming both descriptors, and the gang is faulted before any of them
+//! returns. So on [`Local`], **no rank can ever return `Ok` from a round any
+//! other rank rejects before that round publishes**: two ranks each naming
+//! themselves root, or deriving different partition counts, are a symmetric
+//! typed error on both, never an `Ok` on one and a wrong answer (or a
+//! different error) on the other. A rank-local failure AFTER a round has
+//! published (a `to_device` copy that fails, a concatenation the backend
+//! refuses) is a different case: the round has already handed every rank its
+//! agreed result, so that failure faults the gang for every collective AFTER
+//! this one, but it does not — and cannot — retract the `Ok` peers already
+//! hold for this one. [`Noop`] has no peer to disagree with (`world` is
+//! always 1), so this is vacuous there.
 //!
 //! The `Nccl` arm has none of that. NCCL exchanges the buffers a collective
 //! names and nothing else: there is no counts exchange (by design — see
@@ -128,7 +136,10 @@ pub trait Collective: Send + Sync {
     fn all_reduce_max_flags(&self, flags: u32) -> Result<u32>;
 
     /// Replace `t` with rank `root`'s `t`. `root` must be a rank of this
-    /// gang.
+    /// gang. Every rank — root or not — passes a `t` of the same shape and
+    /// dtype: a host arm that can see every rank's arguments (`Local`)
+    /// refuses a mismatch symmetrically on EVERY rank, never only on the
+    /// non-root rank whose placeholder happened to differ from the root's.
     fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()>;
 
     /// Return only once every rank has reached this call.
@@ -142,8 +153,16 @@ pub trait Collective: Send + Sync {
 }
 
 /// Check `counts` against the gang's shape and the caller's own tensor —
-/// shared by every implementation so one seam decides what a well-formed
-/// gather request is.
+/// shared by every implementation (`Noop`, `Local`, `Nccl`) so ONE seam
+/// decides what a well-formed gather request is; no arm carries a scalar
+/// check of its own.
+///
+/// A 0-dim tensor (a scalar) has no row count to check against `counts` at
+/// all — `dims()` is empty, not `[0]` — so it is refused here, naming the
+/// rank and the shape, BEFORE any arm's own gather logic ever runs. Without
+/// this, a caller-derived `unwrap_or(0)` default would read a scalar as
+/// though it claimed zero rows, which is a different — and valid — case (a
+/// 1-D or higher tensor whose dim-0 extent happens to be zero).
 ///
 /// Returns the total row count the gather produces.
 pub(crate) fn checked_gather_counts(
@@ -159,7 +178,14 @@ pub(crate) fn checked_gather_counts(
             counts.len()
         )));
     }
-    let local_rows = local.dims().first().copied().unwrap_or(0);
+    let dims = local.dims();
+    let Some(&local_rows) = dims.first() else {
+        return Err(JammiError::FineTune(format!(
+            "all_gather: rank {rank} passed a 0-dim tensor (shape {dims:?}) — a gather \
+             concatenates along dim 0, so a scalar has no row count to check against the \
+             partition rule and cannot be a gather slice"
+        )));
+    };
     let claimed = counts[rank as usize];
     if local_rows != claimed {
         return Err(JammiError::FineTune(format!(

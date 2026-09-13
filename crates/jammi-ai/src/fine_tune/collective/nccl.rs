@@ -364,19 +364,22 @@ impl Collective for Nccl {
 /// Zero-pad `t` to `rows` rows along dim 0. Every rank must send the same
 /// element count, and the padding rows are narrowed away again on the far
 /// side.
+///
+/// Called only from [`Collective::all_gather`] after
+/// [`checked_gather_counts`] has already refused a 0-dim `t` for this call —
+/// the seam every arm shares decides that domain, not this arm on its own —
+/// so `t.dims()` is guaranteed non-empty here.
 fn pad_rows(t: &Tensor, rows: usize) -> Result<Tensor> {
-    let have = t.dims().first().copied().unwrap_or(0);
+    let dims = t.dims();
+    let have = *dims.first().expect(
+        "checked_gather_counts already refused a 0-dim tensor before this call reaches pad_rows",
+    );
     if have == rows {
         return t
             .contiguous()
             .map_err(|e| JammiError::Gpu(format!("all_gather: contiguous: {e}")));
     }
-    let mut shape = t.dims().to_vec();
-    if shape.is_empty() {
-        return Err(JammiError::Gpu(
-            "all_gather: a scalar has no rows to gather along".into(),
-        ));
-    }
+    let mut shape = dims.to_vec();
     shape[0] = rows - have;
     let pad = Tensor::zeros(shape, t.dtype(), t.device())
         .map_err(|e| JammiError::Gpu(format!("all_gather: pad: {e}")))?;
@@ -504,9 +507,13 @@ impl NcclAllGather<'_> {
             .all_gather(&send, &mut recv)
             .map_err(|e| candle_core::Error::Cuda(format!("nccl status {:?}", e.0).into()))?;
         let mut dims = layout.shape().dims().to_vec();
-        if dims.is_empty() {
-            candle_core::bail!("all_gather: a scalar has no rows to gather along");
-        }
+        // `pad_rows` (downstream of `checked_gather_counts`) already refused
+        // a 0-dim tensor before this custom op ever runs on device — see
+        // `pad_rows`'s doc comment — so `dims` is never empty here.
+        assert!(
+            !dims.is_empty(),
+            "checked_gather_counts already refused a 0-dim tensor before this custom op runs"
+        );
         dims[0] *= self.world;
         Ok((
             CudaStorage::wrap_cuda_slice(recv, device),

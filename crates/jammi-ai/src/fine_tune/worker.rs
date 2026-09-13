@@ -3495,120 +3495,125 @@ fn build_training_data_loader(
 ) -> Result<TrainingDataLoader> {
     let detected = detect_training_format(columns, task)?;
 
-    if detected == DetectedFormat::MediaTriplet {
-        return build_media_triplet_loader(batches, task);
-    }
+    // Exhaustive on every `DetectedFormat` arm — no `_`, so a seventh variant
+    // is a compile error here rather than a silent fall-through to whatever
+    // arm happened to be last.
+    match detected {
+        DetectedFormat::MediaTriplet => build_media_triplet_loader(batches, task),
+        DetectedFormat::Contrastive => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let a_col = batch
+                    .column_by_name("text_a")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
+                let b_col = batch
+                    .column_by_name("text_b")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
+                let s_col = batch
+                    .column_by_name("score")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
 
-    if detected == DetectedFormat::Contrastive {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let a_col = batch
-                .column_by_name("text_a")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
-            let b_col = batch
-                .column_by_name("text_b")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
-            let s_col = batch
-                .column_by_name("score")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
+                let a_vals = extract_string_column(a_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_a' is not a string column".into())
+                })?;
+                let b_vals = extract_string_column(b_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_b' is not a string column".into())
+                })?;
+                let s_arr = s_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .map(|arr| {
+                        (0..arr.len())
+                            .map(|i| arr.value(i) as f32)
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        s_col
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float32Array>()
+                            .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
+                    })
+                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
 
-            let a_vals = extract_string_column(a_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
-            let b_vals = extract_string_column(b_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
-            let s_arr = s_col
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .map(|arr| {
-                    (0..arr.len())
-                        .map(|i| arr.value(i) as f32)
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| {
-                    s_col
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                })
-                .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
-
-            for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
-                rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
+                for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
+                    rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
+                }
             }
+            Ok(TrainingDataLoader::from_contrastive(rows))
         }
-        Ok(TrainingDataLoader::from_contrastive(rows))
-    } else if detected == DetectedFormat::Triplet {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
+        DetectedFormat::Triplet => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let schema_info = || {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let anchor_vals = batch
+                    .column_by_name("anchor")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
                         "Missing/invalid 'anchor' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
                         schema_info()
                     ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
+                    })?;
+                let pos_vals = batch
+                    .column_by_name("positive")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
                         "Missing/invalid 'positive' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
                         schema_info()
                     ))
-                })?;
-            let neg_vals = batch
-                .column_by_name("negative")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
+                    })?;
+                let neg_vals = batch
+                    .column_by_name("negative")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
                         "Missing/invalid 'negative' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
                         schema_info()
                     ))
-                })?;
+                    })?;
 
-            for i in 0..batch.num_rows() {
-                rows.push((
-                    anchor_vals[i].clone(),
-                    pos_vals[i].clone(),
-                    neg_vals[i].clone(),
-                ));
+                for i in 0..batch.num_rows() {
+                    rows.push((
+                        anchor_vals[i].clone(),
+                        pos_vals[i].clone(),
+                        neg_vals[i].clone(),
+                    ));
+                }
             }
+            Ok(TrainingDataLoader::from_triplets(rows))
         }
-        Ok(TrainingDataLoader::from_triplets(rows))
-    } else if detected == DetectedFormat::Pairs {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
+        DetectedFormat::Pairs => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let schema_info = || {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let anchor_vals = batch
+                    .column_by_name("anchor")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
                         "Missing/invalid 'anchor' column: task {task} expects text columns, and \
                          this source has the anchor/positive PAIR shape, which is read as text \
                          for every task. Image/audio training reads encoded media bytes only \
@@ -3617,97 +3622,99 @@ fn build_training_data_loader(
                          Batch schema: [{}]",
                         schema_info()
                     ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns, \
+                    })?;
+                let pos_vals = batch
+                    .column_by_name("positive")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Missing/invalid 'positive' column: task {task} expects text columns, \
                          and this source has the anchor/positive PAIR shape, which is read as \
                          text for every task. Image/audio training reads encoded media bytes \
                          only from the anchor/positive/negative TRIPLET shape under \
                          task=image_embedding/audio_embedding — add a 'negative' column. \
                          Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for i in 0..batch.num_rows() {
-                rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
+                            schema_info()
+                        ))
+                    })?;
+                for i in 0..batch.num_rows() {
+                    rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
+                }
             }
+            Ok(TrainingDataLoader::from_pairs(rows))
         }
-        Ok(TrainingDataLoader::from_pairs(rows))
-    } else if detected == DetectedFormat::Regression {
-        // Regression: a string `text` column and a numeric `target` column. The
-        // target is read into `f32` (handling int64/float64/float32/… via
-        // `extract_numeric_column`); nulls and NaNs are rejected citing the row
-        // rather than coerced, since a coerced `0.0` would silently corrupt the
-        // scaler's μ/σ.
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let target_col = batch
-                .column_by_name("target")
-                .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
-            let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                JammiError::FineTune(match e {
-                    NumericColumnError::NotNumeric => format!(
-                        "regression 'target' is not a numeric column (its Arrow type is {})",
-                        target_col.data_type()
-                    ),
-                    NumericColumnError::Null(i) => format!(
-                        "regression 'target' has a null at row {i}; a null target cannot be \
+        DetectedFormat::Regression => {
+            // Regression: a string `text` column and a numeric `target` column. The
+            // target is read into `f32` (handling int64/float64/float32/… via
+            // `extract_numeric_column`); nulls and NaNs are rejected citing the row
+            // rather than coerced, since a coerced `0.0` would silently corrupt the
+            // scaler's μ/σ.
+            let mut rows = Vec::new();
+            for batch in batches {
+                let text_vals = batch
+                    .column_by_name("text")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let target_col = batch
+                    .column_by_name("target")
+                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+                let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
+                    JammiError::FineTune(match e {
+                        NumericColumnError::NotNumeric => format!(
+                            "regression 'target' is not a numeric column (its Arrow type is {})",
+                            target_col.data_type()
+                        ),
+                        NumericColumnError::Null(i) => format!(
+                            "regression 'target' has a null at row {i}; a null target cannot be \
                          coerced (it would corrupt the scaler) — remove or fill the row"
-                    ),
-                    NumericColumnError::Nan(i) => format!(
+                        ),
+                        NumericColumnError::Nan(i) => format!(
                         "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
                          (it would corrupt the scaler) — remove or fix the row"
                     ),
+                    })
+                })?;
+                for i in 0..batch.num_rows() {
+                    rows.push((text_vals[i].clone(), target_vals[i]));
+                }
+            }
+            Ok(TrainingDataLoader::from_regression(rows))
+        }
+        DetectedFormat::Classification => {
+            let mut label_set = std::collections::BTreeSet::new();
+            let mut rows = Vec::new();
+            for batch in batches {
+                let text_vals = batch
+                    .column_by_name("text")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let label_vals = batch
+                    .column_by_name("label")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+                for i in 0..batch.num_rows() {
+                    label_set.insert(label_vals[i].clone());
+                    rows.push((text_vals[i].clone(), label_vals[i].clone()));
+                }
+            }
+            let label_to_idx: std::collections::HashMap<String, u32> = label_set
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (l.clone(), i as u32))
+                .collect();
+            let num_classes = label_to_idx.len();
+            let indexed_rows: Vec<(String, u32)> = rows
+                .into_iter()
+                .map(|(text, label)| {
+                    let idx = label_to_idx[&label];
+                    (text, idx)
                 })
-            })?;
-            for i in 0..batch.num_rows() {
-                rows.push((text_vals[i].clone(), target_vals[i]));
-            }
+                .collect();
+            Ok(TrainingDataLoader::from_classification(
+                indexed_rows,
+                num_classes,
+            ))
         }
-        Ok(TrainingDataLoader::from_regression(rows))
-    } else {
-        debug_assert_eq!(detected, DetectedFormat::Classification);
-        let mut label_set = std::collections::BTreeSet::new();
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let label_vals = batch
-                .column_by_name("label")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
-            for i in 0..batch.num_rows() {
-                label_set.insert(label_vals[i].clone());
-                rows.push((text_vals[i].clone(), label_vals[i].clone()));
-            }
-        }
-        let label_to_idx: std::collections::HashMap<String, u32> = label_set
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (l.clone(), i as u32))
-            .collect();
-        let num_classes = label_to_idx.len();
-        let indexed_rows: Vec<(String, u32)> = rows
-            .into_iter()
-            .map(|(text, label)| {
-                let idx = label_to_idx[&label];
-                (text, idx)
-            })
-            .collect();
-        Ok(TrainingDataLoader::from_classification(
-            indexed_rows,
-            num_classes,
-        ))
     }
 }
 

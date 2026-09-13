@@ -6,7 +6,7 @@
 //! nothing about that.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, Tensor};
 
@@ -151,8 +151,9 @@ fn local_all_gather_refuses_counts_that_contradict_the_ranks() {
     );
 
     // Determinant 3: the ranks derived DIFFERENT count vectors. Each is
-    // self-consistent, so only the post-rendezvous check catches it — rank 0
-    // is the one whose vector the gathered rows contradict.
+    // self-consistent, so only the round descriptor's `counts` field catches
+    // it — and it catches it on BOTH ranks, symmetrically, before either is
+    // handed a result (this is the auditor's PROBE2).
     let disagreeing = run_gang(2, move |local| {
         let (rows, counts) = if local.rank() == 0 {
             (1usize, [1usize, 1])
@@ -164,11 +165,13 @@ fn local_all_gather_refuses_counts_that_contradict_the_ranks() {
             .map(|_| String::new())
             .unwrap_or_else(|e| e.to_string())
     });
-    assert!(
-        disagreeing[0].contains("rank 1 contributed 2 rows where the partition rule says 1"),
-        "unexpected message: {}",
-        disagreeing[0]
-    );
+    for (rank, message) in disagreeing.iter().enumerate() {
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank} must be refused, not silently handed a layout the other rank did not \
+             agree to: {message}"
+        );
+    }
 }
 
 /// `all_reduce_sum` folds in RANK ORDER, and the order is a real determinant:
@@ -299,9 +302,9 @@ fn local_barrier_releases_only_after_every_rank_arrives() {
     }
 }
 
-/// A gang whose ranks are executing DIFFERENT collectives has left lockstep,
-/// and is told so rather than pairing a gather with a reduce and returning a
-/// meaningless result.
+/// A gang whose ranks are executing DIFFERENT collectives disagrees at the
+/// verb field of the round descriptor, and BOTH ranks are told so — never a
+/// gather paired with a reduce and handed back as a meaningless result.
 #[test]
 fn local_refuses_a_round_whose_ranks_are_at_different_collectives() {
     let messages = run_gang(2, move |local| {
@@ -317,10 +320,12 @@ fn local_refuses_a_round_whose_ranks_are_at_different_collectives() {
                 .unwrap_or_else(|e| e.to_string())
         }
     });
-    assert!(
-        messages.iter().any(|m| m.contains("left lockstep")),
-        "neither rank reported the mismatch: {messages:?}"
-    );
+    for (rank, message) in messages.iter().enumerate() {
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank} must be refused, not handed a meaningless result: {message}"
+        );
+    }
 }
 
 /// A gang whose peer never arrives fails with a typed deadline error rather
@@ -539,10 +544,9 @@ fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
         ]
     });
     assert!(
-        mismatched.iter().any(|r| r
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.to_string().contains("left lockstep"))),
+        mismatched.iter().any(|r| r.as_ref().err().is_some_and(|e| e
+            .to_string()
+            .contains("disagree about what this round computes"))),
         "the control: the gang must actually be faulted here, or the sweep below is vacuous"
     );
 
@@ -578,4 +582,190 @@ fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
         elapsed < deadline,
         "the ten refusals took {elapsed:?}: at least one parked instead of refusing"
     );
+}
+
+// ── The round descriptor: no rank returns `Ok` from a round any rank rejects ─
+
+/// The auditor's PROBE1: rank 0 calls `broadcast(root = 0)`, rank 1 calls
+/// `broadcast(root = 1)` — each is a valid root of a two-rank gang on its
+/// own, so nothing here is a domain error either rank could catch alone. At
+/// base (`f74943b5`) both return `Ok` with DIFFERENT bytes: rank 0 broadcasts
+/// its own tensor, rank 1 broadcasts its own, and the two never rendezvous
+/// about which of them is really the root. With the round descriptor's
+/// `root` field agreed before publishing, this is a symmetric typed error on
+/// both ranks instead.
+#[test]
+fn probe1_broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
+    let results: Vec<std::result::Result<Vec<u32>, String>> = run_gang(2, move |local| {
+        let mut t = matrix(1, 1, local.rank() as f32 + 1.0);
+        let root = local.rank(); // each rank names ITSELF the root
+        local
+            .broadcast(&mut t, root)
+            .map(|_| bits(&t))
+            .map_err(|e| e.to_string())
+    });
+    for (rank, result) in results.iter().enumerate() {
+        let error = match result {
+            Err(error) => error,
+            Ok(bytes) => panic!(
+                "rank {rank} returned Ok({bytes:?}) from a round rank {} also rejected the \
+                 premise of — a self-named root must never be handed a peer's answer",
+                1 - rank
+            ),
+        };
+        assert!(
+            error.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {error}"
+        );
+    }
+}
+
+/// The auditor's PROBE2: rank 0 calls `all_gather` with `counts = [1, 1]`,
+/// rank 1 calls it with `counts = [1, 2]` — each rank's OWN row count agrees
+/// with its OWN counts vector, so neither can catch the disagreement from its
+/// own inputs alone. At base (`f74943b5`) rank 0 errs (its view of rank 1's
+/// row count contradicts rank 0's copy of `counts`) but rank 1 returns `Ok`
+/// with a 3-row gather (rank 1's copy of `counts` matches everything rank 1
+/// can see). With the round descriptor's `counts` field agreed before
+/// publishing, both ranks are refused.
+#[test]
+fn probe2_all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
+    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
+        let (rows, counts) = if local.rank() == 0 {
+            (1usize, [1usize, 1])
+        } else {
+            (2usize, [1usize, 2])
+        };
+        local
+            .all_gather(&matrix(rows, 2, 0.0), &counts)
+            .map(|t| t.dims().to_vec())
+            .map_err(|e| e.to_string())
+    });
+    for (rank, result) in results.iter().enumerate() {
+        let error = match result {
+            Err(error) => error,
+            Ok(dims) => panic!(
+                "rank {rank} returned Ok(dims = {dims:?}) from a round rank {} also rejected \
+                 the premise of — a disagreeing partition must never be handed a gathered \
+                 layout",
+                1 - rank
+            ),
+        };
+        assert!(
+            error.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {error}"
+        );
+    }
+}
+
+/// A PRE-rendezvous domain refusal on one rank (a `counts` vector of the
+/// wrong length — `exchange` is never even entered) still faults the WHOLE
+/// gang, so the peer's next collective is refused PROMPTLY rather than
+/// discovering the same fact only after waiting out its own deadline. This
+/// is `Local::guarded`'s `fail_detached` call: delete it and rank 1 below
+/// would instead wait the full `deadline` for a rank 0 that never arrives.
+#[test]
+fn a_pre_rendezvous_domain_refusal_on_one_rank_faults_the_gang_before_its_peer_waits_out_the_deadline(
+) {
+    let deadline = Duration::from_secs(4);
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], deadline).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    // Rank 0's own domain check fails before it ever deposits into a round:
+    // a one-entry counts vector cannot describe a two-rank gang.
+    rank0
+        .all_gather(&matrix(1, 2, 0.0), &[1])
+        .expect_err("rank 0's own counts cannot describe this gang");
+
+    let started = Instant::now();
+    let peer = rank1
+        .barrier()
+        .expect_err("the gang is already faulted by rank 0's domain refusal");
+    let elapsed = started.elapsed();
+    assert!(
+        peer.to_string().contains("the gang has already failed"),
+        "rank 1 must be told the gang already failed, not handed a fresh timeout: {peer}"
+    );
+    assert!(
+        elapsed < deadline / 4,
+        "rank 1 waited {elapsed:?} for a fault that had already happened when it called \
+         barrier — a pre-rendezvous domain refusal on one rank must fault the gang promptly, \
+         not leave the peer to discover it only after its own deadline"
+    );
+}
+
+/// `Shared::check_entry` runs BEFORE a collective's own domain checks: on a
+/// faulted gang, `all_gather` with counts that are ALSO independently wrong
+/// reports the FAULT, never the counts error — the fault is the fact that
+/// explains why the round cannot happen at all, and a fresh domain error
+/// would mask it. This is what dies if `check_entry` is mutated to return
+/// `Ok(())` unconditionally: the counts error would surface instead.
+#[test]
+fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
+    let gang =
+        LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    // Fault the gang via a timeout: rank 1 never arrives.
+    rank0
+        .barrier()
+        .expect_err("rank 1 never arrives inside the deadline");
+
+    // Rank 1 now calls `all_gather` with counts that are ALSO independently
+    // wrong (a one-entry vector for a two-rank gang) — `check_entry` must
+    // refuse with the fault before that domain check ever runs.
+    let error = rank1
+        .all_gather(&matrix(1, 2, 0.0), &[1])
+        .expect_err("the gang is already faulted");
+    let message = error.to_string();
+    assert!(
+        message.contains("the gang has already failed"),
+        "a faulted gang must report the FAULT first, never a fresh domain error that masks \
+         it: {message}"
+    );
+    assert!(
+        !message.contains("counts has 1 entries"),
+        "the counts error must never surface once the gang is faulted: {message}"
+    );
+}
+
+/// A third attempt (of this implementer's own design, not one of the
+/// auditor's) to break "no rank can return `Ok` from a round any rank
+/// rejects": a THREE-rank gang where two ranks agree with EACH OTHER and
+/// only the THIRD disagrees, on a field neither PROBE1 (root) nor PROBE2
+/// (counts) exercises — the reduced tensor's dtype. This shape of case is
+/// exactly what a wrong implementation (say, one that compared each rank
+/// only to its immediate neighbor, or that only checked the field the named
+/// probes happened to cover) would get wrong: two agreeing ranks pairing up
+/// and only the outlier ever noticing. `agrees_with` compares every rank's
+/// descriptor against rank 0's, so this must fault symmetrically too.
+#[test]
+fn a_third_attempt_two_ranks_agree_a_third_disagrees_on_dtype_still_faults_every_rank() {
+    let results: Vec<std::result::Result<(), String>> = run_gang(3, move |local| {
+        let dtype = if local.rank() == 2 {
+            DType::F64
+        } else {
+            DType::F32
+        };
+        let mut tensors = vec![Tensor::zeros((2, 2), dtype, &Device::Cpu).expect("tensor")];
+        local
+            .all_reduce_sum(&mut tensors)
+            .map_err(|e| e.to_string())
+    });
+    for (rank, result) in results.iter().enumerate() {
+        let error = match result {
+            Err(error) => error,
+            Ok(()) => panic!(
+                "rank {rank} returned Ok from a round rank 2 also rejected the premise of — \
+                 a disagreeing dtype at one rank out of three must never be handed a result \
+                 to the other two"
+            ),
+        };
+        assert!(
+            error.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {error}"
+        );
+    }
 }

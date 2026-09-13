@@ -28,10 +28,13 @@ use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
     AnchorKind, ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor,
-    MatchVerdict, MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
+    MatchVerdict, MaterializationEnv, MaterializationManifest, ModelContentDigest, ModelIdentity,
+    ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, CacheOutcome, PinnedSource, ResultStore, TrainingSetSpec};
+use jammi_db::store::{
+    BuildingTable, CacheOutcome, PinnedSource, ResultStore, StaleReason, Staleness, TrainingSetSpec,
+};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -622,15 +625,99 @@ fn pinned_spec<'a>(
     format: &'a str,
     anchor: InputAnchor,
 ) -> TrainingSetSpec<'a> {
+    pinned_spec_multi(source_id, columns, format, vec![anchor])
+}
+
+/// [`pinned_spec`]'s general form: the caller supplies the full recorded
+/// input set directly, over the ONE registered `parent` relation — the shape
+/// the two-anchor short-circuit oracle needs (a pinned anchor plus an
+/// unpinned one, neither of which the SQL itself has to distinguish).
+fn pinned_spec_multi<'a>(
+    source_id: &'a str,
+    columns: &'a [String],
+    format: &'a str,
+    inputs: Vec<InputAnchor>,
+) -> TrainingSetSpec<'a> {
     TrainingSetSpec {
         source_id,
         source_sql: PINNED_SOURCE_SQL,
         columns,
         task: ModelTask::TextEmbedding,
         format,
-        inputs: vec![anchor],
+        inputs,
         device: ComputeDevice::Cpu,
     }
+}
+
+/// The SQL a two-anchor pinned spec projects: BOTH parents, registered by
+/// [`pinned_session_two`] under `parent_a`/`parent_b` — a spec naming two
+/// anchors actually reads rows from both relations, rather than naming a
+/// second anchor no query touches.
+const PINNED_SOURCE_SQL_TWO: &str =
+    "SELECT \"q\", \"a\" FROM parent_a UNION ALL SELECT \"q\", \"a\" FROM parent_b";
+
+/// [`pinned_session`]'s two-relation counterpart: registers `pin_a` and
+/// `pin_b` on one fresh session under the bare names [`PINNED_SOURCE_SQL_TWO`]
+/// reads from.
+async fn pinned_session_two(
+    store: &ResultStore,
+    pin_a: &PinnedSource,
+    pin_b: &PinnedSource,
+) -> SessionContext {
+    let ctx = SessionContext::new();
+    let provider_a = store.pinned_provider(&ctx, pin_a).await.unwrap();
+    ctx.register_table("parent_a", provider_a).unwrap();
+    let provider_b = store.pinned_provider(&ctx, pin_b).await.unwrap();
+    ctx.register_table("parent_b", provider_b).unwrap();
+    ctx
+}
+
+/// [`pinned_spec`]'s two-anchor counterpart, over [`PINNED_SOURCE_SQL_TWO`].
+fn pinned_spec_two<'a>(
+    source_id: &'a str,
+    columns: &'a [String],
+    format: &'a str,
+    inputs: Vec<InputAnchor>,
+) -> TrainingSetSpec<'a> {
+    TrainingSetSpec {
+        source_id,
+        source_sql: PINNED_SOURCE_SQL_TWO,
+        columns,
+        task: ModelTask::TextEmbedding,
+        format,
+        inputs,
+        device: ComputeDevice::Cpu,
+    }
+}
+
+/// Re-attest a parent table's `.materialization.json` sidecar to a NEW
+/// artifact digest — models the parent having been independently recomputed
+/// to new content, which [`ResultStore::current_anchor`] (via
+/// [`ResultStore::staleness`]) reads as the parent's current `ResultDigest`.
+/// The same technique `tests/it/freshness.rs`'s
+/// `reattest_parent_with_new_digest` uses, duplicated here for this file's
+/// own fixtures rather than shared across `it` test modules.
+async fn reattest_with_new_digest(
+    store: &ResultStore,
+    parent: &ResultTableRecord,
+    new_digest: ArtifactDigest,
+) {
+    let url = jammi_db::storage::StorageUrl::parse(&parent.parquet_path).unwrap();
+    let original = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("parent has a manifest");
+    let updated = MaterializationManifest {
+        artifact: new_digest,
+        ..original
+    };
+    let handle = store.open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, updated.to_json_bytes().unwrap().into())
+        .await
+        .unwrap();
 }
 
 /// The committed rows, read straight off the Parquet object in FILE order —
@@ -975,6 +1062,290 @@ async fn a_reused_training_set_requires_equal_anchors(backend: BackendKind) {
             table: first.table_name().to_string()
         }
     );
+}
+
+// --- two-anchor reuse: anchor-SET equality, not per-member matching --------
+//
+// Every oracle above pins ONE anchor. A real graph training set (M1) records
+// TWO (`sources.node_source` and `sources.edge_source`), so the reuse probe's
+// contract — exact SET equality over the whole recorded input list, and the
+// unpinned short-circuit firing on ANY member — has to hold once the set has
+// more than one element, not just vacuously at size 1.
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn two_pinned_equal_anchors_reuse_one_table(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let pin_a =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("qa1"), Some("aa1"))])]).await;
+    let pin_b =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("qb1"), Some("ab1"))])]).await;
+    let anchor_a = pin_a.input_anchor();
+    let anchor_b = pin_b.input_anchor();
+    assert_ne!(
+        anchor_a, anchor_b,
+        "the two anchors must genuinely differ, or this oracle proves nothing about SET reuse over two members"
+    );
+
+    // Two runs, each on its OWN session with BOTH anchors pinned equal.
+    let first = store
+        .materialize_training_set(
+            &pinned_session_two(&store, &pin_a, &pin_b).await,
+            pinned_spec_two(
+                &source,
+                &columns,
+                "pairs",
+                vec![anchor_a.clone(), anchor_b.clone()],
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first.outcome, CacheOutcome::Computed));
+
+    let second = store
+        .materialize_training_set(
+            &pinned_session_two(&store, &pin_a, &pin_b).await,
+            pinned_spec_two(&source, &columns, "pairs", vec![anchor_a, anchor_b]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.outcome,
+        CacheOutcome::Reused {
+            table: first.table_name().to_string()
+        },
+        "two anchors, both pinned and both equal, must reuse the first table"
+    );
+    assert_eq!(second.table_name(), first.table_name());
+    assert_eq!(second.definition_hash, first.definition_hash);
+
+    let training_sets: Vec<_> = catalog
+        .find_result_tables(&source, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        1,
+        "two runs over one two-anchor definition must not leave two tables"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn one_unpinned_member_short_circuits_reuse_even_beside_a_pinned_equal_match(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let pin =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("q1"), Some("a1"))])]).await;
+    let anchor = pin.input_anchor();
+    // The SAME instant on both calls: if the short-circuit required EVERY
+    // member to be unpinned (rather than firing on ANY), this literal-equal
+    // unpinned anchor beside the byte-identical pinned one would look like a
+    // sound exact match.
+    let unpinned = InputAnchor::unpinned_at_instant(&source, "2026-09-13T00:00:00Z");
+    let inputs = vec![anchor, unpinned];
+
+    let first = store
+        .materialize_training_set(
+            &pinned_session(&store, &pin).await,
+            pinned_spec_multi(&source, &columns, "pairs", inputs.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first.outcome, CacheOutcome::Computed));
+
+    // Store-level oracle: even the bare exact-match probe over the identical
+    // set resolves NO candidate — the short-circuit fires on the mere
+    // presence of the unpinned member, so `exact_match_candidates` is never
+    // satisfied by the pinned member's byte-identical match either.
+    assert_eq!(
+        store
+            .lookup_cached(&first.definition_hash, &inputs)
+            .await
+            .unwrap(),
+        None,
+        "a request set holding ANY unpinned member must resolve no candidate, even one whose \
+         other member is a byte-identical pinned match"
+    );
+
+    let second = store
+        .materialize_training_set(
+            &pinned_session(&store, &pin).await,
+            pinned_spec_multi(&source, &columns, "pairs", inputs),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(second.outcome, CacheOutcome::Computed),
+        "one unpinned member in a two-anchor set must force recompute, got {:?}",
+        second.outcome
+    );
+    assert_ne!(second.table_name(), first.table_name());
+
+    let training_sets: Vec<String> = catalog
+        .find_result_tables(&source, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .map(|t| t.table_name)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        2,
+        "two runs with an unpinned member must leave two tables, found {training_sets:?}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn two_pinned_anchors_where_only_the_second_differs_is_not_reused(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let pin_a =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("qa1"), Some("aa1"))])]).await;
+    let pin_b =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("qb1"), Some("ab1"))])]).await;
+    let anchor_a = pin_a.input_anchor();
+    let anchor_b = pin_b.input_anchor();
+
+    let first = store
+        .materialize_training_set(
+            &pinned_session_two(&store, &pin_a, &pin_b).await,
+            pinned_spec_two(&source, &columns, "pairs", vec![anchor_a.clone(), anchor_b]),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first.outcome, CacheOutcome::Computed));
+
+    // ONLY the SECOND anchor differs between the two requests — the FIRST
+    // element (`anchor_a`) is byte-identical across both. A comparison that
+    // checked membership by POSITION (or only the first recorded element)
+    // rather than SET equality over the whole list would wrongly call this a
+    // hit.
+    let advanced_b = InputAnchor::result_digest(
+        pin_b.table_name(),
+        &ArtifactDigest(format!("{:0>64}", "advanceddigest")),
+    );
+    assert_ne!(advanced_b, pin_b.input_anchor());
+    let second = store
+        .materialize_training_set(
+            &pinned_session_two(&store, &pin_a, &pin_b).await,
+            pinned_spec_two(&source, &columns, "pairs", vec![anchor_a, advanced_b]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first.definition_hash, second.definition_hash,
+        "the two requests share one definition; the anchor SET is the only thing that moved"
+    );
+    assert!(
+        matches!(second.outcome, CacheOutcome::Computed),
+        "one anchor differing in a two-anchor SET must not reuse, got {:?}",
+        second.outcome
+    );
+    assert_ne!(second.table_name(), first.table_name());
+
+    let training_sets: Vec<_> = catalog
+        .find_result_tables(&source, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        2,
+        "one anchor differing must leave two tables, not share one"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn staleness_over_a_two_anchor_manifest_reports_on_both_relations(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let pin_a =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("qa1"), Some("aa1"))])]).await;
+    let pin_b =
+        pinned_training_source(&store, &dir, vec![ts_batch(&[(Some("qb1"), Some("ab1"))])]).await;
+    let anchor_a = pin_a.input_anchor();
+    let anchor_b = pin_b.input_anchor();
+
+    let training_set = store
+        .materialize_training_set(
+            &pinned_session_two(&store, &pin_a, &pin_b).await,
+            pinned_spec_two(&source, &columns, "pairs", vec![anchor_a, anchor_b]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .staleness(&training_set.record, &training_set.definition_hash)
+            .await
+            .unwrap(),
+        Staleness::Fresh,
+        "unchanged, both parents must read Fresh"
+    );
+
+    // Both parents are independently recomputed to NEW digests — the
+    // training set's manifest still records the OLD ones for both relations.
+    reattest_with_new_digest(
+        &store,
+        pin_a.record(),
+        ArtifactDigest::of_bytes(b"parent-a-v2"),
+    )
+    .await;
+    reattest_with_new_digest(
+        &store,
+        pin_b.record(),
+        ArtifactDigest::of_bytes(b"parent-b-v2"),
+    )
+    .await;
+
+    match store
+        .staleness(&training_set.record, &training_set.definition_hash)
+        .await
+        .unwrap()
+    {
+        Staleness::Stale { reasons } => {
+            let advanced: std::collections::HashSet<&str> = reasons
+                .iter()
+                .filter_map(|r| match r {
+                    StaleReason::InputAdvanced { source, .. } => Some(source.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                advanced.contains(pin_a.table_name()) && advanced.contains(pin_b.table_name()),
+                "staleness over a two-anchor manifest must report BOTH relations, got {reasons:?}"
+            );
+        }
+        other => panic!("expected Stale with both relations reported, got {other:?}"),
+    }
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]

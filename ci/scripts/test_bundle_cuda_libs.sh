@@ -23,9 +23,31 @@
 # `packaging/server-cu12/verify_link_set.py`'s own suite pins for the shipped
 # `jammi-server` binary (read off the `server-cu12-binary` artifact of run
 # 34717957779), plus `libnccl.so.2`, which is what `candle-core/nccl` in
-# `jammi-ai`'s `cuda` feature adds. One fixture edge is DERIVED rather than
-# measured and is marked as such where it is declared: `libnvrtc.so.12` ->
-# `libnvrtc-builtins`.
+# `jammi-ai`'s `cuda` feature adds.
+#
+# One edge a PRIOR revision of this fixture inferred, rather than measured,
+# was WRONG: `libnvrtc.so.12 -> libnvrtc-builtins`. A MEASUREMENT — `docker run
+# --rm --platform linux/amd64 nvidia/cuda:12.6.3-devel-ubi8 readelf -d
+# /usr/local/cuda-12.6/lib64/libnvrtc.so.12` — shows the real `libnvrtc.so.12`'s
+# `Dynamic section` names exactly these `NEEDED` entries (an S1-style fact,
+# recorded here because nothing else in this repo pins it):
+#
+#   libpthread.so.0
+#   librt.so.1
+#   libdl.so.2
+#   libm.so.6
+#   libc.so.6
+#   ld-linux-x86-64.so.2
+#
+# Every one of those is host-provided (platform). There is NO `NEEDED` entry
+# for `libnvrtc-builtins` anywhere in that list — NVRTC `dlopen`s its builtins
+# library at runtime rather than linking it, so a `DT_NEEDED`-only closure
+# walk, however faithfully implemented, structurally cannot discover it. This
+# is exactly why `bundle_stage_floor` exists as a mechanism independent of the
+# `DT_NEEDED` closure: the fixture below matches the measured fact (`libnvrtc.
+# so.12`'s own needed-sonames case names only a host-provided dependency), and
+# the suite's own assertions below prove `libnvrtc-builtins` still ends up
+# staged — through the floor, never through the closure.
 #
 # Run: `bash ci/scripts/test_bundle_cuda_libs.sh`
 set -uo pipefail
@@ -154,19 +176,19 @@ ld-linux-x86-64.so.2"
 # The fixture that replaces the script's one ELF-reading function, keyed by
 # BASENAME so a resolved absolute path answers the same as a bare soname.
 #
-# `libnvrtc.so.12 -> libnvrtc-builtins.so.12.6` is the one DERIVED edge here,
-# and it is stated as derived rather than measured: the binary's own measured
-# `DT_NEEDED` list above does NOT name `libnvrtc-builtins`, yet the hand list
-# this unit retires bundled it, which leaves a transitive edge through
-# `libnvrtc` as the explanation. This suite pins the CONSEQUENCE — a
-# transitively needed library is staged — rather than the edge's exact owner;
-# on real bytes, the release lane's independent loader check is the arm that
-# would object if the edge sat elsewhere.
+# `libnvrtc.so.12`'s and `libnccl.so.2`'s own `NEEDED` sets are MEASURED (see
+# the module doc for `libnvrtc.so.12`'s recorded `readelf -d` output): both
+# name only host-provided (platform) libraries, so neither contributes a
+# further non-host soname to the closure. In particular this fixture no
+# longer claims `libnvrtc.so.12 -> libnvrtc-builtins` — that edge does not
+# exist on the real object — which is exactly why `bundle_stage_floor` is
+# exercised below as the ONLY mechanism this suite has for staging
+# `libnvrtc-builtins` at all.
 install_fixture_needed() {
   bundle_needed_sonames() {
     case "$(basename "$1")" in
       fake-jammi-server) printf '%s\n' "$BINARY_NEEDED" ;;
-      libnvrtc.so.12) printf '%s\n' "libnvrtc-builtins.so.12.6" "libc.so.6" ;;
+      libnvrtc.so.12) printf '%s\n' "libc.so.6" ;;
       libnccl.so.2) printf '%s\n' "libc.so.6" ;;
       *) : ;;
     esac
@@ -202,8 +224,13 @@ assert_eq "the toolkit precedes /usr/lib64 in the default search path" \
 # ---------------------------------------------------------------------------
 assert_contains "nccl soname staged from /usr/lib64" "$sources" "${SYSLIB}/libnccl.so.2
 "
-assert_contains "nccl versioned object staged from /usr/lib64" "$sources" "${SYSLIB}/libnccl.so.2.23.4
-"
+# No trailing newline in this needle (unlike the sibling check above): with
+# the fictional `libnvrtc -> libnvrtc-builtins` edge gone (measured false;
+# see the module doc), `libnccl.so.2.23.4` is now genuinely the LAST line
+# `bundle_copy_sources` emits, and `$(...)` command substitution strips a
+# trailing newline — a needle anchored on one would never match the true
+# last line regardless of correctness.
+assert_contains "nccl versioned object staged from /usr/lib64" "$sources" "${SYSLIB}/libnccl.so.2.23.4"
 
 # ---------------------------------------------------------------------------
 # 2. Search-path ORDER: `libcudart.so.12` exists in both directories; the
@@ -219,14 +246,18 @@ assert_eq "resolver reports /usr/lib64 for a soname only it holds" \
   "$(bundle_resolve_soname libnccl.so.2 "$SEARCH")" "$SYSLIB"
 
 # ---------------------------------------------------------------------------
-# 3. Every name the retired hand list carried is still carried — the
-#    derivation replaces that list, it does not shrink it. `libnvrtc-builtins`
-#    included, which the binary itself never names: the closure is transitive,
-#    and a direct-only walk would drop it.
+# 3. Every name the retired hand list carried, that a `DT_NEEDED` closure walk
+#    CAN reach, is still carried by the DERIVATION alone (`$sources`) —
+#    `libnvrtc-builtins` is deliberately excluded from this list: measurement
+#    shows it is not reachable by any `DT_NEEDED` edge (see the module doc),
+#    so it is asserted separately, below, as a FLOOR fact rather than a
+#    derivation fact.
 # ---------------------------------------------------------------------------
-for stem in libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins; do
-  assert_contains "hand-list member ${stem} still staged" "$sources" "${TOOLKIT}/${stem}.so."
+for stem in libcudart libcublas libcublasLt libcurand libnvrtc; do
+  assert_contains "hand-list member ${stem} still staged by the closure" "$sources" "${TOOLKIT}/${stem}.so."
 done
+assert_not_contains "libnvrtc-builtins is NOT reachable by the DT_NEEDED closure alone (measured fact)" \
+  "$sources" "libnvrtc-builtins"
 
 # ---------------------------------------------------------------------------
 # 4. The host-provided partition: neither the platform's own libraries nor the
@@ -306,8 +337,10 @@ main_rc=$?
 assert_eq "bundle_main succeeds over the fixture tree" "$main_rc" "0"
 assert_contains "bundle_main names what it stages" "$main_out" "staging ${SYSLIB}/libnccl.so.2"
 staged="$(LC_ALL=C ls "$STAGE" | LC_ALL=C sort | tr '\n' ' ')"
-assert_eq "the staged tree is exactly the derived set" "$staged" \
+assert_eq "the staged tree is exactly the derived closure UNION the floor" "$staged" \
   "libcublas.so.12 libcublas.so.12.6.4.1 libcublasLt.so.12 libcublasLt.so.12.6.4.1 libcudart.so.12 libcudart.so.12.6.77 libcurand.so.10 libcurand.so.10.3.7.77 libnccl.so.2 libnccl.so.2.23.4 libnvrtc-builtins.so.12.6 libnvrtc-builtins.so.12.6.85 libnvrtc.so.12 libnvrtc.so.12.6.85 "
+assert_eq "libnvrtc-builtins ends up staged (via the floor, not the closure)" \
+  "$([ -f "${STAGE}/libnvrtc-builtins.so.12.6" ] && echo yes || echo no)" "yes"
 
 # A binary that needs nothing bundle-able is a build defect, not an empty-but-
 # correct staging run: a CUDA build always links at least the CUDA runtime.
@@ -334,7 +367,7 @@ UNVER_STAGE="${ROOT}/stage-unver/lib"
 bundle_needed_sonames() {
   case "$(basename "$1")" in
     fake-jammi-server-unver) printf '%s\n' "$BINARY_NEEDED" "libfakeunversioned.so" ;;
-    libnvrtc.so.12) printf '%s\n' "libnvrtc-builtins.so.12.6" "libc.so.6" ;;
+    libnvrtc.so.12) printf '%s\n' "libc.so.6" ;;
     libnccl.so.2) printf '%s\n' "libc.so.6" ;;
     *) : ;;
   esac
@@ -349,6 +382,8 @@ assert_eq "an ordinary versioned-only object (cudart) is staged alongside it" \
   "$([ -f "${UNVER_STAGE}/libcudart.so.12" ] && echo yes || echo no)" "yes"
 assert_eq "an ordinary versioned-only object (cudart's real object) is staged alongside it" \
   "$([ -f "${UNVER_STAGE}/libcudart.so.12.6.77" ] && echo yes || echo no)" "yes"
+assert_eq "the floor-only member (libnvrtc-builtins) is staged in the same run" \
+  "$([ -f "${UNVER_STAGE}/libnvrtc-builtins.so.12.6" ] && echo yes || echo no)" "yes"
 install_fixture_needed
 
 # ---------------------------------------------------------------------------

@@ -23,8 +23,7 @@ def notes_schema() -> pa.Schema:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
-        db = jammi.connect(f"file://{tmp}")
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
 
         # 1. Create the mutable table. The catalog now resolves
         #    `mutable.public.notes` for SQL DML and reads.

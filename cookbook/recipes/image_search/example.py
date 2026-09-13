@@ -153,9 +153,8 @@ def build_image_triplets() -> pa.Table:
 
 def main() -> int:
     print(f"image_search: model = {MODEL}")
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
         tmp_path = Path(tmp)
-        db = jammi.connect(f"file://{str(tmp_path)}")
 
         # 1. Load the corpus images into a Parquet source (inline image bytes).
         corpus_parquet = tmp_path / "corpus.parquet"

@@ -15,10 +15,8 @@ Each test genuinely exercises its property and fails if it broke.
 from __future__ import annotations
 
 import os
-import tempfile
 import uuid
 
-import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -29,6 +27,26 @@ TENANT_A = "11111111-1111-1111-1111-111111111111"
 TENANT_B = "22222222-2222-2222-2222-222222222222"
 
 
+@pytest.fixture
+def db(embedded):
+    """A real embedded engine, CLOSED in teardown.
+
+    The shared `embedded` fixture (tests/conftest.py) owns the lifecycle: the
+    session is closed before anything can remove its catalog directory, and the
+    suite-wide leak guard fails any test that opens one by hand and forgets.
+    """
+    return embedded
+
+
+@pytest.fixture
+def root(tmp_path):
+    """A directory for the parquet files these tests register as sources — kept
+    apart from the engine's own catalog directory."""
+    d = tmp_path / "sources"
+    d.mkdir()
+    return str(d)
+
+
 def _register(db, name: str, table: pa.Table, *, root: str) -> None:
     # The embedded engine resolves a registered source's table by the parquet file
     # stem, so the file is named for the source (as the cookbook loaders do).
@@ -37,9 +55,8 @@ def _register(db, name: str, table: pa.Table, *, root: str) -> None:
     db.add_source(name, url=path, format="parquet")
 
 
-def test_tenant_context_restores_prior_scope():
+def test_tenant_context_restores_prior_scope(db):
     """``rails.tenant`` binds the scope in place and restores it on exit."""
-    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     assert db.tenant() is None
     with rails.tenant(db, TENANT_A) as scoped:
         assert scoped is db  # binds in place, yields the same handle
@@ -47,14 +64,12 @@ def test_tenant_context_restores_prior_scope():
     assert db.tenant() is None  # restored
 
 
-def test_catalog_listing_isolation():
+def test_catalog_listing_isolation(db, root):
     """Tenant A's ``list_sources`` excludes a source registered under tenant B.
 
     The first genuine layer: the registry is filtered to ``tenant_id = $cur OR
     IS NULL``. Would fail if listing leaked a foreign tenant's registration.
     """
-    root = tempfile.mkdtemp()
-    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     with rails.tenant(db, TENANT_A):
         _register(db, "src_a", pa.table({"code": ["AAA", "BBB"]}), root=root)
     with rails.tenant(db, TENANT_B):
@@ -66,15 +81,13 @@ def test_catalog_listing_isolation():
     rails.assert_listing_isolated(a_listed, {"src_b"}, tenant_id=TENANT_A)
 
 
-def test_discriminator_column_row_isolation():
+def test_discriminator_column_row_isolation(db, root):
     """One ``tenant_id``-tagged source returns disjoint rows under A vs B.
 
     The second genuine layer: the analyzer injects ``tenant_id = $cur OR IS NULL``
     onto the ``TableScan`` because the schema carries the discriminator column.
     Would fail if the analyzer did not filter (both tenants would see all rows).
     """
-    root = tempfile.mkdtemp()
-    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     with rails.tenant(db, ""):  # register the shared source globally
         _register(db, "tagged", pa.table({
             "code": ["AAA", "BBB", "XXX", "YYY"],
@@ -92,7 +105,7 @@ def test_discriminator_column_row_isolation():
     rails.assert_rows_isolated(seen_a, set(seen_b), tenant_id=TENANT_A)
 
 
-def test_discriminator_less_source_is_globally_readable():
+def test_discriminator_less_source_is_globally_readable(db, root):
     """A source with NO ``tenant_id`` column is globally readable (the caveat).
 
     The honest limit, asserted positively: with no discriminator column there is
@@ -100,8 +113,6 @@ def test_discriminator_less_source_is_globally_readable():
     tenant A reads ALL of a source registered under tenant B when it names it. The
     remedy is a discriminator column or an access gate above the engine.
     """
-    root = tempfile.mkdtemp()
-    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     with rails.tenant(db, TENANT_B):
         _register(db, "b_open", pa.table({"code": ["XXX", "YYY"]}), root=root)
 

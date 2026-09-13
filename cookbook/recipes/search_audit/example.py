@@ -31,8 +31,7 @@ def main() -> None:
         # production this comes from your secret manager, never hard-coded.
         os.environ["JAMMI_AUDIT_MASTER_KEY"] = "00" * 32
 
-    with tempfile.TemporaryDirectory() as tmp:
-        db = jammi.connect(f"file://{tmp}")
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
         db.set_tenant(TENANT)
 
         # 1. Build an audit record for a (hypothetical) search. query_lineage

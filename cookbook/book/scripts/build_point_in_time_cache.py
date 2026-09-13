@@ -447,8 +447,12 @@ def emit(target: str, server_bin: str | None) -> None:
         spine_path, facts_path = _write_spine_and_facts(work, facts)
 
         # --- embedded asof (the canonical feature rows) --------------------- #
-        with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi.connect(f"file://{catalog}")
+        with (
+            tempfile.TemporaryDirectory() as catalog,
+            # closed BEFORE the directory is removed: `with A, B` unwinds B first,
+            # and a live embedded engine keeps writing its catalog (Errno 39).
+            jammi.connect(f"file://{catalog}") as embedded,
+        ):
             print("== embedded asof_join ==", flush=True)
             e_out, e_rows, e_verdict = run_asof(embedded, spine_path, facts_path)
 

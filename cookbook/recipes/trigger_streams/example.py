@@ -23,8 +23,7 @@ def events_schema() -> pa.Schema:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
-        db = jammi.connect(f"file://{tmp}")
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
 
         # 1. Register a topic with a typed schema. `broker_metadata`
         #    flows through to the broker driver — the in-process broker

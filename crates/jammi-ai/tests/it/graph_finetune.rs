@@ -268,6 +268,7 @@ fn graph_spec_round_trip_resamples_identical_pairs() {
             base_model: "local:tiny".into(),
             config: jammi_ai::fine_tune::FineTuneConfig::default(),
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
+            cache: jammi_db::store::CachePolicy::Bypass,
         },
     };
 

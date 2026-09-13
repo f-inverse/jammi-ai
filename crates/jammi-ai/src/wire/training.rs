@@ -210,6 +210,10 @@ fn lora_common_from_proto(
         base_model,
         config,
         world_size: world_size_from_proto(world_size),
+        // `pb::SubmitJobRequest` carries no cache field yet (wiring `Use`
+        // through the wire proto is a follow-up); `Bypass` matches the
+        // pre-`cache` behaviour byte-for-byte for every remote submitter.
+        cache: jammi_db::store::CachePolicy::Bypass,
     })
 }
 
@@ -472,6 +476,7 @@ mod tests {
                     ..FineTuneConfig::default()
                 },
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
         };
 

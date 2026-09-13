@@ -978,6 +978,7 @@ mod tests {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
+                cache: jammi_db::store::CachePolicy::Bypass,
             },
         }));
         let json = serde_json::to_string(&spec).unwrap();

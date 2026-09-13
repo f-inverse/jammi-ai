@@ -611,6 +611,76 @@ than rebuild) is **phase 2 of this unit, not in this PR**, and is blocked on
 a user action: creating the bucket (`jammi-seed-cache`) and a read-only
 access token. Nothing in this tooling reads or writes that bucket today.
 
+## The gang leg — two GPUs in one pod
+
+`gpu-gang.yml` rents ONE pod holding TWO A100s and runs the distributed
+fine-tune (gang) tests on it, through `ci/scripts/runpod_gpu_gang.sh` and the
+same shared primitive every other lane uses (`ci/scripts/runpod_lib.sh`). It is
+the only lane where a multi-device collective runs on real hardware; every
+other GPU lane rents a single device.
+
+**What makes the pod different.** `RP_GPU_COUNT` (default 1 for every other
+lane) is 2 here — the one caller that moves it. At a count above 1
+`rp_deploy_arch` tries the SXM4 candidates before the PCIe ones: a 2-GPU pod
+provisioned on `A100-SXM4-80GB` SECURE while the PCIe pool reported no 2-GPU
+capacity at all. Both pairs stay in the list, so a multi-GPU rental only
+reorders the capacity search, never narrows it.
+
+**What it proves.** The gang tests in `jammi-ai`'s `gpu_capability` target,
+selected by the `gang_` name filter the driver owns. A name filter that matches
+zero tests exits 0 with "running 0 tests" — the driver reads that as a
+FAILURE, by name, and equally refuses a run that wrote no artifact. A leg with
+no test is a leg with no proof.
+
+**Triggers.** The `run-gang` PR label, a nightly cron, and manual dispatch —
+never a push, never `workflow_call`, and no workflow may `uses:` it. That is
+the same doctrine `gpu-prove.yml` carries, and it is pinned for every
+hardware-renting lane by `ci/scripts/check_gpu_prove_once.py`'s P7 rule
+(`PAID_POD_LANE_TABLE`: the driver script and the one workflow allowed to
+invoke it). Nothing about a release depends on this lane; the release verdict
+is the prove lane's.
+
+**Cost ceiling (human-approved).** One hour x 2 GPU at the rate the 2-GPU SXM4
+pod was rented at — about $3.2 a run. The ceiling is not prose: the driver sets
+`RP_TTL_HOURS=1`, which bakes the deadline into the pod's own entrypoint, so a
+SIGKILLed runner cannot outlive it, and the shared `RP_TIMEOUT` default (50m,
+owned by `runpod_lib.sh` — this lane declares no second one) sits inside that
+hour so the budget cut lands first with the cut group named. Whether a
+cold `cuda,flash-attn` build plus the gang tests fits inside the hour is NOT
+established — nothing has measured it. A budget cut is therefore a cost
+decision for a human (raise the ceiling deliberately), never something the
+script raises on its own.
+
+**Exit codes** (the workflow annotates each one separately, so a capacity night
+never reads as a code regression):
+
+- `0` — every gating group passed.
+- `75` — no 2-GPU capacity. Retried once, then RED: a leg with no capacity
+  proved nothing.
+- `76` — the inactivity watchdog killed a hang with a gating group unresolved.
+  A hung collective is exactly what this lane exists to surface.
+- `77` — wrong tree: the pod's own `PROVE_SHA` disagreed with the commit the
+  run expected.
+- `97` — the rented pod is not the device the leg asked for (fewer GPUs than
+  requested, or the wrong compute capability). Refused before anything is
+  built.
+- `124` — budget cut with a gating group unresolved.
+
+**The artifact.** The gang tests write their evidence into
+`JAMMI_GANG_ARTIFACT_DIR` on the pod; the driver pulls that directory back
+before the EXIT trap tears the pod down (the pod is the only place it exists)
+and the workflow uploads it. A human reviews it and commits it under
+`crates/jammi-kernels/artifacts/cuda-runs/`, where
+`ci/scripts/check_cuda_run_artifacts.py`'s `gang` kind is its schema gate. That
+schema requires the topology the run actually had (`world`, the collective, and
+one device per rank), the same-seed digest pair, the measured per-step loss
+delta, and the epsilon it is read against — with epsilon's own derivation and
+the commit it was registered at, which must already be an ancestor of the
+commit the run measured. An epsilon chosen after seeing the delta it excuses is
+not a tolerance, and the gate refuses it by name. Whether the two digests match
+is the leg's own verdict, recorded in the artifact's `status`; the schema does
+not decide it.
+
 ## Notes
 
 - **A100 capacity on RunPod is intermittent** — deployment fails over across

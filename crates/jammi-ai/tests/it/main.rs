@@ -18,6 +18,7 @@ mod e2e_inference;
 mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
+mod fine_tune_materialization;
 mod ft_correctness_sweep;
 mod ft_determinism;
 mod gguf_qlora;

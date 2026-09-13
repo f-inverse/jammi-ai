@@ -103,7 +103,7 @@ use crate::fine_tune::graph_sampler::{
 };
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::training_set;
-use crate::fine_tune::FineTuneConfig;
+use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
@@ -1256,6 +1256,7 @@ impl JobWorker {
             register,
             metrics,
             mut epoch_checkpoints,
+            materialization,
         } = artifact;
         let model_id = register.model_id.clone();
 
@@ -1264,20 +1265,168 @@ impl JobWorker {
         // a registered model row. The registration does NOT carry the served
         // path: the finalize CAS is the sole writer of `artifact_path`, so a
         // loser's (or zombie's) register can never set the served pointer.
+        //
+        // U3: `dir` is `None` for exactly one case — a `CachePolicy::Use`
+        // model-level cache HIT (`FineTuneMaterializationOutcome::Reused`).
+        // Nothing new is published; the prefix is the ALREADY-committed one
+        // the matched row serves, so this job's own name is finalized
+        // pointing at the SAME prefix (two model rows, one prefix) rather
+        // than writing (and then having to reclaim) a duplicate copy.
         let attempt_str = attempt.to_string();
-        let prefix =
-            match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
-                    // The training loop DID complete and DID write epoch
-                    // checkpoints (we have a `TrainedArtifact`) — but the
-                    // FINAL artifact publish failed, so this attempt never
-                    // reaches finalize at all. Reclaim its epoch-checkpoint
-                    // bytes via the derived sweep (never the vec — one
-                    // reclaim path for every terminating arm, unit 348 F1/F2).
+        let prefix: jammi_db::storage::StorageUrl = match &dir {
+            Some(dir) => {
+                match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, dir)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
+                            .await;
+                        // The training loop DID complete and DID write epoch
+                        // checkpoints (we have a `TrainedArtifact`) — but the
+                        // FINAL artifact publish failed, so this attempt never
+                        // reaches finalize at all. Reclaim its epoch-checkpoint
+                        // bytes via the derived sweep (never the vec — one
+                        // reclaim path for every terminating arm, unit 348 F1/F2).
+                        Self::gc_epoch_checkpoints(
+                            &store,
+                            tenant,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            epoch_checkpoint_bound,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            None => {
+                let Some(FineTuneMaterializationOutcome::Reused { artifact_path, .. }) =
+                    &materialization
+                else {
+                    record_failed(
+                        catalog,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        "internal: no artifact directory and no reused fine-tune prefix".into(),
+                    )
+                    .await;
+                    return;
+                };
+                match jammi_db::storage::StorageUrl::parse(artifact_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
+                            .await;
+                        return;
+                    }
+                }
+            }
+        };
+
+        if let Err(e) = catalog.register_model(register.as_params()).await {
+            // The model row could not be registered. A FRESH prefix we just
+            // wrote is orphaned — best-effort GC it. A REUSED prefix (`dir`
+            // is `None`) is owned by its own original model row and must
+            // NEVER be deleted here.
+            if dir.is_some() {
+                store.delete_artifact_prefix(&prefix).await.ok();
+                Self::gc_epoch_checkpoints(
+                    &store,
+                    tenant,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
+            }
+            record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+            return;
+        }
+
+        // U3: write/record the model-level materialization AFTER
+        // registration, BEFORE the finalize CAS below — the manifest is the
+        // LAST object written into a FRESH prefix (mirroring
+        // `ArtifactStore::put_artifact`'s own "manifest.json last"
+        // discipline: `write_model_materialization` writes
+        // `.materialization.json` strictly after the bundle already exists).
+        // A REUSED hit copies the matched row's own already-recorded triple
+        // rather than recomputing it — the two model rows must agree
+        // byte-for-byte on what they both point at.
+        match &materialization {
+            Some(FineTuneMaterializationOutcome::Fresh {
+                descriptor,
+                env,
+                inputs,
+            }) => {
+                let manifest = match store
+                    .write_model_materialization(
+                        &prefix,
+                        jammi_db::store::manifest::Materialization {
+                            descriptor,
+                            env,
+                            inputs: inputs.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        store.delete_artifact_prefix(&prefix).await.ok();
+                        Self::gc_epoch_checkpoints(
+                            &store,
+                            tenant,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            epoch_checkpoint_bound,
+                        )
+                        .await;
+                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
+                            .await;
+                        return;
+                    }
+                };
+                // The `.materialization.json` sidecar's own well-known
+                // location inside the prefix `ArtifactStore::write_model_materialization`
+                // just wrote it to (see that method's doc: the model-artifact
+                // peer of a result table's `materialization_sidecar_path`,
+                // recorded explicitly here because a model's bundle is a
+                // multi-file prefix, not one Parquet object with an implicit
+                // sibling path — migration 033's own doc).
+                let manifest_path = format!("{prefix}/materialization.json");
+                let anchors_json = match serde_json::to_string(&manifest.input_anchors) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        store.delete_artifact_prefix(&prefix).await.ok();
+                        Self::gc_epoch_checkpoints(
+                            &store,
+                            tenant,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            epoch_checkpoint_bound,
+                        )
+                        .await;
+                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
+                            .await;
+                        return;
+                    }
+                };
+                if let Err(e) = catalog
+                    .record_model_materialization(
+                        &model_id,
+                        register.version,
+                        manifest.definition_hash.as_str(),
+                        &anchors_json,
+                        &manifest_path,
+                    )
+                    .await
+                {
+                    store.delete_artifact_prefix(&prefix).await.ok();
                     Self::gc_epoch_checkpoints(
                         &store,
                         tenant,
@@ -1287,25 +1436,34 @@ impl JobWorker {
                         epoch_checkpoint_bound,
                     )
                     .await;
+                    record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
                     return;
                 }
-            };
-
-        if let Err(e) = catalog.register_model(register.as_params()).await {
-            // The model row could not be registered; the prefix we wrote is
-            // orphaned. Best-effort GC it and fail the job.
-            store.delete_artifact_prefix(&prefix).await.ok();
-            Self::gc_epoch_checkpoints(
-                &store,
-                tenant,
-                job_id,
-                &self.worker_id,
-                attempt,
-                epoch_checkpoint_bound,
-            )
-            .await;
-            record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
-            return;
+            }
+            Some(FineTuneMaterializationOutcome::Reused {
+                definition_hash,
+                input_anchors_json,
+                manifest_path,
+                ..
+            }) => {
+                if let Err(e) = catalog
+                    .record_model_materialization(
+                        &model_id,
+                        register.version,
+                        definition_hash,
+                        input_anchors_json,
+                        manifest_path,
+                    )
+                    .await
+                {
+                    record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+                    return;
+                }
+            }
+            // `GraphFineTune` / a context predictor: no materialization to
+            // record (`ProducingDescriptor::FineTune` covers only the
+            // column-source `FineTune` kind at this commit).
+            None => {}
         }
 
         // Unit 348 F2: TRIM to the trailing retention window before
@@ -1760,9 +1918,9 @@ impl JobWorker {
             TrainingSpec::FineTune {
                 source,
                 columns,
+                method,
                 task,
                 common,
-                ..
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
@@ -1771,7 +1929,7 @@ impl JobWorker {
                 // attested artifact, not this worker's private scan.
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
-                let (_table, batches) = training_set::materialize_projection(
+                let (table, batches) = training_set::materialize_projection(
                     session,
                     &source,
                     &columns,
@@ -1794,10 +1952,44 @@ impl JobWorker {
                         loader.format().format_tag()
                     ))));
                 }
+                // U3: the `ProducingDescriptor::FineTune` materialization
+                // identity — the training-set table's own definition hash,
+                // artifact digest and row count, binding this fine-tune to
+                // the EXACT materialised `TrainingSet` it trained from (see
+                // that descriptor variant's own doc). Only the column-source
+                // `FineTune` kind carries this; `GraphFineTune` does not (see
+                // `FineTuneMaterializationSource`'s doc).
+                let training_set_artifact_digest = {
+                    let parquet_url =
+                        jammi_db::storage::StorageUrl::parse(&table.record.parquet_path)
+                            .map_err(JammiError::from)
+                            .map_err(WorkerJobError::from)?;
+                    session
+                        .result_store()
+                        .read_materialization_manifest(&parquet_url)
+                        .await
+                        .map_err(WorkerJobError::from)?
+                        .map(|manifest| manifest.artifact.0)
+                        .ok_or_else(|| {
+                            WorkerJobError::from(JammiError::FineTune(format!(
+                                "training set '{}' has no materialization manifest",
+                                table.record.table_name
+                            )))
+                        })?
+                };
+                let materialization_source = Some(FineTuneMaterializationSource {
+                    source: source.clone(),
+                    columns: columns.clone(),
+                    method,
+                    training_set_definition_hash: table.definition_hash.as_str().to_string(),
+                    training_set_artifact_digest,
+                    training_set_row_count: table.record.row_count as u64,
+                });
                 let run = FineTuneRun {
                     task,
                     common,
                     loader,
+                    materialization_source,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -1819,6 +2011,11 @@ impl JobWorker {
                     task: ModelTask::TextEmbedding,
                     common,
                     loader,
+                    // `ProducingDescriptor::FineTune` covers only the
+                    // column-source `FineTune` kind at this commit (its own
+                    // doc); a graph fine-tune's model row carries no
+                    // materialization.
+                    materialization_source: None,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -2032,6 +2229,7 @@ impl JobWorker {
             task,
             common,
             loader,
+            materialization_source,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
@@ -2048,7 +2246,137 @@ impl JobWorker {
         let hidden_size = guard.model.embedding_dim().ok_or_else(|| {
             WorkerJobError::Failed("Base model does not support embeddings".into())
         })?;
+
+        // U3: the `ProducingDescriptor::FineTune` materialization identity is
+        // built HERE, while the model guard is still held (the identity needs
+        // the loaded model's backend/precision/digest/quantization — the SAME
+        // uniform path `pipeline::embedding`'s `embedding_definition` already
+        // uses for the model it invokes). The `CachePolicy::Use` probe runs
+        // BEFORE the expensive blocking trainer below — never after — so a
+        // hit skips training entirely (`reused` short-circuits the return).
+        let mut pending_materialization: Option<FineTuneMaterializationOutcome> = None;
+        let mut reused: Option<TrainedArtifact> = None;
+        if let Some(src) = &materialization_source {
+            let canonical_model_id = model_source.to_string();
+            let env = jammi_db::store::manifest::MaterializationEnv::new(
+                session.compute_device(),
+                vec![jammi_db::store::manifest::ModelIdentity {
+                    model_id: canonical_model_id.clone(),
+                    backend: guard.model.backend_kind().to_string(),
+                    compute_precision: guard.model.compute_precision(),
+                    content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
+                    quantization: guard.model.quantization(),
+                }],
+            );
+            let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
+                &src.source,
+                &src.columns,
+                src.method,
+                task,
+                &common.base_model,
+                &common.config,
+                common.world_size,
+            )
+            .map_err(WorkerJobError::from)?;
+            let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {
+                training_set_definition_hash: src.training_set_definition_hash.clone(),
+                training_set_artifact_digest: src.training_set_artifact_digest.clone(),
+                training_set_row_count: src.training_set_row_count,
+                spec_canonical,
+                spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
+                base_model_id: canonical_model_id,
+                world_size: common.world_size,
+            };
+            // The sole input, anchored PINNED by content digest (never
+            // `unpinned_at_instant`, which `Catalog::probe_model_by_definition`
+            // refuses to match by construction — see that method's doc). The
+            // anchor's `source` is the FINE-TUNE's own registered source
+            // (`src.source`, e.g. `"training"`) — STABLE across two
+            // submissions of the identical spec — never
+            // `src.training_set_table`: `materialize_training_set` never
+            // reuses an unpinned-source table across calls (module doc), so
+            // every submission's own training-set table carries a FRESH,
+            // never-repeating name even when its content is byte-identical;
+            // anchoring on that name would make two submissions of the exact
+            // same spec never match on `anchors` and defeat reuse entirely.
+            // The digest is what actually says whether the data moved.
+            let inputs = vec![jammi_db::store::manifest::InputAnchor::result_digest(
+                src.source.clone(),
+                &jammi_db::store::manifest::ArtifactDigest(
+                    src.training_set_artifact_digest.clone(),
+                ),
+            )];
+            let definition_hash =
+                jammi_db::store::manifest::MaterializationManifest::definition_of(
+                    &descriptor,
+                    &env,
+                )
+                .map_err(jammi_db::store::manifest_to_jammi)
+                .map_err(WorkerJobError::from)?;
+
+            if common.cache == jammi_db::store::CachePolicy::Use {
+                if let Some(hit) = catalog
+                    .probe_model_by_definition(definition_hash.as_str(), &inputs)
+                    .await
+                    .map_err(WorkerJobError::from)?
+                {
+                    let missing = |field: &str| {
+                        WorkerJobError::from(JammiError::FineTune(format!(
+                            "model '{}' matched the fine-tune reuse probe but carries no {field}",
+                            hit.catalog_pk
+                        )))
+                    };
+                    let artifact_path = hit
+                        .artifact_path
+                        .clone()
+                        .ok_or_else(|| missing("artifact_path"))?;
+                    let reused_definition_hash = hit
+                        .definition_hash
+                        .clone()
+                        .ok_or_else(|| missing("definition_hash"))?;
+                    let reused_anchors_json = hit
+                        .input_anchors_json
+                        .clone()
+                        .ok_or_else(|| missing("input_anchors_json"))?;
+                    let reused_manifest_path = hit
+                        .manifest_path
+                        .clone()
+                        .ok_or_else(|| missing("manifest_path"))?;
+                    reused = Some(TrainedArtifact {
+                        dir: None,
+                        register: ModelRegistration {
+                            model_id: output_model_id.clone(),
+                            version: 1,
+                            model_type: "fine-tuned",
+                            task,
+                            base_model_id: Some(common.base_model.clone()),
+                            config_json: None,
+                        },
+                        metrics: None,
+                        epoch_checkpoints: Vec::new(),
+                        materialization: Some(FineTuneMaterializationOutcome::Reused {
+                            artifact_path,
+                            definition_hash: reused_definition_hash,
+                            input_anchors_json: reused_anchors_json,
+                            manifest_path: reused_manifest_path,
+                        }),
+                    });
+                }
+            }
+            if reused.is_none() {
+                pending_materialization = Some(FineTuneMaterializationOutcome::Fresh {
+                    descriptor: Box::new(descriptor),
+                    env,
+                    inputs,
+                });
+            }
+        }
         drop(guard);
+
+        if let Some(reused) = reused {
+            // A cache HIT: training never ran (the point of `CachePolicy::Use`).
+            return Ok(reused);
+        }
 
         // #485 BLOCK B1 test hook: a no-op in production (the whole call
         // compiles away without `test-hooks`). Parks here, with the job's
@@ -2145,7 +2473,7 @@ impl JobWorker {
         // deterministic (`jammi:fine-tuned:{job_id}`) and the catalog upserts, so
         // a re-claiming worker is idempotent.
         Ok(TrainedArtifact {
-            dir: training.artifact_dir,
+            dir: Some(training.artifact_dir),
             register: ModelRegistration {
                 model_id: output_model_id,
                 version: 1,
@@ -2156,6 +2484,7 @@ impl JobWorker {
             },
             metrics: Some(training.metrics_json),
             epoch_checkpoints: training.epoch_checkpoints,
+            materialization: pending_materialization,
         })
     }
 }
@@ -2938,6 +3267,65 @@ struct FineTuneRun {
     task: ModelTask,
     common: TrainingCommon,
     loader: TrainingDataLoader,
+    /// Set ONLY for the column-source `TrainingSpec::FineTune` kind — see
+    /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
+    /// carries `None` here at this commit.
+    materialization_source: Option<FineTuneMaterializationSource>,
+}
+
+/// The `ProducingDescriptor::FineTune`-specific inputs a `TrainingSpec::FineTune`
+/// run's materialization is built from — everything [`FineTuneRun`]'s shared
+/// fields (`task`, `common`) do not already carry.
+///
+/// `ProducingDescriptor::FineTune` covers only the column-source `FineTune`
+/// kind at this commit (its own doc in `jammi_db::store::manifest`): a graph
+/// fine-tune's sampled-pairs training set has no recorded fine-tune-level
+/// reuse key, so [`FineTuneRun::materialization_source`] is `None` for that
+/// kind and its model row carries no materialization.
+struct FineTuneMaterializationSource {
+    /// The registered source the rows were projected from — folds into
+    /// `spec_canonical`.
+    source: String,
+    /// The projected columns, in declared order — folds into `spec_canonical`.
+    columns: Vec<String>,
+    /// The adapter method — folds into `spec_canonical`.
+    method: FineTuneMethod,
+    /// The materialised `TrainingSet` table's own [`DefinitionHash`], hex.
+    training_set_definition_hash: String,
+    /// The materialised `TrainingSet` table's own artifact digest, hex — the
+    /// [`jammi_db::store::manifest::InputAnchor::result_digest`] anchor's value.
+    training_set_artifact_digest: String,
+    /// The materialised `TrainingSet` table's committed row count.
+    training_set_row_count: u64,
+}
+
+/// What [`JobWorker::publish_and_finalize`] does with a `TrainingSpec::FineTune`
+/// run's materialization identity, decided BEFORE training by
+/// [`JobWorker::train_fine_tune`]'s `CachePolicy::Use` probe.
+pub(crate) enum FineTuneMaterializationOutcome {
+    /// A model-level cache HIT
+    /// ([`jammi_db::catalog::Catalog::probe_model_by_definition`]): training
+    /// never ran. This job completes by registering its OWN model name
+    /// pointing at the REUSED prefix — two model rows sharing one prefix —
+    /// with the SAME definition hash / input anchors / manifest path the
+    /// reused row already carries (copied, not recomputed).
+    Reused {
+        /// The reused row's served `artifact_path` — this job's own row is
+        /// finalized pointing at the SAME prefix, never a new one.
+        artifact_path: String,
+        definition_hash: String,
+        input_anchors_json: String,
+        manifest_path: String,
+    },
+    /// A FRESH training run: after the worker publishes this attempt's new
+    /// prefix, `.materialization.json` is written LAST (before the finalize
+    /// CAS) from this descriptor + environment + input anchors, and recorded
+    /// on the model row.
+    Fresh {
+        descriptor: Box<jammi_db::store::manifest::ProducingDescriptor>,
+        env: jammi_db::store::manifest::MaterializationEnv,
+        inputs: Vec<jammi_db::store::manifest::InputAnchor>,
+    },
 }
 
 /// A successful training run's output, awaiting the worker's unified
@@ -2953,9 +3341,11 @@ struct FineTuneRun {
 /// run-metrics JSON the CAS records (the fine-tune loop's loss/step/timing
 /// detail; `None` for a kind that records none beyond the terminal flip).
 pub struct TrainedArtifact {
-    /// Local tempdir holding the final artifact files. Removed on drop, after
-    /// the worker has published its contents.
-    pub dir: tempfile::TempDir,
+    /// Local tempdir holding the final artifact files, removed on drop after
+    /// the worker has published its contents — `None` for a
+    /// `FineTuneMaterializationOutcome::Reused` (private) cache hit, which
+    /// publishes nothing new (see the `materialization` field below).
+    pub dir: Option<tempfile::TempDir>,
     /// The catalog model row to register for this artifact.
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
@@ -2970,6 +3360,10 @@ pub struct TrainedArtifact {
     /// row for each entry — never a separate publish step, since the bytes
     /// are already complete by the time this reaches `publish_and_finalize`.
     pub epoch_checkpoints: Vec<(usize, String)>,
+    /// `Some` for a `TrainingSpec::FineTune` run only (never `GraphFineTune`
+    /// or a context predictor) — the model-level materialization
+    /// [`JobWorker::publish_and_finalize`] writes/records.
+    pub(crate) materialization: Option<FineTuneMaterializationOutcome>,
 }
 
 /// The catalog model-row descriptor a training kind hands the worker's finalize.

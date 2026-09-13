@@ -988,7 +988,7 @@ impl InferenceSession {
         .to_string();
 
         Ok(crate::fine_tune::worker::TrainedArtifact {
-            dir,
+            dir: Some(dir),
             register: crate::fine_tune::worker::ModelRegistration {
                 model_id: spec.model_id.clone(),
                 version: 1,
@@ -1002,6 +1002,10 @@ impl InferenceSession {
             // checkpointing (unit 348 is fine-tune-specific; v1 out of
             // scope here) — nothing to register.
             epoch_checkpoints: Vec::new(),
+            // `ProducingDescriptor::FineTune` covers only the column-source
+            // `TrainingSpec::FineTune` kind (its own doc); a context
+            // predictor's model row carries no materialization.
+            materialization: None,
         })
     }
 }

@@ -120,6 +120,18 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // U3 (#500): `.materialization.json` embeds `produced_at`
+            // (wall-clock) and `produced_by` (a per-process run id) — never
+            // byte-stable across runs by design (provenance metadata, not the
+            // reproducibility anchor; see `MaterializationManifest`'s own
+            // doc), so it can never join a byte-for-byte pinned fixture the
+            // way the other files here can. Excluded from the print set
+            // rather than pinned or ignored silently: this comment is the
+            // record of why the file this fine-tune now publishes is absent
+            // from `PARITY_ADAPTER_PRINTS`.
+            if name == "materialization.json" {
+                continue;
+            }
             prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
         }
     }

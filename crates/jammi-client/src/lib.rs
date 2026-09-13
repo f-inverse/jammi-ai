@@ -22,6 +22,7 @@
 //!   [`jammi_wire`] conversions the server's receive side uses.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +69,9 @@ use jammi_wire::proto::job::{
 use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
-use jammi_wire::request::{FineTuneJobId, Modality, QueryInput, SearchQuery, SearchRequest};
+use jammi_wire::request::{
+    FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+};
 use jammi_wire::{
     audit_error_from_status, cohorts_to_proto, config_to_proto, decode_ipc_stream,
     decode_subscribed_batch, encode_publish_batch, error_from_status, eval_task_to_proto,
@@ -377,8 +380,13 @@ impl DataClient {
 
     // --- fine-tune (submits through JobService.SubmitJob) -----------------
 
-    /// Start a fine-tuning job and return its id. Poll completion with
-    /// [`Self::fine_tune_status`], or [`Self::wait_job`] for a resumable wait.
+    /// Start a fine-tuning job on the engine's defaults for every knob
+    /// [`FineTuneRequest`] carries beyond this verb's parameters, and return
+    /// its id. Poll completion with [`Self::fine_tune_status`], or
+    /// [`Self::wait_job`] for a resumable wait.
+    ///
+    /// Submits a single-rank job: the data-parallel rank count is left unset.
+    /// Use [`Self::submit_fine_tune`] to choose one.
     pub async fn fine_tune(
         &self,
         source: &str,
@@ -388,6 +396,34 @@ impl DataClient {
         task: ModelTask,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJobId> {
+        self.submit_fine_tune(FineTuneRequest {
+            source: source.to_string(),
+            base_model: base_model.to_string(),
+            columns: columns.to_vec(),
+            method,
+            task,
+            config,
+            world_size: None,
+        })
+        .await
+    }
+
+    /// Start a fine-tuning job from a whole [`FineTuneRequest`] and return its
+    /// id — the flattened form of [`Self::fine_tune`], carrying the knobs that
+    /// verb's parameter list does not name (today, the data-parallel rank
+    /// count). One request shape rather than a growing parameter list, the
+    /// same way [`Self::search`] takes a whole
+    /// [`jammi_wire::request::SearchRequest`].
+    pub async fn submit_fine_tune(&self, request: FineTuneRequest) -> Result<FineTuneJobId> {
+        let FineTuneRequest {
+            source,
+            base_model,
+            columns,
+            method,
+            task,
+            config,
+            world_size,
+        } = request;
         // The column-source fine-tune is the `FineTuneSpec` arm of the
         // `SubmitJob` spec oneof; built inline from the transport-neutral
         // config vocabulary so the data client (which carries no engine
@@ -396,14 +432,19 @@ impl DataClient {
             .job_client()
             .submit_job(SubmitJobRequest {
                 spec: Some(ProtoTrainingSpec::FineTune(FineTuneSpec {
-                    source: source.to_string(),
-                    columns: columns.to_vec(),
+                    source,
+                    columns,
                     method: method_to_proto(method) as i32,
                     task: model_task_to_proto(task) as i32,
                 })),
-                base_model: base_model.to_string(),
+                base_model,
                 config: config.as_ref().map(config_to_proto),
                 idempotency_key: String::new(),
+                // `0` IS the unset value of the wire's implicit-presence
+                // `uint32`, so an unchosen count sends the same bytes a caller
+                // sent before the field existed and the engine resolves it to
+                // one rank.
+                world_size: world_size.map_or(0, NonZeroU32::get),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -1195,5 +1236,239 @@ mod grpc_timeout_header_tests {
             matches!(captured, Some(Some(_))),
             "subscribe_with_timeout must send a grpc-timeout header, got {captured:?}"
         );
+    }
+}
+
+/// What this client puts on the wire for the data-parallel rank count, read
+/// off a request a real `JobService` handler received.
+///
+/// The count is the one submit knob whose default is a *silent* value — `0`,
+/// the implicit-presence `uint32`'s unset — so "the caller did not choose" and
+/// "the caller chose" have to be distinguishable at the server, not merely at
+/// the call site. These tests read the field a genuine handler received over a
+/// loopback connection, the same fixture shape
+/// [`grpc_timeout_header_tests`](self::grpc_timeout_header_tests) uses:
+/// `DataClient::submit_fine_tune` builds and sends the request in one async
+/// fn against a live channel, so a hand-built request inspected without
+/// sending it would not exercise the code path production uses.
+#[cfg(test)]
+mod world_size_tests {
+    use std::net::SocketAddr;
+    use std::num::NonZeroU32;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use futures::Stream;
+    use tokio::net::{TcpListener, TcpStream};
+    use tonic::transport::{Endpoint, Server};
+    use tonic::{Request, Response, Status};
+
+    use jammi_db::ModelTask;
+    use jammi_wire::fine_tune::FineTuneMethod;
+    use jammi_wire::proto::job::job_service_server::{JobService, JobServiceServer};
+    use jammi_wire::proto::job::{
+        CancelJobRequest, CancelJobResponse, JobEvent, JobHandle, JobStatusRequest,
+        JobStatusResponse, ListJobsRequest, ListJobsResponse, ListWorkersRequest,
+        ListWorkersResponse, PruneJobsRequest, PruneJobsResponse, SubmitJobRequest,
+        SubmitJobResponse,
+    };
+    use jammi_wire::request::FineTuneRequest;
+
+    use super::DataClient;
+
+    /// The one `SubmitJobRequest` this fixture's test drives, captured whole so
+    /// a test can assert on any field of it (not only the count).
+    type CapturedSubmit = Arc<Mutex<Option<SubmitJobRequest>>>;
+
+    /// A `TcpListener` as an accepted-connection stream, so `tonic`'s server
+    /// can be handed a loopback listener without the `tokio-stream` `net`
+    /// feature (not enabled workspace-wide).
+    struct AcceptStream(TcpListener);
+
+    impl Stream for AcceptStream {
+        type Item = std::io::Result<TcpStream>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            use std::task::Poll;
+            match self.0.poll_accept(cx) {
+                Poll::Ready(Ok((stream, _peer))) => Poll::Ready(Some(Ok(stream))),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A `JobService` double whose only LIVE method is `submit_job`; every
+    /// other method is unreachable from these tests, so a wiring mistake
+    /// panics loudly rather than returning a plausible-looking placeholder.
+    struct SubmitCapturingJobService {
+        submitted: CapturedSubmit,
+    }
+
+    #[tonic::async_trait]
+    impl JobService for SubmitCapturingJobService {
+        type WaitJobStream = Pin<Box<dyn Stream<Item = Result<JobEvent, Status>> + Send + 'static>>;
+
+        async fn submit_job(
+            &self,
+            request: Request<SubmitJobRequest>,
+        ) -> Result<Response<SubmitJobResponse>, Status> {
+            *self.submitted.lock().unwrap() = Some(request.into_inner());
+            Ok(Response::new(SubmitJobResponse {
+                job_id: "job-1".to_string(),
+                kind: "fine_tune".to_string(),
+                output_model_id: String::new(),
+            }))
+        }
+
+        async fn job_status(
+            &self,
+            _request: Request<JobStatusRequest>,
+        ) -> Result<Response<JobStatusResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn wait_job(
+            &self,
+            _request: Request<JobHandle>,
+        ) -> Result<Response<Self::WaitJobStream>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn list_jobs(
+            &self,
+            _request: Request<ListJobsRequest>,
+        ) -> Result<Response<ListJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: Request<CancelJobRequest>,
+        ) -> Result<Response<CancelJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn list_workers(
+            &self,
+            _request: Request<ListWorkersRequest>,
+        ) -> Result<Response<ListWorkersResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn prune_jobs(
+            &self,
+            _request: Request<PruneJobsRequest>,
+        ) -> Result<Response<PruneJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+    }
+
+    /// Spin up a loopback tonic server hosting only the capturing double and
+    /// connect a client to it. The serve task is detached: nothing here needs
+    /// graceful shutdown, since process teardown reclaims the port.
+    async fn connected_client() -> (DataClient, CapturedSubmit) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let submitted: CapturedSubmit = Arc::new(Mutex::new(None));
+        let svc = JobServiceServer::new(SubmitCapturingJobService {
+            submitted: Arc::clone(&submitted),
+        });
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(AcceptStream(listener))
+                .await
+                .expect("capturing server");
+        });
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+        let client = DataClient::connect(endpoint)
+            .await
+            .expect("data client connect");
+        (client, submitted)
+    }
+
+    /// A request for the two-column fine-tune both tests submit, differing
+    /// only in the count — so the count is the only determinant of any
+    /// difference the handler sees.
+    fn request(world_size: Option<NonZeroU32>) -> FineTuneRequest {
+        FineTuneRequest {
+            source: "patents".to_string(),
+            base_model: "local:tiny-bert".to_string(),
+            columns: vec!["abstract".to_string()],
+            method: FineTuneMethod::Lora,
+            task: ModelTask::TextEmbedding,
+            config: None,
+            world_size,
+        }
+    }
+
+    /// SET. A chosen count reaches the server as that count — the client does
+    /// not drop, clamp, or reinterpret it.
+    #[tokio::test]
+    async fn a_chosen_rank_count_reaches_the_server() {
+        let (client, submitted) = connected_client().await;
+
+        client
+            .submit_fine_tune(request(NonZeroU32::new(2)))
+            .await
+            .expect("submit returns the double's handle");
+
+        let received = submitted.lock().unwrap().take().expect("handler ran");
+        assert_eq!(received.world_size, 2);
+    }
+
+    /// UNSET. An unchosen count reaches the server as `0` — the wire's unset,
+    /// which the engine resolves to a single rank. Asserted against the
+    /// received request, so this pins what the server sees rather than what
+    /// the client meant.
+    #[tokio::test]
+    async fn an_unchosen_rank_count_reaches_the_server_unset() {
+        let (client, submitted) = connected_client().await;
+
+        client
+            .submit_fine_tune(request(None))
+            .await
+            .expect("submit returns the double's handle");
+
+        let received = submitted.lock().unwrap().take().expect("handler ran");
+        assert_eq!(received.world_size, 0);
+    }
+
+    /// The six-parameter [`DataClient::fine_tune`] is exactly
+    /// [`DataClient::submit_fine_tune`] with the count unset: every caller
+    /// that predates the count keeps submitting the single-rank job it always
+    /// did, and the two verbs agree field-for-field on everything else (the
+    /// whole received request is compared, not only the count).
+    #[tokio::test]
+    async fn the_six_parameter_verb_submits_the_identical_unset_request() {
+        let (client, submitted) = connected_client().await;
+
+        client
+            .fine_tune(
+                "patents",
+                "local:tiny-bert",
+                &["abstract".to_string()],
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                None,
+            )
+            .await
+            .expect("submit returns the double's handle");
+        let via_verb = submitted.lock().unwrap().take().expect("handler ran");
+
+        client
+            .submit_fine_tune(request(None))
+            .await
+            .expect("submit returns the double's handle");
+        let via_request = submitted.lock().unwrap().take().expect("handler ran");
+
+        assert_eq!(via_verb.world_size, 0);
+        assert_eq!(via_verb, via_request);
     }
 }

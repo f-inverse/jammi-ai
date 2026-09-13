@@ -1032,6 +1032,61 @@ def test_failed_job_wait_raises_training_error_on_both_raise_sites():
     assert client_errors.TrainingError is jammi.TrainingError
 
 
+def test_empty_training_set_refusal_is_invalid_argument_on_both_transports():
+    """Tier B (converter-level) — the K2 refusal of an EMPTY training set maps
+    to ONE class, `jammi.errors.InvalidArgument`, on both transports.
+
+    A training set whose projection yields zero rows is refused by the producer
+    (`JammiError::EmptyTrainingSet`) rather than materialised as a 0-row table.
+    The server sends that refusal as `INVALID_ARGUMENT`
+    (`jammi_server::grpc::wire::map_engine_error`), so the remote client raises
+    `InvalidArgument` — and the embedded converter must not classify the same
+    engine error as a `BackendError`, or one `except InvalidArgument` would catch
+    the caller's own degenerate input remotely and miss it in-process.
+
+    Converter-level on the EMBEDDED arm BY NECESSITY, the same shape (and for the
+    same reason) as the failed-job parity test above: driving a real refusal needs
+    a fine-tune over a real source and base model, which is not hermetic. The two
+    raise-sites are therefore pinned at their converters:
+      * the REMOTE raise-site is driven directly — `_rpc_to_jammi` over a status
+        carrying the engine's own `EmptyTrainingSet` message text;
+      * the EMBEDDED raise-site (`error.rs::jammi_error_class`'s
+        `JammiError::EmptyTrainingSet` arm → `client_error("InvalidArgument", …)`)
+        is pinned in Rust by
+        `empty_training_set_raises_the_class_the_remote_transport_raises`, which
+        asserts that arm equals the class this crate maps `INVALID_ARGUMENT` to;
+        the class name it looks up is asserted here to resolve to the very object
+        the remote arm raised.
+    """
+    from jammi._database import _rpc_to_jammi
+
+    message = (
+        "training set over `SELECT text, label FROM reviews.public.rows` is "
+        "empty: the projection yielded zero rows"
+    )
+
+    class _EmptyTrainingSetStatus(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.INVALID_ARGUMENT
+
+        def details(self):
+            return message
+
+    mapped = _rpc_to_jammi(_EmptyTrainingSetStatus())
+    assert type(mapped) is jammi.InvalidArgument
+    assert mapped.code is grpc.StatusCode.INVALID_ARGUMENT
+    assert message in str(mapped)
+
+    # The embedded converter raises BY NAME out of `jammi.errors` — the same
+    # module object, so the class it resolves is the one asserted above and a
+    # caller's single `except` holds on either transport.
+    from jammi import errors as client_errors
+
+    assert client_errors.InvalidArgument is jammi.InvalidArgument
+    assert issubclass(jammi.InvalidArgument, jammi.JammiError)
+    assert issubclass(jammi.InvalidArgument, ValueError)
+
+
 def test_job_handle_protocol_is_satisfied_by_both_handles():
     """Both `jammi_native.Job` (native) and `jammi.RemoteJob`
     satisfy the `JobHandle` protocol — a caller treats the two

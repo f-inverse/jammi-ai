@@ -1059,13 +1059,13 @@ mod cache_key_tests {
         assert!(inner.in_flight.contains_key(&first));
         assert!(inner.in_flight.contains_key(&second));
 
-        // Determinant 2 — the entries map and its LRU order. A `CacheEntry`
-        // needs a really-loaded model, which this hermetic oracle does not
-        // build; what it pins here is that BOTH are keyed by the same
-        // [`CacheKey`] (these calls do not type-check against an
-        // id-keyed map) and that the two devices occupy two distinct slots
-        // of the LRU rather than one.
-        assert!(!inner.entries.contains_key(&first));
+        // Determinant 2 — the LRU order. The two devices occupy two distinct
+        // slots of it rather than one, and touching one copy does not move
+        // the other. (The entries map itself is determinant 3, in
+        // `the_entries_map_holds_one_entry_per_device_for_one_model_id`
+        // below: it takes a really-loaded model, so it cannot be asserted
+        // here.)
+        assert!(inner.entries.is_empty());
         inner.lru_order.push_back(first.clone());
         inner.lru_order.push_back(second.clone());
         inner.touch_lru(&first);
@@ -1079,17 +1079,114 @@ mod cache_key_tests {
             Some(&first),
             "touching device 0's copy must not move device 1's"
         );
+    }
 
-        let mut entries: HashMap<CacheKey, &str> = HashMap::new();
-        entries.insert(first.clone(), "device 0's copy");
-        entries.insert(second.clone(), "device 1's copy");
-        assert_eq!(
-            entries.len(),
-            2,
-            "two devices are two resident copies of one model id"
+    /// Determinant 3 — the PRODUCTION entries map holds one entry per
+    /// device for one model id.
+    ///
+    /// Asserted on `CacheInner::entries`, the map `get_or_load` reads and
+    /// writes, and not on a throwaway `HashMap` built beside it: a mirror
+    /// keyed by [`CacheKey`] would report two entries however the real map
+    /// were keyed, so it measures this test's own construction rather than
+    /// the cache's.
+    ///
+    /// A `CacheEntry` needs a really-loaded model, so this oracle loads one
+    /// and shares the handle between the two entries — the model object is
+    /// not what is under test; the key is. The two entries are told apart by
+    /// their `memory_bytes`, which is per-entry state a collision would
+    /// destroy.
+    #[tokio::test]
+    async fn the_entries_map_holds_one_entry_per_device_for_one_model_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(
+            jammi_db::catalog::Catalog::open(catalog_dir.path())
+                .await
+                .unwrap(),
         );
-        assert_eq!(entries.get(&first), Some(&"device 0's copy"));
-        assert_eq!(entries.get(&second), Some(&"device 1's copy"));
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let store = Arc::new(
+            jammi_db::store::ArtifactStore::with_root(
+                jammi_db::storage::StorageUrl::memory("cache-key-test-artifacts"),
+                jammi_db::storage::StorageRegistry::new(),
+                cache_dir,
+            )
+            .unwrap(),
+        );
+        let hub = crate::model::hub::HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(tempfile::tempdir().unwrap().keep()),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap();
+        let resolver = ModelResolver::new(Arc::clone(&catalog), store, hub).unwrap();
+
+        let dir = tmp.path().join("tiny_bert");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for file in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
+        }
+        let source = ModelSource::local(&dir);
+
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            devices: vec![-1],
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        let loader = ModelCache::new(resolver, device_config, Arc::clone(&scheduler));
+        let guard = loader
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap();
+        let model = Arc::clone(&guard.model);
+        drop(guard);
+
+        let first = CacheKey::for_test("tiny-bert", 0);
+        let second = CacheKey::for_test("tiny-bert", 1);
+        assert_eq!(
+            first.model_id, second.model_id,
+            "the control: it is ONE model id, so an id-keyed map would hold one entry"
+        );
+
+        let mut inner = CacheInner {
+            entries: HashMap::new(),
+            lru_order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        };
+        for (id, memory_bytes) in [(&first, 11usize), (&second, 22)] {
+            inner.entries.insert(
+                id.clone(),
+                CacheEntry {
+                    model: Arc::clone(&model),
+                    ref_count: Arc::new(AtomicUsize::new(0)),
+                    memory_bytes,
+                    _residency: ModelResidency::Gpu,
+                    gpu_permit: Arc::new(scheduler.try_acquire(memory_bytes).unwrap()),
+                },
+            );
+        }
+
+        assert_eq!(
+            inner.entries.len(),
+            2,
+            "two devices are two resident copies of one model id, in the cache's own map"
+        );
+        assert_eq!(
+            inner.entries.get(&first).map(|e| e.memory_bytes),
+            Some(11),
+            "device 0's entry must still be device 0's"
+        );
+        assert_eq!(
+            inner.entries.get(&second).map(|e| e.memory_bytes),
+            Some(22),
+            "device 1's entry must not have overwritten device 0's"
+        );
     }
 
     /// `None` is a distinct key VALUE, never a wildcard: a load that named

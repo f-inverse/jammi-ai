@@ -1,0 +1,53 @@
+diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
+index c5751795..2e7e9c77 100755
+--- a/.claude/hooks/lead-gate-lib.py
++++ b/.claude/hooks/lead-gate-lib.py
+@@ -1876,13 +1876,47 @@ def cmd_export(argv: list[str]) -> int:
+     return 0
+ 
+ 
++def cmd_export_oracle(argv: list[str]) -> int:
++    """esc-lead-invariants-2: `--export-oracle <unit_slug>` prints every
++    `agent_type == "oracle"` row from `unit_file(sdir, unit_slug)`'s own
++    rows, one JSON object per line, to stdout — the hook's OWN row schema,
++    verbatim, never hand-typed. A pure READ: no stdin, no payload, never
++    touches `decide_pre` or any gate decision.
++
++    The lead runs `python3 .claude/hooks/lead-gate-lib.py --export-oracle
++    <slug> > docs/rigor/<slug>.oracle.jsonl` and commits the result — the
++    carrier `ci/scripts/check_oracle_gate.py` reads. Deliberately narrower
++    than the general `--export` (it exports only oracle rows, to a distinct
++    `*.oracle.jsonl` path) so this addition never collides with
++    `cmd_export`'s own `--export` form — both coexist; a human may later
++    fold this into the general form, which is not required for this one
++    to work today."""
++    if len(argv) < 3 or not argv[2].strip():
++        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-oracle <unit_slug>\n")
++        return 2
++    slug = argv[2]
++    sdir = state_dir()
++    rows = read_rows(unit_file(sdir, slug))
++    n = 0
++    for row in rows:
++        if "verdict" not in row or row.get("agent_type") != "oracle":
++            continue
++        sys.stdout.write(json.dumps(row, sort_keys=True))
++        sys.stdout.write("\n")
++        n += 1
++    sys.stderr.write(f"lead-gate-lib: exported {n} oracle row(s) for {slug!r}\n")
++    return 0
++
++
+ def main(argv: list[str]) -> int:
++    if len(argv) >= 2 and argv[1] == "--export-oracle":
++        return cmd_export_oracle(argv)
+     if len(argv) >= 2 and argv[1] == "--export":
+         return cmd_export(argv)
+     if len(argv) < 2 or argv[1] not in ("start", "stop", "pre"):
+         sys.stderr.write(
+             "lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json "
+-            "| --export <unit_slug>\n")
++            "| --export <unit_slug> | --export-oracle <unit_slug>\n")
+         return 2
+     cmd = argv[1]
+ 

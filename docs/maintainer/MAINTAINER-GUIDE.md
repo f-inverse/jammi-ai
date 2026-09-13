@@ -605,9 +605,16 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 - **Typed status enums** — `crates/jammi-db/src/catalog/status.rs`:
   `ResultTableStatus`, `JobStatus`, `EvalRunStatus`, `ModelStatus`. Each
   impls `Display`+`FromStr`. **Contract: the DB value set is total over the enum**
-  (round-trip test in `status.rs`). `ResultTableKind` (Model/NeighborGraph,
-  `crates/jammi-db/src/catalog/result_repo.rs`) is a *separate* discriminator from
-  `ModelTask`.
+  (round-trip test in `status.rs`). `ResultTableKind`
+  (Model / NeighborGraph / AsofJoin / TrainingSet,
+  `crates/jammi-db/src/catalog/result_repo.rs`) is a *separate* discriminator
+  from `ModelTask`; `ResultTableKind::ALL` is the one set its string codec's
+  round-trip oracle ranges over. A `TrainingSet` table is the immutable,
+  canonically ordered row set a training run reads from
+  (`ResultStore::materialize_training_set`); like `AsofJoin` it is data of
+  record rather than a search structure — no ANN sidecar, and excluded from
+  embedding-table resolution even though its `task` column names a genuine
+  model task (the task the rows train, not one this table is the output of).
 - **The lease module** — `crates/jammi-db/src/catalog/lease.rs`: the ONE lease
   primitive a claimed `jobs` row (training AND compute kinds share this one
   table, migration 029) and a `building` `result_tables` row both share —
@@ -1933,6 +1940,7 @@ CI if the guide and the code diverge:
 - `GraphPropagation` — K hops of feature propagation over a neighbor graph.
 - `ContextSet` — per-target pooled context vectors materialised as an embedding table.
 - `AsofJoin` — a point-in-time temporal join, each spine row matched as-of within its group.
+- `TrainingSet` — the rows a training run reads, projected from a source relation and committed in one canonical full-tuple order; replayed by re-materializing.
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.

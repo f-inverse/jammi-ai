@@ -204,6 +204,39 @@ text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> outpu
 4. Only the A/B matrices receive gradients
 5. The adapter is saved as `adapter.safetensors` in the artifact directory
 
+### The training set a run reads
+
+A fine-tune does not re-read your source relation each time it trains. It
+materialises its training set once as an **immutable result table** of kind
+`TrainingSet` — a Parquet artifact carrying a definition hash and a
+materialization manifest attestation — and reads that table back in one
+canonical **full-tuple order** (every projected column, in declared order, is
+part of the sort key, so identical tuples are identical rows and the read order
+is the committed order).
+
+The definition hash folds the source query, the projected columns, the model
+task, the training format and the order rule — and nothing about how a run
+*consumes* the rows, so jobs of different world size, batch size or validation
+split share one artifact rather than fragmenting it. A job whose definition hash
+matches a `ready` training set reuses that table instead of writing a second
+copy of the same rows, and the reuse is reported rather than inferred.
+
+The probe key is the definition hash alone. A registered source relation exposes
+no version or digest surface to pin, so its input anchor is unpinned-at-instant
+— the anchor an exact-inputs probe (the one the embedding and as-of producers
+match on) correctly never treats as a match, which would leave a training set
+unshareable in any real deployment. What reuse therefore assumes is stated
+plainly rather than hidden: that the source query still names the same rows,
+which the engine cannot verify for an unpinned source. The manifest keeps those
+anchors, so a staleness check over the table answers the same honest
+`Undecidable` it gives for every unpinned input; a caller who wants different
+rows changes the definition — the query or the projection — rather than asking
+for a second copy of one.
+
+A projection that yields no rows is refused with a typed `EmptyTrainingSet`
+error before any catalog row or byte exists, so a run never trains on an empty
+set in silence.
+
 ## Encoder-adapters fine-tuning (PEFT-style adapter injection)
 
 The default flow above trains a single low-rank **projection head** sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **encoder adapters** — LoRA injected into named linear layers *inside* the encoder stack, matching the PEFT convention.

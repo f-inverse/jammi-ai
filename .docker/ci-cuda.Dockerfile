@@ -12,12 +12,35 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # GCC 13: CUDA 12.6 supports GCC ≤ 13.2; manylinux_2_28 ships GCC 14.2.
 # Install gcc-toolset-13 and put it on PATH so nvcc (which ignores CC/CXX
 # and finds the host compiler via PATH) sees GCC 13.
+#
+# `libnccl` + `libnccl-devel`: `jammi-ai`'s `cuda` feature reaches
+# `candle-core/nccl`, whose cudarc `dynamic-linking` build script emits
+# `cargo:rustc-link-lib=dylib=nccl`. Every stage that LINKS a CUDA binary in
+# this image therefore needs `libnccl.so` and `nccl.h` on disk at link time —
+# `Dockerfile`'s `builder-cuda` stage (driving `server-image.yml`,
+# `pypi-server-cuda.yml`/`_pypi-server.yml`, and `release-binaries.yml`'s CUDA
+# leg). `cuda-toolkit-12-6` carries neither; the cuda-rhel8 repo added just
+# above does, so both halves ride in the SAME `dnf install` call under the same
+# `install_weak_deps=False` discipline.
+#
+# The version is a fully-qualified NVR rather than a bare package name, for two
+# measured reasons. A bare `libnccl-devel` resolves to the newest build the
+# cuda-rhel8 repo holds — 2.31.2-1+cuda13.4, a CUDA 13 NCCL against this
+# image's CUDA 12.6 toolkit — and dnf's glob forms (`libnccl-*+cuda12.6`,
+# `libnccl-devel-*cuda12.6`) do not resolve at all ("No match for argument"),
+# so a CUDA-minor pin has to be spelled out in full. 2.23.4-1+cuda12.6 is the
+# exact build `nvidia/cuda:12.6.3-runtime-ubi8` already ships, and that is the
+# GPU runtime stage these binaries are copied INTO (`Dockerfile`'s
+# `runtime-cuda`), so the soname the builder links against and the one the
+# runtime resolves are the same library.
 RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ \
                    'dnf-command(config-manager)' \
     && dnf config-manager --add-repo \
        https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
     && dnf install -y --setopt=install_weak_deps=False \
        cuda-toolkit-12-6 \
+       libnccl-2.23.4-1+cuda12.6 \
+       libnccl-devel-2.23.4-1+cuda12.6 \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 

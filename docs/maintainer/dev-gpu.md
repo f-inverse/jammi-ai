@@ -716,11 +716,15 @@ recorded and not asserted: nothing has established what byte-identity should
 mean for a reduction whose NCCL pin set is untested there.
 
 **Where epsilon has to sit in history.** The gate reads the registration commit
-against the artifact's *evidence anchor*: `merged_as` when the artifact carries
-one that is an ancestor of `HEAD` (a measured tip whose landing commit rewrote
-it), otherwise `git_sha` when that is an ancestor of `HEAD`. The registration
-commit must be an ancestor of `HEAD` and a **strict** ancestor of that anchor;
-an artifact with neither anchor in this history fails, naming both. What that
+against the artifact's *evidence anchor*: `git_sha` when that is an ancestor of
+`HEAD` — the tree the run actually measured — otherwise `merged_as` as the
+rescue, when the artifact carries one that is an ancestor of `HEAD` (a measured
+tip whose landing commit rewrote it). A `merged_as` stamped beside a `git_sha`
+that is still in this history changes nothing: it names a later commit, and
+ordering against it would admit an epsilon registered in the measured commit
+itself. The registration commit must be an ancestor of `HEAD` and a **strict**
+ancestor of that anchor; an artifact with neither anchor in this history fails,
+naming both. What that
 asks of whoever runs the leg: commit epsilon on its own, **before** the commit
 you measure with, on the same branch. Landing that branch by a merge commit —
 this repository's own merge style — keeps epsilon a strict ancestor afterwards.

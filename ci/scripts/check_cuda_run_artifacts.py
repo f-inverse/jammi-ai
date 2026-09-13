@@ -162,12 +162,14 @@ must carry:
       PRE-registered at — a commit that must be an ancestor of HEAD and a
       STRICT ancestor of the artifact's own EVIDENCE ANCHOR (an ε landing
       in the same commit as the tree it excuses is not pre-registered).
-      The anchor is `merged_as` when that is present, well-typed and an
-      ancestor of HEAD, else `git_sha` when that is an ancestor of HEAD,
+      The anchor is `git_sha` when that is an ancestor of HEAD, else
+      `merged_as` when that is present, well-typed and an ancestor of HEAD,
       else the artifact FAILS naming both — the same order rule (d) itself
       applies, so a measured tip whose landing commit REWROTE it is still
       ordered against something real instead of skipping the ε check
-      entirely (`_gang_evidence_anchor` carries the full reasoning).
+      entirely, while a tip that IS in this history is ordered against
+      itself and no landing commit stamped beside it can loosen that
+      (`_gang_evidence_anchor` carries the full reasoning).
 
       A FAILING gang run is REPRESENTABLE: a `fail` is admitted with its deltas and digests as
       measured, and owes a non-empty `gang.reason` plus a top-level
@@ -1159,18 +1161,24 @@ def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str 
     means no anchor exists in this history and `failures` carries the one
     finding that names BOTH candidates.
 
-    The order mirrors `check_ancestry` (rule (d)) — `merged_as` FIRST, then
-    `git_sha`, each held to `git merge-base --is-ancestor` against HEAD:
+    The order mirrors `check_ancestry` (rule (d)) — `git_sha` FIRST, then
+    `merged_as` as the RESCUE, each held to `git merge-base --is-ancestor`
+    against HEAD:
 
-      * `merged_as` when present, 40-hex, and an ancestor of HEAD. A
+      * `git_sha` when 40-hex and an ancestor of HEAD — the ordinary shape,
+        a tip that survived into this history verbatim. It is where the
+        measurement actually happened, so it is the tree ε has to predate;
+        a `merged_as` stamped beside it names a LATER commit, and reading
+        the order against that later commit would admit an ε registered in
+        the measured commit itself. `merged_as` is a rescue for a lost
+        anchor, never a relaxation of a present one.
+      * else `merged_as` when present, 40-hex, and an ancestor of HEAD. A
         measured branch tip that landed by a commit which REWROTE it (a
         squash, or a pre-merge rebase) has a `git_sha` that is an ancestor
-        of nothing; `merged_as` is the commit whose content is in this
-        history, so it is the only anchor an ordering claim can mean. On
-        this repo's corpus that is not a corner case: of the 111 cuda-run
-        artifacts carrying a `git_sha`, 7 need this arm.
-      * else `git_sha` when 40-hex and an ancestor of HEAD — the ordinary
-        shape, a tip that survived into this history verbatim.
+        of nothing; `merged_as` is then the only commit whose content is in
+        this history, so it is the only anchor an ordering claim can mean.
+        On this repo's corpus that is not a corner case: of the 111
+        cuda-run artifacts carrying a `git_sha`, 7 need this arm.
       * else neither: a hard FAIL naming both, never a silent skip. The
         previous revision of this rule guarded BOTH of its ε arms behind
         `_is_ancestor(git_sha, HEAD)`, so exactly the artifacts that need
@@ -1199,10 +1207,10 @@ def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str 
     """
     git_sha = data.get("git_sha")
     merged_as = data.get("merged_as")
-    if isinstance(merged_as, str) and GIT_SHA_RE.match(merged_as) and _is_ancestor(merged_as, repo_root):
-        return "merged_as", merged_as, []
     if isinstance(git_sha, str) and GIT_SHA_RE.match(git_sha) and _is_ancestor(git_sha, repo_root):
         return "git_sha", git_sha, []
+    if isinstance(merged_as, str) and GIT_SHA_RE.match(merged_as) and _is_ancestor(merged_as, repo_root):
+        return "merged_as", merged_as, []
     return (
         None,
         None,
@@ -1307,8 +1315,9 @@ GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
         "epsilon",
         _gang_check_epsilon,
         "the pre-registered tolerance, its derivation, and the commit it was registered at — a STRICT "
-        "ancestor of this artifact's evidence anchor (`merged_as` when that is in this history, else "
-        "`git_sha`; neither in this history is a FAIL, never a skip — see `_gang_evidence_anchor`)",
+        "ancestor of this artifact's evidence anchor (`git_sha` when that is in this history, else "
+        "`merged_as` as the rescue; neither in this history is a FAIL, never a skip — see "
+        "`_gang_evidence_anchor`)",
     ),
     (
         "verdict",
@@ -2911,6 +2920,46 @@ def self_test() -> int:
             "rule (k): ε registered at a commit AFTER the measured tree",
         )
 
+        # (2b) BOTH anchors are in this history: the measured `git_sha`
+        # survived into HEAD's history AND a `merged_as` was stamped beside
+        # it. The evidence is the tree `git_sha` names — that is where the
+        # measurement happened — so the anchor is `git_sha`, and the later
+        # landing commit must not be allowed to relax the ordering. The
+        # first revision of `_gang_evidence_anchor` tried `merged_as` FIRST,
+        # which retargeted ε's constraint onto the landing commit: an ε
+        # registered in the very commit it measures was then ADMITTED.
+        def both_anchors_gang() -> dict:
+            d = gang_baseline()  # git_sha == second_sha, itself an ancestor of HEAD
+            d["merged_as"] = third_sha
+            d["merged_via_pr"] = 4243
+            return d
+
+        bad = both_anchors_gang()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=second_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "equals the artifact's own `git_sha`",
+            "rule (k): ε registered in the measured commit, `merged_as` also in this history",
+        )
+
+        bad = both_anchors_gang()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "is not an ancestor of the measured `git_sha`",
+            "rule (k): ε registered AFTER the measured commit, `merged_as` also in this history",
+        )
+
+        ok = both_anchors_gang()
+        ok["gang"]["epsilon"] = dict(ok["gang"]["epsilon"], registered_sha=root_sha)
+        expect_clean(
+            ok,
+            "control-both-anchors.json",
+            "rule (k): ε strictly before the measured `git_sha`, `merged_as` also in this history",
+        )
+
         # (3) no anchor at all — FAILS naming BOTH candidates, never skipped.
         bad = gang_baseline()
         bad["git_sha"] = orphan_sha
@@ -3682,12 +3731,15 @@ def self_test() -> int:
         "registration commit / was registered in the very commit it measures, and a measured delta "
         "outside its own pre-registered ε — and each of its three anchors (artifact_kind, the gang "
         "block, the committed filename) independently pulls an artifact into the rule, while a "
-        "non-gang artifact stays untouched. ε's EVIDENCE ANCHOR is driven arm by arm: a `merged_as` "
-        "artifact whose measured tip was rewritten on landing is ordered against `merged_as` (clean "
-        "when ε precedes it, caught when ε IS it, caught when ε is the rewritten tip), an ε "
-        "registered at a commit that is an ancestor of HEAD but AFTER the measured tree is caught, "
-        "and an artifact with neither anchor in this history — `git_sha_unresolved` included — is "
-        "caught by a finding naming BOTH candidates, never skipped. `gang.verdict` closes the same "
+        "non-gang artifact stays untouched. ε's EVIDENCE ANCHOR is driven arm by arm: an artifact "
+        "whose measured tip was rewritten on landing is ordered against `merged_as` (clean when ε "
+        "precedes it, caught when ε IS it, caught when ε is the rewritten tip), an artifact carrying "
+        "BOTH a `git_sha` in this history and a `merged_as` is ordered against the `git_sha` — the "
+        "tree it measured — so the later landing commit cannot relax it (caught when ε is the "
+        "measured commit, caught when ε is after it, clean when ε precedes it), an ε registered at a "
+        "commit that is an ancestor of HEAD but AFTER the measured tree is caught, and an artifact "
+        "with neither anchor in this history — `git_sha_unresolved` included — is caught by a "
+        "finding naming BOTH candidates, never skipped. `gang.verdict` closes the same "
         "loop from the other side: the wrong case and an unknown string are refused, a `fail` with "
         "no reason and a `fail` filed GREEN are caught, a `pass` at world 2 whose same-seed pair "
         "disagrees is caught while the same pair above world 2 is recorded rather than asserted, "

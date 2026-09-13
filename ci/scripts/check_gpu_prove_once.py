@@ -141,6 +141,21 @@ string):
      workflow missing from the tree, an unreadable `on:` block, and zero
      invokers are each a FAIL, never a silent skip.
 
+     P7's SUBJECT SET IS DERIVED, and that table is a COMPLETENESS
+     ASSERTION over it. The deploy-capable function set is computed from
+     `ci/scripts/runpod_lib.sh` — the transitive callers of
+     `_rp_deploy_payload` — and a RENTING DRIVER is any tracked
+     `ci/scripts/**` file whose comment-stripped text calls one of them.
+     Each derived driver is either a table row (held to the three
+     sub-rules) or must satisfy a machine predicate: every workflow step
+     invoking it hands it a literal non-renting verb, or sits in a job that
+     never passes `RUNPOD_API_KEY`. A derived driver in neither state, and
+     a table row whose driver has left the derived set, are both FAILs by
+     name. `check_p7_paid_pod_lanes` takes the script map and the library
+     text as parameters (the same shape `load_workflow_texts` gives the
+     workflow scan), so its own suite injects a fifth renting driver, or a
+     new deploy wrapper, without touching this tree.
+
 Mechanism: comment-stripped line scan plus a minimal indentation-based
 `jobs:` block splitter (no PyYAML, this repo's own gate convention). Every
 check function takes an explicit `workflows_dir`/`manifest_path` so
@@ -162,6 +177,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -743,9 +759,266 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     "runpod_gpu_howwell.sh": "gpu-howwell.yml",
 }
 
+# --------------------------------------------------------------------------- #
+# P7's SUBJECT SET is DERIVED, and the table above is a COMPLETENESS
+# ASSERTION over it — never the other way round.
+#
+# A hand-maintained table of paid lanes has the failure mode its own subject
+# matter warns about: the next renting driver is added, nobody remembers the
+# table, and the doctrine silently does not apply to it. That is the exact
+# escape shape P7 was written to close one file over, reproduced inside P7.
+#
+# So the set of DEPLOY-CAPABLE functions is computed from `runpod_lib.sh`
+# itself — the transitive callers of `_rp_deploy_payload`, the one function
+# that builds a pod-creation payload — and a RENTING DRIVER is any tracked
+# `ci/scripts/**` file whose comment-stripped text calls a member of that
+# closure. Each derived driver must then be EITHER a table row (held to the
+# three sub-rules above) OR must satisfy a machine predicate showing that no
+# workflow can make it rent (below). A table row whose driver has left the
+# derived set is reported as ROT.
+#
+# WHAT THE DERIVATION DELIBERATELY DOES NOT DO:
+#
+#   * It does not follow `source`. Every `source` target in this class is
+#     variable-interpolated (`source "$DIR/runpod_lib.sh"`), so a transitive
+#     "this file sources a file that can deploy" clause is not decidable by
+#     a static scan — and a clause that pretended otherwise would be a
+#     guess. A driver is judged on the calls IT makes.
+#   * It does not parse bash. Function bodies are split at top-level
+#     `name() {` starts, and a body runs to the NEXT such start — so
+#     top-level code sitting between two functions is attributed to the
+#     preceding one. That over-approximates: it can only ADD members to the
+#     closure, never drop one, which is the fail-closed direction.
+#   * A word-boundary occurrence of a closure member's name in
+#     comment-stripped text counts as a call. That over-approximates too,
+#     again in the fail-closed direction: `test_check_gpu_prove_once.py`
+#     spells the members out in its own fixture strings and is therefore
+#     derived as a driver itself. Nothing is exempted for being ours — such
+#     a file is cleared by the same machine predicate as any other (the
+#     guard job that runs it passes no `RUNPOD_API_KEY`), which is exactly
+#     the outcome an exemption list would have hidden.
+#
+# RESIDUAL, disclosed rather than assumed away: a workflow step that invokes
+# a driver through a variable path (`bash "$SCRIPT"`) is invisible to the
+# invocation scan below, exactly as it is to every other line-shaped rule in
+# this file. No such step exists in this tree today; the scan reports what
+# it can see, and a driver no visible step invokes is reported as such
+# rather than credited or condemned.
+# --------------------------------------------------------------------------- #
+SCRIPTS_ROOT = "ci/scripts/"
+RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
+DEPLOY_PAYLOAD_FN = "_rp_deploy_payload"
 
-def check_p7_paid_pod_lanes(workflow_texts: dict[str, str]) -> list[str]:
+# The secret that turns a script that CAN deploy into a step that WILL: with
+# no `RUNPOD_API_KEY` in the invoking job, `rp_init` refuses before any pod
+# is created. The secret's presence is the capability.
+RUNPOD_SECRET = "RUNPOD_API_KEY"
+
+# First-argument verbs a deploy-capable driver may be handed from a workflow
+# WITHOUT that invocation being a rental. `reap` is `gpu-dev.sh`'s
+# terminate-only sweep (gpu-reap.yml's own step). A verb that is not a
+# literal — a `${{ … }}` expression whose value this gate cannot read — is
+# never credited here: it fails closed, because the whole point of the verb
+# arm is that the invocation's behaviour is legible in the committed text.
+NON_RENTING_VERBS = frozenset({"reap"})
+
+_BASH_FN_DEF_RE = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{", re.MULTILINE)
+
+
+def _bash_function_bodies(text: str) -> dict[str, str]:
+    """`{function name: its (over-approximated) body}` for every top-level
+    `name() {` definition in a comment-stripped bash file. See the section
+    comment for why the body boundary is the next definition."""
+    stripped = drop_comment_lines(text)
+    starts = list(_BASH_FN_DEF_RE.finditer(stripped))
+    bodies: dict[str, str] = {}
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(stripped)
+        bodies[m.group("name")] = bodies.get(m.group("name"), "") + stripped[m.start() : end]
+    return bodies
+
+
+def _mentions(text: str, name: str) -> bool:
+    return re.search(r"\b" + re.escape(name) + r"\b", text) is not None
+
+
+def derive_deploy_closure(lib_text: str) -> tuple[frozenset[str], list[str]]:
+    """The deploy-capable function set: the TRANSITIVE CALLERS of
+    `_rp_deploy_payload` inside `runpod_lib.sh`. Returns
+    `(closure, findings)`; a non-empty `findings` means the closure could
+    not be computed and P7 has no subject set — a FAIL, never a skip."""
+    bodies = _bash_function_bodies(lib_text)
+    if DEPLOY_PAYLOAD_FN not in bodies:
+        return frozenset(), [
+            f"P7: cannot derive the deploy closure — no `{DEPLOY_PAYLOAD_FN}() {{` definition in "
+            f"{RUNPOD_LIB_REL}. P7's subject set is computed from that function's transitive "
+            "callers; with no seed there is no set, and every renting driver would go unchecked"
+        ]
+    members: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        targets = {DEPLOY_PAYLOAD_FN} | members
+        for name, body in bodies.items():
+            if name == DEPLOY_PAYLOAD_FN or name in members:
+                continue
+            if any(_mentions(body, t) for t in targets):
+                members.add(name)
+                changed = True
+    if not members:
+        return frozenset(), [
+            f"P7: the deploy closure is EMPTY — nothing in {RUNPOD_LIB_REL} calls "
+            f"`{DEPLOY_PAYLOAD_FN}`. Either the payload builder was renamed (rename it here too) or "
+            "the deploy path moved; an empty closure would silently exempt every renting driver"
+        ]
+    return frozenset(members), []
+
+
+def derive_renting_drivers(
+    script_texts: dict[str, str], closure: frozenset[str]
+) -> dict[str, list[str]]:
+    """`{repo-relative script path: the closure members it calls}` for every
+    tracked `ci/scripts/**` file except `runpod_lib.sh` itself (which DEFINES
+    the closure — its own definitions and internal calls are the seam, not a
+    lane)."""
+    drivers: dict[str, list[str]] = {}
+    for rel, text in sorted(script_texts.items()):
+        if rel == RUNPOD_LIB_REL or not rel.startswith(SCRIPTS_ROOT):
+            continue
+        stripped = drop_comment_lines(text)
+        called = sorted(name for name in closure if _mentions(stripped, name))
+        if called:
+            drivers[rel] = called
+    return drivers
+
+
+def load_script_texts(repo_root: Path = REPO_ROOT) -> dict[str, str]:
+    """Every TRACKED `ci/scripts/**` file's text, keyed by repo-relative
+    path (`git ls-files`, the same enumeration `check_execution_surface_
+    reachability.py` and `check_ci_guard_wiring.py` already use — a script
+    CI's own checkout would not have is not a lane)."""
+    out = subprocess.run(
+        ["git", "ls-files", "ci/scripts"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    texts: dict[str, str] = {}
+    for rel in out.stdout.splitlines():
+        if not rel.startswith(SCRIPTS_ROOT):
+            continue
+        path = repo_root / rel
+        try:
+            texts[rel] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return texts
+
+
+def _invocation_verbs(job_body: str, script_rel: str) -> list[str | None]:
+    """The first positional token handed to `script_rel` on each line of
+    `job_body` that names it. `None` marks an invocation whose verb this
+    gate cannot read as a literal (absent, or a `${{ … }}` expression) —
+    the caller treats `None` as NOT credited."""
+    verbs: list[str | None] = []
+    for line in job_body.splitlines():
+        idx = line.find(script_rel)
+        while idx != -1:
+            tail = line[idx + len(script_rel) :]
+            token = tail.strip().split(" ", 1)[0].strip() if tail.strip() else ""
+            if not token or token.startswith("${{") or not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
+                verbs.append(None)
+            else:
+                verbs.append(token)
+            idx = line.find(script_rel, idx + 1)
+    return verbs
+
+
+def _check_derived_driver_cannot_rent(
+    script_rel: str, workflow_texts: dict[str, str]
+) -> list[str]:
+    """The machine predicate a derived driver that is NOT a
+    `PAID_POD_LANE_TABLE` row must satisfy: EVERY workflow step that invokes
+    it either hands it a literal `NON_RENTING_VERBS` verb, or sits in a job
+    that never passes `RUNPOD_SECRET` (so `rp_init` refuses before a pod
+    exists). Quantified over every visible invocation — one bad site is a
+    finding naming the driver, the workflow and the job."""
     findings: list[str] = []
+    for name in sorted(workflow_texts):
+        stripped = drop_comment_lines(workflow_texts[name])
+        if script_rel not in stripped:
+            continue
+        job_bodies = _workflow_job_bodies(workflow_texts[name])
+        # A reference outside any `jobs:` block (a top-level comment is
+        # already stripped; anything else is unusual) is judged against the
+        # whole file, so it can never fall through unexamined.
+        scopes = {job: body for job, body in job_bodies.items() if script_rel in body}
+        if not scopes:
+            scopes = {"<outside any job body>": stripped}
+        for job, body in sorted(scopes.items()):
+            secret_present = RUNPOD_SECRET in body
+            for verb in _invocation_verbs(body, script_rel):
+                if verb in NON_RENTING_VERBS:
+                    continue
+                if not secret_present:
+                    continue
+                shown = "<no literal verb>" if verb is None else repr(verb)
+                findings.append(
+                    f"P7: {script_rel} calls runpod_lib.sh's deploy closure and is invoked by "
+                    f"{name} (job `{job}`) with {RUNPOD_SECRET} in scope and first verb {shown} — "
+                    f"that step can RENT. A deploy-capable driver reachable from a workflow with "
+                    f"the secret is a paid pod lane: give it a PAID_POD_LANE_TABLE row (one "
+                    f"workflow, no push:/workflow_call: trigger, nothing uses: it), hand it a "
+                    f"literal non-renting verb ({sorted(NON_RENTING_VERBS)}), or drop the secret "
+                    f"from that job"
+                )
+    return findings
+
+
+def check_p7_paid_pod_lanes(
+    workflow_texts: dict[str, str],
+    script_texts: dict[str, str] | None = None,
+    lib_text: str | None = None,
+) -> list[str]:
+    findings: list[str] = []
+
+    # --- the DERIVED subject set (see the section comment above) ---------- #
+    if script_texts is None:
+        script_texts = load_script_texts()
+    if lib_text is None:
+        lib_text = script_texts.get(RUNPOD_LIB_REL)
+    if lib_text is None:
+        findings.append(
+            f"P7: {RUNPOD_LIB_REL} is not in the scanned ci/scripts set — the deploy closure P7's "
+            "subject set is derived from cannot be computed, so no renting driver can be checked"
+        )
+        closure: frozenset[str] = frozenset()
+        derived: dict[str, list[str]] = {}
+    else:
+        closure, closure_findings = derive_deploy_closure(lib_text)
+        findings += closure_findings
+        derived = derive_renting_drivers(script_texts, closure) if closure else {}
+
+    if closure:
+        table_basenames = set(PAID_POD_LANE_TABLE)
+        derived_basenames = {rel.rsplit("/", 1)[-1]: rel for rel in derived}
+        # Rot: a row whose driver no longer calls the deploy closure (it was
+        # rewritten, or the closure moved) is a row asserting a fact that
+        # stopped being true.
+        for script in sorted(table_basenames - set(derived_basenames)):
+            findings.append(
+                f"P7: PAID_POD_LANE_TABLE row `{script}` names a driver that does NOT call "
+                f"runpod_lib.sh's deploy closure ({sorted(closure)}) — the row asserts a paid pod "
+                "lane that no longer exists; delete the row, or restore the call"
+            )
+        # Completeness: a derived driver that is not a row must be provably
+        # unable to rent from any workflow.
+        for base, rel in sorted(derived_basenames.items()):
+            if base in table_basenames:
+                continue
+            findings += _check_derived_driver_cannot_rent(rel, workflow_texts)
+
     for script, workflow in sorted(PAID_POD_LANE_TABLE.items()):
         producers = sorted(
             name for name, text in workflow_texts.items() if script in drop_comment_lines(text)
@@ -1596,6 +1869,7 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
 def run_gate(
     workflows_dir: Path = WORKFLOWS_DIR,
     manifest_path: Path = MANIFEST_PATH,
+    script_texts: dict[str, str] | None = None,
 ) -> list[str]:
     workflow_texts = load_workflow_texts(workflows_dir)
     if not workflow_texts:
@@ -1603,7 +1877,7 @@ def run_gate(
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     findings: list[str] = []
     findings += check_p1_p2(workflow_texts)
-    findings += check_p7_paid_pod_lanes(workflow_texts)
+    findings += check_p7_paid_pod_lanes(workflow_texts, script_texts)
     findings += check_gate_file_absent(workflows_dir)
     findings += check_promotion_table(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
@@ -1622,9 +1896,11 @@ def main() -> int:
     print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every release "
           "publisher's promotion gates on the shared verdict (all-or-nothing, not only the CUDA "
           "lanes), consumer/producer names agree, the reusable actually consults the verdict keyed "
-          "by the promoted commit, no publishing job in the tree is unlisted, and every paid pod "
+          "by the promoted commit, no publishing job in the tree is unlisted, every paid pod "
           "lane in PAID_POD_LANE_TABLE has exactly one invoker whose on: block carries no "
-          "push:/workflow_call: trigger and which nothing uses:.")
+          "push:/workflow_call: trigger and which nothing uses:, and every renting driver DERIVED "
+          "from runpod_lib.sh's own deploy closure is either such a row or cannot rent from any "
+          "workflow that invokes it.")
     return 0
 
 

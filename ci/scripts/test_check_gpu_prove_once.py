@@ -483,6 +483,295 @@ class PaidPodLaneTest(unittest.TestCase):
                 self.assertIn(f"{workflow}'s on: block carries ['push']", "\n".join(findings), script)
 
 
+# --------------------------------------------------------------------------- #
+# P7's DERIVED subject set (the deploy closure) — fixtures.
+#
+# Every case below drives the derivation through its PARAMETERS, so no case
+# needs a file written into the real tree: `check_p7_paid_pod_lanes` takes
+# the tracked-script map and the library text, the same way the workflow
+# scan already takes `workflow_texts`.
+# --------------------------------------------------------------------------- #
+FIXTURE_LIB = """\
+#!/usr/bin/env bash
+rp_init() { : "${RUNPOD_API_KEY:?}"; }
+_rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
+  echo "{\\"gpuCount\\": ${RP_GPU_COUNT}}"
+}
+rp_deploy_live() {
+  local body
+  body="$(_rp_deploy_payload "$1" "$2")"
+  echo "$body"
+}
+rp_deploy_arch() { # $1=arch
+  rp_deploy_live "SECURE|NVIDIA A100 80GB PCIe"
+}
+rp_deploy_live_a100() { rp_deploy_arch a100; }
+rp_sweep() { echo sweeping; }
+"""
+
+# A one-line wrapper added to the library: the RED case for "the closure is
+# COMPUTED, never a literal name list".
+FIXTURE_LIB_WITH_WRAPPER = FIXTURE_LIB + "rp_deploy_h100() { rp_deploy_arch h100; }\n"
+
+
+def _driver(call: str) -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        "# a comment naming rp_deploy_live_a100 must NOT count as a call\n"
+        'source "$DIR/runpod_lib.sh"\n'
+        "rp_init\n"
+        f"{call}\n"
+    )
+
+
+def fixture_scripts() -> dict[str, str]:
+    """The tracked `ci/scripts/**` map the derivation ranges over: the four
+    PAID_POD_LANE_TABLE drivers plus the two non-table deploy-capable
+    scripts this tree really has (`gpu-dev.sh`, `test_pod_substrate.sh`)."""
+    return {
+        cgo.RUNPOD_LIB_REL: FIXTURE_LIB,
+        "ci/scripts/runpod_gpu_prove.sh": _driver("rp_deploy_arch a100"),
+        "ci/scripts/runpod_gpu_gang.sh": _driver("rp_deploy_arch a100"),
+        "ci/scripts/runpod_gpu_perf_ab.sh": _driver("rp_deploy_live_a100"),
+        "ci/scripts/runpod_gpu_howwell.sh": _driver("rp_deploy_live_a100"),
+        "ci/scripts/gpu-dev.sh": _driver("rp_deploy_arch \"$ARCH\""),
+        "ci/scripts/test_pod_substrate.sh": _driver("rp_deploy_live \"SECURE|X\""),
+        # A tracked script that calls NOTHING in the closure: the derivation
+        # must not sweep the whole directory in.
+        "ci/scripts/check_something.py": "print('no deploy here')\n",
+    }
+
+
+REAP_YML = """\
+name: GPU reap
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reap
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}
+"""
+
+GUARD_YML = """\
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: JAMMI_REQUIRE_LOCK_TEST=1 bash ci/scripts/test_pod_substrate.sh
+"""
+
+
+def _derived_texts(**overrides: str) -> dict[str, str]:
+    texts = _positive_texts()
+    texts["gpu-reap.yml"] = REAP_YML
+    texts["ci.yml"] = GUARD_YML
+    texts.update(overrides)
+    return texts
+
+
+class DerivedRentingDriverTest(unittest.TestCase):
+    """P7's subject set is DERIVED from `runpod_lib.sh`'s own deploy
+    closure; `PAID_POD_LANE_TABLE` is a completeness assertion over it. The
+    pre-fix rule iterated the TABLE only, so a fifth renting driver, a new
+    deploy wrapper, and a row whose driver stopped renting were all
+    silently admitted."""
+
+    def test_closure_is_computed_from_the_library(self):
+        closure, findings = cgo.derive_deploy_closure(FIXTURE_LIB)
+        self.assertEqual(findings, [])
+        self.assertEqual(
+            set(closure), {"rp_deploy_live", "rp_deploy_arch", "rp_deploy_live_a100"}
+        )
+
+    def test_a_new_deploy_wrapper_joins_the_closure_without_a_gate_edit(self):
+        closure, findings = cgo.derive_deploy_closure(FIXTURE_LIB_WITH_WRAPPER)
+        self.assertEqual(findings, [])
+        self.assertIn("rp_deploy_h100", closure)
+
+    def test_a_library_with_no_payload_builder_fails_closed(self):
+        _closure, findings = cgo.derive_deploy_closure("#!/usr/bin/env bash\nrp_init() { :; }\n")
+        self.assertTrue(any("cannot derive the deploy closure" in f for f in findings), findings)
+
+    def test_a_library_nothing_calls_the_payload_builder_from_fails_closed(self):
+        _closure, findings = cgo.derive_deploy_closure(
+            "#!/usr/bin/env bash\n_rp_deploy_payload() { echo '{}'; }\nrp_init() { :; }\n"
+        )
+        self.assertTrue(any("deploy closure is EMPTY" in f for f in findings), findings)
+
+    def test_a_missing_library_in_the_script_map_fails_closed(self):
+        scripts = fixture_scripts()
+        del scripts[cgo.RUNPOD_LIB_REL]
+        findings = cgo.check_p7_paid_pod_lanes(_derived_texts(), scripts)
+        self.assertTrue(
+            any("is not in the scanned ci/scripts set" in f for f in findings), findings
+        )
+
+    def test_derived_drivers_are_exactly_the_deploy_callers(self):
+        closure, _ = cgo.derive_deploy_closure(FIXTURE_LIB)
+        derived = cgo.derive_renting_drivers(fixture_scripts(), closure)
+        self.assertEqual(
+            sorted(derived),
+            [
+                "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_gpu_gang.sh",
+                "ci/scripts/runpod_gpu_howwell.sh",
+                "ci/scripts/runpod_gpu_perf_ab.sh",
+                "ci/scripts/runpod_gpu_prove.sh",
+                "ci/scripts/test_pod_substrate.sh",
+            ],
+        )
+        # The library itself DEFINES the closure; it is not a lane.
+        self.assertNotIn(cgo.RUNPOD_LIB_REL, derived)
+        # A comment naming a closure member is not a call.
+        self.assertNotIn("rp_deploy_live_a100", derived["ci/scripts/gpu-dev.sh"])
+
+    def test_the_positive_derived_fixture_is_clean(self):
+        self.assertEqual(
+            cgo.check_p7_paid_pod_lanes(_derived_texts(), fixture_scripts()), []
+        )
+
+    def test_a_fifth_renting_driver_with_no_table_row_fails(self):
+        scripts = fixture_scripts()
+        scripts["ci/scripts/runpod_gpu_new.sh"] = _driver("rp_deploy_arch a100")
+        new_lane = (
+            "name: new lane\n\non:\n  push:\n    branches: [main]\n  workflow_call:\n"
+            "  workflow_dispatch:\n\njobs:\n  rent:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - name: Rent\n        env:\n"
+            "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "        run: bash ci/scripts/runpod_gpu_new.sh\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"new-lane.yml": new_lane, "new-lane-2.yml": new_lane}), scripts
+        )
+        joined = "\n".join(findings)
+        self.assertIn("ci/scripts/runpod_gpu_new.sh", joined)
+        self.assertIn("that step can RENT", joined)
+        self.assertIn("new-lane.yml", joined)
+        self.assertIn("new-lane-2.yml", joined)
+
+    def test_a_driver_calling_a_NEW_deploy_wrapper_is_caught(self):
+        # The whole point of computing the closure: the wrapper did not
+        # exist when this rule was written, and no name list mentions it.
+        scripts = fixture_scripts()
+        scripts[cgo.RUNPOD_LIB_REL] = FIXTURE_LIB_WITH_WRAPPER
+        scripts["ci/scripts/runpod_gpu_h100.sh"] = _driver("rp_deploy_h100")
+        lane = (
+            "name: h100 lane\n\non:\n  workflow_dispatch:\n\njobs:\n  rent:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - name: Rent\n        env:\n"
+            "          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "        run: bash ci/scripts/runpod_gpu_h100.sh\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"h100.yml": lane}), scripts
+        )
+        self.assertIn("ci/scripts/runpod_gpu_h100.sh", "\n".join(findings))
+
+    def test_a_table_row_whose_driver_stopped_renting_is_reported_as_rot(self):
+        scripts = fixture_scripts()
+        scripts["ci/scripts/runpod_gpu_gang.sh"] = "#!/usr/bin/env bash\necho 'no longer rents'\n"
+        findings = cgo.check_p7_paid_pod_lanes(_derived_texts(), scripts)
+        joined = "\n".join(findings)
+        self.assertIn("PAID_POD_LANE_TABLE row `runpod_gpu_gang.sh`", joined)
+        self.assertIn("does NOT call", joined)
+
+    def test_a_literal_non_renting_verb_is_credited(self):
+        # gpu-dev.sh IS deploy-capable and IS invoked by a workflow holding
+        # the secret — the literal `reap` verb is the whole reason that is
+        # not a paid lane.
+        findings = cgo.check_p7_paid_pod_lanes(_derived_texts(), fixture_scripts())
+        self.assertFalse(any("gpu-dev.sh" in f for f in findings), findings)
+
+    def test_an_expression_verb_fails_closed(self):
+        broken = REAP_YML.replace(
+            "bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}",
+            "bash ci/scripts/gpu-dev.sh ${{ inputs.verb }}",
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"gpu-reap.yml": broken}), fixture_scripts()
+        )
+        joined = "\n".join(findings)
+        self.assertIn("ci/scripts/gpu-dev.sh", joined)
+        self.assertIn("<no literal verb>", joined)
+
+    def test_a_renting_verb_on_a_secret_holding_job_fails(self):
+        broken = REAP_YML.replace(
+            "bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}",
+            "bash ci/scripts/gpu-dev.sh up --arch a100",
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"gpu-reap.yml": broken}), fixture_scripts()
+        )
+        self.assertIn("first verb 'up'", "\n".join(findings))
+
+    def test_the_secret_is_the_capability(self):
+        # test_pod_substrate.sh is deploy-capable and IS invoked by the
+        # guard job — clean only because that job passes no RUNPOD_API_KEY.
+        self.assertFalse(
+            any("test_pod_substrate.sh" in f for f in cgo.check_p7_paid_pod_lanes(
+                _derived_texts(), fixture_scripts()
+            ))
+        )
+        with_secret = GUARD_YML.replace(
+            "    steps:\n      - uses: actions/checkout@v4\n",
+            "    env:\n      RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}\n"
+            "    steps:\n      - uses: actions/checkout@v4\n",
+        )
+        findings = cgo.check_p7_paid_pod_lanes(
+            _derived_texts(**{"ci.yml": with_secret}), fixture_scripts()
+        )
+        self.assertIn("ci/scripts/test_pod_substrate.sh", "\n".join(findings))
+
+    def test_the_real_tree_derives_the_set_this_suite_claims(self):
+        """Anti-vacuity, stated as the SET the property ranged over: the
+        real `runpod_lib.sh` closure and the real derived-driver set, so a
+        fixture that drifts from the tree is a failure here, not a silent
+        loss of coverage."""
+        scripts = cgo.load_script_texts()
+        closure, findings = cgo.derive_deploy_closure(scripts[cgo.RUNPOD_LIB_REL])
+        self.assertEqual(findings, [])
+        self.assertEqual(
+            set(closure), {"rp_deploy_live", "rp_deploy_arch", "rp_deploy_live_a100"}
+        )
+        derived = cgo.derive_renting_drivers(scripts, closure)
+        self.assertEqual(
+            sorted(derived),
+            [
+                "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_gpu_gang.sh",
+                "ci/scripts/runpod_gpu_howwell.sh",
+                "ci/scripts/runpod_gpu_perf_ab.sh",
+                "ci/scripts/runpod_gpu_prove.sh",
+                # THIS file: its fixtures above spell the closure members
+                # out in non-comment text, so the deliberately
+                # over-approximating scan derives it too (see the gate's own
+                # "WHAT THE DERIVATION DELIBERATELY DOES NOT DO"). It is
+                # cleared by the machine predicate like any other derived
+                # driver — ci.yml's guard job invokes it with no
+                # RUNPOD_API_KEY — never by an exemption, which is the
+                # point: nothing here gets a pass for being ours.
+                "ci/scripts/test_check_gpu_prove_once.py",
+                "ci/scripts/test_pod_substrate.sh",
+            ],
+        )
+        # ... and the real tree is clean over exactly that derived set.
+        self.assertEqual(cgo.run_gate(), [])
+
+
 class PreFixShapeFixtureTest(unittest.TestCase):
     """Reproduces the PRE-FIX shape (esc-084's own wording): three
     publishers `uses:` a renting `_gpu-prove-gate.yml` which itself invokes

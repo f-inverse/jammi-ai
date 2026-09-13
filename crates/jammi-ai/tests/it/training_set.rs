@@ -130,10 +130,20 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 ///
 /// Every file the smallest deterministic job-path fine-tune publishes,
 /// fingerprinted at base `9db8d395` (`crates/jammi-ai/src/fine_tune/**`
-/// untouched) with:
+/// untouched) with the recipe that actually runs: `git checkout 9db8d395 --
+/// crates/jammi-ai/src` on ITS OWN does not work, because every OTHER test in
+/// this file references `TrainingSet` APIs (`materialize_projection`,
+/// `ResultTableKind::TrainingSet`, …) that do not exist at base, so the whole
+/// `--test it` binary fails to compile with only `src/` reverted. The working
+/// recipe is a full checkout plus a graft:
 ///
 /// ```text
-/// git checkout 9db8d395 -- crates/jammi-ai/src
+/// git worktree add /tmp/base-9db8d395 9db8d395
+/// # Base predates this test file. Copy `refactor_parity` and its helpers
+/// # (`fingerprint`, `tiny_bert_model`, `parity_config`, `parity_columns`,
+/// # `session_over`, `run_parity_fixture`) into a test module in that
+/// # checkout — nothing else in this file, which would not compile there.
+/// cd /tmp/base-9db8d395
 /// cargo test -p jammi-ai --test it -- \
 ///     training_set::refactor_parity --exact --nocapture
 /// ```
@@ -144,6 +154,18 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 /// byte. This fixture carries no NULLs, so the producer's `NULLS FIRST` order
 /// key and the base read's default NULL placement agree on it — the parity
 /// claim is over row order and row content, not over NULL placement.
+///
+/// **What this pin does NOT cover.** Only the TABULAR arm
+/// (`training_set::materialize_projection`) is fingerprinted here. The graph
+/// arm's adapter bytes (`training_set::materialize_sampled_pairs`, driven
+/// through `fine_tune_graph`) are a deliberate, intended change from base —
+/// base built the loader straight from the sampler's in-memory pairs, this
+/// branch routes them through the same materialize-and-read-back producer the
+/// tabular arm uses — and no parity pin covers that arm at all: it has no
+/// base-equivalent byte fixture to compare against (base's graph path never
+/// wrote Parquet rows to read back). The `NULLS FIRST` order key is likewise
+/// stated as intended in `training_set`'s module docs, not pinned by (c),
+/// which carries no NULLs to exercise it.
 ///
 /// The per-step `checkpoint_N` files are pinned alongside the final adapter on
 /// purpose: they fingerprint the *trajectory*, so a row-order change that a
@@ -247,6 +269,92 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
             );
         }
         other => panic!("expected a TrainingSet descriptor, got {other:?}"),
+    }
+}
+
+/// Corrected (b) — two fine-tune JOBS over the same plain source, columns,
+/// task and format materialise TWO training-set tables, never one.
+///
+/// `CONTRACT-U2a.md`'s original (b) ("two jobs over the same
+/// source/columns/task/format reuse ONE table") was refuted by the lead's own
+/// K7 ruling: reuse requires pinned EQUAL anchors, and a registered source
+/// exposes no version surface, so the engine anchors it
+/// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
+/// and never reuses across two independent reads of it — the same honest
+/// off-ness the embedding cache records (`pipeline/embedding.rs:89-93`).
+/// Reuse over a genuinely PINNED anchor is exercised at the store level
+/// (`crates/jammi-db/tests/it/materialization.rs:767/:847/:911`); this is the
+/// job-level corollary: each job's OWN materialize call runs the producer
+/// fresh (the reuse probe never matches), so two jobs leave two tables
+/// behind, each the one its own run actually read from before training.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let mut model_ids = Vec::new();
+    for _ in 0..2 {
+        let job = session
+            .fine_tune(
+                "training",
+                &tiny_bert_model(),
+                &parity_columns(),
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(parity_config()),
+            )
+            .await
+            .unwrap();
+        job.wait().await.unwrap();
+        model_ids.push(job.model_id().to_string());
+    }
+    assert_ne!(
+        model_ids[0], model_ids[1],
+        "two distinct jobs register two distinct output models"
+    );
+    for model_id in &model_ids {
+        let record = session
+            .catalog()
+            .get_model(model_id)
+            .await
+            .unwrap()
+            .expect("each job registers its own output model");
+        assert!(
+            record.artifact_path.is_some(),
+            "job {model_id} must have published an adapter"
+        );
+    }
+
+    let tables = session
+        .catalog()
+        .list_result_tables_by_status(ResultTableStatus::Ready)
+        .await
+        .unwrap();
+    let training_sets: Vec<_> = tables
+        .iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        2,
+        "two jobs over an unpinned plain source must materialise TWO tables \
+         (never reused), got {:?}",
+        training_sets
+            .iter()
+            .map(|t| &t.table_name)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        training_sets[0].table_name, training_sets[1].table_name,
+        "the two tables must have distinct ids"
+    );
+    for table in &training_sets {
+        assert_eq!(
+            table.row_count, 30,
+            "every source row is committed, per table"
+        );
     }
 }
 

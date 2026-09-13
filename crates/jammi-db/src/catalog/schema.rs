@@ -1139,3 +1139,32 @@ ALTER TABLE result_tables ADD COLUMN current_version INTEGER;
 ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE index_segments ADD COLUMN version INTEGER;
 "#;
+
+/// Migration 033 (U3, #500) — the `model_materialization` contract columns.
+///
+/// A fine-tuned model is a producer like any other
+/// ([`crate::store::manifest::ProducingDescriptor::FineTune`]): `definition_hash`
+/// and `input_anchors_json` are the same indexable summary migration 021 added
+/// to `result_tables`, restated on `models` because a fine-tuned model's row
+/// lives there instead. `manifest_path` additionally names the
+/// `.materialization.json` sidecar inside the model's artifact prefix — a
+/// model's bundle is a multi-file object-store prefix, not a single Parquet
+/// object with an implicit sibling path, so the sidecar's location must be
+/// recorded rather than derived from the artifact path the way
+/// `materialization_sidecar_path` derives it for a `result_tables` row.
+///
+/// All three are NULLABLE: `ContextPredictor` has no materialization at all,
+/// and a directly-registered base model (never itself a producer's output)
+/// has none either.
+/// [`crate::catalog::model_repo::Catalog::probe_model_by_definition`]'s
+/// `definition_hash = $1` equality predicate can never match a `NULL` column,
+/// so a pre-migration or non-materialized row is simply never a cache-hit
+/// candidate — no separate `IS NOT NULL` guard is load-bearing. The index
+/// mirrors migration 022's `idx_result_tables_definition_hash` for the same
+/// probe's hot-path predicate.
+pub(super) const MIGRATION_033_MODEL_MATERIALIZATION: &str = r#"
+ALTER TABLE models ADD COLUMN definition_hash TEXT;
+ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
+ALTER TABLE models ADD COLUMN manifest_path TEXT;
+CREATE INDEX idx_models_definition_hash ON models(definition_hash);
+"#;

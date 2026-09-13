@@ -110,6 +110,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "032_result_table_versions",
         schema::MIGRATION_032_RESULT_TABLE_VERSIONS,
     ),
+    (
+        "033_model_materialization",
+        schema::MIGRATION_033_MODEL_MATERIALIZATION,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

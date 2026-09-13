@@ -20,6 +20,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::store::TrainingSetTable;
 
 use super::worker::{extract_binary_column, extract_numeric_column, extract_string_column};
+use crate::model::ModelTask;
 use crate::session::InferenceSession;
 
 /// A training batch — either contrastive pairs or triplets.
@@ -415,6 +416,14 @@ struct StreamSource {
     session: Arc<InferenceSession>,
     table: TrainingSetTable,
     columns: Vec<String>,
+    /// The job's declared task — the MODALITY discriminator a decode failure
+    /// on the `Triplet`/`MediaTriplet` shapes names in its refusal (mirrors
+    /// `worker::build_training_data_loader`'s original messages: "task
+    /// {task} expects text columns; for image/audio triplets submit
+    /// task=image_embedding/audio_embedding", "Missing/invalid binary
+    /// 'anchor' column for media triplets (task {task})"), never used to
+    /// pick the decode shape itself (`format` already fixes that).
+    task: ModelTask,
     /// This loader's OWN row range within the committed table — the train
     /// prefix or the validation suffix, fixed once by
     /// [`TrainingDataLoader::split`] and never touched afterward.
@@ -503,6 +512,7 @@ struct EpochStreamJob {
     table: TrainingSetTable,
     columns: Vec<String>,
     format: TrainingFormat,
+    task: ModelTask,
     range: Range<usize>,
     cfg: StreamConfig,
     residency: Arc<ResidencyBound>,
@@ -536,7 +546,7 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
                 return;
             }
         };
-        let rows = match decode_record_batch(job.format, &job.columns, &batch) {
+        let rows = match decode_record_batch(job.format, job.task, &job.columns, &batch) {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Err(e));
@@ -560,7 +570,11 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
 ///
 /// `format` is the loader's OWN already-fixed format (the committed table's
 /// tag, decided once by `worker::detect_training_format` before the table was
-/// even materialised) — never re-detected from `columns` here.
+/// even materialised) — never re-detected from `columns` here. `task` is
+/// carried ONLY for the `Triplet`/`MediaTriplet` refusal messages below (a
+/// text/binary column-type mismatch on those two shapes is refused by name,
+/// mirroring `worker::build_training_data_loader`'s original messages
+/// exactly, not by picking the decode shape — `format` already fixed that).
 ///
 /// `TrainingFormat::Classification { .. }` is refused: classification needs
 /// every row's label before any row's class INDEX is knowable
@@ -575,12 +589,22 @@ async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedS
 /// this unit's report for why) and never reaches this function.
 fn decode_record_batch(
     format: TrainingFormat,
+    task: ModelTask,
     columns: &[String],
     batch: &RecordBatch,
 ) -> Result<Vec<TrainingRow>> {
     let missing =
         |col: &str| JammiError::FineTune(format!("streamed batch missing column '{col}'"));
     let not_text = |col: &str| JammiError::FineTune(format!("streamed column '{col}' is not text"));
+    let schema_info = || {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}:{}", f.name(), f.data_type()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match format.underlying() {
         UnderlyingFormat::Contrastive => {
             let a = extract_string_column(
@@ -611,20 +635,31 @@ fn decode_record_batch(
                 .collect())
         }
         UnderlyingFormat::Pairs => {
+            let not_text_pairs = |col: &str| {
+                JammiError::FineTune(format!(
+                    "Missing/invalid '{col}' column: task {task} expects text columns, and \
+                     this source has the anchor/positive PAIR shape, which is read as text \
+                     for every task. Image/audio training reads encoded media bytes only \
+                     from the anchor/positive/negative TRIPLET shape under \
+                     task=image_embedding/audio_embedding — add a 'negative' column. \
+                     Batch schema: [{}]",
+                    schema_info()
+                ))
+            };
             let anchor = extract_string_column(
                 batch
                     .column_by_name("anchor")
                     .ok_or_else(|| missing("anchor"))?
                     .as_ref(),
             )
-            .ok_or_else(|| not_text("anchor"))?;
+            .ok_or_else(|| not_text_pairs("anchor"))?;
             let positive = extract_string_column(
                 batch
                     .column_by_name("positive")
                     .ok_or_else(|| missing("positive"))?
                     .as_ref(),
             )
-            .ok_or_else(|| not_text("positive"))?;
+            .ok_or_else(|| not_text_pairs("positive"))?;
             Ok((0..batch.num_rows())
                 .map(|i| TrainingRow::Pairs {
                     anchor: anchor[i].clone(),
@@ -633,27 +668,35 @@ fn decode_record_batch(
                 .collect())
         }
         UnderlyingFormat::Triplet => {
+            let not_text_triplet = |col: &str| {
+                JammiError::FineTune(format!(
+                    "Missing/invalid '{col}' column: task {task} expects text columns; for \
+                     image/audio triplets submit task=image_embedding/audio_embedding. \
+                     Batch schema: [{}]",
+                    schema_info()
+                ))
+            };
             let anchor = extract_string_column(
                 batch
                     .column_by_name("anchor")
                     .ok_or_else(|| missing("anchor"))?
                     .as_ref(),
             )
-            .ok_or_else(|| not_text("anchor"))?;
+            .ok_or_else(|| not_text_triplet("anchor"))?;
             let positive = extract_string_column(
                 batch
                     .column_by_name("positive")
                     .ok_or_else(|| missing("positive"))?
                     .as_ref(),
             )
-            .ok_or_else(|| not_text("positive"))?;
+            .ok_or_else(|| not_text_triplet("positive"))?;
             let negative = extract_string_column(
                 batch
                     .column_by_name("negative")
                     .ok_or_else(|| missing("negative"))?
                     .as_ref(),
             )
-            .ok_or_else(|| not_text("negative"))?;
+            .ok_or_else(|| not_text_triplet("negative"))?;
             Ok((0..batch.num_rows())
                 .map(|i| TrainingRow::Triplet {
                     anchor: anchor[i].clone(),
@@ -663,27 +706,34 @@ fn decode_record_batch(
                 .collect())
         }
         UnderlyingFormat::MediaTriplet => {
+            let not_binary = |col: &str| {
+                JammiError::FineTune(format!(
+                    "Missing/invalid binary '{col}' column for media triplets (task \
+                     {task}). Batch schema: [{}]",
+                    schema_info()
+                ))
+            };
             let anchor = extract_binary_column(
                 batch
                     .column_by_name("anchor")
                     .ok_or_else(|| missing("anchor"))?
                     .as_ref(),
             )
-            .ok_or_else(|| JammiError::FineTune("streamed 'anchor' is not binary".into()))?;
+            .ok_or_else(|| not_binary("anchor"))?;
             let positive = extract_binary_column(
                 batch
                     .column_by_name("positive")
                     .ok_or_else(|| missing("positive"))?
                     .as_ref(),
             )
-            .ok_or_else(|| JammiError::FineTune("streamed 'positive' is not binary".into()))?;
+            .ok_or_else(|| not_binary("positive"))?;
             let negative = extract_binary_column(
                 batch
                     .column_by_name("negative")
                     .ok_or_else(|| missing("negative"))?
                     .as_ref(),
             )
-            .ok_or_else(|| JammiError::FineTune("streamed 'negative' is not binary".into()))?;
+            .ok_or_else(|| not_binary("negative"))?;
             Ok((0..batch.num_rows())
                 .map(|i| TrainingRow::MediaTriplet {
                     anchor: anchor[i].clone(),
@@ -1070,6 +1120,7 @@ impl TrainingDataLoader {
         session: Arc<InferenceSession>,
         table: TrainingSetTable,
         columns: Vec<String>,
+        task: ModelTask,
         format: TrainingFormat,
         cfg: StreamConfig,
     ) -> Result<Self> {
@@ -1084,6 +1135,7 @@ impl TrainingDataLoader {
                 session,
                 table,
                 columns,
+                task,
                 range,
                 cfg,
                 runtime,
@@ -1149,7 +1201,7 @@ impl TrainingDataLoader {
             .result_store()
             .materialize_training_set(session.context(), spec)
             .await?;
-        Self::from_training_set_stream(session, table, columns, format, cfg).await
+        Self::from_training_set_stream(session, table, columns, task, format, cfg).await
     }
 
     /// Total number of data points (rows for text, batches for precomputed).
@@ -1235,6 +1287,7 @@ impl TrainingDataLoader {
                         session: Arc::clone(&src.session),
                         table: src.table.clone(),
                         columns: src.columns.clone(),
+                        task: src.task,
                         range,
                         cfg: src.cfg,
                         runtime: src.runtime.clone(),
@@ -1538,6 +1591,7 @@ impl TrainingDataLoader {
                 table: src.table.clone(),
                 columns: src.columns.clone(),
                 format: self.format,
+                task: src.task,
                 range: src.range.clone(),
                 cfg,
                 residency: Arc::clone(&residency),
@@ -1699,6 +1753,7 @@ impl TrainingDataLoader {
     /// (`ResidencyBound`) `run_epoch_stream` uses for the main loop.
     fn stream_drain_all(&self, src: &StreamSource) -> Result<Vec<TrainingRow>> {
         let format = self.format;
+        let task = src.task;
         let columns = src.columns.clone();
         let session = Arc::clone(&src.session);
         let table = src.table.clone();
@@ -1710,7 +1765,7 @@ impl TrainingDataLoader {
             let mut rows = Vec::new();
             while let Some(batch) = stream.next().await {
                 let batch = batch.map_err(JammiError::from)?;
-                rows.extend(decode_record_batch(format, &columns, &batch)?);
+                rows.extend(decode_record_batch(format, task, &columns, &batch)?);
             }
             Ok(rows)
         })

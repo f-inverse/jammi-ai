@@ -113,6 +113,7 @@ async fn residency_bound_holds_on_a_fixture_larger_than_batch_times_prefetch() {
         Arc::clone(&session),
         table,
         contrastive_columns(),
+        ModelTask::TextEmbedding,
         TrainingFormat::Contrastive,
         cfg,
     )
@@ -193,6 +194,39 @@ async fn streamed_order_matches_committed_order_at_target_partitions_one_and_n()
             .unwrap();
 
         let table = materialize_contrastive_table(&session).await;
+
+        // The impossibility claim behind (e)'s mechanism, MEASURED rather than
+        // assumed: the exact scoped-session, no-`ORDER BY` scan
+        // `open_row_range_stream` builds contains no `SortExec` node at all —
+        // walk the real physical plan's `Debug` output and assert the string
+        // "SortExec" never appears, at both `target_partitions` values (the
+        // ambient session's own config, which the loader's private scoped
+        // session always overrides to 1 regardless).
+        {
+            use datafusion::execution::SessionState;
+            use datafusion::physical_plan::ExecutionPlan;
+            use datafusion::prelude::SessionContext;
+
+            let mut state: SessionState = session.context().state();
+            let scoped_config = state
+                .config()
+                .clone()
+                .with_target_partitions(1)
+                .with_batch_size(7);
+            *state.config_mut() = scoped_config;
+            let scoped_ctx = SessionContext::new_with_state(state);
+            let sql = format!("SELECT * FROM {} LIMIT 30 OFFSET 0", table.sql_relation());
+            let df = scoped_ctx.sql(&sql).await.unwrap();
+            let physical: std::sync::Arc<dyn ExecutionPlan> =
+                df.create_physical_plan().await.unwrap();
+            let plan_debug = format!("{physical:?}");
+            assert!(
+                !plan_debug.contains("SortExec"),
+                "target_partitions={target_partitions}: the streamed read must contain NO \
+                 SortExec (no ORDER BY was ever asked for) — got plan: {plan_debug}"
+            );
+        }
+
         // The committed order, read back the WAY `training_set::read_back_sql`
         // defines it (full-tuple `ORDER BY`) — the oracle this test's
         // streamed order must match.
@@ -219,6 +253,7 @@ async fn streamed_order_matches_committed_order_at_target_partitions_one_and_n()
             Arc::clone(&session),
             table,
             contrastive_columns(),
+            ModelTask::TextEmbedding,
             TrainingFormat::Contrastive,
             cfg,
         )

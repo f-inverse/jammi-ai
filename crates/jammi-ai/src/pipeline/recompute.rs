@@ -406,6 +406,18 @@ impl InferenceSession {
                 self.recompute_training_set(table, source, columns, task, format, order_rule)
                     .await
             }
+            ProducingDescriptor::FineTune {
+                training_set_definition_hash: _,
+                training_set_artifact_digest: _,
+                training_set_row_count: _,
+                spec_canonical,
+                spec_schema_version,
+                base_model_id: _,
+                world_size: _,
+            } => {
+                self.recompute_fine_tune(table, &spec_canonical, spec_schema_version)
+                    .await
+            }
             // An external producer is a verb the engine does not own, so there is
             // no faithful call to reconstruct — a loud refusal, never a guessed
             // re-run. Recomputing an external table is the producing consumer's
@@ -448,7 +460,35 @@ impl InferenceSession {
     /// inferred, and a future pinned source would legitimately make the replay a
     /// hit.
     ///
-    /// # The two refusals
+    /// # A recorded PINNED anchor is re-resolved PINNED, never silently downgraded
+    ///
+    /// Every anchor `materialize_projection` itself records today is
+    /// [`AnchorKind::UnpinnedAtInstant`] — but the recorded `input_anchors` this
+    /// function reads come from the table's own `.materialization.json`
+    /// sidecar, and `ProducingDescriptor::FineTune` (U3) is the first producer
+    /// to anchor a `TrainingSet`-kind table by its content digest
+    /// ([`AnchorKind::ResultDigest`]) rather than by an unpinned read instant.
+    /// A future producer over a *versioned* source ([`AnchorKind::MutableVersion`])
+    /// is the same shape. For each recorded anchor this loop therefore
+    /// dispatches on its OWN kind rather than blanket-downgrading every entry
+    /// to unpinned:
+    ///
+    /// - [`AnchorKind::UnpinnedAtInstant`] re-anchors at a fresh instant, as
+    ///   before.
+    /// - [`AnchorKind::MutableVersion`] / [`AnchorKind::ResultDigest`]
+    ///   RE-RESOLVE against the named relation's CURRENT state
+    ///   ([`crate::session::InferenceSession::result_store`]'s
+    ///   [`jammi_db::store::ResultStore::pin_current_version`]) and stay
+    ///   pinned — a re-resolution, never a re-use of the stale recorded value.
+    ///   A relation that no longer resolves (deregistered, or the pinned
+    ///   version was reaped) is [`JammiError::NotRecomputable`], naming the
+    ///   anchor's source, rather than silently treated as unpinned.
+    /// - [`AnchorKind::SourceVersion`] names an external/federated source's
+    ///   pinned as-of value, which this engine owns no local surface to
+    ///   re-verify or refresh — refused the same way, rather than fabricate a
+    ///   re-resolution it cannot honestly perform.
+    ///
+    /// # The three refusals
     ///
     /// - An `order_rule` this build does not commit is
     ///   [`JammiError::NotRecomputable`]. The producer commits exactly
@@ -456,6 +496,9 @@ impl InferenceSession {
     ///   replaying a table committed under some other rule would write rows in
     ///   an order the recorded descriptor does not claim, which is a fabricated
     ///   re-run, not a recompute.
+    /// - A recorded PINNED anchor whose target no longer resolves is
+    ///   [`JammiError::NotRecomputable`] (see above) — never silently
+    ///   downgraded to unpinned.
     /// - A recorded `source` query that no longer resolves in this session
     ///   (its relation was deregistered, or it never was a durable relation)
     ///   fails at the planner inside the verb, naming the missing relation.
@@ -492,10 +535,10 @@ impl InferenceSession {
             .map(|manifest| manifest.input_anchors)
             .unwrap_or_default();
         let now = chrono::Utc::now().to_rfc3339();
-        let inputs: Vec<InputAnchor> = recorded_anchors
-            .iter()
-            .map(|anchor| InputAnchor::unpinned_at_instant(anchor.source.clone(), now.clone()))
-            .collect();
+        let mut inputs: Vec<InputAnchor> = Vec::with_capacity(recorded_anchors.len());
+        for anchor in &recorded_anchors {
+            inputs.push(self.reresolve_recorded_anchor(table, anchor, &now).await?);
+        }
         let materialized = self
             .result_store()
             .materialize_training_set(
@@ -515,6 +558,96 @@ impl InferenceSession {
             materialized.record.table_name.clone(),
             materialized.outcome.clone(),
         ))
+    }
+
+    /// Re-resolve ONE recorded anchor for [`Self::recompute_training_set`],
+    /// dispatching on its own [`AnchorKind`] — see that method's "A recorded
+    /// PINNED anchor is re-resolved PINNED" doc section for the policy this
+    /// implements.
+    async fn reresolve_recorded_anchor(
+        self: &Arc<Self>,
+        table: &ResultTableRecord,
+        anchor: &InputAnchor,
+        now: &str,
+    ) -> Result<InputAnchor> {
+        use jammi_db::store::manifest::AnchorKind;
+        match anchor.kind {
+            AnchorKind::UnpinnedAtInstant => {
+                Ok(InputAnchor::unpinned_at_instant(anchor.source.clone(), now))
+            }
+            AnchorKind::MutableVersion | AnchorKind::ResultDigest => {
+                let current = self
+                    .catalog()
+                    .get_result_table(&anchor.source)
+                    .await?
+                    .ok_or_else(|| JammiError::NotRecomputable {
+                        table: format!(
+                            "{} (pinned input anchor '{}' no longer resolves: the relation is \
+                             gone)",
+                            table.table_name, anchor.source
+                        ),
+                    })?;
+                self.result_store()
+                    .pin_current_version(current)
+                    .await
+                    .map(|pinned| pinned.input_anchor())
+            }
+            // An external/federated source's pinned as-of value has no local
+            // surface this engine can re-verify or refresh — refusing rather
+            // than fabricating a re-resolution it cannot honestly perform.
+            AnchorKind::SourceVersion => Err(JammiError::NotRecomputable {
+                table: format!(
+                    "{} (pinned input anchor '{}' is an external source_version this engine \
+                     cannot re-resolve)",
+                    table.table_name, anchor.source
+                ),
+            }),
+        }
+    }
+
+    /// Re-invoke a `TrainingSpec::FineTune` job — the
+    /// [`ProducingDescriptor::FineTune`] replay, which K1 fixes as **retrain**,
+    /// never a re-derivation from the recorded fields: `spec_canonical` +
+    /// `spec_schema_version` decode back into the exact
+    /// [`crate::fine_tune::spec::TrainingSpec::FineTune`] the original job ran
+    /// ([`crate::fine_tune::spec::fine_tune_spec_from_canonical`]), which is
+    /// then submitted and driven to completion the same way any fresh
+    /// fine-tune submission is — over the source's *current* rows, under a
+    /// fresh training-set materialization, so a replay reflects the inputs'
+    /// present state exactly like every other producer this module replays.
+    /// `CachePolicy::Bypass` (baked into the decode) means a replay never
+    /// short-circuits into the model-level reuse probe: a recompute that
+    /// reused a cache would be a no-op, not a recompute (module doc).
+    ///
+    /// `table` names the row whose descriptor was read — used only for the
+    /// refusal message, since `pipeline::recompute` operates over
+    /// `result_tables` rows exclusively (`ResultTableRecord`) while a
+    /// fine-tuned model's descriptor lives on its `models` row instead. No
+    /// production caller of [`InferenceSession::recompute`] can therefore
+    /// hand this arm a `ProducingDescriptor::FineTune` today; the arm exists
+    /// so the match stays exhaustive (K7) and so a future model-level
+    /// recompute surface, should one land, replays this variant correctly
+    /// from day one rather than needing this logic written under pressure
+    /// then.
+    async fn recompute_fine_tune(
+        self: &Arc<Self>,
+        table: &ResultTableRecord,
+        spec_canonical: &str,
+        spec_schema_version: u32,
+    ) -> Result<(String, CacheOutcome)> {
+        let spec = crate::fine_tune::spec::fine_tune_spec_from_canonical(
+            spec_canonical,
+            spec_schema_version,
+        )
+        .map_err(|e| JammiError::NotRecomputable {
+            table: format!(
+                "{} (undecodable fine-tune spec_canonical: {e})",
+                table.table_name
+            ),
+        })?;
+        let job = self.run_training_spec(spec).await?;
+        job.wait().await?;
+        Ok((job.model_id.clone(), CacheOutcome::Computed))
     }
 
     /// Re-invoke the `assemble_context`→`materialize_context` **pair** — the real

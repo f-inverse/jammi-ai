@@ -273,9 +273,22 @@ live-gpu-tests = ["local"]
 # itself is now a direct entry too: `fine_tune::adamw::AdamW::step` depends
 # on `jammi-kernels` directly (the fused multi-tensor AdamW step), not only
 # transitively through `jammi-encoders`/`jammi-lora`.
+# `candle-core/nccl` is the collective's CUDA arm
+# (`fine_tune::collective::nccl`), and it belongs to `cuda` rather than to a
+# feature of its own: TOPOLOGY IS CONFIGURATION -- `[worker] collective`
+# selects the arm at runtime, and a build in which `Nccl` could not be
+# selected would make the same binary answer differently for the same
+# configuration. `candle-core`'s `nccl` is a pure pass-through to
+# `cudarc/nccl` (it gates nothing in candle itself) and `nccl` implies
+# `cuda`, so a build without `cuda` resolves the identical dependency graph
+# it resolved before: `cudarc` is optional, is not compiled, and nothing
+# links. On a CUDA build cudarc's `dynamic-linking` emits
+# `-lnccl` at LINK time, so the toolchain that builds this feature needs
+# `libnccl` present -- not only the runtime host.
 cuda = [
     "local",
     "candle-core/cuda",
+    "candle-core/nccl",
     "candle-nn/cuda",
     "jammi-encoders/cuda",
     "jammi-lora/cuda",

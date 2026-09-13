@@ -1,0 +1,399 @@
+//! #500 U4a: what a deployment admits a rank count for, and where it refuses
+//! one.
+//!
+//! Two edges, and the tests here are about which is which.
+//!
+//! **Session open** decides whether this BUILD can reach the configured
+//! collective. A process that cannot honour its own configuration should not
+//! come up and then refuse every job it is handed.
+//!
+//! **The submit edge** decides whether this DEPLOYMENT can serve the count a
+//! particular job asks for. It is the last point at which refusing costs
+//! nothing: past it the spec is a durable row a worker will claim, fail and
+//! retry. Every refusal here is asserted on two things — the typed error
+//! variant, and that the `jobs` table is unchanged — because a refusal that
+//! leaves a queued row behind is a job that later runs with a count the
+//! deployment cannot serve.
+//!
+//! The submit edge has more than one entrance, and this file ranges over the
+//! set of them:
+//!
+//! | entry path | reaches the edge through |
+//! |---|---|
+//! | embedded, per-verb (`fine_tune`, `fine_tune_graph`, `submit_fine_tune`) | `InferenceSession::submit_fine_tune_spec_deduped` |
+//! | embedded, generic (`InferenceSession::enqueue(JobSpec::Training)`) | `InferenceSession::enqueue` |
+//! | wire (`JobService::SubmitJob`) | `run_training_spec_deduped` → `submit_fine_tune_spec_deduped` |
+//! | Python (`Database._start_training_proto`) | `jammi_ai::wire::training_spec_from_bytes` → `run_training_spec_deduped` → the same |
+//!
+//! The wire and Python paths are the embedded path plus a decode: both build
+//! a `SubmitJobRequest`, both hand it to `training_spec_from_proto`, and both
+//! then call `run_training_spec_deduped`, which funnels into the same
+//! method the per-verb entry points do. This file drives the two EMBEDDED
+//! entrances directly and the decode seam through
+//! `training_spec_from_bytes` (the Python entrance's own first call); the
+//! remote entrance's own end-to-end oracle lives in the server suite
+//! (`crates/jammi-server/tests/it/grpc_remote_compute.rs`), where a real
+//! client is available.
+
+use std::sync::Arc;
+
+use jammi_ai::fine_tune::spec::{RankAdmission, TrainingCommon, TrainingSpec};
+use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, HardNegativeConfig};
+use jammi_ai::jobs::JobSpec;
+use jammi_ai::model::ModelTask;
+use jammi_ai::session::InferenceSession;
+use jammi_db::config::CollectiveSelection;
+use jammi_db::error::JammiError;
+use tempfile::TempDir;
+
+use crate::common;
+
+/// A session over a deployment that declares `devices` devices.
+///
+/// Real ordinals with `device = 0`, which is what `GpuConfig::validate`
+/// requires of a multi-entry list (a list mixing the CPU with real ordinals
+/// is refused: a gang runs on one kind of device). Hermetic anyway —
+/// `require_gpu` stays false, so a host with no such device degrades to the
+/// CPU exactly as every other fixture's session does, and it is the declared
+/// COUNT, not the execution device, that the submit edge reads.
+async fn session_with_devices(devices: usize) -> (Arc<InferenceSession>, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.gpu.device = 0;
+    config.gpu.devices = Some((0..devices as i32).collect());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    (session, dir)
+}
+
+fn spec_with_world_size(world_size: u32) -> TrainingSpec {
+    spec_with(world_size, FineTuneConfig::default())
+}
+
+fn spec_with(world_size: u32, config: FineTuneConfig) -> TrainingSpec {
+    TrainingSpec::FineTune {
+        source: "patents".into(),
+        columns: vec!["abstract".into()],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        common: TrainingCommon {
+            base_model: "local:tiny".into(),
+            config,
+            world_size,
+        },
+    }
+}
+
+async fn job_count(session: &Arc<InferenceSession>) -> usize {
+    session.catalog().list_jobs().await.unwrap().len()
+}
+
+/// Every refusal, on BOTH embedded entrances, asserted on the typed variant
+/// and on an unchanged `jobs` table.
+///
+/// One test over the whole refusal set rather than five, because the
+/// expensive part is the session and the interesting part is that the set is
+/// closed: each case names the bound it crosses, and the deployment that
+/// admits it is exercised at the end so no case passes by refusing
+/// everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
+    // One device: a two-rank job is unservable here.
+    let (session, _dir) = session_with_devices(1).await;
+    let before = job_count(&session).await;
+
+    let cached = FineTuneConfig {
+        cached: true,
+        ..FineTuneConfig::default()
+    };
+    let mining = FineTuneConfig {
+        hard_negatives: HardNegativeConfig {
+            mine: true,
+            ..HardNegativeConfig::default()
+        },
+        ..FineTuneConfig::default()
+    };
+
+    // The two bounds a ONE-device deployment can state. The two
+    // single-rank-only mechanisms need a deployment where the device bound
+    // does not bite first, so they are checked on the wide session below.
+    let cases: [(&str, TrainingSpec, &str); 2] = [
+        (
+            "a zero-rank count",
+            spec_with_world_size(0),
+            "world_size must be >= 1",
+        ),
+        (
+            "a count beyond the deployment's devices",
+            spec_with_world_size(2),
+            "exceeds the 1 configured device(s)",
+        ),
+    ];
+
+    for (name, spec, expected) in cases {
+        // Entrance 1: the per-verb funnel.
+        let per_verb = session
+            .run_training_spec(spec.clone())
+            .await
+            .expect_err(name);
+        assert!(
+            matches!(per_verb, JammiError::Config(_)),
+            "{name}: the refusal must be typed, got {per_verb:?}"
+        );
+        assert!(
+            per_verb.to_string().contains(expected),
+            "{name}: the refusal must name the bound it crosses, got {per_verb}"
+        );
+
+        // Entrance 2: the generic enqueue, which takes an already-built spec
+        // and so does not pass the per-verb entry points at all.
+        let generic = match session
+            .enqueue(JobSpec::Training(Box::new(spec.clone())), 0)
+            .await
+        {
+            Ok(handle) => panic!(
+                "{name}: the generic entrance admitted job {}",
+                handle.job_id
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(generic, JammiError::Config(_)),
+            "{name}: the generic entrance must refuse the same way, got {generic:?}"
+        );
+        assert_eq!(
+            generic.to_string(),
+            per_verb.to_string(),
+            "{name}: one rule, one message, whichever entrance the spec came through"
+        );
+
+        assert_eq!(
+            job_count(&session).await,
+            before,
+            "{name}: a refused submission must enqueue nothing"
+        );
+    }
+
+    // Two devices: the device bound no longer bites, so the two
+    // single-rank-only mechanisms are the reason a two-rank job is refused.
+    let (wide, _wide_dir) = session_with_devices(2).await;
+    let wide_before = job_count(&wide).await;
+    for (name, spec, expected) in [
+        (
+            "a multi-rank GradCache run",
+            spec_with(2, cached),
+            "cannot be combined with GradCache",
+        ),
+        (
+            "a multi-rank mining run",
+            spec_with(2, mining),
+            "cannot be combined with hard-negative mining",
+        ),
+    ] {
+        let error = wide.run_training_spec(spec.clone()).await.expect_err(name);
+        assert!(matches!(error, JammiError::Config(_)), "{name}: {error:?}");
+        assert!(error.to_string().contains(expected), "{name}: got {error}");
+        let generic = match wide.enqueue(JobSpec::Training(Box::new(spec)), 0).await {
+            Ok(handle) => panic!(
+                "{name}: the generic entrance admitted job {}",
+                handle.job_id
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(generic.to_string(), error.to_string());
+    }
+    assert_eq!(
+        job_count(&wide).await,
+        wide_before,
+        "a refused submission must enqueue nothing"
+    );
+
+    // The control: the SAME two-rank submission with neither
+    // single-rank-only mechanism is admitted on the two-device deployment and
+    // does write a row. Without this the refusals above could all be a
+    // submit edge that refuses everything.
+    wide.run_training_spec(spec_with_world_size(2))
+        .await
+        .expect("a two-rank job on a two-device deployment is servable");
+    assert_eq!(
+        job_count(&wide).await,
+        wide_before + 1,
+        "the admitted submission must enqueue exactly one row"
+    );
+}
+
+/// The single-rank job every caller that names no count submits is still
+/// admitted on a one-device deployment — the no-regression case the refusals
+/// above must not have swept up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_rank_job_is_admitted_on_a_one_device_deployment() {
+    let (session, _dir) = session_with_devices(1).await;
+    let before = job_count(&session).await;
+    session
+        .run_training_spec(spec_with_world_size(1))
+        .await
+        .expect("the single-rank job is what every deployment can serve");
+    assert_eq!(job_count(&session).await, before + 1);
+}
+
+/// The Python entrance's own first call: the embedded binding assembles a
+/// `SubmitJobRequest`, serializes it, and hands the BYTES to
+/// `training_spec_from_bytes` — so a count that crossed that seam wrongly
+/// would reach the same submit edge with the wrong value. Decoding the bytes
+/// and submitting the decoded spec is exactly what
+/// `Database::_start_training_proto` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_serialized_request_entrance_carries_the_count_to_the_same_edge() {
+    use prost::Message;
+
+    let (session, _dir) = session_with_devices(1).await;
+    let before = job_count(&session).await;
+
+    let mut body = Vec::new();
+    jammi_ai::wire::training_spec_to_proto(&spec_with_world_size(2))
+        .encode(&mut body)
+        .expect("encode");
+    let decoded = jammi_ai::wire::training_spec_from_bytes(&body).expect("decode");
+    let TrainingSpec::FineTune { common, .. } = &decoded else {
+        panic!("expected the fine_tune variant");
+    };
+    assert_eq!(
+        common.world_size, 2,
+        "the count must survive the serialized round trip, or this entrance would submit a \
+         different job than the caller assembled"
+    );
+
+    let error = session
+        .run_training_spec(decoded)
+        .await
+        .expect_err("a two-rank job on a one-device deployment is unservable");
+    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert_eq!(
+        job_count(&session).await,
+        before,
+        "a refusal on this entrance enqueues nothing either"
+    );
+}
+
+/// `collective = "nccl"` is refused at session OPEN on a build without CUDA,
+/// and `auto`/`cpu` open fine.
+///
+/// Stated for both builds rather than only this one: on a CUDA build the same
+/// configuration must OPEN, so the refusal is a statement about the build and
+/// not a blanket rejection of the knob.
+#[tokio::test(flavor = "multi_thread")]
+async fn nccl_without_cuda_is_refused_at_session_open() {
+    for collective in [CollectiveSelection::Auto, CollectiveSelection::Cpu] {
+        let dir = TempDir::new().unwrap();
+        let mut config = common::test_config(dir.path());
+        config.worker.collective = collective;
+        InferenceSession::new(config)
+            .await
+            .unwrap_or_else(|e| panic!("collective = {collective} must open: {e}"));
+    }
+
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.worker.collective = CollectiveSelection::Nccl;
+    let opened = InferenceSession::new(config).await;
+
+    if cfg!(feature = "cuda") {
+        assert!(
+            opened.is_ok(),
+            "a CUDA build can reach NCCL, so the same configuration must open"
+        );
+    } else {
+        let error = opened
+            .err()
+            .expect("a build without CUDA cannot reach NCCL and must refuse to open");
+        assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("cuda"),
+            "the refusal must name the missing build feature: {error}"
+        );
+    }
+}
+
+/// The admission rule itself, over deployments this host does not have.
+///
+/// The `nccl`-without-CUDA arm is unreachable from a LIVE session — the open
+/// refusal above stops such a session from existing — so the rule is pinned
+/// here, where the build flag is data: a host build states what a CUDA build
+/// admits, and a CUDA build states what a host build refuses. Both
+/// directions are asserted, so the arm cannot pass by never firing.
+#[test]
+fn the_admission_rule_reads_the_build_as_data() {
+    let spec = spec_with_world_size(1);
+
+    let host_build = RankAdmission::new(1, CollectiveSelection::Nccl, false);
+    let error = host_build
+        .admit(&spec)
+        .expect_err("a build without CUDA cannot reach NCCL");
+    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+
+    let cuda_build = RankAdmission::new(1, CollectiveSelection::Nccl, true);
+    cuda_build
+        .admit(&spec)
+        .expect("a CUDA build reaches NCCL, so the same spec is admitted");
+
+    for collective in [CollectiveSelection::Auto, CollectiveSelection::Cpu] {
+        RankAdmission::new(1, collective, false)
+            .admit(&spec)
+            .unwrap_or_else(|e| panic!("{collective} needs no CUDA: {e}"));
+    }
+}
+
+/// A context-predictor spec carries no rank count at all: the variant has no
+/// `TrainingCommon`, so there is no field to hold one and nothing for the
+/// submit edge to admit. The count is refused at the wire decode instead —
+/// the last edge that can still see one a caller chose.
+///
+/// The impossibility is the TYPE's, and this is the executed attempt to
+/// falsify it: the variant is destructured exhaustively, so a `world_size`
+/// added to it later would fail to compile here rather than silently become
+/// an unadmitted count.
+#[test]
+fn a_context_predictor_spec_has_no_rank_count_to_admit() {
+    let spec = TrainingSpec::ContextPredictor {
+        source: "episodes".into(),
+        predictor_spec: predictor_config(),
+    };
+    match &spec {
+        TrainingSpec::ContextPredictor {
+            source,
+            predictor_spec,
+        } => {
+            assert_eq!(source, "episodes");
+            assert_eq!(predictor_spec.context_k, 4);
+        }
+        other => panic!("expected the predictor variant, got {other:?}"),
+    }
+    RankAdmission::new(1, CollectiveSelection::Auto, false)
+        .admit(&spec)
+        .expect("a predictor spec has no count, so there is nothing to refuse");
+}
+
+fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictorTrainConfig {
+    use jammi_ai::pipeline::context_predictor::{
+        ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
+    };
+    ContextPredictorTrainConfig {
+        model_id: "ctx-pred-admission".into(),
+        architecture: ContextArchitecture::Tnp,
+        key_column: "row_key".into(),
+        task_column: "cohort".into(),
+        value_column: "outcome".into(),
+        context_k: 4,
+        hidden_dim: 32,
+        num_heads: 2,
+        num_layers: 1,
+        head: PredictiveHead::Gaussian {
+            objective: GaussianObjective::Nll { beta: 0.5 },
+        },
+        epochs: 1,
+        learning_rate: 3e-4,
+        grad_clip: 1.0,
+        test_task_fraction: 0.3,
+        min_task_count: 2,
+        seed: 7,
+    }
+}

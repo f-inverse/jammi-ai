@@ -49,8 +49,14 @@ consolidated pass. A finding that is a defect gets a round.
 
 **Wave 2 (PR-B).** Independent of every plan-68 unit. Its units edit regions of the worker that
 operability did not, but operability landed first, so rebase rather than assume. Spike S1 found the
-CUDA continuous-integration image lacks the NCCL development package; U4a carries that as a
-precondition and it is not fixed.
+CUDA continuous-integration image lacked the NCCL development package; that precondition is now
+fixed — its own PR merged the image change and the `jammi-ai --features cuda` clippy arm ahead of
+PR-B, so U4a's own commit only asserts it, never repeats the fix. Status on the consolidated
+`feat/500-B-gang-local` branch: U7a (the gpu-gang pod leg, the artifact schema, the allowlist)
+is complete and merged into it; U2a (the `TrainingSet` producer) and U4a (the `Collective` trait,
+device-plural session, `CacheKey`, config refusals) are each in a closing audit round, not yet
+merged into it; U2b (the streaming loader) and U3 (the `FineTune` producer) have started from a
+provisional consolidation ahead of U2a/U4a's own closes, so they rebase once those land.
 
 **Wave 3 (PR-C).** U5a's job slot wraps the loop operability rewrote. U5b-1 builds the membership
 substrate the distributed unit's design sketches but does not implement. U5b-2 uses operability's

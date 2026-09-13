@@ -81,7 +81,23 @@ those still in force are restated here in their v4 form. Principle in parenthese
     capability-scoping the ring is a 68 follow-on. (One membership mechanism; DIST D9.)
 29. **Knobs.** `[gpu] devices = [..]`; `[worker] world_size = 1`, `rank_timeout_secs = 120`,
     `collective = "auto"`; per-job `world_size` on `TrainingCommon` (`#[serde(default)]` = 1).
-    `[training]` no longer exists on the branch.
+    `[training]` no longer exists on the branch. On the wire (`wt-U4a: job.proto`, U4a's
+    unmerged commit), `SubmitJobRequest.world_size` is tag 9: tags 7 and 8 are `reserved` for the
+    job-dependency unit's `depends_on` and `parent_id`, deferred to #515 and recoverable by
+    cherry-pick without a tag collision. The field is implicit-presence `uint32` (`0` = unset),
+    so an explicit rank count of one encodes identically to "not chosen" in both clients: the
+    Rust `FineTuneRequest.world_size: Option<NonZeroU32>` (`wt-U4a: crates/jammi-wire/src/
+    request.rs:117-123`) and the Python `_wire_world_size` (`wt-U4a: clients/python/jammi/
+    _assembly.py:502-512`) both write the field only above one, so `Some(1)`/`world_size=1` and
+    the unset default are one wire value and the engine sees one encoding for a single-rank job
+    regardless of caller or surface. On the job path, a typed `EmptyTrainingSet` (U2a's unmerged
+    commit; mapped to `InvalidArgument` at the synchronous edge, `wt-U2a: crates/jammi-python/
+    src/error.rs:85`) is stripped to a plain string by `failed_job_message`
+    (`fine_tune/worker.rs:3020` on `main`) before it reaches `jobs.error`, so the embedded Python
+    binding reads a failed job's error uniformly as `TrainingError` (`JammiError::FineTune`,
+    `wt-U2a: crates/jammi-python/src/error.rs:54`, raised at `wt-U2a: crates/jammi-python/src/
+    job.rs:380-382`) — never `InvalidArgument` — on the job path, even though the same class is
+    `InvalidArgument` at the synchronous `Recompute` RPC edge.
 30. **Migrations.** 67 appends exactly three: `model_materialization` (U3, PR-B),
     `instances_peer_addr` (U5b-1, PR-C), `compute_cluster_state` (U8b, PR-D — distributor-neutral
     name and columns; `workers.devices` rides in it, since U8b is its first reader). No plan
@@ -91,9 +107,13 @@ those still in force are restated here in their v4 form. Principle in parenthese
     asserts) — and OPS's relative-position oracle; the second merger renumbers (K5). Three 68
     units (OPS, GRAPH, DELTA) also append one each.
 31. **The training set is not this attempt's partial result.** U2a materializes it with
-    `job_attempt: None`: it is a shared producer output reused by definition hash, not an
-    attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
-    reached. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
+    `job_attempt: None`: it is a shared producer output, not an attempt-owned table, so the
+    `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never reached. Reuse is by definition
+    hash **and** pinned equal input anchors — the engine's existing rule (`embedding.rs:89-93`):
+    a plain, unpinned source anchors as `AnchorKind::UnpinnedAtInstant` and the cache probe
+    short-circuits any unpinned anchor, so it is honestly always a miss; a training set over a
+    plain source is never reused, and two jobs over the same plain source each materialize their
+    own table. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
     jobs CAS, `result_repo.rs:99-130`) but outside OPS's linked release sweep, so a crashed or
     released coordinator leaves a live `building` row: the successor (or a second job over the
     same training set) that finds a live same-named `building` row **backs off** — returns the
@@ -108,8 +128,10 @@ those still in force are restated here in their v4 form. Principle in parenthese
 33. **`GangService` is a second service on `[server] peer_bind`** (DIST D7's third listener),
     never on the tenant-scoped public chain, never advertised by `GetServerInfo`. **68 DIST unit
     1 merged is a hard precondition of U5a** (its listener commit is ~22 files on top of ~10;
-    there is no verbatim-carry fallback). PR-C(67) also waits for OPS and GRAPH, because OPS C2
-    rewrites the claim loop U5a's `JobSlot` wraps and GRAPH rewrites `claim_next`.
+    there is no verbatim-carry fallback). PR-C(67) also waits for OPS, because OPS C2 rewrites
+    the claim loop U5a's `JobSlot` wraps. GRAPH is deferred to #515 and is not a precondition:
+    its `claim_next` rewrite (`jobs_repo.rs:711`) does not land in this wave, so U5a's `JobSlot`
+    wraps `claim_next` as it stands on `main`.
 34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
     `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
     tenant predicate, never admin scope (`get_job` is tenant-filtered, `jobs_repo.rs:580-596`,
@@ -182,9 +204,16 @@ those still in force are restated here in their v4 form. Principle in parenthese
     (`scheduler_server/mod.rs:395`) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
-    **without consulting `task_max_failures`**. With both retry knobs at 0, a `GangExec` on a
-    killed executor is re-launched by Ballista on a surviving executor and the job succeeds on
-    its own — in parallel with jammi's own reclaim. U8b needs an explicit bind-time guard in
+    **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
+    (`query_stage_scheduler.rs:320-340`) only resets the freed/re-failed tasks; it posts no
+    `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
+    automatic: `ReviveOffers` fires only from a later, independent event — a new executor
+    registering under push-staged scheduling (`do_register_executor`, `scheduler_server/mod.rs:
+    419`) or a subsequent `TaskUpdating` success under push-staged scheduling
+    (`query_stage_scheduler.rs:300-303`) — so with both retry knobs at 0, a `GangExec` on a killed
+    executor is picked up only if one of those triggers fires afterward; with no other executor
+    registering and no other in-flight task reporting status, the freed task can sit unscheduled
+    with nothing to revive it. U8b needs an explicit bind-time guard in
     `CatalogClusterState::bind_schedulable_tasks` / `DevicePlacement` that refuses to re-bind a
     task whose `(job_id, stage_id, partition)` was already launched, keyed on jammi's own job row
     (Ballista's `task_attempt` counter is not bumped by this reset, so the refusal cannot key on
@@ -311,9 +340,9 @@ with the OpenTelemetry family #501 added.
    `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips `SWARM_GATE_TOUCHED`, so PR-B is
    an admin merge too;
    U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
-6. PR-C(67) after DIST unit 1, OPS and GRAPH merge (they rewrite the claim loop and
-   `claim_next`). U7b ∥ U5a; U6; U5b-1; U5b-2; `distributed.yml` dispatched manually,
-   deterministic leg green before merge.
+6. PR-C(67) after DIST unit 1 and OPS merge (OPS rewrites the claim loop U5a's `JobSlot`
+   wraps). GRAPH is deferred to #515 and is not a precondition. U7b ∥ U5a; U6; U5b-1; U5b-2;
+   `distributed.yml` dispatched manually, deterministic leg green before merge.
 7. PR-D after 68 K: U8a, U8b (the completion gate), U9a, U9b. `distributed.yml` dispatched
    manually with the three-process arm green before merge. PR-D edits a swarm domain card, so it
    needs an admin merge (`SWARM_GATE_TOUCHED`).

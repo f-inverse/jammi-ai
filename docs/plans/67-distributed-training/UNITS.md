@@ -43,7 +43,10 @@ per-step `$?`. Naming per README ruling 23.
   `check_execution_surface_reachability.py` green with the new tuples allowlisted; every
   existing lane still deploys `gpuCount: 1`. Provisioning proof is spike S4, not an acceptance.
 - **lane**: gate scripts. **depends_on**: S4. **size**: L.
-- **cost ceiling** (human-approved before first run): ≤ 1 h × 2 GPU × $1.59 ≈ $3.2 per run.
+- **cost ceiling** (human-approved before first run), basis `$3.18/h` (the SECURE 2-GPU
+  `A100-SXM4-80GB` pod's measured rate, not `$1.59 × 2`): terminate-succeeds bound (i)
+  `4 × 300s × $3.18/h + 1h × $3.18/h = $4.24`/run; sweep-only bound (ii)
+  `(4 + 1) × 1h × $3.18/h = $15.90`/run (`dev-gpu.md:655-663`).
 
 ## U2a — `TrainingSet` producer (PR-B commit 2)
 
@@ -83,15 +86,34 @@ per-step `$?`. Naming per README ruling 23.
   (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
   (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
-- **precondition (S1)**: `jammi-ai`'s `cuda` feature adds `candle-core/nccl`, and cudarc's
-  `dynamic-linking` emits `cargo:rustc-link-lib=dylib=nccl` at link time; `.docker/ci-cuda.Dockerfile`
-  installs `cuda-toolkit-12-6` only, which does not carry NCCL, so the `builder-cuda` stage fails
-  to link as of this commit. The CI CUDA image must carry `libnccl-devel` (rhel8 packages
-  `libnccl`/`libnccl-devel` 2.23.4-1+cuda12.6 — the version the runtime image
-  `nvidia/cuda:12.6.3-runtime-ubi8` already ships, and the version S1's GPU leg ran against) and
-  be republished **before** this commit lands. A `jammi-ai --features cuda` clippy arm must also
-  exist in the nvcc lane (today only `jammi-encoders` and `jammi-kernels` are built with `cuda`
-  there), so the `Nccl` arm is compiled somewhere before the GPU leg runs.
+  (docs-ci) the six cu12 packaging sites that name the CUDA runtime library set, so it gains
+  `libnccl` (unmerged — U4a's own commit; cited as `wt-U4a:` below):
+  `wt-U4a: .github/workflows/release-binaries.yml:377-380` (the `DT_NEEDED`-closure comment
+  naming `libnccl` alongside the CUDA runtime) and `:528-532` (the derivation note recording that
+  a prior hand-listed six-name set missed the `DT_NEEDED libnccl.so.2` `candle-core/nccl` adds —
+  why the set is derived, not listed), `packaging/server-cu12/verify_link_set.py`,
+  `wt-U4a: packaging/server-cu12/jammi_server/_entry.py:23` (`_CUDA_COMPONENTS`),
+  `packaging/server-cu12/pyproject.toml` (the `nvidia-*-cu12` pins), `wt-U4a: packaging/
+  server-cu12/README.md:12`; and `.github/workflows/ci.yml`'s `flash-attn-compile` job, which
+  gains a preflight step (`wt-U4a`: `Preflight — the image carries NCCL`, `rpm -q libnccl
+  libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so`) so a `:latest`
+  published before B0's Dockerfile change reds this job before any `--features cuda` step tries
+  to link.
+- **precondition (S1) — satisfied by B0** (`ci/500-cuda-image-nccl`, merged to `main`): the CI
+  CUDA image carries NCCL (`.docker/ci-cuda.Dockerfile` pins `libnccl-2.23.4-1+cuda12.6` and
+  `libnccl-devel-2.23.4-1+cuda12.6`, the version `nvidia/cuda:12.6.3-runtime-ubi8` already ships)
+  and the `flash-attn-compile` job's preflight step above (unmerged, `wt-U4a`) is meant to assert
+  it before this unit's own `cargo clippy -p jammi-ai --features cuda --tests -- -D warnings`
+  step (`ci.yml:913`, already on `main`) compiles the `Nccl` arm. The CUDA-tarball soname set the
+  cu12 packaging above bundles is DERIVED, not hand-listed (`wt-U4a: ci/scripts/
+  bundle_cuda_libs.sh`, a new file): it walks the binary's transitive `DT_NEEDED` closure and
+  adds a fixed floor of seven stems (`libcudart libcublas libcublasLt libcurand libnvrtc
+  libnvrtc-builtins libnccl`) no closure walk can be trusted to reach on its own —
+  `libnvrtc-builtins` in particular is `dlopen`'d by `libnvrtc` rather than linked, a MEASURED
+  fact (`readelf -d` against the toolkit's `libnvrtc.so.12` names no such `NEEDED` entry). The
+  post-copy check is filesystem presence only, never the real runtime loader (`wt-U4a:
+  release-binaries.yml:392-393`); a runtime loader verification is filed as issue #534, not
+  established by this unit.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
   `nccl` without CUDA, `world_size > 1` with `cached == true` or `hard_negatives.mine == true`
   refused with typed errors at the submit edge), K4 (remote parity suite unchanged), B6.
@@ -164,9 +186,19 @@ per-step `$?`. Naming per README ruling 23.
   `train_count` is not a multiple of W·B (RED at base); (c) W=2 × B vs W=1 × 2B within
   pre-registered ε at `lora_dropout=0`, rung pinned (RED at base); (d) lockstep: forced
   divergence on one rank; a Var absent from one rank's `GradStore`; a zero-row rank — the gang
-  completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden. (pod leg,
+  completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden; (f) two real
+  devices in one session hold two entries in the production model-cache map for one model id —
+  U4a's own hermetic assertion pins the key-type fact against a mirror map, never the production
+  insert (`wt-U4a: model/cache.rs:885`, `do_load`'s `cache.entries.insert`); only one device
+  exists off the pod, so a device-collapse mutation at that insert site is hermetically
+  UNCOVERED and this determinant is a pod-leg obligation, not a hermetic one. (pod leg,
   `Nccl`, 2×A100): (a) as a digest pair + per-step delta against the pre-registered ε, (c)
-  with GPU ε; artifact committed as PR-B commit 7.
+  with GPU ε, (f) above; artifact committed as PR-B commit 7 under the `gang` artifact kind's
+  rule (k) (`check_cuda_run_artifacts.py:909-1170`): the evidence anchor is `git_sha` when it is
+  an ancestor of HEAD, else `merged_as` (never unconditionally `git_sha`); `gang.verdict` is
+  exactly `pass` or `fail` (a failing gang run is representable, never silently omitted); and
+  the pre-registered ε must be committed in a commit that is a strict ancestor of the anchor —
+  never the measuring commit itself, so ε cannot be tuned to the run it judges.
 - **lane**: hermetic + gpu-gang pod leg. **depends_on**: U2b, U3, U4a, S1. **size**: XL (the
   plan's mathematical core; five hermetic oracles).
 
@@ -215,8 +247,10 @@ per-step `$?`. Naming per README ruling 23.
   from any public RPC and ignores any caller tenant (invariant oracles); (f) an assignment naming
   an instance id that is not a fresh member is refused (RED at base).
 - **lane**: hermetic + server it-suite. **depends_on**: U4a, **68 DIST unit 1 merged** (the
-  `peer_bind` listener — a hard precondition, no fallback), **68 OPS and GRAPH merged** (they
-  rewrite the claim loop and `claim_next` that `JobSlot` wraps). **size**: L.
+  `peer_bind` listener — a hard precondition, no fallback), **68 OPS merged** (it rewrites the
+  claim loop that `JobSlot` wraps). GRAPH does not depend_on: it is deferred to #515, so
+  `claim_next` (`jobs_repo.rs:711`) is unrewritten in this wave and `JobSlot` wraps it as it
+  stands on `main`. **size**: L.
 
 ## U6 — Partition-aware inference operator; distributed frozen forward (PR-C commit 3)
 

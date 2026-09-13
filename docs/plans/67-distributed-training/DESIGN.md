@@ -44,9 +44,14 @@ source plan through the session, sorts by the full projected tuple (identical tu
 identical rows, so their mutual order is immaterial), and writes an immutable Parquet result
 table of kind `TrainingSet` (`crates/jammi-db/src/catalog/result_repo.rs:27`) with the standard
 attestation (`MaterializationManifest`, `manifest.rs:874`). The descriptor carries **no
-topology and no split**: the table is shared by every job over the same source, columns, task
-and format, whatever their world size, batch or validation fraction. Input anchors are the
-source anchors. `GraphFineTune` materializes its seeded, deterministic sampled pairs
+topology and no split**, so the table is shared by every job over the same source, columns,
+task and format ONLY when the input anchors are equal AND pinned — the engine's existing rule
+(`crates/jammi-ai/src/pipeline/embedding.rs:89-93`): a plain, unpinned source anchors as
+`AnchorKind::UnpinnedAtInstant` and the cache probe short-circuits any unpinned anchor, so it is
+honestly always a miss. Whatever their world size, batch or validation fraction, two jobs over
+the same PLAIN source still each materialize their own table; reuse needs a pinned source.
+Input anchors are the source anchors. `GraphFineTune` materializes its seeded, deterministic
+sampled pairs
 (`graph_sampler.rs:374`) the same way. Media blob columns are stored as today.
 
 **Split.** The job's `validation_fraction` defines the train prefix exactly as today
@@ -275,7 +280,7 @@ single-process table (K4 shape).
 |---|---|---|
 | **Refactor parity**: W=1 with the new loader, scaler-over-train-prefix and `Noop` produces adapter bytes identical to the base commit on every cookbook fine-tune fixture (`cookbook/book/artifacts/finetune_*/checksums.json`) | byte | cookbook 6.5; hermetic |
 | **K4 (real)**: W=2 over the wire (`Peer`, two processes) equals W=2 in-process (`Local`), byte-for-byte; rank 0 is always in-process, so W=1 never crosses the wire and is covered by the `Noop` parity row | byte | distributed lane |
-| **Equal-topology reproducibility**: two runs, same W and plan → identical bytes; also across a resume (kill at epoch k, resume, compare to uninterrupted) | byte on `Local`/`Peer` (hermetic); on GPU legs the digest pair is recorded (never a failure until S5 promotes) and the per-step loss delta is compared to an ε pre-registered per leg before the first gating run (S5, or the max delta over ≥ 3 same-seed baseline runs on that box) | hermetic; gpu-gang |
+| **Equal-topology reproducibility**: two runs, same W and plan → identical bytes; also across a resume (kill at epoch k, resume, compare to uninterrupted) | byte on `Local`/`Peer` (hermetic); on GPU legs at world size 2 the digest pair is ASSERTED on a pass verdict — S5 measured candle 0.11 LoRA-shaped forward/backward/SGD byte-identical across two A100s with no env pins at world 2 — and the per-step loss delta is compared to an ε pre-registered per leg before the first gating run (or the max delta over ≥ 3 same-seed baseline runs on that box); at world size ≥ 3 the NCCL collective-algorithm pin set is unproven (reduction is commutative at world 2), so the digest pair there stays recorded, not asserted, until the cluster leg characterizes it | hermetic; gpu-gang |
 | **W-invariance**: W × B versus W=1 × W·B, identical loss per step within ε, at `lora_dropout = 0` and a pinned bucket rung; ε measured on the leg that gates (CPU ε never inherited by GPU) | tolerance | hermetic; gpu-gang |
 | **Gather exactness**: for CoSENT, AnglE, MNRL, **classification** and **quantile regression**, the W=2 global loss and the summed adapter gradient at step t equal the W=1 loss and gradient on the same rows bit-for-bit on CPU, on a fixture whose `train_count` is not a multiple of W·B (a zero-row rank occurs) | byte | hermetic |
 | **Lockstep**: one rank's batch forced to diverge; one rank's batch yields no gradient for a Var; the gang completes | property | hermetic |

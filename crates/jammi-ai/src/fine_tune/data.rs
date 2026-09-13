@@ -1092,6 +1092,66 @@ impl TrainingDataLoader {
         })
     }
 
+    /// Materialise `columns` of `source_id` as a training set — WRITE ONLY,
+    /// never the eager read-back — and wrap the result in a per-epoch
+    /// STREAMING loader ([`Self::from_training_set_stream`]); the production
+    /// `FineTune` path's constructor (`worker::run_spec`).
+    ///
+    /// The write-side spec construction mirrors
+    /// `training_set::materialize_projection`'s exactly (the same
+    /// `source_sql` shape, the same [`InputAnchor::unpinned_at_instant`]
+    /// anchor), calling
+    /// [`jammi_db::store::ResultStore::materialize_training_set`] directly
+    /// rather than that function — which always eagerly reads the table back
+    /// too (`materialize_and_read`), precisely the residency this
+    /// constructor exists to avoid. Duplicated rather than shared because
+    /// splitting `training_set.rs` into a write-only half is outside this
+    /// unit's file scope (co-owned by db/U2a) — see this unit's report.
+    pub async fn from_source_stream(
+        session: Arc<InferenceSession>,
+        source_id: &str,
+        columns: Vec<String>,
+        task: crate::model::ModelTask,
+        format: TrainingFormat,
+        cfg: StreamConfig,
+    ) -> Result<Self> {
+        use jammi_db::sql::{quote_ident, source_relation};
+        use jammi_db::store::manifest::InputAnchor;
+        use jammi_db::store::TrainingSetSpec;
+
+        let table_name = session.find_table_name(source_id)?;
+        let projection = columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source_sql = format!(
+            "SELECT {projection} FROM {}",
+            source_relation(source_id, &table_name)
+        );
+        let spec = TrainingSetSpec {
+            source_id,
+            source_sql: &source_sql,
+            columns: &columns,
+            task,
+            format: format.format_tag(),
+            // The source has no version surface to pin, so it is anchored at
+            // the instant it was read — the same honest anchor
+            // `training_set::materialize_projection` records for the same
+            // reason.
+            inputs: vec![InputAnchor::unpinned_at_instant(
+                source_id,
+                chrono::Utc::now().to_rfc3339(),
+            )],
+            device: session.compute_device(),
+        };
+        let table = session
+            .result_store()
+            .materialize_training_set(session.context(), spec)
+            .await?;
+        Self::from_training_set_stream(session, table, columns, format, cfg).await
+    }
+
     /// Total number of data points (rows for text, batches for precomputed).
     pub fn len(&self) -> usize {
         match &self.data {

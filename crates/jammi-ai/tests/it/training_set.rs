@@ -216,6 +216,110 @@ async fn refactor_parity() {
     );
 }
 
+/// U2b acceptance (c) — the regression fixture, extending [`refactor_parity`]
+/// (which only covers the contrastive shape) with the SAME pinned-oracle
+/// discipline over `task=regression`.
+///
+/// Pinned at THIS unit's own base (`4e27156a`, U2b's dispatch base — U2a and
+/// U4a already landed, so `task=regression` already routed through the
+/// `TrainingSet` producer and read it back eagerly; U2b's own change is the
+/// per-epoch STREAMING read that replaces that eager collect). Fingerprinted
+/// with the recipe: `git worktree add <dir> 4e27156a`, copy
+/// `regression_parity_columns`/`regression_parity_config`/
+/// `run_regression_parity_fixture`/`regression_parity_baseline_capture` (a
+/// print-only capture, no assertion) into a test module there, `cargo test
+/// -p jammi-ai --test it -- training_set::regression_parity_baseline_capture
+/// --exact --nocapture`, twice, to confirm byte-stability before pinning.
+///
+/// The regression fixture routes the K3 scaler (`TrainingDataLoader::
+/// regression_targets`) and the streamed `Regression` chunk decode
+/// (`decode_record_batch`'s `UnderlyingFormat::Regression` arm) through
+/// paths [`refactor_parity`]'s contrastive fixture never exercises at all.
+const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
+    ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("adapter_config.json", "284:6d66bd5b8594e1fa"),
+    ("checkpoint_1.safetensors", "1888:6ca7a223b9045945"),
+    ("checkpoint_2.safetensors", "1888:33c390ee0a486f52"),
+    ("checkpoint_3.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("checkpoint_best.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("manifest.json", "676:db99b094ab1030df"),
+];
+
+fn regression_parity_columns() -> Vec<String> {
+    vec!["text".to_string(), "target".to_string()]
+}
+
+fn regression_parity_config() -> FineTuneConfig {
+    FineTuneConfig {
+        epochs: 1,
+        batch_size: 8,
+        lora_rank: 4,
+        warmup_steps: 0,
+        ..Default::default()
+    }
+}
+
+async fn run_regression_parity_fixture(
+    session: &Arc<InferenceSession>,
+) -> BTreeMap<String, String> {
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session)
+        .expect("default worker intervals are valid");
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_model(),
+            &regression_parity_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::Regression,
+            Some(regression_parity_config()),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let models = session.catalog().list_models().await.unwrap();
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the fine-tune registers its output model");
+    let prefix =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix)
+        .await
+        .expect("the published adapter fetches and verifies");
+
+    let mut prints = BTreeMap::new();
+    for entry in std::fs::read_dir(local.dir()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
+        }
+    }
+    prints
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_refactor_parity() {
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("regression_years.csv")).await;
+    let prints = run_regression_parity_fixture(&session).await;
+    println!("REGRESSION_PARITY_ADAPTER_PRINTS = {prints:#?}");
+
+    let expected: BTreeMap<String, String> = REGRESSION_PARITY_ADAPTER_PRINTS
+        .iter()
+        .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        prints, expected,
+        "the adapter bytes moved: streaming the committed TrainingSet back \
+         (U2b) instead of collecting it eagerly must not change which rows \
+         the trainer sees, in which order, or how the K3 scaler is computed"
+    );
+}
+
 /// (a) A fine-tune job creates a `ready` `TrainingSet` result table carrying a
 /// definition hash and a manifest attestation, and trains from it.
 #[tokio::test(flavor = "multi_thread")]

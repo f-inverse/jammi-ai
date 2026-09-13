@@ -80,6 +80,7 @@ mod classification_parity;
 mod clip_text_embeddings_parity;
 mod embeddings_parity;
 mod fine_tune_learns;
+mod gang_nccl;
 mod gguf_quantized_gpu;
 mod graph_finetune_learns;
 mod graph_propagation_parity;

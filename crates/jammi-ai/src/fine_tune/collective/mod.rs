@@ -3,8 +3,9 @@
 //! One trait, one implementation per transport, selected by CONFIGURATION —
 //! `[worker] collective` and `[worker] world_size`, never a cargo feature. The
 //! trainer holds a `&dyn Collective` and is never `cfg`-forked: a single-rank
-//! run holds a [`Noop`] and a multi-rank run on one host holds a [`Local`],
-//! and the trainer's own code is the same code in every case.
+//! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`] or
+//! (on a CUDA build) an [`nccl::Nccl`], and the trainer's own code is the same
+//! code in every case.
 //!
 //! # The five operations
 //!
@@ -43,6 +44,8 @@ use jammi_db::error::{JammiError, Result};
 use candle_core::Tensor;
 
 pub mod local;
+#[cfg(feature = "cuda")]
+pub mod nccl;
 pub mod noop;
 
 #[cfg(test)]

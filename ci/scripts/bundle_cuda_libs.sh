@@ -45,6 +45,20 @@
 #      all — `DT_NEEDED` says nothing about it, and neither does this check;
 #      that failure mode is UNCOVERED by this script.
 #
+#      Two more failure shapes that a bare "no defect line" reading would
+#      miss, because neither one is a `not found` or a wrong-directory entry:
+#      `ldd` itself can exit non-zero (not a dynamic executable, a crashed
+#      loader, a truncated invocation) — that exit status is asserted, never
+#      discarded, and a non-zero exit is a named FAIL before the report's text
+#      is read at all. Separately, a report that runs cleanly to exit 0 can
+#      still be VACUOUS — naming none, or only some, of the sonames the
+#      binary's own direct `DT_NEEDED` list carries (a `linux-vdso.so.1`-only
+#      report, say) — which a rule that only inspects the lines present would
+#      call clean because there is no bad line to find; the report is
+#      therefore cross-checked as a SET against `bundle_needed_sonames`'s own
+#      output for the binary, and any name that set carries but the report
+#      never mentions is a named FAIL.
+#
 # Usage:
 #   bundle_cuda_libs.sh <binary> <stage-lib-dir> [search-path]
 #     `search-path` is a colon-separated list of directories, tried in order;
@@ -227,6 +241,47 @@ bundle_realpath_dir() {
   fi
 }
 
+# `realpath`-normalise a FILE, following the FILE's own symlink chain, not
+# only the directory it sits in. `bundle_realpath_dir` alone is not enough
+# here: `cd`+`pwd -P` resolves every symlink in a path it can `cd` into, but
+# it can only `cd` into a DIRECTORY, so a soname staged as a symlink pointing
+# to a path OUTSIDE `$lib_dir` (`$STAGE/libnccl.so.2 -> $elsewhere/libnccl.
+# so.2`) would have its directory component normalise to `$STAGE` — correct,
+# and useless, since the question is where the FILE resolves, not where its
+# directory entry sits. This walks the symlink chain by hand (`readlink`,
+# resolving a relative target against the link's own directory, bailing out
+# on a cycle rather than looping forever) until it reaches a non-symlink, then
+# hands the final directory to `bundle_realpath_dir` and re-appends the
+# basename. Falls back to the literal path, unchanged, when nothing on this
+# filesystem answers — same fallback contract as `bundle_realpath_dir`, for
+# the same reason (the hermetic suite's fixture paths are strings, never
+# files).
+bundle_realpath_file() {
+  local path="$1" dir target seen=" " real_dir
+  while [ -L "$path" ]; do
+    case "$seen" in
+      *" $path "*)
+        printf '%s\n' "$path"
+        return 0
+        ;;
+    esac
+    seen="$seen$path "
+    dir="$(dirname -- "$path")"
+    target="$(readlink -- "$path")"
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="${dir}/${target}" ;;
+    esac
+  done
+  if [ -e "$path" ]; then
+    dir="$(dirname -- "$path")"
+    real_dir="$(bundle_realpath_dir "$dir")"
+    printf '%s/%s\n' "${real_dir%/}" "$(basename -- "$path")"
+    return 0
+  fi
+  printf '%s\n' "$path"
+}
+
 # The lines of a loader report that are DEFECTS, given the report and the
 # stage `lib_dir` it was generated against. For each `DT_NEEDED` entry the
 # report names:
@@ -252,12 +307,28 @@ bundle_realpath_dir() {
 # hermetic suite over fixture loader output, on a host that has neither `ldd`
 # nor an ELF binary to point it at. Prints nothing when the report is clean;
 # otherwise prints one `soname => defect` line per problem, naming both the
-# soname and the path (or `not found`) it defects on.
+# soname and the path (or `not found`, or "missing from loader report") it
+# defects on.
+#
+# The optional third argument is the SET of sonames the report is required to
+# name — `bundle_needed_sonames`'s own output for the binary the report was
+# generated against, one per line. Without it (the two-argument form) this
+# function checks only the lines the report actually contains, which is
+# exactly the shape that calls a VACUOUS report clean: an empty string, "not a
+# dynamic executable", or a `linux-vdso.so.1`-only report all contain zero bad
+# lines, because they contain no lines about any staged dependency at all.
+# With the third argument, every name in that set is required to appear as
+# SOME entry in the report (resolved, not-found, or otherwise) — `derived -
+# reported = ∅`, checked as a set, not by scanning for one known-bad shape —
+# and any name the set carries but the report never mentions is its own named
+# defect line. `bundle_verify_stage` always supplies it; the suite's direct
+# calls that omit it are testing the WHERE-resolved rule in isolation.
 bundle_unresolved_from_loader_output() {
   local loader_output="$1"
   local lib_dir="$2"
-  local real_lib_dir line soname rest resolved_path resolved_dir real_resolved_dir
-  local defect=""
+  local derived_sonames="${3:-}"
+  local real_lib_dir line soname rest resolved_path real_resolved_path real_resolved_dir
+  local defect="" reported=" " needed
   real_lib_dir="$(bundle_realpath_dir "$lib_dir")"
   real_lib_dir="${real_lib_dir%/}"
 
@@ -270,6 +341,7 @@ bundle_unresolved_from_loader_output() {
     esac
     soname="$(printf '%s' "${line%%=>*}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     rest="$(printf '%s' "${line#*=>}" | sed -e 's/^[[:space:]]*//')"
+    reported="${reported}${soname} "
 
     if [ "$rest" = "not found" ]; then
       if bundle_is_driver_soname "$soname"; then
@@ -284,10 +356,12 @@ bundle_unresolved_from_loader_output() {
       continue
     fi
 
-    # Strip the trailing ` (0xADDRESS)` the loader appends, leaving the path.
+    # Strip the trailing ` (0xADDRESS)` the loader appends, leaving the path,
+    # then resolve the FILE's own symlink chain — not merely the directory it
+    # sits in — before comparing against `$lib_dir` (`bundle_realpath_file`).
     resolved_path="${rest% (*}"
-    resolved_dir="$(dirname -- "$resolved_path")"
-    real_resolved_dir="$(bundle_realpath_dir "$resolved_dir")"
+    real_resolved_path="$(bundle_realpath_file "$resolved_path")"
+    real_resolved_dir="$(dirname -- "$real_resolved_path")"
     real_resolved_dir="${real_resolved_dir%/}"
     case "$real_resolved_dir" in
       "$real_lib_dir" | "$real_lib_dir"/*) continue ;;
@@ -298,26 +372,53 @@ bundle_unresolved_from_loader_output() {
 $loader_output
 EOF
 
+  if [ -n "$derived_sonames" ]; then
+    while IFS= read -r needed; do
+      [ -n "$needed" ] || continue
+      case "$reported" in
+        *" $needed "*) continue ;;
+      esac
+      defect="${defect}${needed} => missing from loader report
+"
+    done <<EOF
+$derived_sonames
+EOF
+  fi
+
   printf '%s' "$defect"
 }
 
 # Ask the real loader whether the staged tree satisfies the staged binary, and
 # fail on any defect `bundle_unresolved_from_loader_output` names.
+#
+# The tool's own exit status is asserted BEFORE its output is read at all — a
+# swallowed `|| true` here would read a non-zero `ldd` (a crash, "not a
+# dynamic executable", a truncated invocation) as an empty, and therefore
+# clean, report. It is also given the binary's own direct `DT_NEEDED` list, so
+# `bundle_unresolved_from_loader_output`'s set cross-check can catch a report
+# that exits 0 but is otherwise vacuous.
 bundle_verify_stage() {
   local binary="$1"
   local lib_dir="$2"
-  local loader_output unresolved
-  loader_output="$(LD_LIBRARY_PATH="$lib_dir" ldd "$binary" 2>&1 || true)"
-  unresolved="$(bundle_unresolved_from_loader_output "$loader_output" "$lib_dir")"
+  local loader_output unresolved needed
+  local ldd_rc=0
+  loader_output="$(LD_LIBRARY_PATH="$lib_dir" ldd "$binary" 2>&1)" || ldd_rc=$?
+  if [ "$ldd_rc" -ne 0 ]; then
+    echo "::error::bundle_cuda_libs.sh: ldd exited ${ldd_rc} against ${binary} — the loader could not even be asked whether the stage satisfies the binary, which is not a clean report:" >&2
+    printf '%s\n' "$loader_output" >&2
+    return 1
+  fi
+  needed="$(bundle_needed_sonames "$binary")"
+  unresolved="$(bundle_unresolved_from_loader_output "$loader_output" "$lib_dir" "$needed")"
   if [ -n "$unresolved" ]; then
-    echo "::error::bundle_cuda_libs.sh: the staged tarball does not satisfy its own binary — a bundled dependency did not resolve, or resolved from somewhere other than ${lib_dir}:" >&2
+    echo "::error::bundle_cuda_libs.sh: the staged tarball does not satisfy its own binary — a bundled dependency did not resolve, resolved from somewhere other than ${lib_dir}, or the loader report never named it at all:" >&2
     printf '%s\n' "$unresolved" >&2
     echo "Full loader output:" >&2
     printf '%s\n' "$loader_output" >&2
     return 1
   fi
   printf '%s\n' "$loader_output"
-  echo "bundle_cuda_libs.sh: every non-platform, non-driver DT_NEEDED entry resolved under ${lib_dir} (checked by path, not merely by presence; driver and platform libraries excepted)."
+  echo "bundle_cuda_libs.sh: every non-platform, non-driver DT_NEEDED entry resolved under ${lib_dir} (checked by path, not merely by presence; driver and platform libraries excepted), and the loader named every entry the binary directly needs."
 }
 
 bundle_main() {

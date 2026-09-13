@@ -209,6 +209,29 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
   predicate's input domain is never actually bounded by patching the instances found so far.
   The mechanism meant to close F10 needed F10's own lesson (the class, not the instance)
   applied to ITSELF twice before it stopped trying to read free text at all.
+- **A THIRD incident found a sub-shape of F10 the round-3/4 mechanism above never closed:
+  INSTITUTIONALISED DEFERRAL — the open question handed to the next round (esc-lead-gate-R10 →
+  esc-lead-gate-R12).** `esc-097`'s own relay gained a required `open_question` field: a site
+  examined and explicitly NOT closed, "naming the attack for the NEXT ROUND to run." A
+  tarball-loader fix BLOCKed three further closing audits in a row, each on the mechanism the
+  PREVIOUS fix introduced (a builder-resolved soname passed an `LD_LIBRARY_PATH` prepend; a
+  vacuous pass on an `ldd` failure; a set cross-check that failed a CORRECT stage because `ldd`
+  prints an absolute path) — every one discoverable by the lead executing the mechanism once, on
+  real input, before dispatching the re-audit. Every relay along the way satisfied `open_question`
+  in full, literally: the field's OWN spelling names "the next round" as the executor, so a lead
+  writing a plausible-sounding attack description and never running it is INDISTINGUISHABLE, at
+  the schema layer, from one that ran it and found nothing. The user's own words, verbatim: "it's
+  not about the count — I never wanted it to be about the count. The mechanism intended was for
+  the lead to proactively anticipate and act even before the next audit round's finding." The fix
+  (esc-lead-gate-R12) moves the check to the one moment that cannot be gamed after the fact: an
+  implementer dispatch onto a unit with an open verifier BLOCK is denied unless a pre-fix
+  anticipation artifact already exists whose commands the hook itself re-executes and hash-matches,
+  and whose named branch's CURRENT tip equals the BLOCK's own `head_sha` — proof the attack ran
+  against the BROKEN code, never after a fix already landed; the closing relay then must show the
+  fix measurably moved at least one such witness. `open_question`/`residual_risk`'s own text is
+  never trusted as a substitute for having run something — a field that only ADMITS an unclosed
+  site cannot, by its own schema, defer the CLOSING of it to a future round that the mechanism
+  never actually requires to happen.
 
 ---
 

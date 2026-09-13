@@ -4391,6 +4391,7 @@ dependencies = [
  "directories",
  "flate2",
  "futures",
+ "half",
  "hex",
  "hf-hub",
  "http",

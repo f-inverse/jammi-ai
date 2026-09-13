@@ -396,12 +396,16 @@ fn nccl_error(op: &str, e: candle_core::cuda::cudarc::nccl::result::NcclError) -
     JammiError::Gpu(format!("{op}: nccl status {:?}", e.0))
 }
 
-/// The dtypes that have an `ncclDataType_t`, refused at this seam rather than
-/// failing to compile a match arm deeper in.
+/// Refuse a dtype this arm's `cuda_fwd` match does not cover, at this seam
+/// rather than failing to compile a match arm deeper in.
+///
+/// The message says only that THIS ARM does not dispatch it — never that
+/// NCCL lacks a data type for it, which is not always true: `I16` and the
+/// `F8`/`F6`/`F4` family really have no `ncclDataType_t`, but `i8`, `i32` and
+/// `u64` do (S1 facts) and are refused here anyway, because the match arms
+/// below only cover f32, f64, f16, bf16, u8, u32 and i64.
 fn refuse_unsupported_dtype(op: &str, dtype: DType) -> candle_core::Result<()> {
-    candle_core::bail!(
-        "{op}: dtype {dtype:?} has no NCCL data type (f32, f64, f16, bf16, u8, u32 and i64 do)"
-    )
+    candle_core::bail!("{op}: this arm does not dispatch {dtype:?}")
 }
 
 /// The contiguous device slice a collective sends from.

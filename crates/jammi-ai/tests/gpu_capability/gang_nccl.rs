@@ -46,10 +46,13 @@ fn serial_cuda_device_or_require(test: &str) -> Option<harness::SerialGpu> {
 
 /// A second CUDA device (`candle_core::Device::new_cuda(1)`), or a hard
 /// failure when `JAMMI_REQUIRE_CUDA_GANG` is set and only one CUDA device is
-/// visible. A two-rank NCCL gang needs two devices to answer anything: the
-/// gang pod leg (U4b's `gpu-gang.yml`) exports this variable, while the
-/// single-GPU prove lane does not, so a one-device host on that lane still
-/// skips with the reason rather than failing.
+/// visible. A two-rank NCCL gang needs two devices to answer anything: it is
+/// the gang pod lane's obligation (`ci/scripts/runpod_gpu_gang.sh`'s remote
+/// environment, per plan 67) to export this variable, so the pod's own run
+/// hard-fails rather than skipping — that export does not exist yet, so a
+/// green run of this suite elsewhere is not NCCL coverage on its own. The
+/// single-GPU prove lane never sets it, so a one-device host on that lane
+/// still skips with the reason rather than failing.
 #[cfg(feature = "cuda")]
 fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
     match candle_core::Device::new_cuda(1) {

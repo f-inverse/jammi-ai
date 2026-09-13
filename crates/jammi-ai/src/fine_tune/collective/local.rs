@@ -930,13 +930,14 @@ mod rendezvous_state_tests {
     /// manufacture the sequence directly rather than reach it through a real
     /// gang. A MULTI-device gang has a real route here that this module does
     /// not exercise: the post-publish `to_device` calls at `all_gather`'s
-    /// peer-slice conversion, `all_reduce_sum`'s per-peer accumulation, and
-    /// its final per-slot store CAN fail on real hardware (an OOM, a
-    /// transfer error), which faults the gang for the round that just
-    /// published itself — exactly the asymmetry this test manufactures, but
-    /// reached for real. That route is UNCOVERED here; U4b's pod leg is
-    /// where a real multi-device `LocalGang` exists to exercise it (filed to
-    /// `CONTRACT-U4b.md`). So this test manufactures it directly, the
+    /// peer-slice conversion, `all_reduce_sum`'s per-peer accumulation, its
+    /// final per-slot store, and `broadcast`'s `from_root.to_device` CAN fail
+    /// on real hardware (an OOM, a transfer error), which faults the gang for
+    /// the round that just published itself — exactly the asymmetry this
+    /// test manufactures, but reached for real. That route is UNCOVERED
+    /// here; U4b's pod leg is where a real multi-device `LocalGang` exists
+    /// to exercise it (`docs/plans/67-distributed-training/UNITS.md` § U4b).
+    /// So this test manufactures it directly, the
     /// same way `a_round_holding_a_superseded_contribution_is_refused_by_the_rank_completing_it`
     /// manufactures its condition: rank 1 is parked in `exchange`, waiting on
     /// `round.published` with only its own contribution deposited

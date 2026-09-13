@@ -147,8 +147,11 @@ impl RankAdmission {
         }
     }
 
-    /// An admission stated outright — for a test that needs a deployment
-    /// this host does not have.
+    /// An admission stated outright, rather than read off a live
+    /// [`jammi_db::config::JammiConfig`] — for an embedder that has its own
+    /// source of the device count, collective and build flag (a test that
+    /// needs a deployment this host does not have is one such caller, not
+    /// the only one).
     pub fn new(
         devices: usize,
         collective: jammi_db::config::CollectiveSelection,

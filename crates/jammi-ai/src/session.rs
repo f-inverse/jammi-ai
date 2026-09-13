@@ -569,13 +569,13 @@ impl InferenceSession {
         self.inner.list_index_segments(table_name).await
     }
 
-    /// Access the catalog.
     /// This session's loaded configuration — the deployment's own statement
     /// of its devices, its worker knobs and its storage roots.
     pub fn jammi_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()
     }
 
+    /// Access the catalog.
     pub fn catalog(&self) -> &jammi_db::catalog::Catalog {
         self.inner.catalog()
     }

@@ -294,7 +294,7 @@ CUDA-shipping artifact answers for that soname its own way:
 | --- | --- |
 | `jammi-server-cu12` tarball | staged into the tarball's `lib/` by `ci/scripts/bundle_cuda_libs.sh`, which derives the set from the binary's own `DT_NEEDED` closure and then re-checks it against `ldd` |
 | `jammi-server-cu12` wheel | the `nvidia-nccl-cu12` dependency; the console script puts `nvidia/nccl/lib/` on `LD_LIBRARY_PATH`, and `verify_link_set.py` fails the build if a needed library is unclassified |
-| `jammi-ai-server` CUDA image | the `nvidia/cuda` runtime base already ships it |
+| `jammi-ai-server` CUDA image | nothing to do: the `nvidia/cuda:12.6.3-runtime-ubi8` base installs `libnccl-2.23.4-1+cuda12.6` itself (its own image config's `NV_LIBNCCL_PACKAGE`) — the same build the CI image and the wheel pin |
 
 The host NVIDIA driver's own libraries (`libcuda.so.1`, `libnvidia-*`) are the
 opposite case: never bundled anywhere, because they must match the driver the

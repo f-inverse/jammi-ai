@@ -1527,6 +1527,27 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
     ),
     (
         "crates/jammi-db/src/store/mod.rs",
+        "registered_name",
+        1, // ordinal 1 — the only `registered_name` in this file
+        1,
+        // `TrainingSetTable::registered_name` — the key a materialised
+        // training set is bound under, the accessor `sql_relation` (and
+        // through it `jammi_ai::fine_tune::training_set::read_back_sql`)
+        // quotes for the read-back. There is no version to straddle here,
+        // and that is a property of the KIND, not a hope:
+        // `ResultTableKind::TrainingSet` is data of record, excluded from
+        // embedding-table resolution by the `kind = 'model'` predicate
+        // (`result_repo.rs`; pinned by the db-side oracle
+        // `a_training_set_never_resolves_as_a_sources_embedding_table`), so
+        // no refresh or compaction can ever publish a second version of one
+        // and `current_version` is always absent — the same reasoning
+        // `graph_propagation.rs`'s `edge_source_anchor` records for the
+        // `NeighborGraph` kind. The table is also immutable by construction:
+        // it is written once through the single `building -> ready` funnel
+        // and never rewritten.
+    ),
+    (
+        "crates/jammi-db/src/store/mod.rs",
         "register_table",
         1, // ordinal 1 — the only `register_table` in this file; line 1073 today
         1,

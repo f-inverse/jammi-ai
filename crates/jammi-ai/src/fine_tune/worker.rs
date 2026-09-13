@@ -1771,41 +1771,14 @@ impl JobWorker {
                 // attested artifact, not this worker's private scan.
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
-                // The Parquet write and the read-back are CPU-bound work
-                // wrapped in async fns (DataFusion planning and Arrow/Parquet
-                // encoding run inline on whichever thread polls them, with no
-                // cooperative yield inside the computation itself). Run them
-                // on the blocking pool — the same discipline
-                // `run_fine_tune_blocking` below already follows for the
-                // training loop — so this step can never starve the SAME
-                // runtime threads the lease keeper's heartbeat and the
-                // RELEASE machinery depend on between the hold being
-                // registered (`register_job_hold_or_release`, which runs
-                // BEFORE this arm) and the first heartbeat renewal. A longer
-                // materialization only lengthens the time this blocking-pool
-                // thread runs; it never re-occupies an async worker thread,
-                // so it cannot re-lengthen the claim→heartbeatable window
-                // this guards.
-                let session_for_materialize = Arc::clone(session);
-                let columns_for_materialize = columns.clone();
-                let format_tag = detected.format_tag();
-                let (_table, batches) = tokio::task::spawn_blocking(move || {
-                    tokio::runtime::Handle::current().block_on(
-                        training_set::materialize_projection(
-                            &session_for_materialize,
-                            &source,
-                            &columns_for_materialize,
-                            task,
-                            format_tag,
-                        ),
-                    )
-                })
+                let (_table, batches) = training_set::materialize_projection(
+                    session,
+                    &source,
+                    &columns,
+                    task,
+                    detected.format_tag(),
+                )
                 .await
-                .map_err(|join_err| {
-                    WorkerJobError::Failed(format!(
-                        "training-set materialization task join error: {join_err}"
-                    ))
-                })?
                 .map_err(WorkerJobError::from)?;
                 let loader = build_training_data_loader(&batches, &columns, task)
                     .map_err(WorkerJobError::from)?;

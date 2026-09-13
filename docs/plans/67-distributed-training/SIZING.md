@@ -18,7 +18,7 @@ seven crates. It is merged; every 68 unit cuts after it and so does every 67 uni
   drain hooks); U9b needs K and OPS C6. DIST "unit 2" is a sketch, so U5b-1 builds the
   membership substrate itself (README r28). U2a no longer needs OPS C1 (`job_attempt: None`).
   With #501 merged, K, OPS, GRAPH, DELTA and DIST-1 are all unblocked and run concurrently with
-  PR-A and PR-B. The single cross-plan schedule is `../68-compute-tier-substrate/PROGRAM.md`.
+  PR-A and PR-B1. The single cross-plan schedule is `../68-compute-tier-substrate/PROGRAM.md`.
 - **Migrations**: 67 appends three (`model_materialization` U3, `instances_peer_addr` U5b-1,
   `compute_cluster_state` U8b); no number is reserved — each PR takes the next free at rebase and
   updates both pin sites (`catalog/migrations.rs` const list; `tests/it/migrations.rs:23-54`
@@ -26,8 +26,9 @@ seven crates. It is merged; every 68 unit cuts after it and so does every 67 uni
 
 ```
 #501 (merged) → PR-A [U1] ∥ K (#502, in CI) ∥ DIST-1, OPS, GRAPH, DELTA (68)
-        → PR-B [U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact]          (needs PR-A only)
-        → PR-C(67) [U7b ∥ U5a → U6 → U5b-1 → U5b-2 → artifact]         (needs DIST-1, OPS, GRAPH)
+        → PR-B1 [U7a ∥ U2a ∥ U4a]                                       (needs PR-A, fix/500-release-claim-spin)
+        → PR-B2 [U2b ∥ U3 → U4b → artifact]                             (cut from PR-B1's merge)
+        → PR-C(67) [U7b ∥ U5a → U6 → U5b-1 → U5b-2 → artifact]         (needs DIST-1, OPS, GRAPH, PR-B1; U5a's multi-rank arm, if it needs one, waits on PR-B2)
         → PR-D [U8a → U8b → U9a → U9b]                                  (needs K, OPS; admin merge)
 ```
 

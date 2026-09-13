@@ -26,7 +26,7 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: hermetic + cookbook; `distributed.yml` dispatched manually before merge.
 - **depends_on**: S3 (sizes it). **size**: L if S3 compiles with local fixes only; XL otherwise.
 
-## U7a — `gpu-gang.yml` pod leg (PR-B commit 1)
+## U7a — `gpu-gang.yml` pod leg (PR-B1 commit 1)
 
 - **files_in_scope** (docs-ci): `.github/workflows/gpu-gang.yml` (label `run-gang`, nightly,
   manual; never `push`/`workflow_call`), `ci/scripts/runpod_lib.sh` (`gpuCount` becomes a
@@ -48,7 +48,7 @@ per-step `$?`. Naming per README ruling 23.
   `4 × 300s × $3.18/h + 1h × $3.18/h = $4.24`/run; sweep-only bound (ii)
   `(4 + 1) × 1h × $3.18/h = $15.90`/run (`dev-gpu.md:655-663`).
 
-## U2a — `TrainingSet` producer (PR-B commit 2)
+## U2a — `TrainingSet` producer (PR-B1 commit 2)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::TrainingSet` with
   `format` as a canonical string), `catalog/result_repo.rs` (`ResultTableKind::TrainingSet`),
@@ -73,7 +73,7 @@ per-step `$?`. Naming per README ruling 23.
   for an unordered scan; `session.rs:189` sets `target_partitions`).
 - **lane**: hermetic + cookbook. **depends_on**: U1. **size**: M.
 
-## U4a — `Collective` trait; device-plural session; `CacheKey`; config refusals (PR-B commit 3)
+## U4a — `Collective` trait; device-plural session; `CacheKey`; config refusals (PR-B1 commit 3)
 
 - **files_in_scope**: (ai-core) new `fine_tune/collective/{mod.rs, noop.rs, local.rs, nccl.rs}`,
   `model/cache.rs` (`CacheKey { model_id, device, task: Option, backend: Option }` — shared
@@ -88,10 +88,11 @@ per-step `$?`. Naming per README ruling 23.
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
   (docs-ci) the six cu12 packaging sites that name the CUDA runtime library set, so it gains
   `libnccl` (unmerged — U4a's own commit; cited as `wt-U4a:` below):
-  `wt-U4a: .github/workflows/release-binaries.yml:377-380` (the `DT_NEEDED`-closure comment
-  naming `libnccl` alongside the CUDA runtime) and `:528-532` (the derivation note recording that
-  a prior hand-listed six-name set missed the `DT_NEEDED libnccl.so.2` `candle-core/nccl` adds —
-  why the set is derived, not listed), `packaging/server-cu12/verify_link_set.py`,
+  `wt-U4a: .github/workflows/release-binaries.yml:377-380` (the comment naming `libnccl`
+  alongside the CUDA runtime's other hard `DT_NEEDED` entries) and its packaging step's soname
+  loop (a note recording that the prior six-name hand list missed the `DT_NEEDED
+  libnccl.so.2` `candle-core/nccl` adds — why the list gained a seventh, still hand-listed, name
+  rather than a `DT_NEEDED` closure walk, issue #535), `packaging/server-cu12/verify_link_set.py`,
   `wt-U4a: packaging/server-cu12/jammi_server/_entry.py:23` (`_CUDA_COMPONENTS`),
   `packaging/server-cu12/pyproject.toml` (the `nvidia-*-cu12` pins), `wt-U4a: packaging/
   server-cu12/README.md:12`; and `.github/workflows/ci.yml`'s `flash-attn-compile` job, which
@@ -105,13 +106,16 @@ per-step `$?`. Naming per README ruling 23.
   and the `flash-attn-compile` job's preflight step above (unmerged, `wt-U4a`) is meant to assert
   it before this unit's own `cargo clippy -p jammi-ai --features cuda --tests -- -D warnings`
   step (`ci.yml:913`, already on `main`) compiles the `Nccl` arm. The CUDA-tarball soname set the
-  cu12 packaging above bundles is DERIVED, not hand-listed (`wt-U4a: ci/scripts/
-  bundle_cuda_libs.sh`, a new file): it walks the binary's transitive `DT_NEEDED` closure and
-  adds a fixed floor of seven stems (`libcudart libcublas libcublasLt libcurand libnvrtc
-  libnvrtc-builtins libnccl`) no closure walk can be trusted to reach on its own —
-  `libnvrtc-builtins` in particular is `dlopen`'d by `libnvrtc` rather than linked, a MEASURED
-  fact (`readelf -d` against the toolkit's `libnvrtc.so.12` names no such `NEEDED` entry). The
-  post-copy check is filesystem presence only, never the real runtime loader (`wt-U4a:
+  cu12 packaging above bundles is a fixed HAND LIST of seven stems (`libcudart libcublas
+  libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl`), searched first in the CUDA 12.6
+  toolkit's lib dir then in `/usr/lib64`, fail-closed per name — a name absent from both
+  locations fails the build rather than silently shipping a tarball missing it (`wt-U4a:
+  .github/workflows/release-binaries.yml`, the `server-cu12-build` job's packaging step). Deriving
+  the set from the binary's transitive `DT_NEEDED` closure was excised under this unit's stop
+  rule — a closure walk cannot be trusted to reach `libnvrtc-builtins` on its own, since it is
+  `dlopen`'d by `libnvrtc` rather than linked, a MEASURED fact (`readelf -d` against the toolkit's
+  `libnvrtc.so.12` names no such `NEEDED` entry) — and is filed as issue #535, not built by this
+  unit. The post-copy check is filesystem presence only, never the real runtime loader (`wt-U4a:
   release-binaries.yml:392-393`); a runtime loader verification is filed as issue #534, not
   established by this unit.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
@@ -125,7 +129,7 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: hermetic (+ pod leg smoke). **depends_on**: S1. **size**: L. No loader contact;
   U2b takes `world` as a partition-rule argument fed from this field (U4a → U2b).
 
-## U2b — Streaming loader; partition rule; scaler; whole-set arms (PR-B commit 4)
+## U2b — Streaming loader; partition rule; scaler; whole-set arms (PR-B2 commit 1)
 
 - **files_in_scope** (ai-core): `fine_tune/data.rs` (stream + per-batch converters for every
   format; the tests-only `Precomputed` arm unchanged), `fine_tune/trainer.rs` (epoch loop over
@@ -146,7 +150,7 @@ per-step `$?`. Naming per README ruling 23.
   the row-group reader, with no blocking sort (RED at base).
 - **lane**: hermetic + cookbook. **depends_on**: U2a, U4a (the `world` argument). **size**: XL.
 
-## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B commit 5, concurrent with U2b)
+## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B2 commit 2, concurrent with U2b)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::FineTune`;
   `MaterializationEnv` kernel-profile), `catalog/{schema.rs, migrations.rs}` (`model_materialization`,
@@ -167,7 +171,7 @@ per-step `$?`. Naming per README ruling 23.
   reference-counted reaping, artifact ordering, ten files across two crates). Co-ownership:
   `manifest.rs` and `recompute.rs` with U2a/U4b.
 
-## U4b — Rank context; gather rule; lockstep; single-node gang (PR-B commit 6)
+## U4b — Rank context; gather rule; lockstep; single-node gang (PR-B2 commit 3)
 
 - **files_in_scope** (ai-core): `fine_tune/trainer.rs` (`RankContext`; per-arm gather points
   — encoder outputs / classification **logits** / regression head output; identical global
@@ -193,7 +197,7 @@ per-step `$?`. Naming per README ruling 23.
   exists off the pod, so a device-collapse mutation at that insert site is hermetically
   UNCOVERED and this determinant is a pod-leg obligation, not a hermetic one. (pod leg,
   `Nccl`, 2×A100): (a) as a digest pair + per-step delta against the pre-registered ε, (c)
-  with GPU ε, (f) above; artifact committed as PR-B commit 7 under the `gang` artifact kind's
+  with GPU ε, (f) above; artifact committed as PR-B2 commit 4 under the `gang` artifact kind's
   rule (k) (`check_cuda_run_artifacts.py:909-1170`): the evidence anchor is `git_sha` when it is
   an ancestor of HEAD, else `merged_as` (never unconditionally `git_sha`); `gang.verdict` is
   exactly `pass` or `fail` (a failing gang run is representable, never silently omitted); and

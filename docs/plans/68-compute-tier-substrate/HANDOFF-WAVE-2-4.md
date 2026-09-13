@@ -47,19 +47,26 @@ consolidated pass. A finding that is a defect gets a round.
 
 ## Wave-specific knowledge you would otherwise rediscover
 
-**Wave 2 (PR-B).** Independent of every plan-68 unit. Its units edit regions of the worker that
-operability did not, but operability landed first, so rebase rather than assume. Spike S1 found the
-CUDA continuous-integration image lacked the NCCL development package; that precondition is now
-fixed — its own PR merged the image change and the `jammi-ai --features cuda` clippy arm ahead of
-PR-B, so U4a's own commit only asserts it, never repeats the fix. Status on the consolidated
-`feat/500-B-gang-local` branch: U7a (the gpu-gang pod leg, the artifact schema, the allowlist)
-is complete and merged into it; U2a (the `TrainingSet` producer) and U4a (the `Collective` trait,
-device-plural session, `CacheKey`, config refusals) are each in a closing audit round, not yet
-merged into it; U2b (the streaming loader) and U3 (the `FineTune` producer) have started from a
-provisional consolidation ahead of U2a/U4a's own closes, so they rebase once those land.
+**Wave 2 (PR-B1) and wave 2.5 (PR-B2).** PR-B is split in two. PR-B1 carries U7a (the gpu-gang pod
+leg, the artifact schema, the allowlist), U2a (the `TrainingSet` producer) and U4a (the
+`Collective` trait, device-plural session, `CacheKey`, config refusals); it merges to `main` right
+after `fix/500-release-claim-spin`. PR-B2 is cut from PR-B1's merge and carries U2b (the streaming
+loader), U3 (the `FineTune` producer) and U4b (rank context, gather rule, lockstep, single-node
+gang); U4b needs U2b's `PartitionSpec` and a two-GPU pod leg. Both are independent of every
+plan-68 unit. Their units edit regions of the worker that operability did not, but operability
+landed first, so rebase rather than assume. Spike S1 found the CUDA continuous-integration image
+lacked the NCCL development package; that precondition is now fixed — its own PR merged the image
+change and the `jammi-ai --features cuda` clippy arm ahead of PR-B1, so U4a's own commit only
+asserts it, never repeats the fix. Status on the consolidated `feat/500-B-gang-local` branch
+(PR-B1): U7a is complete and merged into it; U2a and U4a are each in a closing audit round, not
+yet merged into it. U2b and U3, PR-B2's units, have started from a provisional consolidation ahead
+of U2a/U4a's own closes on PR-B1, so PR-B2 rebases once PR-B1 lands and cuts from it.
 
-**Wave 3 (PR-C).** U5a's job slot wraps the loop operability rewrote. U5b-1 builds the membership
-substrate the distributed unit's design sketches but does not implement. U5b-2 uses operability's
+**Wave 3 (PR-C).** U5a's job slot wraps the loop operability rewrote. Wave 3's base is `main`
+after PR-B1 for U5a-1 (the `JobSlot`/authorization acceptance items, none of which run a
+multi-rank job) and U7b; U5a-2 (any acceptance item its own re-attack finds does need the
+multi-rank run path) additionally needs PR-B2. U5b-1 builds the membership substrate the
+distributed unit's design sketches but does not implement. U5b-2 uses operability's
 lease-release primitive, which changed shape in wave 1: the per-hold pass now returns a value carrying
 released, not-required, failed and attempted counts rather than a bare count.
 

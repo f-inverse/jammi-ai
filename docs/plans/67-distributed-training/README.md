@@ -98,7 +98,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     `wt-U2a: crates/jammi-python/src/error.rs:54`, raised at `wt-U2a: crates/jammi-python/src/
     job.rs:380-382`) — never `InvalidArgument` — on the job path, even though the same class is
     `InvalidArgument` at the synchronous `Recompute` RPC edge.
-30. **Migrations.** 67 appends exactly three: `model_materialization` (U3, PR-B),
+30. **Migrations.** 67 appends exactly three: `model_materialization` (U3, PR-B2),
     `instances_peer_addr` (U5b-1, PR-C), `compute_cluster_state` (U8b, PR-D — distributor-neutral
     name and columns; `workers.devices` rides in it, since U8b is its first reader). No plan
     reserves a number: each PR takes the next free number at rebase and updates **both pin
@@ -267,27 +267,29 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 
 46. **Order against the sibling work.** PR-C(68) merged as #501 (242 files, both manifests, seven
     crates) before any 67 unit — so PR-A (U1) starts now from `main`; 68's K (PR in CI) and DIST
-    unit 1 precede PR-B; PR-C(67) needs DIST unit 2 and OPS; PR-D needs K. `SIZING.md` carries
-    the edge list. Correction to v3.1 ruling 18: the issue's "jobs table, migrations 029/030"
-    was describing #485/#486's branch, which is now merged; only the "#485 is unrelated" remark
-    in the 2026-09-10 issue comment was wrong.
+    unit 1 precede PR-B1; PR-B2 cuts from PR-B1's merge; PR-C(67) needs DIST unit 2, OPS and
+    PR-B1 (U5a-2 additionally needs PR-B2 only if its own re-attack finds it needs the
+    multi-rank run path); PR-D needs K. `SIZING.md` carries the edge list. Correction to v3.1
+    ruling 18: the issue's "jobs table, migrations 029/030" was describing #485/#486's branch,
+    which is now merged; only the "#485 is unrelated" remark in the 2026-09-10 issue comment was
+    wrong.
 
 ## Units and order
 
 | PR | Commit | Unit | Name | Lane | Depends on |
 |---|---|---|---|---|---|
 | A | 1 | U1 | DataFusion 54 line upgrade (workspace-atomic) | hermetic + cookbook + db-features clippy lane | S3 (main already carries #501) |
-| B | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; allowlist; artifact schema | gate scripts | S4 |
-| B | 2 | U2a | `TrainingSet` producer (`job_attempt: None`; wire mirror; guide block) | hermetic + cookbook | U1 |
-| B | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; refusals | hermetic (+ pod smoke) | S1 |
-| B | 4 | U2b | Streaming loader; partition rule; scaler; whole-set arms | hermetic + cookbook | U2a, U4a |
-| B | 5 | U3 | `FineTune` producer; `model_materialization` migration; cache reuse | hermetic | U2a |
-| B | 6 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U3, U4a, S1 |
-| B | 7 | — | pod-leg artifact | gpu-gang | U4b |
+| B1 | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; allowlist; artifact schema | gate scripts | S4 |
+| B1 | 2 | U2a | `TrainingSet` producer (`job_attempt: None`; wire mirror; guide block) | hermetic + cookbook | U1 |
+| B1 | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; refusals | hermetic (+ pod smoke) | S1 |
+| B2 | 1 | U2b | Streaming loader; partition rule; scaler; whole-set arms | hermetic + cookbook | U2a, U4a (PR-B1) |
+| B2 | 2 | U3 | `FineTune` producer; `model_materialization` migration; cache reuse | hermetic | U2a (PR-B1) |
+| B2 | 3 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U3, U4a (PR-B1), S1 |
+| B2 | 4 | — | pod-leg artifact | gpu-gang | U4b |
 | C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
-| C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
-| C | 3 | U6 | Partition-aware inference operator | hermetic | U2b, U5a |
-| C | 4 | U5b-1 | Coordinator; `Peer` collective; membership substrate (`peer_advertise`, `instances.peer_addr`, `list_gang_members`); determinism; two-worker forward leg | distributed | U4b, U5a, U6, S1 |
+| C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a (PR-B1), 68 DIST unit 1 |
+| C | 3 | U6 | Partition-aware inference operator | hermetic | U2b (PR-B2), U5a |
+| C | 4 | U5b-1 | Coordinator; `Peer` collective; membership substrate (`peer_advertise`, `instances.peer_addr`, `list_gang_members`); determinism; two-worker forward leg | distributed | U4b (PR-B2), U5a, U6, S1 |
 | C | 5 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg | distributed + cluster leg | U5b-1, 68 OPS |
 | C | 6 | — | cluster-leg artifact | gpu-gang | U5b-2 |
 | D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b-1, U6, S6 |
@@ -336,13 +338,16 @@ with the OpenTelemetry family #501 added.
 3. Run S3 on `main` (it carries #501); S1, S4, S5, S6 concurrently.
 4. PR-A (U1) from `main` now; one worktree, one commit. 68's PR-K is in CI and may merge
    before PR-A — rebase, no ordering constraint between them.
-5. PR-B after PR-A merges; no 68 dependency. Commit order as in the table; PR-B edits
-   `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips `SWARM_GATE_TOUCHED`, so PR-B is
-   an admin merge too;
-   U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
-6. PR-C(67) after DIST unit 1 and OPS merge (OPS rewrites the claim loop U5a's `JobSlot`
-   wraps). GRAPH is deferred to #515 and is not a precondition. U7b ∥ U5a; U6; U5b-1; U5b-2;
-   `distributed.yml` dispatched manually, deterministic leg green before merge.
+5. PR-B1 after PR-A and `fix/500-release-claim-spin` merge; no 68 dependency. Commit order as in
+   the table; PR-B1 edits `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips
+   `SWARM_GATE_TOUCHED`, so PR-B1 is an admin merge too; U7a ∥ U2a ∥ U4a; label the PR for the
+   pod leg. PR-B2 is cut from PR-B1's merge: U2b ∥ U3; U4b last (it needs U2b's `PartitionSpec`
+   and a two-GPU pod leg).
+6. PR-C(67) after DIST unit 1, OPS and PR-B1 merge (OPS rewrites the claim loop U5a's `JobSlot`
+   wraps). GRAPH is deferred to #515 and is not a precondition. U7b ∥ U5a-1 start from PR-B1;
+   U5a-2 additionally needs PR-B2, only if its own re-attack finds it needs the multi-rank run
+   path. U6; U5b-1; U5b-2; `distributed.yml` dispatched manually, deterministic leg green before
+   merge.
 7. PR-D after 68 K: U8a, U8b (the completion gate), U9a, U9b. `distributed.yml` dispatched
    manually with the three-process arm green before merge. PR-D edits a swarm domain card, so it
    needs an admin merge (`SWARM_GATE_TOUCHED`).

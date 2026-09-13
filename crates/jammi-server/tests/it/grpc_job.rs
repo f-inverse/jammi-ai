@@ -113,6 +113,9 @@ fn start_request() -> SubmitJobRequest {
         // test runtime.
         config: None,
         idempotency_key: String::new(),
+        // Unset (`0`) rank count: the single-rank job every one of these
+        // fixtures has always submitted.
+        world_size: 0,
     }
 }
 
@@ -506,6 +509,7 @@ fn predictor_start_request() -> SubmitJobRequest {
         base_model: String::new(),
         config: None,
         idempotency_key: String::new(),
+        world_size: 0,
     }
 }
 
@@ -686,6 +690,7 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
         base_model: tiny_bert_model_id(),
         config: None,
         idempotency_key: String::new(),
+        world_size: 0,
     };
 
     let start = client
@@ -722,6 +727,7 @@ async fn start_training_rejects_unspecified_method() {
             base_model: tiny_bert_model_id(),
             config: None,
             idempotency_key: String::new(),
+            world_size: 0,
         })
         .await
         .expect_err("unspecified method must be rejected");
@@ -747,6 +753,7 @@ async fn start_training_rejects_missing_columns() {
             base_model: tiny_bert_model_id(),
             config: None,
             idempotency_key: String::new(),
+            world_size: 0,
         })
         .await
         .expect_err("missing columns must be rejected");

@@ -332,7 +332,7 @@ enum LoaderData {
 /// How a per-epoch training-set stream is bounded: the per-rank batch size
 /// (also the DataFusion execution batch size the scoped read is pinned to,
 /// so a polled `RecordBatch` is at most this many rows — see
-/// [`open_row_range_stream`]) and how many such batches may be resident
+/// `open_row_range_stream`) and how many such batches may be resident
 /// (decoded, reserved, not yet handed to the caller) at once. Together these
 /// are the residency bound acceptance (a) checks: `batch * prefetch` rows.
 #[derive(Debug, Clone, Copy)]
@@ -1058,7 +1058,7 @@ impl TrainingDataLoader {
     /// validation suffix with no I/O.
     ///
     /// `format = TrainingFormat::Classification { .. }` cannot be decoded a
-    /// chunk at a time ([`decode_record_batch`]'s doc: the class index needs
+    /// chunk at a time (`decode_record_batch`'s doc: the class index needs
     /// the WHOLE label column first), so this constructor falls back to an
     /// eager whole-table build for it — `build_classification_loader_eager`
     /// mirrors `worker::build_training_data_loader`'s classification arm
@@ -1099,7 +1099,7 @@ impl TrainingDataLoader {
     ///
     /// The write-side spec construction mirrors
     /// `training_set::materialize_projection`'s exactly (the same
-    /// `source_sql` shape, the same [`InputAnchor::unpinned_at_instant`]
+    /// `source_sql` shape, the same `InputAnchor::unpinned_at_instant`
     /// anchor), calling
     /// [`jammi_db::store::ResultStore::materialize_training_set`] directly
     /// rather than that function — which always eagerly reads the table back
@@ -1192,7 +1192,7 @@ impl TrainingDataLoader {
     /// The `Stream` arm does no I/O at all — it narrows the SAME committed
     /// table's row range by the identical `val_count = round(len *
     /// fraction)` arithmetic the `TextRows` arm uses, and hands each half a
-    /// fresh, idle [`StreamState`] (a split loader has never opened an epoch
+    /// fresh, idle `StreamState` (a split loader has never opened an epoch
     /// stream yet, whatever the parent had done).
     pub fn split(&self, fraction: f64) -> Result<(TrainingDataLoader, TrainingDataLoader)> {
         match &self.data {
@@ -1459,7 +1459,7 @@ impl TrainingDataLoader {
     /// step `step`, over THIS loader's own row count as the train prefix
     /// (DESIGN.md §2, partition rule v1 — [`super::partition::PartitionSpec::
     /// rows_for_step`] computes the slice; this method decodes it through the
-    /// SAME [`Self::rows_to_text_chunk`] converter [`Self::text_chunks`]
+    /// SAME `Self::rows_to_text_chunk` converter [`Self::text_chunks`]
     /// uses). A rank whose slice is empty (a zero-row rank at the trailing
     /// global batch, K2) yields a well-formed [`TextChunk`] with empty inner
     /// vectors, never an out-of-bounds panic — `rows_for_step` never returns

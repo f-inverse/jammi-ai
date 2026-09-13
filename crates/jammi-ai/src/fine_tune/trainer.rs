@@ -497,7 +497,7 @@ impl TrainingLoopBuilder {
 
     /// Set the data-parallel world this run's global-batch step formula
     /// indexes by. Omit it for a single-rank run (defaults to `1`, today's
-    /// only reachable value — see [`TrainingLoop::world_size`]).
+    /// only reachable value — see `TrainingLoop::world_size`).
     pub fn world_size(mut self, world_size: usize) -> Self {
         self.world_size = world_size;
         self

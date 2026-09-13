@@ -22,6 +22,50 @@
 use crate::harness;
 use crate::skip_without_gpu;
 
+/// [`harness::serial_cuda_device`], or a hard failure when `JAMMI_REQUIRE_CUDA`
+/// is set and no usable CUDA device opens. Same require-gate idiom as
+/// `crates/jammi-ai/src/fine_tune/optimizer.rs::cuda_device` and
+/// `crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs::
+/// device_memory_used_bytes_or_require`: on a pod leg this test is meant to
+/// run on, a missing device is a hard failure, never a silent skip.
+#[cfg(feature = "cuda")]
+fn serial_cuda_device_or_require(test: &str) -> Option<harness::SerialGpu> {
+    match harness::serial_cuda_device() {
+        Some(slot) => Some(slot),
+        None => {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                panic!(
+                    "{test}: JAMMI_REQUIRE_CUDA is set but no usable CUDA device could be \
+                     acquired — a silent skip is not acceptable here"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// A second CUDA device (`candle_core::Device::new_cuda(1)`), or a hard
+/// failure when `JAMMI_REQUIRE_CUDA_GANG` is set and only one CUDA device is
+/// visible. A two-rank NCCL gang needs two devices to answer anything: the
+/// gang pod leg (U4b's `gpu-gang.yml`) exports this variable, while the
+/// single-GPU prove lane does not, so a one-device host on that lane still
+/// skips with the reason rather than failing.
+#[cfg(feature = "cuda")]
+fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
+    match candle_core::Device::new_cuda(1) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA_GANG").is_some() {
+                panic!(
+                    "{test}: JAMMI_REQUIRE_CUDA_GANG is set but a second CUDA device could not \
+                     be acquired — a two-rank NCCL gang needs two visible devices: {e}"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Two ranks on two devices: the rank-ordered sum of a known vector, an
 /// unequal-count gather (including the zero-row rank a remainder batch
 /// produces), and the lockstep control word — each compared to the value the
@@ -35,19 +79,23 @@ fn gang_nccl_reduces_a_known_vector_over_two_devices() {
 
     #[cfg(feature = "cuda")]
     {
-        use candle_core::{Device, Tensor};
+        use candle_core::Tensor;
         use jammi_ai::fine_tune::collective::nccl::Nccl;
         use jammi_ai::fine_tune::collective::Collective;
 
         // The binary's one-at-a-time device slot, held for the whole gang:
         // this test allocates on every visible device, so a sibling leg
         // measuring device memory must not run beside it.
-        let Some(slot) = harness::serial_cuda_device() else {
+        let Some(slot) =
+            serial_cuda_device_or_require("gang_nccl_reduces_a_known_vector_over_two_devices")
+        else {
             tracing::warn!("SKIP: no usable CUDA device");
             return;
         };
         let first = slot.device().clone();
-        let Ok(second) = Device::new_cuda(1) else {
+        let Some(second) =
+            second_cuda_device_or_require("gang_nccl_reduces_a_known_vector_over_two_devices")
+        else {
             tracing::warn!("SKIP: a two-rank NCCL gang needs two CUDA devices; this host has one");
             return;
         };

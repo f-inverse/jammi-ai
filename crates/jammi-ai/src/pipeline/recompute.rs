@@ -43,6 +43,15 @@
 //! every target's context over the source's *current* rows under the recorded
 //! recipe, then routes the pooled rows back through `materialize_context` (see
 //! `recompute_context_set`).
+//!
+//! Two producers carry no `CachePolicy` dial at all — `asof_join` and
+//! [`ProducingDescriptor::TrainingSet`]'s
+//! [`materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set),
+//! which owns its own reuse probe. Their replays still always recompute, and for
+//! a stated reason rather than by assumption: `asof_join` never reuses, and the
+//! training-set probe matches on the `(definition, input anchors)` pair, which an
+//! unpinned source anchor — the only anchor a replay of a projected source
+//! relation can honestly supply — never satisfies. See `recompute_training_set`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,8 +60,8 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator, ContextCandidateSource,
-    ContextEdgeGather, ProducingDescriptor, PropagationDirection, PropagationOutput,
-    PropagationWeighting,
+    ContextEdgeGather, InputAnchor, ProducingDescriptor, PropagationDirection, PropagationOutput,
+    PropagationWeighting, TRAINING_SET_ORDER_RULE_V1,
 };
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
@@ -387,6 +396,16 @@ impl InferenceSession {
                 // replay is unconditionally a fresh `Computed`.
                 Ok((record.table_name, CacheOutcome::Computed))
             }
+            ProducingDescriptor::TrainingSet {
+                source,
+                columns,
+                task,
+                format,
+                order_rule,
+            } => {
+                self.recompute_training_set(table, source, columns, task, format, order_rule)
+                    .await
+            }
             // An external producer is a verb the engine does not own, so there is
             // no faithful call to reconstruct — a loud refusal, never a guessed
             // re-run. Recomputing an external table is the producing consumer's
@@ -395,6 +414,81 @@ impl InferenceSession {
                 table: table.table_name.clone(),
             }),
         }
+    }
+
+    /// Re-invoke the training-set producer
+    /// ([`jammi_db::store::ResultStore::materialize_training_set`]) over the
+    /// recorded projection — the [`ProducingDescriptor::TrainingSet`] replay.
+    ///
+    /// Every determinant is taken from the descriptor (the source query, the
+    /// projected columns, the task, the format tag) except the `source_id`
+    /// lineage column, which is the recomputed table's own catalog row — the
+    /// same shape the `NeighborGraph` arm uses.
+    ///
+    /// # Why this always recomputes
+    ///
+    /// The verb carries no cache dial: it owns its own reuse probe, which
+    /// matches on the `(definition, input anchors)` pair. The anchors a replay
+    /// can honestly supply for a projected source relation are
+    /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
+    /// — a registered source exposes no version surface to pin — and an
+    /// unpinned anchor never matches that probe, so the replay writes a fresh
+    /// table and reports [`CacheOutcome::Computed`]. The outcome is returned as
+    /// the verb reports it rather than asserted here: reuse is reported, never
+    /// inferred, and a future pinned source would legitimately make the replay a
+    /// hit.
+    ///
+    /// # The two refusals
+    ///
+    /// - An `order_rule` this build does not commit is
+    ///   [`JammiError::NotRecomputable`]. The producer commits exactly
+    ///   [`TRAINING_SET_ORDER_RULE_V1`](jammi_db::store::manifest::TRAINING_SET_ORDER_RULE_V1);
+    ///   replaying a table committed under some other rule would write rows in
+    ///   an order the recorded descriptor does not claim, which is a fabricated
+    ///   re-run, not a recompute.
+    /// - A recorded `source` query that no longer resolves in this session
+    ///   (its relation was deregistered, or it never was a durable relation)
+    ///   fails at the planner inside the verb, naming the missing relation.
+    ///   That is the failure mode of a training set whose rows were projected
+    ///   from a session-scoped relation — a graph fine-tune's sampled pairs are
+    ///   registered for the length of the materialization and dropped after it,
+    ///   so their table is not replayable in a later session.
+    async fn recompute_training_set(
+        self: &Arc<Self>,
+        table: &ResultTableRecord,
+        source: String,
+        columns: Vec<String>,
+        task: crate::model::ModelTask,
+        format: String,
+        order_rule: String,
+    ) -> Result<(String, CacheOutcome)> {
+        if order_rule != TRAINING_SET_ORDER_RULE_V1 {
+            return Err(JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            });
+        }
+        let materialized = self
+            .result_store()
+            .materialize_training_set(
+                self.context(),
+                jammi_db::store::TrainingSetSpec {
+                    source_id: &table.source_id,
+                    source_sql: &source,
+                    columns: &columns,
+                    task,
+                    format: &format,
+                    inputs: vec![InputAnchor::unpinned_at_instant(
+                        &table.source_id,
+                        chrono::Utc::now().to_rfc3339(),
+                    )],
+                    device: self.compute_device(),
+                },
+            )
+            .await?;
+        Ok((
+            materialized.record.table_name.clone(),
+            materialized.outcome.clone(),
+        ))
     }
 
     /// Re-invoke the `assemble_context`→`materialize_context` **pair** — the real

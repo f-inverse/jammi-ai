@@ -401,6 +401,19 @@ impl WorkerShared {
         *self.stop.borrow()
     }
 
+    /// Whether the loop may initiate a new `claim_next`: no stop has been
+    /// requested AND the phase is still `Running`. `EmbeddedWorker::run_until`
+    /// reads this ONE predicate at two sites — the loop's top-of-iteration
+    /// gate and again, with no `.await` between that second read and the
+    /// `claim_next` call itself, immediately after `reclaim_expired_jobs`
+    /// returns — so the two reads can never drift apart (P1',
+    /// `CONTRACT-RELEASE-SPIN.md`): a RELEASE landing anywhere in the
+    /// reclaim round trip is caught by the second read even when the first,
+    /// now-stale read had already admitted the iteration.
+    fn admits_claim(&self) -> bool {
+        !self.stop_requested() && self.phase() == WorkerPhase::Running
+    }
+
     fn request_stop(&self) {
         self.stop.send_replace(true);
     }
@@ -766,16 +779,23 @@ impl JobWorker {
     /// selected against the stop, flips the row to `claiming` when the gate
     /// opens, and only then claims — one sequential chain, so `claiming` can
     /// never precede `warming` and a stop during the wait returns without a
-    /// claim. Each tick's top-of-iteration gate refuses a new claim on EITHER
-    /// of two independent signals — `stop_requested()` (the wakeup: it also
-    /// interrupts an idle sleep) or `phase() != Running` (admits `Running`
-    /// only; a `Draining` or `Releasing` phase refuses even in the window
-    /// before the stop watch is next polled) — so a `Releasing` loop already
-    /// at its top never starts another `claim_next` regardless of which of
-    /// the two signals it observes first. On a claim it runs the job to a
-    /// terminal state inline (the next claim waits for it), on no claim it
-    /// sleeps the configured idle poll `select!`ed against the stop watch
-    /// (level-triggered: no lost wakeup, no waiting out the poll). The
+    /// claim. `WorkerShared::admits_claim` (one private predicate, two
+    /// independent signals — `stop_requested()`, the wakeup that also
+    /// interrupts an idle sleep, and `phase() == Running`) is read at TWO
+    /// sites before any `claim_next`: the top of the iteration, and again,
+    /// with no `.await` between that second read and `claim_next` itself,
+    /// immediately after `reclaim_expired_jobs` returns — so a `Releasing`
+    /// (or `Draining`) phase that lands during the reclaim round trip is
+    /// caught by the second read even though the first, now-stale read had
+    /// already admitted the iteration (P1', `CONTRACT-RELEASE-SPIN.md`); a
+    /// loop already at either read point never starts a `claim_next`
+    /// regardless of which of the two signals it observes first. The one
+    /// residual — a claim whose own catalog round trip is already in flight
+    /// when the phase flips — runs into `register_job_hold_or_release`,
+    /// which self-releases it instead of dispatching. On a claim it runs the
+    /// job to a terminal state inline (the next claim waits for it), on no
+    /// claim it sleeps the configured idle poll `select!`ed against the stop
+    /// watch (level-triggered: no lost wakeup, no waiting out the poll). The
     /// catalog used for reclaim/claim is unscoped — a worker serves every
     /// tenant's queue. The terminal [`LoopState`] is written on every exit
     /// path by an in-task guard.
@@ -823,13 +843,16 @@ impl JobWorker {
         loop {
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::maybe_panic(&self.worker_id);
-            // ONE predicate, two independent signals: `stop_requested()` is
-            // the wakeup (it also interrupts an idle sleep, see the `None`
-            // arm's `select!` below); `phase() != Running` refuses a new
-            // claim the instant RELEASE (or DRAIN) flips the phase, even in
-            // the window before the stop watch is next polled — see
-            // `EmbeddedWorker::release_and_stop`'s 2a.
-            if shared.stop_requested() || shared.phase() != WorkerPhase::Running {
+            // `admits_claim()` bundles two independent signals:
+            // `stop_requested()` is the wakeup (it also interrupts an idle
+            // sleep, see the `None` arm's `select!` below); `phase() !=
+            // Running` refuses a new claim the instant RELEASE (or DRAIN)
+            // flips the phase, even in the window before the stop watch is
+            // next polled — see `EmbeddedWorker::release_and_stop`'s 2a. Read
+            // again below, after `reclaim_expired_jobs`, so a RELEASE landing
+            // during that round trip cannot ride this now-stale read into a
+            // claim (P1', `CONTRACT-RELEASE-SPIN.md`).
+            if !shared.admits_claim() {
                 break;
             }
             let session = match self.session.upgrade() {
@@ -846,6 +869,17 @@ impl JobWorker {
                 tracing::error!(worker = %self.worker_id, error = %e, "reclaim_expired_jobs failed");
             }
 
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::maybe_park_after_reclaim(&self.worker_id).await;
+
+            // The second read: no `.await` between this and `claim_next`
+            // itself (`record_claim_next` is sync). A claim whose own
+            // catalog round trip is already in flight when 2a runs is the
+            // one residual neither read catches — `register_job_hold_or_release`'s
+            // self-release arm exists for exactly that case.
+            if !shared.admits_claim() {
+                break;
+            }
             let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::record_claim_next(&self.worker_id);
@@ -2470,13 +2504,17 @@ impl EmbeddedWorker {
     /// In order:
     ///
     /// * **2a** phase `Releasing` AND stop requested, together, as
-    ///   `begin_drain` does for its own phase — from this instant the loop's
-    ///   top-of-iteration gate refuses to enter a new `claim_next` (it breaks
-    ///   on `phase() != Running`, not merely on `stop_requested()`, so an
-    ///   idle-sleeping loop is woken by the stop and a loop already at its
-    ///   top never starts another claim even in the window before the stop
-    ///   watch is polled) and a claim that nonetheless lands (it began before
-    ///   this instant) runs into `register_job_hold_or_release`, which
+    ///   `begin_drain` does for its own phase — from this instant `claim_next`
+    ///   is initiated only after a read of `WorkerShared::admits_claim` that
+    ///   returned `true` with no `.await` between that read and the call
+    ///   (P1', `CONTRACT-RELEASE-SPIN.md`): the loop reads it at the top of
+    ///   the iteration AND again, immediately after `reclaim_expired_jobs`
+    ///   returns, so a phase/stop flip that lands during that reclaim round
+    ///   trip is still caught by the second read even though the first,
+    ///   now-stale read had already admitted the iteration. The one
+    ///   residual — a claim whose own catalog round trip is already in
+    ///   flight when 2a runs, so no later read of this loop's own state can
+    ///   observe it — runs into `register_job_hold_or_release`, which
     ///   self-releases instead of dispatching. Folds what was once a separate
     ///   later `stop` step: deferring it past 2b/2c left a window in which
     ///   the loop could reclaim and re-claim the same row under `Releasing`
@@ -2799,6 +2837,67 @@ pub mod loop_test_hooks {
             let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
             list.iter()
                 .position(|a| a.job_id == job_id && a.point == point)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
+    }
+
+    struct ArmedInstance {
+        instance_id: String,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn instance_armed() -> &'static Mutex<Vec<ArmedInstance>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedInstance>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Arm a one-shot park for the next time the loop of `instance_id`
+    /// reaches the post-reclaim, pre-claim gate re-read — immediately after
+    /// `reclaim_expired_jobs` returns and before `WorkerShared::admits_claim`'s
+    /// second read, the reclaim-window instant the audit's falsification
+    /// names (`CONTRACT-RELEASE-SPIN.md`'s P1'). Keyed by `instance_id`
+    /// (unlike [`arm`], there is no claimed job yet at this point).
+    pub fn arm_after_reclaim(instance_id: &str) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        instance_armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedInstance {
+                instance_id: instance_id.to_string(),
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park_after_reclaim(instance_id: &str) {
+        let taken = {
+            let mut list = instance_armed()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.instance_id == instance_id)
                 .map(|i| list.remove(i))
         };
         let Some(armed) = taken else {

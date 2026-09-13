@@ -2924,6 +2924,47 @@ fn load_refuses_repeated_and_out_of_domain_device_ordinals() {
 }
 
 #[test]
+fn the_two_arities_get_the_same_verdict_on_the_same_deployment() {
+    // A rule that bites on the plural and not on the singular would make the
+    // verdict depend on how the same one-device deployment was spelled. Both
+    // spellings resolve to the same list, so both are refused — and both
+    // accepted at the boundary value.
+    for src in [
+        "[gpu]\ndevice = -5\n",
+        "[gpu]\ndevice = -5\ndevices = [-5]\n",
+    ] {
+        let err = load_src(src).unwrap_err();
+        assert!(
+            matches!(&err, JammiError::Config(m) if m.contains("not a device ordinal")),
+            "{src:?} must be refused, got {err:?}"
+        );
+    }
+    for src in [
+        "[gpu]\ndevice = -1\n",
+        "[gpu]\ndevice = -1\ndevices = [-1]\n",
+    ] {
+        let cfg = load_src(src).unwrap();
+        assert_eq!(cfg.gpu.device_list(), vec![-1], "{src:?}");
+    }
+    // The message names the key the value was written under, either way.
+    let JammiError::Config(singular) = load_src("[gpu]\ndevice = -5\n").unwrap_err() else {
+        panic!("expected a Config error");
+    };
+    assert!(
+        singular.contains("[gpu] device = -5"),
+        "the singular refusal must name `device`: {singular}"
+    );
+    let JammiError::Config(plural) = load_src("[gpu]\ndevice = -5\ndevices = [-5]\n").unwrap_err()
+    else {
+        panic!("expected a Config error");
+    };
+    assert!(
+        plural.contains("[gpu] devices[0] = -5"),
+        "the plural refusal must name the entry: {plural}"
+    );
+}
+
+#[test]
 fn worker_rank_knobs_default_to_the_single_rank_deployment() {
     let w = WorkerConfig::default();
     assert_eq!(w.world_size, 1);

@@ -795,42 +795,53 @@ impl GpuConfig {
     /// names something no rank can be placed on. Returns a typed
     /// [`JammiError::Config`] naming the offending key (R7).
     ///
-    /// The refusals, each a boundary the resolved list must clear:
+    /// Two rules are about the plural itself:
     ///
-    /// - an explicit `devices = []` — a deployment with nowhere to run;
+    /// - an explicit `devices = []` — a deployment with nowhere to run, and
+    ///   a different statement from omitting the key;
     /// - a first entry that is not `device` — the plural and the primary
     ///   disagree about which device is rank 0's, and guessing one of them is
-    ///   how a "CPU-pinned" session ends up on a GPU;
+    ///   how a "CPU-pinned" session ends up on a GPU.
+    ///
+    /// The rest are about the RESOLVED list ([`Self::device_list`]), so the
+    /// same configuration gets the same verdict at either arity — `device =
+    /// -5` and `devices = [-5]` describe one deployment and are refused
+    /// alike:
+    ///
+    /// - an ordinal below [`Self::CPU_DEVICE`] — not a device;
     /// - a repeated ordinal — two ranks on one device is a placement mistake,
     ///   and it makes the `world_size <= devices` bound meaningless;
-    /// - an ordinal below [`Self::CPU_DEVICE`] — not a device;
     /// - the CPU (`-1`) listed alongside real ordinals — one gang runs on one
     ///   kind of device, and a mixed list has no collective that spans it.
     pub fn validate(&self) -> Result<()> {
-        let Some(devices) = &self.devices else {
-            // No plural configured: the resolved list is `[device]`, a
-            // single entry that satisfies every rule below by construction.
-            return Ok(());
+        if let Some(devices) = &self.devices {
+            if devices.is_empty() {
+                return Err(JammiError::Config(
+                    "[gpu] devices must not be empty (omit the key for the single-device default)"
+                        .into(),
+                ));
+            }
+            if devices[0] != self.device {
+                return Err(JammiError::Config(format!(
+                    "[gpu] devices = {:?} disagrees with device = {}: the first entry is rank \
+                     0's device and must equal `device` (set `device = {}` or list it first)",
+                    devices, self.device, devices[0]
+                )));
+            }
+        }
+        let devices = self.device_list();
+        // Name the key the value was actually written under, so the message
+        // points at the line the operator has to edit.
+        let key = |i: usize| match self.devices {
+            Some(_) => format!("devices[{i}]"),
+            None => "device".to_string(),
         };
-        if devices.is_empty() {
-            return Err(JammiError::Config(
-                "[gpu] devices must not be empty (omit the key for the single-device default)"
-                    .into(),
-            ));
-        }
-        if devices[0] != self.device {
-            return Err(JammiError::Config(format!(
-                "[gpu] devices = {:?} disagrees with device = {}: the first entry is rank 0's \
-                 device and must equal `device` (set `device = {}` or list it first)",
-                devices, self.device, devices[0]
-            )));
-        }
         for (i, ordinal) in devices.iter().enumerate() {
             if *ordinal < Self::CPU_DEVICE {
                 return Err(JammiError::Config(format!(
-                    "[gpu] devices[{i}] = {ordinal} is not a device ordinal (>= {} required, \
-                     {} is the CPU)",
-                    Self::CPU_DEVICE,
+                    "[gpu] {} = {ordinal} is not a device ordinal ({} is the CPU and the \
+                     smallest accepted value)",
+                    key(i),
                     Self::CPU_DEVICE
                 )));
             }

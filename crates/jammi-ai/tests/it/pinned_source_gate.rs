@@ -1168,6 +1168,41 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str, usize)] = &[
            // DELTA round-4 contract (M2's `graph_propagation.rs:816` carve-out) —
            // carried forward here rather than re-litigated.
     ),
+    (
+        "crates/jammi-ai/src/pipeline/recompute.rs",
+        "reresolve_recorded_anchor",
+        1, // ordinal 1 -- the only `reresolve_recorded_anchor` in this file; line 567 today
+           // `InferenceSession::reresolve_recorded_anchor` -- never mints a NEW
+           // pinned anchor from arbitrary live state: it dispatches on the KIND
+           // already recorded in the table's OWN `.materialization.json`
+           // sidecar (read by its caller, `recompute_training_set`, into
+           // `recorded_anchors`) and only re-resolves that SAME recorded
+           // relation name (`anchor.source`). The `UnpinnedAtInstant` arm
+           // re-stamps the read instant but stays unpinned -- the same weak
+           // guarantee the original recording made, never upgraded. The
+           // `MutableVersion`/`ResultDigest` arm fetches the named relation and
+           // routes it through `pin_current_version(current).await?
+           // .input_anchor()` -- the same sanctioned pattern
+           // `edge_source_anchor`'s entry above uses, not an independent
+           // anchor-only resolve -- and REFUSES (`JammiError::NotRecomputable`,
+           // naming the anchor's own source) when the relation no longer
+           // resolves, rather than silently downgrading to unpinned. Both
+           // determinants are standing tests, not merely reviewed once:
+           // `recompute_training_set_re_resolves_a_pinned_result_digest_anchor_pinned`
+           // (a recorded `ResultDigest` anchor replays PINNED, at the source's
+           // CURRENT digest, never the stale recorded one) and
+           // `recompute_training_set_refuses_a_pinned_anchor_whose_target_is_gone`
+           // (a recorded anchor whose target no longer resolves is
+           // `NotRecomputable`, never silently treated as unpinned). No
+           // in-tree producer writes a `MutableVersion`/`ResultDigest` anchor
+           // onto a `TrainingSet`-kind table today (`training_set.rs`'s own
+           // "Anchors" doc: both `materialize_projection` and
+           // `materialize_sampled_pairs` record `UnpinnedAtInstant` only) --
+           // this arm is exercised by the two tests above via a forged
+           // manifest, future-proofing the exhaustive `AnchorKind` match (K7)
+           // for a producer that does, the same disclosed-but-unreached shape
+           // `recompute_fine_tune`'s own doc names for its arm.
+    ),
 ];
 
 /// Pattern 2 — `(file, function name, ordinal)`.

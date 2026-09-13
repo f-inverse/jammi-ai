@@ -843,7 +843,9 @@ impl ModelCache {
             }
             let evicted = {
                 let mut cache = self.inner.write().await;
-                cache.evict_one()
+                // The budget this loop is waiting on is `id.device`'s, so
+                // only a copy resident on `id.device` can release it.
+                cache.evict_one(id.device)
             };
             if evicted {
                 continue;
@@ -929,9 +931,23 @@ impl CacheInner {
         self.lru_order.push_back(id.clone());
     }
 
-    /// Evict the oldest idle entry and report whether real progress was
-    /// made (i.e. a `GpuPermit` reservation was actually released).
+    /// Evict the oldest idle entry RESIDENT ON `device` and report whether
+    /// real progress was made (i.e. a `GpuPermit` reservation on that
+    /// device was actually released).
     ///
+    /// The device is a parameter and not a convenience: admission is per
+    /// device (`DeviceSchedulers` holds one `GpuScheduler` per card, and a
+    /// reservation on one is invisible to the other), so the only eviction
+    /// that can answer a shortage on `device` is an eviction FROM `device`.
+    /// A device-blind scan would hand `do_load`'s admission loop a `true`
+    /// for a copy removed from some other card — real progress against a
+    /// budget nobody was waiting on — and the loop, still unable to
+    /// `try_acquire`, would come round and do it again until the other
+    /// card's cache was empty. `false` here means "nothing resident on
+    /// `device` can be released", which is the answer that makes the
+    /// admission loop wait rather than spin.
+    ///
+
     /// Audit round 62, F-A: `ref_count == 0` alone is NOT sufficient to
     /// promise a caller (`do_load`'s admission loop) that removing this
     /// entry frees GPU budget. A `ModelGuard`'s `Drop` releases its permit
@@ -951,15 +967,16 @@ impl CacheInner {
     /// not idle in the accounting sense: we skip it (leave it in the cache)
     /// and keep scanning for another candidate, rather than removing it and
     /// lying about progress.
-    fn evict_one(&mut self) -> bool {
+    fn evict_one(&mut self, device: i32) -> bool {
         let evict_id = self
             .lru_order
             .iter()
             .find(|id| {
-                self.entries.get(*id).is_some_and(|e| {
-                    e.ref_count.load(Ordering::Relaxed) == 0
-                        && Arc::strong_count(&e.gpu_permit) == 1
-                })
+                id.device == device
+                    && self.entries.get(*id).is_some_and(|e| {
+                        e.ref_count.load(Ordering::Relaxed) == 0
+                            && Arc::strong_count(&e.gpu_permit) == 1
+                    })
             })
             .cloned();
 
@@ -1444,7 +1461,7 @@ mod f3_prime_tests {
         );
 
         assert!(
-            inner.evict_one(),
+            inner.evict_one(-1),
             "Y is genuinely idle (no outstanding permit clone) — evict_one \
              must find and remove it, skipping past the misleading X"
         );
@@ -1469,7 +1486,7 @@ mod f3_prime_tests {
         // Now only the misleading X remains. evict_one must report NO
         // progress rather than removing X and lying about it.
         assert!(
-            !inner.evict_one(),
+            !inner.evict_one(-1),
             "evict_one claimed progress for the sole remaining entry even \
              though its permit clone is still outstanding — this is the F-A \
              bug: removing X here would not decrement \
@@ -1494,7 +1511,7 @@ mod f3_prime_tests {
              has one live clone (the entry's own)"
         );
         assert!(
-            inner.evict_one(),
+            inner.evict_one(-1),
             "once the outstanding clone is gone, X is genuinely idle and \
              evict_one must now claim (and deliver) real progress"
         );
@@ -1505,6 +1522,130 @@ mod f3_prime_tests {
             "the final evict_one — now genuinely idle — must ACTUALLY \
              release X's reserved byte too, matching its claimed progress"
         );
+    }
+
+    /// Eviction is scoped to the device whose admission is under pressure.
+    ///
+    /// Admission is per device — `DeviceSchedulers` holds one budget per
+    /// card and a reservation on one is invisible to the other — so removing
+    /// a resident copy from device 1 releases device 1's budget and not one
+    /// byte of device 0's. A device-blind LRU scan answers device 0's
+    /// pressure with device 1's oldest idle entry, reports `true`, sends
+    /// `do_load`'s admission loop round again against an unchanged budget,
+    /// and repeats: device 1's cache is emptied and device 0 is exactly
+    /// where it started.
+    ///
+    /// The LRU deliberately leads with device 1's entries, so a scan that
+    /// merely happened to reach device 0's first would not pass.
+    #[tokio::test]
+    async fn evict_one_frees_the_admitting_device_and_never_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
+        let (source, _weights_len) = tiny_bert_source(tmp.path(), "model_a");
+
+        // A real `Arc<LoadedModel>`, used only as a valid handle for the
+        // hand-built entries below; the cache it comes from is unbudgeted
+        // and plays no part in the accounting under test.
+        let loader = ModelCache::new(
+            resolver,
+            device_config(),
+            Arc::new(GpuScheduler::new_unlimited()),
+        );
+        let guard = loader
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap();
+        let model = Arc::clone(&guard.model);
+        drop(guard);
+
+        // One budget per device, each with exactly one byte of slack beyond
+        // what its resident copies hold.
+        let budget_0 = Arc::new(GpuScheduler::new(1, 0.0));
+        let budget_1 = Arc::new(GpuScheduler::new(2, 0.0));
+
+        let on_device_0 = CacheKey::for_test("model_a", 0);
+        let older_on_device_1 = CacheKey::for_test("model_b", 1);
+        let newer_on_device_1 = CacheKey::for_test("model_c", 1);
+
+        let mut inner = CacheInner {
+            entries: HashMap::new(),
+            lru_order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        };
+        for (id, scheduler) in [
+            (&older_on_device_1, &budget_1),
+            (&newer_on_device_1, &budget_1),
+            (&on_device_0, &budget_0),
+        ] {
+            inner.entries.insert(
+                id.clone(),
+                CacheEntry {
+                    model: Arc::clone(&model),
+                    ref_count: Arc::new(AtomicUsize::new(0)),
+                    memory_bytes: 1,
+                    _residency: ModelResidency::Gpu,
+                    gpu_permit: Arc::new(scheduler.try_acquire(1).unwrap()),
+                },
+            );
+            // Device 1's two copies are the OLDEST entries in the LRU.
+            inner.lru_order.push_back(id.clone());
+        }
+        assert_eq!(budget_0.available(), 0, "sanity: device 0 is full");
+        assert_eq!(budget_1.available(), 0, "sanity: device 1 is full");
+
+        // Device 0 is the one under pressure.
+        assert!(
+            inner.evict_one(0),
+            "device 0 holds an idle entry, so there is real progress to make"
+        );
+        assert!(
+            !inner.entries.contains_key(&on_device_0),
+            "the entry evicted for device 0's pressure must be device 0's own"
+        );
+        assert!(
+            inner.entries.contains_key(&older_on_device_1)
+                && inner.entries.contains_key(&newer_on_device_1),
+            "device 1's resident copies are not device 0's to spend"
+        );
+        assert_eq!(
+            budget_0.available(),
+            1,
+            "the eviction must release the budget of the device that was short of it"
+        );
+        assert_eq!(
+            budget_1.available(),
+            0,
+            "device 1's budget must be exactly where it started"
+        );
+
+        // Device 0 now has nothing idle. The honest answer is "no progress"
+        // — NOT device 1's oldest entry, which would free nothing for
+        // device 0 while emptying another card's cache.
+        assert!(
+            !inner.evict_one(0),
+            "nothing device 0 holds can be evicted, and nothing another device holds would help"
+        );
+        assert_eq!(inner.entries.len(), 2, "device 1's entries are untouched");
+        assert!(
+            inner.lru_order.iter().all(|id| id.device == 1),
+            "the LRU still tracks exactly device 1's two copies"
+        );
+
+        // Device 1's own pressure evicts device 1's oldest, and only it.
+        assert!(inner.evict_one(1));
+        assert!(
+            !inner.entries.contains_key(&older_on_device_1)
+                && inner.entries.contains_key(&newer_on_device_1),
+            "within a device the scan is still oldest-first"
+        );
+        assert_eq!(budget_1.available(), 1);
     }
 }
 

@@ -272,6 +272,34 @@ a `--ref` with such an image is an error — the request cannot be honoured, and
 pod that quietly ignored it would be exactly the failure `--ref` exists to
 remove. Every other bootstrap failure stays fatal and takes the pod with it.
 
+## NCCL is part of the CUDA link set
+
+`jammi-ai`'s `cuda` feature includes `candle-core/nccl`, and cudarc's build
+script emits `cargo:rustc-link-lib=dylib=nccl` for it. Two consequences follow,
+and they land on different machines.
+
+**At build time**, every host that compiles anything with `--features cuda`
+needs `nccl.h` and the `libnccl.so` development symlink on disk — a pod, a
+laptop with a local toolkit, and CI alike. The CUDA toolkit package does not
+carry NCCL; the CUDA CI image installs it separately
+(`.docker/ci-cuda.Dockerfile`), and `ci.yml`'s `flash-attn-compile` job asserts
+it before its first clippy step, so a run on an image without the package reds
+on a one-line preflight instead of on a `cannot find -lnccl` deep in a link.
+
+**At run time**, the binary carries `DT_NEEDED libnccl.so.2` whether or not a
+job ever forms a communicator — the loader resolves it before `main`. Each
+CUDA-shipping artifact answers for that soname its own way:
+
+| artifact | how `libnccl.so.2` gets there |
+| --- | --- |
+| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by `ci/scripts/bundle_cuda_libs.sh`, which derives the set from the binary's own `DT_NEEDED` closure and then re-checks it against `ldd` |
+| `jammi-server-cu12` wheel | the `nvidia-nccl-cu12` dependency; the console script puts `nvidia/nccl/lib/` on `LD_LIBRARY_PATH`, and `verify_link_set.py` fails the build if a needed library is unclassified |
+| `jammi-ai-server` CUDA image | the `nvidia/cuda` runtime base already ships it |
+
+The host NVIDIA driver's own libraries (`libcuda.so.1`, `libnvidia-*`) are the
+opposite case: never bundled anywhere, because they must match the driver the
+GPU is running.
+
 ## Long-running work
 
 ```bash

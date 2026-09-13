@@ -722,9 +722,12 @@ rescue, when the artifact carries one that is an ancestor of `HEAD` (a measured
 tip whose landing commit rewrote it). A `merged_as` stamped beside a `git_sha`
 that is still in this history changes nothing: it names a later commit, and
 ordering against it would admit an epsilon registered in the measured commit
-itself. The registration commit must be an ancestor of `HEAD` and a **strict**
-ancestor of that anchor; an artifact with neither anchor in this history fails,
-naming both. What that
+itself. When `merged_as` IS the anchor, epsilon is ordered against that
+**landing** commit, never against the (now-unreachable) commit where the
+measurement itself ran — the measured tip's own commit has no content left in
+this history to order anything against. The registration commit must be an
+ancestor of `HEAD` and a **strict** ancestor of that anchor; an artifact with
+neither anchor in this history fails, naming both. What that
 asks of whoever runs the leg: commit epsilon on its own, **before** the commit
 you measure with, on the same branch. Landing that branch by a merge commit —
 this repository's own merge style — keeps epsilon a strict ancestor afterwards.

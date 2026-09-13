@@ -1177,8 +1177,12 @@ def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str 
         squash, or a pre-merge rebase) has a `git_sha` that is an ancestor
         of nothing; `merged_as` is then the only commit whose content is in
         this history, so it is the only anchor an ordering claim can mean.
-        On this repo's corpus that is not a corner case: of the 111
-        cuda-run artifacts carrying a `git_sha`, 7 need this arm.
+        Concretely: ε is here ordered against the LANDING commit
+        (`merged_as`), never against the (now-unreachable) commit where the
+        measurement itself ran — that commit has no content in this
+        history for anything to be ordered against. On this repo's corpus
+        that is not a corner case: of the 111 cuda-run artifacts carrying a
+        `git_sha`, 7 need this arm.
       * else neither: a hard FAIL naming both, never a silent skip. The
         previous revision of this rule guarded BOTH of its ε arms behind
         `_is_ancestor(git_sha, HEAD)`, so exactly the artifacts that need
@@ -1385,9 +1389,24 @@ def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
         and all(_is_real_number(v) for v in deltas)
         and isinstance(epsilon, dict)
         and _is_real_number(epsilon.get("value"))
+        # Deliberately redundant with `_gang_check_epsilon`'s own `value > 0`
+        # guard (that validator runs unconditionally, above, in the
+        # GANG_FIELD_REGISTRY loop): this cross-field block runs regardless
+        # of whether that validator already appended a failure, so without
+        # this guard a malformed epsilon (0, negative, or non-numeric) would
+        # ALSO produce a nonsensical "worst step exceeds epsilon.value"
+        # finding piled on top of the primary `gang.epsilon.value must be...`
+        # one. Pinned here, not dropped: the two checks read the same field
+        # for two different questions (is epsilon well-formed vs. does the
+        # measured delta respect it) and this block must not run its own
+        # comparison against a value the other validator already rejected.
         and epsilon["value"] > 0
     ):
         worst = max(abs(v) for v in deltas)
+        # Strict `>`, deliberately: `worst == epsilon.value` is INSIDE the
+        # tolerance (inclusive), never a boundary failure — ε is "within",
+        # not "strictly less than". A fixture at exactly that boundary stays
+        # green (see the self-test's own boundary case).
         if worst > epsilon["value"]:
             failures.append(
                 f"`{GANG_BLOCK_KEY}.per_step_loss_delta`'s worst step ({worst}) exceeds "
@@ -3053,6 +3072,15 @@ def self_test() -> int:
         bad = gang_baseline()
         bad["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
         expect_hit(bad, "x.json", "exceeds", "rule (k): a delta outside the pre-registered ε")
+
+        # The boundary: `worst == epsilon.value` exactly. ε is an INCLUSIVE
+        # tolerance (a run measured AT its pre-registered ceiling is not a
+        # violation of it), so this must stay green -- the strict `>` in
+        # `check_gang_artifact`'s cross-field block is deliberate, not an
+        # off-by-one to fix.
+        ok = gang_baseline()
+        ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-6]
+        expect_clean(ok, "control-gang-epsilon-boundary.json", "rule (k): worst == epsilon.value is inside the tolerance")
 
         # M2 — `gang.verdict`. One mutation per DETERMINANT: the value
         # itself, each thing a `fail` owes, and each consequence that binds

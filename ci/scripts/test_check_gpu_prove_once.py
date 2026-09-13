@@ -443,6 +443,20 @@ class PaidPodLaneTest(unittest.TestCase):
         self.assertIn("more than one workflow", joined)
         self.assertIn("second-gang-renter.yml", joined)
 
+    def test_one_WRONG_invoker_is_a_failure_that_says_so(self):
+        """Still a FAIL — but the finding describes the state it found. The
+        two arms used to fire together here, the second of them claiming
+        'more than one workflow' about a single invoker."""
+        only_other = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: second-gang-renter")
+        no_invoke = GANG_YML_GOOD.replace("bash ci/scripts/runpod_gpu_gang.sh", "echo nothing")
+        findings = cgo.check_p7_paid_pod_lanes(
+            self._texts(**{"gpu-gang.yml": no_invoke, "second-gang-renter.yml": only_other})
+        )
+        joined = "\n".join(findings)
+        self.assertIn("none of which is gpu-gang.yml", joined)
+        self.assertIn("second-gang-renter.yml", joined)
+        self.assertNotIn("more than one workflow", joined)
+
     def test_zero_invokers_fails(self):
         broken = GANG_YML_GOOD.replace("bash ci/scripts/runpod_gpu_gang.sh", "echo nothing")
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))

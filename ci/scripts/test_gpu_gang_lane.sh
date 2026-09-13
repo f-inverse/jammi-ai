@@ -8,6 +8,9 @@
 # `GANG_GROUPS` and the lane's own env pins are the committed ones.
 #
 # Cases:
+#   G0  sourcing the driver invokes no curl/ssh/scp/runpodctl — the
+#       "mocks-only" claim measured through a PATH shim, not asserted in a
+#       comment.
 #   G1  `rp_gang_verdict` over EVERY rc arm: a clean pass; ssh 0 with a
 #       missing marker; ssh 0 with a non-zero group; a cut/hang (76, 124)
 #       with no `PROVE_EXIT`; an in-suite exit returned verbatim (1, 97,
@@ -48,6 +51,11 @@ ok()  { PASS=$((PASS + 1)); echo "ok   - $*"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
 
 SANDBOX="$(mktemp -d)"
+NETPROBE_LOG="$SANDBOX/netprobe.log"
+# This EXIT trap does NOT survive the `source` below: runpod_lib.sh installs
+# `trap rp_cleanup EXIT` of its own at source time, replacing whatever was
+# registered here (measured, not assumed). So nothing in this suite may rely
+# on an exit-time hook, and the external-call claim below is asserted inline.
 trap 'rm -rf "$SANDBOX"' EXIT
 
 # --------------------------------------------------------------------------
@@ -56,8 +64,49 @@ trap 'rm -rf "$SANDBOX"' EXIT
 # validate its own env at source time, hence the dummy key.
 # --------------------------------------------------------------------------
 export RUNPOD_API_KEY="test-dummy-key"
+
+# "Sourcing rents nothing" is a MEASURED claim here, not a comment.
+#
+# A bash-function stub for `rp_deploy_arch`/`rp_deploy_live` would measure
+# NOTHING: `runpod_gpu_gang.sh` sources `runpod_lib.sh`, whose own
+# definitions REPLACE any same-named function defined beforehand (checked:
+# after sourcing, `declare -f rp_deploy_arch` is the library's body). So the
+# probe is placed one level down, on the primitives the library cannot
+# redefine — `curl`, which every deploy/terminate/query goes through via
+# `rp_gql`, and `ssh`, the only other external effect on that path. Each is
+# a real executable on a PATH prefix that appends its argv to a log; the
+# claim is then the log, not an assumption about the guard.
+#
+# The shims exit 1, so a driver that reaches one fails LOUDLY rather than
+# proceeding on a fabricated response. That also means a guard regression
+# aborts this suite inside the `source`, before the assertion below prints:
+# the observable is then the suite's own non-zero exit (measured: with the
+# guard neutralised to `if true`, the suite exits 1 and the driver's RunPod
+# query/deploy errors are what stopped it — a real key would have rented).
+# The shims stay on PATH for the whole run: nothing in a mocks-only suite
+# has any business calling them later either.
+NETPROBE_BIN="$SANDBOX/netprobe-bin"
+mkdir -p "$NETPROBE_BIN"
+for tool in curl ssh scp runpodctl; do
+  cat >"$NETPROBE_BIN/$tool" <<PROBE
+#!/usr/bin/env bash
+printf '%s %s\n' "$tool" "\$*" >>"$NETPROBE_LOG"
+exit 1
+PROBE
+  chmod +x "$NETPROBE_BIN/$tool"
+done
+: >"$NETPROBE_LOG"
+PATH="$NETPROBE_BIN:$PATH"
+
 # shellcheck source=ci/scripts/runpod_gpu_gang.sh
 source "$GANG_SH"
+
+netprobe_calls="$(grep -c . "$NETPROBE_LOG" 2>/dev/null || true)" # tripwire-ok: grep -c on an EMPTY log legitimately exits 1; zero IS the pass condition, asserted on the next line.
+if [ "${netprobe_calls:-0}" -eq 0 ]; then
+  ok "sourcing runpod_gpu_gang.sh invoked NO curl/ssh/scp/runpodctl (counted through a PATH shim, not assumed) — the sourced-execution guard really does cover the rent/deploy path"
+else
+  bad "sourcing runpod_gpu_gang.sh invoked ${netprobe_calls} external call(s): $(tr '\n' '; ' <"$NETPROBE_LOG") — the sourced-execution guard no longer covers the rent path, and this suite would spend money"
+fi
 
 if declare -f rp_gang_verdict >/dev/null && declare -f rp_run_remote_watched >/dev/null; then
   ok "sourcing runpod_gpu_gang.sh (no network) defines rp_gang_verdict and (via runpod_lib.sh) rp_run_remote_watched"

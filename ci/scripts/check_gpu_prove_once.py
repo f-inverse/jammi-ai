@@ -1092,13 +1092,25 @@ def check_p7_paid_pod_lanes(
                 "so nothing runs it and nothing can be proven by it"
             )
         else:
-            if resolved_workflow is None or resolved_workflow not in producers:
+            # Two DISTINCT states, each with its own message. They used to
+            # share one ("more than one workflow") that was simply false for
+            # the commonest shape — a single invoker which is the WRONG one —
+            # and a finding that misdescribes what it found sends the reader
+            # looking for a second site that does not exist.
+            if resolved_workflow is None:
+                findings.append(
+                    f"P7: {script} is invoked by {producers}, but its PAID_POD_LANE_TABLE row names "
+                    f"{workflow}, which does not resolve to a workflow in this tree — the row's "
+                    "'exactly one invoker' claim cannot be checked against anything"
+                )
+            elif resolved_workflow not in producers:
                 findings.append(
                     f"P7: {script} is invoked by {producers}, none of which is {workflow} — a paid pod "
-                    "lane's driver belongs to exactly one workflow"
+                    f"lane's driver belongs to the one workflow its row names, so either {workflow} "
+                    f"lost the invocation or the row now names the wrong workflow"
                 )
             extra = [p for p in producers if p != resolved_workflow]
-            if extra:
+            if extra and len(producers) > 1:
                 findings.append(
                     f"P7: {script} is invoked by more than one workflow ({producers}) — only {workflow} "
                     f"may rent for this lane; extra site(s): {extra}"

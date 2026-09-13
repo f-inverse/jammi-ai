@@ -2823,6 +2823,47 @@ def self_test() -> int:
         bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": 0, "device": "cuda:0"}]
         expect_hit(bad, "x.json", "repeats a rank index", "rule (k): both entries claim rank 0")
 
+        # The remaining `_gang_check_ranks` arms, one fixture each. Each was
+        # written and left undriven: neutralising the arm kept `--self-test`
+        # green, and three of them would then have ADMITTED the malformed
+        # payload into the corpus.
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = []
+        expect_hit(bad, "x.json", "`gang.ranks` must be a non-empty list", "rule (k): an empty rank list")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, "cuda:1 NVIDIA A100-SXM4-80GB"]
+        expect_hit(bad, "x.json", "`gang.ranks[1]` must be an object", "rule (k): a rank entry that is not an object")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": "zero", "device": "cuda:1"}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.ranks[1].rank` must be a rank index >= 0",
+            "rule (k): a rank index spelled as a string",
+        )
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": -1, "device": "cuda:1"}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.ranks[1].rank` must be a rank index >= 0",
+            "rule (k): a negative rank index",
+        )
+
+        # Right count, right types, no repeat — and still not the gang's own
+        # ranks: 0 recorded no device. Only the coverage arm catches this.
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 1, "device": "cuda:0"}, {"rank": 2, "device": "cuda:1"}]
+        expect_hit(
+            bad,
+            "x.json",
+            "covers rank indices [1, 2], not 0..1",
+            "rule (k): two well-formed ranks that are not 0..world-1",
+        )
+
         bad = gang_baseline()
         bad["gang"]["digests"] = [{"seed": 7, "digest": "a" * 64}]
         expect_hit(bad, "x.json", "exactly two entries", "rule (k): a single digest is not a pair")
@@ -2837,6 +2878,28 @@ def self_test() -> int:
         bad = gang_baseline()
         bad["gang"]["digests"] = [{"seed": 7, "digest": "nope"}, {"seed": 7, "digest": "a" * 64}]
         expect_hit(bad, "x.json", "`gang.digests[0].digest` must be a 64-lowercase-hex", "rule (k): malformed digest")
+
+        bad = gang_baseline()
+        bad["gang"]["digests"] = ["a" * 64, {"seed": 7, "digest": "a" * 64}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.digests[0]` must be an object",
+            "rule (k): a digest entry that is not an object",
+        )
+
+        # A non-integer seed is not just a type finding: with `seeds` left
+        # empty, BOTH the same-seed arm and the pass@world-2 equality arm
+        # skip, so an unreadable seed would otherwise buy an artifact its way
+        # out of the digest oracle entirely.
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [{"seed": "a", "digest": "a" * 64}, {"seed": 7, "digest": "b" * 64}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.digests[0].seed` must be an integer seed",
+            "rule (k): a seed that is not an integer",
+        )
 
         bad = gang_baseline()
         bad["gang"]["per_step_loss_delta"] = []
@@ -3076,6 +3139,18 @@ def self_test() -> int:
         del bad["artifact_kind"]
         del bad["gang"]
         expect_hit(bad, "2026-01-01-gang-2xa100.json", "the committed filename", "rule (k): filename anchor")
+
+        # The other side of the same door: an artifact that DECLARES the kind
+        # and carries no `gang` block at all owes the whole registry, not a
+        # pass for having nothing to check.
+        bad = baseline()
+        bad["artifact_kind"] = "gang"
+        expect_hit(
+            bad,
+            "control-kind-without-block.json",
+            "but there is no `gang` object",
+            "rule (k): artifact_kind gang with no gang block",
+        )
 
         # rule (d) — ancestry ---------------------------------------------------
         bad = baseline()
@@ -3726,6 +3801,10 @@ def self_test() -> int:
         "against the basename only, never an ancestor directory's own name) round out rule (j). "
         "Rule (k)'s `gang` kind bites on every determinant of its own registry — each GANG_FIELD_"
         "REGISTRY field missing, world < 2, a device count that disagrees with world, a repeated rank, "
+        "an empty rank list, a rank entry that is not an object, a rank index that is a string or "
+        "negative, two well-formed ranks that are not 0..world-1, a digest entry that is not an "
+        "object, a seed that is not an integer (which would otherwise skip BOTH the same-seed and "
+        "the digest-equality arms), a declared `artifact_kind` with no `gang` block at all, "
         "a digest pair that is not exactly two same-seed entries, a malformed digest, an empty or "
         "non-numeric delta series, an ε that is zero / has no derivation / names a short or unknown "
         "registration commit / was registered in the very commit it measures, and a measured delta "

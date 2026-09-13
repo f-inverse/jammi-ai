@@ -731,6 +731,182 @@ fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
     );
 }
 
+// ── The shared seam: a 0-dim tensor is refused before any arm signs it ─────
+
+/// The auditor's PROBE-A1 (closing audit #3, `c9d20550`): a 0-dim scalar has
+/// no row count to check against a partition rule, so `checked_gather_counts`
+/// — the ONE seam every arm calls before it does anything else — must refuse
+/// it, naming the rank and the shape, before any arm's own gather logic ever
+/// runs.
+///
+/// At `c9d20550` `checked_gather_counts` read a 0-dim tensor's row count as
+/// `unwrap_or(0)`, and `Descriptor::of_gather_slice` signed it with
+/// `unwrap_or_default()` exactly like a 1-D tensor's trailing shape — so a
+/// two-rank gather where rank 0 passes a 0-dim scalar and rank 1 a real 1-D
+/// `[0]` tensor (both claiming zero rows) produced two descriptors that
+/// happened to agree (`{ dims: [] }` for both) and the round published:
+/// `[Ok([]), Ok([0])]`, one rank silently signing a shape the other rank
+/// never actually held.
+#[test]
+fn probe_a1_a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
+    // Noop (world = 1): the single-rank topology gets the same domain check.
+    let noop = Noop::new();
+    let scalar = Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar");
+    let error = noop
+        .all_gather(&scalar, &[0])
+        .expect_err("a 0-dim tensor has no row count to gather along");
+    assert!(
+        error.to_string().contains("0-dim"),
+        "unexpected message: {error}"
+    );
+
+    // Local (world = 2): the auditor's exact PROBE-A1 shape — rank 0 a 0-dim
+    // scalar, rank 1 a real 1-D `[0]` tensor, both claiming zero rows.
+    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
+        let counts = [0usize, 0];
+        let t = if local.rank() == 0 {
+            Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar")
+        } else {
+            Tensor::from_vec(Vec::<f32>::new(), (0,), &Device::Cpu).expect("1-D [0]")
+        };
+        local
+            .all_gather(&t, &counts)
+            .map(|g| g.dims().to_vec())
+            .map_err(|e| e.to_string())
+    });
+    for (rank, result) in results.iter().enumerate() {
+        let error = match result {
+            Err(error) => error,
+            Ok(dims) => panic!(
+                "rank {rank} returned Ok(dims = {dims:?}) — a 0-dim tensor must never be signed \
+                 as though it were a 1-D tensor of the same trailing shape (at c9d20550 this was \
+                 `[Ok([]), Ok([0])]`)"
+            ),
+        };
+        assert!(
+            error.contains("0-dim"),
+            "rank {rank}: unexpected message: {error}"
+        );
+    }
+}
+
+/// A reachability probe (not one of the auditor's numbered probes): three
+/// ranks name an ASYMMETRIC set of roots for `broadcast` — two agree with
+/// each other, one disagrees — so more than one rank's `Contribution` carries
+/// `Some` at once if the round were ever (wrongly) assembled. The property
+/// under test is that this is refused before any rank reaches that far, never
+/// that a particular unwrap happens not to panic on this input: a thread that
+/// panicked would fail `run_gang`'s own `.expect("a rank thread panicked")`.
+#[test]
+fn reachability_a_three_rank_asymmetric_root_broadcast_never_panics() {
+    let roots = [0u32, 1, 0];
+    let messages = run_gang(3, move |local| {
+        let mut t = matrix(1, 1, local.rank() as f32);
+        local
+            .broadcast(&mut t, roots[local.rank() as usize])
+            .map(|_| String::new())
+            .unwrap_or_else(|e| e.to_string())
+    });
+    for (rank, message) in messages.iter().enumerate() {
+        assert!(
+            !message.is_empty(),
+            "rank {rank} returned Ok from an asymmetric-root round — a round naming two \
+             different roots must never be handed a result"
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {message}"
+        );
+    }
+}
+
+/// A reachability probe: two ranks call `all_reduce_sum` with lists of
+/// DIFFERENT lengths. `Local::all_reduce_sum`'s fold loop indexes every
+/// peer's contribution at each of the CALLING rank's own tensor indices
+/// (`peer_tensors[index]`) — a peer with a shorter list is an out-of-bounds
+/// index if such a round were ever assembled, so the length mismatch must be
+/// caught before the fold ever runs, not merely happen not to panic for this
+/// particular pair of lengths.
+#[test]
+fn reachability_a_two_rank_uneven_all_reduce_sum_list_never_panics() {
+    let messages = run_gang(2, move |local| {
+        let mut tensors = if local.rank() == 0 {
+            vec![matrix(1, 1, 0.0), matrix(1, 1, 1.0)]
+        } else {
+            vec![matrix(1, 1, 0.0)]
+        };
+        local
+            .all_reduce_sum(&mut tensors)
+            .map(|_| String::new())
+            .unwrap_or_else(|e| e.to_string())
+    });
+    for (rank, message) in messages.iter().enumerate() {
+        assert!(
+            !message.is_empty(),
+            "rank {rank} returned Ok from a round whose peer reduced a different number of \
+             tensors"
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "rank {rank}: unexpected message: {message}"
+        );
+    }
+}
+
+/// PROBE-A4 (from the fold list): the root passes a `[2, 3]` tensor, the
+/// non-root a `[1, 1]` tensor. `broadcast`'s descriptor carries every rank's
+/// OWN tensor shape, not only the root's, so a shape mismatch off the root is
+/// a symmetric typed error on BOTH ranks, and the gang is left faulted for
+/// any later collective.
+#[test]
+fn probe_a4_broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically() {
+    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+    let rank0 = gang.rank(0).expect("rank 0");
+    let rank1 = gang.rank(1).expect("rank 1");
+
+    let results = std::thread::scope(|scope| {
+        let root = scope.spawn(move || {
+            let mut t = matrix(2, 3, 0.0);
+            rank0
+                .broadcast(&mut t, 0)
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        let non_root = scope.spawn(move || {
+            let mut t = matrix(1, 1, 0.0);
+            rank1
+                .broadcast(&mut t, 0)
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string())
+        });
+        [
+            root.join().expect("root thread"),
+            non_root.join().expect("non-root thread"),
+        ]
+    });
+
+    for (who, message) in [("root", &results[0]), ("non-root", &results[1])] {
+        assert!(
+            !message.is_empty(),
+            "{who} returned Ok from a broadcast the peer's shape disagreed with"
+        );
+        assert!(
+            message.contains("disagree about what this round computes"),
+            "{who}: unexpected message: {message}"
+        );
+    }
+
+    // The gang is left faulted: a fresh handle's next collective refuses.
+    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+    let refused = after_fault
+        .barrier()
+        .expect_err("the gang must stay faulted after the shape mismatch");
+    assert!(
+        refused.to_string().contains("the gang has already failed"),
+        "unexpected message: {refused}"
+    );
+}
+
 /// A third attempt (of this implementer's own design, not one of the
 /// auditor's) to break "no rank can return `Ok` from a round any rank
 /// rejects": a THREE-rank gang where two ranks agree with EACH OTHER and

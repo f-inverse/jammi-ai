@@ -121,6 +121,16 @@ fn gang_nccl_reduces_a_known_vector_over_two_devices() {
                         "rank {r}: the gather must equal the serial concatenation bit-for-bit"
                     );
 
+                    // (2.5) PROBE-A1 (U4a fix round 3): `checked_gather_counts`
+                    // is the ONE seam every arm shares, and it refuses a
+                    // 0-dim scalar before this arm's own pad/gather logic
+                    // ever runs — the same predicate the hermetic `Noop` and
+                    // `Local` oracles pin in
+                    // `fine_tune::collective::tests`.
+                    let scalar = Tensor::new(1.0f32, &device).expect("0-dim scalar");
+                    rank.all_gather(&scalar, &[0, 0])
+                        .expect_err("a 0-dim tensor has no row count to gather along");
+
                     // (3) The lockstep control word: a flag set on ONE rank is
                     // seen by both.
                     let mine = if r == 1 { 0b100 } else { 0 };

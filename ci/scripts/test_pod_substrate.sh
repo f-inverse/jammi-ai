@@ -4254,6 +4254,229 @@ PY
   fi
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# (ab/gpuCount) the shared deploy payload's `gpuCount` is a PARAMETER
+# (RP_GPU_COUNT, default 1), and for a count > 1 the a100 candidate order
+# puts SXM4 before PCIe (spike S4: a `gpuCount: 2` SXM4 pod provisioned
+# while the PCIe pool returned zero 2-GPU capacity). Four behavioural
+# determinants, each with its OWN revert-RED mutant on a scratch copy of
+# runpod_lib.sh — the default value, the parameter being honoured, the
+# count-1 candidate order (unchanged), the count>1 order (SXM4 first) —
+# plus a fifth, SET-shaped leg: no lane other than the reviewed two below
+# sets RP_GPU_COUNT anywhere, so every EXISTING lane (gpu-prove,
+# gpu-perf-ab, gpu-dev, howwell) still deploys `gpuCount: 1`. That leg's
+# set is DERIVED (`git ls-files` over ci/scripts + .github/workflows, then
+# grep), never a hand list, so a future lane that starts setting the
+# variable reds here instead of silently changing three other lanes'
+# payloads.
+#
+# No network and no RunPod account: `_rp_deploy_payload` is a pure
+# JSON-emitting function, and the candidate legs intercept `rp_deploy_live`
+# itself (this suite's own established function-boundary technique — see
+# leg (a)'s module doc) so nothing is ever deployed.
+# ═════════════════════════════════════════════════════════════════════════
+{
+  AB_LIB="$REPO_ROOT/ci/scripts/runpod_lib.sh"
+  AB_DRIVER="$SANDBOX/ab_payload_driver.sh"
+  cat > "$AB_DRIVER" <<'DRV'
+#!/usr/bin/env bash
+set -uo pipefail
+export RUNPOD_API_KEY=test-dummy-key
+export RP_SESSION_ROOT="${AB_DRV_SESSIONS}"
+export RP_SSH_CONFIG="${AB_DRV_SSH_CONFIG}"
+mkdir -p "$RP_SESSION_ROOT"
+# shellcheck disable=SC1090
+. "${AB_DRV_LIB}"
+# rp_init (which normally mints this) is never called here: it writes an ssh
+# key and installs an EXIT trap, neither of which a payload/candidate-order
+# reading needs.
+RP_PUBKEY="ssh-ed25519 AAAAfixturekey test@fixture"
+case "${AB_DRV_MODE}" in
+  payload)
+    _rp_deploy_payload SECURE "NVIDIA A100-SXM4-80GB"
+    ;;
+  candidates)
+    # The candidate list is the ARGUMENT rp_deploy_arch hands to
+    # rp_deploy_live; intercepting that one function boundary reads the
+    # order without deploying anything.
+    rp_deploy_live() { printf '%s\n' "$@"; return 0; }
+    rp_deploy_arch a100
+    ;;
+  *)
+    echo "unknown AB_DRV_MODE ${AB_DRV_MODE}" >&2; exit 2
+    ;;
+esac
+DRV
+  chmod +x "$AB_DRIVER"
+
+  # $1=lib path  $2=mode  $3=RP_GPU_COUNT value ("" = leave it unset)
+  ab_run() {
+    if [ -n "$3" ]; then
+      AB_DRV_LIB="$1" AB_DRV_MODE="$2" RP_GPU_COUNT="$3" \
+        AB_DRV_SESSIONS="$SANDBOX/ab_sessions" AB_DRV_SSH_CONFIG="$SANDBOX/ab_ssh_config" \
+        bash "$AB_DRIVER" 2>&1
+    else
+      AB_DRV_LIB="$1" AB_DRV_MODE="$2" \
+        AB_DRV_SESSIONS="$SANDBOX/ab_sessions" AB_DRV_SSH_CONFIG="$SANDBOX/ab_ssh_config" \
+        bash "$AB_DRIVER" 2>&1
+    fi
+  }
+
+  # Reads the deploy mutation's own `gpuCount`, and REFUSES a JSON string
+  # (the RunPod API takes an unquoted number; `"2"` would be a silent
+  # payload defect this leg exists to catch).
+  ab_gpu_count() {
+    python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+v = d["variables"]["i"]["gpuCount"]
+print(v if isinstance(v, int) and not isinstance(v, bool) else "NOT-AN-INT:%r" % (v,))
+' 2>&1
+  }
+
+  AB_PCIE_FIRST="SECURE|NVIDIA A100 80GB PCIe
+COMMUNITY|NVIDIA A100 80GB PCIe
+SECURE|NVIDIA A100-SXM4-80GB
+COMMUNITY|NVIDIA A100-SXM4-80GB"
+  AB_SXM_FIRST="SECURE|NVIDIA A100-SXM4-80GB
+COMMUNITY|NVIDIA A100-SXM4-80GB
+SECURE|NVIDIA A100 80GB PCIe
+COMMUNITY|NVIDIA A100 80GB PCIe"
+
+  # ---- D1: default (no RP_GPU_COUNT in the environment) is gpuCount 1 -----
+  ab_d1="$(ab_run "$AB_LIB" payload "" | ab_gpu_count)"
+  if [ "$ab_d1" = "1" ]; then
+    ok "(ab/gpuCount D1) the deploy payload's default gpuCount is the JSON number 1 — every lane that never sets RP_GPU_COUNT deploys a single-GPU pod"
+  else
+    bad "(ab/gpuCount D1) expected default gpuCount=1, got '${ab_d1}'"
+  fi
+
+  # ---- D2: RP_GPU_COUNT=2 reaches the payload as the number 2 ------------
+  ab_d2="$(ab_run "$AB_LIB" payload 2 | ab_gpu_count)"
+  if [ "$ab_d2" = "2" ]; then
+    ok "(ab/gpuCount D2) RP_GPU_COUNT=2 emits gpuCount as the JSON number 2 — the gang leg's 1 pod x 2 GPU shape (S4)"
+  else
+    bad "(ab/gpuCount D2) expected gpuCount=2 under RP_GPU_COUNT=2, got '${ab_d2}'"
+  fi
+
+  # ---- D3: the count-1 a100 candidate ORDER is unchanged (PCIe first) ----
+  ab_d3="$(ab_run "$AB_LIB" candidates "")"
+  if [ "$ab_d3" = "$AB_PCIE_FIRST" ]; then
+    ok "(ab/gpuCount D3) at the default count the a100 candidate order is unchanged (PCIe SECURE/COMMUNITY, then SXM4) — no existing lane's provisioning order moved"
+  else
+    bad "(ab/gpuCount D3) count-1 candidate order changed; got: ${ab_d3}"
+  fi
+
+  # ---- D4: count > 1 puts SXM4 first, dropping no candidate --------------
+  ab_d4="$(ab_run "$AB_LIB" candidates 2)"
+  if [ "$ab_d4" = "$AB_SXM_FIRST" ]; then
+    ok "(ab/gpuCount D4) at RP_GPU_COUNT=2 the a100 candidates are SXM4-first with the PCIe pair kept as a fallback and each pair's SECURE-before-COMMUNITY order preserved (S4: the PCIe pool had zero 2-GPU capacity)"
+  else
+    bad "(ab/gpuCount D4) expected the SXM4-first order at RP_GPU_COUNT=2; got: ${ab_d4}"
+  fi
+
+  # ---- D5 (set-shaped): which TRACKED files mention RP_GPU_COUNT at all --
+  # The reviewed set is exactly runpod_lib.sh (the parameter's own home),
+  # runpod_gpu_gang.sh (the ONE lane that asks for more than one GPU) and
+  # this suite. Anything else appearing here means some OTHER lane started
+  # moving its own deploy payload off `gpuCount: 1`.
+  ab_mentions="$(cd "$REPO_ROOT" && git ls-files ci/scripts .github/workflows | while IFS= read -r f; do
+    if grep -q 'RP_GPU_COUNT' "$f"; then printf '%s\n' "$f"; fi
+  done | sort)"
+  ab_unexpected="$(printf '%s\n' "$ab_mentions" | grep -v '^$' \
+    | grep -vx 'ci/scripts/runpod_lib.sh' \
+    | grep -vx 'ci/scripts/runpod_gpu_gang.sh' \
+    | grep -vx 'ci/scripts/test_pod_substrate.sh' || true)" # tripwire-ok: grep -v with no surviving line legitimately exits 1; the emptiness IS the pass condition, asserted on the next line.
+  if printf '%s\n' "$ab_mentions" | grep -qx 'ci/scripts/runpod_lib.sh' && [ -z "$ab_unexpected" ]; then
+    ok "(ab/gpuCount D5) RP_GPU_COUNT is mentioned only by runpod_lib.sh, the gang driver and this suite across every tracked ci/scripts + .github/workflows file — gpu-prove, gpu-perf-ab, gpu-dev and howwell all inherit the default"
+  else
+    bad "(ab/gpuCount D5) unexpected RP_GPU_COUNT site(s) — a lane other than the gang driver is changing its own gpuCount: ${ab_unexpected:-<runpod_lib.sh itself never mentions it>}"
+  fi
+
+  # ---- revert-RED mutants: one per behavioural determinant above ---------
+  AB_MUTANT_DIR="$SANDBOX/ab_mutants"
+  rm -rf "$AB_MUTANT_DIR"; mkdir -p "$AB_MUTANT_DIR"
+
+  # M1 (kills D2): the payload hard-codes the count again.
+  AB_M1="$AB_MUTANT_DIR/m1_literal_count.sh"
+  cp "$AB_LIB" "$AB_M1"
+  python3 - "$AB_M1" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '"gpuCount": int(gpu_count),'
+new = '"gpuCount": 1,'
+assert t.count(old) == 1, "M1 fixture: expected exactly one parameterised gpuCount site"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+  bash -n "$AB_M1" || bad "(ab/gpuCount M1) the mutated runpod_lib.sh copy has a syntax error"
+  ab_m1="$(ab_run "$AB_M1" payload 2 | ab_gpu_count)"
+  if [ "$ab_m1" != "2" ]; then
+    ok "(ab/gpuCount M1 revert-RED) hard-coding the payload's gpuCount back to a literal makes D2 fail (got '${ab_m1}') — D2 genuinely binds the parameter, not the literal"
+  else
+    bad "(ab/gpuCount M1 revert-RED) the literal-count mutant still emitted gpuCount=2 — D2 does not bite"
+  fi
+
+  # M2 (kills D1): the default becomes 2.
+  AB_M2="$AB_MUTANT_DIR/m2_default_two.sh"
+  cp "$AB_LIB" "$AB_M2"
+  python3 - "$AB_M2" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = 'RP_GPU_COUNT="${RP_GPU_COUNT:-1}"'
+new = 'RP_GPU_COUNT="${RP_GPU_COUNT:-2}"'
+assert t.count(old) == 1, "M2 fixture: expected exactly one RP_GPU_COUNT default site"
+open(p, "w").write(t.replace(old, new, 1))
+PY
+  bash -n "$AB_M2" || bad "(ab/gpuCount M2) the mutated runpod_lib.sh copy has a syntax error"
+  ab_m2="$(ab_run "$AB_M2" payload "" | ab_gpu_count)"
+  if [ "$ab_m2" != "1" ]; then
+    ok "(ab/gpuCount M2 revert-RED) moving the default off 1 makes D1 fail (got '${ab_m2}') — D1 genuinely pins the default every existing lane inherits"
+  else
+    bad "(ab/gpuCount M2 revert-RED) the default-2 mutant still emitted gpuCount=1 — D1 does not bite"
+  fi
+
+  # M3 (kills D4): the multi-GPU reordering is removed.
+  AB_M3="$AB_MUTANT_DIR/m3_no_reorder.sh"
+  cp "$AB_LIB" "$AB_M3"
+  python3 - "$AB_M3" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '  _rp_order_candidates_for_gpu_count\n'
+assert t.count(old) == 1, "M3 fixture: expected exactly one candidate-ordering call site"
+open(p, "w").write(t.replace(old, "", 1))
+PY
+  bash -n "$AB_M3" || bad "(ab/gpuCount M3) the mutated runpod_lib.sh copy has a syntax error"
+  ab_m3="$(ab_run "$AB_M3" candidates 2)"
+  if [ "$ab_m3" != "$AB_SXM_FIRST" ]; then
+    ok "(ab/gpuCount M3 revert-RED) removing the multi-GPU reordering makes D4 fail — D4 genuinely binds the SXM4-first order, not the arch table's own literal order"
+  else
+    bad "(ab/gpuCount M3 revert-RED) the no-reorder mutant still produced the SXM4-first order — D4 does not bite"
+  fi
+
+  # M4 (kills D3): the reordering becomes unconditional (count-1 lanes move too).
+  AB_M4="$AB_MUTANT_DIR/m4_unconditional_reorder.sh"
+  cp "$AB_LIB" "$AB_M4"
+  python3 - "$AB_M4" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '  [ "$RP_GPU_COUNT" -gt 1 ] || return 0\n'
+assert t.count(old) == 1, "M4 fixture: expected exactly one count>1 guard"
+open(p, "w").write(t.replace(old, "", 1))
+PY
+  bash -n "$AB_M4" || bad "(ab/gpuCount M4) the mutated runpod_lib.sh copy has a syntax error"
+  ab_m4="$(ab_run "$AB_M4" candidates "")"
+  if [ "$ab_m4" != "$AB_PCIE_FIRST" ]; then
+    ok "(ab/gpuCount M4 revert-RED) dropping the count>1 guard reorders the DEFAULT lanes too and makes D3 fail — D3 genuinely pins the existing lanes' provisioning order"
+  else
+    bad "(ab/gpuCount M4 revert-RED) the unconditional-reorder mutant left the count-1 order intact — D3 does not bite"
+  fi
+}
+
+
 echo
 echo "test_pod_substrate: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

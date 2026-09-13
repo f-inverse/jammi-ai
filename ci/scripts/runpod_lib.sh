@@ -86,6 +86,10 @@
 #   RP_VOLUME_GB  attached volume size in GB (default 0). The pod is deliberately
 #                 disposable (see "state" above) — leave this 0 unless a caller
 #                 has a specific reason to attach one.
+#   RP_GPU_COUNT  GPUs per pod (default 1). Every lane that leaves it alone
+#                 deploys the single-GPU pod it always did; the gang lane
+#                 (runpod_gpu_gang.sh) sets 2. A count > 1 also reorders the
+#                 arch candidate list — see _rp_order_candidates_for_gpu_count.
 #   RP_SSH_WAIT_SECS  wall-clock deadline on rp_deploy_live's SSH-reachability
 #                 poll, in seconds (default 600). A cold host still pulling the
 #                 multi-GB CUDA image can take minutes before sshd is even up;
@@ -128,6 +132,26 @@ esac
 case "$RP_VOLUME_GB" in
   ''|*[!0-9]*) echo "::error::RP_VOLUME_GB must be a non-negative integer (got '${RP_VOLUME_GB}')" >&2; exit 2 ;;
 esac
+# How many GPUs ONE pod is rented with. Default 1: every lane that does not
+# set this deploys the single-GPU pod it always did (gpu-prove, gpu-perf-ab,
+# gpu-dev, howwell all inherit it — `test_pod_substrate.sh`'s own
+# `(ab/gpuCount D5)` leg derives that set by scanning every tracked
+# ci/scripts + .github/workflows file for this variable, so a lane that
+# starts overriding it is named there rather than silently changing its own
+# payload). The gang lane (`runpod_gpu_gang.sh`) is the one caller that asks
+# for more: 1 pod x 2 GPU.
+#
+# Same validation shape as RP_TTL_HOURS/RP_DISK_GB above: it lands in the
+# GraphQL payload as an unquoted JSON number and drives an arithmetic
+# comparison in `_rp_order_candidates_for_gpu_count`, with no `-e` set
+# anywhere in this file.
+RP_GPU_COUNT="${RP_GPU_COUNT:-1}"
+case "$RP_GPU_COUNT" in
+  ''|*[!0-9]*) echo "::error::RP_GPU_COUNT must be a positive integer (got '${RP_GPU_COUNT}')" >&2; exit 2 ;;
+esac
+[ "${#RP_GPU_COUNT}" -le 2 ] || { echo "::error::RP_GPU_COUNT has too many digits (got '${RP_GPU_COUNT}')" >&2; exit 2; }
+RP_GPU_COUNT=$((10#$RP_GPU_COUNT))
+[ "$RP_GPU_COUNT" -gt 0 ] || { echo "::error::RP_GPU_COUNT must be > 0" >&2; exit 2; }
 # Wall-clock deadline for rp_deploy_live's SSH-reachability poll. Default 600s:
 # a cold image pull alone has measured ~2 minutes, and a healthy candidate has
 # needed over 4 minutes end to end (2026-08-26) — the previous fixed
@@ -1214,9 +1238,9 @@ SCRIPT
 }
 
 _rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
-  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" "$RP_DISK_GB" "$RP_VOLUME_GB" <<'PY'
+  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" "$RP_DISK_GB" "$RP_VOLUME_GB" "$RP_GPU_COUNT" <<'PY'
 import json, sys
-cloud, gpu, image, pub, ttl_h, prefix, disk_gb, volume_gb = sys.argv[1:9]
+cloud, gpu, image, pub, ttl_h, prefix, disk_gb, volume_gb, gpu_count = sys.argv[1:10]
 ttl = int(ttl_h) * 3600
 # The deadline is part of the pod's own entrypoint, so it exists from the moment
 # the container starts. It CANNOT be installed over SSH after the fact: the
@@ -1261,7 +1285,10 @@ setup = (watchdog
 # the pod boots, bills, and never becomes reachable: a silent, paid failure that
 # looks exactly like a capacity problem. Quote with double quotes only.
 assert "'" not in setup, "pod entrypoint must contain no single quotes (breaks bash -c wrapping)"
-inp = {"cloudType": cloud, "gpuCount": 1, "gpuTypeId": gpu,
+# `gpuCount` is the caller's own RP_GPU_COUNT (default 1, validated as a
+# positive integer at the top of this file), passed as an unquoted JSON
+# number — the API rejects the string form.
+inp = {"cloudType": cloud, "gpuCount": int(gpu_count), "gpuTypeId": gpu,
        # The deadline travels in the name so any sweeper honours THIS pod's limit.
        "name": "%s-ttl%s" % (prefix, ttl_h),
        "imageName": image, "containerDiskInGb": int(disk_gb), "volumeInGb": int(volume_gb), "ports": "22/tcp",
@@ -1416,6 +1443,36 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 # capacity-only fallback within this SAME rp_deploy_live call, so exit 75
 # (SUPPLY_CONSTRAINT) still means "neither L4 nor L40S had capacity", not
 # "L4 didn't".
+# Multi-GPU candidate ordering. Rewrites the CALLER's own `cand` array in
+# place (bash locals are dynamically scoped, so `rp_deploy_arch`'s array is
+# visible here) as a STABLE partition: every candidate whose GPU-type name
+# carries `SXM` first, every other candidate after, each group keeping its
+# own declared SECURE-before-COMMUNITY order. No candidate is dropped — a
+# multi-GPU rental never narrows the capacity search, it only reorders it.
+#
+# WHY: spike S4 rented a `gpuCount: 2` pod and found the A100 PCIe pool
+# returning zero 2-GPU capacity while `A100-SXM4-80GB` SECURE provisioned
+# immediately at $3.18/h. That is a measurement about sm_80's pools on that
+# day; nothing here establishes how any other arch's multi-GPU pools behave,
+# and an arch whose candidate list carries no `SXM` spelling is simply left
+# in its declared order.
+#
+# At the default count this returns immediately, so every existing lane's
+# provisioning order is byte-for-byte the one it always had
+# (`test_pod_substrate.sh`'s `(ab/gpuCount D3)` leg pins that, and its M4
+# mutant proves the guard below is what holds it).
+_rp_order_candidates_for_gpu_count() {
+  [ "$RP_GPU_COUNT" -gt 1 ] || return 0
+  local combo ordered=()
+  for combo in "${cand[@]}"; do
+    case "${combo##*|}" in *SXM*) ordered+=("$combo") ;; esac
+  done
+  for combo in "${cand[@]}"; do
+    case "${combo##*|}" in *SXM*) ;; *) ordered+=("$combo") ;; esac
+  done
+  cand=("${ordered[@]}")
+}
+
 rp_deploy_arch() { # $1=arch
   local cand
   case "$1" in
@@ -1445,6 +1502,7 @@ rp_deploy_arch() { # $1=arch
     *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4|l4_l40s)"; return 2 ;;
   esac
   RP_ARCH="$1"
+  _rp_order_candidates_for_gpu_count
   rp_deploy_live "${cand[@]}"
 }
 

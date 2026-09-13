@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 032) -- a new migration is added here
+/// (K5: append-only, currently ending at 033) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -53,6 +53,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "030_jobs_idempotency_key",
     "031_jobs_releases_workers_state",
     "032_result_table_versions",
+    "033_model_materialization",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -1548,4 +1549,218 @@ async fn migration_032_creates_result_table_versions(
         .await
         .unwrap();
     assert_eq!(dflt, 0, "next_version defaults to 0");
+}
+
+/// U3 (#500) — migration `033_model_materialization` is present and ordered
+/// AFTER `032_result_table_versions` (K5: relative position, never
+/// `.last()`, so the lead's renumber-on-second-merge keeps this green), adds
+/// the three NULLABLE `models` columns (`definition_hash`,
+/// `input_anchors_json`, `manifest_path`), and the
+/// `idx_models_definition_hash` cache-lookup index — on both backends.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_033_is_ordered_after_032_and_adds_model_materialization_columns(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::BackendKind;
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("033_model_materialization") > position("032_result_table_versions"),
+        "the model_materialization migration must follow 032"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    let applied = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM applied_migrations ORDER BY name",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    let ledger_position = |name: &str| {
+        applied
+            .iter()
+            .position(|m| m == name)
+            .unwrap_or_else(|| panic!("{name} missing from the applied ledger: {applied:?}"))
+    };
+    assert!(
+        ledger_position("033_model_materialization") > ledger_position("032_result_table_versions")
+    );
+
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('models')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable \
+                                 FROM information_schema.columns WHERE table_name = 'models'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for expected in ["definition_hash", "input_anchors_json", "manifest_path"] {
+        assert!(
+            columns.iter().any(|(c, notnull)| c == expected && !notnull),
+            "models.{expected} must exist and be nullable after migration 033; got {columns:?}"
+        );
+    }
+
+    let index_present = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query::<_, i64>(
+                                "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
+                                 AND name='idx_models_definition_hash' AND tbl_name='models'",
+                                &[],
+                                |row| row.get("one"),
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query::<_, i64>(
+                                "SELECT 1::bigint AS one FROM pg_indexes WHERE tablename = 'models' \
+                                 AND indexname = 'idx_models_definition_hash'",
+                                &[],
+                                |row| row.get("one"),
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        index_present.len(),
+        1,
+        "idx_models_definition_hash must exist on models"
+    );
+
+    // A pre-migration-shaped row (NULL definition_hash) is never matched by
+    // an equality probe -- the SQL-level half of "NULL never matches" the
+    // model_repo unit test exercises through `probe_model_by_definition`.
+    let name = format!("mig033_{}", jammi_test_utils::unique_suffix());
+    let pk = name.clone();
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let pk = pk.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO models (model_id, name, model_type, task, version) \
+                     VALUES ($1, $1, 'lora', 'text_embedding', 1)",
+                    &[jammi_db::catalog::backend::SqlValue::TextOwned(pk)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    let matches: i64 = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let name = name.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT count(*) AS c FROM models WHERE model_id = $1 \
+                         AND definition_hash = $2",
+                        &[
+                            jammi_db::catalog::backend::SqlValue::TextOwned(name),
+                            jammi_db::catalog::backend::SqlValue::Text("anything"),
+                        ],
+                        |row| row.get::<i64>("c"),
+                    )
+                    .await
+                    .map(|c| c.unwrap_or(-1))
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        matches, 0,
+        "a NULL definition_hash must never equality-match a probed hash"
+    );
 }

@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::backend_postgres::PostgresBackend;
@@ -31,7 +31,7 @@ use jammi_db::store::manifest::{
     MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, CacheOutcome, ResultStore, TrainingSetSpec};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -77,9 +77,13 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
 }
 
 async fn create_building(store: &ResultStore) -> BuildingTable {
+    create_building_for(store, "docs").await
+}
+
+async fn create_building_for(store: &ResultStore, source_id: &str) -> BuildingTable {
     store
         .create_table(
-            "docs",
+            source_id,
             ModelTask::TextEmbedding,
             ResultTableKind::Model,
             None,
@@ -91,6 +95,22 @@ async fn create_building(store: &ResultStore) -> BuildingTable {
         )
         .await
         .unwrap()
+}
+
+/// A source id unique to this test's temp directory.
+///
+/// The SQLite arm gets a fresh catalog per test (the catalog file lives in the
+/// temp dir); the Postgres arm shares ONE database across the whole run, so a
+/// per-source count assertion would read another test's rows. Keying the
+/// source on the temp dir's own random component makes every such assertion
+/// range over exactly the rows its own test created, on both backends.
+fn unique_source(dir: &tempfile::TempDir, stem: &str) -> String {
+    let suffix = dir
+        .path()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("a temp dir has a UTF-8 final component");
+    format!("{stem}-{suffix}")
 }
 
 async fn write_embedding_parquet(store: &ResultStore, info: &BuildingTable, n: usize) -> usize {
@@ -494,6 +514,486 @@ async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backe
         after.status, "failed",
         "a post-contract ready table missing its manifest is reaped, not left queryable"
     );
+}
+
+// --- the training-set producer ---------------------------------------------
+//
+// A training set is a producer output shared by definition hash, not a run's
+// scratch space (r31). These tests pin the db half of that contract: the kind
+// and the manifest, reuse by definition hash, the K2 refusal of an empty
+// projection, the committed full-tuple order under a partitioned plan, the
+// exclusion from embedding resolution, and the promise that materializing
+// never touches a `building` row this call does not own.
+
+/// The training-set fixture's columns, in the declared order that is also the
+/// order key.
+fn ts_columns() -> Vec<String> {
+    vec!["q".to_string(), "a".to_string()]
+}
+
+fn ts_schema() -> arrow_schema::SchemaRef {
+    Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("q", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("a", arrow_schema::DataType::Utf8, true),
+    ]))
+}
+
+fn ts_batch(rows: &[(Option<&str>, Option<&str>)]) -> RecordBatch {
+    let q: StringArray = rows.iter().map(|(q, _)| *q).collect();
+    let a: StringArray = rows.iter().map(|(_, a)| *a).collect();
+    RecordBatch::try_new(ts_schema(), vec![Arc::new(q), Arc::new(a)]).unwrap()
+}
+
+/// A session whose plans run at `partitions` target partitions, with the
+/// fixture registered as `rows` across `batches` (one partition per batch), so
+/// a scan really is partitioned and the producer's own merge is the only thing
+/// keeping the committed order total.
+fn ts_session(partitions: usize, batches: Vec<RecordBatch>) -> SessionContext {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
+
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_target_partitions(partitions.max(1)),
+    );
+    let partitioned: Vec<Vec<RecordBatch>> = batches.into_iter().map(|b| vec![b]).collect();
+    let table = MemTable::try_new(ts_schema(), partitioned).unwrap();
+    ctx.register_table("rows", Arc::new(table)).unwrap();
+    ctx
+}
+
+fn ts_spec<'a>(source_id: &'a str, columns: &'a [String], format: &'a str) -> TrainingSetSpec<'a> {
+    TrainingSetSpec {
+        source_id,
+        source_sql: "SELECT * FROM rows",
+        columns,
+        task: ModelTask::TextEmbedding,
+        format,
+        // A registered relation exposes no version surface, so the honest
+        // anchor is the read instant — the shape a real caller passes, and the
+        // one an exact-inputs probe would (correctly) never match on.
+        inputs: vec![InputAnchor::unpinned_at_instant(
+            source_id,
+            "2026-09-13T00:00:00Z",
+        )],
+        device: ComputeDevice::Cpu,
+    }
+}
+
+/// The committed rows, read straight off the Parquet object in FILE order —
+/// never back through a DataFusion scan, whose partitioning is exactly what
+/// this oracle must not be at the mercy of. Returns the rows and the file's
+/// row-group count.
+async fn committed_rows(
+    store: &ResultStore,
+    record: &ResultTableRecord,
+) -> (Vec<(Option<String>, Option<String>)>, usize) {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let handle = store.open_parquet(&url).unwrap();
+    let path = handle.data_path().unwrap();
+    let bytes = handle.get_bytes(&path).await.unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let row_groups = builder.metadata().num_row_groups();
+    let reader = builder.build().unwrap();
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let q = string_column(&batch, "q");
+        let a = string_column(&batch, "a");
+        for i in 0..batch.num_rows() {
+            out.push((q[i].clone(), a[i].clone()));
+        }
+    }
+    (out, row_groups)
+}
+
+/// A Parquet string column read without assuming which Arrow string type the
+/// reader hands back: the default parquet reader yields `Utf8View` in some
+/// configurations and `Utf8` in others, and a `downcast_ref::<StringArray>()`
+/// that assumed one would silently read nothing under the other.
+fn string_column(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+    let column = batch.column_by_name(name).expect("column present");
+    let cast = arrow::compute::cast(column, &arrow_schema::DataType::Utf8).unwrap();
+    let values = cast.as_any().downcast_ref::<StringArray>().unwrap();
+    (0..values.len())
+        .map(|i| {
+            if values.is_null(i) {
+                None
+            } else {
+                Some(values.value(i).to_string())
+            }
+        })
+        .collect()
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(
+        1,
+        vec![ts_batch(&[
+            (Some("q2"), Some("a2")),
+            (Some("q1"), Some("a1")),
+        ])],
+    );
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+
+    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+    assert_eq!(
+        materialized.record.status,
+        ResultTableStatus::Ready.to_string()
+    );
+    assert_eq!(materialized.record.row_count, 2);
+    assert!(matches!(materialized.outcome, CacheOutcome::Computed));
+    // The catalog's summary column is the hash the verb reports.
+    assert_eq!(
+        materialized.record.definition_hash.as_deref(),
+        Some(materialized.definition_hash.as_str())
+    );
+    // The row is nobody's partial result (r31): it was created with no job
+    // attempt, so no job row was ever touched.
+    assert!(materialized.record.derived_from.is_none());
+
+    // The attestation is on disk and names this producer with these exact
+    // determinants.
+    let manifest = store
+        .read_materialization_manifest(
+            &jammi_db::storage::StorageUrl::parse(&materialized.record.parquet_path).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("a training set carries a materialization attestation");
+    assert_eq!(manifest.definition_hash, materialized.definition_hash);
+    match &manifest.descriptor {
+        ProducingDescriptor::TrainingSet {
+            source,
+            columns: recorded,
+            task,
+            format,
+            order_rule,
+        } => {
+            assert_eq!(source, "SELECT * FROM rows");
+            assert_eq!(recorded, &columns);
+            assert_eq!(*task, ModelTask::TextEmbedding);
+            assert_eq!(format, "pairs");
+            assert_eq!(order_rule, jammi_db::store::TRAINING_SET_ORDER_RULE_V1);
+        }
+        other => panic!("expected a TrainingSet descriptor, got {other:?}"),
+    }
+
+    // The table reads back under the name a caller queries it by.
+    let rows = ctx
+        .sql(&format!(
+            "SELECT \"q\" FROM {} {}",
+            materialized.sql_relation(),
+            jammi_db::store::training_set_order_by(&columns)
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn two_runs_over_one_definition_share_one_training_set(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+    let rows = vec![ts_batch(&[
+        (Some("q1"), Some("a1")),
+        (Some("q2"), Some("a2")),
+    ])];
+
+    // Two runs, each on its OWN session — the second must find the table
+    // through the catalog, not through a registration the first left behind.
+    let first = store
+        .materialize_training_set(
+            &ts_session(1, rows.clone()),
+            ts_spec(&source, &columns, "pairs"),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .materialize_training_set(
+            &ts_session(1, rows.clone()),
+            ts_spec(&source, &columns, "pairs"),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(first.outcome, CacheOutcome::Computed));
+    assert_eq!(
+        second.outcome,
+        CacheOutcome::Reused {
+            table: first.table_name().to_string()
+        },
+        "the second run must report the reuse, never hand back a copy in silence"
+    );
+    assert_eq!(second.table_name(), first.table_name());
+    assert_eq!(second.definition_hash, first.definition_hash);
+
+    // One table, not two.
+    let tables = catalog
+        .find_result_tables(&source, None, None)
+        .await
+        .unwrap();
+    let training_sets: Vec<_> = tables
+        .iter()
+        .filter(|t| t.kind == ResultTableKind::TrainingSet)
+        .collect();
+    assert_eq!(
+        training_sets.len(),
+        1,
+        "two runs over one definition must not leave two tables"
+    );
+
+    // …and the sharing is not "reuse whatever exists": one determinant moved
+    // (the format) is a different training set.
+    let other_format = store
+        .materialize_training_set(&ts_session(1, rows), ts_spec(&source, &columns, "triplets"))
+        .await
+        .unwrap();
+    assert!(matches!(other_format.outcome, CacheOutcome::Computed));
+    assert_ne!(other_format.table_name(), first.table_name());
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn an_empty_projection_is_refused_before_any_row_exists(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    // A source that exists and has the right schema — and zero rows.
+    let ctx = ts_session(1, vec![ts_batch(&[])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+
+    let err = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .expect_err("an empty training set must be refused, never materialized");
+    assert!(
+        matches!(err, jammi_db::error::JammiError::EmptyTrainingSet { .. }),
+        "expected the typed K2 refusal, got {err:?}"
+    );
+
+    // K2's real content: no row, in ANY status, and no bytes.
+    let tables = catalog
+        .find_result_tables(&source, None, None)
+        .await
+        .unwrap();
+    assert!(
+        tables.is_empty(),
+        "the refusal must leave no catalog row behind, found {:?}",
+        tables.iter().map(|t| &t.table_name).collect::<Vec<_>>()
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn the_committed_order_is_the_full_projected_tuple(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+
+    // The fixture is deliberately hostile to an unordered scan: the rows are
+    // scrambled, split across four partitions, and read at
+    // `target_partitions = 4`; the tuple's SECOND column is what separates
+    // rows that tie on the first (so a key-column-only sort would not be
+    // total); and NULLs are present in both columns (so the NULL placement is
+    // exercised, not assumed).
+    //
+    // It is also large enough that the writer flushes more than one row group
+    // (65_536 rows per group), so the order oracle ranges over a real
+    // multi-row-group file rather than passing vacuously on a single group.
+    const ROWS: usize = 70_000;
+    let mut partitions: Vec<Vec<(Option<String>, Option<String>)>> = vec![Vec::new(); 4];
+    for i in 0..ROWS {
+        // A scrambling permutation with no fixed point in the sort order.
+        let n = (i * 37) % ROWS;
+        // Every `q` value appears twice, so `a` is the separator.
+        let q = Some(format!("q{:05}", n / 2));
+        let a = Some(format!("a{n:05}"));
+        partitions[i % 4].push((q, a));
+    }
+    // Degenerate rows the sort must place, not skip: a NULL in each column and
+    // a fully-NULL row.
+    partitions[0].push((None, Some("a-null-q".to_string())));
+    partitions[1].push((Some("q-null-a".to_string()), None));
+    partitions[2].push((None, None));
+
+    let batches: Vec<RecordBatch> = partitions
+        .iter()
+        .map(|rows| {
+            let borrowed: Vec<(Option<&str>, Option<&str>)> = rows
+                .iter()
+                .map(|(q, a)| (q.as_deref(), a.as_deref()))
+                .collect();
+            ts_batch(&borrowed)
+        })
+        .collect();
+    let ctx = ts_session(4, batches);
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+
+    let (rows, row_groups) = committed_rows(&store, &materialized.record).await;
+    assert!(
+        row_groups > 1,
+        "the order oracle is vacuous on a single row group; the fixture produced {row_groups}"
+    );
+    assert_eq!(rows.len(), ROWS + 3);
+
+    // `full_tuple_v1`: ascending on (q, a), NULLs first. Compared as the
+    // producer's own key — an `Option` orders `None` before `Some`, which IS
+    // "NULLs first".
+    let mut expected = rows.clone();
+    expected.sort();
+    assert_eq!(
+        rows, expected,
+        "the committed file order must be the canonical full-tuple order"
+    );
+    // Non-vacuity: the fixture as the scan sees it — partition 0 first, then
+    // 1, 2, 3, each in its own arrival order — is NOT already sorted, so the
+    // assertion above had something to catch. (This is exactly what a
+    // `CoalescePartitionsExec` over the unmerged sort would have committed.)
+    let input_order: Vec<(Option<String>, Option<String>)> =
+        partitions.iter().flatten().cloned().collect();
+    let mut sorted_input = input_order.clone();
+    sorted_input.sort();
+    assert_ne!(
+        input_order, sorted_input,
+        "the fixture must not arrive already ordered, or the oracle proves nothing"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "docs");
+
+    // The training set carries a genuine embedding `task` (the task its rows
+    // train), which is exactly the trap: only the KIND separates it from a
+    // model output for the same source.
+    let mut spec = ts_spec(&source, &columns, "pairs");
+    spec.task = ModelTask::TextEmbedding;
+    let training_set = store.materialize_training_set(&ctx, spec).await.unwrap();
+    assert_eq!(training_set.record.task, ModelTask::TextEmbedding);
+
+    // With ONLY the training set present, the source has no embedding table.
+    let err = catalog
+        .resolve_embedding_table(&source, None)
+        .await
+        .expect_err("a training set must not resolve as an embedding table");
+    assert!(
+        err.to_string().contains("No ready embedding table"),
+        "{err}"
+    );
+
+    // And with a real embedding table present, resolution picks that one even
+    // though the training set is the newer row.
+    let info = create_building_for(&store, &source).await;
+    let rows = write_embedding_parquet(&store, &info, 2).await;
+    let embedding = info
+        .finish(
+            &ctx,
+            rows,
+            jammi_db::store::manifest::Materialization::new(&descriptor(), &env(), vec![]),
+        )
+        .await
+        .unwrap();
+    let resolved = catalog
+        .resolve_embedding_table(&source, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.table_name, embedding.table_name);
+    assert_eq!(resolved.kind, ResultTableKind::Model);
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn materializing_never_touches_a_live_building_row(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+
+    // A live `building` training-set row for the same source — what a crashed
+    // coordinator leaves behind. Its reclaim is the lease's job; what must
+    // hold HERE is that a second materialization neither deletes it, promotes
+    // it, nor writes over it.
+    let abandoned = store
+        .create_table(
+            &source,
+            ModelTask::TextEmbedding,
+            ResultTableKind::TrainingSet,
+            None,
+            "training-set",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let abandoned_name = abandoned.table_name().to_string();
+    let before = catalog
+        .get_result_table(&abandoned_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.status, ResultTableStatus::Building.to_string());
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+    assert_ne!(materialized.table_name(), abandoned_name);
+
+    let after = catalog
+        .get_result_table(&abandoned_name)
+        .await
+        .unwrap()
+        .expect("the live building row must still exist");
+    assert_eq!(after.status, ResultTableStatus::Building.to_string());
+    assert_eq!(after.writer_id, before.writer_id);
+    assert_eq!(after.lease_expires_at, before.lease_expires_at);
+    assert_eq!(after.row_count, before.row_count);
+    // Let the handle release its own row cleanly so the test leaves no
+    // heartbeat running.
+    abandoned.abort().await.unwrap();
 }
 
 // --- helpers reaching the store's manifest sidecar for torn-state setup ----

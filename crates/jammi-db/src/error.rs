@@ -404,6 +404,27 @@ pub enum JammiError {
         reason: String,
     },
 
+    /// A training set's source projection yielded **zero rows**, so there is
+    /// nothing to train on. Raised by
+    /// [`crate::store::ResultStore::materialize_training_set`] *before* any
+    /// catalog row or byte exists.
+    ///
+    /// An empty training set is a refusal, never a 0-row table: a run that
+    /// trained on one would complete "successfully" having learned nothing,
+    /// publishing a model whose emptiness is invisible downstream. The
+    /// degenerate input is caught at the producer's own edge — the boundary
+    /// where the row count is first known — rather than left for a consumer
+    /// to notice, so no half-built artifact and no `building` row survives
+    /// the refusal.
+    #[error("training set over `{source_query}` is empty: the projection yielded zero rows")]
+    EmptyTrainingSet {
+        /// The producer's query text that yielded no rows. Named
+        /// `source_query`, not `source`: `thiserror` reads a field named
+        /// `source` as the error's `std::error::Error::source()`, which a
+        /// `String` cannot be.
+        source_query: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

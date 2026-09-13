@@ -214,6 +214,24 @@ const ALLOWED: &[(&str, &str, usize, usize, &str)] = &[
          stored — the entry, before anything is written.",
     ),
     (
+        "crates/jammi-db/src/store/mod.rs",
+        "validate_columns",
+        1, // ordinal 1 — the only `validate_columns` in this file
+        1, // occurrence 1 — the single `JammiError::Schema` the shared
+        // `schema_error` closure builds for all three refusals
+        "`TrainingSetSpec::validate_columns` — the training-set producer's \
+         projection check: empty column list, blank name, repeated name. \
+         Reviewed and left CALLER-class: every value checked is the \
+         caller's OWN argument on this call (`spec.columns`), tested \
+         against nothing but itself, at the entry and before any plan, any \
+         catalog row, or any byte exists. No stored artifact is read, so \
+         `IncompatibleFormat` (a downstream drift class) would be the \
+         wrong label. The one non-caller-fault arm this producer has (an \
+         empty order key surviving into the planner) is deliberately NOT \
+         this class — it reports as an engine-invariant breach in \
+         `plan_training_set_rows`.",
+    ),
+    (
         "crates/jammi-db/src/store/schema.rs",
         "embedding_batch_with_null_hash",
         1, // ordinal 1 — the only `embedding_batch_with_null_hash` in this

@@ -52,6 +52,7 @@ mod search_attribution;
 mod smoke;
 mod storage_precision;
 mod storage_root;
+mod streaming_loader;
 #[cfg(feature = "telemetry-otlp")]
 mod telemetry_otlp;
 mod tower_adapters;

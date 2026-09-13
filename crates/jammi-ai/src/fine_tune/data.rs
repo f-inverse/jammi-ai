@@ -11,8 +11,16 @@
 //! - **Precomputed** (`from_precomputed`): stores pre-built tensor batches.
 //!   `batches()` returns them as-is. Used in tests.
 
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
+use arrow::array::RecordBatch;
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::store::TrainingSetTable;
+
+use super::worker::{extract_binary_column, extract_numeric_column, extract_string_column};
+use crate::session::InferenceSession;
 
 /// A training batch — either contrastive pairs or triplets.
 #[derive(Clone)]
@@ -289,7 +297,7 @@ impl TextChunk {
     /// batch, DESIGN.md §2, K2), not a malformed chunk: every producer of a
     /// [`TextChunk`] (`TrainingDataLoader::rows_to_text_chunk`) builds it by
     /// `.map().collect()` over a row slice that can itself be empty.
-    pub(crate) fn row_count(&self) -> usize {
+    pub fn row_count(&self) -> usize {
         match self {
             TextChunk::Contrastive { texts_a, .. } => texts_a.len(),
             TextChunk::Pairs { anchors, .. } => anchors.len(),
@@ -307,10 +315,497 @@ impl TextChunk {
 /// hard-negative mining, which treat the dataset as one in-batch-negative batch.
 pub type InBatchNegativeTexts = (Vec<String>, Vec<String>, Option<Vec<String>>);
 
-/// Internal storage: either text rows (from source) or precomputed batches (for tests).
+/// Internal storage: text rows already resident (from source, or the tests-only
+/// synthetic constructors), precomputed batches (tests only), or a per-epoch
+/// STREAM over a committed training set's Parquet row groups (the production
+/// `FineTune` path — see [`StreamSource`]).
 enum LoaderData {
     TextRows(Vec<TrainingRow>),
     Precomputed(Vec<TrainingBatch>),
+    // Boxed: `StreamSource` (session handle, table record, columns, tokio
+    // handle, mutexed stream state) dwarfs the other two variants, and every
+    // `TrainingDataLoader` value pays that size regardless of which variant
+    // it actually holds.
+    Stream(Box<StreamSource>),
+}
+
+/// How a per-epoch training-set stream is bounded: the per-rank batch size
+/// (also the DataFusion execution batch size the scoped read is pinned to,
+/// so a polled `RecordBatch` is at most this many rows — see
+/// [`open_row_range_stream`]) and how many such batches may be resident
+/// (decoded, reserved, not yet handed to the caller) at once. Together these
+/// are the residency bound acceptance (a) checks: `batch * prefetch` rows.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamConfig {
+    pub batch: usize,
+    pub prefetch: usize,
+}
+
+/// The residency accounting a streamed epoch's background reader task
+/// reserves against before decoding each chunk, and the consumer releases
+/// (by dropping the returned permit) once it hands that chunk's rows to the
+/// caller.
+///
+/// **The counting seam** acceptance (a) asserts on: [`Self::high_water_mark`]
+/// is the largest number of rows ever simultaneously reserved. Backed by a
+/// [`tokio::sync::Semaphore`] with `bound` permits — reserving `n` permits
+/// for an `n`-row chunk BLOCKS (async) until enough residency frees up, so
+/// the bound is enforced BY CONSTRUCTION, not merely measured after the
+/// fact: a background task can never decode past it, only wait. **This is
+/// why it cannot under-count** (the R-A this unit's contract asks for): the
+/// unit test `residency_bound_try_acquire_refuses_past_the_shrunk_bound`
+/// shrinks `bound` by one row and shows a reservation that fit at the full
+/// bound is refused at `bound - 1`, non-blockingly (`try_acquire_many`) —
+/// the semaphore's own permit count, not a value this type merely reports.
+struct ResidencyBound {
+    bound: usize,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    high_water: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ResidencyBound {
+    fn new(bound: usize) -> Self {
+        Self {
+            bound,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(bound)),
+            high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Reserve `n` rows' worth of residency, waiting (async) until enough is
+    /// free. `n` must not exceed `bound` (the caller picks `batch <=
+    /// batch * prefetch`, which always holds for `prefetch >= 1`) — a larger
+    /// request can never be satisfied and would wait forever, which is the
+    /// correct, visible failure mode for a caller that mis-sized its own
+    /// bound rather than a value silently exceeding it.
+    async fn reserve(&self, n: usize) -> tokio::sync::OwnedSemaphorePermit {
+        let permit = Arc::clone(&self.semaphore)
+            .acquire_many_owned(n as u32)
+            .await
+            .expect("the residency semaphore is never closed while its reader task is alive");
+        let occupied = self.bound - self.semaphore.available_permits();
+        self.high_water
+            .fetch_max(occupied, std::sync::atomic::Ordering::SeqCst);
+        permit
+    }
+
+    fn high_water_mark(&self) -> usize {
+        self.high_water.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One decoded, row-bounded piece of a per-epoch stream, plus the permit
+/// that reserves its residency until the receiver drops it.
+type StreamItem = Result<(Vec<TrainingRow>, tokio::sync::OwnedSemaphorePermit)>;
+
+/// A committed training set, streamed a bounded window of rows at a time —
+/// the mechanism `TrainingDataLoader::from_training_set_stream` builds and
+/// `TrainingDataLoader::text_chunk_for_rank` (the `Stream` arm) drives.
+///
+/// Holds no decoded rows itself between calls: a fresh per-epoch stream opens
+/// on `step == 0` (DESIGN.md §2 — "a per-epoch RecordBatch stream") and each
+/// call pulls exactly one bounded chunk, tracked by `state`'s `next_step` so
+/// a caller that asks in the sequential order the trainer always does (0, 1,
+/// 2, ...) never re-reads a row. A caller that asks out of that order (a step
+/// behind, or ahead of, `next_step`) gets a FRESH restart from row 0 with the
+/// intervening chunks fast-forwarded (received and dropped) — correct for
+/// any access pattern, but only genuinely bounded/efficient for the
+/// sequential one the trainer's loop and this unit's acceptance tests use.
+struct StreamSource {
+    session: Arc<InferenceSession>,
+    table: TrainingSetTable,
+    columns: Vec<String>,
+    /// This loader's OWN row range within the committed table — the train
+    /// prefix or the validation suffix, fixed once by
+    /// [`TrainingDataLoader::split`] and never touched afterward.
+    range: Range<usize>,
+    cfg: StreamConfig,
+    /// The training loop runs on a `spawn_blocking` thread
+    /// (`worker.rs::train_fine_tune`), so every read here bridges from that
+    /// SYNC context back into the tokio runtime — captured once, at
+    /// construction, on the ASYNC side that built this loader.
+    runtime: tokio::runtime::Handle,
+    state: Mutex<StreamState>,
+}
+
+enum StreamState {
+    /// No epoch stream open — a fresh loader, or the last one fully drained.
+    Idle,
+    /// An epoch stream is open. `next_step` is the step this receiver's next
+    /// `recv()` will satisfy.
+    Open {
+        next_step: usize,
+        rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
+        residency: Arc<ResidencyBound>,
+    },
+}
+
+impl std::fmt::Debug for StreamSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamSource")
+            .field("table", &self.table.table_name())
+            .field("columns", &self.columns)
+            .field("range", &self.range)
+            .field("cfg", &self.cfg)
+            .finish()
+    }
+}
+
+/// Opens a [`datafusion::physical_plan::SendableRecordBatchStream`] over
+/// `[range.start, range.end)` of `table`, reading with **no `ORDER BY`** at a
+/// SCOPED `target_partitions = 1` — the mechanism behind acceptance (e). The
+/// producer already writes a training set's rows sorted by the full
+/// projected tuple before committing them
+/// (`crates/jammi-db/src/store/mod.rs`'s `plan_training_set_rows`), so a
+/// single-partition sequential scan visits row groups in exactly that
+/// committed order with no re-sort needed; the physical plan for a plain
+/// `SELECT * ... LIMIT ... OFFSET ...` (no `ORDER BY` clause at all) never
+/// contains a `SortExec` to begin with, so there is nothing to prove
+/// sortedness against.
+///
+/// The scoped session clones the CALLER's own
+/// [`datafusion::execution::session_state::SessionState`] — a shallow,
+/// `Arc`-shared clone, so it resolves the SAME tenant-gated catalog the
+/// committed table's `jammi.{name}` binding lives in — and overrides only
+/// `target_partitions` (pinned to 1) and `batch_size` (pinned to the
+/// caller's per-rank `batch`, so a polled `RecordBatch` is at most `batch`
+/// rows). The AMBIENT session's own configured `target_partitions` (1 or N
+/// — acceptance (e) is checked at both) never reaches this scan.
+async fn open_row_range_stream(
+    session: &InferenceSession,
+    table: &TrainingSetTable,
+    range: Range<usize>,
+    batch_size: usize,
+) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    let mut state = session.context().state();
+    let scoped_config = state
+        .config()
+        .clone()
+        .with_target_partitions(1)
+        .with_batch_size(batch_size.max(1));
+    *state.config_mut() = scoped_config;
+    let scoped_ctx = datafusion::prelude::SessionContext::new_with_state(state);
+    let sql = format!(
+        "SELECT * FROM {} LIMIT {} OFFSET {}",
+        table.sql_relation(),
+        range.len(),
+        range.start
+    );
+    let df = scoped_ctx.sql(&sql).await?;
+    Ok(df.execute_stream().await?)
+}
+
+/// Everything one call to [`run_epoch_stream`] needs — bundled so the
+/// function takes one argument instead of the seven independent pieces
+/// (`clippy::too_many_arguments`).
+struct EpochStreamJob {
+    session: Arc<InferenceSession>,
+    table: TrainingSetTable,
+    columns: Vec<String>,
+    format: TrainingFormat,
+    range: Range<usize>,
+    cfg: StreamConfig,
+    residency: Arc<ResidencyBound>,
+}
+
+/// Runs on [`StreamSource::runtime`]: opens
+/// [`open_row_range_stream`] and, for each polled `RecordBatch`, decodes it
+/// into [`TrainingRow`]s under `job.format`/`job.columns`
+/// ([`decode_record_batch`]), reserves that many rows against
+/// `job.residency` (blocking this task, never the consumer, when the bound
+/// is full), and sends `(rows, permit)` into `tx`. Exits silently once
+/// `tx`'s receiver drops (the loader moved on without draining this epoch's
+/// stream to the end — never reached by the trainer's own sequential
+/// access, but a correct, non-panicking exit for any other caller).
+async fn run_epoch_stream(job: EpochStreamJob, tx: tokio::sync::mpsc::UnboundedSender<StreamItem>) {
+    use futures::StreamExt;
+
+    let mut stream =
+        match open_row_range_stream(&job.session, &job.table, job.range, job.cfg.batch).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+    while let Some(batch) = stream.next().await {
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(Err(JammiError::from(e)));
+                return;
+            }
+        };
+        let rows = match decode_record_batch(job.format, &job.columns, &batch) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let permit = job.residency.reserve(rows.len()).await;
+        if tx.send(Ok((rows, permit))).is_err() {
+            return; // The receiver (loader) was dropped mid-epoch.
+        }
+    }
+}
+
+/// Decode ONE polled `RecordBatch` into [`TrainingRow`]s under `format` — the
+/// per-chunk analogue of `worker::build_training_data_loader`'s per-batch
+/// loop bodies (this decodes exactly one batch; [`run_epoch_stream`] loops
+/// over the stream calling it once per polled batch).
+///
+/// `format` is the loader's OWN already-fixed format (the committed table's
+/// tag, decided once by `worker::detect_training_format` before the table was
+/// even materialised) — never re-detected from `columns` here.
+///
+/// `TrainingFormat::Classification { .. }` is refused: classification needs
+/// every row's label before any row's class INDEX is knowable
+/// (`build_training_data_loader`'s own `label_to_idx` is built from the
+/// whole label column, a genuinely whole-set dependency, not a per-chunk
+/// one), so `TrainingDataLoader::from_training_set_stream` falls back to an
+/// eager whole-table build for it rather than calling this function.
+/// `TrainingFormat::Graph { .. }` maps onto `Pairs`/`Triplet` here (its own
+/// `underlying()`) and decodes through those arms — this function would
+/// handle it correctly if it were ever called, but at this commit
+/// `worker::reconstruct_graph_loader` stays on its existing eager read (see
+/// this unit's report for why) and never reaches this function.
+fn decode_record_batch(
+    format: TrainingFormat,
+    columns: &[String],
+    batch: &RecordBatch,
+) -> Result<Vec<TrainingRow>> {
+    let missing =
+        |col: &str| JammiError::FineTune(format!("streamed batch missing column '{col}'"));
+    let not_text = |col: &str| JammiError::FineTune(format!("streamed column '{col}' is not text"));
+    match format.underlying() {
+        UnderlyingFormat::Contrastive => {
+            let a = extract_string_column(
+                batch
+                    .column_by_name("text_a")
+                    .ok_or_else(|| missing("text_a"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("text_a"))?;
+            let b = extract_string_column(
+                batch
+                    .column_by_name("text_b")
+                    .ok_or_else(|| missing("text_b"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("text_b"))?;
+            let score_col = batch
+                .column_by_name("score")
+                .ok_or_else(|| missing("score"))?;
+            let scores: Vec<f32> = extract_numeric_column(score_col.as_ref())
+                .map_err(|_| JammiError::FineTune("streamed 'score' is not numeric".into()))?;
+            Ok((0..batch.num_rows())
+                .map(|i| TrainingRow::Contrastive {
+                    text_a: a[i].clone(),
+                    text_b: b[i].clone(),
+                    score: scores[i],
+                })
+                .collect())
+        }
+        UnderlyingFormat::Pairs => {
+            let anchor = extract_string_column(
+                batch
+                    .column_by_name("anchor")
+                    .ok_or_else(|| missing("anchor"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("anchor"))?;
+            let positive = extract_string_column(
+                batch
+                    .column_by_name("positive")
+                    .ok_or_else(|| missing("positive"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("positive"))?;
+            Ok((0..batch.num_rows())
+                .map(|i| TrainingRow::Pairs {
+                    anchor: anchor[i].clone(),
+                    positive: positive[i].clone(),
+                })
+                .collect())
+        }
+        UnderlyingFormat::Triplet => {
+            let anchor = extract_string_column(
+                batch
+                    .column_by_name("anchor")
+                    .ok_or_else(|| missing("anchor"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("anchor"))?;
+            let positive = extract_string_column(
+                batch
+                    .column_by_name("positive")
+                    .ok_or_else(|| missing("positive"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("positive"))?;
+            let negative = extract_string_column(
+                batch
+                    .column_by_name("negative")
+                    .ok_or_else(|| missing("negative"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("negative"))?;
+            Ok((0..batch.num_rows())
+                .map(|i| TrainingRow::Triplet {
+                    anchor: anchor[i].clone(),
+                    positive: positive[i].clone(),
+                    negative: negative[i].clone(),
+                })
+                .collect())
+        }
+        UnderlyingFormat::MediaTriplet => {
+            let anchor = extract_binary_column(
+                batch
+                    .column_by_name("anchor")
+                    .ok_or_else(|| missing("anchor"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| JammiError::FineTune("streamed 'anchor' is not binary".into()))?;
+            let positive = extract_binary_column(
+                batch
+                    .column_by_name("positive")
+                    .ok_or_else(|| missing("positive"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| JammiError::FineTune("streamed 'positive' is not binary".into()))?;
+            let negative = extract_binary_column(
+                batch
+                    .column_by_name("negative")
+                    .ok_or_else(|| missing("negative"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| JammiError::FineTune("streamed 'negative' is not binary".into()))?;
+            Ok((0..batch.num_rows())
+                .map(|i| TrainingRow::MediaTriplet {
+                    anchor: anchor[i].clone(),
+                    positive: positive[i].clone(),
+                    negative: negative[i].clone(),
+                })
+                .collect())
+        }
+        UnderlyingFormat::Regression => {
+            let text = extract_string_column(
+                batch
+                    .column_by_name("text")
+                    .ok_or_else(|| missing("text"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("text"))?;
+            let target_col = batch
+                .column_by_name("target")
+                .ok_or_else(|| missing("target"))?;
+            let target = extract_numeric_column(target_col.as_ref()).map_err(|e| match e {
+                super::worker::NumericColumnError::NotNumeric => JammiError::FineTune(format!(
+                    "streamed regression 'target' is not numeric (Arrow type {})",
+                    target_col.data_type()
+                )),
+                super::worker::NumericColumnError::Null(i) => JammiError::FineTune(format!(
+                    "streamed regression 'target' has a null at row {i}"
+                )),
+                super::worker::NumericColumnError::Nan(i) => JammiError::FineTune(format!(
+                    "streamed regression 'target' has a NaN at row {i}"
+                )),
+            })?;
+            Ok((0..batch.num_rows())
+                .map(|i| TrainingRow::Regression {
+                    text: text[i].clone(),
+                    target: target[i],
+                })
+                .collect())
+        }
+        UnderlyingFormat::Ner => {
+            let text = extract_string_column(
+                batch
+                    .column_by_name("text")
+                    .ok_or_else(|| missing("text"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("text"))?;
+            let entities = extract_string_column(
+                batch
+                    .column_by_name("entities_json")
+                    .ok_or_else(|| missing("entities_json"))?
+                    .as_ref(),
+            )
+            .ok_or_else(|| not_text("entities_json"))?;
+            Ok((0..batch.num_rows())
+                .map(|i| TrainingRow::Ner {
+                    text: text[i].clone(),
+                    entities_json: entities[i].clone(),
+                })
+                .collect())
+        }
+        UnderlyingFormat::Classification => Err(JammiError::FineTune(format!(
+            "classification cannot be decoded one streamed chunk at a time (columns {columns:?}): \
+             the class index needs the WHOLE label column first"
+        ))),
+    }
+}
+
+/// The eager whole-table build [`TrainingDataLoader::from_training_set_stream`]
+/// falls back to for `TrainingFormat::Classification` — mirrors
+/// `worker::build_training_data_loader`'s classification arm exactly (same
+/// `text`/`label` column names, same label→index derivation over the WHOLE
+/// label set before any row's class index is built), just reading `range`
+/// off the committed table directly rather than off an already-materialised
+/// `Vec<RecordBatch>`.
+async fn build_classification_loader_eager(
+    session: &InferenceSession,
+    table: &TrainingSetTable,
+    range: Range<usize>,
+) -> Result<TrainingDataLoader> {
+    let sql = format!(
+        "SELECT * FROM {} LIMIT {} OFFSET {}",
+        table.sql_relation(),
+        range.len(),
+        range.start
+    );
+    let batches = session.sql(&sql).await?;
+    let mut label_set = std::collections::BTreeSet::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for batch in &batches {
+        let text_vals = extract_string_column(
+            batch
+                .column_by_name("text")
+                .ok_or_else(|| JammiError::FineTune("missing column 'text'".into()))?
+                .as_ref(),
+        )
+        .ok_or_else(|| JammiError::FineTune("'text' is not text".into()))?;
+        let label_vals = extract_string_column(
+            batch
+                .column_by_name("label")
+                .ok_or_else(|| JammiError::FineTune("missing column 'label'".into()))?
+                .as_ref(),
+        )
+        .ok_or_else(|| JammiError::FineTune("'label' is not text".into()))?;
+        for i in 0..batch.num_rows() {
+            label_set.insert(label_vals[i].clone());
+            rows.push((text_vals[i].clone(), label_vals[i].clone()));
+        }
+    }
+    let label_to_idx: std::collections::HashMap<String, u32> = label_set
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.clone(), i as u32))
+        .collect();
+    let num_classes = label_to_idx.len();
+    let indexed_rows: Vec<(String, u32)> = rows
+        .into_iter()
+        .map(|(text, label)| (text, label_to_idx[&label]))
+        .collect();
+    Ok(TrainingDataLoader::from_classification(
+        indexed_rows,
+        num_classes,
+    ))
 }
 
 /// Loads training data and produces batches of tensors.
@@ -557,11 +1052,52 @@ impl TrainingDataLoader {
         }
     }
 
+    /// Build a per-epoch STREAMING loader over a committed training set
+    /// (DESIGN.md §2), covering the WHOLE table (`0..table.record.row_count`)
+    /// at construction — [`Self::split`] narrows it to a train prefix / a
+    /// validation suffix with no I/O.
+    ///
+    /// `format = TrainingFormat::Classification { .. }` cannot be decoded a
+    /// chunk at a time ([`decode_record_batch`]'s doc: the class index needs
+    /// the WHOLE label column first), so this constructor falls back to an
+    /// eager whole-table build for it — `build_classification_loader_eager`
+    /// mirrors `worker::build_training_data_loader`'s classification arm
+    /// exactly (same column names, same label→index derivation), so a
+    /// classification run's residency is simply exempt from this unit's
+    /// bound rather than silently wrong; every other format streams
+    /// genuinely, bounded by `cfg`.
+    pub async fn from_training_set_stream(
+        session: Arc<InferenceSession>,
+        table: TrainingSetTable,
+        columns: Vec<String>,
+        format: TrainingFormat,
+        cfg: StreamConfig,
+    ) -> Result<Self> {
+        let range = 0..table.record.row_count;
+        if matches!(format, TrainingFormat::Classification { .. }) {
+            return build_classification_loader_eager(&session, &table, range).await;
+        }
+        let runtime = tokio::runtime::Handle::current();
+        Ok(Self {
+            format,
+            data: LoaderData::Stream(Box::new(StreamSource {
+                session,
+                table,
+                columns,
+                range,
+                cfg,
+                runtime,
+                state: Mutex::new(StreamState::Idle),
+            })),
+        })
+    }
+
     /// Total number of data points (rows for text, batches for precomputed).
     pub fn len(&self) -> usize {
         match &self.data {
             LoaderData::TextRows(rows) => rows.len(),
             LoaderData::Precomputed(batches) => batches.len(),
+            LoaderData::Stream(src) => src.range.len(),
         }
     }
 
@@ -581,10 +1117,23 @@ impl TrainingDataLoader {
                 }
             }
             LoaderData::Precomputed(batches) => batches.len(),
+            LoaderData::Stream(src) => {
+                if batch_size == 0 || src.range.is_empty() {
+                    0
+                } else {
+                    src.range.len().div_ceil(batch_size)
+                }
+            }
         }
     }
 
     /// Deterministic split: last `fraction` of data goes to validation.
+    ///
+    /// The `Stream` arm does no I/O at all — it narrows the SAME committed
+    /// table's row range by the identical `val_count = round(len *
+    /// fraction)` arithmetic the `TextRows` arm uses, and hands each half a
+    /// fresh, idle [`StreamState`] (a split loader has never opened an epoch
+    /// stream yet, whatever the parent had done).
     pub fn split(&self, fraction: f64) -> Result<(TrainingDataLoader, TrainingDataLoader)> {
         match &self.data {
             LoaderData::TextRows(rows) => {
@@ -615,6 +1164,34 @@ impl TrainingDataLoader {
                     },
                 ))
             }
+            LoaderData::Stream(src) => {
+                let len = src.range.len();
+                let val_count = (len as f64 * fraction).round() as usize;
+                let train_count = len - val_count;
+                let train_range = src.range.start..src.range.start + train_count;
+                let val_range = src.range.start + train_count..src.range.end;
+                let fresh = |range: Range<usize>| {
+                    Box::new(StreamSource {
+                        session: Arc::clone(&src.session),
+                        table: src.table.clone(),
+                        columns: src.columns.clone(),
+                        range,
+                        cfg: src.cfg,
+                        runtime: src.runtime.clone(),
+                        state: Mutex::new(StreamState::Idle),
+                    })
+                };
+                Ok((
+                    TrainingDataLoader {
+                        format: self.format,
+                        data: LoaderData::Stream(fresh(train_range)),
+                    },
+                    TrainingDataLoader {
+                        format: self.format,
+                        data: LoaderData::Stream(fresh(val_range)),
+                    },
+                ))
+            }
         }
     }
 
@@ -629,7 +1206,7 @@ impl TrainingDataLoader {
     /// For precomputed loaders: returns the pre-built batches.
     pub fn batches(&self, _batch_size: usize) -> Result<Vec<Result<TrainingBatch>>> {
         match &self.data {
-            LoaderData::TextRows(_) => Err(JammiError::FineTune(
+            LoaderData::TextRows(_) | LoaderData::Stream(_) => Err(JammiError::FineTune(
                 "Text-based loaders require model-in-loop encoding. Use text_chunks() instead."
                     .into(),
             )),
@@ -641,13 +1218,29 @@ impl TrainingDataLoader {
     /// batch of text data to be encoded through the base model.
     /// Only works for text-based loaders (from_contrastive/from_triplets/from_rows).
     /// Returns empty for precomputed loaders.
-    pub fn text_chunks(&self, batch_size: usize) -> Vec<TextChunk> {
+    ///
+    /// Fallible (unlike the `TextRows`/`Precomputed` arms) because the
+    /// `Stream` arm drains its own range whole — the SAME whole-set exemption
+    /// [`Self::in_batch_negative_texts`] uses — which is real I/O. The
+    /// trainer's MAIN loop never calls this for a `Stream` loader (it drives
+    /// [`Self::text_chunk_for_rank`] instead, per-step and residency-bounded);
+    /// this arm exists so `evaluate`/`evaluate_held_out` — which call
+    /// `text_chunks` on the validation split, not the train prefix — still
+    /// work correctly on a streamed loader, just without that bound.
+    pub fn text_chunks(&self, batch_size: usize) -> Result<Vec<TextChunk>> {
         match &self.data {
-            LoaderData::TextRows(rows) => rows
+            LoaderData::TextRows(rows) => Ok(rows
                 .chunks(batch_size)
                 .map(|chunk| self.rows_to_text_chunk(chunk))
-                .collect(),
-            LoaderData::Precomputed(_) => Vec::new(),
+                .collect()),
+            LoaderData::Precomputed(_) => Ok(Vec::new()),
+            LoaderData::Stream(src) => {
+                let rows = self.stream_drain_all(src)?;
+                Ok(rows
+                    .chunks(batch_size.max(1))
+                    .map(|chunk| self.rows_to_text_chunk(chunk))
+                    .collect())
+            }
         }
     }
 
@@ -666,139 +1259,139 @@ impl TrainingDataLoader {
     /// of its own.
     fn rows_to_text_chunk(&self, chunk: &[TrainingRow]) -> TextChunk {
         match self.format.underlying() {
-                    UnderlyingFormat::Contrastive => TextChunk::Contrastive {
-                        texts_a: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Contrastive { text_a, .. } => text_a.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        texts_b: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Contrastive { text_b, .. } => text_b.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        scores: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Contrastive { score, .. } => *score,
-                                _ => 0.0,
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Pairs => TextChunk::Pairs {
-                        anchors: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Pairs { anchor, .. } => anchor.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        positives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Pairs { positive, .. } => positive.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Triplet => TextChunk::Triplet {
-                        anchors: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Triplet { anchor, .. } => anchor.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        positives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Triplet { positive, .. } => positive.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        negatives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Triplet { negative, .. } => negative.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::MediaTriplet => TextChunk::MediaTriplet {
-                        anchors: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::MediaTriplet { anchor, .. } => anchor.clone(),
-                                _ => Vec::new(),
-                            })
-                            .collect(),
-                        positives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::MediaTriplet { positive, .. } => positive.clone(),
-                                _ => Vec::new(),
-                            })
-                            .collect(),
-                        negatives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::MediaTriplet { negative, .. } => negative.clone(),
-                                _ => Vec::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Classification => TextChunk::Classification {
-                        texts: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Classification { text, .. } => text.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        labels: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Classification { label, .. } => *label,
-                                _ => 0,
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Ner => TextChunk::Ner {
-                        texts: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Ner { text, .. } => text.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        entities_json: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Ner { entities_json, .. } => entities_json.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Regression => TextChunk::Regression {
-                        texts: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Regression { text, .. } => text.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        targets: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Regression { target, .. } => *target,
-                                _ => 0.0,
-                            })
-                            .collect(),
-                    },
+            UnderlyingFormat::Contrastive => TextChunk::Contrastive {
+                texts_a: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Contrastive { text_a, .. } => text_a.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                texts_b: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Contrastive { text_b, .. } => text_b.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                scores: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Contrastive { score, .. } => *score,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Pairs => TextChunk::Pairs {
+                anchors: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Pairs { anchor, .. } => anchor.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                positives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Pairs { positive, .. } => positive.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Triplet => TextChunk::Triplet {
+                anchors: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Triplet { anchor, .. } => anchor.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                positives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Triplet { positive, .. } => positive.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                negatives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Triplet { negative, .. } => negative.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::MediaTriplet => TextChunk::MediaTriplet {
+                anchors: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::MediaTriplet { anchor, .. } => anchor.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+                positives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::MediaTriplet { positive, .. } => positive.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+                negatives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::MediaTriplet { negative, .. } => negative.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Classification => TextChunk::Classification {
+                texts: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Classification { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                labels: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Classification { label, .. } => *label,
+                        _ => 0,
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Ner => TextChunk::Ner {
+                texts: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Ner { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                entities_json: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Ner { entities_json, .. } => entities_json.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Regression => TextChunk::Regression {
+                texts: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Regression { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                targets: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Regression { target, .. } => *target,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            },
         }
     }
 
@@ -816,7 +1409,7 @@ impl TrainingDataLoader {
     /// partition; a `Stream` loader reads its own range directly rather than
     /// slicing an in-memory `Vec` — see `worker.rs`'s `run_spec` for that
     /// path, exercised only at `spec.world == 1` at this commit).
-    pub(crate) fn text_chunk_for_rank(
+    pub fn text_chunk_for_rank(
         &self,
         spec: &super::partition::PartitionSpec,
         step: usize,
@@ -829,6 +1422,102 @@ impl TrainingDataLoader {
             LoaderData::Precomputed(_) => Err(JammiError::FineTune(
                 "a precomputed loader has no row-level partition".into(),
             )),
+            LoaderData::Stream(src) => {
+                // At this commit `run_spec` always builds rank 0 of world 1
+                // (U4b spawns the per-rank readers a genuinely larger world
+                // would need); refuse rather than silently reading rank 0's
+                // rows for every rank.
+                if spec.world != 1 || spec.rank != 0 {
+                    return Err(JammiError::FineTune(format!(
+                        "a streamed loader supports only rank 0 of world 1 at this commit \
+                         (got rank {} of world {}); U4b spawns per-rank readers",
+                        spec.rank, spec.world
+                    )));
+                }
+                self.stream_next_chunk(src, spec.batch, step)
+            }
+        }
+    }
+
+    /// The `Stream` arm of [`Self::text_chunk_for_rank`]: serve step `step`
+    /// of a per-epoch stream over `src`'s own range, opening a FRESH one
+    /// whenever `step == 0` or the caller asks behind where the current
+    /// stream already is (DESIGN.md §2 — "a per-epoch RecordBatch stream").
+    ///
+    /// Efficient and residency-bounded ONLY for the sequential access
+    /// pattern the trainer's loop and this unit's acceptance tests use (`0,
+    /// 1, 2, ...`, once per epoch): an out-of-order ask still returns the
+    /// CORRECT chunk (by restarting and fast-forwarding, discarding the
+    /// skipped chunks), never a wrong one, but pays the discarded I/O.
+    fn stream_next_chunk(
+        &self,
+        src: &StreamSource,
+        batch: usize,
+        step: usize,
+    ) -> Result<TextChunk> {
+        let mut guard = src
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let needs_restart = step == 0
+            || match &*guard {
+                StreamState::Open { next_step, .. } => *next_step > step,
+                StreamState::Idle => true,
+            };
+        if needs_restart {
+            let cfg = StreamConfig {
+                batch,
+                prefetch: src.cfg.prefetch,
+            };
+            let residency = Arc::new(ResidencyBound::new(
+                cfg.batch.saturating_mul(cfg.prefetch.max(1)),
+            ));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let job = EpochStreamJob {
+                session: Arc::clone(&src.session),
+                table: src.table.clone(),
+                columns: src.columns.clone(),
+                format: self.format,
+                range: src.range.clone(),
+                cfg,
+                residency: Arc::clone(&residency),
+            };
+            src.runtime.spawn(run_epoch_stream(job, tx));
+            *guard = StreamState::Open {
+                next_step: 0,
+                rx,
+                residency,
+            };
+        }
+        loop {
+            let (current_step, item) = match &mut *guard {
+                StreamState::Open { next_step, rx, .. } => {
+                    let item = src.runtime.block_on(rx.recv());
+                    let served = *next_step;
+                    *next_step += 1;
+                    (served, item)
+                }
+                StreamState::Idle => unreachable!("just opened Open above"),
+            };
+            match item {
+                None => {
+                    // The stream is exhausted: every step from here on is a
+                    // zero-row state (K2), not an error.
+                    return Ok(self.rows_to_text_chunk(&[]));
+                }
+                Some(Err(e)) => return Err(e),
+                Some(Ok((rows, permit))) => {
+                    // Handed to the caller now — release the residency this
+                    // chunk reserved.
+                    drop(permit);
+                    if current_step == step {
+                        return Ok(self.rows_to_text_chunk(&rows));
+                    }
+                    // `current_step < step`: an out-of-order ask asked ahead
+                    // of a stream that had already progressed less far;
+                    // discard and keep fast-forwarding.
+                }
+            }
         }
     }
 
@@ -839,23 +1528,35 @@ impl TrainingDataLoader {
 
     /// Every regression target in this loader, in row order — the whole-dataset
     /// view the trainer reduces into a fixed target scaler once before the
-    /// loop. `None` for any non-regression loader (no targets to standardise) and
-    /// for the precomputed test path (which supplies head/target tensors
-    /// directly, not text rows).
-    pub fn regression_targets(&self) -> Option<Vec<f32>> {
+    /// loop (K3). `Ok(None)` for any non-regression loader (no targets to
+    /// standardise) and for the precomputed test path (which supplies
+    /// head/target tensors directly, not text rows).
+    ///
+    /// The named 4-byte-per-row scaler exemption from the residency bound
+    /// (DESIGN.md §2): a `Stream` loader still collects this column ONCE,
+    /// fully, into a single `Vec<f32>` — the same bit-identical two-pass
+    /// `TargetScaler::from_targets` shape `Ok`/`TextRows` already gave —
+    /// rather than through the bounded per-chunk path.
+    ///
+    /// Fallible (unlike the `TextRows`/`Precomputed` arms, which never touch
+    /// I/O) because the `Stream` arm issues its own one-shot query; a
+    /// non-regression or precomputed loader never reaches that query and
+    /// never fails.
+    pub fn regression_targets(&self) -> Result<Option<Vec<f32>>> {
         if !matches!(self.format, TrainingFormat::Regression) {
-            return None;
+            return Ok(None);
         }
         match &self.data {
-            LoaderData::TextRows(rows) => Some(
+            LoaderData::TextRows(rows) => Ok(Some(
                 rows.iter()
                     .filter_map(|row| match row {
                         TrainingRow::Regression { target, .. } => Some(*target),
                         _ => None,
                     })
                     .collect(),
-            ),
-            LoaderData::Precomputed(_) => None,
+            )),
+            LoaderData::Precomputed(_) => Ok(None),
+            LoaderData::Stream(src) => Ok(Some(stream_collect_target_column(src)?)),
         }
     }
 
@@ -864,13 +1565,23 @@ impl TrainingDataLoader {
     /// consume. `negatives` is `Some` for a `Triplet` loader (explicit hard
     /// negatives) and `None` for a `Pairs` loader. Returns an error for any
     /// other format — only in-batch-negative training has this shape.
+    ///
+    /// A `Stream` loader drains its own range fully here — the named
+    /// whole-set exemption (DESIGN.md §2): mining/GradCache are W=1-only
+    /// (U4a's refusal) and "stream the table in and hold what they need",
+    /// never bounded by the per-chunk residency check.
     pub fn in_batch_negative_texts(&self) -> Result<InBatchNegativeTexts> {
-        let rows = match &self.data {
+        let owned_rows;
+        let rows: &[TrainingRow] = match &self.data {
             LoaderData::TextRows(rows) => rows,
             LoaderData::Precomputed(_) => {
                 return Err(JammiError::FineTune(
                     "GradCache requires text rows, not precomputed batches".into(),
                 ))
+            }
+            LoaderData::Stream(src) => {
+                owned_rows = self.stream_drain_all(src)?;
+                &owned_rows
             }
         };
         // A `Graph` loader is itself an in-batch-negative loader — it stores
@@ -918,11 +1629,145 @@ impl TrainingDataLoader {
     pub fn is_precomputed(&self) -> bool {
         matches!(self.data, LoaderData::Precomputed(_))
     }
+
+    /// Fully drain a `Stream` loader's own range into `TrainingRow`s —
+    /// the whole-set exemption every whole-dataset consumer
+    /// (`in_batch_negative_texts`, and `text_chunks`'s `Stream` fallback for
+    /// any non-main-loop caller such as `evaluate`) goes through. Blocks the
+    /// calling (sync, `spawn_blocking`) thread on `src`'s captured tokio
+    /// handle; never touches the bounded residency machinery
+    /// (`ResidencyBound`) `run_epoch_stream` uses for the main loop.
+    fn stream_drain_all(&self, src: &StreamSource) -> Result<Vec<TrainingRow>> {
+        let format = self.format;
+        let columns = src.columns.clone();
+        let session = Arc::clone(&src.session);
+        let table = src.table.clone();
+        let range = src.range.clone();
+        let batch = src.cfg.batch.max(1);
+        src.runtime.block_on(async move {
+            use futures::StreamExt;
+            let mut stream = open_row_range_stream(&session, &table, range, batch).await?;
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(JammiError::from)?;
+                rows.extend(decode_record_batch(format, &columns, &batch)?);
+            }
+            Ok(rows)
+        })
+    }
+
+    /// Test-only counting seam: the residency bound's own
+    /// [`ResidencyBound::high_water_mark`] for the current (or last-run) per-epoch
+    /// stream — `None` for a non-`Stream` loader or a `Stream` loader whose
+    /// epoch stream has never been opened. Acceptance (a) asserts on this.
+    /// `test-hooks`-gated (this crate's own test targets always build with it
+    /// on, via its `[dev-dependencies]` self-dependency) rather than
+    /// `#[cfg(test)]` alone, so the `tests/it` integration binary — a
+    /// SEPARATE compilation of this crate — can reach it too.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn stream_residency_high_water_mark(&self) -> Option<usize> {
+        match &self.data {
+            LoaderData::Stream(src) => {
+                let guard = src
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*guard {
+                    StreamState::Open { residency, .. } => Some(residency.high_water_mark()),
+                    StreamState::Idle => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The K3 scaler exemption's one-shot query: collect the WHOLE `target`
+/// column of `src`'s own range into one `Vec<f32>`, in committed order — the
+/// same single, unbounded read [`TrainingDataLoader::regression_targets`]'s
+/// `TextRows` arm already gave (there, because everything was already
+/// resident; here, by a dedicated single-column query rather than the
+/// per-chunk residency-bounded path).
+fn stream_collect_target_column(src: &StreamSource) -> Result<Vec<f32>> {
+    let session = Arc::clone(&src.session);
+    let table = src.table.clone();
+    let range = src.range.clone();
+    src.runtime.block_on(async move {
+        use futures::StreamExt;
+        // `batch_size` here only bounds how many rows arrive per polled
+        // `RecordBatch` of this ONE-OFF collect; nothing here is
+        // residency-bounded, so any positive value is fine — the caller's
+        // configured per-rank batch keeps this consistent with the epoch
+        // stream's own scan shape.
+        let mut stream = open_row_range_stream(&session, &table, range.clone(), 8192).await?;
+        let mut targets = Vec::with_capacity(range.len());
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(JammiError::from)?;
+            let target_col = batch.column_by_name("target").ok_or_else(|| {
+                JammiError::FineTune("streamed batch missing column 'target'".into())
+            })?;
+            let values = extract_numeric_column(target_col.as_ref()).map_err(|e| match e {
+                super::worker::NumericColumnError::NotNumeric => JammiError::FineTune(format!(
+                    "streamed regression 'target' is not numeric (Arrow type {})",
+                    target_col.data_type()
+                )),
+                super::worker::NumericColumnError::Null(i) => JammiError::FineTune(format!(
+                    "streamed regression 'target' has a null at row {i}"
+                )),
+                super::worker::NumericColumnError::Nan(i) => JammiError::FineTune(format!(
+                    "streamed regression 'target' has a NaN at row {i}"
+                )),
+            })?;
+            targets.extend(values);
+        }
+        Ok(targets)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-A for acceptance (a): the residency bound's own permit count is what
+    /// a reservation actually relies on, never merely reported. At the real
+    /// bound (`batch * prefetch = 8`) a fresh `batch`-sized (4-row)
+    /// reservation succeeds twice (filling the bound exactly) and a third
+    /// is refused (`try_acquire_many`, non-blocking, so the probe cannot
+    /// hang). Shrink the SAME configuration by exactly one row (bound 7) and
+    /// the SECOND reservation — which fit at bound 8 — is now refused too:
+    /// "make the bound one row too small and watch it fail."
+    #[test]
+    fn residency_bound_semaphore_refuses_one_row_past_a_shrunk_bound() {
+        let batch = 4usize;
+        let prefetch = 2usize;
+        let bound = batch * prefetch; // 8
+
+        let full = ResidencyBound::new(bound);
+        let first = full.semaphore.try_acquire_many(batch as u32);
+        assert!(first.is_ok(), "the first 4-row chunk must fit at bound 8");
+        let second = full.semaphore.try_acquire_many(batch as u32);
+        assert!(
+            second.is_ok(),
+            "the second 4-row chunk must ALSO fit — 4 + 4 == the bound exactly"
+        );
+        let third = full.semaphore.try_acquire_many(1);
+        assert!(
+            third.is_err(),
+            "a bound of 8 must refuse a 9th row — the semaphore is exhausted"
+        );
+
+        // R-A: the SAME batch/prefetch, but the residency bound is
+        // constructed one row too small (7, not 8).
+        let shrunk = ResidencyBound::new(bound - 1);
+        let first = shrunk.semaphore.try_acquire_many(batch as u32);
+        assert!(first.is_ok(), "the first 4-row chunk still fits at bound 7");
+        let second = shrunk.semaphore.try_acquire_many(batch as u32);
+        assert!(
+            second.is_err(),
+            "at the shrunk bound (7), the SAME second 4-row chunk that fit at 8 must now be \
+             refused — the bound is one row too small to hold two full chunks"
+        );
+    }
 
     /// Every [`TrainingFormat`] value the tag mapping must cover, in
     /// [`TRAINING_FORMAT_TAGS`] order. Hand-written, and ANCHORED to the
@@ -1071,7 +1916,7 @@ mod tests {
         assert!(matches!(loader.format(), TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
 
-        let chunks = loader.text_chunks(2);
+        let chunks = loader.text_chunks(2).unwrap();
         assert_eq!(chunks.len(), 2, "3 rows at batch 2 → two chunks");
         match &chunks[0] {
             TextChunk::Regression { texts, targets } => {

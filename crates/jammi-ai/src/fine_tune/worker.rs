@@ -3349,7 +3349,7 @@ fn classify_training_error(
 /// A column that was ALREADY null keeps its historical `""` reading: that is a
 /// pre-existing null-handling contract of the text path, not a value this
 /// function invented.
-fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
+pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
     use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
     use arrow::datatypes::DataType;
 
@@ -3383,7 +3383,7 @@ fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
 /// families DataFusion produces for an audio-bytes column
 /// (`Binary`/`LargeBinary`/`BinaryView`). Returns `None` for any other type so
 /// the caller can surface a typed schema error.
-fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> {
     use arrow::array::{Array, BinaryArray, BinaryViewArray, LargeBinaryArray};
 
     if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
@@ -3399,7 +3399,7 @@ fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> 
 }
 
 /// Why a numeric column could not be read into clean `f32` targets.
-enum NumericColumnError {
+pub(crate) enum NumericColumnError {
     /// The column's Arrow type is not numeric (and the cast fallback failed).
     NotNumeric,
     /// A null target at the cited row index. Rejected rather than coerced to
@@ -3421,7 +3421,7 @@ enum NumericColumnError {
 /// returns a zero default rather than erroring, which would silently corrupt
 /// the scaler's μ/σ. A null or `NaN` target therefore returns a typed error
 /// citing the row, never a coerced `0.0`.
-fn extract_numeric_column(
+pub(crate) fn extract_numeric_column(
     col: &dyn arrow::array::Array,
 ) -> std::result::Result<Vec<f32>, NumericColumnError> {
     use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array};
@@ -6427,7 +6427,7 @@ mod tests {
         assert!(matches!(loader.format(), TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
         assert_eq!(
-            loader.regression_targets().unwrap(),
+            loader.regression_targets().unwrap().unwrap(),
             vec![2017.0, 2018.0, 2016.0]
         );
     }
@@ -6448,7 +6448,10 @@ mod tests {
             let loader =
                 build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
                     .unwrap();
-            assert_eq!(loader.regression_targets().unwrap(), vec![1.5, 2.5]);
+            assert_eq!(
+                loader.regression_targets().unwrap().unwrap(),
+                vec![1.5, 2.5]
+            );
         }
     }
 
@@ -6460,7 +6463,10 @@ mod tests {
         let loader =
             build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
                 .unwrap();
-        assert_eq!(loader.regression_targets().unwrap(), vec![10.0, 20.0]);
+        assert_eq!(
+            loader.regression_targets().unwrap().unwrap(),
+            vec![10.0, 20.0]
+        );
     }
 
     /// THE headline guard: a `(text, label)` source under `task=regression` no
@@ -6568,7 +6574,7 @@ mod tests {
             build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
                 .unwrap();
         assert_eq!(
-            loader.regression_targets().unwrap(),
+            loader.regression_targets().unwrap().unwrap(),
             vec![2017.0, 2017.0, 2017.0]
         );
     }

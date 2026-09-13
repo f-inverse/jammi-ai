@@ -849,7 +849,7 @@ impl TrainingLoop {
         // (a regression run only). Computed from the train split — the val split
         // is held out — so every regression-loss call scores in a z-space the
         // zero-init head can reach, while the head stays in raw space.
-        self.target_scaler = match train_loader.regression_targets() {
+        self.target_scaler = match train_loader.regression_targets()? {
             Some(targets) if !targets.is_empty() => {
                 let n = targets.len();
                 let tensor = Tensor::from_vec(targets, (n,), &self.device)
@@ -3224,7 +3224,7 @@ impl TrainingLoop {
                 accumulate(batch?, &mut total_loss, &mut count)?;
             }
         } else {
-            let text_chunks = val_loader.text_chunks(self.config.batch_size);
+            let text_chunks = val_loader.text_chunks(self.config.batch_size)?;
             for chunk in &text_chunks {
                 let batch = self.encode_chunk(chunk)?;
                 accumulate(batch, &mut total_loss, &mut count)?;
@@ -3459,7 +3459,7 @@ impl TrainingLoop {
                 consume(batch?)?;
             }
         } else {
-            for chunk in val_loader.text_chunks(batch_size) {
+            for chunk in val_loader.text_chunks(batch_size)? {
                 let batch = self.encode_chunk(&chunk)?;
                 consume(batch)?;
             }

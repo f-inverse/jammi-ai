@@ -889,9 +889,13 @@ jobs:
       # `cargo metadata` closure over `required-features` targets — credits
       # this step for nothing at all (`jammi-ai` declares no target requiring
       # `cuda`), which is precisely why the registry row exists. The registry
-      # matches parsed lanes, never step names, so renaming or moving this
-      # step is free; dropping `--tests`, dropping `-D warnings`, marking it
-      # `continue-on-error`, or deleting it is a FAIL.
+      # matches parsed lanes, never step names, so renaming this step, or
+      # moving it to another job of a workflow that still runs on every PR
+      # touching `crates/jammi-ai/**`, is free; dropping `--tests`, dropping
+      # `-D warnings`, marking it `continue-on-error`, deleting it, or moving
+      # it into a workflow that does NOT run on such a PR (a push-to-main-only
+      # host like `image-cuda.yml`, or a `paths:`-filtered one like
+      # `pypi-server-cuda.yml`) is a FAIL.
       #
       # Same image, job, and toolchain as the two steps above — `cuda` selects
       # the feature chain (`candle-core/cuda`, `jammi-{encoders,lora,kernels}/

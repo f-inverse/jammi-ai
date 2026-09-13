@@ -50,7 +50,7 @@ image (`ci/scripts/runpod_lib.sh:98`).
 
 ## M2 — the nvcc lane type-checks `jammi-ai`'s cuda arm under `-D warnings`
 
-- **Value:** the step at `.github/workflows/ci.yml:907-908`
+- **Value:** the step at `.github/workflows/ci.yml:911-912`
   (`cargo clippy -p jammi-ai --features cuda --tests -- -D warnings`) in the `flash-attn-compile`
   job (`.github/workflows/ci.yml:720`). Measured cost on job 103688700438: 5m50s of a 19m20s job.
 - **Readers:** the merge path itself; and `ci/scripts/check_lint_surface_closure.py`, which is what
@@ -58,7 +58,11 @@ image (`ci/scripts/runpod_lib.sh:98`).
   that gate's `cargo metadata` closure half credits this step for nothing; the row
   `jammi-ai cuda tests` in `ci/scripts/lint_surface_required_lanes.txt` is the reader that fails
   when no merge-path lane matches it. Deleting the step, dropping its `--tests` or its
-  `-D warnings`, or marking it `continue-on-error` each red the gate, naming the row.
+  `-D warnings`, marking it `continue-on-error`, or moving it into a workflow that does not run
+  on a PR touching `crates/jammi-ai/**` each red the gate, naming the row — the row is credited
+  only by a lane whose hosting workflow carries a `pull_request`-to-main trigger admitting that
+  crate's own sources, so a push-to-main-only host (`image-cuda.yml`) and a narrowly
+  `paths:`-filtered one (`pypi-server-cuda.yml`) satisfy nothing.
 - **Property:** no other merge-path lane lints this crate's cuda arm under `-D warnings`, and none
   compiles it under `cfg(test)`. The two CUDA release builds that compile its cuda `src/` are
   path-filtered (`.github/workflows/pypi-server-cuda.yml:22-27`,

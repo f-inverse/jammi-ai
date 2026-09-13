@@ -658,3 +658,135 @@ async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
         .artifact
         .0
 }
+
+/// A materialised training set carries NO version, and the mechanism that
+/// keeps it that way is a caller-side kind refusal in this crate — pinned here.
+///
+/// `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s `SESSION_LITERAL_ALLOWED`
+/// entry for `TrainingSetTable::registered_name` rests on that versionlessness:
+/// a read through the session registration cannot straddle a version boundary
+/// on a relation that never gets a second version. Every verb that could
+/// publish one over a result table — `refresh_embeddings` and
+/// `compact_embeddings`, plus `expire_versions`, which deletes versions rather
+/// than publishing them — enters through
+/// `InferenceSession::refreshable_record`, which refuses any record whose
+/// `kind` is not `ResultTableKind::Model` with
+/// `NotRefreshable { NotEmbeddingTable }`. This test drives all three at a real
+/// `ready` `TrainingSet` row and asserts the typed refusal plus the state it
+/// leaves behind.
+///
+/// **R-A — this is caller discipline, not a storage-layer impossibility.** The
+/// db owner's executed probe publishes a base version on a `TrainingSet` row
+/// through `Catalog::publish_base_version` (`current_version` None → `Some(0)`)
+/// and allocates a second through `ResultStore::allocate_version` (`Ok(1)`):
+/// both succeed. The `kind = 'model'` predicate in `resolve_embedding_table`
+/// gates only source_id-addressed resolution, which none of these verbs uses.
+/// Nothing in the schema keeps a version off a training-set row; only the
+/// refusal asserted here does, so this oracle is the whole guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_and_compaction_refuse_a_training_set_leaving_it_versionless() {
+    use jammi_ai::pipeline::embedding_refresh::RefreshOptions;
+    use jammi_db::error::{JammiError, NotRefreshableReason};
+
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let (table, _) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "training",
+        &parity_columns(),
+        ModelTask::TextEmbedding,
+        "contrastive",
+    )
+    .await
+    .unwrap();
+    let name = table.table_name().to_string();
+
+    // The preconditions the refusals have to be measured against: a REAL row,
+    // `ready` (so `refreshable_record`'s earlier `NotReady` arm cannot be what
+    // answers), of kind `TrainingSet`, with no version yet.
+    let before = session
+        .catalog()
+        .get_result_table(&name)
+        .await
+        .unwrap()
+        .expect("the producer promoted a catalog row");
+    assert_eq!(before.kind, ResultTableKind::TrainingSet);
+    assert_eq!(
+        before.status,
+        ResultTableStatus::Ready.to_string(),
+        "a non-ready row would be refused for an unrelated reason, making this \
+         oracle vacuous about the KIND"
+    );
+    assert_eq!(before.current_version, None);
+
+    // Each verb, driven at that row. `expire_versions` is asked for the widest
+    // possible window so nothing but the refusal can be what stops it.
+    let arms: Vec<(&str, std::result::Result<String, JammiError>)> = vec![
+        (
+            "refresh_embeddings",
+            session
+                .refresh_embeddings(&name, RefreshOptions::default())
+                .await
+                .map(|r| format!("{r:?}")),
+        ),
+        (
+            "compact_embeddings",
+            session
+                .compact_embeddings(&name)
+                .await
+                .map(|r| format!("{r:?}")),
+        ),
+        (
+            "expire_versions",
+            session
+                .expire_versions(&name, i64::MAX)
+                .await
+                .map(|r| format!("{r:?}")),
+        ),
+    ];
+    for (verb, outcome) in arms {
+        match outcome {
+            Err(JammiError::NotRefreshable { table: t, reason }) => {
+                assert_eq!(t, name, "{verb} must name the table it refused");
+                assert_eq!(
+                    reason,
+                    NotRefreshableReason::NotEmbeddingTable,
+                    "{verb} must refuse a TrainingSet as a non-embedding table"
+                );
+            }
+            other => panic!(
+                "{verb} must refuse a TrainingSet with \
+                 NotRefreshable {{ NotEmbeddingTable }}, got {other:?}"
+            ),
+        }
+    }
+
+    // ... and the refusals left the relation versionless: no `current_version`,
+    // no allocation consumed, no version row at all. The last is what the
+    // allowlist entry actually needs — a read through `registered_name` has one
+    // and only one state to see.
+    let after = session
+        .catalog()
+        .get_result_table(&name)
+        .await
+        .unwrap()
+        .expect("a refusal never deletes the row");
+    assert_eq!(
+        after.current_version, None,
+        "a refused verb must publish no version"
+    );
+    assert_eq!(
+        after.next_version, before.next_version,
+        "a refused verb must not even consume a version number"
+    );
+    assert_eq!(after.status, ResultTableStatus::Ready.to_string());
+    let versions = session
+        .catalog()
+        .list_result_table_versions(&name)
+        .await
+        .unwrap();
+    assert!(
+        versions.is_empty(),
+        "a training set has no version rows, got {versions:?}"
+    );
+}

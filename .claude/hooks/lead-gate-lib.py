@@ -1593,8 +1593,21 @@ def _install_self_alarm() -> None:
     Windows-hook deployment of this hook family today) silently skips
     installing it — an HONEST LIMIT, not a workaround: the harness's own
     `timeout` setting remains the only bound in that case, stated here
-    rather than pretended away."""
+    rather than pretended away.
+
+    esc-lead-gate-R12 fix round 2 advisory: BEFORE `os._exit(2)` (which
+    skips normal interpreter cleanup — no atexit handlers, no child-process
+    reaping), the handler `killpg`s `_CURRENT_ATTACK_PID`'s own process
+    group when one is live — an attack subprocess mid-execution at the
+    moment the alarm fires would otherwise be orphaned, continuing to run
+    detached from the now-dead hook process."""
     def _handler(signum: int, frame: object) -> None:  # noqa: ARG001
+        pid = _CURRENT_ATTACK_PID
+        if pid is not None:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
         sys.stderr.write(
             f"lead-gate: internal self-bound ({_SELF_ALARM_S:g}s) exceeded during "
             "esc-lead-gate-R12 attack re-execution — denying rather than risk the "
@@ -1643,21 +1656,67 @@ def anticipation_artifact_path(sdir: Path, unit_slug: str, tip_sha: str) -> Path
     return sdir / f"{unit_slug}.anticipation.{_fs_safe(tip_sha)}.json"
 
 
+# esc-lead-gate-R12 fix round 2 item 12: substrings a TEST RUNNER's own
+# summary line prints that vary by wall-clock alone, never by the mechanism
+# under attack — an UNMUTATED, execution-class command (e.g. `cargo test -p
+# foo`) run TWICE naturally differs in ITS OWN timing text every run, so
+# hashing RAW output would make reader 2's pre/post differential trivially
+# "pass" (a hash inequality) on pure noise, never a real behavioural change.
+_R12_VOLATILE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    # cargo/libtest: "... finished in 0.42s" / "... finished in 1.03s".
+    (re.compile(r"finished in [\d.]+s"), "finished in <T>s"),
+    # pytest's own summary line: "=== 3 passed in 0.12s ===".
+    (re.compile(r"in [\d.]+s ==="), "in <T>s ==="),
+    # A bare "... in 0.12s" trailer some runners print without the "===".
+    (re.compile(r"\bin [\d.]+s\b"), "in <T>s"),
+)
+
+
+def _r12_normalize_output(text: str) -> str:
+    """esc-lead-gate-R12 fix round 2 item 12 — the ONE committed
+    normalizer every witness hash runs its `stdout` through before
+    hashing. Strips ONLY the volatile timing substrings above; every other
+    byte (pass/fail counts, assertion text, stdout content) is untouched —
+    a genuine behavioural difference still changes the normalized hash.
+    This is deliberately narrow: it does not attempt to normalize paths,
+    PIDs, or any other source of run-to-run variance not measured as an
+    actual false-negative/false-positive risk (see the fixture's own
+    docstring for the measured case this closes)."""
+    normalized = text
+    for pattern, replacement in _R12_VOLATILE_PATTERNS:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
+
+
 def _witness_hash(rc: int, stdout: str, stderr_first_line: str) -> str:
-    """`sha256(rc + "\\n" + stdout + "\\n" + first line of stderr)`. The
-    stderr line is INCLUDED (unlike R11's `_run_claim_command`, which
-    excludes stderr entirely): the design round measured that two
-    DIFFERENT commands — a real script absent from a stale
-    `$CLAUDE_PROJECT_DIR` checkout, and a nonexistent script — both produce
-    `rc=127` with EMPTY stdout, and hash IDENTICALLY (`743c7850…`) under
-    `sha256(rc+stdout)` alone; `rc=1` (a real, meaningful failure) does NOT
-    collide with `rc=127` under either hashing scheme — the two are
-    already distinguished by `rc` alone. The independent `rc in (126,
+    """`sha256(rc + "\\n" + normalize(stdout) + "\\n" + first line of
+    stderr)`. The stderr line is INCLUDED (unlike R11's
+    `_run_claim_command`, which excludes stderr entirely): the design round
+    measured that two DIFFERENT commands — a real script absent from a
+    stale `$CLAUDE_PROJECT_DIR` checkout, and a nonexistent script — both
+    produce `rc=127` with EMPTY stdout, and hash IDENTICALLY (`743c7850…`)
+    under `sha256(rc+stdout)` alone; `rc=1` (a real, meaningful failure)
+    does NOT collide with `rc=127` under either hashing scheme — the two
+    are already distinguished by `rc` alone. The independent `rc in (126,
     127)`/empty-stdout vacuity check below still applies even with the
     stderr-disambiguated hash: a command that is simply broken can
     reproduce its own broken witness consistently, which proves nothing
-    about the mechanism under attack."""
-    return hashlib.sha256(f"{rc}\n{stdout}\n{stderr_first_line}".encode("utf-8")).hexdigest()
+    about the mechanism under attack. `stdout` is run through
+    `_r12_normalize_output` FIRST (item 12) — an execution-class command's
+    own wall-clock timing text must never be the thing that makes a pre/
+    post differential "pass"."""
+    return hashlib.sha256(
+        f"{rc}\n{_r12_normalize_output(stdout)}\n{stderr_first_line}".encode("utf-8")
+    ).hexdigest()
+
+
+# esc-lead-gate-R12 fix round 2 advisory: the PID of the currently in-
+# flight attack subprocess's OWN process group (it is always started with
+# `start_new_session=True`, so its pgid equals its pid) — set only for the
+# duration of one `_run_attack_command` call, read by `_install_self_alarm`'s
+# handler so a SIGALRM firing mid-attack kills the child rather than
+# leaking it as an orphan when `os._exit(2)` skips normal cleanup.
+_CURRENT_ATTACK_PID: int | None = None
 
 
 def _run_attack_command(command: str, cwd: str, deadline: float) -> tuple[bool, int | None, str, str, str]:
@@ -1670,10 +1729,12 @@ def _run_attack_command(command: str, cwd: str, deadline: float) -> tuple[bool, 
     tempfiles, never `subprocess.PIPE`), duplicated deliberately for the
     same reason those two never share code. Returns `(True, rc, stdout,
     stderr_first_line, "")` on a completed run, or `(False, None, "", "",
-    reason)` otherwise — a timeout's reason explicitly states this is NOT
-    the evidence-destroying `rm` hatch."""
+    reason)` otherwise. `_CURRENT_ATTACK_PID` is published for the
+    duration of the child's lifetime so the self-alarm handler can kill it
+    too — cleared in a `finally`, never left stale after this returns."""
+    global _CURRENT_ATTACK_PID
     remaining = min(deadline - time.monotonic(), _ATTACK_PER_COMMAND_CAP_S)
-    if remaining <= 0:
+    if remaining <= 0:  # R12-RESIDUAL: requires the shared attack budget to already be exhausted BEFORE this specific command's own turn; not exercised by a fast self-test fixture (the caller-level equivalent at :2091 is the same residual)
         return False, None, "", "", "the shared attack budget (or the per-command cap) was already exhausted"
     try:
         out_f = tempfile.TemporaryFile()
@@ -1687,6 +1748,7 @@ def _run_attack_command(command: str, cwd: str, deadline: float) -> tuple[bool, 
         out_f.close()
         err_f.close()
         return False, None, "", "", f"command failed to run ({exc})"
+    _CURRENT_ATTACK_PID = proc.pid
     try:
         rc = proc.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
@@ -1703,7 +1765,9 @@ def _run_attack_command(command: str, cwd: str, deadline: float) -> tuple[bool, 
         return (False, None, "", "",
                 f"command timed out (per-command cap {_ATTACK_PER_COMMAND_CAP_S:g}s / shared "
                 f"{_ATTACK_BUDGET_S:g}s attack budget) — name the slow key and narrow the "
-                "command; this is NOT the evidence-destroying `rm` hatch")
+                "command")
+    finally:
+        _CURRENT_ATTACK_PID = None
     try:
         out_f.seek(0)
         stdout = out_f.read().decode("utf-8", errors="replace")
@@ -1728,7 +1792,7 @@ def _resolve_worktree_cwd(unit_branch: str, project_dir: str, deadline: float) -
     registered for the branch is an HONEST LIMIT, not a workaround: an
     attack command needs real checked-out files to run against."""
     ok, out, _rc = _run_git(["worktree", "list", "--porcelain"], project_dir, deadline, [])
-    if not ok:
+    if not ok:  # R12-RESIDUAL: requires the `git worktree list` subprocess call itself to fail (e.g. a broken git binary); not exercised by a fast self-test fixture
         return None, f"could not resolve a worktree for {unit_branch!r} (`git worktree list`) — {out}"
     found = None
     current_path = None
@@ -1771,7 +1835,7 @@ def _r12_attack_command_denied(command: object, cwd: str, *, require_tracked_at:
     script the lead committed or modified in the SAME PR is tracked and CI
     still runs it; the controls remain the write-verb denylist below, the
     human SWARM_GATE_TOUCHED review, and same-repo `on: pull_request`."""
-    if not isinstance(command, str) or not command.strip():
+    if not isinstance(command, str) or not command.strip():  # R12-RESIDUAL: both real callers (_r12_validate_and_run_entry) already reject an empty/non-string `command` before this function is ever called; dead code from every reachable caller, kept as defense-in-depth
         return "empty or non-string command"
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -1779,7 +1843,7 @@ def _r12_attack_command_denied(command: object, cwd: str, *, require_tracked_at:
         tokens = list(lex)
     except ValueError as exc:
         return f"command does not tokenize as a shell command ({exc})"
-    if not tokens:
+    if not tokens:  # R12-RESIDUAL: a string non-empty after `.strip()` that tokenizes to zero shlex tokens is not constructible by any real caller's own upstream validation; not exercised by a fast self-test fixture
         return "empty command"
     segments: list[list[str]] = [[]]
     for tok in tokens:
@@ -1805,7 +1869,7 @@ def _r12_attack_command_denied(command: object, cwd: str, *, require_tracked_at:
                 ok, out, _rc = _run_git(["ls-tree", "-r", "--name-only", require_tracked_at],
                                          project_dir, deadline, [])
                 tracked = set(out.splitlines()) if ok else set()
-                if seg[1] not in tracked:
+                if seg[1] not in tracked:  # R12-RESIDUAL: this arm is only ever reached with `require_tracked_at` set, which only Reader 3 (ci/scripts/check_rigor_record.py) passes; it is exercised there (its own tracked-vs-untracked bash path fixtures), never through check_lead_gate.py's own FIXTURES list this sweep credits from
                     return (f"`{prog} {seg[1]}` is not git-TRACKED at {require_tracked_at[:12]}… "
                              "(esc-lead-gate-R12 M3': CI never executes an untracked lead-written "
                              "file from a detached checkout)")
@@ -1846,9 +1910,45 @@ def _r12_is_inspector_only(command: str) -> bool:
         else:
             segments[-1].append(tok)
     real_segments = [seg for seg in segments if seg]
-    if not real_segments:
+    if not real_segments:  # R12-RESIDUAL: `_r12_validate_and_run_entry`'s own denylist check (`_r12_attack_command_denied`, "empty command") already rejects a command with zero real segments before this is ever consulted; dead code from every reachable caller
         return False
     return all(seg[0].lower() in _R12_INSPECTOR_PROGRAMS for seg in real_segments)
+
+
+def _r12_is_execution_class(command: str) -> bool:
+    """esc-lead-gate-R12 fix round 2 F2: True iff AT LEAST ONE shell segment
+    of `command` invokes a program in `_R12_EXECUTION_PROGRAMS`, or `bash`/
+    `sh <path>` (the relaxed denylist's own real-tracked-script shape,
+    already validated by `_r12_attack_command_denied` before this is ever
+    consulted). This is the POSITIVE membership test the "at least one
+    execution-class attack" requirement needs — `_R12_EXECUTION_PROGRAMS`
+    was previously declared but never actually membership-tested anywhere,
+    so the callers below inferred "execution-class" from merely "not
+    inspector-only", which let a `printf`/`echo` placeholder (neither an
+    inspector NOR an execution program) slip through both the inspector-
+    only deny (it isn't one) and the execution requirement (nothing ever
+    checked it WAS one)."""
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    segments: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok in _SHELL_OPERATOR_TOKENS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    for seg in segments:
+        if not seg:
+            continue
+        prog = seg[0].lower()
+        if prog in _R12_EXECUTION_PROGRAMS:
+            return True
+        if prog in ("bash", "sh") and len(seg) == 2 and not seg[1].startswith("-"):
+            return True
+    return False
 
 
 def _r12_targeted_open_blocks(sdir: Path, unit_slug: str) -> list[tuple[str, dict]]:
@@ -1877,6 +1977,58 @@ def _r12_required_by_file(targeted: list[tuple[str, dict]]) -> tuple[dict[str, s
         for key in _derived_attack_keys(row):
             by_file.setdefault(_key_to_file(key), set()).add(key)
     return by_file, covers
+
+
+def _r12_find_pre_fix_artifact(sdir: Path, unit_slug: str, block_ts: str,
+                                block_sha: str | None) -> dict | None:
+    """esc-lead-gate-R12 fix round 2 F1: locates the pre-fix anticipation
+    artifact that COVERS this BLOCK's own `ts`, never by re-deriving the
+    artifact's filename from the BLOCK row's own `head_sha` alone. M1' keys
+    the artifact by the branch's CURRENT TIP at the moment Reader 1 required
+    it; when TWO open blocks of different types sit at different shas, the
+    union's own covering artifact sits at the NEWER tip, and the OLDER
+    block's own `head_sha` names no artifact file at all — the previous
+    lookup treated that as "no pre-fix witness required" instead of "the
+    witness this block needed is filed under a different name", silently
+    allowing the older block's relay through with no differential check at
+    all.
+
+    Scans every `<unit_slug>.anticipation.*.json` artifact on disk — there
+    is normally at most one live at a time (Reader 1 re-records at the
+    CURRENT tip on every dispatch), but a prior dispatch's artifact can
+    still be sitting on disk uncollected — and returns the most recently
+    WRITTEN one (by mtime) whose own `covers` list names `block_ts`. An
+    artifact recorded with NO `covers` field at all (the pre-union, single-
+    artifact shape every existing fixture and every anticipation artifact
+    written before a second block opened still produces) is treated as
+    implicitly covering exactly the block it was filed under — i.e. it
+    counts only when its own `pre_fix_sha` equals `block_sha`, which is
+    what "filed under" means for that shape; this is the ONLY place
+    `block_sha` is still consulted, and only as a fallback for artifacts
+    that predate the `covers` field.
+
+    `None` when nothing on disk covers this block at all — the caller
+    treats that as a DENY (a pre-fix witness Reader 1 required is simply
+    missing), never a silent skip."""
+    candidates: list[tuple[float, dict]] = []
+    for p in sorted(sdir.glob(f"{unit_slug}.anticipation.*.json")):
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        covers = data.get("covers")
+        if isinstance(covers, list) and covers:
+            if block_ts in covers:
+                candidates.append((p.stat().st_mtime, data))
+            continue
+        if isinstance(block_sha, str) and block_sha and data.get("pre_fix_sha") == block_sha:
+            candidates.append((p.stat().st_mtime, data))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda mc: mc[0])
+    return candidates[-1][1]
 
 
 _R12_MAIN_REF_CANDIDATES = ("main", "master")
@@ -1936,11 +2088,11 @@ def _r12_validate_and_run_entry(artifact_name: str, key: str, entry: object, cwd
     if deny is not None:
         return f"anticipation artifact {artifact_name} attacks[{key!r}] command is denied: {deny}", None, False
     remaining = attack_deadline - time.monotonic()
-    if remaining <= 0:
+    if remaining <= 0:  # R12-RESIDUAL: requires a real attack to consume the FULL _ATTACK_BUDGET_S (300s default) between two entries to trigger through a live fixture; not exercised by a fast self-test fixture
         return (f"the shared {_ATTACK_BUDGET_S:g}s attack budget for this decision was already "
                  f"exhausted before attacks[{key!r}]'s command could run (esc-lead-gate-R12)"), None, False
     ok, rc, stdout, stderr_line, run_why = _run_attack_command(command, cwd, attack_deadline)
-    if not ok:
+    if not ok:  # R12-RESIDUAL: the OSError/tempfile-open-failure paths inside _run_attack_command require breaking the filesystem or process-creation itself; not exercised by a fast self-test fixture (the budget-exhaustion sub-case of `ok=False` IS covered indirectly by the arm above, which returns before this line is even reached)
         return f"anticipation artifact {artifact_name} attacks[{key!r}] command could not be re-executed: {run_why}", None, False
     if rc in (126, 127) or stdout == "":
         return (f"anticipation artifact {artifact_name} attacks[{key!r}] command's re-executed "
@@ -1974,6 +2126,7 @@ def _r12_empty_set_rejection(artifact_name: str, attacks: object, unit_branch: s
         return why
     seen_pairs: dict[tuple[str, str], str] = {}
     all_inspector = True
+    any_execution_class = False
     for key, entry in attacks.items():
         f = _key_to_file(key)
         if f not in changed:
@@ -1981,15 +2134,23 @@ def _r12_empty_set_rejection(artifact_name: str, attacks: object, unit_branch: s
                      f"is not in the unit's own changed-file set against "
                      f"{'/'.join(_R12_MAIN_REF_CANDIDATES)} — a lead-chosen key on the empty-set "
                      "path must attack a file the unit actually touches (esc-lead-gate-R12)")
-        err, _command, is_inspector = _r12_validate_and_run_entry(
+        err, command, is_inspector = _r12_validate_and_run_entry(
             artifact_name, key, entry, cwd, attack_deadline, seen_pairs)
         if err is not None:
             return err
         all_inspector = all_inspector and is_inspector
+        if command is not None and _r12_is_execution_class(command):
+            any_execution_class = True
     if all_inspector:
         return (f"anticipation artifact {artifact_name} carries only inspector-class commands — "
                  "at least one lead-chosen attack must be execution-class (sh|bash <tracked "
                  "path>, cargo, python3, pytest, make) (esc-lead-gate-R12)")
+    if not any_execution_class:
+        return (f"anticipation artifact {artifact_name} carries no execution-class attack — "
+                 "esc-lead-gate-R12 F2: at least one command's first token must actually be "
+                 "cargo/python3/pytest/make or a `sh|bash <tracked path>` invocation; a "
+                 "placeholder command (e.g. printf/echo) is neither inspector-class nor "
+                 "execution-class and proves nothing about the mechanism (esc-lead-gate-R12)")
     return None
 
 
@@ -2032,9 +2193,9 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
     ok, tip_now, out = _run_git(
         ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{relay_ub}^{{commit}}"],
         project_dir, git_deadline, [])
-    if not ok:
+    if not ok:  # R12-RESIDUAL: requires the `git rev-parse` subprocess call itself to fail; not exercised by a fast self-test fixture
         return f"could not re-resolve {relay_ub!r} under refs/heads/ to confirm the pre-fix tip — {out}"
-    if tip_now != tip:
+    if tip_now != tip:  # R12-RESIDUAL: requires the branch to advance in the narrow window BETWEEN the caller's own tip resolution and this internal re-check, inside ONE synchronous hook invocation — a genuine race condition, not exercised by a fast self-test fixture (R12P5 tests a DIFFERENT, easier-to-construct case: the artifact simply not existing at an already-moved tip)
         return (f"{relay_ub!r}'s tip moved to {tip_now[:12]}… since this decision began (was "
                  f"{tip[:12]}…) — re-record the anticipation artifact at the new tip "
                  "(esc-lead-gate-R12)")
@@ -2043,7 +2204,7 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
     if why is not None:
         return why
     ok, status_out, _rc = _run_git(["status", "--porcelain"], cwd, git_deadline, [])
-    if not ok:
+    if not ok:  # R12-RESIDUAL: requires the `git status` subprocess call itself to fail; not exercised by a fast self-test fixture
         return f"could not check {cwd} for a clean tree (`git status --porcelain`) — {status_out}"
     if status_out.strip():
         dirty = [ln[3:].strip() if len(ln) > 3 else ln for ln in status_out.splitlines()[:5]]
@@ -2051,7 +2212,7 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
                  "commit them or move them outside the worktree before anticipation attacks can "
                  "prove they ran against the tip exactly (esc-lead-gate-R12)")
     ok, head_now, _rc = _run_git(["rev-parse", "HEAD"], cwd, git_deadline, [])
-    if not ok or head_now != tip:
+    if not ok or head_now != tip:  # R12-RESIDUAL: `_resolve_worktree_cwd` only ever returns a path git ITSELF reports as `branch refs/heads/{unit_branch}` in `git worktree list --porcelain`, which makes that worktree's own HEAD (a symref to the SAME branch ref) equal `tip` by construction barring exotic repo corruption; not exercised by a fast self-test fixture
         return (f"the worktree at {cwd}'s HEAD ({head_now if ok else '?'}) does not match the "
                  f"branch tip {tip[:12]}… (esc-lead-gate-R12)")
 
@@ -2071,17 +2232,26 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
 
     seen_pairs: dict[tuple[str, str], str] = {}
     all_inspector = True
+    any_execution_class = False
     for f in sorted(by_file):
-        err, _command, is_inspector = _r12_validate_and_run_entry(
+        err, command, is_inspector = _r12_validate_and_run_entry(
             path.name, f, attacks.get(f), cwd, attack_deadline, seen_pairs)
         if err is not None:
             return err
         all_inspector = all_inspector and is_inspector
+        if command is not None and _r12_is_execution_class(command):
+            any_execution_class = True
     if all_inspector:
         return (f"anticipation artifact {path.name} carries only inspector-class commands "
                  "(sed/grep/cat/head/awk/rg/wc/tail/ls) — at least one attack must be "
                  "execution-class (sh|bash <tracked path>, cargo, python3, pytest, make) "
                  "(esc-lead-gate-R12)")
+    if not any_execution_class:
+        return (f"anticipation artifact {path.name} carries no execution-class attack — "
+                 "esc-lead-gate-R12 F2: at least one command's first token must actually be "
+                 "cargo/python3/pytest/make or a `sh|bash <tracked path>` invocation; a "
+                 "placeholder command (e.g. printf/echo) is neither inspector-class nor "
+                 "execution-class and proves nothing about the mechanism (esc-lead-gate-R12)")
     return None
 
 
@@ -2109,7 +2279,10 @@ def _post_fix_attacks_rejection(row: dict, data: dict, project_dir: str, cwd: st
     Reader 3, `check_rigor_record.py`, which independently re-derives from
     a real checkout instead)."""
     new_surface_files = {_key_to_file(k) for k in (new_surfaces or {}).keys()}
-    required = set(pre_by_file) | new_surface_files
+    # F3: widen by EVERY file the fix's own diff changed, not merely the
+    # artifact's keys and new-surface definitions — a fix-changed file with
+    # no covering key at all was previously invisible to this check.
+    required = set(pre_by_file) | new_surface_files | set(fix_changed or [])
     if "open_question" in data and not (isinstance(data.get("attacks_post"), dict) and data.get("attacks_post")):
         return (
             "relay carries `open_question`, which esc-lead-gate-R12 REPLACES with "
@@ -2374,31 +2547,51 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
     if claims_why is not None:
         return claims_why
 
-    # esc-lead-gate-R12 READER 2 (M4') — the post-fix differential. Runs in
-    # the SAME resolved worktree the fix landed in (never
-    # $CLAUDE_PROJECT_DIR), bounded by its OWN `_ATTACK_BUDGET_S`, separate
-    # from the git budget above. The pre-fix artifact is looked up by the
-    # BLOCK's own `head_sha` (M1': the artifact is keyed by TIP, and this
-    # BLOCK's own head_sha WAS the tip at the moment Reader 1 required
-    # anticipation for it); the required set is `keys(ARTIFACT) ∪
-    # new_surfaces`, PER FILE — never merely this row's own derived keys —
-    # so lead-chosen keys the empty-set path added are differentiated too.
+    # esc-lead-gate-R12 READER 2 (M4', fix round 2 F1/F3) — the post-fix
+    # differential. Runs in the SAME resolved worktree the fix landed in
+    # (never $CLAUDE_PROJECT_DIR), bounded by its OWN `_ATTACK_BUDGET_S`,
+    # separate from the git budget above. F1: the pre-fix artifact is
+    # located by SCANNING for the one whose own `covers` list names this
+    # BLOCK's `ts` (`_r12_find_pre_fix_artifact`) — never by re-deriving the
+    # filename from the BLOCK row's own `head_sha`, which only ever equals
+    # ONE covering artifact's filename when exactly one block was open at
+    # dispatch time; a second, OLDER open block's own `head_sha` names no
+    # artifact at all once the tip has moved past it, and the old lookup
+    # silently treated "no file at that name" as "nothing required" rather
+    # than "the witness is filed under a different name". `by_file_this_
+    # row` is this ONE block's own derived-keys-to-files map, computed
+    # independent of whatever the artifact contains, so a genuinely MISSING
+    # (deleted, never-written) covering artifact still leaves `pre_by_file`
+    # non-empty and the guard below fires instead of silently emptying the
+    # requirement it exists to enforce. The required set is `keys(ARTIFACT)
+    # ∪ new_surfaces ∪ fix_changed` (F3: every file the fix touched, not
+    # only new-surface files), PER FILE — never merely this row's own
+    # derived keys — so lead-chosen keys the empty-set path added, and any
+    # file the fix changed with no covering key at all, are both
+    # differentiated too.
     relay_ub = data.get("unit_branch")
+    agent_type_local = row.get("agent_type") or ""
+    by_file_this_row, _covers_this_row = _r12_required_by_file([(agent_type_local, row)])
     anticipation_data = None
     if isinstance(relay_ub, str) and relay_ub.strip():
+        block_ts_local = row.get("ts")
         block_sha_local = row.get("head_sha")
-        if isinstance(block_sha_local, str) and block_sha_local:
-            apath = anticipation_artifact_path(sdir, unit_slug, block_sha_local)
-            if apath.exists():
-                try:
-                    anticipation_data = json.loads(apath.read_text())
-                except Exception:
-                    anticipation_data = None
+        if isinstance(block_ts_local, str) and block_ts_local:
+            anticipation_data = _r12_find_pre_fix_artifact(sdir, unit_slug, block_ts_local,
+                                                             block_sha_local if isinstance(block_sha_local, str) else None)
     if isinstance(anticipation_data, dict) and isinstance(anticipation_data.get("attacks"), dict):
         pre_by_file: dict[str, set[str]] = {f: set() for f in anticipation_data["attacks"].keys()}
+    elif by_file_this_row:
+        # F1: no covering artifact was found (deleted, or never written) —
+        # keep `pre_by_file` non-empty from this row's OWN derived keys so
+        # the "no pre-fix anticipation artifact found" guard below actually
+        # fires, instead of a missing file quietly emptying the set it was
+        # supposed to enforce.
+        pre_by_file = dict(by_file_this_row)
     else:
         pre_by_file = {}
-    required_r12 = set(pre_by_file) | {_key_to_file(k) for k in (new_surfaces or {}).keys()}
+    required_r12 = (set(pre_by_file) | {_key_to_file(k) for k in (new_surfaces or {}).keys()}
+                    | set(fix_changed or []))
     if required_r12:
         project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if not project_dir:

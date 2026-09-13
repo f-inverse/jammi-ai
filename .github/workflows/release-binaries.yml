@@ -376,18 +376,24 @@ jobs:
   # self-sufficient: it bundles the CUDA-enabled binary, every shared library
   # that binary's own `DT_NEEDED` closure names and the host does not provide
   # (the CUDA runtime out of the toolkit — libcudart / libcublas / libcublasLt /
-  # libcurand / libnvrtc and nvrtc's builtins — plus libnccl out of
-  # `/usr/lib64`, which `jammi-ai`'s `cuda` feature pulls in through
-  # `candle-core/nccl`), and a `jammi-server` launcher that prepends the bundled
-  # `lib/` to LD_LIBRARY_PATH then execs the binary. The candle/cudarc binary
-  # has hard DT_NEEDED entries for those libraries, so it will not exec without
-  # them on the loader path; bundling makes the tarball run on any host with
-  # only an NVIDIA driver. That set is DERIVED from the binary rather than
-  # listed by hand (`ci/scripts/bundle_cuda_libs.sh`, whose own doc says why),
-  # and the staged tree is then checked against the real loader. The driver's
-  # own libraries (`libcuda.so.1`, `libnvidia-*`) are deliberately NOT bundled —
-  # they must match the host's driver. A GPU-less runner is fine — nothing runs
-  # the binary here.
+  # libcurand / libnvrtc — plus libnccl out of `/usr/lib64`, which `jammi-ai`'s
+  # `cuda` feature pulls in through `candle-core/nccl`), plus a fixed FLOOR of
+  # libraries no `DT_NEEDED` closure can be trusted to reach on its own
+  # (nvrtc's builtins library in particular — NVRTC `dlopen`s it rather than
+  # linking it, a measured fact `ci/scripts/bundle_cuda_libs.sh`'s own doc
+  # records), and a `jammi-server` launcher that prepends the bundled `lib/` to
+  # LD_LIBRARY_PATH then execs the binary. The candle/cudarc binary has hard
+  # DT_NEEDED entries for those libraries, so it will not exec without them on
+  # the loader path; bundling makes the tarball run on any host with only an
+  # NVIDIA driver. That set is DERIVED from the binary rather than listed by
+  # hand (`ci/scripts/bundle_cuda_libs.sh`, whose own doc says why), and a
+  # post-copy assertion checks — by filesystem presence, not by asking the
+  # runtime loader — that every derived and floor soname landed under the
+  # stage directory. Asking the REAL loader whether it resolves those files
+  # FROM the stage directory at run time is a separate, filed follow-up, not
+  # something this job establishes. The driver's own libraries (`libcuda.so.1`,
+  # `libnvidia-*`) are deliberately NOT bundled — they must match the host's
+  # driver. A GPU-less runner is fine — nothing runs the binary here.
   gpu-proof:
     name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
@@ -503,16 +509,21 @@ jobs:
           strip target/release/jammi-server
           cp target/release/jammi-server "${stage}/bin-jammi-server"
 
-          # Stage the libraries this tarball must carry, and check the result
-          # against the loader. Both halves live in
+          # Stage the libraries this tarball must carry. Both halves live in
           # `ci/scripts/bundle_cuda_libs.sh`: it walks the STAGED binary's own
           # transitive `DT_NEEDED` closure, resolves each soname that is
           # neither the platform's nor the driver's from its default search
           # path (the CUDA 12.6 toolkit, then `/usr/lib64`), copies every
-          # versioned object with `cp -L`, and then asks `ldd` whether the
-          # staged tree actually satisfies the binary — failing on any
-          # unresolved entry other than the driver's own libraries, which no
-          # GPU-less build runner has.
+          # versioned object with `cp -L`, separately resolves and stages a
+          # fixed FLOOR of libraries no `DT_NEEDED` closure can be trusted to
+          # reach on its own (nvrtc's builtins library, which NVRTC `dlopen`s
+          # rather than links — the script's own doc records the measurement),
+          # then asserts — by filesystem presence alone, no ELF reader, no
+          # `ldd` — that every closure and floor soname landed under the stage
+          # directory as a regular file of its own SONAME. It does NOT ask the
+          # real loader whether it resolves those files FROM the stage
+          # directory at run time; that verification is a separate, filed
+          # follow-up.
           #
           # No soname list is passed: a list is a copy of a fact that lives in
           # the binary, and this leg shipped six literal names right up until

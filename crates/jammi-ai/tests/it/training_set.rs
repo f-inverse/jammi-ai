@@ -934,6 +934,72 @@ async fn recompute_refuses_a_training_set_with_an_unknown_order_rule() {
     }
 }
 
+/// M2's second unwitnessed refusal — a `TrainingSet` table whose
+/// `.materialization.json` sidecar has gone missing between the catalog's
+/// descriptor read and `recompute`'s anchor read is `NotRecomputable` naming
+/// the table, never a silent "zero recorded anchors" that would replay the
+/// table with none of its original lineage.
+///
+/// No producer or verb in this build ever tears the sidecar off a `ready`
+/// table on its own, so the only way to exercise the refusal honestly is to
+/// delete a real manifest sidecar out from under a real table (same Parquet
+/// object, same catalog row — the sidecar is the ONE thing this test removes)
+/// and drive `recompute` at it.
+#[tokio::test(flavor = "multi_thread")]
+async fn recompute_refuses_a_training_set_with_a_missing_sidecar() {
+    use jammi_ai::pipeline::recompute::Cascade;
+    use jammi_db::error::JammiError;
+    use jammi_db::storage::DeleteOutcome;
+
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_pairs.csv")).await;
+    let columns = parity_columns();
+    let (table, _) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "training",
+        &columns,
+        ModelTask::TextEmbedding,
+        "contrastive",
+    )
+    .await
+    .unwrap();
+
+    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let handle = session.result_store().open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    assert!(
+        handle.exists(&sidecar).await.unwrap(),
+        "the producer must have written a manifest sidecar for the corruption \
+         below to mean anything"
+    );
+    assert_eq!(
+        handle.delete_if_exists(&sidecar).await.unwrap(),
+        DeleteOutcome::Deleted,
+        "the sidecar must actually be removed, or the refusal below would be \
+         exercising something else"
+    );
+    assert!(
+        session
+            .result_store()
+            .read_materialization_manifest(&url)
+            .await
+            .unwrap()
+            .is_none(),
+        "with the sidecar gone, the manifest read must report Ok(None), not an error"
+    );
+
+    let err = jammi_ai::Session::new(Arc::clone(&session))
+        .recompute(table.table_name(), Cascade::ReportOnly)
+        .await
+        .expect_err("a missing sidecar must refuse, never replay with zero recorded anchors");
+    match err {
+        JammiError::NotRecomputable { table: named } => {
+            assert_eq!(named, table.table_name());
+        }
+        other => panic!("expected NotRecomputable, got {other:?}"),
+    }
+}
+
 /// The artifact digest a table's manifest attests — the byte-identity witness.
 async fn artifact_digest(session: &InferenceSession, table: &str) -> String {
     let record = session

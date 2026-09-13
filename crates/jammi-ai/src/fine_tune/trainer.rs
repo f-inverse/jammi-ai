@@ -691,10 +691,16 @@ impl TrainingLoopBuilder {
 /// `encode_texts_bucketing_oracle::tokenize_and_bucket_pads_every_row_to_the_bucket_ladder`
 /// red (rows stay at their natural, unbucketed width, so `cols` no longer
 /// matches every row's actual length).
+/// `pinned_rung`: DESIGN.md §2's rung-pinning option
+/// (`batch_bucket::resolve_bucket_rung`'s own doc has the full "why") —
+/// `None` at the sole production call site today (every reachable run trains
+/// world 1 alone, so there is no other rank's shape to agree with); U4b is
+/// what would ever pass `Some`.
 fn tokenize_and_bucket(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
     effective_max: usize,
+    pinned_rung: Option<usize>,
 ) -> Result<(crate::model::tokenizer::BatchEncoding, usize, usize)> {
     #[cfg(test)]
     BUCKETED_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -713,7 +719,11 @@ fn tokenize_and_bucket(
     // `EncoderAdapters` TRAINING-STEP call site is bucketed uniformly —
     // never an f16-specific knob (but see the eval-time exemption above:
     // this function is only reached from the training-step path today).
-    let cols = jammi_numerics::bucket_seq_len(natural_cols, effective_max);
+    let cols = crate::fine_tune::batch_bucket::resolve_bucket_rung(
+        natural_cols,
+        effective_max,
+        pinned_rung,
+    );
     crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.input_ids, cols, 0);
     crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.attention_masks, cols, 0);
 
@@ -1879,7 +1889,10 @@ impl TrainingLoop {
                 // the pre-esc-076 baseline for eval, it does not newly
                 // bound that axis.
                 let (encoding, rows, cols) = if self.training_mode {
-                    tokenize_and_bucket(tokenizer, texts, effective_max)?
+                    // `None`: world 1 alone has no other rank's rung to
+                    // agree with at this commit (see `tokenize_and_bucket`'s
+                    // own doc).
+                    tokenize_and_bucket(tokenizer, texts, effective_max, None)?
                 } else {
                     tokenize_natural_width(tokenizer, texts, effective_max)?
                 };
@@ -11706,7 +11719,7 @@ mod encode_texts_bucketing_oracle {
 
         let texts = ragged_texts();
         let (encoding, rows, cols) =
-            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, None).unwrap();
 
         assert_eq!(rows, texts.len());
 
@@ -11749,6 +11762,58 @@ mod encode_texts_bucketing_oracle {
             for &m in &row[natural_cols..] {
                 assert_eq!(m, 0, "padded tail of attention_mask row {i} must be masked");
             }
+        }
+    }
+
+    /// DESIGN.md §2's rung-pinning option, at the production call site: a
+    /// `Some(rung)` wins outright over this batch's own natural width — the
+    /// plumbing U4b's cross-rank gather would use, proven here through
+    /// `tokenize_and_bucket` itself (not just `resolve_bucket_rung` in
+    /// isolation), against a real tokenizer, at both a rung ABOVE and BELOW
+    /// what the batch's own natural width would otherwise resolve to.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn tokenize_and_bucket_pinned_rung_overrides_the_batchs_own_natural_width() {
+        let base = tiny_modernbert_base_model().await;
+        let tokenizer = tokenizer_of(&base);
+        let texts = ragged_texts();
+
+        let (_encoding, _rows, unpinned_cols) =
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, None).unwrap();
+
+        // A rung strictly ABOVE what this batch would otherwise resolve to.
+        let higher_rung = unpinned_cols * 2;
+        let (higher_encoding, rows, cols) =
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, Some(higher_rung))
+                .unwrap();
+        assert_eq!(rows, texts.len());
+        assert_eq!(cols, higher_rung);
+        for row in &higher_encoding.input_ids {
+            assert_eq!(row.len(), higher_rung);
+        }
+        for row in &higher_encoding.attention_masks {
+            assert_eq!(row.len(), higher_rung);
+        }
+
+        // A rung strictly BELOW `unpinned_cols` but still `>=` the batch's
+        // natural width, so the pin does not become a truncation (the
+        // tokenizer's own `Some(effective_max)` cap already bounds the
+        // natural width; `MIN_BUCKET_LEN` is always `<= unpinned_cols`).
+        let lower_rung = crate::fine_tune::batch_bucket::MIN_BUCKET_LEN;
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let natural = tokenizer
+            .encode_batch(&text_refs, Some(EFFECTIVE_MAX))
+            .unwrap();
+        let natural_cols = natural.input_ids[0].len();
+        if lower_rung >= natural_cols && lower_rung < unpinned_cols {
+            let (_lower_encoding, _rows, cols) =
+                super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, Some(lower_rung))
+                    .unwrap();
+            assert_eq!(
+                cols, lower_rung,
+                "a pinned rung must win even when it is BELOW what the batch's own \
+                 natural width would otherwise resolve to"
+            );
         }
     }
 
@@ -11943,7 +12008,7 @@ mod encode_texts_bucketing_oracle {
         // not two paths that happen to coincide for this input.
         let tokenizer = tokenizer_of(&base_model);
         let (_, _, bucketed_cols) =
-            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, None).unwrap();
         let (_, _, natural_cols) =
             super::tokenize_natural_width(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
         assert!(

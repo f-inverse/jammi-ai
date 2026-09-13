@@ -186,7 +186,23 @@ pub(crate) fn checked_gather_counts(
              partition rule and cannot be a gather slice"
         )));
     };
-    let claimed = counts[rank as usize];
+    // `rank` is never checked against `world` here: every arm's constructor
+    // already guarantees `rank < world` before a `Collective` value exists at
+    // all — `Noop` hardcodes rank 0 of world 1, `LocalGang::rank` refuses a
+    // rank outside the gang before handing out a `Local`, and
+    // `Nccl::from_rank` refuses the same before handing out an `Nccl`. So
+    // `counts.get(rank as usize)` returning `None` here is unreachable
+    // through any of the three arms today; it is still a typed error rather
+    // than an index panic, for defense in depth, and no second refusal site
+    // for `world == 0` / `rank >= world` is added anywhere else in this
+    // module — the length check above and this one are the only two.
+    let Some(&claimed) = counts.get(rank as usize) else {
+        return Err(JammiError::FineTune(format!(
+            "all_gather: rank {rank} is not an index into a {world}-entry counts vector — every \
+             arm's constructor guarantees rank < world before a collective ever runs, so this \
+             should be unreachable"
+        )));
+    };
     if local_rows != claimed {
         return Err(JammiError::FineTune(format!(
             "all_gather: rank {rank} holds {local_rows} rows but the partition rule says \

@@ -317,7 +317,11 @@ impl ModelCache {
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
-        let device_config = self.device_config.for_device(device)?;
+        // The device is validated here — a warm hit must not be able to
+        // return a copy from a device this deployment never declared — but
+        // the per-device `DeviceConfig` is built in `do_load`, on the cold
+        // path only: it owns a `Vec`, and cloning one per warm hit would put
+        // an allocation on the path that exists to avoid work.
         let scheduler = Arc::clone(self.gpu_schedulers.get(device).ok_or_else(|| {
             JammiError::Config(format!(
                 "device {device} has no admission budget in this session: it is not one of \
@@ -553,7 +557,7 @@ impl ModelCache {
             drop(cache);
 
             let result = self
-                .do_load(&id, &device_config, &scheduler, source, task, backend_hint)
+                .do_load(&id, &scheduler, source, task, backend_hint)
                 .await;
 
             let mut cache = self.inner.write().await;
@@ -731,12 +735,15 @@ impl ModelCache {
     async fn do_load(
         &self,
         id: &CacheKey,
-        device_config: &DeviceConfig,
         gpu_scheduler: &Arc<GpuScheduler>,
         source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
+        // This load's device, as the backend sees it. Built here rather than
+        // at the (warm-hit) entry point: it owns a `Vec`, and the cold path
+        // is the only one that needs it.
+        let device_config = self.device_config.for_device(id.device)?;
         let resolved = self.resolver.resolve(source, task, backend_hint).await?;
         let source_str = source.to_string();
         let backend: &dyn ModelBackend = match resolved.backend {
@@ -858,7 +865,7 @@ impl ModelCache {
             }
         };
 
-        let loaded = backend.load(&resolved, device_config)?;
+        let loaded = backend.load(&resolved, &device_config)?;
 
         // Register model in catalog (idempotent — ignores if already registered).
         // See `Self::complete_generic_registration`'s own doc for the full

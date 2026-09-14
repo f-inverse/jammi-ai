@@ -166,6 +166,24 @@ const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Rpcs served ONLY on the internal `[server] peer_bind` listener, beside
+/// `PeerService` — but NEVER appended to [`PEER_LISTENER_ALLOWLIST`], whose
+/// own doc explicitly calls its bucket "deliberately tenant-free". Gang
+/// admission is the OPPOSITE shape: I-GANG derives tenant from the verified
+/// `jobs` row (never the caller), so this bucket carries its own sentence
+/// rather than reusing the peer bucket's "deliberately tenant-free" one.
+///
+/// The exemption's premise — that this path is NOT reachable on the public
+/// listener — is proven in this file by
+/// [`gang_service_is_unimplemented_on_the_public_listener`], the same way
+/// [`peer_service_is_unimplemented_on_the_public_listener`] proves it for
+/// `PeerService`.
+const GANG_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[(
+    "GangService",
+    "RunRank",
+    "served only on peer_bind; tenant derived from the verified job row, never the caller",
+)];
+
 // ---------------------------------------------------------------------------
 // Case model
 // ---------------------------------------------------------------------------
@@ -3113,6 +3131,9 @@ fn covered_on_wire(cases: &[IsolationCase]) -> BTreeSet<String> {
     for (service, rpc, _why) in PEER_LISTENER_ALLOWLIST {
         covered.insert(format!("{service}/{rpc}"));
     }
+    for (service, rpc, _why) in GANG_LISTENER_ALLOWLIST {
+        covered.insert(format!("{service}/{rpc}"));
+    }
     covered
 }
 
@@ -3171,6 +3192,11 @@ fn allowlist_and_cases_partition_the_wire_surface() {
         .map(|(s, r)| format!("{s}/{r}"))
         .chain(
             PEER_LISTENER_ALLOWLIST
+                .iter()
+                .map(|(s, r, _why)| format!("{s}/{r}")),
+        )
+        .chain(
+            GANG_LISTENER_ALLOWLIST
                 .iter()
                 .map(|(s, r, _why)| format!("{s}/{r}")),
         )
@@ -3274,6 +3300,49 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
                 && why.contains("tenant enforced by the coordinator")
                 && why.contains("deliberately tenant-free"),
             "{service}/{rpc}: the allowlist entry must carry the I-PEER text"
+        );
+    }
+}
+
+/// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`:
+/// `GangServiceServer` is mounted only on the internal `peer_bind` `Routes`
+/// (`OssServer::bind`), beside `PeerServiceServer`, and is never added to the
+/// public `Routes`. This is the invariant that makes
+/// [`GANG_LISTENER_ALLOWLIST`] sound — a tenant-bearing caller cannot reach
+/// the gang admission handler through the public tenant layer; I-GANG's own
+/// tenant derivation (from the verified job row) is the only tenant
+/// authority a gang rpc is ever decided under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gang_service_is_unimplemented_on_the_public_listener() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+    use jammi_wire::proto::gang::{rank_control, Assign, RankControl};
+
+    let server = crate::common::grpc::start_engine_server().await;
+    let channel = crate::common::grpc::channel(server.addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(RankControl {
+        control: Some(rank_control::Control::Assign(Assign {
+            job_id: "any".into(),
+            attempt: 0,
+            rank: 0,
+            world: 1,
+            coordinator_instance_id: "any".into(),
+        })),
+    });
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("the public listener must not serve GangService");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "public listener must answer UNIMPLEMENTED for GangService/RunRank: {err:?}"
+    );
+    for (service, rpc, why) in GANG_LISTENER_ALLOWLIST {
+        assert!(
+            why.contains("served only on peer_bind")
+                && why.contains("tenant derived from the verified job row"),
+            "{service}/{rpc}: the allowlist entry must carry the I-GANG text"
         );
     }
 }

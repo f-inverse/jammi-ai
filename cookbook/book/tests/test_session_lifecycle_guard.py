@@ -350,6 +350,74 @@ def test_every_alias_and_construction_shape_leaks_by_name(pytester: pytest.Pytes
     assert not any("test_shape_closing_control_passes" in line for line in error_lines)
 
 
+def test_leak_inside_an_already_failing_test_is_warned_not_failed_again(
+    pytester: pytest.Pytester,
+):
+    """The guard's OTHER arm (`conftest.py`'s `_no_leaked_sessions`, the
+    ``request.session.testsfailed > failed_before`` branch): a test that
+    already failed on its own assertion and ALSO leaks a session is reported
+    as exactly one `failed` -- the test's own assertion -- plus a WARNING
+    naming the leaked label, never a second `error` piled on top of the true
+    cause.
+
+    The mirror case -- the identical leak inside a test that otherwise
+    PASSES -- is already covered above by
+    `test_leaked_session_reports_exactly_once_by_name`: there, nothing else
+    failed for the guard to defer to, so the leak itself is the teardown
+    `error`. Referencing rather than duplicating it keeps the two arms next
+    to their one shared fixture shape.
+    """
+    pytester.makeconftest(_CONFTEST)
+    pytester.makepyfile(
+        test_the_throwaway_suite='''
+import jammi
+
+def test_already_failing_test_that_also_leaks(tmp_path):
+    jammi.connect(f"file://{tmp_path}")
+    assert False, "already-failing"
+'''
+    )
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    # One `failed` (the assertion, at CALL), no `errors` at all -- the guard's
+    # own fixture finalizer took the warn branch instead of `pytest.fail`ing a
+    # second time on top of an already-failing test.
+    result.assert_outcomes(failed=1, errors=0, passed=0, warnings=1)
+    assert result.ret != 0, "the test's own assertion must still fail the run"
+
+    full = "\n".join(result.outlines)
+    assert "left 1 jammi session(s) open" in full
+    assert "test_already_failing_test_that_also_leaks" in full
+
+    # The leak message lives under the warnings summary, as a `PytestWarning`
+    # -- not under a `FAILED`/`ERROR` short-summary line of its own (that
+    # would mean it was reported as a SECOND problem, not folded into a
+    # warning).
+    result.stdout.fnmatch_lines(["*warnings summary*"])
+    warning_lines = [
+        line
+        for line in result.outlines
+        if "left 1 jammi session(s) open" in line
+    ]
+    assert warning_lines, "the leak message must appear somewhere in the run"
+    assert not any(
+        "FAILED" in line or line.strip().startswith("ERROR")
+        for line in warning_lines
+    ), "the leak message must not be reported as its own FAILED/ERROR line"
+
+    short_summary = [
+        line
+        for line in result.outlines
+        if line.startswith("FAILED") or line.startswith("ERROR")
+    ]
+    assert len(short_summary) == 1, (
+        "exactly one short-summary line -- the assertion's FAILED -- and "
+        f"nothing else; got {short_summary!r}"
+    )
+    assert short_summary[0].startswith("FAILED")
+
+
 def test_leaked_session_in_a_tests_subdirectory_module_is_failed_by_name(
     pytester: pytest.Pytester,
 ):

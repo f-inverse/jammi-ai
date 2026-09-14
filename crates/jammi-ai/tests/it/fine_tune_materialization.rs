@@ -337,6 +337,24 @@ async fn a_lost_lease_on_a_cache_hit_never_deletes_the_reused_prefix() {
         "a lost-lease abort on a cache hit must never delete or unpoint the REUSED model's own \
          prefix"
     );
+    // The DB column alone is not load-bearing (a mutated `delete_if_owned`
+    // that deletes the OBJECT STORE bytes unconditionally would leave this
+    // column untouched — it is the artifact store's own prefix, not the
+    // catalog row, `delete_artifact_prefix` reaches). Fetch the actual
+    // bytes: `ArtifactStore::fetch_artifact` fails with `StorageError::
+    // NotPublished` when the manifest is gone (module doc), so a
+    // successful fetch here is the one assertion this test cannot pass
+    // vacuously.
+    let reused_prefix_url = jammi_db::storage::StorageUrl::parse(&reused_prefix)
+        .expect("the recorded artifact_path must be a valid StorageUrl");
+    session
+        .artifact_store()
+        .fetch_artifact(&reused_prefix_url)
+        .await
+        .expect(
+            "the reused prefix's bytes must still be fetchable after a lost-lease abort on the \
+             cache-hit attempt that pointed at them",
+        );
 
     // The legitimate owner (worker-b) still finalizes correctly against the
     // SAME reused prefix.

@@ -17,36 +17,104 @@ handshake; the gRPC + Flight channels) — there is no separate "session façade
 object wrapping either one, so registering the backend IS registering the
 session `connect()` returned.
 
-A `weakref.WeakSet` so a session a caller drops without closing disappears
-here too, exactly when it is collected — this registry answers "what is open
-right now", never "what did the caller forget to close"; a caller (or test
-harness) that wants to catch a forgotten `close()` must hold its own strong
-reference across the window it is checking, so the entry survives to be seen.
+A `weakref.WeakSet` backs :func:`open_sessions`, so a session a caller drops
+without closing disappears from THAT view exactly when it is collected — a
+snapshot diff over `open_sessions()` answers "what is open right now", never
+"what leaked". That is unsound for exactly the shape a leak guard needs to
+catch: a bare `jammi.connect(...)` statement (or a local dropped at a test
+frame's exit) is refcount-collected before any `finally`/fixture-teardown
+code runs, so it is gone from the WeakSet before a diff ever sees it — the
+after-count reads identical to the closed case.
+
+So this module ALSO keeps a non-weak ledger of currently-open
+`(handle, label)` pairs, and fires synchronous events on register/unregister
+to any subscribed observer. The ledger and the events see a session for as
+long as it is registered, independent of whether anything ever held a strong
+reference to look — a caller that wants to know "was this handle EVER opened
+and never closed" reads `open_session_labels()` (or an `observe()` listener's
+delivered `(handle, label)` pairs) rather than diffing `open_sessions()`.
+
+`register()` assigns each session a small monotonic integer handle — never
+`id()`, which a already-collected-and-reused address would silently alias to
+an unrelated, later object — and returns it so a caller can correlate a
+registration with its eventual unregistration.
 """
 
 from __future__ import annotations
 
+import itertools
 import threading
 import weakref
-from typing import Tuple
+from typing import Callable, Dict, Tuple
 
 _lock = threading.Lock()
 _live: "weakref.WeakSet[object]" = weakref.WeakSet()
+_handle_counter = itertools.count(1)
+
+# The handle this module assigned each currently-registered session — read
+# under `_lock`, set on `register`, popped on `unregister`. A
+# `WeakKeyDictionary`, keyed by the session object itself, so an entry never
+# outlives the session it names and `unregister` can look one up by identity
+# without this dict itself keeping the session alive.
+_session_handles: "weakref.WeakKeyDictionary[object, int]" = (
+    weakref.WeakKeyDictionary()
+)
+
+# The non-weak ledger: every handle currently open, by label, independent of
+# whether the session object itself is still reachable. Removed on
+# `unregister`; NOT removed by garbage collection — that is the whole point
+# (a dropped-without-close session stays visible here).
+_open_ledger: Dict[int, str] = {}
+
+# Subscribed (on_register, on_unregister) pairs. A plain list under `_lock`;
+# `observe()`'s returned unsubscriber removes by identity.
+_listeners: list = []
 
 
-def register(session: object) -> None:
-    """Record `session` as open. Called once, from the `__init__` of every
-    class that owns a session's underlying resource."""
+def register(session: object, label: str) -> int:
+    """Record `session` as open under `label`, returning its handle.
+
+    Called once, as the LAST statement of the `__init__` of every class that
+    owns a session's underlying resource — by the time this returns, the
+    session is live in every view this module offers (`open_sessions()`,
+    `open_session_labels()`, and every :func:`observe` listener), so its
+    construction and its visibility here are the same event.
+
+    `label` is the printable target the session was opened against (an
+    embedded catalog location, or a remote endpoint) — never derived from
+    `session` itself here, so it survives collection in the ledger and in a
+    delivered event even after the session object is gone.
+    """
     with _lock:
+        handle = next(_handle_counter)
         _live.add(session)
+        _session_handles[session] = handle
+        _open_ledger[handle] = label
+        listeners = list(_listeners)
+    # Fired OUTSIDE the lock: a listener that itself calls back into this
+    # module (e.g. `open_session_labels()`) must not deadlock on `_lock`, and
+    # a slow or raising listener must not hold up another thread's
+    # register/unregister.
+    for on_register, _on_unregister in listeners:
+        on_register(handle, label)
+    return handle
 
 
 def unregister(session: object) -> None:
     """Record `session` as closed. Called from `close()`; a no-op if `session`
     is already absent (closed twice, or already collected), so `close()`
-    stays idempotent."""
+    stays idempotent — a second `unregister` of the same session fires no
+    event and touches nothing.
+    """
     with _lock:
+        handle = _session_handles.pop(session, None)
+        if handle is None:
+            return
+        label = _open_ledger.pop(handle, None)
         _live.discard(session)
+        listeners = list(_listeners)
+    for _on_register, on_unregister in listeners:
+        on_unregister(handle, label)
 
 
 def open_sessions() -> Tuple[object, ...]:
@@ -59,7 +127,57 @@ def open_sessions() -> Tuple[object, ...]:
     or not anything ever closed it — so this answers "what is open right
     now", not "what leaked"; a caller that wants to catch a forgotten
     `close()` must snapshot this, hold its own strong references across the
-    window under test, and diff against a later snapshot.
+    window under test, and diff against a later snapshot — or, to catch a
+    session dropped without a surviving reference at all, use
+    :func:`open_session_labels` or :func:`observe` instead, which see a
+    session for as long as it is registered, independent of reachability.
     """
     with _lock:
         return tuple(_live)
+
+
+def open_session_labels() -> Tuple[Tuple[int, str], ...]:
+    """Every currently-open `(handle, label)` pair, independent of whether the
+    session object itself is still reachable.
+
+    Backed by a non-weak ledger, so a session dropped without `close()` stays
+    listed here after it is collected — the property `open_sessions()`
+    cannot offer, because its `WeakSet` sees exactly the sessions something
+    still holds a reference to.
+    """
+    with _lock:
+        return tuple(_open_ledger.items())
+
+
+def observe(
+    on_register: Callable[[int, str], None],
+    on_unregister: Callable[[int, str], None],
+) -> Callable[[], None]:
+    """Subscribe to every future register/unregister event; returns an
+    unsubscribe callable.
+
+    Both callbacks run SYNCHRONOUSLY, on the thread that called `register` /
+    `unregister`, outside `_lock` — so a listener sees `(handle, label)` for
+    a registration or unregistration exactly as it happens, with no polling
+    and no risk of missing a session that is opened and dropped-without-close
+    faster than a diff could observe it. Thread-safe: two threads registering
+    or unregistering concurrently each fire their own events without
+    interleaving corruption, though the ORDER two threads' events arrive in
+    is not itself guaranteed.
+
+    Does not replay history: a listener sees only events fired after it
+    subscribes. Idempotent unsubscribe (calling the returned callable twice
+    is a no-op).
+    """
+    pair = (on_register, on_unregister)
+    with _lock:
+        _listeners.append(pair)
+
+    def _unsubscribe() -> None:
+        with _lock:
+            try:
+                _listeners.remove(pair)
+            except ValueError:
+                pass  # already unsubscribed
+
+    return _unsubscribe

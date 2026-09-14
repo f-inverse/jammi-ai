@@ -999,8 +999,11 @@ class RemoteDatabase:
         # The ONE registration point for every remote session: `open_remote`
         # (the factory `connect()` uses) and any direct construction both run
         # this `__init__`, so both are visible to `jammi.open_sessions()` from
-        # here — see `_sessions`.
-        _register_session(self)
+        # here — see `_sessions`. Labeled by `endpoint` — the printable target
+        # `jammi.open_session_labels()` / an `observe()` listener reports for
+        # this handle even after the session itself is collected. Called LAST
+        # so a session that exists at all is unconditionally live here.
+        self._session_handle = _register_session(self, endpoint)
 
     @property
     def session_id(self) -> str:

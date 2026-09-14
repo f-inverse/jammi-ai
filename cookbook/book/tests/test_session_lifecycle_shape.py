@@ -40,6 +40,45 @@ by widening the regex into a real dataflow analysis, which is disproportionate
 for a line-based shape gate. A reviewer adding a NEW multi-hop
 `TemporaryDirectory` -> `mkdtemp(dir=...)` -> `jammi.connect` chain should not
 rely on this test to catch it.
+
+The close oracle for the ``handle = jammi.connect(...)`` ASSIGNMENT form is
+exit-path-aware, not a whole-file textual search: a tainted handle counts as
+closed only if a ``handle.close(`` sits in the ``finally:`` of a ``try:`` that
+either directly encloses the connect (the connect is a statement in the try's
+own body), or is a later sibling of the connect — at or above the connect's
+own column, and still inside the SAME ``TemporaryDirectory`` block — guarding
+the handle's use forward from the connect (``db = jammi.connect(...); try: ...
+finally: db.close()``, the shape every hand-verified site in this tree uses).
+A close that is a plain statement with no enclosing ``try``, or that lives
+past this block's own dedent (in another function, or after the block has
+already exited), is an OFFENDER — see ``_closed_via_finally``. The `with`-item
+and nested-`with ... as handle:` forms need no entry in that logic at all:
+``_CONNECT`` matches only the assignment form, so a connect that is itself a
+`with`-item is invisible to the offender scan from the start (`Session.__exit__`
+already closes it, and the items unwind in reverse, before the tempdir).
+
+Seven more connect/alias shapes are invisible to ``_CONNECT`` / ``_ALIAS``
+altogether, so a site using them would be invisible to the whole-file scan
+regardless of the close oracle above:
+
+- the URL bound to a variable first (`url = f"file://{d}"; jammi.connect(url)`)
+- a helper function that returns an open session
+- string concatenation instead of an f-string (`"file://" + str(d)`)
+- a `tempfile.TemporaryDirectory()` OBJECT bound to a name, with its `.name`
+  attribute read at the connect site (rather than the `as NAME` form binding
+  the path directly)
+- `contextlib.ExitStack().enter_context(tempfile.TemporaryDirectory())`
+- a tuple-unpack alias (`(tmp, other) = (d, 1); jammi.connect(f"file://{tmp}")`)
+- a catalog opened in a freshly-named SUBDIRECTORY of the temp directory
+  (`sub = f"{d}/nested"; jammi.connect(f"file://{sub}")` — `_ALIAS` matches a
+  bare name or `Path(...)`/`str(...)` wrapper, not an f-string expression)
+
+None of these seven shapes exists in `cookbook/**` today (swept by hand: every
+`jammi.connect` call site with a `file://` target uses the inline f-string
+form this gate already sees; the remaining variable-target connects are
+`--target` CLI overrides whose defaults are a `grpc://` endpoint or a fixed,
+never-removed path, neither of which this gate needs to see). A reviewer
+introducing one of them should not rely on this test to catch it.
 """
 
 from __future__ import annotations
@@ -68,9 +107,104 @@ def _indent(line: str) -> int:
     return len(line) - len(line.lstrip())
 
 
+def _closed_via_finally(
+    lines: list[str], connect_idx: int, indent: int, boundary_indent: int, handle: str
+) -> bool:
+    """Exit-path-aware close check for ONE connect site (0-indexed `connect_idx`
+    into `lines`, at column `indent`, tainted by a `TemporaryDirectory` opened
+    at column `boundary_indent`).
+
+    Returns True only if `handle.close(` sits in the `finally:` of a `try:`
+    that either
+
+    (a) directly ENCLOSES the connect — the connect is a statement in the
+        try's own body (R1(b), literally): walk backward for the nearest
+        compound statement the connect dedents out of; or
+    (b) is a later SIBLING of the connect — at or above the connect's own
+        column, and still inside the SAME `TemporaryDirectory` block —
+        guarding the handle's use forward from the connect (`db =
+        jammi.connect(...); try: <use db> finally: db.close()`, the shape
+        every hand-verified site in this tree already uses).
+
+    A close that is a plain statement with no enclosing `try` (happy-path
+    only), or that lives past this block's own dedent (in another function,
+    or after the block has already exited), is NOT counted: those are the two
+    OFFENDER shapes R1 names.
+    """
+    n = len(lines)
+    close_pat = re.compile(rf"\b{re.escape(handle)}\.close\(")
+
+    def _finally_closes(try_idx: int, try_indent: int) -> bool:
+        k = try_idx + 1
+        while k < n:
+            line = lines[k]
+            if line.strip():
+                li = _indent(line)
+                stripped = line.strip()
+                if li <= try_indent:
+                    if li == try_indent and (
+                        stripped.startswith("except") or stripped.startswith("else:")
+                    ):
+                        k += 1
+                        continue
+                    if li == try_indent and stripped.startswith("finally:"):
+                        m = k + 1
+                        while m < n:
+                            fline = lines[m]
+                            if fline.strip():
+                                fi = _indent(fline)
+                                if fi <= try_indent:
+                                    return False
+                                if close_pat.search(fline):
+                                    return True
+                            m += 1
+                        return False
+                    return False
+            k += 1
+        return False
+
+    # (a) directly enclosing try.
+    depth_indent = indent
+    j = connect_idx - 1
+    while j >= 0:
+        line = lines[j]
+        if line.strip():
+            li = _indent(line)
+            if li < depth_indent:
+                if line.strip().startswith("try:") and _finally_closes(j, li):
+                    return True
+                depth_indent = li
+                if li <= boundary_indent:
+                    break
+        j -= 1
+
+    # (b) sibling try, still inside the same TemporaryDirectory block. Comment
+    # lines between the connect and the try (real shape: a comment explaining
+    # WHY the close is awaited, then `try:`) are trivia, not a risky statement
+    # -- skipped rather than treated as "the next sibling wasn't a try".
+    k = connect_idx + 1
+    while k < n:
+        line = lines[k]
+        if line.strip():
+            li = _indent(line)
+            if li <= boundary_indent:
+                break
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                k += 1
+                continue
+            if li <= indent:
+                if stripped.startswith("try:") and _finally_closes(k, li):
+                    return True
+                break
+        k += 1
+    return False
+
+
 def _offending_sites(text: str) -> list[tuple[int, str, str]]:
     """Sites in one file where an embedded engine is opened on a temp directory
-    and never closed. Returns (line number, handle, directory name).
+    and never closed ON EVERY EXIT PATH. Returns (line number, handle, directory
+    name).
 
     The taint is scoped by INDENTATION, the way the block that removes the
     directory is: a name bound by `with TemporaryDirectory() as X` is tainted
@@ -79,9 +213,10 @@ def _offending_sites(text: str) -> list[tuple[int, str, str]]:
     it — that is a leak, but nothing removes its directory, so it is not this
     race and this gate does not speak to it.
     """
+    lines = text.splitlines()
     sites: list[tuple[int, str, str]] = []
     tainted: dict[str, int] = {}  # name -> indent of the `with` that binds it
-    for lineno, line in enumerate(text.splitlines(), 1):
+    for lineno, line in enumerate(lines, 1):
         if line.strip():
             here = _indent(line)
             tainted = {n: i for n, i in tainted.items() if here > i}
@@ -100,15 +235,16 @@ def _offending_sites(text: str) -> list[tuple[int, str, str]]:
         base = re.sub(r"^(?:str|Path)\(", "", arg).split(")")[0].split("/")[0].strip()
         if base not in tainted:
             continue  # the catalog is not inside a directory being removed
-        if re.search(rf"\b{re.escape(handle)}\.close\(", text):
+        if _closed_via_finally(lines, lineno - 1, _indent(line), tainted[base], handle):
             continue
         sites.append((lineno, handle, base))
     return sites
 
 
 def test_no_embedded_engine_outlives_its_temporary_directory():
-    """No file in the cookbook opens an embedded engine on a `TemporaryDirectory`
-    without closing it — the defect class, enumerated rather than remembered."""
+    """esc-112 fix test (`closes_escape: esc-112`): no file in the cookbook opens
+    an embedded engine on a `TemporaryDirectory` without closing it ON EVERY EXIT
+    PATH — the defect class, enumerated rather than remembered."""
     offenders = []
     for path in sorted(_COOKBOOK.rglob("*.py")) + sorted(_COOKBOOK.rglob("*.qmd")):
         for lineno, handle, directory in _offending_sites(
@@ -130,45 +266,108 @@ def test_no_embedded_engine_outlives_its_temporary_directory():
 
 
 def test_the_gate_sees_the_shape_it_claims_to_see():
-    """The gate is not vacuous: the pre-fix shape is flagged, the fixed shape is
-    not, and the close-in-a-finally form counts as closed."""
+    """The gate is not vacuous: the pre-fix shape is flagged, and the close
+    oracle is exit-path-aware (R1) — each of the five shapes R1 names is its
+    own positive or negative control, not folded into one assertion."""
     bad = (
         'with tempfile.TemporaryDirectory() as d:\n'
         '    embedded = jammi.connect(f"file://{d}")\n'
         '    embedded.set_tenant("x")\n'
     )
+
+    # R1 self-test 1/5: happy-path-only close -> RED. A plain statement after
+    # the connect, with no enclosing `try`, does not survive an exception from
+    # `set_tenant` (or anything else in the block) -- exactly F2 and F3's shape
+    # before this round's fix.
+    happy_path_only_close = bad + '    embedded.close()\n'
+    assert [s[1] for s in _offending_sites(happy_path_only_close)] == ["embedded"]
+
+    # R1 self-test 2/5: close in an unrelated function -> RED. `handle` is a
+    # same-named `close()` call in a DIFFERENT function's `try/finally`, well
+    # past this block's own dedent -- it cannot run when the tainted block
+    # unwinds and must not be credited to it.
+    close_in_unrelated_function = (
+        'def a():\n'
+        '    with tempfile.TemporaryDirectory() as d:\n'
+        '        handle = jammi.connect(f"file://{d}")\n'
+        '        handle.set_tenant("x")\n'
+        'def b():\n'
+        '    try:\n'
+        '        pass\n'
+        '    finally:\n'
+        '        handle.close()\n'
+    )
+    assert [s[1] for s in _offending_sites(close_in_unrelated_function)] == ["handle"]
+
+    # R1 self-test 3/5: `finally:` close -> GREEN. The connect is a statement
+    # in the try's own body (R1(b), the literal shape) and the finally closes
+    # it on every exit, including an exception from `set_tenant`.
+    finally_close = (
+        'with tempfile.TemporaryDirectory() as d:\n'
+        '    try:\n'
+        '        embedded = jammi.connect(f"file://{d}")\n'
+        '        embedded.set_tenant("x")\n'
+        '    finally:\n'
+        '        embedded.close()\n'
+    )
+    assert _offending_sites(finally_close) == []
+
+    # R1 self-test 4/5: `with`-item -> GREEN. `_CONNECT` only matches the
+    # `handle = jammi.connect(...)` assignment form, so a connect that is
+    # itself a `with`-item is invisible to the offender scan from the start;
+    # `Session.__exit__` closes it before the tempdir unwinds either way.
+    with_item = (
+        'with tempfile.TemporaryDirectory() as d, jammi.connect(f"file://{d}") as db:\n'
+        '    db.set_tenant("x")\n'
+    )
+    assert _offending_sites(with_item) == []
+
+    # R1 self-test 5/5: nested `with ... as handle:` -> GREEN. Same reasoning
+    # as the with-item form: no `=` before `jammi.connect`, so `_CONNECT`
+    # never matches, and the nested block closes before the outer one unwinds.
+    nested_with = (
+        'with tempfile.TemporaryDirectory() as d:\n'
+        '    with jammi.connect(f"file://{d}") as handle:\n'
+        '        handle.set_tenant("x")\n'
+    )
+    assert _offending_sites(nested_with) == []
+
+    # Retained regressions from the taint tracker itself (aliasing, the
+    # `--target` fallback shape, directory taint, and cross-function scope
+    # isolation) -- unaffected by, or updated for, the R1 close oracle.
     aliased = (
         'with tempfile.TemporaryDirectory() as tmp:\n'
         '    tmp_path = Path(tmp)\n'
         '    db = jammi.connect(f"file://{str(tmp_path)}")\n'
     )
-    fixed = bad + '    embedded.close()\n'
-    context_form = (
-        'with tempfile.TemporaryDirectory() as d, jammi.connect(f"file://{d}") as db:\n'
-        '    db.set_tenant("x")\n'
-    )
     not_a_tempdir = 'db = jammi.connect(f"file://{ARTIFACT_DIR}")\n'
     # an emit script's `--target` override: the f-string is not the first token
-    # after the open paren (real defect found in build_cdc_cache.py et al.).
+    # after the open paren (real defect found in build_cdc_cache.py et al.);
+    # closed the same `try: <use> finally: close()` way that file now is.
     fallback_target = (
         'with tempfile.TemporaryDirectory() as catalog:\n'
         '    db = jammi.connect(args.target or f"file://{catalog}")\n'
     )
-    fallback_target_fixed = fallback_target + '    db.close()\n'
+    fallback_target_fixed = (
+        fallback_target
+        + '    try:\n'
+        + '        db.set_tenant("x")\n'
+        + '    finally:\n'
+        + '        db.close()\n'
+    )
     other_scope = (
         'def a():\n'
         '    with tempfile.TemporaryDirectory() as catalog:\n'
-        '        db = jammi.connect(f"file://{catalog}")\n'
-        '        db.close()\n'
+        '        try:\n'
+        '            db = jammi.connect(f"file://{catalog}")\n'
+        '        finally:\n'
+        '            db.close()\n'
         'def b():\n'
         '    catalog = tempfile.mkdtemp()\n'
         '    other = jammi.connect(f"file://{catalog}")\n'
     )
 
-    assert [s[1] for s in _offending_sites(bad)] == ["embedded"]
     assert [s[1] for s in _offending_sites(aliased)] == ["db"]
-    assert _offending_sites(fixed) == []
-    assert _offending_sites(context_form) == []
     assert _offending_sites(not_a_tempdir) == []
     assert [s[1] for s in _offending_sites(fallback_target)] == ["db"]
     assert _offending_sites(fallback_target_fixed) == []

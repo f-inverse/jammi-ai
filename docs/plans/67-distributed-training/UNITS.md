@@ -356,7 +356,8 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
 One bidi RPC, `GangService.RunRank(stream RankControl) returns (stream
 RankEvent)` (`crates/jammi-wire/proto/jammi/v1/gang.proto`) — no
 `RankAssignment`/`FetchPartition`/`RankEvent::Released`/`RankEvent::Progress`;
-message shape and arity are protected by review and `CONTRACT-U5a.md`, not by
+message shape and arity are protected by review and
+`docs/rigor/contracts/feat_500-C-U5a-1.md`, not by
 `api_freeze` (which tracks only `PACKAGE`/`RPC` tokens). Two sub-units, split
 across two branches: U5a-1 freezes the wire, I-GANG, and the training-set
 identity; U5a-2 builds `HostAdmission` (the admit-and-hold session, drain,

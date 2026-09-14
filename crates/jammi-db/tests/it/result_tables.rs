@@ -496,9 +496,7 @@ async fn the_sweep_writes_a_null_lease_the_backend_reads_back(backend: BackendKi
 
 /// `Catalog::get_result_table_for_tenant`'s strict-predicate property (the
 /// tenant-isolation guard this verb IS, independent of any caller built on
-/// top of it — the gang admission handler's own former use of this verb is
-/// `HostAdmission`'s to rebuild elsewhere, `docs/plans/67-distributed-training/UNITS.md`
-/// § U5a-2): a NULL-tenant `result_tables` row (as if materialized outside
+/// top of it): a NULL-tenant `result_tables` row (as if materialized outside
 /// any tenant scope) must never resolve for a REAL tenant's lookup, even
 /// though the RELAXED `get_result_table` read (the other seam) still sees
 /// it — the hazard this strict predicate exists to close.

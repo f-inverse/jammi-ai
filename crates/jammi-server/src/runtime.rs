@@ -560,7 +560,7 @@ impl OssServer {
         // paths. Its routes are a plain `tonic::service::Routes`, so a second
         // internal service is mounted beside `PeerService` on the SAME
         // `Routes` here: `GangService` (see
-        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §W1/§I1 — tenant
+        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.7/§2 (P3) — tenant
         // derived from the verified job row, never the caller; the public
         // listener answers UNIMPLEMENTED for its paths too). The registry is
         // cloned now because `MetricsLayer::new(self.metrics)` moves the
@@ -578,7 +578,7 @@ impl OssServer {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
                 // `GangServer::fresh_instance` (see
-                // `docs/rigor/contracts/feat_500-C-U5a-1.md` §I1) needs
+                // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.5) needs
                 // the `[lease]` window this deployment runs with — read once,
                 // here, from the already-validated config
                 // (`OssServer::new`'s own `config.lease.intervals()` call
@@ -750,7 +750,8 @@ pub struct BoundServer {
     /// `GangServer` exists to hold a handle onto). Lets an `it` test driving
     /// `RunRank` over the real network still observe, same-process, which
     /// `GangRefusalReason` the served call refused for — never reaching the
-    /// wire (§I1 Non-disclosure only binds the `Status` a client sees).
+    /// wire (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2),
+    /// Non-disclosure, only binds the `Status` a client sees).
     #[cfg(feature = "test-hooks")]
     gang_refusal_handle: Option<crate::grpc::gang::GangRefusalHandle>,
 }

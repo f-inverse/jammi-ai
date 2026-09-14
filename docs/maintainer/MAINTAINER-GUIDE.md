@@ -3178,8 +3178,8 @@ admission-time catalog read on it uses this same classification. This
 handler never reaches `Catalog::get_result_table_for_tenant` or
 `ResultStore::read_materialization_manifest` at all — the training-set
 sidecar lookup they backed is `HostAdmission`'s to build from the filed
-property, not from parked code in this crate (no such wrapper exists here
-today). `Catalog::get_result_table_for_tenant`'s own strict-predicate
+property. No such wrapper exists in this crate.
+`Catalog::get_result_table_for_tenant`'s own strict-predicate
 property (a NULL-tenant row never matches a real tenant's lookup) is
 `jammi-db`'s own tenant-isolation guard, tested directly there
 (`crates/jammi-db/tests/it/result_tables.rs`), independent of any caller

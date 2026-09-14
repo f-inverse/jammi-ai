@@ -9,12 +9,9 @@
 //! predicate and `fresh_instance` for the coordinator's own liveness. Every
 //! determinant collapses to the SAME `FailedPrecondition` status with a
 //! FIXED message (non-disclosure) — the listener discloses neither a job's
-//! existence, claimant, nor attempt. Having decided every determinant and
-//! found no reason to refuse, this handler still has no `HostAdmission`
-//! session to hand the call to, so it ends `Unimplemented`: a call
-//! satisfying EVERY I-GANG determinant still reaches the handler ... and,
-//! having no `HostAdmission` session to hand the call to, returns
-//! `Unimplemented`.
+//! existence, claimant, nor attempt. A call satisfying EVERY I-GANG
+//! determinant still reaches the handler and, having no `HostAdmission`
+//! session to hand it to, returns `Unimplemented`.
 //! `HostAdmission` itself (the admit-and-hold session, drain,
 //! re-verification) is built on top of this handler once it exists
 //! (docs/plans/67-distributed-training/UNITS.md § U5a-2).
@@ -33,17 +30,16 @@
 //! [`GangRefusalReason::MultiHostUnsupported`]) — the training-set pair
 //! conjunct and its sidecar verify that would admit a genuine multi-host row
 //! are `HostAdmission`'s to build (docs/plans/67-distributed-training/UNITS.md
-//! § U5a-2; the property this conjunct must satisfy, and everything deleted
-//! from this file to ship the `world_size == 1` lattice alone, is filed at
-//! <https://github.com/f-inverse/jammi-ai/issues/566>); this handler never
-//! attempts them.
+//! § U5a-2, filed at <https://github.com/f-inverse/jammi-ai/issues/566>);
+//! this handler never attempts them.
 //!
 //! **A catalog fault during admission is `Unavailable`, never
 //! `FailedPrecondition`**: see `admission_catalog_fault`.
 //!
 //! **I-GANG derives tenant from the row, never ambient admin scope**
-//! (§I1(a)) — this handler refuses outright, before any row is even read,
-//! whenever [`TenantBinding::is_admin_scope`] is ambient: see
+//! (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3)) — this handler
+//! refuses outright, before any row is even read, whenever
+//! [`TenantBinding::is_admin_scope`] is ambient: see
 //! [`GangRefusalReason::AdminScope`].
 //!
 //! **`test-hooks` non-disclosure introspection**: behind
@@ -80,7 +76,8 @@ use tokio_stream::StreamExt;
 use crate::grpc::proto::gang::gang_service_server::GangService;
 use crate::grpc::proto::gang::{rank_control, RankControl, RankEvent};
 
-/// §I1 Non-disclosure: every I-GANG refusal — ambient admin scope, row
+/// Non-disclosure (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2)):
+/// every I-GANG refusal — ambient admin scope, row
 /// absent, wrong status, wrong claimant, wrong attempt, lease not live, an
 /// undecodable `world_size`, the caller's `Assign.world` not matching the
 /// row's own `world_size`, a row whose own `world_size` names more than one
@@ -155,7 +152,8 @@ const FIRST_ASSIGN_BOUND: Duration = Duration::from_secs(10);
 /// [`crate::grpc::peer::PeerServer`] holds for the owner side of the
 /// distributed data plane — and the `[lease]` window this deployment runs
 /// with, needed for [`jammi_db::catalog::Catalog::fresh_instance`]'s own
-/// `instance_liveness_margin` computation (§I1) without reaching back into
+/// `instance_liveness_margin` computation
+/// (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.5) without reaching back into
 /// `InferenceSession` for a config accessor this crate does not own.
 pub struct GangServer {
     session: Arc<InferenceSession>,
@@ -243,8 +241,9 @@ impl GangRefusalHandle {
     }
 }
 
-/// §I3/§I4's transient class: a genuine catalog fault reached DURING
-/// admission — `Catalog::get_job_for_rank`'s own read or
+/// The transient class this admission path uses (see
+/// `docs/rigor/contracts/feat_500-C-U5a-1.md` §B4): a genuine catalog fault
+/// reached DURING admission — `Catalog::get_job_for_rank`'s own read or
 /// `Catalog::fresh_instance`'s own read ERRORING rather than simply finding
 /// no row / no fresh instance — is `Unavailable`, never `map_engine_error`'s
 /// generic mapping. A raw catalog-backend fault surfaces as
@@ -260,7 +259,7 @@ impl GangRefusalHandle {
 /// handler never reaches `Catalog::get_result_table_for_tenant` or
 /// `ResultStore::read_materialization_manifest` at all — the training-set
 /// sidecar lookup they backed is `HostAdmission`'s to build from the filed
-/// property, not from parked code in this crate.
+/// property. No such wrapper exists in this crate.
 fn admission_catalog_fault(err: JammiError) -> Status {
     tracing::warn!(
         error = %err,
@@ -306,7 +305,8 @@ impl GangService for GangServer {
             }
         };
 
-        // §W1 K2, decided before I-GANG runs: `world == 0` and `rank >=
+        // Wire-level K2 (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2),
+        // decided before I-GANG runs: `world == 0` and `rank >=
         // world` are refused `InvalidArgument`, one case each.
         if assign.world == 0 {
             return Err(Status::invalid_argument("world must be greater than zero"));
@@ -316,7 +316,8 @@ impl GangService for GangServer {
         }
 
         // I-GANG derives tenant from the row, never ambient admin scope
-        // (§I1(a)) — this holds for the WHOLE handler, not merely a
+        // (docs/rigor/contracts/feat_500-C-U5a-1.md §2 (P3)) — this holds
+        // for the WHOLE handler, not merely a
         // tenant-scoped catalog read it might one day perform: a call
         // reaching this handler while wrapped in admin scope is refused
         // outright, before any row is even read, the same fixed way every
@@ -388,7 +389,7 @@ impl GangService for GangServer {
         }
 
         // This unit ships the `world_size == 1` lattice only: the
-        // training-set pair conjunct and its sidecar verify (§I1(b)) that
+        // training-set pair conjunct and its sidecar verify that
         // would admit a genuine multi-host row are `HostAdmission`'s to
         // build (docs/plans/67-distributed-training/UNITS.md § U5a-2). A row
         // whose OWN `world_size` (now known to equal `assign.world`, the
@@ -399,7 +400,8 @@ impl GangService for GangServer {
             return Err(i_gang_refused());
         }
 
-        // §I1: the coordinator's own `instances` row must be fresh. A
+        // Coordinator freshness (`docs/rigor/contracts/feat_500-C-U5a-1.md`
+        // §1.5): the coordinator's own `instances` row must be fresh. A
         // genuine catalog fault reading this row is `Unavailable`
         // (`admission_catalog_fault`), the SAME admission-time
         // classification every other catalog read on this path uses — never

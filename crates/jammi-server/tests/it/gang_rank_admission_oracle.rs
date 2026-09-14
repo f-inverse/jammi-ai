@@ -4,10 +4,10 @@
 //! is called from nowhere outside the gang `RunRank` handler (plus
 //! `jammi-db`'s own tests, which call it directly to exercise it in
 //! isolation). The training-set sidecar verify's own enumerating-caller
-//! oracle (`get_result_table_for_tenant`'s only production caller) is
-//! GONE, not merely retired: the gang `RunRank` handler no longer reaches
-//! that verb at all — this unit ships the `world_size == 1` lattice only —
-//! so there is no gang-adjacent caller surface left to enumerate here.
+//! oracle (`get_result_table_for_tenant`'s only production caller) does
+//! not apply: the gang `RunRank` handler does not reach that verb at all —
+//! this unit ships the `world_size == 1` lattice only — so there is no
+//! gang-adjacent caller surface left to enumerate here.
 //! `get_result_table_for_tenant`'s own strict-predicate property is
 //! `jammi-db`'s own tenant-isolation guard, tested directly there
 //! (`crates/jammi-db/tests/it/result_tables.rs`), independent of any

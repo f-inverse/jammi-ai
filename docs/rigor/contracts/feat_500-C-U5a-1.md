@@ -551,7 +551,7 @@ gate the training-set pair conjunct and the sidecar verify — never
 `assign.world`.
 
 The pairwise conjunct (`world > 1`) is described the same way in
-`docs/maintainer/MAINTAINER-GUIDE.md#28a-gangservice-multi-host-gang-admission-i-gang`
+`docs/maintainer/MAINTAINER-GUIDE.md#28a-gangservice--multi-host-gang-admission-i-gang`
 ("2.8a"): "the ROW-keyed lattice" — rewritten by this round from the pinned
 contract's assign-keyed description; that same section's `get_job_for_rank`
 entry states it "decides nothing itself and returns `Ok(None)` only when no
@@ -646,7 +646,7 @@ crates/jammi-server/tests/` (confirmed at this commit) returns no hits —
 because no fault-injection seam exists in `jammi-db`'s catalog backend
 reachable from this crate's `it` harness without touching `jammi-db`, out of
 this round's wire-server scope; the mapping is stated, not tested, matching
-`docs/maintainer/MAINTAINER-GUIDE.md#28a-gangservice-multi-host-gang-admission-i-gang`'s
+`docs/maintainer/MAINTAINER-GUIDE.md#28a-gangservice--multi-host-gang-admission-i-gang`'s
 own wording ("A genuine catalog fault during admission is `Unavailable`, not
 `FailedPrecondition`").
 

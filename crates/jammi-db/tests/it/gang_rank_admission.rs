@@ -8,8 +8,8 @@
 //! `jobs_queue.rs` already covers for the shared lease/reclaim machinery),
 //! except `world_size` decoding (a targeted JSON field read with no
 //! backend-specific SQL of its own, but still worth the same
-//! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses, per
-//! the round-2 fold) — those cases also run a `::postgres` arm gated by
+//! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses) —
+//! those cases also run a `::postgres` arm gated by
 //! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
 //! is unset.
 

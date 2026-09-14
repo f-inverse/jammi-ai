@@ -730,11 +730,13 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
     is eligible. Within whichever pool applies, the row naming the
     GREATEST `ts` TEXT governs, never the row nearest the end of the
     file — and when the pool holds >=2 candidate rows and ANY of them
-    lacks a non-empty string `ts` (a hand-typed or pre-Z5 record, never
-    one the real exporter produced), OR two or more rows share the
+    lacks a non-empty string `ts`, OR two or more rows share the
     IDENTICAL `ts` text, this FAILS LOUDLY, naming the tied rows' own
     line numbers, rather than silently falling back to `rows[0]`/append
-    order.
+    order. A missing, empty, or non-string `ts` and an identical `ts`
+    text are refused as AMBIGUOUS; ordering among the surviving rows is
+    by `ts` text alone, unvalidated as to shape (filed at
+    https://github.com/f-inverse/jammi-ai/issues/557).
 
     Fix round 7 Z19 (narrowing fix round 6 Z17): the tie compare is `ts`
     TEXT ONLY — never a parsed `datetime` instant. An executed probe
@@ -1825,7 +1827,7 @@ def fixture_rr20_omits_a_required_file_fails() -> None:
 
 
 def _rr_anticipation_commit(work: Path, art: dict) -> None:
-    """Shared setup for RR21-24/RR27-29: one open second-round BLOCK naming
+    """Shared setup for RR21-24: one open second-round BLOCK naming
     a single required file (`a.py`), and `art` written verbatim as the
     anticipation record's own (only) row — `agent_type` defaults to
     `lead-anticipation` (the real exporter's own stamp, esc-lead-gate-R12

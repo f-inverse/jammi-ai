@@ -2457,6 +2457,28 @@ def fixture_r12e7_empty_derived_set_printf_only_denies() -> None:
     _assert("no execution-class attack" in p.stderr, "R12E7", p.stderr)
 
 
+def fixture_r12e8_empty_derived_set_reused_pair_denies() -> None:
+    """fix round 5 (sweep closure): the empty-derived-set path has NO
+    shared-validator call downstream of `_r12_validate_and_run_entry`
+    (unlike the non-empty by_file path, where R12P8's identical scenario
+    is caught redundantly by BOTH `_r12_validate_and_run_entry`'s own
+    pair-reuse check and `_r12_anticipation_rejection`'s) -- two
+    lead-chosen keys reusing the IDENTICAL (command, hash) pair must
+    still deny HERE, with no backstop to catch it if this arm alone were
+    silently neutered."""
+    unit = "feat/r12e8"
+    root = _r12_empty_set_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", None, [])
+    shared = _auto_r12_attack("shared")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": shared["command"], "hash": shared["hash"]},
+        "b.py": {"command": shared["command"], "hash": shared["hash"]},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12E8", f"a reused (command, hash) pair on the empty-set path must deny, got {p.returncode}")
+    _assert("IDENTICAL" in p.stderr, "R12E8", f"reason must name the templated pair: {p.stderr!r}")
+
+
 def fixture_r12f1_pre_fix_sha_mismatch_denies() -> None:
     """The artifact is found at the CORRECT tip-keyed filename, but its OWN
     internal `pre_fix_sha` field (a forged or copy-pasted artifact) does
@@ -5079,6 +5101,7 @@ FIXTURES = [
     ("R12E5", fixture_r12e5_empty_derived_set_unresolvable_main_denies),
     ("R12E6", fixture_r12e6_empty_derived_set_malformed_entry_denies),
     ("R12E7", fixture_r12e7_empty_derived_set_printf_only_denies),
+    ("R12E8", fixture_r12e8_empty_derived_set_reused_pair_denies),
     ("R12F1", fixture_r12f1_pre_fix_sha_mismatch_denies),
     ("R12F2", fixture_r12f2_unit_branch_field_mismatch_denies),
     ("R12F3", fixture_r12f3_missing_residual_risk_denies),

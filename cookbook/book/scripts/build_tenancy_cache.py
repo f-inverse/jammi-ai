@@ -252,8 +252,11 @@ def main() -> None:
                     help="connect() target — file:// for the embedded CPU engine "
                          "(a fresh temp catalog is used if omitted).")
     args = ap.parse_args()
-    with tempfile.TemporaryDirectory() as catalog, tempfile.TemporaryDirectory() as work:
-        db = jammi.connect(args.target or f"file://{catalog}")
+    with (
+        tempfile.TemporaryDirectory() as catalog,
+        tempfile.TemporaryDirectory() as work,
+        jammi.connect(args.target or f"file://{catalog}") as db,
+    ):
         emit(db, Path(work))
 
 

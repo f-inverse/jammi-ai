@@ -211,9 +211,13 @@ def main() -> int:
 
     # Introspect through the composition: open the embedded engine and resolve each
     # verb on the live instance, the way a caller invokes it.
-    with tempfile.TemporaryDirectory() as artifact_dir:
-        db = jammi.connect(f"file://{artifact_dir}")
-
+    with (
+        tempfile.TemporaryDirectory() as artifact_dir,
+        # closed BEFORE the directory is removed: `with A, B` unwinds B first, and
+        # a live embedded engine keeps writing its catalog, so a cleanup racing it
+        # fails with ENOTEMPTY (Errno 39 on Linux). Drop is not a release here.
+        jammi.connect(f"file://{artifact_dir}") as db,
+    ):
         for name, kwargs in REQUIRED.items():
             sig = _signature(db, name)
             if sig is None:

@@ -246,31 +246,6 @@ def _read_segment_catalog(db, table_name: str) -> dict:
     return {"segments": segments, "segment_count": len(segments)}
 
 
-def _close_engine(db) -> None:
-    """Close the handle at the end of its life. An AWAITED event, not a drop.
-
-    Nothing below depends on this any more — the segment set was read through
-    the public verb while the engine was live. It stays because a handle that
-    opened an artifact directory closes it before that directory goes away, and
-    because `close()` is the only release point the engine documents: under the
-    `unix-excl` VFS the catalog pool holds a process-scoped exclusive lock for as
-    long as ANY connection in this process has the file open, and dropping the
-    handle is not observable (`sqlx` returns connections from a background task).
-    `close()` AWAITS the handshake: stop the training worker, close and drain the
-    pool, then wait out SQLite's own release evidence over a settle window. When
-    it returns, the catalog is released — its return is the proof, and this
-    script adds no second check.
-
-    This goes through the PUBLIC front door and nothing else. `close()` is a real
-    member of the `jammi.Session` surface on BOTH arms — the embedded arm
-    releases the catalog file, the remote arm closes a channel — so `Capability`
-    no longer carries a `CLOSE` flag (a flag every backend sets discriminates
-    nothing) and this script never reaches for the compiled handle.
-    """
-    db.close()
-    print("  engine closed via the public Session.close()", flush=True)
-
-
 def _seg0_sidecar_files_present(index_path: str) -> dict:
     """Whether the three sidecar files an F32 (no-rescore) segment carries exist
     on disk, keyed off the URL the catalog itself recorded (a `file://` path in
@@ -348,8 +323,18 @@ def _fixtures_root(arg: str | None) -> Path:
 def emit(fixtures_root: Path) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="jammi_segmented_ann_") as artifact_dir:
-        db = jammi.connect(f"file://{artifact_dir}")
+    # `db` is a `with`-item alongside its `TemporaryDirectory`: `Session.__exit__`
+    # closes it — an AWAITED event (stop the training worker, close and drain the
+    # pool, wait out SQLite's own release evidence), not a drop — on every exit
+    # from the block, including the `RuntimeError` raised below and any exception
+    # out of `_run_n1_property` / `_read_segment_catalog`. `with A, B` unwinds B
+    # (the connect) before A (the directory), so the catalog is always released
+    # before `artifact_dir` is removed. This goes through the PUBLIC front door:
+    # `close()` is a real member of the `jammi.Session` surface on both arms.
+    with (
+        tempfile.TemporaryDirectory(prefix="jammi_segmented_ann_") as artifact_dir,
+        jammi.connect(f"file://{artifact_dir}") as db,
+    ):
         print("== embedded engine: N=1 segmented-index property ==", flush=True)
         n1 = _run_n1_property(db, fixtures_root)
         # The segment set, through the public verb, on the LIVE engine — the
@@ -365,10 +350,7 @@ def emit(fixtures_root: Path) -> None:
         seg0 = catalog["segments"][0]
         naming_ok = seg0["index_path"].endswith(f"{n1['table_name']}__seg0.idx")
         sidecar = _seg0_sidecar_files_present(seg0["index_path"])
-        # Everything that needs the engine is done; close the handle before the
-        # temporary artifact directory it opened goes away.
         print("== releasing the catalog ==", flush=True)
-        _close_engine(db)
 
     print("== jammi-db it-suite: append/no-rebuild property (live) ==", flush=True)
     append_suite = _run_append_suite(fixtures_root)

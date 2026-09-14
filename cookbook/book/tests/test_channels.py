@@ -24,7 +24,6 @@ opaque tenant UUIDs.
 
 from __future__ import annotations
 
-import tempfile
 import uuid
 
 import pytest
@@ -37,18 +36,25 @@ _EVAL = contracts._dataset_dir("eval")
 _HAVE_GOLDEN = (_EVAL / "golden_metrics.json").exists()
 
 
-def _fresh_db():
-    return jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_ch14_chan_')}")
+@pytest.fixture
+def db(embedded):
+    """A fresh embedded engine per test, CLOSED in teardown.
+
+    The shared `embedded` fixture (tests/conftest.py) owns the lifecycle: it
+    connects on `tmp_path` and closes the session before anything can remove the
+    catalog directory. A test that opened its own connection here and forgot to
+    close it would be failed by the suite-wide leak guard, not silently raced.
+    """
+    return embedded
 
 
 def _fresh_tenant() -> str:
     return str(uuid.uuid4())
 
 
-def test_register_then_list_round_trip():
+def test_register_then_list_round_trip(db):
     """A registered channel reappears in list_channels with its exact declared
     shape, alongside the global seed channels, ordered by (priority, channel_id)."""
-    db = _fresh_db()
     tenant = _fresh_tenant()
     with db.tenant_scope(tenant):
         db.register_channel(
@@ -73,9 +79,8 @@ def test_register_then_list_round_trip():
     assert keys == sorted(keys), "list_channels must be ordered by (priority, channel_id)"
 
 
-def test_add_columns_appends_in_declaration_order():
+def test_add_columns_appends_in_declaration_order(db):
     """add_channel_columns appends new columns after the originals, in order."""
-    db = _fresh_db()
     tenant = _fresh_tenant()
     with db.tenant_scope(tenant):
         db.register_channel("annotated_by", priority=10, columns=[("label", "Utf8")])
@@ -92,10 +97,9 @@ def test_add_columns_appends_in_declaration_order():
     ]
 
 
-def test_redeclare_column_different_dtype_rejected():
+def test_redeclare_column_different_dtype_rejected(db):
     """Redeclaring an existing column with a DIFFERENT dtype raises the
     append-only violation — the engine rejects, it does not silently no-op."""
-    db = _fresh_db()
     tenant = _fresh_tenant()
     with db.tenant_scope(tenant):
         db.register_channel("typed_chan", priority=1, columns=[("v", "Float32")])
@@ -104,11 +108,10 @@ def test_redeclare_column_different_dtype_rejected():
     assert "cannot redeclare" in str(err.value)
 
 
-def test_tenant_isolation_and_non_collision():
+def test_tenant_isolation_and_non_collision(db):
     """The #170 property, embedded-live: A's channel is invisible to B; B may
     register the same id with different columns without collision; A's channel is
     unchanged by B's; an unbound connection sees only the global seeds."""
-    db = _fresh_db()
     tenant_a = _fresh_tenant()
     tenant_b = _fresh_tenant()
 
@@ -146,11 +149,10 @@ def test_tenant_isolation_and_non_collision():
 
 
 @pytest.mark.skipif(not _HAVE_GOLDEN, reason="eval cache not emitted")
-def test_channel_goldens_reproduce_live():
+def test_channel_goldens_reproduce_live(db):
     """The channel counts the emit froze reproduce live on the embedded engine:
     A's channel count, the annotated_by column count, zero tenant leak, zero
     collision (#170)."""
-    db = _fresh_db()
     tenant_a = _fresh_tenant()
     tenant_b = _fresh_tenant()
 

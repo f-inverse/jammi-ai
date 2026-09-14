@@ -119,6 +119,7 @@ model the embedding step runs. CPU/hermetic. Emit-only; PR CI reads the cache.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -179,15 +180,22 @@ def _build_chain(db, model: str, src_path: Path) -> tuple[str, str, str]:
     return emb, g, prop
 
 
-def _fresh_chain(catalog_root: Path, model: str, src_path: Path) -> tuple:
+@contextlib.contextmanager
+def _fresh_chain(catalog_root: Path, model: str, src_path: Path):
     """Open a brand-new ephemeral catalog and build the chain in it, so the
     recompute/derives-from counts are deterministic (a shared catalog accumulates
-    redundant recomputed tables and inflates the downstream / edge counts). Returns
-    `(db, emb, g, prop)`."""
+    redundant recomputed tables and inflates the downstream / edge counts). Yields
+    `(db, emb, g, prop)` and CLOSES `db` on exit — before the block that removed
+    `catalog_root` (a `TemporaryDirectory`, in `emit`) can unwind past it: a live
+    embedded engine keeps writing its catalog, so a cleanup racing an open session
+    fails with ENOTEMPTY (Errno 39 on Linux). Drop is not a release here."""
     catalog = tempfile.mkdtemp(prefix="jammi_recompute_", dir=catalog_root)
     db = jammi.connect(f"file://{catalog}")
-    emb, g, prop = _build_chain(db, model, src_path)
-    return db, emb, g, prop
+    try:
+        emb, g, prop = _build_chain(db, model, src_path)
+        yield db, emb, g, prop
+    finally:
+        db.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -202,44 +210,53 @@ def run_cache(catalog_root: Path, model: str, src_path: Path) -> dict:
     MISS a new timestamped name. Every cell is the boolean of that identity."""
     catalog = tempfile.mkdtemp(prefix="jammi_recompute_cache_", dir=catalog_root)
     db = jammi.connect(f"file://{catalog}")
-    db.add_source("docs", url=f"file://{src_path}", format="parquet")
-    emb = db.generate_embeddings(source="docs", model=model, columns=["text"], key="_row_id")
+    # closed BEFORE `catalog_root` (a `TemporaryDirectory` in `emit`) is removed:
+    # a live embedded engine keeps writing its catalog, so a cleanup racing an
+    # open session fails with ENOTEMPTY (Errno 39 on Linux).
+    try:
+        db.add_source("docs", url=f"file://{src_path}", format="parquet")
+        emb = db.generate_embeddings(source="docs", model=model, columns=["text"], key="_row_id")
 
-    # neighbor-graph: bypass computes, then use REUSES the same materialisation.
-    g_bypass = db.build_neighbor_graph("docs", k=3, exact=True, cache="bypass")
-    g_use = db.build_neighbor_graph("docs", k=3, exact=True, cache="use")
-    bng_reused = g_bypass == g_use
+        # neighbor-graph: bypass computes, then use REUSES the same materialisation.
+        g_bypass = db.build_neighbor_graph("docs", k=3, exact=True, cache="bypass")
+        g_use = db.build_neighbor_graph("docs", k=3, exact=True, cache="use")
+        bng_reused = g_bypass == g_use
 
-    # the probe keys on the FULL descriptor: a different k, or a different
-    # min_similarity, is a different definition → a MISS (a new name).
-    g_k4 = db.build_neighbor_graph("docs", k=4, exact=True, cache="use")
-    g_minsim = db.build_neighbor_graph("docs", k=3, exact=True, min_similarity=0.5, cache="use")
-    bng_k4_recomputed = g_k4 != g_use
-    bng_minsim_recomputed = g_minsim != g_use
+        # the probe keys on the FULL descriptor: a different k, or a different
+        # min_similarity, is a different definition → a MISS (a new name).
+        g_k4 = db.build_neighbor_graph("docs", k=4, exact=True, cache="use")
+        g_minsim = db.build_neighbor_graph(
+            "docs", k=3, exact=True, min_similarity=0.5, cache="use")
+        bng_k4_recomputed = g_k4 != g_use
+        bng_minsim_recomputed = g_minsim != g_use
 
-    # propagate: pinned embedding table + hops=1 reuses; hops=2 is a new definition.
-    p_h1_a = db.propagate_embeddings(
-        "docs", embedding_table=emb, edge_graph_table=g_use,
-        hops=1, alpha=0.5, output="final", cache="use",
-    )
-    p_h1_b = db.propagate_embeddings(
-        "docs", embedding_table=emb, edge_graph_table=g_use,
-        hops=1, alpha=0.5, output="final", cache="use",
-    )
-    prop_reused = p_h1_a == p_h1_b
-    p_h2 = db.propagate_embeddings(
-        "docs", embedding_table=emb, edge_graph_table=g_use,
-        hops=2, alpha=0.5, output="final", cache="use",
-    )
-    prop_hops_recomputed = p_h2 != p_h1_a
+        # propagate: pinned embedding table + hops=1 reuses; hops=2 is a new
+        # definition.
+        p_h1_a = db.propagate_embeddings(
+            "docs", embedding_table=emb, edge_graph_table=g_use,
+            hops=1, alpha=0.5, output="final", cache="use",
+        )
+        p_h1_b = db.propagate_embeddings(
+            "docs", embedding_table=emb, edge_graph_table=g_use,
+            hops=1, alpha=0.5, output="final", cache="use",
+        )
+        prop_reused = p_h1_a == p_h1_b
+        p_h2 = db.propagate_embeddings(
+            "docs", embedding_table=emb, edge_graph_table=g_use,
+            hops=2, alpha=0.5, output="final", cache="use",
+        )
+        prop_hops_recomputed = p_h2 != p_h1_a
 
-    # the unpinned producer honestly NEVER hits: generate_embeddings is anchored on
-    # an UnpinnedAtInstant source, so cache="use" twice still yields two names.
-    emb_a = db.generate_embeddings(source="docs", model=model, columns=["text"], key="_row_id",
-                                   cache="use")
-    emb_b = db.generate_embeddings(source="docs", model=model, columns=["text"], key="_row_id",
-                                   cache="use")
-    unpinned_reused = emb_a == emb_b  # expected False — never reuses
+        # the unpinned producer honestly NEVER hits: generate_embeddings is
+        # anchored on an UnpinnedAtInstant source, so cache="use" twice still
+        # yields two names.
+        emb_a = db.generate_embeddings(source="docs", model=model, columns=["text"],
+                                       key="_row_id", cache="use")
+        emb_b = db.generate_embeddings(source="docs", model=model, columns=["text"],
+                                       key="_row_id", cache="use")
+        unpinned_reused = emb_a == emb_b  # expected False — never reuses
+    finally:
+        db.close()
 
     return {
         "bng_reused": bool(bng_reused),
@@ -269,12 +286,11 @@ def run_staleness(catalog_root: Path, model: str, src_path: Path) -> dict:
     different hash)` is `stale` with reason `definition_changed` naming `recorded`
     and `current`. The `result_digest` input-drift arm is CUT (see the module note)
     — described in prose, not measured."""
-    db, emb, g, prop = _fresh_chain(catalog_root, model, src_path)
-
-    recorded = _definition_of(db, prop)
-    fresh = db.staleness(prop, recorded)
-    a_different_hash = "00000000" if recorded != "00000000" else "11111111"
-    stale = db.staleness(prop, a_different_hash)
+    with _fresh_chain(catalog_root, model, src_path) as (db, emb, g, prop):
+        recorded = _definition_of(db, prop)
+        fresh = db.staleness(prop, recorded)
+        a_different_hash = "00000000" if recorded != "00000000" else "11111111"
+        stale = db.staleness(prop, a_different_hash)
 
     is_fresh = fresh.get("staleness") == "fresh"
     reasons = stale.get("reasons", [])
@@ -305,37 +321,38 @@ def run_recompute(catalog_root: Path, model: str, src_path: Path) -> dict:
     deterministic)."""
 
     # --- child recompute is byte-identical -------------------------------- #
-    db, emb, g, prop = _fresh_chain(catalog_root, model, src_path)
-    original_hash = _definition_of(db, prop)
-    rc_child = db.recompute(prop, cascade="report_only")
-    recomputed_name = rc_child["recomputed"][0]["recomputed"]
-    child_outcome = rc_child["recomputed"][0]["outcome"]
-    # byte-identical: the recompute's verdict against the ORIGINAL's recorded hash
-    # is `match`, AND the recompute's own recorded hash equals the original's.
-    verdict = db.verify_materialization(recomputed_name, expected_definition=original_hash)
-    byte_identical = (
-        child_outcome == "computed"
-        and verdict["verdict"] == "match"
-        and _definition_of(db, recomputed_name) == original_hash
-    )
+    with _fresh_chain(catalog_root, model, src_path) as (db, emb, g, prop):
+        original_hash = _definition_of(db, prop)
+        rc_child = db.recompute(prop, cascade="report_only")
+        recomputed_name = rc_child["recomputed"][0]["recomputed"]
+        child_outcome = rc_child["recomputed"][0]["outcome"]
+        # byte-identical: the recompute's verdict against the ORIGINAL's recorded
+        # hash is `match`, AND the recompute's own recorded hash equals the
+        # original's.
+        verdict = db.verify_materialization(recomputed_name, expected_definition=original_hash)
+        byte_identical = (
+            child_outcome == "computed"
+            and verdict["verdict"] == "match"
+            and _definition_of(db, recomputed_name) == original_hash
+        )
 
     # --- parent report_only reports the downstream-stale set, recomputes none of it #
-    db, emb, g, prop = _fresh_chain(catalog_root, model, src_path)
-    rc_parent_report = db.recompute(g, cascade="report_only")
-    downstream_stale = rc_parent_report["downstream_stale"]
-    report_recomputed_only_parent = len(rc_parent_report["recomputed"]) == 1
-    child_in_downstream = prop in downstream_stale
+    with _fresh_chain(catalog_root, model, src_path) as (db, emb, g, prop):
+        rc_parent_report = db.recompute(g, cascade="report_only")
+        downstream_stale = rc_parent_report["downstream_stale"]
+        report_recomputed_only_parent = len(rc_parent_report["recomputed"]) == 1
+        child_in_downstream = prop in downstream_stale
 
     # --- parent cascade=downstream sweeps parent + child once ------------- #
-    db, emb, g, prop = _fresh_chain(catalog_root, model, src_path)
-    rc_parent_down = db.recompute(g, cascade="downstream")
-    cascade_recomputed = rc_parent_down["recomputed"]
+    with _fresh_chain(catalog_root, model, src_path) as (db, emb, g, prop):
+        rc_parent_down = db.recompute(g, cascade="downstream")
+        cascade_recomputed = rc_parent_down["recomputed"]
 
     # --- lineage: derives_from(emb) one-hop edges, all result_digest ------ #
-    db, emb, g, prop = _fresh_chain(catalog_root, model, src_path)
-    edges = db.derives_from(emb)
-    edge_kinds = sorted({e["kind"] for e in edges})
-    all_result_digest = edge_kinds == ["result_digest"]
+    with _fresh_chain(catalog_root, model, src_path) as (db, emb, g, prop):
+        edges = db.derives_from(emb)
+        edge_kinds = sorted({e["kind"] for e in edges})
+        all_result_digest = edge_kinds == ["result_digest"]
 
     return {
         "child_recompute_byte_identical": bool(byte_identical),

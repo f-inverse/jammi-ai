@@ -34,9 +34,8 @@ def expand_golden_to_csv(json_path: Path, out_path: Path) -> None:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
         tmp_path = Path(tmp)
-        db = jammi.connect(f"file://{str(tmp_path)}")
 
         # 1. Register the corpus and build the embedding index.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")

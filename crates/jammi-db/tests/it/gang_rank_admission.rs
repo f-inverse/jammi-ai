@@ -2,14 +2,14 @@
 //! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A1) and
 //! `Catalog::fill_training_set_identity` (the training-set identity
 //! write-once CAS). `Catalog::fresh_instance`'s own
-//! tests live in `gang_instance_freshness.rs`. Most tests run on a fresh
-//! SQLite catalog (a private tempdir per test; the gang admission surface has
-//! no Postgres-only behaviour these primitives need to exercise beyond what
-//! `jobs_queue.rs` already covers for the shared lease/reclaim machinery),
-//! except `world_size` decoding (a targeted JSON field read with no
-//! backend-specific SQL of its own, but still worth the same
-//! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses) —
-//! those cases also run a `::postgres` arm gated by
+//! tests live in `gang_instance_freshness.rs`. Every test not itself
+//! exercising a Postgres-only expression runs on a fresh SQLite catalog (a
+//! private tempdir per test); `world_size` decoding (a targeted JSON field
+//! read with no backend-specific SQL of its own, but still worth the same
+//! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses) and
+//! `lease_live`/`remaining` (`super::lease::lease_remaining_seconds_expr`
+//! renders a DIFFERENT SQL expression per backend, so these have no oracle
+//! at all on Postgres without it) also run a `::postgres` arm gated by
 //! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
 //! is unset.
 
@@ -128,9 +128,32 @@ async fn get_job_for_rank_returns_none_for_an_absent_job() {
 
 /// The row's `status`/`claimed_by`/`attempts`/`lease_live` mirror a genuine
 /// claim exactly, and `lease_live` is `true` for a freshly-claimed lease.
+/// Parameterized (sqlite/postgres, the `migrations.rs` shape):
+/// `lease_remaining_seconds_expr` renders a DIFFERENT SQL expression per
+/// backend (`lease.rs`), so `lease_live`/`remaining` have no oracle at all on
+/// the Postgres arm without this; the postgres arm skips (never fails) when
+/// `JAMMI_TEST_PG_URL` is unset.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
 #[tokio::test]
-async fn get_job_for_rank_reflects_a_live_claim() {
-    let (_dir, catalog) = base_catalog().await;
+async fn get_job_for_rank_reflects_a_live_claim(kind: BackendKind) {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
     catalog.submit_job(job_params("job-1")).await.unwrap();
     let claimed = catalog
         .claim_next("coord-1", KINDS, Duration::from_secs(30))
@@ -153,17 +176,35 @@ async fn get_job_for_rank_reflects_a_live_claim() {
         "remaining must be close to the freshly-stamped 30s window, got {:?}",
         row.remaining
     );
-    assert_eq!(row.training_set_ref, None);
-    assert_eq!(row.training_set_location, None);
 }
 
 /// A lease forced to `NULL` (the state both reclaim arms leave behind, and
 /// migration invariant `lease.rs` documents: `NULL` means remaining 0, never
 /// live-by-default) reads back `lease_live == false`, `remaining ==
-/// Duration::ZERO` — never a panic, never a "live" default.
+/// Duration::ZERO` — never a panic, never a "live" default. Parameterized
+/// (sqlite/postgres): the postgres arm skips (never fails) when
+/// `JAMMI_TEST_PG_URL` is unset.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
 #[tokio::test]
-async fn get_job_for_rank_treats_a_null_lease_as_not_live() {
-    let (_dir, catalog) = base_catalog().await;
+async fn get_job_for_rank_treats_a_null_lease_as_not_live(kind: BackendKind) {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
     catalog.submit_job(job_params("job-2")).await.unwrap();
     catalog
         .claim_next("coord-1", KINDS, Duration::from_secs(30))
@@ -194,9 +235,29 @@ async fn get_job_for_rank_treats_a_null_lease_as_not_live() {
 
 /// An expired (past) lease reads back `lease_live == false` with zero
 /// remaining — the boundary the `< now()` / `< $now` clause names.
+/// Parameterized (sqlite/postgres): the postgres arm skips (never fails)
+/// when `JAMMI_TEST_PG_URL` is unset.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
 #[tokio::test]
-async fn get_job_for_rank_treats_an_expired_lease_as_not_live() {
-    let (_dir, catalog) = base_catalog().await;
+async fn get_job_for_rank_treats_an_expired_lease_as_not_live(kind: BackendKind) {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
     catalog.submit_job(job_params("job-3")).await.unwrap();
     catalog
         .claim_next("coord-1", KINDS, Duration::from_millis(1))
@@ -208,27 +269,6 @@ async fn get_job_for_rank_treats_an_expired_lease_as_not_live() {
     let row = catalog.get_job_for_rank("job-3").await.unwrap().unwrap();
     assert!(!row.lease_live, "an expired lease must never read as live");
     assert_eq!(row.remaining, Duration::ZERO);
-}
-
-/// The pair round-trips exactly once filled.
-#[tokio::test]
-async fn get_job_for_rank_returns_the_filled_pair() {
-    let (_dir, catalog) = base_catalog().await;
-    catalog.submit_job(job_params("job-4")).await.unwrap();
-    catalog
-        .claim_next("coord-1", KINDS, Duration::from_secs(30))
-        .await
-        .unwrap()
-        .unwrap();
-    let outcome = catalog
-        .fill_training_set_identity("job-4", "coord-1", 1, "digest-x", "table-y")
-        .await
-        .unwrap();
-    assert_eq!(outcome, TrainingSetFillOutcome::Filled);
-
-    let row = catalog.get_job_for_rank("job-4").await.unwrap().unwrap();
-    assert_eq!(row.training_set_ref.as_deref(), Some("digest-x"));
-    assert_eq!(row.training_set_location.as_deref(), Some("table-y"));
 }
 
 /// The row's OWN `world_size`, decoded from `spec`
@@ -374,8 +414,6 @@ async fn get_job_for_rank_malformed_world_size_is_undecodable_not_a_fault(kind: 
     assert_eq!(row.status, "running", "every other column stays populated");
     assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
     assert_eq!(row.attempts, 1);
-    assert_eq!(row.training_set_ref, None);
-    assert_eq!(row.training_set_location, None);
 }
 
 /// Spec text that is not valid JSON at all (so it is not even representable

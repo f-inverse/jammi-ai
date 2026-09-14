@@ -1428,66 +1428,6 @@ impl Catalog {
             .await?)
     }
 
-    /// Fetch a single result table by name, tenant-pinned by an EXPLICIT
-    /// argument — never `self.current_tenant()` — under the STRICT predicate
-    /// `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`: matches only a
-    /// row whose tenant is IDENTICAL to the caller's (including the
-    /// NULL-equals-NULL case), never a row of a different or absent tenant
-    /// the way [`Self::get_result_table`]'s relaxed `OR tenant_id IS NULL`
-    /// arm would. Inside a [`crate::session::JammiSession::with_admin_scope`]
-    /// closure the tenant predicate is STILL dropped and the row resolves by
-    /// its primary key alone (unchanged from every other verb's admin-scope
-    /// behaviour in this module) — a caller that must never resolve under
-    /// admin scope, regardless of which tenant it passes, guards that at its
-    /// own call site rather than relying on this method to refuse.
-    ///
-    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2 ("Ruling 5
-    /// (strict-predicate verb, never the relaxed read)"): a rank
-    /// resolving its job's training-set identity through
-    /// [`Self::get_result_table`] could resolve a NULL-tenant table of the
-    /// same name belonging to no tenant (or the wrong one) whenever one
-    /// exists — this verb is the seam that hazard cannot reach.
-    pub async fn get_result_table_for_tenant(
-        &self,
-        name: &str,
-        tenant: Option<TenantId>,
-    ) -> Result<Option<ResultTableRecord>> {
-        let name = name.to_string();
-        let admin = TenantBinding::is_admin_scope();
-        Ok(self
-            .backend()
-            .transaction(
-                TxOptions {
-                    read_only: true,
-                    ..Default::default()
-                },
-                |tx| {
-                    Box::pin(async move {
-                        if admin {
-                            tx.query_opt(
-                                "SELECT * FROM result_tables WHERE table_name = $1",
-                                &[SqlValue::TextOwned(name)],
-                                parse_row,
-                            )
-                            .await
-                        } else {
-                            tx.query_opt(
-                                "SELECT * FROM result_tables WHERE table_name = $1 \
-                                   AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                                &[
-                                    SqlValue::TextOwned(name),
-                                    SqlValue::from(tenant.map(|t| t.to_string())),
-                                ],
-                                parse_row,
-                            )
-                            .await
-                        }
-                    })
-                },
-            )
-            .await?)
-    }
-
     /// List result tables with a given status, scoped to the session tenant.
     ///
     /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the

@@ -161,9 +161,11 @@ pub struct JobRecord {
     pub training_set_ref: Option<String>,
     /// The `result_tables` NAME the coordinator
     /// materialized the training set under — the one coordinate a rank
-    /// resolves with a single tenant-pinned lookup
-    /// (`Catalog::get_result_table_for_tenant`). See
-    /// [`Self::training_set_ref`]'s pairing note.
+    /// resolves with a single tenant-pinned lookup. The strict-predicate
+    /// resolver that once backed that lookup (`get_result_table_for_tenant`)
+    /// is `HostAdmission`'s to rebuild from the filed property
+    /// (<https://github.com/f-inverse/jammi-ai/issues/566>), not parked code
+    /// in this crate. See [`Self::training_set_ref`]'s pairing note.
     pub training_set_location: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -199,14 +201,15 @@ pub enum TrainingSetFillOutcome {
 
 /// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
 /// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
-/// computed in ONE statement. Tenant is a plain column here (never
-/// consulted against [`TenantBinding::is_admin_scope`] or
-/// [`Catalog::current_tenant`]) — the CALLER derives and pins it: tenant is
-/// derived from the row, never from caller metadata.
+/// computed in ONE statement. No `tenant_id` column: the `world_size == 1`
+/// I-GANG lattice this unit ships derives no determinant from tenant at all
+/// (`status`/`claimed_by`/`attempts`/`lease_live`/`world_size` are the whole
+/// predicate) — a caller that DOES need the row's tenant (e.g. a future
+/// tenant-scoped sidecar lookup) reads it from [`Catalog::get_job`], never
+/// from this row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmissionRow {
     pub status: String,
-    pub tenant_id: Option<TenantId>,
     pub claimed_by: Option<String>,
     pub attempts: u32,
     /// `NOT(lease_expired_clause)`, computed against the SAME clock
@@ -241,8 +244,6 @@ pub struct RankAdmissionRow {
     /// means the read itself faulted (no such row reachable at all), never
     /// that this row's content failed to decode.
     pub world_size: WorldSizeFact,
-    pub training_set_ref: Option<String>,
-    pub training_set_location: Option<String>,
 }
 
 /// The outcome of decoding [`RankAdmissionRow::world_size`] from a job's
@@ -1966,10 +1967,13 @@ impl Catalog {
     /// only in prose, never as an intra-doc link).
     /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
-    /// not consult it at all: tenant is returned as a plain column for the
-    /// CALLER to derive/pin, per `docs/rigor/contracts/feat_500-C-U5a-1.md`
-    /// §2 (P3) — "tenant is derived, never accepted").
-    /// ONE statement: the row's `status`/`claimed_by`/`attempts`/pair
+    /// not consult it at all, and returns no `tenant_id` column either: the
+    /// `world_size == 1` I-GANG lattice this unit ships derives no
+    /// determinant from tenant at all, per
+    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3) — "tenant is
+    /// derived, never accepted" — a caller that DOES need the row's tenant
+    /// reads it from [`Catalog::get_job`], never from this row).
+    /// ONE statement: the row's `status`/`claimed_by`/`attempts`
     /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
     /// remaining window, from which [`RankAdmissionRow::lease_live`] is
     /// derived — never a second round trip, and never the caller's OWN
@@ -2017,25 +2021,13 @@ impl Catalog {
                         params.push(SqlValue::TextOwned(job_id));
                         let job_bind = params.len();
                         let sql = format!(
-                            "SELECT status, tenant_id, claimed_by, attempts, spec, \
-                                 training_set_ref, training_set_location, \
+                            "SELECT status, claimed_by, attempts, spec, \
                                  {remaining_expr} AS remaining_secs \
                              FROM jobs WHERE job_id = ${job_bind}"
                         );
                         tx.query_opt(&sql, &params, |row| {
                             let spec: String = row.get("spec")?;
                             let world_size = world_size_from_spec_json(&spec);
-                            let tenant_id = row
-                                .try_get::<String>("tenant_id")?
-                                .map(|s| {
-                                    s.parse::<TenantId>().map_err(|e| {
-                                        BackendError::TypeConversion {
-                                            column: "tenant_id".to_string(),
-                                            detail: e.to_string(),
-                                        }
-                                    })
-                                })
-                                .transpose()?;
                             let remaining_secs: Option<f64> = row.try_get("remaining_secs")?;
                             // NULL (no lease) is treated exactly like an
                             // expired one -- zero remaining, never live --
@@ -2048,14 +2040,11 @@ impl Catalog {
                             let lease_live = remaining_secs.is_some_and(|s| s >= 0.0);
                             Ok(RankAdmissionRow {
                                 status: row.get("status")?,
-                                tenant_id,
                                 claimed_by: row.try_get("claimed_by")?,
                                 attempts: row.get::<i32>("attempts")? as u32,
                                 lease_live,
                                 remaining,
                                 world_size,
-                                training_set_ref: row.try_get("training_set_ref")?,
-                                training_set_location: row.try_get("training_set_location")?,
                             })
                         })
                         .await

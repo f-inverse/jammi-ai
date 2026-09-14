@@ -400,12 +400,17 @@ re-verification) on top of it.
   `training_set_location`, both nullable TEXT, a paired-nullability `CHECK`
   constraint — numbered 033 (`jobs_training_set_identity`) on this branch's
   base; when PR-B2's `033_model_materialization` is on `main` first, PR-C1's
-  rebase renumbers `034_jobs_training_set_identity` to 034 (three pin sites +
+  rebase renumbers `033_jobs_training_set_identity` to 034 (four pin sites +
   the ordered-after oracle: the tuple in `catalog/migrations.rs`'s const
-  list, the `MIGRATION_034_JOBS_TRAINING_SET_IDENTITY` constant name in
-  `catalog/schema.rs`, the const `tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`, and
-  `migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge`'s
-  own `position("034_jobs_training_set_identity")` literal,
+  list, the `MIGRATION_033_JOBS_TRAINING_SET_IDENTITY` constant name in
+  `catalog/schema.rs`, the const `tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`,
+  the SQL `IN`-list literal inside
+  `tests/it/migrations.rs::migration_029_copies_training_jobs_rows_into_jobs_as_queued`
+  (`tests/it/migrations.rs:848`, `DELETE FROM applied_migrations WHERE name
+  IN (…, '033_jobs_training_set_identity')` — the ledger rows this test
+  clears so the reopen replays every later migration that alters `jobs`, and
+  `migration_033_is_ordered_after_032_and_pins_the_pair_at_the_schema_edge`'s
+  own `position("033_jobs_training_set_identity")` literal,
   `tests/it/migrations.rs:1572-1746`). (docs-ci)
   `crates/jammi-server/tests/it/api_freeze_baseline.txt` +  `api_freeze.rs`
   (`PACKAGE jammi.v1.gang` / `RPC GangService/RunRank`),

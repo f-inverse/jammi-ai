@@ -8,6 +8,7 @@ use jammi_db::error::{JammiError, Result};
 ///
 /// `new_unlimited()` passes every permit — useful for tests and CPU-only
 /// deployments. `new()` enforces memory-budget admission via CAS.
+#[derive(Debug)]
 pub struct GpuScheduler {
     total_gpu_memory: usize,
     reserved_memory: AtomicUsize,
@@ -238,9 +239,155 @@ impl GpuScheduler {
     }
 }
 
+/// One [`GpuScheduler`] per configured device.
+///
+/// A memory budget is a property of a DEVICE, not of a process: two ranks on
+/// two cards have two budgets, and admitting against a single shared counter
+/// would either over-admit on one card or starve the other. This is the map
+/// from ordinal to that device's scheduler, plus the primary — the device a
+/// caller that names none gets.
+///
+/// Built from the resolved `[gpu] devices` list, so an entry exists for every
+/// device the deployment declared and for no other: [`Self::get`] returning
+/// `None` means "this deployment never declared that device", which is a
+/// typed refusal at the caller rather than a silently fabricated budget.
+#[derive(Debug)]
+pub struct DeviceSchedulers {
+    primary: i32,
+    by_device: Vec<(i32, Arc<GpuScheduler>)>,
+}
+
+impl DeviceSchedulers {
+    /// A scheduler per entry of `devices`, each sized to that device by
+    /// [`GpuScheduler::for_device`] (so a CPU ordinal, a CPU-only build, or a
+    /// device that cannot be probed is an unlimited pass-through, exactly as
+    /// for a single-device session). `devices[0]` is the primary.
+    ///
+    /// An empty list is refused: a session with no device has nowhere to
+    /// place a model, and the alternative to refusing here is a `None` from
+    /// every later lookup with no statement of why.
+    pub fn for_devices(devices: &[i32], memory_fraction: f64) -> Result<Self> {
+        let Some(&primary) = devices.first() else {
+            return Err(JammiError::Config(
+                "[gpu] devices resolved to an empty list: a session needs at least one device"
+                    .into(),
+            ));
+        };
+        let mut by_device: Vec<(i32, Arc<GpuScheduler>)> = Vec::with_capacity(devices.len());
+        for &device in devices {
+            if by_device.iter().any(|(d, _)| *d == device) {
+                // Two entries for one ordinal would be two budgets over one
+                // card's memory — each admitting as if it owned all of it.
+                return Err(JammiError::Config(format!(
+                    "[gpu] devices repeats device {device}: one budget per device"
+                )));
+            }
+            by_device.push((
+                device,
+                Arc::new(GpuScheduler::for_device(device, memory_fraction)),
+            ));
+        }
+        Ok(Self { primary, by_device })
+    }
+
+    /// Unlimited pass-through schedulers for `devices` — the CPU-only and
+    /// test shape of [`Self::for_devices`].
+    pub fn unlimited(devices: &[i32]) -> Result<Self> {
+        let mut schedulers = Self::for_devices(devices, 1.0)?;
+        schedulers.by_device = schedulers
+            .by_device
+            .into_iter()
+            .map(|(d, _)| (d, Arc::new(GpuScheduler::new_unlimited())))
+            .collect();
+        Ok(schedulers)
+    }
+
+    /// A one-device set over `scheduler` — the single-device deployment,
+    /// where the caller already owns the scheduler.
+    pub fn single(device: i32, scheduler: Arc<GpuScheduler>) -> Self {
+        Self {
+            primary: device,
+            by_device: vec![(device, scheduler)],
+        }
+    }
+
+    /// The device a caller that names none gets: the first configured one.
+    pub fn primary(&self) -> i32 {
+        self.primary
+    }
+
+    /// Every configured device, in order.
+    pub fn devices(&self) -> impl Iterator<Item = i32> + '_ {
+        self.by_device.iter().map(|(d, _)| *d)
+    }
+
+    /// This device's scheduler, or `None` when the deployment never declared
+    /// it.
+    pub fn get(&self, device: i32) -> Option<&Arc<GpuScheduler>> {
+        self.by_device
+            .iter()
+            .find(|(d, _)| *d == device)
+            .map(|(_, s)| s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scheduler per declared device, the first one primary, and a device
+    /// the deployment never declared has none — the lookup states the
+    /// absence rather than handing back the primary's budget.
+    #[test]
+    fn device_schedulers_cover_exactly_the_declared_devices() {
+        let schedulers = DeviceSchedulers::for_devices(&[0, 1, 2], 0.9).expect("schedulers");
+        assert_eq!(schedulers.primary(), 0);
+        assert_eq!(schedulers.devices().collect::<Vec<_>>(), vec![0, 1, 2]);
+        for device in [0, 1, 2] {
+            assert!(schedulers.get(device).is_some(), "device {device}");
+        }
+        assert!(
+            schedulers.get(3).is_none(),
+            "an undeclared device has no budget of its own"
+        );
+        // Two ranks on two devices hold two independent budgets: a
+        // reservation on one is invisible to the other.
+        let first = Arc::clone(schedulers.get(0).expect("device 0"));
+        let second = Arc::clone(schedulers.get(1).expect("device 1"));
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// An empty list and a repeated ordinal are domain errors at
+    /// construction, not conditions a later admission discovers.
+    #[test]
+    fn device_schedulers_refuse_an_empty_or_repeating_list() {
+        DeviceSchedulers::for_devices(&[], 0.9).expect_err("a session needs a device");
+        DeviceSchedulers::for_devices(&[0, 0], 0.9)
+            .expect_err("two budgets over one card each admit as if they owned all of it");
+    }
+
+    /// Two devices' budgets are accounted separately: filling one admits
+    /// nothing more on it and everything still fits on the other.
+    #[test]
+    fn a_reservation_on_one_device_does_not_consume_another_device_budget() {
+        let schedulers = DeviceSchedulers {
+            primary: 0,
+            by_device: vec![
+                (0, Arc::new(GpuScheduler::new(1_000, 0.0))),
+                (1, Arc::new(GpuScheduler::new(1_000, 0.0))),
+            ],
+        };
+        let first = Arc::clone(schedulers.get(0).expect("device 0"));
+        let second = Arc::clone(schedulers.get(1).expect("device 1"));
+        let _permit = first
+            .try_acquire(1_000)
+            .expect("device 0 admits its budget");
+        assert!(first.try_acquire(1).is_none(), "device 0's budget is spent");
+        assert!(
+            second.try_acquire(1_000).is_some(),
+            "device 1's budget is its own"
+        );
+    }
 
     /// A negative ordinal is CPU: no budget, admit everything.
     #[test]

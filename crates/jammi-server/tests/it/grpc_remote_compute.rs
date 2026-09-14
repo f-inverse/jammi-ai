@@ -40,7 +40,7 @@ use jammi_db::{ChannelId, ModelTask};
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::transport::Endpoint;
 
-use super::common::grpc::{start_engine_server, EngineServer};
+use super::common::grpc::{start_engine_server, start_engine_server_with_devices, EngineServer};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -1005,4 +1005,206 @@ fn normalized_single_batch(
     }
     arrow::record_batch::RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), columns)
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// #500 U4a: the data-parallel rank count across the two submit surfaces.
+// ---------------------------------------------------------------------------
+
+/// The one submission both surfaces make, identical in every field — so a
+/// divergence in the persisted spec can only be attributed to the surface it
+/// came through.
+fn two_rank_request(model: &str) -> jammi_wire::request::FineTuneRequest {
+    jammi_wire::request::FineTuneRequest {
+        source: "patents".to_string(),
+        base_model: model.to_string(),
+        columns: vec!["abstract".to_string()],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        config: Some(FineTuneConfig {
+            epochs: 1,
+            lora_rank: 4,
+            ..FineTuneConfig::default()
+        }),
+        world_size: std::num::NonZeroU32::new(2),
+    }
+}
+
+/// PARITY (K4). The same multi-rank submission through the remote client and
+/// through the embedded session persists the BYTE-IDENTICAL `jobs.spec` — the
+/// stored `TrainingSpec` JSON, not merely two `Ok` responses.
+///
+/// The count is exactly the field that diverges invisibly: it rides on the
+/// request rather than inside the spec `oneof`, its default is silent (`0` on
+/// the wire = unset), and the embedded path never touches the wire at all — so
+/// a remote path that dropped, defaulted, or clamped it would still hand back
+/// a job id. Comparing the persisted spec catches that; comparing the
+/// responses does not. A multi-rank count is also the divergence-prone input
+/// here: the single-rank case is the one both paths get right by doing
+/// nothing.
+///
+/// The count is asserted PRESENT in the JSON as well as equal across the two
+/// surfaces: two surfaces that both dropped it would otherwise agree
+/// vacuously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_and_embedded_submits_persist_the_identical_multi_rank_spec() {
+    let server = start_engine_server_with_devices(2).await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    add_patents(&local).await;
+    let model = tiny_bert_model_id();
+
+    let remote_job = remote
+        .submit_fine_tune(two_rank_request(&model))
+        .await
+        .expect("remote submit of a two-rank job returns a handle");
+    let local_job = local
+        .submit_fine_tune(two_rank_request(&model))
+        .await
+        .expect("embedded submit of a two-rank job returns a handle");
+
+    let catalog = server.engine.catalog();
+    let remote_spec = catalog
+        .get_job(&remote_job.0)
+        .await
+        .expect("remote get_job")
+        .spec;
+    let local_spec = catalog
+        .get_job(&local_job.0)
+        .await
+        .expect("local get_job")
+        .spec;
+
+    assert!(
+        remote_spec.contains("\"world_size\":2"),
+        "the persisted spec must carry the count the caller chose, so this \
+         oracle cannot pass with both surfaces dropping it: {remote_spec}"
+    );
+    assert_eq!(
+        remote_spec, local_spec,
+        "a job submitted over the wire and the same job submitted in-process \
+         must persist byte-identical specs"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// PARITY, the unset boundary. A submission that chooses no count persists the
+/// same spec through both surfaces too, and that spec carries the engine's
+/// single rank — a case the multi-rank test above does not cover, because the
+/// wire's `0` is a DIFFERENT value from the engine's `1`: the remote path has a
+/// resolution step the embedded path does not, and an unresolved `0` reaching
+/// the spec is a zero-rank job on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() {
+    let server = start_engine_server_with_devices(2).await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    add_patents(&local).await;
+    let model = tiny_bert_model_id();
+
+    let request = || jammi_wire::request::FineTuneRequest {
+        world_size: None,
+        ..two_rank_request(&model)
+    };
+
+    let remote_job = remote
+        .submit_fine_tune(request())
+        .await
+        .expect("remote submit with no chosen count returns a handle");
+    let local_job = local
+        .submit_fine_tune(request())
+        .await
+        .expect("embedded submit with no chosen count returns a handle");
+
+    let catalog = server.engine.catalog();
+    let remote_spec = catalog
+        .get_job(&remote_job.0)
+        .await
+        .expect("remote get_job")
+        .spec;
+    let local_spec = catalog
+        .get_job(&local_job.0)
+        .await
+        .expect("local get_job")
+        .spec;
+
+    assert!(
+        remote_spec.contains("\"world_size\":1"),
+        "an unset count resolves to the engine's single rank BEFORE it is \
+         persisted -- the wire's 0 must never reach the spec: {remote_spec}"
+    );
+    assert_eq!(
+        remote_spec, local_spec,
+        "an unset count must persist byte-identically through both surfaces"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// REFUSAL, over the REMOTE path. A count the deployment cannot serve
+/// (`world_size > devices`) is refused at the submit edge from the wire, not
+/// only from the embedded API: the refusal is a property of the submit edge,
+/// and the submit edge has more than one entrance.
+///
+/// Three assertions, because a refusal can be wrong in three independent ways:
+/// the remote caller reconstructs the SAME typed `JammiError` the embedded
+/// caller sees (not a coarse status, not the lossy `Other` fallback), the
+/// message is the engine's own, and NOTHING was enqueued — a refusal that
+/// leaves a queued row behind is a job that later runs with an unservable
+/// count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_count_beyond_the_devices_is_refused_from_the_wire_and_enqueues_nothing() {
+    // One device: a two-rank job is unservable on this deployment.
+    let server = start_engine_server_with_devices(1).await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    add_patents(&local).await;
+    let model = tiny_bert_model_id();
+
+    let before = server
+        .engine
+        .catalog()
+        .list_jobs()
+        .await
+        .expect("list_jobs")
+        .len();
+
+    let remote_err = remote
+        .submit_fine_tune(two_rank_request(&model))
+        .await
+        .expect_err("a two-rank job on a one-device deployment must be refused");
+    let local_err = local
+        .submit_fine_tune(two_rank_request(&model))
+        .await
+        .expect_err("the embedded surface refuses the same submission");
+
+    assert_eq!(
+        std::mem::discriminant(&remote_err),
+        std::mem::discriminant(&local_err),
+        "the remote caller must reconstruct the SAME typed refusal the embedded \
+         caller sees: {remote_err:?} vs {local_err:?}"
+    );
+    assert_eq!(
+        remote_err.to_string(),
+        local_err.to_string(),
+        "the remote caller must carry the refusal message the engine produced"
+    );
+
+    let after = server
+        .engine
+        .catalog()
+        .list_jobs()
+        .await
+        .expect("list_jobs")
+        .len();
+    assert_eq!(
+        before, after,
+        "a refused submission must enqueue nothing -- on either path"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
 }

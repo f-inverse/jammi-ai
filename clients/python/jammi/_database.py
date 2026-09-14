@@ -1702,6 +1702,7 @@ class RemoteDatabase:
         quantile_levels: Optional[List[float]] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
     ) -> RemoteJob:
         """Submit a LoRA fine-tuning job to the remote engine; poll the handle.
 
@@ -1710,7 +1711,10 @@ class RemoteDatabase:
         `JobService.SubmitJob` with the `FineTuneSpec` arm; all config
         kwargs are optional, applying the engine defaults when omitted.
         `idempotency_key`, when non-empty, dedupes the submission (migration
-        030's durable per-tenant key).
+        030's durable per-tenant key). `world_size` is the number of ranks that
+        train this job cooperatively; `1` (the default) is a single process, and
+        a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted.
         """
         request = build_fine_tune_request(
             source=source,
@@ -1749,6 +1753,7 @@ class RemoteDatabase:
             quantile_levels=quantile_levels,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
         )
         return self._submit_job(request)
 
@@ -1781,6 +1786,7 @@ class RemoteDatabase:
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
     ) -> RemoteJob:
         """Submit a graph-supervised fine-tune (S11) to the remote engine.
 
@@ -1790,7 +1796,10 @@ class RemoteDatabase:
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
         `idempotency_key`, when non-empty, dedupes the submission (migration
-        030's durable per-tenant key).
+        030's durable per-tenant key). `world_size` is the number of ranks that
+        train this job cooperatively; `1` (the default) is a single process, and
+        a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted.
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -1819,6 +1828,7 @@ class RemoteDatabase:
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
         )
         return self._submit_job(request)
 

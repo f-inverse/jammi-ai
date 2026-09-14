@@ -105,7 +105,12 @@ those still in force are restated here in their v4 form. Principle in parenthese
     asserts) — and OPS's relative-position oracle; the second merger renumbers (K5). Three 68
     units (OPS, GRAPH, DELTA) also append one each.
 31. **The training set is not this attempt's partial result.** U2a materializes it with
-    `job_attempt: None`: it is a shared producer output reused by definition hash, not an
+    `job_attempt: None`: it is a shared producer output reused by definition hash **and** pinned
+    equal input anchors — the engine's existing rule
+    (`crates/jammi-db/src/store/manifest.rs::AnchorKind::UnpinnedAtInstant`): a plain, unpinned
+    source anchors as `UnpinnedAtInstant` and the cache probe short-circuits any unpinned anchor,
+    so it is honestly always a miss; a training set over a plain source is never reused, and two
+    jobs over the same plain source each materialize their own table — not an
     attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
     reached. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
     jobs CAS, `crates/jammi-db/src/catalog/result_repo.rs::Catalog::release_building_tables_of_claimant`)
@@ -124,8 +129,10 @@ those still in force are restated here in their v4 form. Principle in parenthese
 33. **`GangService` is a second service on `[server] peer_bind`** (DIST D7's third listener),
     never on the tenant-scoped public chain, never advertised by `GetServerInfo`. **68 DIST unit
     1 merged is a hard precondition of U5a** (its listener commit is ~22 files on top of ~10;
-    there is no verbatim-carry fallback). PR-C(67) also waits for OPS and GRAPH, because OPS C2
-    rewrites the claim loop U5a's `JobSlot` wraps and GRAPH rewrites `claim_next`.
+    there is no verbatim-carry fallback). PR-C(67) also waits for OPS, because OPS C2 rewrites
+    the claim loop U5a's `JobSlot` wraps. GRAPH is deferred to #515 and is not a precondition:
+    its `claim_next` rewrite (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`) does not land in this wave, so U5a's `JobSlot`
+    wraps `claim_next` as it stands on `main`.
 34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
     `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
     tenant predicate, never admin scope (`get_job` is tenant-filtered, `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::get_job`,
@@ -198,9 +205,18 @@ those still in force are restated here in their v4 form. Principle in parenthese
     (Ballista's `scheduler/src/scheduler_server/mod.rs`, read from source 2026-09-10) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
-    **without consulting `task_max_failures`**. With both retry knobs at 0, a `GangExec` on a
-    killed executor is re-launched by Ballista on a surviving executor and the job succeeds on
-    its own — in parallel with jammi's own reclaim. U8b needs an explicit bind-time guard in
+    **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
+    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    `QueryStageSchedulerEvent::ExecutorLost` match arm) only resets the freed/re-failed tasks; it posts no
+    `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
+    automatic: `ReviveOffers` fires only from a later, independent event — a new executor
+    registering under push-staged scheduling (`do_register_executor`, `scheduler_server/mod.rs:
+    419`) or a subsequent `TaskUpdating` success under push-staged scheduling
+    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    `QueryStageSchedulerEvent::TaskUpdating` match arm's `ReviveOffers` post) — so with both retry knobs at 0, a `GangExec` on a killed
+    executor is picked up only if one of those triggers fires afterward; with no other executor
+    registering and no other in-flight task reporting status, the freed task can sit unscheduled
+    with nothing to revive it. U8b needs an explicit bind-time guard in
     `CatalogClusterState::bind_schedulable_tasks` / `DevicePlacement` that refuses to re-bind a
     task whose `(job_id, stage_id, partition)` was already launched, keyed on jammi's own job row
     (Ballista's `task_attempt` counter is not bumped by this reset, so the refusal cannot key on
@@ -256,10 +272,12 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 
 46. **Order against the sibling work.** PR-C(68) merged as #501 (242 files, both manifests, seven
     crates) before any 67 unit — so PR-A (U1) starts now from `main`; 68's K (PR in CI) and DIST
-    unit 1 precede PR-B; PR-C(67) needs DIST unit 2 and OPS; PR-D needs K. `SIZING.md` carries
-    the edge list. Correction to v3.1 ruling 18: the issue's "jobs table, migrations 029/030"
-    was describing #485/#486's branch, which is now merged; only the "#485 is unrelated" remark
-    in the 2026-09-10 issue comment was wrong.
+    unit 1 precede PR-B1; PR-B2 cuts from PR-B1's merge; PR-C(67) needs DIST unit 2, OPS and
+    PR-B1 (U5a-2 additionally needs PR-B2 only if its own re-attack finds it needs the
+    multi-rank run path); PR-D needs K. `SIZING.md` carries the edge list. Correction to v3.1
+    ruling 18: the issue's "jobs table, migrations 029/030" was describing #485/#486's branch,
+    which is now merged; only the "#485 is unrelated" remark in the 2026-09-10 issue comment was
+    wrong.
 
 ## Units and order
 

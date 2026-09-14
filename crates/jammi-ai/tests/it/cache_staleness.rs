@@ -55,6 +55,7 @@ fn new_cache(catalog: Arc<Catalog>) -> ModelCache {
     .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
+        devices: vec![-1],
         memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -555,6 +556,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
+        devices: vec![-1],
         memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -700,6 +702,7 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
     .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
+        devices: vec![-1],
         memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,

@@ -287,6 +287,16 @@ pub fn map_engine_error(err: JammiError) -> Status {
         JammiError::Unavailable { resource, reason } => {
             (Code::Unavailable, format!("{resource}: {reason}"))
         }
+        // A training set whose projection yields no rows is a degenerate
+        // input the caller must change — the same `InvalidArgument`
+        // convention `InvalidKey` / `NonUniqueKey` follow, never the
+        // `Internal` a fold would give it.
+        JammiError::EmptyTrainingSet { source_query } => (
+            Code::InvalidArgument,
+            format!(
+                "training set over `{source_query}` is empty: the projection yielded zero rows"
+            ),
+        ),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)
@@ -463,6 +473,37 @@ mod tests {
             error_from_status(&cancelled),
             JammiError::JobCancelled { job_id } if job_id == "job-2"
         ));
+    }
+
+    /// K2's refusal must reach a remote caller as the refusal it is. An empty
+    /// training set is raised by the producer before any row or byte exists;
+    /// folded into `Other`/`Internal` a remote caller would read a server
+    /// fault where the embedded caller reads a typed, caller-fixable
+    /// `EmptyTrainingSet` naming the query — the two surfaces disagreeing on
+    /// exactly the degenerate input K2 exists to catch. This pins the classified
+    /// code, the typed reconstruction, and the `Display` text through the same
+    /// `attach_error_detail` → real `tonic::Status` → `error_from_status` chain
+    /// a live call uses.
+    #[test]
+    fn empty_training_set_round_trips_as_its_typed_variant_not_other() {
+        let query = "SELECT \"abstract\" FROM patents WHERE 1 = 0";
+        let engine = JammiError::EmptyTrainingSet {
+            source_query: query.to_string(),
+        };
+        let status = map_engine_error(JammiError::EmptyTrainingSet {
+            source_query: query.to_string(),
+        });
+        assert_eq!(status.code(), Code::InvalidArgument);
+        let back = error_from_status(&status);
+        assert!(
+            matches!(&back, JammiError::EmptyTrainingSet { source_query } if source_query == query),
+            "an empty training set must reconstruct as itself, got {back:?}"
+        );
+        assert_eq!(
+            back.to_string(),
+            engine.to_string(),
+            "the remote text must be the embedded text"
+        );
     }
 
     /// esc-089: this wire test pins

@@ -24,6 +24,7 @@ from ._generated.jammi.v1 import inference_pb2
 from ._generated.jammi.v1 import job_pb2
 from ._generated.jammi.v1 import pipeline_pb2
 from ._generated.jammi.v1 import training_pb2
+from .errors import InvalidArgument
 
 # snake-case modality string → the `Modality` enum the wire carries. One map,
 # shared by every `modality=` parameter; the unified form (no per-modality
@@ -58,11 +59,15 @@ _SOURCE_KIND_NAME = {
 # identically whether it crossed the gRPC wire or came back from the
 # in-process engine. `RESULT_TABLE_KIND_UNSPECIFIED` is deliberately absent —
 # a live `ResultTable` always carries a concrete kind, so seeing it on the
-# wire is a proto-version skew, not a value to default.
+# wire is a proto-version skew, not a value to default. Every OTHER served
+# value of the enum must appear here: a missing kind reads `"Unspecified"`
+# remotely and its real name embedded, which is the disagreement
+# `tests/test_result_table_kind_parity.py` pins this map TOTAL against.
 _RESULT_TABLE_KIND_NAME = {
     embedding_pb2.ResultTableKind.MODEL: "Model",
     embedding_pb2.ResultTableKind.NEIGHBOR_GRAPH: "NeighborGraph",
     embedding_pb2.ResultTableKind.ASOF_JOIN: "AsofJoin",
+    embedding_pb2.ResultTableKind.TRAINING_SET: "TrainingSet",
 }
 
 # File-format string → wire `FileFormat` enum. Mirrors the engine's `FileFormat`
@@ -498,6 +503,35 @@ def build_fine_tune_config(
     return config
 
 
+def _wire_world_size(world_size: int) -> Optional[int]:
+    """Convert a `world_size` kwarg into the value `SubmitJobRequest.world_size`
+    should carry, refusing anything outside the keyword's domain here — at the
+    kwargs→proto edge — rather than letting it reach the wire.
+
+    `world_size` is the number of ranks that train one job cooperatively; `1`
+    (the default) is a single process. The wire field's `0` means UNSET and the
+    engine resolves it to `1`, so a single-rank job leaves the field OFF the
+    encoding entirely (``None`` here — the proto constructor skips a ``None``
+    kwarg): a caller that never names the keyword submits byte-for-byte the
+    request it always did, and one encoding, not two, denotes a single-rank job.
+
+    Refused: anything that is not an ``int`` (``bool`` included — it is an
+    ``int`` in Python, so ``world_size=True`` would silently encode one rank)
+    and any ``int`` below `1`. `0` in particular is the wire's UNSET marker, so
+    a caller writing it means something the wire has no way to say.
+    """
+    if isinstance(world_size, bool) or not isinstance(world_size, int):
+        raise InvalidArgument(
+            f"world_size must be an int >= 1 (got {world_size!r})"
+        )
+    if world_size < 1:
+        raise InvalidArgument(
+            f"world_size must be >= 1 — the rank count that trains the job "
+            f"cooperatively, 1 being a single process (got {world_size})"
+        )
+    return world_size if world_size > 1 else None
+
+
 def build_fine_tune_request(
     *,
     source: str,
@@ -536,6 +570,7 @@ def build_fine_tune_request(
     quantile_levels: Optional[List[float]] = None,
     keep_last_n_checkpoints: Optional[int] = None,
     idempotency_key: str = "",
+    world_size: int = 1,
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for a LoRA fine-tune (the `FineTuneSpec`
     arm) from the embed binding's flat kwargs.
@@ -545,8 +580,11 @@ def build_fine_tune_request(
     the same shape the embed binding's `fine_tune` submits. `idempotency_key`
     (empty by default) rides straight onto `SubmitJobRequest.idempotency_key` —
     a non-empty key dedupes the submission per `JobService.SubmitJob`'s
-    durable per-tenant contract (migration 030).
+    durable per-tenant contract (migration 030). `world_size` is the number of
+    ranks that train this job cooperatively; `1` (the default) is a single
+    process and leaves the wire field unset — see :func:`_wire_world_size`.
     """
+    wire_world_size = _wire_world_size(world_size)
     try:
         wire_method = _FINE_TUNE_METHOD[method]
     except KeyError:
@@ -597,6 +635,7 @@ def build_fine_tune_request(
         base_model=base_model,
         config=config,
         idempotency_key=idempotency_key,
+        world_size=wire_world_size,
     )
 
 
@@ -628,6 +667,7 @@ def build_fine_tune_graph_request(
     seed: Optional[int] = None,
     keep_last_n_checkpoints: Optional[int] = None,
     idempotency_key: str = "",
+    world_size: int = 1,
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for a graph-supervised fine-tune (S11,
     the `GraphFineTuneSpec` arm) from the embed binding's flat kwargs.
@@ -637,8 +677,11 @@ def build_fine_tune_graph_request(
     the graph-only embedding-loss guard (only `mnrl`/`triplet` for graph
     supervision). `edge_provenance` is the load-bearing circularity distinction —
     "declared" external edges teach the metric something new; "similarity" edges
-    are a weak bootstrap only.
+    are a weak bootstrap only. `world_size` is the number of ranks that train
+    this job cooperatively; `1` (the default) is a single process and leaves the
+    wire field unset — see :func:`_wire_world_size`.
     """
+    wire_world_size = _wire_world_size(world_size)
     try:
         provenance = _EDGE_PROVENANCE[edge_provenance]
     except KeyError:
@@ -714,6 +757,7 @@ def build_fine_tune_graph_request(
         base_model=base_model,
         config=config,
         idempotency_key=idempotency_key,
+        world_size=wire_world_size,
     )
 
 
@@ -812,6 +856,12 @@ def build_context_predictor_request(
         min_task_count=min_task_count,
         seed=seed,
     )
+    # The third and last `SubmitJobRequest` construction in this module, and the
+    # one that carries NO `world_size`: that field is the wire form of the two
+    # LoRA kinds' `TrainingCommon.world_size`, and `ContextPredictorSpec` folds
+    # no common block (`crates/jammi-wire/proto/jammi/v1/job.proto` says so on
+    # the field itself). Exposing the keyword here would let a caller encode a
+    # rank count the engine refuses at submit, so the verb does not offer it.
     return job_pb2.SubmitJobRequest(
         context_predictor=training_pb2.ContextPredictorSpec(
             source=source,

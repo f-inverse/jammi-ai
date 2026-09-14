@@ -529,6 +529,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         common: TrainingCommon {
             base_model: tiny_modernbert_model(),
             config: config.clone(),
+            world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
     };
     let spec_json = serde_json::to_string(&spec).unwrap();
@@ -1399,8 +1400,8 @@ fn assert_terminal_report_is_undetermined(
 ///   intended, inside `train_fine_tune`'s `model_cache().get_or_load`, AFTER
 ///   the claim and well before any probe.
 /// - **3 — loader reconstruction error.** A job whose spec names a source
-///   table this session never registered, so `read_source_columns`'s SQL
-///   fails.
+///   table this session never registered, so the training-set producer's
+///   source resolution fails.
 /// - **1/2 — no / undeserialisable `training_spec`.** Covered by
 ///   [`pre_device_resolution_failure_reports_undetermined_acceleration`]
 ///   above, which additionally pins the MORE specific
@@ -1461,6 +1462,7 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
             common: TrainingCommon {
                 base_model: base_model.to_string(),
                 config: encoder_adapters_config(ComputePrecision::F32),
+                world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
         })
         .unwrap()
@@ -1631,6 +1633,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
         common: TrainingCommon {
             base_model: tiny_modernbert_model(),
             config: encoder_adapters_config(ComputePrecision::F32),
+            world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
     })
     .unwrap();

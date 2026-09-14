@@ -150,6 +150,49 @@ must carry:
       filename anchors close exactly that escape hatch
       (`check_producer_source_identity_marker`).
 
+  (k) the `gang` ARTIFACT KIND (the gpu-gang pod leg's evidence): an
+      artifact declared `gang` by ANY of three independent anchors —
+      `artifact_kind == "gang"`, a top-level `gang` block, or a committed
+      filename matching `GANG_ARTIFACT_FILENAME_RE` — must carry every row
+      of `GANG_FIELD_REGISTRY`: `world` (>= 2), `collective`, one per-rank
+      `device` for each of `world` ranks, the same-seed `digests` PAIR
+      (exactly two), the measured `per_step_loss_delta`, the leg's own
+      `verdict` (exactly `pass` or `fail`), and `epsilon`
+      with its `value`, its `derivation`, and the `registered_sha` it was
+      PRE-registered at — a commit that must be an ancestor of HEAD and a
+      STRICT ancestor of the artifact's own EVIDENCE ANCHOR (an ε landing
+      in the same commit as the tree it excuses is not pre-registered).
+      The anchor is `git_sha` when that is an ancestor of HEAD, else
+      `merged_as` when that is present, well-typed and an ancestor of HEAD,
+      else the artifact FAILS naming both — the same order rule (d) itself
+      applies, so a measured tip whose landing commit REWROTE it is still
+      ordered against something real instead of skipping the ε check
+      entirely, while a tip that IS in this history is ordered against
+      itself and no landing commit stamped beside it can loosen that
+      (`_gang_evidence_anchor` carries the full reasoning).
+
+      A FAILING gang run is REPRESENTABLE: a `fail` is admitted with its deltas and digests as
+      measured, and owes a non-empty `gang.reason` plus a top-level
+      `status` that is not `GREEN`. A `pass` is a CLAIM, so on a `pass` the
+      measured delta must be within ε (an artifact cannot record a run that
+      blew its own tolerance as if it passed) and the same-seed digest PAIR
+      must be EQUAL at `world == 2` — the one regime a spike measured
+      byte-identical. Above that world the pair is recorded, not asserted:
+      the NCCL pin set is untested at world >= 3, and a state defined by
+      missing evidence gets no definite consequence. A new required field
+      lands as a registry row (the same discipline `_TIER_SOURCE_REGISTRY`
+      follows), never an inline literal in a checker. No artifact committed
+      before this kind existed carries any anchor, so none reddens.
+
+      WHAT THE ANCHOR RULE ASKS OF A PRODUCER: register ε in its OWN
+      commit, BEFORE the commit that measures with it, on the same branch.
+      A landing that keeps the branch's commits (this repository's merge
+      commits, with no pre-merge rebase) keeps that ε a strict ancestor of
+      `git_sha` afterwards. A squash, or a rebase performed AFTER the
+      measurement, rewrites both commits, and the artifact then fails this
+      rule from the merge onwards — so do not rebase a branch after
+      measuring on it; land it, or re-measure.
+
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
 `fetch-depth: 1`) reads back EVERY `git_sha` as a false non-ancestor —
@@ -858,6 +901,518 @@ def check_oracle_separation(data: dict) -> list[str]:
                 f"{json_path}: healthy_max_offsample ({healthy}) < bound ({bound}) < "
                 f"min_control ({min_control}) does not hold — the bound does not "
                 "demonstrably separate healthy noise from a real control/regression"
+            )
+    return failures
+
+
+# --------------------------------------------------------------------------- #
+# rule (k) — the `gang` artifact kind (the gpu-gang pod leg's own evidence).
+#
+# A distributed fine-tune run on one 2-GPU pod proves something no
+# single-device artifact can, and it proves it with a DIFFERENT payload: the
+# topology it ran (`world`, the collective, the device each rank held), a
+# digest PAIR from two same-seed runs, the measured per-step loss delta, and
+# the ε that delta is read against. The ε is the part that rots silently, so
+# it is the part this rule is hardest about: it must carry its own
+# derivation AND the commit it was registered at, and that commit must
+# already be history by the time the measured tree existed. An ε chosen
+# after seeing the delta it excuses is not a tolerance, it is a rationalisation.
+#
+# "By the time the measured tree existed" is checked against the artifact's
+# EVIDENCE ANCHOR, not unconditionally against `git_sha`: see
+# `_gang_evidence_anchor`. Guarding the check behind "`git_sha` is an
+# ancestor of HEAD" (this rule's first revision) skipped it entirely for
+# exactly the artifacts whose measured tip was rewritten on landing.
+#
+# LETTER: (a)-(j) are taken (see the module doc; (h) is taken repo-wide by
+# check_perf_claims.py and the v2 leg-identity rule took (i) after an
+# accidental collision with KO-3's (g)). This one is (k). As with every
+# other letter here, it is comment/self-test-label prose only — no gate,
+# allowlist, or error message parses it.
+#
+# WHY A REGISTRY, NOT AN INLINE LITERAL: this file's own module doc requires
+# a new kind to land as registry ROWS (the same discipline `_TIER_SOURCE_
+# REGISTRY` follows for the v2 identity tuples), so the field set, its
+# validator, and the REASON each field is required all sit in one table a
+# reader can enumerate — and the next required field is a row, never another
+# `if` buried in a checker.
+#
+# A FAILING GANG RUN IS REPRESENTABLE. `gang.verdict` (`pass`/`fail`) is the
+# leg's own call, and it is what every consequence in this rule is
+# conditioned on: a `fail` is ADMITTED with its deltas and digests exactly
+# as measured (with a `gang.reason` naming what failed, and a top-level
+# `status` that is not GREEN), because a non-reproducible run's own numbers
+# are precisely the evidence that has to survive into the repository. The
+# tolerance and reproducibility assertions bind on `pass` only — and there
+# they bind hard, because a `pass` is a CLAIM.
+#
+# WHAT THIS RULE ASSERTS ONLY CONDITIONALLY: digest EQUALITY. On a `pass`
+# it is required at `world == 2` — the regime spike S5 measured
+# byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD across
+# A100s, with no env pins — and merely RECORDED above that, because nothing
+# has established byte-identity for a reduction whose NCCL pin set is
+# untested at world >= 3. A state defined by missing
+# evidence gets no definite consequence: the gate does not decide the
+# higher-world case in either direction.
+# --------------------------------------------------------------------------- #
+GANG_ARTIFACT_KIND = "gang"
+ARTIFACT_KIND_KEY = "artifact_kind"
+GANG_BLOCK_KEY = "gang"
+GANG_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Third anchor (the same three-anchor shape rule (j) uses): a committed
+# artifact whose FILENAME declares the family cannot escape this rule by
+# dropping its own `artifact_kind` key.
+GANG_ARTIFACT_FILENAME_RE = re.compile(r"(?:^|[-_])gang(?:[-_.]|$)")
+
+# The leg's own call. EXACT strings, closed set: a verdict spelled anything
+# else (`PASS`, `ok`, `failed`) is a FAIL, never coerced — every conditional
+# consequence below reads this field, so a value the gate does not
+# understand must never silently take the lenient branch.
+GANG_VERDICT_PASS = "pass"
+GANG_VERDICT_FAIL = "fail"
+GANG_VERDICTS = (GANG_VERDICT_PASS, GANG_VERDICT_FAIL)
+
+# The one top-level `status` spelling a `fail` verdict may not carry. The
+# corpus vocabulary is GREEN/RED/RECORD/SUPERSEDED, but `status` itself is
+# free text repo-wide (several pre-schema artifacts carry their own
+# phrasing) — so this rule refuses exactly the one contradiction it can
+# state without inventing a vocabulary: a leg that says it failed cannot
+# also be filed GREEN.
+GANG_GREEN_STATUS = "GREEN"
+
+# The world size at which a `pass` must show an EQUAL same-seed digest pair.
+# Above it the pair is recorded, not asserted — see the section comment.
+GANG_DIGEST_EQUALITY_WORLD = 2
+
+
+def _is_real_number(value) -> bool:
+    """A JSON number that is not a bool (`isinstance(True, int)` is True in
+    Python) and not a NaN/Infinity (`json.load` accepts both by default)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _gang_check_world(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    world = gang.get("world")
+    if isinstance(world, bool) or not isinstance(world, int):
+        return [f"`gang.world` must be an integer rank count, got {world!r}"]
+    if world < 2:
+        return [f"`gang.world` must be >= 2 — a one-rank run is not a gang, got {world}"]
+    return []
+
+
+def _gang_check_collective(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    collective = gang.get("collective")
+    if not isinstance(collective, str) or not collective.strip():
+        return [
+            f"`gang.collective` must be a non-empty string naming the collective the run used, "
+            f"got {collective!r}"
+        ]
+    return []
+
+
+def _gang_check_ranks(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    ranks = gang.get("ranks")
+    if not isinstance(ranks, list) or not ranks:
+        return [f"`gang.ranks` must be a non-empty list, one entry per rank, got {ranks!r}"]
+    failures: list[str] = []
+    world = gang.get("world")
+    if isinstance(world, int) and not isinstance(world, bool) and len(ranks) != world:
+        failures.append(
+            f"`gang.ranks` carries {len(ranks)} per-rank `device` entr(y/ies) but `gang.world` is "
+            f"{world} — every rank records the device it held, so the counts must be equal"
+        )
+    seen: list[int] = []
+    for i, entry in enumerate(ranks):
+        if not isinstance(entry, dict):
+            failures.append(f"`gang.ranks[{i}]` must be an object with `rank` and `device`, got {entry!r}")
+            continue
+        rank = entry.get("rank")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            failures.append(f"`gang.ranks[{i}].rank` must be a rank index >= 0, got {rank!r}")
+        else:
+            seen.append(rank)
+        device = entry.get("device")
+        if not isinstance(device, str) or not device.strip():
+            failures.append(
+                f"`gang.ranks[{i}].device` must be a non-empty string naming the device this rank "
+                f"held, got {device!r}"
+            )
+    if len(set(seen)) != len(seen):
+        failures.append(f"`gang.ranks` repeats a rank index ({sorted(seen)}) — each rank appears once")
+    elif isinstance(world, int) and not isinstance(world, bool) and seen and sorted(seen) != list(range(world)):
+        failures.append(
+            f"`gang.ranks` covers rank indices {sorted(seen)}, not 0..{world - 1} — every rank of the "
+            "gang records its own device"
+        )
+    return failures
+
+
+def _gang_check_digests(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    digests = gang.get("digests")
+    if not isinstance(digests, list) or len(digests) != 2:
+        return [
+            "`gang.digests` must be the PAIR of same-seed runs the equal-topology reproducibility "
+            f"oracle produces — exactly two entries, got {digests!r}"
+        ]
+    failures: list[str] = []
+    seeds: list = []
+    values: list[str] = []
+    for i, entry in enumerate(digests):
+        if not isinstance(entry, dict):
+            failures.append(f"`gang.digests[{i}]` must be an object with `seed` and `digest`, got {entry!r}")
+            continue
+        seed = entry.get("seed")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            failures.append(f"`gang.digests[{i}].seed` must be an integer seed, got {seed!r}")
+        else:
+            seeds.append(seed)
+        digest = entry.get("digest")
+        if not isinstance(digest, str) or not GANG_DIGEST_RE.match(digest):
+            failures.append(
+                f"`gang.digests[{i}].digest` must be a 64-lowercase-hex digest, got {digest!r}"
+            )
+        else:
+            values.append(digest)
+    if len(seeds) == 2 and seeds[0] != seeds[1]:
+        failures.append(
+            f"`gang.digests` records two DIFFERENT seeds ({seeds[0]} and {seeds[1]}) — the pair is two "
+            "runs of the SAME seed; two seeds prove nothing about reproducibility"
+        )
+    # Equality, asserted CONDITIONALLY (see the section comment above): only
+    # on a `pass` verdict, and only in the world size a spike actually
+    # measured byte-identical. A `fail` records its pair as measured — that
+    # is the whole point of admitting a failing run — and a `pass` at a
+    # larger world records it too, because nothing here establishes what
+    # byte-identity should mean for an untested NCCL pin set.
+    world = gang.get("world")
+    if (
+        gang.get("verdict") == GANG_VERDICT_PASS
+        and not isinstance(world, bool)
+        and world == GANG_DIGEST_EQUALITY_WORLD
+        and len(seeds) == 2
+        and seeds[0] == seeds[1]
+        and len(values) == 2
+        and values[0] != values[1]
+    ):
+        failures.append(
+            f"`gang.digests` records a `pass` at `gang.world` {GANG_DIGEST_EQUALITY_WORLD} whose two "
+            f"same-seed runs produced DIFFERENT digests ({values[0]} vs {values[1]}) — spike S5 "
+            "measured this regime byte-identical, so an unequal pair is a failed run: record it as "
+            f"`gang.verdict` {GANG_VERDICT_FAIL!r} with its own `gang.reason`, never as a pass"
+        )
+    return failures
+
+
+def _gang_check_delta_series(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    deltas = gang.get("per_step_loss_delta")
+    if not isinstance(deltas, list) or not deltas:
+        return [
+            "`gang.per_step_loss_delta` must be a non-empty list of the MEASURED per-step loss "
+            f"deltas (one per global step), got {deltas!r}"
+        ]
+    bad = [(i, v) for i, v in enumerate(deltas) if not _is_real_number(v)]
+    if bad:
+        i, v = bad[0]
+        return [f"`gang.per_step_loss_delta[{i}]` must be a finite number, got {v!r}"]
+    return []
+
+
+def _gang_check_verdict(gang: dict, data: dict, _repo_root: Path) -> list[str]:
+    """The leg's own pass/fail call, and the two things a `fail` owes a
+    reader. Every other conditional consequence in this rule (the ε
+    tolerance read, the conditional digest-equality assertion) is gated on
+    this field, so an unrecognised value is refused here rather than
+    quietly routed down the lenient branch."""
+    verdict = gang.get("verdict")
+    if verdict not in GANG_VERDICTS:
+        return [
+            f"`gang.verdict` must be exactly one of {list(GANG_VERDICTS)} — the leg's own call about "
+            "the run this artifact records; a run that failed is recorded AS failed, with its "
+            f"numbers as measured, never omitted or filed as a pass, got {verdict!r}"
+        ]
+    if verdict != GANG_VERDICT_FAIL:
+        return []
+    failures: list[str] = []
+    reason = gang.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        failures.append(
+            f"`gang.verdict` is {GANG_VERDICT_FAIL!r} but `gang.reason` is missing or blank — a "
+            "recorded failure states WHAT failed (which rank, which collective, which step), or it "
+            f"is an unactionable number, got {reason!r}"
+        )
+    status = data.get("status")
+    if isinstance(status, str) and status.strip().upper() == GANG_GREEN_STATUS:
+        failures.append(
+            f"`gang.verdict` is {GANG_VERDICT_FAIL!r} but the artifact's top-level `status` is "
+            f"{status!r} — a leg that reports its own failure cannot also be filed "
+            f"{GANG_GREEN_STATUS}; the two fields would contradict each other in the corpus"
+        )
+    return failures
+
+
+def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str | None, list[str]]:
+    """The commit in THIS history that a gang artifact's evidence is anchored
+    at — the thing ε's pre-registration is ordered against.
+
+    Returns `(anchor_field, anchor_sha, failures)`; `anchor_sha is None`
+    means no anchor exists in this history and `failures` carries the one
+    finding that names BOTH candidates.
+
+    The order mirrors `check_ancestry` (rule (d)) — `git_sha` FIRST, then
+    `merged_as` as the RESCUE, each held to `git merge-base --is-ancestor`
+    against HEAD:
+
+      * `git_sha` when 40-hex and an ancestor of HEAD — the ordinary shape,
+        a tip that survived into this history verbatim. It is where the
+        measurement actually happened, so it is the tree ε has to predate;
+        a `merged_as` stamped beside it names a LATER commit, and reading
+        the order against that later commit would admit an ε registered in
+        the measured commit itself. `merged_as` is a rescue for a lost
+        anchor, never a relaxation of a present one.
+      * else `merged_as` when present, 40-hex, and an ancestor of HEAD. A
+        measured branch tip that landed by a commit which REWROTE it (a
+        squash, or a pre-merge rebase) has a `git_sha` that is an ancestor
+        of nothing; `merged_as` is then the only commit whose content is in
+        this history, so it is the only anchor an ordering claim can mean.
+        Concretely: ε is here ordered against the LANDING commit
+        (`merged_as`), never against the (now-unreachable) commit where the
+        measurement itself ran — that commit has no content in this
+        history for anything to be ordered against. On this repo's corpus
+        that is not a corner case: of the 111 cuda-run artifacts carrying a
+        `git_sha`, 7 need this arm.
+      * else neither: a hard FAIL naming both, never a silent skip. The
+        previous revision of this rule guarded BOTH of its ε arms behind
+        `_is_ancestor(git_sha, HEAD)`, so exactly the artifacts that need
+        the `merged_as` rescue had their whole ε pre-registration check
+        skipped — including an ε registered in the landing commit itself.
+
+    ANCESTRY, never "resolvable": whether a rewritten sha is READABLE here
+    is a property of the clone (4 of those 7 exist only as loose objects in
+    one operator's checkout, and not at all in a fresh CI clone), so
+    `git cat-file`-style resolvability would make this gate's verdict
+    depend on who ran it. Ancestry is the same question for every clone
+    with real history — which `run_gate`'s shallow guard already insists on.
+
+    `git_sha_unresolved` is NOT an exemption here: rule (a) lets a reviewed
+    legacy artifact carry a short/malformed ref instead of a `git_sha`, and
+    rule (d) has nothing resolvable to check for it — but an ε is a claim
+    about ORDER IN THIS HISTORY, and an artifact with no anchor in this
+    history cannot make that claim at all. Such an artifact lands as this
+    finding, not as a silent pass.
+
+    Git failures are NOT swallowed: `_run` (see its own definition) does not
+    catch a missing/broken `git`, so a `FileNotFoundError`/`OSError`
+    propagates out of `_is_ancestor` and the gate exits non-zero with the
+    traceback. Fail-closed BY EXIT — never by a `False` that would read as
+    "not an ancestor" and produce a misleading per-artifact finding.
+    """
+    git_sha = data.get("git_sha")
+    merged_as = data.get("merged_as")
+    if isinstance(git_sha, str) and GIT_SHA_RE.match(git_sha) and _is_ancestor(git_sha, repo_root):
+        return "git_sha", git_sha, []
+    if isinstance(merged_as, str) and GIT_SHA_RE.match(merged_as) and _is_ancestor(merged_as, repo_root):
+        return "merged_as", merged_as, []
+    return (
+        None,
+        None,
+        [
+            f"`gang.epsilon` has no commit in this history to be pre-registered AGAINST: neither "
+            f"`git_sha` ({git_sha!r}) nor `merged_as` ({merged_as!r}) is an ancestor of HEAD, so the "
+            "claim 'ε was on record before the measured tree' names no order this checkout can "
+            "establish (a `git_sha_unresolved` artifact is not exempt — it has no anchor either)"
+        ],
+    )
+
+
+def _gang_check_epsilon(gang: dict, data: dict, repo_root: Path) -> list[str]:
+    epsilon = gang.get("epsilon")
+    if not isinstance(epsilon, dict):
+        return [
+            "`gang.epsilon` must be an object carrying the PRE-REGISTERED tolerance: "
+            f"`value`, `derivation`, `registered_sha`, got {epsilon!r}"
+        ]
+    failures: list[str] = []
+    value = epsilon.get("value")
+    if not _is_real_number(value) or value <= 0:
+        failures.append(f"`gang.epsilon.value` must be a finite number > 0, got {value!r}")
+    derivation = epsilon.get("derivation")
+    if not isinstance(derivation, str) or not derivation.strip():
+        failures.append(
+            "`gang.epsilon.derivation` must state HOW this ε was arrived at (the spike that measured "
+            "it, or the max delta over the same-seed baseline runs on this box) — a bare number is "
+            f"not a tolerance, got {derivation!r}"
+        )
+    registered_sha = epsilon.get("registered_sha")
+    if not isinstance(registered_sha, str) or not GIT_SHA_RE.match(registered_sha):
+        failures.append(
+            "`gang.epsilon.registered_sha` must be the 40-hex commit this ε was registered at, "
+            f"got {registered_sha!r}"
+        )
+        return failures
+    # PRE-registered means: already in history when the measured tree existed.
+    # Checked in the strongest form this checkout can actually establish —
+    # ancestry — never inferred from the artifact's own prose.
+    if not _is_ancestor(registered_sha, repo_root):
+        failures.append(
+            f"`gang.epsilon.registered_sha` ({registered_sha}) is not an ancestor of HEAD — an ε whose "
+            "own registration commit is not in this history was never pre-registered here"
+        )
+        return failures
+    anchor_field, anchor, anchor_failures = _gang_evidence_anchor(data, repo_root)
+    if anchor is None:
+        failures.extend(anchor_failures)
+        return failures
+    if registered_sha == anchor:
+        failures.append(
+            f"`gang.epsilon.registered_sha` equals the artifact's own `{anchor_field}` ({anchor}) — the ε "
+            "must be registered BEFORE the tree that was measured, never in the same commit"
+        )
+    elif not _is_ancestor(registered_sha, repo_root, target=anchor):
+        failures.append(
+            f"`gang.epsilon.registered_sha` ({registered_sha}) is not an ancestor of the measured "
+            f"`{anchor_field}` ({anchor}) — this ε was not on record before the run it gates"
+        )
+    return failures
+
+
+# (field key, validator, why this field is required). The registry IS the
+# schema: a new required field lands as a row here, in the same unit that
+# teaches the leg to emit it.
+GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
+    (
+        "world",
+        _gang_check_world,
+        "the rank count the run actually ran at — every other field is read against it",
+    ),
+    (
+        "collective",
+        _gang_check_collective,
+        "which collective carried the reduction; the same topology over a different collective is a "
+        "different run",
+    ),
+    (
+        "ranks",
+        _gang_check_ranks,
+        "the device each rank held — one entry per rank, so a 'two-GPU' run that silently placed both "
+        "ranks on one device cannot be recorded as a gang",
+    ),
+    (
+        "digests",
+        _gang_check_digests,
+        "the same-seed digest PAIR the equal-topology reproducibility oracle produces. Equality is "
+        f"ASSERTED on a {GANG_VERDICT_PASS!r} verdict at `world` {GANG_DIGEST_EQUALITY_WORLD} (the "
+        "regime spike S5 measured byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD "
+        "on A100s with no env pins) and merely RECORDED above that world — the NCCL pin set is "
+        "untested at world >= 3, and a state defined by missing evidence gets no "
+        f"definite consequence. A {GANG_VERDICT_FAIL!r} verdict records its pair as measured",
+    ),
+    (
+        "per_step_loss_delta",
+        _gang_check_delta_series,
+        "the MEASURED per-step loss delta — the quantity ε is about; an artifact carrying ε and no "
+        "delta records a tolerance with nothing to tolerate",
+    ),
+    (
+        "epsilon",
+        _gang_check_epsilon,
+        "the pre-registered tolerance, its derivation, and the commit it was registered at — a STRICT "
+        "ancestor of this artifact's evidence anchor (`git_sha` when that is in this history, else "
+        "`merged_as` as the rescue; neither in this history is a FAIL, never a skip — see "
+        "`_gang_evidence_anchor`)",
+    ),
+    (
+        "verdict",
+        _gang_check_verdict,
+        f"the leg's own call, exactly {list(GANG_VERDICTS)}. Without it a FAILING gang run is not "
+        "representable at all: the tolerance and digest-equality assertions would refuse to record "
+        f"the very numbers a non-reproducible run must leave behind. A {GANG_VERDICT_FAIL!r} carries "
+        f"a non-empty `gang.reason` and a top-level `status` that is not {GANG_GREEN_STATUS}",
+    ),
+)
+
+
+def gang_anchors(data: dict, relpath: str) -> list[str]:
+    """Which independent anchor(s) declare this artifact a gang artifact.
+    Three of them (rule (j)'s own shape), so dropping any ONE — renaming the
+    kind key, folding the block away, renaming the file — does not silently
+    return the artifact to the unchecked state."""
+    anchors: list[str] = []
+    if data.get(ARTIFACT_KIND_KEY) == GANG_ARTIFACT_KIND:
+        anchors.append(f"{ARTIFACT_KIND_KEY} == {GANG_ARTIFACT_KIND!r}")
+    if isinstance(data.get(GANG_BLOCK_KEY), dict):
+        anchors.append(f"a top-level `{GANG_BLOCK_KEY}` block")
+    if GANG_ARTIFACT_FILENAME_RE.search(relpath.rsplit("/", 1)[-1]):
+        anchors.append("the committed filename (GANG_ARTIFACT_FILENAME_RE)")
+    return anchors
+
+
+def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
+    """Rule (k): an artifact declared `gang` by ANY anchor must carry the
+    complete `GANG_FIELD_REGISTRY` payload. An artifact declared by none of
+    them is not a gang artifact and is untouched by this rule (every
+    artifact committed before this kind existed stays green)."""
+    anchors = gang_anchors(data, relpath)
+    if not anchors:
+        return []
+    failures: list[str] = []
+    if data.get(ARTIFACT_KIND_KEY) != GANG_ARTIFACT_KIND:
+        return [
+            f"declared a gang artifact by {anchors[0]} but `{ARTIFACT_KIND_KEY}` is "
+            f"{data.get(ARTIFACT_KIND_KEY)!r} — a gang artifact names its own kind"
+        ]
+    gang = data.get(GANG_BLOCK_KEY)
+    if not isinstance(gang, dict):
+        return [
+            f"`{ARTIFACT_KIND_KEY}` is {GANG_ARTIFACT_KIND!r} but there is no `{GANG_BLOCK_KEY}` "
+            f"object carrying {', '.join(f'`{k}`' for k, _v, _w in GANG_FIELD_REGISTRY)}"
+        ]
+    for key, validator, why in GANG_FIELD_REGISTRY:
+        if key not in gang:
+            failures.append(f"`{GANG_BLOCK_KEY}.{key}` is missing — {why}")
+            continue
+        failures.extend(validator(gang, data, repo_root))
+    # Cross-field: on a `pass`, the recorded delta is read against the
+    # recorded ε. A committed artifact whose own numbers contradict its own
+    # verdict is a finding here, not a thing a later reader has to notice by
+    # hand. On a `fail` the deltas are admitted exactly as measured — a run
+    # that blew its tolerance is what a `fail` IS, and refusing to record it
+    # would leave the corpus with only the runs that went well.
+    deltas = gang.get("per_step_loss_delta")
+    epsilon = gang.get("epsilon")
+    if (
+        gang.get("verdict") == GANG_VERDICT_PASS
+        and isinstance(deltas, list)
+        and deltas
+        and all(_is_real_number(v) for v in deltas)
+        and isinstance(epsilon, dict)
+        and _is_real_number(epsilon.get("value"))
+        # Deliberately redundant with `_gang_check_epsilon`'s own `value > 0`
+        # guard (that validator runs unconditionally, above, in the
+        # GANG_FIELD_REGISTRY loop): this cross-field block runs regardless
+        # of whether that validator already appended a failure, so without
+        # this guard a malformed epsilon (0, negative, or non-numeric) would
+        # ALSO produce a nonsensical "worst step exceeds epsilon.value"
+        # finding piled on top of the primary `gang.epsilon.value must be...`
+        # one. Pinned here, not dropped: the two checks read the same field
+        # for two different questions (is epsilon well-formed vs. does the
+        # measured delta respect it) and this block must not run its own
+        # comparison against a value the other validator already rejected.
+        and epsilon["value"] > 0
+    ):
+        worst = max(abs(v) for v in deltas)
+        # Strict `>`, deliberately: `worst == epsilon.value` is INSIDE the
+        # tolerance (inclusive), never a boundary failure — ε is "within",
+        # not "strictly less than". A fixture at exactly that boundary stays
+        # green (see the self-test's own boundary case).
+        if worst > epsilon["value"]:
+            failures.append(
+                f"`{GANG_BLOCK_KEY}.per_step_loss_delta`'s worst step ({worst}) exceeds "
+                f"`{GANG_BLOCK_KEY}.epsilon.value` ({epsilon['value']}) — this artifact records a run "
+                f"that failed its own pre-registered tolerance as a {GANG_VERDICT_PASS!r}; record it "
+                f"as {GANG_VERDICT_FAIL!r} with its own `{GANG_BLOCK_KEY}.reason`"
             )
     return failures
 
@@ -1631,6 +2186,7 @@ def validate_artifact(
     failures += check_none_allowlist(data, relpath, allowlist)
     failures += check_ancestry(data, repo_root)
     failures += check_oracle_separation(data)
+    failures += check_gang_artifact(data, relpath, repo_root)
     return failures
 
 
@@ -1831,6 +2387,36 @@ def self_test() -> int:
         (repo / "unrelated.txt").write_text("x\n")
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "second"], repo)
+        # rule (k) needs TWO shas with a real ancestry relation between
+        # them: an ε registered at `root_sha` was on record before the tree
+        # `second_sha` names ever existed.
+        second_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+
+        # rule (k), M1's anchor arms need two MORE shas:
+        #   `third_sha` (== HEAD) is a commit strictly AFTER `second_sha`, so
+        #   an ε "registered" there is an ancestor of HEAD yet NOT an
+        #   ancestor of the anchor — the one arm no mutation used to drive;
+        #   `orphan_sha` is a real commit object on an orphan branch, an
+        #   ancestor of nothing in HEAD's history — the shape a measured tip
+        #   takes once its landing commit rewrote it (the `merged_as` case).
+        (repo / "unrelated2.txt").write_text("y\n")
+        _run(["git", "add", "-A"], repo)
+        _run(["git", "commit", "-q", "-m", "third"], repo)
+        third_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+        main_branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip()
+        _run(["git", "checkout", "-q", "--orphan", "sidebranch"], repo)
+        (repo / "orphan.txt").write_text("z\n")
+        _run(["git", "add", "-A"], repo)
+        _run(["git", "commit", "-q", "-m", "orphan tip"], repo)
+        orphan_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+        _run(["git", "checkout", "-q", "-f", main_branch], repo)
+        # The fixture is worthless if the checkout did not come back: every
+        # anchor arm below is stated relative to HEAD == third_sha.
+        if _run(["git", "rev-parse", "HEAD"], repo).stdout.strip() != third_sha:
+            failures.append(
+                "self-test FAILED: the fixture repo did not return to its main branch after the "
+                "orphan commit — every rule (k) anchor case below is stated relative to HEAD"
+            )
 
         tracked = git_ls_files(repo)
         allowlist = {"legacy-none.json": "synthetic legacy fixture"}
@@ -2181,6 +2767,418 @@ def self_test() -> int:
         bad["producer"]["path"] = "crates/no-rf-crate/tests/cuda_parity.rs"
         bad["producer"]["gating"] = "required-features"
         expect_hit(bad, "x.json", "has no `[[test]]` section", "rule (c): claimed required-features absent")
+
+        # rule (k) — the `gang` artifact kind -----------------------------------
+        # One mutation per DETERMINANT of the kind: each required field
+        # removed, then each malformed in the way that field is actually
+        # gettable wrong, plus the two anchors that must not let an artifact
+        # slip back into the unchecked state, plus the delta-vs-ε
+        # cross-field. Every needle below names the field, so the finding a
+        # producer reads tells it which part of its own payload is wrong.
+        def gang_baseline() -> dict:
+            d = baseline()
+            # A gang artifact measures a tree; its ε was registered EARLIER
+            # (root_sha), which is what makes it pre-registered.
+            d["git_sha"] = second_sha
+            d["artifact_kind"] = "gang"
+            d["gang"] = {
+                "world": 2,
+                "collective": "nccl",
+                "ranks": [
+                    {"rank": 0, "device": "cuda:0 NVIDIA A100-SXM4-80GB"},
+                    {"rank": 1, "device": "cuda:1 NVIDIA A100-SXM4-80GB"},
+                ],
+                "digests": [
+                    {"seed": 7, "digest": "a" * 64},
+                    {"seed": 7, "digest": "a" * 64},
+                ],
+                "per_step_loss_delta": [0.0, 1.0e-7, 2.0e-7],
+                "epsilon": {
+                    "value": 1.0e-6,
+                    "derivation": (
+                        "max |per-step loss delta| over three same-seed baseline runs on this box, "
+                        "registered before the first gating run"
+                    ),
+                    "registered_sha": root_sha,
+                },
+                "verdict": "pass",
+            }
+            return d
+
+        expect_clean(gang_baseline(), "2026-01-01-gang-2xa100.json", "rule (k): complete gang artifact")
+
+        # A non-gang artifact is untouched by this rule (every artifact
+        # committed before the kind existed stays green).
+        expect_clean(
+            baseline(), "control-single-device.json", "rule (k): non-gang artifact is not gang-checked"
+        )
+
+        for field in ("world", "collective", "ranks", "digests", "per_step_loss_delta", "epsilon", "verdict"):
+            bad = gang_baseline()
+            del bad["gang"][field]
+            expect_hit(bad, "x.json", f"`gang.{field}` is missing", f"rule (k): missing gang.{field}")
+
+        bad = gang_baseline()
+        bad["gang"]["world"] = 1
+        expect_hit(bad, "x.json", "`gang.world` must be >= 2", "rule (k): world 1 is not a gang")
+
+        bad = gang_baseline()
+        bad["gang"]["world"] = "2"
+        expect_hit(bad, "x.json", "`gang.world` must be an integer", "rule (k): world as a string")
+
+        bad = gang_baseline()
+        bad["gang"]["collective"] = "   "
+        expect_hit(bad, "x.json", "`gang.collective` must be a non-empty string", "rule (k): blank collective")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}]
+        expect_hit(bad, "x.json", "but `gang.world` is 2", "rule (k): one device for a world of two")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": 1, "device": ""}]
+        expect_hit(bad, "x.json", "`gang.ranks[1].device` must be a non-empty string", "rule (k): empty device")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": 0, "device": "cuda:0"}]
+        expect_hit(bad, "x.json", "repeats a rank index", "rule (k): both entries claim rank 0")
+
+        # The remaining `_gang_check_ranks` arms, one fixture each. Each was
+        # written and left undriven: neutralising the arm kept `--self-test`
+        # green, and three of them would then have ADMITTED the malformed
+        # payload into the corpus.
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = []
+        expect_hit(bad, "x.json", "`gang.ranks` must be a non-empty list", "rule (k): an empty rank list")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, "cuda:1 NVIDIA A100-SXM4-80GB"]
+        expect_hit(bad, "x.json", "`gang.ranks[1]` must be an object", "rule (k): a rank entry that is not an object")
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": "zero", "device": "cuda:1"}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.ranks[1].rank` must be a rank index >= 0",
+            "rule (k): a rank index spelled as a string",
+        )
+
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": -1, "device": "cuda:1"}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.ranks[1].rank` must be a rank index >= 0",
+            "rule (k): a negative rank index",
+        )
+
+        # Right count, right types, no repeat — and still not the gang's own
+        # ranks: 0 recorded no device. Only the coverage arm catches this.
+        bad = gang_baseline()
+        bad["gang"]["ranks"] = [{"rank": 1, "device": "cuda:0"}, {"rank": 2, "device": "cuda:1"}]
+        expect_hit(
+            bad,
+            "x.json",
+            "covers rank indices [1, 2], not 0..1",
+            "rule (k): two well-formed ranks that are not 0..world-1",
+        )
+
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [{"seed": 7, "digest": "a" * 64}]
+        expect_hit(bad, "x.json", "exactly two entries", "rule (k): a single digest is not a pair")
+
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 8, "digest": "a" * 64},
+        ]
+        expect_hit(bad, "x.json", "two DIFFERENT seeds", "rule (k): the pair must share one seed")
+
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [{"seed": 7, "digest": "nope"}, {"seed": 7, "digest": "a" * 64}]
+        expect_hit(bad, "x.json", "`gang.digests[0].digest` must be a 64-lowercase-hex", "rule (k): malformed digest")
+
+        bad = gang_baseline()
+        bad["gang"]["digests"] = ["a" * 64, {"seed": 7, "digest": "a" * 64}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.digests[0]` must be an object",
+            "rule (k): a digest entry that is not an object",
+        )
+
+        # A non-integer seed is not just a type finding: with `seeds` left
+        # empty, BOTH the same-seed arm and the pass@world-2 equality arm
+        # skip, so an unreadable seed would otherwise buy an artifact its way
+        # out of the digest oracle entirely.
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [{"seed": "a", "digest": "a" * 64}, {"seed": 7, "digest": "b" * 64}]
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.digests[0].seed` must be an integer seed",
+            "rule (k): a seed that is not an integer",
+        )
+
+        bad = gang_baseline()
+        bad["gang"]["per_step_loss_delta"] = []
+        expect_hit(bad, "x.json", "`gang.per_step_loss_delta` must be a non-empty list", "rule (k): empty delta series")
+
+        bad = gang_baseline()
+        bad["gang"]["per_step_loss_delta"] = [0.0, "1e-7"]
+        expect_hit(bad, "x.json", "`gang.per_step_loss_delta[1]` must be a finite number", "rule (k): non-numeric delta")
+
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = 1.0e-6
+        expect_hit(bad, "x.json", "`gang.epsilon` must be an object", "rule (k): ε as a bare number")
+
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], value=0)
+        expect_hit(bad, "x.json", "`gang.epsilon.value` must be a finite number > 0", "rule (k): ε of zero")
+
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], derivation="")
+        expect_hit(bad, "x.json", "`gang.epsilon.derivation` must state HOW", "rule (k): ε with no derivation")
+
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha="abc1234")
+        expect_hit(bad, "x.json", "`gang.epsilon.registered_sha` must be the 40-hex", "rule (k): short registration sha")
+
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha="b" * 40)
+        expect_hit(bad, "x.json", "is not an ancestor of HEAD", "rule (k): ε registered at an unknown commit")
+
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=second_sha)
+        expect_hit(bad, "x.json", "equals the artifact's own `git_sha`", "rule (k): ε registered in the measured commit")
+
+        # M1 — the EVIDENCE ANCHOR (`_gang_evidence_anchor`). One mutation
+        # per arm, over both anchor shapes plus the no-anchor case. The
+        # first revision of this rule guarded both ε ordering arms behind
+        # "`git_sha` is an ancestor of HEAD", so every case in the
+        # `merged_as` block below was SILENTLY ADMITTED, and the
+        # not-an-ancestor-of-the-anchor arm was driven by no mutation at all.
+
+        # (1) merged_as shape: the measured tip was rewritten on landing, so
+        # `git_sha` is an ancestor of nothing and `merged_as` is the anchor.
+        def merged_gang() -> dict:
+            d = gang_baseline()
+            d["git_sha"] = orphan_sha
+            d["merged_as"] = third_sha
+            d["merged_via_pr"] = 4242
+            return d
+
+        ok = merged_gang()
+        ok["gang"]["epsilon"] = dict(ok["gang"]["epsilon"], registered_sha=second_sha)
+        expect_clean(ok, "control-merged-anchor.json", "rule (k): ε strictly before the merged_as anchor")
+
+        bad = merged_gang()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "equals the artifact's own `merged_as`",
+            "rule (k): ε registered in the landing commit itself (merged_as anchor)",
+        )
+
+        bad = merged_gang()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=orphan_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "is not an ancestor of HEAD",
+            "rule (k): ε registered on the rewritten tip, which is in no history here",
+        )
+
+        # (2) ancestor shape: an ε registered AFTER the anchor. `third_sha`
+        # is an ancestor of HEAD (so the HEAD arm passes) but is NOT an
+        # ancestor of `second_sha`, which is the artifact's own anchor.
+        bad = gang_baseline()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "is not an ancestor of the measured `git_sha`",
+            "rule (k): ε registered at a commit AFTER the measured tree",
+        )
+
+        # (2b) BOTH anchors are in this history: the measured `git_sha`
+        # survived into HEAD's history AND a `merged_as` was stamped beside
+        # it. The evidence is the tree `git_sha` names — that is where the
+        # measurement happened — so the anchor is `git_sha`, and the later
+        # landing commit must not be allowed to relax the ordering. The
+        # first revision of `_gang_evidence_anchor` tried `merged_as` FIRST,
+        # which retargeted ε's constraint onto the landing commit: an ε
+        # registered in the very commit it measures was then ADMITTED.
+        def both_anchors_gang() -> dict:
+            d = gang_baseline()  # git_sha == second_sha, itself an ancestor of HEAD
+            d["merged_as"] = third_sha
+            d["merged_via_pr"] = 4243
+            return d
+
+        bad = both_anchors_gang()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=second_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "equals the artifact's own `git_sha`",
+            "rule (k): ε registered in the measured commit, `merged_as` also in this history",
+        )
+
+        bad = both_anchors_gang()
+        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
+        expect_hit(
+            bad,
+            "x.json",
+            "is not an ancestor of the measured `git_sha`",
+            "rule (k): ε registered AFTER the measured commit, `merged_as` also in this history",
+        )
+
+        ok = both_anchors_gang()
+        ok["gang"]["epsilon"] = dict(ok["gang"]["epsilon"], registered_sha=root_sha)
+        expect_clean(
+            ok,
+            "control-both-anchors.json",
+            "rule (k): ε strictly before the measured `git_sha`, `merged_as` also in this history",
+        )
+
+        # (3) no anchor at all — FAILS naming BOTH candidates, never skipped.
+        bad = gang_baseline()
+        bad["git_sha"] = orphan_sha
+        expect_hit(
+            bad,
+            "x.json",
+            "has no commit in this history to be pre-registered AGAINST",
+            "rule (k): neither git_sha nor merged_as is an ancestor of HEAD",
+        )
+
+        # `git_sha_unresolved` is not an exemption for ε: rule (d) has
+        # nothing resolvable to check for such an artifact, but an ε is a
+        # claim about ORDER IN THIS HISTORY and there is no anchor to order
+        # it against.
+        bad = gang_baseline()
+        del bad["git_sha"]
+        bad["git_sha_unresolved"] = "abc1234"
+        bad["producer"] = {"path": None, "kind": "none", "invocation": None, "gating": "none"}
+        allowlist["legacy-gang.json"] = "synthetic legacy gang fixture"
+        expect_hit(
+            bad,
+            "legacy-gang.json",
+            "has no commit in this history to be pre-registered AGAINST",
+            "rule (k): git_sha_unresolved is not an ε exemption",
+        )
+        del allowlist["legacy-gang.json"]
+
+        bad = gang_baseline()
+        bad["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
+        expect_hit(bad, "x.json", "exceeds", "rule (k): a delta outside the pre-registered ε")
+
+        # The boundary: `worst == epsilon.value` exactly. ε is an INCLUSIVE
+        # tolerance (a run measured AT its pre-registered ceiling is not a
+        # violation of it), so this must stay green -- the strict `>` in
+        # `check_gang_artifact`'s cross-field block is deliberate, not an
+        # off-by-one to fix.
+        ok = gang_baseline()
+        ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-6]
+        expect_clean(ok, "control-gang-epsilon-boundary.json", "rule (k): worst == epsilon.value is inside the tolerance")
+
+        # M2 — `gang.verdict`. One mutation per DETERMINANT: the value
+        # itself, each thing a `fail` owes, and each consequence that binds
+        # on `pass` ONLY (so the same payload that FAILS as a pass must be
+        # ADMITTED as a fail — the property is "a failing run is
+        # representable", which an assertion-only gate silently refused).
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "PASS"
+        expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict in the wrong case")
+
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "unknown"
+        expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict outside the closed set")
+
+        # A `pass` at world 2 with an unequal same-seed pair: S5's measured
+        # regime, so this is a failed run recorded as a pass.
+        bad = gang_baseline()
+        bad["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 7, "digest": "c" * 64},
+        ]
+        expect_hit(
+            bad,
+            "x.json",
+            "same-seed runs produced DIFFERENT digests",
+            "rule (k): a pass at world 2 whose digest pair disagrees",
+        )
+
+        # The SAME unequal pair above world 2 is RECORDED, not asserted —
+        # nothing has measured byte-identity for an untested NCCL pin set.
+        ok = gang_baseline()
+        ok["gang"]["world"] = 4
+        ok["gang"]["ranks"] = [
+            {"rank": i, "device": f"cuda:{i} NVIDIA A100-SXM4-80GB"} for i in range(4)
+        ]
+        ok["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 7, "digest": "c" * 64},
+        ]
+        expect_clean(ok, "control-gang-world4.json", "rule (k): an unequal pair above world 2 is recorded, not asserted")
+
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "fail"
+        bad["status"] = "RED"
+        expect_hit(bad, "x.json", "`gang.reason` is missing or blank", "rule (k): a fail with no reason")
+
+        bad = gang_baseline()
+        bad["gang"]["verdict"] = "fail"
+        bad["gang"]["reason"] = "rank 1's all-reduce diverged at global step 3"
+        expect_hit(
+            bad,
+            "x.json",
+            "cannot also be filed GREEN",
+            "rule (k): a fail filed as a GREEN artifact",
+        )
+
+        # The two admissions: the exact payloads that FAIL as a `pass` are
+        # ADMITTED as a `fail`, deltas and digests as measured.
+        ok = gang_baseline()
+        ok["gang"]["verdict"] = "fail"
+        ok["gang"]["reason"] = "worst per-step delta 1e-5 exceeded the pre-registered 1e-6"
+        ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
+        ok["status"] = "RED"
+        expect_clean(ok, "control-gang-fail-delta.json", "rule (k): a fail records a delta outside ε as measured")
+
+        ok = gang_baseline()
+        ok["gang"]["verdict"] = "fail"
+        ok["gang"]["reason"] = "the same-seed pair did not reproduce"
+        ok["gang"]["digests"] = [
+            {"seed": 7, "digest": "a" * 64},
+            {"seed": 7, "digest": "c" * 64},
+        ]
+        ok["status"] = "RED"
+        expect_clean(ok, "control-gang-fail-digests.json", "rule (k): a fail records an unequal digest pair as measured")
+
+        # Anchors: dropping the `artifact_kind` key does NOT return a gang
+        # artifact to the unchecked state — the `gang` block itself, and the
+        # committed filename, each independently declare the kind.
+        bad = gang_baseline()
+        del bad["artifact_kind"]
+        expect_hit(bad, "control-block-anchor.json", "a top-level `gang` block", "rule (k): block anchor")
+
+        bad = gang_baseline()
+        del bad["artifact_kind"]
+        del bad["gang"]
+        expect_hit(bad, "2026-01-01-gang-2xa100.json", "the committed filename", "rule (k): filename anchor")
+
+        # The other side of the same door: an artifact that DECLARES the kind
+        # and carries no `gang` block at all owes the whole registry, not a
+        # pass for having nothing to check.
+        bad = baseline()
+        bad["artifact_kind"] = "gang"
+        expect_hit(
+            bad,
+            "control-kind-without-block.json",
+            "but there is no `gang` object",
+            "rule (k): artifact_kind gang with no gang block",
+        )
 
         # rule (d) — ancestry ---------------------------------------------------
         bad = baseline()
@@ -2828,7 +3826,31 @@ def self_test() -> int:
         "INDEPENDENT anchors fires: a known SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS producer.path, an "
         "artifact that already carries a non-empty producer.source_sha256 block, or an artifact whose own "
         "basename matches a known profile/frontend SOURCE_IDENTITY_DECLARING_FILENAME_RE family, matched "
-        "against the basename only, never an ancestor directory's own name) round out rule (j)."
+        "against the basename only, never an ancestor directory's own name) round out rule (j). "
+        "Rule (k)'s `gang` kind bites on every determinant of its own registry — each GANG_FIELD_"
+        "REGISTRY field missing, world < 2, a device count that disagrees with world, a repeated rank, "
+        "an empty rank list, a rank entry that is not an object, a rank index that is a string or "
+        "negative, two well-formed ranks that are not 0..world-1, a digest entry that is not an "
+        "object, a seed that is not an integer (which would otherwise skip BOTH the same-seed and "
+        "the digest-equality arms), a declared `artifact_kind` with no `gang` block at all, "
+        "a digest pair that is not exactly two same-seed entries, a malformed digest, an empty or "
+        "non-numeric delta series, an ε that is zero / has no derivation / names a short or unknown "
+        "registration commit / was registered in the very commit it measures, and a measured delta "
+        "outside its own pre-registered ε — and each of its three anchors (artifact_kind, the gang "
+        "block, the committed filename) independently pulls an artifact into the rule, while a "
+        "non-gang artifact stays untouched. ε's EVIDENCE ANCHOR is driven arm by arm: an artifact "
+        "whose measured tip was rewritten on landing is ordered against `merged_as` (clean when ε "
+        "precedes it, caught when ε IS it, caught when ε is the rewritten tip), an artifact carrying "
+        "BOTH a `git_sha` in this history and a `merged_as` is ordered against the `git_sha` — the "
+        "tree it measured — so the later landing commit cannot relax it (caught when ε is the "
+        "measured commit, caught when ε is after it, clean when ε precedes it), an ε registered at a "
+        "commit that is an ancestor of HEAD but AFTER the measured tree is caught, and an artifact "
+        "with neither anchor in this history — `git_sha_unresolved` included — is caught by a "
+        "finding naming BOTH candidates, never skipped. `gang.verdict` closes the same "
+        "loop from the other side: the wrong case and an unknown string are refused, a `fail` with "
+        "no reason and a `fail` filed GREEN are caught, a `pass` at world 2 whose same-seed pair "
+        "disagrees is caught while the same pair above world 2 is recorded rather than asserted, "
+        "and the exact delta/digest payloads that FAIL as a pass are ADMITTED as a fail."
     )
     return 0
 

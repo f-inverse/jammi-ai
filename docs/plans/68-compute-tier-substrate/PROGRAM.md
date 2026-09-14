@@ -15,6 +15,10 @@ files. Base: `main` @ `4ecc0230` (PR #501, the jobs fleet, merged). PR-K = #502 
 | 4 | **PR-D** (U8a → U8b → U9a → U9b) | K, OPS, PR-B2, PR-C(67) | admin merge (domain-card edit); `distributed.yml` three-process arm green before merge |
 | later | DIST-2 `RendezvousPlacement` (68) on U5b-1a's substrate; DIST-3 `datafusion-distributed` behind the DF-55 gate | PR-C(67); flight-sql-server on DF 55 | 68's, unchanged |
 
+A lead-gate anticipation proposal runs concurrently, independent of every wave above: it amends
+the swarm's own gate mechanism (`SWARM_GATE_TOUCHED`), so it lands as its own human-merged PR,
+never folded into a wave's admin merge.
+
 ## Shared files (merge order inside each)
 
 - `crates/jammi-ai/src/fine_tune/worker.rs`: OPS C2 (loop) and GRAPH (`claim_next`) before

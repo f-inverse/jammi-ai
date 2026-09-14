@@ -15,6 +15,8 @@ pub mod batch_bucket;
 #[cfg(feature = "local")]
 pub mod classifier;
 #[cfg(feature = "local")]
+pub mod collective;
+#[cfg(feature = "local")]
 pub mod data;
 #[cfg(feature = "local")]
 pub mod gradcache;
@@ -38,6 +40,8 @@ pub mod target;
 pub mod trainer;
 #[cfg(feature = "local")]
 pub mod training_job;
+#[cfg(feature = "local")]
+pub mod training_set;
 #[cfg(feature = "local")]
 pub mod worker;
 

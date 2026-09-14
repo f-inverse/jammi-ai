@@ -58,7 +58,9 @@ use crate::session::InferenceSession;
 /// The request / result vocabulary lives on the wire substrate so the gRPC
 /// converters can satisfy the orphan rule; re-exported here so an embedded
 /// consumer reaches it as `jammi_ai::*`, alongside the [`Session`] it drives.
-pub use jammi_wire::request::{FineTuneJobId, Modality, QueryInput, SearchQuery, SearchRequest};
+pub use jammi_wire::request::{
+    FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+};
 
 pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 
@@ -633,6 +635,21 @@ impl Session {
             .engine
             .fine_tune(source, base_model, columns, method, task, config)
             .await?;
+        Ok(FineTuneJobId(job.job_id))
+    }
+
+    /// Submit a column-source fine-tune from the flattened request shape, and
+    /// return the job's id. Poll completion with [`Self::fine_tune_status`].
+    ///
+    /// Deliberately the same name, input type and return type as
+    /// `jammi_client::DataClient::submit_fine_tune`: that identity is what
+    /// lets one test submit the SAME request through the embedded session and
+    /// over the wire and compare the two persisted specs, rather than
+    /// comparing two request vocabularies that could each be wrong in its own
+    /// way. [`Self::fine_tune`] remains the loose-argument form for a caller
+    /// that builds no request.
+    pub async fn submit_fine_tune(&self, request: FineTuneRequest) -> Result<FineTuneJobId> {
+        let job = self.engine.submit_fine_tune(request).await?;
         Ok(FineTuneJobId(job.job_id))
     }
 

@@ -373,13 +373,26 @@ jobs:
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
-  # self-sufficient: it bundles the CUDA-enabled binary, the CUDA runtime `.so`s
-  # the binary links dynamically (libcudart / libcublas / libcublasLt / libcurand
-  # / libnvrtc), and a `jammi-server` launcher that prepends the bundled `lib/`
-  # to LD_LIBRARY_PATH then execs the binary. The candle/cudarc binary has hard
-  # DT_NEEDED entries for those libraries, so it will not exec without them on the
-  # loader path; bundling makes the tarball run on any host with only an NVIDIA
-  # driver. A GPU-less runner is fine — nothing runs the binary here.
+  # self-sufficient: it bundles the CUDA-enabled binary, the seven CUDA
+  # runtime shared libraries the binary needs on a host with only an NVIDIA
+  # driver (libcudart / libcublas / libcublasLt / libcurand / libnvrtc /
+  # libnvrtc-builtins out of the toolkit, plus libnccl, which `jammi-ai`'s
+  # `cuda` feature pulls in through `candle-core/nccl`), and a `jammi-server`
+  # launcher that prepends the bundled `lib/` to LD_LIBRARY_PATH then execs
+  # the binary. The candle/cudarc binary has hard DT_NEEDED entries for six
+  # of those seven libraries — every one but libnvrtc-builtins, which
+  # libnvrtc dlopens at runtime instead of linking — so it will not exec
+  # without the six on the loader path; bundling all seven still makes the
+  # tarball run on any host with only an NVIDIA driver. That set is a HAND
+  # LIST (seven names), not a derivation off the binary's own `DT_NEEDED`
+  # closure: a derivation arm existed and was EXCISED (#535) after the
+  # hermetic suite sourcing it — under its own `set +e`, not the script's
+  # fail-closed `set -euo pipefail`, which does not survive `source` —
+  # reported green with `libnccl` and `libnvrtc-builtins` missing from the
+  # stage directory; the hand list below fails the step by name instead.
+  # The driver's own libraries (`libcuda.so.1`, `libnvidia-*`)
+  # are deliberately NOT bundled — they must match the host's driver. A
+  # GPU-less runner is fine — nothing runs the binary here.
   gpu-proof:
     name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
@@ -495,18 +508,52 @@ jobs:
           strip target/release/jammi-server
           cp target/release/jammi-server "${stage}/bin-jammi-server"
 
-          # Source the exact CUDA runtime `.so`s the binary links from the
-          # toolkit baked into the CUDA CI base (CUDA 12.6 lives at
-          # /usr/local/cuda-12.6/lib64). Copy the SONAME-versioned files so the
-          # binary's DT_NEEDED entries resolve. `cp -L` follows the dev symlinks
-          # to the real versioned object.
+          # Source the CUDA runtime `.so`s the binary links from the toolkit
+          # baked into the CUDA CI base (CUDA 12.6 lives at
+          # /usr/local/cuda-12.6/lib64), falling back to /usr/lib64 (where
+          # this image's `libnccl` RPM installs `libnccl.so.2` — the toolkit
+          # dir carries no NCCL at all). This is a HAND LIST of seven names —
+          # the six the toolkit itself carries, plus `libnccl`, the soname
+          # `jammi-ai`'s `cuda` feature pulls in through `candle-core/nccl`.
+          # A derivation that read this set off the binary's own `DT_NEEDED`
+          # closure existed and was EXCISED (#535, filed there): the script
+          # itself ran fail-closed (`set -euo pipefail`), but the hermetic
+          # suite that sourced it took `set +e` right after — needed to
+          # assert on exit codes without dying itself — and errexit does
+          # not survive `source`; under that `set +e` the suite reported
+          # green with `libnccl` and `libnvrtc-builtins` missing from the
+          # stage directory — this hand list's whole reason to fail closed
+          # by name, below, is closing exactly that failure mode without
+          # re-taking on the derivation's own risk surface.
+          # `libnvrtc-builtins` carries no `DT_NEEDED` entry naming it at
+          # all — MEASURED: `readelf -d` against the CUDA 12.6 toolkit's own
+          # `libnvrtc.so.12` (run inside `nvidia/cuda:12.6.3-devel-ubi8`)
+          # shows NVRTC `dlopen`s it at runtime rather than linking it — so
+          # it stays on this hand list rather than being left to a
+          # `DT_NEEDED` walk that could never discover it anyway. `cp -L`
+          # follows the dev symlinks to the real versioned object; a name
+          # that resolves to no versioned file in EITHER directory FAILS
+          # this step by name (unlike the loop this one replaces on `main`,
+          # which tolerated a missing name silently).
           cuda_lib="/usr/local/cuda-12.6/lib64"
-          for soname in libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins; do
-            # Grab every matching versioned object (e.g. libcudart.so.12,
-            # libcudart.so.12.6.x) so the loader finds the SONAME it wants.
-            for so in "${cuda_lib}/${soname}.so".*; do
-              [ -e "$so" ] && cp -L "$so" "${stage}/lib/"
+          for soname in libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl; do
+            staged=""
+            for dir in "${cuda_lib}" /usr/lib64; do
+              # Grab every matching versioned object (e.g. libcudart.so.12,
+              # libcudart.so.12.6.x) so the loader finds the SONAME it
+              # wants; the first directory that holds any match wins.
+              for so in "${dir}/${soname}.so".*; do
+                if [ -e "$so" ]; then
+                  cp -L "$so" "${stage}/lib/"
+                  staged=1
+                fi
+              done
+              [ -n "$staged" ] && break
             done
+            if [ -z "$staged" ]; then
+              echo "::error::server-cu12-build: no versioned object for '${soname}' found in ${cuda_lib} or /usr/lib64" >&2
+              exit 1
+            fi
           done
 
           # The launcher: a host with only an NVIDIA driver has no system CUDA,

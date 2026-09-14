@@ -57,6 +57,12 @@ COVERED = {
     "cublas": {"libcublas", "libcublasLt"},     # nvidia-cublas-cu12 (cublasLt rides along)
     "curand": {"libcurand"},                    # nvidia-curand-cu12
     "cuda_nvrtc": {"libnvrtc", "libnvrtc-builtins"},  # nvidia-cuda-nvrtc-cu12
+    # nvidia-nccl-cu12, which installs exactly one object,
+    # `nvidia/nccl/lib/libnccl.so.2` (measured: the central directory of
+    # `nvidia_nccl_cu12-2.23.4-py3-none-manylinux2014_x86_64.whl`). The binary
+    # links it because `jammi-ai`'s `cuda` feature includes `candle-core/nccl`
+    # and cudarc's build script then emits `cargo:rustc-link-lib=dylib=nccl`.
+    "nccl": {"libnccl"},
 }
 
 # CUDA libraries that come from the host NVIDIA driver, never from a wheel. The

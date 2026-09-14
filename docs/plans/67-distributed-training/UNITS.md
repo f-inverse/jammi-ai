@@ -26,7 +26,7 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: hermetic + cookbook; `distributed.yml` dispatched manually before merge.
 - **depends_on**: S3 (sizes it). **size**: L if S3 compiles with local fixes only; XL otherwise.
 
-## U7a — `gpu-gang.yml` pod leg (PR-B commit 1)
+## U7a — `gpu-gang.yml` pod leg (PR-B1 commit 1)
 
 - **files_in_scope** (docs-ci): `.github/workflows/gpu-gang.yml` (label `run-gang` or manual
   `workflow_dispatch` only — never `push`/`workflow_call`; U7b-A1-pull deletes the `schedule:`
@@ -45,9 +45,12 @@ per-step `$?`. Naming per README ruling 23.
   `check_execution_surface_reachability.py` green with the new tuples allowlisted; every
   existing lane still deploys `gpuCount: 1`. Provisioning proof is spike S4, not an acceptance.
 - **lane**: gate scripts. **depends_on**: S4. **size**: L.
-- **cost ceiling** (human-approved before first run): ≤ 1 h × 2 GPU × $1.59 ≈ $3.2 per run.
+- **cost ceiling** (human-approved before first run), basis `$3.18/h` (the SECURE 2-GPU
+  `A100-SXM4-80GB` pod's measured rate, not `$1.59 × 2`): terminate-succeeds bound (i)
+  `4 × 300s × $3.18/h + 1h × $3.18/h = $4.24`/run; sweep-only bound (ii)
+  `(4 + 1) × 1h × $3.18/h = $15.90`/run (`docs/maintainer/dev-gpu.md#the-gang-leg--two-gpus-in-one-pod`).
 
-## U2a — `TrainingSet` producer (PR-B commit 2)
+## U2a — `TrainingSet` producer (PR-B1 commit 2)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::TrainingSet` with
   `format` as a canonical string), `catalog/result_repo.rs` (`ResultTableKind::TrainingSet`),
@@ -58,8 +61,10 @@ per-step `$?`. Naming per README ruling 23.
   then read the table back through `session.sql` over the registered `jammi.{name}` result
   table — `crates/jammi-db/src/store/mod.rs::ResultStore::register_table`
   and `crates/jammi-ai/src/session.rs::infer_ordered_read_back_sql` precedent — with the canonical `ORDER BY`
-  re-applied, into today's loader: a compiling intermediate), `fine_tune/graph_sampler.rs`
-  (pairs → table), `pipeline/recompute.rs` (arm = re-materialize). (docs-ci) the
+  re-applied, into today's loader: a compiling intermediate). The `GraphFineTune` arm does
+  not route through this producer: `fine_tune/graph_sampler.rs`'s pairs stay in-memory, and a
+  graph training set's own table is https://github.com/f-inverse/jammi-ai/issues/538.
+  `pipeline/recompute.rs` (arm = re-materialize). (docs-ci) the
   `PRODUCING-DESCRIPTOR-VARIANTS` block of `docs/maintainer/MAINTAINER-GUIDE.md`
   (`check_doc_parity.py` runs on every PR with no path filter; co-owned with U3, U9). The
   cookbook fixture golden.
@@ -74,7 +79,7 @@ per-step `$?`. Naming per README ruling 23.
   for an unordered scan; `crates/jammi-db/src/session.rs::JammiSession::build` sets `target_partitions`).
 - **lane**: hermetic + cookbook. **depends_on**: U1. **size**: M.
 
-## U4a — `Collective` trait; device-plural session; `CacheKey`; config refusals (PR-B commit 3)
+## U4a — `Collective` trait; device-plural session; `CacheKey`; config refusals (PR-B1 commit 3)
 
 - **files_in_scope**: (ai-core) new `fine_tune/collective/{mod.rs, noop.rs, local.rs, nccl.rs}`,
   `model/cache.rs` (`CacheKey { model_id, device, task: Option, backend: Option }` — shared
@@ -88,15 +93,39 @@ per-step `$?`. Naming per README ruling 23.
   (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
   (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
-- **precondition (S1)**: `jammi-ai`'s `cuda` feature adds `candle-core/nccl`, and cudarc's
-  `dynamic-linking` emits `cargo:rustc-link-lib=dylib=nccl` at link time; `.docker/ci-cuda.Dockerfile`
-  installs `cuda-toolkit-12-6` only, which does not carry NCCL, so the `builder-cuda` stage fails
-  to link as of this commit. The CI CUDA image must carry `libnccl-devel` (rhel8 packages
-  `libnccl`/`libnccl-devel` 2.23.4-1+cuda12.6 — the version the runtime image
-  `nvidia/cuda:12.6.3-runtime-ubi8` already ships, and the version S1's GPU leg ran against) and
-  be republished **before** this commit lands. A `jammi-ai --features cuda` clippy arm must also
-  exist in the nvcc lane (today only `jammi-encoders` and `jammi-kernels` are built with `cuda`
-  there), so the `Nccl` arm is compiled somewhere before the GPU leg runs.
+  (docs-ci) the six cu12 packaging sites that name the CUDA runtime library set, so it gains
+  `libnccl`:
+  `.github/workflows/release-binaries.yml::server-cu12-build` (the comment naming `libnccl`
+  alongside the CUDA runtime's other hard `DT_NEEDED` entries) and its packaging step's soname
+  loop (`release-binaries.yml::server-cu12-build`'s `Package` step; a note recording that the prior six-name hand list missed
+  the `DT_NEEDED libnccl.so.2` `candle-core/nccl` adds — why the list gained a seventh, still
+  hand-listed, name rather than a `DT_NEEDED` closure walk, issue #535), `packaging/server-cu12/
+  verify_link_set.py`, `packaging/server-cu12/jammi_server/_entry.py::_CUDA_COMPONENTS`,
+  `packaging/server-cu12/pyproject.toml` (the `nvidia-*-cu12` pins), `packaging/
+  server-cu12/README.md#jammi-server-cu12`; and `.github/workflows/ci.yml`'s `flash-attn-compile` job, which
+  gains a preflight step (`ci.yml::flash-attn-compile`: `Preflight — the image carries NCCL`, `rpm -q libnccl
+  libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so`) so a `:latest`
+  published before B0's Dockerfile change reds this job before any `--features cuda` step tries
+  to link.
+- **precondition (S1) — satisfied by B0** (`ci/500-cuda-image-nccl`, merged to `main`): the CI
+  CUDA image carries NCCL (`.docker/ci-cuda.Dockerfile` pins `libnccl-2.23.4-1+cuda12.6` and
+  `libnccl-devel-2.23.4-1+cuda12.6`, the version `nvidia/cuda:12.6.3-runtime-ubi8` already ships)
+  and the `flash-attn-compile` job's preflight step above (`ci.yml::flash-attn-compile`) asserts
+  it before this unit's own `cargo clippy -p jammi-ai --features cuda --tests -- -D warnings`
+  step (`ci.yml::flash-attn-compile`'s `Clippy jammi-ai --features cuda (nvcc, no GPU)` step) compiles the `Nccl` arm. The CUDA-tarball soname set the
+  cu12 packaging above bundles is a fixed HAND LIST of seven stems (`libcudart libcublas
+  libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl`), searched first in the CUDA 12.6
+  toolkit's lib dir then in `/usr/lib64`, fail-closed per name — a name absent from both
+  locations fails the build rather than silently shipping a tarball missing it
+  (`.github/workflows/release-binaries.yml::server-cu12-build`, the `Package` step's soname
+  loop). Deriving the set from the binary's transitive `DT_NEEDED` closure was excised under
+  this unit's stop rule — a closure walk cannot be trusted to reach `libnvrtc-builtins` on its
+  own, since it is `dlopen`'d by `libnvrtc` rather than linked, a MEASURED fact (`readelf -d`
+  against the toolkit's `libnvrtc.so.12` names no such `NEEDED` entry) — and is filed as issue
+  #535, not built by this unit. The post-copy check is filesystem presence only, never the real
+  runtime loader (`release-binaries.yml::server-cu12-build`'s `Package` step, the
+  `no versioned object for '${soname}' found` failure arm); a runtime loader verification is filed as
+  issue #534, not established by this unit.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
   `nccl` without CUDA, `world_size > 1` with `cached == true` or `hard_negatives.mine == true`
   refused with typed errors at the submit edge), K4 (remote parity suite unchanged), B6.
@@ -208,7 +237,7 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   U2c** — even though its own base is the PR-B2 branch after U2b/U3 land (before U4b's own
   commit); the implementation wave is 3 (built concurrently with PR-C(67) once PR-B1 merges).
 
-## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B commit 5, concurrent with U2b)
+## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B2 commit 2, concurrent with U2b)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::FineTune`;
   `MaterializationEnv` kernel-profile), `catalog/{schema.rs, migrations.rs}` (`model_materialization`,
@@ -229,7 +258,7 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   reference-counted reaping, artifact ordering, ten files across two crates). Co-ownership:
   `manifest.rs` and `recompute.rs` with U2a/U4b.
 
-## U4b — Rank context; gather rule; lockstep; single-node gang (PR-B commit 6)
+## U4b — Rank context; gather rule; lockstep; single-node gang (PR-B2 commit 3)
 
 - **files_in_scope** (ai-core): `fine_tune/trainer.rs` (`RankContext`; per-arm gather points
   — encoder outputs / classification **logits** / regression head output; identical global
@@ -248,7 +277,12 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   `train_count` is not a multiple of W·B (RED at base); (c) W=2 × B vs W=1 × 2B within
   pre-registered ε at `lora_dropout=0`, rung pinned (RED at base); (d) lockstep: forced
   divergence on one rank; a Var absent from one rank's `GradStore`; a zero-row rank — the gang
-  completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden. (pod leg,
+  completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden; (f) two real
+  devices in one session hold two entries in the production model-cache map for one model id —
+  U4a's own hermetic assertion pins the key-type fact against a mirror map, never the production
+  insert (`crates/jammi-ai/src/model/cache.rs::ModelCache::do_load`'s `cache.entries.insert`); only one device
+  exists off the pod, so a device-collapse mutation at that insert site is hermetically
+  UNCOVERED and this determinant is a pod-leg obligation, not a hermetic one. (pod leg,
   `Nccl`, 2×A100): (a) as a digest pair + per-step delta against the pre-registered ε, (c)
   with GPU ε; artifact committed as PR-B commit 7.
 - **lane**: hermetic + gpu-gang pod leg. **depends_on**: U2b, U2c (the per-rank residency-bounded
@@ -334,8 +368,10 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
   from any public RPC and ignores any caller tenant (invariant oracles); (f) an assignment naming
   an instance id that is not a fresh member is refused (RED at base).
 - **lane**: hermetic + server it-suite. **depends_on**: U4a, **68 DIST unit 1 merged** (the
-  `peer_bind` listener — a hard precondition, no fallback), **68 OPS and GRAPH merged** (they
-  rewrite the claim loop and `claim_next` that `JobSlot` wraps). **size**: L.
+  `peer_bind` listener — a hard precondition, no fallback), **68 OPS merged** (it rewrites the
+  claim loop that `JobSlot` wraps). GRAPH does not depend_on: it is deferred to #515, so
+  `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`) is unrewritten in this wave and `JobSlot` wraps it as it
+  stands on `main`. **size**: L.
 
 **Partition-aware inference operator.** Out of scope for this plan; filed as GitHub issue #540.
 The head target's frozen forward is a per-batch call inside the trainer

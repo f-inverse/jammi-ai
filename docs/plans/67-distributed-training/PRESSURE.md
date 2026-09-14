@@ -66,7 +66,7 @@ scaler call site and the mining-refresh check are in `TrainingLoop::run`), `Trai
 | 7 | `Precomputed` arm splits by batch count (`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split`, the `Precomputed` arm) | Tests-only arm stays outside the table path, unchanged. README r3; DESIGN §2; U2b |
 | 8 | "Streams into the reduction" is not bit-identical (`from_targets` two-pass) | One collected `Vec<f32>`, `from_targets` once; named 4 B/row exemption. README r4; DESIGN §2; U2b |
 | A9 | Fence keyed `(job_id, rank)` misses a rank that moved hosts; "lesser" vs "lesser or equal" | Fence on `job_id`; lesser-or-equal refused. README r8; DESIGN §4; U5a (c) |
-| A10 | GPU ε chosen after the run | ε pre-registered per leg before the first gating run; digest pair never a failure until S5. README r16; DESIGN §6; U7a schema |
+| A10 | GPU ε chosen after the run | ε pre-registered per leg before the first gating run; digest pair ASSERTED (equal on a pass) at world 2, the regime S5 measured byte-identical; recorded, not asserted, above world 2 (NCCL pin set untested there). README r16; DESIGN §6; U7a schema; `check_cuda_run_artifacts.py` rule (k) |
 | A11 | Seven governance stems, not two; `CacheKey` `None` semantics; `in_flight` map | All seven quoted; `None` distinct; `in_flight` rekeyed. README r14, r23; DESIGN §4 |
 
 ### Sizing lens — 6 block, 8 advisory

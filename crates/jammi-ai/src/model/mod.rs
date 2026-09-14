@@ -112,7 +112,11 @@ impl From<&ModelSource> for ModelId {
 }
 
 /// Which backend to use for this model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Hash` because a caller's backend HINT is part of a cached model's
+/// identity (`model::cache::CacheKey`): the same checkpoint asked for
+/// through two backends is two different loaded objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendType {
     /// Candle — native Rust inference via safetensors weights.

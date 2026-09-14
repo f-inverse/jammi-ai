@@ -556,6 +556,7 @@ class EmbeddedBackend:
         quantile_levels: Optional[List[float]] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
     ):
         """Submit a LoRA fine-tuning job to the in-process engine; poll the handle.
 
@@ -564,7 +565,10 @@ class EmbeddedBackend:
         shared `FineTuneSpec` builder and submitted through the engine's wire
         seam; all config kwargs are optional, applying the engine defaults when
         omitted. `idempotency_key`, when non-empty, dedupes the submission
-        (migration 030) the same way the remote arm's does.
+        (migration 030) the same way the remote arm's does. `world_size` is the
+        number of ranks that train this job cooperatively; `1` (the default) is
+        a single process, and a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted.
         """
         request = build_fine_tune_request(
             source=source,
@@ -603,6 +607,7 @@ class EmbeddedBackend:
             quantile_levels=quantile_levels,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
         )
         return self._native._start_training_proto(
             request.SerializeToString(), idempotency_key or None
@@ -637,6 +642,7 @@ class EmbeddedBackend:
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
     ):
         """Submit a graph-supervised fine-tune (S11) to the in-process engine.
 
@@ -647,7 +653,10 @@ class EmbeddedBackend:
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
         `idempotency_key`, when non-empty, dedupes the submission (migration
-        030) the same way the remote arm's does.
+        030) the same way the remote arm's does. `world_size` is the number of
+        ranks that train this job cooperatively; `1` (the default) is a single
+        process, and a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted.
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -676,6 +685,7 @@ class EmbeddedBackend:
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
         )
         return self._native._start_training_proto(
             request.SerializeToString(), idempotency_key or None

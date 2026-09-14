@@ -43,6 +43,15 @@
 //! every target's context over the source's *current* rows under the recorded
 //! recipe, then routes the pooled rows back through `materialize_context` (see
 //! `recompute_context_set`).
+//!
+//! Two producers carry no `CachePolicy` dial at all — `asof_join` and
+//! [`ProducingDescriptor::TrainingSet`]'s
+//! [`materialize_training_set`](jammi_db::store::ResultStore::materialize_training_set),
+//! which owns its own reuse probe. Their replays still always recompute, and for
+//! a stated reason rather than by assumption: `asof_join` never reuses, and the
+//! training-set probe matches on the `(definition, input anchors)` pair, which an
+//! unpinned source anchor — the only anchor a replay of a projected source
+//! relation can honestly supply — never satisfies. See `recompute_training_set`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,8 +60,8 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator, ContextCandidateSource,
-    ContextEdgeGather, ProducingDescriptor, PropagationDirection, PropagationOutput,
-    PropagationWeighting,
+    ContextEdgeGather, InputAnchor, ProducingDescriptor, PropagationDirection, PropagationOutput,
+    PropagationWeighting, TRAINING_SET_ORDER_RULE_V1,
 };
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
@@ -387,6 +396,16 @@ impl InferenceSession {
                 // replay is unconditionally a fresh `Computed`.
                 Ok((record.table_name, CacheOutcome::Computed))
             }
+            ProducingDescriptor::TrainingSet {
+                source,
+                columns,
+                task,
+                format,
+                order_rule,
+            } => {
+                self.recompute_training_set(table, source, columns, task, format, order_rule)
+                    .await
+            }
             // An external producer is a verb the engine does not own, so there is
             // no faithful call to reconstruct — a loud refusal, never a guessed
             // re-run. Recomputing an external table is the producing consumer's
@@ -395,6 +414,130 @@ impl InferenceSession {
                 table: table.table_name.clone(),
             }),
         }
+    }
+
+    /// Re-invoke the training-set producer
+    /// ([`jammi_db::store::ResultStore::materialize_training_set`]) over the
+    /// recorded projection — the [`ProducingDescriptor::TrainingSet`] replay.
+    ///
+    /// Every determinant is taken from the descriptor (the source query, the
+    /// projected columns, the task, the format tag) except the `source_id`
+    /// lineage column, which is the recomputed table's own catalog row — the
+    /// same shape the `NeighborGraph` arm uses.
+    ///
+    /// # Anchors re-derive from the RECORDED anchor set, not from `source_id`
+    ///
+    /// The original materialization may have anchored more than one relation
+    /// (the graph arm anchors both its node and its edge source); `source_id`
+    /// is one lineage column and can name only one of them. The replay instead
+    /// reads the table's own `.materialization.json` sidecar for its recorded
+    /// `input_anchors` and re-anchors every one of THOSE relation names — at a
+    /// fresh, shared instant — so a replay's manifest never reports a narrower
+    /// anchor set than the original materialization actually read.
+    ///
+    /// # Why this always recomputes
+    ///
+    /// The verb carries no cache dial: it owns its own reuse probe, which
+    /// matches on the `(definition, input anchors)` pair. The anchors a replay
+    /// can honestly supply for a projected source relation are
+    /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
+    /// — a registered source exposes no version surface to pin — and an
+    /// unpinned anchor never matches that probe, so the replay writes a fresh
+    /// table and reports [`CacheOutcome::Computed`]. The outcome is returned as
+    /// the verb reports it rather than asserted here: reuse is reported, never
+    /// inferred, and a future pinned source would legitimately make the replay a
+    /// hit.
+    ///
+    /// # The three refusals
+    ///
+    /// - An `order_rule` this build does not commit is
+    ///   [`JammiError::NotRecomputable`]. The producer commits exactly
+    ///   [`TRAINING_SET_ORDER_RULE_V1`](jammi_db::store::manifest::TRAINING_SET_ORDER_RULE_V1);
+    ///   replaying a table committed under some other rule would write rows in
+    ///   an order the recorded descriptor does not claim, which is a fabricated
+    ///   re-run, not a recompute.
+    /// - The `.materialization.json` sidecar this function re-reads for the
+    ///   anchor set (below) has gone missing since the caller's own descriptor
+    ///   read succeeded — also [`JammiError::NotRecomputable`], never a silent
+    ///   "zero recorded anchors" default. The caller (`recompute`'s outer
+    ///   dispatch) already reads the SAME sidecar once, through
+    ///   `ResultStore::producing_descriptor`, to obtain the `source` /
+    ///   `columns` / `task` / `format` / `order_rule` this function is called
+    ///   with; this second, independent read is for the anchor set, and a
+    ///   sidecar that vanished strictly between the two reads must refuse
+    ///   here exactly as it would have refused there.
+    /// - A recorded `source` query that no longer resolves in this session
+    ///   (its relation was deregistered, or it never was a durable relation)
+    ///   fails at the planner inside the verb, naming the missing relation —
+    ///   the failure mode of a training set whose rows were projected from a
+    ///   session-scoped relation rather than a durable registered source. No
+    ///   producer in this tree names one today: `materialize_projection` (the
+    ///   only [`ProducingDescriptor::TrainingSet`] producer) always reads a
+    ///   durable registered source, and the graph arm samples in memory and
+    ///   never writes a `TrainingSet` table at all
+    ///   (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it
+    ///   a table of its own). This refusal stays because the planner error is
+    ///   the honest response to ANY table whose recorded source is not
+    ///   durable, not because one is expected today.
+    async fn recompute_training_set(
+        self: &Arc<Self>,
+        table: &ResultTableRecord,
+        source: String,
+        columns: Vec<String>,
+        task: crate::model::ModelTask,
+        format: String,
+        order_rule: String,
+    ) -> Result<(String, CacheOutcome)> {
+        if order_rule != TRAINING_SET_ORDER_RULE_V1 {
+            return Err(JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            });
+        }
+        // Re-anchor from the RECORDED anchor set's relation names, never from
+        // `table.source_id` alone: a graph training set's original
+        // materialization anchored BOTH the node and the edge relation, and a
+        // replay that only re-derived one would silently drop the other from
+        // the new manifest's lineage. `table.source_id` names one relation by
+        // construction (the catalog row's single lineage column); the
+        // manifest's own `input_anchors` is the only record of the full set.
+        let parquet_url = jammi_db::storage::StorageUrl::parse(&table.parquet_path)?;
+        // A missing sidecar is not "zero anchors" — it is the same honest
+        // refusal as an unrecognised order rule: without the manifest there is
+        // no recorded anchor SET to re-anchor from, and silently defaulting to
+        // an empty one would replay the table with NONE of its original inputs
+        // recorded, which is a fabricated lineage, not a recompute.
+        let manifest = self
+            .result_store()
+            .read_materialization_manifest(&parquet_url)
+            .await?
+            .ok_or_else(|| JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            })?;
+        let recorded_anchors = manifest.input_anchors;
+        let now = chrono::Utc::now().to_rfc3339();
+        let inputs: Vec<InputAnchor> = recorded_anchors
+            .iter()
+            .map(|anchor| InputAnchor::unpinned_at_instant(anchor.source.clone(), now.clone()))
+            .collect();
+        let materialized = self
+            .result_store()
+            .materialize_training_set(
+                self.context(),
+                jammi_db::store::TrainingSetSpec {
+                    source_id: &table.source_id,
+                    source_sql: &source,
+                    columns: &columns,
+                    task,
+                    format: &format,
+                    inputs,
+                    device: self.compute_device(),
+                },
+            )
+            .await?;
+        Ok((
+            materialized.record.table_name.clone(),
+            materialized.outcome.clone(),
+        ))
     }
 
     /// Re-invoke the `assemble_context`→`materialize_context` **pair** — the real
@@ -827,4 +970,123 @@ fn read_row_id_column(batch: &arrow::array::RecordBatch, table: &str) -> Result<
     Ok((0..strings.len())
         .map(|i| strings.value(i).to_string())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+    use crate::model::ModelTask;
+    use crate::session::InferenceSession;
+
+    /// The function-level exercise of the race `recompute_training_set`'s own
+    /// "The three refusals" doc section names: `recompute`'s outer dispatch
+    /// reads the descriptor through `ResultStore::producing_descriptor` (the
+    /// "descriptor read"), THEN `recompute_training_set` reads the SAME
+    /// sidecar again for the anchor set (the "anchor read"). A sidecar that
+    /// disappears in that window cannot be constructed by driving the public
+    /// `recompute` entry
+    /// point end to end: `producing_descriptor` already refuses with
+    /// `NotRecomputable` if the sidecar is absent at ITS read, so an
+    /// end-to-end test that deletes the sidecar up front only ever exercises
+    /// that earlier, already-correct guard and never reaches this function's
+    /// own read at all (confirmed: with this function's fix reverted to
+    /// `.map(..).unwrap_or_default()`, an end-to-end `Session::recompute` test
+    /// against a table whose sidecar was deleted before the call still returns
+    /// `NotRecomputable`, unchanged — the outer guard, not this one, is what it
+    /// observes). This test instead calls `recompute_training_set` directly,
+    /// with the SAME `source`/`columns`/`task`/`format`/`order_rule` values the
+    /// outer dispatch would have destructured from a successful descriptor
+    /// read (not routed through `producing_descriptor` itself here, so the
+    /// call does not add a second in-tree caller for
+    /// `pinned_source_gate.rs`'s machine-checked `PRODUCING_DESCRIPTOR_CALLERS`
+    /// to enumerate) — exactly reproducing the state this function sees when
+    /// the sidecar vanishes strictly between the two reads. `order_rule` is
+    /// the only one of the five this function reads before the anchor read
+    /// (the earlier guard at the top of the function), so it is the only one
+    /// that has to be the real committed value; the rest are inert on this
+    /// path — the function returns before ever using them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recompute_training_set_refuses_when_its_own_manifest_read_finds_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            InferenceSession::new(jammi_test_utils::test_config(dir.path()))
+                .await
+                .unwrap(),
+        );
+        let csv = dir.path().join("pairs.csv");
+        std::fs::write(&csv, "text_a,text_b,score\nhello,world,1.0\n").unwrap();
+        session
+            .add_source(
+                "training",
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", csv.display())),
+                    format: Some(FileFormat::Csv),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let columns = vec![
+            "text_a".to_string(),
+            "text_b".to_string(),
+            "score".to_string(),
+        ];
+        let (table, _) = crate::fine_tune::training_set::materialize_projection(
+            &session,
+            "training",
+            &columns,
+            ModelTask::TextEmbedding,
+            "contrastive",
+        )
+        .await
+        .unwrap();
+
+        // Stand-ins for the fields the outer dispatch would have destructured
+        // from a successful `producing_descriptor` read. Only `order_rule`
+        // has to be the real committed value (`TRAINING_SET_ORDER_RULE_V1`,
+        // checked at the top of `recompute_training_set` before the anchor
+        // read this test targets); the rest never reach a use on this path —
+        // the function returns at the anchor read, before ever running
+        // `source` as SQL.
+        let source = "SELECT \"text_a\", \"text_b\", \"score\" FROM stand_in".to_string();
+        let format = "contrastive".to_string();
+        let order_rule = TRAINING_SET_ORDER_RULE_V1.to_string();
+
+        // The window: the sidecar vanishes strictly between the descriptor
+        // read (elided above — see the doc comment) and the anchor read
+        // `recompute_training_set` is about to make.
+        let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+        let handle = session.result_store().open_parquet(&url).unwrap();
+        let sidecar = handle.sibling_path("materialization.json").unwrap();
+        assert_eq!(
+            handle.delete_if_exists(&sidecar).await.unwrap(),
+            jammi_db::storage::DeleteOutcome::Deleted,
+            "the sidecar must actually be removed for the window to be real"
+        );
+
+        let err = session
+            .recompute_training_set(
+                &table.record,
+                source,
+                columns,
+                ModelTask::TextEmbedding,
+                format,
+                order_rule,
+            )
+            .await
+            .expect_err(
+                "a sidecar missing at the anchor read must refuse, never replay with \
+                 zero recorded anchors",
+            );
+        match err {
+            JammiError::NotRecomputable { table: named } => {
+                assert_eq!(named, table.record.table_name);
+            }
+            other => panic!("expected NotRecomputable, got {other:?}"),
+        }
+    }
 }

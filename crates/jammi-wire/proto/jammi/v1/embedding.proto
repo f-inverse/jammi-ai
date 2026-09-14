@@ -117,14 +117,21 @@ message GenerateEmbeddingsRequest {
 // Which kind of derivation a `ResultTable` is — the wire mirror of the
 // engine's `jammi_db::catalog::result_repo::ResultTableKind`. A `DescribeSource`
 // projection carries a source's embedding tables AND its derived tables
-// (neighbor graphs, as-of joins) under the same shape, so the kind is what
-// tells a remote consumer which one it is looking at rather than fabricating
-// `MODEL` for every row.
+// (neighbor graphs, as-of joins, training sets) under the same shape, so the
+// kind is what tells a remote consumer which one it is looking at rather than
+// fabricating `MODEL` for every row.
+//
+// Append-only: values are frozen once served, so a new derivation kind takes
+// the next free number and never reuses or renumbers an existing one.
 enum ResultTableKind {
   RESULT_TABLE_KIND_UNSPECIFIED = 0;
   MODEL = 1;
   NEIGHBOR_GRAPH = 2;
   ASOF_JOIN = 3;
+  // An immutable, canonically ordered training set materialized from a source
+  // projection. Like ASOF_JOIN it is data of record with no ANN sidecar, so it
+  // is excluded from embedding-table resolution.
+  TRAINING_SET = 4;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
@@ -159,7 +166,8 @@ message ResultTable {
   // Direct model output vs. a derivation of another result table.
   ResultTableKind kind = 10;
   // The table this one was derived from (a `NEIGHBOR_GRAPH` or `ASOF_JOIN`
-  // row's origin embedding table); unset for a `MODEL` row.
+  // row's origin embedding table); unset for a row that derives from no other
+  // result table (a `MODEL` row).
   optional string derived_from = 11;
 }
 

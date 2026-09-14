@@ -423,17 +423,26 @@ def crate_source_origins(metadata: dict, repo_root: Path = REPO_ROOT) -> dict[st
     return origins
 
 
-def lanes_from_workflows(exec_mod, repo_root: Path = REPO_ROOT) -> list[ClippyLane]:
-    """The union of every `cargo clippy -D warnings` line reachable from a
-    genuinely merge-path-triggered job/step, across every workflow —
+def lanes_from_workflows(exec_mod, repo_root: Path = REPO_ROOT) -> tuple[list[ClippyLane], list[str]]:
+    """(lanes, findings). The lanes are the union of every `cargo clippy
+    -D warnings` line reachable from a genuinely merge-path-triggered
+    job/step, across every workflow —
     `check_execution_surface_reachability.scan_workflows`'s own Rule 1a +
     1c honesty (trigger + if:/continue-on-error: conditioning), reused
     rather than re-derived. Each lane keeps the scan it came from (its
     hosting workflow and that workflow's `pull_request`-to-main trigger
     lanes): the registry half asks Rule 1b of the HOST, so discarding the
     scan here would make "moved into a workflow no PR touching this crate
-    ever runs" indistinguishable from "still on `ci.yml`"."""
-    scans, _pattern_findings = exec_mod.scan_workflows(repo_root)
+    ever runs" indistinguishable from "still on `ci.yml`". `findings` is
+    `scan_workflows`'s OWN findings list, propagated rather than discarded:
+    it names every unsupported `paths:`/`paths-ignore:` pattern AND every
+    workflow file the shared loader could not examine at all (unparseable,
+    an anchor/alias/tag, a duplicate key, ...) — a workflow this reader
+    cannot parse might be the one that actually hosts (or is meant to
+    host) a required lane, so silently excluding it from `scans` and
+    saying nothing would read as "the lane just doesn't exist" for the
+    wrong reason."""
+    scans, findings = exec_mod.scan_workflows(repo_root)
     workflows_dir = repo_root / exec_mod.WORKFLOWS_DIR_REL
     lanes: list[ClippyLane] = []
     for scan in scans:
@@ -444,7 +453,7 @@ def lanes_from_workflows(exec_mod, repo_root: Path = REPO_ROOT) -> list[ClippyLa
             lane = parse_clippy_lane(tuple_text, origin=origin)
             if lane is not None:
                 lanes.append(lane)
-    return lanes
+    return lanes, findings
 
 
 # --------------------------------------------------------------------------- #
@@ -775,12 +784,17 @@ def _corpus_with_step_moved(exec_mod, moved_to: str | None, remove_from_ci: bool
                 + _SYNTHETIC_JOB.format(tuple_text=_MOVED_STEP_TUPLE),
                 encoding="utf-8",
             )
-        return lanes_from_workflows(exec_mod, root)
+        lanes, _findings = lanes_from_workflows(exec_mod, root)
+        return lanes
 
 
 def self_test() -> int:
     exec_mod = _load_exec_surface_module()
-    lanes = lanes_from_workflows(exec_mod, REPO_ROOT)
+    lanes, workflow_findings = lanes_from_workflows(exec_mod, REPO_ROOT)
+    assert not workflow_findings, (
+        "self-test FAILED: scan_workflows reported unexaminable workflow(s)/pattern(s) on the real, "
+        f"committed corpus (should be zero on a clean tree): {workflow_findings}"
+    )
     assert lanes, "self-test: no `cargo clippy -D warnings` lane found on the merge path at all"
     metadata = load_metadata(REPO_ROOT)
     feature_maps = package_feature_maps(metadata)
@@ -790,6 +804,26 @@ def self_test() -> int:
         f"{crate_dirs.get('jammi-ai')!r}; the host-workflow controls below are written against "
         "`crates/jammi-ai/**` and would prove nothing against a different one"
     )
+
+    # An unexaminable workflow FAILS this gate with the named reason,
+    # never a silent `[]`/no-finding read as "the corpus is just smaller"
+    # (W9): a synthetic `.github/workflows/` copy carrying one workflow
+    # this shared loader cannot parse (a YAML anchor, which GitHub's own
+    # parser also refuses) must surface in `lanes_from_workflows`'s own
+    # `findings`, not be silently dropped from `scans`.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        wf_dir = root / exec_mod.WORKFLOWS_DIR_REL
+        wf_dir.mkdir(parents=True, exist_ok=True)
+        (wf_dir / "unparseable.yml").write_text(
+            'on: &trig\n  push:\njobs:\n  a:\n    runs-on: u\n    steps:\n      - run: echo hi\n',
+            encoding="utf-8",
+        )
+        _unparseable_lanes, unparseable_findings = lanes_from_workflows(exec_mod, root)
+        assert any("not accepted by GitHub Actions" in f for f in unparseable_findings), (
+            "self-test FAILED: a workflow the shared loader cannot examine (an anchor GitHub itself "
+            f"refuses) did not surface in lanes_from_workflows' own findings: {unparseable_findings}"
+        )
 
     # Positive control: a target shaped exactly like the real,
     # currently-covered `jammi-kernels::cuda_parity` (required-features =
@@ -1068,6 +1102,18 @@ def self_test() -> int:
 # main
 # --------------------------------------------------------------------------- #
 def main(argv: list[str]) -> int:
+    # A missing PyYAML install is a GATE PREREQUISITE failure, never a
+    # finding and never a pass -- checked FIRST, before dispatching
+    # `--self-test` or running the gate itself, via the ONE predicate
+    # `check_execution_surface_reachability.py` exports for every
+    # importing gate (loading that module never itself requires PyYAML --
+    # it degrades to `yaml = None` internally and this predicate is what
+    # turns that into one named, distinct message here).
+    exec_mod = _load_exec_surface_module()
+    prereq_rc = exec_mod.require_pyyaml_or_exit("lint-surface-closure")
+    if prereq_rc is not None:
+        return prereq_rc
+
     if "--self-test" in argv:
         try:
             return self_test()
@@ -1075,11 +1121,15 @@ def main(argv: list[str]) -> int:
             print(f"lint-surface-closure self-test: FAIL: {e}", file=sys.stderr)
             return 1
 
-    exec_mod = _load_exec_surface_module()
     metadata = load_metadata(REPO_ROOT)
     targets = feature_gated_targets(metadata)
     feature_maps = package_feature_maps(metadata)
-    lanes = lanes_from_workflows(exec_mod, REPO_ROOT)
+    lanes, workflow_findings = lanes_from_workflows(exec_mod, REPO_ROOT)
+    if workflow_findings:
+        print("lint-surface-closure: FAIL", file=sys.stderr)
+        for f in workflow_findings:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
     try:
         required = load_required_lanes()
     except RegistryError as e:

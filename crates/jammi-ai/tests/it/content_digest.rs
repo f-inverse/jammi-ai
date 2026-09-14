@@ -354,6 +354,7 @@ async fn resolve_and_load_with_adapter(dir: &Path, adapter_dir: &Path) -> Loaded
     let backend = CandleBackend;
     let device_config = DeviceConfig {
         gpu_device: -1,
+        devices: vec![-1],
         memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -423,6 +424,7 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
     let backend = CandleBackend;
     let device_config = DeviceConfig {
         gpu_device: -1,
+        devices: vec![-1],
         memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
@@ -492,6 +494,7 @@ async fn resolve_and_load_for_task(dir: &Path, task: ModelTask) -> LoadedModel {
     let backend = CandleBackend;
     let device_config = DeviceConfig {
         gpu_device: -1,
+        devices: vec![-1],
         memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,

@@ -102,6 +102,58 @@ lead's own `unit:` line (a decoy is not detected); a fix that REWRITES a functio
 body inside an already-covered file is not separately re-armed beyond that file's own
 required key. A lead can still write a weak attack; what it cannot do is write
 nothing, or write it AFTER a fix already landed, and pass.
+**(2c) Required gates, mutations, exclusions (esc-lead-gate-R12, fix round 3, item
+8a/8b/8c) — three companion checks beside (2b)'s pre/post-fix attack pair, each armed
+strictly by the DATA, never merely by a unit being open.** `ci/lead-gate-
+required-commands.txt` (`_R12_REQUIRED_COMMANDS_FILENAME`, human-amend-only) is a
+committed list of cheap, already-existing gate commands, one per line, `#`-comment/
+blank lines skipped, a trailing `  # measured ~Xs` annotation stripped from each
+(`_r12_required_commands`) — `[]`, an honest default, when the file is missing: no
+committed file means no gate obligation, never a crash. **8a, gates.**
+`_r12_gates_shape_rejection` requires `gates` to be a dict naming EVERY required
+command VERBATIM, each an object with an integer `rc`; called with `judge_rc=False`
+at Reader 1 (the pre-fix anticipation artifact — shape only, the pre-fix tip is
+expected to be broken, so its `rc` value is never inspected) and `judge_rc=True` at
+Reader 2 (the closing relay — SAME shape PLUS `rc == 0` for every line, armed
+UNCONDITIONALLY on every relay, never scoped to only R12-anticipation-covered units).
+The hook never runs these commands itself. **8b, mutations.**
+`_mutations_rejection` is armed only when the fix's own diff adds a new definition
+(`new_surfaces`, the hook's own derived enumeration) inside a file the open BLOCK's
+own `finding_locations` also names — never merely because `finding_locations` is
+non-empty. `None` iff the relay's `mutations` array then carries 1..3 rows
+(`len(mutations) > 3` denies outright — K<=3, a LABELED sample, never an exhaustive
+sweep), each shaped `{site, command, rc_before, rc_after, marker_after}` with EITHER
+an ACCEPTED mutation (`rc_before == 0 ∧ rc_after != 0 ∧ marker_after` matches a
+committed TEST-failure marker — `"test result: FAILED"`, `"FAIL —"`, `"= FAILURES ="`
+— distinct from a build-failure marker) OR an explicit non-empty `uncovered` reason
+(R11's own disposition precedent). No hash-reproduction here — like `gates`, a
+lead-attested record, never re-executed by the hook. **8c, exclusions.**
+`_r12_new_test_surfaces` narrows `new_surfaces` to entries that LOOK like a test (the
+file path contains "test", or the definition name starts with `test_`/`fixture_` or
+contains "test" — a heuristic, stated as one, that can under- or over-include).
+`_exclusions_rejection` then requires the relay's `exclusions` object to name, per
+new test surface, a non-empty case the attack does NOT cover, NORMALIZED-DISTINCT
+(`_probe_normalize`) both from every sibling entry in the SAME relay (a within-relay
+duplicate denies, naming both keys) and from the unit's own PREVIOUS relay of the
+SAME `agent_type` (`_r12_previous_relay_row`, the earlier `ts` — a cross-relay
+duplicate, an exclusion repeated verbatim across rounds, also denies) — the
+anti-templating cousin of `_claims_rejection`'s own uncovered-reason check. LIMIT,
+stated as plainly as R11's own: this cannot prove an exclusion is TRUE, only that two
+are not one. **Reader 3** (`ci/scripts/check_rigor_record.py`'s `check_required_gates`,
+armed only when `ci/lead-gate-required-commands.txt` is itself committed at HEAD)
+hard-fails the committed `docs/rigor/<slug>.anticipation.jsonl` export's GOVERNING
+row on a missing required command or a non-zero `rc`. The governing row is selected
+ORDER-INDEPENDENTLY: a row whose own `head_sha` matches this checkout's actual `HEAD`
+is preferred; when none does — the common case, since a pre-fix witness by
+construction predates the commit Reader 3 validates against — every row is eligible;
+within whichever pool applies, the row with the GREATEST `ts` governs, never the row
+nearest the end of the file (`cmd_export_anticipation` sorts the artifacts it dumps
+by FILENAME — a tip sha, pseudorandom hex with no chronological meaning — so an
+older round's row can sort after a newer one and land on the file's last line).
+Reader 3 never re-executes these commands; they are already CI jobs elsewhere in
+`.github/workflows/`. HONEST LIMITS, stated as plainly as (2b)'s own: `gates`/
+`mutations`/`exclusions` are LEAD-ATTESTED, never re-executed by the hook — the
+control is the human at merge, reading the exported record.
 **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
 `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
 (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE

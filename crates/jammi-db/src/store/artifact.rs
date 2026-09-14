@@ -87,10 +87,11 @@ const RESUME_SEGMENT: &str = "_resume";
 /// (unit 348, CONTRACT item 1 / K7). `N` is the 0-based loop epoch index. This
 /// is the ONE place the epoch-checkpoint key shape is spelled — both
 /// [`ArtifactStore::put_epoch_checkpoint`] (the trainer's write) and
-/// [`ArtifactStore::delete_epoch_checkpoint`] (any terminating path's GC sweep)
-/// build the prefix through it, so a GC sweep can never drift out of sync with
-/// where the writer actually publishes: reachability is a property of shared
-/// code, not of two call sites independently agreeing on a string shape.
+/// [`ArtifactStore::epoch_checkpoint_prefix`] (every guarded GC sweep's
+/// prefix computation) build the prefix through it, so a GC sweep can never
+/// drift out of sync with where the writer actually publishes: reachability
+/// is a property of shared code, not of two call sites independently
+/// agreeing on a string shape.
 const CHECKPOINTS_SEGMENT: &str = "checkpoints";
 
 /// One file in an artifact bundle: its relative name (the candle loader joins
@@ -370,11 +371,12 @@ impl ArtifactStore {
     /// consults [`crate::store::ResultStore::prefix_is_referenced`] first
     /// and refuses, typed, before ever reaching this call — the route for a
     /// worker's abandon path (a losing cache-hit attempt, a zombie's
-    /// orphaned prefix) and for a retained epoch checkpoint (a checkpoint's
-    /// own row means its caller must consult the guard on the checkpoint's
-    /// exact prefix, then call [`Self::delete_epoch_checkpoint`] only once
-    /// unreferenced — this type stays catalog-free, so it cannot perform
-    /// that consult itself); and (2) [`Self::delete_resume_checkpoint`],
+    /// orphaned prefix) and for a retained epoch checkpoint (the caller
+    /// computes the checkpoint's exact prefix via
+    /// [`Self::epoch_checkpoint_prefix`], then reaches this method only
+    /// through the guarded route above — this type stays catalog-free, so
+    /// it cannot perform that consult itself); and (2)
+    /// [`Self::delete_resume_checkpoint`],
     /// whose own doc states why its `_resume/` prefix is proven to need no
     /// guard at all (a namespace no `models` row's `artifact_path` can ever
     /// name, equal or as an immediate containing directory).
@@ -506,19 +508,18 @@ impl ArtifactStore {
         .await
     }
 
-    /// The exact prefix [`Self::put_epoch_checkpoint`] publishes to and
-    /// [`Self::delete_epoch_checkpoint`] deletes, computed without touching
-    /// storage — the SAME segment construction both of those methods use,
-    /// so a caller can never drift into asking
+    /// The exact prefix [`Self::put_epoch_checkpoint`] publishes to, computed
+    /// without touching storage — the SAME segment construction that write
+    /// uses, so a guarded delete can never drift into asking
     /// [`crate::store::ResultStore::prefix_is_referenced`] about a
-    /// different key than the one it is actually about to delete. This is
-    /// the port a caller MUST consult before calling
-    /// [`Self::delete_epoch_checkpoint`]: unlike [`Self::delete_resume_checkpoint`],
-    /// an epoch checkpoint is NOT exempt from the guard — a RETAINED
-    /// checkpoint gets its own `models` row whose `artifact_path` EQUALS
-    /// this exact prefix (the winning finalize CAS inserts one such row per
-    /// retained checkpoint), so an unguarded delete here can remove bytes a
-    /// live row still names.
+    /// different key than the one it is actually about to delete. Every
+    /// epoch-checkpoint delete reaches
+    /// [`crate::store::ResultStore::delete_unreferenced_prefix`] with a
+    /// prefix computed through this method: unlike
+    /// [`Self::delete_resume_checkpoint`], an epoch checkpoint is NOT exempt
+    /// from the guard — a RETAINED checkpoint gets its own `models` row
+    /// whose `artifact_path` EQUALS this exact prefix (the winning finalize
+    /// CAS inserts one such row per retained checkpoint).
     pub fn epoch_checkpoint_prefix(
         &self,
         tenant: Option<&TenantId>,
@@ -532,35 +533,6 @@ impl ArtifactStore {
             tenant,
             &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
         )
-    }
-
-    /// Best-effort GC of ONE epoch-checkpoint prefix
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{epoch}/`), tolerant
-    /// of an epoch that was never actually written (no manifest — the same
-    /// no-op `Self::delete_artifact_prefix` already treats a never-completed
-    /// attempt as, not an error). This lets a caller derive and sweep a whole
-    /// `[0, epochs)` range without first knowing how far training actually
-    /// got: indices past the run's real progress are simply no-ops.
-    ///
-    /// Calls the unguarded `Self::delete_artifact_prefix` directly, with
-    /// NO [`crate::store::ResultStore::prefix_is_referenced`] consult of
-    /// its own: this type stays catalog-free by design, so it cannot
-    /// perform that consult itself. A retained checkpoint's own row means
-    /// its `artifact_path` CAN equal this exact prefix — the caller MUST
-    /// compute the same prefix via [`Self::epoch_checkpoint_prefix`] and
-    /// consult [`crate::store::ResultStore::prefix_is_referenced`] on it
-    /// before calling this method; this is no longer an exempt namespace
-    /// (see [`Self::delete_resume_checkpoint`] for the one that still is).
-    pub async fn delete_epoch_checkpoint(
-        &self,
-        tenant: Option<&TenantId>,
-        job_id: &str,
-        worker_id: &str,
-        attempt: &str,
-        epoch: usize,
-    ) -> Result<()> {
-        let prefix = self.epoch_checkpoint_prefix(tenant, job_id, worker_id, attempt, epoch)?;
-        self.delete_artifact_prefix(&prefix).await
     }
 
     /// Read and parse `manifest.json` under `prefix`. A manifest absent
@@ -754,7 +726,7 @@ fn verify_sha256(prefix: &StorageUrl, entry: &ManifestEntry, bytes: &[u8]) -> Re
 
 /// The `checkpoints/` child segment naming one epoch's checkpoint: `epoch_{N}`.
 /// The single spelling both [`ArtifactStore::put_epoch_checkpoint`] and
-/// [`ArtifactStore::delete_epoch_checkpoint`] build their prefix from.
+/// [`ArtifactStore::epoch_checkpoint_prefix`] build their prefix from.
 fn epoch_segment(epoch: usize) -> String {
     format!("epoch_{epoch}")
 }

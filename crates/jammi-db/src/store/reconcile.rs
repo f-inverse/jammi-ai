@@ -496,11 +496,12 @@ impl ResultStore {
     /// never named by any row — see
     /// [`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`]'s
     /// doc); an epoch-checkpoint delete is NOT exempt — a retained
-    /// checkpoint's own row means its caller must consult
-    /// [`Self::prefix_is_referenced`] on the checkpoint's exact prefix
-    /// before deleting it (`ArtifactStore` itself stays catalog-free, so
-    /// the consult happens in the caller, not inside
-    /// [`crate::store::ArtifactStore::delete_epoch_checkpoint`]).
+    /// checkpoint's own row means its caller must compute the checkpoint's
+    /// exact prefix via
+    /// [`crate::store::ArtifactStore::epoch_checkpoint_prefix`] and reach
+    /// this method with it (`ArtifactStore` itself stays catalog-free, so
+    /// the consult happens here, in the guarded port, never inside
+    /// `ArtifactStore`).
     pub async fn delete_unreferenced_prefix(&self, prefix: &StorageUrl) -> Result<()> {
         let count = self.prefix_is_referenced(prefix).await?;
         if count > 0 {

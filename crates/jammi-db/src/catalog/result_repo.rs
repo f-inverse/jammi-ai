@@ -49,13 +49,15 @@ impl ResultTableKind {
     /// round-trip oracle and its "expected" error text both range over.
     ///
     /// Produced by `Self::all`, an exhaustive match over every variant of
-    /// `Self`: the match has one arm whose pattern is every variant joined
-    /// by `|` and whose value is this list. A variant added to the enum
-    /// without also being named in that pattern is a compiler error
-    /// ("non-exhaustive patterns"), so a kind can never be added to the enum
-    /// without also being listed in `ALL` — unlike a hand-maintained
-    /// constant, which a new variant's own `as_db_str` arm can satisfy the
-    /// compiler for while leaving this list stale.
+    /// `Self`: the match arm's pattern must name every variant joined by
+    /// `|`, or the match fails to compile ("non-exhaustive patterns"). The
+    /// compiler checks only that pattern, not the arm's value — E0004 binds
+    /// the pattern, not the `[Self; 4]` array literal — so a variant named
+    /// in the pattern but omitted from the array still compiles. `ALL`
+    /// therefore names every variant the pattern names, not necessarily
+    /// every variant of `Self`
+    /// (<https://github.com/f-inverse/jammi-ai/issues/550> tracks giving
+    /// enum inventories like this one exhaustiveness by construction).
     pub const ALL: [Self; 4] = Self::all();
 
     /// The exhaustive match backing [`Self::ALL`]; see that constant's doc.
@@ -1849,15 +1851,16 @@ impl Catalog {
 mod tests {
     use super::*;
 
-    /// Family M: `as_db_str` and `try_from_db_str` are inverse over the WHOLE
-    /// enum. The set ranged over is [`ResultTableKind::ALL`]: a kind added to
-    /// the enum without a spelling fails to compile (`as_db_str`'s match is
-    /// exhaustive), and a kind added without being listed in `ALL` also fails
-    /// to compile — `ALL` is itself built by an exhaustive match over every
-    /// variant (see `ResultTableKind::all`), not hand-maintained, so it can
-    /// never silently omit one. The injectivity assertion below then checks a
-    /// property that mechanism cannot enforce: that no two listed kinds share
-    /// one spelling.
+    /// Family M: `as_db_str` and `try_from_db_str` are inverse over the set
+    /// [`ResultTableKind::ALL`], not necessarily the whole enum. A variant
+    /// added to the enum without a spelling fails to compile (`as_db_str`'s
+    /// match is exhaustive), but a variant named in `Self::all`'s match
+    /// pattern and omitted from its `[Self; 4]` array value still compiles
+    /// (see that constant's doc) and is missing from this round-trip test
+    /// exactly as it is missing from `ALL`
+    /// (<https://github.com/f-inverse/jammi-ai/issues/550>). The injectivity
+    /// assertion below then checks a property that mechanism cannot enforce:
+    /// that no two listed kinds share one spelling.
     #[test]
     fn every_result_table_kind_round_trips_through_its_db_string() {
         for kind in ResultTableKind::ALL {

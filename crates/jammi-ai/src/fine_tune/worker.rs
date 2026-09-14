@@ -1763,9 +1763,9 @@ impl JobWorker {
     /// behind, unit 348 F2) drive. For every index in `epochs`, computes the
     /// EXACT checkpoint prefix ([`ArtifactStore::epoch_checkpoint_prefix`])
     /// and consults the guarded [`PrefixReferences`] port on THAT prefix —
-    /// never the unguarded `ArtifactStore::delete_epoch_checkpoint` /
-    /// `delete_artifact_prefix` primitives directly — before ever deleting a
-    /// byte: a RETAINED checkpoint gets its own `models` row whose
+    /// never the unguarded `ArtifactStore::delete_artifact_prefix` primitive
+    /// directly — before ever deleting a byte: a RETAINED checkpoint gets
+    /// its own `models` row whose
     /// `artifact_path` equals this exact prefix (the winning finalize CAS
     /// inserts one such row per retained checkpoint), so an unguarded delete
     /// here could remove bytes a live row still names. A `Referenced`

@@ -21,10 +21,13 @@ either `world_size` or `cache` existed — reused here as the byte-identity
 oracle for the SAME reason: any field this builder appends without matching
 byte-compatibility semantics fails to reproduce it.
 
-The context-predictor verb deliberately carries NO `cache`: the field is the
-wire form of `TrainingCommon.cache`, and `ContextPredictorSpec` folds no
-common block — the same reasoning `test_world_size.py` documents for
-`world_size` on that kind.
+The context-predictor verb deliberately carries NO `cache`: the field lives on
+`TrainingSpec::FineTune` alone — the only kind with a materialization to
+probe — never on the shared `TrainingCommon` that `test_world_size.py`
+documents for `world_size`. `GraphFineTune` (which DOES fold a common block)
+is already refused `cache = USE` with a typed error for the same reason, and
+`ContextPredictorSpec` (which folds no common block at all) has even less
+claim to the field.
 
 No channel is dialed: the builders are free functions in the assembly layer.
 """

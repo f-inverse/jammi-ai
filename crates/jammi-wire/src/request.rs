@@ -129,8 +129,11 @@ pub struct FineTuneRequest {
     /// model + training-set definition for an exact prior materialisation and
     /// registers the caller's own name against the reused artifact prefix
     /// instead of retraining. Defaults to [`CachePolicy::Bypass`] (always
-    /// train), matching the engine's own `TrainingCommon.cache` default and
-    /// every caller that predates this field. On the wire this is
+    /// train), matching the engine's own default on `TrainingSpec::FineTune`'s
+    /// `cache` field (it lives on that variant, not `TrainingCommon` — the
+    /// graph fine-tune kind has no materialization to probe, so it carries no
+    /// `cache` field at all) and every caller that predates this field. On
+    /// the wire this is
     /// `jammi.v1.job.SubmitJobRequest.cache`, the shared
     /// `jammi.v1.inference.CachePolicy` enum every other result-table
     /// producer verb carries — `UNSPECIFIED` and `BYPASS` decode identically,

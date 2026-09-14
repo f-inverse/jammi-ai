@@ -1152,11 +1152,13 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
 
 /// PARITY. `CachePolicy::Use` submitted over the wire persists the
 /// BYTE-IDENTICAL `jobs.spec` a `CachePolicy::Use` submitted through the
-/// embedded session persists — the stored `TrainingCommon.cache`, not merely
-/// two `Ok` responses. `cache` is excluded from the fine-tune definition hash
-/// (a call-time dial, not identity), so nothing about a persisted-spec
-/// comparison depends on the model-level reuse probe ever firing; this test
-/// only proves the wire carries the caller's choice through to the row.
+/// embedded session persists — the stored `TrainingSpec::FineTune::cache`
+/// (the field lives on the `FineTune` variant, not `TrainingCommon`: only
+/// that kind has a materialization to probe), not merely two `Ok` responses.
+/// `cache` is excluded from the fine-tune definition hash (a call-time dial,
+/// not identity), so nothing about a persisted-spec comparison depends on
+/// the model-level reuse probe ever firing; this test only proves the wire
+/// carries the caller's choice through to the row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_use_cache_policy_persists_the_identical_spec_on_both_paths() {
     let server = start_engine_server_with_devices(2).await;

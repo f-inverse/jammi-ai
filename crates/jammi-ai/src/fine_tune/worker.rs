@@ -1336,89 +1336,53 @@ impl JobWorker {
         // path: the finalize CAS is the sole writer of `artifact_path`, so a
         // loser's (or zombie's) register can never set the served pointer.
         //
-        // `dir` is `None` for exactly one case — a `CachePolicy::Use`
-        // model-level cache HIT (`FineTuneMaterializationOutcome::Reused`).
-        // Nothing new is published; the prefix is the ALREADY-committed one
-        // the matched row serves, so this job's own name is finalized
-        // pointing at the SAME prefix (two model rows, one prefix) rather
-        // than writing (and then having to reclaim) a duplicate copy. The
-        // ownership of that fact travels in the TYPE from here on
-        // ([`PublishedPrefix`]) rather than being re-derived from
-        // `dir.is_some()` at each later call site.
+        // Every attempt publishes its OWN bytes under its OWN attempt-unique
+        // prefix — no FineTune run ever shares a `models/` prefix with
+        // another run (model-level cache reuse is not yet supported; see
+        // <https://github.com/f-inverse/jammi-ai/issues/562>).
         let attempt_str = attempt.to_string();
-        let prefix: PublishedPrefix = match &dir {
-            Some(dir) => {
-                match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, dir)
-                    .await
-                {
-                    Ok(p) => PublishedPrefix::Owned(p),
-                    Err(e) => {
-                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
-                            .await;
-                        // The training loop DID complete and DID write epoch
-                        // checkpoints (we have a `TrainedArtifact`) — but the
-                        // FINAL artifact publish failed, so this attempt never
-                        // reaches finalize at all. Reclaim its epoch-checkpoint
-                        // bytes via the derived sweep (never the vec — one
-                        // reclaim path for every terminating arm, unit 348 F1/F2).
-                        Self::gc_epoch_checkpoints(
-                            &store,
-                            refs,
-                            tenant,
-                            job_id,
-                            &self.worker_id,
-                            attempt,
-                            epoch_checkpoint_bound,
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-            None => {
-                let Some(FineTuneMaterializationOutcome::Reused { artifact_path, .. }) =
-                    &materialization
-                else {
-                    record_failed(
-                        catalog,
+        let prefix =
+            match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
+                .await
+            {
+                Ok(p) => PublishedPrefix(p),
+                Err(e) => {
+                    record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+                    // The training loop DID complete and DID write epoch
+                    // checkpoints (we have a `TrainedArtifact`) — but the
+                    // FINAL artifact publish failed, so this attempt never
+                    // reaches finalize at all. Reclaim its epoch-checkpoint
+                    // bytes via the derived sweep (never the vec — one
+                    // reclaim path for every terminating arm, unit 348 F1/F2).
+                    Self::gc_epoch_checkpoints(
+                        &store,
+                        refs,
+                        tenant,
                         job_id,
                         &self.worker_id,
                         attempt,
-                        "internal: no artifact directory and no reused fine-tune prefix".into(),
+                        epoch_checkpoint_bound,
                     )
                     .await;
                     return;
-                };
-                match jammi_db::storage::StorageUrl::parse(artifact_path) {
-                    Ok(p) => PublishedPrefix::Reused(p),
-                    Err(e) => {
-                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
-                            .await;
-                        return;
-                    }
                 }
-            }
-        };
+            };
 
         if let Err(e) = catalog.register_model(register.as_params()).await {
-            // The model row could not be registered. A FRESH prefix we just
-            // wrote is orphaned — best-effort GC it via `abandon_unfinalized_attempt`,
-            // whose own `PublishedPrefix::delete_if_owned` can never touch a
-            // REUSED prefix — it is owned by its own original model
-            // row.
+            // The model row could not be registered. The prefix we just
+            // wrote is orphaned — best-effort GC it via
+            // `abandon_unfinalized_attempt`.
             abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version).await;
-            if dir.is_some() {
-                Self::gc_epoch_checkpoints(
-                    &store,
-                    refs,
-                    tenant,
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    epoch_checkpoint_bound,
-                )
-                .await;
-            }
+            Self::gc_epoch_checkpoints(
+                &store,
+                refs,
+                tenant,
+                job_id,
+                &self.worker_id,
+                attempt,
+                epoch_checkpoint_bound,
+            )
+            .await;
             record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
             return;
         }
@@ -1436,9 +1400,7 @@ impl JobWorker {
         // before that CAS ever runs — would refuse every single time for a
         // fresh run. The two pieces of information that call needs are
         // captured into `pending_record` now and used AFTER the CAS wins,
-        // below. A REUSED hit copies the matched row's own already-recorded
-        // pair rather than recomputing it — the two model rows must agree
-        // byte-for-byte on what they both point at.
+        // below.
         let mut pending_record: Option<(String, String)> = None;
         match &materialization {
             Some(FineTuneMaterializationOutcome::Fresh {
@@ -1511,18 +1473,11 @@ impl JobWorker {
                 pending_record =
                     Some((manifest.definition_hash.as_str().to_string(), anchors_json));
             }
-            Some(FineTuneMaterializationOutcome::Reused {
-                definition_hash,
-                input_anchors_json,
-                ..
-            }) => {
-                pending_record = Some((definition_hash.clone(), input_anchors_json.clone()));
-            }
             // `GraphFineTune` / a context predictor: no materialization to
             // record. `ProducingDescriptor::FineTune` covers only the
             // column-source `FineTune` kind — `GraphFineTune` has no `cache`
-            // field to probe at all (it is unrepresentable on that variant,
-            // see `TrainingSpec`'s own doc), so there is never anything to
+            // field at all (it is unrepresentable on that variant, see
+            // `TrainingSpec`'s own doc), so there is never anything to
             // record here for it.
             None => {}
         }
@@ -1578,21 +1533,15 @@ impl JobWorker {
         // The tagged terminal payload `jobs.result` carries the model
         // metrics blob: the generalised `jobs` schema has no dedicated
         // metrics column, so it folds into `result` instead (see
-        // `crate::jobs::JobResult::Model`). `cache_outcome`
-        // makes a reuse OBSERVABLE on this job's own result, the same
-        // contract `JobResult::Table::cache_outcome` already keeps for a
-        // compute kind — never merely inferred from an absent `metrics`.
-        let cache_outcome = match &materialization {
-            Some(FineTuneMaterializationOutcome::Reused {
-                reused_model_id, ..
-            }) => format!("reused:{reused_model_id}"),
-            _ => "computed".to_string(),
-        };
+        // `crate::jobs::JobResult::Model`). `cache_outcome` shares the
+        // `Table` arm's `"computed"`/`"reused:{name}"` vocabulary, but every
+        // FineTune run always records `"computed"` today — model-level
+        // cache reuse is not yet supported (see that field's own doc).
         let job_result = crate::jobs::JobResult::Model {
             model_id: model_id.clone(),
             artifact_path: prefix.url().to_string(),
             metrics: metrics.clone(),
-            cache_outcome,
+            cache_outcome: "computed".to_string(),
         };
         let result_json = match serde_json::to_string(&job_result) {
             Ok(j) => j,
@@ -1695,8 +1644,7 @@ impl JobWorker {
             Ok(false) => {
                 // Lost the lease before finalizing: our CAS matched zero rows, so
                 // we committed neither the job status nor any served path. Our
-                // prefix is never the committed pointer (and, if it is a
-                // `Reused` one, was never OUR bytes to begin with) —
+                // prefix is never the committed pointer —
                 // GC it best-effort and reap this attempt's own unfinalized
                 // row so no hash-less zombie survives; leave the job
                 // for reclaim (the re-claiming worker writes its own prefix
@@ -2079,7 +2027,14 @@ impl JobWorker {
                 method,
                 task,
                 common,
-                cache,
+                // `cache = USE` is refused, typed, at submit
+                // (`InferenceSession::submit_fine_tune_spec_deduped` — the
+                // one point every FineTune submission path, embedded or
+                // decoded off the wire, passes through before any row is
+                // written): a queued `fine_tune` row can therefore only ever
+                // carry `Bypass` here, and the worker has nothing left to
+                // branch on.
+                cache: _cache,
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
@@ -2149,7 +2104,6 @@ impl JobWorker {
                     common,
                     loader,
                     materialization_source,
-                    cache,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -2173,11 +2127,6 @@ impl JobWorker {
                     // column-source `FineTune` kind (its own doc); a graph
                     // fine-tune's model row carries no materialization.
                     materialization_source: None,
-                    // `TrainingSpec::GraphFineTune` has no `cache` field at
-                    // all — see `FineTuneRun::cache`'s own doc for why
-                    // `Bypass` states the true behaviour here rather than a
-                    // value that merely happens to be inert.
-                    cache: jammi_db::store::CachePolicy::Bypass,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -2319,7 +2268,6 @@ impl JobWorker {
             common,
             loader,
             materialization_source,
-            cache,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
@@ -2341,11 +2289,8 @@ impl JobWorker {
         // built HERE, while the model guard is still held (the identity needs
         // the loaded model's backend/precision/digest/quantization — the SAME
         // uniform path `pipeline::embedding`'s `embedding_definition` already
-        // uses for the model it invokes). The `CachePolicy::Use` probe runs
-        // BEFORE the expensive blocking trainer below — never after — so a
-        // hit skips training entirely (`reused` short-circuits the return).
+        // uses for the model it invokes).
         let mut pending_materialization: Option<FineTuneMaterializationOutcome> = None;
-        let mut reused: Option<TrainedArtifact> = None;
         if let Some(src) = &materialization_source {
             let canonical_model_id = model_source.to_string();
             let device = session.compute_device();
@@ -2406,86 +2351,23 @@ impl JobWorker {
             //
             // Redundant: nothing above needed the anchor to DISCRIMINATE.
             // `ProducingDescriptor::FineTune::training_set_artifact_digest`
-            // (already folded into `descriptor`, hence into `definition_hash`
-            // below) is the SAME digest the removed anchor carried — two
-            // fine-tunes over different training-set content already hash
-            // differently without an anchor's help. And no CONSUMER ever
-            // reads a FineTune-recorded anchor: `probe_model_by_definition`'s
-            // anchor-equality check degenerates to comparing two empty sets
-            // (trivially equal, contributing no additional constraint beyond
-            // the hash already being equal), and the model-kind's OWN replay
-            // policy is retrain (K1, `recompute_fine_tune`), which never
-            // reads a recorded anchor at all — `reresolve_recorded_anchor`
-            // is reached only from the TrainingSet-table replay arm, over
-            // THAT table's own separately-recorded anchors, never these.
+            // (already folded into `descriptor`) is the SAME digest the
+            // removed anchor carried — two fine-tunes over different
+            // training-set content already hash differently without an
+            // anchor's help. And no CONSUMER ever reads a FineTune-recorded
+            // anchor: the model-kind's OWN replay policy is retrain (K1,
+            // `recompute_fine_tune`), which never reads a recorded anchor at
+            // all — `reresolve_recorded_anchor` is reached only from the
+            // TrainingSet-table replay arm, over THAT table's own
+            // separately-recorded anchors, never these.
             let inputs: Vec<jammi_db::store::manifest::InputAnchor> = Vec::new();
-            let definition_hash =
-                jammi_db::store::manifest::MaterializationManifest::definition_of(
-                    &descriptor,
-                    &env,
-                )
-                .map_err(jammi_db::store::manifest_to_jammi)
-                .map_err(WorkerJobError::from)?;
-
-            if cache == jammi_db::store::CachePolicy::Use {
-                if let Some(hit) = catalog
-                    .probe_model_by_definition(definition_hash.as_str(), &inputs)
-                    .await
-                    .map_err(WorkerJobError::from)?
-                {
-                    let missing = |field: &str| {
-                        WorkerJobError::from(JammiError::FineTune(format!(
-                            "model '{}' matched the fine-tune reuse probe but carries no {field}",
-                            hit.catalog_pk
-                        )))
-                    };
-                    let artifact_path = hit
-                        .artifact_path
-                        .clone()
-                        .ok_or_else(|| missing("artifact_path"))?;
-                    let reused_definition_hash = hit
-                        .definition_hash
-                        .clone()
-                        .ok_or_else(|| missing("definition_hash"))?;
-                    let reused_anchors_json = hit
-                        .input_anchors_json
-                        .clone()
-                        .ok_or_else(|| missing("input_anchors_json"))?;
-                    reused = Some(TrainedArtifact {
-                        dir: None,
-                        register: ModelRegistration {
-                            model_id: output_model_id.clone(),
-                            version: 1,
-                            model_type: "fine-tuned",
-                            task,
-                            base_model_id: Some(common.base_model.clone()),
-                            config_json: None,
-                        },
-                        metrics: None,
-                        epoch_checkpoints: Vec::new(),
-                        materialization: Some(FineTuneMaterializationOutcome::Reused {
-                            artifact_path,
-                            reused_model_id: hit.model_id.clone(),
-                            definition_hash: reused_definition_hash,
-                            input_anchors_json: reused_anchors_json,
-                        }),
-                    });
-                }
-            }
-            if reused.is_none() {
-                pending_materialization = Some(FineTuneMaterializationOutcome::Fresh {
-                    descriptor: Box::new(descriptor),
-                    env,
-                    inputs,
-                });
-            }
+            pending_materialization = Some(FineTuneMaterializationOutcome::Fresh {
+                descriptor: Box::new(descriptor),
+                env,
+                inputs,
+            });
         }
         drop(guard);
-
-        if let Some(reused) = reused {
-            // A cache HIT: training never ran (the point of `CachePolicy::Use`).
-            return Ok(reused);
-        }
 
         // #485 BLOCK B1 test hook: a no-op in production (the whole call
         // compiles away without `test-hooks`). Parks here, with the job's
@@ -2582,7 +2464,7 @@ impl JobWorker {
         // deterministic (`jammi:fine-tuned:{job_id}`) and the catalog upserts, so
         // a re-claiming worker is idempotent.
         Ok(TrainedArtifact {
-            dir: Some(training.artifact_dir),
+            dir: training.artifact_dir,
             register: ModelRegistration {
                 model_id: output_model_id,
                 version: 1,
@@ -3499,16 +3381,6 @@ struct FineTuneRun {
     /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
     /// carries `None` here.
     materialization_source: Option<FineTuneMaterializationSource>,
-    /// The reuse dial `TrainingSpec::FineTune` carries at its own top
-    /// level, not on `TrainingCommon` — `TrainingSpec::GraphFineTune`
-    /// cannot represent one at all. Always
-    /// [`jammi_db::store::CachePolicy::Bypass`] for the graph kind, which
-    /// never sets [`Self::materialization_source`] either — the probe below
-    /// only ever runs inside that `Some` arm, so this value is structurally
-    /// unreachable for a graph run regardless of what it is set to; `Bypass`
-    /// states the true, unconditional behaviour rather than a value that
-    /// happens to be inert here.
-    cache: jammi_db::store::CachePolicy,
 }
 
 /// The `ProducingDescriptor::FineTune`-specific inputs a `TrainingSpec::FineTune`
@@ -3538,31 +3410,9 @@ struct FineTuneMaterializationSource {
 }
 
 /// What [`JobWorker::publish_and_finalize`] does with a `TrainingSpec::FineTune`
-/// run's materialization identity, decided BEFORE training by
-/// [`JobWorker::train_fine_tune`]'s `CachePolicy::Use` probe.
+/// run's materialization identity, built by [`JobWorker::train_fine_tune`]
+/// before the trainer runs.
 pub(crate) enum FineTuneMaterializationOutcome {
-    /// A model-level cache HIT
-    /// ([`jammi_db::catalog::Catalog::probe_model_by_definition`]): training
-    /// never ran. This job completes by registering its OWN model name
-    /// pointing at the REUSED prefix — two model rows sharing one prefix —
-    /// with the SAME definition hash / input anchors the reused row already
-    /// carries (copied, not recomputed). No `manifest_path` field: `models`
-    /// carries no such column — the sidecar path is always DERIVED from
-    /// `artifact_path` (mirroring
-    /// `ArtifactStore::read_model_materialization`'s own doc), never
-    /// carried as a separate value.
-    Reused {
-        /// The reused row's served `artifact_path` — this job's own row is
-        /// finalized pointing at the SAME prefix, never a new one.
-        artifact_path: String,
-        /// The reused row's own catalog model id — folded into this job's
-        /// own `JobResult::Model::cache_outcome` so a reuse is
-        /// OBSERVABLE (which row's bytes were reused), never merely
-        /// inferred from an absent metrics field.
-        reused_model_id: String,
-        definition_hash: String,
-        input_anchors_json: String,
-    },
     /// A FRESH training run: after the worker publishes this attempt's new
     /// prefix, `materialization.json` is written LAST (before the finalize
     /// CAS) from this descriptor + environment + input anchors, and recorded
@@ -3588,10 +3438,9 @@ pub(crate) enum FineTuneMaterializationOutcome {
 /// detail; `None` for a kind that records none beyond the terminal flip).
 pub struct TrainedArtifact {
     /// Local tempdir holding the final artifact files, removed on drop after
-    /// the worker has published its contents — `None` for a
-    /// `FineTuneMaterializationOutcome::Reused` (private) cache hit, which
-    /// publishes nothing new (see the `materialization` field below).
-    pub dir: Option<tempfile::TempDir>,
+    /// the worker has published its contents under a fresh, attempt-unique
+    /// prefix (see the `materialization` field below).
+    pub dir: tempfile::TempDir,
     /// The catalog model row to register for this artifact.
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
@@ -3764,90 +3613,63 @@ impl PrefixReferences for ResultStore {
     }
 }
 
-/// Ownership of the prefix [`JobWorker::publish_and_finalize`] is about to
-/// finalize against: whether this attempt wrote these bytes itself (`Owned`,
-/// safe to reclaim on any abort
-/// before the finalize CAS commits) or the prefix is a PRIOR attempt's
-/// already-committed artifact this attempt is merely finalizing a SECOND
-/// model row to point at (`Reused`, a `CachePolicy::Use` cache hit —
-/// [`FineTuneMaterializationOutcome::Reused`]).
-///
-/// The distinction is a TYPE, not a `dir.is_some()` boolean re-checked at
-/// every call site: a boolean re-checked at each site is exactly the kind of
-/// invariant a new call site can silently forget to re-check.
-/// [`Self::delete_if_owned`] is the ONLY way to delete a
-/// prefix through this type, and it is structurally incapable of deleting a
-/// `Reused` one — a `Reused` prefix is owned by whichever model row(s)
-/// already reference it (`store::reconcile`'s attribution), and deleting it
-/// out from under a concurrent reader of that OTHER, unrelated, already-
-/// servable row would be exactly the hazard the pre-existing `:1334`-style
-/// guard was invented for, restated so it cannot be forgotten again.
-///
-/// The `Owned` arm does not trust its own ownership claim unconditionally
-/// either: it deletes only through [`PrefixReferences`], which itself
-/// refuses if some OTHER live `models` row has, in the meantime, come to
-/// name the exact same prefix.
-enum PublishedPrefix {
-    /// This attempt's own freshly-published bytes.
-    Owned(jammi_db::storage::StorageUrl),
-    /// A prior attempt's already-committed prefix, matched by
-    /// [`jammi_db::catalog::Catalog::probe_model_by_definition`]. NEVER
-    /// deleted by this attempt.
-    Reused(jammi_db::storage::StorageUrl),
-}
+/// The prefix [`JobWorker::publish_and_finalize`] is about to finalize
+/// against — always bytes this attempt published itself (no FineTune run
+/// ever shares a `models/` prefix with another run; see
+/// [`FineTuneMaterializationOutcome`]'s own doc). A newtype rather than a
+/// bare [`jammi_db::storage::StorageUrl`] so [`Self::delete`] is the ONLY
+/// way to delete a prefix reached through this type, and it never trusts
+/// its own ownership claim unconditionally: it deletes only through
+/// [`PrefixReferences`], which itself refuses if some OTHER live `models`
+/// row has, in the meantime, come to name the exact same prefix (the
+/// pre-existing `:1334`-style guard this restates so it cannot be forgotten
+/// again).
+struct PublishedPrefix(jammi_db::storage::StorageUrl);
 
 impl PublishedPrefix {
-    /// The underlying [`jammi_db::storage::StorageUrl`], regardless of
-    /// ownership — every READ (the manifest write target, the finalize
-    /// CAS's `artifact_path`, the terminal `jobs.result`) needs the bytes
-    /// regardless of who owns them; only a DELETE cares about the
-    /// distinction, and only [`Self::delete_if_owned`] performs one.
+    /// The underlying [`jammi_db::storage::StorageUrl`] — every READ (the
+    /// manifest write target, the finalize CAS's `artifact_path`, the
+    /// terminal `jobs.result`) needs the bytes; only a DELETE goes through
+    /// [`Self::delete`] instead.
     fn url(&self) -> &jammi_db::storage::StorageUrl {
-        match self {
-            PublishedPrefix::Owned(u) | PublishedPrefix::Reused(u) => u,
-        }
+        &self.0
     }
 
-    /// Best-effort delete iff this attempt owns the bytes (see the type's
-    /// own doc for why a `Reused` prefix is never touched here), routed
-    /// EXCLUSIVELY through the guarded [`PrefixReferences`] port — never
-    /// the unguarded [`ArtifactStore::delete_artifact_prefix`] primitive. A
+    /// Best-effort delete, routed EXCLUSIVELY through the guarded
+    /// [`PrefixReferences`] port — never the unguarded
+    /// [`ArtifactStore::delete_artifact_prefix`] primitive. A
     /// [`jammi_db::error::JammiError::Storage`]`(`[`StorageError::Referenced`]`)`
     /// refusal means some OTHER live `models` row names these exact bytes:
     /// logged with the prefix and the referencing count, never escalated —
     /// the bytes belong to that other row now, and this attempt's own
     /// row-level cleanup (see [`abandon_unfinalized_attempt`]) proceeds
     /// regardless.
-    async fn delete_if_owned(&self, refs: &dyn PrefixReferences) {
-        if let PublishedPrefix::Owned(url) = self {
-            if let Err(e) = refs.delete_unreferenced_prefix(url).await {
-                match e {
-                    JammiError::Storage(StorageError::Referenced { prefix, count }) => {
-                        tracing::warn!(
-                            prefix,
-                            count,
-                            "abandon: this attempt's own prefix is still referenced by another \
-                             live models row; leaving the bytes in place"
-                        );
-                    }
-                    other => tracing::debug!(
-                        error = %other,
-                        "abandon: best-effort prefix delete failed"
-                    ),
+    async fn delete(&self, refs: &dyn PrefixReferences) {
+        if let Err(e) = refs.delete_unreferenced_prefix(&self.0).await {
+            match e {
+                JammiError::Storage(StorageError::Referenced { prefix, count }) => {
+                    tracing::warn!(
+                        prefix,
+                        count,
+                        "abandon: this attempt's own prefix is still referenced by another \
+                         live models row; leaving the bytes in place"
+                    );
                 }
+                other => tracing::debug!(
+                    error = %other,
+                    "abandon: best-effort prefix delete failed"
+                ),
             }
         }
     }
 }
 
 /// Every exit arm between a successful `register_model` and a WON finalize
-/// CAS must leave behind neither
-/// this attempt's own unpublished bytes (`prefix`, reclaimed iff `Owned` —
-/// see [`PublishedPrefix`]'s own doc) nor the unfinalized `models` row
-/// `register_model` just created: a row still carrying `artifact_path IS
-/// NULL` when this attempt gives up is exactly the poisoned-zombie shape the
-/// probe's servability predicate exists to keep unreachable from the
-/// SERVABLE set, and
+/// CAS must leave behind neither this attempt's own unpublished bytes
+/// (`prefix`, best-effort reclaimed via [`PublishedPrefix::delete`]) nor the
+/// unfinalized `models` row `register_model` just created: a row still
+/// carrying `artifact_path IS NULL` when this attempt gives up is a
+/// permanently-unservable zombie, and
 /// [`jammi_db::catalog::Catalog::delete_registered_model_if_unfinalized`]'s
 /// own guard (`artifact_path IS NULL`) means calling this can never delete a
 /// row a WINNING finalize CAS (this attempt's or a peer's) already
@@ -3856,10 +3678,10 @@ impl PublishedPrefix {
 /// Best-effort on both halves: an error here is logged, never escalated,
 /// since the caller's own terminal classification (this function's return)
 /// is what the job's outcome hinges on, not this cleanup. The row-level
-/// cleanup below runs UNCONDITIONALLY, even when [`PublishedPrefix::
-/// delete_if_owned`] refuses to touch the bytes because another live row
-/// now names them — the bytes are the other row's business, but this
-/// attempt's own zombie row is still this attempt's to reap.
+/// cleanup below runs UNCONDITIONALLY, even when [`PublishedPrefix::delete`]
+/// refuses to touch the bytes because another live row now names them —
+/// the bytes are the other row's business, but this attempt's own zombie
+/// row is still this attempt's to reap.
 async fn abandon_unfinalized_attempt(
     refs: &dyn PrefixReferences,
     catalog: &Arc<Catalog>,
@@ -3867,7 +3689,7 @@ async fn abandon_unfinalized_attempt(
     model_id: &str,
     version: i32,
 ) {
-    prefix.delete_if_owned(refs).await;
+    prefix.delete(refs).await;
     if let Err(e) = catalog
         .delete_registered_model_if_unfinalized(model_id, version)
         .await
@@ -8116,21 +7938,21 @@ mod tests {
             .expect("a second stop_and_join on an already-joined worker is Ok");
     }
 
-    /// `PublishedPrefix::delete_if_owned`'s `Owned` arm routes through the
-    /// SAME guarded [`PrefixReferences`] port as every other `models/**`
-    /// byte-delete — it does not trust its own ownership claim
-    /// unconditionally. Real traffic can never make two attempts collide on
-    /// the SAME prefix (`job_id` uniqueness), so this fabricates the
-    /// collision directly (a global prefix a second tenant's row also
-    /// names): a SECOND tenant's already-servable model row is made to name
-    /// the exact bytes this attempt is about to abandon as `Owned`. Oracle:
-    /// the bytes survive, the typed refusal is observed directly, and the
-    /// abandoning attempt's OWN unfinalized row is still reaped (the two
-    /// halves of `abandon_unfinalized_attempt` are independent).
+    /// `PublishedPrefix::delete` routes through the SAME guarded
+    /// [`PrefixReferences`] port as every other `models/**` byte-delete — it
+    /// does not trust its own ownership claim unconditionally. Real traffic
+    /// can never make two attempts collide on the SAME prefix (`job_id`
+    /// uniqueness), so this fabricates the collision directly (a global
+    /// prefix a second tenant's row also names): a SECOND tenant's
+    /// already-servable model row is made to name the exact bytes this
+    /// attempt is about to abandon. Oracle: the bytes survive, the typed
+    /// refusal is observed directly, and the abandoning attempt's OWN
+    /// unfinalized row is still reaped (the two halves of
+    /// `abandon_unfinalized_attempt` are independent).
     ///
-    /// Mutation: reverting [`PublishedPrefix::delete_if_owned`] to call the
-    /// unguarded `ArtifactStore::delete_artifact_prefix` directly kills this
-    /// test (the reuser's bytes are deleted out from under it).
+    /// Mutation: reverting [`PublishedPrefix::delete`] to call the unguarded
+    /// `ArtifactStore::delete_artifact_prefix` directly kills this test (the
+    /// reuser's bytes are deleted out from under it).
     #[tokio::test(flavor = "multi_thread")]
     async fn abandon_never_deletes_an_owned_prefix_a_second_tenants_row_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -8201,13 +8023,13 @@ mod tests {
             other => panic!("expected StorageError::Referenced, got {other:?}"),
         }
 
-        // Drive the real abandon path with an `Owned` prefix pointed at the
+        // Drive the real abandon path with a published prefix pointed at the
         // colliding bytes.
         let refs: &dyn PrefixReferences = &*result_store;
         abandon_unfinalized_attempt(
             refs,
             &owner_catalog,
-            &PublishedPrefix::Owned(prefix.clone()),
+            &PublishedPrefix(prefix.clone()),
             "abandoning-attempt",
             1,
         )

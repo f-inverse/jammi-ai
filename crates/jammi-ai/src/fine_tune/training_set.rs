@@ -192,13 +192,27 @@ async fn materialize_and_read(
 ///   directly (skipping the quoting) is still on the identical route to the
 ///   same relation, and the order hazard is the same.
 ///
-/// [`TrainingSetTable::table_name`] is deliberately NOT on this scan: it
-/// returns the bare catalog name with no `jammi.` schema prefix, so it
-/// cannot stand in for either route above without a caller re-deriving the
-/// missing prefix and quoting by hand — no such caller exists in this crate
-/// today, and one that started would be re-implementing
-/// `sql_relation`/`registered_name`, which brings it onto this scan the
-/// moment it calls either.
+/// # This scan's universe is exactly these three named routes — nothing wider
+///
+/// The scan matches literal invocation syntax for `sql_relation`/
+/// `registered_name`, so it covers a caller **only** if the caller spells one
+/// of those two names. [`TrainingSetTable::table_name`] returns the bare
+/// catalog name with no `jammi.` schema prefix and is NOT one of the three
+/// needles, so a caller that hand-builds the relation string from it — e.g.
+/// `format!("SELECT * FROM \"jammi.{}\"", table.table_name())`, reproducing
+/// [`TrainingSetTable::sql_relation`]'s own formatting by hand instead of
+/// calling it — is invisible to this scan: it reaches the identical
+/// relation, carries the identical order hazard, and is counted nowhere in
+/// the table above.
+/// [`TrainingSetTable::record`] is a public field, so nothing in the type
+/// system stops this: the allow-list is a scan over spelling, not a closed
+/// set over meaning, and a hand-built key never triggers it no matter how
+/// many such callers exist. Making the hand-built form unrepresentable — a
+/// `RelationKey` newtype that owns quoting and is the only value
+/// [`TrainingSetTable::sql_relation`]-shaped code can hold — is tracked as
+/// <https://github.com/f-inverse/jammi-ai/issues/551>; until it lands, this
+/// scan's guarantee is "every caller that reaches for the relation by NAME
+/// applies the order", not "every caller that reaches the relation at all".
 ///
 /// One exclusion, by construction rather than by allow-listing: `sql_relation`'s
 /// OWN body (`crates/jammi-db/src/store/mod.rs`) calls `registered_name()` on

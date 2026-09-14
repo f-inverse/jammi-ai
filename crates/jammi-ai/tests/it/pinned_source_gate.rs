@@ -1336,8 +1336,8 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
            // (see `session_registration_literal_sites`'s allowlist entry for
            // this same file) rather than through `pinned_provider` — an
            // unpinned, version-branched content read, re-exported publicly at
-           // `read_vectors`, `jammi-ai/src/session.rs:1008` and
-           // `read_vectors`, `jammi-ai/src/local_session.rs:363`.
+           // `read_vectors`, `jammi-ai/src/session.rs:1056` and
+           // `read_vectors`, `jammi-ai/src/local_session.rs:365`.
            // `READ_VECTORS_CALLERS` above is the machine-checked claim: its
            // only two in-tree callers are those two forwarding wrappers, each
            // a one-line delegate, never a provenance-persisting producer.
@@ -2604,8 +2604,8 @@ fn allowlists_match_current_hits_exactly() {
 //     a schema of the same name existed before, it is replaced in the
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
-//     `deregister_schema` is its inverse. `ResultStore::
-//     install_result_schema` (`crates/jammi-db/src/store/mod.rs:1105`) calls
+//     `deregister_schema` is its inverse. `ResultStore`'s own
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1095` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -3166,7 +3166,7 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living
 // anywhere outside those two `src` trees is outside its universe entirely --
 // under `tests/it/` in either crate (e.g. the five `.register_table(`
-// calls this file's own review list keys to
+// calls this file's own review list keys to, `.register_table(`,
 // `crates/jammi-db/tests/it/materialization.rs:565/:616/:669/:671/:1024`,
 // none of them under `crates/jammi-db/src`), or in a third crate, both
 // count the same way. A fifth gap sits inside the scan itself, not at its

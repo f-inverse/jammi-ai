@@ -280,8 +280,9 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
 /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
 /// and never reuses across two independent reads of it — the same honest
 /// off-ness the embedding cache records (`pipeline/embedding.rs:89-93`).
-/// Reuse over a genuinely PINNED anchor is exercised at the store level
-/// (`crates/jammi-db/tests/it/materialization.rs:767/:847/:911`); this is the
+/// Reuse over a genuinely PINNED anchor is exercised at the store level, in
+/// `two_runs_over_one_pinned_definition_share_one_training_set`,
+/// `crates/jammi-db/tests/it/materialization.rs:854`; this is the
 /// job-level corollary: each job's OWN materialize call runs the producer
 /// fresh (the reuse probe never matches), so two jobs leave two tables
 /// behind, each the one its own run actually read from before training.

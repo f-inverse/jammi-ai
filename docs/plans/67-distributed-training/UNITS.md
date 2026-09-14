@@ -127,20 +127,38 @@ per-step `$?`. Naming per README ruling 23.
 ## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B commit 5, concurrent with U2b)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::FineTune`;
-  `MaterializationEnv` kernel-profile), `catalog/{schema.rs, migrations.rs}` (`model_materialization`,
-  next free number at rebase, both pin sites; nullable columns), `catalog/model_repo.rs` (`probe_model_by_definition`, NULL never matches),
-  `store/artifact.rs` (manifest last), `store/reconcile.rs` (prefix reaped only when
-  unreferenced), `tests/it/migrations.rs`. (ai-core) `fine_tune/worker.rs::publish_and_finalize`
-  (materialization; probe before training; own name → reused prefix), `pipeline/recompute.rs`
-  (arm = retrain), `model/resolver.rs` (manifest on `ModelRecord`), the canonical-encoding
-  producer and the exhaustive-destructuring completeness test in `jammi-ai` (and `jammi-wire`
-  for `FineTuneConfig`). (docs-ci) the `PRODUCING-DESCRIPTOR-VARIANTS` guide block (co-owned).
+  `MaterializationEnv` kernel-profile field — declared, UNCOVERED, no writer;
+  https://github.com/f-inverse/jammi-ai/issues/546), `catalog/{schema.rs, migrations.rs}`
+  (`model_materialization` migration 033, both pin sites; two nullable columns —
+  `definition_hash`, `input_anchors_json`; no `manifest_path` column, since the sidecar path
+  is always derived from `artifact_path`), `catalog/model_repo.rs` (`probe_model_by_definition`,
+  NULL never matches), `store/artifact.rs` (manifest last), `store/reconcile.rs`
+  (`prefix_is_referenced`, an admin-scoped whole-catalog scan, guards every `models/`-prefix
+  byte-delete — the reap and `delete_unreferenced_prefix` both consult it; `ReconcileReport.
+  referenced`/`referenced_count`, carried on the wire, name a prefix found still referenced),
+  `tests/it/migrations.rs`. (ai-core) `fine_tune/worker.rs::publish_and_finalize`
+  (materialization; probe before training; own name → reused prefix; every byte-delete on the
+  abandon path routes through the guarded `PrefixReferences` port, never the unguarded
+  primitive), `pipeline/recompute.rs` (arm = retrain), `model/resolver.rs` (manifest on
+  `ModelRecord`), `fine_tune/spec.rs` (`cache` lives on `TrainingSpec::FineTune` itself, not
+  `TrainingCommon`, so `TrainingSpec::GraphFineTune` cannot carry one — a stray `cache` key
+  under `graph_fine_tune` in a persisted `jobs.spec` row is dropped at deserialize, not
+  refused; a hard error on unknown keys is a separate reshape,
+  https://github.com/f-inverse/jammi-ai/issues/548), `wire/training.rs`
+  (`lora_common_from_proto` refuses `cache = Use` for `GraphFineTune`, typed, at decode), the
+  canonical-encoding producer and the exhaustive-destructuring completeness test in `jammi-ai`
+  (and `jammi-wire` for `FineTuneConfig`). (docs-ci) the `PRODUCING-DESCRIPTOR-VARIANTS` guide
+  block (co-owned).
 - **invariants_to_preserve**: K5, K7 (exhaustive destructuring of `FineTuneConfig` and
-  `TrainingCommon`, fields existing at this commit; the descriptor holds an opaque versioned
-  canonical encoding, never a foreign type), K1, B6, B1 (no `register_*`), doc parity.
+  `TrainingCommon`; the descriptor holds an opaque versioned canonical encoding, never a
+  foreign type), K1, B6, B1 (no `register_*`), doc parity.
 - **acceptance**: (a) same spec on the same training-set digest with `CachePolicy::Use` trains
-  once, two model rows share one prefix, deleting one leaves the prefix (RED at base); (b) the
-  exhaustive-destructuring completeness test (RED at base); (c) the append-only migration test admits the appended migration.
+  once, two model rows share one prefix; deleting either row is always allowed (no catalog edge
+  enforces which is the original — the ownership edge is
+  https://github.com/f-inverse/jammi-ai/issues/547) and leaves the prefix servable through the
+  other row; the prefix itself is reclaimed only once no live row, in any tenant, still names
+  it; (b) the exhaustive-destructuring completeness test; (c) the append-only migration test
+  admits the appended migration.
 - **lane**: hermetic. **depends_on**: U2a. **size**: L (migration, NULL-probe semantics,
   reference-counted reaping, artifact ordering, ten files across two crates). Co-ownership:
   `manifest.rs` and `recompute.rs` with U2a/U4b.

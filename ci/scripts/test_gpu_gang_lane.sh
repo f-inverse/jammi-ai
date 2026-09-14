@@ -707,16 +707,28 @@ fi
 
 # ============================================================================
 # citation fixture: every "UNITS.md § U7b acceptance (id-secrecy)" citation
-# under ci/scripts resolves to a real UNITS.md line naming the obligation --
-# the id-secrecy scan's rebuild is SCHEDULED in the committed plan, never
-# named without anywhere for that name to resolve to.
+# resolves to that exact obligation living INSIDE U7b's OWN heading-bounded
+# section of the committed plan (never merely somewhere in the file -- a
+# relocation under a DIFFERENT unit's heading must fail this), and comes
+# from EXACTLY the enumerated citing file set (never `>= 1`, which a
+# citation added to or dropped from some OTHER file would satisfy just as
+# well) -- the id-secrecy scan's rebuild is SCHEDULED in the committed plan,
+# never named without anywhere for that name to resolve to, and never
+# silently satisfied by the obligation drifting into a different unit's
+# section.
 # ============================================================================
 UNITS_MD="$REPO_ROOT/docs/plans/67-distributed-training/UNITS.md"
-citation_sites="$(grep -rl 'UNITS.md § U7b acceptance (id-secrecy)' "$DIR" 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$citation_sites" -ge 1 ] && grep -q 'id-secrecy' "$UNITS_MD"; then
-  ok "citation fixture: every 'UNITS.md § U7b acceptance (id-secrecy)' citation under ci/scripts resolves to a UNITS.md line naming id-secrecy (${citation_sites} site(s))"
+EXPECTED_CITING_FILES="ci/scripts/runpod_gpu_gang.sh
+ci/scripts/test_gpu_gang_lane.sh"
+citing_files="$(cd "$REPO_ROOT" && grep -rl 'UNITS.md § U7b acceptance (id-secrecy)' ci/scripts 2>/dev/null | sort)"
+# U7b's own section: from its `## U7b ` heading up to (not including) the
+# next top-level `## ` heading -- the id-secrecy acceptance line must sit
+# strictly inside that span.
+u7b_section="$(awk '/^## U7b /{on=1; print; next} /^## /{if (on) exit} on' "$UNITS_MD")"
+if [ "$citing_files" = "$EXPECTED_CITING_FILES" ] && printf '%s\n' "$u7b_section" | grep -q 'acceptance (id-secrecy)'; then
+  ok "citation fixture: 'UNITS.md § U7b acceptance (id-secrecy)' is cited by exactly the enumerated file set and the obligation itself sits inside U7b's own UNITS.md section"
 else
-  bad "citation fixture: no citation resolves -- ${citation_sites} site(s) under ci/scripts, UNITS.md id-secrecy line present=$(grep -q 'id-secrecy' "$UNITS_MD" && echo yes || echo no)"
+  bad "citation fixture: citing_files=[$(printf '%s' "$citing_files" | tr '\n' ',')] expected=[$(printf '%s' "$EXPECTED_CITING_FILES" | tr '\n' ',')]; U7b section carries id-secrecy=$(printf '%s\n' "$u7b_section" | grep -q 'acceptance (id-secrecy)' && echo yes || echo no)"
 fi
 
 echo

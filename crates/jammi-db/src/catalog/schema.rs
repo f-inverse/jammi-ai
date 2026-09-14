@@ -1183,7 +1183,9 @@ ALTER TABLE models ADD COLUMN definition_hash TEXT;
 ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
 CREATE INDEX idx_models_definition_hash ON models(definition_hash);
 CREATE INDEX idx_models_artifact_path ON models(artifact_path);
-/// Migration 033 (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6): the
+"#;
+
+/// Migration 034 (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6): the
 /// gang's training-set identity pair on `jobs` — the `ArtifactDigest` of the
 /// coordinator's materialized `TrainingSet` (`training_set_ref`) and the
 /// `result_tables` NAME it materialized under (`training_set_location`),

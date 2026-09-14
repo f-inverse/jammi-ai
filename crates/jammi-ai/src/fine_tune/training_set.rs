@@ -416,7 +416,6 @@ mod reader_class_allow_list {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +460,4 @@ mod tests {
              relative to constructing the SAME fields directly"
         );
     }
-
 }

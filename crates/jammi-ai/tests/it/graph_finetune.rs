@@ -471,11 +471,14 @@ async fn fine_tune_graph_end_to_end_completes() {
     // P3 (#500 U2a fix round 4, the graph-arm excision): this fixture's
     // `reconstruct_graph_loader` is `origin/main` (fe5ac560)'s text, restored
     // rather than re-derived, so it must produce `origin/main`'s BYTES too —
-    // not just its source. Measured, not assumed: this exact test, unmodified,
-    // run on a detached `origin/main` checkout, prints this same fingerprint
-    // for `adapter.safetensors`. The two agree, which is the expected
-    // consequence of identical code over an identical seeded fixture, not a
-    // coincidence this pin merely records.
+    // not just its source. Measured, not assumed: this fixture's OWN body is
+    // byte-identical to `origin/main`'s (the `fingerprint()` helper and this
+    // `assert_eq!` are this pin's own additions, grafted onto that body to
+    // read the value out), and the value below is derived from code identity
+    // over the whole producing path — `reconstruct_graph_loader`, `run_spec`'s
+    // `GraphFineTune` arm, `graph_sampler.rs`, `trainer.rs`, `model/**` and
+    // `session.rs` are byte-identical to `fe5ac560` — not by re-running an
+    // unmodified test on a separate checkout.
     assert_eq!(
         fingerprint(&std::fs::read(&adapter).unwrap()),
         "1184:8f34fc6e6f33abea",

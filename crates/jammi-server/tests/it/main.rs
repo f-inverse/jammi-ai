@@ -4,6 +4,7 @@ mod common;
 mod composability_seam;
 mod flight_annotate;
 mod flight_tenant;
+mod gang_rank_admission_oracle;
 mod gang_service;
 mod grpc_byo_auth;
 mod grpc_embedding;

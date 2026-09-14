@@ -3102,16 +3102,25 @@ its own status:
 1. **Wire K2** (`gang.rs`, before any row read): `world == 0` →
    `InvalidArgument("world must be greater than zero")`; `rank >= world` →
    `InvalidArgument("rank must be less than world")`.
-2. **I-GANG, a row predicate AND a host-local verify — two conjuncts.**
-   (a) `Catalog::get_job_for_rank(job_id)` (`crates/jammi-db/src/catalog/jobs_repo.rs`,
-   primary-key-only, no tenant predicate, never admin scope) returns a row
-   iff: `status = 'running'`; `claimed_by = assign.coordinator_instance_id`;
-   `attempts == assign.attempt`; the lease is live (the negation of
+2. **I-GANG, a row predicate AND a host-local verify — two conjuncts, the
+   ROW-keyed lattice (fix round 1, R2).** (a) `Catalog::get_job_for_rank(job_id)`
+   (`crates/jammi-db/src/catalog/jobs_repo.rs`, primary-key-only, no tenant
+   predicate, never admin scope) returns a row iff: `status = 'running'`;
+   `claimed_by = assign.coordinator_instance_id`; `attempts ==
+   assign.attempt`; the lease is live (the negation of
    `lease_expired_clause`, `crates/jammi-db/src/catalog/lease.rs` — a NULL
-   lease column reads not-live, never live-by-default); and, when
-   `assign.world > 1`, `training_set_ref`/`training_set_location` are both
-   non-null. Any conjunct false, or the row absent, refuses. (b) For
-   `world > 1` only, AFTER (a) succeeds: `resolve_training_set_identity`
+   lease column reads not-live, never live-by-default). The ROW's OWN
+   `RankAdmissionRow::world_size` (decoded from the job's `spec` JSON, never
+   the caller's `Assign.world`) then decides two more conjuncts inside the
+   `GangServer::run_rank` handler itself, never inside `get_job_for_rank`'s
+   own statement: `assign.world != row.world_size` is itself a refusal (a
+   caller-keyed gate lets a `world_size > 1` job admit under a
+   caller-supplied `world = 1`, skipping (b) entirely — the closing-audit #1
+   F1 finding this row-keyed lattice closes); and, only when `row.world_size
+   > 1` (by then known to equal `assign.world`), `training_set_ref`/
+   `training_set_location` must both be non-null. Any conjunct false, or the
+   row absent, refuses. (b) For `row.world_size > 1` only, AFTER (a)
+   succeeds: `resolve_training_set_identity_classified`
    (`crates/jammi-server/src/grpc/gang.rs`) performs its own host-local
    sidecar verify — `Catalog::get_result_table_for_tenant` (the STRICT
    tenant predicate `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`,

@@ -345,18 +345,21 @@ fn mask_non_code_hides_comments_and_strings_but_not_code() {
         "a block-comment occurrence must be masked"
     );
 
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — proves a whole `fn ... { ... }` literal is masked
     let string_literal = "fn f() { let s = \"get_job_for_rank(\"; }\n";
     assert!(
         !mask_non_code(string_literal).contains("get_job_for_rank("),
         "a string-literal occurrence must be masked"
     );
 
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — same reason as the plain string literal above
     let raw_string_literal = "fn f() { let s = r#\"get_job_for_rank(\"#; }\n";
     assert!(
         !mask_non_code(raw_string_literal).contains("get_job_for_rank("),
         "a raw-string-literal occurrence must be masked"
     );
 
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — `fn` here is fixture scaffolding around the call under test
     let real_call = "fn f() { catalog.get_job_for_rank(&id); }\n";
     assert!(
         mask_non_code(real_call).contains("get_job_for_rank("),
@@ -371,12 +374,14 @@ fn mask_non_code_hides_comments_and_strings_but_not_code() {
 /// or nothing at all) IS.
 #[test]
 fn contains_code_token_rejects_a_same_tokened_longer_identifier() {
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — reproduces this file's own test-fn-name shape on purpose
     let fn_declaration = "fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {}\n";
     assert!(
         !contains_code_token(fn_declaration, "get_job_for_rank("),
         "a longer identifier merely ending in the token must not count as a call"
     );
 
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — same reason as the identical fixture above
     let method_call = "fn f() { catalog.get_job_for_rank(&id); }\n";
     assert!(
         contains_code_token(method_call, "get_job_for_rank("),
@@ -389,6 +394,7 @@ fn contains_code_token_rejects_a_same_tokened_longer_identifier() {
         "a call at byte 0 (no preceding byte at all) must count"
     );
 
+    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — same reason as above
     let whitespace_preceded = "fn f() { let _ = get_job_for_rank(&id); }\n";
     assert!(
         contains_code_token(whitespace_preceded, "get_job_for_rank("),

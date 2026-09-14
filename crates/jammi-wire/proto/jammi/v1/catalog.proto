@@ -775,10 +775,25 @@ message ReconcileReport {
   // `damaged` was truncated.
   uint64 damaged_count = 12;
   // `true` iff any of `rows_failed` / `orphans` / `pending` / `unattributed`
-  // / `damaged` was cut to the report's list cap — the corresponding
-  // `*_count` field is still the true total either way.
+  // / `damaged` / `referenced` was cut to the report's list cap — the
+  // corresponding `*_count` field is still the true total either way.
   bool truncated = 13;
   // The true count of rows flipped `ready -> failed` this pass, independent
   // of whether `rows_failed` was truncated.
   uint64 rows_failed_count = 14;
+  // A `models/`-namespaced object this pass's reap-site consult of the
+  // engine's referenced-prefix predicate found still referenced by some live
+  // `models` row, in SOME tenant scope — reported instead of reclaimed, at
+  // any grace or `apply`. Distinct from `damaged` (a live row names the
+  // prefix but its manifest is absent) — this field means the opposite
+  // direction of evidence: the object itself looked unattributed, but a
+  // fresh admin-scoped catalog consult still found a live reference. Never
+  // names row ids, model names, or tenant ids — only the object key. Unset
+  // on an older encoder decodes to empty, matching every other repeated
+  // field's additive default.
+  repeated string referenced = 15;
+  // The true count of `referenced` keys found this pass, independent of
+  // whether `referenced` was truncated. Unset on an older encoder decodes to
+  // `0`.
+  uint64 referenced_count = 16;
 }

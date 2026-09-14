@@ -558,6 +558,8 @@ pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileRepor
         damaged: report.damaged.clone(),
         damaged_count: report.damaged_count,
         truncated: report.truncated,
+        referenced: report.referenced.clone(),
+        referenced_count: report.referenced_count,
     }
 }
 
@@ -565,14 +567,6 @@ pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileRepor
 /// inverse of [`reconcile_report_to_proto`], for the remote client receive
 /// side. Total: every wire field maps straight onto the engine struct, no
 /// fallible decode.
-///
-/// [`ReconcileReport::referenced`] / [`ReconcileReport::referenced_count`]
-/// have no matching `pb::ReconcileReport` wire field, so this decode cannot
-/// recover them — they are filled with the empty/zero value here rather
-/// than refusing to compile every crate downstream of `jammi-wire`. A
-/// remote client therefore never observes a referenced-but-unreclaimed key
-/// a report found; adding the real proto field and wiring it through both
-/// directions closes this gap.
 pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileReport {
     ReconcileReport {
         scope: report.scope,
@@ -589,8 +583,8 @@ pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileRepo
         damaged_count: report.damaged_count,
         truncated: report.truncated,
         bytes_reclaimed: report.bytes_reclaimed,
-        referenced: Vec::new(),
-        referenced_count: 0,
+        referenced: report.referenced,
+        referenced_count: report.referenced_count,
     }
 }
 
@@ -687,11 +681,11 @@ mod tests {
             bytes_reclaimed: 12_345,
             orphan_count: 2,
             pending_count: 1,
-            // Not yet on the wire (see `reconcile_report_from_proto`'s own
-            // doc) — never asserted on `decoded` below for exactly that
-            // reason.
-            referenced: Vec::new(),
-            referenced_count: 0,
+            referenced: vec![
+                "models/_global/beef-job/debug_dump.tmp".to_string(),
+                "models/01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a/other-job/scratch.bin".to_string(),
+            ],
+            referenced_count: 2,
         };
         let encoded = reconcile_report_to_proto(&report);
         let decoded = reconcile_report_from_proto(encoded);
@@ -709,6 +703,40 @@ mod tests {
         assert_eq!(decoded.damaged_count, report.damaged_count);
         assert_eq!(decoded.truncated, report.truncated);
         assert_eq!(decoded.bytes_reclaimed, report.bytes_reclaimed);
+        assert_eq!(decoded.referenced, report.referenced);
+        assert_eq!(decoded.referenced_count, report.referenced_count);
+    }
+
+    /// The additive-default property: a wire message that never sets
+    /// `referenced` / `referenced_count` at all (the shape an older encoder,
+    /// compiled before these fields existed, would have produced) decodes to
+    /// the empty/zero value — never an error, never a truncated-but-nonzero
+    /// mismatch — exactly like every other repeated field's proto3 default.
+    #[test]
+    fn reconcile_report_referenced_defaults_to_empty_when_unset_on_the_wire() {
+        let wire = pb::ReconcileReport {
+            scope: "_global".to_string(),
+            applied: false,
+            rows_failed: Vec::new(),
+            rows_failed_count: 0,
+            orphans: Vec::new(),
+            orphan_count: 0,
+            pending: Vec::new(),
+            pending_count: 0,
+            unattributed: Vec::new(),
+            unattributed_count: 0,
+            damaged: Vec::new(),
+            damaged_count: 0,
+            truncated: false,
+            bytes_reclaimed: 0,
+            // Deliberately omitted: `referenced` / `referenced_count` take
+            // their `Default` (empty vec / 0), simulating an older encoder's
+            // bytes on the wire.
+            ..Default::default()
+        };
+        let decoded = reconcile_report_from_proto(wire);
+        assert_eq!(decoded.referenced, Vec::<String>::new());
+        assert_eq!(decoded.referenced_count, 0);
     }
 
     /// `grace_secs` unset on the wire (proto3 `optional uint64`, never sent —

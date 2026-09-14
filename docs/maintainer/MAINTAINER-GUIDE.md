@@ -3176,12 +3176,14 @@ erroring, and `Catalog::fresh_instance` erroring, to `Status::unavailable(..)`
 fact. `map_engine_error` is never called on the `RunRank` path — every
 admission-time catalog read on it uses this same classification. This
 handler never reaches `Catalog::get_result_table_for_tenant` or
-`ResultStore::read_materialization_manifest` at all (the training-set
-sidecar lookup those back is `resolve_training_set_identity_classified`,
-`crates/jammi-server/src/grpc/gang.rs` — a standalone, directly-tested
-primitive with no production caller in this unit, retained for
-`HostAdmission` to build on, docs/plans/67-distributed-training/UNITS.md §
-U5a-2). The mid-stream re-verification three-way split
+`ResultStore::read_materialization_manifest` at all — the training-set
+sidecar lookup they backed is `HostAdmission`'s to build from the filed
+property, not from parked code in this crate (no such wrapper exists here
+today). `Catalog::get_result_table_for_tenant`'s own strict-predicate
+property (a NULL-tenant row never matches a real tenant's lookup) is
+`jammi-db`'s own tenant-isolation guard, tested directly there
+(`crates/jammi-db/tests/it/result_tables.rs`), independent of any caller
+built on top of it. The mid-stream re-verification three-way split
 (`Refuted`/`Unavailable`/`StoreUnavailable`) is likewise built with
 `HostAdmission` once an admitted session exists to re-verify inside.
 

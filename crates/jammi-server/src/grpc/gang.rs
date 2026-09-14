@@ -33,7 +33,10 @@
 //! [`GangRefusalReason::MultiHostUnsupported`]) — the training-set pair
 //! conjunct and its sidecar verify that would admit a genuine multi-host row
 //! are `HostAdmission`'s to build (docs/plans/67-distributed-training/UNITS.md
-//! § U5a-2); this handler never attempts them.
+//! § U5a-2; the property this conjunct must satisfy, and everything deleted
+//! from this file to ship the `world_size == 1` lattice alone, is filed at
+//! <https://github.com/f-inverse/jammi-ai/issues/566>); this handler never
+//! attempts them.
 //!
 //! **A catalog fault during admission is `Unavailable`, never
 //! `FailedPrecondition`**: see `admission_catalog_fault`.
@@ -67,13 +70,9 @@ use std::time::Duration;
 use futures::Stream;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::{RankAdmissionRow, WorldSizeFact};
-use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::JammiError;
-use jammi_db::storage::StorageUrl;
-use jammi_db::store::ResultStore;
 use jammi_db::tenant_scope::TenantBinding;
-use jammi_db::TenantId;
 use tonic::{Request, Response, Status};
 
 use tokio_stream::StreamExt;
@@ -136,7 +135,9 @@ pub enum GangRefusalReason {
     /// — this unit ships the `world_size == 1` lattice only; the
     /// training-set pair conjunct and its sidecar verify that would admit a
     /// genuine multi-host row are `HostAdmission`'s to build
-    /// (docs/plans/67-distributed-training/UNITS.md § U5a-2).
+    /// (docs/plans/67-distributed-training/UNITS.md § U5a-2 — the property
+    /// this refusal holds the line for, filed at
+    /// <https://github.com/f-inverse/jammi-ai/issues/566>).
     MultiHostUnsupported,
     /// The coordinator's own `instances` row was absent or stale
     /// (`Catalog::fresh_instance` returned `false`).
@@ -257,11 +258,9 @@ impl GangRefusalHandle {
 /// with `HostAdmission` (docs/plans/67-distributed-training/UNITS.md §
 /// U5a-2) once an admitted session exists to re-verify inside. This unit's
 /// handler never reaches `Catalog::get_result_table_for_tenant` or
-/// `ResultStore::read_materialization_manifest` (the training-set sidecar
-/// lookup `resolve_training_set_identity_classified` still uses this same
-/// classification for, as a standalone, directly-tested primitive —
-/// `HostAdmission`'s to call once it exists, docs/plans/67-distributed-training/UNITS.md
-/// § U5a-2).
+/// `ResultStore::read_materialization_manifest` at all — the training-set
+/// sidecar lookup they backed is `HostAdmission`'s to build from the filed
+/// property, not from parked code in this crate.
 fn admission_catalog_fault(err: JammiError) -> Status {
     tracing::warn!(
         error = %err,
@@ -424,165 +423,5 @@ impl GangService for GangServer {
         Err(Status::unimplemented(
             "gang admission is not implemented on this build",
         ))
-    }
-}
-
-/// Verifies (never locates) the result table
-/// `training_set_location` names, for the tenant `get_job_for_rank`
-/// resolves the calling job under — the ONE tenant-pinned lookup a rank
-/// performs, no listing, no candidate search.
-///
-/// Two properties bind this function:
-///
-/// - **Admin scope is guarded explicitly at this call site, not left to the
-///   verb below.** [`TenantBinding::is_admin_scope`] reads ambient
-///   task-local state this call site does not control by construction, so
-///   this function refuses immediately, before ever calling the strict
-///   resolver, whenever admin scope is active — regardless of which tenant
-///   or table it was asked to resolve. This never relies on
-///   `jammi_db::catalog::Catalog::get_result_table_for_tenant`'s OWN
-///   admin-scope behaviour (unchanged by this function: called directly,
-///   outside this guard, it still resolves any tenant's table under admin
-///   scope, matching the rest of that repo's verbs).
-/// - **The lookup is the strict-predicate verb, never the relaxed read.**
-///   The lookup below is exactly `Catalog::get_result_table_for_tenant`,
-///   never `Catalog::get_result_table` — the strict predicate `tenant_id =
-///   $t OR (tenant_id IS NULL AND $t IS NULL)`, never the relaxed `OR
-///   tenant_id IS NULL` a *read* resolver uses to also see a global row.
-///
-/// The admission-time classification collapses every unresolvable /
-/// unverifiable outcome — name absent, the strict resolver returns `None`,
-/// the row not `ready`, the sidecar absent (`Ok(None)`), a digest mismatch,
-/// or [`ResultStore::read_materialization_manifest`] itself erroring (a
-/// network/backend fault reaching this host's own store) — into the ONE
-/// member-scoped `FailedPrecondition` already names for this class; the
-/// three-way split that distinguishes a `StoreUnavailable` re-verification
-/// end from a `Refuted` one is mid-stream, once an admitted session
-/// (`HostAdmission`, docs/plans/67-distributed-training/UNITS.md § U5a-2)
-/// exists to be mid-stream in.
-///
-/// This is the ONLY call site this program has for
-/// `Catalog::get_result_table_for_tenant` outside its own crate's tests
-/// (`impossibility_claims`, below) — it sits inside
-/// `resolve_training_set_identity_classified`, which has NO production
-/// caller in this unit: `GangServer::run_rank` ships the `world_size == 1`
-/// lattice only and never reaches a tenant-scoped catalog read (see the
-/// module-level doc). This function, and the classification it wraps, are
-/// retained as the tested primitive the multi-host admission gate builds on
-/// once `HostAdmission` exists to admit a `world_size > 1` row into
-/// (docs/plans/67-distributed-training/UNITS.md § U5a-2) — its only callers
-/// today are the two direct unit tests below, which exercise it in isolation
-/// to demonstrate the tenant-isolation and admin-scope hazards it guards
-/// against.
-pub async fn resolve_training_set_identity(
-    store: &ResultStore,
-    tenant: Option<TenantId>,
-    training_set_ref: &str,
-    training_set_location: &str,
-) -> Result<(), Status> {
-    match resolve_training_set_identity_classified(
-        store,
-        tenant,
-        training_set_ref,
-        training_set_location,
-    )
-    .await?
-    {
-        TrainingSetOutcome::Verified => Ok(()),
-        TrainingSetOutcome::AdminScopeRefused => Err(Status::failed_precondition(
-            "training-set resolution is refused under admin scope",
-        )),
-        TrainingSetOutcome::OtherTenant
-        | TrainingSetOutcome::NotReady
-        | TrainingSetOutcome::DigestMismatch => {
-            Err(Status::failed_precondition("training set unresolved"))
-        }
-    }
-}
-
-/// The classification [`resolve_training_set_identity`] collapses to
-/// `FailedPrecondition` for the wire (non-disclosure; the admission-time
-/// collapse) — kept distinguishable here (never on the wire) for a future
-/// caller (`HostAdmission`, docs/plans/67-distributed-training/UNITS.md §
-/// U5a-2) to name its own exact refusal reason from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrainingSetOutcome {
-    /// The row resolved for this job's own tenant, is `ready`, and its
-    /// sidecar manifest verifies `training_set_ref`.
-    Verified,
-    /// [`TenantBinding::is_admin_scope`] was ambient; refused before the
-    /// strict resolver ever ran (never an I-GANG determinant `run_rank`
-    /// records a [`GangRefusalReason`] for — not reachable through the
-    /// tenant-derived `run_rank` path in production, only through
-    /// `resolve_training_set_identity`'s own direct callers under
-    /// `with_admin_scope`).
-    AdminScopeRefused,
-    /// The strict tenant-pinned resolver found no `result_tables` row —
-    /// whether none exists at all, or it belongs to another tenant (the
-    /// strict predicate does not distinguish the two).
-    OtherTenant,
-    /// A row was found for this job's own tenant, but its `status` was not
-    /// `ready`.
-    NotReady,
-    /// The row was `ready`, but its sidecar manifest did not verify
-    /// `training_set_ref` — the URL failed to parse, the sidecar read
-    /// erred, no sidecar existed, or the digest genuinely mismatched — this
-    /// verify's own admission-time collapse: none of these are
-    /// distinguished here either (only RE-VERIFICATION, §I3, needs the
-    /// three-way `Refuted`/`StoreUnavailable` split, once an admitted
-    /// session exists to re-verify inside).
-    DigestMismatch,
-}
-
-/// Classifies §I1(b)'s sidecar verify (see [`resolve_training_set_identity`]
-/// for the two properties this implements: the explicit admin-scope guard,
-/// and the strict-predicate lookup). A genuine catalog fault reading
-/// `Catalog::get_result_table_for_tenant` (not merely finding no row) is
-/// `Err(Unavailable)` (`admission_catalog_fault`) — the ONLY
-/// way this function returns `Err`; every other outcome, including every
-/// unresolvable/unverifiable one `ResultStore::read_materialization_manifest`
-/// itself erroring produces, is classified into a `TrainingSetOutcome`
-/// variant and returned `Ok`.
-pub(crate) async fn resolve_training_set_identity_classified(
-    store: &ResultStore,
-    tenant: Option<TenantId>,
-    training_set_ref: &str,
-    training_set_location: &str,
-) -> Result<TrainingSetOutcome, Status> {
-    if TenantBinding::is_admin_scope() {
-        return Ok(TrainingSetOutcome::AdminScopeRefused);
-    }
-
-    let lookup = store
-        .catalog()
-        .get_result_table_for_tenant(training_set_location, tenant)
-        .await
-        .map_err(admission_catalog_fault)?;
-    let record: ResultTableRecord = match lookup {
-        None => return Ok(TrainingSetOutcome::OtherTenant),
-        Some(record) if record.status != ResultTableStatus::Ready.to_string() => {
-            return Ok(TrainingSetOutcome::NotReady)
-        }
-        Some(record) => record,
-    };
-
-    let url = match StorageUrl::parse(&record.parquet_path) {
-        Ok(url) => url,
-        Err(_) => return Ok(TrainingSetOutcome::DigestMismatch),
-    };
-
-    // Admission-time classification: every unresolvable /
-    // unverifiable outcome — `Ok(None)` (no sidecar), a digest mismatch, or
-    // the read itself erroring — collapses to the same `DigestMismatch`
-    // classification (itself the same member-scoped `FailedPrecondition` on
-    // the wire). The three-way split into `Refuted` / `StoreUnavailable` is
-    // §I3's re-verification classification, which needs an admitted
-    // (`HostAdmission`) session to re-verify inside — not this
-    // admission-time call.
-    match store.read_materialization_manifest(&url).await {
-        Ok(Some(manifest)) if manifest.artifact.0 == training_set_ref => {
-            Ok(TrainingSetOutcome::Verified)
-        }
-        Ok(_) | Err(_) => Ok(TrainingSetOutcome::DigestMismatch),
     }
 }

@@ -2010,6 +2010,43 @@ impl Catalog {
         Ok(updated == 1)
     }
 
+    /// `CONTRACT-U5a.md` §I1: is `instance_id`'s `instances` row FRESH —
+    /// present, and last seen within [`super::lease::instance_liveness_margin`]
+    /// (`2 * lease`) on the DB clock? Primary-key lookup; `instances` carries
+    /// no tenant column, so there is no tenant predicate to drop or keep.
+    /// `false` for an absent OR a stale row alike — the caller (a gang rank
+    /// checking its coordinator) maps either to the same member-scoped
+    /// `FailedPrecondition`, disclosing nothing about which.
+    pub async fn fresh_instance(&self, instance_id: &str, lease: Duration) -> Result<bool> {
+        let instance_id = instance_id.to_string();
+        let kind = self.backend().backend_kind();
+        let margin = instance_liveness_margin(lease);
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let stale = stale_before_clause("last_seen_at", kind, margin, &mut params);
+                        params.push(SqlValue::TextOwned(instance_id));
+                        let id_bind = params.len();
+                        let sql = format!(
+                            "SELECT 1 AS present FROM instances \
+                             WHERE instance_id = ${id_bind} AND NOT ({stale})"
+                        );
+                        tx.query_opt(&sql, &params, |row| row.get::<i32>("present"))
+                            .await
+                    })
+                },
+            )
+            .await?
+            .is_some())
+    }
+
     /// Upsert this process's `workers` row — present only while the process
     /// runs the claim loop. `kinds` is the comma-joined (or otherwise
     /// producer-encoded) kind set this worker claims; `state` is the loop's

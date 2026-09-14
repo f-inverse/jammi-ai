@@ -9,15 +9,17 @@ checker's disclosure requirement — IF the checker ever arms for this unit. It 
 file) and `.jammi/escapes.jsonl` — none of `crates/**`, `ci/**`, `.github/workflows/**` — so
 `check_rigor_record.py`'s own arming predicate (`ARMING_GLOBS`) never fires for this PR, and this contract
 is written on the same footing as the record would be: for the human reviewer, not for a required check.
-Citations below are tagged **(at 23ec336f)** — the commit this worktree's `HEAD` sits at as of this
-revision of the file; every `path:line` was re-opened and re-verified at that sha by this agent (this file
-was first written at `47613450` and re-anchored here after three further commits on this same branch moved
-line numbers in `conftest.py`, `test_session_lifecycle_guard.py` and `test_session_registry.py`).
+Citations below are tagged **(at the branch head)** — every `path:line` was re-opened and
+re-verified at this worktree's current `HEAD` by this agent, and are named this way rather than by a
+sha because a sha is rewritten by rebase (this file was first written at the commit whose subject is "test(cookbook): #536 leak guard subscribes to the client's session events — every construction route and alias shape, and a session collected without close, fail by name" (the events-subscription commit) and
+re-anchored here after three further commits on this same branch moved line numbers in `conftest.py`,
+`test_session_lifecycle_guard.py` and `test_session_registry.py`).
 
 Owner: **docs-ci** (dispatched to write this contract only; the fix itself is `cookbook`/client-python
-work already landed on this branch). Worktree `scratchpad/wt-536`, branch `fix/536-embedded-close`, HEAD
-`23ec336f` (23 commits ahead of `main`, 6 behind `origin/main` per this branch's own stale local `main`
-ref — the merge-base against the real `origin/main` is `2055b33c`).
+work already landed on this branch). Worktree `scratchpad/wt-536`, branch `fix/536-embedded-close`, at
+the branch head (23 commits ahead of `main`, 6 behind `origin/main` per this branch's own stale local
+`main` ref, as of the revision that counted them — the merge-base against the real `origin/main` is
+`2055b33c`).
 
 ## The defect (esc-112, `.jammi/escapes.jsonl` id `esc-112-embedded-engine-outlives-its-tempdir`)
 An embedded engine opened inside a `TemporaryDirectory` in a `cookbook/**` pytest lane could outlive the
@@ -39,25 +41,25 @@ session object itself is still reachable at the point of detection (a session dr
 any teardown code runs must still be caught).
 
 ## Mechanism
-### `clients/python/jammi/_sessions.py` — the live-session registry (183 lines at 23ec336f, unchanged since 47613450)
+### `clients/python/jammi/_sessions.py` — the live-session registry (183 lines at the branch head, unchanged since the events-subscription commit)
 A process-wide, non-weak ledger keyed by a monotonic integer handle (`itertools.count`, never `id()` —
 a collected-and-reused address would silently alias to an unrelated later object; guarded by
 `test_handles_are_unique_across_sessions_even_after_collection`,
-`clients/python/tests/test_session_registry.py:270-291` at 23ec336f):
+`clients/python/tests/test_session_registry.py:270-291` at the branch head):
 
-- `register(session, label) -> int` (def at `clients/python/jammi/_sessions.py:74`, at 23ec336f): assigns the next handle,
+- `register(session, label) -> int` (def at `clients/python/jammi/_sessions.py:74`, at the branch head): assigns the next handle,
   adds `session` to a `weakref.WeakSet` (`_live`, backing `open_sessions()`), records `{handle: label}` in
   a plain (non-weak) dict (`_open_ledger`, backing `open_session_labels()`), and fires every subscribed
   `on_register(handle, label)` listener synchronously, outside the lock.
-- `unregister(session) -> None` (def at `:103`, at 23ec336f): pops the handle for `session`, removes it
+- `unregister(session) -> None` (def at `:103`, at the branch head): pops the handle for `session`, removes it
   from the ledger and the `WeakSet`, and fires every `on_unregister(handle, label)` listener. A no-op
   (fires nothing) if `session` is not currently registered — closing twice, or closing after collection,
   stays safe.
 - `open_sessions() -> Tuple[object, ...]` (def at `:120`) and `open_session_labels() -> Tuple[Tuple[int,
   str], ...]` (def at `:139`) are read-only snapshots; `observe(on_register, on_unregister) ->
   Callable[[], None]` (def at `:152`) subscribes and returns an idempotent unsubscriber. THREE of these
-  four — `open_sessions`, `open_session_labels`, `observe` — are re-exported at
-  `clients/python/jammi/__init__.py:31` and named in `__all__` at `:51-53` (at 23ec336f); `register` and
+  five module-level functions — `open_sessions`, `open_session_labels`, `observe` — are re-exported at
+  `clients/python/jammi/__init__.py:31` and named in `__all__` at `:51-53` (at the branch head); `register` and
   `unregister` stay private to this module (called only from the two `__init__`/`close()` seams below), so
   no external caller reaches them directly.
 
@@ -65,25 +67,25 @@ a collected-and-reused address would silently alias to an unrelated later object
 the one seam every construction route (`jammi.connect`, any direct backend construction, any future
 `open`/`from_*` helper) passes through:
 
-- `EmbeddedBackend.__init__` (`clients/python/jammi/_embedded.py:130-143`, at 23ec336f): line 143 is
+- `EmbeddedBackend.__init__` (`clients/python/jammi/_embedded.py:130-143`, at the branch head): line 143 is
   `self._session_handle = _register_session(self, label)`, where `label` is the resolved artifact
   directory (the `file://` target `_open_embedded` dispatches on; `""` for a direct construction that
   passes none).
-- `RemoteDatabase.__init__` (`clients/python/jammi/_database.py:961-1006`, at 23ec336f): line 1006 is
+- `RemoteDatabase.__init__` (`clients/python/jammi/_database.py:961-1006`, at the branch head): line 1006 is
   `self._session_handle = _register_session(self, endpoint)`, where `endpoint` is the printable remote
   target (not the original `target` string with its scheme — `_database.py`'s own `open_remote` strips
   that before this call).
 
 `unregister` is called from `close()` in both classes: `EmbeddedBackend.close`
-(`clients/python/jammi/_embedded.py:186-233`, at 23ec336f — `_unregister_session(self)` at `:233`, after the native handle's own
-`close(release)` returns) and `RemoteDatabase.close` (`clients/python/jammi/_database.py:2848-2875`, at 23ec336f —
+(`clients/python/jammi/_embedded.py:186-233`, at the branch head — `_unregister_session(self)` at `:233`, after the native handle's own
+`close(release)` returns) and `RemoteDatabase.close` (`clients/python/jammi/_database.py:2848-2875`, at the branch head —
 `_unregister_session(self)` at `:2875`, after the gRPC/Flight channels close and `self._closed = True`).
 `tenant_scope()` on both backends yields the SAME already-registered instance, so it is not a separate
 registration site (stated, not separately gated, in `clients/python/tests/test_session_registry.py:20-22`
-at 23ec336f).
+at the branch head).
 
-### `cookbook/book/tests/conftest.py::_no_leaked_sessions` — the runtime rail (228 lines at 23ec336f, 176 at 47613450)
-An `autouse=True` fixture (def at `cookbook/book/tests/conftest.py:164`, at 23ec336f) that, for the duration of each test,
+### `cookbook/book/tests/conftest.py::_no_leaked_sessions` — the runtime rail (228 lines at the branch head, 176 at the events-subscription commit)
+An `autouse=True` fixture (def at `cookbook/book/tests/conftest.py:164`, at the branch head) that, for the duration of each test,
 calls `jammi.observe(_on_register, _on_unregister)` (`:201`) to record every `(handle, label)` registered
 and every handle unregistered during that test — synchronously, so a session dropped by refcount before
 any teardown code runs is still recorded as registered. In its `finally` (`:204-228`), it unsubscribes
@@ -94,11 +96,11 @@ pytrace=False)` (`:228`) naming every leaked handle's label, unless the test alr
 reason (`:224-226`, in which case it only warns, so a leak inside an already-failing test does not bury
 the true cause). This subscribes to the registry's *events*, never a liveness snapshot: `open_sessions()`
 alone (a `WeakSet` view) is documented as unsound for exactly this shape (`_sessions.py`'s own module
-docstring, lines 1-41 at 23ec336f, unchanged since 47613450) because a bare `jammi.connect(...)` statement, or a local dropped at
+docstring, lines 1-41 at the branch head, unchanged since the events-subscription commit) because a bare `jammi.connect(...)` statement, or a local dropped at
 frame exit, is refcount-collected before any `finally`/teardown code runs, so a snapshot-diff guard would
 see it as already closed.
 
-**The capability arm** (new since 47613450, all at 23ec336f): the rail depends on the installed client
+**The capability arm** (new since the events-subscription commit, all at the branch head): the rail depends on the installed client
 actually carrying the registry, not merely on `jammi` being importable. `_RAIL_ACTIVE =
 jammi is not None and getattr(jammi, "observe", None) is not None` (`cookbook/book/tests/conftest.py:100`)
 is computed once, at import, never per test. A session-scoped, `autouse=True` fixture,
@@ -112,14 +114,14 @@ every test's setup; the whole session-leak rail is simply inactive for the run, 
 than a per-test crash.
 
 ## Oracles (by name, each with what it excludes)
-- **`clients/python/tests/test_session_registry.py`** (328 lines at 23ec336f, 329 at 47613450 — a
+- **`clients/python/tests/test_session_registry.py`** (328 lines at the branch head, 329 at the events-subscription commit — a
   docstring rewrite dropped one review-process line, no test moved otherwise): per-route
   register/unregister round-trips for `jammi.connect("file://…")`, direct `EmbeddedBackend` construction,
   `jammi.connect("grpc://…")` and direct `RemoteDatabase` construction
   (`test_connect_file_route_appears_and_disappears`,
   `test_direct_embedded_backend_construction_appears_and_disappears`,
   `test_connect_grpc_route_appears_and_disappears`,
-  `test_direct_remote_database_construction_appears_and_disappears`, `:75-91`, `:113-133` at 23ec336f) —
+  `test_direct_remote_database_construction_appears_and_disappears`, `:75-91`, `:113-133` at the branch head) —
   each excludes the OTHER route, so no single test's pass certifies the shared seam; together they cover
   every constructor route named in the mechanism section. `test_embedded_unclosed_session_disappears_once_collected`
   / `test_remote_unclosed_session_disappears_once_collected` (`:102-107`, `:146-153`) exclude the
@@ -135,7 +137,7 @@ than a per-test crash.
   with overwhelming reliability while a monotonic counter never repeats). `test_unsubscribe_stops_delivery`
   (`:294-302`) and `test_concurrent_open_close_produce_balanced_events` (`:305-328`) exclude the
   registration seam entirely; they check only `observe()`'s own subscription contract.
-- **`cookbook/book/tests/test_session_lifecycle_guard.py`** (519 lines at 23ec336f, 376 at 47613450 — two
+- **`cookbook/book/tests/test_session_lifecycle_guard.py`** (519 lines at the branch head, 376 at the events-subscription commit — two
   test functions and the capability suite below were added by later commits on this branch): the runtime
   rail's own non-vacuity control, run as a REAL pytest session via `pytester` against the actual committed
   `conftest.py` (read from disk, `:45`) — no test in this file exercises a helper function directly,
@@ -159,7 +161,7 @@ than a per-test crash.
     `test_shape_closing_control_passes` (`:286-291`) asserted ABSENT from any ERROR line (`:347-348`);
     excludes the subdirectory-collection shape and the two-transport-only case above (disjoint fixtures).
   - **`test_leak_inside_an_already_failing_test_is_warned_not_failed_again`** (`:351-416`, new since
-    47613450): the guard's OTHER arm — a test that fails on its own assertion AND also leaves a session
+    the events-subscription commit): the guard's OTHER arm — a test that fails on its own assertion AND also leaves a session
     open is reported as exactly one `failed` (the assertion, at CALL) plus ONE `PytestWarning` naming the
     leaked label (`result.assert_outcomes(failed=1, errors=0, passed=0, warnings=1)` at `:384`, the label
     check at `:388`), never a second `error` piled on top of the true cause — the short-summary line count
@@ -175,7 +177,7 @@ than a per-test crash.
     static alias gate's documented scope limit was one directory level; this rail is not walking files at
     all, so it has none).
   - **`test_rail_inactive_without_the_registry_warns_once_and_runs_clean`** (`:492-519`, new since
-    47613450, F1): exercises the capability arm (`cookbook/book/tests/conftest.py`'s `_RAIL_ACTIVE` at
+    the events-subscription commit, F1): exercises the capability arm (`cookbook/book/tests/conftest.py`'s `_RAIL_ACTIVE` at
     `:100`, the session-scoped `_warn_if_rail_inactive` fixture at `:144-160`, and the early return in
     `_no_leaked_sessions` at `:181-186`) against a minimal fake `jammi` — `_FAKE_PRE_REGISTRY_JAMMI`
     (`:454-468`) exposes `connect` but no `observe`, standing in for a client built before the registry
@@ -205,13 +207,13 @@ precondition. The real exit-path control-flow analysis that would let a STATIC g
 soundly — the capability none of the four attempts had — is filed as its own unit,
 [issue #539](https://github.com/f-inverse/jammi-ai/issues/539), which owns only the non-pytest lanes
 (scripts, recipes, quickstart, the executed chapter cells) that this runtime rail cannot reach because it
-is a pytest fixture, not a file walker (`cookbook/book/tests/conftest.py:76-78`, at 23ec336f, states this
+is a pytest fixture, not a file walker (`cookbook/book/tests/conftest.py:76-78`, at the branch head, states this
 limit by name — see also "Stated limits" below).
 
 ## Stated limits (this rail's own scope, not a defect)
 The rail observes sessions constructed inside a test's OWN function-scoped fixture window: it subscribes
 at that test's own setup and reads the diff in its own `finally`, before any coarser fixture tears down
-(`cookbook/book/tests/conftest.py:64-69`, at 23ec336f). The suite rule this actually enforces is narrower
+(`cookbook/book/tests/conftest.py:64-69`, at the branch head). The suite rule this actually enforces is narrower
 than "every session is eventually closed" — it is that **a test-opened session is closed by that SAME
 test** (`:67-69`). Two shapes fall outside this window by construction, both filed as
 [issue #552](https://github.com/f-inverse/jammi-ai/issues/552) (`:69-76`): a session registered before

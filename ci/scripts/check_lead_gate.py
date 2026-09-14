@@ -4527,6 +4527,26 @@ def fixture_r12m8b12_mutation_missing_marker_after_denies() -> None:
                         "carries no `marker_after`")
 
 
+def fixture_r12m8b13_identical_uncovered_reasons_deny() -> None:
+    """fix round 5 Z11 (audit advisory 8): three `mutations` rows (the K<=3
+    cap's own limit), each carrying the IDENTICAL (normalized) `uncovered`
+    reason -- a templated disposition satisfying the row-shape obligation
+    three times over with ONE real examination, never denied before this
+    fix (R11's own distinctness precedent was never reused here)."""
+    unit = "feat/r12m8b13"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    same = "no test harness reaches this call site directly"
+    rows = [{"site": f"bar.py:{i}", "command": "true", "uncovered": same} for i in (4, 5, 6)]
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": rows})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12M8b13", f"three identical uncovered reasons must deny, got {p.returncode}: {p.stderr}")
+    _assert("IDENTICAL `uncovered` reason" in p.stderr, "R12M8b13", p.stderr)
+
+
 def _r12_exclusions_setup(unit: str):
     """A fix that adds a REAL new TEST definition (`tests/test_x.py`'s
     `def test_thing():`) -- the DATA-armed condition item 8c's
@@ -4756,6 +4776,45 @@ def fixture_r12x7_missing_previous_relay_artifact_denies() -> None:
     _assert("no on-disk artifact" in p2.stderr, "R12X7", p2.stderr)
 
 
+def fixture_r12x8_export_carries_relay_mutations_and_exclusions() -> None:
+    """fix round 5 Z8: `--export-anticipation` also dumps any `<slug>.
+    relay.*.json` carrying a non-empty `mutations`/`exclusions` field, as a
+    distinct `lead-relay-attestation` row -- these are the lead's OWN
+    attestations, and `.claude/hooks/README.md`/`lead.md`'s own claim
+    ("the human reads them in the exported record") was false until this
+    export actually carried them anywhere a human reviewing a committed
+    diff could see them."""
+    unit = "feat/r12x8"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    mutation_rows = [{"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 1,
+                       "marker_after": "test result: FAILED. 0 passed; 1 failed"}]
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": mutation_rows, "exclusions": {"tests/test_z.py::test_new": "does not cover X"}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 0, "R12X8 setup", f"the relay must itself allow, got {p.returncode}: {p.stderr}")
+
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    proc = subprocess.run(
+        [sys.executable, str(LEAD_GATE_LIB), "--export-anticipation", _slug(unit)],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    _assert(proc.returncode == 0, "R12X8", f"--export-anticipation must exit 0: {proc.stderr}")
+    exported_rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    attestations = [r for r in exported_rows if r.get("agent_type") == "lead-relay-attestation"]
+    _assert(len(attestations) == 1, "R12X8",
+            f"expected exactly 1 lead-relay-attestation row, got {len(attestations)}: {exported_rows}")
+    _assert(attestations[0].get("mutations") == mutation_rows, "R12X8",
+            f"exported row must carry the relay's own `mutations` verbatim: {attestations[0]}")
+    _assert(attestations[0].get("exclusions") == {"tests/test_z.py::test_new": "does not cover X"}, "R12X8",
+            f"exported row must carry the relay's own `exclusions` verbatim: {attestations[0]}")
+    _assert("verdict" not in attestations[0], "R12X8",
+            "a lead-relay-attestation row must carry no `verdict` key (never enters the gate lattice)")
+
+
 def _parse_new_surfaces_of(root: Path, base_sha: str, head_sha: str) -> dict[str, str]:
     """Test-harness helper: the SAME `_parse_new_surfaces` the hook itself
     uses, applied to a real `-U0` diff in `root` -- used only to derive
@@ -4787,6 +4846,7 @@ FIXTURES = [
     ("R12M8b10", fixture_r12m8b10_mutation_missing_rc_before_denies),
     ("R12M8b11", fixture_r12m8b11_mutation_missing_rc_after_denies),
     ("R12M8b12", fixture_r12m8b12_mutation_missing_marker_after_denies),
+    ("R12M8b13", fixture_r12m8b13_identical_uncovered_reasons_deny),
     ("R12X1", fixture_r12x1_missing_exclusions_denies),
     ("R12X2", fixture_r12x2_exclusions_present_allows),
     ("R12X3", fixture_r12x3_empty_exclusion_denies),
@@ -4794,6 +4854,7 @@ FIXTURES = [
     ("R12X5", fixture_r12x5_exclusions_duplicate_within_relay_denies),
     ("R12X6", fixture_r12x6_exclusions_duplicate_across_previous_relay_denies),
     ("R12X7", fixture_r12x7_missing_previous_relay_artifact_denies),
+    ("R12X8", fixture_r12x8_export_carries_relay_mutations_and_exclusions),
     ("G1", fixture_g1_first_round_never_gated),
     ("G2", fixture_g2_second_round_denied_worktree),
     ("G3", fixture_g3_second_round_denied_full_sha),

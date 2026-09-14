@@ -2590,6 +2590,7 @@ def _mutations_rejection(row: dict, data: dict, new_surfaces: dict[str, str] | N
     if len(mutations) > 3:
         return (f"relay `mutations` carries {len(mutations)} row(s) — esc-lead-gate-R12 item 8b "
                 "caps this at K<=3, a LABELED sample, never an exhaustive sweep")
+    seen_uncovered: dict[str, int] = {}
     for i, entry in enumerate(mutations):
         if not isinstance(entry, dict):
             return f"relay `mutations`[{i}] is not an object (esc-lead-gate-R12 item 8b)"
@@ -2603,6 +2604,17 @@ def _mutations_rejection(row: dict, data: dict, new_surfaces: dict[str, str] | N
         if uncovered is not None:
             if not isinstance(uncovered, str) or not uncovered.strip():
                 return f"relay `mutations`[{i}] `uncovered` is present but empty (esc-lead-gate-R12 item 8b)"
+            # Fix round 5 Z11 (audit advisory 8): three identical `uncovered`
+            # strings would otherwise satisfy the row-shape obligation three
+            # times over with ONE real disposition — reuse R11's own
+            # distinctness precedent (`_claims_rejection`'s uncovered-reason
+            # check), never a length/word-count proxy.
+            norm = _probe_normalize(uncovered)
+            if norm in seen_uncovered:
+                return (f"relay `mutations`[{i}] and `mutations`[{seen_uncovered[norm]}] carry the "
+                         "IDENTICAL `uncovered` reason (normalized) — a templated disposition is "
+                         "not a per-site examination (esc-lead-gate-R12 item 8b)")
+            seen_uncovered[norm] = i
             continue
         rc_before = entry.get("rc_before")
         rc_after = entry.get("rc_after")
@@ -3555,7 +3567,59 @@ def cmd_export_anticipation(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(row, sort_keys=True))
             sys.stdout.write("\n")
             n += 1
-    sys.stderr.write(f"lead-gate-lib: exported {n} anticipation row(s) for {slug!r}\n")
+
+    # Fix round 5 Z8: `mutations`/`exclusions` are the lead's OWN
+    # attestations, written into the (gitignored, CI-invisible) RELAY
+    # artifact — `.claude/hooks/README.md`/`lead.md`'s own "the control is
+    # the human at merge, reading the exported record" sentence was false
+    # until this export actually carried them anywhere a human reviewing a
+    # diff could see them. Every `<slug>.relay.*.json` that carries a
+    # non-empty `mutations` or `exclusions` field is exported too — a
+    # SEPARATE sentinel `agent_type` (never `lead-anticipation`, so
+    # reader 3's own selection logic above is untouched), DELIBERATELY NO
+    # `verdict` key for the same closed-world-lattice reason as above.
+    m = 0
+    relay_prefix = f"{slug}.relay."
+    if sdir.exists():
+        for entry in sorted(sdir.iterdir()):
+            if not (entry.name.startswith(relay_prefix) and entry.name.endswith(".json")):
+                continue
+            try:
+                data = json.loads(entry.read_text())
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            mutations = data.get("mutations")
+            exclusions = data.get("exclusions")
+            has_mutations = isinstance(mutations, list) and mutations
+            has_exclusions = isinstance(exclusions, dict) and exclusions
+            if not (has_mutations or has_exclusions):
+                continue
+            row = {
+                "agent_type": "lead-relay-attestation",
+                "unit_branch": data.get("unit_branch"),
+                "relay_agent_type": data.get("agent_type"),
+                "block_ts": data.get("block_ts"),
+                "fix_head": data.get("fix_head"),
+            }
+            if has_mutations:
+                row["mutations"] = mutations
+            if has_exclusions:
+                row["exclusions"] = exclusions
+            try:
+                mtime = entry.stat().st_mtime
+                row["ts"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:  # R12-RESIDUAL: requires the artifact file to vanish between the `iterdir()` listing and this `stat()` call, a TOCTOU race not exercised by a fast self-test fixture
+                row["ts"] = now_iso()
+            fix_head = data.get("fix_head")
+            if isinstance(fix_head, str) and fix_head:
+                row["head_sha"] = fix_head
+            sys.stdout.write(json.dumps(row, sort_keys=True))
+            sys.stdout.write("\n")
+            m += 1
+    sys.stderr.write(f"lead-gate-lib: exported {n} anticipation row(s) and {m} relay-attestation "
+                      f"row(s) for {slug!r}\n")
     return 0
 
 

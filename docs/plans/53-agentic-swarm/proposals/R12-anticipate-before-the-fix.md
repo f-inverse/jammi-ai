@@ -215,13 +215,25 @@ armed strictly by the DATA (never merely by a unit being open):
   own previous relay of the same agent_type — the anti-templating cousin of R11's own
   uncovered-claim check.
 
-HONEST LIMITS, stated as plainly as the pair above: `gates`/`mutations` are LEAD-ATTESTED,
-never re-executed by the hook — the control is the human at merge, reading the exported
-record, same as R11's own `claims` disposition and the "attack quality" limit already named
-for the pre/post-fix pair. `_r12_new_test_surfaces`'s "looks like a test" filter can under- or
+HONEST LIMITS, stated as plainly as the pair above: `gates`/`mutations`/`exclusions` are
+LEAD-ATTESTED, never re-executed by the hook — the control is the human at merge, reading the
+exported record (fix round 5: `--export-anticipation` also dumps any relay's non-empty
+`mutations`/`exclusions` as a `lead-relay-attestation` row, so these fields are actually
+visible in that record, not merely in a gitignored relay artifact no CI checkout ever sees),
+same as R11's own `claims` disposition and the "attack quality" limit already named for the
+pre/post-fix pair. `_r12_new_test_surfaces`'s "looks like a test" filter can under- or
 over-include relative to a human's own judgment, the same class of limit `_parse_new_surfaces`
-itself already carries. Reader 3's `check_required_gates` selects the governing row
-order-independently — by `head_sha` match against the checkout's own `HEAD`, then by the
-greatest `ts` — never by position in the file, so an older round's row sorting after a newer
-one in the export (`cmd_export_anticipation` sorts by filename, a tip sha with no
-chronological meaning) cannot stand in for the fix's own verified state.
+itself already carries.
+
+Reader 3's SHAPE checks (unit_branch/residual_risk presence, attack pair-reuse, the
+execution-class requirement, the omits-a-command arm, and the gates governing row's shape/
+value) run through the SAME shared validator Reader 1 calls — never a second, independently
+maintained implementation. Governing-row selection is order-independent BY CONSTRUCTION,
+never by an impossibility claim: `cmd_export_anticipation` stamps `ts` (the artifact file's
+own mtime) and `head_sha` (its own `pre_fix_sha`) on every row it emits, and selection is by
+`head_sha` match against the checkout's own `HEAD`, else by the greatest `ts` — never by
+position in the file, so an older round's row sorting after a newer one in the export (which
+sorts by filename, a tip sha with no chronological meaning) cannot stand in for the fix's own
+verified state. When the candidate pool holds two or more rows and any lacks `ts` at all (a
+shape the real exporter no longer produces, but a hand-typed or pre-fix-round-5 record still
+can), selection FAILS LOUDLY naming the ambiguity rather than falling back to append order.

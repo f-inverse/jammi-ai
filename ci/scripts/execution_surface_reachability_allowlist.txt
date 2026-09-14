@@ -169,8 +169,8 @@ cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Car
 # its own. Same off-merge-path residual as every row above, on a narrower
 # fact: the tuple needs TWO real A100s in one box, which no hermetic runner
 # has and no single-GPU lane can stand in for. Its one invoker is
-# `.github/workflows/gpu-gang.yml` (the `run-gang` PR label, a nightly
-# schedule, manual dispatch — deliberately no `push:`/`workflow_call:`
+# `.github/workflows/gpu-gang.yml` (the `run-gang` PR label and manual
+# dispatch — deliberately no `push:`/`workflow_call:`
 # trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s
 # paid-pod-lane rule pins that `on:` block by name, exactly as its P1 pins
 # the prove lane's). ---

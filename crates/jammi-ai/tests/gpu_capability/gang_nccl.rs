@@ -26,8 +26,9 @@ use crate::skip_without_gpu;
 /// is set and no usable CUDA device opens. Same require-gate idiom as
 /// `crates/jammi-ai/src/fine_tune/optimizer.rs::cuda_device` and
 /// `crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs::
-/// device_memory_used_bytes_or_require`: on a pod leg this test is meant to
-/// run on, a missing device is a hard failure, never a silent skip.
+/// device_memory_used_bytes_or_require`: the gang pod lane's remote heredoc
+/// (`ci/scripts/runpod_gpu_gang.sh`) exports `JAMMI_REQUIRE_CUDA=1`, so on
+/// that lane a missing device is a hard failure, never a silent skip.
 #[cfg(feature = "cuda")]
 fn serial_cuda_device_or_require(test: &str) -> Option<harness::SerialGpu> {
     match harness::serial_cuda_device() {
@@ -46,13 +47,13 @@ fn serial_cuda_device_or_require(test: &str) -> Option<harness::SerialGpu> {
 
 /// A second CUDA device (`candle_core::Device::new_cuda(1)`), or a hard
 /// failure when `JAMMI_REQUIRE_CUDA_GANG` is set and only one CUDA device is
-/// visible. A two-rank NCCL gang needs two devices to answer anything: it is
-/// the gang pod lane's obligation (`ci/scripts/runpod_gpu_gang.sh`'s remote
-/// environment, per plan 67) to export this variable, so the pod's own run
-/// hard-fails rather than skipping — that export does not exist yet, so a
-/// green run of this suite elsewhere is not NCCL coverage on its own. The
-/// single-GPU prove lane never sets it, so a one-device host on that lane
-/// still skips with the reason rather than failing.
+/// visible. A two-rank NCCL gang needs two devices to answer anything: the
+/// gang pod lane's remote heredoc (`ci/scripts/runpod_gpu_gang.sh`) exports
+/// `JAMMI_REQUIRE_CUDA_GANG=1`, so the pod's own run hard-fails rather than
+/// skipping — a green run of this suite elsewhere is still not NCCL
+/// coverage on its own, because only that lane sets it. The single-GPU
+/// prove lane never sets it, so a one-device host on that lane still skips
+/// with the reason rather than failing.
 #[cfg(feature = "cuda")]
 fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
     match candle_core::Device::new_cuda(1) {

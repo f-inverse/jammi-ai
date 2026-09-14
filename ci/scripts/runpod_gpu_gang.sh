@@ -69,8 +69,8 @@
 # kind (rule (k)); a human reviews the pulled artifact and commits it under
 # `crates/jammi-kernels/artifacts/cuda-runs/`.
 #
-# TRIGGERS: `.github/workflows/gpu-gang.yml` only — the `run-gang` PR label,
-# a nightly schedule, and manual dispatch. Never `push:`, never
+# TRIGGERS: `.github/workflows/gpu-gang.yml` only — the `run-gang` PR label
+# and manual dispatch. Never `push:`, never
 # `workflow_call:`, and nothing may `uses:` that workflow: a paid leg is
 # never in the critical path of an automated publisher (gpu-prove.yml's own
 # header states the doctrine; `check_gpu_prove_once.py` pins both lanes by

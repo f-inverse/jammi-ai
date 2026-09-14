@@ -34,7 +34,11 @@
 #       contiguous hex characters (the shape of a hex-encoded NCCL id,
 #       256 at full length) found in the pulled
 #       artifact dir OR the run's own log fails the leg too — a clean pull
-#       with a clean artifact/log stays silent.
+#       with a clean artifact/log stays silent. Boundary fixtures pin the
+#       128 threshold on both sides (64/127 do not trip, 128 does), a
+#       256-hex id split 128/128 across two lines (each half already meets
+#       the threshold), and a 200-hex run behind a leading NUL byte (a
+#       binary-looking carrier, only caught because the scan drops `-I`).
 #   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
 #       the `<<REMOTE` heredoc body, beside the existing env block; removing
 #       either is a mutation this case catches.
@@ -363,7 +367,7 @@ fi
 RSYNC_BIN="$SANDBOX/rsync-bin"
 mkdir -p "$RSYNC_BIN"
 
-run_retrieval() { # $1=initial rc  $2=rsync exit code  $3=artifact content(none|clean|leak)  $4=log content(clean|leak) -> "rc|stderr"
+run_retrieval() { # $1=initial rc  $2=rsync exit code  $3=artifact content(none|clean|leak|hex64|hex127|hex128|hex256split|nulprefix200)  $4=log content(clean|leak) -> "rc|stderr"
   cat >"$RSYNC_BIN/rsync" <<RS
 #!/usr/bin/env bash
 exit $2
@@ -377,6 +381,15 @@ RS
     clean) echo '{"world":2}' > "$GANG_ARTIFACT_DIR/gang.json" ;;
     leak) python3 -c "print('a' * 256)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
     none) : ;;
+    # G5 boundary fixtures (U7b-A1-pull fix round 1, Q3): the 128-hex
+    # threshold's own boundary, on both sides, plus the two shapes that
+    # exercise "every carrier" (a run split across two lines; a run behind
+    # a leading NUL byte, which only trips with -I dropped).
+    hex64) python3 -c "print('a' * 64)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
+    hex127) python3 -c "print('a' * 127)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
+    hex128) python3 -c "print('a' * 128)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
+    hex256split) python3 -c "print('a' * 128); print('a' * 128)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
+    nulprefix200) python3 -c "import sys; sys.stdout.buffer.write(b'\x00' + b'a' * 200 + b'\n')" > "$GANG_ARTIFACT_DIR/gang.json" ;;
   esac
   local LOG="$SANDBOX/g5-retrieval.log"
   case "$4" in
@@ -437,6 +450,43 @@ if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
   ok "G5: a clean artifact and log never trip the id-secrecy scan (not blanket-refusing)"
 else
   bad "G5: expected the id-secrecy scan to stay silent on clean input; got $res"
+fi
+
+# --- G5 boundary fixtures (U7b-A1-pull fix round 1, Q3): the 128-hex
+# threshold has no boundary oracle until these five exist. ---
+res="$(run_retrieval 0 0 hex64 clean)"
+if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
+  ok "G5 boundary: a 64-hex run (a sha256 digest's own length) does NOT trip the scan"
+else
+  bad "G5 boundary: expected a 64-hex run to stay silent; got $res"
+fi
+
+res="$(run_retrieval 0 0 hex127 clean)"
+if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
+  ok "G5 boundary: a 127-hex run (one short of the threshold) does NOT trip the scan"
+else
+  bad "G5 boundary: expected a 127-hex run to stay silent; got $res"
+fi
+
+res="$(run_retrieval 0 0 hex128 clean)"
+if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
+  ok "G5 boundary: a 128-hex run (exactly the threshold) DOES trip the scan"
+else
+  bad "G5 boundary: expected a 128-hex run to trip the scan; got $res"
+fi
+
+res="$(run_retrieval 0 0 hex256split clean)"
+if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
+  ok "G5 boundary: a 256-hex id split 128/128 across two lines DOES trip the scan (each half already meets the threshold)"
+else
+  bad "G5 boundary: expected a 256-hex id split across two lines to trip the scan; got $res"
+fi
+
+res="$(run_retrieval 0 0 nulprefix200 clean)"
+if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
+  ok "G5 boundary: a 200-hex run behind a leading NUL byte DOES trip the scan (proves -I is gone: a binary-looking carrier is still scanned)"
+else
+  bad "G5 boundary: expected a 200-hex run behind a leading NUL byte to trip the scan; got $res"
 fi
 
 # ============================================================================

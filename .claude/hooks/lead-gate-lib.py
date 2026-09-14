@@ -2700,19 +2700,31 @@ def _exclusions_rejection(new_test_surfaces: dict[str, str], data: dict, unit_sl
     if prev_row is not None:
         prev_path = relay_artifact_path(sdir, unit_slug, prev_row.get("agent_type") or "",
                                          prev_row.get("ts") or "")
-        if prev_path.exists():
-            try:
-                prev_data = json.loads(prev_path.read_text())
-            except Exception:
-                prev_data = None
-            if isinstance(prev_data, dict) and isinstance(prev_data.get("exclusions"), dict):
-                prev_norms = {_probe_normalize(v) for v in prev_data["exclusions"].values() if isinstance(v, str)}
-                for key, norm in normalized.items():
-                    if norm in prev_norms:
-                        return (f"relay `exclusions`[{key!r}] repeats the IDENTICAL exclusion "
-                                 "(normalized) from this unit's own PREVIOUS relay — a templated "
-                                 "exclusion carried across rounds is not a per-round examination "
-                                 "(esc-lead-gate-R12 item 8c)")
+        if not prev_path.exists():
+            # Fix round 5 Z9: the ledger records a PRIOR round for this
+            # unit (`prev_row` is real), but its own relay artifact is
+            # gone — the cross-round distinctness check above cannot run
+            # at all, which would silently DEGRADE to "no prior text to
+            # collide with" instead of denying. The SAME shape as F1's
+            # missing-pre-fix-artifact arm (lib:2122): a witness the
+            # ledger says should exist, but doesn't, is a DENY, never a
+            # silent skip.
+            return (f"this unit's own previous relay row (agent_type={prev_row.get('agent_type')!r}, "
+                    f"ts={prev_row.get('ts')!r}) names no on-disk artifact at {prev_path.name} — "
+                    "the cross-round `exclusions` distinctness check cannot compare against a "
+                    "missing prior witness (esc-lead-gate-R12 fix round 5 Z9)")
+        try:
+            prev_data = json.loads(prev_path.read_text())
+        except Exception:
+            prev_data = None
+        if isinstance(prev_data, dict) and isinstance(prev_data.get("exclusions"), dict):
+            prev_norms = {_probe_normalize(v) for v in prev_data["exclusions"].values() if isinstance(v, str)}
+            for key, norm in normalized.items():
+                if norm in prev_norms:
+                    return (f"relay `exclusions`[{key!r}] repeats the IDENTICAL exclusion "
+                             "(normalized) from this unit's own PREVIOUS relay — a templated "
+                             "exclusion carried across rounds is not a per-round examination "
+                             "(esc-lead-gate-R12 item 8c)")
     return None
 # R12-END
 

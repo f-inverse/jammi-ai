@@ -4702,6 +4702,60 @@ def fixture_r12x6_exclusions_duplicate_across_previous_relay_denies() -> None:
     _assert("PREVIOUS relay" in p2.stderr, "R12X6", p2.stderr)
 
 
+def fixture_r12x7_missing_previous_relay_artifact_denies() -> None:
+    """fix round 5 Z9: the SAME two-round shape as R12X6, but the FIRST
+    round's own relay artifact is `rm`'d off disk BEFORE the second round
+    dispatches -- the ledger (`docs/rigor`-style row history) still
+    records that a previous round happened, so the cross-round
+    distinctness check cannot silently treat "no artifact to compare
+    against" as "nothing to compare, therefore fine": it must DENY,
+    naming the missing witness (the SAME shape F1's missing-pre-fix-
+    artifact arm takes at lib:2122)."""
+    unit = "feat/r12x7"
+    root, row1, fix_head1 = _r12_exclusions_setup(unit)
+    a = _auto_r12_attack("a.py")
+    surfaces1 = _parse_new_surfaces_of(root, row1["head_sha"], fix_head1)
+    key1 = [k for k, v in surfaces1.items() if "test_thing" in v][0]
+    test_content1 = (root / "tests" / "test_x.py").read_text()
+    _write_relay_exact(root, row1, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head1,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_x.py": {"command": "cat tests/test_x.py", "hash": _r12_hash(0, test_content1, "")},
+                        },
+                        override={"exclusions": {key1: "does not cover an assertion failure, only that the function runs"}})
+    p1 = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p1.returncode == 0, "R12X7 setup", f"the FIRST round's relay must itself allow, got {p1.returncode}: {p1.stderr}")
+
+    # The FIRST round's own relay artifact is removed -- the ledger row
+    # (`_write_block_row`'s own committed history) still names it, but the
+    # witness itself is gone.
+    first_relay_path = _relay_path_exact(root, row1)
+    _assert(first_relay_path.exists(), "R12X7 setup", "the first round's relay artifact must exist before removal")
+    first_relay_path.unlink()
+
+    row2 = _write_block_row(root, unit, "a2", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    (root / "tests" / "test_y.py").write_text("def test_second():\n    assert True\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: add tests/test_y.py")
+    fix_head2 = _git(root, "rev-parse", "HEAD")
+    surfaces2 = _parse_new_surfaces_of(root, row2["head_sha"], fix_head2)
+    key2 = [k for k, v in surfaces2.items() if "test_second" in v][0]
+    test_content2 = (root / "tests" / "test_y.py").read_text()
+    _write_relay_exact(root, row2, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_y.py"],
+                        fix_head=fix_head2,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_y.py": {"command": "cat tests/test_y.py", "hash": _r12_hash(0, test_content2, "")},
+                        },
+                        override={"exclusions": {key2: "a distinct exclusion text, never seen before"}})
+    p2 = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p2.returncode == 2, "R12X7", f"a missing previous-relay witness must deny, got {p2.returncode}: {p2.stderr}")
+    _assert("no on-disk artifact" in p2.stderr, "R12X7", p2.stderr)
+
+
 def _parse_new_surfaces_of(root: Path, base_sha: str, head_sha: str) -> dict[str, str]:
     """Test-harness helper: the SAME `_parse_new_surfaces` the hook itself
     uses, applied to a real `-U0` diff in `root` -- used only to derive
@@ -4739,6 +4793,7 @@ FIXTURES = [
     ("R12X4", fixture_r12x4_exclusions_partial_completeness_denies),
     ("R12X5", fixture_r12x5_exclusions_duplicate_within_relay_denies),
     ("R12X6", fixture_r12x6_exclusions_duplicate_across_previous_relay_denies),
+    ("R12X7", fixture_r12x7_missing_previous_relay_artifact_denies),
     ("G1", fixture_g1_first_round_never_gated),
     ("G2", fixture_g2_second_round_denied_worktree),
     ("G3", fixture_g3_second_round_denied_full_sha),

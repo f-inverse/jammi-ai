@@ -145,10 +145,14 @@ by a `JobWorker` through `claim_next` (`wt-C: crates/jammi-db/src/catalog/jobs_r
 the only lease (`heartbeat_job`, `wt-C: jobs_repo.rs:772`, driven by the lease keeper).
 `context_predictor` is refused at `world_size > 1`. The coordinator materializes or reuses the
 training set (with `job_attempt: None` — a shared producer output, never this attempt's
-`partial_result`), computes the scaler, resolves `W−1` **members** from the catalog
-(`workers.kinds` ∋ kind, `instances.peer_addr` set — the column U5b-1a appends and DIST's placement consumes — `last_seen_at`
-fresh, and from U8b `workers.devices` sufficient), mints the NCCL id when the collective is
-`nccl`, and sends each member:
+`partial_result`), computes the scaler, resolves `W−1` **members** via U5b-1a's
+`list_gang_members(GangListing { kind, self_instance, canonical_root, window })` (`workers.kinds`
+∋ kind, `instances.peer_addr` set — the column U5b-1a appends and DIST's placement consumes —
+canonical `result_root` agreeing with this coordinator's own — NECESSARY, never SUFFICIENT, for
+shared storage; sufficiency is the attestation VERIFY (§2's whole-artifact sidecar / U5b-0's
+per-partition leaf inventory) — and `last_seen_at` fresh under
+`instance_liveness_margin()`, and from U8b `workers.devices` sufficient), mints the NCCL id when
+the collective is `nccl`, and sends each member:
 
 ```
 RankAssignment { job_id, attempt, coordinator_instance_id, rank, world_size,
@@ -165,10 +169,10 @@ tenant-scoped catalog and derives storage URLs itself.
 peer never claims while it runs a rank, never aborts a claim transaction (68 OPS D6), never
 receives a rank while training its own job, and is reachable whenever idle. Handler order: same
 `job_id` with a lesser attempt → abort that runner and take the slot; lesser-or-equal → refuse;
-otherwise try-lock; busy → typed `Unavailable`. No new worker state. Membership is read through
-`list_gang_members(kind)` (a new joined listing over `workers ⋈ instances`: `kinds` split on `,`
-and compared as whole tokens in Rust; `peer_addr` set; `last_seen_at` within `[lease]
-duration_secs`; from U8b `devices` sufficient).
+otherwise try-lock; busy → typed `Unavailable`. No new worker state. The full-roster read above
+(`list_gang_members`) is the coordinator's OWN dispatch-time tool; a peer's inbound-`RunRank`
+freshness check never calls it — it reads the coordinator's own `instances` row alone, through
+U5a-1's `fresh_instance(coordinator_instance_id)`, one row by primary key.
 
 **Authorization (invariant I-GANG: the job row is the capability).** The service is mounted on
 the internal `[server] peer_bind` listener (68 DIST D7), never on the tenant-scoped public chain.
@@ -178,9 +182,9 @@ jobs_repo.rs:580-596`; D7 forbids `with_admin_scope` on the peer path), reachabl
 gang handler — verifies `status = 'running'`, `claimed_by = coordinator_instance_id` and a live
 lease, then **derives the tenant from the row** (`jobs.tenant_id`) and pins every subsequent
 catalog read to it. Nothing dialable travels on the wire: the assignment carries
-`peers[rank → instance_id]`; each peer resolves addresses through `instances.peer_addr` and
-refuses a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the only
-out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
+`peers[rank → instance_id]`; each peer resolves addresses through U5b-1a's `peer_addr_of(instance_id,
+window) -> Option<PeerAddr>` and refuses a rank naming any instance that resolves to `None` — not
+a fresh member (the NCCL id, an opaque secret, is the only out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
 "served only on peer_bind; tenant derived from the verified job row; deliberately not
 caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
 `api_freeze_baseline.txt` lines land in the same commit. Peers fence on **`job_id`**: a `RunRank`

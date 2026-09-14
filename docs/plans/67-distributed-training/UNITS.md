@@ -237,10 +237,14 @@ verbatim from the excised arm.
   `crates/jammi-wire/src/{lib.rs, gang.rs}`, `crates/jammi-server/src/grpc/gang.rs` (handler on
   the **peer listener** — 68 DIST D7's routes built outside `assemble_grpc_chain`; the I-GANG
   verification through `get_job_for_rank`, `status = 'running'`, `claimed_by`, live lease, tenant
-  derived from the row and pinned; peer addresses resolved from `instances.peer_addr` by
-  instance id; handler order fence-then-slot; #485
+  derived from the row and pinned; peer addresses resolved through U5b-1a's
+  `peer_addr_of(instance_id, window)`, never a raw `instances.peer_addr` read; handler order
+  fence-then-slot; #485
   bounds), (db) `crates/jammi-db/src/catalog/jobs_repo.rs` (`get_job_for_rank(job_id)`: primary
-  key, no tenant predicate, never admin scope; `list_gang_members(kind)`), `crates/jammi-server/src/runtime.rs` (mount on the peer
+  key, no tenant predicate, never admin scope; the coordinator-freshness check on an inbound
+  `RunRank` is U5a-1's own `fresh_instance(coordinator_instance_id)` — a single by-id read, never
+  U5b-1a's `list_gang_members`, the full-roster enumerator that unit owns end to end for the
+  coordinator's OWN dispatch), `crates/jammi-server/src/runtime.rs` (mount on the peer
   routes), `crates/jammi-server/tests/it/{api_freeze_baseline.txt (RPC + PACKAGE lines),
   api_freeze.rs (package count prose), tenant_isolation_oracle.rs (`GANG_LISTENER_ALLOWLIST`,
   unioned into `covered_on_wire`; public-listener `UNIMPLEMENTED`
@@ -285,22 +289,60 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ### U5b-1a — Membership substrate (PR-C commit 3a)
 
 - **files_in_scope**: (db) `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr_result_root`
-  migration, number at rebase, three pin sites incl. an ordered-after oracle on both backends),
-  `catalog/jobs_repo.rs` (`upsert_instance` gains `peer_addr` + a canonicalized `result_root`;
-  `list_gang_members(GangListing { kind, self_instance, canonical_root, window })` excludes
-  self, stale (freshness via U5a-1's `instance_liveness_margin()`, consumed here, never
-  recomputed), draining/warming, other-kind (kinds split on `,`, matched as whole tokens), and
-  root-divergent instances; sorted in Rust), `config/mod.rs` (`[server] peer_advertise` validated
-  at load — requires `peer_bind` and `[storage] result_root`; `canonicalize_result_root(url)`:
-  scheme-aliased, trailing slash trimmed, a non-existent or relative `file://` root refused at
-  load with the row never written). (docs-ci) `docs/guide/src/{configuration.md, security.md,
+  migration, number at rebase, three pin sites incl. an ordered-after oracle on both backends —
+  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern,
+  `tests/it/migrations.rs:1284`, repeated at the new migration's own number, `wt-C:
+  tests/it/migrations.rs:1572`), `catalog/jobs_repo.rs` (`upsert_instance` gains `peer_addr` + a
+  canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
+  by-id resolution verb, fresh-only under the same margin, no kind/root/self filter — is the
+  address-resolution surface DESIGN.md §4 names; `list_gang_members(GangListing { kind,
+  self_instance, canonical_root, window })` excludes self, stale (freshness via U5a-1's
+  `instance_liveness_margin()`, consumed here, never recomputed), draining/warming, other-kind
+  (kinds split on `,`, matched as whole tokens), and root-divergent instances; the member order is
+  byte order on `instance_id`, sorted and compared in Rust — never a SQL `ORDER BY`, whose
+  collation is backend-dependent; root divergence is likewise a byte-exact Rust comparison of the
+  canonicalized string, never a SQL `=`; `prune_instances`' window (`session.rs:259-261`'s call
+  site, today exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
+  will return) moves to STRICTLY BEYOND the margin, so a member judged merely stale is never also
+  eligible for deletion; the lease keeper's `Instance` arm (`lease_keeper.rs:765-771`, folded into
+  the generic `Some(false) → lost` dispatch at `:826-827`) RE-UPSERTS the row on a failed touch
+  instead of only flipping `lost` — `touch_instance` (`jobs_repo.rs:1763-1779`) is a pure `UPDATE`
+  that can never resurrect a pruned row, so a process whose row was pruned during a transient
+  outage now rejoins on its next heartbeat with no restart), `config/mod.rs` (`[server]
+  peer_advertise` validated at load — requires `peer_bind`; `canonicalize_result_root()`
+  canonicalizes the RESOLVED result-table root — `[storage] result_root` when set, else
+  `{artifact_dir}/jammi_db` (`config/mod.rs:305-307`'s documented default, mirroring
+  `session.rs`'s `build_result_store`, `session.rs:2241-2272`) — scheme-aliased, trailing slash
+  trimmed, a non-existent or relative `file://` root refused at load with the row never written;
+  canonical-root equality is NECESSARY, never SUFFICIENT, for shared storage — sufficiency is
+  established only by the attestation VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and
+  U5b-1b-i's per-partition inventory, never by this predicate alone). (ai-core) `session.rs` (the
+  ONLY production call site of `upsert_instance`, `session.rs:286-289` — gains the `peer_addr` /
+  canonicalized-`result_root` arguments; `:109-110`'s shared-`artifact_dir` topology note stays
+  configurable for a gang; `:2241-2272`'s `build_result_store` stays the one place the effective
+  root is actually computed at runtime). (docs-ci) `docs/guide/src/{configuration.md, security.md,
   deploy-server.md, reference-topologies.md}`.
 - **invariants_to_preserve**: B6, K2 (validate chain), K5 (migration, three pin sites).
 - **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, other-kind and
-  root-divergent instance on both backends, plus one fresh multi-kind worker included (RED at
-  base); (b) `peer_advertise` without `peer_bind`, without `result_root`, or with a non-existent
-  or relative `file://` root is refused at load, each its own typed error (RED at base); (c) the
-  migration's ordered-after oracle on both backends.
+  root-divergent instance on both backends, plus one fresh multi-kind worker included, from a DB
+  return order permuted away from `instance_id` order — the returned list is still sorted (RED at
+  base); (b) `peer_advertise` without `peer_bind`, or with a non-existent or relative `file://`
+  root, is refused at load, each its own typed error; `peer_advertise` with `result_root` UNSET is
+  ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: today's refusal sentence is
+  dropped); (c) the migration's ordered-after oracle on both backends; (d) a config with
+  `peer_advertise` set (result root set OR unset) produces a non-NULL `peer_addr`/`canonical_root`
+  `instances` row through the real session-construction path (`InferenceSession::open` /
+  `open_with_placement`), never a direct db write (RED at base: no caller threads the new
+  arguments today); (e) `peer_addr_of` resolves a busy or other-kind fresh member and returns
+  `None` for a stale one; it is unreachable from any public RPC and ignores any caller tenant (the
+  invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not exist); (f) two
+  members whose canonicalized `result_root` strings are byte-identical but sit on different
+  filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY, never
+  silently — root equality alone never green-lights a round; (g) a `2×`-lease heartbeat gap
+  followed by recovery makes the member fresh again without a process restart, via the keeper's
+  re-upsert on a failed touch (RED at base: `touch_instance` never resurrects a pruned row); (h)
+  `gang_instance_freshness` runs on BOTH backends — the SQLite-only file is widened, and the
+  live-postgres lane exercises it too.
 - **lane**: hermetic + distributed. **depends_on**: **U5a-1** (creates
   `instance_liveness_margin()`; merge order pinned, U5a-1 lands first), PR-B1. **size**: M.
 
@@ -500,7 +542,10 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   `compute_executors(executor_id, instance_id, heartbeat_at, slots)`, `compute_jobs(job_id,
   graph, status)` — plus `workers.devices TEXT` JSON `[{kind, ordinal, memory}]` written by
   `upsert_worker` from the session's device list, `wt-C: jobs_repo.rs:1556`; number at rebase,
-  both pin sites), `catalog/jobs_repo.rs` (`WorkerRecord.devices`), `catalog/compute_repo.rs`
+  three pin sites incl. an ordered-after oracle on both backends — this migration lands after
+  PR-C(67)'s, so the oracle asserts ordered-after BOTH `instances_peer_addr_result_root` (U5b-1a)
+  and `jobs_assembly_failures_next_after` (U5b-1b-ii)), `catalog/jobs_repo.rs`
+  (`WorkerRecord.devices`), `catalog/compute_repo.rs`
   (new, generic CRUD). Tests in `tests/distributed/cluster_state.rs`.
 - **invariants_to_preserve**: K5 (neutral names; append-only), B1/B2 (no distributor vocabulary
   in the engine's catalog), B4, K4, B6, the actuator-rule disposition (README r42), OPS D6.

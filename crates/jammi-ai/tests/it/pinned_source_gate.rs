@@ -3202,7 +3202,7 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // anywhere outside those two `src` trees is outside its universe entirely --
 // under `tests/it/` in either crate (e.g. the five `.register_table(`
 // calls this file's own review list keys to, `.register_table(`,
-// `crates/jammi-db/tests/it/materialization.rs:565/:616/:669/:671/:1024`,
+// `crates/jammi-db/tests/it/materialization.rs:567/:616/:669/:671/:1024`,
 // none of them under `crates/jammi-db/src`), or in a third crate, both
 // count the same way. A fifth gap sits inside the scan itself, not at its
 // boundary: [`mask_comments_only`]'s masking step desyncs on a raw string

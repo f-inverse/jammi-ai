@@ -544,9 +544,11 @@ fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictor
 /// only: a re-implementation of the SAME checks inline at an edge, without
 /// going through the shared function, would pass every behavioural oracle
 /// above yet violate the property this test exists to pin — "ONE admission
-/// function", not merely "equivalent behaviour, duplicated". A fourth edge
-/// added later without updating this list is a loud failure here, not a
-/// silently-unadmitted spec.
+/// function", not merely "equivalent behaviour, duplicated". This oracle
+/// reads only the three named files, so a fourth edge in another file is
+/// outside its universe; deriving the edge universe from the tracked source
+/// tree, and a behavioural refusal oracle for the context-predictor edge,
+/// are tracked at <https://github.com/f-inverse/jammi-ai/issues/573>.
 ///
 /// Mutation (executed and reverted, never shipped): deleting the
 /// `admit_training_spec` call from `enqueue` drops the call count to 2 and
@@ -606,8 +608,8 @@ fn every_durable_training_submit_edge_calls_the_one_admission_function() {
         total_calls += calls_in_body;
     }
 
-    // Nothing outside the three edges above calls it either — a stray
-    // fourth call site would mean an edge this list has not named.
+    // Within the three files, no call sits outside its edge's own body — a
+    // stray call there would mean a call site drifted out of the edge.
     let mut whole_crate_calls = 0usize;
     for (path, _) in edges {
         let full = root.join(path);
@@ -616,9 +618,8 @@ fn every_durable_training_submit_edge_calls_the_one_admission_function() {
     }
     assert_eq!(
         whole_crate_calls, total_calls,
-        "a call to the admission function exists outside the three named edge \
-         bodies — either a new edge needs adding to this oracle's list, or a \
-         call site drifted outside its edge's own function"
+        "a call to the admission function exists in one of the three edge files \
+         but outside its edge's own function body"
     );
     assert_eq!(
         total_calls, 3,

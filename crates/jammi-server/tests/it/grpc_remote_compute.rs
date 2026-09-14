@@ -1154,16 +1154,16 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
 /// cache reuse is not supported for `TrainingSpec::FineTune`:
 /// `jammi_ai::fine_tune::spec::admit_training_spec` — the one admission
 /// every durable submit edge for a training spec applies before a `jobs`
-/// row is written — refuses `cache = Use`, and the remote path reaches that
-/// same function through `InferenceSession::enqueue` exactly as the
-/// embedded path does. Three assertions for the refusal (the SAME typed
+/// row is written — refuses `cache = Use`; the remote path reaches it via
+/// `JobService.SubmitJob` -> `run_training_spec_deduped` ->
+/// `submit_fine_tune_spec_deduped`, and the embedded path reaches the same
+/// edge. Three assertions for the refusal (the SAME typed
 /// error, the SAME message, and NOTHING enqueued on either path), mirroring
 /// `a_count_beyond_the_devices_is_refused_from_the_wire_and_enqueues_nothing`'s
 /// shape for the rank count; then the control: the identical spec with
 /// `cache = Bypass` still persists a BYTE-IDENTICAL `jobs.spec` on both
 /// paths, so the refusal above is specific to `Use`, never "the wire drops
-/// `cache` entirely" (which would make the refusal assertions pass
-/// vacuously too).
+/// `cache` entirely".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fine_tune_cache_use_is_refused_identically_on_both_paths() {
     let server = start_engine_server_with_devices(2).await;

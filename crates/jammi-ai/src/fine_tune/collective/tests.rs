@@ -595,7 +595,7 @@ fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
 /// `root` field agreed before publishing, this is a symmetric typed error on
 /// both ranks instead.
 #[test]
-fn probe1_broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
+fn broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
     let results: Vec<std::result::Result<Vec<u32>, String>> = run_gang(2, move |local| {
         let mut t = matrix(1, 1, local.rank() as f32 + 1.0);
         let root = local.rank(); // each rank names ITSELF the root
@@ -629,7 +629,7 @@ fn probe1_broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
 /// can see). With the round descriptor's `counts` field agreed before
 /// publishing, both ranks are refused.
 #[test]
-fn probe2_all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
+fn all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
     let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
         let (rows, counts) = if local.rank() == 0 {
             (1usize, [1usize, 1])
@@ -748,7 +748,7 @@ fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
 /// `[Ok([]), Ok([0])]`, one rank silently signing a shape the other rank
 /// never actually held.
 #[test]
-fn probe_a1_a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
+fn a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
     // Noop (world = 1): the single-rank topology gets the same domain check.
     let noop = Noop::new();
     let scalar = Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar");
@@ -828,7 +828,7 @@ fn a_two_rank_all_gather_with_a_trailing_shape_mismatch_at_equal_counts_faults_b
     }
 }
 
-/// A reachability probe (not a numbered probe): three
+/// A reachability probe: three
 /// ranks name an ASYMMETRIC set of roots for `broadcast` — two agree with
 /// each other, one disagrees — so more than one rank's `Contribution` carries
 /// `Some` at once if the round were ever (wrongly) assembled. The property
@@ -897,7 +897,7 @@ fn reachability_a_two_rank_uneven_all_reduce_sum_list_never_panics() {
 /// a symmetric typed error on BOTH ranks, and the gang is left faulted for
 /// any later collective.
 #[test]
-fn probe_a4_broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically() {
+fn broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically() {
     let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
     let rank0 = gang.rank(0).expect("rank 0");
     let rank1 = gang.rank(1).expect("rank 1");
@@ -950,8 +950,8 @@ fn probe_a4_broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symme
 /// only the THIRD disagrees, on a field neither the root check nor the
 /// counts check exercises — the reduced tensor's dtype. This shape of case is
 /// exactly what a wrong implementation (say, one that compared each rank
-/// only to its immediate neighbor, or that only checked the field the named
-/// probes happened to cover) would get wrong: two agreeing ranks pairing up
+/// only to its immediate neighbor, or that only checked the field the
+/// tests above happened to cover) would get wrong: two agreeing ranks pairing up
 /// and only the outlier ever noticing. `agrees_with` compares every rank's
 /// descriptor against rank 0's, so this must fault symmetrically too.
 #[test]

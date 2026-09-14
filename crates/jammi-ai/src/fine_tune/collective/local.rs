@@ -133,8 +133,8 @@ impl TensorSignature {
     /// least one entry here. This does not fall back to signing an empty
     /// trailing shape for a shape it cannot honestly sign — a 0-dim tensor
     /// used to reach this via `unwrap_or_default()` and be signed exactly
-    /// like a 1-D tensor of the same (empty) trailing shape, which is the
-    /// PROBE-A1 defect.
+    /// like a 1-D tensor of the same (empty) trailing shape, which was the
+    /// defect.
     fn of_gather_slice(t: &Tensor) -> Self {
         let dims = t.dims();
         let trailing = dims.get(1..).expect(
@@ -1209,7 +1209,7 @@ mod descriptor_tests {
         };
         assert!(
             a.agrees_with(&b).is_err(),
-            "two ranks each naming themselves root must never agree — this is PROBE1's field"
+            "two ranks each naming themselves root must never agree — this is the root field"
         );
     }
 
@@ -1219,7 +1219,7 @@ mod descriptor_tests {
         let b = gather_descriptor(vec![1, 2]);
         assert!(
             a.agrees_with(&b).is_err(),
-            "two ranks with different partition vectors must never agree — this is PROBE2's field"
+            "two ranks with different partition vectors must never agree — this is the counts field"
         );
     }
 

@@ -50,6 +50,16 @@ fn main() {
     config.enable_type_names();
     config.type_name_domain(["."], "type.googleapis.com");
 
+    // `JobEvent.Event.done` carries a whole `JobStatusResponse` beside
+    // `Event.progress`'s much smaller `JobProgress`; a `ModelResult` field
+    // (P6, U3 fix round 1: `cache_outcome`) tipped that gap over clippy's
+    // `large_enum_variant` threshold (the streaming frame paid for a full
+    // terminal payload on the hot `progress` variant's stack slot too).
+    // Boxing the rarely-taken terminal frame carries the pointer size on
+    // every frame instead, at the cost of one allocation on the terminal
+    // frame alone.
+    config.boxed(".jammi.v1.job.JobEvent.event.done");
+
     // Export the compiled `FileDescriptorSet` so consumers can decode the
     // service surface from the binary itself. The tenant-isolation oracle
     // derives the live `jammi.v1` rpc list from this descriptor rather than a

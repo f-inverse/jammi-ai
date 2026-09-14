@@ -170,7 +170,14 @@ rule, and the consolidation's own changes are the nine resolutions above.
 ## Residuals recorded UNCOVERED
 
 - `crates/jammi-ai/tests/it/jobs_cancel.rs::a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_boundary`
-  timed out once (15 s) inside the full parallel `it` suite on the U2b+U3 head and passed alone in 1.3 s; a
-  load-sensitive bound, not a consolidation defect — recorded so a CI recurrence is read as such.
+  (a `main` test, unchanged here but for the `cache` field) timed out at its 15 s bound in both full
+  `cargo test --workspace` runs on this branch — each of which ran while the 86-command guard matrix was
+  executing on the same machine — and passed in every uncontended shape: alone (1.3 s), inside the
+  `jammi-ai` `it` suite alone at this head (552/552), and under the workspace-unified feature set alone at
+  this head and on `main` (1.07 s each). A load-sensitive bound, not a consolidation defect — recorded so a
+  CI recurrence is read as such and fixed at the test (widen or make the watcher cadence explicit), never
+  by touching the mechanism. (`main`'s own `jammi-ai` `it` suite fails
+  `acceleration_report::probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_deterministic` on this
+  machine; that test is untouched by this PR and passes at this head.)
 - The kernel-admission profile determinant (#546), the model→prefix ownership edge (#547), the untagged
   `JobSpec` (#548), and the W=1 mining parity oracle (#551) stand as filed by the units.

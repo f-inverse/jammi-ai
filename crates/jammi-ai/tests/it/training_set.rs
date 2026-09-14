@@ -1,4 +1,4 @@
-//! The training set as a producer output (#500 U2a) — the `jammi-ai` half.
+//! The training set as a producer output (#500) — the `jammi-ai` half.
 //!
 //! A tabular fine-tune no longer re-runs its source query into memory: it
 //! materialises the projected rows into an immutable `TrainingSet` result table
@@ -493,10 +493,9 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
 /// Corrected (b) — two fine-tune JOBS over the same plain source, columns,
 /// task and format materialise TWO training-set tables, never one.
 ///
-/// An earlier draft's (b) case ("two jobs over the same
-/// source/columns/task/format reuse ONE table") was refuted by the lead's own
-/// K7 ruling: reuse requires pinned EQUAL anchors, and a registered source
-/// exposes no version surface, so the engine anchors it
+/// Two jobs over the same source/columns/task/format do not reuse ONE table:
+/// reuse requires pinned EQUAL anchors, and a registered source exposes no
+/// version surface, so the engine anchors it
 /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
 /// and never reuses across two independent reads of it — the same honest
 /// off-ness the embedding cache records (`pipeline/embedding.rs:89-93`).

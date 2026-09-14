@@ -64,7 +64,13 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
     let spec = spec.ok_or_else(|| Status::invalid_argument("SubmitJob request carries no spec"))?;
     match spec {
         pb::submit_job_request::Spec::FineTune(ft) => {
-            let common = lora_common_from_proto(base_model, config, world_size, cache)?;
+            let common = lora_common_from_proto(
+                base_model,
+                config,
+                world_size,
+                cache,
+                LoraSpecKind::FineTune,
+            )?;
             if ft.source.is_empty() {
                 return Err(Status::invalid_argument("source is required"));
             }
@@ -83,7 +89,13 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
             })
         }
         pb::submit_job_request::Spec::GraphFineTune(g) => {
-            let common = lora_common_from_proto(base_model, config, world_size, cache)?;
+            let common = lora_common_from_proto(
+                base_model,
+                config,
+                world_size,
+                cache,
+                LoraSpecKind::GraphFineTune,
+            )?;
             let sources = g.sources.ok_or_else(|| {
                 Status::invalid_argument("graph_fine_tune spec carries no sources")
             })?;
@@ -199,14 +211,40 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
     }
 }
 
+/// Which of the two LoRA fine-tune kinds is decoding through
+/// [`lora_common_from_proto`] — the ONE place that can still see which kind
+/// requested a policy it cannot honour (P4, U3 fix round 1), the same "last
+/// edge that can still see it" reasoning [`training_spec_from_proto`]'s own
+/// `ContextPredictor` world_size refusal already uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoraSpecKind {
+    FineTune,
+    GraphFineTune,
+}
+
 /// Fold the request's common `base_model` + optional `config` + `cache` into a
 /// [`TrainingCommon`] for the two LoRA fine-tune kinds. An empty base model is a
 /// client error (the worker has nothing to adapt).
+///
+/// P4 (fix round 1): `cache = USE` is refused, typed, for `kind ==
+/// GraphFineTune` — `ProducingDescriptor::FineTune` (and every
+/// `probe_model_by_definition`/`record_model_materialization` mechanism
+/// built on it) covers only the column-source `FineTune` kind at this
+/// commit (`worker.rs`'s own `materialization_source: None` for the graph
+/// path); a graph fine-tune job carries no materialization to probe or
+/// record, so honouring `Use` for it would be a silent no-op behind a wire
+/// promise the engine cannot keep. This mirrors the `ContextPredictor`
+/// `world_size` refusal above: the policy the kind cannot honour is refused
+/// at the LAST edge that can still see both the kind and the value, rather
+/// than silently dropped once the two are folded into one `TrainingCommon`.
+/// `Bypass`/unset is unaffected — a graph fine-tune always trains, exactly
+/// as it did before this field existed.
 fn lora_common_from_proto(
     base_model: String,
     config: Option<training_pb::FineTuneConfig>,
     world_size: u32,
     cache: i32,
+    kind: LoraSpecKind,
 ) -> Result<TrainingCommon, Status> {
     if base_model.is_empty() {
         return Err(Status::invalid_argument("base_model is required"));
@@ -215,11 +253,25 @@ fn lora_common_from_proto(
         .map(FineTuneConfig::try_from)
         .transpose()?
         .unwrap_or_default();
+    let cache = super::cache_policy_from_proto(cache)?;
+    if kind == LoraSpecKind::GraphFineTune && cache == jammi_db::store::CachePolicy::Use {
+        let message = "cache = USE is not supported for a graph_fine_tune job (a graph \
+                        fine-tune carries no `ProducingDescriptor::FineTune` materialization to \
+                        probe or record — that descriptor covers only the column-source \
+                        `fine_tune` kind); submit it without `cache` or with `cache = BYPASS`"
+            .to_string();
+        let engine_err = JammiError::Config(message.clone());
+        return Err(jammi_wire::attach_error_detail(
+            tonic::Code::InvalidArgument,
+            message,
+            &engine_err,
+        ));
+    }
     Ok(TrainingCommon {
         base_model,
         config,
         world_size: world_size_from_proto(world_size),
-        cache: super::cache_policy_from_proto(cache)?,
+        cache,
     })
 }
 
@@ -775,11 +827,16 @@ mod tests {
         );
     }
 
-    /// The cache field rides on the request like `world_size`, not the kind,
-    /// so the SAME field serves a graph fine-tune: the two LoRA kinds cannot
-    /// diverge on it, because there is only one place to put it.
+    /// The cache field rides on the request like `world_size`, not the kind
+    /// — there is only one place to put it — but P4 (fix round 1) means the
+    /// two LoRA kinds do NOT honour it identically: `cache = USE` on a
+    /// `graph_fine_tune` job is refused, typed, at this same decode (a graph
+    /// fine-tune carries no `ProducingDescriptor::FineTune` materialization
+    /// to probe or record — `worker.rs`'s own `materialization_source: None`
+    /// for this kind). This replaces the prior version of this test, which
+    /// asserted the CARRY; asserting the refusal is the correctness bar now.
     #[test]
-    fn the_same_cache_field_serves_the_graph_fine_tune_kind() {
+    fn graph_fine_tune_refuses_cache_use() {
         use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
 
         let request = pb::SubmitJobRequest {
@@ -804,11 +861,47 @@ mod tests {
             cache: ProtoCachePolicy::Use as i32,
         };
 
+        let status = training_spec_from_proto(request)
+            .expect_err("cache = USE must be refused for graph_fine_tune");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// The refusal above is scoped to `USE` specifically — `BYPASS`/unset
+    /// (the default) still decodes and carries onto a graph fine-tune's
+    /// `TrainingCommon` exactly as before this field existed: this kind is
+    /// never blocked from training, only from a reuse promise it cannot
+    /// keep.
+    #[test]
+    fn graph_fine_tune_still_carries_cache_bypass() {
+        use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
+
+        let request = pb::SubmitJobRequest {
+            spec: Some(pb::submit_job_request::Spec::GraphFineTune(
+                training_pb::GraphFineTuneSpec {
+                    sources: Some(training_pb::GraphFineTuneSources {
+                        node_source: "nodes".into(),
+                        id_column: "id".into(),
+                        text_column: "text".into(),
+                        edge_source: "edges".into(),
+                        src_column: "src".into(),
+                        dst_column: "dst".into(),
+                        provenance: training_pb::EdgeProvenance::Declared as i32,
+                    }),
+                    sample_config: Some(training_pb::GraphSampleConfig::default()),
+                },
+            )),
+            base_model: "local:tiny".into(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size: 0,
+            cache: ProtoCachePolicy::Bypass as i32,
+        };
+
         let spec = training_spec_from_proto(request).expect("decode");
         let TrainingSpec::GraphFineTune { common, .. } = spec else {
             panic!("expected the graph_fine_tune variant");
         };
-        assert_eq!(common.cache, jammi_db::store::CachePolicy::Use);
+        assert_eq!(common.cache, jammi_db::store::CachePolicy::Bypass);
     }
 
     /// r26: a context-predictor job is refused above one rank at the LAST

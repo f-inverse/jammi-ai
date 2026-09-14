@@ -459,19 +459,18 @@ def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], re
             if deny is not None:
                 result.fail(f"{path}:{lineno}: attacks[{file_key!r}] command is denied: {deny}")
 
-    missing = required_files - covered_files
-    if missing:
-        result.fail(f"{path}: omits {len(missing)} file(s) the union of open second-round BLOCK "
-                    f"row(s) require, e.g. {sorted(missing)[:3]}")
-
-    # Fix round 5 Z7: `unit_branch`/`residual_risk` presence, pair-reuse
-    # denial and the execution-class requirement all run through the ONE
-    # shared validator reader 1 (the hook) calls — never re-implemented
-    # here, which is exactly how this file's own earlier gaps (accepting
-    # an all-inspector record, a reused (command, hash) pair, a row with
-    # no `residual_risk`/`unit_branch` at all) went uncaught.
+    # Fix round 5 Z7: the omits-a-command arm (below, `required_files`
+    # threaded through for real), `unit_branch`/`residual_risk` presence,
+    # pair-reuse denial and the execution-class requirement all run
+    # through the ONE shared validator reader 1 (the hook) calls — never
+    # a second, independently maintained implementation (the OLD inline
+    # `missing = required_files - covered_files` check this replaces was
+    # exactly that: a duplicate that happened to agree with the shared
+    # function, which is exactly how this file's own earlier gaps
+    # (accepting an all-inspector record, a reused (command, hash) pair,
+    # a row with no `residual_risk`/`unit_branch` at all) went uncaught).
     shape_why = mod._r12_anticipation_rejection([r for _, r in art_rows], [], check_attacks=True,
-                                                 required_files=set())
+                                                 required_files=required_files)
     if shape_why is not None:
         result.fail(f"{path}: {shape_why}")
 
@@ -1661,6 +1660,39 @@ def fixture_rr18_ambiguous_pool_without_ts_fails_loudly() -> None:
         _assert(any("AMBIGUOUS" in f for f in r.failures), "RR18", f"{r.failures}")
 
 
+def fixture_rr20_omits_a_required_file_fails() -> None:
+    """fix round 5 Z7: the BLOCK's own `finding_locations` names TWO files
+    (`a.py`, `b.py`), but the anticipation record's `attacks` covers only
+    ONE -- the omits-a-command arm, now enforced through the SAME shared
+    validator (`_r12_anticipation_rejection`) reader 1 calls, must FAIL
+    naming the omission. RED at daebd948 by the executed probe: the OLD
+    inline `missing = required_files - covered_files` check this replaced
+    happened to catch this case too, which is exactly why the shared
+    function's OWN identical arm went unexercised (an `if False:` mutation
+    on it killed NOTHING before this fixture existed)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1", "b.py:1"],
+                                 "class_enumeration": ["a.py:1", "b.py:1"]})
+        anticipation_row = json.dumps({
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        _commit(work, "ci: touch a gate script", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR20", "an anticipation record omitting a required file must FAIL")
+        _assert(any("omits" in f and "b.py" in f for f in r.failures), "RR20", f"{r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -1683,6 +1715,7 @@ RR_FIXTURES = [
     ("RR12h", fixture_rr12h_untracked_bash_path_fails_shape),
     ("RR13", fixture_rr13_r12_grandfather_only_shrinks),
     ("RR19", fixture_rr19_required_commands_only_shrinks),
+    ("RR20", fixture_rr20_omits_a_required_file_fails),
     ("RR14", fixture_rr14_missing_gates_fails),
     ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
     ("RR16", fixture_rr16_nonzero_rc_fails),

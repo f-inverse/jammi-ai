@@ -580,14 +580,13 @@ class PaidPodLaneTest(unittest.TestCase):
 
 
 class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
-    """W12 audit fix, round 2 (the lead's own sweep, on top of 7743cad3):
-    P7's 'nothing may call a paid pod lane' rule shared the SAME
-    `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE` text-regex class the P6
-    traversal was fixed for -- mirrors `UsesReadFromTheParsedDocumentTest`
-    (P6) and `P1UsesReadFromTheParsedDocumentTest` one-for-one, driven
-    against the gang row per this module's own convention. RED against the
-    regex form (each case below found 0 at 7743cad3's own P7 shape), GREEN
-    once `uses:` is read from the parsed document via
+    """P7's 'nothing may call a paid pod lane' rule reads a job-level
+    `uses:` (local or cross-repo) from the parsed document, never a text
+    regex -- mirrors `UsesReadFromTheParsedDocumentTest` (P6) and
+    `P1UsesReadFromTheParsedDocumentTest` one-for-one, driven against the
+    gang row per this module's own convention. Each case below is a
+    quoting/`+`-truncation/unexaminable-sibling shape a text regex would
+    miss, GREEN once `uses:` is read from the parsed document via
     `_scan_uses_references`."""
 
     def _texts(self, **overrides: str) -> dict[str, str]:
@@ -1630,13 +1629,12 @@ class OnBlockDoctrineTest(unittest.TestCase):
 
 
 class P1UsesReadFromTheParsedDocumentTest(unittest.TestCase):
-    """W12 audit fix, round 2 (the lead's own sweep, on top of 7743cad3):
-    P1's 'nothing may call the prove lane' rule shared the SAME
-    `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE` text-regex class the P6
-    traversal was fixed for -- mirrors `UsesReadFromTheParsedDocumentTest`
-    one-for-one. RED against the regex form (each case below found 0 at
-    7743cad3's own P1 shape), GREEN once `uses:` is read from the parsed
-    document via `_scan_uses_references`."""
+    """P1's 'nothing may call the prove lane' rule reads a job-level
+    `uses:` (local or cross-repo) from the parsed document, never a text
+    regex -- mirrors `UsesReadFromTheParsedDocumentTest` one-for-one.
+    Each case below is a quoting/`+`-truncation/unexaminable-sibling
+    shape a text regex would miss, GREEN once `uses:` is read from the
+    parsed document via `_scan_uses_references`."""
 
     def test_single_quoted_local_uses_reference_to_prove_workflow_fails(self):
         caller = "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n    uses: './.github/workflows/gpu-prove.yml'\n"
@@ -2466,6 +2464,169 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "clean.yml": clean})
         self.assertEqual(findings, [], findings)
+
+
+class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
+    """The final audit's differential fixtures against f104d15a: a row's
+    `gate_job` was exempt from P6's job-level `uses:` rule UNCONDITIONALLY
+    (by name alone, regardless of what its own `uses:` actually named),
+    and the two name-exempted classes (`REVIEWED_NONPUBLISHING_LOCAL_
+    REUSABLES`, `_gpu-proof-required.yml`) were scanned by nothing at all
+    -- a publish step added to either was silent. Both narrowed: a
+    gate_job is exempt ONLY when its own parsed `uses:` resolves exactly
+    to `_gpu-proof-required.yml`; every exempted-by-name file's own jobs
+    are scanned by the step-level rule directly."""
+
+    def test_gate_job_repointed_elsewhere_with_the_uses_text_in_its_name_is_a_finding(self):
+        # The auditor's own differential: a text-substring check on the
+        # gate job's body would have been satisfied by this `name:`
+        # value; the PARSED job-level `uses:` (what this rule reads
+        # instead) resolves to `_evil.yml`, never `_gpu-proof-required.yml`.
+        texts = _positive_texts()
+        texts["npm.yml"] = _wf(
+            "v*",
+            "  gpu-proof:\n"
+            '    name: "uses: ./.github/workflows/_gpu-proof-required.yml"\n'
+            "    if: startsWith(github.ref, 'refs/tags/v')\n"
+            "    uses: ./.github/workflows/_evil.yml\n"
+            "    secrets: inherit\n" + _step_gated_job("publish", "gpu-proof", "Publish"),
+        )
+        texts["_evil.yml"] = (
+            "name: evil\n\non:\n  workflow_call:\n\njobs:\n"
+            "  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n"
+        )
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "npm.yml" in f and "gpu-proof" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+
+    def test_p3_gate_check_reads_the_parsed_uses_not_a_name_substring(self):
+        texts = _positive_texts()
+        texts["npm.yml"] = _wf(
+            "v*",
+            "  gpu-proof:\n"
+            '    name: "uses: ./.github/workflows/_gpu-proof-required.yml"\n'
+            "    if: startsWith(github.ref, 'refs/tags/v')\n"
+            "    uses: ./.github/workflows/_evil.yml\n"
+            "    secrets: inherit\n" + _step_gated_job("publish", "gpu-proof", "Publish"),
+        )
+        texts["_evil.yml"] = (
+            "name: evil\n\non:\n  workflow_call:\n\njobs:\n"
+            "  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        )
+        findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
+        self.assertTrue(
+            any("npm-publish" in f and "gate job `gpu-proof`" in f and "does not" in f for f in findings),
+            findings,
+        )
+
+    def test_gpu_proof_required_itself_gaining_a_publish_step_is_a_finding(self):
+        texts = _positive_texts()
+        texts["_gpu-proof-required.yml"] = PROOF_REQUIRED_YML_GOOD.replace(
+            "      - uses: actions/checkout@v4\n",
+            "      - uses: actions/checkout@v4\n      - run: npm publish\n",
+            1,
+        )
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "_gpu-proof-required.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("proof-required" in f for f in mine), mine)
+
+    def test_summary_yml_gaining_a_publish_step_is_a_finding(self):
+        texts = _positive_texts()
+        texts["_summary.yml"] = (
+            "name: Summary\n\non:\n  workflow_call:\n    inputs:\n"
+            "      needs_json:\n        required: true\n        type: string\n\n"
+            "jobs:\n  assert:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - run: npm publish\n"
+        )
+        caller = (
+            "name: ci-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  ci-summary:\n    if: always()\n"
+            "    uses: ./.github/workflows/_summary.yml\n"
+            "    with:\n      needs_json: '{}'\n"
+        )
+        texts["ci-caller.yml"] = caller
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "_summary.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("assert" in f for f in mine), mine)
+        # The caller's own job-level uses: to the allowlisted file stays
+        # exempt -- only the exempted file's OWN content is now scanned.
+        self.assertFalse(any("ci-caller.yml" in f for f in findings), findings)
+
+    def test_with_command_carrier_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: nick-fields/retry@v3\n"
+            "        with:\n          command: cargo publish\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_with_script_carrier_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: actions/github-script@v7\n"
+            '        with:\n          script: "npm publish"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_with_args_carrier_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker://alpine\n"
+            '        with:\n          args: "npm publish"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_with_entrypoint_carrier_is_caught(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: docker://alpine\n"
+            "        with:\n          entrypoint: npm publish\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_env_carrier_with_an_indirect_run_command_is_caught(self):
+        # The `run:` line itself never spells the primitive out -- only
+        # the `env:` value does.
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - env:\n          CMD: npm publish\n"
+            '        run: bash -c "$CMD"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_bare_string_step_entry_is_a_named_finding_never_a_silent_skip(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - actions/checkout@v4\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        mine = [f for f in findings if "rogue.yml" in f and "sneak" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("not a mapping" in f for f in mine), mine)
+
+    def test_job_level_uses_that_is_a_list_not_a_string_is_a_finding(self):
+        caller = (
+            "name: list-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  build:\n    uses: [./.github/workflows/_evil.yml]\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "list-caller.yml": caller})
+        mine = [f for f in findings if "list-caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("build", mine[0])
+        self.assertIn("not a string", mine[0])
 
 
 class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):

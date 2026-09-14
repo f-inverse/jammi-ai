@@ -1115,7 +1115,7 @@ mod tests {
     use crate::session::InferenceSession;
 
     /// The function-level exercise of the race `recompute_training_set`'s own
-    /// "The three refusals" doc section names: `recompute`'s outer dispatch
+    /// "The four refusals" doc section names: `recompute`'s outer dispatch
     /// reads the descriptor through `ResultStore::producing_descriptor` (the
     /// "descriptor read"), THEN `recompute_training_set` reads the SAME
     /// sidecar again for the anchor set (the "anchor read"). A sidecar that

@@ -17,9 +17,10 @@ Every citation names a construct by path and item (`path::item`), never a `path:
 `docs/plans/67-distributed-training` (3), `docs/maintainer/MAINTAINER-GUIDE.md`, this directory.
 Commit groups, in order: U2b's 23 own commits (11 plan-doc commits dropped because `main` already
 carried their later twins — the #556 construct-citation conversion and the A4/A14 dated rows), U3's 76,
-U5a-1's 35 (with its migration renumbered at pick time), then four consolidation commits:
-the W=1 digest-pin helper, the plan/contract normalization, and two `jammi-db` fixes for hand-resolved
-migration hunks. The two `pre-consolidation` squash commits on the unit branches are not picked.
+U5a-1's 35 (with its migration renumbered at pick time), then five consolidation commits:
+the W=1 digest-pin helper, the plan/contract normalization, two `jammi-db` fixes for hand-resolved
+migration hunks, and the gang spec-parity fixture's `cache` field — plus this contract and its record
+commits. The two `pre-consolidation` squash commits on the unit branches are not picked.
 
 ## U2b — eager loader, partition rule, scaler, whole-set arms (as shipped: the streaming arm excised)
 
@@ -140,8 +141,9 @@ differed from that target, by exactly the resolutions below.
 - C4 `crates/jammi-db/tests/it/materialization.rs` — both sides' imports merged.
 - C5 `docs/guide/src/fine-tuning.md` — `main`'s graph-arm paragraph (#538) kept above U3's cache section, which
   its own later commit restates as "not yet supported".
-- C6 `crates/jammi-ai/src/fine_tune/worker.rs` — `main`'s `single_rank` comment kept; U3's
-  `.result_store(result_store)` builder call added (the guarded prune port, P6).
+- C6 `crates/jammi-ai/src/fine_tune/worker.rs` — U2b's `single_rank` comment on the builder chain (it is
+  not on `main`; U2b's own head carries it) kept; U3's `.result_store(result_store)` builder call added
+  (the guarded prune port, P6).
 - C7 `crates/jammi-db/src/catalog/{migrations.rs,schema.rs}`, `tests/it/migrations.rs` — 033 (U3) then 034
   (U5a-1); the two `jammi-db` consolidation fixes close 033's raw-string literal before 034's declaration and
   split the ledger into one tuple per migration (both were compile errors, caught by the workspace build at
@@ -155,6 +157,14 @@ differed from that target, by exactly the resolutions below.
   `produced_by`); the three readers collapse to one helper that excludes the sidecar, as the contrastive pin
   already did. Property: P3 compares adapter bytes, not provenance metadata; the adapter prints were identical
   before and after (the failing assertion's `left`/`right` differed only by the sidecar entry).
+- C10 `crates/jammi-server/tests/it/gang_training_spec_parity.rs::fine_tune_spec_world_two` — U5a-1's
+  producer→consumer parity fixture builds a real `TrainingSpec::FineTune` literal, and U3 added the `cache`
+  field to that variant on its own branch, so the literal did not compile on the consolidated head (the one
+  hunk the build, not a test, caught across units). `cache: CachePolicy::Bypass` is added. Property: `cache`
+  is a call-time dial excluded from `spec_canonical`, so the `world_size` decode the oracle asserts is
+  unaffected; `Bypass` is the serde default (`#[serde(default)]` on the field, `#[default]` on the enum) a
+  row persisted before the field existed decodes to, so `get_job_for_rank` reads U3's `TrainingCommon` shape
+  either way — the parity test executes green at this head.
 
 ## Gates at the final head
 
@@ -165,7 +175,7 @@ The rigor record concatenates the three units' gate-state rows and the closers t
 a `pressure-tester` pass over this consolidation and an `oracle` PASS (the oracle record's `head_sha` tree
 equals the head outside `docs/rigor/**`). No further adversarial round was opened on the consolidated head:
 each unit's closing audit ended with its findings filed (#573, #574, #566, #562) under the program's closing
-rule, and the consolidation's own changes are the nine resolutions above.
+rule, and the consolidation's own changes are the ten resolutions above.
 
 ## Residuals recorded UNCOVERED
 

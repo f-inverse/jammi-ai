@@ -172,18 +172,23 @@ preload_models = [
     "sentence-transformers/all-MiniLM-L6-v2",
     { id = "local:/models/bge-small", task = "text_embedding" },
 ]
-# The INTERNAL peer listener for beyond-one-node retrieval: the address this
-# replica serves `jammi.v1.peer.PeerService` (segment search for the
-# segments it owns) on, to OTHER replicas of the same deployment. Unset (the
-# default) = no third listener = single node. A replica is a segment owner
-# iff this is set. Must differ from health_listen and flight_listen at a
-# fixed port (`:0` never collides). I-PEER: every client of this listener is
-# a jammi coordinator -- the owner trusts the channel, binds no tenant, and
-# enforces only that each requested segment belongs to the named table (the
-# coordinator resolved that table through its own tenant-scoped catalog
-# read before fanning out). Bind it on a private interface behind network
-# policy / mTLS from the runtime: on a routable interface without them it
-# exposes cross-tenant reads. See security.md "The peer listener".
+# The INTERNAL peer listener for beyond-one-node retrieval and multi-host
+# gang admission: the address this replica serves `jammi.v1.peer.PeerService`
+# (segment search for the segments it owns) AND `jammi.v1.gang.GangService`
+# (RunRank -- a coordinator admitting this replica into a multi-host training
+# run) on, to OTHER replicas/coordinators of the same deployment. Unset (the
+# default) = no third listener = single node = no gang admission surface.
+# A replica is a segment owner and a gang admission member iff this is set.
+# Must differ from health_listen and flight_listen at a fixed port (`:0`
+# never collides). I-PEER / I-GANG: every client of this listener is a jammi
+# coordinator -- the owner/member trusts the channel; the peer side binds no
+# tenant and enforces only that each requested segment belongs to the named
+# table (the coordinator resolved that table through its own tenant-scoped
+# catalog read before fanning out); the gang side derives tenant from the
+# verified job row, never the caller. Bind it on a private interface behind
+# network policy / mTLS from the runtime: on a routable interface without
+# them it exposes cross-tenant reads. See security.md "The peer listener"
+# and "The gang listener".
 # peer_bind = "10.0.0.5:8082"
 # MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
 # estimated bytes ONE query may load locally for segments it does not own,

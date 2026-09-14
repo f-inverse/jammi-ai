@@ -3084,6 +3084,78 @@ describing a removed surface.
   **Invariant: faithful errors** — each `Status` carries the full structured detail so the
   client reconstructs the exact variant.
 
+### 2.8a GangService — multi-host gang admission (I-GANG)
+
+The coordinator-to-member admission seam for a multi-host training run.
+Proto: `crates/jammi-wire/proto/jammi/v1/gang.proto`, `service GangService`
+with one bidi RPC, `RunRank(stream RankControl) returns (stream RankEvent)`.
+Handler: `crates/jammi-server/src/grpc/gang.rs`, `GangServer::run_rank`.
+Mounted beside `PeerServiceServer` on the internal `[server] peer_bind`
+listener only (`crates/jammi-server/src/runtime.rs`, `OssServer::bind`) —
+never on the public listener, never wrapped by `TenantResolverLayer`; the
+public listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`
+(`GANG_LISTENER_ALLOWLIST`, `crates/jammi-server/tests/it/tenant_isolation_oracle.rs`).
+
+**The RunRank refusal lattice.** A call is decided in this order, each rung
+its own status:
+
+1. **Wire K2** (`gang.rs`, before any row read): `world == 0` →
+   `InvalidArgument("world must be greater than zero")`; `rank >= world` →
+   `InvalidArgument("rank must be less than world")`.
+2. **I-GANG, a row predicate AND a host-local verify — two conjuncts.**
+   (a) `Catalog::get_job_for_rank(job_id)` (`crates/jammi-db/src/catalog/jobs_repo.rs`,
+   primary-key-only, no tenant predicate, never admin scope) returns a row
+   iff: `status = 'running'`; `claimed_by = assign.coordinator_instance_id`;
+   `attempts == assign.attempt`; the lease is live (the negation of
+   `lease_expired_clause`, `crates/jammi-db/src/catalog/lease.rs` — a NULL
+   lease column reads not-live, never live-by-default); and, when
+   `assign.world > 1`, `training_set_ref`/`training_set_location` are both
+   non-null. Any conjunct false, or the row absent, refuses. (b) For
+   `world > 1` only, AFTER (a) succeeds: `resolve_training_set_identity`
+   (`crates/jammi-server/src/grpc/gang.rs`) performs its own host-local
+   sidecar verify — `Catalog::get_result_table_for_tenant` (the STRICT
+   tenant predicate `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`,
+   never the relaxed `get_result_table` read that also matches a
+   NULL-tenant row) resolves the `training_set_location` row under the
+   tenant `get_job_for_rank`'s own row carries (never a caller-supplied
+   tenant), then `ResultStore::read_materialization_manifest` reads the
+   sidecar and the call refuses unless it decodes and
+   `manifest.artifact == training_set_ref`. This function refuses
+   immediately, before calling the strict resolver at all, whenever admin
+   scope is ambient (`TenantBinding::is_admin_scope()`) — a resolution
+   wrapped in `JammiSession::with_admin_scope` is refused regardless of
+   which table exists.
+3. **Coordinator freshness.** `Catalog::fresh_instance(coordinator_instance_id,
+   lease)` (`crates/jammi-db/src/catalog/jobs_repo.rs`) requires the named
+   coordinator's `instances` row present and last seen within
+   `instance_liveness_margin(lease)` — `2 × lease` on the DB clock
+   (`crates/jammi-db/src/catalog/lease.rs`, the same margin
+   `reclaim_expired_jobs`'s inline-execution arm already uses); absent or
+   stale refuses.
+4. Every refusal in rung 2 or 3 is the SAME status and message —
+   `FailedPrecondition("gang admission refused")` — regardless of which
+   conjunct failed: the listener discloses neither a job's existence, its
+   claimant, nor its attempt (non-disclosure). A call that satisfies every
+   rung still ends `Unimplemented("gang admission is not implemented on
+   this build")`: the handler has decided every I-GANG determinant but has
+   no admission session to hand the call to.
+
+**Tenant handling.** Tenant is derived from the `jobs` row `get_job_for_rank`
+returns, never from caller metadata — a caller naming a different tenant is
+silently ignored, not refused. A NULL row tenant is not specially refused
+(the catalog's existing unscoped-read shape).
+
+**Observability.** `jammi_gang_requests_total{rpc="RunRank"}`
+(`crates/jammi-server/src/routes/health.rs`) counts every `RunRank` call
+reaching this member, incremented by the whole-server
+`crate::metrics_layer::Metrics::call` regardless of how the call is
+ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
+`PeerService`.
+
+**Config.** `instance_liveness_margin` is not its own config key: it is `2 ×`
+whatever `[lease] duration_secs` resolves to (`LeaseIntervals::lease()`),
+computed once at `OssServer::bind` and passed into `GangServer::new`.
+
 ### 2.9 Numerics (`jammi-numerics`)
 
 - **`NumericsError` / `Result`** — `crates/jammi-numerics/src/error.rs`. The only

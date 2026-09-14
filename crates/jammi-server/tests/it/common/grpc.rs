@@ -730,7 +730,8 @@ pub struct PeerEngineServer {
     /// directly (the owner's own result store).
     pub engine: Arc<InferenceSession>,
     /// The server's metrics registry — `jammi_peer_requests_total{rpc}` is the
-    /// observable that a peer call reached this owner.
+    /// observable that a peer call reached this owner; `jammi_gang_requests_total{rpc}`
+    /// is the same observable for a coordinator's `RunRank` call.
     pub metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
     pub shutdown: oneshot::Sender<()>,
     pub handle: AbortOnDropHandle<()>,

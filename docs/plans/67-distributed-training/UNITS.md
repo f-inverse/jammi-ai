@@ -398,20 +398,16 @@ re-verification) on top of it.
   relaxed `get_result_table` read), `crates/jammi-db/src/catalog/schema.rs` +
   `migrations.rs` (migration adding `jobs.training_set_ref`/
   `training_set_location`, both nullable TEXT, a paired-nullability `CHECK`
-  constraint — numbered 033 (`jobs_training_set_identity`) on this branch's
-  base; when PR-B2's `033_model_materialization` is on `main` first, PR-C1's
-  rebase renumbers `033_jobs_training_set_identity` to 034 (four pin sites +
-  the ordered-after oracle: the tuple in `catalog/migrations.rs`'s const
-  list, the `MIGRATION_033_JOBS_TRAINING_SET_IDENTITY` constant name in
-  `catalog/schema.rs`, the const `tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`,
-  the SQL `IN`-list literal inside
+  constraint — numbered `034_jobs_training_set_identity`, ordered after U3's
+  `033_model_materialization`, which lands in the same PR; the number is pinned at four
+  sites plus the ordered-after oracle: the tuple in `catalog/migrations.rs`'s const list,
+  the constant `catalog/schema.rs::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY`, the const
+  `tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`, the SQL `IN`-list literal inside
   `tests/it/migrations.rs::migration_029_copies_training_jobs_rows_into_jobs_as_queued`
-  (`tests/it/migrations.rs:848`, `DELETE FROM applied_migrations WHERE name
-  IN (…, '033_jobs_training_set_identity')` — the ledger rows this test
-  clears so the reopen replays every later migration that alters `jobs`, and
-  `migration_033_is_ordered_after_032_and_pins_the_pair_at_the_schema_edge`'s
-  own `position("033_jobs_training_set_identity")` literal,
-  `tests/it/migrations.rs:1572-1746`). (docs-ci)
+  (the ledger rows that test clears so the reopen replays every later migration that
+  alters `jobs`), and
+  `tests/it/migrations.rs::migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge`'s
+  own `position("034_jobs_training_set_identity")` literal). (docs-ci)
   `crates/jammi-server/tests/it/api_freeze_baseline.txt` +  `api_freeze.rs`
   (`PACKAGE jammi.v1.gang` / `RPC GangService/RunRank`),
   `tenant_isolation_oracle.rs` (`GANG_LISTENER_ALLOWLIST`, never appended to
@@ -501,6 +497,12 @@ re-verification) on top of it.
   built below the submit edge). **depends_on**: U5a-1 (cut from its merge),
   68 OPS merged (the claim loop and `WorkerShared` shape this reshapes).
   **size**: L.
+
+**Partition-aware inference operator.** Out of scope for this plan; filed as GitHub issue #540.
+The head target's frozen forward is a per-batch call inside the trainer
+(`project_frozen_embedding`, from `encode_texts`/`encode_media`), not a table produced by
+`InferenceExec` over a partitioned input, so there is no partition set for a fan-out operator to
+act on (DESIGN.md §5).
 
 ## U5b-1 — Coordinator; `Peer` collective; membership substrate; determinism (PR-C commit 3)
 

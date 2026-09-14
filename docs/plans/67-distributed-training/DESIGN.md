@@ -1,13 +1,12 @@
 # DESIGN — distributed training on DataFusion (#500), v4
 
 Companion to `README.md` (rulings) and `UNITS.md` (contracts). Every mechanism names the
-principle it derives from and the code it lands on. Citations without a prefix were read against
-main at `7561658e` (pre-#501) and are re-derived at briefing time; #501 shifted `trainer.rs` by
-up to +28 lines (measured on `4ecc0230`: `classify` 2892→2894, `pairwise_ordering_loss`
-3862→3864, `mnrl_loss` 4110→4112, the CoSENT default 4356→4358, `head_forward` 2245→2247, the
-`.mine` gate 1451→1473) and other cited files by ≤ a few lines. Citations prefixed `wt-C:` were
-read against the jobs-fleet branch at `95993a06`, now merged as #501 with those files
-byte-unchanged, so they hold on `main` at the same lines.
+principle it derives from and the code it lands on. Every citation names a symbol, resolved at
+this branch's head — a Rust item as `crates/<crate>/src/<path>.rs::Item` (fn, struct, enum,
+const, mod or test name; `Type::method` for a nested item), a manifest key as
+`Cargo.toml::[dependencies].<dep>`, a wire message as `<file>.proto::Message`/`::Enum`, or a
+doc section as `<path>.md#heading` — never a `path:line` byte offset, which drifts as the crate
+grows. A trailing `(~:NNN)` is a locus hint only, never load-bearing.
 
 ## 1. What MLlib did to Spark, and what that means here
 
@@ -33,36 +32,60 @@ floats per representation column (anchor, positive, optional negative) plus the 
 (b) the adapter gradients (rank-8 matrices). At W=4, B=32, d=768, f32: about 0.4 MB per
 column and single-digit MB for the adapter gradients. Both are small enough that the exact CPU
 collective is viable far beyond a test twin; NCCL matters when the tensors already live on
-GPUs. The frozen-forward-as-distributed-stage applies to the **projection-head** target
-(`crates/jammi-ai/src/fine_tune/target.rs:249`) and to evaluation.
+GPUs. The **projection-head** target (`TrainingTarget::ProjectionHead`,
+`crates/jammi-ai/src/fine_tune/target.rs`) runs the same per-batch pattern: `encode_texts`/
+`encode_media` call `project_frozen_embedding` inline, per batch, to run the frozen tower
+forward before the head's own LoRA layer projects it — never a separate stage or a materialized
+table (§5) — and evaluation uses the identical call.
 
 ## 2. The training set is a producer
 
 `ProducingDescriptor::TrainingSet { source, columns, task, format, order_rule: "full_tuple_v1" }`
-(`crates/jammi-db/src/store/manifest.rs:305` gains the variant). Materialization runs the
+(`crates/jammi-db/src/store/manifest.rs::ProducingDescriptor::TrainingSet` gains the variant). Materialization runs the
 source plan through the session, sorts by the full projected tuple (identical tuples are
 identical rows, so their mutual order is immaterial), and writes an immutable Parquet result
-table of kind `TrainingSet` (`crates/jammi-db/src/catalog/result_repo.rs:27`) with the standard
-attestation (`MaterializationManifest`, `manifest.rs:874`). The descriptor carries **no
-topology and no split**: the table is shared by every job over the same source, columns, task
-and format, whatever their world size, batch or validation fraction. Input anchors are the
-source anchors. `GraphFineTune` materializes its seeded, deterministic sampled pairs
-(`graph_sampler.rs:374`) the same way. Media blob columns are stored as today.
+table of kind `TrainingSet` (`crates/jammi-db/src/catalog/result_repo.rs::ResultTableKind::TrainingSet`) with the standard
+attestation (`crates/jammi-db/src/store/manifest.rs::MaterializationManifest`). The descriptor carries **no
+topology and no split**, so the table is shared by every job over the same source, columns,
+task and format ONLY when the input anchors are equal AND pinned — the engine's existing rule
+(`crates/jammi-db/src/store/manifest.rs::AnchorKind::UnpinnedAtInstant`): a plain, unpinned
+source anchors as `UnpinnedAtInstant` and the cache probe short-circuits any unpinned anchor, so it
+is honestly always a miss. Whatever their world size, batch or validation fraction, two jobs over
+the same PLAIN source still each materialize their own table; reuse needs a pinned source.
+Input anchors are the source anchors. `GraphFineTune` does not go through this table: its seeded,
+deterministic sampled pairs (`crates/jammi-ai/src/fine_tune/graph_sampler.rs::GraphSampler::sample`)
+are sampled in memory and trained on directly; a graph training set's own table is
+https://github.com/f-inverse/jammi-ai/issues/538. Media blob columns are stored as today.
 
 **Split.** The job's `validation_fraction` defines the train prefix exactly as today
-(`data.rs:477-481`): `val_count = round(rows × fraction)`, train rows `[0, rows − val_count)`,
-validation rows after. The tests-only `Precomputed` loader arm (`data.rs:439-442`; split by
-batch count at `:493-497`) hands tensors straight to the trainer and stays outside the table
-path and the residency bound, unchanged. Every step quantity is a function of the **global**
-batch: `batches_per_epoch = ceil(train_count / (W·B))`; `global_step`, the LR horizon
-(`trainer.rs:843-852`, `compute_lr`) and the trailing-window loss scale (`:2505-2514`) all
+(`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split`, the `TextRows` arm):
+`val_count = round(rows × fraction)`, train rows `[0, rows − val_count)`,
+validation rows after. The tests-only `Precomputed` loader arm
+(`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::from_precomputed`; split by
+batch count in `TrainingDataLoader::split`'s `Precomputed` arm) hands tensors straight to the trainer and stays outside the table
+path, unchanged. Every step quantity is a function of the **global** batch:
+`batches_per_epoch = ceil(train_count / (W·B))`; `global_step`, the LR horizon
+(`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::run`, the horizon computed ahead of
+`compute_lr`) and the trailing-window loss scale
+(`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::process_batch_loss`) all
 index by global batch, so W ranks take exactly the steps W=1 takes at batch W·B. U2b lands
 the formula at W=1.
 
-**Loader.** `TrainingDataLoader` (`data.rs:200`, today `Vec<TrainingRow>`) becomes a per-epoch
-`RecordBatch` stream over the table's row groups with a prefetch bound; each head's constructor
-becomes a per-batch converter. A rank slice that straddles row groups reads the covering groups
-and slices (a reader concern; no materialization alignment).
+**Loader.** `TrainingDataLoader` (`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader`) reads the train prefix eagerly through
+`read_back_sql` (`training_set_order_by` applied — the result-table `ListingTable`
+(`crates/jammi-db/src/store/mod.rs::build_result_table_provider`) declares no file sort order (a plain
+`ParquetReadOptions::default().to_listing_options(...)`), so `read_back_sql`'s `ORDER BY` plans a
+pipeline-breaking `SortExec` at `target_partitions` ∈ {1, N}; **U2c** declares the sort order —
+rendered from `training_set_order_by` via `ListingOptions::with_file_sort_order` — so DataFusion
+elides that `SortExec`; a reader-class allow-list oracle enumerates every reader of
+`sql_relation()`), converting
+rows into `TrainingRow`s per format; the partition rule (below) slices this in-memory sequence
+per rank. A residency-bounded per-rank stream over the table's row groups is NOT part of this
+plan: U2b's own design carried it, a design fix round excised it (issue #544) after a
+lease-held-across-a-carry-over deadlock, and it is rebuilt as its own unit, **U2c** — a
+whole-prefix ORDERED stream per rank with a per-rank `rows_for_step` filter, never a stream
+shared across ranks (the resulting W× read/decode amplification is accepted, stated, and
+measured, never hidden) — scheduled before U4b binds a per-rank reader to it.
 
 **Partition rule v1 ("block-by-global-batch")** over the train prefix: with per-rank batch B
 and world W, global batch t is rows `[t·W·B, (t+1)·W·B)`; rank r reads
@@ -76,19 +99,22 @@ oracle pins the bucket rung (§6).
 
 **`TargetScaler`** (K3): rank 0 collects the target column of the train prefix, in committed
 order, into **one** `Vec<f32>` on the trainer's device and calls `from_targets` **once**
-(`regression_loss.rs:169-190` is a two-pass whole-tensor reduction; f32 summation is
+(`crates/jammi-ai/src/fine_tune/regression_loss.rs::TargetScaler::from_targets` is a two-pass whole-tensor reduction; f32 summation is
 grouping-sensitive, so a chunked accumulation would move the low bits) — bit-identical to
-today (`trainer.rs:824-836`). A named exemption from the residency bound (4 bytes per row).
-μ/σ ship in the `RankAssignment` and persist for resume as today.
+today (`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::run`, the scaler-construction site). The eager loader holds no residency bound for the scaler to be
+exempt from; once U2c's per-rank stream lands, the scaler's whole-prefix reduction will need
+the same named exemption from ITS bound (a 4-bytes-per-row allowance is that unit's own
+contract). μ/σ ship in the `RankAssignment` and persist for resume as today.
 
-**Whole-set arms.** Hard-negative mining (`trainer.rs:1120`, a mined loader rebuilt at each
-refresh epoch from the model) and GradCache (`trainer.rs:1616-1626`, the whole train prefix as
+**Whole-set arms.** Hard-negative mining (`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::run`, the refresh-boundary check that rebuilds a mined loader at each
+refresh epoch from the model) and GradCache (`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::run_gradcache_epoch`, the whole train prefix as
 one in-batch-negative batch) are structurally whole-set consumers. In this plan they run at
 W=1 only: `world_size > 1` with `hard_negatives.mine == true` or `cached == true` is a typed
-K2 refusal at submit time (`mine` is the real gate, `trainer.rs:1451`; `refresh_every` defaults
-to 1 and `== 0` is already refused when mining), and the residency bound exempts them (they
-stream the table in but hold what they need). The gather primitive (§4) is what lifts this
-later.
+K2 refusal at submit time (`mine` is the real gate, `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::mining_eligible`; `refresh_every` defaults
+to 1 and `== 0` is already refused when mining). They read the eager loader's whole train
+prefix directly and need no residency accounting under this plan; once U2c's per-rank stream
+exists under other arms, mining and GradCache stay outside it (their own named exemption, not
+built here). The gather primitive (§4) is what lifts this later.
 
 ## 3. A trained model is a producer
 
@@ -97,7 +123,7 @@ later.
 | field | why it moves the bytes |
 |---|---|
 | training-set definition hash + artifact digest + row count | the data and its order |
-| **canonical serialization of the whole `TrainingSpec` variant** — `FineTuneConfig` (`crates/jammi-wire/src/fine_tune.rs:237-445`: LoRA rank/alpha/dropout, `use_rslora`, `rank_pattern`, `init_lora_weights`, lr, epochs, batch, `max_seq_length`, losses, `matryoshka_dims`, `quantile_levels`, `validation_fraction`, early stopping, `cached`, `hard_negatives`, …), `TrainingCommon`, method, task, seed | everything the trainer reads |
+| **canonical serialization of the whole `TrainingSpec` variant** — `FineTuneConfig` (`crates/jammi-wire/src/fine_tune.rs::FineTuneConfig`: LoRA rank/alpha/dropout, `use_rslora`, `rank_pattern`, `init_lora_weights`, lr, epochs, batch, `max_seq_length`, losses, `matryoshka_dims`, `quantile_levels`, `validation_fraction`, early stopping, `cached`, `hard_negatives`, …), `TrainingCommon`, method, task, seed | everything the trainer reads |
 | base model identity (`ModelIdentity`: id, backend, precision, content digest, quantization) | the frozen weights |
 | backbone dtype; fused-kernel admission profile (declared, UNCOVERED — see below) | bits per op |
 | `world_size`, per-rank batch, partition rule version, collective backend, reduction policy | the summation order and the batch layout |
@@ -105,8 +131,8 @@ later.
 
 **Crate layering.** `jammi-db` depends on no jammi crate but `jammi-numerics`
 (`crates/jammi-db/Cargo.toml::[dependencies].jammi-numerics`), and every existing variant holds primitives and db-local
-types (`manifest.rs:305-345`). `FineTuneConfig` is `jammi-wire`, `TrainingSpec`/`TrainingCommon`
-are `jammi-ai` (`spec.rs:33-63`), `TrainingFormat` is `jammi-ai` (`data.rs:59`). So both new
+types (`crates/jammi-db/src/store/manifest.rs::ProducingDescriptor`). `FineTuneConfig` is `jammi-wire`, `TrainingSpec`/`TrainingCommon`
+are `jammi-ai` (`crates/jammi-ai/src/fine_tune/spec.rs::TrainingSpec`), `TrainingFormat` is `jammi-ai` (`crates/jammi-ai/src/fine_tune/data.rs::TrainingFormat`). So both new
 variants carry an **opaque, versioned canonical encoding** — `spec_canonical: String`
 (sorted-key canonical JSON) with `spec_schema_version: u32` — produced by `jammi-ai` from the
 owning types, plus db-local primitives (`ModelTask`, ids, digests, the topology fields).
@@ -116,8 +142,8 @@ new field fails compilation instead of escaping the hash; U4b extends it with th
 fields.
 
 The catalog name `jammi:fine-tuned:{job_id}` stays as the handle and re-claim idempotency key
-(`training_job.rs:87`; called from `worker.rs:2275`; the id format is documented again on
-`ModelRegistration::model_id`, `worker.rs:3456`). The `model_materialization` migration (033)
+(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::train_fine_tune`; the id format is documented
+again on `ModelRegistration::model_id`). The `model_materialization` migration (033)
 adds nullable `models.definition_hash`, `models.input_anchors` (append-only, K5; nullable
 because `ContextPredictor` has no materialization; the probe never matches NULL —
 `find_models_by_definition`/`probe_model_by_definition` additionally restrict to
@@ -172,15 +198,19 @@ The recompute replay arm (`pipeline/recompute.rs`, K1) for `FineTune` is **retra
 ## 4. The gang
 
 **Roles (on the jobs fleet).** A training-kind job (`fine_tune`, `graph_fine_tune`) is claimed
-by a `JobWorker` through `claim_next` (`wt-C: crates/jammi-db/src/catalog/jobs_repo.rs:658-719`,
+by a `JobWorker` through `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`,
 `FOR UPDATE SKIP LOCKED`, `attempts + 1`); that process is the coordinator and rank 0 and holds
-the only lease (`heartbeat_job`, `wt-C: jobs_repo.rs:772`, driven by the lease keeper).
+the only lease (`heartbeat_job`, `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::heartbeat_job`, driven by the lease keeper).
 `context_predictor` is refused at `world_size > 1`. The coordinator materializes or reuses the
 training set (with `job_attempt: None` — a shared producer output, never this attempt's
-`partial_result`), computes the scaler, resolves `W−1` **members** from the catalog
-(`workers.kinds` ∋ kind, `instances.peer_addr` set — the column U5b-1 appends and DIST's placement consumes — `last_seen_at`
-fresh, and from U8b `workers.devices` sufficient), mints the NCCL id when the collective is
-`nccl`, and sends each member:
+`partial_result`), computes the scaler, resolves `W−1` **members** via U5b-1a's
+`list_gang_members(GangListing { kind, self_instance, canonical_root, window })` (`workers.kinds`
+∋ kind, `instances.peer_addr` set — the column U5b-1a appends and DIST's placement consumes —
+canonical `result_root` agreeing with this coordinator's own — NECESSARY, never SUFFICIENT, for
+shared storage; sufficiency is the attestation VERIFY (§2's whole-artifact sidecar / U5b-0's
+per-partition leaf inventory) — and `last_seen_at` fresh under
+`instance_liveness_margin()`, and from U8b `workers.devices` sufficient), mints the NCCL id when
+the collective is `nccl`, and sends each member:
 
 ```
 RankAssignment { job_id, attempt, coordinator_instance_id, rank, world_size,
@@ -193,30 +223,29 @@ tenant-scoped catalog and derives storage URLs itself.
 
 **A peer is a fleet worker with a busy slot.** `RunRank` takes the worker's single job slot
 (`JobSlot`): the claim loop takes it **before** `claim_next`, **holds it across** the inline
-`run_claimed_job` (`wt-C: worker.rs:355`) and **releases it before** the idle sleep (`:363`), so a
+`run_claimed_job_under` and **releases it before** the idle sleep
+(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`), so a
 peer never claims while it runs a rank, never aborts a claim transaction (68 OPS D6), never
 receives a rank while training its own job, and is reachable whenever idle. Handler order: same
 `job_id` with a lesser attempt → abort that runner and take the slot; lesser-or-equal → refuse;
-otherwise try-lock; busy → typed `Unavailable`. No new worker state. Membership is read through
-`list_gang_members(kind)` (a new joined listing over `workers ⋈ instances`: `kinds` split on `,`
-and compared as whole tokens in Rust; `peer_addr` set; `last_seen_at` within `[lease]
-duration_secs`; from U8b `devices` sufficient).
+otherwise try-lock; busy → typed `Unavailable`. No new worker state. The full-roster read above
+(`list_gang_members`) is the coordinator's OWN dispatch-time tool; a peer's inbound-`RunRank`
+freshness check never calls it — it reads the coordinator's own `instances` row alone, through
+U5a-1's `fresh_instance(coordinator_instance_id)`, one row by primary key.
 
 **Authorization (invariant I-GANG: the job row is the capability).** The service is mounted on
 the internal `[server] peer_bind` listener (68 DIST D7), never on the tenant-scoped public chain.
 The peer reads the `jobs` row through a new db-owned verb `get_job_for_rank(job_id)` — by
-primary key, no tenant predicate, never admin scope (`get_job` is tenant-filtered, `wt-C:
-jobs_repo.rs:580-596`; D7 forbids `with_admin_scope` on the peer path), reachable only from the
+primary key, no tenant predicate, never admin scope (`get_job` is tenant-filtered,
+`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::get_job`; D7 forbids `with_admin_scope` on the peer path), reachable only from the
 gang handler — verifies `status = 'running'`, `claimed_by = coordinator_instance_id` and a live
 lease, then **derives the tenant from the row** (`jobs.tenant_id`) and pins every subsequent
 catalog read to it. Nothing dialable travels on the wire: the assignment carries
-`peers[rank → instance_id]`; each peer resolves addresses through `instances.peer_addr` and
-refuses a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the only
-out-of-band value). `FetchPartition` takes a result-table id and partition index and verifies the table
-belongs to the job's training set (the analogue of D7's segment-belongs-to-table check). The
-RPCs sit in their own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
+`peers[rank → instance_id]`; each peer resolves addresses through U5b-1a's `peer_addr_of(instance_id,
+window) -> Option<PeerAddr>` and refuses a rank naming any instance that resolves to `None` — not
+a fresh member (the NCCL id, an opaque secret, is the only out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
 "served only on peer_bind; tenant derived from the verified job row; deliberately not
-caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and their
+caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
 `api_freeze_baseline.txt` lines land in the same commit. Peers fence on **`job_id`**: a `RunRank`
 at attempt N aborts every local runner of that job with attempt < N; a lesser or equal attempt is
 refused; `(job_id, rank)` is the runner's identity only. Mutual transport auth stays the
@@ -248,39 +277,40 @@ the rank environment). `Nccl` compiles under the existing `cuda` feature; the tr
 **Invariant: the gather point is downstream of every trainable parameter; nothing trainable
 consumes a gathered remote slot** — otherwise the summed gradient of that parameter is W× too
 large. Gather points per `TrainingBatch` arm: contrastive / pairs / triplet gather the encoder
-outputs (post-projection, `trainer.rs:2195-2225`) and the scores; **classification gathers the
+outputs (post-projection, `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::encode_texts`) and the scores; **classification gathers the
 logits from `classify()`** (the trainable head is applied inside the loss today,
-`trainer.rs:2676-2679`, head at `:2892-2897`), never `embeddings`; regression gathers the head
-output (`head_forward` already runs pre-loss, `:2245-2262`) and the targets; NER stays refused
-as today (`:2231`). Every rank then computes the **identical global loss** over the gathered
-batch through the existing loss functions (`dispatch_contrastive_loss`, `trainer.rs:4343-4356`,
+`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::compute_loss` (the `Classification` arm), head at `TrainingLoop::classify`), never `embeddings`; regression gathers the head
+output (`head_forward` already runs pre-loss, `TrainingLoop::head_forward`) and the targets; NER stays refused
+as today (`TrainingLoop::compute_loss_per_example`, the `Ner` arm). Every rank then computes the **identical global loss** over the gathered
+batch through the existing loss functions (`dispatch_contrastive_loss`, `crates/jammi-ai/src/fine_tune/trainer.rs::dispatch_contrastive_loss`,
 `mnrl_loss`, `cross_entropy_loss`, the regression/quantile losses) — batch-coupled objectives
 keep exactly their W=1 semantics, and each loss's own 1/n runs over the global n. Matryoshka
-prefixes narrow dim 1 only (`:4360-4405`) and are orthogonal to a dim-0 gather. Backward runs through a gather whose backward keeps only the local slots (rank
+prefixes narrow dim 1 only (`crates/jammi-ai/src/fine_tune/trainer.rs::matryoshka_sum`) and are orthogonal to a dim-0 gather. Backward runs through a gather whose backward keeps only the local slots (rank
 r's own rows), so no gradient crosses the wire; at each optimizer-step boundary the adapter
 `GradStore` is laid out in the canonical `trainable_vars` order with zeros for absent entries
-(`optimizer.rs:600-611` documents absent entries as a real shape), `all_reduce_sum`med, then
-`clip_and_step` (`optimizer.rs:612`). Gradient accumulation counts global batches. Every rank
+(`crates/jammi-ai/src/fine_tune/optimizer.rs::clip_and_step` documents absent entries as a real shape), `all_reduce_sum`med, then
+`clip_and_step` (`crates/jammi-ai/src/fine_tune/optimizer.rs::clip_and_step`). Gradient accumulation counts global batches. Every rank
 holds identical weights after the step. Rank 0 alone writes the resume checkpoint at epoch
 boundaries and publishes; other ranks' checkpoint calls are no-ops — except that each rank's
-dropout Philox position (`resume.rs:107` `dropout_positions`, per process today) is gathered
+dropout Philox position (`crates/jammi-ai/src/fine_tune/resume.rs::ResumeState::dropout_positions`, per process today) is gathered
 to rank 0 at the epoch boundary and stored **per rank** in the bundle, and each rank's dropout
 seed derives as `f(seed, rank)`; a resumed gang at equal topology therefore reproduces an
 uninterrupted one, and W=1 keeps today's single-entry shape.
 
 **Lockstep control flow.** The step boundary is the global batch index, never a rank-local
-counter. Divergence (`loss.is_nan() || loss > 100`, `trainer.rs:2560-2567`), the 3-strikes
+counter. Divergence (`loss.is_nan() || loss > 100`, `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::process_batch_loss`), the 3-strikes
 abort, early stopping and epoch exit are decided by `all_reduce_max_flags` at the same
 boundary on every rank (validation loss is computed by rank 0 and the stop flag broadcast).
 No rank can reach a collective a different number of times than its peers.
 
-**Failure and release.** `fail_job` is terminal (`wt-C: jobs_repo.rs:1057-1100`); the fleet's
-only requeue path is the leave-`running`-for-reclaim arm (`wt-C: worker.rs:670-676`) → reclaim
-arm 1a (`jobs_repo.rs:1380-1407`) → `attempts + 1` at the successor's claim (`:709`). So any
+**Failure and release.** `fail_job` is terminal (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::fail_job`); the fleet's
+only requeue path is the leave-`running`-for-reclaim arm
+(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_claimed_job_under`, the lease-lost arm) → reclaim
+arm 1a (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::reclaim_expired_jobs_inner`, the "Arm 1a" block) → `attempts + 1` at the successor's claim (`Catalog::claim_next`). So any
 `RankEvent::error`, stream drop, or rank silent for `rank_timeout_secs` fails the attempt like
 this: the coordinator cancels every rank (stream close + NCCL communicator abort), aborts the
 attempt (no publish, no finalize), and flips its hold's `lost` flag (`cancel` *is*
-`hold.lost_flag()`, `wt-C: worker.rs:531-547`) so its own run exits through that arm with no
+`hold.lost_flag()`, `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_claimed_job_under`) so its own run exits through that arm with no
 terminal write; reclaim requeues the job within the remaining lease window (≤ `[lease]
 duration_secs`). A rank ended by a DRAIN/RELEASE on its host (68 OPS) sends
 `RankEvent::Released`; the coordinator first calls OPS's `release_job_lease` (`releases + 1`,
@@ -289,27 +319,34 @@ peer tier costs zero net attempts (OPS D10). Coordinator death expires the lease
 same-named `building` training-set row left by a crashed coordinator is met with the `BackOff`
 disposition and reclaimed through `claim_expired_building_table` after expiry (README r31). The per-attempt watchdog is the lease keeper's
 shape — bounded by the attempt it belongs to, retiring only that attempt — and is allowed under
-the actuator rule (`recompute.rs:29-35`; 68 DIST D5).
+the actuator rule (`crates/jammi-ai/src/pipeline/recompute.rs`'s module doc, "the engine ships
+the actuator; it never ships the control loop that pulls it", `Cascade::Downstream`; 68 DIST D5).
 Either way the next attempt resumes from the job-level resume checkpoint
-(`{tenant}/{job_id}/_resume/`, `artifact.rs:300-323`), which a zombie writer cannot regress
-(the write is gated on the held lease, `trainer.rs:3601`). No per-task retry anywhere.
+(`{tenant}/{job_id}/_resume/`, `crates/jammi-db/src/store/artifact.rs::ArtifactStore::put_resume_checkpoint`), which a zombie writer cannot regress
+(the write is gated on the held lease, `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::save_resume_checkpoint`). No per-task retry anywhere.
 
 **Device-plural session.** `[gpu] devices = [..]` gives one `GpuScheduler` per device and a
 `ModelCache` keyed by a `CacheKey { model_id, device, task: Option<_>, backend: Option<_> }`
 shared with plan 65's rekey — `None` is a distinct key value, never a wildcard — applied to
-both the entries map and the single-flight `in_flight` map (`cache.rs:43-45`); `Local` ranks
+both the entries map and the single-flight `in_flight` map (`crates/jammi-ai/src/model/cache.rs::CacheInner`); `Local` ranks
 are threads pinned to devices.
 
-## 5. The distributed frozen forward (head target) and the partition-aware operator
+## 5. The distributed frozen forward (head target)
 
-For `ProjectionHead` training the tower is frozen, so the features are an `Embedding` result
-table over the training set — the existing embedding producer (`pipeline/embedding.rs`), which
-today collects every batch before writing (`embedding.rs:184-191`) and drives `InferenceExec`
-at partition 0 only (`inference_exec.rs:144`). U6 makes `InferenceExec` inherit its input's
-partitioning, streams batches into the `ResultSink` in partition order, and lets the
-coordinator fan partitions out to peers via `FetchPartition` so each peer computes a disjoint
-slice with the model loaded once per process. The table must be byte-identical to the
-single-process table (K4 shape).
+For `ProjectionHead` training the tower is frozen, but the frozen forward is not a producer
+table: `encode_texts`/`encode_media` (`trainer.rs`) call `project_frozen_embedding` inline, per
+training batch, to run the frozen tower and hand the pooled output to the head's own LoRA layer
+— nothing under `fine_tune/` drives `InferenceExec` or reads an `Embedding` result table for this
+path. At `world_size > 1` each rank runs its own slice's frozen forward inside the normal step,
+and the head's output is a gather point like any other target's (§4's gather rule); no partition
+set exists to fan out over, so there is no peer-to-peer fetch of a shared table. The gang has one
+output artifact, written once by rank 0 — the lease holder — at the finalize CAS (§3; the resume
+checkpoint is likewise lease-holder-only, `crates/jammi-db/src/store/artifact.rs::ArtifactStore::put_resume_checkpoint`), never
+assembled from separate per-peer outputs. Peers exchange data only through the collective (§4's `Peer`
+implementation over the `RunRank` stream); there is no second peer-to-peer surface. A
+partition-aware inference operator that streams `InferenceExec` across partitions and fans a
+table out to peers is a distinct, unscheduled piece of work — GitHub issue #540 — because nothing
+in this design produces a table for it to partition.
 
 ## 6. Oracles
 
@@ -317,24 +354,30 @@ single-process table (K4 shape).
 |---|---|---|
 | **Refactor parity**: W=1 with the new loader, scaler-over-train-prefix and `Noop` produces adapter bytes identical to the base commit on every cookbook fine-tune fixture (`cookbook/book/artifacts/finetune_*/checksums.json`) | byte | cookbook 6.5; hermetic |
 | **K4 (real)**: W=2 over the wire (`Peer`, two processes) equals W=2 in-process (`Local`), byte-for-byte; rank 0 is always in-process, so W=1 never crosses the wire and is covered by the `Noop` parity row | byte | distributed lane |
-| **Equal-topology reproducibility**: two runs, same W and plan → identical bytes; also across a resume (kill at epoch k, resume, compare to uninterrupted) | byte on `Local`/`Peer` (hermetic); on GPU legs the digest pair is recorded (never a failure until S5 promotes) and the per-step loss delta is compared to an ε pre-registered per leg before the first gating run (S5, or the max delta over ≥ 3 same-seed baseline runs on that box) | hermetic; gpu-gang |
+| **Equal-topology reproducibility**: two runs, same W and plan → identical bytes; also across a resume (kill at epoch k, resume, compare to uninterrupted) | byte on `Local`/`Peer` (hermetic); on GPU legs at world size 2 the digest pair is ASSERTED on a pass verdict — S5 measured candle 0.11 LoRA-shaped forward/backward/SGD byte-identical across two A100s with no env pins at world 2 — and the per-step loss delta is compared to an ε pre-registered per leg before the first gating run (or the max delta over ≥ 3 same-seed baseline runs on that box); at world size ≥ 3 the NCCL collective-algorithm pin set is unproven (reduction is commutative at world 2), so the digest pair there stays recorded, not asserted, until the cluster leg characterizes it | hermetic; gpu-gang |
 | **W-invariance**: W × B versus W=1 × W·B, identical loss per step within ε, at `lora_dropout = 0` and a pinned bucket rung; ε measured on the leg that gates (CPU ε never inherited by GPU) | tolerance | hermetic; gpu-gang |
 | **Gather exactness**: for CoSENT, AnglE, MNRL, **classification** and **quantile regression**, the W=2 global loss and the summed adapter gradient at step t equal the W=1 loss and gradient on the same rows bit-for-bit on CPU, on a fixture whose `train_count` is not a multiple of W·B (a zero-row rank occurs) | byte | hermetic |
 | **Lockstep**: one rank's batch forced to diverge; one rank's batch yields no gradient for a Var; the gang completes | property | hermetic |
 | **Gang failure**: kill −9 a peer → job requeued, completed by a new gang from the checkpoint, exactly one model, no orphan prefix promoted; kill −9 the coordinator → same via lease; split-brain: attempt N+1 dispatched while N is live on the peer → N aborted, N+1 runs | property | distributed lane |
 | **Authorization**: `RunRank` for a job not running / not claimed by the caller / lease expired is refused | property | server it-suite |
 | **Cache reuse refused**: `CachePolicy::Use` on a fine-tune is refused on every durable submit edge (reuse: https://github.com/f-inverse/jammi-ai/issues/562); two model rows may share one prefix; reaping respects references | property | hermetic |
-| **Distributor-agnosticism**: same operators through a Ballista scheduler + 2 executors hosted by the jammi binary → identical bytes to the peer path | byte | U8 |
+| **Distributor-agnosticism**: an embedding job through a Ballista scheduler + 2 executors hosted by the jammi binary → identical bytes to the same query's single-executor plan; a gang job through the scheduler → identical bytes to U5b's peer-based run | byte | U8 |
 
 ## 7. Configuration and placement
 
 ```
-[gpu]      device = 0 ; devices = [0, 1]
-[worker]   enabled = true ; kinds = "all" ; world_size = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
-[server]   peer_bind = "..." ; peer_advertise = "..."          # peer_bind: 68 DIST-1; peer_advertise + instances.peer_addr: 67 U5b-1; members are catalog rows, not a list
-[ballista] scheduler_bind = "..." ; executor = { scheduler_address = "...", work_dir = "..." }   # U8a
+[gpu]        device = 0 ; devices = [0, 1]
+[worker]     enabled = true ; kinds = "all" ; local_ranks = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
+[distributed] max_world_size = 1   # widest Peer gang any coordinator on this deployment may accept (67 U5b-1b-ii)
+[server]     peer_bind = "..." ; peer_advertise = "..."          # peer_bind: 68 DIST-1; peer_advertise + instances.peer_addr/result_root: 67 U5b-1a; members are catalog rows, not a list
+[ballista]   scheduler_bind = "..." ; executor = { scheduler_address = "...", work_dir = "..." }   # U8a
 ```
-Per-job `world_size` lives in `TrainingCommon` (identity-relevant; `#[serde(default)]` = 1).
+`[worker] local_ranks` (renamed from `world_size` in U4b S8) is how many ranks THIS HOST places
+on its own `[gpu] devices` for a job it runs entirely in-process — orthogonal to
+`[distributed] max_world_size`, which bounds a `Peer` gang across FLEET MEMBERS; the two knobs
+load independently with no cross-check. Per-job `world_size` lives in `TrainingCommon`
+(identity-relevant; `#[serde(default)]` = 1) — a third, unrelated concept, checked against
+`[distributed] max_world_size` at submit.
 Placement is the deployer's runtime: Kubernetes runs the compute tier as a StatefulSet with a
 headless service (or an indexed Job) with `nvidia.com/gpu: N`; Compose lists services; Slurm
 and Ray are placement options only (#482; owned by U9b after 68 K and OPS merge).
@@ -376,13 +419,13 @@ coordinator; `DevicePlacement` puts it on a device-bearing executor; the ranks a
 reached over `peer_bind` as in U5b. Bytes equal U5b's (K4 shape). A gang stage kind in Ballista
 stays a future upstream option, not a dependency.
 
-**Publishing.** `ci/scripts/publish_crates.sh:40-50` enumerates publishable crates by name in
+**Publishing.** `ci/scripts/publish_crates.sh`'s `PUBLISH_ORDER` array enumerates publishable crates by name in
 topological order; `jammi-ballista` is inserted before `jammi-server` in the same commit (a
 `v*` tag would otherwise half-publish). `check_dep_direction.py` encodes no layering and is
 not touched.
 
 **Oracles.** Codec round-trip for every operator; an embedding job via `submit_physical_plan`
-across two executors byte-identical to U6's peer path; a W=2 gang job through the scheduler
+across two executors byte-identical to the same query's single-executor plan; a W=2 gang job through the scheduler
 byte-identical to U5b's and never task-retried; killing an executor mid-gang fails the job and
 requeues it through jammi's lease path — holds only with U8b's bind-time re-launch guard in
 place (README r42; without it, Ballista re-launches the gang task on its own, S6 probe 5); U8b:

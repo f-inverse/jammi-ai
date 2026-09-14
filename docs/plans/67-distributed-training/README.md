@@ -61,14 +61,14 @@ those still in force are restated here in their v4 form. Principle in parenthese
     whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`
     contends for `HostAdmission`'s single per-process holder cell — `Free` / `ClaimProbe` /
     `JobRun` / `Rank{job_id, attempt}`, every transition a `send_if_modified` CAS, no lock held
-    across an `.await`. The claim loop acquires the holder (`Free → ClaimProbe`, `worker.rs:880`)
+    across an `.await`. The claim loop acquires the holder (`Free → ClaimProbe`, in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`)
     immediately before `claim_next`, and `claim_next`'s `Some(record)` arm flips it
-    `ClaimProbe → JobRun` under the same lock (`worker.rs:898`) — so a peer never claims while it
+    `ClaimProbe → JobRun` under the same lock — so a peer never claims while it
     runs a rank, never aborts a claim transaction (OPS D6), never receives a rank while running
     its own claimed job, and is reachable whenever idle. An admitted rank CASes `Free →
     Rank{job_id, attempt}`; a busy holder (`JobRun` or another `Rank`) refuses `Unavailable` —
     TRANSIENT, no assembly budget consumed, and the coordinator retries after ≥ one heartbeat or
-    picks another member. Inline `run_now` (`jobs.rs:710`, `ComputeSpec` only) never touches the
+    picks another member. Inline `run_now` (`crates/jammi-ai/src/jobs.rs::run_now`, `ComputeSpec` only) never touches the
     holder — it deliberately runs beside a loop-claimed job or an admitted rank, never excluded
     by either. No new worker state beyond the holder cell itself. (B1; OPS D6.)
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design

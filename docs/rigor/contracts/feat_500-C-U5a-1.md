@@ -174,19 +174,18 @@ ALTER TABLE jobs ADD COLUMN training_set_ref TEXT;
 ALTER TABLE jobs ADD COLUMN training_set_location TEXT
     CHECK ((training_set_ref IS NULL) = (training_set_location IS NULL));
 ```
-Registered in the migration table at `crates/jammi-db/src/catalog/migrations.rs:113-116` (at
-c1d918b4), the newest entry (K5: append-only, `crates/jammi-db/src/catalog/migrations.rs:21`'s own
-comment "currently ending at 033"). **Renumbering note (stated so no later unit is surprised):**
-033 is the newest migration *at this base only* because U5b-1a's `instances.peer_addr` migration
-(README ruling 28, `depends_on` this unit per `docs/plans/67-distributed-training/UNITS.md:323`)
-has not yet landed on `main`. If U5b-1a's migration merges first, this unit renumbers to `034` at
-rebase — both pin sites are (1) the tuple at `crates/jammi-db/src/catalog/migrations.rs:113-116`
-(the string literal `"034_jobs_training_set_identity"` and the constant reference) and (2) the
-doc-comment prose and the constant's own name `MIGRATION_034_JOBS_TRAINING_SET_IDENTITY` at
-`crates/jammi-db/src/catalog/schema.rs:1143-1165` — a rename, not a semantic change. No other
-production file names the literal number `033` for this migration: `grep -rn '"033' crates/jammi-db/src`
-at c1d918b4 hits only `crates/jammi-db/src/catalog/migrations.rs` and
-`crates/jammi-db/src/catalog/schema.rs`'s own doc comment — the ordering-test fixtures in
+Registered in the migration table (`crates/jammi-db/src/catalog/migrations.rs`, the const list) as
+`034_jobs_training_set_identity`, ordered directly after U3's `033_model_materialization` — the
+renumbering from this unit's own base (where it was 033, the newest entry) happened once, at the
+consolidation into PR-B2, at the pin sites the plan names (`docs/plans/67-distributed-training/UNITS.md`
+§ U5a-1): the tuple in `crates/jammi-db/src/catalog/migrations.rs`, the constant
+`crates/jammi-db/src/catalog/schema.rs::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY` and its doc comment,
+the const `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`, the `IN`-list literal in
+`crates/jammi-db/tests/it/migrations.rs::migration_029_copies_training_jobs_rows_into_jobs_as_queued`, and
+the ordered-after oracle
+`crates/jammi-db/tests/it/migrations.rs::migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge`
+— a rename, not a semantic change. No production file names the literal number for this migration
+outside `crates/jammi-db/src/catalog/{migrations.rs,schema.rs}`; the ordering-test fixtures in
 `crates/jammi-db/tests/it/migrations.rs` are the only other tracked hits, and are tests, not
 production code.
 
@@ -693,20 +692,12 @@ module doc (immediately above `is_streaming_path`) statement of this fact.
   relative to `lease_expired_clause`'s exact string compare (documented on
   that same function) — negligible at deployment lease scales, stated
   honestly rather than claimed bit-exact.
-- The migration renumber is conditional on PR-B2, never unconditional: `033`
-  is `jobs_training_set_identity`'s number "on this branch's base" only
-  (`docs/plans/67-distributed-training/UNITS.md` § U5a-1); when PR-B2's
-  `033_model_materialization` lands on `main` first, this unit's own
-  migration renumbers to `034` at rebase, at three pin sites — the tuple in
-  `crates/jammi-db/src/catalog/migrations.rs`, the doc comment and constant
-  `crates/jammi-db/src/catalog/schema.rs::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY`,
-  and the const
-  `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES` — plus
-  the ordered-after oracle,
+- The migration is `034_jobs_training_set_identity`: it was `033` on this unit's own base
+  only, and the consolidation into PR-B2 (where U3's `033_model_materialization` precedes it)
+  renumbered it once, at the pin sites and the ordered-after oracle named in § 1.4 above —
   `migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge`
-  (`crates/jammi-db/tests/it/migrations.rs`), whose own
-  `position("034_jobs_training_set_identity")` literal moves with the
-  rename.
+  (`crates/jammi-db/tests/it/migrations.rs`) asserts the position relative to `033`, never
+  `.last()`.
 
 ### A7. Mutations executed, as properties, by named test killed
 

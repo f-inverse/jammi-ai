@@ -172,8 +172,8 @@ async fn get_job_for_rank_reflects_a_live_claim(kind: BackendKind) {
     assert_eq!(row.attempts, 1);
     assert!(row.lease_live, "a freshly-claimed 30s lease must be live");
     assert!(
-        row.remaining > Duration::from_secs(20) && row.remaining <= Duration::from_secs(30),
-        "remaining must be close to the freshly-stamped 30s window, got {:?}",
+        row.remaining > Duration::from_secs(20) && row.remaining <= Duration::from_secs(31),
+        "remaining must be close to the freshly-stamped 30s window (the deadline stamp and the read's own clock are two application-clock reads, so the window may overshoot by the documented sub-millisecond rounding), got {:?}",
         row.remaining
     );
 }

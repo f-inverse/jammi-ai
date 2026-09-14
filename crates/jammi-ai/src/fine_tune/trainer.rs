@@ -10295,6 +10295,171 @@ mod epoch_checkpoint_retention_failure {
     }
 }
 
+/// #500: [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune
+/// (`~:3745`) deletes only through `self.attempt` — never through the
+/// guarded `PrefixReferences` port every OTHER `models/**` byte-deleter in
+/// `crate::fine_tune::worker` now consults, because `TrainingLoop` is
+/// deliberately catalog-free at run time (`TrainingLoopBuilder::build`'s own
+/// doc: the catalog is presence-validated at construction and then
+/// dropped — "no reader of a catalog handle inside the run"). The exemption
+/// is not asserted in prose alone: this module drives the real prune
+/// through a RESUMED attempt (a second, independent `TrainingLoop` sharing
+/// the same `job_id`/`worker_id` but a fresh `attempt`) against a `models`
+/// row that names a PREVIOUS attempt's epoch-checkpoint prefix — the exact
+/// shape a real resumed run's earlier, still-servable retained checkpoint
+/// would have — and proves the prune never reaches it, because the prune's
+/// own prefix construction is keyed on `self.attempt` alone.
+#[cfg(test)]
+mod epoch_checkpoint_retention_isolation {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::lora::build_distribution_head;
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::model_task::ModelTask;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    const HIDDEN: usize = 4;
+
+    /// Build a loop for `attempt`, sharing `job_id`/`worker_id`/`store`/
+    /// `catalog` with every other attempt this test builds — the SAME
+    /// shape a real lease-reclaim resume uses (one job, one worker id, a
+    /// fresh attempt counter), so the two loops' epoch-checkpoint prefixes
+    /// differ ONLY in the attempt segment.
+    fn loop_for_attempt(
+        device: &Device,
+        attempt: &str,
+        artifact_dir: &std::path::Path,
+        store: Arc<ArtifactStore>,
+        catalog: Arc<jammi_db::catalog::Catalog>,
+    ) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let config = FineTuneConfig {
+            keep_last_n_checkpoints: Some(1),
+            ..Default::default()
+        };
+        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("f2-isolation-job".into())
+            .worker_id("f2-isolation-worker".into())
+            .attempt(attempt.into())
+            .catalog(catalog)
+            .artifact_dir(artifact_dir.to_path_buf())
+            .artifact_store(store)
+            .build()
+            .unwrap()
+    }
+
+    /// GREEN: a resumed attempt's mid-run prune never reaches a PREVIOUS
+    /// attempt's retained epoch checkpoint — proven by registering a
+    /// `models` row naming that exact prefix and driving the resumed
+    /// attempt's own prune past it.
+    ///
+    /// Mutation (executed and reverted, never shipped — see this unit's
+    /// report): changing `save_epoch_checkpoint`'s prune call from
+    /// `&self.attempt` to the previous attempt's literal `"0"` makes this
+    /// test fail — the previous attempt's bytes are deleted out from under
+    /// its own live `models` row.
+    #[tokio::test]
+    async fn a_resumed_attempts_prune_never_touches_a_previous_attempts_retained_checkpoint() {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        let store =
+            Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache_dir).unwrap());
+        let artifact_dir = tempfile::tempdir().unwrap().keep();
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        let catalog_dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(
+            jammi_db::catalog::Catalog::open(&catalog_dir)
+                .await
+                .unwrap(),
+        );
+
+        // The PREVIOUS attempt ("0"): writes epoch 0, which this test
+        // registers as a RETAINED checkpoint row — the exact shape a real
+        // winning finalize CAS produces for a checkpoint still inside the
+        // retention window when the attempt that wrote it was reclaimed.
+        let prev_prefix = tokio::task::spawn_blocking({
+            let device = Device::Cpu;
+            let artifact_dir = artifact_dir.clone();
+            let store = Arc::clone(&store);
+            let catalog = Arc::clone(&catalog);
+            let checkpoint_dir = checkpoint_dir.clone();
+            move || {
+                let mut prev = loop_for_attempt(&device, "0", &artifact_dir, store, catalog);
+                prev.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                prev.epoch_checkpoints[0].1.clone()
+            }
+        })
+        .await
+        .unwrap();
+        let prev_prefix_url = StorageUrl::parse(&prev_prefix).unwrap();
+
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "f2-isolation-job:epoch_0",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: Some(&prev_prefix),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        // The RESUMED attempt ("1"): a fresh `TrainingLoop`, same job/worker
+        // id, that never sees `prev`'s in-memory state at all — matching a
+        // real reclaim, where the resuming worker builds a brand-new loop.
+        // Its own retention prune (keep=1) fires on its SECOND save.
+        tokio::task::spawn_blocking({
+            let device = Device::Cpu;
+            let store = Arc::clone(&store);
+            let catalog = Arc::clone(&catalog);
+            move || {
+                let mut resumed = loop_for_attempt(&device, "1", &artifact_dir, store, catalog);
+                resumed.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+                resumed.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+                assert_eq!(
+                    resumed
+                        .epoch_checkpoints
+                        .iter()
+                        .map(|(e, _)| *e)
+                        .collect::<Vec<_>>(),
+                    vec![1],
+                    "the resumed attempt's own retention window is unaffected by the previous \
+                     attempt's row"
+                );
+            }
+        })
+        .await
+        .unwrap();
+
+        // THE PROPERTY: the previous attempt's retained checkpoint — a
+        // DIFFERENT attempt's prefix — is untouched by the resumed
+        // attempt's prune.
+        store.fetch_artifact(&prev_prefix_url).await.expect(
+            "a previous attempt's retained epoch checkpoint must survive a resumed \
+                 attempt's own mid-run retention prune",
+        );
+        let row = catalog
+            .get_model("f2-isolation-job:epoch_0")
+            .await
+            .unwrap()
+            .expect("the previous attempt's checkpoint row must still exist");
+        assert_eq!(row.artifact_path.as_deref(), Some(prev_prefix.as_str()));
+    }
+}
+
 /// H1 (unit 63): CPU-hermetic tests for the public per-pair held-out
 /// evaluation seam — [`TrainingLoop::evaluate_held_out`] /
 /// [`TrainingLoop::compute_loss_per_example`] and their supporting free

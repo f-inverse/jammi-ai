@@ -468,8 +468,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
     tenant_b = "22222222-2222-4222-8222-222222222222"
 
     # --- embedded transport (the canonical reports) -------------------------- #
-    with tempfile.TemporaryDirectory() as catalog:
-        embedded = jammi.connect(f"file://{catalog}")
+    with tempfile.TemporaryDirectory() as catalog, jammi.connect(f"file://{catalog}") as embedded:
         print("== embedded engine: eval suite ==", flush=True)
         embedded_reports = run_eval_suite(embedded, fx, tag="emb")
         print("== embedded engine: channel sequence ==", flush=True)

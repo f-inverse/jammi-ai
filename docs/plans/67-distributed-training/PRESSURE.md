@@ -6,10 +6,10 @@
 
 | # | Finding | Disposition (where folded) |
 |---|---|---|
-| 1 | Default embedding loss (CoSENT, `trainer.rs:4356`), AnglE and MNRL are batch-coupled; per-rank gradient averaging is not the global-batch gradient; the trait cannot express the fix | **Gather rule**: `all_gather` added to the trait; every rank computes the identical global loss over the gathered batch; gather backward keeps local slots; adapter grads summed. DESIGN §1 cost paragraph re-derived. README r6; U4b acceptance (b) gather exactness |
+| 1 | Default embedding loss (CoSENT, `crates/jammi-ai/src/fine_tune/trainer.rs::dispatch_contrastive_loss`, the `CoSent | None` arm), AnglE and MNRL are batch-coupled; per-rank gradient averaging is not the global-batch gradient; the trait cannot express the fix | **Gather rule**: `all_gather` added to the trait; every rank computes the identical global loss over the gathered batch; gather backward keeps local slots; adapter grads summed. DESIGN §1 cost paragraph re-derived. README r6; U4b acceptance (b) gather exactness |
 | 2 | Rank-local, data-dependent control flow (divergence skip, 3-strikes, early stop, mining refresh) breaks lockstep | **Lockstep rule**: global-batch-index step boundary; `all_reduce_max_flags`; rank-0 validation decisions broadcast. README r7; U4b acceptance (d) |
 | 3 | Reduce set can differ per rank (sparse `GradStore`) | Canonical `trainable_vars` order, zero-filled. README r7; U4b |
-| 4 | Scaler over the whole table leaks validation and breaks refactor parity; split and `batches_per_epoch` over the train prefix | Split arithmetic from `data.rs:477-481` in the descriptor via `validation_fraction`; scaler streamed over the train prefix into `from_targets`, bit-identical. README r3/r4; DESIGN §2; U2b |
+| 4 | Scaler over the whole table leaks validation and breaks refactor parity; split and `batches_per_epoch` over the train prefix | Split arithmetic from `crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split` in the descriptor via `validation_fraction`; scaler streamed over the train prefix into `from_targets`, bit-identical. README r3/r4; DESIGN §2; U2b |
 | 5 | Row-group alignment to W·B contradicts K7 on the TrainingSet descriptor | Alignment dropped; reader slices. DESIGN §2 |
 | 6 | `RunRank`/`FetchPartition` are authenticated but unauthorized compute + SSRF primitives | **Authorization**: assignment carries `(job_id, tenant, attempt, coordinator_worker_id)`; peer verifies running/claimed_by/lease via read-only catalog; ids not URLs; typed refusal. README r9; DESIGN §4; U5a acceptance (b) |
 | 7 | GPU byte-equality unsupported (flash `atomicAdd`, NCCL channel split) | Byte oracles on hermetic legs only; GPU legs digest pair + tolerance until S5. README r16; DESIGN §6 |
@@ -40,12 +40,16 @@
 | A14 | U8 three-process arm is distributed, not hermetic | Reclassified; harness in scope |
 | A15 | "required green before merge" has no trigger | Manual dispatch wording, as U1 |
 
-Verified by the lead before folding: `trainer.rs:4356` (CoSENT default), `:3862` (pairwise
-(n,n)), `:4110` (MNRL (n,n)), `:2560-2567` (divergence skip), `:802`/`:824-836` (train-split
-scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arithmetic),
-`regression_loss.rs:169` (`from_targets`), `crates/jammi-wire/src/fine_tune.rs:237-272`
-(`FineTuneConfig` fields), `docs/plans/65-resolve-witness/README.md:23-26` (cache rekey),
-`flash_bwd_kernel.h:122-123` (deterministic path), `crates/jammi-db/Cargo.toml:55` (0.10.1).
+Verified by the lead before folding: `crates/jammi-ai/src/fine_tune/trainer.rs::dispatch_contrastive_loss`
+(the `CoSent | None` arm, CoSENT default), `crates/jammi-ai/src/fine_tune/trainer.rs::pairwise_ordering_loss` (pairwise
+(n,n)), `crates/jammi-ai/src/fine_tune/trainer.rs::mnrl_loss` (MNRL (n,n)),
+`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::process_batch_loss` (divergence skip; also the train-split
+scaler call site and the mining-refresh check are in `TrainingLoop::run`), `TrainingLoop::run_gradcache_epoch` (GradCache),
+`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split` (split arithmetic),
+`crates/jammi-ai/src/fine_tune/regression_loss.rs::TargetScaler::from_targets`, `crates/jammi-wire/src/fine_tune.rs::FineTuneConfig`
+(fields), `docs/plans/65-resolve-witness/README.md#why-this-unit-exists` (item 3, cache rekey),
+`crates/jammi-kernels/third_party/flash-attention/src/flash_bwd_kernel.h`'s
+`compute_dq_dk_dv_1colblock` (~:122, deterministic path), `crates/jammi-db/Cargo.toml::[dependencies].datafusion-table-providers` (0.10.1).
 
 ## Round 2 (2026-09-10, on v2 fd543451) — two lenses, both REFINE; every disposition in v3
 
@@ -53,13 +57,13 @@ scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arit
 
 | # | Finding | Disposition |
 |---|---|---|
-| 1 | "Sum, don't average" is exact only if no trainable parameter consumes gathered remote slots; classification applies the head inside the loss (`trainer.rs:2676-2679`) | Invariant stated; per-arm gather points (logits for classification; head output for regression; encoder outputs otherwise). README r6; DESIGN §4; U4b (b) adds classification + quantile regression |
-| 2 | Refusal predicate `refresh_every > 0` is true by default (`fine_tune.rs:212-231`) — every W>1 job would be refused | Predicate is `hard_negatives.mine` or `cached`. README r2; DESIGN §2; U4a |
-| 3 | Per-rank dropout RNG (`resume.rs:107`) unmodelled — resume of a gang not reproducible | Per-rank `dropout_positions` gathered to rank 0; seed `f(seed, rank)`; oracle across a resume. README r8; DESIGN §4, §6; U4b |
+| 1 | "Sum, don't average" is exact only if no trainable parameter consumes gathered remote slots; classification applies the head inside the loss (`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::compute_loss`, the `Classification` arm) | Invariant stated; per-arm gather points (logits for classification; head output for regression; encoder outputs otherwise). README r6; DESIGN §4; U4b (b) adds classification + quantile regression |
+| 2 | Refusal predicate `refresh_every > 0` is true by default (`crates/jammi-wire/src/fine_tune.rs::HardNegativeConfig`) — every W>1 job would be refused | Predicate is `hard_negatives.mine` or `cached`. README r2; DESIGN §2; U4a |
+| 3 | Per-rank dropout RNG (`crates/jammi-ai/src/fine_tune/resume.rs::ResumeState::dropout_positions`) unmodelled — resume of a gang not reproducible | Per-rank `dropout_positions` gathered to rank 0; seed `f(seed, rank)`; oracle across a resume. README r8; DESIGN §4, §6; U4b |
 | 4 | Descriptor cannot hold `jammi-wire`/`jammi-ai` types (`jammi-db` depends on `jammi-numerics` only) | Opaque versioned canonical encoding; completeness test in the owning crate. README r5; DESIGN §3; U2a/U3 |
 | 5 | `batches_per_epoch` ambiguous between B and W·B; LR horizon and trailing scale follow | `ceil(train_count / (W·B))`; every step quantity indexed by global batch; U2b lands it. README r3/r7; DESIGN §2 |
 | 6 | Zero-row ranks in the trailing global batch unstated | Kept; 0-row tensors, zero counts; fixture with `train_count` not a multiple of W·B. README r3; DESIGN §2; U2b (b), U4b (b) |
-| 7 | `Precomputed` arm splits by batch count (`data.rs:493-497`) | Tests-only arm stays outside the table path, unchanged. README r3; DESIGN §2; U2b |
+| 7 | `Precomputed` arm splits by batch count (`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split`, the `Precomputed` arm) | Tests-only arm stays outside the table path, unchanged. README r3; DESIGN §2; U2b |
 | 8 | "Streams into the reduction" is not bit-identical (`from_targets` two-pass) | One collected `Vec<f32>`, `from_targets` once; named 4 B/row exemption. README r4; DESIGN §2; U2b |
 | A9 | Fence keyed `(job_id, rank)` misses a rank that moved hosts; "lesser" vs "lesser or equal" | Fence on `job_id`; lesser-or-equal refused. README r8; DESIGN §4; U5a (c) |
 | A10 | GPU ε chosen after the run | ε pre-registered per leg before the first gating run; digest pair ASSERTED (equal on a pass) at world 2, the regime S5 measured byte-identical; recorded, not asserted, above world 2 (NCCL pin set untested there). README r16; DESIGN §6; U7a schema; `check_cuda_run_artifacts.py` rule (k) |
@@ -69,7 +73,7 @@ scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arit
 
 | # | Finding | Disposition |
 |---|---|---|
-| 1 | U2a does not compile: `ResultTableKind` wire mirror (`jammi-wire/src/embedding.rs:95-116`, proto) | In U2a scope; wire-server owner; B5 |
+| 1 | U2a does not compile: `ResultTableKind` wire mirror (`crates/jammi-wire/src/embedding.rs::result_table_kind_to_proto`/`::result_table_kind_from_proto`, proto) | In U2a scope; wire-server owner; B5 |
 | 2 | Doc-parity gate runs every PR; guide variant block was in U9 | Block lands with U2a and U3; U9 prose only |
 | 3 | U6 (c) needs U5b's harness and matrix entry | Moved to U5b (e); U5b depends on U6 |
 | 4 | Reachability registry is derived from every `ci/scripts` file; `runpod_gpu_gang.sh` reds it | Allowlist in U7a/U7b scope + acceptance |
@@ -82,16 +86,17 @@ scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arit
 | A11 | PR bases unstated | Stated (SIZING, README hand-off) |
 | A12 | U3, U6 = M; U4b = L understated | L, L, XL |
 | A13 | GPU/gang test targets unnamed | Existing `gpu_capability` / `distributed` targets; no new `[[test]]` |
-| A14 | S4 cost/approval and ledger path not on the README | Added; `runpod_lib.sh:1263` fixed |
+| A14 | S4 cost/approval and ledger path not on the README | see `git log -S 'runpod_lib.sh' -- docs/plans/67-distributed-training/` (abb96a93, 9780d752) |
 
-Verified by the lead before folding: `trainer.rs:2676-2679` (classify inside loss), `:2245`
-(regression head pre-loss), `fine_tune.rs:212-231` (`mine: false`, `refresh_every: 1`),
-`:590-601` (`refresh_every == 0` refused when mining), `trainer.rs:1451` (`.mine` gate),
-`data.rs:439-442`/`:493-497` (Precomputed tests-only, batch split), `cache.rs:43-45`
-(`in_flight` keyed by id), `resume.rs:107`, `crates/jammi-db/Cargo.toml:44`,
-`trainer.rs:843-852`, `jammi-wire/src/embedding.rs:95-101`, `embedding.proto:108-109`,
-`check_doc_parity.py:127-136`, `execution_surface_reachability_allowlist.txt` (162 lines),
-`jammi-wire/build.rs:22-33`.
+Verified by the lead before folding: `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::compute_loss`
+and `TrainingLoop::compute_loss_per_example` (both the `Classification` arm, classify inside loss), `TrainingLoop::head_forward`
+(regression head pre-loss), `crates/jammi-wire/src/fine_tune.rs::HardNegativeConfig` (`mine: false`, `refresh_every: 1`),
+`crates/jammi-wire/src/fine_tune.rs::FineTuneConfig::validate` (`refresh_every == 0` refused when mining), `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::mining_eligible` (`.mine` gate),
+`crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::from_precomputed`/`TrainingDataLoader::split` (Precomputed tests-only, batch split), `crates/jammi-ai/src/model/cache.rs::CacheInner`
+(`in_flight` keyed by id), `crates/jammi-ai/src/fine_tune/resume.rs::ResumeState::dropout_positions`, `crates/jammi-db/Cargo.toml::[dependencies].jammi-numerics`,
+`crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::run` (LR horizon), `crates/jammi-wire/src/embedding.rs::result_table_kind_to_proto`, `crates/jammi-wire/proto/jammi/v1/embedding.proto::ResultTableKind`,
+`ci/scripts/check_doc_parity.py::PRODUCING_DESCRIPTOR`, `ci/scripts/execution_surface_reachability_allowlist.txt`,
+`crates/jammi-wire/build.rs::main` (the `proto_files` list).
 
 ## Round 3 (2026-09-10, on v3 db5dd701) — disposition check: REFINE, consistency only
 
@@ -103,8 +108,8 @@ mechanism change; folded into v3.1 and verified by the lead by grep (no round 4)
 |---|---|---|
 | 1 | U6 → U5b edge present in UNITS only; README table/hand-off and SIZING still said `U6 ∥ U5b` | README unit table, hand-off step 6, SIZING schedule/edges/alternative 6 corrected |
 | 2 | Reachability allowlist missing from U7b scope/acceptance and the co-ownership row | Added to U7b; row extended |
-| 3 | `TrainingCommon.world_size` in U4a without its construction sites, serde default, or the wire field | `#[serde(default)]` = 1 (D10); construction sites (`wire/training.rs:176`, `session.rs:1172`, `:1300`, `tests/it`) and `training.proto`/`jammi-wire/src/training.rs` in U4a with wire-server co-owner; README r17 |
-| A4 | Citations: `fine_tune.rs:237-267` → `:237-445`; `runpod_lib.sh:1263` → `:1264`; `optimizer.rs:612` (correct as cited) | Corrected |
+| 3 | `TrainingCommon.world_size` in U4a without its construction sites, serde default, or the wire field | `#[serde(default)]` = 1 (D10); construction sites (`crates/jammi-ai/src/wire/training.rs::lora_common_from_proto`, `crates/jammi-ai/src/session.rs::InferenceSession::fine_tune`, `InferenceSession::fine_tune_graph`, `tests/it`) and `training.proto`/`jammi-wire/src/training.rs` in U4a with wire-server co-owner; README r17 |
+| A4 | Citations: `crates/jammi-wire/src/fine_tune.rs::FineTuneConfig` corrected from an undersized line range to the whole struct; `crates/jammi-ai/src/fine_tune/optimizer.rs::clip_and_step` (correct as cited) | see `git log -S 'runpod_lib.sh' -- docs/plans/67-distributed-training/` (abb96a93, 9780d752) |
 | A5 | U5b omitted `tests/distributed/main.rs`; U4b listed `store/manifest.rs` under ai-core | Corrected |
 | A6 | U4a → U2b edge (the `world` argument) unstated | Stated in README table, U2b, SIZING edges |
 
@@ -163,7 +168,9 @@ lease-lost arm, `get_job` tenant filter, `list_workers` without `devices`, the m
 hand-off step 5 gave PR-B a false 68 precondition; U5a's `depends_on` still carried the deleted
 fallback and lacked OPS/GRAPH; U3 still named "029"; U8a lacked the card-glob and dep-DAG sites;
 `instances.peer_addr` was owned twice (68 README, DIST D9/K5, DESIGN §4/§7); one reference to the
-deleted reconciliation file; DESIGN's unprefixed citations were anchored pre-#501 (measured shifts
-now stated at DESIGN:5). Advisories folded: U8a → U5b-1; PR-B is also an admin merge (U7a edits a
+deleted reconciliation file; DESIGN's citations resolve at this branch's head, per its own
+preamble (`docs/plans/67-distributed-training/DESIGN.md#design--distributed-training-on-datafusion-500-v4`,
+~ its opening paragraph) — no measured-shift table is carried anywhere in the plan. Advisories
+folded: U8a → U5b-1; PR-B is also an admin merge (U7a edits a
 `check_*.py`); the dep-DAG lane is advisory by standing; U9b owns the StatefulSet consequence;
 `tests/distributed/cluster_state.rs`.

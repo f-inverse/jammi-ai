@@ -352,8 +352,12 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         pq.write_table(pa.table(_PAIRS), corpus_path)
 
         # --- embedded transport (the canonical matrix) ---------------------- #
-        with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi.connect(f"file://{catalog}")
+        with (
+            tempfile.TemporaryDirectory() as catalog,
+            # closed BEFORE the directory is removed: `with A, B` unwinds B first,
+            # and a live embedded engine keeps writing its catalog (Errno 39).
+            jammi.connect(f"file://{catalog}") as embedded,
+        ):
             print("== embedded engine: model catalog ==", flush=True)
             embedded_matrix = run_catalog(embedded, corpus_path, base_model, tag="emb")
 

@@ -19,8 +19,7 @@ BASE_MODEL = f"local:{FIXTURES / 'tiny_bert'}"
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
-        db = jammi.connect(f"file://{tmp}")
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
 
         # 1. Register the contrastive training pairs.
         db.add_source("training", url=str(PAIRS_PATH), format="csv")

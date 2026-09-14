@@ -53,6 +53,8 @@ import pyarrow as pa
 
 from ._capability import Capability
 from .errors import NotSupportedOnBackend
+from ._sessions import register as _register_session
+from ._sessions import unregister as _unregister_session
 from ._assembly import (
     build_add_channel_columns_request,
     build_asof_join_request,
@@ -125,9 +127,20 @@ class EmbeddedBackend:
     silent `AttributeError`.
     """
 
-    def __init__(self, native: object) -> None:
+    def __init__(self, native: object, *, label: str = "") -> None:
         # Held by composition; every verb delegates to it explicitly.
         self._native = native
+        # The ONE registration point for every embedded session: `_open_embedded`
+        # (the `file://` dispatch factory) and any direct construction both run
+        # this `__init__`, so both are visible to `jammi.open_sessions()` from
+        # here — see `_sessions`. `label` is the catalog location this session
+        # was opened on (the `artifact_dir` `_open_embedded` resolved) — the
+        # printable target `jammi.open_session_labels()` / an `observe()`
+        # listener reports for this handle even after the session itself is
+        # collected; direct construction with no `label` registers under `""`,
+        # which is still a valid (if uninformative) label. Called LAST so a
+        # session that exists at all is unconditionally live here.
+        self._session_handle = _register_session(self, label)
 
     # --- Capability contract ----------------------------------------------------
     #
@@ -217,6 +230,7 @@ class EmbeddedBackend:
         claiming process's to open. See :func:`jammi.connect`.
         """
         self._native.close(release)
+        _unregister_session(self)
 
     def __enter__(self) -> "EmbeddedBackend":
         return self
@@ -1433,4 +1447,7 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     """
     import jammi_native
 
-    return EmbeddedBackend(jammi_native.open_local(artifact_dir=artifact_dir, config=config))
+    return EmbeddedBackend(
+        jammi_native.open_local(artifact_dir=artifact_dir, config=config),
+        label=artifact_dir,
+    )

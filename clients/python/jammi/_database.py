@@ -64,6 +64,8 @@ from ._assembly import (
     expiry_report_to_dict,
 )
 from ._capability import Capability
+from ._sessions import register as _register_session
+from ._sessions import unregister as _unregister_session
 from ._credentials import (
     AnonymousCredentials,
     BearerCredentials,
@@ -994,6 +996,14 @@ class RemoteDatabase:
         # first (`_check_open`) — the peer of the embedded engine's FFI-boundary
         # guard, so a closed session behaves the SAME on both transports.
         self._closed = False
+        # The ONE registration point for every remote session: `open_remote`
+        # (the factory `connect()` uses) and any direct construction both run
+        # this `__init__`, so both are visible to `jammi.open_sessions()` from
+        # here — see `_sessions`. Labeled by `endpoint` — the printable target
+        # `jammi.open_session_labels()` / an `observe()` listener reports for
+        # this handle even after the session itself is collected. Called LAST
+        # so a session that exists at all is unconditionally live here.
+        self._session_handle = _register_session(self, endpoint)
 
     @property
     def session_id(self) -> str:
@@ -2872,6 +2882,7 @@ class RemoteDatabase:
             self._flight = None
         self._channel.close()
         self._closed = True
+        _unregister_session(self)
 
     def __enter__(self) -> "RemoteDatabase":
         return self

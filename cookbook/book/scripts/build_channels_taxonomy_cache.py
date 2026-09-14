@@ -322,8 +322,7 @@ def emit(server_bin: str) -> None:
     tenant_b = "22222222-2222-4222-8222-222222222222"
 
     # --- embedded transport (the error-class companion) --------------------- #
-    with tempfile.TemporaryDirectory() as catalog:
-        embedded = jammi.connect(f"file://{catalog}")
+    with tempfile.TemporaryDirectory() as catalog, jammi.connect(f"file://{catalog}") as embedded:
         print("== embedded engine: channel error taxonomy ==", flush=True)
         embedded_run = run_taxonomy(embedded, tenant_a, tag="emb")
 

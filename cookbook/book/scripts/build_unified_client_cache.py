@@ -375,11 +375,16 @@ def _honest_edge_record(embedded) -> dict:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as artifact_dir:
-        # The base client discovers the in-process engine on demand: a `file://`
-        # target resolves to the direct-FFI EmbeddedBackend when the `[embedded]`
-        # extra is installed. This is the REAL new surface — no convenience bundle.
-        embedded = jammi.connect(f"file://{artifact_dir}")
+    # The base client discovers the in-process engine on demand: a `file://`
+    # target resolves to the direct-FFI EmbeddedBackend when the `[embedded]`
+    # extra is installed. This is the REAL new surface — no convenience bundle.
+    with (
+        tempfile.TemporaryDirectory() as artifact_dir,
+        # closed BEFORE the directory is removed: `with A, B` unwinds B first, and
+        # a live embedded engine keeps writing its catalog, so a cleanup racing it
+        # fails with ENOTEMPTY (Errno 39 on Linux). Drop is not a release here.
+        jammi.connect(f"file://{artifact_dir}") as embedded,
+    ):
         remote = jammi.connect("grpc://127.0.0.1:8081")  # lazy; supports() is local
         try:
             record = {

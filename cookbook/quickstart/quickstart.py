@@ -39,10 +39,11 @@ MODEL = f"local:{FIXTURES / 'tiny_bert'}"
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
-        # 1. Connect to a local, in-process engine rooted at the temp dir.
-        db = jammi.connect(f"file://{tmp}")
-
+    # 1. Connect to a local, in-process engine rooted at the temp dir. The session
+    #    is a context manager, and block exit CLOSES it — the embedded engine
+    #    holds its catalog until close() returns, so it must be released before
+    #    the directory is removed (the `with` items unwind in reverse order).
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
         # 2. Register the tiny corpus as a Parquet source.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
 

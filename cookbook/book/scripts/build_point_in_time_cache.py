@@ -319,46 +319,54 @@ def verdict_matrix(work: str) -> dict:
     """
     docs_path = os.path.join(work, "tiny_docs.parquet")
     pq.write_table(pa.table(_TINY_DOCS), docs_path)
-    catalog = tempfile.mkdtemp(prefix="jammi_pit_matrix_")
-    db = jammi.connect(f"file://{catalog}")
-    db.add_source("docs", url=f"file://{docs_path}", format="parquet")
 
-    # MatchWithUnpinnedInputs: embedding over a file source.
-    emb = db.generate_embeddings(source="docs", model=_EMBED_MODEL,
-                                 columns=["text"], key="_row_id")
-    v_unpinned = db.verify_materialization(emb)
+    # `db` is a `with`-item alongside its `TemporaryDirectory`: closed on every
+    # exit from the block (including a `verify_materialization` exception),
+    # before `catalog` is removed. Nothing outside this function reads `catalog`
+    # — every path derived from it (the manifest sidecar) is read to completion
+    # before `return`.
+    with (
+        tempfile.TemporaryDirectory(prefix="jammi_pit_matrix_") as catalog,
+        jammi.connect(f"file://{catalog}") as db,
+    ):
+        db.add_source("docs", url=f"file://{docs_path}", format="parquet")
 
-    # Match: a neighbor graph over the embeddings RESULT TABLE (ResultDigest input).
-    ng = db.build_neighbor_graph("docs", k=2, exact=True)
-    v_match = db.verify_materialization(ng)
+        # MatchWithUnpinnedInputs: embedding over a file source.
+        emb = db.generate_embeddings(source="docs", model=_EMBED_MODEL,
+                                     columns=["text"], key="_row_id")
+        v_unpinned = db.verify_materialization(emb)
 
-    # Read the definition hash off the Match-case manifest sidecar.
-    sidecar = _manifest_sidecar_path(catalog, ng)
-    manifest = json.loads(sidecar.read_text())
-    definition_hash = manifest["definition_hash"]
-    input_anchors = manifest["input_anchors"]
+        # Match: a neighbor graph over the embeddings RESULT TABLE (ResultDigest input).
+        ng = db.build_neighbor_graph("docs", k=2, exact=True)
+        v_match = db.verify_materialization(ng)
 
-    # Match again, this time with the correct expected definition supplied.
-    v_match_expected = db.verify_materialization(ng, expected_definition=definition_hash)
+        # Read the definition hash off the Match-case manifest sidecar.
+        sidecar = _manifest_sidecar_path(catalog, ng)
+        manifest = json.loads(sidecar.read_text())
+        definition_hash = manifest["definition_hash"]
+        input_anchors = manifest["input_anchors"]
 
-    # Mismatch: a wrong expected definition (a different producing query would give a
-    # different hash; an all-zero hash stands in as the canonical "not this definition").
-    wrong = "0" * len(definition_hash)
-    v_mismatch = db.verify_materialization(ng, expected_definition=wrong)
+        # Match again, this time with the correct expected definition supplied.
+        v_match_expected = db.verify_materialization(ng, expected_definition=definition_hash)
 
-    # MissingManifest: remove the sidecar, then verify.
-    sidecar.unlink()
-    v_missing = db.verify_materialization(ng)
+        # Mismatch: a wrong expected definition (a different producing query would give a
+        # different hash; an all-zero hash stands in as the canonical "not this definition").
+        wrong = "0" * len(definition_hash)
+        v_mismatch = db.verify_materialization(ng, expected_definition=wrong)
 
-    return {
-        "match": v_match,
-        "match_expected": v_match_expected,
-        "match_with_unpinned_inputs": v_unpinned,
-        "mismatch": v_mismatch,
-        "missing_manifest": v_missing,
-        "definition_hash": definition_hash,
-        "match_input_anchors": input_anchors,
-    }
+        # MissingManifest: remove the sidecar, then verify.
+        sidecar.unlink()
+        v_missing = db.verify_materialization(ng)
+
+        return {
+            "match": v_match,
+            "match_expected": v_match_expected,
+            "match_with_unpinned_inputs": v_unpinned,
+            "mismatch": v_mismatch,
+            "missing_manifest": v_missing,
+            "definition_hash": definition_hash,
+            "match_input_anchors": input_anchors,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -447,8 +455,12 @@ def emit(target: str, server_bin: str | None) -> None:
         spine_path, facts_path = _write_spine_and_facts(work, facts)
 
         # --- embedded asof (the canonical feature rows) --------------------- #
-        with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi.connect(f"file://{catalog}")
+        with (
+            tempfile.TemporaryDirectory() as catalog,
+            # closed BEFORE the directory is removed: `with A, B` unwinds B first,
+            # and a live embedded engine keeps writing its catalog (Errno 39).
+            jammi.connect(f"file://{catalog}") as embedded,
+        ):
             print("== embedded asof_join ==", flush=True)
             e_out, e_rows, e_verdict = run_asof(embedded, spine_path, facts_path)
 

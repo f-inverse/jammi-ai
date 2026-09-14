@@ -601,11 +601,42 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
     from jammi._database import _reconcile_report_to_dict
     from jammi._generated.jammi.v1 import catalog_pb2
 
-    # The remote projection's own key set — pinned here directly (not via
-    # `_RECONCILE_REPORT_DICT_KEYS`, which this test's non-empty case must
-    # agree with independently) so this test alone still catches a dropped
-    # `referenced` field even if the module-level constant above were wrong.
-    remote_keys = set(_reconcile_report_to_dict(catalog_pb2.ReconcileReport()))
+    # The remote projection's own shape, computed against a POPULATED
+    # `ReconcileReport` — every list field non-empty, `referenced_count`
+    # equal to `len(referenced)`, `truncated` False — never an EMPTY
+    # message. A proto's field set is fixed by its descriptor regardless of
+    # which fields carry values, so comparing key sets against an empty
+    # message is structurally true for any message and would keep passing
+    # even if `_reconcile_report_to_dict` mis-typed or miscounted a
+    # populated field; only a populated fixture exercises that. Pinned here
+    # directly (not via `_RECONCILE_REPORT_DICT_KEYS`, which this test's
+    # non-empty case must agree with independently) so this test alone
+    # still catches a dropped `referenced` field even if the module-level
+    # constant above were wrong.
+    remote_report = catalog_pb2.ReconcileReport(
+        scope="tenant:22222222-2222-4222-8222-222222222222",
+        applied=True,
+        rows_failed=["rf1", "rf2"],
+        rows_failed_count=2,
+        orphans=["o1"],
+        orphan_count=1,
+        pending=["p1", "p2"],
+        pending_count=2,
+        unattributed=["u1"],
+        unattributed_count=1,
+        damaged=["d1"],
+        damaged_count=1,
+        referenced=["r1", "r2", "r3"],
+        referenced_count=3,
+        truncated=False,
+        bytes_reclaimed=42,
+    )
+    remote_projected = _reconcile_report_to_dict(remote_report)
+    remote_keys = set(remote_projected)
+    assert remote_projected["referenced_count"] == len(remote_projected["referenced"]), (
+        "the populated fixture itself must be internally consistent before it "
+        f"is used as the comparison oracle: {remote_projected}"
+    )
 
     # Bootstrap: open + immediately close, so `catalog.db` and the
     # `jammi_db/` root exist (migrations applied) with NO engine connection
@@ -677,6 +708,11 @@ def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key
             f"embed reconcile(apply=True) keys {set(report)} != the remote "
             f"projection's {remote_keys}"
         )
+        for key in remote_keys:
+            assert type(report[key]) is type(remote_projected[key]), (
+                f"{key}: embedded value {report[key]!r} ({type(report[key])}) != "
+                f"remote-projection value type {type(remote_projected[key])}"
+            )
         assert any(r.endswith("debug_dump.tmp") for r in report["referenced"]), (
             f"the reap-site consult must name the stray file referenced: {report}"
         )

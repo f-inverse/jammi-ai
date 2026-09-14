@@ -2135,6 +2135,103 @@ class UnexaminableLocalReusableIsAFindingNeverASilentPassTest(unittest.TestCase)
         )
 
 
+def _fan_out_mid_and_bad(order: str) -> dict[str, str]:
+    """A caller job `uses:` a fan-out reusable `_mid.yml` with two SIBLING
+    jobs: `hop-good` (a direct, examinable publishing primitive -- no
+    further `uses:`) and `hop-bad` (itself `uses:` a THIRD reusable,
+    `_bad.yml`, whose `jobs:` is flow-style and therefore unexaminable).
+    W11 audit: on the real corpus (`image.yml`'s `build` job pointed at
+    this exact shape), `check_p6_discovery` found 0 findings when
+    `hop-good` came first in `_mid.yml`'s own `jobs:` block and 1 when
+    `hop-bad` came first -- the sibling loop returned the instant
+    `hop-good` yielded a primitive, so `hop-bad`'s own unexaminable target
+    was never even loaded. `order` is `"good-first"` or `"bad-first"`; the
+    verdict must not depend on it."""
+    hop_good = "  hop-good:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n"
+    hop_bad = "  hop-bad:\n    uses: ./.github/workflows/_bad.yml\n"
+    jobs = hop_good + hop_bad if order == "good-first" else hop_bad + hop_good
+    caller = (
+        "name: fanout-caller\n\non:\n  push:\n    branches: [main]\n\n"
+        "jobs:\n  build:\n    uses: ./.github/workflows/_mid.yml\n"
+    )
+    mid = f"name: mid\n\non:\n  workflow_call:\n\njobs:\n{jobs}"
+    bad = (
+        "name: bad\n\non:\n  workflow_call:\n\n"
+        "jobs: { publisher: { runs-on: ubuntu-latest, "
+        "steps: [ { run: 'npm publish' } ] } }\n"
+    )
+    return {"fanout-caller.yml": caller, "_mid.yml": mid, "_bad.yml": bad}
+
+
+class SiblingJobOrderNeverMasksAnUnexaminableReusableTest(unittest.TestCase):
+    """W11 audit fix: `job_invokes_publish_primitive_recursive`'s sibling
+    loop used to `return` the instant one sibling job yielded a primitive,
+    so a LATER sibling job's own unexaminable `uses:` target was never even
+    loaded -- the whole reusable it named stayed permanently invisible to
+    P6 whenever it happened to sit after a sibling that already found
+    something. The verdict must be independent of job order, and a
+    transitive refusal must name the true chain, never a flattened or
+    missing hop."""
+
+    def test_good_first_still_finds_the_unexaminable_sibling(self):
+        texts = {**_positive_texts(), **_fan_out_mid_and_bad("good-first")}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "_bad.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+
+    def test_bad_first_still_finds_the_unexaminable_sibling(self):
+        texts = {**_positive_texts(), **_fan_out_mid_and_bad("bad-first")}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "_bad.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+
+    def test_both_job_orders_yield_the_identical_finding_set(self):
+        good_first = cgo.check_p6_discovery({**_positive_texts(), **_fan_out_mid_and_bad("good-first")})
+        bad_first = cgo.check_p6_discovery({**_positive_texts(), **_fan_out_mid_and_bad("bad-first")})
+        mine_good = sorted(
+            f for f in good_first if "fanout-caller.yml" in f or "_mid.yml" in f or "_bad.yml" in f
+        )
+        mine_bad = sorted(
+            f for f in bad_first if "fanout-caller.yml" in f or "_mid.yml" in f or "_bad.yml" in f
+        )
+        self.assertEqual(mine_good, mine_bad, (mine_good, mine_bad))
+
+    def test_the_finding_names_the_true_edge_chain_never_a_flattened_or_missing_hop(self):
+        texts = {**_positive_texts(), **_fan_out_mid_and_bad("bad-first")}
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "_bad.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        finding = mine[0]
+        self.assertIn("fanout-caller.yml", finding)
+        self.assertIn("build", finding)
+        self.assertIn("_mid.yml", finding)
+        self.assertIn("_bad.yml", finding)
+        # The chain must read caller -> _mid -> _bad: `_mid.yml` names the
+        # true intermediate hop and must appear BEFORE `_bad.yml` in the
+        # message text, never a flattened `caller -> _bad` edge that skips
+        # the reusable actually in between.
+        self.assertLess(finding.index("_mid.yml"), finding.index("_bad.yml"), finding)
+
+    def test_a_refusing_reusable_and_a_separate_examinable_publisher_are_both_reported(self):
+        texts = {
+            **_positive_texts(),
+            **_fan_out_mid_and_bad("bad-first"),
+            **_reusable_caller_and_target(
+                "jobs:\n  publisher:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - run: npm publish\n"
+            ),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        self.assertTrue(any("_bad.yml" in f for f in findings), findings)
+        self.assertTrue(
+            any(
+                "caller.yml" in f and "call-it" in f and "not listed in PROMOTION_TABLE" in f
+                for f in findings
+            ),
+            findings,
+        )
+
+
 class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
     """F2 audit fix: an unreadable `on:`/`jobs:` block is a FAIL LOUD, never
     a silent skip -- same doctrine P1 already holds `gpu-prove.yml`'s `on:`

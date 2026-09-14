@@ -1517,10 +1517,29 @@ def job_invokes_publish_primitive_recursive(
     primitive found". `check_p6_discovery` is the one place that turns this
     into a named finding; every OTHER caller of this function must let it
     propagate too, for the same reason `on_err`/`jobs_err` are never
-    discarded at the top level."""
+    discarded at the top level.
+
+    W11 audit fix: the sibling-job loop used to `return` the instant ONE
+    sibling job yielded a primitive -- so whenever a LATER sibling job's own
+    `uses:` reached a reusable this reader cannot examine, that reusable's
+    `_workflow_job_bodies` call was never even made, its `WorkflowLoadError`
+    never fired, and the whole chain stayed permanently invisible to P6
+    (`image.yml`'s `build` -> a fan-out reusable with a `hop-good` job that
+    finds a primitive and a `hop-bad` job whose own target is flow-style:
+    0 findings with `hop-good` first, 1 with `hop-bad` first -- the verdict
+    depended on job order, which the property below forbids). The fix:
+    EVERY sibling reachable through a given `uses:` target -- and every
+    target a job body itself names -- is visited before this function ever
+    returns; a refusal anywhere in that whole reachable set is remembered
+    and re-raised, never masked by another sibling's find, with the
+    resolved target folded onto the FRONT of the message so a multi-hop
+    chain reads as the true edge sequence (`caller's job -> mid -> bad`),
+    never a single flattened edge naming only the last hop."""
     direct = job_invokes_publish_primitive(job_body)
     if direct is not None:
         return direct
+    found_result: str | None = None
+    first_refusal: WorkflowLoadError | None = None
     for target in _local_reusable_workflow_targets(job_body):
         resolved = resolve_workflow(workflow_texts, target)
         if resolved is None or resolved in _visited:
@@ -1529,16 +1548,34 @@ def job_invokes_publish_primitive_recursive(
         try:
             sub_bodies = _workflow_job_bodies(target_text)
         except WorkflowLoadError as exc:
-            raise WorkflowLoadError(
-                f"uses local reusable workflow {resolved!r}, whose jobs: cannot be examined: {exc}"
-            ) from exc
+            if first_refusal is None:
+                first_refusal = WorkflowLoadError(
+                    f"uses local reusable workflow {resolved!r}, whose jobs: cannot be examined: {exc}"
+                )
+                first_refusal.__cause__ = exc
+            continue
+        # Collect refusals AND finds over the whole sibling set before any
+        # short-circuit -- a sibling that already found a primitive must
+        # never stop this loop from reaching a LATER sibling's own
+        # unexaminable reusable.
         for sub_body in sub_bodies.values():
-            found = job_invokes_publish_primitive_recursive(
-                sub_body, workflow_texts, _visited=_visited | {resolved}
-            )
-            if found is not None:
-                return f"{found} (via {resolved})"
-    return None
+            try:
+                found = job_invokes_publish_primitive_recursive(
+                    sub_body, workflow_texts, _visited=_visited | {resolved}
+                )
+            except WorkflowLoadError as exc:
+                if first_refusal is None:
+                    first_refusal = WorkflowLoadError(
+                        f"uses local reusable workflow {resolved!r}, which reaches an "
+                        f"unexaminable reusable: {exc}"
+                    )
+                    first_refusal.__cause__ = exc
+                continue
+            if found is not None and found_result is None:
+                found_result = f"{found} (via {resolved})"
+    if first_refusal is not None:
+        raise first_refusal
+    return found_result
 
 
 def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:

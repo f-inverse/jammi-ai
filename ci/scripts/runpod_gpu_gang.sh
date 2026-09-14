@@ -243,13 +243,16 @@ export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse, ~+33% wall on this image)
 export CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
 export JAMMI_GANG_ARTIFACT_DIR=${GANG_REMOTE_ARTIFACT_DIR}
-# This is the ONE place a missing/broken CUDA device or a single-visible-
-# device host must hard-fail rather than skip: a silent skip here would let
-# this paid two-GPU leg report a false green with no gang ever proven.
-# gang_nccl.rs's own serial_cuda_device_or_require / second_cuda_device_or_
-# require read these two atoms and panic when the matching var is set and
-# this leg's own device acquisition fails; the single-GPU prove lane never
-# sets either, so a one-device host there still skips with its reason.
+# This is the one place a single-visible-device host must hard-fail rather
+# than skip: JAMMI_REQUIRE_CUDA_GANG is exported by no other driver in this
+# tree, so a silent skip here would let this paid two-GPU leg report a
+# false green with no gang ever proven. The plain JAMMI_REQUIRE_CUDA half of
+# this guard is not unique to this leg — it is exported by four other
+# drivers too. gang_nccl.rs's own serial_cuda_device_or_require /
+# second_cuda_device_or_require read these two atoms and panic when the
+# matching var is set and this leg's own device acquisition fails; the
+# single-GPU prove lane never sets either, so a one-device host there still
+# skips with its reason.
 export JAMMI_REQUIRE_CUDA=1
 export JAMMI_REQUIRE_CUDA_GANG=1
 # CUBLAS_WORKSPACE_CONFIG is deliberately NOT pinned here: spike S5 measured

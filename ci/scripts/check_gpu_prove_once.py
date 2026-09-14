@@ -1964,16 +1964,15 @@ def _cli_read_on_block(path: Path) -> int:
 
 def main() -> int:
     # A missing PyYAML install is a GATE PREREQUISITE failure, never a
-    # finding and never a pass -- checked before EITHER CLI form runs, and
-    # returning a distinct code (3, never 2 -- `--read-on-block`'s own
-    # usage-error arm already returns that) so it is never mistaken for a
-    # normal usage error either.
-    if exec_mod.yaml is None:
-        print(
-            f"gpu-prove-once: {exec_mod._MISSING_PYYAML_MESSAGE.format(exec_mod._YAML_IMPORT_ERROR)}",
-            file=sys.stderr,
-        )
-        return 3
+    # finding and never a pass -- checked FIRST, before EITHER CLI form
+    # runs (and before any `--self-test`-shaped dispatch this script might
+    # grow), via the ONE predicate `check_execution_surface_reachability.py`
+    # exports for every importing gate. Returns a distinct code (3, never
+    # 2 -- `--read-on-block`'s own usage-error arm already returns that)
+    # so it is never mistaken for a normal usage error either.
+    prereq_rc = exec_mod.require_pyyaml_or_exit("gpu-prove-once", exit_code=3)
+    if prereq_rc is not None:
+        return prereq_rc
     argv = sys.argv[1:]
     if argv and argv[0] == "--read-on-block":
         if len(argv) != 2:

@@ -409,6 +409,7 @@ only to `git ls-files`; no network, no cargo, no GPU.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -435,6 +436,12 @@ else:
 _MISSING_PYYAML_MESSAGE = (
     "gate prerequisite missing: PyYAML ({}) -- installed by .docker/ci.Dockerfile"
 )
+
+# Set to "1" in a spawned self-test subprocess's own environment so that
+# subprocess never spawns a further subprocess of its own -- bounds the
+# self-test's real-subprocess PyYAML-dispatch-order fixture to exactly one
+# level of nesting regardless of what the code under test does.
+_SELFTEST_SUBPROCESS_GUARD_ENV = "JAMMI_ESR_SELFTEST_SUBPROCESS_GUARD"
 
 
 class WorkflowLoadError(Exception):
@@ -1685,30 +1692,40 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
     return failures, info
 
 
-def _pyyaml_prerequisite_rc() -> int | None:
-    """`None` when PyYAML is importable; otherwise the distinct, non-zero
-    exit code a gate PREREQUISITE failure returns -- never a finding, never
-    a pass, and printed exactly once rather than as one "cannot examine"
-    finding per workflow file. A free function (not inlined into `main`)
-    so the self-test can exercise this exact decision, under a simulated
-    missing import, without re-entering `main`'s own `--self-test`
-    dispatch (which would recurse into `self_test()` again)."""
+def require_pyyaml_or_exit(prefix: str, exit_code: int = 2) -> int | None:
+    """`None` when PyYAML is importable; otherwise prints ONE distinct,
+    named "gate prerequisite missing: PyYAML" line under `prefix` --
+    never a finding, never a pass, never a Python traceback -- and returns
+    `exit_code`. Every gate built on this module's shared loader
+    (`check_lint_surface_closure.py`, `check_gpu_prove_once.py`, and this
+    module's own `main`) calls this FIRST, before dispatching `--self-test`
+    or ANY other argv-driven behavior: a missing install reads as ONE
+    prerequisite failure, never as however many "cannot examine" findings
+    a reader produces when the underlying parser is unavailable -- the
+    property this predicate exists to hold, not a count of any one
+    battery's own case list."""
     if yaml is None:
-        print(
-            f"execution-surface-reachability: {_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR)}",
-            file=sys.stderr,
-        )
-        return 2
+        print(f"{prefix}: {_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR)}", file=sys.stderr)
+        return exit_code
     return None
 
 
-def main() -> int:
-    if "--self-test" in sys.argv[1:]:
-        return self_test()
+def _pyyaml_prerequisite_rc() -> int | None:
+    """This module's own prerequisite check, prefixed for its own gate
+    name. A thin, name-stable wrapper over `require_pyyaml_or_exit` kept so
+    the self-test can exercise this exact decision, under a simulated
+    missing import, without re-entering `main`'s own `--self-test`
+    dispatch (which would recurse into `self_test()` again)."""
+    return require_pyyaml_or_exit("execution-surface-reachability")
 
+
+def main() -> int:
     prereq_rc = _pyyaml_prerequisite_rc()
     if prereq_rc is not None:
         return prereq_rc
+
+    if "--self-test" in sys.argv[1:]:
+        return self_test()
 
     failures, info = run_gate(REPO_ROOT, EXECUTION_SURFACE_ALLOWLIST_PATH)
     for line in info:
@@ -2679,6 +2696,55 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     finally:
         globals()["yaml"] = _saved_yaml
         globals()["_YAML_IMPORT_ERROR"] = _saved_err
+
+    # --- the CLI entry point, in a REAL subprocess (never in-process): a
+    # missing PyYAML must be caught BEFORE `--self-test` is ever dispatched
+    # -- the previous ordering ran the whole ~30-case battery first, and
+    # every case that needs a real parse failed with the prerequisite
+    # message standing in for its own expected value, printed as ~20
+    # separate "self-test FAILED" findings instead of the one prerequisite
+    # line. A stub `yaml` package shadowing the real one on `PYTHONPATH`
+    # (never an actual uninstall, and never touching this process's own
+    # already-imported `yaml`) is the only way to exercise `main`'s actual
+    # argv dispatch order end to end. Guarded by `_SELFTEST_SUBPROCESS_GUARD_ENV`
+    # so this never recurses: under the EXACT mutation this fixture exists to
+    # catch (the prerequisite check moved after the `--self-test` dispatch),
+    # the spawned child would otherwise reach `self_test()` and hit this same
+    # block again, spawning a grandchild, and so on without bound -- a
+    # correctness-testing fixture must never itself become a fork bomb on the
+    # mutant it is designed to kill. ---------------------------------------
+    if os.environ.get(_SELFTEST_SUBPROCESS_GUARD_ENV) != "1":
+        with tempfile.TemporaryDirectory() as td:
+            stub_dir = Path(td) / "yaml"
+            stub_dir.mkdir()
+            (stub_dir / "__init__.py").write_text(
+                "raise ImportError('stubbed out for self-test')\n", encoding="utf-8"
+            )
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--self-test"],
+                cwd=str(REPO_ROOT),
+                env={**os.environ, "PYTHONPATH": td, _SELFTEST_SUBPROCESS_GUARD_ENV: "1"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            combined = proc.stdout + proc.stderr
+            if proc.returncode != 2:
+                failures.append(
+                    f"self-test FAILED (subprocess, missing PyYAML): expected exit 2, got "
+                    f"{proc.returncode}; output: {combined!r}"
+                )
+            if "gate prerequisite missing: PyYAML" not in combined:
+                failures.append(
+                    f"self-test FAILED (subprocess, missing PyYAML): the distinct prerequisite "
+                    f"message never appeared; output: {combined!r}"
+                )
+            if "self-test FAILED" in combined:
+                failures.append(
+                    f"self-test FAILED (subprocess, missing PyYAML): `--self-test` ran its battery "
+                    f"instead of being short-circuited by the prerequisite check first; output: "
+                    f"{combined!r}"
+                )
 
     # --- docs.yml's own shape: a comment line NESTED inside a block `paths:`
     # list must not truncate the list (the F1-adjacent bug this repo's own

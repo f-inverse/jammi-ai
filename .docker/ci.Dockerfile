@@ -25,7 +25,13 @@ RUN yum install -y sqlite-libs \
 # closure.py` -- reads workflows through). A missing install is its own
 # distinct, named gate-prerequisite failure (never a silent finding), so it
 # is pinned here rather than assumed present in this manylinux base image.
-RUN python3 -m pip install --no-cache-dir 'PyYAML==6.*'
+# This base image's `/usr/bin/python3` carries no `pip` (and no bundled
+# wheel for `ensurepip` to install from disk) until `ensurepip --upgrade`
+# fetches one -- a bare `pip install` here fails with "No module named
+# pip" (reproduced against `quay.io/pypa/manylinux_2_28_x86_64` directly),
+# so the bootstrap step is not optional.
+RUN python3 -m ensurepip --upgrade \
+    && python3 -m pip install --no-cache-dir 'PyYAML==6.*'
 
 # Per-arch download variables. TARGETARCH is set by buildx per platform
 # (`linux/amd64` -> `amd64`, `linux/arm64` -> `arm64`) and is NOT the same

@@ -1068,6 +1068,18 @@ def self_test() -> int:
 # main
 # --------------------------------------------------------------------------- #
 def main(argv: list[str]) -> int:
+    # A missing PyYAML install is a GATE PREREQUISITE failure, never a
+    # finding and never a pass -- checked FIRST, before dispatching
+    # `--self-test` or running the gate itself, via the ONE predicate
+    # `check_execution_surface_reachability.py` exports for every
+    # importing gate (loading that module never itself requires PyYAML --
+    # it degrades to `yaml = None` internally and this predicate is what
+    # turns that into one named, distinct message here).
+    exec_mod = _load_exec_surface_module()
+    prereq_rc = exec_mod.require_pyyaml_or_exit("lint-surface-closure")
+    if prereq_rc is not None:
+        return prereq_rc
+
     if "--self-test" in argv:
         try:
             return self_test()
@@ -1075,7 +1087,6 @@ def main(argv: list[str]) -> int:
             print(f"lint-surface-closure self-test: FAIL: {e}", file=sys.stderr)
             return 1
 
-    exec_mod = _load_exec_surface_module()
     metadata = load_metadata(REPO_ROOT)
     targets = feature_gated_targets(metadata)
     feature_maps = package_feature_maps(metadata)

@@ -447,6 +447,89 @@ impl Catalog {
             .await?)
     }
 
+    /// Whole-catalog scan, admin-scoped BY CONSTRUCTION: every `models`
+    /// row's (non-`NULL`) `artifact_path`, across EVERY tenant and
+    /// untenanted rows, regardless of the calling task's own tenant binding
+    /// — this method issues NO tenant predicate at all (never
+    /// [`TenantBinding::current_tenant`], never
+    /// [`TenantBinding::is_admin_scope`]).
+    ///
+    /// [`crate::store::reconcile`]'s attribution set is built from THIS
+    /// scan, never from [`Self::list_models`] (tenant-scoped): a
+    /// tenant-scoped or unbound-but-not-admin-scoped listing can only ever
+    /// see its own tenant's (and untenanted) rows, so a tenant-A row
+    /// reusing a GLOBAL prefix — the cache-hit fan-out shape, where
+    /// [`Self::find_models_by_definition`] returns a `NULL`-tenant row and
+    /// the winning job registers a SECOND, tenant-A row pointing at the
+    /// same prefix — is invisible to an UNBOUND reconcile pass reading
+    /// through [`Self::list_models`]: exactly the gap this method exists to
+    /// close. The per-prefix count predicate over this same admin scan is
+    /// [`Self::count_models_naming_prefix_all_tenants`].
+    ///
+    /// Returns raw `artifact_path` strings — the exact value each row's
+    /// finalize CAS committed (a full [`crate::storage::StorageUrl`]
+    /// string) — never a [`ModelRecord`]: this is a bytes-reachability
+    /// scan, not a row read, so it never discloses a model's name, id, or
+    /// tenant to whatever tenant scope the caller is running under.
+    pub async fn list_model_artifact_paths_all_tenants(&self) -> Result<Vec<String>> {
+        let sql = "SELECT artifact_path FROM models WHERE artifact_path IS NOT NULL";
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(sql, &[], |row| row.get::<String>("artifact_path"))
+                            .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// The count of `models` rows — across EVERY tenant and untenanted
+    /// rows, admin-scoped BY CONSTRUCTION exactly like
+    /// [`Self::list_model_artifact_paths_all_tenants`] (see that method's
+    /// doc for why no tenant predicate is issued here) — whose
+    /// `artifact_path` equals `prefix` EXACTLY.
+    ///
+    /// Equality, never containment: a checkpoint (`_resume/`,
+    /// `checkpoints/epoch_N/`) or any other object living BELOW a model's
+    /// `artifact_path` is a strict path DESCENDANT of it, never equal to
+    /// it, so it can never itself satisfy this predicate — those two
+    /// namespaces stay on [`crate::store::ArtifactStore::delete_artifact_prefix`]'s
+    /// unguarded primitive (see that method's doc for why).
+    ///
+    /// Discloses a COUNT ONLY — never row ids, model names, or tenant ids
+    /// — so a tenant-bound caller consulting this predicate (through
+    /// [`crate::store::ResultStore::prefix_is_referenced`]) learns only
+    /// "referenced" vs. "not", never by whom.
+    pub async fn count_models_naming_prefix_all_tenants(&self, prefix: &str) -> Result<i64> {
+        let sql = "SELECT COUNT(*) AS n FROM models WHERE artifact_path = $1";
+        let prefix = prefix.to_string();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(sql, &[SqlValue::TextOwned(prefix)], |row| {
+                            row.get::<i64>("n")
+                        })
+                        .await
+                        .map(|opt| opt.unwrap_or(0))
+                    })
+                },
+            )
+            .await?)
+    }
+
     /// Every SERVABLE `models` row carrying exactly `definition_hash`, newest
     /// first — the raw candidate set [`Self::probe_model_by_definition`]
     /// narrows with the exact anchor match. Mirrors
@@ -463,7 +546,7 @@ impl Catalog {
     ///   without a separate guard.
     /// - `artifact_path IS NOT NULL` restricts the candidate set to rows the
     ///   finalize CAS ([`Catalog::finish_job_with_model`]) has already
-    ///   committed (P3): a row a losing or still-running attempt registered
+    ///   committed: a row a losing or still-running attempt registered
     ///   with `definition_hash` set but no committed artifact — which would
     ///   otherwise poison every future `cache=Use` probe for that definition
     ///   forever, since the row never becomes servable on its own — is
@@ -479,7 +562,7 @@ impl Catalog {
     /// a global fine-tune output is reusable by any caller, exactly like a
     /// global base model is loadable by any caller — while a tenant-owned
     /// row is visible only to that exact tenant, never a peer's. When a
-    /// caller's own row exists but is unservable (P3), the caller falls
+    /// caller's own row exists but is unservable, the caller falls
     /// through to a matching global row rather than missing outright; when
     /// a caller has no own row at all, the global row is the only candidate.
     /// This is a READ-side relaxation only: the WRITE side
@@ -534,7 +617,7 @@ impl Catalog {
     /// predicate already excludes every row with no recorded
     /// `definition_hash`, so a model with no materialization can never be a
     /// cache-hit candidate. The candidate set is additionally restricted to
-    /// the SERVABLE set (`artifact_path IS NOT NULL`, P3) by that same
+    /// the SERVABLE set (`artifact_path IS NOT NULL`) by that same
     /// predicate, so a hash-bearing row a losing/zombie attempt left behind
     /// is never a hit either — this function issues no SQL of its own and so
     /// inherits both halves automatically. An anchor set containing an
@@ -594,7 +677,7 @@ impl Catalog {
     /// written ([`crate::store::ArtifactStore::write_model_materialization`],
     /// itself written LAST, after the bundle's own `manifest.json`), and
     /// only AFTER the finalize CAS ([`Catalog::finish_job_with_model`]) has
-    /// already committed this exact row's `artifact_path` (P3').
+    /// already committed this exact row's `artifact_path`.
     /// Tenant-scoped with the same STRICT predicate [`Self::delete_model`]
     /// uses (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`).
     ///
@@ -607,7 +690,7 @@ impl Catalog {
     /// transaction — a losing or still-running attempt's row never carries
     /// it — so requiring it here means a losing/zombie attempt's call can
     /// never win this `UPDATE` and leave a hash-bearing row for
-    /// [`Self::find_models_by_definition`] to have to filter out (P3): the
+    /// [`Self::find_models_by_definition`] to have to filter out: the
     /// row simply never becomes probe-eligible in the first place.
     ///
     /// Unconditional `SET` (never a `COALESCE`) for the two columns it does
@@ -622,7 +705,8 @@ impl Catalog {
     /// [`JammiError::Model`] precondition failure when the row exists but
     /// `artifact_path` is still `NULL` — the finalize CAS has not won for
     /// this attempt yet, so recording a definition hash now would create
-    /// exactly the poisoned row P3 exists to keep unreachable.
+    /// exactly the poisoned, hash-bearing-but-unservable row
+    /// [`Self::find_models_by_definition`]'s predicate keeps unreachable.
     pub async fn record_model_materialization(
         &self,
         model_id: &str,

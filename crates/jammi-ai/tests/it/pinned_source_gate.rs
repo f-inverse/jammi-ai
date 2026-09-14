@@ -415,12 +415,24 @@ fn mask_non_code(text: &str) -> String {
 /// literals are still recognised (and skipped over without masking) so that
 /// a `//` or `/*` appearing inside one — a URL, say — is never mistaken for
 /// the start of a comment on the next iteration; raw strings and char
-/// literals are not specially recognised here (this scan's only caller is
-/// scoped to `crates/jammi-ai/src/fine_tune/**`, which has no raw string
-/// containing `//`/`/*` today — `grep -c 'r#*"' crates/jammi-ai/src/fine_tune`
-/// — so this is a disclosed, inert limit, not a silent one; a future raw
-/// string with an embedded comment-like sequence could only ever suppress a
-/// comment it shouldn't, over-approximating in the safe direction).
+/// literals are not specially recognised here. This function has TWO
+/// callers today, with two different scopes: [`fine_tune_ddl_relation_binding_hits`],
+/// scoped to `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
+/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]). Checked
+/// against BOTH callers' surfaces, not just the narrower one: `grep -rn
+/// 'r#*".*\(//\|/\*\)' crates/jammi-db/src crates/jammi-ai/src` finds exactly
+/// two raw strings containing `//` or `/*` in either crate's tracked `src`
+/// tree, both JSON fixtures in `storage/config.rs` (an `https://` URL inside
+/// a quoted field) — and in both, the surrounding double quotes still pair
+/// up the same way a plain `"..."` string's would, so this function's
+/// ordinary `"`-handling already walks past the embedded `//` correctly by
+/// construction of that JSON, not because raw strings are recognised. This
+/// is still a disclosed, checked-today limit rather than a silent one, but
+/// it now rests on the CONTENT of two specific files staying quote-balanced,
+/// not on the absence of any raw string at all; a future raw string whose
+/// quoted content is not symmetrically paired could desync this scan's
+/// notion of "inside a string" and, from that point on in the file,
+/// misclassify code as a comment (suppressing it here) or vice versa.
 fn mask_comments_only(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -580,11 +592,10 @@ struct FnRegion {
 ///
 /// The residual this trades in: inserting or deleting a same-named sibling
 /// ABOVE an allowlisted site (never touched by this program's edits so far
-/// on the sites the allowlists below name) shifts that site's ordinal the
-/// same way a line-count-changing edit used to shift its line — this is not
-/// claimed immune to every edit, only to the specific, common shape (edits
-/// that add/remove lines, comments, or unrelated functions) that broke the
-/// line key. Renaming, reordering, or deleting a same-named sibling remains
+/// on the sites the allowlists below name) shifts that site's ordinal — this
+/// key is not claimed immune to every edit, only to the specific, common
+/// shape (edits that add/remove lines, comments, or unrelated functions).
+/// Renaming, reordering, or deleting a same-named sibling remains
 /// a real edit that requires updating the allowlist entry it displaces, the
 /// same way it always would have under any positional key.
 fn assign_ordinals(regions: &mut [FnRegion]) {
@@ -3113,22 +3124,47 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // reachability question it existed to answer is its own unit,
 // <https://github.com/f-inverse/jammi-ai/issues/549>.
 //
-// **What replaces it.** Rather than trace which binder a `fine_tune/` call
-// can REACH, this gate reviews EVERY occurrence of a registration verb or a
-// DDL-shaped string literal ANYWHERE under both [`SURFACE_DIRS`] -- not only
+// **What replaces it, stated as its own honest universe.** Rather than
+// trace which binder a `fine_tune/` call can REACH, this gate finds every
+// SINGLE-LINE occurrence of one of the 24 `register_*`/`deregister_*`
+// call-site patterns ([`PAIRED_REGISTRATION_VERBS`]/
+// [`UNPAIRED_REGISTRATION_VERBS`]) or the DDL-statement shape
+// ([`ddl_statement_shape`]) in `crates/jammi-ai/src` and
+// `crates/jammi-db/src` (both whole trees, [`SURFACE_DIRS`]) -- not only
 // `crates/jammi-ai/src/fine_tune/**`, which
 // [`fine_tune_session_registration_hits`]/[`fine_tune_ddl_relation_binding_hits`]
-// above already police as the cheap, zero-tolerance DIRECT layer. A caller
-// set enumerated by a call graph can always miss an edge the parser's shape
-// coverage didn't anticipate (this file's own history: line-regex, then
-// AST, both found unsound); an occurrence enumerated by `git ls-files` over
-// two whole directories cannot miss a SITE the same way -- every place
-// either pattern appears in tracked source is found and reviewed, whether or
-// not anything under `fine_tune/` can reach it. What this trades away is
-// precision, not recall: a site with zero real callers (e.g. a trait method
-// a language feature requires but nothing in-tree invokes) is still listed
-// and reviewed here, the same as a site with a hundred callers -- see each
-// entry's own prose for which case it is.
+// above already police as the cheap, zero-tolerance DIRECT layer -- and keys
+// each hit to `(file, enclosing function, ordinal)`, so a human reviews and
+// pins one property per site regardless of how many matching lines that
+// site contains.
+//
+// That key is also this gate's own residual, not a solved problem the
+// deleted gate merely approximated. It counts SITES, never per-site
+// OCCURRENCES: a second `register_table(..)` call planted inside an
+// already-reviewed function, or a second module-scope DDL `const` added to
+// a file that already has one, keys to the SAME `(file, function, ordinal)`
+// an earlier, different line already occupies, and so raises no new hit for
+// [`registration_verb_occurrences_are_all_reviewed`]/
+// [`ddl_literal_occurrences_are_all_reviewed`] to catch. This scan is also
+// strictly line-based: a DDL literal split across two `concat!`/`format!`
+// arguments on separate lines, or pulled in through `include_str!`, is
+// invisible to it -- the same two shapes the deleted AST gate also missed,
+// carried over rather than closed by this replacement. And it is scoped to
+// exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living in any
+// third crate is outside its universe entirely. None of these four gaps
+// (per-site counts, split literals, `include_str!` targets, other crates)
+// is closed here; the rebuild that would close them is
+// <https://github.com/f-inverse/jammi-ai/issues/554>.
+//
+// What this gate DOES buy over the deleted call-graph gate is recall over
+// call SHAPE, not occurrence count or literal assembly: every function, in
+// either crate's whole tree, whose own body contains at least one line
+// matching one of the 24 patterns or the DDL shape is found and reviewed
+// here, whether or not anything under `fine_tune/` can reach it -- a site
+// with zero real callers (e.g. a trait method a language feature requires
+// but nothing in-tree invokes) is still listed and reviewed here, the same
+// as a site with a hundred callers -- see each entry's own prose for which
+// case it is.
 
 /// One occurrence a review has cleared: the registration-verb call/
 /// declaration or DDL-shaped string literal at `(file, function, ordinal)` --
@@ -3252,11 +3288,18 @@ fn ddl_literal_occurrences(surface: &[(String, String)]) -> BTreeSet<(String, St
 /// [`UNPAIRED_REGISTRATION_VERBS`] call-site pattern under [`SURFACE_DIRS`]
 /// TODAY, transcribed by running [`registration_verb_occurrences`] against
 /// `scan_surface()` with an empty allowlist and reading each hit's real call
-/// site -- 18 entries: 17 on the production/test tree
-/// `registration_verb_occurrences` finds unassisted, plus the 18th being
-/// this file's own new `build_result_table_provider` oracle (the test
-/// itself calls `register_object_store` twice, which the same scan
-/// necessarily also finds since it is untracked-directory-agnostic). Kept in
+/// site -- 18 entries: 17 on the production/test call and declaration sites
+/// `registration_verb_occurrences` finds unassisted across both
+/// [`SURFACE_DIRS`] trees, plus the 18th being `build_result_table_provider`'s
+/// own new EXECUTED oracle,
+/// `crates/jammi-db/src/store/mod.rs::tests::register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`
+/// (a `#[cfg(test)]` module inside that `src` file, so still inside
+/// [`SURFACE_DIRS`], not this file) -- that test itself calls
+/// `register_object_store` twice, which the same scan also finds because it
+/// is DIRECTORY-restricted to [`SURFACE_DIRS`], not test-vs-production
+/// restricted: every occurrence of the pattern anywhere under those two
+/// trees is a site, whether the enclosing function is production code or a
+/// test. Kept in
 /// sync by [`registration_verb_occurrences_are_all_reviewed`]: an entry here
 /// whose site no longer produces a hit, or a hit with no entry here, both
 /// fail that test — this comment's own entry count is the only part of this
@@ -3418,13 +3461,23 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    in-tree paths that dispatch to it are DataFusion's own `SessionContext::register_table` \
                    top-level API and `CREATE TABLE` DDL execution, when the target schema resolves \
                    to this provider (i.e. after `install_result_schema` runs). Checked, not assumed \
-                   (`grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src`): the \
-                   ONLY 2-argument `.register_table(name, provider)` call anywhere in either crate's \
-                   tracked source is this file's OWN new test fixture, \
-                   `materialization.rs::install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither` \
-                   (which registers a `rows` fixture through it deliberately, to prove the \
-                   \"preserves the tables it already holds\" property survives a second install) -- \
-                   no PRODUCTION call reaches this implementation today. Its own body inserts \
+                   (`grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src`): there \
+                   are FIVE 2-argument `.register_table(name, provider)` calls in either crate's \
+                   tracked source, ALL in `crates/jammi-db/tests/it/materialization.rs` (`:565`, \
+                   `:616`, `:669`, `:671`, `:1024`) -- not this file, `result_schema.rs`. Of those \
+                   five, only the one at `:1024`, inside \
+                   `install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither`, \
+                   actually dispatches to THIS implementation: it is the only one of the five whose \
+                   `ctx` already had `install_result_schema` called on it earlier in the same \
+                   function, which is what makes the target schema resolve here (traced, not \
+                   assumed: `install_result_schema`'s call at that test's line 1018 precedes its \
+                   `:1024` `register_table` call; the other four calls' enclosing functions --\
+                   `ts_session` (`:565`), `pinned_session` (`:616`), and `pinned_session_two` \
+                   (`:669`, `:671`) -- never call `install_result_schema` on their `ctx` at all, \
+                   so they resolve to DataFusion's \
+                   own default `MemorySchemaProvider` instead). That one call is deliberate, to \
+                   prove the \"preserves the tables it already holds\" property survives a second \
+                   install -- no PRODUCTION call reaches this implementation today. Its own body inserts \
                    UNCONDITIONALLY and returns the displaced provider on a name collision (a \
                    SILENT overwrite, closing audit #3's own finding, `CONTRACT-U2a-fix1.md` round \
                    3) -- moot for `fine_tune/` (#549 is the tracked follow-on for a table of its \

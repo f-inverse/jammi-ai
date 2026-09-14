@@ -711,9 +711,16 @@ def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
 
 def read_top_level_on_block_from_path(path: Path) -> tuple[list[str] | None, str | None]:
     """(trigger_keys, error). Wraps `read_top_level_on_block` with the
-    FILE-level fail-loud rule: an unreadable file (missing, permission
-    denied, not valid UTF-8) is FAIL, never "no key" -- the same doctrine
-    the block reader already holds a readable `on:` block to."""
+    FILE-level fail-loud rule: every read error on the workflow file --
+    missing, a directory, permission denied, not valid UTF-8 -- is a named
+    FAIL, never `([], None)` / "no key", for EVERY euid. A missing path or
+    a directory path raises `FileNotFoundError`/`IsADirectoryError` (both
+    `OSError`) regardless of the caller's privilege, so those two cases
+    hold even for a root caller; a permission-denied path is bypassed by
+    root's own DAC override and can only be exercised as a caller that is
+    genuinely not root -- callers of this function must not assume the
+    permission-denied arm ran under every euid, only that it is the same
+    named FAIL when it does."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:

@@ -2048,5 +2048,59 @@ class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
         self.assertFalse(any("non-canonical" in f or "cannot read" in f for f in findings), findings)
 
 
+class ReadOnBlockFromPathTest(unittest.TestCase):
+    """`read_top_level_on_block_from_path`'s property: EVERY read error on
+    the workflow file is a named FAIL ("cannot read file ..."), never
+    `([], None)` / "no key" -- for EVERY euid, not only a non-root one. A
+    directory path and a missing path raise `IsADirectoryError`/
+    `FileNotFoundError` (both `OSError` subclasses) regardless of the
+    calling user's privilege -- root does not bypass "this path is not a
+    regular file" or "this path does not exist" the way it bypasses a
+    `chmod 000` permission bit -- so these two cases prove the property on
+    every CI runner, including the root container this repo's own lane
+    runs in, where a chmod-000 fixture alone cannot."""
+
+    def test_directory_path_is_a_named_cannot_read_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            keys, err = cgo.read_top_level_on_block_from_path(Path(d))
+        self.assertIsNone(keys)
+        self.assertIsNotNone(err)
+        self.assertIn("cannot read file", err)
+
+    def test_missing_path_is_a_named_cannot_read_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "does-not-exist.yml"
+            keys, err = cgo.read_top_level_on_block_from_path(missing)
+        self.assertIsNone(keys)
+        self.assertIsNotNone(err)
+        self.assertIn("cannot read file", err)
+
+    def test_mode_000_file_is_a_named_cannot_read_fail_where_euid_cannot_bypass_it(self):
+        # Guarded exactly like `test_gpu_gang_lane.sh`'s own G7 mode-000
+        # fixture: root (or an ACL) bypasses a `chmod 000` permission bit
+        # outright, so this case can only be asserted when `os.access`
+        # itself reports the file unreadable post-chmod -- otherwise it is
+        # skipped with a VISIBLE note, never silently reported as passing.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "mode-000.yml"
+            p.write_text("on:\n  workflow_dispatch:\n")
+            os.chmod(p, 0o000)
+            try:
+                if os.access(p, os.R_OK):
+                    print(
+                        f"  * note: skipping the mode-000-file case -- euid {os.geteuid()} "
+                        "can still read a mode-000 file (root or an ACL bypass), so this "
+                        "fixture cannot establish the unreadable-file property here",
+                        file=sys.stderr,
+                    )
+                    return
+                keys, err = cgo.read_top_level_on_block_from_path(p)
+            finally:
+                os.chmod(p, 0o644)
+        self.assertIsNone(keys)
+        self.assertIsNotNone(err)
+        self.assertIn("cannot read file", err)
+
+
 if __name__ == "__main__":
     unittest.main()

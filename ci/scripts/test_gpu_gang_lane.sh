@@ -508,6 +508,21 @@ else
 fi
 chmod 644 "$g7_unreadable"
 
+# G7 fixture: a DIRECTORY path is FAIL, never "no schedule key" -- unlike
+# mode-000, "this path is not a regular file" is not a permission bit, so
+# no euid (including root, which the container this repo's own CI lane
+# runs `test_gpu_gang_lane.sh` in uses by default) bypasses it; this case
+# proves the property on every user, where the mode-000 case above cannot.
+g7_dir="$SANDBOX/g7-a-directory.yml"
+mkdir -p "$g7_dir"
+g7d_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_dir" 2>&1)"
+g7d_rc=$?
+if [ "$g7d_rc" -ne 0 ] && [[ "$g7d_out" == *"cannot read file"* ]]; then
+  ok "G7: a directory path is FAILed by name, never read as 'no schedule key' (euid-independent)"
+else
+  bad "G7: expected a directory path to FAIL naming 'cannot read file'; got rc=${g7d_rc} out=${g7d_out}"
+fi
+
 # ============================================================================
 # G4: the cost bound is what the mechanism produces.
 # ============================================================================

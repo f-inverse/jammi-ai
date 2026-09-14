@@ -565,6 +565,15 @@ impl OssServer {
         // listener answers UNIMPLEMENTED for its paths too). The registry is
         // cloned now because `MetricsLayer::new(self.metrics)` moves the
         // `Arc` into the public chain below.
+        // `test-hooks` only (fix round 1, R3): a handle onto the SAME
+        // `GangServer` instance's refusal-reason state actually mounted
+        // below, cloned out BEFORE that instance moves (by value) into
+        // `GangServiceServer::new` — see `GangServer::refusal_reason_handle`.
+        // Declared unconditionally as `None` so the `BoundServer { .. }`
+        // literal below never needs its own `#[cfg]` branch on this binding;
+        // only the FIELD and the TYPE it holds are `test-hooks`-gated.
+        #[cfg(feature = "test-hooks")]
+        let mut gang_refusal_handle: Option<crate::grpc::gang::GangRefusalHandle> = None;
         let peer = match self.peer_addr {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
@@ -584,13 +593,15 @@ impl OssServer {
                     .intervals()
                     .map_err(|e| ServerError::Config(e.to_string()))?
                     .lease();
+                let gang_server = GangServer::new(Arc::clone(&self.session), lease);
+                #[cfg(feature = "test-hooks")]
+                {
+                    gang_refusal_handle = Some(gang_server.refusal_reason_handle());
+                }
                 let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
                     Arc::clone(&self.session),
                 )))
-                .add_service(GangServiceServer::new(GangServer::new(
-                    Arc::clone(&self.session),
-                    lease,
-                )));
+                .add_service(GangServiceServer::new(gang_server));
                 Some((listener, routes, Arc::clone(&self.metrics)))
             }
             None => None,
@@ -635,6 +646,8 @@ impl OssServer {
             session,
             worker,
             readiness,
+            #[cfg(feature = "test-hooks")]
+            gang_refusal_handle,
         })
     }
 
@@ -731,6 +744,15 @@ pub struct BoundServer {
     worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
     /// The readiness probe, so a shutdown can flip `/readyz` to 503.
     readiness: Arc<ReadinessProbe>,
+    /// `test-hooks` only (fix round 1, R3): a handle onto the SAME
+    /// `GangServer` instance's refusal-reason state actually mounted on the
+    /// peer listener above — `None` when `[server] peer_bind` is unset (no
+    /// `GangServer` exists to hold a handle onto). Lets an `it` test driving
+    /// `RunRank` over the real network still observe, same-process, which
+    /// `GangRefusalReason` the served call refused for — never reaching the
+    /// wire (§I1 Non-disclosure only binds the `Status` a client sees).
+    #[cfg(feature = "test-hooks")]
+    gang_refusal_handle: Option<crate::grpc::gang::GangRefusalHandle>,
 }
 
 /// How [`BoundServer::serve_with_signals`] ended.
@@ -938,6 +960,17 @@ impl BoundServer {
         self.peer_addr
     }
 
+    /// `test-hooks` only (fix round 1, R3): a cheaply cloneable handle onto
+    /// the `GangServer` mounted on the internal peer listener's own
+    /// refusal-reason state — `None` when `[server] peer_bind` is unset. A
+    /// test harness clones this out BEFORE `serve_with_shutdown`/
+    /// `serve_with_signals` consumes `self`, so it can keep observing the
+    /// live, serving instance's state afterward.
+    #[cfg(feature = "test-hooks")]
+    pub fn gang_refusal_handle(&self) -> Option<crate::grpc::gang::GangRefusalHandle> {
+        self.gang_refusal_handle.clone()
+    }
+
     /// Serve both halves on the already-bound listeners until `shutdown`
     /// resolves, then DRAIN: the gRPC surface drains and — concurrently,
     /// gated on the same signal so the worker is never stopped at t = 0 —
@@ -1001,6 +1034,8 @@ impl BoundServer {
             session,
             worker,
             readiness,
+            #[cfg(feature = "test-hooks")]
+                gang_refusal_handle: _,
         } = self;
         tracing::info!(
             address = %health_addr,

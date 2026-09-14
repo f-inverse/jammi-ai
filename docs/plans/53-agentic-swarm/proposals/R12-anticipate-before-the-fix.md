@@ -216,20 +216,19 @@ armed strictly by the DATA (never merely by a unit being open):
   uncovered-claim check.
 
 HONEST LIMITS, stated as plainly as the pair above: `gates`/`mutations`/`exclusions` are
-LEAD-ATTESTED, never re-executed by the hook — the control is the human at merge, reading the
-exported record: `gates` in `docs/rigor/<slug>.anticipation.jsonl`, `mutations`/`exclusions`
-in their OWN `docs/rigor/<slug>.attestation.jsonl` (fix round 6 Z12 — `--export-anticipation`
-writes any relay's non-empty `mutations`/`exclusions` as a `lead-relay-attestation` row
-DIRECTLY to this separate file, never interleaved into the anticipation stream, so these
-fields are actually visible somewhere a CI checkout can see, without a second row kind
-polluting the stream the shared validator reads), same as R11's own `claims` disposition and
-the "attack quality" limit already named for the pre/post-fix pair. Reader 3 REFUSES — a
+LEAD-ATTESTED, never re-executed by the hook. `gates` is visible in the committed
+`docs/rigor/<slug>.anticipation.jsonl` — a human at merge is the control there.
+`mutations`/`exclusions` stay HOOK-ATTESTED ONLY: they are visible in the gitignored relay
+artifact under `.jammi/gate-state/<slug>.relay.*.json`, read directly by Readers 1 and 2, and
+`--export-anticipation` never exports them and never writes a second committed file for
+them — the same "attack quality" limit already named for the pre/post-fix pair, and R11's own
+`claims` disposition, apply. Reader 3 REFUSES — a
 loud, named FAIL, never a silent ignore or select — any row it still finds in the
-anticipation stream whose `agent_type` is not `lead-anticipation` (a stale pre-fix-round-6
-export still committed, or a hand-edit). A CI-side derivation of the REQUIRED non-test
-call-site set from `base...HEAD`, with a hard requirement that every such site carry its own
-`mutations` row in the exported record, is filed as its own, separately-scoped unit, not yet
-implemented: https://github.com/f-inverse/jammi-ai/issues/557. `_r12_new_test_surfaces`'s
+anticipation stream whose `agent_type` is not `lead-anticipation` (a stale export or a
+hand-edit). A committed, reader-required record for `mutations`/`exclusions`, AND a CI-side
+derivation of the REQUIRED non-test call-site set from `base...HEAD` with a hard requirement
+that every such site carry its own `mutations` row, are both filed as one separately-scoped
+unit, not yet implemented: https://github.com/f-inverse/jammi-ai/issues/557. `_r12_new_test_surfaces`'s
 "looks like a test" filter can under- or over-include relative to a human's own judgment, the
 same class of limit `_parse_new_surfaces` itself already carries.
 
@@ -239,15 +238,18 @@ value) run through the SAME shared validator Reader 1 calls — never a second, 
 maintained implementation. Governing-row selection is order-independent BY CONSTRUCTION,
 never by an impossibility claim: `cmd_export_anticipation` stamps `ts` (the artifact file's
 own mtime) and `head_sha` (its own `pre_fix_sha`) on every row it emits, and selection is by
-`head_sha` match against the checkout's own `HEAD`, else by the greatest `ts` — never by
-position in the file, so an older round's row sorting after a newer one in the export (which
-sorts by filename, a tip sha with no chronological meaning) cannot stand in for the fix's own
-verified state. When the candidate pool holds two or more rows and any lacks `ts` at all (a
-shape the real exporter no longer produces, but a hand-typed or pre-fix-round-5 record still
-can), OR when two or more rows share the SAME greatest `ts` (fix round 6 Z15 — a tie is
-exactly as ambiguous as a missing `ts`, and resolving it by append position silently shadows
-a genuinely different sibling row), selection FAILS LOUDLY naming the ambiguity rather than
-falling back to append order.
+`head_sha` match against the checkout's own `HEAD`, else by the row naming the greatest `ts`
+INSTANT (`ts` parsed with `datetime.fromisoformat`, a trailing `Z` accepted as `+00:00`) —
+never by position in the file, so an older round's row sorting after a newer one in the export
+(which sorts by filename, a tip sha with no chronological meaning) cannot stand in for the
+fix's own verified state. When the candidate pool holds two or more rows and any has no
+parseable `ts` instant (missing or unparseable — refused identically; a shape the real
+exporter no longer produces, but a hand-typed or pre-fix-round-5 record still can), OR when
+two or more rows NAME THE SAME INSTANT — even in different text, e.g. a trailing `Z` against
+an explicit `+00:00` offset — (a tie is exactly as ambiguous as a missing `ts`, and resolving
+it by append position or by string equality alone silently shadows a genuinely different
+sibling row), selection FAILS LOUDLY naming the ambiguity rather than falling back to append
+order.
 
 **Item 8's acceptance oracle, stated as a split (fix round 5, acceptance #2).** Item 8's
 fixture set carries 24 DENY oracles (RED at the base commit, each by one mutation) and 6

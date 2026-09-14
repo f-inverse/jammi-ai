@@ -140,26 +140,20 @@ committed TEST-failure marker — `"test result: FAILED"`, `"FAIL —"`, `"= FAI
 (R11's own disposition precedent), and every `uncovered` reason in the array is
 NORMALIZED-DISTINCT from its siblings (three identical excuses is
 one real disposition). No hash-reproduction here — like `gates`, a lead-attested
-record, never re-executed by the hook. `--export-anticipation` (below) ALSO writes any
-`<slug>.relay.*.json` carrying a non-empty `mutations`/`exclusions` as a distinct
-`lead-relay-attestation` row — these fields otherwise live ONLY in
-the gitignored relay artifact, invisible to a human reviewing the committed diff at
-merge; this is a SHAPE export (verbatim, never re-derived), not a re-execution.
-**Fix round 6 Z12 — two files, one row kind each.** `docs/rigor/<slug>.anticipation
-.jsonl` (stdout, redirected by the operator) carries ONLY `lead-anticipation` rows;
-`lead-relay-attestation` rows are written DIRECTLY by the exporter to their OWN
-committed stream, `docs/rigor/<slug>.attestation.jsonl` — never interleaved into the
-anticipation stream, which is exactly what let an attestation row (no `residual_risk`,
-no `gates`) become the "governing" row Reader 3's gates check selected, or deny
-Reader 3's shape check outright. Reader 3 additionally REFUSES — a loud, named FAIL,
-never a silent ignore or a silent select — any row it still finds in the anticipation
-stream whose `agent_type` is not `lead-anticipation` (a stale pre-fix-round-6 export
-still committed, or a hand-edit); the shared validator (`_r12_anticipation_rejection`)
-receives anticipation rows only. Filed as its own, separately-scoped unit (not yet
-implemented, tracked at
-https://github.com/f-inverse/jammi-ai/issues/557): a CI-side derivation
-of the REQUIRED non-test call-site set from `base...HEAD` and a hard requirement that
-every such site carries its own `mutations` row in the exported record. **8c,
+record, never re-executed by the hook. `mutations`/`exclusions` stay HOOK-ATTESTED
+ONLY — they live in the relay artifact under `.jammi/gate-state/<slug>.relay.*.json`,
+read directly by Readers 1 and 2, and `--export-anticipation` never exports them and
+never writes a second committed file for them.
+`docs/rigor/<slug>.anticipation.jsonl` (stdout, redirected by the operator) carries
+ONLY `lead-anticipation` rows; Reader 3 REFUSES — a loud, named FAIL, never a silent
+ignore or a silent select — any row it still finds in that stream whose `agent_type`
+is not `lead-anticipation` (a stale export or a hand-edit); the shared validator
+(`_r12_anticipation_rejection`) receives anticipation rows only. Filed as one
+separately-scoped unit (not yet implemented, tracked at
+https://github.com/f-inverse/jammi-ai/issues/557): a committed, reader-required
+record for `mutations`/`exclusions`, AND a CI-side derivation of the REQUIRED
+non-test call-site set from `base...HEAD` hard-requiring every such site to carry
+its own `mutations` row. **8c,
 exclusions.** `_r12_new_test_surfaces` narrows `new_surfaces` to entries that LOOK
 like a test (the file path contains "test", or the definition name starts with
 `test_`/`fixture_` or contains "test" — a heuristic, stated as one, that can under-
@@ -187,21 +181,26 @@ row's `gates` shape/value. The governing row is selected ORDER-INDEPENDENTLY: a 
 whose own `head_sha` matches this checkout's actual `HEAD` is preferred; when none
 does — the common case, since a pre-fix witness by construction predates the commit
 Reader 3 validates against — every row is eligible; within whichever pool applies,
-the row with the GREATEST `ts` governs, never the row nearest the end of the file
-(`cmd_export_anticipation` sorts the artifacts it dumps by FILENAME — a tip sha,
-pseudorandom hex with no chronological meaning — so an older round's row can sort
-after a newer one and land on the file's last line); BOTH `ts` and `head_sha` are
-stamped by the exporter itself (from the artifact file's own mtime
-and its own `pre_fix_sha`, never hand-typed), and when the candidate pool holds two
-or more rows and ANY lacks `ts`, OR two or more rows share the SAME greatest `ts`
-(fix round 6 Z15 — a tie is exactly as ambiguous as a missing `ts`), Reader 3 FAILS
-LOUDLY naming the ambiguity rather than guessing. Reader 3 never re-executes these commands; they are already CI jobs
+the row naming the GREATEST `ts` INSTANT governs, never the row nearest the end of
+the file (`cmd_export_anticipation` sorts the artifacts it dumps by FILENAME — a tip
+sha, pseudorandom hex with no chronological meaning — so an older round's row can
+sort after a newer one and land on the file's last line); BOTH `ts` and `head_sha`
+are stamped by the exporter itself (from the artifact file's own mtime
+and its own `pre_fix_sha`, never hand-typed). `ts` is parsed as an instant
+(`datetime.fromisoformat`, a trailing `Z` accepted as `+00:00`); an unparseable `ts`
+is refused exactly like a missing one. When the candidate pool holds two or more
+rows and ANY of them has no parseable `ts` instant, OR two or more rows NAME THE
+SAME INSTANT — even in different text, e.g. a trailing `Z` against an explicit
+`+00:00` offset — Reader 3 FAILS LOUDLY naming the ambiguity rather than guessing.
+Reader 3 never re-executes these commands; they are already CI jobs
 elsewhere in `.github/workflows/`. HONEST LIMITS, stated as plainly as (2b)'s own:
-`gates`/`mutations`/`exclusions` are LEAD-ATTESTED, never re-executed by the hook —
-the control is the human at merge, reading the exported record: `gates` in
-`docs/rigor/<slug>.anticipation.jsonl`, `mutations`/`exclusions` in their own
-`docs/rigor/<slug>.attestation.jsonl` (fix round 6 Z12) — the ONLY place any of these
-fields is visible at all outside the gitignored state directory.
+`gates`/`mutations`/`exclusions` are LEAD-ATTESTED, never re-executed by the hook.
+`gates` is visible in the committed `docs/rigor/<slug>.anticipation.jsonl` — a human
+at merge is the control there. `mutations`/`exclusions` are visible ONLY in the
+gitignored relay artifact under `.jammi/gate-state/` (Readers 1 and 2 read them
+directly from there); they are never exported and never committed — a committed,
+reader-required record for these two fields is filed at
+https://github.com/f-inverse/jammi-ai/issues/557.
 **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
 `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
 (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE

@@ -3545,16 +3545,19 @@ def cmd_export_anticipation(argv: list[str]) -> int:
     append/sort position, which the artifact's OWN filename (a content
     hash, not a timestamp) cannot support.
 
-    Fix round 6 Z12: this command writes TWO files, never one. stdout (the
-    operator redirects it into `docs/rigor/<slug>.anticipation.jsonl`)
-    carries ONLY `lead-anticipation` rows. Any relay's non-empty
-    `mutations`/`exclusions` — the lead's own attestations — are written
-    DIRECTLY, by this command, to `docs/rigor/<slug>.attestation.jsonl`
-    (`agent_type: "lead-relay-attestation"`, also no `verdict` key), never
-    interleaved into the anticipation stream: two distinct row kinds
-    committed as one file let an attestation row become the anticipation
-    stream's own "governing" row, hiding a real `gates` object entirely —
-    the bug `check_rigor_record.py`'s reader 3 now REFUSES on sight."""
+    This command writes EXACTLY ONE stream: stdout (the operator
+    redirects it into `docs/rigor/<slug>.anticipation.jsonl`), carrying
+    ONLY `lead-anticipation` rows — `check_rigor_record.py`'s reader 3
+    REFUSES, loudly and by name, any row it still finds in that stream
+    whose `agent_type` is not `lead-anticipation` (a stale export or a
+    hand-edit), never silently ignoring or selecting it. The lead's own
+    `mutations`/`exclusions` attestations are HOOK-ATTESTED ONLY: they
+    live in the relay artifacts under `.jammi/gate-state/<slug>.relay.
+    *.json`, read directly by readers 1 and 2, and are never exported,
+    never written to a committed file, and never counted by this
+    command. A committed, reader-required attestation record and a
+    CI-derived required call-site set are both tracked as one
+    separately-scoped unit: https://github.com/f-inverse/jammi-ai/issues/557."""
     if len(argv) < 3 or not argv[2].strip():
         sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-anticipation <unit_slug>\n")
         return 2
@@ -3587,74 +3590,16 @@ def cmd_export_anticipation(argv: list[str]) -> int:
             sys.stdout.write("\n")
             n += 1
 
-    # Fix round 5 Z8 / fix round 6 Z12: `mutations`/`exclusions` are the
-    # lead's OWN attestations, written into the (gitignored, CI-invisible)
-    # RELAY artifact — `.claude/hooks/README.md`/`lead.md`'s own "the
-    # control is the human at merge, reading the exported record" sentence
-    # was false until this export actually carried them anywhere a human
-    # reviewing a diff could see them. Every `<slug>.relay.*.json` that
-    # carries a non-empty `mutations` or `exclusions` field is exported —
-    # but Z12 (closing audit #4) found that dumping these `lead-relay-
-    # attestation` rows into the SAME STDOUT STREAM the operator redirects
-    # into `docs/rigor/<slug>.anticipation.jsonl` put TWO ROW KINDS in ONE
-    # committed file: neither reader-3 site filtered by `agent_type`, so an
-    # attestation row (no `residual_risk`, no `gates`) could become the
-    # governing row `check_required_gates` selects, or deny `check_
-    # anticipation_witnesses` outright. PROPERTY (Z12): every committed
-    # rigor stream carries exactly ONE row kind. Attestation rows are
-    # therefore written to their OWN committed stream, `docs/rigor/<slug>.
-    # attestation.jsonl` — a SEPARATE FILE, written directly here (never via
-    # stdout, since one redirect cannot populate two distinct committed
-    # artifacts) — DELIBERATELY NO `verdict` key for the same closed-world-
-    # lattice reason as above.
-    m = 0
-    relay_prefix = f"{slug}.relay."
-    attestation_rows: list[dict] = []
-    if sdir.exists():
-        for entry in sorted(sdir.iterdir()):
-            if not (entry.name.startswith(relay_prefix) and entry.name.endswith(".json")):
-                continue
-            try:
-                data = json.loads(entry.read_text())
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            mutations = data.get("mutations")
-            exclusions = data.get("exclusions")
-            has_mutations = isinstance(mutations, list) and mutations
-            has_exclusions = isinstance(exclusions, dict) and exclusions
-            if not (has_mutations or has_exclusions):
-                continue
-            row = {
-                "agent_type": "lead-relay-attestation",
-                "unit_branch": data.get("unit_branch"),
-                "relay_agent_type": data.get("agent_type"),
-                "block_ts": data.get("block_ts"),
-                "fix_head": data.get("fix_head"),
-            }
-            if has_mutations:
-                row["mutations"] = mutations
-            if has_exclusions:
-                row["exclusions"] = exclusions
-            try:
-                mtime = entry.stat().st_mtime
-                row["ts"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-            except OSError:  # R12-RESIDUAL: requires the artifact file to vanish between the `iterdir()` listing and this `stat()` call, a TOCTOU race not exercised by a fast self-test fixture
-                row["ts"] = now_iso()
-            fix_head = data.get("fix_head")
-            if isinstance(fix_head, str) and fix_head:
-                row["head_sha"] = fix_head
-            attestation_rows.append(row)
-            m += 1
-    attestation_path = repo_root() / "docs" / "rigor" / f"{slug}.attestation.jsonl"
-    if attestation_rows:
-        attestation_path.parent.mkdir(parents=True, exist_ok=True)
-        attestation_path.write_text(
-            "".join(json.dumps(r, sort_keys=True) + "\n" for r in attestation_rows))
-    sys.stderr.write(
-        f"lead-gate-lib: exported {n} anticipation row(s) to stdout and {m} relay-attestation "
-        f"row(s) to {attestation_path} for {slug!r}\n")
+    # Round-6 stop rule (audit #5 BLOCK at da30f0b2): the exporter writes
+    # EXACTLY ONE committed stream. `mutations`/`exclusions` are the
+    # lead's own attestations, written into the (gitignored, CI-invisible)
+    # RELAY artifact under `.jammi/gate-state/<slug>.relay.*.json` — read
+    # directly by readers 1 and 2 — and stay there: they are never
+    # exported, never written to a second committed file, and never
+    # counted by this command. A committed, reader-required attestation
+    # record is filed as its own, separately-scoped unit:
+    # https://github.com/f-inverse/jammi-ai/issues/557.
+    sys.stderr.write(f"lead-gate-lib: exported {n} anticipation row(s) to stdout for {slug!r}\n")
     return 0
 
 

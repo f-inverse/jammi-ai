@@ -5036,22 +5036,18 @@ def fixture_r12x7_missing_previous_relay_artifact_denies() -> None:
     _assert("no on-disk artifact" in p2.stderr, "R12X7", p2.stderr)
 
 
-def fixture_r12x8_export_carries_relay_mutations_and_exclusions() -> None:
-    """fix round 5 Z8: `--export-anticipation` also dumps any `<slug>.
-    relay.*.json` carrying a non-empty `mutations`/`exclusions` field, as a
-    distinct `lead-relay-attestation` row -- these are the lead's OWN
-    attestations, and `.claude/hooks/README.md`/`lead.md`'s own claim
-    ("the human reads them in the exported record") was false until this
-    export actually carried them anywhere a human reviewing a committed
-    diff could see them.
-
-    Fix round 6 Z12: this row is written to its OWN committed stream,
-    `docs/rigor/<slug>.attestation.jsonl` -- NEVER interleaved into
-    stdout (the anticipation stream), which is what let an attestation
-    row become the "governing" row `check_rigor_record.py`'s reader 3
-    could select, hiding a real `gates` object. Asserts BOTH shapes: the
-    stdout anticipation stream carries no attestation row at all, and the
-    attestation FILE carries exactly the one this relay produced."""
+def fixture_r12x8_export_emits_no_attestation_row_or_file() -> None:
+    """Round-6 stop rule fired (audit #5 BLOCK at da30f0b2 on Z12's export
+    half): fix round 5 Z8's export half is REVERTED entirely.
+    `--export-anticipation` writes EXACTLY ONE stream — stdout,
+    `lead-anticipation` rows only. The lead's `mutations`/`exclusions`
+    attestations stay HOOK-ATTESTED ONLY: they remain in the relay
+    artifact readers 1 and 2 already read, and are never exported, never
+    written to a committed file, never counted in this command's own
+    stderr summary. A relay carrying non-empty `mutations`/`exclusions`
+    (the exact fixture that used to produce a `lead-relay-attestation`
+    row) must now produce NEITHER a stdout row of that kind NOR a
+    `docs/rigor/<slug>.attestation.jsonl` file at all."""
     unit = "feat/r12x8"
     root, row, fix_head = _r12_mutations_setup(unit)
     mutation_rows = [{"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 1,
@@ -5075,18 +5071,11 @@ def fixture_r12x8_export_carries_relay_mutations_and_exclusions() -> None:
     _assert(all(r.get("agent_type") == "lead-anticipation" for r in exported_rows), "R12X8",
             f"the anticipation stdout stream must carry NO lead-relay-attestation row: {exported_rows}")
     attestation_path = root / "docs" / "rigor" / f"{_slug(unit)}.attestation.jsonl"
-    _assert(attestation_path.exists(), "R12X8",
-            f"expected a SEPARATE {attestation_path} for the relay's own attestation")
-    attestations = [json.loads(line) for line in attestation_path.read_text().splitlines() if line.strip()]
-    _assert(len(attestations) == 1, "R12X8",
-            f"expected exactly 1 lead-relay-attestation row, got {len(attestations)}: {attestations}")
-    _assert(attestations[0].get("agent_type") == "lead-relay-attestation", "R12X8", f"{attestations[0]}")
-    _assert(attestations[0].get("mutations") == mutation_rows, "R12X8",
-            f"exported row must carry the relay's own `mutations` verbatim: {attestations[0]}")
-    _assert(attestations[0].get("exclusions") == {"tests/test_z.py::test_new": "does not cover X"}, "R12X8",
-            f"exported row must carry the relay's own `exclusions` verbatim: {attestations[0]}")
-    _assert("verdict" not in attestations[0], "R12X8",
-            "a lead-relay-attestation row must carry no `verdict` key (never enters the gate lattice)")
+    _assert(not attestation_path.exists(), "R12X8",
+            f"the exporter must write NO attestation file at all (Z8's export half is reverted): "
+            f"{attestation_path}")
+    _assert("attestation" not in proc.stderr, "R12X8",
+            f"the exporter's own stderr summary must not mention attestation rows: {proc.stderr!r}")
 
 
 def _parse_new_surfaces_of(root: Path, base_sha: str, head_sha: str) -> dict[str, str]:
@@ -5128,7 +5117,7 @@ FIXTURES = [
     ("R12X5", fixture_r12x5_exclusions_duplicate_within_relay_denies),
     ("R12X6", fixture_r12x6_exclusions_duplicate_across_previous_relay_denies),
     ("R12X7", fixture_r12x7_missing_previous_relay_artifact_denies),
-    ("R12X8", fixture_r12x8_export_carries_relay_mutations_and_exclusions),
+    ("R12X8", fixture_r12x8_export_emits_no_attestation_row_or_file),
     ("G1", fixture_g1_first_round_never_gated),
     ("G2", fixture_g2_second_round_denied_worktree),
     ("G3", fixture_g3_second_round_denied_full_sha),

@@ -118,6 +118,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -355,33 +356,35 @@ def _r12_reject_foreign_anticipation_rows(path: str, rows: list[tuple[int, dict]
                                            result: Result) -> list[tuple[int, dict]]:
     """esc-lead-gate-R12 fix round 6 Z12: PROPERTY — a committed
     `docs/rigor/<slug>.anticipation.jsonl` carries EXACTLY ONE row kind,
-    `agent_type == "lead-anticipation"`. Since fix round 5 Z8,
-    `cmd_export_anticipation` also emitted the lead's OWN mutations/
-    exclusions attestations (`agent_type == "lead-relay-attestation"`) —
-    and, until fix round 6, into this SAME stdout stream the operator
-    redirects into this SAME file. Neither reader-3 call site filtered by
-    `agent_type`: an attestation row (no `residual_risk`, no `gates`)
-    could become the "governing" row `check_required_gates` selects
-    (hiding a real `gates` object behind "no `gates` object"), or simply
-    deny `check_anticipation_witnesses` outright ("no non-empty
-    `residual_risk`"). Since fix round 6, attestation rows export to
-    their OWN stream (`<slug>.attestation.jsonl`) — so any row of a
-    different kind found HERE is a foreign row: a stale pre-fix-round-6
-    export still committed, or a hand-edit. This function REFUSES it with
-    a loud, NAMED FAIL — never silently ignores it (which would let a
-    tampered/legacy row go undetected) and never silently SELECTS it (the
-    fix round 5/6 bug this replaces) — and returns only the rows that
-    pass the filter for the caller's own downstream checks."""
+    `agent_type == "lead-anticipation"`. `cmd_export_anticipation` once
+    also emitted the lead's OWN mutations/exclusions attestations
+    (`agent_type == "lead-relay-attestation"`) into this SAME stdout
+    stream the operator redirects into this SAME file; neither reader-3
+    call site filtered by `agent_type`, so an attestation row (no
+    `residual_risk`, no `gates`) could become the "governing" row `check_
+    required_gates` selects (hiding a real `gates` object behind "no
+    `gates` object"), or simply deny `check_anticipation_witnesses`
+    outright ("no non-empty `residual_risk`"). The exporter's own
+    attestation-row half was later reverted entirely (mutations/
+    exclusions are HOOK-ATTESTED ONLY — visible in the relay artifact
+    readers 1 and 2 already read, never exported or committed); a
+    `lead-relay-attestation` row found HERE is therefore always a
+    FOREIGN row — a stale pre-revert export still committed, or a
+    hand-edit. This function REFUSES it with a loud, NAMED FAIL — never
+    silently ignores it (which would let a tampered/legacy row go
+    undetected) and never silently SELECTS it (the earlier bug this
+    replaces) — and returns only the rows that pass the filter for the
+    caller's own downstream checks."""
     kept: list[tuple[int, dict]] = []
     for lineno, row in rows:
         agent_type = row.get("agent_type")
         if agent_type != "lead-anticipation":
             result.fail(
                 f"{path}:{lineno}: row carries agent_type={agent_type!r}, not "
-                "`lead-anticipation` -- a foreign row (e.g. a `lead-relay-attestation` row, "
-                "which exports to its own `<slug>.attestation.jsonl` stream) does not belong "
-                "in the anticipation stream; it is REFUSED here, never ignored and never "
-                "selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
+                "`lead-anticipation` -- a foreign row (e.g. a `lead-relay-attestation` row -- "
+                "mutations/exclusions are hook-attested only and never exported) does not "
+                "belong in the anticipation stream; it is REFUSED here, never ignored and "
+                "never selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
             continue
         kept.append((lineno, row))
     return kept
@@ -798,35 +801,51 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         h = r.get("head_sha")
         return h if isinstance(h, str) and h else None
 
-    def _row_ts(r: dict) -> str:
+    def _row_instant(r: dict) -> datetime | None:
+        """fix round 6 Z15/Z17: `ts` is compared as an INSTANT, never as
+        TEXT — `datetime.fromisoformat`, a trailing `Z` accepted as
+        `+00:00` (`fromisoformat` itself rejects a bare `Z` on Python
+        versions below 3.11). `None` for a missing OR an unparseable
+        `ts` — refused identically either way, never distinguished."""
         ts = r.get("ts")
-        return ts if isinstance(ts, str) else ""
+        if not isinstance(ts, str) or not ts:
+            return None
+        normalized = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
 
     matching = [r for r in rows if head_now and _row_head(r) == head_now]
     pool = matching if matching else rows
 
-    if len(pool) >= 2 and any(not (isinstance(r.get("ts"), str) and r.get("ts")) for r in pool):
+    if len(pool) >= 2 and any(_row_instant(r) is None for r in pool):
         result.fail(
             f"{path}: {len(pool)} candidate anticipation row(s) carry no reliable ordering "
-            "evidence (at least one has no `ts`) -- the GOVERNING row is AMBIGUOUS; re-export "
-            "with `lead-gate-lib.py --export-anticipation` (which stamps `ts`/`head_sha` on "
-            "every row since fix round 5) and commit the result (esc-lead-gate-R12 fix round 5 Z5)"
+            "evidence (at least one has no parseable `ts` instant) -- the GOVERNING row is "
+            "AMBIGUOUS; re-export with `lead-gate-lib.py --export-anticipation` (which stamps "
+            "`ts`/`head_sha` on every row since fix round 5) and commit the result "
+            "(esc-lead-gate-R12 fix round 5 Z5)"
         )
         return
 
-    # Fix round 6 Z15: an EQUAL greatest `ts` across >=2 pool rows used to
-    # resolve by append position (`max()` returns the FIRST maximal
-    # element) — an executed probe found two rows with identical `ts`, the
-    # `rc=0` row first, silently governed and shadowed a genuinely
-    # `rc=1` sibling. A tie is exactly as AMBIGUOUS as a missing `ts`.
-    max_ts = max(_row_ts(r) for r in pool)
-    tied = [r for r in pool if _row_ts(r) == max_ts]
+    # Fix round 6 Z15/Z17: an EQUAL greatest `ts` INSTANT across >=2 pool
+    # rows used to resolve by append position (`max()` returns the FIRST
+    # maximal element) — an executed probe found two rows with identical
+    # `ts`, the `rc=0` row first, silently governed and shadowed a
+    # genuinely `rc=1` sibling. Comparing as TEXT also missed the case
+    # where two rows name the SAME instant in different text (a trailing
+    # `Z` vs an explicit `+00:00` offset) -- the compare is by INSTANT, so
+    # that pair ties too. A tie is exactly as AMBIGUOUS as a missing `ts`.
+    instants = [(_row_instant(r), r) for r in pool]
+    max_instant = max(inst for inst, _ in instants)
+    tied = [r for inst, r in instants if inst == max_instant]
     if len(tied) >= 2:
         result.fail(
-            f"{path}: {len(tied)} candidate anticipation row(s) share the SAME greatest `ts` "
-            f"({max_ts!r}) -- the GOVERNING row is AMBIGUOUS on a tie, exactly as it is when "
-            "`ts` is missing entirely; re-export so each round's row carries a distinguishing "
-            "`ts` (esc-lead-gate-R12 fix round 6 Z15)"
+            f"{path}: {len(tied)} candidate anticipation row(s) name the SAME greatest `ts` "
+            f"instant ({max_instant.isoformat()!r}) -- the GOVERNING row is AMBIGUOUS on a tie, "
+            "exactly as it is when `ts` is missing entirely; re-export so each round's row "
+            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15/Z17)"
         )
         return
     governing = tied[0]
@@ -1639,17 +1658,18 @@ def _real_anticipation_export(work: Path, slug: str, artifacts: list[dict],
     EXPORTED shape (real `ts`/`head_sha` stamped from the artifact file's
     own mtime/`pre_fix_sha`), never a hand-typed simulation of it.
 
-    Fix round 6 Z12: `relay_artifacts` (each a full relay-shaped dict
-    carrying `agent_type`/`block_ts`/`fix_head` and a non-empty
-    `mutations`/`exclusions`) are ALSO written to real
-    `.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json` files,
-    at the SAME path shape `relay_artifact_path` itself uses (loaded from
-    `work`'s own copy of the real module), before the real export runs —
-    so a fixture can exercise the exporter's real TWO-STREAM split
-    (this function still returns only stdout, the anticipation stream;
-    the attestation stream it writes DIRECTLY to `docs/rigor/<slug>.
-    attestation.jsonl` under `work`, which the caller reads itself) rather
-    than a hand-typed simulation of the mixed shape."""
+    `relay_artifacts` (each a full relay-shaped dict carrying `agent_type`/
+    `block_ts`/`fix_head` and a non-empty `mutations`/`exclusions`) are
+    ALSO written to real `.jammi/gate-state/<slug>.relay.<agent_type>.
+    <block_ts>.json` files, at the SAME path shape `relay_artifact_path`
+    itself uses (loaded from `work`'s own copy of the real module), before
+    the real export runs — so a fixture can exercise the REAL exporter
+    against a mixed-source disk state (an anticipation artifact AND a
+    relay artifact carrying non-empty `mutations`/`exclusions`) rather
+    than a hand-typed simulation of it. Round-6 stop rule (Z18): the
+    exporter writes stdout ONLY — no second, attestation-shaped file is
+    ever produced, regardless of what `relay_artifacts` carries; the
+    caller asserts that absence itself."""
     sdir = work / ".jammi" / "gate-state"
     sdir.mkdir(parents=True, exist_ok=True)
     for art, mtime in zip(artifacts, mtimes):
@@ -1876,21 +1896,24 @@ def fixture_rr24_inspector_only_fails() -> None:
 
 
 def fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only() -> None:
-    """esc-lead-gate-R12 fix round 6 Z12: the production-shaped case — ONE
-    real anticipation artifact and ONE real relay artifact carrying
-    non-empty `mutations`/`exclusions`, both on disk, exported through the
-    REAL `--export-anticipation` entry point (`_real_anticipation_export`'s
-    relay-artifact arm). RED at 3273f51b: the pre-fix exporter interleaved
-    BOTH row kinds into the SAME stdout stream this fixture redirects into
-    `docs/rigor/<slug>.anticipation.jsonl` — the attestation row's own
-    missing `residual_risk` denied `check_anticipation_witnesses`
-    ("no non-empty `residual_risk`"), and its greatest-`ts` position could
-    govern `check_required_gates`, hiding the real `gates` object entirely
-    ("the governing row carries no `gates` object"). GREEN after the fix:
-    the exporter SPLITS the two row kinds into two files — the
-    anticipation stream carries ONLY the `lead-anticipation` row, reader 3
-    ALLOWS, and `docs/rigor/<slug>.attestation.jsonl` exists on disk with
-    the relay's own `mutations`/`exclusions` verbatim."""
+    """esc-lead-gate-R12 fix round 6 Z12, round-6 stop rule Z18: the
+    production-shaped case — ONE real anticipation artifact AND ONE real
+    relay artifact carrying non-empty `mutations`/`exclusions`, both on
+    disk, exported through the REAL `--export-anticipation` entry point
+    (`_real_anticipation_export`'s relay-artifact arm). RED at 3273f51b:
+    the pre-fix exporter interleaved an attestation row into the SAME
+    stdout stream this fixture redirects into
+    `docs/rigor/<slug>.anticipation.jsonl` — its own missing
+    `residual_risk` denied `check_anticipation_witnesses` ("no non-empty
+    `residual_risk`"), and its greatest-`ts` position could govern
+    `check_required_gates`, hiding the real `gates` object entirely ("the
+    governing row carries no `gates` object"). GREEN after the fix: the
+    exporter writes stdout ONLY (the `lead-anticipation` row), reader 3
+    ALLOWS, and — Z8's export half REVERTED at the round-6 stop rule — the
+    on-disk relay's own `mutations`/`exclusions` produce NO
+    `docs/rigor/<slug>.attestation.jsonl` file at all; they stay
+    hook-attested only, visible in the relay artifact readers 1 and 2
+    already read."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
@@ -1915,20 +1938,16 @@ def fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only() -> Non
             "docs/README-fixture.md": "line one\n",
             "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
         }
-        _commit(work, "ci: touch a gate script (mixed anticipation + attestation, real export)", files)
+        _commit(work, "ci: touch a gate script (mixed-source real export)", files)
         r = _run_check_in(work)
         _assert(r.ok(), "RR25", f"reader 3 must select the anticipation row only and ALLOW: {r.failures}")
         exported_rows = [json.loads(line) for line in exported.splitlines() if line.strip()]
         _assert(bool(exported_rows) and all(row.get("agent_type") == "lead-anticipation" for row in exported_rows),
                 "RR25", f"the anticipation stdout stream must carry ONLY lead-anticipation rows: {exported_rows}")
         attestation_path = work / "docs" / "rigor" / "feat_rr-fixture.attestation.jsonl"
-        _assert(attestation_path.exists(), "RR25",
-                f"the exporter must write a SEPARATE {attestation_path} for the relay's own attestation")
-        attestation_rows = [json.loads(line) for line in attestation_path.read_text().splitlines() if line.strip()]
-        _assert(len(attestation_rows) == 1, "RR25", f"expected exactly 1 attestation row: {attestation_rows}")
-        _assert(attestation_rows[0].get("agent_type") == "lead-relay-attestation", "RR25", f"{attestation_rows[0]}")
-        _assert(attestation_rows[0].get("mutations") == relay["mutations"], "RR25", f"{attestation_rows[0]}")
-        _assert(attestation_rows[0].get("exclusions") == relay["exclusions"], "RR25", f"{attestation_rows[0]}")
+        _assert(not attestation_path.exists(), "RR25",
+                f"the exporter must write NO attestation file at all (Z8's export half is "
+                f"reverted): {attestation_path}")
 
 
 def fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly() -> None:
@@ -2030,13 +2049,16 @@ def fixture_rr29_attacks_entry_invalid_hash_fails() -> None:
 
 
 def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
-    """fix round 6 Z15: TWO candidate rows share the IDENTICAL greatest
-    `ts` — an executed probe found `max(pool, key=_row_ts)` resolves a tie
-    by APPEND POSITION (the FIRST maximal element), so an `rc=0` row
+    """fix round 6 Z15/Z17: TWO candidate rows share the SAME greatest `ts`
+    INSTANT — an executed probe found `max(pool, key=_row_ts)` resolves a
+    tie by APPEND POSITION (the FIRST maximal element), so an `rc=0` row
     listed first silently governed and shadowed a genuinely `rc=1`
     sibling recorded at the exact same instant. A tie is exactly as
     AMBIGUOUS as a missing `ts` and must FAIL the same way, in BOTH
-    orders."""
+    orders, AND when the two rows name the identical instant in DIFFERENT
+    TEXT (a trailing `Z` vs an explicit `+00:00` offset) — the compare is
+    by INSTANT, never by string equality; RED at da30f0b2 by the executed
+    probe against a text compare (quoted in the commit message)."""
     pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
     block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                              "verdict": "BLOCK", "finding_locations": ["a.py:1"],
@@ -2049,7 +2071,14 @@ def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
                   "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
                   "residual_risk": "fixture residual", "ts": "2026-01-01T00:02:00Z", "head_sha": "f" * 40,
                   "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
-    for order_name, ordered in (("ok-first", [row_ok, row_broken]), ("broken-first", [row_broken, row_ok])):
+    # Fix round 6 Z17: the SAME instant (2026-01-01T00:02:00 UTC) as
+    # `row_ok`, named in a DIFFERENT text form -- a naive string compare
+    # (`_row_ts(r) == max_ts`) sees these as UNEQUAL and would silently let
+    # whichever sorts last govern; the instant compare must still tie them.
+    row_broken_offset = dict(row_broken, ts="2026-01-01T00:02:00+00:00",
+                              pre_fix_sha="e" * 40, head_sha="e" * 40)
+    for order_name, ordered in (("ok-first", [row_ok, row_broken]), ("broken-first", [row_broken, row_ok]),
+                                 ("same-instant-different-text", [row_ok, row_broken_offset])):
         with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
             _origin, work = _pr_repo(Path(td))
             _commit(work, f"ci: touch a gate script (tied ts, {order_name})", {

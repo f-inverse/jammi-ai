@@ -1,12 +1,12 @@
 //! `GangService`'s U5a-1 slice.
 //!
-//! The first two tests below prove the §W2 Resolution hazards CONTRACT-U5a.md
-//! round-11 folds 4 and 5 name (both b1' rows) directly against
-//! `crate::grpc::gang::resolve_training_set_identity` and
+//! The first two tests below prove the §W2 Resolution hazards directly
+//! against `crate::grpc::gang::resolve_training_set_identity` and
 //! `jammi_db::Catalog::get_result_table_for_tenant` — the way §W2 Resolution
 //! states the property (a repo-level predicate plus an explicit guard at the
 //! resolution call site), matching `get_job_for_rank`'s own
-//! enumerating-caller-oracle treatment elsewhere in this contract.
+//! enumerating-caller-oracle treatment elsewhere in this contract (see
+//! `docs/rigor/contracts/feat_500-C-U5a-1.md` §W2 Resolution).
 //!
 //! The remaining tests drive the real `RunRank` rpc over the production
 //! `peer_bind` listener (`start_engine_server_with_peer_bind` /
@@ -51,12 +51,10 @@ fn null_tenant_row<'a>(table: &'a str) -> CreateResultTableParams<'a> {
     }
 }
 
-/// CONTRACT-U5a.md §W2 Resolution (round-11 fold, ruling 5), b1' row: "a rank
-/// on tenant A resolves a NULL-tenant table of the requested name through the
-/// relaxed `get_result_table` read." A NULL-tenant `result_tables` row exists
+/// The strict-predicate property: a NULL-tenant `result_tables` row exists
 /// (as if created by a coordinator outside any tenant scope); from tenant A,
-/// the RELAXED `get_result_table` (today's only seam) returns it — the
-/// pre-existing hazard, unconditionally true at base — while the NEW STRICT
+/// the RELAXED `get_result_table` (today's only other seam) returns it — the
+/// pre-existing hazard, unconditionally true at base — while the STRICT
 /// `get_result_table_for_tenant` refuses to match it, and
 /// `resolve_training_set_identity` built on the strict verb refuses
 /// `FAILED_PRECONDITION` rather than resolving the wrong tenant's table.
@@ -129,8 +127,9 @@ async fn strict_resolver_never_matches_a_null_tenant_row_for_a_real_tenant() {
     assert_eq!(err.code(), Code::FailedPrecondition);
 }
 
-/// CONTRACT-U5a.md §W2 Resolution (round-11 fold, ruling 4), b1' row: "a
-/// resolution wrapped in `with_admin_scope` resolves any tenant's table."
+/// The admin-scope-guard property: a resolution wrapped in
+/// `with_admin_scope` would resolve any tenant's table through the raw
+/// verb, so the resolution site guards it explicitly instead.
 /// `TenantBinding::is_admin_scope()` is ambient — the strict verb's OWN
 /// admin-scope behaviour is UNCHANGED (it mirrors every other repo verb's
 /// convention and drops the tenant predicate under admin scope, matching a
@@ -232,9 +231,9 @@ async fn resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_
     // Guard-less call to the raw strict verb, inside `with_admin_scope`,
     // passing tenant A: the verb's OWN admin-scope branch drops the tenant
     // predicate entirely and matches by primary key alone — tenant B's row
-    // comes back despite the caller naming tenant A. This is the hazard
-    // ruling 4 names: the verb's own behaviour under admin scope is
-    // unchanged by this contract.
+    // comes back despite the caller naming tenant A. This is the hazard the
+    // resolution-site guard exists for: the verb's own behaviour under
+    // admin scope is unchanged.
     let table_for_admin = table.clone();
     let guardless = engine
         .with_admin_scope(|admin| {
@@ -252,7 +251,7 @@ async fn resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_
     assert!(
         guardless.is_some(),
         "the raw strict verb must still resolve cross-tenant under admin scope \
-         (unchanged verb behaviour) — the hazard ruling 4 names"
+         (unchanged verb behaviour) — the hazard the resolution-site guard exists for"
     );
 
     // The resolution-site wrapper, called the SAME way (inside

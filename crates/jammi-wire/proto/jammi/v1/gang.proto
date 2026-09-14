@@ -21,10 +21,11 @@ package jammi.v1.gang;
 // layer. Invariant I-GANG: tenant is derived from the verified `jobs` row,
 // never the caller — a caller-supplied tenant is ignored.
 //
-// Message shape and arity are frozen by review and by the contract of record
-// (CONTRACT-U5a.md), not by the api-freeze guard: that guard decodes only the
-// `PACKAGE`/`(Service, Method)` tokens, so later units MAY add fields or
-// oneof variants but MUST NOT rename or remove anything declared here.
+// Message shape and arity are frozen by review and by the committed
+// mechanism contract `docs/rigor/contracts/feat_500-C-U5a-1.md`, not by the
+// api-freeze guard: that guard decodes only the `PACKAGE`/`(Service,
+// Method)` tokens, so later units MAY add fields or oneof variants but MUST
+// NOT rename or remove anything declared here.
 service GangService {
   rpc RunRank(stream RankControl) returns (stream RankEvent);
 }

@@ -152,7 +152,7 @@ pub struct MetricsRegistry {
     /// listener as a gang MEMBER, labelled by `rpc` (`RunRank`). Driven by
     /// the whole-server [`crate::metrics_layer`] on the peer listener —
     /// the observable that a coordinator's `RunRank` call actually reached
-    /// this member (`CONTRACT-U5a.md` §W1).
+    /// this member (see `docs/rigor/contracts/feat_500-C-U5a-1.md` §W1).
     pub gang_requests: IntCounterVec,
 }
 

@@ -2308,6 +2308,225 @@ mod tests {
         );
     }
 
+    /// Item 2 (CONTRACT-U2b-fix1.md fold): a `Precomputed` loader has no
+    /// row-level partition, so `text_chunk_for_rank` refuses it outright
+    /// rather than attempting to slice pre-built tensor batches by row. Dies
+    /// if the refusal is removed (the `LoaderData::Precomputed(_) => Err(...)`
+    /// arm at `text_chunk_for_rank`'s match) — the call would then need to
+    /// fall through to some OTHER arm, which does not compile for an empty
+    /// `Vec<TrainingBatch>` fed in here without inventing a bogus row slice.
+    #[test]
+    fn precomputed_loader_refuses_text_chunk_for_rank() {
+        use super::super::partition::{PartitionRule, PartitionSpec};
+        let loader = TrainingDataLoader::from_precomputed(Vec::new());
+        let spec = PartitionSpec {
+            rank: 0,
+            world: 1,
+            batch: 4,
+            rule: PartitionRule::BlockByGlobalBatch,
+        };
+        match loader.text_chunk_for_rank(&spec, 0) {
+            Err(e) => assert!(
+                e.to_string().contains("no row-level partition"),
+                "expected the typed 'no row-level partition' refusal, got: {e}"
+            ),
+            Ok(_) => panic!("a Precomputed loader must refuse text_chunk_for_rank"),
+        }
+    }
+
+    /// `TrainingRow` has no `Debug` impl, so `Result<Vec<TrainingRow>>::
+    /// unwrap_err` cannot be called directly (its bound needs `T: Debug` for
+    /// the never-taken `Ok` panic message) — this extracts the error by hand
+    /// instead, for the five `decode_record_batch` refusal tests below.
+    fn expect_decode_err(result: Result<Vec<TrainingRow>>) -> JammiError {
+        match result {
+            Err(e) => e,
+            Ok(rows) => panic!(
+                "expected decode_record_batch to refuse, got {} well-formed rows",
+                rows.len()
+            ),
+        }
+    }
+
+    /// Item 2: `decode_record_batch`'s `Contrastive` arm refuses a batch
+    /// missing its `score` column by name — one of the five
+    /// `decode_record_batch` refusal categories this fold pins a dying test
+    /// for (the other four are the sibling tests below). Dies if the
+    /// `missing("score")` refusal is removed (see this test module's
+    /// `decode_record_batch_classification_refusal_dies_if_removed` for the
+    /// EXECUTED version of this mutation, run against the simplest of the
+    /// five categories).
+    #[test]
+    fn decode_record_batch_refuses_a_contrastive_batch_missing_its_score_column() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text_a", DataType::Utf8, false),
+            Field::new("text_b", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a0"])),
+                Arc::new(StringArray::from(vec!["b0"])),
+            ],
+        )
+        .unwrap();
+        let err = expect_decode_err(decode_record_batch(
+            TrainingFormat::Contrastive,
+            ModelTask::TextEmbedding,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            &batch,
+        ));
+        assert!(
+            err.to_string()
+                .contains("streamed batch missing column 'score'"),
+            "expected the missing-column refusal naming 'score', got: {err}"
+        );
+    }
+
+    /// Item 2: `decode_record_batch`'s `Pairs` arm refuses a non-text
+    /// `anchor` column with its OWN message (naming the Pairs/Triplet media
+    /// distinction), not the generic `not_text` closure — distinct from the
+    /// Contrastive test above, which hits `missing`, not `not_text_pairs`.
+    ///
+    /// A `Binary` column, not an integer one: `extract_string_column` CASTS
+    /// most non-string Arrow types to `Utf8` as a fallback (an `Int64`
+    /// column decodes as the STRING "1", never refusing) — only the binary
+    /// families short-circuit to `None` before that cast is even attempted,
+    /// which is the refusal this test needs to exercise.
+    #[test]
+    fn decode_record_batch_refuses_a_pairs_batch_with_a_non_text_anchor_column() {
+        use arrow::array::{BinaryArray, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Binary, false),
+            Field::new("positive", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BinaryArray::from(vec![&b"not-text"[..]])),
+                Arc::new(StringArray::from(vec!["p0"])),
+            ],
+        )
+        .unwrap();
+        let err = expect_decode_err(decode_record_batch(
+            TrainingFormat::Pairs,
+            ModelTask::TextEmbedding,
+            &["anchor".to_string(), "positive".to_string()],
+            &batch,
+        ));
+        assert!(
+            err.to_string().contains("expects text columns"),
+            "expected the Pairs-specific not-text refusal, got: {err}"
+        );
+    }
+
+    /// Item 2: `decode_record_batch`'s `Triplet` arm refuses a batch missing
+    /// its `negative` column by name.
+    #[test]
+    fn decode_record_batch_refuses_a_triplet_batch_missing_its_negative_column() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Utf8, false),
+            Field::new("positive", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a0"])),
+                Arc::new(StringArray::from(vec!["p0"])),
+            ],
+        )
+        .unwrap();
+        let err = expect_decode_err(decode_record_batch(
+            TrainingFormat::Triplet,
+            ModelTask::TextEmbedding,
+            &[
+                "anchor".to_string(),
+                "positive".to_string(),
+                "negative".to_string(),
+            ],
+            &batch,
+        ));
+        assert!(
+            err.to_string()
+                .contains("streamed batch missing column 'negative'"),
+            "expected the missing-column refusal naming 'negative', got: {err}"
+        );
+    }
+
+    /// Item 2: `decode_record_batch`'s `MediaTriplet` arm refuses a
+    /// non-binary `anchor` column (a plain text column stands in for the
+    /// audio/image bytes a media triplet requires).
+    #[test]
+    fn decode_record_batch_refuses_a_media_triplet_batch_with_a_non_binary_anchor_column() {
+        use arrow::array::{BinaryArray, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Utf8, false),
+            Field::new("positive", DataType::Binary, false),
+            Field::new("negative", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["not-binary"])),
+                Arc::new(BinaryArray::from(vec![&b"p"[..]])),
+                Arc::new(BinaryArray::from(vec![&b"n"[..]])),
+            ],
+        )
+        .unwrap();
+        let err = expect_decode_err(decode_record_batch(
+            TrainingFormat::MediaTriplet,
+            ModelTask::ImageEmbedding,
+            &[
+                "anchor".to_string(),
+                "positive".to_string(),
+                "negative".to_string(),
+            ],
+            &batch,
+        ));
+        assert!(
+            err.to_string()
+                .contains("Missing/invalid binary 'anchor' column"),
+            "expected the media-triplet not-binary refusal naming 'anchor', got: {err}"
+        );
+    }
+
+    /// Item 2: `decode_record_batch`'s `Classification` arm refuses
+    /// STRUCTURALLY — the class index needs the whole label column first, so
+    /// no schema of any shape can be decoded one streamed chunk at a time.
+    /// This is the category the executed mutation below removes.
+    #[test]
+    fn decode_record_batch_refuses_classification_structurally() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["t0"]))],
+        )
+        .unwrap();
+        let err = expect_decode_err(decode_record_batch(
+            TrainingFormat::Classification { num_classes: 2 },
+            ModelTask::Classification,
+            &["text".to_string()],
+            &batch,
+        ));
+        assert!(
+            err.to_string()
+                .contains("classification cannot be decoded one streamed chunk at a time"),
+            "expected the Classification structural refusal, got: {err}"
+        );
+    }
+
     /// M1's step-oracle refusal, driven directly (the ONE call site,
     /// `stream_next_chunk`, needs a live tokio runtime and a committed table
     /// to reach — this function does not): a matching length is accepted, and

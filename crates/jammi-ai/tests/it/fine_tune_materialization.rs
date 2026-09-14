@@ -73,13 +73,15 @@ fn spec_with_cache(cache: CachePolicy) -> TrainingSpec {
 }
 
 /// Submit `spec`, claim it with a fresh [`JobWorker`], and drive it to
-/// completion — returning the completed job's own model id and whether ITS
-/// OWN `jobs.result` recorded run-metrics (`Some` only for a run that
-/// actually trained; `None` for a `Reused` cache hit — see this module's doc).
+/// completion — returning the completed job's own model id, whether ITS OWN
+/// `jobs.result` recorded run-metrics (`Some` only for a run that actually
+/// trained; `None` for a `Reused` cache hit — see this module's doc), and
+/// the result's own `cache_outcome` (P6: asserted directly by the callers
+/// below rather than inferred from the metrics flag alone).
 async fn submit_and_run(
     session: &Arc<jammi_ai::session::InferenceSession>,
     spec: TrainingSpec,
-) -> (String, bool) {
+) -> (String, bool, String) {
     let job = session.run_training_spec(spec).await.unwrap();
     let worker = JobWorker::new(session).expect("default worker intervals are valid");
     let claimed = session
@@ -105,10 +107,15 @@ async fn submit_and_run(
             .expect("a completed job has a result"),
     )
     .expect("a fine-tune job's result is a JobResult::Model");
-    let JobResult::Model { metrics, .. } = result else {
+    let JobResult::Model {
+        metrics,
+        cache_outcome,
+        ..
+    } = result
+    else {
         panic!("a training kind's result must be JobResult::Model, got {result:?}");
     };
-    (job.model_id.clone(), metrics.is_some())
+    (job.model_id.clone(), metrics.is_some(), cache_outcome)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -116,22 +123,31 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
     let (session, _dir) = session_with_training_data().await;
 
     // The FIRST submission is honestly always a miss (nothing to reuse yet):
-    // it must train for real — its own result carries metrics.
-    let (first_model_id, first_trained) =
+    // it must train for real — its own result carries metrics and reports
+    // `cache_outcome: "computed"` (P6: asserted directly, not inferred).
+    let (first_model_id, first_trained, first_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
     assert!(
         first_trained,
         "the first submission has nothing to reuse and must train for real"
     );
+    assert_eq!(first_cache_outcome, "computed");
 
     // The SECOND submission (same spec, same training-set digest) must be a
-    // cache HIT: its own result carries no metrics — the trainer never ran.
-    let (second_model_id, second_trained) =
+    // cache HIT: its own result carries no metrics, and its `cache_outcome`
+    // names the FIRST submission's own model id (P6) — the trainer never ran.
+    let (second_model_id, second_trained, second_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
     assert!(
         !second_trained,
         "the second submission (an exact definition-hash + anchors match) must be a cache HIT: \
          the trainer must not run a second time"
+    );
+    assert_eq!(
+        second_cache_outcome,
+        format!("reused:{first_model_id}"),
+        "a cache hit's own result must OBSERVABLY name the reused model, never merely be \
+         inferred from the absent metrics field"
     );
 
     assert_ne!(
@@ -164,7 +180,20 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
     assert!(first.definition_hash.is_some());
     assert_eq!(first.definition_hash, second.definition_hash);
     assert_eq!(first.input_anchors_json, second.input_anchors_json);
-    assert_eq!(first.manifest_path, second.manifest_path);
+    // P5 (fix round 1): the `FineTune` materialization records NO input
+    // anchor — the training-set digest it would otherwise have carried is
+    // already inside `definition_hash` (`ProducingDescriptor::FineTune::
+    // training_set_artifact_digest`), so a separate anchor was redundant,
+    // and pairing it with the fine-tune's own registered SOURCE name (a
+    // long-lived, mutable relation, never the ephemeral training-set table
+    // the digest actually names) was a false attestation. Pinned directly,
+    // not merely "equal to each other": both rows must carry the empty set.
+    assert_eq!(first.input_anchors_json.as_deref(), Some("[]"));
+    // `manifest_path` is not a `models` column (P7, migration 033 rewritten
+    // before merge): the sidecar path is always DERIVED from `artifact_path`
+    // (`ArtifactStore::read_model_materialization`'s own doc), so the two
+    // rows agreeing on `artifact_path` above already implies they agree on
+    // the derived sidecar path — there is no separate column left to compare.
 
     // Deleting one row leaves the prefix and the other model still resolves.
     catalog
@@ -186,9 +215,9 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
 async fn cache_bypass_never_reuses() {
     let (session, _dir) = session_with_training_data().await;
 
-    let (first_model_id, first_trained) =
+    let (first_model_id, first_trained, first_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
-    let (second_model_id, second_trained) =
+    let (second_model_id, second_trained, second_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Bypass)).await;
 
     assert!(
@@ -199,6 +228,8 @@ async fn cache_bypass_never_reuses() {
         second_trained,
         "Bypass never probes: the second run must train too, never short-circuiting"
     );
+    assert_eq!(first_cache_outcome, "computed");
+    assert_eq!(second_cache_outcome, "computed");
 
     let catalog = session.catalog();
     let first = catalog.get_model(&first_model_id).await.unwrap().unwrap();

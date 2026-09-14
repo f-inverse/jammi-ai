@@ -874,16 +874,21 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 
     // Two runs, each on its OWN session — the second must find the table
     // through the catalog, not through a registration the first left behind.
+    // The sessions themselves are kept (not discarded as temporaries) so the
+    // digest check below can query EACH one independently, after both
+    // materialize calls have returned.
+    let first_ctx = pinned_session(&store, &pin).await;
     let first = store
         .materialize_training_set(
-            &pinned_session(&store, &pin).await,
+            &first_ctx,
             pinned_spec(&source, &columns, "pairs", anchor.clone()),
         )
         .await
         .unwrap();
+    let second_ctx = pinned_session(&store, &pin).await;
     let second = store
         .materialize_training_set(
-            &pinned_session(&store, &pin).await,
+            &second_ctx,
             pinned_spec(&source, &columns, "pairs", anchor.clone()),
         )
         .await
@@ -902,28 +907,49 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 
     // The reuse path (`ResultStore::bind_result_table`, the in-tree binder
     // `fine_tune/training_set.rs` reaches through `materialize_training_set`
-    // — see `pinned_source_gate::IN_TREE_SESSION_BINDING_ALLOWLIST`'s doc)
+    // — see `call_graph_gate::FINE_TUNE_REACHABLE_BINDING_ALLOWLIST`'s doc)
     // must rebind the SAME immutable artifact bytes it wrote once, not
-    // merely the same name: an explicit digest check, not an inference from
-    // name equality.
-    let first_manifest = store
-        .read_materialization_manifest(
-            &jammi_db::storage::StorageUrl::parse(&first.record.parquet_path).unwrap(),
-        )
+    // merely the same name. Proven by reading the rows back through the
+    // SECOND, INDEPENDENT `SessionContext` (`second_ctx`) `second` bound its
+    // table on and comparing them against the first session's own read —
+    // never by reading `first`/`second`'s `parquet_path` sidecar twice: a
+    // `Reused` outcome carries the IDENTICAL path by construction
+    // (`second.table_name() == first.table_name()`, asserted above), so two
+    // `read_materialization_manifest` calls against that one shared path
+    // compare a file with itself regardless of what reuse actually did — a
+    // tautology a round-7 audit found here. Querying through two distinct
+    // `SessionContext`s is the only way to exercise `bind_result_table`'s
+    // OWN rebind twice with an independent read each time.
+    let order_by = jammi_db::store::training_set_order_by(&columns);
+    let first_rows = first_ctx
+        .sql(&format!(
+            "SELECT * FROM {} {order_by}",
+            first.sql_relation()
+        ))
         .await
         .unwrap()
-        .expect("a computed training set carries a materialization attestation");
-    let second_manifest = store
-        .read_materialization_manifest(
-            &jammi_db::storage::StorageUrl::parse(&second.record.parquet_path).unwrap(),
-        )
+        .collect()
+        .await
+        .unwrap();
+    let second_rows = second_ctx
+        .sql(&format!(
+            "SELECT * FROM {} {order_by}",
+            second.sql_relation()
+        ))
         .await
         .unwrap()
-        .expect("a reused training set's record still resolves an attestation");
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
-        first_manifest.artifact, second_manifest.artifact,
-        "the reuse path must rebind the identical immutable artifact digest, not merely the \
-         same name"
+        arrow::util::pretty::pretty_format_batches(&first_rows)
+            .unwrap()
+            .to_string(),
+        arrow::util::pretty::pretty_format_batches(&second_rows)
+            .unwrap()
+            .to_string(),
+        "the reuse path must resolve the identical rows through a SECOND, independent \
+         SessionContext — not merely the same name, and not the same sidecar path read twice"
     );
 
     // One table, not two.
@@ -969,8 +995,21 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 /// nanoseconds on their own, proving nothing about the suffix; a `tokio::
 /// join!` of exactly two also did not reproduce a collision under the
 /// mutation below on this host (`chrono::Utc::now()`'s effective resolution
-/// is finer than the gap between two cooperatively-scheduled calls) — a
-/// 64-way burst across 8 OS threads does, reliably.
+/// is finer than the gap between two cooperatively-scheduled calls). **The
+/// real discriminator is OS-thread PARALLELISM (`tokio::spawn` onto a
+/// multi-worker runtime), not the width 64 specifically**: a `tokio::spawn`
+/// burst of only TWO tasks on the same `worker_threads = 8` runtime also
+/// reproduces the race under the mutation below, non-deterministically —
+/// measured on this host at 4/30, 0/30, 5/30 and 8/30 collisions over four
+/// independent 30-run batches (17/120 overall, ~14%) — because a 2-way race
+/// only SOMETIMES lands both `chrono::Utc::now()` reads in the same
+/// nanosecond bucket on two separate OS threads, while a 64-way burst across
+/// 8 OS threads collides on every run measured (below): width increases the
+/// COLLISION PROBABILITY of the same underlying race, it is not itself a
+/// separate necessary condition. `join!`'s zero-collision result is
+/// consistent with this: two COOPERATIVELY SCHEDULED tasks on one OS thread
+/// (Tokio's own `join!` never spawns a second OS-thread-parallel task) never
+/// race on wall-clock reads at all, regardless of count.
 ///
 /// Executed as the contract's own RED-first mutation, not merely asserted:
 /// removing the `_{suffix}` segment from `create_table`'s name builder
@@ -982,6 +1021,19 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 /// unique constraint on `table_name` catching the collision the suffix
 /// exists to prevent, not merely a `HashSet` bookkeeping assertion in this
 /// test.
+///
+/// **This test is itself timing-sensitive, disclosed rather than hidden.**
+/// Measured on this host: the `sqlite` arm ALONE (its own process, its own
+/// `--test it -- create_table_names_a_concurrent_burst_uniquely_over_one_definition`
+/// invocation) fails deterministically under the mutation above, 5/5 runs. A
+/// round-7 audit run found the SAME `sqlite` arm can PASS once when co-run
+/// immediately after the `postgres` arm inside one `--test-threads=1`
+/// process — a warmed-up tokio thread pool (already-spun-up worker threads,
+/// different scheduling latency than a cold start) narrows the race window
+/// below what 64 concurrent `chrono::Utc::now()` reads reliably hit. Call
+/// the `sqlite` arm ALONE before treating a single co-run pass as this
+/// test's own green; a `--test-threads=1` full-file run's own pass is not,
+/// by itself, evidence the mutation was reverted.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

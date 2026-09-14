@@ -1233,7 +1233,7 @@ async fn delete_sidecar(store: &ResultStore, record: &ResultTableRecord) {
     handle.delete_if_exists(&sidecar).await.unwrap();
 }
 
-// ─── model_materialization (U3, #500): `probe_model_by_definition` ────────
+// ─── model_materialization (#500): `probe_model_by_definition` ────────────
 //
 // `FineTune`'s reuse key is the same one `TrainingSet` uses (definition hash
 // AND pinned equal anchors), restated over `models` because a fine-tuned
@@ -1269,8 +1269,8 @@ async fn register_bare_model(catalog: &Catalog, name: &str, version: i32) {
 
 /// Register a model row that already carries `artifact_path` — the shape a
 /// winning finalize CAS ([`Catalog::finish_job_with_model`]) leaves behind,
-/// which `record_model_materialization`'s ordering guard (P3') now requires
-/// before it will accept a definition hash for the row.
+/// which `record_model_materialization`'s ordering guard requires before it
+/// will accept a definition hash for the row.
 async fn register_finalized_model(
     catalog: &Catalog,
     name: &str,
@@ -1295,9 +1295,9 @@ async fn register_finalized_model(
 /// Stamp `definition_hash` directly via SQL, bypassing
 /// `record_model_materialization`'s finalize-CAS ordering guard — simulates a
 /// hash-bearing row whose `artifact_path` was never committed (a shape the
-/// guarded write path can no longer itself produce post-fix, but which P3's
-/// read-side predicate must still exclude defensively: a stale pre-fix row,
-/// or any other writer of the column).
+/// guarded write path can no longer itself produce, but which the read-side
+/// servability predicate must still exclude defensively: a row written by
+/// some other path, or any other writer of the column).
 async fn stamp_definition_hash_bypassing_the_finalize_guard(
     catalog: &Catalog,
     name: &str,
@@ -1444,9 +1444,10 @@ async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(back
         .is_none());
 }
 
-/// The cache-hit shape U3 builds toward: two DISTINCT model rows share one
-/// definition (a reuse chain), and the probe's tie-break is a deterministic
-/// TOTAL order in Rust (r32), never the catalog's raw `ORDER BY` — ties on
+/// The cache-hit shape a fine-tune reuse check builds toward: two DISTINCT
+/// model rows share one definition (a reuse chain), and the probe's
+/// tie-break is a deterministic TOTAL order in Rust, never the catalog's
+/// raw `ORDER BY` — ties on
 /// `created_at` (a real possibility at whatever timestamp resolution a
 /// backend renders) break on `catalog_pk` DESCENDING. `second`'s name is
 /// chosen lexicographically greater than `first`'s so the same row wins
@@ -1507,14 +1508,13 @@ async fn record_model_materialization_refuses_a_missing_row(backend: BackendKind
     );
 }
 
-// ─── Fix round 1, P3'/P3 (#500): the ordered write + the servable-set read ─
+// ─── (#500): the ordered write + the servable-set read ────────────────────
 
-/// P3' — RED at 3b3f88c2 (today's `record_model_materialization` carries no
-/// `artifact_path` guard at all, so this call SUCCEEDS): recording a
-/// definition hash against a row the finalize CAS has not yet committed is a
-/// typed refusal distinct from [`jammi_db::error::JammiError::ModelNotFound`]
-/// — the row exists, so a `NotFound` would be misleading; the refusal names
-/// exactly why (`JammiError::Model`).
+/// Recording a definition hash against a row the finalize CAS has not yet
+/// committed is a typed refusal distinct from
+/// [`jammi_db::error::JammiError::ModelNotFound`] — the row exists, so a
+/// `NotFound` would be misleading; the refusal names exactly why
+/// (`JammiError::Model`).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -1551,15 +1551,14 @@ async fn record_model_materialization_refuses_a_row_the_finalize_cas_has_not_com
     );
 }
 
-/// P3 — RED at 3b3f88c2 (`find_models_by_definition` carries only `hash +
-/// tenant`, so a hash-bearing/unfinalized row IS returned): a row that
-/// carries `definition_hash` but whose `artifact_path` was never committed
-/// is excluded from the servable set — never a candidate `find_models_by_definition`
-/// returns, and never a `probe_model_by_definition` hit even with exactly
-/// matching anchors. Such a row can only arise from a stale pre-fix write or
-/// a defensive-in-depth attacker of the column post-fix (the guarded
-/// `record_model_materialization` can no longer itself produce this shape —
-/// see the sibling test above), so the fixture stamps the column directly.
+/// A row that carries `definition_hash` but whose `artifact_path` was never
+/// committed is excluded from the servable set — never a candidate
+/// `find_models_by_definition` returns, and never a `probe_model_by_definition`
+/// hit even with exactly matching anchors. Such a row can only arise from a
+/// stale write predating the ordering guard or a defensive-in-depth writer
+/// of the column outside the guard (the guarded `record_model_materialization`
+/// can no longer itself produce this shape — see the sibling test above), so
+/// the fixture stamps the column directly.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -1780,8 +1779,8 @@ async fn probe_model_by_definition_tenant_fan_out(backend: BackendKind) {
     );
 
     // Tenant D's own row exists (same hash, same anchors) but is unservable
-    // (P3: artifact_path IS NULL) -- it must never be the hit, and D must
-    // still fall through to the global row rather than getting a miss.
+    // (artifact_path IS NULL) -- it must never be the hit, and D must still
+    // fall through to the global row rather than getting a miss.
     let found_d = cat_d
         .probe_model_by_definition(shared_hash, &anchors)
         .await
@@ -1789,7 +1788,7 @@ async fn probe_model_by_definition_tenant_fan_out(backend: BackendKind) {
         .expect("an unservable own row must fall through to the global candidate, not miss");
     assert_eq!(
         found_d.model_id, name_global,
-        "P3's servability predicate must exclude tenant D's own unfinalized row \
+        "the servability predicate must exclude tenant D's own unfinalized row \
          and fall through to the global one"
     );
 }

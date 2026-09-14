@@ -28,8 +28,11 @@ files. Base: `main` @ `4ecc0230` (PR #501, the jobs fleet, merged). PR-K = #502 
 - `crates/jammi-server/src/runtime.rs`: DIST-1 peer routes, OPS C2–C5, U5a, U5b-1b-i (the
   peer-only listener's decode cap), U8a.
 - `crates/jammi-server/tests/it/{tenant_isolation_oracle.rs, api_freeze_baseline.txt, main.rs}`: DIST-1 PEER bucket, then U5a GANG bucket; mod lines DIST/OPS/U5a.
-- `crates/jammi-db/src/catalog/{migrations.rs, ../../tests/it/migrations.rs}`: every migration-appending unit (OPS, GRAPH, DELTA, U3, **U5b-1a**
-  `instances_peer_addr_result_root`, **U5b-1b-ii** `jobs_assembly_failures_next_after`, U8b) — next free number at rebase, both pin sites, second merger renumbers. U5b-0's leaf-digest
+- `crates/jammi-db/src/catalog/{migrations.rs, ../../tests/it/migrations.rs}`: every migration-appending unit (OPS, GRAPH, DELTA, U3 — the standard two pin sites), **U5b-1a**
+  `instances_peer_addr_result_root`, **U5b-1b-ii** `jobs_assembly_failures_next_after`, and U8b
+  `compute_cluster_state` (each three pin sites: the standard two PLUS an ordered-after oracle —
+  U8b's asserts ordered-after BOTH of PR-C(67)'s migrations, since PR-D lands after PR-C(67)
+  merges) — next free number at rebase, second merger renumbers. U5b-0's leaf-digest
   inventory is sidecar-object-only and appends no migration.
 - `crates/jammi-wire/proto/jammi/v1/error.proto` + `src/error.rs`: DIST-1 `unavailable = 30`, DELTA 32–36, GRAPH 37–38, then 67's typed refusals at the next free tags.
 - `crates/jammi-db/src/catalog/jobs_repo.rs`: OPS `release_job_lease`, GRAPH `claim_next`, U5a

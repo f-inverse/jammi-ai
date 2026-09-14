@@ -190,6 +190,111 @@ async fn start_training_runs_to_completion_over_the_wire() {
     let _ = server.handle.await;
 }
 
+/// P6 (U3 fix round 1) end to end: `ModelResult.cache_outcome` round-trips
+/// through the SERVER's own wire conversion
+/// (`crates/jammi-server/src/grpc/job.rs`,
+/// `job_status_response_from_record`), not merely through the engine's
+/// catalog-JSON layer `fine_tune_materialization.rs` (jammi-ai) already pins.
+/// Two submissions of the identical `FineTuneSpec` with `cache = USE`: the
+/// first has nothing to reuse and must train for real, reporting
+/// `cache_outcome: "computed"`; the second is an exact definition-hash +
+/// anchors match and must be a cache HIT, reporting
+/// `cache_outcome: "reused:{first_model_id}"` — read off the actual
+/// `JobStatusResponse` a live `JobService::job_status` call returns, over a
+/// real loopback gRPC connection, so this pins the wire type
+/// (`pb::ModelResult`) this unit added the field to, not the engine enum
+/// ai-core's own suite already covers.
+///
+/// Chosen over `grpc_remote_session.rs` (that file's fixtures own the
+/// embedded/remote session-parity concern, not `JobService`'s own wire
+/// shape) and over reusing `jammi-ai`'s internal
+/// `fine_tune_materialization.rs` fixture directly (that crate has no wire
+/// layer at all — its assertions read `after.result` JSON off the catalog,
+/// never a `pb::ModelResult`): this file already hosts the `JobService`
+/// FineTune-over-the-wire submit/poll harness (`start_request`,
+/// `poll_until_terminal`) this test only needs to parameterise on `cache`
+/// and a smaller epoch count for speed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fine_tune_cache_hit_reports_cache_outcome_reused_over_the_wire() {
+    use jammi_server::grpc::proto::inference::CachePolicy;
+    use jammi_server::grpc::proto::job::job_status_response::Result as WireResult;
+    use jammi_server::grpc::proto::training::FineTuneConfig;
+
+    let server = start_engine_server().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    // A single epoch over the tiny fixture + tiny model — this test submits
+    // the same spec twice, so it halves each run's already-small cost.
+    let cache_use_request = || {
+        let mut request = start_request();
+        request.cache = CachePolicy::Use as i32;
+        request.config = Some(FineTuneConfig {
+            epochs: Some(1),
+            batch_size: Some(8),
+            warmup_steps: Some(0),
+            ..FineTuneConfig::default()
+        });
+        request
+    };
+
+    let first_start = client
+        .submit_job(cache_use_request())
+        .await
+        .expect("submit_job (first, cache=Use)")
+        .into_inner();
+    let first_resp = poll_until_terminal(&mut client, &first_start.job_id).await;
+    assert_eq!(
+        first_resp.status, "completed",
+        "the first submission has nothing to reuse and must train for real: got '{}' (error: {})",
+        first_resp.status, first_resp.error
+    );
+    let first_cache_outcome = match first_resp.result {
+        Some(WireResult::Model(m)) => m.cache_outcome,
+        other => panic!("expected a Model result for the fine-tune kind, got {other:?}"),
+    };
+    assert_eq!(
+        first_cache_outcome, "computed",
+        "the first submission trains for real: its OWN wire result must report \"computed\""
+    );
+
+    let second_start = client
+        .submit_job(cache_use_request())
+        .await
+        .expect("submit_job (second, cache=Use)")
+        .into_inner();
+    let second_resp = poll_until_terminal(&mut client, &second_start.job_id).await;
+    assert_eq!(
+        second_resp.status, "completed",
+        "the second submission (an exact definition-hash + anchors match) must complete via \
+         reuse: got '{}' (error: {})",
+        second_resp.status, second_resp.error
+    );
+    let second_cache_outcome = match second_resp.result {
+        Some(WireResult::Model(m)) => m.cache_outcome,
+        other => panic!("expected a Model result for the fine-tune kind, got {other:?}"),
+    };
+    assert_eq!(
+        second_cache_outcome,
+        format!("reused:{}", first_start.output_model_id),
+        "a cache hit's own wire result must OBSERVABLY name the reused model, over the actual \
+         JobService.job_status response the server sent"
+    );
+    assert_ne!(
+        first_start.output_model_id, second_start.output_model_id,
+        "each submission completes under its OWN model name (two rows), never re-using the \
+         first job's name"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
     use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;

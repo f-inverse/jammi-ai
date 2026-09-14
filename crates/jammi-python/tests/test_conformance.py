@@ -416,6 +416,8 @@ _RECONCILE_REPORT_DICT_KEYS = {
     "unattributed_count",
     "damaged",
     "damaged_count",
+    "referenced",
+    "referenced_count",
     "truncated",
     "bytes_reclaimed",
 }
@@ -467,6 +469,8 @@ def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
         unattributed_count=12,
         damaged=["d1"],
         damaged_count=33,
+        referenced=["r1", "r2"],
+        referenced_count=44,
         truncated=True,
         bytes_reclaimed=123456,
     )
@@ -489,6 +493,8 @@ def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
         "unattributed_count": 12,
         "damaged": ["d1"],
         "damaged_count": 33,
+        "referenced": ["r1", "r2"],
+        "referenced_count": 44,
         "truncated": True,
         "bytes_reclaimed": 123456,
     }, f"every field must round-trip unchanged: {projected}"
@@ -514,7 +520,14 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
             )
             assert report["applied"] is False
             assert report["scope"] == expected_scope
-            for key in ("rows_failed", "orphans", "pending", "unattributed", "damaged"):
+            for key in (
+                "rows_failed",
+                "orphans",
+                "pending",
+                "unattributed",
+                "damaged",
+                "referenced",
+            ):
                 assert report[key] == [], f"a freshly-opened engine reports nothing: {report}"
             for key in (
                 "rows_failed_count",
@@ -522,6 +535,7 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
                 "pending_count",
                 "unattributed_count",
                 "damaged_count",
+                "referenced_count",
             ):
                 assert report[key] == 0, f"a freshly-opened engine reports nothing: {report}"
             assert report["truncated"] is False

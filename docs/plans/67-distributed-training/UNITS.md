@@ -350,10 +350,12 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ### U5b-1a — Membership substrate (PR-C commit 3a)
 
 - **files_in_scope**: (db) `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr_result_root`
-  migration, number at rebase, three pin sites incl. an ordered-after oracle on both backends —
-  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern,
-  `tests/it/migrations.rs:1284`, repeated at the new migration's own number, `wt-C:
-  tests/it/migrations.rs:1572`), `catalog/jobs_repo.rs` (`upsert_instance` gains `peer_addr` + a
+  migration, number at rebase, three pin sites incl. the ordered-after oracle in
+  `crates/jammi-db/tests/it/migrations.rs` (added by U5a-1) — the same
+  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern
+  (`tests/it/migrations.rs:1284`, on `main` today) repeated for this migration, cited by
+  construct rather than by an offset on a branch this fold cannot read), `catalog/jobs_repo.rs`
+  (`upsert_instance` gains `peer_addr` + a
   canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
   by-id resolution verb, fresh-only under the same margin, no kind/root/self filter — is the
   address-resolution surface DESIGN.md §4 names; `list_gang_members(GangListing { kind,

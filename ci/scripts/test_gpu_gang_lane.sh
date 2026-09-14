@@ -62,11 +62,16 @@ GANG_SH="$DIR/runpod_gpu_gang.sh"
 LIB_SH="$DIR/runpod_lib.sh"
 GANG_YML="$REPO_ROOT/.github/workflows/gpu-gang.yml"
 DEV_GPU_MD="$REPO_ROOT/docs/maintainer/dev-gpu.md"
+PROVE_ONCE_PY="$DIR/check_gpu_prove_once.py"
 
 PASS=0
 FAIL=0
-ok()  { PASS=$((PASS + 1)); echo "ok   - $*"; }
-bad() { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
+ok()   { PASS=$((PASS + 1)); echo "ok   - $*"; }
+bad()  { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
+# note() is uncounted advisory output -- never a pass, never a fail; used
+# only where a real environment fact (root bypasses file permissions) makes
+# a fixture unable to establish anything one way or the other here.
+note() { echo "note - $*"; }
 
 SANDBOX="$(mktemp -d)"
 NETPROBE_LOG="$SANDBOX/netprobe.log"
@@ -438,12 +443,70 @@ fi
 # block with its own never-vacuous writer, in the same diff as that writer —
 # a permanent "no schedule" assertion would then reject the correct end
 # state this repo is meant to reach.
+#
+# Read through the SAME `on:` block reader `check_gpu_prove_once.py`'s own
+# P7 (push:/workflow_call: absence) reads through -- shelled out to via its
+# `--read-on-block` CLI, never a second, independently-drifting regex. A
+# text grep for `schedule:` is evaded by a quoted `"schedule":` key or a
+# flow-style `on: {...}` map, and reports "no schedule key" on a file it
+# could not even open; the shared reader instead quote-normalizes child
+# keys and FAILS LOUD (never "absent") on anything it cannot examine.
 # ============================================================================
-if grep -n '^\s*schedule:' "$GANG_YML" >/dev/null 2>&1; then
+gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML")"
+gang_on_rc=$?
+if [ "$gang_on_rc" -ne 0 ]; then
+  bad "G7: cannot examine gpu-gang.yml's on: block -- $gang_on_keys"
+elif printf '%s\n' "$gang_on_keys" | grep -qx schedule; then
   bad "G7: gpu-gang.yml carries a schedule: key -- between U7b-A1-pull's merge and U7b-A3's re-add, NO cron of any kind may fire this paid two-GPU lane"
 else
-  ok "G7: gpu-gang.yml carries no schedule: key (hermetic, source-text check)"
+  ok "G7: gpu-gang.yml carries no schedule: key (read through the shared on: block reader)"
 fi
+
+# G7 fixture: a QUOTED "schedule": key is read the same as a bare one --
+# quote-normalization must not let a re-add through unnoticed.
+g7_quoted="$SANDBOX/g7-quoted-schedule.yml"
+printf 'on:\n  "schedule":\n    - cron: "30 8 * * *"\n  workflow_dispatch:\n' > "$g7_quoted"
+g7q_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_quoted")"
+g7q_rc=$?
+if [ "$g7q_rc" -eq 0 ] && printf '%s\n' "$g7q_keys" | grep -qx schedule; then
+  ok "G7: a quoted \"schedule\": key is read as schedule (quote-normalized, never silently dropped)"
+else
+  bad "G7: expected a quoted \"schedule\": key to be read as schedule; got rc=${g7q_rc} keys=${g7q_keys}"
+fi
+
+# G7 fixture: a FLOW-STYLE on: {...} map cannot be examined -- refused, not
+# read as "no schedule key present".
+g7_flow="$SANDBOX/g7-flow-style.yml"
+printf 'on: {workflow_dispatch: {}}\n' > "$g7_flow"
+g7f_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_flow" 2>&1)"
+g7f_rc=$?
+if [ "$g7f_rc" -ne 0 ] && [[ "$g7f_out" == *"flow-style"* ]]; then
+  ok "G7: a flow-style on: {...} map is refused as unreadable, naming the shape (cannot examine, never a silent pass)"
+else
+  bad "G7: expected a flow-style on: map to be refused naming 'flow-style'; got rc=${g7f_rc} out=${g7f_out}"
+fi
+
+# G7 fixture: a mode-000 (unreadable) FILE is FAIL, never "no schedule key".
+# NOTE: root bypasses UNIX file permissions outright, so this fixture can
+# only establish the property when the invoking user is not root (this
+# repo's own CI lane runs `test_gpu_gang_lane.sh` inside a container image,
+# which runs as root by default) -- guarded with `note()`, never asserted
+# as a silent pass, so a root run never claims this property was checked.
+g7_unreadable="$SANDBOX/g7-unreadable.yml"
+printf 'on:\n  workflow_dispatch:\n' > "$g7_unreadable"
+chmod 000 "$g7_unreadable"
+if [ -r "$g7_unreadable" ]; then
+  note "G7: skipping the mode-000-file oracle -- the current user (euid $(id -u)) can read a mode-000 file (root or an ACL bypass), so this fixture cannot establish the unreadable-file property here"
+else
+  g7u_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_unreadable" 2>&1)"
+  g7u_rc=$?
+  if [ "$g7u_rc" -ne 0 ] && [[ "$g7u_out" == *"cannot read file"* ]]; then
+    ok "G7: an unreadable (mode-000) file is FAILed by name, never read as 'no schedule key'"
+  else
+    bad "G7: expected a mode-000 file to FAIL naming 'cannot read file'; got rc=${g7u_rc} out=${g7u_out}"
+  fi
+fi
+chmod 644 "$g7_unreadable"
 
 # ============================================================================
 # G4: the cost bound is what the mechanism produces.

@@ -453,6 +453,34 @@ class PaidPodLaneTest(unittest.TestCase):
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
         self.assertIn("cannot read", "\n".join(findings))
 
+    def test_quoted_push_key_still_fails_p7(self):
+        # X1 (closing audit #3, F1): the CHILD key regex used to be
+        # unquoted-only (`^  ([A-Za-z0-9_]+):`), so a quoted `"push":`
+        # trigger was silently dropped from the returned key list and P7
+        # never saw it -- verified against ea0e30c9: `read_top_level_on_block`
+        # returned only `['workflow_dispatch']` for this exact fixture, with
+        # `push` missing. The shared reader now quote-normalizes child keys
+        # (`push:`/`"push":`/`'push':` are the same key), so this must fail
+        # exactly like the unquoted form in `test_push_trigger_on_the_gang_
+        # workflow_fails` above.
+        broken = GANG_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:", 'on:\n  "push":\n    branches: [main]\n  workflow_dispatch:'
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        joined = "\n".join(findings)
+        self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
+
+    def test_unreadable_child_line_under_on_is_refused_not_dropped(self):
+        # A line at the `on:` block's own child indentation that matches
+        # none of `key:`/`"key":`/`'key':` (e.g. a merge key or a list item
+        # where a mapping is expected) is "cannot examine", never silently
+        # skipped the way a mis-shaped key used to be.
+        broken = GANG_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:", "on:\n  <<: *anchors\n  workflow_dispatch:"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        self.assertIn("cannot examine", "\n".join(findings))
+
     def test_two_invokers_of_the_gang_driver_fail(self):
         second = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: second-gang-renter")
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"second-gang-renter.yml": second}))

@@ -645,11 +645,24 @@ def check_promoting_if(expr: str, gate_job: str, tag_family: str | None = None) 
 
 
 # --------------------------------------------------------------------------- #
-# on: block reader (P1's fail-loud-on-unreadable rule).
+# on: block reader (P1's fail-loud-on-unreadable rule). SHARED: this is the
+# one reader `check_p7_paid_pod_lanes` (push/workflow_call absence) and
+# `test_gpu_gang_lane.sh`'s G7 (schedule absence) both read the `on:` block
+# through -- G7 shells out to this module's `--read-on-block` CLI (below)
+# rather than carrying a second, independently-drifting regex.
 # --------------------------------------------------------------------------- #
+_ON_CHILD_KEY_RE = re.compile(r'^(?:"([A-Za-z0-9_]+)"|\'([A-Za-z0-9_]+)\'|([A-Za-z0-9_]+)):')
+
+
 def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
     """(trigger_keys, error). A quoted `"on":`/`'on':` or flow-style
-    `on: {...}` is a "cannot read" FAIL, never a silent pass.
+    `on: {...}` is a "cannot read" FAIL, never a silent pass. Child keys
+    are read quote-normalized -- `push:`, `"push":` and `'push':` are the
+    SAME key -- and a line at the child keys' own indentation that matches
+    none of those three shapes is itself a "cannot examine" FAIL naming the
+    unreadable line, never a silently dropped key (a deeper-indented line
+    is nested content under a child key and is skipped, never examined as
+    a sibling).
     """
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -668,22 +681,44 @@ def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
         rest = re.sub(r"\s*#.*$", "", line[len("on:") :]).strip()
         if rest == "":
             keys: list[str] = []
+            child_indent: int | None = None
             for j in range(i + 1, len(lines)):
                 l2 = lines[j]
                 if l2.strip() == "" or l2.strip().startswith("#"):
                     continue
-                if re.match(r"^\S", l2):
+                indent = len(l2) - len(l2.lstrip(" "))
+                if indent == 0:
                     break
-                m2 = re.match(r"^  ([A-Za-z0-9_]+):", l2)
+                if child_indent is None:
+                    child_indent = indent
+                if indent > child_indent:
+                    continue  # nested content under a child key -- not a sibling
+                if indent < child_indent:
+                    break  # dedented past the on: block
+                m2 = _ON_CHILD_KEY_RE.match(l2.strip())
                 if m2:
-                    keys.append(m2.group(1))
-                elif not re.match(r"^  ", l2):
-                    break
+                    keys.append(next(g for g in m2.groups() if g is not None))
+                else:
+                    return None, (
+                        f"on: block child line is unreadable -- cannot examine: {l2.strip()!r}"
+                    )
             return keys, None
         if rest.startswith("{") or rest.startswith("["):
             return None, "on: is flow-style -- cannot read"
         return [rest], None
     return None, "no top-level on: block found"
+
+
+def read_top_level_on_block_from_path(path: Path) -> tuple[list[str] | None, str | None]:
+    """(trigger_keys, error). Wraps `read_top_level_on_block` with the
+    FILE-level fail-loud rule: an unreadable file (missing, permission
+    denied, not valid UTF-8) is FAIL, never "no key" -- the same doctrine
+    the block reader already holds a readable `on:` block to."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"cannot read file {path}: {exc}"
+    return read_top_level_on_block(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -2007,7 +2042,30 @@ def run_gate(
     return findings
 
 
+def _cli_read_on_block(path: Path) -> int:
+    """`--read-on-block <path>` CLI form of the shared `on:` block reader
+    (X1): prints each top-level trigger key on its own line and exits 0, or
+    prints the reader's own "cannot read"/"cannot examine" message to
+    stderr and exits 1 -- an unreadable path is the same FAIL, never a
+    silent "no key". `test_gpu_gang_lane.sh`'s G7 shells out to this exact
+    CLI so the bash lane suite and this gate's own P7 arm read the `on:`
+    block through one function, never two independently-drifting regexes."""
+    keys, err = read_top_level_on_block_from_path(path)
+    if err is not None:
+        print(err, file=sys.stderr)
+        return 1
+    for k in keys or []:
+        print(k)
+    return 0
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--read-on-block":
+        if len(argv) != 2:
+            print("usage: check_gpu_prove_once.py --read-on-block <path>", file=sys.stderr)
+            return 2
+        return _cli_read_on_block(Path(argv[1]))
     notes: list[str] = []
     findings = run_gate(notes=notes)
     for n in notes:

@@ -4,30 +4,44 @@
 //!
 //! This module freezes the wire (`jammi.v1.gang`, see `gang.proto`), the
 //! wire-level K2 edges (`world == 0`, `rank >= world`) decided before any row
-//! is ever read, and this handler's own full I-GANG decision: `get_job_for_rank`
-//! for the row predicate, `resolve_training_set_identity_classified` for the
-//! `world_size > 1` sidecar verify, and `fresh_instance` for the
-//! coordinator's own liveness. Every determinant collapses to the SAME
-//! `FailedPrecondition` status with a FIXED message (non-disclosure) — the
-//! listener discloses neither a job's existence, claimant, nor attempt.
-//! Having decided every determinant and found no reason to refuse, this
-//! handler still has no `HostAdmission` session to hand the call to, so it
-//! ends `Unimplemented`: a call satisfying EVERY I-GANG determinant still
-//! reaches the handler ... and, having no `HostAdmission` session to hand
-//! the call to, returns `Unimplemented`.
+//! is ever read, and this handler's own full I-GANG decision for the
+//! `world_size == 1` lattice this unit ships: `get_job_for_rank` for the row
+//! predicate and `fresh_instance` for the coordinator's own liveness. Every
+//! determinant collapses to the SAME `FailedPrecondition` status with a
+//! FIXED message (non-disclosure) — the listener discloses neither a job's
+//! existence, claimant, nor attempt. Having decided every determinant and
+//! found no reason to refuse, this handler still has no `HostAdmission`
+//! session to hand the call to, so it ends `Unimplemented`: a call
+//! satisfying EVERY I-GANG determinant still reaches the handler ... and,
+//! having no `HostAdmission` session to hand the call to, returns
+//! `Unimplemented`.
 //! `HostAdmission` itself (the admit-and-hold session, drain,
 //! re-verification) is built on top of this handler once it exists
 //! (docs/plans/67-distributed-training/UNITS.md § U5a-2).
 //!
-//! **The lattice is keyed on the ROW's own `world_size`**, never the
-//! caller's `Assign.world`: `row.world_size > 1` gates the pair conjunct and
-//! the sidecar verify, and `assign.world != row.world_size` is itself an
-//! I-GANG refusal (the SAME fixed message as every other one) — see
-//! [`RankAdmissionRow::world_size`]'s own doc for why a caller-keyed gate is
-//! unsound.
+//! **This unit ships the `world_size == 1` lattice only.** `row.world_size`
+//! (`jammi_db::catalog::jobs_repo::WorldSizeFact`) is a ROW FACT, decoded
+//! from the SAME `spec` JSON the claiming worker reconstructs its run from —
+//! never the caller's own `Assign.world`. A `spec` column that does not
+//! decode a `world_size` at all is likewise a row fact, never a fault of the
+//! read that found it (see [`GangRefusalReason::SpecUndecodable`]).
+//! `assign.world != row.world_size` is itself an I-GANG refusal (the SAME
+//! fixed message as every other one — see [`RankAdmissionRow::world_size`]'s
+//! own doc for why a caller-keyed gate is unsound); separately, a row whose
+//! own `world_size` disagrees with `1` refuses the SAME way EVEN WHEN the
+//! caller's `Assign.world` agrees with it (see
+//! [`GangRefusalReason::MultiHostUnsupported`]) — the training-set pair
+//! conjunct and its sidecar verify that would admit a genuine multi-host row
+//! are `HostAdmission`'s to build (docs/plans/67-distributed-training/UNITS.md
+//! § U5a-2); this handler never attempts them.
 //!
 //! **A catalog fault during admission is `Unavailable`, never
 //! `FailedPrecondition`**: see `admission_catalog_fault`.
+//!
+//! **I-GANG derives tenant from the row, never ambient admin scope**
+//! (§I1(a)) — this handler refuses outright, before any row is even read,
+//! whenever [`TenantBinding::is_admin_scope`] is ambient: see
+//! [`GangRefusalReason::AdminScope`].
 //!
 //! **`test-hooks` non-disclosure introspection**: behind
 //! `#[cfg(feature = "test-hooks")]`, `GangServer::last_refusal_reason`
@@ -52,7 +66,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::jobs_repo::RankAdmissionRow;
+use jammi_db::catalog::jobs_repo::{RankAdmissionRow, WorldSizeFact};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
 use jammi_db::error::JammiError;
@@ -66,15 +80,15 @@ use tokio_stream::StreamExt;
 
 use crate::grpc::proto::gang::gang_service_server::GangService;
 use crate::grpc::proto::gang::{rank_control, RankControl, RankEvent};
-use crate::grpc::wire::map_engine_error;
 
-/// §I1 Non-disclosure: every I-GANG refusal — row absent, wrong status,
-/// wrong claimant, wrong attempt, lease not live, the caller's `Assign.world`
-/// not matching the row's own `world_size`, the training-set pair
-/// missing/unresolved for `world_size > 1`, or the coordinator's own
-/// `instances` row not fresh — collapses to this ONE status with this ONE
-/// fixed message. Never interpolate a job id, a claimant, or a reason into
-/// it: that is exactly the disclosure this property forbids.
+/// §I1 Non-disclosure: every I-GANG refusal — ambient admin scope, row
+/// absent, wrong status, wrong claimant, wrong attempt, lease not live, an
+/// undecodable `world_size`, the caller's `Assign.world` not matching the
+/// row's own `world_size`, a row whose own `world_size` names more than one
+/// rank, or the coordinator's own `instances` row not fresh — collapses to
+/// this ONE status with this ONE fixed message. Never interpolate a job id,
+/// a claimant, or a reason into it: that is exactly the disclosure this
+/// property forbids.
 const I_GANG_REFUSAL_MESSAGE: &str = "gang admission refused";
 
 fn i_gang_refused() -> Status {
@@ -97,6 +111,12 @@ fn i_gang_refused() -> Status {
 /// there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GangRefusalReason {
+    /// [`TenantBinding::is_admin_scope`] was ambient when this call reached
+    /// the handler — I-GANG derives tenant from the row, never ambient admin
+    /// scope, so this is decided before any row is even read.
+    AdminScope,
+    /// No row exists for `assign.job_id`.
+    NotFound,
     /// The row was not `status = 'running'`.
     NotRunning,
     /// `claimed_by` did not match `assign.coordinator_instance_id`.
@@ -105,26 +125,19 @@ pub enum GangRefusalReason {
     WrongAttempt,
     /// The lease was not live (`NOT(lease_expired_clause)` was false).
     LeaseDead,
-    /// No row exists for `assign.job_id`.
-    NotFound,
-    /// `assign.world != row.world_size`.
+    /// The row's `spec` column did not decode a `world_size`
+    /// (`WorldSizeFact::Undecodable`) — a row fact about the content this
+    /// claimant wrote, never a fault of the read that found it.
+    SpecUndecodable,
+    /// `assign.world != row.world_size` (the row's own `world_size`
+    /// decoded successfully).
     WorldMismatch,
-    /// `row.world_size > 1` and the training-set pair
-    /// (`training_set_ref`/`training_set_location`) was not filled.
-    TrainingSetPairMissing,
-    /// The strict tenant-pinned resolver found no `result_tables` row for
-    /// this job's own tenant at `training_set_location` — whether because no
-    /// such row exists at all, or because it belongs to another tenant
-    /// (§I1(b)'s tenant-isolation determinant; the strict predicate does not
-    /// distinguish the two, and neither does this reason).
-    TrainingSetOtherTenant,
-    /// A `result_tables` row was found for this job's own tenant, but its
-    /// `status` was not `ready`.
-    TrainingSetNotReady,
-    /// The row was `ready`, but its sidecar manifest did not verify
-    /// `training_set_ref` (absent, unreadable, or a genuine mismatch — the
-    /// sidecar verify's own admission-time collapse).
-    TrainingSetDigestMismatch,
+    /// `assign.world == row.world_size`, but that shared value is not `1`
+    /// — this unit ships the `world_size == 1` lattice only; the
+    /// training-set pair conjunct and its sidecar verify that would admit a
+    /// genuine multi-host row are `HostAdmission`'s to build
+    /// (docs/plans/67-distributed-training/UNITS.md § U5a-2).
+    MultiHostUnsupported,
     /// The coordinator's own `instances` row was absent or stale
     /// (`Catalog::fresh_instance` returned `false`).
     CoordinatorNotFresh,
@@ -230,23 +243,25 @@ impl GangRefusalHandle {
 }
 
 /// §I3/§I4's transient class: a genuine catalog fault reached DURING
-/// admission — `Catalog::get_job_for_rank`'s own read, or
-/// `Catalog::get_result_table_for_tenant`'s own read inside the
-/// `world_size > 1` sidecar lookup, ERRORING rather than simply finding no
-/// row — is `Unavailable`, never [`map_engine_error`]'s generic mapping. A
-/// raw catalog-backend fault surfaces as `JammiError::BackendDriver`, an arm
-/// `map_engine_error` has no case for — it would fall through to that
-/// function's own `other => Internal` catch-all and never tell a retrying
-/// caller this was transient. This is the ADMISSION-time classification; the
-/// mid-stream three-way split between `Refuted` / `Unavailable` /
-/// `StoreUnavailable` at RE-VERIFICATION is built with `HostAdmission`
-/// (docs/plans/67-distributed-training/UNITS.md § U5a-2) once an admitted
-/// session exists to re-verify inside. Deliberately NOT applied to
-/// `Catalog::fresh_instance`'s own read (out of this ruling's stated scope:
-/// "the `get_job_for_rank` / training-set lookup erroring") or to
-/// `ResultStore::read_materialization_manifest` erroring (the sidecar
-/// verify's own admission-time collapse to `FailedPrecondition` for
-/// "unresolvable / unverifiable on this host", unchanged by this ruling).
+/// admission — `Catalog::get_job_for_rank`'s own read or
+/// `Catalog::fresh_instance`'s own read ERRORING rather than simply finding
+/// no row / no fresh instance — is `Unavailable`, never `map_engine_error`'s
+/// generic mapping. A raw catalog-backend fault surfaces as
+/// `JammiError::BackendDriver`, an arm `map_engine_error` has no case for —
+/// it would fall through to that function's own `other => Internal`
+/// catch-all and never tell a retrying caller this was transient. Every
+/// admission-time catalog read on the `RunRank` path uses this SAME
+/// classification; `map_engine_error` is never called on this path. This is
+/// the ADMISSION-time classification; the mid-stream three-way split between
+/// `Refuted` / `Unavailable` / `StoreUnavailable` at RE-VERIFICATION is built
+/// with `HostAdmission` (docs/plans/67-distributed-training/UNITS.md §
+/// U5a-2) once an admitted session exists to re-verify inside. This unit's
+/// handler never reaches `Catalog::get_result_table_for_tenant` or
+/// `ResultStore::read_materialization_manifest` (the training-set sidecar
+/// lookup `resolve_training_set_identity_classified` still uses this same
+/// classification for, as a standalone, directly-tested primitive —
+/// `HostAdmission`'s to call once it exists, docs/plans/67-distributed-training/UNITS.md
+/// § U5a-2).
 fn admission_catalog_fault(err: JammiError) -> Status {
     tracing::warn!(
         error = %err,
@@ -301,6 +316,17 @@ impl GangService for GangServer {
             return Err(Status::invalid_argument("rank must be less than world"));
         }
 
+        // I-GANG derives tenant from the row, never ambient admin scope
+        // (§I1(a)) — this holds for the WHOLE handler, not merely a
+        // tenant-scoped catalog read it might one day perform: a call
+        // reaching this handler while wrapped in admin scope is refused
+        // outright, before any row is even read, the same fixed way every
+        // other determinant refuses.
+        if TenantBinding::is_admin_scope() {
+            self.record_refusal(GangRefusalReason::AdminScope);
+            return Err(i_gang_refused());
+        }
+
         // The row predicate: primary-key-only, no tenant predicate —
         // `Catalog::get_job_for_rank` never reads `assign.job_id`'s tenant
         // from the caller (I-GANG: tenant is derived from the row itself,
@@ -335,64 +361,51 @@ impl GangService for GangServer {
             return Err(i_gang_refused());
         }
 
+        // The row's own `world_size` is a ROW FACT
+        // (`jammi_db::catalog::jobs_repo::WorldSizeFact`), never a fault of
+        // the read that found it: a `spec` column that does not decode a
+        // `world_size` at all refuses the SAME fixed way every other
+        // determinant does, counted against the attempt budget like every
+        // refusal — never `admission_catalog_fault`, which is reserved for
+        // the read ITSELF faulting (`get_job_for_rank` returning `Err`).
+        let world_size = match row.world_size {
+            WorldSizeFact::Undecodable => {
+                self.record_refusal(GangRefusalReason::SpecUndecodable);
+                return Err(i_gang_refused());
+            }
+            WorldSizeFact::Decoded(n) => n,
+        };
+
         // The lattice is keyed on the ROW's own `world_size`, never the
-        // caller's `assign.world` — a caller naming
-        // a `world` the row does not agree with is itself a refusal, with
-        // the SAME fixed message every other I-GANG determinant refuses
-        // with. This runs BEFORE the `row.world_size > 1` gate below so a
-        // `world_size > 1` job assigned at a mismatched `world` (in either
-        // direction) never reaches — and never skips past — the pair
-        // conjunct or the sidecar verify by having its caller-supplied
-        // `world` disagree with the row.
-        if assign.world != row.world_size {
+        // caller's `assign.world` — a caller naming a `world` the row does
+        // not agree with is itself a refusal, with the SAME fixed message
+        // every other I-GANG determinant refuses with. This runs BEFORE the
+        // `world_size != 1` gate below so a multi-host job assigned at a
+        // mismatched `world` (in either direction) is distinguished from one
+        // whose caller-supplied `world` genuinely agrees with the row.
+        if assign.world != world_size {
             self.record_refusal(GangRefusalReason::WorldMismatch);
             return Err(i_gang_refused());
         }
 
-        // §I1(b), only for the ROW's own `world_size > 1` (never
-        // `assign.world`, which is now known equal to `row.world_size` by
-        // the conjunct above): the pair must be filled, and its sidecar must
-        // verify — a separate, host-local step, never folded into
-        // `get_job_for_rank`'s own statement.
-        if row.world_size > 1 {
-            let (Some(training_set_ref), Some(training_set_location)) = (
-                row.training_set_ref.as_deref(),
-                row.training_set_location.as_deref(),
-            ) else {
-                self.record_refusal(GangRefusalReason::TrainingSetPairMissing);
-                return Err(i_gang_refused());
-            };
-            match resolve_training_set_identity_classified(
-                self.session.result_store().as_ref(),
-                row.tenant_id,
-                training_set_ref,
-                training_set_location,
-            )
-            .await
-            {
-                Ok(TrainingSetOutcome::Verified) => {}
-                Ok(TrainingSetOutcome::AdminScopeRefused) => return Err(i_gang_refused()),
-                Ok(TrainingSetOutcome::OtherTenant) => {
-                    self.record_refusal(GangRefusalReason::TrainingSetOtherTenant);
-                    return Err(i_gang_refused());
-                }
-                Ok(TrainingSetOutcome::NotReady) => {
-                    self.record_refusal(GangRefusalReason::TrainingSetNotReady);
-                    return Err(i_gang_refused());
-                }
-                Ok(TrainingSetOutcome::DigestMismatch) => {
-                    self.record_refusal(GangRefusalReason::TrainingSetDigestMismatch);
-                    return Err(i_gang_refused());
-                }
-                // The training-set catalog lookup itself erroring —
-                // `Unavailable`, propagated as-is (already classified by
-                // `admission_catalog_fault` inside), never collapsed into
-                // the fixed I-GANG refusal.
-                Err(e) => return Err(e),
-            }
+        // This unit ships the `world_size == 1` lattice only: the
+        // training-set pair conjunct and its sidecar verify (§I1(b)) that
+        // would admit a genuine multi-host row are `HostAdmission`'s to
+        // build (docs/plans/67-distributed-training/UNITS.md § U5a-2). A row
+        // whose OWN `world_size` (now known to equal `assign.world`, the
+        // conjunct above) names more than one rank refuses the SAME fixed
+        // way — never admitted, never silently treated as `world_size == 1`.
+        if world_size != 1 {
+            self.record_refusal(GangRefusalReason::MultiHostUnsupported);
+            return Err(i_gang_refused());
         }
 
-        // §I1: the coordinator's own `instances` row must be fresh.
+        // §I1: the coordinator's own `instances` row must be fresh. A
+        // genuine catalog fault reading this row is `Unavailable`
+        // (`admission_catalog_fault`), the SAME admission-time
+        // classification every other catalog read on this path uses — never
+        // `map_engine_error`'s generic mapping, which has no case for a raw
+        // backend fault and would fall through to `Internal`.
         match catalog
             .fresh_instance(&assign.coordinator_instance_id, self.lease)
             .await
@@ -402,7 +415,7 @@ impl GangService for GangServer {
                 self.record_refusal(GangRefusalReason::CoordinatorNotFresh);
                 return Err(i_gang_refused());
             }
-            Err(e) => return Err(map_engine_error(e)),
+            Err(e) => return Err(admission_catalog_fault(e)),
         }
 
         // Every I-GANG determinant is satisfied. This handler has no
@@ -451,13 +464,16 @@ impl GangService for GangServer {
 /// This is the ONLY call site this program has for
 /// `Catalog::get_result_table_for_tenant` outside its own crate's tests
 /// (`impossibility_claims`, below) — it sits inside
-/// `resolve_training_set_identity_classified`, whose SOLE production
-/// caller is [`GangServer::run_rank`] (threading the job's own `tenant_id`,
-/// `training_set_ref`, and `training_set_location` straight from the row
-/// `get_job_for_rank` resolved, for `row.world_size > 1` runs only); this
-/// function is the thin public wrapper the two direct unit tests below call,
-/// built on that same classification so there is exactly one
-/// implementation, never two copies of the lookup + verify to drift apart.
+/// `resolve_training_set_identity_classified`, which has NO production
+/// caller in this unit: `GangServer::run_rank` ships the `world_size == 1`
+/// lattice only and never reaches a tenant-scoped catalog read (see the
+/// module-level doc). This function, and the classification it wraps, are
+/// retained as the tested primitive the multi-host admission gate builds on
+/// once `HostAdmission` exists to admit a `world_size > 1` row into
+/// (docs/plans/67-distributed-training/UNITS.md § U5a-2) — its only callers
+/// today are the two direct unit tests below, which exercise it in isolation
+/// to demonstrate the tenant-isolation and admin-scope hazards it guards
+/// against.
 pub async fn resolve_training_set_identity(
     store: &ResultStore,
     tenant: Option<TenantId>,
@@ -484,11 +500,11 @@ pub async fn resolve_training_set_identity(
     }
 }
 
-/// The classification [`resolve_training_set_identity`] (and
-/// [`GangServer::run_rank`], through it) collapses to `FailedPrecondition`
-/// for the wire (non-disclosure; the admission-time collapse) — kept
-/// distinguishable here (never on the wire) so `run_rank` can name the exact
-/// [`GangRefusalReason`] the `test-hooks` lane records.
+/// The classification [`resolve_training_set_identity`] collapses to
+/// `FailedPrecondition` for the wire (non-disclosure; the admission-time
+/// collapse) — kept distinguishable here (never on the wire) for a future
+/// caller (`HostAdmission`, docs/plans/67-distributed-training/UNITS.md §
+/// U5a-2) to name its own exact refusal reason from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrainingSetOutcome {
     /// The row resolved for this job's own tenant, is `ready`, and its

@@ -6,53 +6,50 @@
 //! verify states the property (a repo-level predicate plus an explicit
 //! guard at the resolution call site), matching `get_job_for_rank`'s own
 //! enumerating-caller-oracle treatment elsewhere in this contract (see
-//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A2).
+//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A2). This unit's `RunRank`
+//! handler has no production caller for that resolver at all (it ships the
+//! `world_size == 1` lattice only, below) — these two tests are its only
+//! exercise, retained as the tested primitive the multi-host admission gate
+//! builds on once `HostAdmission` exists to admit into
+//! (docs/plans/67-distributed-training/UNITS.md § U5a-2).
 //!
 //! The remaining tests drive the real `RunRank` rpc over the production
 //! `peer_bind` listener (`start_engine_server_with_peer_bind` /
 //! `start_no_worker_server`) — the wire-level K2 edges (`world == 0`,
-//! `rank >= world`, refused before I-GANG runs), every I-GANG determinant
+//! `rank >= world`, refused before I-GANG runs), ambient admin scope
+//! (refused before any row is even read), every I-GANG determinant
 //! `get_job_for_rank` decides (job not found, not `running`, wrong
-//! claimant, wrong attempt, lease not live); a call satisfying
-//! EVERY determinant still ends `UNIMPLEMENTED` — this unit has no
-//! `HostAdmission` session to hand it to
+//! claimant, wrong attempt, lease not live, an undecodable `world_size`);
+//! a call satisfying EVERY determinant still ends `UNIMPLEMENTED` — this
+//! unit has no `HostAdmission` session to hand it to
 //! (docs/plans/67-distributed-training/UNITS.md § U5a-2 builds it).
 //!
-//! The final group drives `RunRank` itself with `world_size > 1` — the ONLY
-//! path through this handler that ever reads a tenant-scoped catalog row
-//! (threading `row.tenant_id` into `resolve_training_set_identity`).
-//! Every `world_size == 1` test above (and the two direct unit tests at the
-//! top of this file, which call `resolve_training_set_identity` directly,
-//! never through the RPC) leaves this block cold. These tests drive it
-//! through the wire: a job's own `training_set_location` naming a
-//! `result_tables` row registered under ANOTHER tenant, or under NO tenant
-//! while the job is tenant-bound, must refuse `FAILED_PRECONDITION` without
-//! disclosing the other tenant's row; a pair that genuinely resolves for the
-//! job's OWN tenant must still reach the handler's own `UNIMPLEMENTED`
-//! terminal (proving the sidecar path was actually decided, not merely
-//! "always denies"); and the pair missing entirely at `world_size > 1` must
-//! refuse the same way.
-//!
-//! Every `world_size > 1` test below is keyed on the
-//! ROW's own `world_size` (a spec naming `{"common":{"world_size":2}}`,
-//! `WORLD2_SPEC`), never on the caller's own `assign.world` — a
-//! `world_size > 1` job admitted at a
-//! caller-supplied `world = 1` would otherwise skip the pair conjunct and
-//! the sidecar verify entirely. `run_rank_refuses_when_assign_world_mismatches_row_world_size`
-//! is the determinant that closes this: `assign.world != row.world_size`
-//! is itself a refusal. Also covered: a training-set row found for the
-//! job's OWN tenant but not `ready`, and one that IS `ready` but whose
-//! sidecar digest does not match — both refuse the same way as every other
-//! determinant.
+//! **This unit ships the `world_size == 1` lattice only.** A row whose own
+//! `world_size` (decoded from `spec`, never the caller's `assign.world`) is
+//! not exactly `1` refuses the SAME fixed way every other determinant does
+//! — whether or not the caller's `assign.world` happens to agree with it —
+//! since the training-set pair conjunct and its sidecar verify that would
+//! admit a genuine multi-host row are `HostAdmission`'s to build
+//! (docs/plans/67-distributed-training/UNITS.md § U5a-2); this handler never
+//! attempts them.
+//! `run_rank_refuses_when_assign_world_mismatches_row_world_size` drives
+//! BOTH directions of `assign.world != row.world_size` (below the row's own
+//! value, and above it); `run_rank_refuses_world_gt_one_when_matching_caller_world`
+//! drives the case where `assign.world` genuinely AGREES with a row's own
+//! `world_size > 1` — refused all the same, distinguishably
+//! (`test-hooks`) from a genuine mismatch.
 //!
 //! `run_rank_refusal_is_non_disclosing_across_every_determinant`
 //! is the ONE table-driven non-disclosure oracle — every I-GANG determinant
 //! refuses with the pairwise-identical `(code, message)`. The
 //! `test-hooks`-gated `run_rank_last_refusal_reason_distinguishes_every_determinant`
 //! drives the exact SAME scenarios and asserts `GangServer::last_refusal_reason`
-//! (via `PeerEngineServer::gang_last_refusal_reason`) distinguishes every one
-//! of them same-process — the plain lane and the `test-hooks` lane therefore
-//! run a DIFFERENT number of gang-prefixed test cases (stated at each test).
+//! (via `PeerEngineServer::gang_last_refusal_reason`, or — for the
+//! `AdminScope` determinant, which no network client can ever trigger — a
+//! standalone `GangServer` invoked in-process, see `refusal_scenario`'s own
+//! doc) distinguishes every one of them same-process — the plain lane and
+//! the `test-hooks` lane therefore run a DIFFERENT number of gang-prefixed
+//! test cases (stated at each test).
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -814,403 +811,63 @@ async fn run_rank_refuses_when_claimed_by_a_different_coordinator() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-// ---------------------------------------------------------------------------
-// §I1(b) (world_size > 1), through the RPC: the ONLY tenant-scoped catalog
-// read `run_rank` ever performs. No test above ever sets `world > 1` on a
-// row that reaches this block (the lone `world == 2` frame, above, is
-// refused at the §W1 K2 edge before any row is read) — these tests are the
-// first to drive it.
-// ---------------------------------------------------------------------------
-
-/// A job submitted under an explicit tenant scope — mirroring
-/// [`submit_and_claim`], but pinning the row's own `tenant_id` the way a
-/// genuine tenant-bound submission would, via `with_tenant_scoped`
-/// (`submit_job`'s own ambient `current_tenant()` picks it up) — then
-/// claimed exactly like [`submit_and_claim`]. `claim_next` itself carries no
-/// tenant predicate at all (the production worker claims globally, then
-/// reads tenant off the claimed row), so the claim step runs unscoped.
-/// Returns the claimed `attempts` value.
-async fn submit_and_claim_for_tenant(
-    server: &crate::common::grpc::PeerEngineServer,
-    tenant: TenantId,
-    job_id: &str,
-    coordinator_instance_id: &str,
-    lease: std::time::Duration,
-    spec: &str,
-) -> i64 {
-    use jammi_db::catalog::jobs_repo::SubmitJobParams;
-    use jammi_db::catalog::status::JobExecution;
-
-    let job_id_owned = job_id.to_string();
-    let spec_owned = spec.to_string();
-    server
-        .engine
-        .with_tenant_scoped(tenant, move |scope| {
-            let job_id = job_id_owned.clone();
-            let spec = spec_owned.clone();
-            async move {
-                scope
-                    .catalog()
-                    .submit_job(SubmitJobParams {
-                        job_id: &job_id,
-                        kind: "fine_tune",
-                        execution: JobExecution::Queued,
-                        spec: &spec,
-                        model_ref: None,
-                        output_model_id: None,
-                        model_source: None,
-                        priority: 0,
-                    })
-                    .await
-                    .unwrap()
-            }
-        })
-        .await;
-    let claimed = server
-        .engine
-        .catalog()
-        .claim_next(coordinator_instance_id, &["fine_tune"], lease)
-        .await
-        .unwrap()
-        .expect("must claim the only queued job");
-    i64::from(claimed.attempts)
-}
-
-/// Materializes a REAL `ready` `result_tables` row (Parquet + sidecar
-/// manifest, the identical fixture shape
-/// `resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_resolve`
-/// uses above) under `tenant`, and returns the `(training_set_location,
-/// training_set_ref)` pair a genuine coordinator's
-/// `fill_training_set_identity` call would carry: the table name, and the
-/// digest read back from the SAME sidecar `resolve_training_set_identity`
-/// itself verifies against.
-async fn materialize_ready_table_for_tenant(
-    server: &crate::common::grpc::PeerEngineServer,
-    tenant: TenantId,
-    source_id: &str,
-) -> (String, String) {
-    use datafusion::prelude::SessionContext;
-    use jammi_db::store::manifest::{
-        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelContentDigest, ModelIdentity, ProducingDescriptor,
-    };
-    use jammi_db::store::EmbeddingTableSpec;
-
-    let descriptor = ProducingDescriptor::Embedding {
-        model_id: "rt-base".into(),
-        task: ModelTask::TextEmbedding,
-        source_id: source_id.to_string(),
-        columns: vec!["body".into()],
-        key_column: "_row_id".into(),
-        dimensions: 4,
-    };
-    let env = MaterializationEnv::new(
-        ComputeDevice::Cpu,
-        vec![ModelIdentity {
-            model_id: "rt-base".into(),
-            backend: "candle".into(),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("gang-fixture-digest".into()),
-            quantization: None,
-        }],
-    );
-    let ctx = SessionContext::new();
-    let source_id_owned = source_id.to_string();
-    let engine_for_scope = Arc::clone(&server.engine);
-    let record = server
-        .engine
-        .with_tenant_scoped(tenant, move |_scope| async move {
-            let store = engine_for_scope.result_store();
-            store
-                .materialize_embedding_table(
-                    &ctx,
-                    EmbeddingTableSpec {
-                        source_id: &source_id_owned,
-                        model_id: "rt-base",
-                        derived_from: None,
-                        dimensions: 4,
-                        key_column: None,
-                        text_columns: None,
-                    },
-                    &[],
-                    Materialization::new(
-                        &descriptor,
-                        &env,
-                        vec![InputAnchor::mutable_version(&source_id_owned, 1)],
-                    ),
-                    None,
-                )
-                .await
-                .unwrap()
-        })
-        .await;
-    let store = server.engine.result_store();
-    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
-    let manifest = store
-        .read_materialization_manifest(&url)
-        .await
-        .unwrap()
-        .expect("finish() must have written the sidecar");
-    (record.table_name.clone(), manifest.artifact.0.clone())
-}
-
-/// §I1(b) tenant isolation: `training_set_location` names a `result_tables`
-/// row that genuinely resolves and verifies — but for ANOTHER tenant than
-/// the one `get_job_for_rank` resolves the calling job under. Refused
-/// `FAILED_PRECONDITION`, the SAME status and (§I1 Non-disclosure) the SAME
-/// fixed message every other I-GANG determinant refuses with — the response
-/// discloses neither the other tenant's id nor its table name. Mutation
-/// proof: deleting `run_rank`'s entire `if assign.world > 1 { .. }` block
-/// (the only tenant-scoped catalog read this handler performs) leaves the
-/// full `jammi-server` `it` suite green — this test, driving the RPC at
-/// `world == 2` on a filled pair, is what catches that deletion.
+/// A genuine catalog fault reading `Catalog::fresh_instance` (the
+/// `instances` table itself gone, mirroring `jammi-db`'s own
+/// `get_job_for_rank_driver_fault_still_surfaces_as_err` DROP-TABLE
+/// technique) maps through `admission_catalog_fault` to `Unavailable` — the
+/// SAME admission-time classification every other catalog read on this path
+/// uses, never `map_engine_error`'s generic mapping (which has no case for a
+/// raw backend fault and would fall through to `Internal`). Every OTHER
+/// I-GANG determinant is satisfied by construction, isolating this fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_refuses_a_training_set_another_tenant_owns() {
-    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
-
-    let server = start_no_worker_server().await;
-    let tenant_owner = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e01").unwrap();
-    let tenant_caller = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e02").unwrap();
-    let source_id = format!(
-        "gang_cross_tenant_src_{}",
-        jammi_test_utils::unique_suffix()
-    );
-    let (table, digest) =
-        materialize_ready_table_for_tenant(&server, tenant_owner, &source_id).await;
-
-    server
-        .engine
-        .catalog()
-        .upsert_instance("coord-cross-tenant", Some("label"), Some("host"))
-        .await
-        .unwrap();
-    let attempt = submit_and_claim_for_tenant(
-        &server,
-        tenant_caller,
-        "job-cross-tenant",
-        "coord-cross-tenant",
-        std::time::Duration::from_secs(30),
-        WORLD2_SPEC,
-    )
-    .await;
-    let outcome = server
-        .engine
-        .catalog()
-        .fill_training_set_identity(
-            "job-cross-tenant",
-            "coord-cross-tenant",
-            attempt as u32,
-            &digest,
-            &table,
-        )
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            outcome,
-            jammi_db::catalog::jobs_repo::TrainingSetFillOutcome::Filled
-        ),
-        "the fixture's own CAS must land cleanly on a freshly claimed row"
-    );
-
-    let channel = crate::common::grpc::channel(server.peer_addr).await;
-    let mut client = GangServiceClient::new(channel);
-    let outbound = tokio_stream::once(assign_frame_full(
-        "job-cross-tenant",
-        attempt,
-        0,
-        2,
-        "coord-cross-tenant",
-    ));
-    let err = client
-        .run_rank(outbound)
-        .await
-        .expect_err("a training set owned by another tenant must be refused");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        err.message(),
-        "gang admission refused",
-        "the fixed §I1 Non-disclosure message, never a distinguishing reason"
-    );
-    assert!(
-        !err.message().contains(&table) && !err.message().contains(&tenant_owner.to_string()),
-        "the refusal must disclose neither the other tenant's table name nor its id, got: {}",
-        err.message()
-    );
-}
-
-/// §I1(b) tenant isolation, the NULL-tenant variant: `training_set_location`
-/// names a `result_tables` row created with NO tenant scope active (as if a
-/// coordinator materialized it outside any tenant binding) while the
-/// calling job IS tenant-bound. The strict resolver
-/// (`get_result_table_for_tenant`) never matches a NULL-tenant row for a
-/// real tenant (the same property the direct unit test at the top of this
-/// file proves against the resolver alone) — refused `FAILED_PRECONDITION`
-/// through the RPC too, never resolving the orphaned row.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job() {
-    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
-
-    let server = start_no_worker_server().await;
-    let tenant_caller = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e03").unwrap();
-    let table = format!("gang_null_tenant_rpc_{}", jammi_test_utils::unique_suffix());
-    // Created with NO tenant scope active, exactly like this file's
-    // `strict_resolver_never_matches_a_null_tenant_row_for_a_real_tenant` —
-    // the row's `tenant_id` lands NULL.
-    server
-        .engine
-        .catalog()
-        .create_result_table(null_tenant_row(&table))
-        .await
-        .unwrap();
-
-    server
-        .engine
-        .catalog()
-        .upsert_instance("coord-null-tenant", Some("label"), Some("host"))
-        .await
-        .unwrap();
-    let attempt = submit_and_claim_for_tenant(
-        &server,
-        tenant_caller,
-        "job-null-tenant-table",
-        "coord-null-tenant",
-        std::time::Duration::from_secs(30),
-        WORLD2_SPEC,
-    )
-    .await;
-    server
-        .engine
-        .catalog()
-        .fill_training_set_identity(
-            "job-null-tenant-table",
-            "coord-null-tenant",
-            attempt as u32,
-            "any-digest",
-            &table,
-        )
-        .await
-        .unwrap();
-
-    let channel = crate::common::grpc::channel(server.peer_addr).await;
-    let mut client = GangServiceClient::new(channel);
-    let outbound = tokio_stream::once(assign_frame_full(
-        "job-null-tenant-table",
-        attempt,
-        0,
-        2,
-        "coord-null-tenant",
-    ));
-    let err = client
-        .run_rank(outbound)
-        .await
-        .expect_err("a NULL-tenant training set must be refused for a tenant-bound job");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(err.message(), "gang admission refused");
-}
-
-/// At `world_size > 1`: a training-set pair that genuinely resolves and
-/// verifies for the job's OWN tenant (materialized and filled under the SAME
-/// tenant `get_job_for_rank` resolves the job under) still reaches this
-/// unit's own terminal — `UNIMPLEMENTED`, never `FAILED_PRECONDITION`.
-/// Without this test, the three refusal tests above could all pass for the
-/// wrong reason (a handler that unconditionally refuses every `world_size >
-/// 1` call, tenant match or not) — this is the admitting case that proves
-/// the tenant-scoped path was actually DECIDED, not skipped to an easy
-/// refusal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_world_two_own_tenant_training_set_reaches_unimplemented() {
-    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
-
-    let server = start_no_worker_server().await;
-    let tenant = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e04").unwrap();
-    let source_id = format!("gang_own_tenant_src_{}", jammi_test_utils::unique_suffix());
-    let (table, digest) = materialize_ready_table_for_tenant(&server, tenant, &source_id).await;
-
-    server
-        .engine
-        .catalog()
-        .upsert_instance("coord-own-tenant", Some("label"), Some("host"))
-        .await
-        .unwrap();
-    let attempt = submit_and_claim_for_tenant(
-        &server,
-        tenant,
-        "job-own-tenant-table",
-        "coord-own-tenant",
-        std::time::Duration::from_secs(30),
-        WORLD2_SPEC,
-    )
-    .await;
-    server
-        .engine
-        .catalog()
-        .fill_training_set_identity(
-            "job-own-tenant-table",
-            "coord-own-tenant",
-            attempt as u32,
-            &digest,
-            &table,
-        )
-        .await
-        .unwrap();
-
-    let channel = crate::common::grpc::channel(server.peer_addr).await;
-    let mut client = GangServiceClient::new(channel);
-    let outbound = tokio_stream::once(assign_frame_full(
-        "job-own-tenant-table",
-        attempt,
-        0,
-        2,
-        "coord-own-tenant",
-    ));
-    let err = client
-        .run_rank(outbound)
-        .await
-        .expect_err("no HostAdmission session exists yet to admit into");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
-}
-
-/// §I1(b): at `world_size > 1`, the training-set pair itself missing
-/// (never filled) is refused `FAILED_PRECONDITION` — isolated from every
-/// other I-GANG determinant, which all hold (a genuine claim, live lease,
-/// fresh coordinator).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_refuses_world_gt_one_when_training_set_pair_missing() {
+async fn run_rank_fresh_instance_fault_is_unavailable() {
+    use jammi_db::catalog::backend::TxOptions;
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 
     let server = start_no_worker_server().await;
     server
         .engine
         .catalog()
-        .upsert_instance("coord-no-pair", Some("label"), Some("host"))
+        .upsert_instance("coord-fresh-fault", Some("l"), Some("h"))
         .await
         .unwrap();
-    // `submit_and_claim` never fills the training-set pair — it stays NULL.
     let attempt = submit_and_claim(
         &server,
-        "job-no-pair",
-        "coord-no-pair",
+        "job-fresh-fault",
+        "coord-fresh-fault",
         std::time::Duration::from_secs(30),
-        WORLD2_SPEC,
+        WORLD1_SPEC,
     )
     .await;
+    server
+        .engine
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move { tx.execute("DROP TABLE instances", &[]).await })
+        })
+        .await
+        .unwrap();
 
     let channel = crate::common::grpc::channel(server.peer_addr).await;
     let mut client = GangServiceClient::new(channel);
     let outbound = tokio_stream::once(assign_frame_full(
-        "job-no-pair",
+        "job-fresh-fault",
         attempt,
         0,
-        2,
-        "coord-no-pair",
+        1,
+        "coord-fresh-fault",
     ));
     let err = client
         .run_rank(outbound)
         .await
-        .expect_err("world_size > 1 with an unset training-set pair must be refused");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(err.message(), "gang admission refused");
+        .expect_err("a dropped instances table must surface as a genuine catalog fault");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "fresh_instance erroring must map through admission_catalog_fault, never \
+         map_engine_error's generic mapping"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,44 +875,56 @@ async fn run_rank_refuses_world_gt_one_when_training_set_pair_missing() {
 // `test-hooks` seam.
 // ---------------------------------------------------------------------------
 
-/// A GENUINELY resolvable `result_tables` row for `tenant` — real Parquet,
-/// real sidecar manifest, the identical fixture shape
-/// [`materialize_ready_table_for_tenant`] builds — forced back to `status =
-/// 'building'` via raw SQL AFTER materialization finishes (mirroring
-/// `run_rank_refuses_when_job_not_running`'s own technique above: manufacture
-/// the ONE conjunct under test directly, never through a path whose own
-/// guards could refuse the setup itself). This is the property that matters:
-/// a `null_tenant_row`-style row whose `parquet_path` never resolves would
-/// ALSO fail the sidecar verify once found — making a "drop the Ready
-/// conjunct" mutation invisible, since the outcome (`FailedPrecondition`)
-/// would stay the same for the WRONG reason. Returns the `(table,
-/// training_set_ref)` pair, exactly like [`materialize_ready_table_for_tenant`]
-/// — this row verifies fine; only its `status` isolates the Ready conjunct.
-async fn create_not_ready_but_verifiable_table_for_tenant(
-    server: &crate::common::grpc::PeerEngineServer,
-    tenant: TenantId,
-    source_id: &str,
-) -> (String, String) {
-    use jammi_db::catalog::backend::TxOptions;
+/// Builds a `tonic::Streaming<RankControl>` by hand from `frames`,
+/// length-prefixed exactly the way the real gRPC wire frames a message
+/// (`tonic-prost`'s own codec tests use the identical shape: a `0`
+/// compression byte, a big-endian `u32` length, then the encoded bytes) —
+/// never a real network connection. The ONLY caller needing this is
+/// [`refusal_scenario`]'s `AdminScope` arm: ambient admin scope is
+/// per-process task-local state that never crosses a network hop (a client
+/// cannot set it on the server's own request-handling task, nor does it
+/// survive a `tokio::spawn` boundary), so exercising that determinant
+/// requires calling `GangServer::run_rank` directly, in the SAME task tree a
+/// test wraps in `with_admin_scope` — which needs a real `tonic::Streaming`
+/// value to satisfy `run_rank`'s own signature, not a bare `Stream`.
+fn streaming_of(
+    frames: Vec<jammi_wire::proto::gang::RankControl>,
+) -> tonic::Streaming<jammi_wire::proto::gang::RankControl> {
+    use bytes::{BufMut, Bytes, BytesMut};
+    use jammi_wire::proto::gang::RankControl;
+    use prost::Message;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tonic::codec::BufferSettings;
+    use tonic_prost::ProstCodec;
 
-    let (table, digest) = materialize_ready_table_for_tenant(server, tenant, source_id).await;
-    // Table names here are test-controlled (`jammi_test_utils::unique_suffix`
-    // suffixed, never external input) — a fixed literal SQL string built the
-    // same way `run_rank_refuses_when_job_not_running`'s own mutation above
-    // does, never a parameterized statement this fixture needs `SqlValue`
-    // plumbing for.
-    let sql = format!("UPDATE result_tables SET status = 'building' WHERE table_name = '{table}'");
-    server
-        .engine
-        .catalog()
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            let sql = sql.clone();
-            Box::pin(async move { tx.execute(&sql, &[]).await })
-        })
-        .await
-        .unwrap();
-    (table, digest)
+    /// A one-shot `http_body::Body` handing back every framed byte in a
+    /// single poll — sufficient since `tonic::Streaming`'s own decode loop
+    /// reads incrementally from whatever bytes a `poll_frame` call yields,
+    /// never requiring one HTTP frame per gRPC message.
+    struct OnceBody(Option<Bytes>);
+    impl http_body::Body for OnceBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.0.take().map(|b| Ok(http_body::Frame::data(b))))
+        }
+    }
+
+    let mut buf = BytesMut::new();
+    for frame in frames {
+        let mut msg = BytesMut::new();
+        frame.encode(&mut msg).expect("encode RankControl");
+        buf.put_u8(0); // uncompressed
+        buf.put_u32(msg.len() as u32);
+        buf.put_slice(&msg);
+    }
+
+    let decoder = ProstCodec::<RankControl, RankControl>::raw_decoder(BufferSettings::default());
+    tonic::Streaming::new_request(decoder, OnceBody(Some(buf.freeze())), None, None)
 }
 
 /// Drives ONE `RunRank` call end-to-end for a NAMED
@@ -1269,6 +938,16 @@ async fn create_not_ready_but_verifiable_table_for_tenant(
 /// the call was driven against (a `test-hooks` caller reads
 /// `PeerEngineServer::gang_last_refusal_reason` off this SAME instance
 /// afterward) paired with the `Status` the RPC returned.
+///
+/// `GangRefusalReason::AdminScope` is the ONE exception to "drives it over
+/// the real listener": no network client can ever make ambient admin scope
+/// visible on the SERVER's own request-handling task (see [`streaming_of`]'s
+/// own doc), so this arm builds a STANDALONE `GangServer` from the SAME
+/// `server.engine` (never the instance mounted on `server.peer_addr`) and
+/// calls `run_rank` on it DIRECTLY, inside `server.engine.with_admin_scope`
+/// — swapping the standalone server's (`test-hooks` only) refusal handle
+/// onto the returned `server` so `PeerEngineServer::gang_last_refusal_reason`
+/// still observes the call this function actually made.
 async fn refusal_scenario(
     reason: jammi_server::grpc::gang::GangRefusalReason,
 ) -> (crate::common::grpc::PeerEngineServer, tonic::Status) {
@@ -1276,7 +955,64 @@ async fn refusal_scenario(
     use jammi_server::grpc::gang::GangRefusalReason;
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 
-    let server = start_no_worker_server().await;
+    #[allow(unused_mut)]
+    let mut server = start_no_worker_server().await;
+
+    if reason == GangRefusalReason::AdminScope {
+        use jammi_server::grpc::gang::GangServer;
+        use jammi_server::grpc::proto::gang::gang_service_server::GangService;
+
+        let coord = "nd-coord-admin-scope";
+        server
+            .engine
+            .catalog()
+            .upsert_instance(coord, Some("l"), Some("h"))
+            .await
+            .unwrap();
+        let attempt = submit_and_claim(
+            &server,
+            "nd-job-admin-scope",
+            coord,
+            std::time::Duration::from_secs(30),
+            WORLD1_SPEC,
+        )
+        .await;
+        // A standalone `GangServer`, never the one mounted on
+        // `server.peer_addr` — see this function's own doc for why.
+        let standalone = GangServer::new(
+            Arc::clone(&server.engine),
+            std::time::Duration::from_secs(30),
+        );
+        #[cfg(feature = "test-hooks")]
+        {
+            server.gang_refusal_handle = Some(standalone.refusal_reason_handle());
+        }
+        let request = tonic::Request::new(streaming_of(vec![assign_frame_full(
+            "nd-job-admin-scope",
+            attempt,
+            0,
+            1,
+            coord,
+        )]));
+        let status = server
+            .engine
+            .with_admin_scope(|_admin| async {
+                // `Response<Self::RunRankStream>` (the `Ok` type) is not
+                // `Debug` (a boxed `dyn Stream` has no such impl), so
+                // `.expect_err` (which requires it) cannot be used here —
+                // a plain `match` avoids the bound entirely.
+                match standalone.run_rank(request).await {
+                    Ok(_) => panic!(
+                        "admin scope must be refused, even though every OTHER I-GANG \
+                         determinant this job satisfies would otherwise admit it"
+                    ),
+                    Err(status) => status,
+                }
+            })
+            .await;
+        return (server, status);
+    }
+
     let outbound_frame = match reason {
         GangRefusalReason::NotRunning => {
             server
@@ -1382,60 +1118,57 @@ async fn refusal_scenario(
             .await;
             assign_frame_full("nd-job-coord-not-fresh", attempt, 0, 1, "nd-coord-stale")
         }
+        GangRefusalReason::SpecUndecodable => {
+            server
+                .engine
+                .catalog()
+                .upsert_instance("nd-coord-undecodable", Some("l"), Some("h"))
+                .await
+                .unwrap();
+            // A `world_size` key present but not a valid non-negative rank
+            // count — `world_size_from_spec_json` (jammi-db) classifies this
+            // `Undecodable`, never a fault of the read that found it.
+            let attempt = submit_and_claim(
+                &server,
+                "nd-job-undecodable",
+                "nd-coord-undecodable",
+                std::time::Duration::from_secs(30),
+                r#"{"common":{"world_size":"not-a-number"}}"#,
+            )
+            .await;
+            // `assign.world` is irrelevant here (any value >= 1 satisfies
+            // the wire-level K2 edges) — the row's own spec never decodes,
+            // so this refuses before `assign.world` is ever compared to
+            // anything.
+            assign_frame_full("nd-job-undecodable", attempt, 0, 1, "nd-coord-undecodable")
+        }
         GangRefusalReason::WorldMismatch => {
-            // Strengthened (lead mutation `if false && assign.world !=
-            // row.world_size` survived against the original fixture here):
-            // the row must be OTHERWISE ADMISSIBLE at its own `world_size`
-            // (2) — own tenant, `ready`, digest-verified pair, fresh
-            // coordinator, exactly `run_rank_world_two_own_tenant_
-            // training_set_reaches_unimplemented`'s own fixture shape —
-            // so the mismatch conjunct is the ONLY arm that can refuse
-            // `assign.world = 1` against it. The original fixture (no
-            // tenant, no pair) let the deleted-gate mutation survive: with
-            // the mismatch conjunct gone, the SAME request fell into the
-            // `row.world_size > 1` block and was refused by the UNFILLED
-            // PAIR conjunct instead — the SAME fixed message, so the
-            // pairwise/RPC-level oracles could not tell which arm refused.
-            let tenant = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e15").unwrap();
-            let source_id = format!(
-                "gang_nd_world_mismatch_{}",
-                jammi_test_utils::unique_suffix()
-            );
-            let (table, digest) =
-                materialize_ready_table_for_tenant(&server, tenant, &source_id).await;
+            // Direction (a): `assign.world` (1) BELOW the row's own
+            // `world_size` (2, `WORLD2_SPEC`) — no training-set fixture
+            // needed at all, since this unit ships the `world_size == 1`
+            // lattice only: a row whose own `world_size` disagrees with `1`
+            // refuses regardless of any pair/sidecar state (`MultiHostUnsupported`,
+            // its own determinant below), so isolating the MISMATCH conjunct
+            // specifically needs the `test-hooks` reason, not the wire
+            // status/message alone — see `run_rank_refuses_when_assign_world_
+            // mismatches_row_world_size` for the executed both-directions
+            // proof (including the direction whose plain-lane status alone
+            // already distinguishes the mismatch conjunct from every other
+            // determinant).
             server
                 .engine
                 .catalog()
                 .upsert_instance("nd-coord-world-mismatch", Some("l"), Some("h"))
                 .await
                 .unwrap();
-            let attempt = submit_and_claim_for_tenant(
+            let attempt = submit_and_claim(
                 &server,
-                tenant,
                 "nd-job-world-mismatch",
                 "nd-coord-world-mismatch",
                 std::time::Duration::from_secs(30),
                 WORLD2_SPEC,
             )
             .await;
-            server
-                .engine
-                .catalog()
-                .fill_training_set_identity(
-                    "nd-job-world-mismatch",
-                    "nd-coord-world-mismatch",
-                    attempt as u32,
-                    &digest,
-                    &table,
-                )
-                .await
-                .unwrap();
-            // The row's own `world_size` is 2 (`WORLD2_SPEC`) and is
-            // otherwise fully admissible at world 2 (see the control call
-            // `run_rank_refuses_when_assign_world_mismatches_row_world_size`
-            // drives against this SAME row, below); the caller names
-            // `world = 1` — case (f). This is the ONLY conjunct that can
-            // refuse this row.
             assign_frame_full(
                 "nd-job-world-mismatch",
                 attempt,
@@ -1444,147 +1177,31 @@ async fn refusal_scenario(
                 "nd-coord-world-mismatch",
             )
         }
-        GangRefusalReason::TrainingSetPairMissing => {
+        GangRefusalReason::MultiHostUnsupported => {
+            // `assign.world` (2) genuinely AGREES with the row's own
+            // `world_size` (2, `WORLD2_SPEC`) — no mismatch, and (unlike
+            // every prior round of this fixture) no training-set pair is
+            // filled either, since this unit never reaches that conjunct at
+            // all: a row whose own `world_size` is not `1` refuses outright,
+            // pair state irrelevant.
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-pair-missing", Some("l"), Some("h"))
+                .upsert_instance("nd-coord-multi-host", Some("l"), Some("h"))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
                 &server,
-                "nd-job-pair-missing",
-                "nd-coord-pair-missing",
+                "nd-job-multi-host",
+                "nd-coord-multi-host",
                 std::time::Duration::from_secs(30),
                 WORLD2_SPEC,
             )
             .await;
-            assign_frame_full(
-                "nd-job-pair-missing",
-                attempt,
-                0,
-                2,
-                "nd-coord-pair-missing",
-            )
+            assign_frame_full("nd-job-multi-host", attempt, 0, 2, "nd-coord-multi-host")
         }
-        GangRefusalReason::TrainingSetOtherTenant => {
-            let tenant_owner = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e11").unwrap();
-            let tenant_caller = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e12").unwrap();
-            let source_id = format!("gang_nd_other_tenant_{}", jammi_test_utils::unique_suffix());
-            let (table, digest) =
-                materialize_ready_table_for_tenant(&server, tenant_owner, &source_id).await;
-            server
-                .engine
-                .catalog()
-                .upsert_instance("nd-coord-other-tenant", Some("l"), Some("h"))
-                .await
-                .unwrap();
-            let attempt = submit_and_claim_for_tenant(
-                &server,
-                tenant_caller,
-                "nd-job-other-tenant",
-                "nd-coord-other-tenant",
-                std::time::Duration::from_secs(30),
-                WORLD2_SPEC,
-            )
-            .await;
-            server
-                .engine
-                .catalog()
-                .fill_training_set_identity(
-                    "nd-job-other-tenant",
-                    "nd-coord-other-tenant",
-                    attempt as u32,
-                    &digest,
-                    &table,
-                )
-                .await
-                .unwrap();
-            assign_frame_full(
-                "nd-job-other-tenant",
-                attempt,
-                0,
-                2,
-                "nd-coord-other-tenant",
-            )
-        }
-        GangRefusalReason::TrainingSetNotReady => {
-            let tenant = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e13").unwrap();
-            let source_id = format!("gang_nd_not_ready_{}", jammi_test_utils::unique_suffix());
-            let (table, digest) =
-                create_not_ready_but_verifiable_table_for_tenant(&server, tenant, &source_id).await;
-            server
-                .engine
-                .catalog()
-                .upsert_instance("nd-coord-not-ready", Some("l"), Some("h"))
-                .await
-                .unwrap();
-            let attempt = submit_and_claim_for_tenant(
-                &server,
-                tenant,
-                "nd-job-not-ready",
-                "nd-coord-not-ready",
-                std::time::Duration::from_secs(30),
-                WORLD2_SPEC,
-            )
-            .await;
-            server
-                .engine
-                .catalog()
-                .fill_training_set_identity(
-                    "nd-job-not-ready",
-                    "nd-coord-not-ready",
-                    attempt as u32,
-                    &digest,
-                    &table,
-                )
-                .await
-                .unwrap();
-            assign_frame_full("nd-job-not-ready", attempt, 0, 2, "nd-coord-not-ready")
-        }
-        GangRefusalReason::TrainingSetDigestMismatch => {
-            let tenant = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e14").unwrap();
-            let source_id = format!(
-                "gang_nd_digest_mismatch_{}",
-                jammi_test_utils::unique_suffix()
-            );
-            let (table, digest) =
-                materialize_ready_table_for_tenant(&server, tenant, &source_id).await;
-            server
-                .engine
-                .catalog()
-                .upsert_instance("nd-coord-digest-mismatch", Some("l"), Some("h"))
-                .await
-                .unwrap();
-            let attempt = submit_and_claim_for_tenant(
-                &server,
-                tenant,
-                "nd-job-digest-mismatch",
-                "nd-coord-digest-mismatch",
-                std::time::Duration::from_secs(30),
-                WORLD2_SPEC,
-            )
-            .await;
-            let wrong_digest = format!("{digest}-wrong");
-            server
-                .engine
-                .catalog()
-                .fill_training_set_identity(
-                    "nd-job-digest-mismatch",
-                    "nd-coord-digest-mismatch",
-                    attempt as u32,
-                    &wrong_digest,
-                    &table,
-                )
-                .await
-                .unwrap();
-            assign_frame_full(
-                "nd-job-digest-mismatch",
-                attempt,
-                0,
-                2,
-                "nd-coord-digest-mismatch",
-            )
+        GangRefusalReason::AdminScope => {
+            unreachable!("handled above, before this match: no network client can trigger it")
         }
     };
 
@@ -1598,103 +1215,237 @@ async fn refusal_scenario(
     (server, status)
 }
 
-/// §I1(b): at `world_size > 1`, a training-set row found for the job's OWN
-/// tenant but NOT `ready` is refused `FAILED_PRECONDITION` — case (e), the
-/// determinant no test before this round covered.
+/// The byte-identity oracle an undecodable `world_size` must satisfy: a row
+/// whose `spec` does not decode a `world_size` — either shape (`world_size`
+/// present but non-numeric, or `spec` text that
+/// is not valid JSON at all — the identical two shapes
+/// `jammi-db`'s own `gang_rank_admission.rs` decodes) — refuses
+/// BYTE-IDENTICALLY (code, message) to a job id no row exists for at all:
+/// an undecodable spec is a ROW FACT, never `admission_catalog_fault`'s
+/// `Unavailable` (reserved for the READ itself faulting). The `test-hooks`
+/// seam names `SpecUndecodable` specifically for both shapes, distinguishing
+/// them from `NotFound` same-process even though the wire cannot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_refuses_world_gt_one_when_training_set_not_ready() {
-    use jammi_server::grpc::gang::GangRefusalReason;
-
-    let (_server, status) = refusal_scenario(GangRefusalReason::TrainingSetNotReady).await;
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(status.message(), "gang admission refused");
-}
-
-/// §I1(b): at `world_size > 1`, a `ready` training-set row whose sidecar
-/// digest does NOT match `training_set_ref` is refused `FAILED_PRECONDITION`
-/// — case (d), the determinant no test before this round covered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_refuses_world_gt_one_when_training_set_digest_mismatches() {
-    use jammi_server::grpc::gang::GangRefusalReason;
-
-    let (_server, status) = refusal_scenario(GangRefusalReason::TrainingSetDigestMismatch).await;
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(status.message(), "gang admission refused");
-}
-
-/// The world-mismatch determinant — case (f): `assign.world` disagreeing with the
-/// ROW's own `world_size` (`WORLD2_SPEC`'s `2` here, named `world = 1`) is
-/// itself a refusal, the SAME fixed message every other I-GANG determinant
-/// refuses with.
-///
-/// The row `refusal_scenario`'s `WorldMismatch` arm builds is OTHERWISE
-/// ADMISSIBLE at its own `world_size` (own tenant, `ready`, digest-verified
-/// pair, fresh coordinator) — so the mismatch conjunct is the ONLY arm that
-/// can refuse `assign.world = 1` against it (a lead mutation,
-/// `if false && assign.world != row.world_size`, survived against an
-/// earlier fixture with no training-set pair filled: with the mismatch
-/// conjunct gone, that request fell into the `row.world_size > 1` block and
-/// was refused by the unfilled-pair conjunct instead, the SAME fixed
-/// message, so the oracle could not tell which arm actually refused). The
-/// control below drives the SAME row a second time at `assign.world = 2`
-/// (matching its own `world_size`) and asserts it reaches `UNIMPLEMENTED` —
-/// proving world 1 above refused for the mismatch alone, never because this
-/// row was unresolvable for some other reason.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
+async fn run_rank_refuses_an_undecodable_world_size_byte_identically_to_not_found() {
     use jammi_server::grpc::gang::GangRefusalReason;
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 
-    let (server, status) = refusal_scenario(GangRefusalReason::WorldMismatch).await;
+    let (_absent, not_found_status) = refusal_scenario(GangRefusalReason::NotFound).await;
+
+    for (label, coord, job_id, spec) in [
+        (
+            "non-numeric world_size",
+            "nd-coord-poison-numeric",
+            "nd-job-poison-numeric",
+            r#"{"common":{"world_size":"two"}}"#,
+        ),
+        (
+            "spec not valid JSON",
+            "nd-coord-poison-json",
+            "nd-job-poison-json",
+            "not-even-json",
+        ),
+    ] {
+        let server = start_no_worker_server().await;
+        server
+            .engine
+            .catalog()
+            .upsert_instance(coord, Some("l"), Some("h"))
+            .await
+            .unwrap();
+        let attempt = submit_and_claim(
+            &server,
+            job_id,
+            coord,
+            std::time::Duration::from_secs(30),
+            spec,
+        )
+        .await;
+        let channel = crate::common::grpc::channel(server.peer_addr).await;
+        let mut client = GangServiceClient::new(channel);
+        let poisoned = client
+            .run_rank(tokio_stream::once(assign_frame_full(
+                job_id, attempt, 0, 1, coord,
+            )))
+            .await
+            .expect_err("an undecodable world_size must be refused");
+        assert_eq!(
+            (poisoned.code(), poisoned.message()),
+            (not_found_status.code(), not_found_status.message()),
+            "{label}: an undecodable world_size must refuse byte-identically to an absent job"
+        );
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            server.gang_last_refusal_reason(),
+            Some(GangRefusalReason::SpecUndecodable),
+            "{label}: the test-hooks seam must name SpecUndecodable specifically"
+        );
+    }
+}
+
+/// `assign.world` genuinely AGREES with a row's own `world_size`, but that
+/// shared value is not `1` — refused all the same (this unit ships the
+/// `world_size == 1` lattice only, the training-set pair conjunct and its
+/// sidecar verify are `HostAdmission`'s to build), distinguishably
+/// (`test-hooks`) from a genuine `assign.world != row.world_size` mismatch —
+/// see `run_rank_refuses_when_assign_world_mismatches_row_world_size`'s own
+/// direction-(a) control, below, for the executed side-by-side proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_world_gt_one_when_caller_world_matches_the_row() {
+    use jammi_server::grpc::gang::GangRefusalReason;
+
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+    let (server, status) = refusal_scenario(GangRefusalReason::MultiHostUnsupported).await;
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert_eq!(status.message(), "gang admission refused");
     #[cfg(feature = "test-hooks")]
-    {
-        assert_eq!(
-            server.gang_last_refusal_reason(),
-            Some(GangRefusalReason::WorldMismatch),
-            "the served GangServer must record WorldMismatch, not some other determinant, \
-             for this exact request"
-        );
-    }
+    assert_eq!(
+        server.gang_last_refusal_reason(),
+        Some(GangRefusalReason::MultiHostUnsupported)
+    );
+}
 
-    // Control: the SAME row (same job, same claim, same genuinely-verified
-    // pair), driven a SECOND time on this SAME server, at `assign.world = 2`
-    // (matching the row's own `world_size`) — admits all the way to
-    // `UNIMPLEMENTED`, `run_rank_world_two_own_tenant_training_set_reaches_
-    // unimplemented`'s own outcome (case c). `run_rank` never mutates the
-    // `jobs` row (a read-only classification), so re-driving the identical
-    // job here is sound: nothing about the row's own state changed between
-    // the two calls. `attempt = 1`: `refusal_scenario`'s `WorldMismatch` arm
-    // calls `submit_and_claim_for_tenant` exactly once on a freshly
-    // submitted job with no prior claim — `Catalog::claim_next`'s first
-    // (and only) claim always lands at `attempts = 1` (documented on
-    // `submit_and_claim`/`submit_and_claim_for_tenant` above: "always `1`,
-    // the first claim"). Reading the row back via `get_job_for_rank` here
-    // instead would ADD a second call site outside this crate's own
-    // `RunRank` handler — `only_the_gang_run_rank_handler_calls_get_job_
-    // for_rank` (`gang_rank_admission_oracle.rs`) enumerates every caller of
-    // that primary-key-only, non-tenant-scoped verb and would (correctly)
-    // fail on exactly that.
-    let attempt = 1;
-    let channel = crate::common::grpc::channel(server.peer_addr).await;
-    let mut client = GangServiceClient::new(channel);
-    let outbound = tokio_stream::once(assign_frame_full(
-        "nd-job-world-mismatch",
-        attempt,
-        0,
-        2,
-        "nd-coord-world-mismatch",
-    ));
-    let control_err = client
-        .run_rank(outbound)
+/// The world-mismatch determinant, `assign.world != row.world_size`,
+/// exercised in BOTH directions — the caller's `assign.world` below the
+/// row's own value, and above it — each with a CONTROL call against the
+/// SAME row proving the mismatch conjunct specifically is what refused,
+/// never a coincidence with some other determinant.
+///
+/// **Direction (a)** (`assign.world` BELOW `row.world_size`): the row's own
+/// `world_size` (`WORLD2_SPEC`'s `2`) is ALSO refused outright by
+/// `GangRefusalReason::MultiHostUnsupported` regardless of the caller's
+/// `world` — this unit ships the `world_size == 1` lattice only — so this
+/// direction's control is distinguishable ONLY via the `test-hooks` reason,
+/// never the wire status/message (both refuse `FAILED_PRECONDITION` with the
+/// identical fixed message, by design, §I1 Non-disclosure).
+///
+/// **Direction (b)** (`assign.world` ABOVE `row.world_size`): the row's own
+/// `world_size` is `1` (`WORLD1_SPEC`), so its control (`assign.world`
+/// matching, `= 1`) admits all the way to `UNIMPLEMENTED` — a
+/// WIRE-VISIBLE distinction from the mismatched call's
+/// `FAILED_PRECONDITION`, catching the mutation `if false && assign.world !=
+/// row.world_size` on the PLAIN lane alone (direction (a)'s control cannot,
+/// since `MultiHostUnsupported` refuses the SAME fixed way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
+    #[cfg(feature = "test-hooks")]
+    use jammi_server::grpc::gang::GangRefusalReason;
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    // Direction (a): assign.world (1) BELOW row.world_size (2).
+    let server_a = start_no_worker_server().await;
+    server_a
+        .engine
+        .catalog()
+        .upsert_instance("nd-coord-mismatch-below", Some("l"), Some("h"))
+        .await
+        .unwrap();
+    let attempt_a = submit_and_claim(
+        &server_a,
+        "nd-job-mismatch-below",
+        "nd-coord-mismatch-below",
+        std::time::Duration::from_secs(30),
+        WORLD2_SPEC,
+    )
+    .await;
+    let channel_a1 = crate::common::grpc::channel(server_a.peer_addr).await;
+    let mut client_a1 = GangServiceClient::new(channel_a1);
+    let mismatched = client_a1
+        .run_rank(tokio_stream::once(assign_frame_full(
+            "nd-job-mismatch-below",
+            attempt_a,
+            0,
+            1,
+            "nd-coord-mismatch-below",
+        )))
+        .await
+        .expect_err("assign.world (1) below row.world_size (2) must be refused");
+    assert_eq!(mismatched.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(mismatched.message(), "gang admission refused");
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        server_a.gang_last_refusal_reason(),
+        Some(GangRefusalReason::WorldMismatch),
+        "must record WorldMismatch specifically, not MultiHostUnsupported"
+    );
+    // Control: the SAME row, assign.world (2) matching row.world_size (2).
+    let channel_a2 = crate::common::grpc::channel(server_a.peer_addr).await;
+    let mut client_a2 = GangServiceClient::new(channel_a2);
+    let matching = client_a2
+        .run_rank(tokio_stream::once(assign_frame_full(
+            "nd-job-mismatch-below",
+            attempt_a,
+            0,
+            2,
+            "nd-coord-mismatch-below",
+        )))
+        .await
+        .expect_err("the row's own world_size (2) is unsupported in this unit regardless");
+    assert_eq!(matching.code(), tonic::Code::FailedPrecondition);
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        server_a.gang_last_refusal_reason(),
+        Some(GangRefusalReason::MultiHostUnsupported),
+        "the SAME row at its own world_size must refuse for MultiHostUnsupported, \
+         distinguishing it from the mismatch above"
+    );
+
+    // Direction (b): assign.world (2) ABOVE row.world_size (1).
+    let server_b = start_no_worker_server().await;
+    server_b
+        .engine
+        .catalog()
+        .upsert_instance("nd-coord-mismatch-above", Some("l"), Some("h"))
+        .await
+        .unwrap();
+    let attempt_b = submit_and_claim(
+        &server_b,
+        "nd-job-mismatch-above",
+        "nd-coord-mismatch-above",
+        std::time::Duration::from_secs(30),
+        WORLD1_SPEC,
+    )
+    .await;
+    let channel_b1 = crate::common::grpc::channel(server_b.peer_addr).await;
+    let mut client_b1 = GangServiceClient::new(channel_b1);
+    let mismatched_b = client_b1
+        .run_rank(tokio_stream::once(assign_frame_full(
+            "nd-job-mismatch-above",
+            attempt_b,
+            0,
+            2,
+            "nd-coord-mismatch-above",
+        )))
+        .await
+        .expect_err("assign.world (2) above row.world_size (1) must be refused");
+    assert_eq!(mismatched_b.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(mismatched_b.message(), "gang admission refused");
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        server_b.gang_last_refusal_reason(),
+        Some(GangRefusalReason::WorldMismatch)
+    );
+    // Control: the SAME row, assign.world (1) matching row.world_size (1) —
+    // admits all the way to UNIMPLEMENTED, a WIRE-VISIBLE distinction from
+    // the mismatched call above, proving the mismatch conjunct (never some
+    // other reason) is what refused it.
+    let channel_b2 = crate::common::grpc::channel(server_b.peer_addr).await;
+    let mut client_b2 = GangServiceClient::new(channel_b2);
+    let matching_b = client_b2
+        .run_rank(tokio_stream::once(assign_frame_full(
+            "nd-job-mismatch-above",
+            attempt_b,
+            0,
+            1,
+            "nd-coord-mismatch-above",
+        )))
         .await
         .expect_err("no HostAdmission session exists yet to admit into");
     assert_eq!(
-        control_err.code(),
+        matching_b.code(),
         tonic::Code::Unimplemented,
-        "the SAME row at its own world_size must admit, proving world 1 above refused for \
-         the mismatch alone"
+        "the SAME row at its own world_size (1) must admit, proving direction (b) above \
+         refused for the mismatch alone"
     );
 }
 
@@ -1702,28 +1453,57 @@ async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
 /// shared by the plain lane's non-disclosure oracle and the `test-hooks`
 /// lane's reason-distinguishing oracle below — one definition, so adding a
 /// determinant to one automatically covers it in the other.
-fn every_gang_refusal_reason() -> [jammi_server::grpc::gang::GangRefusalReason; 11] {
-    use jammi_server::grpc::gang::GangRefusalReason;
-    [
-        GangRefusalReason::NotRunning,
-        GangRefusalReason::WrongClaimant,
-        GangRefusalReason::WrongAttempt,
-        GangRefusalReason::LeaseDead,
-        GangRefusalReason::NotFound,
-        GangRefusalReason::CoordinatorNotFresh,
-        GangRefusalReason::WorldMismatch,
-        GangRefusalReason::TrainingSetPairMissing,
-        GangRefusalReason::TrainingSetOtherTenant,
-        GangRefusalReason::TrainingSetNotReady,
-        GangRefusalReason::TrainingSetDigestMismatch,
-    ]
+///
+/// Derived from an EXHAUSTIVE match over a witness of each variant, never a
+/// hardcoded `[..; N]` array: `assert_every_variant_is_a_witness`'s own
+/// match has NO wildcard arm, so a new `GangRefusalReason` variant fails
+/// THIS FILE to compile — naming the missing arm — until it is added both
+/// there and to `WITNESSES` below. A hardcoded fixed-length array could
+/// silently omit a new variant (the array type only checks the COUNT, never
+/// which variants); this cannot, since the match's exhaustiveness is
+/// checked against the enum's REAL variant set, not against whatever this
+/// function happens to list.
+fn every_gang_refusal_reason() -> Vec<jammi_server::grpc::gang::GangRefusalReason> {
+    use jammi_server::grpc::gang::GangRefusalReason as R;
+
+    const WITNESSES: &[R] = &[
+        R::AdminScope,
+        R::NotFound,
+        R::NotRunning,
+        R::WrongClaimant,
+        R::WrongAttempt,
+        R::LeaseDead,
+        R::SpecUndecodable,
+        R::WorldMismatch,
+        R::MultiHostUnsupported,
+        R::CoordinatorNotFresh,
+    ];
+
+    fn assert_every_variant_is_a_witness(variant: R) {
+        match variant {
+            R::AdminScope
+            | R::NotFound
+            | R::NotRunning
+            | R::WrongClaimant
+            | R::WrongAttempt
+            | R::LeaseDead
+            | R::SpecUndecodable
+            | R::WorldMismatch
+            | R::MultiHostUnsupported
+            | R::CoordinatorNotFresh => {}
+        }
+    }
+    for w in WITNESSES {
+        assert_every_variant_is_a_witness(*w);
+    }
+    WITNESSES.to_vec()
 }
 
 /// The ONE non-disclosure oracle. Every I-GANG determinant
-/// (not running / wrong claimant / wrong attempt / lease dead / not found /
-/// coordinator not fresh / world mismatch / pair NULL / other tenant /
-/// digest mismatch / not Ready — eleven total) refuses with the
-/// PAIRWISE-IDENTICAL `(code, message)` — compared pairwise so a single
+/// (ambient admin scope / not found / not running / wrong claimant / wrong
+/// attempt / lease dead / undecodable world_size / world mismatch /
+/// multi-host unsupported / coordinator not fresh — ten total) refuses with
+/// the PAIRWISE-IDENTICAL `(code, message)` — compared pairwise so a single
 /// differing pair fails naming exactly that pair, never merely "some
 /// determinant's message differs somewhere". Mutation proof: make any ONE
 /// determinant's message leak (e.g. append the reason) and this fails,
@@ -1751,7 +1531,7 @@ async fn run_rank_refusal_is_non_disclosing_across_every_determinant() {
     }
 }
 
-/// `test-hooks` only: drives the SAME eleven scenarios
+/// `test-hooks` only: drives the SAME ten scenarios
 /// [`run_rank_refusal_is_non_disclosing_across_every_determinant`] does, but
 /// asserts `PeerEngineServer::gang_last_refusal_reason` names the EXACT
 /// determinant each one refused for — the seam that lets this lane
@@ -1760,8 +1540,13 @@ async fn run_rank_refusal_is_non_disclosing_across_every_determinant() {
 /// `test-hooks` lane's `cargo test -p jammi-server --test it -- gang`
 /// execute ONE MORE gang-prefixed test-fn than the plain lane (this
 /// function itself is compiled only under `test-hooks`; the plain lane's
-/// case above still runs the same eleven RPC calls, just without this
-/// additional reason assertion).
+/// case above still runs the same ten RPC calls, just without this
+/// additional reason assertion). One of the ten (`AdminScope`) is driven
+/// in-process by `refusal_scenario` itself (see its own doc) rather than
+/// over the real listener — this test's own assertion still holds, since it
+/// reads `PeerEngineServer::gang_last_refusal_reason`, which `refusal_scenario`
+/// re-points at the standalone `GangServer` it actually called for that one
+/// scenario.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_last_refusal_reason_distinguishes_every_determinant() {

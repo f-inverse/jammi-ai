@@ -280,10 +280,20 @@ async fn get_job_for_rank_reflects_the_row_world_size() {
 )]
 #[tokio::test]
 async fn get_job_for_rank_defaults_world_size_when_absent_from_spec(kind: BackendKind) {
-    let Some((_dir, catalog)) = base_catalog_kind(kind).await else {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
         eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
         return;
-    };
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
     catalog
         .submit_job(job_params("job-world-absent"))
         .await
@@ -318,10 +328,20 @@ async fn get_job_for_rank_defaults_world_size_when_absent_from_spec(kind: Backen
 )]
 #[tokio::test]
 async fn get_job_for_rank_malformed_world_size_is_undecodable_not_a_fault(kind: BackendKind) {
-    let Some((_dir, catalog)) = base_catalog_kind(kind).await else {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
         eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
         return;
-    };
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
     catalog
         .submit_job(SubmitJobParams {
             job_id: "job-world-malformed",
@@ -370,10 +390,20 @@ async fn get_job_for_rank_malformed_world_size_is_undecodable_not_a_fault(kind: 
 )]
 #[tokio::test]
 async fn get_job_for_rank_spec_not_json_is_undecodable_not_a_fault(kind: BackendKind) {
-    let Some((_dir, catalog)) = base_catalog_kind(kind).await else {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
         eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
         return;
-    };
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
     catalog
         .submit_job(SubmitJobParams {
             job_id: "job-world-not-json",

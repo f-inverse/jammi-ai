@@ -1,4 +1,4 @@
-//! #500 U4a: what a deployment admits a rank count for, and where it refuses
+//! #500: what a deployment admits a rank count for, and where it refuses
 //! one.
 //!
 //! Two edges, and the tests here are about which is which.

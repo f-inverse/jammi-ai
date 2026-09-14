@@ -1,10 +1,17 @@
-//! Two enumerating-caller oracles (see
+//! An enumerating-caller oracle (see
 //! `docs/rigor/contracts/feat_500-C-U5a-1.md` § 1.6 — the I-GANG row
-//! predicate and the training-set sidecar verify), each
-//! a MEASURED claim (never prose): `Catalog::get_job_for_rank` and
-//! `Catalog::get_result_table_for_tenant` are each called from nowhere
-//! outside the gang `RunRank` handler (plus each function's own crate's
-//! tests, which call it directly to exercise it in isolation).
+//! predicate), a MEASURED claim (never prose): `Catalog::get_job_for_rank`
+//! is called from nowhere outside the gang `RunRank` handler (plus
+//! `jammi-db`'s own tests, which call it directly to exercise it in
+//! isolation). The training-set sidecar verify's own enumerating-caller
+//! oracle (`get_result_table_for_tenant`'s only production caller) is
+//! GONE, not merely retired: the gang `RunRank` handler no longer reaches
+//! that verb at all — this unit ships the `world_size == 1` lattice only —
+//! so there is no gang-adjacent caller surface left to enumerate here.
+//! `get_result_table_for_tenant`'s own strict-predicate property is
+//! `jammi-db`'s own tenant-isolation guard, tested directly there
+//! (`crates/jammi-db/tests/it/result_tables.rs`), independent of any
+//! caller built on top of it.
 //!
 //! The scanned surface is derived from `git ls-files` (never a hand-rolled
 //! directory walk) over the whole tracked tree — `crates/**` and everything
@@ -17,8 +24,8 @@
 //! raw), and char literal is masked to spaces first (`mask_non_code`,
 //! ported verbatim from `whose_fault_gate.rs`'s own function of the same
 //! name). This is load-bearing, not cosmetic — this very oracle file names
-//! both call-tokens in its own doc comments, in its assert messages, and as
-//! string-literal arguments to `files_containing` itself; an unmasked
+//! the call-token in its own doc comments, in its assert messages, and as a
+//! string-literal argument to `files_containing` itself; an unmasked
 //! substring scan would find those and self-hit, and the fix must never be
 //! to allowlist this file (a self-allowlisted oracle could hide a real new
 //! call site behind its own comments and never notice). Masking is what
@@ -26,10 +33,9 @@
 //! string literals are masked away.
 //!
 //! Masking alone is not quite enough, though: this file's OWN test
-//! functions are named `only_the_gang_run_rank_handler_calls_get_job_for_\
-//! rank` and `only_resolve_training_set_identity_calls_get_result_table_\
-//! for_tenant`, so their declarations (`fn ...calls_get_job_for_rank() {`)
-//! are a genuine CODE occurrence of the substring `get_job_for_rank(` that
+//! function is named `only_the_gang_run_rank_handler_calls_get_job_for_\
+//! rank`, so its declaration (`fn ...calls_get_job_for_rank() {`)
+//! is a genuine CODE occurrence of the substring `get_job_for_rank(` that
 //! is nonetheless not a call — it is a longer identifier that happens to
 //! end in the token, immediately followed by its own empty parameter
 //! list's `(`. `contains_code_token` closes that gap with an
@@ -253,8 +259,11 @@ fn files_containing(token: &str) -> HashSet<String> {
 }
 
 /// The enumerating-caller oracle over `crates/**`: `get_job_for_rank`'s only
-/// production caller is the gang `RunRank` handler; the sole other hit is
-/// `jammi-db`'s own unit test exercising the method directly.
+/// production caller is the gang `RunRank` handler; the other hits are
+/// `jammi-db`'s own unit tests exercising the method directly and the
+/// producer→consumer parity test, which calls it directly (never through
+/// the RPC) to compare its own decode against a real `TrainingSpec`
+/// producer's serialization.
 #[test]
 fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
     let hits = files_containing("get_job_for_rank(");
@@ -262,6 +271,7 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
         "crates/jammi-db/src/catalog/jobs_repo.rs", // the definition itself
         "crates/jammi-server/src/grpc/gang.rs",     // the ONE production caller
         "crates/jammi-db/tests/it/gang_rank_admission.rs", // jammi-db's own unit tests
+        "crates/jammi-server/tests/it/gang_training_spec_parity.rs", // producer/consumer parity, direct call
     ]
     .into_iter()
     .collect();
@@ -284,50 +294,12 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
     }
 }
 
-/// The enumerating-caller oracle for the strict-tenant resolver: no caller
-/// other than the gang `RunRank` handler resolves `training_set_location`
-/// — `get_result_table_for_tenant`'s only production caller is
-/// `resolve_training_set_identity` inside the gang handler; the two other
-/// hits are `gang_service.rs`'s own tests exercising the raw verb directly
-/// to demonstrate the hazard that resolver guards against (see
-/// `docs/rigor/contracts/feat_500-C-U5a-1.md` § A2).
-#[test]
-fn only_resolve_training_set_identity_calls_get_result_table_for_tenant() {
-    let hits = files_containing("get_result_table_for_tenant(");
-    let allowed: HashSet<&str> = [
-        "crates/jammi-db/src/catalog/result_repo.rs", // the definition itself
-        "crates/jammi-server/src/grpc/gang.rs",       // the ONE production caller
-        "crates/jammi-server/tests/it/gang_service.rs", // this crate's own refusal tests
-    ]
-    .into_iter()
-    .collect();
-    for hit in &hits {
-        assert!(
-            allowed.contains(hit.as_str()),
-            "unexpected `get_result_table_for_tenant(` occurrence outside the allowed \
-             set: {hit} (allowed: {allowed:?}) — a new caller of this strict-tenant \
-             verb must be reviewed against the admin-scope hazard \
-             (see docs/rigor/contracts/feat_500-C-U5a-1.md § A2) \
-             before this allowlist grows"
-        );
-    }
-    for must_hit in &allowed {
-        assert!(
-            hits.contains(*must_hit),
-            "{must_hit} is in the allowlist but no longer contains \
-             `get_result_table_for_tenant(` — shrink the allowlist rather than leaving \
-             a stale entry"
-        );
-    }
-}
-
-/// The masking self-test both enumerating-caller oracles above depend on:
+/// The masking self-test the enumerating-caller oracle above depends on:
 /// a call-token inside a `//` line comment, a `///` doc comment, or a
 /// string literal is NOT a code occurrence; the same token appearing as an
 /// actual call in code IS one. Without this, this very file's own doc
-/// comments and its `files_containing("get_job_for_rank(")` /
-/// `files_containing("get_result_table_for_tenant(")` string-literal
-/// arguments would self-hit and force a self-allowlist entry — the one
+/// comments and its `files_containing("get_job_for_rank(")` string-literal
+/// argument would self-hit and force a self-allowlist entry — the one
 /// outcome this design rejects.
 #[test]
 fn mask_non_code_hides_comments_and_strings_but_not_code() {

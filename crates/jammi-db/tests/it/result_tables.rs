@@ -8,6 +8,7 @@
 //! is (SQLite always; Postgres under `live-postgres-tests`, skipped at
 //! runtime when `JAMMI_TEST_PG_URL` is unset).
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::{LeaseConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
+use jammi_db::TenantId;
 use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
@@ -490,4 +492,42 @@ async fn the_sweep_writes_a_null_lease_the_backend_reads_back(backend: BackendKi
         .next()
         .unwrap();
     assert_eq!(null_count, 1);
+}
+
+/// `Catalog::get_result_table_for_tenant`'s strict-predicate property (the
+/// tenant-isolation guard this verb IS, independent of any caller built on
+/// top of it — the gang admission handler's own former use of this verb is
+/// `HostAdmission`'s to rebuild elsewhere, `docs/plans/67-distributed-training/UNITS.md`
+/// § U5a-2): a NULL-tenant `result_tables` row (as if materialized outside
+/// any tenant scope) must never resolve for a REAL tenant's lookup, even
+/// though the RELAXED `get_result_table` read (the other seam) still sees
+/// it — the hazard this strict predicate exists to close.
+#[tokio::test]
+async fn get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant() {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = catalog_for!(BackendKind::Sqlite, dir.path());
+
+    let table = format!("strict_null_tenant_{}", unique_suffix());
+    catalog
+        .create_result_table(building_row(&table, "writer-strict", None))
+        .await
+        .unwrap();
+
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+
+    let relaxed = catalog.get_result_table(&table).await.unwrap();
+    assert!(
+        relaxed.is_some(),
+        "the relaxed get_result_table read must still see the NULL-tenant row \
+         (the only relaxed seam) — the hazard the strict predicate guards against"
+    );
+
+    let strict = catalog
+        .get_result_table_for_tenant(&table, Some(tenant_a))
+        .await
+        .unwrap();
+    assert!(
+        strict.is_none(),
+        "the strict resolver must never match a NULL-tenant row for a real tenant, got {strict:?}"
+    );
 }

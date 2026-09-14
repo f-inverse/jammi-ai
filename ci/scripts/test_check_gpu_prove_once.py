@@ -27,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_gpu_prove_once as cgo  # noqa: E402
@@ -2230,6 +2231,257 @@ class SiblingJobOrderNeverMasksAnUnexaminableReusableTest(unittest.TestCase):
             ),
             findings,
         )
+
+
+def _quoted_job_level_caller(target: str, quote: str, job_name: str = "call-it") -> str:
+    """`caller.yml`'s single job's job-level `uses:` wrapped in `quote`
+    (`'"'` or `"'"`) -- GitHub reads a quoted `uses:` identically to a bare
+    one; the OLD text regex (`uses:\\s*\\./...`) matched neither quote
+    style."""
+    return (
+        "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
+        f"jobs:\n  {job_name}:\n    uses: {quote}./.github/workflows/{target}{quote}\n"
+    )
+
+
+class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
+    """W12 audit fix (closing audit #9 at 2de0b93f): every `uses:` P6
+    reasons about -- job-level local reusable, step-level action -- is
+    read from the ONE parsed document, never a text regex. RED at
+    2de0b93f for every case below (each either finds 0 where the fixed
+    reader finds >=1, or silently drops a refusal the fixed reader
+    surfaces)."""
+
+    @staticmethod
+    def _reusable(jobs_text: str) -> str:
+        return f"name: reuse\n\non:\n  workflow_call:\n\n{jobs_text}"
+
+    _PUBLISHING_JOBS = (
+        "jobs:\n  publisher:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n"
+    )
+    _UNEXAMINABLE_JOBS = (
+        "jobs: { publisher: { runs-on: ubuntu-latest, steps: [ { run: 'npm publish' } ] } }\n"
+    )
+
+    # -- BLOCK-2: quoted job-level `uses:` (double and single quotes), to a
+    # publishing reusable and to an unexaminable one. --------------------
+    def test_double_quoted_job_level_uses_finds_a_publishing_reusable(self):
+        texts = {
+            **_positive_texts(),
+            "caller.yml": _quoted_job_level_caller("_reuse.yml", '"'),
+            "_reuse.yml": self._reusable(self._PUBLISHING_JOBS),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("not listed in PROMOTION_TABLE", mine[0])
+
+    def test_single_quoted_job_level_uses_finds_a_publishing_reusable(self):
+        texts = {
+            **_positive_texts(),
+            "caller.yml": _quoted_job_level_caller("_reuse.yml", "'"),
+            "_reuse.yml": self._reusable(self._PUBLISHING_JOBS),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("not listed in PROMOTION_TABLE", mine[0])
+
+    def test_double_quoted_job_level_uses_to_an_unexaminable_reusable_is_a_finding(self):
+        texts = {
+            **_positive_texts(),
+            "caller.yml": _quoted_job_level_caller("_reuse.yml", '"'),
+            "_reuse.yml": self._reusable(self._UNEXAMINABLE_JOBS),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f or "_reuse.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_reuse.yml" in f and "call-it" in f for f in mine), mine)
+
+    def test_single_quoted_job_level_uses_to_an_unexaminable_reusable_is_a_finding(self):
+        texts = {
+            **_positive_texts(),
+            "caller.yml": _quoted_job_level_caller("_reuse.yml", "'"),
+            "_reuse.yml": self._reusable(self._UNEXAMINABLE_JOBS),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f or "_reuse.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_reuse.yml" in f and "call-it" in f for f in mine), mine)
+
+    # -- BLOCK-3: quoted step-level docker-publish (push: true) and
+    # release-upload. --------------------------------------------------
+    def test_quoted_double_docker_publish_push_true_unlisted_fails(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            '      - uses: "./.github/actions/docker-publish"\n'
+            "        with:\n          push: true\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_quoted_single_release_upload_unlisted_fails(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: './.github/actions/release-upload'\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_quoted_cross_repo_docker_publish_push_true_unlisted_fails(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            '      - uses: "f-inverse/other-repo/.github/actions/docker-publish@main"\n'
+            '        with:\n          push: "true"\n'
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    # -- BLOCK-2 (`+`-truncation): a local reusable whose filename contains
+    # a `+` -- the old character class stopped at `pub`. --------------
+    def test_plus_bearing_filename_is_never_truncated(self):
+        caller = (
+            "name: plus-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  build:\n    uses: ./.github/workflows/pub+lish.yml\n"
+        )
+        texts = {
+            **_positive_texts(),
+            "plus-caller.yml": caller,
+            "pub+lish.yml": self._reusable(self._PUBLISHING_JOBS),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "plus-caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("build", mine[0])
+        self.assertIn("pub+lish.yml", mine[0])
+
+    # -- BLOCK-2 (dangling target): a job-level `uses:` naming a workflow
+    # that does not exist anywhere in the discovered tree. ----------------
+    def test_dangling_job_level_target_is_a_finding_naming_job_and_target(self):
+        caller = (
+            "name: dangling-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  build:\n    uses: ./.github/workflows/_does_not_exist.yml\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "dangling-caller.yml": caller})
+        mine = [f for f in findings if "dangling-caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("build", mine[0])
+        self.assertIn("_does_not_exist.yml", mine[0])
+
+    # -- BLOCK-1: the self-mask -- a LISTED job's own direct-match text
+    # must never prevent its `uses:` target from being examined. The exact
+    # audit shape: image.yml's registered `build` row repointed at an
+    # unexaminable reusable, with a `name:` line that also gives the job a
+    # direct primitive match. ----------------------------------------
+    @staticmethod
+    def _image_yml_pointed_at(target: str, with_direct_match_name: bool) -> str:
+        name_line = "    name: docker push (cpu base)\n" if with_direct_match_name else ""
+        return (
+            "name: caller\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\n"
+            f"jobs:\n  build:\n{name_line}"
+            "    if: github.ref_type != 'tag'\n"
+            f"    uses: ./.github/workflows/{target}\n"
+        )
+
+    def test_control_listed_job_pointed_at_an_unexaminable_reusable_is_a_finding(self):
+        texts = dict(_positive_texts())
+        texts["image.yml"] = self._image_yml_pointed_at("_unexaminable.yml", with_direct_match_name=False)
+        texts["_unexaminable.yml"] = self._reusable(self._UNEXAMINABLE_JOBS)
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "image.yml" in f or "_unexaminable.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_unexaminable.yml" in f and "build" in f for f in mine), mine)
+
+    def test_listed_jobs_own_direct_match_never_masks_its_own_unexaminable_reusable(self):
+        texts = dict(_positive_texts())
+        texts["image.yml"] = self._image_yml_pointed_at("_unexaminable.yml", with_direct_match_name=True)
+        texts["_unexaminable.yml"] = self._reusable(self._UNEXAMINABLE_JOBS)
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "image.yml" in f or "_unexaminable.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_unexaminable.yml" in f and "build" in f for f in mine), mine)
+
+    # -- two refusing reusables reached from ONE caller: both must be
+    # named, never only the first. ---------------------------------------
+    def test_two_refusing_reusables_under_one_caller_are_both_named(self):
+        caller = (
+            "name: fanout2-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  build:\n    uses: ./.github/workflows/_mid2.yml\n"
+        )
+        mid = (
+            "name: mid2\n\non:\n  workflow_call:\n\njobs:\n"
+            "  hop-bad-1:\n    uses: ./.github/workflows/_bad1.yml\n"
+            "  hop-bad-2:\n    uses: ./.github/workflows/_bad2.yml\n"
+        )
+        texts = {
+            **_positive_texts(),
+            "fanout2-caller.yml": caller,
+            "_mid2.yml": mid,
+            "_bad1.yml": self._reusable(self._UNEXAMINABLE_JOBS),
+            "_bad2.yml": self._reusable(self._UNEXAMINABLE_JOBS),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "fanout2-caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("_bad1.yml", mine[0])
+        self.assertIn("_bad2.yml", mine[0])
+
+    # -- a diamond: the same reusable reached from two different callers is
+    # walked exactly once per scan. ---------------------------------------
+    def test_diamond_reusable_is_walked_once_not_once_per_caller(self):
+        shared_text = self._reusable(self._PUBLISHING_JOBS)
+        caller_a = (
+            "name: caller-a\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  a:\n    uses: ./.github/workflows/_shared.yml\n"
+        )
+        caller_b = (
+            "name: caller-b\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  b:\n    uses: ./.github/workflows/_shared.yml\n"
+        )
+        texts = {
+            **_positive_texts(),
+            "caller-a.yml": caller_a,
+            "caller-b.yml": caller_b,
+            "_shared.yml": shared_text,
+        }
+        calls: list[str] = []
+        real = cgo._workflow_job_bodies
+
+        def counting(text):
+            if text == shared_text:
+                calls.append(text)
+            return real(text)
+
+        with mock.patch.object(cgo, "_workflow_job_bodies", side_effect=counting):
+            findings = cgo.check_p6_discovery(texts)
+        self.assertEqual(
+            len(calls), 1, "the shared reusable's own jobs: must be examined once per scan, not once per caller"
+        )
+        self.assertTrue(any("caller-a.yml" in f for f in findings), findings)
+        self.assertTrue(any("caller-b.yml" in f for f in findings), findings)
+
+    # -- a depth-bound refusal: a genuine `uses:` cycle terminates in a
+    # named refusal, never an uncaught RecursionError. ---------------------
+    def test_uses_cycle_terminates_in_a_named_depth_refusal(self):
+        caller = (
+            "name: cycle-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  start:\n    uses: ./.github/workflows/_cycle_a.yml\n"
+        )
+        cycle_a = "name: cycle-a\n\non:\n  workflow_call:\n\njobs:\n  hop:\n    uses: ./.github/workflows/_cycle_b.yml\n"
+        cycle_b = "name: cycle-b\n\non:\n  workflow_call:\n\njobs:\n  hop:\n    uses: ./.github/workflows/_cycle_a.yml\n"
+        texts = {
+            **_positive_texts(),
+            "cycle-caller.yml": caller,
+            "_cycle_a.yml": cycle_a,
+            "_cycle_b.yml": cycle_b,
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "cycle-caller.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertIn("depth", mine[0])
 
 
 class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):

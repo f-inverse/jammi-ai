@@ -235,6 +235,7 @@ from check_execution_surface_reachability import (  # noqa: E402
     WorkflowLoadError,
     job_source_spans,
     jobs_or_fail,
+    load_workflow_text,
     read_top_level_on_block,
     read_top_level_on_block_from_path,
 )
@@ -1436,6 +1437,25 @@ _PUSH_VALUE_RE = re.compile(r"^[ \t]*push:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
 _LOCAL_RELEASE_UPLOAD_RE = re.compile(r"uses:\s*\./\.github/actions/release-upload\b")
 _CROSS_REPO_RELEASE_UPLOAD_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/actions/release-upload@")
 
+# W12 audit fix: the four constants above are anchored on the literal text
+# `uses:\s*` -- a GitHub-valid QUOTED value (`uses: "./.github/actions/
+# docker-publish"`, single or double quotes) never matches `\./` right
+# after that prefix, so a quoted local/cross-repo docker-publish or
+# release-upload reference was entirely invisible to P6 (executed: 0
+# findings quoted vs 1 unquoted). These VALUE-anchored twins match the
+# DECODED `uses:` scalar itself -- read from the parsed document
+# (`job_invokes_publish_primitive`'s own `step_uses_values` parameter,
+# populated from `load_workflow_text`'s constructed step mappings) -- so
+# quoting can no longer hide a step-level action reference. Never applied
+# to `_DOCKER_BUILD_PUSH_ACTION_RE` (kept unanchored on purpose, see its
+# own comment: it is a bare substring search, not `uses:`-anchored, so a
+# quoted `docker/build-push-action@v6` still contains that literal
+# substring and was never vulnerable to this class).
+_LOCAL_DOCKER_PUBLISH_VALUE_RE = re.compile(r"^\./\.github/actions/docker-publish\b")
+_CROSS_REPO_DOCKER_PUBLISH_VALUE_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/docker-publish@")
+_LOCAL_RELEASE_UPLOAD_VALUE_RE = re.compile(r"^\./\.github/actions/release-upload\b")
+_CROSS_REPO_RELEASE_UPLOAD_VALUE_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/release-upload@")
+
 
 def _push_value_is_promoting(job_body: str) -> bool:
     for m in _PUSH_VALUE_RE.finditer(job_body):
@@ -1448,133 +1468,299 @@ def _push_value_is_promoting(job_body: str) -> bool:
     return False
 
 
-def job_invokes_publish_primitive(job_body: str) -> str | None:
+def job_invokes_publish_primitive(
+    job_body: str, step_uses_values: list[str] | None = None
+) -> str | None:
     """`job_body` must already be comment-stripped. Returns the matched
     primitive's display name, or `None`. A job whose body invokes ANY
     listed primitive is a "promotion job" for P6's purposes -- it must be
     listed in `PROMOTION_TABLE` (any row, any gate_kind) or this gate fails
     by name. DIRECT match only -- see `job_invokes_publish_primitive_
     recursive` for the "delegates to a local reusable that itself pushes"
-    case."""
+    case.
+
+    `step_uses_values` (W12 audit fix): the DECODED `uses:` scalar for
+    every step directly under this job, read from the ONE parsed document
+    (`load_workflow_text`'s own constructed mapping) -- never a text
+    regex, so a quoted `uses: "./.github/actions/docker-publish"` (double
+    OR single quotes) can no longer hide from this rule, and a target
+    filename is never silently truncated by a text character class (a
+    `pub+lish.yml` local reusable used to be read as `pub` and then fail
+    to resolve). `None` -- the ONLY other caller, `_other_publishing_
+    steps`'s own per-step text scan (P3's step-gated-row rule, a separate,
+    narrower text-based mechanism this excision does not touch) -- falls
+    back to the legacy `uses:`-anchored text regex for ONLY this one
+    sub-check; every other rule in this function already reads `job_body`
+    raw regardless, since a `run:` shell command has no YAML-quoting
+    escape to begin with, so quoting was never a hole for those."""
     for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
         if pattern.search(job_body):
             return label
     if _DOCKER_BUILD_PUSH_ACTION_RE.search(job_body) and _push_value_is_promoting(job_body):
         return "docker/build-push-action (push != false)"
-    if (
-        _LOCAL_DOCKER_PUBLISH_RE.search(job_body) or _CROSS_REPO_DOCKER_PUBLISH_RE.search(job_body)
-    ) and _push_value_is_promoting(job_body):
-        return "./.github/actions/docker-publish (push != false)"
-    if _LOCAL_RELEASE_UPLOAD_RE.search(job_body) or _CROSS_REPO_RELEASE_UPLOAD_RE.search(job_body):
-        return "./.github/actions/release-upload"
+    if step_uses_values is None:
+        local_docker_publish = _LOCAL_DOCKER_PUBLISH_RE.search(job_body) or _CROSS_REPO_DOCKER_PUBLISH_RE.search(
+            job_body
+        )
+        if local_docker_publish and _push_value_is_promoting(job_body):
+            return "./.github/actions/docker-publish (push != false)"
+        if _LOCAL_RELEASE_UPLOAD_RE.search(job_body) or _CROSS_REPO_RELEASE_UPLOAD_RE.search(job_body):
+            return "./.github/actions/release-upload"
+        return None
+    for uses in step_uses_values:
+        if (
+            _LOCAL_DOCKER_PUBLISH_VALUE_RE.match(uses) or _CROSS_REPO_DOCKER_PUBLISH_VALUE_RE.match(uses)
+        ) and _push_value_is_promoting(job_body):
+            return "./.github/actions/docker-publish (push != false)"
+        if _LOCAL_RELEASE_UPLOAD_VALUE_RE.match(uses) or _CROSS_REPO_RELEASE_UPLOAD_VALUE_RE.match(uses):
+            return "./.github/actions/release-upload"
     return None
 
 
-def _local_reusable_workflow_targets(job_body: str) -> list[str]:
-    """Job-level `uses: ./.github/workflows/<X>.yml` targets referenced
-    directly in this job's body (never a step-level action `uses:`, which
-    `job_invokes_publish_primitive` already covers by pattern)."""
-    return [m.group(1) for m in _USES_LOCAL_RE.finditer(job_body)]
+_LOCAL_WORKFLOW_USES_PREFIX = "./.github/workflows/"
+
+
+def _local_reusable_workflow_target(job_node: dict) -> str | None:
+    """The job-level `uses: ./.github/workflows/<X>.yml` target THIS job
+    delegates to (never a step-level action `uses:`, which lives under a
+    DIFFERENT key, `steps:`, and is `job_invokes_publish_primitive`'s own
+    concern) -- read directly from the job's own PARSED mapping
+    (`load_workflow_text`'s construction), never a text regex. A job
+    carries at most one job-level `uses:` (GitHub Actions itself makes
+    `uses:` and `steps:`/`runs-on:` mutually exclusive at the job level),
+    so this returns a single target, never a list. `None` when this job
+    has no job-level `uses:` at all, or that value does not name a LOCAL
+    workflow (a cross-repo or step-level reference is out of this
+    function's scope by construction). W12 audit fix: the OLD text regex
+    (`uses:\\s*\\./\\.github/workflows/([A-Za-z0-9_.-]+)`) matched neither a
+    quoted value NOR a filename containing `+` (the character class
+    stopped at `pub` for `pub+lish.yml`) -- reading the parsed scalar
+    directly closes both holes at once, since YAML quoting and the exact
+    filename are both already resolved by the parser."""
+    uses = job_node.get("uses")
+    if not isinstance(uses, str):
+        return None
+    uses = uses.strip()
+    if not uses.startswith(_LOCAL_WORKFLOW_USES_PREFIX):
+        return None
+    return uses[len(_LOCAL_WORKFLOW_USES_PREFIX) :]
 
 
 def _workflow_job_bodies(text: str) -> dict[str, str]:
     """{job_id: body} for every job under `text`'s own top-level `jobs:`.
     W10 audit fix: a target this cannot parse/compose is NEVER swallowed
     into `{}` here -- `job_source_spans`'s own `WorkflowLoadError` is left
-    to propagate to the caller (`job_invokes_publish_primitive_recursive`),
-    which names the RESOLVED PATH of the reusable this body came from before
-    re-raising; `check_p6_discovery` is the one place that turns it into a
-    FINDING. A workflow reached ONLY through a caller's `uses:` (a
-    `workflow_call`-only reusable, P6's own top-level loop skips scanning it
-    directly by design) would otherwise have no other path to examination at
-    all -- swallowing its load error here made it invisible everywhere."""
+    to propagate to the caller (`_traverse_reusable`), which names the
+    RESOLVED PATH of the reusable this body came from before re-raising;
+    `check_p6_discovery` is the one place that turns it into a FINDING. A
+    workflow reached ONLY through a caller's `uses:` (a `workflow_call`-
+    only reusable, P6's own top-level loop skips scanning it directly by
+    design) would otherwise have no other path to examination at all --
+    swallowing its load error here made it invisible everywhere."""
     stripped = drop_comment_lines(text)
     lines = stripped.splitlines()
     jobs = job_source_spans(stripped)
     return {name: "\n".join(lines[s:e]) for name, (s, e) in jobs.items()}
 
 
+def _parsed_jobs_or_fail(text: str) -> tuple[dict[str, dict], str | None]:
+    """(job_id -> parsed job mapping, error). The PARSED-DOCUMENT twin of
+    `_workflow_job_bodies`/`jobs_or_fail` -- `load_workflow_text(text)
+    ["jobs"]`, the SAME construction `check_execution_surface_
+    reachability.py` already exposes, never a second reader. `error` is
+    `None` on success; on failure it names why, the same fail-loud
+    doctrine `jobs_or_fail` already holds text-span discovery to -- never
+    a silent `{}` standing in for "this file has zero jobs". A job entry
+    that is not itself a mapping (never valid GitHub Actions, but not
+    assumed here) is its own named failure, never silently skipped."""
+    try:
+        doc = load_workflow_text(text)
+    except WorkflowLoadError as exc:
+        return {}, str(exc)
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return {}, "no top-level jobs: mapping"
+    result: dict[str, dict] = {}
+    for job_id, job_node in jobs.items():
+        if not isinstance(job_node, dict):
+            return {}, f"job {job_id!r} is not a mapping -- cannot examine"
+        result[str(job_id)] = job_node
+    return result, None
+
+
+# W12 audit fix: bounds the `uses:` traversal with a NAMED refusal rather
+# than trusting a `_visited` cycle-guard alone (or, worse, an uncaught
+# `RecursionError`) -- comfortably above GitHub Actions' own reusable-
+# workflow nesting limit (4), far below Python's default recursion limit.
+_MAX_USES_DEPTH = 10
+
+
 def job_invokes_publish_primitive_recursive(
     job_body: str,
+    job_node: dict,
     workflow_texts: dict[str, str],
-    _visited: frozenset[str] = frozenset(),
+    _memo: dict[str, tuple[str | None, WorkflowLoadError | None]] | None = None,
+    _depth: int = 0,
 ) -> str | None:
-    """F1 audit fix (RECURSIVE discovery): a direct match first; if none,
-    and this job's body itself `uses:` a LOCAL reusable workflow (job-level
-    `uses: ./.github/workflows/<X>.yml` -- e.g. `image.yml`'s `build` job
+    """F1 audit fix (RECURSIVE discovery): a direct match; AND, whether or
+    not one was found, if this job's OWN parsed mapping carries a job-level
+    `uses:` naming a LOCAL reusable workflow (e.g. `image.yml`'s `build` job
     calling `_ci-base-image.yml`), recurse into THAT workflow's own jobs.
     `_ci-base-image.yml` itself pushes to GHCR (`docker/build-push-action`,
     `push: true`); a job that merely delegates to it is still a promoting
-    job for P6's purposes. `_visited` guards a workflow-`uses:`-cycle from
-    recursing forever (never expected in this repo's tree, but a guard, not
-    an assumption).
+    job for P6's purposes.
 
-    W10 audit fix: a reusable this delegates into but cannot load/compose
-    (its own `jobs:` is flow-style, a job value that does not occupy its
-    own line span, an anchor/alias/tag, a syntax error, ...) raises
-    `WorkflowLoadError` -- RE-RAISED here with the resolved reusable's own
-    path folded into the message, never caught and treated as "no
-    primitive found". `check_p6_discovery` is the one place that turns this
-    into a named finding; every OTHER caller of this function must let it
-    propagate too, for the same reason `on_err`/`jobs_err` are never
-    discarded at the top level.
+    W12 audit fix (BLOCK-1, the self-mask): this used to `return` the
+    instant a DIRECT match was found, before ever looking at this job's own
+    `uses:` -- so a listed job (e.g. `image.yml`'s `build` row) whose body
+    ALSO happened to contain direct-match text (a `name:` line reading
+    "docker push (cpu base)") masked its OWN unexaminable reusable target
+    entirely: 1 finding as a control, 0 the moment the direct-match text was
+    added, with the reusable's refusal never even attempted. The traversal
+    below ALWAYS runs, regardless of `direct`; a `found_result` already set
+    from `direct` is only ever used when the traversal itself raises
+    nothing (a refusal anywhere downstream still propagates and wins, the
+    same precedence a sibling refusal already held over a sibling's own
+    find).
 
-    W11 audit fix: the sibling-job loop used to `return` the instant ONE
-    sibling job yielded a primitive -- so whenever a LATER sibling job's own
-    `uses:` reached a reusable this reader cannot examine, that reusable's
-    `_workflow_job_bodies` call was never even made, its `WorkflowLoadError`
-    never fired, and the whole chain stayed permanently invisible to P6
-    (`image.yml`'s `build` -> a fan-out reusable with a `hop-good` job that
-    finds a primitive and a `hop-bad` job whose own target is flow-style:
-    0 findings with `hop-good` first, 1 with `hop-bad` first -- the verdict
-    depended on job order, which the property below forbids). The fix:
-    EVERY sibling reachable through a given `uses:` target -- and every
-    target a job body itself names -- is visited before this function ever
-    returns; a refusal anywhere in that whole reachable set is remembered
-    and re-raised, never masked by another sibling's find, with the
-    resolved target folded onto the FRONT of the message so a multi-hop
-    chain reads as the true edge sequence (`caller's job -> mid -> bad`),
-    never a single flattened edge naming only the last hop."""
-    direct = job_invokes_publish_primitive(job_body)
-    if direct is not None:
-        return direct
-    found_result: str | None = None
-    first_refusal: WorkflowLoadError | None = None
-    for target in _local_reusable_workflow_targets(job_body):
+    W12 audit fix (BLOCK-2, dangling target): a job-level `uses:` naming a
+    workflow this reader cannot RESOLVE at all (not present in
+    `workflow_texts` under either extension spelling) used to be silently
+    `continue`d past -- now a named refusal, since "the caller's `uses:`
+    target does not exist" is exactly as much a break in the promotion
+    guarantee as "the target exists but its `jobs:` cannot be examined".
+
+    `job_node` is this job's own PARSED mapping (`load_workflow_text`'s
+    construction) -- `_local_reusable_workflow_target` and this function's
+    `step_uses_values` argument to `job_invokes_publish_primitive` both read
+    from it directly, never from a text regex over `job_body` (W12; see
+    `_local_reusable_workflow_target`'s and the `_..._VALUE_RE` constants'
+    own docstrings/comments for the quoting and `+`-truncation holes this
+    closes).
+
+    `_memo`, keyed by RESOLVED workflow path (W12 audit fix): a DIAMOND --
+    the same reusable reached through two different callers, or two
+    different sibling jobs in the same scan -- is walked exactly once per
+    `check_p6_discovery` call; every subsequent lookup reuses the memoized
+    (found, refusal) pair, re-raising an already-memoized refusal so a
+    caller reached SECOND sees the identical named refusal a caller reached
+    FIRST already surfaced, never a silent `None` standing in for "already
+    visited, nothing to report here". `check_p6_discovery` creates ONE
+    memo dict and threads it through every top-level job it scans; a
+    standalone call (as every test in this module makes) defaults `_memo`
+    to `None` and gets a fresh, call-scoped dict.
+
+    `_depth` bounds the walk (see `_MAX_USES_DEPTH`) -- a genuine `uses:`
+    cycle (never expected in this repo's tree, but not assumed) still
+    terminates in a NAMED refusal rather than recursing until Python's own
+    `RecursionError` fires.
+
+    W10 audit fix (unchanged): a reusable this delegates into but cannot
+    load/compose (its own `jobs:` is flow-style, a job value that does not
+    occupy its own line span, an anchor/alias/tag, a syntax error, ...)
+    raises `WorkflowLoadError` -- RE-RAISED here with the resolved
+    reusable's own path folded into the message, never caught and treated
+    as "no primitive found". `check_p6_discovery` is the one place that
+    turns this into a named finding.
+
+    W11 audit fix (unchanged, now generalized in `_traverse_reusable`):
+    EVERY sibling reachable through a given `uses:` target is visited
+    before that reusable's traversal ever returns; a refusal anywhere in
+    that whole reachable set is remembered, with the resolved target
+    folded onto the FRONT of the message so a multi-hop chain reads as the
+    true edge sequence (`caller's job -> mid -> bad`), never a single
+    flattened edge naming only the last hop. W12 additionally collects
+    EVERY refusing reusable reached under one caller, never only the
+    first -- see `_traverse_reusable`."""
+    if _memo is None:
+        _memo = {}
+    step_uses_values = [
+        step["uses"]
+        for step in (job_node.get("steps") or [])
+        if isinstance(step, dict) and isinstance(step.get("uses"), str)
+    ]
+    direct = job_invokes_publish_primitive(job_body, step_uses_values)
+    found_result: str | None = direct
+    target = _local_reusable_workflow_target(job_node)
+    if target is not None:
         resolved = resolve_workflow(workflow_texts, target)
-        if resolved is None or resolved in _visited:
+        if resolved is None:
+            raise WorkflowLoadError(
+                f"uses local reusable workflow {target!r}, which does not exist anywhere in the "
+                "discovered workflow tree (dangling target) -- cannot examine"
+            )
+        found = _traverse_reusable(resolved, workflow_texts, _memo, _depth + 1)
+        if found is not None and found_result is None:
+            found_result = f"{found} (via {resolved})"
+    return found_result
+
+
+def _traverse_reusable(
+    resolved: str,
+    workflow_texts: dict[str, str],
+    _memo: dict[str, tuple[str | None, WorkflowLoadError | None]],
+    _depth: int,
+) -> str | None:
+    """Examine EVERY job inside the reusable workflow named by `resolved`
+    (a key already present in `workflow_texts`) for a publishing primitive
+    -- memoized by `resolved` (see `job_invokes_publish_primitive_
+    recursive`'s own docstring) and depth-bounded by `_MAX_USES_DEPTH`.
+    Collects EVERY sibling job's own find/refusal before returning or
+    raising (W11); W12 widens this to collect EVERY refusing reusable
+    reached from `resolved`'s own jobs, not only the first, naming all of
+    them in the raised message."""
+    if resolved in _memo:
+        found, refusal = _memo[resolved]
+        if refusal is not None:
+            raise refusal
+        return found
+    if _depth > _MAX_USES_DEPTH:
+        refusal = WorkflowLoadError(
+            f"uses: chain exceeds the max examined depth ({_MAX_USES_DEPTH}) reaching {resolved!r} "
+            "-- refusing to keep recursing (a uses: cycle, or a pathologically deep reusable chain)"
+        )
+        _memo[resolved] = (None, refusal)
+        raise refusal
+    target_text = workflow_texts[resolved]
+    try:
+        sub_bodies = _workflow_job_bodies(target_text)
+        sub_jobs, jobs_err = _parsed_jobs_or_fail(target_text)
+        if jobs_err is not None:
+            raise WorkflowLoadError(jobs_err)
+    except WorkflowLoadError as exc:
+        refusal = WorkflowLoadError(
+            f"uses local reusable workflow {resolved!r}, whose jobs: cannot be examined: {exc}"
+        )
+        refusal.__cause__ = exc
+        _memo[resolved] = (None, refusal)
+        raise refusal
+    found_result: str | None = None
+    refusal_messages: list[str] = []
+    for sub_job_id, sub_body in sub_bodies.items():
+        sub_node = sub_jobs.get(sub_job_id)
+        if sub_node is None:
+            refusal_messages.append(f"job {sub_job_id!r} is missing from the parsed document")
             continue
-        target_text = workflow_texts[resolved]
         try:
-            sub_bodies = _workflow_job_bodies(target_text)
+            found = job_invokes_publish_primitive_recursive(
+                sub_body, sub_node, workflow_texts, _memo=_memo, _depth=_depth + 1
+            )
         except WorkflowLoadError as exc:
-            if first_refusal is None:
-                first_refusal = WorkflowLoadError(
-                    f"uses local reusable workflow {resolved!r}, whose jobs: cannot be examined: {exc}"
-                )
-                first_refusal.__cause__ = exc
+            refusal_messages.append(str(exc))
             continue
-        # Collect refusals AND finds over the whole sibling set before any
-        # short-circuit -- a sibling that already found a primitive must
-        # never stop this loop from reaching a LATER sibling's own
-        # unexaminable reusable.
-        for sub_body in sub_bodies.values():
-            try:
-                found = job_invokes_publish_primitive_recursive(
-                    sub_body, workflow_texts, _visited=_visited | {resolved}
-                )
-            except WorkflowLoadError as exc:
-                if first_refusal is None:
-                    first_refusal = WorkflowLoadError(
-                        f"uses local reusable workflow {resolved!r}, which reaches an "
-                        f"unexaminable reusable: {exc}"
-                    )
-                    first_refusal.__cause__ = exc
-                continue
-            if found is not None and found_result is None:
-                found_result = f"{found} (via {resolved})"
-    if first_refusal is not None:
-        raise first_refusal
+        if found is not None and found_result is None:
+            found_result = f"{found} (via {resolved})"
+    if refusal_messages:
+        # W12 audit fix: EVERY refusing reusable reached from `resolved`'s
+        # own jobs is named, never only the first.
+        if len(refusal_messages) == 1:
+            detail = f"an unexaminable reusable: {refusal_messages[0]}"
+        else:
+            detail = f"{len(refusal_messages)} unexaminable reusables: " + " | ".join(refusal_messages)
+        combined = WorkflowLoadError(f"uses local reusable workflow {resolved!r}, which reaches {detail}")
+        _memo[resolved] = (None, combined)
+        raise combined
+    _memo[resolved] = (found_result, None)
     return found_result
 
 
@@ -1589,6 +1775,12 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
     for workflow, job in listed:
         resolved = resolve_workflow(workflow_texts, workflow)
         listed_resolved.add((resolved if resolved is not None else workflow, job))
+
+    # W12 audit fix: ONE memo, shared across every top-level job this scan
+    # examines -- a DIAMOND (the same reusable reached from two different
+    # callers) is walked exactly once for the whole `check_p6_discovery`
+    # call, never once per caller that happens to reach it.
+    memo: dict[str, tuple[str | None, WorkflowLoadError | None]] = {}
 
     for name, text in sorted(workflow_texts.items()):
         # F2 audit fix: NO trigger filtering at all -- every workflow file
@@ -1612,9 +1804,23 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
             findings.append(f"P6: {name}: {jobs_err}")
             continue
         assert jobs is not None
+        # W12 audit fix: the PARSED twin of the text-span `jobs` above --
+        # `uses:` (job-level and step-level) is read from THIS, never from
+        # a text regex over `body` below. Both readers derive from the
+        # same document, so a mismatch here (parsed fails where the
+        # text-span reader above did not) is itself a named FAIL, never a
+        # silent skip.
+        parsed_jobs, parsed_jobs_err = _parsed_jobs_or_fail(text)
+        if parsed_jobs_err is not None:
+            findings.append(f"P6: {name}: {parsed_jobs_err}")
+            continue
         lines = text.splitlines()
         for job_name, (start, end) in jobs.items():
             body = drop_comment_lines("\n".join(lines[start:end]))
+            job_node = parsed_jobs.get(job_name)
+            if job_node is None:
+                findings.append(f"P6: {name}: job `{job_name}` is missing from the parsed document -- cannot examine")
+                continue
             # W10 audit fix: a reusable this job's `uses:` reaches but that
             # cannot be loaded/composed is a named FINDING here -- never a
             # silent "no primitive found". This is the ONLY place in the
@@ -1624,7 +1830,7 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
             # the recursive helper made such a reusable invisible to P6
             # entirely, regardless of what its own `jobs:` actually did.
             try:
-                primitive = job_invokes_publish_primitive_recursive(body, workflow_texts)
+                primitive = job_invokes_publish_primitive_recursive(body, job_node, workflow_texts, _memo=memo)
             except WorkflowLoadError as exc:
                 findings.append(f"P6: {name}'s job `{job_name}` {exc}")
                 continue

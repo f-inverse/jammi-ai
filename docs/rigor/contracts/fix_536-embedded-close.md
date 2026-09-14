@@ -137,58 +137,66 @@ than a per-test crash.
   with overwhelming reliability while a monotonic counter never repeats). `test_unsubscribe_stops_delivery`
   (`:294-302`) and `test_concurrent_open_close_produce_balanced_events` (`:305-328`) exclude the
   registration seam entirely; they check only `observe()`'s own subscription contract.
-- **`cookbook/book/tests/test_session_lifecycle_guard.py`** (519 lines at the branch head, 376 at the events-subscription commit — two
-  test functions and the capability suite below were added by later commits on this branch): the runtime
-  rail's own non-vacuity control, run as a REAL pytest session via `pytester` against the actual committed
-  `conftest.py` (read from disk, `:45`) — no test in this file exercises a helper function directly,
+- **`cookbook/book/tests/test_session_lifecycle_guard.py`** (line citations below are re-anchored at
+  the branch head; two test functions and the capability suite were added by later commits on this
+  branch, and a still later commit rewrote the two transport-fixture assertions from a width-dependent
+  substring count into the width-independent section-based form cited below): the runtime rail's own
+  non-vacuity control, run as a REAL pytest session via `pytester` against the actual committed
+  `conftest.py` (read from disk, `:46`) — no test in this file exercises a helper function directly,
   because the guard's own subject is what the OUTER pytest run reports (exit code, ERROR summary, message
   text), which excludes nothing smaller could assert honestly.
-  - The two **transport fixtures** — `test_leaked_session_fails_by_name_on_both_transports` (`:74-112`):
-    an embedded leak (bare `jammi.connect(f"file://{tmp_path}")`, no binding held) and a remote leak
-    (bare `jammi.connect("grpc://<loopback>")` on the conventional local port, a lazy channel needing no server) each produce exactly
-    one teardown ERROR, named (`:99-104`), with the label present in the message (`:110-112`); excludes
-    every alias/construction shape below (a single pair of transports only).
-  - The **closing control** — `test_closing_control_passes` embedded in `_THROWAWAY_SUITE` (`:65-70`) and
-    asserted via `result.assert_outcomes(passed=3, errors=2, failed=0)` (`:96`): proves the guard does not
+  - The two **transport fixtures** — `test_leaked_session_fails_by_name_on_both_transports`
+    (`:156-213`): an embedded leak (bare `jammi.connect(f"file://{tmp_path}")`, no binding held) and a
+    remote leak (bare `jammi.connect("grpc://<loopback>")` on the conventional local port, a lazy
+    channel needing no server) each produce exactly one `ERROR at teardown of <nodeid>` section, matched
+    by node id via `_teardown_error_sections` (`:191-198`) rather than a width-dependent substring count
+    over the whole run's stdout — pytest truncates its short-summary line to `COLUMNS`, so a substring
+    count over that line varies by terminal width, the exact defect the module-level comment (`:75-87`)
+    names by its own cause experiment; `:181-186` additionally pins each name via `fnmatch_lines`, the
+    remote label is checked against that leak's own section body (`:206-212`), and
+    `_assert_no_second_report_class` (`:213`) rules out either leak ALSO surfacing through a second,
+    vaguer channel; excludes every alias/construction shape below (a single pair of transports only).
+  - The **closing control** — `test_closing_control_passes` embedded in `_THROWAWAY_SUITE` (`:66-71`) and
+    asserted via `result.assert_outcomes(passed=3, errors=2, failed=0)` (`:178`): proves the guard does not
     fail a test merely for having opened a session; excludes the leak-detection path entirely.
   - The **16-shape leak fixture** — `test_every_alias_and_construction_shape_leaks_by_name`
-    (`:318-348`), driving `_SHAPES_SUITE` (`:150-292`): the 13 import-time binding shapes audit #5 found
+    (`:427-457`), driving `_SHAPES_SUITE` (`:259-401`): the 13 import-time binding shapes audit #5 found
     (class-body alias, `try:`/`if:`-nested import, parenthesised multi-line import, star import,
     module-alias-then-attribute, `getattr`, `importlib.import_module`, tuple-unpack, default-arg,
     aliased import, underscore bare assignment, plain column-zero import, and a local dropped at frame
     exit) plus both backends' direct construction — 16 leaking tests named in `_LEAKING_SHAPE_TESTS`
-    (`:298-315`) — each individually asserted present under an `ERROR` line (`:342-344`), with
-    `test_shape_closing_control_passes` (`:286-291`) asserted ABSENT from any ERROR line (`:347-348`);
+    (`:407-424`) — each individually asserted present under an `ERROR` line (`:450-453`), with
+    `test_shape_closing_control_passes` (`:395-400`) asserted ABSENT from any ERROR line (`:456-457`);
     excludes the subdirectory-collection shape and the two-transport-only case above (disjoint fixtures).
-  - **`test_leak_inside_an_already_failing_test_is_warned_not_failed_again`** (`:351-416`, new since
+  - **`test_leak_inside_an_already_failing_test_is_warned_not_failed_again`** (`:460-525`, new since
     the events-subscription commit): the guard's OTHER arm — a test that fails on its own assertion AND also leaves a session
     open is reported as exactly one `failed` (the assertion, at CALL) plus ONE `PytestWarning` naming the
-    leaked label (`result.assert_outcomes(failed=1, errors=0, passed=0, warnings=1)` at `:384`, the label
-    check at `:388`), never a second `error` piled on top of the true cause — the short-summary line count
+    leaked label (`result.assert_outcomes(failed=1, errors=0, passed=0, warnings=1)` at `:493`, the label
+    check at `:497-498`), never a second `error` piled on top of the true cause — the short-summary line count
     is asserted to stay at exactly one, and that one line must start with `FAILED`, never `ERROR`
-    (`:407-416`). A leak inside an already-failing test is a warning, never a second failure — this test is
+    (`:516-525`). A leak inside an already-failing test is a warning, never a second failure — this test is
     the only oracle for that branch; it excludes the mirror case (the identical leak inside an otherwise
     PASSING test), already covered above by `test_leaked_session_reports_exactly_once_by_name`
-    (`:115-134`), where the leak itself IS the sole reported problem.
+    (`:216-243`), where the leak itself IS the sole reported problem.
   - The **subdirectory fixture** —
-    `test_leaked_session_in_a_tests_subdirectory_module_is_failed_by_name` (`:419-442`): a leak inside
-    `pytester.mkpydir("nested_suite")/test_nested_leak.py` (`:428-436`) is still failed by name
-    (`:442`) — excludes every shape/transport above; it is a collection-scope oracle only (the deleted
+    `test_leaked_session_in_a_tests_subdirectory_module_is_failed_by_name` (`:528-551`): a leak inside
+    `pytester.mkpydir("nested_suite")/test_nested_leak.py` (`:537-545`) is still failed by name
+    (`:551`) — excludes every shape/transport above; it is a collection-scope oracle only (the deleted
     static alias gate's documented scope limit was one directory level; this rail is not walking files at
     all, so it has none).
-  - **`test_rail_inactive_without_the_registry_warns_once_and_runs_clean`** (`:492-519`, new since
+  - **`test_rail_inactive_without_the_registry_warns_once_and_runs_clean`** (`:601-628`, new since
     the events-subscription commit, F1): exercises the capability arm (`cookbook/book/tests/conftest.py`'s `_RAIL_ACTIVE` at
     `:100`, the session-scoped `_warn_if_rail_inactive` fixture at `:144-160`, and the early return in
     `_no_leaked_sessions` at `:181-186`) against a minimal fake `jammi` — `_FAKE_PRE_REGISTRY_JAMMI`
-    (`:454-468`) exposes `connect` but no `observe`, standing in for a client built before the registry
+    (`:563-577`) exposes `connect` but no `observe`, standing in for a client built before the registry
     shipped. The run reports zero setup errors, including for the one test that actually leaks
-    (`result.assert_outcomes(passed=3, errors=0, failed=0, warnings=1)` at `:514`, `result.ret == 0` at
-    `:515`), and exactly ONE warning naming the fake version (`:518-519`). A client without the registry
+    (`result.assert_outcomes(passed=3, errors=0, failed=0, warnings=1)` at `:623`, `result.ret == 0` at
+    `:624`), and exactly ONE warning naming the fake version (`:627-628`). A client without the registry
     runs the suite with the rail inactive and ONE visible warning — the published-wheel lane (the nightly
     release-recipe leg pinning nothing, per `.github/workflows/cookbook-render.yml`) lags HEAD by
     construction, so this is the expected shape, not a bug; excludes every leak-detection property above
     entirely — a leak under this fake client is invisible by construction (`test_leaks_but_the_rail_is_inactive`,
-    `:483-489`), not caught and reported.
+    `:592-597`), not caught and reported.
 
 ## The excision (no static shape gate ships)
 Four narrower mechanisms were tried, on this same branch, and each was falsified by execution before this
@@ -250,18 +258,18 @@ superseded, not retained.
   address is the next one CPython's per-size-class freelist hands back).
 - **`unregister` removed from `close()`** (either backend): every "…appears_and_disappears" test
   (`clients/python/tests/test_session_registry.py:75-91`, `:113-133`, `:127-133`) fails its post-`close()` assertion, and
-  every closing-control test in `test_session_lifecycle_guard.py` (`:65-70`, `:286-291`) starts failing
+  every closing-control test in `test_session_lifecycle_guard.py` (`:66-71`, `:395-400`) starts failing
   because the closed session is now reported as a leak.
 - **Registration moved off the shared constructor** (e.g. into `_open_embedded`/`open_remote` instead of
   `EmbeddedBackend.__init__`/`RemoteDatabase.__init__`): `test_direct_embedded_backend_construction_appears_and_disappears`
   and `test_direct_remote_database_construction_appears_and_disappears`
   (`clients/python/tests/test_session_registry.py:87-91`, `:127-133`) fail, and
   `test_shape_direct_embedded_construction`/`test_shape_direct_remote_construction`
-  (`cookbook/book/tests/test_session_lifecycle_guard.py:265-284`) stop being reported as leaks at all — the completeness
-  claim in `test_every_alias_and_construction_shape_leaks_by_name` (`:318-348`) fails on those two names.
+  (`cookbook/book/tests/test_session_lifecycle_guard.py:374-393`) stop being reported as leaks at all — the completeness
+  claim in `test_every_alias_and_construction_shape_leaks_by_name` (`:427-457`) fails on those two names.
 - **The guard's fail neutered** (`pytest.fail` replaced with a no-op or `request.node.warn` on every
   path in `cookbook/book/tests/conftest.py:212-228`): every ERROR assertion across
-  `test_session_lifecycle_guard.py` (`:96`, `:131`, `:334-344`, `:440-442`) fails — the runs report
+  `test_session_lifecycle_guard.py` (`:178`, `:232`, `:443-453`, `:549-551`) fails — the runs report
   `errors=0` where the tests expect leaks named.
 - **Unsubscribe before yield** (moving `unsubscribe()`, `cookbook/book/tests/conftest.py:205`, to before `yield` at `:202-203`
   instead of in `finally` after it): the fixture stops observing any event fired during the test body
@@ -271,24 +279,24 @@ superseded, not retained.
   unregistered, `cookbook/book/tests/conftest.py:206-210`): every closing-control test starts failing (a properly closed
   session is now reported as the "leak") and every genuine leak stops being reported — both directions of
   `test_leaked_session_fails_by_name_on_both_transports`'s and
-  `test_every_alias_and_construction_shape_leaks_by_name`'s outcome assertions (`:96`, `:334-338`) fail.
+  `test_every_alias_and_construction_shape_leaks_by_name`'s outcome assertions (`:178`, `:443-447`) fail.
 - **Capability arm removed** (`_RAIL_ACTIVE`'s check deleted from `_no_leaked_sessions`,
   `cookbook/book/tests/conftest.py:181-186`, so the fixture always calls `jammi.observe(...)`
   unconditionally): `test_rail_inactive_without_the_registry_warns_once_and_runs_clean`
-  (`cookbook/book/tests/test_session_lifecycle_guard.py:492-519`) fails — every test's setup against the
+  (`cookbook/book/tests/test_session_lifecycle_guard.py:601-628`) fails — every test's setup against the
   fake pre-registry `jammi` now raises `AttributeError: module 'jammi' has no attribute 'observe'`, so
-  `result.assert_outcomes(passed=3, errors=0, ...)` at `:514` sees setup errors instead, and `result.ret
-  == 0` at `:515` fails too.
+  `result.assert_outcomes(passed=3, errors=0, ...)` at `:623` sees setup errors instead, and `result.ret
+  == 0` at `:624` fails too.
 - **Warning suppressed** (`request.node.warn(pytest.PytestWarning(message))` at
   `cookbook/book/tests/conftest.py:226` replaced with a no-op, or the whole `if`/`else` at `:224-228`
   collapsed to nothing on the already-failed branch): `test_leak_inside_an_already_failing_test_is_warned_not_failed_again`'s
-  `warnings=1` assertion (`cookbook/book/tests/test_session_lifecycle_guard.py:384`) fails, and `assert
-  "left 1 jammi session(s) open" in full` (`:388`) fails too — the leak is dropped silently rather than
+  `warnings=1` assertion (`cookbook/book/tests/test_session_lifecycle_guard.py:493`) fails, and `assert
+  "left 1 jammi session(s) open" in full` (`:497`) fails too — the leak is dropped silently rather than
   reported at all, once the test that leaked it has already failed.
 - **Warn-arm inverted** (the `if request.session.testsfailed > failed_before` / `else` branches at
   `cookbook/book/tests/conftest.py:224-228` swapped, so an already-failing test now takes the
   `pytest.fail` branch and a cleanly-failing-nothing test takes the `warn` branch — both branches fail):
-  `test_leak_inside_an_already_failing_test_is_warned_not_failed_again`'s `errors=0` (`:384`) fails (the
+  `test_leak_inside_an_already_failing_test_is_warned_not_failed_again`'s `errors=0` (`:493`) fails (the
   guard now piles a second `error` on top of the test's own `FAILED`), and
-  `test_leaked_session_reports_exactly_once_by_name`'s `errors=1` (`:131`) flips to a mere warning, so its
+  `test_leaked_session_reports_exactly_once_by_name`'s `errors=1` (`:232`) flips to a mere warning, so its
   own outcome assertion fails too.

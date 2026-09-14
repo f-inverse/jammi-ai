@@ -2027,13 +2027,12 @@ impl JobWorker {
                 method,
                 task,
                 common,
-                // `cache = USE` is refused, typed, at submit
-                // (`InferenceSession::submit_fine_tune_spec_deduped` — the
-                // one point every FineTune submission path, embedded or
-                // decoded off the wire, passes through before any row is
-                // written): a queued `fine_tune` row can therefore only ever
-                // carry `Bypass` here, and the worker has nothing left to
-                // branch on.
+                // `cache = USE` is refused, typed, by
+                // `fine_tune::spec::admit_training_spec` — the ONE admission
+                // every durable submit edge for a training spec applies
+                // before a row is ever written: a queued `fine_tune` row can
+                // therefore only ever carry `Bypass` here, and the worker
+                // has nothing left to branch on.
                 cache: _cache,
             } => {
                 // Materialise the projected rows into an immutable

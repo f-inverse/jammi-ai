@@ -223,9 +223,33 @@ pub fn stale_before_clause(
     }
 }
 
+/// The instance-liveness margin: `2 * lease`, against `instances.last_seen_at`
+/// (the DB clock via [`stale_before_clause`]) — the same tolerance
+/// `Catalog::reclaim_expired_jobs`'s inline-execution arm already computes
+/// inline for "owning instance dead". Named here so a second caller (a gang
+/// coordinator's own freshness check, `fresh_instance` — CONTRACT-U5a.md §I1)
+/// shares the SAME margin rather than re-deriving the `2 *` factor at its own
+/// call site.
+pub fn instance_liveness_margin(lease: Duration) -> Duration {
+    lease.saturating_mul(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_liveness_margin_is_twice_the_lease() {
+        assert_eq!(
+            instance_liveness_margin(Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
+        // `saturating_mul`, never a wrapping/panicking overflow, at the
+        // `Duration` ceiling — the same overflow shape
+        // `reclaim_expired_jobs`'s own inline `lease.saturating_mul(2)`
+        // relied on before this extraction.
+        assert_eq!(instance_liveness_margin(Duration::MAX), Duration::MAX);
+    }
 
     #[test]
     fn deadline_is_after_now_and_sorts_lexicographically() {

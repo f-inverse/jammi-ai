@@ -220,15 +220,15 @@ def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
 def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
     """Project a wire `ReconcileReport` into the dict a caller reads.
 
-    The whole report and nothing else — all 14 fields, the same keys, spelled
+    The whole report and nothing else — all 16 fields, the same keys, spelled
     the same way, the embedded `Database.reconcile` produces by serializing
     the identical engine struct: `scope`, `applied`, `rows_failed`,
     `rows_failed_count`, `orphans`, `orphan_count`, `pending`, `pending_count`,
     `unattributed`, `unattributed_count`, `damaged`, `damaged_count`,
-    `truncated`, `bytes_reclaimed`. Every list is already sorted by the
-    engine; this projection does not re-sort. Every `*_count` field is the
-    true total independent of whether its list was capped; `truncated` says
-    whether any list was.
+    `referenced`, `referenced_count`, `truncated`, `bytes_reclaimed`. Every
+    list is already sorted by the engine; this projection does not re-sort.
+    Every `*_count` field is the true total independent of whether its list
+    was capped; `truncated` says whether any list was.
     """
     return {
         "scope": r.scope,
@@ -243,6 +243,8 @@ def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
         "unattributed_count": r.unattributed_count,
         "damaged": list(r.damaged),
         "damaged_count": r.damaged_count,
+        "referenced": list(r.referenced),
+        "referenced_count": r.referenced_count,
         "truncated": r.truncated,
         "bytes_reclaimed": r.bytes_reclaimed,
     }
@@ -2583,9 +2585,10 @@ class RemoteDatabase:
         produces, tagged ``{"scope", "applied", "rows_failed",
         "rows_failed_count", "orphans", "orphan_count", "pending",
         "pending_count", "unattributed", "unattributed_count", "damaged",
-        "damaged_count", "truncated", "bytes_reclaimed"}`` — all 14 fields of
-        the engine's ``ReconcileReport``, byte-for-byte the same key set the
-        embedded PyO3 arm projects. Maps to `CatalogService.Reconcile`.
+        "damaged_count", "referenced", "referenced_count", "truncated",
+        "bytes_reclaimed"}`` — all 16 fields of the engine's
+        ``ReconcileReport``, byte-for-byte the same key set the embedded
+        PyO3 arm projects. Maps to `CatalogService.Reconcile`.
         """
         request = catalog_pb2.ReconcileRequest(
             apply=apply, grace_secs=grace_secs, all=all

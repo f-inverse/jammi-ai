@@ -987,8 +987,8 @@ mod tests {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
-                cache: jammi_db::store::CachePolicy::Bypass,
             },
+            cache: jammi_db::store::CachePolicy::Bypass,
         }));
         let json = serde_json::to_string(&spec).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();

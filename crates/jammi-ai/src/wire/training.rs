@@ -64,7 +64,7 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
     let spec = spec.ok_or_else(|| Status::invalid_argument("SubmitJob request carries no spec"))?;
     match spec {
         pb::submit_job_request::Spec::FineTune(ft) => {
-            let common = lora_common_from_proto(
+            let (common, cache) = lora_common_from_proto(
                 base_model,
                 config,
                 world_size,
@@ -86,10 +86,16 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
                 method: method_from_proto(ft.method)?,
                 task: model_task_from_proto(ft.task)?,
                 common,
+                cache,
             })
         }
         pb::submit_job_request::Spec::GraphFineTune(g) => {
-            let common = lora_common_from_proto(
+            // `TrainingSpec::GraphFineTune` has no `cache` field at all (P4
+            // design, #500 fix round 3): the decoded policy is discarded
+            // after `lora_common_from_proto` has already refused `USE` for
+            // this kind — there is nowhere left to put a `BYPASS`/unset
+            // value even if we wanted to.
+            let (common, _cache) = lora_common_from_proto(
                 base_model,
                 config,
                 world_size,
@@ -153,6 +159,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             method,
             task,
             common,
+            cache,
         } => pb::SubmitJobRequest {
             spec: Some(pb::submit_job_request::Spec::FineTune(
                 training_pb::FineTuneSpec {
@@ -166,7 +173,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
             world_size: common.world_size,
-            cache: super::cache::cache_policy_to_proto(common.cache) as i32,
+            cache: super::cache::cache_policy_to_proto(*cache) as i32,
         },
         TrainingSpec::GraphFineTune {
             sources,
@@ -183,7 +190,12 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
             world_size: common.world_size,
-            cache: super::cache::cache_policy_to_proto(common.cache) as i32,
+            // `TrainingSpec::GraphFineTune` carries no `cache` field at all
+            // (P4 design, #500 fix round 3) — there is no value to encode,
+            // so this emits the wire's unset value, the same `UNSPECIFIED`
+            // the `ContextPredictor` arm below emits for the identical
+            // reason.
+            cache: 0,
         },
         TrainingSpec::ContextPredictor {
             source,
@@ -222,12 +234,17 @@ enum LoraSpecKind {
     GraphFineTune,
 }
 
-/// Fold the request's common `base_model` + optional `config` + `cache` into a
-/// [`TrainingCommon`] for the two LoRA fine-tune kinds. An empty base model is a
-/// client error (the worker has nothing to adapt).
+/// Fold the request's common `base_model` + optional `config` into a
+/// [`TrainingCommon`] for the two LoRA fine-tune kinds, and separately decode
+/// and validate `cache`, returned alongside rather than folded INTO the
+/// `TrainingCommon` (P4 design, #500 fix round 3: `cache` lives directly on
+/// `TrainingSpec::FineTune`, not on the type shared with `GraphFineTune`, so
+/// only the `FineTune` decode arm threads the returned value onto its spec;
+/// the `GraphFineTune` arm discards it once this function has validated it).
+/// An empty base model is a client error (the worker has nothing to adapt).
 ///
-/// P4 (fix round 1): `cache = USE` is refused, typed, for `kind ==
-/// GraphFineTune` — `ProducingDescriptor::FineTune` (and every
+/// P4: `cache = USE` is refused, typed, for `kind == GraphFineTune` —
+/// `ProducingDescriptor::FineTune` (and every
 /// `probe_model_by_definition`/`record_model_materialization` mechanism
 /// built on it) covers only the column-source `FineTune` kind at this
 /// commit (`worker.rs`'s own `materialization_source: None` for the graph
@@ -235,8 +252,7 @@ enum LoraSpecKind {
 /// record, so honouring `Use` for it would be a silent no-op behind a wire
 /// promise the engine cannot keep. This mirrors the `ContextPredictor`
 /// `world_size` refusal above: the policy the kind cannot honour is refused
-/// at the LAST edge that can still see both the kind and the value, rather
-/// than silently dropped once the two are folded into one `TrainingCommon`.
+/// at the LAST edge that can still see both the kind and the value.
 /// `Bypass`/unset is unaffected — a graph fine-tune always trains, exactly
 /// as it did before this field existed.
 fn lora_common_from_proto(
@@ -245,7 +261,7 @@ fn lora_common_from_proto(
     world_size: u32,
     cache: i32,
     kind: LoraSpecKind,
-) -> Result<TrainingCommon, Status> {
+) -> Result<(TrainingCommon, jammi_db::store::CachePolicy), Status> {
     if base_model.is_empty() {
         return Err(Status::invalid_argument("base_model is required"));
     }
@@ -267,12 +283,14 @@ fn lora_common_from_proto(
             &engine_err,
         ));
     }
-    Ok(TrainingCommon {
-        base_model,
-        config,
-        world_size: world_size_from_proto(world_size),
+    Ok((
+        TrainingCommon {
+            base_model,
+            config,
+            world_size: world_size_from_proto(world_size),
+        },
         cache,
-    })
+    ))
 }
 
 /// Resolve the wire's rank count into the engine's.
@@ -534,7 +552,6 @@ mod tests {
                     ..FineTuneConfig::default()
                 },
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
-                cache: jammi_db::store::CachePolicy::Bypass,
             },
         };
 
@@ -726,6 +743,16 @@ mod tests {
         }
     }
 
+    /// [`decoded_common`]'s peer for the top-level `cache` field — separate
+    /// because `cache` lives directly on `TrainingSpec::FineTune`, not on
+    /// `TrainingCommon` (P4 design, #500 fix round 3).
+    fn decoded_cache(req: pb::SubmitJobRequest) -> jammi_db::store::CachePolicy {
+        match training_spec_from_proto(req).expect("decode") {
+            TrainingSpec::FineTune { cache, .. } => cache,
+            other => panic!("expected the fine_tune variant, got {other:?}"),
+        }
+    }
+
     /// The wire's unset count (`0`) resolves to the engine's single rank AT
     /// THE DECODE, before the spec can be persisted: a `0` reaching
     /// `jobs.spec` would be a zero-rank job on disk that no worker can place.
@@ -773,17 +800,15 @@ mod tests {
         use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
 
         assert_eq!(
-            decoded_common(fine_tune_request_with_cache(
+            decoded_cache(fine_tune_request_with_cache(
                 ProtoCachePolicy::Unspecified as i32
-            ))
-            .cache,
+            )),
             jammi_db::store::CachePolicy::Bypass
         );
         assert_eq!(
-            decoded_common(fine_tune_request_with_cache(
+            decoded_cache(fine_tune_request_with_cache(
                 ProtoCachePolicy::Bypass as i32
-            ))
-            .cache,
+            )),
             jammi_db::store::CachePolicy::Bypass
         );
     }
@@ -795,7 +820,7 @@ mod tests {
         use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
 
         assert_eq!(
-            decoded_common(fine_tune_request_with_cache(ProtoCachePolicy::Use as i32)).cache,
+            decoded_cache(fine_tune_request_with_cache(ProtoCachePolicy::Use as i32)),
             jammi_db::store::CachePolicy::Use
         );
     }
@@ -867,15 +892,18 @@ mod tests {
     }
 
     /// The refusal above is scoped to `USE` specifically — `BYPASS`/unset
-    /// (the default) still decodes and carries onto a graph fine-tune's
-    /// `TrainingCommon` exactly as before this field existed: this kind is
-    /// never blocked from training, only from a reuse promise it cannot
-    /// keep.
+    /// (the default) still decodes successfully into a graph fine-tune job:
+    /// this kind is never blocked from training, only from a reuse promise
+    /// it cannot keep. `TrainingSpec::GraphFineTune` has no `cache` field to
+    /// inspect at all (P4 design, #500 fix round 3 — the policy is
+    /// unrepresentable for this kind, not merely defaulted), so the
+    /// observable property is that decode succeeds, never that some field
+    /// carries a particular value.
     #[test]
-    fn graph_fine_tune_still_carries_cache_bypass() {
+    fn graph_fine_tune_bypass_or_unset_decodes_successfully() {
         use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;
 
-        let request = pb::SubmitJobRequest {
+        let request = |cache: i32| pb::SubmitJobRequest {
             spec: Some(pb::submit_job_request::Spec::GraphFineTune(
                 training_pb::GraphFineTuneSpec {
                     sources: Some(training_pb::GraphFineTuneSources {
@@ -894,14 +922,19 @@ mod tests {
             config: None,
             idempotency_key: String::new(),
             world_size: 0,
-            cache: ProtoCachePolicy::Bypass as i32,
+            cache,
         };
 
-        let spec = training_spec_from_proto(request).expect("decode");
-        let TrainingSpec::GraphFineTune { common, .. } = spec else {
-            panic!("expected the graph_fine_tune variant");
-        };
-        assert_eq!(common.cache, jammi_db::store::CachePolicy::Bypass);
+        for cache in [
+            ProtoCachePolicy::Unspecified as i32,
+            ProtoCachePolicy::Bypass as i32,
+        ] {
+            let spec = training_spec_from_proto(request(cache)).expect("decode");
+            assert!(
+                matches!(spec, TrainingSpec::GraphFineTune { .. }),
+                "expected the graph_fine_tune variant, got {spec:?}"
+            );
+        }
     }
 
     /// r26: a context-predictor job is refused above one rank at the LAST

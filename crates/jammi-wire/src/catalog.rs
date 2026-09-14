@@ -565,6 +565,16 @@ pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileRepor
 /// inverse of [`reconcile_report_to_proto`], for the remote client receive
 /// side. Total: every wire field maps straight onto the engine struct, no
 /// fallible decode.
+///
+/// COMPILE-FORCED STOP-GAP (#500 U3, ai-core, out of `crates/jammi-wire`
+/// scope): the db step landed [`ReconcileReport::referenced`] /
+/// [`ReconcileReport::referenced_count`] without a matching `pb::
+/// ReconcileReport` wire field, so this decode cannot recover them — they
+/// are filled with the empty/zero value here rather than left as a
+/// compile error blocking every crate downstream of `jammi-wire`. A remote
+/// client therefore never observes a referenced-but-unreclaimed key a
+/// report found; wire-server owns adding the real proto field and wiring it
+/// through both directions.
 pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileReport {
     ReconcileReport {
         scope: report.scope,
@@ -581,6 +591,8 @@ pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileRepo
         damaged_count: report.damaged_count,
         truncated: report.truncated,
         bytes_reclaimed: report.bytes_reclaimed,
+        referenced: Vec::new(),
+        referenced_count: 0,
     }
 }
 
@@ -677,6 +689,11 @@ mod tests {
             bytes_reclaimed: 12_345,
             orphan_count: 2,
             pending_count: 1,
+            // Not yet on the wire (see `reconcile_report_from_proto`'s own
+            // doc) — never asserted on `decoded` below for exactly that
+            // reason.
+            referenced: Vec::new(),
+            referenced_count: 0,
         };
         let encoded = reconcile_report_to_proto(&report);
         let decoded = reconcile_report_from_proto(encoded);

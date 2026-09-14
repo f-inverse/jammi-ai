@@ -1784,13 +1784,13 @@ impl InferenceSession {
                 base_model: base_model.to_string(),
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
-                // This loose-argument entry point has no cache parameter to
-                // carry a caller's choice; a caller that wants the model-level
-                // reuse probe builds the spec directly and submits it through
-                // `Self::run_training_spec`. Matches the pre-`cache` behaviour
-                // byte-for-byte.
-                cache: jammi_db::store::CachePolicy::Bypass,
             },
+            // This loose-argument entry point has no cache parameter to
+            // carry a caller's choice; a caller that wants the model-level
+            // reuse probe builds the spec directly and submits it through
+            // `Self::run_training_spec`. Matches the pre-`cache` behaviour
+            // byte-for-byte.
+            cache: jammi_db::store::CachePolicy::Bypass,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -1840,8 +1840,8 @@ impl InferenceSession {
                 config,
                 world_size: world_size
                     .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
-                cache,
             },
+            cache,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -2044,12 +2044,6 @@ impl InferenceSession {
                 base_model: base_model.to_string(),
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
-                // `GraphFineTune` carries no `ProducingDescriptor::FineTune`
-                // materialization at this commit (that descriptor variant
-                // covers only the column-source `TrainingSpec::FineTune`
-                // kind — see its own doc), so this field is inert here;
-                // `Bypass` matches the pre-`cache` behaviour byte-for-byte.
-                cache: jammi_db::store::CachePolicy::Bypass,
             },
         };
         self.submit_fine_tune_spec(spec).await

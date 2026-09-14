@@ -79,8 +79,8 @@ fn spec_with(world_size: u32, config: FineTuneConfig) -> TrainingSpec {
             base_model: "local:tiny".into(),
             config,
             world_size,
-            cache: jammi_db::store::CachePolicy::Bypass,
         },
+        cache: jammi_db::store::CachePolicy::Bypass,
     }
 }
 

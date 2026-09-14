@@ -1881,6 +1881,30 @@ impl InferenceSession {
         // the Python binding both drive) — is admitted by this call. A
         // refusal leaves no row behind, because no row has been written yet.
         crate::fine_tune::spec::RankAdmission::from_config(self.inner.config()).admit(&spec)?;
+        // `cache = USE` on `TrainingSpec::FineTune` is refused HERE, typed,
+        // for the same reason the rank count is admitted at this exact
+        // point rather than at either individual decode: this method is the
+        // one place a LoRA spec becomes a `jobs` row, so it is the earliest
+        // point every submission path reaches, regardless of whether the
+        // spec was built in-process ([`Self::fine_tune`],
+        // [`Self::submit_fine_tune`]) or decoded off the wire
+        // ([`Self::run_training_spec_deduped`], which the gRPC handler and
+        // the Python binding both drive through
+        // `crate::wire::training::training_spec_from_proto`/`training_spec_from_bytes`).
+        // Model-level cache reuse is not yet supported — see
+        // <https://github.com/f-inverse/jammi-ai/issues/562>. A refusal
+        // leaves no row behind, because no row has been written yet.
+        if let TrainingSpec::FineTune {
+            cache: jammi_db::store::CachePolicy::Use,
+            ..
+        } = &spec
+        {
+            return Err(JammiError::Config(
+                "model-level cache reuse is not yet supported: submit this fine_tune job \
+                 without `cache` or with `cache = BYPASS`"
+                    .into(),
+            ));
+        }
         let job_id = uuid::Uuid::new_v4().to_string();
         let links = self.training_job_links(&spec, &job_id).await?;
         let spec_json = serde_json::to_string(&spec)?;

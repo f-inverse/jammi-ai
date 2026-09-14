@@ -63,12 +63,15 @@ pub enum TrainingSpec {
         task: ModelTask,
         /// Common base-model + optimisation knobs.
         common: TrainingCommon,
-        /// Whether this job's model-level reuse probe
-        /// ([`jammi_db::catalog::Catalog::probe_model_by_definition`]) is
-        /// consulted **before** training —
         /// [`ProducingDescriptor::FineTune`](jammi_db::store::manifest::ProducingDescriptor::FineTune)'s
         /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
-        /// `cache` field already carries for every compute kind.
+        /// `cache` field already carries for every compute kind — except
+        /// that model-level cache reuse is not yet supported for this kind:
+        /// `Use` is refused, typed, at submit
+        /// (`InferenceSession::submit_fine_tune_spec_deduped`); see
+        /// <https://github.com/f-inverse/jammi-ai/issues/562>. `Bypass` (the
+        /// only value a submitted job can carry past that refusal) always
+        /// trains.
         ///
         /// Lives HERE — on the `FineTune` variant, not on [`TrainingCommon`]
         /// — because only this kind has a materialization to probe:

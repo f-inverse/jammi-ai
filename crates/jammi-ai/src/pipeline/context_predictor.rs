@@ -988,7 +988,7 @@ impl InferenceSession {
         .to_string();
 
         Ok(crate::fine_tune::worker::TrainedArtifact {
-            dir: Some(dir),
+            dir,
             register: crate::fine_tune::worker::ModelRegistration {
                 model_id: spec.model_id.clone(),
                 version: 1,

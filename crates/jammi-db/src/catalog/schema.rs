@@ -1149,10 +1149,12 @@ ALTER TABLE index_segments ADD COLUMN version INTEGER;
 /// lives there instead.
 ///
 /// This migration is UNMERGED as of the P7 fix round: it originally also
-/// added a `manifest_path` column to record the `.materialization.json`
+/// added a `manifest_path` column to record the model's `materialization.json`
 /// sidecar's location, but that column had no production reader — the sidecar
 /// path is always the fixed name `materialization.json` under the model's
-/// artifact prefix (`ArtifactStore::MATERIALIZATION_NAME`), exactly the way
+/// artifact prefix (`ArtifactStore::MATERIALIZATION_NAME`) — no leading dot,
+/// unlike a result table's `{table}.materialization.json` sidecar, because a
+/// model prefix has no stem to suffix — exactly the way
 /// `materialization_sidecar_path` derives the `result_tables` sidecar from a
 /// sibling path rather than a recorded column. Because the migration had not
 /// merged to `main`, K5's append-only rule binds the ledger, not this not-yet-

@@ -64,7 +64,9 @@ pub struct ModelRecord {
     pub created_at: String,
     /// The materialization-contract definition hash (migration
     /// `model_materialization`) — the indexable summary of this model's
-    /// `.materialization.json` sidecar, mirroring
+    /// `materialization.json` sidecar (no leading dot — a fixed name under
+    /// the model's artifact prefix, `ArtifactStore::MATERIALIZATION_NAME`,
+    /// unlike a result table's `{table}.materialization.json`), mirroring
     /// `result_tables.definition_hash`. `None` for a model with no
     /// materialization (a directly-registered base model, a
     /// `ContextPredictor`) or a pre-migration row.
@@ -588,7 +590,7 @@ impl Catalog {
 
     /// Record a fine-tuned model's materialization-contract summary (the
     /// `model_materialization` migration's two columns) — called after the
-    /// model's artifact prefix's `.materialization.json` sidecar has been
+    /// model's artifact prefix's `materialization.json` sidecar has been
     /// written ([`crate::store::ArtifactStore::write_model_materialization`],
     /// itself written LAST, after the bundle's own `manifest.json`), and
     /// only AFTER the finalize CAS ([`Catalog::finish_job_with_model`]) has

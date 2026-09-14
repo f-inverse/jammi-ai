@@ -228,7 +228,7 @@ impl ArtifactStore {
         Ok(prefix)
     }
 
-    /// Compute and write the `.materialization.json` attestation for the
+    /// Compute and write the `materialization.json` attestation for the
     /// bundle already published at `prefix` by [`Self::put_artifact`] — the
     /// model-artifact peer of a result table's attestation
     /// (`crate::store::ResultStore::write_attestation`). Written strictly
@@ -273,7 +273,7 @@ impl ArtifactStore {
         Ok(attestation)
     }
 
-    /// Read a model artifact prefix's `.materialization.json` sidecar, if
+    /// Read a model artifact prefix's `materialization.json` sidecar, if
     /// present — the model-artifact peer of
     /// [`crate::store::ResultStore::read_materialization_manifest`]. Returns
     /// `Ok(None)` when no sidecar exists (a model that predates this
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(m1.combined_hash(), m2.combined_hash());
     }
 
-    // ─── U3 (#500): the `.materialization.json` attestation ────────────────
+    // ─── U3 (#500): the model `materialization.json` attestation ───────────
 
     fn fine_tune_descriptor() -> crate::store::manifest::ProducingDescriptor {
         crate::store::manifest::ProducingDescriptor::FineTune {
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     /// RED at base: before this unit, `ArtifactStore` has no
-    /// `write_model_materialization` at all — no `.materialization.json` is
+    /// `write_model_materialization` at all — no `materialization.json` is
     /// ever written into a model artifact prefix. This proves the mechanism
     /// now exists, is readable back byte-for-byte, and folds the RIGHT
     /// artifact digest (the bundle's `combined_hash`, not an arbitrary one).
@@ -1325,7 +1325,7 @@ mod tests {
 
     /// The materialization sidecar is the LAST object written into the
     /// prefix: every data file, then the bundle's own `manifest.json`
-    /// (`put_artifact`'s existing guarantee), then `.materialization.json`.
+    /// (`put_artifact`'s existing guarantee), then `materialization.json`.
     /// Observed through the object store's own `last_modified` timestamps
     /// (the crate-private `list` seam `reconcile.rs` also uses) rather than
     /// asserted from code-reading alone: the materialization sidecar's

@@ -1414,7 +1414,7 @@ impl JobWorker {
         }
 
         // U3 fix round 1 (P3'): the model-level materialization SIDECAR
-        // OBJECT (`.materialization.json`'s bytes) is still written into the
+        // OBJECT (`materialization.json`'s bytes) is still written into the
         // prefix here, BEFORE the finalize CAS below — mirroring
         // `ArtifactStore::put_artifact`'s own "manifest.json last"
         // discipline. The CATALOG COLUMNS
@@ -3504,7 +3504,7 @@ pub(crate) enum FineTuneMaterializationOutcome {
         input_anchors_json: String,
     },
     /// A FRESH training run: after the worker publishes this attempt's new
-    /// prefix, `.materialization.json` is written LAST (before the finalize
+    /// prefix, `materialization.json` is written LAST (before the finalize
     /// CAS) from this descriptor + environment + input anchors, and recorded
     /// on the model row.
     Fresh {

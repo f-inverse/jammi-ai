@@ -1,4 +1,4 @@
-//! `CONTRACT-U5a.md` §I1 — `Catalog::fresh_instance`: is a gang
+//! `Catalog::fresh_instance`: is a gang
 //! coordinator's `instances` row FRESH within
 //! `instance_liveness_margin(lease) == 2 * lease` on the DB clock? Every
 //! test runs on a fresh SQLite catalog (a private tempdir per test).

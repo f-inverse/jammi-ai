@@ -1140,8 +1140,8 @@ ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE index_segments ADD COLUMN version INTEGER;
 "#;
 
-/// Migration 033 (`CONTRACT-U5a.md` §W2 Routing, U5a-1): the gang's
-/// training-set identity pair on `jobs` — the `ArtifactDigest` of the
+/// Migration 033 (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6): the
+/// gang's training-set identity pair on `jobs` — the `ArtifactDigest` of the
 /// coordinator's materialized `TrainingSet` (`training_set_ref`) and the
 /// `result_tables` NAME it materialized under (`training_set_location`),
 /// job-scoped (never attempt-scoped), written/consulted only for
@@ -1149,9 +1149,9 @@ ALTER TABLE index_segments ADD COLUMN version INTEGER;
 /// row; a `world_size == 1` job never touches them, so this migration
 /// changes zero observable behaviour for every row it does not itself write.
 ///
-/// **The pair is one fact, not two independently nullable columns (§W2
-/// Fill's stop rule).** A `CHECK` constraint pins this at the schema edge —
-/// preferred over "the only writer is the CAS" (Greenfield: a schema
+/// **The pair is one fact, not two independently nullable columns (the
+/// write-once CAS's own stop rule).** A `CHECK` constraint pins this at the
+/// schema edge — preferred over "the only writer is the CAS" (Greenfield: a schema
 /// constraint that makes the wrong shape UNREPRESENTABLE beats a mechanism
 /// that merely avoids constructing it) — because both backends support a
 /// same-table-column `CHECK` referenced from an `ALTER TABLE ADD COLUMN`
@@ -1160,7 +1160,7 @@ ALTER TABLE index_segments ADD COLUMN version INTEGER;
 /// `CHECK` expression years ago, and Postgres has never had that
 /// restriction. The constraint fires on every `UPDATE` that would leave the
 /// pair split, not just on `INSERT` — a raw single-column write (never a
-/// call site this program makes; the CAS is the only writer, §W2 Fill) is
+/// call site this program makes; the CAS is the only writer) is
 /// refused by the database itself, not merely by convention.
 pub(super) const MIGRATION_033_JOBS_TRAINING_SET_IDENTITY: &str = r#"
 ALTER TABLE jobs ADD COLUMN training_set_ref TEXT;

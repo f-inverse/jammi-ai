@@ -1,5 +1,6 @@
 //! Two enumerating-caller oracles (see
-//! `docs/rigor/contracts/feat_500-C-U5a-1.md` §I1(a) / §W2 Resolution), each
+//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § 1.6 — the I-GANG row
+//! predicate and the training-set sidecar verify), each
 //! a MEASURED claim (never prose): `Catalog::get_job_for_rank` and
 //! `Catalog::get_result_table_for_tenant` are each called from nowhere
 //! outside the gang `RunRank` handler (plus each function's own crate's
@@ -271,7 +272,7 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
              (allowed: {allowed:?}) — a new caller of this primary-key-only, \
              non-tenant-scoped verb must be reviewed and this allowlist \
              deliberately grown, never left stale \
-             (see docs/rigor/contracts/feat_500-C-U5a-1.md §I1(a))"
+             (see docs/rigor/contracts/feat_500-C-U5a-1.md § A1)"
         );
     }
     for must_hit in &allowed {
@@ -289,14 +290,14 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
 /// `resolve_training_set_identity` inside the gang handler; the two other
 /// hits are `gang_service.rs`'s own tests exercising the raw verb directly
 /// to demonstrate the hazard that resolver guards against (see
-/// `docs/rigor/contracts/feat_500-C-U5a-1.md` §W2 Resolution).
+/// `docs/rigor/contracts/feat_500-C-U5a-1.md` § A2).
 #[test]
 fn only_resolve_training_set_identity_calls_get_result_table_for_tenant() {
     let hits = files_containing("get_result_table_for_tenant(");
     let allowed: HashSet<&str> = [
         "crates/jammi-db/src/catalog/result_repo.rs", // the definition itself
         "crates/jammi-server/src/grpc/gang.rs",       // the ONE production caller
-        "crates/jammi-server/tests/it/gang_service.rs", // this crate's own b1' tests
+        "crates/jammi-server/tests/it/gang_service.rs", // this crate's own refusal tests
     ]
     .into_iter()
     .collect();
@@ -306,7 +307,7 @@ fn only_resolve_training_set_identity_calls_get_result_table_for_tenant() {
             "unexpected `get_result_table_for_tenant(` occurrence outside the allowed \
              set: {hit} (allowed: {allowed:?}) — a new caller of this strict-tenant \
              verb must be reviewed against the admin-scope hazard \
-             (see docs/rigor/contracts/feat_500-C-U5a-1.md §W2 Resolution) \
+             (see docs/rigor/contracts/feat_500-C-U5a-1.md § A2) \
              before this allowlist grows"
         );
     }

@@ -133,13 +133,14 @@
 //! [`is_streaming_path`] is a hardcoded three-path allowlist rather than a
 //! path→class map derived from the compiled `FILE_DESCRIPTOR_SET`: this
 //! codebase's `jammi.v1.*` surface declares exactly three server-streaming
-//! RPCs today (`WaitJob`, `Subscribe`, `RunRank`), so the derived map's only
+//! RPCs (`WaitJob`, `Subscribe`, `RunRank`), so the derived map's only
 //! observable behaviour over THIS binary is this same three-path set. This
 //! is a documented, deliberate scope reduction — a fourth server-streaming
 //! RPC added later needs this list extended by hand, but
 //! `is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set`
 //! (below) fails loudly the moment it lands undeclared here, exactly the gap
-//! `RunRank`'s own addition (U5a-1) left open until this fix.
+//! `RunRank`'s own addition (the `GangService` streaming RPC) left open
+//! until this fix.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -1753,10 +1754,10 @@ mod tests {
     /// deliberate scope reduction (module docs' "Streaming-path exemption"
     /// section) -- but nothing catches a FOURTH server-streaming rpc landing
     /// without the list being extended by hand (a THIRD, `RunRank`, landed
-    /// with U5a-1 without this list being extended -- this test itself is
-    /// what caught that, and the fix that added `RUN_RANK_PATH` above is
-    /// what closes it). This DERIVES the actual server-streaming method set
-    /// from the compiled `jammi.v1` `FILE_DESCRIPTOR_SET`
+    /// with `GangService` without this list being extended -- this test
+    /// itself is what caught that, and the fix that added `RUN_RANK_PATH`
+    /// above is what closes it). This DERIVES the actual server-streaming
+    /// method set from the compiled `jammi.v1` `FILE_DESCRIPTOR_SET`
     /// (`MethodDescriptorProto::server_streaming`) and asserts it equals the
     /// hardcoded set -- symmetric, so a stale entry (a removed rpc still
     /// allowlisted) fails just as loudly as a missing one.

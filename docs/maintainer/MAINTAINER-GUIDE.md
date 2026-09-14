@@ -3093,9 +3093,10 @@ above, which is a genuine, non-retriable row fact. This is the ADMISSION-time
 classification only; `Catalog::fresh_instance` erroring and
 `ResultStore::read_materialization_manifest` erroring are unchanged
 (the latter's admission-time "unresolvable/unverifiable" collapse to
-`FailedPrecondition` stands, §W2 Resolution). The mid-stream re-verification
-three-way split (`Refuted`/`Unavailable`/`StoreUnavailable`) is U5a-2's,
-built once an admitted `HostAdmission` session exists to re-verify inside.
+`FailedPrecondition` stands). The mid-stream re-verification three-way split
+(`Refuted`/`Unavailable`/`StoreUnavailable`) is built with `HostAdmission`
+(docs/plans/67-distributed-training/UNITS.md § U5a-2) once an admitted
+session exists to re-verify inside.
 
 **Tenant handling.** Tenant is derived from the `jobs` row `get_job_for_rank`
 returns, never from caller metadata — a caller naming a different tenant is

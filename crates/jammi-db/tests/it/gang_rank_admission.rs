@@ -1,5 +1,7 @@
-//! `CONTRACT-U5a.md` §I1(a)/§W2 Fill — `Catalog::get_job_for_rank` and
-//! `Catalog::fill_training_set_identity`. `Catalog::fresh_instance`'s own
+//! `Catalog::get_job_for_rank` (I-GANG's row predicate,
+//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A1) and
+//! `Catalog::fill_training_set_identity` (the training-set identity
+//! write-once CAS). `Catalog::fresh_instance`'s own
 //! tests live in `gang_instance_freshness.rs`. Every test runs on a fresh
 //! SQLite catalog (a private tempdir per test; the gang admission surface has
 //! no Postgres-only behaviour these primitives need to exercise beyond what
@@ -174,7 +176,7 @@ async fn get_job_for_rank_returns_the_filled_pair() {
     assert_eq!(row.training_set_location.as_deref(), Some("table-y"));
 }
 
-/// R1 (fix round 1, F1): the row's OWN `world_size`, decoded from `spec`
+/// The row's OWN `world_size`, decoded from `spec`
 /// JSON, never the caller's `Assign.world`. A spec whose `common.world_size`
 /// names 2 must read back 2 through `get_job_for_rank`.
 #[tokio::test]
@@ -273,7 +275,7 @@ async fn get_job_for_rank_malformed_world_size_is_a_typed_error() {
 }
 
 // ---------------------------------------------------------------------------
-// `Catalog::fill_training_set_identity` (§W2 Fill)
+// `Catalog::fill_training_set_identity` (the training-set identity write-once CAS)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

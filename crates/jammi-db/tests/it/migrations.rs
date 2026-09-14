@@ -1555,12 +1555,13 @@ async fn migration_032_creates_result_table_versions(
     assert_eq!(dflt, 0, "next_version defaults to 0");
 }
 
-/// `CONTRACT-U5a.md` §W2 Routing — migration `033_jobs_training_set_identity`
+/// Migration `033_jobs_training_set_identity`
+/// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6)
 /// is present, ordered AFTER `032_result_table_versions` (K5: relative
 /// position, never `.last()`), adds `jobs.training_set_ref` /
 /// `jobs.training_set_location` as nullable `TEXT` columns, and pins the
 /// pair's stop rule ("never one column without the other in the same
-/// statement", §W2 Fill) at the SCHEMA edge: a raw single-column write is
+/// statement") at the SCHEMA edge: a raw single-column write is
 /// refused by the `CHECK` constraint itself, on both backends — never left
 /// to "the only writer is the CAS" as the sole guarantee.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]

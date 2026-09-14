@@ -1008,7 +1008,7 @@ fn normalized_single_batch(
 }
 
 // ---------------------------------------------------------------------------
-// #500 U4a: the data-parallel rank count across the two submit surfaces.
+// The data-parallel rank count across the two submit surfaces.
 // ---------------------------------------------------------------------------
 
 /// The one submission both surfaces make, identical in every field — so a

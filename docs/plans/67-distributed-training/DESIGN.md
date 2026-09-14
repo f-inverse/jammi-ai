@@ -56,16 +56,20 @@ source anchors. `GraphFineTune` materializes its seeded, deterministic sampled p
 (`data.rs:477-481`): `val_count = round(rows × fraction)`, train rows `[0, rows − val_count)`,
 validation rows after. The tests-only `Precomputed` loader arm (`data.rs:439-442`; split by
 batch count at `:493-497`) hands tensors straight to the trainer and stays outside the table
-path and the residency bound, unchanged. Every step quantity is a function of the **global**
-batch: `batches_per_epoch = ceil(train_count / (W·B))`; `global_step`, the LR horizon
+path, unchanged. Every step quantity is a function of the **global** batch:
+`batches_per_epoch = ceil(train_count / (W·B))`; `global_step`, the LR horizon
 (`trainer.rs:843-852`, `compute_lr`) and the trailing-window loss scale (`:2505-2514`) all
 index by global batch, so W ranks take exactly the steps W=1 takes at batch W·B. U2b lands
 the formula at W=1.
 
-**Loader.** `TrainingDataLoader` (`data.rs:200`, today `Vec<TrainingRow>`) becomes a per-epoch
-`RecordBatch` stream over the table's row groups with a prefetch bound; each head's constructor
-becomes a per-batch converter. A rank slice that straddles row groups reads the covering groups
-and slices (a reader concern; no materialization alignment).
+**Loader.** `TrainingDataLoader` (`data.rs:200`) reads the train prefix eagerly through
+`read_back_sql`/`read_back_range_sql` (`training_set_order_by` applied; a reader-class
+allow-list oracle enumerates every reader of `sql_relation()`), converting rows into
+`TrainingRow`s per format; the partition rule (below) slices this in-memory sequence per rank.
+A residency-bounded per-rank stream over the table's row groups is NOT part of this plan: U2b's
+own design carried it, a design fix round excised it (issue #544) after a lease-held-across-a-
+carry-over deadlock, and it is rebuilt as its own unit, **U2c**, scheduled before U4b binds a
+per-rank reader to it.
 
 **Partition rule v1 ("block-by-global-batch")** over the train prefix: with per-rank batch B
 and world W, global batch t is rows `[t·W·B, (t+1)·W·B)`; rank r reads
@@ -81,17 +85,20 @@ oracle pins the bucket rung (§6).
 order, into **one** `Vec<f32>` on the trainer's device and calls `from_targets` **once**
 (`regression_loss.rs:169-190` is a two-pass whole-tensor reduction; f32 summation is
 grouping-sensitive, so a chunked accumulation would move the low bits) — bit-identical to
-today (`trainer.rs:824-836`). A named exemption from the residency bound (4 bytes per row).
-μ/σ ship in the `RankAssignment` and persist for resume as today.
+today (`trainer.rs:824-836`). The eager loader holds no residency bound for the scaler to be
+exempt from; once U2c's per-rank stream lands, the scaler's whole-prefix reduction will need
+the same named exemption from ITS bound (a 4-bytes-per-row allowance is that unit's own
+contract). μ/σ ship in the `RankAssignment` and persist for resume as today.
 
 **Whole-set arms.** Hard-negative mining (`trainer.rs:1120`, a mined loader rebuilt at each
 refresh epoch from the model) and GradCache (`trainer.rs:1616-1626`, the whole train prefix as
 one in-batch-negative batch) are structurally whole-set consumers. In this plan they run at
 W=1 only: `world_size > 1` with `hard_negatives.mine == true` or `cached == true` is a typed
 K2 refusal at submit time (`mine` is the real gate, `trainer.rs:1451`; `refresh_every` defaults
-to 1 and `== 0` is already refused when mining), and the residency bound exempts them (they
-stream the table in but hold what they need). The gather primitive (§4) is what lifts this
-later.
+to 1 and `== 0` is already refused when mining). They read the eager loader's whole train
+prefix directly and need no residency accounting under this plan; once U2c's per-rank stream
+exists under other arms, mining and GradCache stay outside it (their own named exemption, not
+built here). The gather primitive (§4) is what lifts this later.
 
 ## 3. A trained model is a producer
 
@@ -139,7 +146,7 @@ the only lease (`heartbeat_job`, `wt-C: jobs_repo.rs:772`, driven by the lease k
 `context_predictor` is refused at `world_size > 1`. The coordinator materializes or reuses the
 training set (with `job_attempt: None` — a shared producer output, never this attempt's
 `partial_result`), computes the scaler, resolves `W−1` **members** from the catalog
-(`workers.kinds` ∋ kind, `instances.peer_addr` set — the column U5b-1 appends and DIST's placement consumes — `last_seen_at`
+(`workers.kinds` ∋ kind, `instances.peer_addr` set — the column U5b-1a appends and DIST's placement consumes — `last_seen_at`
 fresh, and from U8b `workers.devices` sufficient), mints the NCCL id when the collective is
 `nccl`, and sends each member:
 
@@ -294,12 +301,18 @@ in this design produces a table for it to partition.
 ## 7. Configuration and placement
 
 ```
-[gpu]      device = 0 ; devices = [0, 1]
-[worker]   enabled = true ; kinds = "all" ; world_size = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
-[server]   peer_bind = "..." ; peer_advertise = "..."          # peer_bind: 68 DIST-1; peer_advertise + instances.peer_addr: 67 U5b-1; members are catalog rows, not a list
-[ballista] scheduler_bind = "..." ; executor = { scheduler_address = "...", work_dir = "..." }   # U8a
+[gpu]        device = 0 ; devices = [0, 1]
+[worker]     enabled = true ; kinds = "all" ; local_ranks = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
+[distributed] max_world_size = 1   # widest Peer gang any coordinator on this deployment may accept (67 U5b-1b-ii)
+[server]     peer_bind = "..." ; peer_advertise = "..."          # peer_bind: 68 DIST-1; peer_advertise + instances.peer_addr/result_root: 67 U5b-1a; members are catalog rows, not a list
+[ballista]   scheduler_bind = "..." ; executor = { scheduler_address = "...", work_dir = "..." }   # U8a
 ```
-Per-job `world_size` lives in `TrainingCommon` (identity-relevant; `#[serde(default)]` = 1).
+`[worker] local_ranks` (renamed from `world_size` in U4b S8) is how many ranks THIS HOST places
+on its own `[gpu] devices` for a job it runs entirely in-process — orthogonal to
+`[distributed] max_world_size`, which bounds a `Peer` gang across FLEET MEMBERS; the two knobs
+load independently with no cross-check. Per-job `world_size` lives in `TrainingCommon`
+(identity-relevant; `#[serde(default)]` = 1) — a third, unrelated concept, checked against
+`[distributed] max_world_size` at submit.
 Placement is the deployer's runtime: Kubernetes runs the compute tier as a StatefulSet with a
 headless service (or an indexed Job) with `nvidia.com/gpu: N`; Compose lists services; Slurm
 and Ray are placement options only (#482; owned by U9b after 68 K and OPS merge).

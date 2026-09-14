@@ -351,8 +351,11 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
 }
 
-_USES_LOCAL_RE = re.compile(r"uses:\s*\./\.github/workflows/([A-Za-z0-9_.-]+)")
-_USES_CROSS_REPO_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/workflows/([A-Za-z0-9_.-]+)@")
+# W12 audit fix, round 2: `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE` (the text
+# regexes P1 and P7 used to read a job-level `uses:` with) are DELETED,
+# not left behind a fallback -- no caller remains. Both rules now read
+# `uses:` from the parsed document via `_scan_uses_references` (defined
+# below, alongside the other W12 parsed-document helpers).
 
 
 # --------------------------------------------------------------------------- #
@@ -670,19 +673,32 @@ def check_p1_p2(workflow_texts: dict[str, str]) -> list[str]:
     # self-matches these patterns and needs no skip at all in practice.
     resolved_producer = producers[0] if len(producers) == 1 and producers[0] == PROVE_PRODUCER_WORKFLOW else None
 
+    # W12 audit fix, round 2: `uses:` (local or cross-repo) is read from
+    # the PARSED document -- never `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE`
+    # text regexes, which a quoted reference or a `+`-bearing target name
+    # both evaded (see `_scan_uses_references`'s own docstring).
+    parsed_cache = _parsed_jobs_cache(workflow_texts)
+    references, refusals = _scan_uses_references(
+        workflow_texts, parsed_cache, prove_producer_variants, resolved_producer
+    )
+    for ref in references:
+        if ref.kind == "local":
+            findings.append(f"P1: {ref.workflow} `uses:` {ref.target} -- nothing may call the prove lane")
+        else:
+            findings.append(
+                f"P1: {ref.workflow} `uses:` a cross-repo reference to {ref.target} -- "
+                "nothing may call the prove lane"
+            )
+    for name, err in refusals:
+        findings.append(
+            f"P1: {name}: cannot examine its jobs: to check whether it uses: "
+            f"{PROVE_PRODUCER_WORKFLOW} -- {err}"
+        )
+
     for name, text in workflow_texts.items():
         if resolved_producer is not None and name == resolved_producer:
             continue
         stripped = drop_comment_lines(text)
-        for m in _USES_LOCAL_RE.finditer(stripped):
-            if m.group(1) in prove_producer_variants:
-                findings.append(f"P1: {name} `uses:` {m.group(1)} -- nothing may call the prove lane")
-        for m in _USES_CROSS_REPO_RE.finditer(stripped):
-            if m.group(1) in prove_producer_variants:
-                findings.append(
-                    f"P1: {name} `uses:` a cross-repo reference to {m.group(1)} -- "
-                    "nothing may call the prove lane"
-                )
         for gate_variant in gate_workflow_variants:
             if gate_variant in stripped:
                 findings.append(f"P2: {name} references the deleted renting reusable {gate_variant}")
@@ -1049,6 +1065,11 @@ def check_p7_paid_pod_lanes(
                 continue
             findings += _check_derived_driver_cannot_rent(rel, workflow_texts, notes)
 
+    # W12 audit fix, round 2: computed ONCE, shared by every row below --
+    # see `_parsed_jobs_cache`'s own docstring.
+    parsed_cache = _parsed_jobs_cache(workflow_texts)
+    reported_refusals: set[str] = set()
+
     for script, workflow in sorted(PAID_POD_LANE_TABLE.items()):
         producers = sorted(
             name for name, text in workflow_texts.items() if script in drop_comment_lines(text)
@@ -1101,22 +1122,28 @@ def check_p7_paid_pod_lanes(
                     "(it fires on a label, a schedule, or a manual dispatch only)"
                 )
 
+        # W12 audit fix, round 2: `uses:` (local or cross-repo) is read
+        # from the PARSED document -- never a text regex; see
+        # `_scan_uses_references`'s own docstring for the quoting and
+        # `+`-truncation holes this closes.
         workflow_variants = set(_workflow_name_variants(workflow))
-        for name, text in workflow_texts.items():
-            if name == resolved_workflow:
+        references, refusals = _scan_uses_references(workflow_texts, parsed_cache, workflow_variants, resolved_workflow)
+        for ref in references:
+            if ref.kind == "local":
+                findings.append(f"P7: {ref.workflow} `uses:` {ref.target} — nothing may call a paid pod lane")
+            else:
+                findings.append(
+                    f"P7: {ref.workflow} `uses:` a cross-repo reference to {ref.target} — nothing may call "
+                    "a paid pod lane"
+                )
+        for name, err in refusals:
+            if name in reported_refusals:
                 continue
-            stripped = drop_comment_lines(text)
-            for m in _USES_LOCAL_RE.finditer(stripped):
-                if m.group(1) in workflow_variants:
-                    findings.append(
-                        f"P7: {name} `uses:` {m.group(1)} — nothing may call a paid pod lane"
-                    )
-            for m in _USES_CROSS_REPO_RE.finditer(stripped):
-                if m.group(1) in workflow_variants:
-                    findings.append(
-                        f"P7: {name} `uses:` a cross-repo reference to {m.group(1)} — nothing may call "
-                        "a paid pod lane"
-                    )
+            reported_refusals.add(name)
+            findings.append(
+                f"P7: {name}: cannot examine its jobs: to check whether it uses: a paid pod lane "
+                f"workflow -- {err}"
+            )
     return findings
 
 
@@ -1544,6 +1571,92 @@ def _local_reusable_workflow_target(job_node: dict) -> str | None:
     if not uses.startswith(_LOCAL_WORKFLOW_USES_PREFIX):
         return None
     return uses[len(_LOCAL_WORKFLOW_USES_PREFIX) :]
+
+
+# W12 audit fix, round 2 (the lead's own sweep): the SAME quoting/`+`-
+# truncation class the P6 traversal was fixed for also lived in P1's
+# "nothing may call the prove lane" and P7's "nothing may call a paid pod
+# lane" rules -- both scanned every OTHER workflow's raw text with
+# `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE`, so a quoted `uses: "./.github/
+# workflows/gpu-prove.yml"` (or a `+`-bearing target name) evaded both
+# rules exactly as it evaded P6. `_cross_repo_reusable_workflow_target` is
+# this function's cross-repo twin -- ANY owner/repo (basename-matched, the
+# scope the deleted text regex already had), pinned ref or branch alike,
+# read from the parsed scalar so quoting cannot hide it either.
+_CROSS_REPO_WORKFLOW_USES_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/workflows/(.+)@")
+
+
+def _cross_repo_reusable_workflow_target(job_node: dict) -> str | None:
+    """The `<X>` in a job-level `uses: <owner>/<repo>/.github/workflows/
+    <X>@<ref>` reference (ANY owner/repo, any ref -- branch, tag, or
+    pinned sha alike) -- read from the job's own PARSED mapping, never a
+    text regex. `None` when this job has no job-level `uses:`, or that
+    value is not a cross-repo workflow reference (a local reference is
+    `_local_reusable_workflow_target`'s own concern; the two are mutually
+    exclusive since a job carries at most one job-level `uses:`)."""
+    uses = job_node.get("uses")
+    if not isinstance(uses, str):
+        return None
+    m = _CROSS_REPO_WORKFLOW_USES_RE.match(uses.strip())
+    return m.group(1) if m else None
+
+
+def _parsed_jobs_cache(workflow_texts: dict[str, str]) -> dict[str, tuple[dict[str, dict] | None, str | None]]:
+    """{name: (parsed_jobs, error)} computed ONCE per workflow -- shared
+    across every `PAID_POD_LANE_TABLE` row P7 checks (and P1's own single
+    target), so an unexaminable workflow is reported ONCE per scan, never
+    once per row/target it happens to be compared against."""
+    return {name: _parsed_jobs_or_fail(text) for name, text in workflow_texts.items()}
+
+
+@dataclass(frozen=True)
+class _UsesReference:
+    """One job-level `uses:` (read from the parsed document) whose LOCAL
+    or CROSS-REPO target matches a guarded workflow name."""
+
+    workflow: str
+    job: str
+    kind: str  # "local" or "cross-repo"
+    target: str
+
+
+def _scan_uses_references(
+    workflow_texts: dict[str, str],
+    parsed_cache: dict[str, tuple[dict[str, dict] | None, str | None]],
+    variants: set[str],
+    skip_name: str | None,
+) -> tuple[list[_UsesReference], list[tuple[str, str]]]:
+    """(references, refusals) for every workflow OTHER than `skip_name`.
+    `references`: every job-level `uses:` -- local or cross-repo,
+    basename-matched -- naming any spelling in `variants`, read from the
+    PARSED document (`_local_reusable_workflow_target`/`_cross_repo_
+    reusable_workflow_target`), never a text regex; this is P1's/P7's own
+    W12 audit fix, closing the same quoting and `+`-truncation holes the
+    P6 traversal was fixed for. `refusals`: `(workflow, error)` for every
+    OTHER workflow whose own `jobs:` cannot be parsed/composed at all --
+    an unexaminable workflow might be the very one hiding a forbidden
+    reference, so it is a named FAIL here too, never a silent skip (the
+    same fail-loud doctrine P1/P6 already hold an unreadable `on:`/`jobs:`
+    block to)."""
+    references: list[_UsesReference] = []
+    refusals: list[tuple[str, str]] = []
+    for name in sorted(workflow_texts):
+        if skip_name is not None and name == skip_name:
+            continue
+        jobs, err = parsed_cache[name]
+        if err is not None:
+            refusals.append((name, err))
+            continue
+        assert jobs is not None
+        for job_name, job_node in sorted(jobs.items()):
+            local_target = _local_reusable_workflow_target(job_node)
+            if local_target is not None and local_target in variants:
+                references.append(_UsesReference(name, job_name, "local", local_target))
+                continue
+            cross_target = _cross_repo_reusable_workflow_target(job_node)
+            if cross_target is not None and cross_target in variants:
+                references.append(_UsesReference(name, job_name, "cross-repo", cross_target))
+    return references, refusals
 
 
 def _workflow_job_bodies(text: str) -> dict[str, str]:

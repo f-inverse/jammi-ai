@@ -579,6 +579,98 @@ class PaidPodLaneTest(unittest.TestCase):
                 self.assertIn(f"{workflow}'s on: block carries ['push']", "\n".join(findings), script)
 
 
+class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
+    """W12 audit fix, round 2 (the lead's own sweep, on top of 7743cad3):
+    P7's 'nothing may call a paid pod lane' rule shared the SAME
+    `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE` text-regex class the P6
+    traversal was fixed for -- mirrors `UsesReadFromTheParsedDocumentTest`
+    (P6) and `P1UsesReadFromTheParsedDocumentTest` one-for-one, driven
+    against the gang row per this module's own convention. RED against the
+    regex form (each case below found 0 at 7743cad3's own P7 shape), GREEN
+    once `uses:` is read from the parsed document via
+    `_scan_uses_references`."""
+
+    def _texts(self, **overrides: str) -> dict[str, str]:
+        texts = _positive_texts()
+        texts.update(overrides)
+        return texts
+
+    def test_single_quoted_local_uses_of_the_gang_lane_fails(self):
+        caller = (
+            "name: publisher\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  gang:\n    uses: './.github/workflows/gpu-gang.yml'\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
+        self.assertIn("nothing may call a paid pod lane", "\n".join(findings))
+
+    def test_double_quoted_local_uses_of_the_gang_lane_fails(self):
+        caller = (
+            'name: publisher\n\non:\n  push:\n    tags: ["v*"]\n\njobs:\n'
+            '  gang:\n    uses: "./.github/workflows/gpu-gang.yml"\n'
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
+        self.assertIn("nothing may call a paid pod lane", "\n".join(findings))
+
+    def test_quoted_cross_repo_pinned_ref_to_the_gang_lane_fails(self):
+        caller = (
+            "name: publisher\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            '  gang:\n    uses: "f-inverse/jammi-ai/.github/workflows/gpu-gang.yml@a1b2c3d4"\n'
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"a-publisher.yml": caller}))
+        self.assertIn("cross-repo reference", "\n".join(findings))
+
+    def test_plus_bearing_lane_name_is_never_truncated(self):
+        # The old regex's character class ([A-Za-z0-9_.-]+) stops at `+` --
+        # a lane workflow named `pub+lish.yml` used to be read as `pub`,
+        # which never equals the real target and so never matched.
+        producer = _paid_lane_yml("pub+lish", "publish-job", "fake_plus.sh", "run-pub-plus")
+        caller = (
+            "name: some-caller\n\non:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  x:\n    uses: ./.github/workflows/pub+lish.yml\n"
+        )
+        texts = self._texts(**{"pub+lish.yml": producer, "some-caller.yml": caller})
+        with mock.patch.dict(cgo.PAID_POD_LANE_TABLE, {"ci/scripts/fake_plus.sh": "pub+lish.yml"}):
+            findings = cgo.check_p7_paid_pod_lanes(texts)
+        mine = [f for f in findings if "some-caller.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("uses:` pub+lish.yml" in f for f in mine), mine)
+
+    def test_unexaminable_other_workflow_is_a_finding_never_a_silent_skip(self):
+        # A genuine YAML anchor makes the WHOLE document unexaminable
+        # (`_assert_no_github_incompatible_yaml` refuses it outright,
+        # regardless of whether the anchor is ever referenced) --
+        # `_parsed_jobs_or_fail` fails here where flow-style alone would
+        # not (flow-style is still valid, constructible YAML; only
+        # `job_source_spans`'s own LINE-SPAN reader refuses it, and this
+        # rule no longer uses that reader for `uses:` discovery).
+        unexaminable = (
+            "name: bad\n\non: &trig\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"bad.yml": unexaminable}))
+        mine = [f for f in findings if "bad.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("cannot examine" in f for f in mine), mine)
+
+    def test_unexaminable_other_workflow_is_reported_once_not_once_per_row(self):
+        # Reported ONCE across the whole scan, never once per
+        # PAID_POD_LANE_TABLE row it happens to be compared against.
+        # A genuine YAML anchor makes the WHOLE document unexaminable
+        # (`_assert_no_github_incompatible_yaml` refuses it outright,
+        # regardless of whether the anchor is ever referenced) --
+        # `_parsed_jobs_or_fail` fails here where flow-style alone would
+        # not (flow-style is still valid, constructible YAML; only
+        # `job_source_spans`'s own LINE-SPAN reader refuses it, and this
+        # rule no longer uses that reader for `uses:` discovery).
+        unexaminable = (
+            "name: bad\n\non: &trig\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"bad.yml": unexaminable}))
+        mine = [f for f in findings if "bad.yml" in f and "cannot examine" in f]
+        self.assertEqual(len(mine), 1, mine)
+
+
 # --------------------------------------------------------------------------- #
 # P7's DERIVED subject set (the deploy closure) — fixtures.
 #
@@ -1490,6 +1582,75 @@ class OnBlockDoctrineTest(unittest.TestCase):
         texts["some-caller.yml"] = caller
         findings = cgo.check_p1_p2(texts)
         self.assertTrue(any("cross-repo reference" in f for f in findings))
+
+
+class P1UsesReadFromTheParsedDocumentTest(unittest.TestCase):
+    """W12 audit fix, round 2 (the lead's own sweep, on top of 7743cad3):
+    P1's 'nothing may call the prove lane' rule shared the SAME
+    `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE` text-regex class the P6
+    traversal was fixed for -- mirrors `UsesReadFromTheParsedDocumentTest`
+    one-for-one. RED against the regex form (each case below found 0 at
+    7743cad3's own P1 shape), GREEN once `uses:` is read from the parsed
+    document via `_scan_uses_references`."""
+
+    def test_single_quoted_local_uses_reference_to_prove_workflow_fails(self):
+        caller = "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n    uses: './.github/workflows/gpu-prove.yml'\n"
+        texts = _positive_texts()
+        texts["some-caller.yml"] = caller
+        findings = cgo.check_p1_p2(texts)
+        self.assertTrue(any("uses:` gpu-prove.yml" in f for f in findings), findings)
+
+    def test_double_quoted_local_uses_reference_to_prove_workflow_fails(self):
+        caller = 'name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n    uses: "./.github/workflows/gpu-prove.yml"\n'
+        texts = _positive_texts()
+        texts["some-caller.yml"] = caller
+        findings = cgo.check_p1_p2(texts)
+        self.assertTrue(any("uses:` gpu-prove.yml" in f for f in findings), findings)
+
+    def test_quoted_cross_repo_pinned_ref_to_prove_workflow_fails(self):
+        caller = (
+            "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n"
+            '    uses: "f-inverse/jammi-ai/.github/workflows/gpu-prove.yml@a1b2c3d4"\n'
+        )
+        texts = _positive_texts()
+        texts["some-caller.yml"] = caller
+        findings = cgo.check_p1_p2(texts)
+        self.assertTrue(any("cross-repo reference" in f for f in findings), findings)
+
+    def test_plus_bearing_producer_name_is_never_truncated(self):
+        # The old regex's character class ([A-Za-z0-9_.-]+) stops at `+` --
+        # a producer named `pub+lish.yml` used to be read as `pub`, which
+        # never equals the real target and so never matched.
+        texts = _positive_texts()
+        texts["pub+lish.yml"] = texts.pop("gpu-prove.yml")
+        caller = "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n    uses: ./.github/workflows/pub+lish.yml\n"
+        texts["some-caller.yml"] = caller
+        with mock.patch.object(cgo, "PROVE_PRODUCER_WORKFLOW", "pub+lish.yml"):
+            findings = cgo.check_p1_p2(texts)
+        self.assertTrue(any("uses:` pub+lish.yml" in f for f in findings), findings)
+
+    def test_unexaminable_other_workflow_is_a_finding_never_a_silent_skip(self):
+        # A sibling workflow whose own jobs: cannot be parsed might be the
+        # very one hiding a forbidden reference -- it is a named FAIL, not
+        # simply excluded from the scan the way a raw text regex always
+        # examines it (successfully or not) regardless of parseability.
+        # A genuine YAML anchor makes the WHOLE document unexaminable
+        # (`_assert_no_github_incompatible_yaml` refuses it outright,
+        # regardless of whether the anchor is ever referenced) --
+        # `_parsed_jobs_or_fail` fails here where flow-style alone would
+        # not (flow-style is still valid, constructible YAML; only
+        # `job_source_spans`'s own LINE-SPAN reader refuses it, and this
+        # rule no longer uses that reader for `uses:` discovery).
+        unexaminable = (
+            "name: bad\n\non: &trig\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        )
+        texts = _positive_texts()
+        texts["bad.yml"] = unexaminable
+        findings = cgo.check_p1_p2(texts)
+        mine = [f for f in findings if "bad.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("cannot examine" in f for f in mine), mine)
 
 
 class GateFileAbsentTest(unittest.TestCase):

@@ -1,13 +1,16 @@
 //! `ResultStore::reconcile` / `reconcile_all` — the object-store cross-check
 //! against the catalog. Every oracle here is engine-level (`file://` and
-//! `memory://`, SQLite catalog); the wire/CLI surface lands in a later
-//! commit.
+//! `memory://`); most run against a SQLite catalog only, with one
+//! dual-dialect (SQLite/Postgres) exception guarding the epoch-checkpoint
+//! reclaim boundary (`prefix_is_referenced`'s one-level containment
+//! predicate); the wire/CLI surface lands in a later commit.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
@@ -27,6 +30,7 @@ use jammi_db::store::{
 };
 use jammi_db::TenantId;
 use tempfile::tempdir;
+use test_case::test_case;
 use uuid::Uuid;
 
 const DIMS: usize = 4;
@@ -3028,22 +3032,34 @@ async fn a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containme
 
     // Both the served bundle and the retained epoch checkpoint are
     // referenced: the guarded delete refuses each, each by exactly its OWN
-    // row — the checkpoint's row is two segments below the served prefix
-    // (past `checkpoints/epoch_0`), never its immediate containing
-    // directory, so the served row's equality match does not ALSO count
-    // here; the predicate deliberately stops at one level.
-    assert!(matches!(
-        store.delete_unreferenced_prefix(&prefix_url).await,
+    // row, never a count inflated by the OTHER row too. The served prefix's
+    // own row is the only thing that can name it, so its count is 1
+    // regardless of the checkpoint's existence. The checkpoint's row is two
+    // segments below the served prefix (past `checkpoints/epoch_0`), never
+    // the served prefix's immediate containing directory, so — under the
+    // predicate's deliberate one-level stop — the served row's match must
+    // NOT also count here: this count staying exactly 1, not 2, is the
+    // executed proof that a nested artifact's ancestor is never inherited
+    // protection for it.
+    match store.delete_unreferenced_prefix(&prefix_url).await {
         Err(jammi_db::error::JammiError::Storage(
-            jammi_db::storage::StorageError::Referenced { count: 1, .. }
-        ))
-    ));
-    assert!(matches!(
-        store.delete_unreferenced_prefix(&epoch_prefix_url).await,
+            jammi_db::storage::StorageError::Referenced { count, .. },
+        )) => assert_eq!(
+            count, 1,
+            "the served prefix is named by exactly its own row"
+        ),
+        other => panic!("expected StorageError::Referenced, got: {other:?}"),
+    }
+    match store.delete_unreferenced_prefix(&epoch_prefix_url).await {
         Err(jammi_db::error::JammiError::Storage(
-            jammi_db::storage::StorageError::Referenced { count: 1, .. }
-        ))
-    ));
+            jammi_db::storage::StorageError::Referenced { count, .. },
+        )) => assert_eq!(
+            count, 1,
+            "the checkpoint is named by exactly its own row; the served row's ancestor match \
+             must never also count here — the predicate deliberately stops at one level"
+        ),
+        other => panic!("expected StorageError::Referenced, got: {other:?}"),
+    }
 
     // The resume prefix is referenced by NEITHER row, even under the
     // containment-aware predicate: it is never an ancestor or descendant
@@ -3088,4 +3104,169 @@ async fn a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containme
     let epoch_dir = prefix_dir.join("checkpoints").join("epoch_0");
     assert!(epoch_dir.join("adapter.safetensors").exists());
     assert!(epoch_dir.join("manifest.json").exists());
+}
+
+/// The one-level stop `count_models_naming_prefix_all_tenants`'s own doc
+/// names — proven, not merely asserted, on both catalog dialects: a live
+/// served attempt's row is never inherited protection for a SEPARATE,
+/// independently-registrable artifact nested underneath it.
+///
+/// An UNRETAINED epoch checkpoint (published, but carrying no `models` row
+/// of its own) sitting under a live served attempt's `artifact_path` is
+/// reclaimable: `prefix_is_referenced` answers `0` for its exact prefix even
+/// though the served attempt's row is very much alive one level up, and
+/// `delete_unreferenced_prefix` actually deletes it, leaving the enclosing
+/// served bundle's own bytes untouched. The SAME shape, RETAINED (the
+/// checkpoint gets its own row, exactly as the winning finalize CAS inserts
+/// for a checkpoint it keeps, before anyone ever asks about it), is the
+/// opposite: `prefix_is_referenced` answers `1` (its own row, and only its
+/// own row — the served row's equality match never also counts here) and
+/// `delete_unreferenced_prefix` refuses with a typed `Referenced { count: 1
+/// }`, bytes intact.
+///
+/// RED against the full-ancestor form of the predicate
+/// (`artifact_path = $1 OR $1 LIKE artifact_path || '/%'`): the unretained
+/// checkpoint's prefix is a syntactic descendant of the served row's
+/// `artifact_path`, so that predicate reports it referenced and the delete
+/// is wrongly refused — exactly the state this test exists to pin.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn an_unretained_epoch_checkpoint_under_a_live_served_attempt_is_reclaimable_while_a_retained_one_is_not(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let Some(session) = jammi_test_utils::make_test_session(backend, dir.path()).await else {
+        eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+        return;
+    };
+    let catalog = Arc::clone(session.catalog());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    // Production finalize shape: the served bundle lives at the
+    // attempt-level three-segment prefix — the same registration verb
+    // (`register_model`) the reap-site oracle above uses.
+    let job_id = Uuid::new_v4().to_string();
+    let bundle = vec![(
+        "adapter.safetensors".to_string(),
+        bytes::Bytes::from_static(b"weights"),
+    )];
+    let prefix_url = store
+        .artifact_store()
+        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
+        .await
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "served-attempt-model",
+            version: 1,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(prefix_url.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    // An UNRETAINED epoch checkpoint published under the SAME attempt, with
+    // NO row of its own.
+    let epoch_bundle = vec![(
+        "adapter.safetensors".to_string(),
+        bytes::Bytes::from_static(b"epoch-weights"),
+    )];
+    store
+        .artifact_store()
+        .put_epoch_checkpoint(None, &job_id, "worker-1", "0", 7, &epoch_bundle)
+        .await
+        .unwrap();
+    let unretained_prefix = store
+        .artifact_store()
+        .epoch_checkpoint_prefix(None, &job_id, "worker-1", "0", 7)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .prefix_is_referenced(&unretained_prefix)
+            .await
+            .unwrap(),
+        0,
+        "an unretained checkpoint nested under a live served attempt carries no row of its \
+         own, so it must never inherit the enclosing attempt's reference"
+    );
+    store
+        .delete_unreferenced_prefix(&unretained_prefix)
+        .await
+        .expect("an unretained checkpoint must be reclaimable");
+
+    let served_dir = dir
+        .path()
+        .join("jammi_db")
+        .join("models")
+        .join("_global")
+        .join(&job_id)
+        .join("worker-1")
+        .join("0");
+    let unretained_dir = served_dir.join("checkpoints").join("epoch_7");
+    assert!(
+        !unretained_dir.join("manifest.json").exists(),
+        "the unretained checkpoint's bytes must actually be gone"
+    );
+    assert!(
+        served_dir.join("manifest.json").exists(),
+        "the enclosing served bundle must survive the checkpoint's own reclaim"
+    );
+    assert!(served_dir.join("adapter.safetensors").exists());
+
+    // The SAME shape, RETAINED: the checkpoint's own row is registered (as
+    // the winning finalize CAS does for a checkpoint it keeps) before this
+    // one is ever asked about.
+    store
+        .artifact_store()
+        .put_epoch_checkpoint(None, &job_id, "worker-1", "0", 8, &epoch_bundle)
+        .await
+        .unwrap();
+    let retained_prefix = store
+        .artifact_store()
+        .epoch_checkpoint_prefix(None, &job_id, "worker-1", "0", 8)
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "served-attempt-model:epoch_8",
+            version: 1,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(retained_prefix.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.prefix_is_referenced(&retained_prefix).await.unwrap(),
+        1,
+        "a retained checkpoint's own row makes it referenced exactly once"
+    );
+    match store.delete_unreferenced_prefix(&retained_prefix).await {
+        Err(jammi_db::error::JammiError::Storage(
+            jammi_db::storage::StorageError::Referenced { count, .. },
+        )) => assert_eq!(
+            count, 1,
+            "exactly the checkpoint's own row, never the served row too"
+        ),
+        other => panic!("expected StorageError::Referenced, got: {other:?}"),
+    }
+    let retained_dir = served_dir.join("checkpoints").join("epoch_8");
+    assert!(
+        retained_dir.join("manifest.json").exists(),
+        "a refused delete must never touch a retained checkpoint's bytes"
+    );
 }

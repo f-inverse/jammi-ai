@@ -90,11 +90,10 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
             })
         }
         pb::submit_job_request::Spec::GraphFineTune(g) => {
-            // `TrainingSpec::GraphFineTune` has no `cache` field at all (P4
-            // design, #500 fix round 3): the decoded policy is discarded
-            // after `lora_common_from_proto` has already refused `USE` for
-            // this kind — there is nowhere left to put a `BYPASS`/unset
-            // value even if we wanted to.
+            // `TrainingSpec::GraphFineTune` has no `cache` field at all: the
+            // decoded policy is discarded after `lora_common_from_proto` has
+            // already refused `USE` for this kind — there is nowhere left to
+            // put a `BYPASS`/unset value even if we wanted to.
             let (common, _cache) = lora_common_from_proto(
                 base_model,
                 config,
@@ -191,10 +190,9 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             idempotency_key: String::new(),
             world_size: common.world_size,
             // `TrainingSpec::GraphFineTune` carries no `cache` field at all
-            // (P4 design, #500 fix round 3) — there is no value to encode,
-            // so this emits the wire's unset value, the same `UNSPECIFIED`
-            // the `ContextPredictor` arm below emits for the identical
-            // reason.
+            // — there is no value to encode, so this emits the wire's unset
+            // value, the same `UNSPECIFIED` the `ContextPredictor` arm below
+            // emits for the identical reason.
             cache: 0,
         },
         TrainingSpec::ContextPredictor {
@@ -237,13 +235,13 @@ enum LoraSpecKind {
 /// Fold the request's common `base_model` + optional `config` into a
 /// [`TrainingCommon`] for the two LoRA fine-tune kinds, and separately decode
 /// and validate `cache`, returned alongside rather than folded INTO the
-/// `TrainingCommon` (P4 design, #500 fix round 3: `cache` lives directly on
-/// `TrainingSpec::FineTune`, not on the type shared with `GraphFineTune`, so
-/// only the `FineTune` decode arm threads the returned value onto its spec;
-/// the `GraphFineTune` arm discards it once this function has validated it).
+/// `TrainingCommon`: `cache` lives directly on `TrainingSpec::FineTune`, not
+/// on the type shared with `GraphFineTune`, so only the `FineTune` decode arm
+/// threads the returned value onto its spec; the `GraphFineTune` arm
+/// discards it once this function has validated it.
 /// An empty base model is a client error (the worker has nothing to adapt).
 ///
-/// P4: `cache = USE` is refused, typed, for `kind == GraphFineTune` —
+/// `cache = USE` is refused, typed, for `kind == GraphFineTune` —
 /// `ProducingDescriptor::FineTune` (and every
 /// `probe_model_by_definition`/`record_model_materialization` mechanism
 /// built on it) covers only the column-source `FineTune` kind at this
@@ -745,7 +743,7 @@ mod tests {
 
     /// [`decoded_common`]'s peer for the top-level `cache` field — separate
     /// because `cache` lives directly on `TrainingSpec::FineTune`, not on
-    /// `TrainingCommon` (P4 design, #500 fix round 3).
+    /// `TrainingCommon`.
     fn decoded_cache(req: pb::SubmitJobRequest) -> jammi_db::store::CachePolicy {
         match training_spec_from_proto(req).expect("decode") {
             TrainingSpec::FineTune { cache, .. } => cache,
@@ -895,10 +893,9 @@ mod tests {
     /// (the default) still decodes successfully into a graph fine-tune job:
     /// this kind is never blocked from training, only from a reuse promise
     /// it cannot keep. `TrainingSpec::GraphFineTune` has no `cache` field to
-    /// inspect at all (P4 design, #500 fix round 3 — the policy is
-    /// unrepresentable for this kind, not merely defaulted), so the
-    /// observable property is that decode succeeds, never that some field
-    /// carries a particular value.
+    /// inspect at all — the policy is unrepresentable for this kind, not
+    /// merely defaulted — so the observable property is that decode
+    /// succeeds, never that some field carries a particular value.
     #[test]
     fn graph_fine_tune_bypass_or_unset_decodes_successfully() {
         use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;

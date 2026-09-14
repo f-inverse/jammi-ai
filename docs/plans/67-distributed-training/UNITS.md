@@ -12,15 +12,15 @@ per-step `$?`. Naming per README ruling 23.
   0.13`, `datafusion-federation 0.5.5`, `datafusion-flight-sql-server 0.4.18`, `pyo3-arrow` to the
   arrow-58 line; `Cargo.lock`; `deny.toml`; `.github/workflows/ci.yml` — a NEW step
   `cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings` registered
-  with `ci/scripts/check_lint_surface_closure.py`. (db) `crates/jammi-db/Cargo.toml:55`
-  `datafusion-table-providers` 0.10.1 → 0.13 and its compat surface: `PostgresTableFactory`,
-  `PostgresConnectionPool` (`source/postgres.rs:10-11`), `MySQLTableFactory`,
-  `MySQLConnectionPool` (`source/mysql.rs:10-11`); `tenant_scope.rs` analyzer API. (ai-core,
+  with `ci/scripts/check_lint_surface_closure.py`. (db) `crates/jammi-db/Cargo.toml::[dependencies].datafusion-table-providers`
+  (already 0.13.1) and its compat surface: `PostgresTableFactory`,
+  `PostgresConnectionPool` (`crates/jammi-db/src/source/postgres.rs`), `MySQLTableFactory`,
+  `MySQLConnectionPool` (`crates/jammi-db/src/source/mysql.rs`); `tenant_scope.rs` analyzer API. (ai-core,
   wire-server, python, cli, bench) compile fixes in their crates.
 - **invariants_to_preserve**: B6, K6, K4 (`grpc_remote_session.rs` green), B5, K1.
 - **acceptance**: the RED-at-base oracle is the `DATAFUSION_VERSION` test (the only criterion
   RED at base by construction); the new db-features clippy step is a **coverage lane** (the
-  0.10.1 pin compiles today — record the base-commit run of the exact command in the ledger);
+  current `datafusion-table-providers` pin compiles today — record the base-commit run of the exact command in the ledger);
   workspace gate green including that lane; cookbook 6.5 zero divergence; `cargo tree -d`
   shows one `arrow` and one `datafusion` line.
 - **lane**: hermetic + cookbook; `distributed.yml` dispatched manually before merge.
@@ -52,10 +52,12 @@ per-step `$?`. Naming per README ruling 23.
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::TrainingSet` with
   `format` as a canonical string), `catalog/result_repo.rs` (`ResultTableKind::TrainingSet`),
   tests. (wire-server) `crates/jammi-wire/proto/jammi/v1/embedding.proto` (`TRAINING_SET = 4`,
-  append-only) and `crates/jammi-wire/src/embedding.rs:95-116` (the two exhaustive
+  append-only) and `crates/jammi-wire/src/embedding.rs::result_table_kind_to_proto`/
+  `::result_table_kind_from_proto` (the two exhaustive
   `ResultTableKind` mirrors). (ai-core) `fine_tune/worker.rs::run_spec` (materialize-or-reuse,
   then read the table back through `session.sql` over the registered `jammi.{name}` result
-  table — `store/mod.rs:855`, `session.rs:944` precedent — with the canonical `ORDER BY`
+  table — `crates/jammi-db/src/store/mod.rs::ResultStore::register_table`
+  and `crates/jammi-ai/src/session.rs::infer_ordered_read_back_sql` precedent — with the canonical `ORDER BY`
   re-applied, into today's loader: a compiling intermediate), `fine_tune/graph_sampler.rs`
   (pairs → table), `pipeline/recompute.rs` (arm = re-materialize). (docs-ci) the
   `PRODUCING-DESCRIPTOR-VARIANTS` block of `docs/maintainer/MAINTAINER-GUIDE.md`
@@ -69,7 +71,7 @@ per-step `$?`. Naming per README ruling 23.
   (RED at base); (c) refactor parity: adapter bytes identical to base on every cookbook
   fine-tune fixture; (d) order: the read-back re-applies the canonical `ORDER BY` and matches
   the committed order on a fixture with > 1 row group at `execution_threads > 1` (RED at base
-  for an unordered scan; `session.rs:189` sets `target_partitions`).
+  for an unordered scan; `crates/jammi-db/src/session.rs::JammiSession::build` sets `target_partitions`).
 - **lane**: hermetic + cookbook. **depends_on**: U1. **size**: M.
 
 ## U4a — `Collective` trait; device-plural session; `CacheKey`; config refusals (PR-B commit 3)
@@ -80,8 +82,9 @@ per-step `$?`. Naming per README ruling 23.
   `concurrency/gpu_scheduler.rs` (per device), `session.rs`, `fine_tune/spec.rs`
   (`TrainingCommon.world_size`, `#[serde(default)]` = 1 — the field lands here so the
   refusals below are testable at this commit; queued specs still deserialize), every
-  `TrainingCommon { .. }` construction site (`wire/training.rs:176`, `session.rs:1172`,
-  `:1300`, the `tests/it` sites), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`).
+  `TrainingCommon { .. }` construction site (`crates/jammi-ai/src/wire/training.rs::lora_common_from_proto`,
+  `crates/jammi-ai/src/session.rs::InferenceSession::fine_tune`,
+  `InferenceSession::fine_tune_graph`, the `tests/it` sites), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`).
   (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
   (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
@@ -125,7 +128,7 @@ issue #544 and scheduled before U4b binds a per-rank reader to it.
   `fine_tune/batch_bucket.rs` (rung pinning option), the one `TrainingSetSpec` constructor
   shared by every construction site (or a field-by-field oracle asserting the sites agree),
   tests. (db) `store/mod.rs` reader slicing over the result-table `ListingTable` (no injectable
-  row-group knob: `crates/jammi-db/src/storage/writer.rs:32`'s `set_max_row_group_row_count`
+  row-group knob: `crates/jammi-db/src/storage/writer.rs::ObjectParquetWriter::open`'s `set_max_row_group_row_count`
   stays hardcoded at `65_536`; a multi-row-group fixture is simply >65,536 rows
   through that one writer).
 - **invariants_to_preserve**: K3 (scaler over the train prefix, bit-identical), K2, B6.
@@ -171,7 +174,7 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   `ResidencyBound`/`StreamConfig` shapes carried over unchanged), `fine_tune/trainer.rs` (the
   per-rank stream consumer U4b's rank body binds to), tests. No injectable row-group knob: the
   multi-row-group fixture is simply >65,536 rows written through the one existing writer
-  (`storage/writer.rs:32`'s hardcoded `set_max_row_group_row_count(Some(65_536))` — its absence
+  (`crates/jammi-db/src/storage/writer.rs::ObjectParquetWriter::open`'s hardcoded `set_max_row_group_row_count(Some(65_536))` — its absence
   of a knob is itself pinned by `default_row_group_row_count_is_65_536`); the two headline
   oracles (the residency bound and the no-`SortExec` provider plan) share ONE materialized
   fixture per test binary.
@@ -291,7 +294,7 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
   no arm reads `schedule:` at all), GREEN once this unit's P7 and its fixture land together.
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
 - **cost ceiling** (human-approved before first run, committed figures — never re-derived per
-  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md:300 — never the 2-GPU pod rate),
+  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md#units-and-order (~:305) — never the 2-GPU pod rate),
   the 2×1 shape bills $3.816/h; ≤ 1 h billed wall per run, ≤ 2 runs per authorization; label-only
   until a flake-free streak.
 
@@ -299,7 +302,7 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
 
 - **files_in_scope**: (wire-server) `crates/jammi-wire/proto/jammi/v1/gang.proto`
   (`RunRank(RankAssignment) returns (stream RankEvent)` with `RankEvent::Released`),
-  `crates/jammi-wire/build.rs:22-33`,
+  `crates/jammi-wire/build.rs::main` (the `proto_files` list),
   `crates/jammi-wire/src/{lib.rs, gang.rs}`, `crates/jammi-server/src/grpc/gang.rs` (handler on
   the **peer listener** — 68 DIST D7's routes built outside `assemble_grpc_chain`; the I-GANG
   verification through `get_job_for_rank`, `status = 'running'`, `claimed_by`, live lease, tenant
@@ -315,8 +318,8 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
   api_freeze.rs (package count prose), tenant_isolation_oracle.rs (`GANG_LISTENER_ALLOWLIST`,
   unioned into `covered_on_wire`; public-listener `UNIMPLEMENTED`
   probe), gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot`: taken before
-  `claim_next` (`wt-C: worker.rs:346`), held across `run_claimed_job` (`:355`), released before
-  the idle sleep (`:363`)). (db) `config/mod.rs` (`rank_timeout_secs`
+  `claim_next`, held across `run_claimed_job_under`, released before
+  the idle sleep — all three in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`). (db) `config/mod.rs` (`rank_timeout_secs`
   if not already in U4a).
 - **invariants_to_preserve**: B5 (I-GANG written invariant; no double binder — never mounted under
   `TenantResolverLayer`), K2, B1 (no `stage`/`register` stems), B6, OPS D6 (no abort while a claim
@@ -358,7 +361,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   migration, number at rebase, three pin sites incl. the ordered-after oracle in
   `crates/jammi-db/tests/it/migrations.rs` (added by U5a-1) — the same
   `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern
-  (`tests/it/migrations.rs:1284`, on `main`) repeated for this migration, cited by
+  (`crates/jammi-db/tests/it/migrations.rs::migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`, on `main`) repeated for this migration, cited by
   construct rather than by an offset on a branch this fold cannot read), `catalog/jobs_repo.rs`
   (`upsert_instance` gains `peer_addr` + a
   canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
@@ -369,25 +372,25 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   (kinds split on `,`, matched as whole tokens), and root-divergent instances; the member order is
   byte order on `instance_id`, sorted and compared in Rust — never a SQL `ORDER BY`, whose
   collation is backend-dependent; root divergence is likewise a byte-exact Rust comparison of the
-  canonicalized string, never a SQL `=`; `prune_instances`' window (`session.rs:259-261`'s call
+  canonicalized string, never a SQL `=`; `prune_instances`' window (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`'s call
   site, exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
   will return) moves to STRICTLY BEYOND the margin, so a member judged merely stale is never also
-  eligible for deletion; the lease keeper's `Instance` arm (`lease_keeper.rs:765-771`, folded into
-  the generic `Some(false) → lost` dispatch at `:826-827`) RE-UPSERTS the row on a failed touch
-  instead of only flipping `lost` — `touch_instance` (`jobs_repo.rs:1763-1779`) is a pure `UPDATE`
+  eligible for deletion; the lease keeper's `Instance` arm (`crates/jammi-db/src/catalog/lease_keeper.rs::renew_all`, folded into
+  the generic `Some(false) → lost` dispatch at `renew_all`) RE-UPSERTS the row on a failed touch
+  instead of only flipping `lost` — `touch_instance` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`) is a pure `UPDATE`
   that can never resurrect a pruned row, so a process whose row was pruned during a transient
   outage now rejoins on its next heartbeat with no restart), `config/mod.rs` (`[server]
   peer_advertise` validated at load — requires `peer_bind`; `canonicalize_result_root()`
   canonicalizes the RESOLVED result-table root — `[storage] result_root` when set, else
-  `{artifact_dir}/jammi_db` (`config/mod.rs:305-307`'s documented default, mirroring
-  `session.rs`'s `build_result_store`, `session.rs:2241-2272`) — scheme-aliased, trailing slash
+  `{artifact_dir}/jammi_db` (`crates/jammi-db/src/config/mod.rs::StorageConfig`'s documented default, mirroring
+  `session.rs`'s `build_result_store`, `crates/jammi-ai/src/session.rs::build_result_store`) — scheme-aliased, trailing slash
   trimmed, a non-existent or relative `file://` root refused at load with the row never written;
   canonical-root equality is NECESSARY, never SUFFICIENT, for shared storage — sufficiency is
   established only by the attestation VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and
   U5b-1b-i's per-partition inventory, never by this predicate alone). (ai-core) `session.rs` (the
-  ONLY production call site of `upsert_instance`, `session.rs:286-289` — gains the `peer_addr` /
-  canonicalized-`result_root` arguments; `:109-110`'s shared-`artifact_dir` topology note stays
-  configurable for a gang; `:2241-2272`'s `build_result_store` stays the one place the effective
+  ONLY production call site of `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — gains the `peer_addr` /
+  canonicalized-`result_root` arguments; `InferenceSession::open_with_placement`'s shared-`artifact_dir` topology note stays
+  configurable for a gang; `build_result_store` stays the one place the effective
   root is actually computed at runtime). (docs-ci) `docs/guide/src/{configuration.md, security.md,
   deploy-server.md, reference-topologies.md}`.
 - **invariants_to_preserve**: B6, K2 (validate chain), K5 (migration, three pin sites).
@@ -541,7 +544,8 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ## U5b-2 — Watchdog; abort with no terminal write; released-vs-failed; chaos (PR-C commit 4)
 
 - **files_in_scope** (ai-core): `fine_tune/worker.rs` (watchdog; attempt abort by flipping the
-  hold's `lost` flag so the run exits through the leave-for-reclaim arm, `wt-C: worker.rs:670-676`;
+  hold's `lost` flag so the run exits through the leave-for-reclaim arm,
+  `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_claimed_job_under` (the lease-lost arm);
   `Released` → `release_job_lease` first, then the flag; `BackOff` on a live same-named
   `building` training-set row), `tests/distributed/gang_chaos.rs`. (wire-server) `grpc/gang.rs`
   (the drain hook that emits `RankEvent::Released`).
@@ -577,7 +581,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   `crates/jammi-ai/src/operator/gang_exec.rs` (single-partition operator whose `execute` runs the
   U5b coordinator). `tests/distributed/{main.rs, harness.rs (scheduler/executor TOML),
   ballista_parity.rs}`; `.github/workflows/distributed.yml` matrix entries;
-  `ci/scripts/publish_crates.sh:40-50` (`jammi-ballista` inserted before `jammi-server` in the
+  `ci/scripts/publish_crates.sh`'s `PUBLISH_ORDER` array (`jammi-ballista` inserted before `jammi-server` in the
   topological publish list — a `v*` tag would otherwise half-publish); `.claude/agents/
   wire-server.md` `owns:` gains `crates/jammi-ballista/**` (`check_swarm_bijection.py` asserts a
   total partition of `crates/`; this edit trips `SWARM_GATE_TOUCHED`, so **PR-D is an admin
@@ -609,7 +613,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   `catalog/{schema.rs, migrations.rs}` (`compute_cluster_state`: distributor-neutral tables —
   `compute_executors(executor_id, instance_id, heartbeat_at, slots)`, `compute_jobs(job_id,
   graph, status)` — plus `workers.devices TEXT` JSON `[{kind, ordinal, memory}]` written by
-  `upsert_worker` from the session's device list, `wt-C: jobs_repo.rs:1556`; number at rebase,
+  `upsert_worker` from the session's device list, `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_worker`; number at rebase,
   three pin sites incl. an ordered-after oracle on both backends — this migration lands after
   PR-C(67)'s, so the oracle asserts ordered-after BOTH `instances_peer_addr_result_root` (U5b-1a)
   and `jobs_assembly_failures_next_after` (U5b-1b-ii)), `catalog/jobs_repo.rs`

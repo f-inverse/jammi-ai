@@ -36,6 +36,7 @@ embedded engine per shape.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,87 @@ def test_closing_control_passes(embedded, remote):
 '''
 
 
+# pytest truncates its short-summary "ERROR <nodeid> - Failed: <message>"
+# line to the terminal width (see COLUMNS in `runpytest_subprocess`'s
+# environment): a narrow terminal drops the message entirely from that
+# line, a wide one shows it in full, so counting a message SUBSTRING across
+# the whole run's stdout counts a different number of occurrences per
+# terminal width -- the exact defect this file's cause experiment
+# (COLUMNS=80 vs COLUMNS=300, documented in the commit that added these
+# helpers) reproduced: 1 occurrence at 80 columns, 2 at 300. The section
+# header and body pytest writes under `=== ERRORS ===` -- `ERROR at
+# teardown of <nodeid>`, one per failing fixture finalizer -- are never
+# truncated by width, `-r` flags or summary formatting, so keying off that
+# header is the width-independent form of "each leak is reported exactly
+# once, attributed to its node id".
+_TEARDOWN_ERROR_HEADER_RE = re.compile(r"^_+\s+ERROR at teardown of (.+?)\s+_+$")
+_BANNER_RE = re.compile(r"^=+\s.*\s=+$")
+
+
+def _teardown_error_sections(outlines: list[str]) -> list[tuple[str, list[str]]]:
+    """Split a pytest run's plain-text stdout into one ``(nodeid, body
+    lines)`` entry per ``ERROR at teardown of <nodeid>`` section pytest
+    emits under its ``=== ERRORS ===`` banner. A list, not a dict keyed by
+    name: a name appearing twice (a second, duplicate report for the same
+    node id) must stay visible to the caller, not silently collapse."""
+    sections: list[tuple[str, list[str]]] = []
+    current_lines: list[str] | None = None
+    for line in outlines:
+        header = _TEARDOWN_ERROR_HEADER_RE.match(line)
+        if header:
+            current_lines = []
+            sections.append((header.group(1), current_lines))
+            continue
+        if current_lines is not None:
+            if _BANNER_RE.match(line):
+                current_lines = None
+            else:
+                current_lines.append(line)
+    return sections
+
+
+def _section_after_banner(outlines: list[str], banner_substring: str) -> list[str]:
+    """Return the body lines of the FIRST pytest banner section (a line
+    matching pytest's ``=== <text> ===`` banner format) whose own text
+    contains ``banner_substring``, up to (not including) the next banner.
+    Used the same way `_teardown_error_sections` uses `_BANNER_RE`: keyed
+    off text pytest always writes, not a width-dependent truncation."""
+    lines: list[str] = []
+    collecting = False
+    for line in outlines:
+        if _BANNER_RE.match(line):
+            if collecting:
+                break
+            collecting = banner_substring in line
+            continue
+        if collecting:
+            lines.append(line)
+    return lines
+
+
+def _assert_no_second_report_class(outlines: list[str]) -> None:
+    """No leak is EVER reported through a second, vaguer channel alongside
+    its own ``ERROR at teardown of <nodeid>`` section: no bare
+    unraisable-exception warning, no "Exception ignored" interpreter
+    traceback tail, no duplicate teardown-error section for the same node
+    id, and no co-occurring entry in the warnings summary (the guard's OTHER
+    arm -- an already-failing test -- legitimately reports a leak only
+    through the warnings summary INSTEAD of an ERROR section; a leak that
+    got both is the double-report this guards against)."""
+    full = "\n".join(outlines)
+    assert "PytestUnraisableExceptionWarning" not in full
+    assert "Exception ignored" not in full
+    names = [name for name, _ in _teardown_error_sections(outlines)]
+    assert len(names) == len(set(names)), (
+        f"duplicate teardown-error section for the same node id: {names!r}"
+    )
+    warnings_body = "\n".join(_section_after_banner(outlines, "warnings summary"))
+    assert "left 1 jammi session(s) open" not in warnings_body, (
+        "the leak must not ALSO be reported via the warnings summary "
+        f"alongside its own ERROR at teardown section: {warnings_body!r}"
+    )
+
+
 def test_leaked_session_fails_by_name_on_both_transports(pytester: pytest.Pytester):
     """The runtime guard's non-vacuity control: a leak on EACH transport is
     reported by name at teardown, and a test that closes properly still
@@ -102,14 +184,33 @@ def test_leaked_session_fails_by_name_on_both_transports(pytester: pytest.Pytest
     result.stdout.fnmatch_lines(
         ["*ERROR*test_leaked_remote_session_is_failed_by_name*"]
     )
-    # The two leak messages name the target label, not just "a session": the
-    # embedded label is the artifact_dir it was opened on, the remote label
-    # is the endpoint `RemoteDatabase.__init__` was given (no scheme --
+    # Each leak is reported exactly once, attributed to its own node id, and
+    # to neither the wrong test nor a vaguer second channel -- asserted here
+    # in the width-independent form (see the module-level comment above
+    # `_teardown_error_sections`).
+    sections = _teardown_error_sections(result.outlines)
+    names = [name for name, _ in sections]
+    assert sorted(names) == sorted(
+        [
+            "test_leaked_embedded_session_is_failed_by_name",
+            "test_leaked_remote_session_is_failed_by_name",
+        ]
+    ), f"expected exactly one teardown-error section per leaking test, got {names!r}"
+    for name, lines in sections:
+        assert "left 1 jammi session(s) open" in "\n".join(lines), (name, lines)
+    # The remote leak message names the target label, not just "a session":
+    # the embedded label is the artifact_dir it was opened on, the remote
+    # label is the endpoint `RemoteDatabase.__init__` was given (no scheme --
     # `_sessions.register` is called with `endpoint`, not the original
     # `target` string; see `_database.py`'s own `open_remote`).
-    full = "\n".join(result.outlines)
-    assert full.count("left 1 jammi session(s) open") == 2
-    assert "127.0.0.1:8081" in full
+    remote_body = "\n".join(
+        line
+        for name, lines in sections
+        if name == "test_leaked_remote_session_is_failed_by_name"
+        for line in lines
+    )
+    assert "127.0.0.1:8081" in remote_body
+    _assert_no_second_report_class(result.outlines)
 
 
 def test_leaked_session_reports_exactly_once_by_name(pytester: pytest.Pytester):
@@ -129,9 +230,17 @@ def test_leaked_embedded_session_is_failed_by_name(tmp_path):
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
 
     result.assert_outcomes(passed=1, errors=1, failed=0)
-    full = "\n".join(result.outlines)
-    assert full.count("left 1 jammi session(s) open") == 1
-    assert full.count("test_leaked_embedded_session_is_failed_by_name") >= 1
+    # Exactly one `ERROR at teardown of <nodeid>` section, attributed to the
+    # exact node id, carrying the leak message -- and no second, vaguer
+    # report of the same leak (asserted in the width-independent form; see
+    # the module-level comment above `_teardown_error_sections`).
+    sections = _teardown_error_sections(result.outlines)
+    names = [name for name, _ in sections]
+    assert names == [
+        "test_leaked_embedded_session_is_failed_by_name"
+    ], f"expected exactly one teardown-error section, got {names!r}"
+    assert "left 1 jammi session(s) open" in "\n".join(sections[0][1])
+    _assert_no_second_report_class(result.outlines)
 
 
 # --------------------------------------------------------------------------- #

@@ -18,7 +18,7 @@
 
 use std::ops::Range;
 
-/// The row-partitioning rule a streamed training set is read under. `V1` is
+/// The row-partitioning rule a training set's rows are read under. `V1` is
 /// the only rule this plan defines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionRule {

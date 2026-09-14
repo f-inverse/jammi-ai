@@ -1229,7 +1229,7 @@ impl TrainingLoop {
                 // Production path: encode text through the target, then
                 // compute loss. Walks `epoch_loader` by PartitionSpec-selected
                 // GLOBAL step (DESIGN.md §2) rather than a pre-collected
-                // `Vec<TextChunk>` — a per-epoch stream reads a chunk at a
+                // `Vec<TextChunk>` — one step's row slice is decoded at a
                 // time, never the whole epoch's chunks at once. At
                 // `self.world_size == 1` (every reachable value today,
                 // `rank = 0`) `rows_for_step` walks exactly the same `[s*B,
@@ -1647,23 +1647,13 @@ impl TrainingLoop {
     /// used as the mining fall-back. Pairs become a `Pairs` loader; triplets
     /// keep their explicit negatives.
     ///
-    /// **CONTRACT-U2b-fix1.md fold (live defect, fixed here).** The base
-    /// shape of this function folded EVERY `Err` from `in_batch_negative_
-    /// texts` into the empty-triplets fallback, including a genuine I/O or
-    /// decode failure from a `Stream` loader's whole-set drain
-    /// (`TrainingDataLoader::stream_drain_all`) — silently training the
-    /// fallback epoch on ZERO rows instead of reporting the failure. The two
-    /// cases are told apart BEFORE any I/O runs, not by inspecting the error
-    /// afterward: a loader with no in-batch-negative SHAPE at all
-    /// (`is_precomputed()`, or a format other than `Pairs`/`Triplet`/`Graph`)
-    /// takes the empty-triplets fallback without ever calling `in_batch_
-    /// negative_texts`; every other loader genuinely has that shape, so an
-    /// `Err` from here on is an OPERATIONAL failure and propagates typed.
+    /// A loader with no in-batch-negative SHAPE at all (`is_precomputed()`, or
+    /// a format other than `Pairs`/`Triplet`/`Graph`) takes the empty-triplets
+    /// fallback directly, without ever calling `in_batch_negative_texts` —
+    /// every other loader genuinely has that shape, so an `Err` from there
+    /// propagates typed rather than folding into the same fallback.
     ///
-    /// Not `&self` — this never reads trainer state, and the dying test for
-    /// the fold above (`clone_text_loader_propagates_a_genuine_drain_io_
-    /// error_instead_of_swallowing_it`) drives it directly against a `Stream`
-    /// loader with no `Trainer` (base model, catalog, claimed job) to build.
+    /// Not `&self` — this never reads trainer state.
     fn clone_text_loader(loader: &TrainingDataLoader) -> Result<TrainingDataLoader> {
         if loader.is_precomputed()
             || !matches!(
@@ -4661,100 +4651,53 @@ mod cuda_htod_cache_premise_pin {
     }
 }
 
-/// CONTRACT-U2b-fix1.md item 5 (live defect, fixed alongside this test):
-/// `TrainingLoop::clone_text_loader`'s `Err(_)` arm used to fold a genuine
-/// I/O failure from the `Stream` arm's whole-set drain
-/// (`TrainingDataLoader::in_batch_negative_texts` → `stream_drain_all`) into
-/// the SAME empty-triplets fallback a loader with no in-batch-negative shape
-/// at all takes — silently training the hard-negative-mining fallback epoch
-/// on zero rows instead of reporting the failure. This drives
-/// `clone_text_loader` directly against a real `Stream` loader (no
-/// `TrainingLoop` — base model, catalog, claimed job — needed; see the
-/// function's own doc for why) with the drain forced to fail via
-/// [`super::data::TrainingDataLoader::FORCE_STREAM_DRAIN_ERROR_ENV`].
-///
-/// RED at 92531ce2 (observed by reverting the fold in a detached copy):
-/// `clone_text_loader` returns `Ok` with an EMPTY loader instead of the
-/// injected error.
+/// `TrainingLoop::clone_text_loader`'s shape-before-I/O guard, on the eager
+/// `TextRows` path (no `Trainer` — base model, catalog, claimed job — needed;
+/// see the function's own doc for why): a loader that genuinely has an
+/// in-batch-negative shape (`Pairs`/`Triplet`) clones every row, and a loader
+/// with no such shape (`Contrastive`, or a `Precomputed` loader) takes the
+/// empty-triplets fallback WITHOUT ever calling `in_batch_negative_texts` —
+/// which would otherwise error for those formats.
 #[cfg(test)]
-mod clone_text_loader_fold {
-    use std::sync::Arc;
-
-    use tempfile::TempDir;
-
+mod clone_text_loader_tests {
     use super::TrainingLoop;
-    use crate::fine_tune::data::{StreamConfig, TrainingDataLoader, TrainingFormat};
-    use crate::model::ModelTask;
-    use crate::session::InferenceSession;
-    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+    use crate::fine_tune::data::{TrainingBatch, TrainingDataLoader};
 
-    /// A tiny "anchor,positive" CSV, registered and materialised as a
-    /// per-epoch `Stream` loader. `Pairs` genuinely HAS an in-batch-negative
-    /// shape, so `clone_text_loader` reaches `in_batch_negative_texts`'s
-    /// `Stream` drain rather than taking the "no shape" fallback before any
-    /// I/O runs — the property this test needs to tell the two failure modes
-    /// apart.
-    async fn stream_pairs_loader(dir: &TempDir) -> TrainingDataLoader {
-        let path = dir.path().join("pairs.csv");
-        std::fs::write(&path, "anchor,positive\na0,p0\na1,p1\na2,p2\n").unwrap();
-        let config = jammi_test_utils::test_config(dir.path());
-        let session = Arc::new(InferenceSession::new(config).await.unwrap());
-        session
-            .add_source(
-                "clone-text-loader-fold",
-                SourceType::File,
-                SourceConnection {
-                    url: Some(format!("file://{}", path.display())),
-                    format: Some(FileFormat::Csv),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        TrainingDataLoader::from_source_stream(
-            session,
-            "clone-text-loader-fold",
-            vec!["anchor".to_string(), "positive".to_string()],
-            ModelTask::TextEmbedding,
-            TrainingFormat::Pairs,
-            StreamConfig {
-                batch: 2,
-                prefetch: 2,
-            },
-        )
-        .await
-        .unwrap()
+    #[test]
+    fn a_pairs_loader_clones_every_row() {
+        let loader = TrainingDataLoader::from_pairs(vec![
+            ("a0".into(), "p0".into()),
+            ("a1".into(), "p1".into()),
+            ("a2".into(), "p2".into()),
+        ]);
+        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        assert_eq!(cloned.len(), 3, "the clone must carry every source row");
     }
 
     #[test]
-    fn genuine_drain_io_error_propagates_instead_of_being_swallowed() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let dir = TempDir::new().unwrap();
-        let loader = rt.block_on(stream_pairs_loader(&dir));
-
-        // Control: the healthy drain clones every source row — proves the
-        // loader genuinely has an in-batch-negative shape and that the
-        // failure below is NOT a "wrong shape" false positive.
+    fn a_triplet_loader_keeps_its_explicit_negatives() {
+        let loader =
+            TrainingDataLoader::from_triplets(vec![("a0".into(), "p0".into(), "n0".into())]);
         let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
-        assert_eq!(cloned.len(), 3, "the clone must carry every source row");
+        assert_eq!(cloned.len(), 1);
+    }
 
-        // Mechanism: force the SAME drain to fail and assert the failure
-        // propagates typed, rather than silently folding into the
-        // empty-triplets fallback.
-        std::env::set_var(TrainingDataLoader::FORCE_STREAM_DRAIN_ERROR_ENV, "1");
-        let result = TrainingLoop::clone_text_loader(&loader);
-        std::env::remove_var(TrainingDataLoader::FORCE_STREAM_DRAIN_ERROR_ENV);
-        match result {
-            Err(e) => assert!(
-                e.to_string().contains("forced I/O failure"),
-                "expected the injected drain failure to propagate typed, got: {e}"
-            ),
-            Ok(loader) => panic!(
-                "a genuine I/O failure in the Stream arm's whole-set drain must propagate, not \
-                 be swallowed into the empty-triplets fallback (got a loader of length {})",
-                loader.len()
-            ),
-        }
+    /// A format with no in-batch-negative shape at all (`Contrastive`) takes
+    /// the empty-triplets fallback before `in_batch_negative_texts` is ever
+    /// called — that call would otherwise error for this format.
+    #[test]
+    fn a_contrastive_loader_takes_the_empty_fallback_without_erroring() {
+        let loader = TrainingDataLoader::from_contrastive(vec![("a".into(), "b".into(), 0.5)]);
+        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        assert_eq!(cloned.len(), 0);
+    }
+
+    /// A `Precomputed` loader (`is_precomputed()`) takes the same fallback.
+    #[test]
+    fn a_precomputed_loader_takes_the_empty_fallback_without_erroring() {
+        let loader = TrainingDataLoader::from_precomputed(Vec::<TrainingBatch>::new());
+        let cloned = TrainingLoop::clone_text_loader(&loader).unwrap();
+        assert_eq!(cloned.len(), 0);
     }
 }
 

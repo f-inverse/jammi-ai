@@ -84,7 +84,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-#[cfg(test)]
 use arrow::array::RecordBatch;
 use bytes::Bytes;
 use jammi_db::catalog::jobs_repo::WorkerState;
@@ -98,7 +97,7 @@ use jammi_db::store::ArtifactStore;
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
-use crate::fine_tune::data::{StreamConfig, TrainingDataLoader, TrainingFormat};
+use crate::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
@@ -949,7 +948,7 @@ impl JobWorker {
     /// |---|---|---|
     /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
     /// | 2 | undeserialisable `training_spec` | same as 1 |
-    /// | 3 | training-set materialization / loader reconstruction error (`TrainingDataLoader::from_source_stream`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
     /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
     /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
     /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |
@@ -1828,35 +1827,26 @@ impl JobWorker {
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
-                // carries this definition) — WRITE ONLY, no eager read-back
-                // (`TrainingDataLoader::from_source_stream`, U2b) — then
-                // stream that table back a bounded window of rows at a time,
-                // per epoch. The rows a run trains on are a durable, attested
-                // artifact, not this worker's private scan, and are never
-                // fully resident in this worker just to build the loader.
+                // carries this definition), then read that table back in its
+                // committed order. The rows a run trains on are a durable,
+                // attested artifact, not this worker's private scan.
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
-                let format = training_format_for(detected);
-                let loader = TrainingDataLoader::from_source_stream(
-                    Arc::clone(session),
+                let (_table, batches) = training_set::materialize_projection(
+                    session,
                     &source,
-                    columns.clone(),
+                    &columns,
                     task,
-                    format,
-                    StreamConfig {
-                        batch: common.config.batch_size,
-                        prefetch: DEFAULT_STREAM_PREFETCH,
-                    },
+                    detected.format_tag(),
                 )
                 .await
                 .map_err(WorkerJobError::from)?;
-                // The tag the table was WRITTEN under (`format`, built from
-                // the SAME classifier `detected` came from) and the tag the
-                // loader reports must be the same string by construction:
-                // `format.format_tag()` is exactly what
-                // `from_source_stream` records as the descriptor's `format`.
-                // Loud rather than silent because a divergence would mean two
-                // formats sharing one definition hash.
+                let loader = build_training_data_loader(&batches, &columns, task)
+                    .map_err(WorkerJobError::from)?;
+                // The tag the table was WRITTEN under and the shape its loader
+                // reports come from one classifier, so a mismatch is a broken
+                // engine invariant rather than a caller error — and it must be
+                // loud: it would mean two formats sharing one definition hash.
                 if loader.format().format_tag() != detected.format_tag() {
                     return Err(WorkerJobError::from(JammiError::Other(format!(
                         "training set was committed as format '{}' but its loader reports \
@@ -3603,41 +3593,11 @@ fn detect_training_format(columns: &[String], task: ModelTask) -> Result<Detecte
     }
 }
 
-/// How many per-rank `batch`-sized chunks [`run_spec`]'s streaming
-/// constructor buffers ahead of the trainer's own consumption (DESIGN.md §2)
-/// — the residency bound is `batch_size * DEFAULT_STREAM_PREFETCH` rows.
-/// `FineTuneConfig` has no `prefetch` knob at this commit (a config surface
-/// is out of this unit's scope); this fixed default is the production value
-/// until one exists.
-const DEFAULT_STREAM_PREFETCH: usize = 4;
-
-/// [`DetectedFormat`] as the [`TrainingFormat`] the streaming constructor
-/// needs — the same classifier, restated as the enum the loader itself
-/// carries. `Classification`'s `num_classes` is unknowable before the rows
-/// are read (the eager whole-table fallback derives the real one), so `0`
-/// stands in here exactly as [`DetectedFormat::format_tag`]'s own doc
-/// explains for the identical placeholder.
-fn training_format_for(detected: DetectedFormat) -> TrainingFormat {
-    match detected {
-        DetectedFormat::Contrastive => TrainingFormat::Contrastive,
-        DetectedFormat::Pairs => TrainingFormat::Pairs,
-        DetectedFormat::Triplet => TrainingFormat::Triplet,
-        DetectedFormat::MediaTriplet => TrainingFormat::MediaTriplet,
-        DetectedFormat::Classification => TrainingFormat::Classification { num_classes: 0 },
-        DetectedFormat::Regression => TrainingFormat::Regression,
-    }
-}
-
-/// The base tree's eager, whole-`Vec<RecordBatch>` loader builder. `run_spec`
-/// no longer calls this (U2b: `TrainingDataLoader::from_source_stream`
-/// streams the committed table instead, never collecting it into memory as
-/// `RecordBatch`es up front) — kept `#[cfg(test)]` because this crate's own
-/// unit tests below still exercise the format-decoding edge cases
-/// (null/NaN target rejection, classification label mapping, media-triplet
-/// binary columns, …) directly against hand-built batches, and rewriting
-/// every one of them onto the streaming path is a separable change from this
-/// unit's residency/order/formula acceptance criteria.
-#[cfg(test)]
+/// The training-set producer's read-back, converted into a
+/// [`TrainingDataLoader`]: dispatches on [`detect_training_format`]'s
+/// classification of the projected columns and the job's task, then decodes
+/// every `RecordBatch` the eager read-back returned into the matching
+/// `TrainingRow` shape.
 fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
@@ -3871,9 +3831,7 @@ fn build_training_data_loader(
 /// Build a MEDIA-triplet loader: read `anchor`/`positive`/`negative` as
 /// encoded binary columns (audio clips or images, per `task`). Shares the
 /// triplet column shape with the text path; only the cell type differs
-/// (binary blobs vs strings). `#[cfg(test)]` for the same reason as its sole
-/// caller, [`build_training_data_loader`].
-#[cfg(test)]
+/// (binary blobs vs strings).
 fn build_media_triplet_loader(
     batches: &[RecordBatch],
     task: ModelTask,

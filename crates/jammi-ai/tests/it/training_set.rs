@@ -222,9 +222,8 @@ async fn refactor_parity() {
 ///
 /// Pinned at THIS unit's own base (`4e27156a`, U2b's dispatch base — U2a and
 /// U4a already landed, so `task=regression` already routed through the
-/// `TrainingSet` producer and read it back eagerly; U2b's own change is the
-/// per-epoch STREAMING read that replaces that eager collect). Fingerprinted
-/// with the recipe: `git worktree add <dir> 4e27156a`, copy
+/// `TrainingSet` producer and read it back eagerly). Fingerprinted with the
+/// recipe: `git worktree add <dir> 4e27156a`, copy
 /// `regression_parity_columns`/`regression_parity_config`/
 /// `run_regression_parity_fixture`/`regression_parity_baseline_capture` (a
 /// print-only capture, no assertion) into a test module there, `cargo test
@@ -232,9 +231,9 @@ async fn refactor_parity() {
 /// --exact --nocapture`, twice, to confirm byte-stability before pinning.
 ///
 /// The regression fixture routes the K3 scaler (`TrainingDataLoader::
-/// regression_targets`) and the streamed `Regression` chunk decode
-/// (`decode_record_batch`'s `UnderlyingFormat::Regression` arm) through
-/// paths [`refactor_parity`]'s contrastive fixture never exercises at all.
+/// regression_targets`) and the `Regression` `TextChunk` decode
+/// (`worker::build_training_data_loader`'s regression arm) through paths
+/// [`refactor_parity`]'s contrastive fixture never exercises at all.
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
@@ -314,9 +313,8 @@ async fn regression_refactor_parity() {
         .collect();
     assert_eq!(
         prints, expected,
-        "the adapter bytes moved: streaming the committed TrainingSet back \
-         (U2b) instead of collecting it eagerly must not change which rows \
-         the trainer sees, in which order, or how the K3 scaler is computed"
+        "the adapter bytes moved: which rows the trainer sees, in which \
+         order, and how the K3 scaler is computed must stay unchanged"
     );
 }
 

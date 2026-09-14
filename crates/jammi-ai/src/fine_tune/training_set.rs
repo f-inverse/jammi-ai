@@ -79,48 +79,11 @@ pub fn read_back_sql(table: &TrainingSetTable, columns: &[String]) -> String {
     )
 }
 
-/// [`read_back_sql`]'s RANGE-scoped sibling (CONTRACT-U2b-fix1.md M3): the
-/// same committed-order `ORDER BY` re-applied via [`training_set_order_by`],
-/// with a `LIMIT`/`OFFSET` pair carved from `range` rather than reading the
-/// whole table. **No `target_partitions` pin** — unlike
-/// `data::open_row_range_stream`'s scoped, `ORDER BY`-free scan
-/// (which relies on a single-partition sequential plan visiting row groups in
-/// committed order because there is no sort to get wrong), this query asks
-/// DataFusion to sort explicitly, so the ambient session's own partitioning
-/// is free to plan however it likes — a `SortExec` (or a sort-preserving
-/// merge over several partitions) makes the result correct regardless of how
-/// many partitions read it.
-///
-/// The one caller today (`data::build_classification_loader_eager`)
-/// needs exactly this: a bounded, but still fully-ordered, read of a range
-/// that cannot be decoded one `RecordBatch` at a time (a chunk-at-a-time
-/// classification decode is refused — see `decode_record_batch`'s doc — so
-/// this reader stays an eager, whole-range-at-once query, unlike the
-/// streaming scan).
-///
-/// `range.start`/`range.len()` become `OFFSET`/`LIMIT` by plain
-/// interpolation, never a bound parameter (this crate's own convention —
-/// `LIMIT` is not bindable in DataFusion's SQL front end).
-pub fn read_back_range_sql(
-    table: &TrainingSetTable,
-    columns: &[String],
-    range: std::ops::Range<usize>,
-) -> String {
-    format!(
-        "SELECT * FROM {} {} LIMIT {} OFFSET {}",
-        table.sql_relation(),
-        training_set_order_by(columns),
-        range.len(),
-        range.start,
-    )
-}
-
 /// The single constructor every production call site in this crate builds a
-/// [`TrainingSetSpec`] through (CONTRACT-U2b-fix1.md's unification fold): a
-/// future field added to the spec is added in exactly ONE place, rather than
-/// re-derived at each of the (until this commit) three independent struct
-/// literals in [`materialize_projection`], `data.rs`'s `from_source_stream`
-/// and `pipeline/recompute.rs`'s `recompute_training_set`.
+/// [`TrainingSetSpec`] through: a future field added to the spec is added in
+/// exactly ONE place, rather than re-derived independently at each of
+/// [`materialize_projection`] and `pipeline/recompute.rs`'s
+/// `recompute_training_set`.
 ///
 /// A thin pass-through by design — it changes nothing about what a caller
 /// supplies, only WHERE the seven fields are named — so it cannot move a
@@ -208,24 +171,18 @@ async fn materialize_and_read(
     let batches = session.sql(&read_back_sql(&table, &columns)).await?;
     Ok((table, batches))
 }
-/// The reader-class allow-list (CONTRACT-U2b-fix1.md M3): every production
-/// (non-test) call site of [`TrainingSetTable::sql_relation`] in this crate,
-/// keyed by `path:function` rather than `path:line` — a line number drifts
-/// under an unrelated edit, a function name does not — with the ONE property
-/// each entry must hold: it either applies [`training_set_order_by`] itself,
-/// or pins `target_partitions = 1` on a scan with no `ORDER BY` at all (the
-/// only way an un-ordered read is still correct — see
-/// [`super::data::open_row_range_stream`]'s doc). A caller that reads a
-/// relation by name without doing one of the two loses the committed order
-/// silently on a multi-row-group table scanned by more than one partition —
-/// exactly the class M3 fixed (the base tree's classification fallback read
-/// the relation with no order applied at all).
+
+/// The reader-class allow-list: every production (non-test) call site of
+/// [`TrainingSetTable::sql_relation`] in this crate, keyed by `path:function`
+/// rather than `path:line` — a line number drifts under an unrelated edit, a
+/// function name does not — with the ONE property each entry must hold: it
+/// applies [`training_set_order_by`] itself. A caller that reads a relation
+/// by name without doing so loses the committed order silently on a
+/// multi-row-group table scanned by more than one partition.
 ///
 /// | `path:function`                                  | mechanism                          | behavioural order assertion |
 /// |---------------------------------------------------|-------------------------------------|------------------------------|
 /// | `fine_tune/training_set.rs:read_back_sql`          | `ORDER BY` via `training_set_order_by` | `training_set::read_back_re_applies_the_committed_order_across_row_groups` (`tests/it/training_set.rs`) |
-/// | `fine_tune/training_set.rs:read_back_range_sql`    | `ORDER BY` via `training_set_order_by`, `LIMIT`/`OFFSET` from the range | `streaming_loader::classification_eager_fallback_preserves_committed_order_across_row_groups` (`tests/it/streaming_loader.rs`) |
-/// | `fine_tune/data.rs:open_row_range_stream`          | NO `ORDER BY`; `target_partitions = 1` pinned | `streaming_loader::streamed_order_matches_committed_order_at_target_partitions_one_and_n` + `streaming_loader::removing_the_target_partitions_pin_breaks_order_on_a_multi_row_group_table` (`tests/it/streaming_loader.rs`) |
 ///
 /// This test finds every call site itself (never hand-transcribes the count)
 /// by walking every `crates/*/src/**/*.rs` file from the workspace root and
@@ -240,20 +197,10 @@ async fn materialize_and_read(
 mod reader_class_allow_list {
     /// `(workspace-relative path, enclosing function name)` for every
     /// production call site this fold has audited and accepted.
-    const ALLOWED: &[(&str, &str)] = &[
-        (
-            "crates/jammi-ai/src/fine_tune/training_set.rs",
-            "read_back_sql",
-        ),
-        (
-            "crates/jammi-ai/src/fine_tune/training_set.rs",
-            "read_back_range_sql",
-        ),
-        (
-            "crates/jammi-ai/src/fine_tune/data.rs",
-            "open_row_range_stream",
-        ),
-    ];
+    const ALLOWED: &[(&str, &str)] = &[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs",
+        "read_back_sql",
+    )];
 
     /// The invocation this scan looks for, assembled from two literal parts
     /// so the exact contiguous text never appears once in this file (which

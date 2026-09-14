@@ -63,13 +63,17 @@ index by global batch, so W ranks take exactly the steps W=1 takes at batch W·B
 the formula at W=1.
 
 **Loader.** `TrainingDataLoader` (`data.rs:200`) reads the train prefix eagerly through
-`read_back_sql`/`read_back_range_sql` (`training_set_order_by` applied; a reader-class
-allow-list oracle enumerates every reader of `sql_relation()`), converting rows into
-`TrainingRow`s per format; the partition rule (below) slices this in-memory sequence per rank.
-A residency-bounded per-rank stream over the table's row groups is NOT part of this plan: U2b's
-own design carried it, a design fix round excised it (issue #544) after a lease-held-across-a-
-carry-over deadlock, and it is rebuilt as its own unit, **U2c**, scheduled before U4b binds a
-per-rank reader to it.
+`read_back_sql` (`training_set_order_by` applied — the result-table `ListingTable`
+(`store/mod.rs`'s `build_result_table_provider`) DECLARES this order as its own file sort order,
+so DataFusion elides the `SortExec` a plain listing would otherwise plan at `target_partitions`
+1 or N; a reader-class allow-list oracle enumerates every reader of `sql_relation()`), converting
+rows into `TrainingRow`s per format; the partition rule (below) slices this in-memory sequence
+per rank. A residency-bounded per-rank stream over the table's row groups is NOT part of this
+plan: U2b's own design carried it, a design fix round excised it (issue #544) after a
+lease-held-across-a-carry-over deadlock, and it is rebuilt as its own unit, **U2c** — a
+whole-prefix ORDERED stream per rank with a per-rank `rows_for_step` filter, never a stream
+shared across ranks (the resulting W× read/decode amplification is accepted, stated, and
+measured, never hidden) — scheduled before U4b binds a per-rank reader to it.
 
 **Partition rule v1 ("block-by-global-batch")** over the train prefix: with per-rank batch B
 and world W, global batch t is rows `[t·W·B, (t+1)·W·B)`; rank r reads

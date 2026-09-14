@@ -113,10 +113,10 @@ only. A residency-bounded, per-rank streaming reader is its own unit, **U2c** (b
 issue #544 and scheduled before U4b binds a per-rank reader to it.
 
 - **files_in_scope** (ai-core): `fine_tune/data.rs` (per-batch converters over the eager
-  `TextRows` path read back through `read_back_sql`/`read_back_range_sql` — both apply
-  `training_set_order_by`; the tests-only `Precomputed` arm unchanged; a reader-class allow-list
-  oracle enumerates every reader of `sql_relation()` and asserts each either applies the order
-  or pins `target_partitions = 1`), `fine_tune/trainer.rs` (the epoch loop over `TextRows`,
+  `TextRows` path read back through `read_back_sql` — applies `training_set_order_by`; the
+  tests-only `Precomputed` arm unchanged; a reader-class allow-list oracle enumerates every
+  reader of `sql_relation()` and asserts each either applies the order or pins
+  `target_partitions = 1`), `fine_tune/trainer.rs` (the epoch loop over `TextRows`,
   byte-identical to its pre-U2b shape; `batches_per_epoch = ceil(train_count / (W·B))` and every
   step quantity indexed by global batch, at W=1), `fine_tune/worker.rs::run_spec`
   (`PartitionSpec { rank, world, batch, rule }`), `fine_tune/regression_loss.rs` (scaler from
@@ -124,19 +124,20 @@ issue #544 and scheduled before U4b binds a per-rank reader to it.
   and `fine_tune/gradcache.rs` (whole-prefix consumers of the eager loader, W=1-only),
   `fine_tune/batch_bucket.rs` (rung pinning option), the one `TrainingSetSpec` constructor
   shared by every construction site (or a field-by-field oracle asserting the sites agree),
-  tests. (db) `store/mod.rs` reader slicing; `store/writer.rs`'s row-group count made injectable
-  under `test-hooks` (default 65 536, never in a release build) so a multi-row-group fixture is
-  cheap to reproduce.
+  tests. (db) `store/mod.rs` reader slicing over the result-table `ListingTable` (no injectable
+  row-group knob: `crates/jammi-db/src/storage/writer.rs:32`'s `set_max_row_group_row_count`
+  stays the hardcoded `65_536` it is today; a multi-row-group fixture is simply >65,536 rows
+  through that one writer).
 - **invariants_to_preserve**: K3 (scaler over the train prefix, bit-identical), K2, B6.
 - **acceptance**: (a) partition rule: for W ∈ {1,2,4} the multiset of rows over ranks at each
   global step equals the W=1 batch, on a fixture whose `train_count` is not a multiple of W·B
   (RED at base); (b) refactor parity holds on every cookbook fixture including regression; (c)
-  mining/GradCache runs at W=1 produce bytes identical to base; (d) order: `read_back_sql`/
-  `read_back_range_sql` apply the canonical order on a multi-row-group fixture at
-  `execution_threads > 1` (RED at base for an unordered scan), and the reader-class oracle
-  covers every reader of `sql_relation()`; (e) the one `TrainingSetSpec` constructor is shared
-  by every construction site, asserted by a byte-parity test. This unit's acceptance carries no
-  residency-bound row — that criterion moved to U2c.
+  mining/GradCache runs at W=1 produce bytes identical to base; (d) order: `read_back_sql`
+  applies the canonical order on a multi-row-group fixture at `execution_threads > 1` (RED at
+  base for an unordered scan), and the reader-class oracle covers every reader of
+  `sql_relation()`; (e) the one `TrainingSetSpec` constructor is shared by every construction
+  site, asserted by a byte-parity test. This unit's acceptance carries no residency-bound row —
+  that criterion moved to U2c.
 - **lane**: hermetic + cookbook. **depends_on**: U2a, U4a (the `world` argument). **size**: L.
 
 ## U2c — Streaming training-set loader with a residency bound (PR-B2, before U4b's commit; wave 3; issue #544)
@@ -144,31 +145,65 @@ issue #544 and scheduled before U4b binds a per-rank reader to it.
 Excised from U2b by that unit's fix round 3 (a second BLOCK on the residency mechanism: a lease
 held across the excised `BatchChunker`'s carry-over deadlocked at `prefetch = 2` on any
 multi-row-group table). Rebuilt here against issue #544's constraints, never carried over
-verbatim from the excised arm.
+verbatim from the excised arm. The root defect the excised arm never named: the result-table
+provider (`store/mod.rs`'s `build_result_table_provider`, a plain `ListingTable` with no
+declared file sort order) makes `read_back_sql`'s `ORDER BY` plan a pipeline-breaking `SortExec`
+at `target_partitions` ∈ {1, N} — the whole table arrives on the first poll, so no stream built
+on top of it can ever be bounded. This unit fixes the provider FIRST, then builds the stream.
 
-- **files_in_scope** (ai-core): `fine_tune/data.rs` (a per-rank `StreamSource` over the table's
-  row groups, sliced by U2b's partition rule; the residency-accounting types re-designed against
-  this unit's own contract — never the excised `BatchChunker`/`ChunkLease`/`ResidencyBound`/
-  `StreamConfig` shapes carried over unchanged), `fine_tune/trainer.rs` (the per-rank stream
-  consumer U4b's rank body binds to), tests. (db) `store/mod.rs` reader slicing over the
-  multi-row-group fixture; `store/writer.rs`'s injectable row-group knob (shared with U2b).
+- **files_in_scope** (db): `store/mod.rs` (`build_result_table_provider` declares
+  `ListingOptions::with_file_sort_order`, rendered from the single source of truth
+  `training_set_order_by` — never a third hand-spelling of the order, NULLS placement included),
+  `storage/reader.rs` (the per-rank slicing reader the stream is built over), `config/mod.rs`
+  (`engine.memory_limit`, today DEAD — no `MemoryPool`/`RuntimeEnvBuilder` reads it — wired to a
+  bounded `MemoryPool` on the session's `RuntimeEnv`, so exceeding the bound is a TYPED error,
+  never an assertion over the loader's own counters), `tests/it/pinned_source_gate.rs`
+  (`session_registration_literal_sites` gets its reviewed entry if the stream spells the
+  relation literal). (ai-core) `fine_tune/training_set.rs`'s reader-class allow-list (a direct
+  `parquet_path` reader — issue #551's `RelationKey` — is a covered member of this allow-list,
+  never a silent second route around the engine's `MemoryPool`), `fine_tune/data.rs` (a per-rank
+  `StreamSource`: a WHOLE-PREFIX ORDERED stream per rank, filtered by a per-rank `rows_for_step`
+  predicate — row groups are 65,536 rows, the partition rule strides at `W·B`, so every rank
+  scans and decodes the WHOLE prefix and keeps only its own rows; this `W×` read/decode
+  amplification is STATED, not hidden, and is the accepted cost of a per-rank stream over a
+  provider with no row-group-level partition pushdown; the residency-accounting types are
+  re-designed against this unit's own contract — never the excised `BatchChunker`/`ChunkLease`/
+  `ResidencyBound`/`StreamConfig` shapes carried over unchanged), `fine_tune/trainer.rs` (the
+  per-rank stream consumer U4b's rank body binds to), tests. No injectable row-group knob: the
+  multi-row-group fixture is simply >65,536 rows written through the one existing writer
+  (`storage/writer.rs:32`'s hardcoded `set_max_row_group_row_count(Some(65_536))` — its absence
+  of a knob is itself pinned by `default_row_group_row_count_is_65_536`); the two headline
+  oracles (the residency bound and the no-`SortExec` provider plan) share ONE materialized
+  fixture per test binary.
 - **invariants_to_preserve**: K3 (the scaler stays U2b's whole-prefix, one-pass reduction —
   never itself streamed), K2, B6.
-- **acceptance**: (a) the residency bound is a property over EVERY resident population —
-  decoded rows, rows in flight to the consumer, AND the stream's own carry-over/decode-handoff
-  transients — never a flat `batch × prefetch` term alone; on a multi-row-group fixture with a
-  consumer holding each chunk ≥ 50 ms the high-water mark stays within the stated bound (RED at
-  base: U2c does not exist); (b) liveness is a property over EVERY held lease, not only the
+- **acceptance**: (a) the provider's physical plan for `read_back_sql` contains NO `SortExec` at
+  `target_partitions` ∈ {1, N} (RED at base: the `SortExec` is present today); a mutation that
+  declares NULLS LAST instead of the canonical placement kills this oracle; (b) the residency
+  bound is stated as `live_bytes(rank) ≤ f(B, prefetch, carry_over) + Σ named_exemptions`, each
+  exemption its own separately asserted term — the K3 scaler's one collected `Vec<f32>` over the
+  train prefix (4 bytes/row) and the whole-set mining/GradCache arms — never a flat
+  `batch × prefetch` term alone with the exemptions folded in unstated; on a multi-row-group
+  fixture with a consumer holding each chunk ≥ 50 ms the high-water mark stays within the stated
+  bound (RED at base: U2c does not exist); a whole-set read under a `MemoryPool` sized below the
+  bound fails TYPED, and the streamed read under the SAME pool completes (RED at base: no
+  `MemoryPool` is wired); (c) liveness is a property over EVERY held lease, not only the
   steady-state case: the same multi-row-group fixture completes within a wall-clock timeout with
   no deadlock, at every named prefetch value — this is the regression pin for the excised arm's
-  `prefetch = 2` deadlock; (c) the reader is per-rank: a `StreamSource` sliced by the partition
-  rule, never a whole-table stream shared across ranks; (d) every wired refusal (a chunk-length
-  mismatch, `ResidencyBound::new(0)`, a `prefetch` floor, …) has a BEHAVIOURAL oracle — a dying
-  test exercised through the loader's public path, never a deletable dead branch.
-- **lane**: hermetic + cookbook. **depends_on**: U2a, U2b, U4a. **size**: M. Scheduled BEFORE
-  U4b binds a per-rank reader to it — **U4b depends_on U2c** — even though its own base is the
-  PR-B2 branch after U2b/U3 land (before U4b's own commit); the implementation wave is 3 (built
-  concurrently with PR-C(67) once PR-B1 merges).
+  `prefetch = 2` deadlock; (d) the slicing is per-rank: a whole-table row-group SCAN with a
+  per-rank `rows_for_step` FILTER is what this DEMANDS; a stream SHARED across ranks (rank r
+  observing rank r′'s rows) is what it FORBIDS — an oracle that can fail both ways: two ranks'
+  streams are independent objects, and swapping the filter for a shared cursor dies it; (e) the
+  parity oracle: streamed rows == `read_back_sql`'s rows, in committed order, at
+  `target_partitions` ∈ {1, N}; at W=1 the streamed training bytes == U2b's eager golden,
+  byte-for-byte; (f) every wired refusal (a chunk-length mismatch, `ResidencyBound::new(0)`, a
+  `prefetch` floor, …) has a BEHAVIOURAL oracle — a dying test exercised through the loader's
+  public path, never a deletable dead branch.
+- **lane**: hermetic + cookbook. **depends_on**: U2a, U2b, U4a. **size**: L (the provider fix,
+  the `MemoryPool` instrument, and the per-rank stream are three separately-oracled mechanisms
+  sharing one fixture). Scheduled BEFORE U4b binds a per-rank reader to it — **U4b depends_on
+  U2c** — even though its own base is the PR-B2 branch after U2b/U3 land (before U4b's own
+  commit); the implementation wave is 3 (built concurrently with PR-C(67) once PR-B1 merges).
 
 ## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B commit 5, concurrent with U2b)
 
@@ -219,15 +254,41 @@ verbatim from the excised arm.
 
 ## U7b — cluster leg + cluster reap (PR-C commit 1)
 
-- **files_in_scope** (docs-ci): `ci/scripts/runpod_lib.sh` (cluster create/teardown primitive
-  with deadline), `ci/scripts/runpod_gpu_gang.sh` (cluster leg: TRAINING cluster, 2 pods × 2
-  GPUs), `ci/scripts/execution_surface_reachability_allowlist.txt` (the cluster-leg tuples;
-  U7a's rows re-verified if their command lines change), `.github/workflows/gpu-reap.yml`
-  (clusters enumerated and reaped), `gpu-gang.yml`.
+The cluster leg is a SEPARATE driver from the pod-tier smoke — never `runpod_gpu_gang.sh`, which
+stays the pod-tier driver end to end. The cluster leg's own driver script (built on
+`runpod_lib.sh`'s `rp_cluster_*` primitives) launches, ships the NCCL id, and assembles the one
+committed artifact for a **2×1 shape**: 2 hosts, 1 GPU each (never `gpuCount: 4`) — a genuine
+two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process bootstrap.
+
+- **files_in_scope** (docs-ci): `ci/scripts/runpod_lib.sh` (cluster create/get/pods/delete/list
+  primitives with the same self-terminating entrypoint deadline a pod already carries), the
+  cluster leg's OWN driver script (never `runpod_gpu_gang.sh`) — launch, id-ship, report-ship,
+  single-writer assembly (both members only ever REPORT; the driver alone assembles and writes
+  the one artifact) — `ci/scripts/execution_surface_reachability_allowlist.txt` (the cluster-leg
+  tuples; U7a's rows re-verified if their command lines change), `.github/workflows/gpu-reap.yml`
+  (clusters enumerated and reaped; the reaper's second enumeration is fail-closed on a failed
+  GET, mirroring the pod arm), `gpu-gang.yml` (never carries a `schedule:` trigger for the
+  cluster leg without the allow-listed exception below).
+- **invariants_to_preserve**: `check_gpu_prove_once.py` P1/P7 rules (schedule-trigger refusal on
+  every paid lane); B2.
 - **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring;
   `check_execution_surface_reachability.py` green with the cluster-leg tuples allowlisted.
+- **acceptance (id-secrecy)**: the NCCL id's out-of-band crossing is backstopped by a scan over
+  its full carrier set — the pulled artifact directory, the run log, the committed `gang.reason`
+  field, and the driver's own staging copy of the id file created for the ship step — asserting
+  none of them ever carries the id's 128 bytes (base64 or raw), the staging copy deleted after
+  the pull scan runs; an unexaminable carrier (unreadable log, missing staging path) is a
+  refusal, never a silent pass (RED at base: the cluster leg and its driver do not exist yet, so
+  this scan has nothing to run against).
+- **acceptance (schedule visibility)**: `check_gpu_prove_once.py`'s P1/P7 refuse a `schedule:`
+  trigger on ANY paid lane workflow — pod or cluster — unless that workflow is on a reviewed cron
+  allow-list with its own never-vacuous arm named; a planted cron on an
+  unallow-listed paid workflow is refused (RED at base: a planted cron passes today).
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
-- **cost ceiling**: ≤ 1 h × 4 GPU × $1.59 ≈ $6.4 per run; label-only until a flake-free streak.
+- **cost ceiling** (human-approved before first run, committed figures — never re-derived per
+  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md:300 — never the 2-GPU pod rate),
+  the 2×1 shape bills $3.816/h; ≤ 1 h billed wall per run, ≤ 2 runs per authorization; label-only
+  until a flake-free streak.
 
 ## U5a — `GangService` on `peer_bind`; I-GANG authorization (PR-C commit 2)
 

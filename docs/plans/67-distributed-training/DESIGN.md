@@ -323,7 +323,7 @@ single-process table (K4 shape).
 | **Lockstep**: one rank's batch forced to diverge; one rank's batch yields no gradient for a Var; the gang completes | property | hermetic |
 | **Gang failure**: kill −9 a peer → job requeued, completed by a new gang from the checkpoint, exactly one model, no orphan prefix promoted; kill −9 the coordinator → same via lease; split-brain: attempt N+1 dispatched while N is live on the peer → N aborted, N+1 runs | property | distributed lane |
 | **Authorization**: `RunRank` for a job not running / not claimed by the caller / lease expired is refused | property | server it-suite |
-| **Cache reuse**: same spec on the same training-set digest with `CachePolicy::Use` → no second training; two model rows, one prefix; reaping respects references | property | hermetic |
+| **Cache reuse refused**: `CachePolicy::Use` on a fine-tune is refused on every durable submit edge (reuse: https://github.com/f-inverse/jammi-ai/issues/562); two model rows may share one prefix; reaping respects references | property | hermetic |
 | **Distributor-agnosticism**: same operators through a Ballista scheduler + 2 executors hosted by the jammi binary → identical bytes to the peer path | byte | U8 |
 
 ## 7. Configuration and placement

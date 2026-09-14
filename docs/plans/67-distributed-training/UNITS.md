@@ -152,8 +152,9 @@ per-step `$?`. Naming per README ruling 23.
 - **invariants_to_preserve**: K5, K7 (exhaustive destructuring of `FineTuneConfig` and
   `TrainingCommon`; the descriptor holds an opaque versioned canonical encoding, never a
   foreign type), K1, B6, B1 (no `register_*`), doc parity.
-- **acceptance**: (a) same spec on the same training-set digest with `CachePolicy::Use` trains
-  once, two model rows share one prefix; deleting either row is always allowed (no catalog edge
+- **acceptance**: (a) same spec on the same training-set digest with `CachePolicy::Use` is
+  refused on every durable submit edge (reuse is https://github.com/f-inverse/jammi-ai/issues/562);
+  `Bypass` trains, two model rows may share one prefix; deleting either row is always allowed (no catalog edge
   enforces which is the original — the ownership edge is
   https://github.com/f-inverse/jammi-ai/issues/547) and leaves the prefix servable through the
   other row; the prefix itself is reclaimed only once no live row, in any tenant, still names

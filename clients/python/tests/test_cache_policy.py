@@ -1,8 +1,9 @@
 """Hermetic tests for the `cache` keyword on the two LoRA fine-tune verbs.
 
-`cache` opts a fine-tune job into the engine's model-level cache reuse
-(`CachePolicy::Use`): a hit registers the caller's own name against a prior
-materialisation instead of retraining. It rides `SubmitJobRequest.cache`, the
+`cache` carries a fine-tune job's model-level cache policy; the engine
+refuses `CachePolicy::Use` for a fine-tune at submit
+(https://github.com/f-inverse/jammi-ai/issues/562), so these tests pin the
+WIRE ENCODING of the keyword, never a reuse outcome. It rides `SubmitJobRequest.cache`, the
 same shared `jammi.v1.inference.CachePolicy` enum every other producer verb's
 `cache` field carries (`_cache_policy_value`) — EXCEPT that `SubmitJobRequest`
 is the frozen, append-only wire surface `world_size` was appended to

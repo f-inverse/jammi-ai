@@ -126,6 +126,7 @@ jobs:
             ':(glob)ci/scripts/**/check_*.py' \
             ':(glob)ci/scripts/**/check_*.sh' \
             'ci/scripts/no_consumer_names_allowlist.txt' \
+            'ci/lead-gate-required-commands.txt' \
             '.claude/settings.json' \
             ':(glob).claude/evals/**' \
             ':(glob).claude/hooks/**' \
@@ -164,6 +165,22 @@ jobs:
       - name: Guard — the R12 anticipation-record grandfather list only shrinks (esc-lead-gate-R12)
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         run: python3 ci/scripts/check_rigor_record.py --check-r12-grandfather-only-shrinks
+
+      # esc-lead-gate-R12 fix round 5 Z4(b): the OPPOSITE polarity from the
+      # two ratchets above — this file names REQUIRED gates, so it may only
+      # GROW; removing a committed line is the weakening this catches.
+      - name: Guard — the R12 required-commands gate list only grows (esc-lead-gate-R12)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: python3 ci/scripts/check_rigor_record.py --check-required-commands-only-shrinks
+
+      # esc-lead-gate-R12 fix round 5 Z10: the committed sweep-survivor
+      # baseline — arms the sweep step above already found and printed —
+      # can never grow autonomously; a human commits a NEW entry on main
+      # directly, and only ever shrinks it once an arm gets a real fixture
+      # or a `# R12-RESIDUAL` marker.
+      - name: Guard — the R12 deny-coverage sweep survivor list only shrinks (esc-lead-gate-R12)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: python3 ci/scripts/check_lead_gate.py --check-r12-survivors-only-shrinks
 
       # esc-lead-invariants-2: ARMED BY THE DIFF (crates/**, cookbook/**),
       # SATISFIED BY DISCLOSURE, JUDGED BY THE HUMAN — never described any

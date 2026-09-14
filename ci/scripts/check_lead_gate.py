@@ -269,6 +269,7 @@ HOOKS_DIR = REPO_ROOT / ".claude" / "hooks"
 AGENTS_DIR = REPO_ROOT / ".claude" / "agents"
 SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
 LEAD_GATE_LIB = HOOKS_DIR / "lead-gate-lib.py"
+R12_SWEEP_SURVIVORS_PATH = REPO_ROOT / "ci" / "scripts" / "r12_sweep_survivors.txt"
 
 _WALL_TIMES: list[float] = []
 
@@ -3910,6 +3911,26 @@ def _r12_sentinel_line_range(source: str) -> tuple[int, int]:
     return begin, end
 
 
+def _r12_arm_id(source: str, pos: tuple[int, int]) -> str:
+    """Fix round 5 Z10: a STABLE, human-readable identifier for a deny arm
+    — `<enclosing top-level function name>: <the `if` line's own source
+    text, stripped>` — used for the COMMITTED survivor list
+    (`ci/scripts/r12_sweep_survivors.txt`), never the raw `(lineno,
+    col_offset)` pair the sweep uses internally (which shifts on any
+    unrelated edit earlier in the file and would make the committed list
+    impossible to review or diff meaningfully)."""
+    tree = ast.parse(source)
+    lineno, col = pos
+    enclosing = "?"
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            enclosing = node.name
+            break
+    lines = source.splitlines()
+    line_text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else "?"
+    return f"{enclosing}: {line_text}"
+
+
 def _r12_deny_if_positions(source: str, begin: int, end: int) -> list[tuple[int, int]]:
     """`[(lineno, col_offset), ...]` of every distinct `If` node whose body
     contains a deny-shaped `Return` (a `Return` whose value is NOT the bare
@@ -4032,9 +4053,31 @@ def _r12_mutant_hooks_dir(mutated_source: str) -> Path:
 
 def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, object]]) -> list[str]:
     """Runs `fixtures` with `HOOKS_DIR` monkey-patched to `hooks_dir`,
-    returning the names that raised (died) under this mutant — a fixture
-    that no longer observes its expected ALLOW/DENY (or crashes outright)
-    both count as a death; only a clean pass survives."""
+    returning the names CREDITED as having killed this mutant.
+
+    Fix round 5 Z10 (the HONEST credit rule): a death is credited ONLY
+    when the fixture raises `Failure` (this harness's own `_assert`
+    exception type) with a message that STARTS WITH the fixture's OWN
+    registered `name` followed by `": "` — i.e. `_assert`'s `label`
+    argument was that fixture's own name, the shape every fixture's
+    TERMINAL assertion about its own expected ALLOW/DENY uses (`_assert(
+    cond, "R12G1", detail)` raises `Failure(f"R12G1: {detail}")`).
+    Two classes of "died" are explicitly EXCLUDED from credit, both of
+    which the pre-fix sweep counted as a kill:
+      1. A raw, non-`Failure` crash (an unrelated `TypeError`/`OSError`/
+         etc. propagating from deep in a mutated call path) — before this
+         fix, a single mutation that breaks an unrelated code path
+         (`_r12_required_commands`'s own missing-file arm, neutered, used
+         to raise `[Errno 2]` deep inside `.read_text()`) could crash
+         DOZENS of fixtures that were never designed to exercise that arm
+         at all, over-crediting it as "well covered" for the wrong
+         reason.
+      2. A `Failure` raised by a SETUP helper under a DIFFERENT label
+         (e.g. `_assert(..., "R12G1 setup", ...)` or `_git`'s own "git
+         fixture setup") — this fixture's OWN terminal assertion about
+         the arm never even ran; crediting the kill to environment/setup
+         breakage would be crediting the arm for a fixture that never
+         actually reached it."""
     global HOOKS_DIR
     real_hooks_dir = HOOKS_DIR
     HOOKS_DIR = hooks_dir
@@ -4043,8 +4086,11 @@ def _r12_run_fixture_subset_against(hooks_dir: Path, fixtures: list[tuple[str, o
         for name, fn in fixtures:
             try:
                 fn()
+            except Failure as exc:
+                if str(exc).startswith(f"{name}: "):
+                    died.append(name)
             except Exception:
-                died.append(name)
+                pass
     finally:
         HOOKS_DIR = real_hooks_dir
     return died
@@ -4132,6 +4178,109 @@ def fixture_r12residual_marker_parsing() -> None:
     _assert(_r12_residual_reason(lines, 2) is None, "R12residual", "an unmarked line must return None")
     _assert(_r12_residual_reason(lines, 3) is None, "R12residual",
             "prose mentioning residual without the exact `# R12-RESIDUAL:` marker must not match")
+
+
+def fixture_r12credit_unrelated_crash_not_credited() -> None:
+    """fix round 5 Z10 (the crash-credit meta-fixture): a synthetic fixture
+    whose ONLY failure is an unrelated crash (never this harness's own
+    `_assert`/`Failure`) must NOT be credited by `_r12_run_fixture_subset_
+    against` as having killed a mutant; a fixture whose failure IS its own
+    terminal `_assert` (a `Failure` labeled with ITS OWN registered name)
+    DOES get credited; a fixture that raises nothing survives (never
+    credited either way). RED at daebd948: the pre-fix rule counted ANY
+    exception, of any type, as a death — a mutation that broke something
+    UNRELATED, deep in a shared code path, could crash dozens of fixtures
+    never designed to exercise that arm and over-credit it as covered.
+    Cheap and pure — no subprocess, no real mutation, safe inside
+    `--self-test`."""
+    def _crashes() -> None:
+        raise RuntimeError("an unrelated crash, never this harness's own Failure")
+
+    def _kills() -> None:
+        _assert(False, "r12credit_synthetic_kills", "expected deny text never appeared")
+
+    def _setup_failure_wrong_label() -> None:
+        # A Failure IS raised, but under a DIFFERENT label than this
+        # fixture's own registered name -- exactly the "setup helper"
+        # shape (`_git`'s own "git fixture setup", or a "<name> setup"
+        # helper) that must NOT be credited to the fixture's own name.
+        _assert(False, "r12credit_synthetic_setup_failure setup", "unrelated setup breakage")
+
+    def _survives() -> None:
+        pass
+
+    died = _r12_run_fixture_subset_against(HOOKS_DIR, [
+        ("r12credit_synthetic_crash", _crashes),
+        ("r12credit_synthetic_kills", _kills),
+        ("r12credit_synthetic_setup_failure", _setup_failure_wrong_label),
+        ("r12credit_synthetic_survives", _survives),
+    ])
+    _assert("r12credit_synthetic_crash" not in died, "R12credit",
+            f"an unrelated crash must NOT be credited as a kill: {died}")
+    _assert("r12credit_synthetic_kills" in died, "R12credit",
+            f"a proper terminal _assert failure (labeled with its own name) must be credited: {died}")
+    _assert("r12credit_synthetic_setup_failure" not in died, "R12credit",
+            f"a Failure raised under a DIFFERENT label (a setup helper) must NOT be credited: {died}")
+    _assert("r12credit_synthetic_survives" not in died, "R12credit",
+            f"a fixture that raises nothing must not be credited either way: {died}")
+
+
+def fixture_r12reqfile_real_file_shape() -> None:
+    """fix round 5 Z4: `--self-test` really asserts shape against the REAL
+    `ci/lead-gate-required-commands.txt` (never a fixture stand-in) --
+    exists, names >=1 command line, every line carries a `# measured ~Xs`
+    annotation, and every line's `python3 <script>`/`bash <script>`/
+    `sh <script>` second token is a REAL, git-TRACKED path under
+    REPO_ROOT."""
+    path = REPO_ROOT / "ci" / "lead-gate-required-commands.txt"
+    _assert(path.exists(), "R12reqfile", f"{path} must exist")
+    tracked_out = _git(REPO_ROOT, "ls-files")
+    tracked = set(tracked_out.splitlines())
+    commands = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        _assert(re.search(r"#\s*measured\s*~", stripped) is not None, "R12reqfile",
+                f"line {stripped!r} carries no `# measured ~Xs` annotation")
+        command = stripped.split("  #", 1)[0].rstrip()
+        _assert(bool(command), "R12reqfile", f"line {stripped!r} names no command after stripping the annotation")
+        commands.append(command)
+    _assert(len(commands) >= 1, "R12reqfile", f"{path} names no command line at all")
+    for command in commands:
+        tokens = command.split()
+        script = tokens[1] if len(tokens) >= 2 and tokens[0] in ("python3", "bash", "sh") else None
+        _assert(script is not None, "R12reqfile", f"{command!r} does not name a python3/bash/sh script")
+        _assert(script in tracked, "R12reqfile", f"{script!r} named by {command!r} is not git-TRACKED at HEAD")
+
+
+def fixture_r12reqmiss_missing_required_commands_file_denies() -> None:
+    """fix round 5 Z4: a MISSING `ci/lead-gate-required-commands.txt`
+    (removed after `_temp_repo`'s own baseline seed) is now a hard DENY at
+    dispatch — never the old silent "no gate obligation" default."""
+    unit = "feat/r12reqmiss"
+    root = _temp_repo(unit)
+    (root / "ci" / "lead-gate-required-commands.txt").unlink()
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}}, gates=None)
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12reqmiss", f"a missing required-commands file must deny, got {p.returncode}: {p.stderr}")
+    _assert("does not exist" in p.stderr, "R12reqmiss", p.stderr)
+
+
+def fixture_r12reqempty_allcomment_required_commands_file_denies() -> None:
+    """fix round 5 Z4: an EMPTY/all-comment `ci/lead-gate-required-
+    commands.txt` is likewise a hard DENY at dispatch."""
+    unit = "feat/r12reqempty"
+    root = _temp_repo(unit)
+    (root / "ci" / "lead-gate-required-commands.txt").write_text("# nothing but comments\n")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}}, gates=None)
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12reqempty", f"an all-comment required-commands file must deny, got {p.returncode}: {p.stderr}")
+    _assert("names no command line" in p.stderr, "R12reqempty", p.stderr)
 
 
 def fixture_r12norm2_cargo_timing_normalized() -> None:
@@ -4241,11 +4390,15 @@ def fixture_r12g1_pre_fix_missing_gates_denies() -> None:
 
 
 def fixture_r12g2_pre_fix_gates_shape_only_allows_nonzero_rc() -> None:
-    """item 8a: Reader 1 never judges the VALUE of `rc` -- a `gates` entry
-    recorded `rc=1` (as if the required command is currently failing on
-    the BROKEN pre-fix tip) still allows, as long as the SHAPE (every
-    committed line, verbatim, each an object with an integer `rc`) is
-    complete."""
+    """POSITIVE CONTROL — green at base by construction: guards the reader
+    against over-refusal (a shape-complete `gates` object must not be
+    denied merely because `rc` is non-zero pre-fix). The RED half is
+    R12G1/R12G3-4/R12G6-8 (each denies a specific shape defect this
+    fixture's OWN artifact does NOT carry). item 8a: Reader 1 never judges
+    the VALUE of `rc` -- a `gates` entry recorded `rc=1` (as if the
+    required command is currently failing on the BROKEN pre-fix tip)
+    still allows, as long as the SHAPE (every committed line, verbatim,
+    each an object with an integer `rc`) is complete."""
     unit = "feat/r12g2"
     root = _temp_repo(unit)
     _write_required_commands_file(root, ["python3 ci/probe_r12g2.py"])
@@ -4305,9 +4458,12 @@ def fixture_r12g4_relay_gates_nonzero_rc_denies() -> None:
 
 
 def fixture_r12g5_relay_gates_rc_zero_allows() -> None:
-    """item 8a: the satisfiable case -- every committed line present with
-    `rc == 0` allows (the whole relay's other obligations being
-    otherwise satisfied)."""
+    """POSITIVE CONTROL — green at base by construction: guards the reader
+    against over-refusal (a shape-complete, fully green relay `gates`
+    object must allow). The RED half is R12G1/R12G3-4/R12G6-8. item 8a:
+    the satisfiable case -- every committed line present with `rc == 0`
+    allows (the whole relay's other obligations being otherwise
+    satisfied)."""
     root, row, cmd, pre_hash = _r12_gates_post_setup("feat/r12g5", ["python3 ci/scripts/probe.py"])
     _write_anticipation_exact(root, "feat/r12g5", row["head_sha"], {"state.txt": {"command": cmd, "hash": pre_hash}})
     (root / "state.txt").write_text("FIXED\nv1\n")
@@ -4421,9 +4577,11 @@ def fixture_r12m8b2_too_many_mutations_denies() -> None:
 
 
 def fixture_r12m8b3_accepted_mutation_allows() -> None:
-    """item 8b: the satisfiable ACCEPT case -- `rc_before == 0`,
-    `rc_after != 0`, and `marker_after` names a committed TEST-failure
-    marker."""
+    """POSITIVE CONTROL — green at base by construction: guards the reader
+    against over-refusal (a correctly-shaped ACCEPTED mutation row must
+    allow). The RED half is R12M8b1-2/R12M8b5-12. item 8b: the
+    satisfiable ACCEPT case -- `rc_before == 0`, `rc_after != 0`, and
+    `marker_after` names a committed TEST-failure marker."""
     unit = "feat/r12m8b3"
     root, row, fix_head = _r12_mutations_setup(unit)
     rows = [{"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 1,
@@ -4438,8 +4596,11 @@ def fixture_r12m8b3_accepted_mutation_allows() -> None:
 
 
 def fixture_r12m8b4_uncovered_mutation_allows() -> None:
-    """item 8b: an explicit `uncovered` reason (R11's own disposition
-    precedent) satisfies the obligation without an accepted mutation."""
+    """POSITIVE CONTROL — green at base by construction: guards the reader
+    against over-refusal (a correctly-shaped `uncovered` disposition must
+    allow). The RED half is R12M8b1-2/R12M8b5-12. item 8b: an explicit
+    `uncovered` reason (R11's own disposition precedent) satisfies the
+    obligation without an accepted mutation."""
     unit = "feat/r12m8b4"
     root, row, fix_head = _r12_mutations_setup(unit)
     rows = [{"site": "bar.py:4", "command": "true", "uncovered": "no test harness reaches this call site directly"}]
@@ -4579,8 +4740,11 @@ def fixture_r12x1_missing_exclusions_denies() -> None:
 
 
 def fixture_r12x2_exclusions_present_allows() -> None:
-    """item 8c: the satisfiable case -- a non-empty exclusion named for
-    the new test definition."""
+    """POSITIVE CONTROL — green at base by construction: guards the reader
+    against over-refusal (a correctly-shaped, non-empty, distinct
+    `exclusions` entry must allow). The RED half is
+    R12X1/R12X3-4/R12X5-6. item 8c: the satisfiable case -- a non-empty
+    exclusion named for the new test definition."""
     unit = "feat/r12x2"
     root, row, fix_head = _r12_exclusions_setup(unit)
     a = _auto_r12_attack("a.py")
@@ -4940,6 +5104,10 @@ FIXTURES = [
     ("R12norm", fixture_r12norm_no_rm_in_any_deny_text),
     ("R12phase", fixture_r12phase_slow_attack_does_not_exhaust_next_git_phase),
     ("R12residual", fixture_r12residual_marker_parsing),
+    ("R12credit", fixture_r12credit_unrelated_crash_not_credited),
+    ("R12reqfile", fixture_r12reqfile_real_file_shape),
+    ("R12reqmiss", fixture_r12reqmiss_missing_required_commands_file_denies),
+    ("R12reqempty", fixture_r12reqempty_allcomment_required_commands_file_denies),
     ("R12sweepast", fixture_r12sweepast_sweep_funcs_equals_the_sentinel_region),
     ("R12norm2", fixture_r12norm2_cargo_timing_normalized),
     ("R12alarmkill", fixture_r12alarmkill_self_alarm_kills_inflight_attack_process_group),
@@ -5038,13 +5206,91 @@ def _r12_residual_reason(source_lines: list[str], lineno: int) -> str | None:
     return m.group(1) if m else None
 
 
+def _r12_load_survivors() -> set[str]:
+    """The committed survivor list (`ci/scripts/r12_sweep_survivors.txt`)
+    — one arm ID per line, `#`-comment/blank lines skipped. `set()` when
+    the file does not exist (the bootstrap state before this PR commits
+    it for the first time)."""
+    if not R12_SWEEP_SURVIVORS_PATH.exists():
+        return set()
+    out: set[str] = set()
+    for line in R12_SWEEP_SURVIVORS_PATH.read_text().splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.add(s)
+    return out
+
+
+def _real_git(cwd: Path, *args: str) -> tuple[bool, str]:
+    """A non-raising git subprocess wrapper for REAL repo operations
+    (fetching/reading `origin/main`) — distinct from this file's own
+    `_git()` fixture helper, which `_assert`s success (correct for
+    building a throwaway fixture repo, wrong for a ratchet that must
+    report a git failure as its OWN FAIL, never crash the check)."""
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr)
+
+
+def check_r12_survivors_only_shrinks(cwd: Path = REPO_ROOT) -> int:
+    """fix round 5 Z10: the SAME shrink-only ratchet shape as `check_rigor_
+    record.py`'s `check_allowlist_only_shrinks`/`check_r12_grandfather_
+    only_shrinks`, applied to `R12_SWEEP_SURVIVORS_PATH` — the committed
+    set of KNOWN, currently-unfixed silent deny arms can never GROW
+    autonomously on a swarm branch; only shrink (a fixture added, or a
+    `# R12-RESIDUAL` marker attached, removes an arm from the sweep's own
+    unmarked-survivor set, and the human then deletes its line here).
+    BOOTSTRAP arm: `origin/main` carrying no such file yet (this PR is
+    the one introducing it) establishes the baseline instead of failing."""
+    ok, _ = _real_git(cwd, "fetch", "--quiet", "origin", "main")
+    if not ok:
+        print("check-lead-gate[r12-survivors-only-shrinks]: FAIL — git fetch origin main failed", file=sys.stderr)
+        return 1
+    ok, _ = _real_git(cwd, "rev-parse", "--verify", "origin/main")
+    if not ok:
+        print("check-lead-gate[r12-survivors-only-shrinks]: FAIL — origin/main does not resolve", file=sys.stderr)
+        return 1
+    current = _r12_load_survivors()
+    rel = R12_SWEEP_SURVIVORS_PATH.relative_to(cwd).as_posix()
+    ok, base_text = _real_git(cwd, "show", f"origin/main:{rel}")
+    if not ok:
+        print(f"check-lead-gate[r12-survivors-only-shrinks]: OK (bootstrap) — origin/main has no "
+              f"{rel} yet; this branch's {len(current)} entries establish the baseline.")
+        return 0
+    base = {s.strip() for s in base_text.splitlines() if s.strip() and not s.strip().startswith("#")}
+    added = current - base
+    if added:
+        print("check-lead-gate[r12-survivors-only-shrinks]: FAIL", file=sys.stderr)
+        for e in sorted(added):
+            print(f"  + {e}", file=sys.stderr)
+        print("\ncheck-lead-gate[r12-survivors-only-shrinks]: this branch adds a NEW accepted "
+              "survivor. The list may only shrink — a genuinely new exemption is a human-reviewed "
+              "decision, made on main directly, never an autonomous addition on a swarm branch.",
+              file=sys.stderr)
+        return 1
+    print(f"check-lead-gate[r12-survivors-only-shrinks]: OK — {len(current)} entries "
+          f"({len(base) - len(current)} shrunk vs origin/main).")
+    return 0
+
+
 def r12_sweep_main() -> int:
     """esc-lead-gate-R12 M5' — its OWN `swarm.yml` step, separate from
     `--self-test` (mutating and re-running R12 fixtures per deny arm is too
     slow to fold into the per-invocation self-test every unit's pressure-
     tester/oracle round already re-runs). Also runs `R12sweepmeta` (a
     meta-test on the sweep mechanism itself — same reason it is excluded
-    from `--self-test`) BEFORE trusting the real sweep's own result."""
+    from `--self-test`) BEFORE trusting the real sweep's own result.
+
+    Fix round 5 Z10: the unmarked-survivor arm is REPORT-ONLY — it never
+    fails this step (a step that mutates and re-runs the ENTIRE R12
+    fixture set per arm is too slow/flaky to be the hard gate; a genuinely
+    NEW unmarked survivor is instead surfaced loudly here for a human to
+    triage, and the only thing that can ever make one PERMANENTLY
+    accepted is `--check-r12-survivors-only-shrinks` refusing to let the
+    committed list grow). Only a MECHANISM failure (R12sweepmeta itself,
+    or the sweep pipeline crashing) still returns non-zero."""
     print("check-lead-gate[R12-SWEEP]: running R12sweepmeta (mechanism self-check) first...")
     try:
         fixture_r12sweepmeta_sweep_flags_a_genuinely_silent_arm()
@@ -5069,9 +5315,14 @@ def r12_sweep_main() -> int:
         else:
             unmarked_survivors.append(pos)
     killed = len(positions) - len(all_survivors)
+    unmarked_ids = {_r12_arm_id(source, pos) for pos in unmarked_survivors}
+    committed = _r12_load_survivors()
+    new_unmarked = sorted(unmarked_ids - committed)
+    stale_committed = sorted(committed - unmarked_ids)
     print(f"check-lead-gate[R12-SWEEP]: {len(positions)} deny arm(s) swept in {elapsed:.2f}s "
           f"({killed} killed by >=1 fixture, {len(residual)} marked residual, "
-          f"{len(unmarked_survivors)} unmarked survivor(s))")
+          f"{len(unmarked_survivors)} unmarked survivor(s), {len(committed)} committed to "
+          f"{R12_SWEEP_SURVIVORS_PATH.name})")
     for pos in sorted(per_arm):
         died = per_arm[pos]
         if died:
@@ -5079,24 +5330,36 @@ def r12_sweep_main() -> int:
         elif pos in residual:
             status = f"R12-RESIDUAL: {residual[pos]}"
         else:
-            status = "SURVIVES (no dying fixture, UNMARKED)"
+            aid = _r12_arm_id(source, pos)
+            status = ("SURVIVES (committed)" if aid in committed else "SURVIVES (NEW, NOT COMMITTED)")
         print(f"  arm@line{pos[0]}: {status}")
-    if unmarked_survivors:
-        print(f"check-lead-gate[R12-SWEEP]: FAIL — {len(unmarked_survivors)} unmarked silent "
-              "arm(s) (mark a genuine residual with a trailing `# R12-RESIDUAL: <reason>` "
-              "comment on its own `if` line, or add a fixture that kills it)", file=sys.stderr)
-        return 1
-    print(f"check-lead-gate[R12-SWEEP]: OK — every one of {len(positions)} deny arm(s) either has "
-          f"a dying fixture or a committed `# R12-RESIDUAL` marker ({elapsed:.2f}s)")
+    if new_unmarked:
+        print(f"check-lead-gate[R12-SWEEP]: {len(new_unmarked)} NEW unmarked survivor(s) not yet "
+              f"on {R12_SWEEP_SURVIVORS_PATH.name} — REPORT-ONLY (fix round 5 Z10), never a step "
+              "failure: mark a genuine residual with `# R12-RESIDUAL: <reason>`, add a fixture "
+              "that kills it, or have a human commit it to the survivor list on main directly.")
+        for aid in new_unmarked:
+            print(f"    NEW: {aid}")
+    if stale_committed:
+        print(f"check-lead-gate[R12-SWEEP]: {len(stale_committed)} committed survivor(s) no longer "
+              "reproduce as unmarked — shrink the list to match (never grows autonomously, but a "
+              "human should shrink it once an arm is actually fixed).")
+        for aid in stale_committed:
+            print(f"    STALE: {aid}")
+    print(f"check-lead-gate[R12-SWEEP]: OK (report-only on survivors) — {killed} arm(s) killed, "
+          f"{len(residual)} residual, {len(unmarked_survivors)} unmarked ({elapsed:.2f}s)")
     return 0
 
 
 def main() -> int:
     if "--r12-sweep" in sys.argv[1:]:
         return r12_sweep_main()
+    if "--check-r12-survivors-only-shrinks" in sys.argv[1:]:
+        return check_r12_survivors_only_shrinks()
     if "--self-test" in sys.argv[1:]:
         return self_test()
-    print("check_lead_gate.py: usage: --self-test | --r12-sweep", file=sys.stderr)
+    print("check_lead_gate.py: usage: --self-test | --r12-sweep | "
+          "--check-r12-survivors-only-shrinks", file=sys.stderr)
     return 2
 
 

@@ -55,18 +55,28 @@ def _lib():
     return mod
 
 
-def _from_gate_state(mod, repo_root: Path) -> set[str]:
+def _from_gate_state(mod, repo_root: Path) -> tuple[set[str], int]:
+    """`(slugs, rows_considered)` — `rows_considered` is EVERY open-block
+    row `all_open_blocks` returned, regardless of `agent_type` (fix round
+    5: the merge-precondition's own stderr count needs an honest
+    denominator, never just the numerator of what happened to match)."""
     sdir = repo_root / ".jammi" / "gate-state"
     slugs: set[str] = set()
+    considered = 0
     for unit_slug, atype, row, _idx in mod.all_open_blocks(sdir):
+        considered += 1
         if atype in mod.VERIFIER_SECOND_ROUND_TYPES:
             slugs.add(unit_slug)
-    return slugs
+    return slugs, considered
 
 
-def _from_rigor_docs(mod, repo_root: Path) -> set[str]:
+def _from_rigor_docs(mod, repo_root: Path) -> tuple[set[str], int]:
+    """`(slugs, rows_considered)` — `rows_considered` is every parseable
+    row across every `docs/rigor/*.jsonl` file, before any agent_type/
+    verdict filtering."""
     rigor_dir = repo_root / "docs" / "rigor"
     latest: dict[tuple[str, str], dict] = {}
+    considered = 0
     if rigor_dir.exists():
         for p in sorted(rigor_dir.glob("*.jsonl")):
             for line in p.read_text().splitlines():
@@ -84,6 +94,7 @@ def _from_rigor_docs(mod, repo_root: Path) -> set[str]:
                 ts = row.get("ts")
                 if not (isinstance(atype, str) and isinstance(unit_branch, str) and isinstance(ts, str)):
                     continue
+                considered += 1
                 key = (unit_branch, atype)
                 if key not in latest or ts > latest[key].get("ts", ""):
                     latest[key] = row
@@ -103,12 +114,25 @@ def _from_rigor_docs(mod, repo_root: Path) -> set[str]:
         verdict = row.get("verdict")
         if isinstance(verdict, str) and mod.is_open(verdict):
             slugs.add(mod.slugify(unit_branch))
-    return slugs
+    return slugs, considered
 
 
-def derive(repo_root: Path = REPO_ROOT) -> list[str]:
+def derive(repo_root: Path = REPO_ROOT, *, report: bool = False) -> list[str]:
+    """fix round 5 (merge-precondition): `report=True` prints a stderr
+    count of rows CONSIDERED (from both sources) and slugs EMITTED —
+    never a silent rc 0 on absent inputs, so a checkout that scanned
+    NOTHING (wrong cwd, an empty `docs/rigor/`, no live gate-state) is
+    visibly distinguishable from one that scanned real rows and genuinely
+    found no open second-round BLOCK."""
     mod = _lib()
-    return sorted(_from_gate_state(mod, repo_root) | _from_rigor_docs(mod, repo_root))
+    gate_slugs, gate_considered = _from_gate_state(mod, repo_root)
+    doc_slugs, doc_considered = _from_rigor_docs(mod, repo_root)
+    slugs = sorted(gate_slugs | doc_slugs)
+    if report:
+        print(f"derive_r12_grandfather: considered {gate_considered} live gate-state row(s) + "
+              f"{doc_considered} committed docs/rigor row(s) ({gate_considered + doc_considered} "
+              f"total) -- emitting {len(slugs)} slug(s)", file=sys.stderr)
+    return slugs
 
 
 def _self_test() -> int:
@@ -142,18 +166,33 @@ def _self_test() -> int:
         got = derive(root)
         if got != ["feat_open"]:
             failures.append(f"expected exactly ['feat_open'], got {got!r}")
+
+        # (3) merge-precondition: `report=True` prints a stderr count of
+        # rows CONSIDERED (never silent on absent inputs) -- 3 rows total
+        # across both `docs/rigor/*.jsonl` files above (1 in feat_open,
+        # 2 in feat_closed), emitting exactly 1 slug.
+        import io
+        real_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            derive(root, report=True)
+            report_text = sys.stderr.getvalue()
+        finally:
+            sys.stderr = real_stderr
+        if "(3 total)" not in report_text or "emitting 1 slug" not in report_text:
+            failures.append(f"report=True must print an honest rows-considered/emitted count, got: {report_text!r}")
     if failures:
         for f in failures:
             print(f"derive_r12_grandfather[self-test]: FAIL — {f}", file=sys.stderr)
         return 1
-    print("derive_r12_grandfather[self-test]: OK (2/2 cases)")
+    print("derive_r12_grandfather[self-test]: OK (3/3 cases)")
     return 0
 
 
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
-    slugs = derive()
+    slugs = derive(report=True)
     for s in slugs:
         print(s)
     if "--write" in sys.argv[1:]:

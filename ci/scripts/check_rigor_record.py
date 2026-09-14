@@ -102,6 +102,7 @@ Modes:
   python3 ci/scripts/check_rigor_record.py                       # the check
   python3 ci/scripts/check_rigor_record.py --check-allowlist-only-shrinks
   python3 ci/scripts/check_rigor_record.py --check-r12-grandfather-only-shrinks
+  python3 ci/scripts/check_rigor_record.py --check-required-commands-only-shrinks
   python3 ci/scripts/check_rigor_record.py --self-test
 """
 from __future__ import annotations
@@ -132,6 +133,13 @@ ALLOWLIST_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_allowlist.txt"
 # (this one is read only by `check_anticipation_witnesses`, never by
 # `run_check`'s own top-level arming).
 R12_GRANDFATHER_PATH = REPO_ROOT / "ci" / "scripts" / "rigor_record_r12_grandfather.txt"
+# esc-lead-gate-R12 fix round 5 Z4: the OPPOSITE polarity from the two
+# exemption lists above — this file names REQUIRED gate commands, so
+# GROWING it (adding a line) tightens the swarm and ADDING/keeping every
+# existing line is fine; REMOVING a line (a shrink in the count of
+# required commands) WEAKENS item 8a and is exactly what this ratchet
+# catches and fails, never allows silently.
+REQUIRED_COMMANDS_PATH = REPO_ROOT / "ci" / "lead-gate-required-commands.txt"
 
 ARMING_GLOBS = ("crates/*", "crates/**", "ci/*", "ci/**", ".github/workflows/*", ".github/workflows/**")
 CONTRACT_GLOBS = ("docs/plans/*/proposals/*", "docs/plans/*/proposals/**", "docs/rigor/contracts/*", "docs/rigor/contracts/**")
@@ -828,6 +836,63 @@ def check_r12_grandfather_only_shrinks(cwd: Path = REPO_ROOT) -> int:
     return 0
 
 
+def _parse_required_commands(text: str) -> set[str]:
+    """The SAME parse `_r12_required_commands_or_deny` in lead-gate-lib.py
+    applies — `#`-comment/blank lines skipped, a trailing `  # ...`
+    annotation stripped — reduced to a SET of command strings (never the
+    annotation, which a committer may re-measure/reword without that
+    being a real removal)."""
+    out: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        command = stripped.split("  #", 1)[0].rstrip()
+        if command:
+            out.add(command)
+    return out
+
+
+def check_required_commands_only_shrinks(cwd: Path = REPO_ROOT) -> int:
+    """esc-lead-gate-R12 fix round 5 Z4(b): the OPPOSITE polarity from
+    `check_allowlist_only_shrinks`/`check_r12_grandfather_only_shrinks` —
+    `REQUIRED_COMMANDS_PATH` names REQUIRED gates, so this check's job is
+    to CATCH a SHRINK (a committed command REMOVED, weakening item 8a)
+    and FAIL it; adding a new required command, or leaving the set
+    unchanged, always passes. BOOTSTRAP arm: `origin/main` carrying no
+    such file yet (this PR is the one introducing it) establishes the
+    baseline instead of failing."""
+    ok, _ = _git(cwd, "fetch", "--quiet", "origin", "main")
+    if not ok:
+        print("rigor-record-required-commands-only-shrinks: FAIL — git fetch origin main failed", file=sys.stderr)
+        return 1
+    ok, _ = _git(cwd, "rev-parse", "--verify", "origin/main")
+    if not ok:
+        print("rigor-record-required-commands-only-shrinks: FAIL — origin/main does not resolve", file=sys.stderr)
+        return 1
+    current = _parse_required_commands(REQUIRED_COMMANDS_PATH.read_text()) if REQUIRED_COMMANDS_PATH.exists() else set()
+    rel = REQUIRED_COMMANDS_PATH.relative_to(cwd).as_posix()
+    ok, base_text = _git(cwd, "show", f"origin/main:{rel}")
+    if not ok:
+        print(f"rigor-record-required-commands-only-shrinks: OK (bootstrap) — origin/main has no "
+              f"{rel} yet; this branch's {len(current)} command(s) establish the baseline.")
+        return 0
+    base = _parse_required_commands(base_text)
+    removed = base - current
+    if removed:
+        print("rigor-record-required-commands-only-shrinks: FAIL", file=sys.stderr)
+        for e in sorted(removed):
+            print(f"  - {e}", file=sys.stderr)
+        print("\nrigor-record-required-commands-only-shrinks: this branch REMOVES a committed "
+              "required gate command. The list may only grow (or stay the same) — removing a "
+              "required gate weakens item 8a and is a human-reviewed decision, made on main "
+              "directly, never an autonomous removal on a swarm branch.", file=sys.stderr)
+        return 1
+    print(f"rigor-record-required-commands-only-shrinks: OK — {len(current)} command(s) "
+          f"({len(current) - len(base)} added vs origin/main).")
+    return 0
+
+
 # ==========================================================================
 # --self-test — hermetic fixtures, the check_lead_gate.py harness pattern:
 # a real `origin` remote + a real feature-branch clone, run against the
@@ -1392,6 +1457,35 @@ def fixture_rr13_r12_grandfather_only_shrinks() -> None:
             R12_GRANDFATHER_PATH = real_path
 
 
+def fixture_rr19_required_commands_only_shrinks() -> None:
+    """fix round 5 Z4(b): the OPPOSITE polarity from RR13's own ratchet —
+    `ci/lead-gate-required-commands.txt` names REQUIRED gates, so ADDING a
+    line passes (tightening) and REMOVING a committed line FAILS
+    (weakening item 8a with zero human review)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        origin, work = _pr_repo(Path(td))
+        rc_rel = "ci/lead-gate-required-commands.txt"
+        _commit(work, "seed required-commands file", {rc_rel: "python3 ci/scripts/probe_a.py  # measured ~0.1s\n"})
+        _sh(work, "push", "-q", "origin", "HEAD:main")
+        _sh(work, "fetch", "-q", "origin", "main")
+        global REQUIRED_COMMANDS_PATH
+        real_path = REQUIRED_COMMANDS_PATH
+        REQUIRED_COMMANDS_PATH = work / rc_rel
+        try:
+            rc = check_required_commands_only_shrinks(work)
+            _assert(rc == 0, "RR19a", "an unchanged required-commands file must pass the ratchet")
+            (work / rc_rel).write_text(
+                "python3 ci/scripts/probe_a.py  # measured ~0.1s\n"
+                "python3 ci/scripts/probe_b.py  # measured ~0.1s\n")
+            rc = check_required_commands_only_shrinks(work)
+            _assert(rc == 0, "RR19b", "ADDING a new required command must PASS the ratchet (tightening)")
+            (work / rc_rel).write_text("# nothing but comments\n")
+            rc = check_required_commands_only_shrinks(work)
+            _assert(rc != 0, "RR19c", "REMOVING a committed required command must FAIL the ratchet")
+        finally:
+            REQUIRED_COMMANDS_PATH = real_path
+
+
 def _rr_gates_commit(work: Path, extra_files: dict[str, str], gates: dict | None) -> None:
     """Shared setup for RR14-RR16: a committed `ci/lead-gate-required-
     commands.txt` (one line) plus an anticipation record whose single row
@@ -1431,8 +1525,11 @@ def fixture_rr14_missing_gates_fails() -> None:
 
 
 def fixture_rr15_complete_gates_rc_zero_allows() -> None:
-    """item 8a READER 3: the satisfiable case -- every committed line
-    present with `rc == 0` ALLOWS."""
+    """POSITIVE CONTROL — green at base by construction: guards the reader
+    against over-refusal (a shape-complete, fully green governing `gates`
+    row must ALLOW). The RED half is RR14/RR16. item 8a READER 3: the
+    satisfiable case -- every committed line present with `rc == 0`
+    ALLOWS."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         _rr_gates_commit(work, {}, gates={"python3 ci/scripts/probe.py": {"rc": 0}})
@@ -1585,6 +1682,7 @@ RR_FIXTURES = [
     ("RR12g", fixture_rr12g_tracked_bash_path_allows),
     ("RR12h", fixture_rr12h_untracked_bash_path_fails_shape),
     ("RR13", fixture_rr13_r12_grandfather_only_shrinks),
+    ("RR19", fixture_rr19_required_commands_only_shrinks),
     ("RR14", fixture_rr14_missing_gates_fails),
     ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
     ("RR16", fixture_rr16_nonzero_rc_fails),
@@ -1621,6 +1719,8 @@ def main(argv: list[str]) -> int:
         return check_allowlist_only_shrinks()
     if "--check-r12-grandfather-only-shrinks" in argv:
         return check_r12_grandfather_only_shrinks()
+    if "--check-required-commands-only-shrinks" in argv:
+        return check_required_commands_only_shrinks()
     result = run_check()
     for w in result.warnings:
         print(f"check-rigor-record: WARNING (advisory) — {w}")

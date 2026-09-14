@@ -237,3 +237,13 @@ sorts by filename, a tip sha with no chronological meaning) cannot stand in for 
 verified state. When the candidate pool holds two or more rows and any lacks `ts` at all (a
 shape the real exporter no longer produces, but a hand-typed or pre-fix-round-5 record still
 can), selection FAILS LOUDLY naming the ambiguity rather than falling back to append order.
+
+**Item 8's acceptance oracle, stated as a split (fix round 5, acceptance #2).** Item 8's
+fixture set carries 24 DENY oracles (RED at the base commit, each by one mutation) and 6
+POSITIVE CONTROLS (green at base BY CONSTRUCTION — a shape-complete/satisfiable artifact must
+allow, guarding the reader against over-refusal, never itself a RED-at-base oracle): R12G2,
+R12G5, R12M8b3, R12M8b4, R12X2, and RR15. Each positive control's own docstring names its
+paired deny fixture(s) (R12G1/R12G3-4/R12G6-8; R12M8b1-2/R12M8b5-12; R12X1/R12X3-6; RR14/RR16).
+The round-3 commit message's "29 oracles RED" predates this split and stays as committed
+history, uncorrected — the correction lives here and in the unit's own rigor-record ledger
+row, never as a rewrite of a past commit's message.

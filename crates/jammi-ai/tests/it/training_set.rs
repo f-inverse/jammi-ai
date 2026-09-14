@@ -157,13 +157,8 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 ///
 /// **What this pin does NOT cover.** Only the TABULAR arm
 /// (`training_set::materialize_projection`) is fingerprinted here. The graph
-/// arm never went through `training_set` at all in this unit's shipped shape:
-/// an earlier round routed its sampled pairs through the same
-/// materialize-and-read-back producer the tabular arm uses, but that guard
-/// could not be made safe under a reclaimed lease (see
-/// `pinned_source_gate::no_session_table_registration_under_fine_tune`'s doc)
-/// and was excised — the graph arm is `origin/main`'s code again, sampling in
-/// memory and training directly, with its own byte-identity pin at
+/// arm never goes through `training_set` at all: it samples in memory and
+/// trains directly, with its own byte-identity pin at
 /// `graph_finetune::fine_tune_graph_end_to_end_completes`
 /// (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it a
 /// table of its own). The `NULLS FIRST` order key is likewise stated as

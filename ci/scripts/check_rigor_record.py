@@ -1693,6 +1693,85 @@ def fixture_rr20_omits_a_required_file_fails() -> None:
         _assert(any("omits" in f and "b.py" in f for f in r.failures), "RR20", f"{r.failures}")
 
 
+def _rr_anticipation_commit(work: Path, art: dict) -> None:
+    """Shared setup for RR21-24: one open second-round BLOCK naming a
+    single required file (`a.py`), and `art` written verbatim as the
+    anticipation record's own (only) row."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    _commit(work, "ci: touch a gate script", {
+        "ci/scripts/probe.py": "print('x')\n",
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/rigor/feat_rr-fixture.anticipation.jsonl": json.dumps(art) + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    })
+
+
+def fixture_rr21_no_unit_branch_fails() -> None:
+    """fix round 5 Z7: a row with NO `unit_branch` at all -- reader 3
+    inherits this check from the SAME shared validator reader 1 already
+    enforces (a case the audit's A1-A5 probe found reader 3 previously
+    never checked at all)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR21", "a row with no unit_branch must FAIL")
+        _assert(any("unit_branch" in f for f in r.failures), "RR21", f"{r.failures}")
+
+
+def fixture_rr22_no_residual_risk_fails() -> None:
+    """fix round 5 Z7: a row with NO `residual_risk` at all."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR22", "a row with no residual_risk must FAIL")
+        _assert(any("residual_risk" in f for f in r.failures), "RR22", f"{r.failures}")
+
+
+def fixture_rr23_identical_pair_reused_fails() -> None:
+    """fix round 5 Z7: TWO keys in the SAME row reusing the IDENTICAL
+    (command, hash) pair -- a templated attack, never a per-site
+    examination."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        same = {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": dict(same), "b.py": dict(same)},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR23", "a reused (command, hash) pair must FAIL")
+        _assert(any("IDENTICAL" in f for f in r.failures), "RR23", f"{r.failures}")
+
+
+def fixture_rr24_inspector_only_fails() -> None:
+    """fix round 5 Z7: the record's ONLY attack is inspector-class
+    (`cat`) -- reading a file is not attacking a mechanism."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "cat a.py", "hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR24", "an inspector-only record must FAIL")
+        _assert(any("inspector-class" in f for f in r.failures), "RR24", f"{r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -1716,6 +1795,10 @@ RR_FIXTURES = [
     ("RR13", fixture_rr13_r12_grandfather_only_shrinks),
     ("RR19", fixture_rr19_required_commands_only_shrinks),
     ("RR20", fixture_rr20_omits_a_required_file_fails),
+    ("RR21", fixture_rr21_no_unit_branch_fails),
+    ("RR22", fixture_rr22_no_residual_risk_fails),
+    ("RR23", fixture_rr23_identical_pair_reused_fails),
+    ("RR24", fixture_rr24_inspector_only_fails),
     ("RR14", fixture_rr14_missing_gates_fails),
     ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
     ("RR16", fixture_rr16_nonzero_rc_fails),

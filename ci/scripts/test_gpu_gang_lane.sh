@@ -450,10 +450,13 @@ fi
 # text grep for `schedule:` is evaded by a quoted `"schedule":` key, a
 # folded/literal block scalar, or a flow-style `on: {...}` map, and reports
 # "no schedule key" on a file it could not even open; the shared reader is
-# a real YAML parse -- every one of those shapes is read CORRECTLY (never
-# refused merely for being an unusual spelling), and only a genuinely
-# unparseable/ambiguous document (a YAML syntax error, a duplicate key)
-# FAILS LOUD (never "absent") on anything it cannot examine.
+# a real YAML parse -- every one of those shapes (and any other
+# unusual-but-valid spelling) is read EXACTLY as GitHub Actions itself
+# reads it, never refused merely for being unusual. A genuinely
+# unparseable/ambiguous document -- a YAML syntax error, a duplicate key,
+# OR an anchor/alias/tag anywhere in the file (GitHub's own parser rejects
+# all three, so this reader refuses them too, loudly, naming the exact
+# construct) -- FAILS LOUD (never "absent") on anything it cannot examine.
 # ============================================================================
 gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML" 2>&1)"
 gang_on_rc=$?

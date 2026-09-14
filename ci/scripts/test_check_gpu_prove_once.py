@@ -471,10 +471,11 @@ class PaidPodLaneTest(unittest.TestCase):
         self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
 
     def test_quoted_inline_on_push_fails_p7(self):
-        # Round-4 audit RED: the inline-value arm returned the raw text as
-        # the trigger key, so `on: "push"` produced a key list of
-        # `['"push"']` -- never equal to the bare string `"push"` P7
-        # compares against -- and this exact evasion passed silently.
+        # The inline-value arm strips flanking quotes off a single trigger
+        # key, so `on: "push"` reads as the key `push`, the same bare
+        # string P7 compares against -- an unnormalized `'"push"'` key
+        # equals no bare trigger name and lets this exact shape evade
+        # every check that gates on a specific trigger.
         broken = GANG_YML_GOOD.replace(
             "on:\n  workflow_dispatch:\n  pull_request:\n    types: [labeled]\n", 'on: "push"\n'
         )
@@ -2127,11 +2128,10 @@ class ReadOnBlockFromPathTest(unittest.TestCase):
         self.assertIn("cannot read file", err)
 
     def test_non_utf8_file_is_a_named_cannot_read_fail_not_an_uncaught_traceback(self):
-        # Round-4 audit RED: `read_top_level_on_block_from_path` caught only
-        # `OSError` -- a non-UTF-8 workflow file raises `UnicodeDecodeError`
-        # (not an `OSError` subclass) straight past this function as an
-        # uncaught traceback instead of the named "cannot read file" FAIL
-        # every other read error already gets.
+        # `read_top_level_on_block_from_path` catches `UnicodeDecodeError`
+        # beside `OSError` (the former is not a subclass of the latter), so
+        # a non-UTF-8 workflow file is the same named "cannot read file"
+        # FAIL every other read error gets, never an uncaught traceback.
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "not-utf8.yml"
             p.write_bytes(b"on:\n  push:\n  \xff\xfe not valid utf-8 \x80\x81\n")

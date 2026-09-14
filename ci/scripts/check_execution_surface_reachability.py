@@ -972,7 +972,7 @@ _ON_CHILD_KEY_RE = re.compile(r'^(?:"([A-Za-z0-9_]+)"|\'([A-Za-z0-9_]+)\'|([A-Za
 
 
 def _dequote_scalar(value: str) -> str:
-    """Strip one matching pair of surrounding quotes (`"push"` / `'push'`)
+    """Strip one matching pair of flanking quotes (`"push"` / `'push'`)
     off an inline scalar — `on: "push"` and `on: push` read as the SAME
     single trigger key, never as the raw quoted text `'"push"'`, which
     never equals the bare string a caller compares a trigger name against
@@ -2522,7 +2522,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     quoted_pr = parse_on_block('on:\n  "pull_request":\n    branches: [main]\n')
     ok, _reason = is_merge_path(quoted_pr)
     if not ok:
-        failures.append(f'self-test FAILED: a quoted "pull_request": trigger was not classified as merge-path: {_reason}')
+        failures.append(f'self-test FAILED: a quoted "pull_request": trigger is not classified as merge-path: {_reason}')
 
     # --- `read_top_level_on_block`: the single `on:`-block trigger-key
     # reader check_gpu_prove_once.py's P1, P5, P6, P7 and its

@@ -736,3 +736,115 @@ module doc (immediately above `is_streaming_path`) statement of this fact.
   `get_job_for_rank_defaults_world_size_when_absent_from_spec` (same file);
   **a decode that fails to read a genuinely present `world_size`** kills
   `get_job_for_rank_reflects_the_row_world_size` (same file).
+
+---
+
+## Addendum 2 — the shipped shape at `1f2ab6ba`
+
+The addendum above states the mechanism as it existed at `77c15f10`; the
+sentences below supersede it on the training-set world-gate and the
+`world_size` decode — every other sentence there (the wire freeze, §A5's
+streaming-allowlist arm, §A6's carried-forward limits) is unaffected and
+remains its own record. This addendum states the mechanism as it EXISTS at
+`1f2ab6ba` — every sentence below was read directly against that commit in
+this worktree by the agent writing this addendum, cited by crate-qualified
+`path::item`.
+
+### B1. The training-set pair conjunct and its sidecar verify are gone from this unit
+
+`crates/jammi-server/src/grpc/gang.rs::GangServer::run_rank` no longer
+resolves training-set identity at all: `resolve_training_set_identity`,
+`resolve_training_set_identity_classified`, and the `TrainingSetOutcome`
+type they returned do not exist anywhere in `crates/` — confirmed by
+`grep -rn 'TrainingSetOutcome\|resolve_training_set_identity' crates/`
+returning no hits. `GangRefusalReason` accordingly drops
+`TrainingSetPairMissing`, `TrainingSetOtherTenant`, `TrainingSetNotReady`,
+and `TrainingSetDigestMismatch`, and gains none in their place: the enum now
+names exactly ten determinants — `AdminScope`, `NotFound`, `NotRunning`,
+`WrongClaimant`, `WrongAttempt`, `LeaseDead`, `SpecUndecodable`,
+`WorldMismatch`, `MultiHostUnsupported`, `CoordinatorNotFresh`. A row whose
+own `world_size` decodes successfully to a value other than `1` refuses
+under `MultiHostUnsupported` unconditionally, whether or not the caller's
+`assign.world` happens to agree with it — the pair conjunct and the sidecar
+verify that would admit a genuine multi-host row are recorded, on the
+variant's own doc comment and in
+`docs/plans/67-distributed-training/UNITS.md` § U5a-2, as `HostAdmission`'s
+to build, filed at <https://github.com/f-inverse/jammi-ai/issues/566>.
+`crates/jammi-server/tests/it/gang_service.rs::every_gang_refusal_reason`
+derives its ten-element witness list from an exhaustive match with no
+wildcard arm over `GangRefusalReason`'s real variant set — a future variant
+fails that file to compile, naming the missing arm, until it is added both
+to the witness list and the match — and the pairwise non-disclosure oracle
+that consumes it now drives all ten scenarios.
+
+### B2. `world_size` is a row fact, never a fault, at decode time
+
+`crates/jammi-db/src/catalog/jobs_repo.rs::WorldSizeFact` is a two-armed
+enum, `Decoded(u32)` or `Undecodable` — the malformed-value case the
+addendum above (§A1) described as a typed `Err`
+(`BackendError::TypeConversion`) is gone: `RankAdmissionRow::world_size` is
+a `WorldSizeFact`, never wrapped in a `Result`, and
+`Catalog::get_job_for_rank` returns `Ok(Some(row))` for a row whose `spec`
+fails to decode a `world_size` — the row exists, every other column is
+populated, and the content defect is the row's own fact, never a fault of
+the read that found it.
+`crates/jammi-server/src/grpc/gang.rs::GangServer::run_rank` refuses a
+`WorldSizeFact::Undecodable` row under `GangRefusalReason::SpecUndecodable`,
+counted against the attempt budget like every other refusal.
+`crates/jammi-server/tests/it/gang_service.rs` asserts the poisoned-row and
+the absent-row refusals are byte-identical `(code, message)` through the
+real RPC, as part of the same pairwise non-disclosure oracle named above,
+while the `test-hooks` seam names `SpecUndecodable` specifically for both
+shapes.
+`crates/jammi-db/tests/it/gang_rank_admission.rs::get_job_for_rank_malformed_world_size_is_undecodable_not_a_fault`
+(parameterized sqlite/postgres, the postgres arm skipping rather than
+failing when `JAMMI_TEST_PG_URL` is unset) and its not-valid-JSON-at-all
+sibling pin this directly against `Catalog::submit_job`/`claim_next`/
+`get_job_for_rank`, asserting `WorldSizeFact::Undecodable` with every other
+column still populated.
+
+### B3. Producer and consumer are coupled by an executed test, never prose
+
+`crates/jammi-server/tests/it/gang_training_spec_parity.rs::get_job_for_rank_world_size_matches_the_real_training_spec_producer`
+serializes a real `jammi_ai::fine_tune::spec::TrainingSpec::FineTune` naming
+`TrainingCommon { world_size: 2, .. }`, submits it through
+`Catalog::submit_job`, and asserts
+`get_job_for_rank(..).world_size == WorldSizeFact::Decoded(2)` — the SAME
+decode path the gang handler reads, never a hand-written JSON literal
+standing in for either side. A second real spec
+(`ContextPredictorTrainConfig`, itself asserted in the test to genuinely
+omit the `world_size` key rather than merely default it) pins the
+absent-field case to `WorldSizeFact::Decoded(DEFAULT_WORLD_SIZE)` — since
+`jammi-db`'s own private `WORLD_SIZE_IF_ABSENT` const feeds the same decode
+this test reads, this assertion pins `WORLD_SIZE_IF_ABSENT` equal to
+`jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE` without either crate
+depending on the other's constant directly (`jammi-db` cannot depend on
+`jammi-ai`).
+
+### B4. Every admission-time catalog read on this path is `Unavailable`, never `map_engine_error`
+
+`crates/jammi-server/tests/it/gang_admission_catalog_fault_oracle.rs` is a
+source-scan oracle over `GangServer::run_rank`'s own function body — located
+textually from the `fn run_rank` declaration to its matching closing brace
+by a brace-depth walk, comments and string/char literals masked to spaces
+first, never "the rest of the file". It asserts the span does not contain
+`map_engine_error` as code, and does contain `admission_catalog_fault` at
+least twice: confirmed at exactly two call sites in
+`crates/jammi-server/src/grpc/gang.rs::GangServer::run_rank` —
+`get_job_for_rank`'s `Err` arm and `fresh_instance`'s `Err` arm — each
+mapping through `admission_catalog_fault` to `Status::unavailable(..)`,
+distinct from every rung's `FailedPrecondition` refusal.
+
+### B5. Stop rule fired; the world>1 conjunct is U5a-2's, filed
+
+The pre-committed stop rule — a second BLOCK against the admission
+lattice's determinants excises the world>1 conjunct — fired: the
+training-set pair conjunct and its sidecar verify are excised from this
+unit whole; `HostAdmission` (U5a-2) inherits them together with the
+`world_size`-decode and catalog-fault-classification properties above,
+which remained load-bearing at the reduced base. This unit ships the
+`world_size == 1` lattice — every `world_size != 1` row, and every
+`assign.world != row.world_size` call in either direction, refuses the same
+fixed way — plus the wire surface, the migration, and the write-once
+identity CAS as a db-layer primitive with no wire-path caller yet. Filed at
+<https://github.com/f-inverse/jammi-ai/issues/566>.

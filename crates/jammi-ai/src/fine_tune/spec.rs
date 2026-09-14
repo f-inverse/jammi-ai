@@ -67,8 +67,9 @@ pub enum TrainingSpec {
         /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
         /// `cache` field already carries for every compute kind — except
         /// that model-level cache reuse is not yet supported for this kind:
-        /// `Use` is refused, typed, at submit
-        /// (`InferenceSession::submit_fine_tune_spec_deduped`); see
+        /// `Use` is refused, typed, by `admit_training_spec` — the ONE
+        /// admission every durable submit edge for a `TrainingSpec` applies,
+        /// so no edge can enqueue this value; see
         /// <https://github.com/f-inverse/jammi-ai/issues/562>. `Bypass` (the
         /// only value a submitted job can carry past that refusal) always
         /// trains.
@@ -284,6 +285,51 @@ impl RankAdmission {
         }
         Ok(())
     }
+}
+
+/// The ONE admission every durable submit edge for a [`TrainingSpec`]
+/// applies before a `jobs` row is ever written: the per-kind validation
+/// (`FineTuneConfig::validate`/`GraphSampleConfig::validate`/
+/// `ContextPredictorTrainConfig::validate`), the rank admission
+/// [`RankAdmission::admit`] performs, and — for the column-source
+/// `FineTune` kind only, the sole kind `cache` is representable on —
+/// the `cache = Use` refusal (model-level cache reuse is not yet
+/// supported; see <https://github.com/f-inverse/jammi-ai/issues/562>).
+///
+/// Every edge that can turn a `TrainingSpec` into a durable row calls this:
+/// [`crate::session::InferenceSession::submit_fine_tune_spec_deduped`],
+/// [`crate::session::InferenceSession::enqueue`], and
+/// [`crate::pipeline::context_predictor`]'s
+/// `train_context_predictor_deduped`. A refusal here leaves no row behind,
+/// because no row has been written yet.
+pub(crate) fn admit_training_spec(
+    config: &jammi_db::config::JammiConfig,
+    spec: &TrainingSpec,
+) -> Result<()> {
+    match spec {
+        TrainingSpec::FineTune { common, cache, .. } => {
+            common.config.validate()?;
+            if *cache == CachePolicy::Use {
+                return Err(JammiError::Config(
+                    "model-level cache reuse is not yet supported: submit this fine_tune job \
+                     without `cache` or with `cache = BYPASS`"
+                        .into(),
+                ));
+            }
+        }
+        TrainingSpec::GraphFineTune {
+            common,
+            sample_config,
+            ..
+        } => {
+            common.config.validate()?;
+            sample_config.validate()?;
+        }
+        TrainingSpec::ContextPredictor { predictor_spec, .. } => {
+            predictor_spec.validate()?;
+        }
+    }
+    RankAdmission::from_config(config).admit(spec)
 }
 
 impl TrainingSpec {

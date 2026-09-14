@@ -654,14 +654,15 @@ impl InferenceSession {
     /// scan and `JobStatus`'s `output_model_id` resolution both see as
     /// fully linked.
     pub async fn enqueue(self: &Arc<Self>, spec: JobSpec, priority: i32) -> Result<JobHandle> {
-        // The SECOND durable submit edge for a training spec (the first is
-        // `submit_fine_tune_spec_deduped`): this one takes an already-built
-        // `JobSpec`, so a rank count reaches the queue through it without
-        // passing the per-verb entry points. Same admission, same typed
-        // refusal, nothing enqueued.
+        // One of the three durable submit edges for a training spec (the
+        // other two are `submit_fine_tune_spec_deduped` and
+        // `train_context_predictor_deduped`): this one takes an
+        // already-built `JobSpec`, so a training spec reaches the queue
+        // through it without passing the per-verb entry points. Same
+        // admission — [`crate::fine_tune::spec::admit_training_spec`] — same
+        // typed refusals, nothing enqueued on any of them.
         if let JobSpec::Training(training) = &spec {
-            crate::fine_tune::spec::RankAdmission::from_config(self.jammi_config())
-                .admit(training)?;
+            crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training)?;
         }
         let job_id = uuid::Uuid::new_v4().to_string();
         let kind = spec.kind();

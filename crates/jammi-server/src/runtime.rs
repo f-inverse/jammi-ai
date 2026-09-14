@@ -567,12 +567,28 @@ impl OssServer {
         let peer = match self.peer_addr {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
+                // `GangServer::fresh_instance` (`CONTRACT-U5a.md` §I1) needs
+                // the `[lease]` window this deployment runs with — read once,
+                // here, from the already-validated config
+                // (`OssServer::new`'s own `config.lease.intervals()` call
+                // already rejected an invalid pair at construction, so this
+                // one cannot fail in practice; still handled, never
+                // `.unwrap()`ed, since a config reload between `new` and
+                // `bind` is not something this method can rule out).
+                let lease = self
+                    .session
+                    .inner_config()
+                    .lease
+                    .intervals()
+                    .map_err(|e| ServerError::Config(e.to_string()))?
+                    .lease();
                 let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
                     Arc::clone(&self.session),
                 )))
-                .add_service(GangServiceServer::new(GangServer::new(Arc::clone(
-                    &self.session,
-                ))));
+                .add_service(GangServiceServer::new(GangServer::new(
+                    Arc::clone(&self.session),
+                    lease,
+                )));
                 Some((listener, routes, Arc::clone(&self.metrics)))
             }
             None => None,

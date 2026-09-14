@@ -6,17 +6,16 @@
 //! `jammi_db::Catalog::get_result_table_for_tenant` — the way §W2 Resolution
 //! states the property (a repo-level predicate plus an explicit guard at the
 //! resolution call site), matching `get_job_for_rank`'s own
-//! enumerating-caller-oracle treatment elsewhere in this contract. Neither
-//! wires into `RunRank`'s own control flow yet: that needs `get_job_for_rank`,
-//! this unit's still-pending db step, so there is no rpc-level "call
-//! `RunRank`" surface to drive for either row today.
+//! enumerating-caller-oracle treatment elsewhere in this contract.
 //!
 //! The remaining tests drive the real `RunRank` rpc over the production
-//! `peer_bind` listener (`start_engine_server_with_peer_bind`) — the wire-level
-//! K2 edges (§W1: `world == 0`, `rank >= world`, refused before I-GANG runs)
-//! and the interim state between this unit's merge and the day
-//! `get_job_for_rank` lands: with no I-GANG determinant wired in yet, every
-//! wire-valid `Assign` currently ends `UNIMPLEMENTED`.
+//! `peer_bind` listener (`start_engine_server_with_peer_bind` /
+//! `start_no_worker_server`) — the wire-level K2 edges (§W1: `world == 0`,
+//! `rank >= world`, refused before I-GANG runs), every I-GANG determinant
+//! `get_job_for_rank` decides (§I1(a): job not found, not `running`, wrong
+//! claimant, wrong attempt, lease not live), and f1': a call satisfying
+//! EVERY determinant still ends `UNIMPLEMENTED` — this unit has no
+//! `HostAdmission` session to hand it to (U5a-2 builds that).
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -287,16 +286,77 @@ async fn resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_
 // ---------------------------------------------------------------------------
 
 fn assign_frame(world: u32, rank: u32) -> jammi_wire::proto::gang::RankControl {
+    assign_frame_full("job-1", 0, rank, world, "coord-1")
+}
+
+fn assign_frame_full(
+    job_id: &str,
+    attempt: i64,
+    rank: u32,
+    world: u32,
+    coordinator_instance_id: &str,
+) -> jammi_wire::proto::gang::RankControl {
     use jammi_wire::proto::gang::{rank_control, Assign, RankControl};
     RankControl {
         control: Some(rank_control::Control::Assign(Assign {
-            job_id: "job-1".into(),
-            attempt: 0,
+            job_id: job_id.into(),
+            attempt,
             rank,
             world,
-            coordinator_instance_id: "coord-1".into(),
+            coordinator_instance_id: coordinator_instance_id.into(),
         })),
     }
+}
+
+/// A peer-bound server with `[worker] enabled = false` — every fixture below
+/// drives `Catalog::submit_job`/`claim_next` directly (matching
+/// `jobs_queue.rs`'s own fixture style) and needs the row's `status`/
+/// `claimed_by`/`attempts` to stay exactly what the fixture set, never raced
+/// by this same process's own production claim loop (`[worker] enabled`
+/// defaults to `true`, `config/mod.rs`).
+async fn start_no_worker_server() -> crate::common::grpc::PeerEngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = crate::common::grpc::peer_bind_config(dir.path());
+    cfg.worker.enabled = false;
+    crate::common::grpc::start_engine_server_from_config(cfg, Some(dir)).await
+}
+
+/// A minimal `world_size == 1` job, submitted and claimed on `server`'s own
+/// engine catalog directly (bypassing the wire `JobService`, matching
+/// `jobs_queue.rs`'s own fixture style — the gang admission surface reads
+/// the row, not the submission RPC). `model_ref: None` avoids needing a
+/// registered model FK target (the column is nullable). Returns the
+/// `attempts` value the claim landed at (always `1`, the first claim), for
+/// the caller to build a matching `Assign` frame with.
+async fn submit_and_claim(
+    server: &crate::common::grpc::PeerEngineServer,
+    job_id: &str,
+    coordinator_instance_id: &str,
+    lease: std::time::Duration,
+) -> i64 {
+    use jammi_db::catalog::jobs_repo::SubmitJobParams;
+    use jammi_db::catalog::status::JobExecution;
+
+    let catalog = server.engine.catalog();
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id,
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next(coordinator_instance_id, &["fine_tune"], lease)
+        .await
+        .unwrap()
+        .expect("must claim the only queued job");
+    i64::from(claimed.attempts)
 }
 
 /// §W1 K2: `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG (which
@@ -384,24 +444,276 @@ async fn run_rank_refuses_a_stream_closed_before_assign() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
-/// f1' (U5a-1's OWN interim state, before `get_job_for_rank` lands): a
-/// wire-valid `Assign` — every §W1 K2 edge satisfied — reaches the handler
-/// and, with no I-GANG determinant wired in yet and no `HostAdmission`
-/// session to hand the call to, ends `UNIMPLEMENTED`. Under U5a-2 (§I5) the
-/// SAME call instead receives `Admitted`; this row's own claim is narrower
-/// than full f1' (I-GANG is not yet DECIDED here, only bypassed) and is
-/// superseded once `get_job_for_rank` is wired into this handler.
+// ---------------------------------------------------------------------------
+// §I1 (I-GANG, the full row predicate) + f1' (this unit's own terminal state)
+// ---------------------------------------------------------------------------
+
+/// f1' (this unit's own success path): a call satisfying EVERY I-GANG
+/// determinant — the row is `running`, claimed by the caller's own
+/// `coordinator_instance_id`, at the matching `attempt`, under a live
+/// lease, and (`world_size == 1` here, so the training-set pair is not
+/// gated) the coordinator's own `instances` row is fresh — still reaches
+/// `UNIMPLEMENTED`: this unit has no `HostAdmission` session to hand the
+/// call to (U5a-2 builds that). Proves every determinant was actually
+/// DECIDED (not skipped) — a call that satisfies all of them does not stop
+/// short at some earlier, easier-to-satisfy refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_wire_valid_assign_is_unimplemented_before_i_gang_is_wired() {
+async fn run_rank_every_i_gang_determinant_satisfied_is_unimplemented() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 
-    let server = crate::common::grpc::start_engine_server_with_peer_bind().await;
+    let server = start_no_worker_server().await;
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-full", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim(
+        &server,
+        "job-full",
+        "coord-full",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
     let channel = crate::common::grpc::channel(server.peer_addr).await;
     let mut client = GangServiceClient::new(channel);
-    let outbound = tokio_stream::once(assign_frame(1, 0));
+    let outbound = tokio_stream::once(assign_frame_full("job-full", attempt, 0, 1, "coord-full"));
     let err = client
         .run_rank(outbound)
         .await
         .expect_err("no HostAdmission session exists yet to admit into");
     assert_eq!(err.code(), tonic::Code::Unimplemented);
+}
+
+/// b1': a job id no row exists for is refused `FAILED_PRECONDITION` — the
+/// SAME status and message every other I-GANG determinant refuses with
+/// (§I1 Non-disclosure), never a distinguishing "not found" text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_job_not_found() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = crate::common::grpc::start_engine_server_with_peer_bind().await;
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full("no-such-job", 0, 0, 1, "coord-1"));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("an absent job must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// b1': a `queued` (never claimed) row is refused `FAILED_PRECONDITION` —
+/// the "not `running`" determinant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_job_not_running() {
+    use jammi_db::catalog::backend::TxOptions;
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    // Freshness satisfied — this determinant is isolated from "coordinator
+    // not fresh" (a separate conjunct, §I1), never a confound this test
+    // would accidentally also exercise.
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-1", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim(
+        &server,
+        "job-completed",
+        "coord-1",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    // Force status away from `running` WITHOUT touching `claimed_by` /
+    // `attempts` / the lease, so this row fails ONLY the "not running"
+    // conjunct — every other conjunct (`claimant_matches`, `attempt_matches`,
+    // `lease_live`) still holds. A row this engine's own claim path can
+    // reach this way (`finish_job`), manufactured directly via raw SQL so
+    // the fixture does not depend on that path's own guards.
+    server
+        .engine
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE job_id = 'job-completed'",
+                    &[],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full("job-completed", attempt, 0, 1, "coord-1"));
+    let err = client.run_rank(outbound).await.expect_err(
+        "a non-running job must be refused, even with a matching claimant/attempt/lease",
+    );
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// b1': a lease claimed for 1ms, then allowed to expire, is refused
+/// `FAILED_PRECONDITION` — the "lease not live" determinant (never a
+/// `NULL`-vs-expired distinction the caller can observe).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_lease_expired() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    // Freshness satisfied — isolates "lease not live" from "coordinator not
+    // fresh".
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-expired", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim(
+        &server,
+        "job-expired",
+        "coord-expired",
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-expired",
+        attempt,
+        0,
+        1,
+        "coord-expired",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("an expired lease must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// b1': every OTHER I-GANG determinant satisfied, but the coordinator's own
+/// `instances` row was never upserted (absent) — refused
+/// `FAILED_PRECONDITION`, the "coordinator not fresh" determinant §I1 names
+/// beside the row predicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_coordinator_not_fresh() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    // Deliberately no `upsert_instance` call for "coord-stale" — every other
+    // conjunct is satisfied by a genuine claim.
+    let attempt = submit_and_claim(
+        &server,
+        "job-stale-coord",
+        "coord-stale",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-stale-coord",
+        attempt,
+        0,
+        1,
+        "coord-stale",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("a coordinator with no instances row must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// b1': a caller naming the RIGHT coordinator but the WRONG attempt (a
+/// zombie of a prior attempt this job already moved past) is refused
+/// `FAILED_PRECONDITION` — the "wrong attempt" determinant, isolated from
+/// "not claimed" by using the SAME coordinator the row was actually claimed
+/// by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_attempt_does_not_match() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-1", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim(
+        &server,
+        "job-wrong-attempt",
+        "coord-1",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-wrong-attempt",
+        attempt + 1,
+        0,
+        1,
+        "coord-1",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("a caller naming a stale attempt must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// b1': a job claimed by a DIFFERENT coordinator than the caller names is
+/// refused `FAILED_PRECONDITION` — the "not claimed [by this caller]"
+/// determinant. Caller-supplied identity is never trusted over the row's
+/// own `claimed_by` (I-GANG).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_when_claimed_by_a_different_coordinator() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    // Freshness satisfied for the NAMED (impostor) coordinator — isolates
+    // "not claimed by this caller" from "coordinator not fresh": `run_rank`
+    // checks freshness against `assign.coordinator_instance_id`
+    // ("coord-impostor"), never the row's own `claimed_by`.
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-impostor", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim(
+        &server,
+        "job-wrong-claimant",
+        "coord-real",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-wrong-claimant",
+        attempt,
+        0,
+        1,
+        "coord-impostor",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("a caller naming a different coordinator than claimed_by must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }

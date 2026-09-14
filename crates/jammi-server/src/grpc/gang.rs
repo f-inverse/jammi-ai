@@ -1,5 +1,6 @@
 //! `GangService` — the coordinator-to-member admission wire for a multi-host
-//! gang run (`CONTRACT-U5a.md`, U5a-1).
+//! gang run (see `docs/rigor/contracts/feat_500-C-U5a-1.md` for the
+//! committed mechanism contract this module implements).
 //!
 //! U5a-1 freezes the wire (`jammi.v1.gang`, see `gang.proto`), the wire-level
 //! K2 edges (`world == 0`, `rank >= world`) decided before any row is ever
@@ -192,23 +193,23 @@ impl GangService for GangServer {
 /// resolves the calling job under — the ONE tenant-pinned lookup a rank
 /// performs, no listing, no candidate search.
 ///
-/// Two properties bind this function, both round-11 folds:
+/// Two properties bind this function:
 ///
-/// - **Ruling 4 (admin-scope is ambient, guard it explicitly here).**
-///   [`TenantBinding::is_admin_scope`] reads ambient task-local state this
-///   call site does not control by construction, so this function refuses
-///   immediately, before ever calling the strict resolver, whenever admin
-///   scope is active — regardless of which tenant or table it was asked to
-///   resolve. This never relies on
+/// - **Admin scope is guarded explicitly at this call site, not left to the
+///   verb below.** [`TenantBinding::is_admin_scope`] reads ambient
+///   task-local state this call site does not control by construction, so
+///   this function refuses immediately, before ever calling the strict
+///   resolver, whenever admin scope is active — regardless of which tenant
+///   or table it was asked to resolve. This never relies on
 ///   `jammi_db::catalog::Catalog::get_result_table_for_tenant`'s OWN
-///   admin-scope behaviour (which this contract does not change: called
-///   directly, outside this guard, it still resolves any tenant's table
-///   under admin scope, matching the rest of that repo's verbs).
-/// - **Ruling 5 (a strict-predicate verb, never the relaxed read).** The
-///   lookup below is exactly `Catalog::get_result_table_for_tenant`, never
-///   `Catalog::get_result_table` — the strict predicate `tenant_id = $t OR
-///   (tenant_id IS NULL AND $t IS NULL)`, never the relaxed `OR tenant_id IS
-///   NULL` a *read* resolver uses to also see a global row.
+///   admin-scope behaviour (unchanged by this function: called directly,
+///   outside this guard, it still resolves any tenant's table under admin
+///   scope, matching the rest of that repo's verbs).
+/// - **The lookup is the strict-predicate verb, never the relaxed read.**
+///   The lookup below is exactly `Catalog::get_result_table_for_tenant`,
+///   never `Catalog::get_result_table` — the strict predicate `tenant_id =
+///   $t OR (tenant_id IS NULL AND $t IS NULL)`, never the relaxed `OR
+///   tenant_id IS NULL` a *read* resolver uses to also see a global row.
 ///
 /// The admission-time classification collapses every unresolvable /
 /// unverifiable outcome — name absent, the strict resolver returns `None`,

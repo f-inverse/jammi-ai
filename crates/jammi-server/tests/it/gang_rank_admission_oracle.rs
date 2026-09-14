@@ -1,6 +1,7 @@
-//! `CONTRACT-U5a.md` §I1(a) / §W2 Resolution — two enumerating-caller
-//! oracles, each a MEASURED claim (never prose): `Catalog::get_job_for_rank`
-//! and `Catalog::get_result_table_for_tenant` are each called from nowhere
+//! Two enumerating-caller oracles (see
+//! `docs/rigor/contracts/feat_500-C-U5a-1.md` §I1(a) / §W2 Resolution), each
+//! a MEASURED claim (never prose): `Catalog::get_job_for_rank` and
+//! `Catalog::get_result_table_for_tenant` are each called from nowhere
 //! outside the gang `RunRank` handler (plus each function's own crate's
 //! tests, which call it directly to exercise it in isolation).
 //!
@@ -250,10 +251,9 @@ fn files_containing(token: &str) -> HashSet<String> {
     hits
 }
 
-/// `CONTRACT-U5a.md` §I1(a): "the enumerating-caller oracle over `crates/**`"
-/// — `get_job_for_rank`'s only production caller is the gang `RunRank`
-/// handler; the sole other hit is `jammi-db`'s own unit test exercising the
-/// method directly.
+/// The enumerating-caller oracle over `crates/**`: `get_job_for_rank`'s only
+/// production caller is the gang `RunRank` handler; the sole other hit is
+/// `jammi-db`'s own unit test exercising the method directly.
 #[test]
 fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
     let hits = files_containing("get_job_for_rank(");
@@ -269,8 +269,9 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
             allowed.contains(hit.as_str()),
             "unexpected `get_job_for_rank(` occurrence outside the allowed set: {hit} \
              (allowed: {allowed:?}) — a new caller of this primary-key-only, \
-             non-tenant-scoped verb must be reviewed against CONTRACT-U5a.md §I1(a) \
-             before this allowlist grows"
+             non-tenant-scoped verb must be reviewed and this allowlist \
+             deliberately grown, never left stale \
+             (see docs/rigor/contracts/feat_500-C-U5a-1.md §I1(a))"
         );
     }
     for must_hit in &allowed {
@@ -282,12 +283,13 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
     }
 }
 
-/// `CONTRACT-U5a.md` §W2 Resolution (round-11 fold, ruling 5): "no caller
-/// other than the gang `RunRank` handler resolves `training_set_location`"
+/// The enumerating-caller oracle for the strict-tenant resolver: no caller
+/// other than the gang `RunRank` handler resolves `training_set_location`
 /// — `get_result_table_for_tenant`'s only production caller is
 /// `resolve_training_set_identity` inside the gang handler; the two other
-/// hits are `gang_service.rs`'s own b1' tests (rulings 4/5) exercising the
-/// raw verb directly to demonstrate the hazard those rulings name.
+/// hits are `gang_service.rs`'s own tests exercising the raw verb directly
+/// to demonstrate the hazard that resolver guards against (see
+/// `docs/rigor/contracts/feat_500-C-U5a-1.md` §W2 Resolution).
 #[test]
 fn only_resolve_training_set_identity_calls_get_result_table_for_tenant() {
     let hits = files_containing("get_result_table_for_tenant(");
@@ -303,8 +305,9 @@ fn only_resolve_training_set_identity_calls_get_result_table_for_tenant() {
             allowed.contains(hit.as_str()),
             "unexpected `get_result_table_for_tenant(` occurrence outside the allowed \
              set: {hit} (allowed: {allowed:?}) — a new caller of this strict-tenant \
-             verb must be reviewed against CONTRACT-U5a.md §W2 Resolution's admin-scope \
-             hazard (ruling 4) before this allowlist grows"
+             verb must be reviewed against the admin-scope hazard \
+             (see docs/rigor/contracts/feat_500-C-U5a-1.md §W2 Resolution) \
+             before this allowlist grows"
         );
     }
     for must_hit in &allowed {

@@ -559,7 +559,8 @@ impl OssServer {
         // `GetServerInfo`. The public listener answers UNIMPLEMENTED for its
         // paths. Its routes are a plain `tonic::service::Routes`, so a second
         // internal service is mounted beside `PeerService` on the SAME
-        // `Routes` here: `GangService` (`CONTRACT-U5a.md` §W1/§I1 — tenant
+        // `Routes` here: `GangService` (see
+        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §W1/§I1 — tenant
         // derived from the verified job row, never the caller; the public
         // listener answers UNIMPLEMENTED for its paths too). The registry is
         // cloned now because `MetricsLayer::new(self.metrics)` moves the
@@ -567,7 +568,8 @@ impl OssServer {
         let peer = match self.peer_addr {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
-                // `GangServer::fresh_instance` (`CONTRACT-U5a.md` §I1) needs
+                // `GangServer::fresh_instance` (see
+                // `docs/rigor/contracts/feat_500-C-U5a-1.md` §I1) needs
                 // the `[lease]` window this deployment runs with — read once,
                 // here, from the already-validated config
                 // (`OssServer::new`'s own `config.lease.intervals()` call

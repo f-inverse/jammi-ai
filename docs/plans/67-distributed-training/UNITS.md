@@ -234,12 +234,23 @@ re-verification) on top of it.
 - **files_in_scope**: (wire) `crates/jammi-wire/proto/jammi/v1/gang.proto`,
   `crates/jammi-wire/build.rs`, `crates/jammi-wire/src/lib.rs`. (wire-server)
   `crates/jammi-server/src/grpc/gang.rs` (`GangServer::run_rank`: wire K2
-  before any row read; the full I-GANG decision — `get_job_for_rank` for the
-  row predicate, `resolve_training_set_identity` for the `world_size > 1`
-  sidecar verify, `fresh_instance` for the coordinator's own liveness; every
-  determinant collapses to one `FailedPrecondition` with a fixed message;
-  ends `Unimplemented` — no `HostAdmission` session exists yet in this
-  sub-unit), `crates/jammi-server/src/runtime.rs` (`GangServiceServer`
+  before any row read; the `world_size == 1` admission lattice, keyed on the
+  ROW's own `world_size` (`WorldSizeFact::{Decoded, Undecodable}`,
+  `get_job_for_rank`), never the caller's `assign.world` —
+  `assign.world != row.world_size` refuses
+  (`GangRefusalReason::WorldMismatch`); a row whose `world_size` decodes but
+  is not `1` refuses (`GangRefusalReason::MultiHostUnsupported` — the
+  training-set pair conjunct and its sidecar verify that would admit a
+  genuine multi-host row are U5a-2's to build, filed at
+  <https://github.com/f-inverse/jammi-ai/issues/566>); a row whose `spec`
+  does not decode a `world_size` at all refuses as a row fact
+  (`GangRefusalReason::SpecUndecodable`), never a fault of the read that
+  found it; `fresh_instance` for the coordinator's own liveness; every
+  admission-time catalog read maps its `Err` through
+  `admission_catalog_fault` to `Unavailable`, never `map_engine_error`;
+  every determinant collapses to one `FailedPrecondition` with a fixed
+  message; ends `Unimplemented` — no `HostAdmission` session exists yet in
+  this sub-unit), `crates/jammi-server/src/runtime.rs` (`GangServiceServer`
   mounted beside `PeerServiceServer` on `[server] peer_bind`, never the
   public listener), `crates/jammi-server/src/metrics_layer.rs` +
   `crates/jammi-server/src/routes/health.rs` (`jammi_gang_requests_total{rpc}`).
@@ -265,30 +276,46 @@ re-verification) on top of it.
   `crates/jammi-server/tests/it/api_freeze_baseline.txt` +  `api_freeze.rs`
   (`PACKAGE jammi.v1.gang` / `RPC GangService/RunRank`),
   `tenant_isolation_oracle.rs` (`GANG_LISTENER_ALLOWLIST`, never appended to
-  `PEER_LISTENER_ALLOWLIST`), `gang_rank_admission_oracle.rs` (enumerating
-  caller oracles: `get_job_for_rank`'s only production caller is the gang
-  `RunRank` handler; `get_result_table_for_tenant`'s only production caller
-  is `resolve_training_set_identity`).
+  `PEER_LISTENER_ALLOWLIST`), `gang_rank_admission_oracle.rs` (the
+  enumerating caller oracle: `get_job_for_rank`'s only production caller is
+  the gang `RunRank` handler — the `get_result_table_for_tenant` caller
+  surface this file once also enumerated is gone, not merely retired, since
+  this sub-unit's handler no longer reaches that verb at all),
+  `gang_admission_catalog_fault_oracle.rs` (a source-scan oracle: no
+  admission-time catalog read in `run_rank` reaches `map_engine_error`,
+  every one reaches `admission_catalog_fault`), `gang_training_spec_parity.rs`
+  (producer→consumer parity: `get_job_for_rank`'s `world_size` decode reads
+  exactly what a real `TrainingSpec::FineTune`'s `TrainingCommon` producer
+  writes, never a hand-written spec literal on either side).
 - **invariants_to_preserve**: B5 (I-GANG beside I-PEER, never under
   `TenantResolverLayer`, tenant from the row, non-disclosure on refusal), K2
   (`world == 0`, `rank >= world`; the lease-NULL edge), B6 (docs same commit
   set), B4 (no admitted `RunRank` session reaches a rank body in this
   sub-unit or U5a-2 — every session parks and ends `Aborted{NoBody}` absent
-  an earlier exit, once U5a-2 lands), K4 (this sub-unit's instance: write-once
-  identity + verify-at-read), B1 (`RunRank`/`Assign`/`Outcome` are mechanism
-  names), `api_freeze` additive-only (`Outcome` is a new oneof arm, not a new
-  RPC).
+  an earlier exit, once U5a-2 lands), K4 (this sub-unit's instance: the
+  `training_set_ref`/`training_set_location` write-once CAS, exercised
+  directly at the db layer; no caller on this sub-unit's wire path reaches
+  it yet, since the row-keyed world gate refuses every `world_size != 1` row
+  outright — verify-at-read is U5a-2's K4 instance, built once a rank
+  actually reads the pair it names), B1 (`RunRank`/`Assign`/`Outcome` are
+  mechanism names), `api_freeze` additive-only (`Outcome` is a new oneof
+  arm, not a new RPC).
 - **acceptance**: a1' (the `training_set_ref`/`training_set_location` CAS
-  fires exactly once per job; a rank's sidecar verify against the same row
-  returns the same `manifest.artifact` every time, including after a
-  coordinator restart under the same `attempts`); b1' (one refusal test per
-  I-GANG determinant, status + `test-hooks` reason, on both the plain and
-  `--features test-hooks` lanes, counted separately; plus wire K2); e1
-  (`api_freeze` green with the gang lines; `every_rpc_is_covered` green with
-  the new allowlist; public-listener `Unimplemented` probe; the
-  `get_job_for_rank` caller oracle); f1' (a call satisfying every I-GANG
-  determinant still ends `Unimplemented` — this sub-unit has no
-  `HostAdmission` session to hand it to).
+  fires exactly once per job, and a concurrent racer reuses the winner's
+  pair rather than overwriting it — both asserted directly against the CAS
+  at the db layer); b1' (one refusal test per I-GANG determinant — ten
+  total: `AdminScope`, `NotFound`, `NotRunning`, `WrongClaimant`,
+  `WrongAttempt`, `LeaseDead`, `SpecUndecodable`, `WorldMismatch`,
+  `MultiHostUnsupported`, `CoordinatorNotFresh` — status + `test-hooks`
+  reason pairwise-identical across every determinant, on both the plain and
+  `--features test-hooks` lanes, counted separately; plus wire K2; plus the
+  producer→consumer `world_size` parity oracle; plus the admission-catalog-
+  fault-maps-to-`Unavailable` source-scan oracle); e1 (`api_freeze` green
+  with the gang lines; `every_rpc_is_covered` green with the new allowlist;
+  public-listener `Unimplemented` probe; the `get_job_for_rank` caller
+  oracle); f1' (a call satisfying every I-GANG determinant still ends
+  `Unimplemented` — this sub-unit has no `HostAdmission` session to hand it
+  to).
 - **lane**: hermetic + server it-suite. **depends_on**: U2b, U4a, PR-B2 merged
   (the `peer_bind` listener this mounts beside `PeerService` on). GRAPH does
   not depend_on: it is deferred to #515. **size**: M.
@@ -305,7 +332,12 @@ re-verification) on top of it.
   only after it, the guard moved into a spawned HOLD-loop future driving
   re-verification and the park-bound timer; the `select!`'s four arms —
   inbound stream, drain signal, re-verification tick, park-bound timer — no
-  fifth "quiesce" arm, since `Quiesce` is never emitted).
+  fifth "quiesce" arm, since `Quiesce` is never emitted; **carried whole from
+  U5a-1** — the `world_size > 1` conjunct U5a-1 refuses outright under
+  `GangRefusalReason::MultiHostUnsupported`: the training-set pair conjunct
+  against the already-written `training_set_ref`/`training_set_location` CAS
+  and the sidecar verify that would admit a genuine multi-host row, filed at
+  <https://github.com/f-inverse/jammi-ai/issues/566>).
 - **invariants_to_preserve**: OPS D6/D10 (a rank is not loop work; the
   release decision reads the holder kind, never `in_flight`; a peer-tier
   rolling restart costs zero net attempts), B4, K2 (a second `Assign` on an

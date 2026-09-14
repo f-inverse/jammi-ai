@@ -1265,6 +1265,95 @@ async fn register_bare_model(catalog: &Catalog, name: &str, version: i32) {
         .unwrap();
 }
 
+/// Register a model row that already carries `artifact_path` — the shape a
+/// winning finalize CAS ([`Catalog::finish_job_with_model`]) leaves behind,
+/// which `record_model_materialization`'s ordering guard (P3') now requires
+/// before it will accept a definition hash for the row.
+async fn register_finalized_model(
+    catalog: &Catalog,
+    name: &str,
+    version: i32,
+    artifact_path: &str,
+) {
+    catalog
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+            model_id: name,
+            version,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(artifact_path),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// Stamp `definition_hash` directly via SQL, bypassing
+/// `record_model_materialization`'s finalize-CAS ordering guard — simulates a
+/// hash-bearing row whose `artifact_path` was never committed (a shape the
+/// guarded write path can no longer itself produce post-fix, but which P3's
+/// read-side predicate must still exclude defensively: a stale pre-fix row,
+/// or any other writer of the column).
+async fn stamp_definition_hash_bypassing_the_finalize_guard(
+    catalog: &Catalog,
+    name: &str,
+    version: i32,
+    definition_hash: &str,
+) {
+    let name = name.to_string();
+    let definition_hash = definition_hash.to_string();
+    catalog
+        .backend_arc()
+        .transaction(jammi_db::catalog::backend::TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE models SET definition_hash = $1 WHERE name = $2 AND version = $3",
+                    &[
+                        jammi_db::catalog::backend::SqlValue::TextOwned(definition_hash),
+                        jammi_db::catalog::backend::SqlValue::TextOwned(name),
+                        jammi_db::catalog::backend::SqlValue::Int(version as i64),
+                    ],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// Stamp `input_anchors_json` directly via SQL, the anchors-leg peer of
+/// [`stamp_definition_hash_bypassing_the_finalize_guard`] — both bypass the
+/// guarded write path so a test can construct a row shape the guard itself
+/// can no longer produce.
+async fn stamp_input_anchors_bypassing_the_finalize_guard(
+    catalog: &Catalog,
+    name: &str,
+    version: i32,
+    input_anchors_json: &str,
+) {
+    let name = name.to_string();
+    let input_anchors_json = input_anchors_json.to_string();
+    catalog
+        .backend_arc()
+        .transaction(jammi_db::catalog::backend::TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE models SET input_anchors_json = $1 WHERE name = $2 AND version = $3",
+                    &[
+                        jammi_db::catalog::backend::SqlValue::TextOwned(input_anchors_json),
+                        jammi_db::catalog::backend::SqlValue::TextOwned(name),
+                        jammi_db::catalog::backend::SqlValue::Int(version as i64),
+                    ],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+}
+
 /// RED at base: a row created before migration 033 (or a model that never
 /// carries a fine-tune materialization, e.g. `ContextPredictor`) has
 /// `definition_hash IS NULL`. `NULL = $1` is never true, so such a row is
@@ -1304,7 +1393,7 @@ async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(back
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog_or_skip!(backend, dir);
     let name = unique_model_name(&dir, "fine-tuned-x");
-    register_bare_model(&catalog, &name, 1).await;
+    register_finalized_model(&catalog, &name, 1, "models/x/artifact").await;
 
     let anchors = vec![InputAnchor::result_digest(
         "training-set",
@@ -1312,13 +1401,7 @@ async fn probe_model_by_definition_finds_a_row_with_matching_pinned_anchors(back
     )];
     let anchors_json = serde_json::to_string(&anchors).unwrap();
     catalog
-        .record_model_materialization(
-            &name,
-            1,
-            "hash-a",
-            &anchors_json,
-            "models/x/materialization.json",
-        )
+        .record_model_materialization(&name, 1, "hash-a", &anchors_json)
         .await
         .unwrap();
 
@@ -1379,28 +1462,16 @@ async fn two_models_can_share_one_definition_and_the_probe_is_deterministic(back
     let anchors_json = serde_json::to_string(&anchors).unwrap();
 
     let first = unique_model_name(&dir, "fine-tuned-a");
-    register_bare_model(&catalog, &first, 1).await;
+    register_finalized_model(&catalog, &first, 1, "models/a/artifact").await;
     catalog
-        .record_model_materialization(
-            &first,
-            1,
-            "hash-shared",
-            &anchors_json,
-            "models/a/materialization.json",
-        )
+        .record_model_materialization(&first, 1, "hash-shared", &anchors_json)
         .await
         .unwrap();
 
     let second = unique_model_name(&dir, "fine-tuned-b");
-    register_bare_model(&catalog, &second, 1).await;
+    register_finalized_model(&catalog, &second, 1, "models/b/artifact").await;
     catalog
-        .record_model_materialization(
-            &second,
-            1,
-            "hash-shared",
-            &anchors_json,
-            "models/b/materialization.json",
-        )
+        .record_model_materialization(&second, 1, "hash-shared", &anchors_json)
         .await
         .unwrap();
 
@@ -1425,11 +1496,157 @@ async fn record_model_materialization_refuses_a_missing_row(backend: BackendKind
     let catalog = fresh_catalog_or_skip!(backend, dir);
     let name = unique_model_name(&dir, "never-registered");
     let err = catalog
-        .record_model_materialization(&name, 1, "hash", "[]", "models/x/materialization.json")
+        .record_model_materialization(&name, 1, "hash", "[]")
         .await
         .unwrap_err();
     assert!(
         matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
         "expected ModelNotFound, got {err:?}"
+    );
+}
+
+// ─── Fix round 1, P3'/P3 (#500): the ordered write + the servable-set read ─
+
+/// P3' — RED at 3b3f88c2 (today's `record_model_materialization` carries no
+/// `artifact_path` guard at all, so this call SUCCEEDS): recording a
+/// definition hash against a row the finalize CAS has not yet committed is a
+/// typed refusal distinct from [`jammi_db::error::JammiError::ModelNotFound`]
+/// — the row exists, so a `NotFound` would be misleading; the refusal names
+/// exactly why (`JammiError::Model`).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn record_model_materialization_refuses_a_row_the_finalize_cas_has_not_committed(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let name = unique_model_name(&dir, "not-yet-finalized");
+    register_bare_model(&catalog, &name, 1).await;
+
+    let err = catalog
+        .record_model_materialization(&name, 1, "hash", "[]")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "expected a typed Model precondition refusal (row exists but unfinalized), got {err:?}"
+    );
+    assert!(
+        !matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
+        "an existing-but-unfinalized row must never be reported as NotFound"
+    );
+
+    // The row is left exactly as it was: no definition_hash recorded.
+    let row = catalog
+        .get_model_version(&name, 1)
+        .await
+        .unwrap()
+        .expect("the row still exists");
+    assert!(
+        row.definition_hash.is_none(),
+        "a refused write must never partially apply"
+    );
+}
+
+/// P3 — RED at 3b3f88c2 (`find_models_by_definition` carries only `hash +
+/// tenant`, so a hash-bearing/unfinalized row IS returned): a row that
+/// carries `definition_hash` but whose `artifact_path` was never committed
+/// is excluded from the servable set — never a candidate `find_models_by_definition`
+/// returns, and never a `probe_model_by_definition` hit even with exactly
+/// matching anchors. Such a row can only arise from a stale pre-fix write or
+/// a defensive-in-depth attacker of the column post-fix (the guarded
+/// `record_model_materialization` can no longer itself produce this shape —
+/// see the sibling test above), so the fixture stamps the column directly.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_hash_bearing_row_with_null_artifact_path_is_never_servable(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let name = unique_model_name(&dir, "poisoned-attempt");
+    register_bare_model(&catalog, &name, 1).await;
+    stamp_definition_hash_bypassing_the_finalize_guard(&catalog, &name, 1, "hash-poison").await;
+
+    let candidates = catalog
+        .find_models_by_definition("hash-poison")
+        .await
+        .unwrap();
+    assert!(
+        candidates.is_empty(),
+        "a hash-bearing row with NULL artifact_path must never be in the servable candidate set"
+    );
+
+    let anchors = vec![InputAnchor::result_digest(
+        "training-set",
+        &ArtifactDigest::of_bytes(b"rows"),
+    )];
+    let anchors_json = serde_json::to_string(&anchors).unwrap();
+    stamp_input_anchors_bypassing_the_finalize_guard(&catalog, &name, 1, &anchors_json).await;
+    let found = catalog
+        .probe_model_by_definition("hash-poison", &anchors)
+        .await
+        .unwrap();
+    assert!(
+        found.is_none(),
+        "an unfinalized row must never be a cache-hit probe result, even with exactly matching anchors"
+    );
+}
+
+/// Item 3 — both arms of `delete_registered_model_if_unfinalized`: it removes
+/// an unfinalized (`artifact_path IS NULL`) row and reports `true`; it never
+/// touches a finalized row and reports `false`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn delete_registered_model_if_unfinalized_removes_only_the_unfinalized_arm(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+
+    // Arm A: unfinalized row is deleted.
+    let unfinalized = unique_model_name(&dir, "zombie-attempt");
+    register_bare_model(&catalog, &unfinalized, 1).await;
+    let deleted = catalog
+        .delete_registered_model_if_unfinalized(&unfinalized, 1)
+        .await
+        .unwrap();
+    assert!(deleted, "an unfinalized row must be deleted");
+    assert!(
+        catalog
+            .get_model_version(&unfinalized, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "the deleted row must no longer resolve"
+    );
+
+    // Arm B: a finalized row is never touched.
+    let finalized = unique_model_name(&dir, "won-attempt");
+    register_finalized_model(&catalog, &finalized, 1, "models/won/artifact").await;
+    let deleted = catalog
+        .delete_registered_model_if_unfinalized(&finalized, 1)
+        .await
+        .unwrap();
+    assert!(!deleted, "a finalized row must never be deleted");
+    assert!(
+        catalog
+            .get_model_version(&finalized, 1)
+            .await
+            .unwrap()
+            .is_some(),
+        "the finalized row must still resolve"
+    );
+
+    // A row that never existed is a no-op `false`, never an error.
+    let never_registered = unique_model_name(&dir, "never-registered-2");
+    let deleted = catalog
+        .delete_registered_model_if_unfinalized(&never_registered, 1)
+        .await
+        .unwrap();
+    assert!(
+        !deleted,
+        "a row that never existed is a no-op, not an error"
     );
 }

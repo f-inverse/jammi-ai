@@ -1554,9 +1554,12 @@ async fn migration_032_creates_result_table_versions(
 /// U3 (#500) — migration `033_model_materialization` is present and ordered
 /// AFTER `032_result_table_versions` (K5: relative position, never
 /// `.last()`, so the lead's renumber-on-second-merge keeps this green), adds
-/// the three NULLABLE `models` columns (`definition_hash`,
-/// `input_anchors_json`, `manifest_path`), and the
-/// `idx_models_definition_hash` cache-lookup index — on both backends.
+/// the two NULLABLE `models` columns (`definition_hash`,
+/// `input_anchors_json`), and the `idx_models_definition_hash` cache-lookup
+/// index — on both backends. `manifest_path` is deliberately absent (P7): the
+/// migration was unmerged when the fix round dropped it, so K5's append-only
+/// rule binds the ledger, not this column, and the sidecar path stays derived
+/// from the artifact prefix rather than recorded.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -1669,12 +1672,17 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
         )
         .await
         .unwrap();
-    for expected in ["definition_hash", "input_anchors_json", "manifest_path"] {
+    for expected in ["definition_hash", "input_anchors_json"] {
         assert!(
             columns.iter().any(|(c, notnull)| c == expected && !notnull),
             "models.{expected} must exist and be nullable after migration 033; got {columns:?}"
         );
     }
+    assert!(
+        columns.iter().all(|(c, _)| c != "manifest_path"),
+        "manifest_path must never exist on models (P7: dropped before merge; \
+         the sidecar path is derived from the artifact prefix, never recorded); got {columns:?}"
+    );
 
     let index_present = backend
         .transaction(

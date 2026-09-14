@@ -74,12 +74,6 @@ pub struct ModelRecord {
     /// against, mirroring `result_tables.input_anchors_json`. `None`
     /// alongside [`Self::definition_hash`].
     pub input_anchors_json: Option<String>,
-    /// Path to this model's `.materialization.json` sidecar inside its
-    /// artifact prefix (written LAST, after the bundle's own
-    /// `manifest.json`, by
-    /// [`crate::store::ArtifactStore::write_model_materialization`]). `None`
-    /// alongside [`Self::definition_hash`].
-    pub manifest_path: Option<String>,
 }
 
 /// Registry introspection for one registered model — the client-facing
@@ -138,7 +132,7 @@ pub struct RegisterModelParams<'a> {
 
 const SELECT_COLS: &str =
     "model_id, name, model_type, task, backend, version, status, metadata, artifact_path, \
-     created_at, definition_hash, input_anchors_json, manifest_path";
+     created_at, definition_hash, input_anchors_json";
 
 impl Catalog {
     /// Register or refresh a model in the catalog. The session's bound
@@ -451,25 +445,41 @@ impl Catalog {
             .await?)
     }
 
-    /// Every `models` row carrying exactly `definition_hash`, newest first —
-    /// the raw candidate set [`Self::probe_model_by_definition`] narrows with
-    /// the exact anchor match. Mirrors
+    /// Every SERVABLE `models` row carrying exactly `definition_hash`, newest
+    /// first — the raw candidate set [`Self::probe_model_by_definition`]
+    /// narrows with the exact anchor match. Mirrors
     /// [`Catalog::find_ready_result_tables_by_definition`]'s shape for
     /// `result_tables`. Tenant-scoped like every other catalog read.
     ///
-    /// `definition_hash = $1` can never match a `NULL` column (SQL's
-    /// three-valued equality), so a pre-migration or non-materialized row
-    /// (`ContextPredictor`, a directly-registered base model) is excluded by
-    /// the predicate alone — this function adds no separate `IS NOT NULL`
-    /// guard because none is load-bearing.
+    /// The predicate is `definition_hash = $1 AND artifact_path IS NOT NULL
+    /// AND (tenant_id = $2 OR tenant_id IS NULL)` — ONE predicate, both
+    /// halves load-bearing:
+    ///
+    /// - `definition_hash = $1` can never match a `NULL` column (SQL's
+    ///   three-valued equality), so a pre-migration or non-materialized row
+    ///   (`ContextPredictor`, a directly-registered base model) is excluded
+    ///   without a separate guard.
+    /// - `artifact_path IS NOT NULL` restricts the candidate set to rows the
+    ///   finalize CAS ([`Catalog::finish_job_with_model`]) has already
+    ///   committed (P3): a row a losing or still-running attempt registered
+    ///   with `definition_hash` set but no committed artifact — which would
+    ///   otherwise poison every future `cache=Use` probe for that definition
+    ///   forever, since the row never becomes servable on its own — is
+    ///   excluded from the candidate set rather than merely filtered
+    ///   downstream. A miss caused by this predicate is exactly that: a
+    ///   miss, never an error, so the caller trains.
     pub async fn find_models_by_definition(
         &self,
         definition_hash: &str,
     ) -> Result<Vec<ModelRecord>> {
         let hash = definition_hash.to_string();
         let tenant = self.current_tenant();
-        let sql =
-            format!("SELECT {SELECT_COLS} FROM models WHERE definition_hash = $1 AND (tenant_id = $2 OR tenant_id IS NULL) ORDER BY created_at DESC");
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM models \
+             WHERE definition_hash = $1 AND artifact_path IS NOT NULL \
+               AND (tenant_id = $2 OR tenant_id IS NULL) \
+             ORDER BY created_at DESC"
+        );
         Ok(self
             .backend()
             .transaction(
@@ -504,7 +514,11 @@ impl Catalog {
     /// `NULL` never matches: [`Self::find_models_by_definition`]'s own
     /// predicate already excludes every row with no recorded
     /// `definition_hash`, so a model with no materialization can never be a
-    /// cache-hit candidate. An anchor set containing an
+    /// cache-hit candidate. The candidate set is additionally restricted to
+    /// the SERVABLE set (`artifact_path IS NOT NULL`, P3) by that same
+    /// predicate, so a hash-bearing row a losing/zombie attempt left behind
+    /// is never a hit either — this function issues no SQL of its own and so
+    /// inherits both halves automatically. An anchor set containing an
     /// [`crate::store::manifest::AnchorKind::UnpinnedAtInstant`] anchor is
     /// likewise never a hit — an unpinned input's current instant proves
     /// nothing about what the training set actually was, so no recorded
@@ -556,38 +570,150 @@ impl Catalog {
     }
 
     /// Record a fine-tuned model's materialization-contract summary (the
-    /// `model_materialization` migration's three columns) — called after the
+    /// `model_materialization` migration's two columns) — called after the
     /// model's artifact prefix's `.materialization.json` sidecar has been
     /// written ([`crate::store::ArtifactStore::write_model_materialization`],
-    /// itself written LAST, after the bundle's own `manifest.json`).
+    /// itself written LAST, after the bundle's own `manifest.json`), and
+    /// only AFTER the finalize CAS ([`Catalog::finish_job_with_model`]) has
+    /// already committed this exact row's `artifact_path` (P3').
     /// Tenant-scoped with the same STRICT predicate [`Self::delete_model`]
     /// uses (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`).
     ///
-    /// Unconditional `SET` (never a `COALESCE`), unlike `artifact_path`'s
-    /// re-registration guard: a model's materialization summary is written
-    /// exactly once, by the same finalize sequence that sets its
-    /// `artifact_path`, so there is no "leave unchanged on re-registration"
-    /// case to protect here.
+    /// **The ordering guard.** `models` carries no per-attempt identity of
+    /// its own (unlike `jobs.claimed_by`/`jobs.attempts`) to bind a lease
+    /// directly against, so the predicate binds to the ONE fact only the
+    /// winning attempt's finalize CAS can have produced on this row:
+    /// `artifact_path IS NOT NULL`. `artifact_path` is written exactly once,
+    /// unconditionally, by `finish_job_with_model`'s attempt-guarded
+    /// transaction — a losing or still-running attempt's row never carries
+    /// it — so requiring it here means a losing/zombie attempt's call can
+    /// never win this `UPDATE` and leave a hash-bearing row for
+    /// [`Self::find_models_by_definition`] to have to filter out (P3): the
+    /// row simply never becomes probe-eligible in the first place.
     ///
-    /// Refuses [`JammiError::ModelNotFound`] when no row matches `model_id`
-    /// (this name), `version`, and the caller's tenant — the row must already
-    /// exist (created by [`Self::register_model`] or the finalize path) for
-    /// this to have anything to update.
+    /// Unconditional `SET` (never a `COALESCE`) for the two columns it does
+    /// write: a model's materialization summary is written exactly once, by
+    /// the same finalize sequence that already committed its `artifact_path`,
+    /// so there is no "leave unchanged on re-registration" case to protect
+    /// here.
+    ///
+    /// Refuses distinctly depending on why zero rows matched:
+    /// [`JammiError::ModelNotFound`] when no row exists at all for
+    /// `model_id` (this name), `version`, and the caller's tenant; a typed
+    /// [`JammiError::Model`] precondition failure when the row exists but
+    /// `artifact_path` is still `NULL` — the finalize CAS has not won for
+    /// this attempt yet, so recording a definition hash now would create
+    /// exactly the poisoned row P3 exists to keep unreachable.
     pub async fn record_model_materialization(
         &self,
         model_id: &str,
         version: i32,
         definition_hash: &str,
         input_anchors_json: &str,
-        manifest_path: &str,
     ) -> Result<()> {
         let tenant = self.current_tenant();
         let model_id_for_tx = model_id.to_string();
         let version_i64 = version as i64;
         let definition_hash = definition_hash.to_string();
         let input_anchors_json = input_anchors_json.to_string();
-        let manifest_path = manifest_path.to_string();
 
+        let outcome = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
+                    let affected = tx
+                        .execute(
+                            "UPDATE models SET definition_hash = $1, input_anchors_json = $2, \
+                             updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
+                             WHERE name = $3 AND version = $4 \
+                               AND (tenant_id = $5 OR (tenant_id IS NULL AND $5 IS NULL)) \
+                               AND artifact_path IS NOT NULL",
+                            &[
+                                SqlValue::TextOwned(definition_hash),
+                                SqlValue::TextOwned(input_anchors_json),
+                                SqlValue::TextOwned(model_id_for_tx.clone()),
+                                SqlValue::Int(version_i64),
+                                tenant_val.clone(),
+                            ],
+                        )
+                        .await?;
+                    if affected == 1 {
+                        return Ok(RecordMaterializationOutcome::Recorded);
+                    }
+                    // Disambiguate a missing row from an unfinalized one so
+                    // the caller gets a precise typed refusal rather than a
+                    // misleading `ModelNotFound` for a row that DOES exist.
+                    let exists = tx
+                        .query_opt(
+                            "SELECT 1 AS one FROM models \
+                             WHERE name = $1 AND version = $2 \
+                               AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))",
+                            &[
+                                SqlValue::TextOwned(model_id_for_tx),
+                                SqlValue::Int(version_i64),
+                                tenant_val,
+                            ],
+                            |row| row.get::<i32>("one"),
+                        )
+                        .await?
+                        .is_some();
+                    Ok(if exists {
+                        RecordMaterializationOutcome::RowNotYetFinalized
+                    } else {
+                        RecordMaterializationOutcome::RowAbsent
+                    })
+                })
+            })
+            .await?;
+
+        match outcome {
+            RecordMaterializationOutcome::Recorded => Ok(()),
+            RecordMaterializationOutcome::RowAbsent => Err(JammiError::ModelNotFound {
+                model_id: model_id.to_string(),
+            }),
+            RecordMaterializationOutcome::RowNotYetFinalized => Err(JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "cannot record a materialization summary before the finalize CAS \
+                          has committed artifact_path for this attempt's row"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Delete a `models` row still in its pre-finalize state — the failure-
+    /// arm cleanup for a fine-tune attempt that registered a row
+    /// ([`Self::register_model`], `artifact_path: None`) and then lost its
+    /// lease, errored, or was superseded before the finalize CAS
+    /// ([`Catalog::finish_job_with_model`]) ever ran. Named beside
+    /// [`Self::delete_model`] (the referenced-checked hard delete for a
+    /// SERVED model) as the unfinalized-row peer: this one carries no
+    /// referential scan because an unfinalized row can carry no outbound
+    /// reference yet.
+    ///
+    /// The guard is `artifact_path IS NULL` — the same fact
+    /// [`Self::record_model_materialization`]'s ordering guard requires the
+    /// OPPOSITE of. A row the finalize CAS already committed (`artifact_path`
+    /// set) is never matched, so this can never delete a servable model out
+    /// from under a concurrent reader, even called against the wrong
+    /// attempt or a job whose finalize CAS actually won the race the caller
+    /// believed it lost. Tenant-scoped with the same STRICT predicate
+    /// [`Self::delete_model`] uses.
+    ///
+    /// Returns `true` when a row was deleted, `false` when no row matched —
+    /// already deleted, already finalized, or never registered. A caller
+    /// treats `false` as a no-op, never an error: every one of those states
+    /// is already the state this call exists to converge on.
+    pub async fn delete_registered_model_if_unfinalized(
+        &self,
+        model_id: &str,
+        version: i32,
+    ) -> Result<bool> {
+        let tenant = self.current_tenant();
+        let model_id = model_id.to_string();
+        let version_i64 = version as i64;
         let affected = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
@@ -596,15 +722,11 @@ impl Catalog {
                     tx.assert_tenant_matches(tenant, "models")?;
                     let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
                     tx.execute(
-                        "UPDATE models SET definition_hash = $1, input_anchors_json = $2, \
-                         manifest_path = $3, updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE name = $4 AND version = $5 \
-                           AND (tenant_id = $6 OR (tenant_id IS NULL AND $6 IS NULL))",
+                        "DELETE FROM models WHERE name = $1 AND version = $2 \
+                           AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL)) \
+                           AND artifact_path IS NULL",
                         &[
-                            SqlValue::TextOwned(definition_hash),
-                            SqlValue::TextOwned(input_anchors_json),
-                            SqlValue::TextOwned(manifest_path),
-                            SqlValue::TextOwned(model_id_for_tx),
+                            SqlValue::TextOwned(model_id),
                             SqlValue::Int(version_i64),
                             tenant_val,
                         ],
@@ -613,14 +735,20 @@ impl Catalog {
                 })
             })
             .await?;
-
-        if affected == 0 {
-            return Err(JammiError::ModelNotFound {
-                model_id: model_id.to_string(),
-            });
-        }
-        Ok(())
+        Ok(affected == 1)
     }
+}
+
+/// In-transaction outcome of [`Catalog::record_model_materialization`]'s
+/// guarded `UPDATE`, distinguishing "no such row" from "row exists but the
+/// finalize CAS has not committed `artifact_path` yet" so the caller gets a
+/// precise typed refusal ([`JammiError::ModelNotFound`] vs
+/// [`JammiError::Model`]) rather than one error shape standing in for two
+/// distinct preconditions.
+enum RecordMaterializationOutcome {
+    Recorded,
+    RowAbsent,
+    RowNotYetFinalized,
 }
 
 /// In-transaction outcome of [`Catalog::delete_model`]'s scan-then-delete: the
@@ -734,7 +862,7 @@ async fn scan_model_references(
 }
 
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata,
-/// artifact_path, created_at, definition_hash, input_anchors_json, manifest_path
+/// artifact_path, created_at, definition_hash, input_anchors_json
 fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
     let catalog_pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
@@ -770,7 +898,6 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
     // these columns entirely (an older wire projection) still parses.
     let definition_hash: Option<String> = row.try_get("definition_hash")?;
     let input_anchors_json: Option<String> = row.try_get("input_anchors_json")?;
-    let manifest_path: Option<String> = row.try_get("manifest_path")?;
 
     Ok(ModelRecord {
         model_id: name,
@@ -786,7 +913,6 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         created_at,
         definition_hash,
         input_anchors_json,
-        manifest_path,
     })
 }
 

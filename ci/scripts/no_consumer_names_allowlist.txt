@@ -79,4 +79,4 @@ register_content_hash_udf	crates/jammi-ai/src/query/content_hash_udf.rs	c0e1faec
 # (2026-09-14, audit #8, stop rule); see issue #554 for the ruling
 # (https://github.com/f-inverse/jammi-ai/issues/554). Flagged for human
 # review at PR-B1 admin-merge, per this file's human-amend-only status.
-register_content_hash_udf	crates/jammi-ai/tests/it/pinned_source_gate.rs	6668d09bf5de82da1842297da0872fd5b1f5a8c7	#554	Appears only inside a string-literal test fixture reproducing the real registration site's source text for a falsification assertion, never as a compiled declaration in this file.
+register_content_hash_udf	crates/jammi-ai/tests/it/pinned_source_gate.rs	b1f3b4d214e73771e52ebf01b67db2baa5df5243	#554	Appears only inside a string-literal test fixture reproducing the real registration site's source text for a falsification assertion, never as a compiled declaration in this file.

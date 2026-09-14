@@ -1008,7 +1008,7 @@ fn normalized_single_batch(
 }
 
 // ---------------------------------------------------------------------------
-// #500 U4a: the data-parallel rank count across the two submit surfaces.
+// The data-parallel rank count across the two submit surfaces.
 // ---------------------------------------------------------------------------
 
 /// The one submission both surfaces make, identical in every field — so a
@@ -1146,7 +1146,7 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
 }
 
 // ---------------------------------------------------------------------------
-// U3 wire-server follow-up: `SubmitJobRequest.cache` across the two submit
+// `SubmitJobRequest.cache` across the two submit
 // surfaces.
 // ---------------------------------------------------------------------------
 

@@ -241,8 +241,10 @@ pub struct RankAdmissionRow {
     /// found it: [`Catalog::get_job_for_rank`] still returns `Ok(Some(row))`
     /// with every other column populated, and the caller (the gang admission
     /// handler) decides how to refuse it. `Err` from `get_job_for_rank`
-    /// means the read itself faulted (no such row reachable at all), never
-    /// that this row's content failed to decode.
+    /// means the read itself faulted, never that this row's `spec` failed to
+    /// decode; a malformed `lease_expires_at` is still re-parsed in SQL on
+    /// Postgres and surfaces there as `Err` (tracked at
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
     pub world_size: WorldSizeFact,
 }
 
@@ -1979,8 +1981,11 @@ impl Catalog {
     /// derived — never a second round trip, and never the caller's OWN
     /// clock standing in for the remaining-window computation (see that
     /// function's docs). `Ok(None)` when no such job exists. `Err` means the
-    /// read itself faulted — never that the row's `spec` failed to decode a
-    /// `world_size`: that outcome is a ROW FACT, represented in
+    /// read itself faulted, or — on Postgres only — that the row's
+    /// `lease_expires_at` text did not parse as a timestamp (tracked at
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>); never that the
+    /// row's `spec` failed to decode a `world_size`: that outcome is a ROW
+    /// FACT, represented in
     /// [`RankAdmissionRow::world_size`] as [`WorldSizeFact::Undecodable`],
     /// and still returned `Ok(Some(row))` with every other column populated
     /// (see that type's docs).

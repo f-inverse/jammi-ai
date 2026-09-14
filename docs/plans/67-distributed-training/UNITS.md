@@ -128,7 +128,7 @@ issue #544 and scheduled before U4b binds a per-rank reader to it.
   `fine_tune/batch_bucket.rs` (rung pinning option), the one `TrainingSetSpec` constructor
   shared by every construction site (or a field-by-field oracle asserting the sites agree),
   tests. (db) `store/mod.rs` reader slicing over the result-table `ListingTable` (no injectable
-  row-group knob: `crates/jammi-db/src/storage/writer.rs:32`'s `set_max_row_group_row_count`
+  row-group knob: `crates/jammi-db/src/storage/writer.rs::ObjectParquetWriter::open`'s `set_max_row_group_row_count`
   stays hardcoded at `65_536`; a multi-row-group fixture is simply >65,536 rows
   through that one writer).
 - **invariants_to_preserve**: K3 (scaler over the train prefix, bit-identical), K2, B6.
@@ -174,7 +174,7 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   `ResidencyBound`/`StreamConfig` shapes carried over unchanged), `fine_tune/trainer.rs` (the
   per-rank stream consumer U4b's rank body binds to), tests. No injectable row-group knob: the
   multi-row-group fixture is simply >65,536 rows written through the one existing writer
-  (`storage/writer.rs:32`'s hardcoded `set_max_row_group_row_count(Some(65_536))` — its absence
+  (`crates/jammi-db/src/storage/writer.rs::ObjectParquetWriter::open`'s hardcoded `set_max_row_group_row_count(Some(65_536))` — its absence
   of a knob is itself pinned by `default_row_group_row_count_is_65_536`); the two headline
   oracles (the residency bound and the no-`SortExec` provider plan) share ONE materialized
   fixture per test binary.
@@ -294,7 +294,7 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
   no arm reads `schedule:` at all), GREEN once this unit's P7 and its fixture land together.
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
 - **cost ceiling** (human-approved before first run, committed figures — never re-derived per
-  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md:300 — never the 2-GPU pod rate),
+  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md#units-and-order (~:305) — never the 2-GPU pod rate),
   the 2×1 shape bills $3.816/h; ≤ 1 h billed wall per run, ≤ 2 runs per authorization; label-only
   until a flake-free streak.
 
@@ -361,7 +361,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   migration, number at rebase, three pin sites incl. the ordered-after oracle in
   `crates/jammi-db/tests/it/migrations.rs` (added by U5a-1) — the same
   `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern
-  (`tests/it/migrations.rs:1284`, on `main`) repeated for this migration, cited by
+  (`crates/jammi-db/tests/it/migrations.rs::migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`, on `main`) repeated for this migration, cited by
   construct rather than by an offset on a branch this fold cannot read), `catalog/jobs_repo.rs`
   (`upsert_instance` gains `peer_addr` + a
   canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
@@ -372,25 +372,25 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   (kinds split on `,`, matched as whole tokens), and root-divergent instances; the member order is
   byte order on `instance_id`, sorted and compared in Rust — never a SQL `ORDER BY`, whose
   collation is backend-dependent; root divergence is likewise a byte-exact Rust comparison of the
-  canonicalized string, never a SQL `=`; `prune_instances`' window (`session.rs:259-261`'s call
+  canonicalized string, never a SQL `=`; `prune_instances`' window (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`'s call
   site, exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
   will return) moves to STRICTLY BEYOND the margin, so a member judged merely stale is never also
-  eligible for deletion; the lease keeper's `Instance` arm (`lease_keeper.rs:765-771`, folded into
-  the generic `Some(false) → lost` dispatch at `:826-827`) RE-UPSERTS the row on a failed touch
-  instead of only flipping `lost` — `touch_instance` (`jobs_repo.rs:1763-1779`) is a pure `UPDATE`
+  eligible for deletion; the lease keeper's `Instance` arm (`crates/jammi-db/src/catalog/lease_keeper.rs::renew_all`, folded into
+  the generic `Some(false) → lost` dispatch at `renew_all`) RE-UPSERTS the row on a failed touch
+  instead of only flipping `lost` — `touch_instance` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`) is a pure `UPDATE`
   that can never resurrect a pruned row, so a process whose row was pruned during a transient
   outage now rejoins on its next heartbeat with no restart), `config/mod.rs` (`[server]
   peer_advertise` validated at load — requires `peer_bind`; `canonicalize_result_root()`
   canonicalizes the RESOLVED result-table root — `[storage] result_root` when set, else
-  `{artifact_dir}/jammi_db` (`config/mod.rs:305-307`'s documented default, mirroring
-  `session.rs`'s `build_result_store`, `session.rs:2241-2272`) — scheme-aliased, trailing slash
+  `{artifact_dir}/jammi_db` (`crates/jammi-db/src/config/mod.rs::StorageConfig`'s documented default, mirroring
+  `session.rs`'s `build_result_store`, `crates/jammi-ai/src/session.rs::build_result_store`) — scheme-aliased, trailing slash
   trimmed, a non-existent or relative `file://` root refused at load with the row never written;
   canonical-root equality is NECESSARY, never SUFFICIENT, for shared storage — sufficiency is
   established only by the attestation VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and
   U5b-1b-i's per-partition inventory, never by this predicate alone). (ai-core) `session.rs` (the
-  ONLY production call site of `upsert_instance`, `session.rs:286-289` — gains the `peer_addr` /
-  canonicalized-`result_root` arguments; `:109-110`'s shared-`artifact_dir` topology note stays
-  configurable for a gang; `:2241-2272`'s `build_result_store` stays the one place the effective
+  ONLY production call site of `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — gains the `peer_addr` /
+  canonicalized-`result_root` arguments; `InferenceSession::open_with_placement`'s shared-`artifact_dir` topology note stays
+  configurable for a gang; `build_result_store` stays the one place the effective
   root is actually computed at runtime). (docs-ci) `docs/guide/src/{configuration.md, security.md,
   deploy-server.md, reference-topologies.md}`.
 - **invariants_to_preserve**: B6, K2 (validate chain), K5 (migration, three pin sites).

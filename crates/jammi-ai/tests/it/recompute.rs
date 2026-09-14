@@ -1049,9 +1049,8 @@ async fn reattest_with_new_digest(session: &InferenceSession, table: &str, new_b
         .unwrap();
 }
 
-// ── U2a discipline-pass addendum (#500 U3): the `TrainingSet` replay arm
-//    re-resolves a recorded PINNED anchor pinned, never silently downgrading
-//    it to unpinned ──
+// ── #500: the `TrainingSet` replay arm re-resolves a recorded PINNED
+//    anchor pinned, never silently downgrading it to unpinned ──
 //
 // `pipeline::recompute`'s `TrainingSet` arm reads the table's own recorded
 // `input_anchors` and re-anchors every relation they name at replay time.
@@ -1059,12 +1058,12 @@ async fn reattest_with_new_digest(session: &InferenceSession, table: &str, new_b
 // regardless of the recorded anchor's own kind — harmless while every
 // training-set input actually recorded was itself unpinned (the only shape
 // `materialize_projection` ever wrote), but a latent bug the moment ANY
-// producer records a PINNED input on a `TrainingSet`-kind table, which U3
-// makes possible for the first time (`ProducingDescriptor::FineTune`
-// anchors the training set it trained from by content digest). These tests
+// producer records a PINNED input on a `TrainingSet`-kind table:
+// `ProducingDescriptor::FineTune` makes that possible for the first time,
+// anchoring the training set it trained from by content digest. These tests
 // exercise `recompute_training_set`'s anchor handling directly via a
-// hand-forged manifest fixture — the addendum's own stated method — rather
-// than requiring an end-to-end pinned-source production path.
+// hand-forged manifest fixture rather than requiring an end-to-end
+// pinned-source production path.
 
 /// Overwrite a table's `.materialization.json` sidecar's `input_anchors` —
 /// the addendum test fixture: forges the ONE thing under test (the recorded

@@ -465,7 +465,7 @@ impl InferenceSession {
     /// Every anchor `materialize_projection` itself records today is
     /// [`AnchorKind::UnpinnedAtInstant`] — but the recorded `input_anchors` this
     /// function reads come from the table's own `.materialization.json`
-    /// sidecar, and `ProducingDescriptor::FineTune` (U3) is the first producer
+    /// sidecar, and `ProducingDescriptor::FineTune` is the first producer
     /// to anchor a `TrainingSet`-kind table by its content digest
     /// ([`AnchorKind::ResultDigest`]) rather than by an unpinned read instant.
     /// A future producer over a *versioned* source ([`AnchorKind::MutableVersion`])

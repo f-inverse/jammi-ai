@@ -1152,6 +1152,7 @@ impl JobWorker {
                 // lease-lost and the cancel-requested arm below.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
+                    &*session.result_store(),
                     catalog.current_tenant(),
                     &job_id,
                     &self.worker_id,
@@ -1195,6 +1196,7 @@ impl JobWorker {
                 // failure — none of which ever produced a `TrainedArtifact`.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
+                    &*session.result_store(),
                     catalog.current_tenant(),
                     &job_id,
                     &self.worker_id,
@@ -1300,6 +1302,7 @@ impl JobWorker {
                         // reclaim path for every terminating arm, unit 348 F1/F2).
                         Self::gc_epoch_checkpoints(
                             &store,
+                            refs,
                             tenant,
                             job_id,
                             &self.worker_id,
@@ -1346,6 +1349,7 @@ impl JobWorker {
             if dir.is_some() {
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1404,6 +1408,7 @@ impl JobWorker {
                         .await;
                         Self::gc_epoch_checkpoints(
                             &store,
+                            refs,
                             tenant,
                             job_id,
                             &self.worker_id,
@@ -1429,6 +1434,7 @@ impl JobWorker {
                         .await;
                         Self::gc_epoch_checkpoints(
                             &store,
+                            refs,
                             tenant,
                             job_id,
                             &self.worker_id,
@@ -1452,8 +1458,11 @@ impl JobWorker {
                 pending_record = Some((definition_hash.clone(), input_anchors_json.clone()));
             }
             // `GraphFineTune` / a context predictor: no materialization to
-            // record (`ProducingDescriptor::FineTune` covers only the
-            // column-source `FineTune` kind at this commit).
+            // record. `ProducingDescriptor::FineTune` covers only the
+            // column-source `FineTune` kind — `GraphFineTune` has no `cache`
+            // field to probe at all (it is unrepresentable on that variant,
+            // see `TrainingSpec`'s own doc), so there is never anything to
+            // record here for it.
             None => {}
         }
 
@@ -1531,6 +1540,7 @@ impl JobWorker {
                     .await;
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1611,6 +1621,7 @@ impl JobWorker {
                 if !epoch_checkpoints.is_empty() {
                     Self::gc_epoch_checkpoints_by_index(
                         &store,
+                        refs,
                         tenant,
                         job_id,
                         &self.worker_id,
@@ -1633,6 +1644,7 @@ impl JobWorker {
                     .await;
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1651,6 +1663,7 @@ impl JobWorker {
                     .await;
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1692,16 +1705,16 @@ impl JobWorker {
     /// immediately, before even the trivial `attempt.to_string()` allocation,
     /// so a legacy/default job's terminating arm issues ZERO store requests
     /// (F1: an opt-in blast radius, not a tax on every job). For an ENABLED
-    /// job, [`ArtifactStore::delete_epoch_checkpoint`] is already a no-op for
-    /// any index that was never written (an absent manifest is "nothing
-    /// durable to reclaim", not an error — the same rule
-    /// [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping the
-    /// full `[0, epochs)` configured range costs at most `epochs` no-op reads
-    /// beyond whatever indices actually existed — correct regardless of how
-    /// far training got, or whether it ever ran a single epoch boundary. This
-    /// O(epochs) failure-path reclaim cost is the accepted price of "opt-in,
-    /// bounded, and never silent" — see [`Self::gc_epoch_checkpoints_by_index`]
-    /// for the one-warning-per-sweep diagnostic.
+    /// job, an index that was never written is already a no-op (an absent
+    /// manifest is "nothing durable to reclaim", not an error — the same
+    /// rule [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping
+    /// the full `[0, epochs)` configured range costs at most `epochs` no-op
+    /// reads beyond whatever indices actually existed — correct regardless
+    /// of how far training got, or whether it ever ran a single epoch
+    /// boundary. This O(epochs) failure-path reclaim cost is the accepted
+    /// price of "opt-in, bounded, and never silent" — see
+    /// [`Self::gc_epoch_checkpoints_by_index`] for the one-warning-per-sweep
+    /// diagnostic and the referenced-vs-reclaimed accounting.
     ///
     /// This is the ONE reclaim path (family E, the term that grows — every
     /// reclaimed/failed attempt's per-epoch storage — must be bounded, not
@@ -1713,67 +1726,117 @@ impl JobWorker {
     /// [`jammi_db::catalog::jobs_repo::EpochCheckpointRow`]).
     async fn gc_epoch_checkpoints(
         store: &ArtifactStore,
+        refs: &dyn PrefixReferences,
         tenant: Option<TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: u32,
         epoch_checkpoint_bound: usize,
-    ) {
+    ) -> EpochCheckpointSweep {
         if epoch_checkpoint_bound == 0 {
-            return;
+            return EpochCheckpointSweep::default();
         }
         Self::gc_epoch_checkpoints_by_index(
             store,
+            refs,
             tenant,
             job_id,
             worker_id,
             attempt,
             0..epoch_checkpoint_bound,
         )
-        .await;
+        .await
     }
 
     /// The shared epoch-index sweep both [`Self::gc_epoch_checkpoints`] (a
     /// full `[0, bound)` range) and `publish_and_finalize`'s winner arm (the
     /// specific stale indices a persistently-failed mid-run prune left
-    /// behind, unit 348 F2) drive. Attempts a best-effort delete of every
-    /// index in `epochs`; if ANY fail, emits exactly ONE `tracing::warn!`
-    /// naming the job/worker/attempt and the failed-vs-attempted count —
-    /// never zero (a silently-swallowed sweep failure) and never one warning
-    /// per failed delete (a warning storm when the whole store is down for
-    /// this attempt).
+    /// behind, unit 348 F2) drive. For every index in `epochs`, computes the
+    /// EXACT checkpoint prefix ([`ArtifactStore::epoch_checkpoint_prefix`])
+    /// and consults the guarded [`PrefixReferences`] port on THAT prefix —
+    /// never the unguarded `ArtifactStore::delete_epoch_checkpoint` /
+    /// `delete_artifact_prefix` primitives directly — before ever deleting a
+    /// byte: a RETAINED checkpoint gets its own `models` row whose
+    /// `artifact_path` equals this exact prefix (the winning finalize CAS
+    /// inserts one such row per retained checkpoint), so an unguarded delete
+    /// here could remove bytes a live row still names. A `Referenced`
+    /// refusal is expected and unremarkable here (this sweep's own caller,
+    /// `publish_and_finalize`'s winner arm, only ever targets the STALE
+    /// indices already excluded from `retained` — see that call site's own
+    /// doc), never escalated: it means the checkpoint survives and this
+    /// sweep leaves it alone, counted and logged, never a hard failure. Any
+    /// OTHER error counts as a failed delete; if ANY fail, emits exactly ONE
+    /// `tracing::warn!` naming the job/worker/attempt and the failed-vs-
+    /// attempted count — never zero (a silently-swallowed sweep failure) and
+    /// never one warning per failed delete (a warning storm when the whole
+    /// store is down for this attempt).
     async fn gc_epoch_checkpoints_by_index(
         store: &ArtifactStore,
+        refs: &dyn PrefixReferences,
         tenant: Option<TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: u32,
         epochs: impl Iterator<Item = usize>,
-    ) {
+    ) -> EpochCheckpointSweep {
         let attempt_str = attempt.to_string();
-        let mut attempted = 0usize;
-        let mut failed = 0usize;
+        let mut summary = EpochCheckpointSweep::default();
         for epoch in epochs {
-            attempted += 1;
-            if store
-                .delete_epoch_checkpoint(tenant.as_ref(), job_id, worker_id, &attempt_str, epoch)
-                .await
-                .is_err()
-            {
-                failed += 1;
+            summary.attempted += 1;
+            let prefix = match store.epoch_checkpoint_prefix(
+                tenant.as_ref(),
+                job_id,
+                worker_id,
+                &attempt_str,
+                epoch,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    summary.failed += 1;
+                    tracing::debug!(
+                        job_id = %job_id,
+                        worker_id = %worker_id,
+                        attempt,
+                        epoch,
+                        error = %e,
+                        "epoch-checkpoint GC sweep: could not compute this index's prefix"
+                    );
+                    continue;
+                }
+            };
+            match refs.delete_unreferenced_prefix(&prefix).await {
+                Ok(()) => {}
+                Err(JammiError::Storage(StorageError::Referenced { count, .. })) => {
+                    summary.retained += 1;
+                    tracing::debug!(
+                        job_id = %job_id,
+                        worker_id = %worker_id,
+                        attempt,
+                        epoch,
+                        referenced_by = count,
+                        "epoch-checkpoint GC sweep: a live models row still names this \
+                         checkpoint; leaving its bytes in place"
+                    );
+                }
+                Err(_) => {
+                    summary.failed += 1;
+                }
             }
         }
-        if failed > 0 {
+        if summary.failed > 0 {
             tracing::warn!(
                 job_id = %job_id,
                 worker_id = %worker_id,
                 attempt,
-                failed,
-                attempted,
-                "epoch-checkpoint GC sweep: {failed} of {attempted} delete(s) failed — those \
-                 bytes remain durable but unreachable by this sweep"
+                failed = summary.failed,
+                attempted = summary.attempted,
+                "epoch-checkpoint GC sweep: {} of {} delete(s) failed — those \
+                 bytes remain durable but unreachable by this sweep",
+                summary.failed,
+                summary.attempted
             );
         }
+        summary
     }
 
     /// Run a claimed compute-kind job (`neighbor_graph`/`propagate`/
@@ -1987,7 +2050,7 @@ impl JobWorker {
                         loader.format().format_tag()
                     ))));
                 }
-                // U3: the `ProducingDescriptor::FineTune` materialization
+                // The `ProducingDescriptor::FineTune` materialization
                 // identity — the training-set table's own definition hash,
                 // artifact digest and row count, binding this fine-tune to
                 // the EXACT materialised `TrainingSet` it trained from (see
@@ -2288,7 +2351,7 @@ impl JobWorker {
             WorkerJobError::Failed("Base model does not support embeddings".into())
         })?;
 
-        // U3: the `ProducingDescriptor::FineTune` materialization identity is
+        // The `ProducingDescriptor::FineTune` materialization identity is
         // built HERE, while the model guard is still held (the identity needs
         // the loaded model's backend/precision/digest/quantization — the SAME
         // uniform path `pipeline::embedding`'s `embedding_definition` already
@@ -3329,7 +3392,7 @@ struct FineTuneRun {
     loader: TrainingDataLoader,
     /// Set ONLY for the column-source `TrainingSpec::FineTune` kind — see
     /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
-    /// carries `None` here at this commit.
+    /// carries `None` here.
     materialization_source: Option<FineTuneMaterializationSource>,
     /// The reuse dial `TrainingSpec::FineTune` carries at its own top
     /// level, not on `TrainingCommon` — `TrainingSpec::GraphFineTune`
@@ -3348,10 +3411,10 @@ struct FineTuneRun {
 /// fields (`task`, `common`) do not already carry.
 ///
 /// `ProducingDescriptor::FineTune` covers only the column-source `FineTune`
-/// kind at this commit (its own doc in `jammi_db::store::manifest`): a graph
-/// fine-tune's sampled-pairs training set has no recorded fine-tune-level
-/// reuse key, so [`FineTuneRun::materialization_source`] is `None` for that
-/// kind and its model row carries no materialization.
+/// kind (its own doc in `jammi_db::store::manifest`): a graph fine-tune's
+/// sampled-pairs training set has no recorded fine-tune-level reuse key, so
+/// [`FineTuneRun::materialization_source`] is `None` for that kind and its
+/// model row carries no materialization.
 struct FineTuneMaterializationSource {
     /// The registered source the rows were projected from — folds into
     /// `spec_canonical`.
@@ -3501,6 +3564,25 @@ impl ModelRegistration {
 /// the same prefix and no object is overwritten. Only top-level files are
 /// published (the trainer's checkpoint subdirectories are training scratch, not
 /// part of the served artifact).
+///
+/// **The layout invariant every `models/**` byte-deleter's guard depends
+/// on**: every object this worker ever publishes under a `models/**`
+/// attempt prefix sits either directly IN the attempt directory this
+/// function writes to (this bundle's own files, plus `manifest.json` and,
+/// for a fresh materialization, `materialization.json` — never in a
+/// subdirectory of it) or directly inside an epoch-checkpoint directory
+/// that is its OWN `models` row
+/// ([`ArtifactStore::put_epoch_checkpoint`]/[`ArtifactStore::epoch_checkpoint_prefix`]),
+/// or under the one exempt sibling namespace, `{job_id}/_resume`
+/// ([`ArtifactStore::put_resume_checkpoint`]). `ResultStore::
+/// prefix_is_referenced`'s predicate checks containment exactly ONE level
+/// deep by construction (its own doc) precisely because this invariant
+/// holds — reading `dir` non-recursively here (`entry.file_type()?.
+/// is_file()` skips any subdirectory outright) is this function's own half
+/// of keeping it true; proven directly by an executed test that walks the
+/// physical object tree a real run publishes and asserts every file's
+/// immediate parent is a known row's `artifact_path`
+/// (`fine_tune_materialization::every_published_object_sits_flat_under_its_own_row`).
 async fn publish_artifact(
     store: &ArtifactStore,
     tenant: Option<TenantId>,
@@ -3524,8 +3606,29 @@ async fn publish_artifact(
         .await
 }
 
-/// The narrow port the worker's abandon path reaches the ONE guarded
-/// `models/**` byte-delete through — never the
+/// The tally [`JobWorker::gc_epoch_checkpoints_by_index`] returns: how many
+/// indices it was asked to sweep, how many it actually deleted (implied —
+/// `attempted - retained - failed`), how many it left in place because the
+/// guarded [`PrefixReferences`] port reported a live `models` row still
+/// naming that exact checkpoint, and how many it could not delete for any
+/// other reason. Every field is a plain count, never a row identity — the
+/// same disclosure discipline [`ResultStore::prefix_is_referenced`] itself
+/// keeps.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EpochCheckpointSweep {
+    /// Indices this sweep was asked to reclaim.
+    attempted: usize,
+    /// Indices the guard reported as still referenced by a live `models`
+    /// row — left in place, not an error.
+    retained: usize,
+    /// Indices whose delete failed for a reason other than being
+    /// referenced.
+    failed: usize,
+}
+
+/// The narrow port the worker's abandon path AND
+/// [`JobWorker::gc_epoch_checkpoints_by_index`]'s sweep reach the ONE
+/// guarded `models/**` byte-delete through — never the
 /// unguarded [`ArtifactStore::delete_artifact_prefix`] primitive directly.
 /// Implemented by [`ResultStore`], whose
 /// [`ResultStore::delete_unreferenced_prefix`] consults the admin-scoped
@@ -8014,6 +8117,118 @@ mod tests {
                 .is_none(),
             "the abandoning attempt's own unfinalized row must still be reaped even though its \
              bytes were refused"
+        );
+    }
+
+    /// [`JobWorker::gc_epoch_checkpoints_by_index`]'s guard consult, driven
+    /// through the same store/catalog wiring as the reuse-collision test
+    /// above: an epoch checkpoint whose bytes a live `models` row names
+    /// (fabricated directly — a real finalize CAS registers exactly this
+    /// shape for every RETAINED checkpoint) survives the sweep and is
+    /// counted `retained`, never `failed`; a checkpoint no row names (the
+    /// stale shape a persistently-failed mid-run prune leaves behind) is
+    /// reclaimed.
+    ///
+    /// Mutation: reverting `gc_epoch_checkpoints_by_index` to call the
+    /// unguarded `ArtifactStore::delete_epoch_checkpoint` directly (its
+    /// shape before this property) deletes the retained checkpoint's bytes
+    /// out from under its own live row — this test's `fetch_artifact` on
+    /// the retained prefix then fails, killing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_epoch_checkpoints_by_index_retains_a_referenced_checkpoint_and_reclaims_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+        let store = session.artifact_store();
+        let result_store = session.result_store();
+        let refs: &dyn PrefixReferences = &*result_store;
+
+        let job_id = "fake-epoch-sweep-job";
+        let worker_id = "fake-worker";
+        let attempt_str = "1";
+
+        // Epoch 0: the RETAINED shape — its own `models` row names this
+        // exact checkpoint prefix, exactly as the winning finalize CAS
+        // registers for every retained checkpoint (unit 348, CONTRACT item
+        // 4).
+        let retained_prefix = store
+            .put_epoch_checkpoint(
+                None,
+                job_id,
+                worker_id,
+                attempt_str,
+                0,
+                &[(
+                    "adapter.bin".to_string(),
+                    bytes::Bytes::from_static(b"epoch-0-weights"),
+                )],
+            )
+            .await
+            .unwrap();
+        // Epoch 1: the STALE shape — durable bytes with no row naming them
+        // (a persistently-failed mid-run prune, unit 348 F2).
+        let stale_prefix = store
+            .put_epoch_checkpoint(
+                None,
+                job_id,
+                worker_id,
+                attempt_str,
+                1,
+                &[(
+                    "adapter.bin".to_string(),
+                    bytes::Bytes::from_static(b"epoch-1-weights"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        session
+            .catalog()
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "epoch-0-checkpoint",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: Some(retained_prefix.as_str()),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        let summary = JobWorker::gc_epoch_checkpoints_by_index(
+            &store,
+            refs,
+            None,
+            job_id,
+            worker_id,
+            1,
+            0..2,
+        )
+        .await;
+
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(
+            summary.retained, 1,
+            "the referenced epoch checkpoint must be reported retained, not silently skipped"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "a referenced checkpoint is an expected outcome, never a failure"
+        );
+
+        // The referenced checkpoint's bytes survive.
+        store
+            .fetch_artifact(&retained_prefix)
+            .await
+            .expect("a checkpoint a live models row names must survive the sweep");
+
+        // The unreferenced checkpoint's bytes are reclaimed.
+        let reclaimed = store.fetch_artifact(&stale_prefix).await;
+        assert!(
+            reclaimed.is_err(),
+            "an unreferenced epoch checkpoint must be reclaimed by the sweep"
         );
     }
 

@@ -252,15 +252,12 @@ def main() -> None:
                     help="connect() target — file:// for the embedded CPU engine "
                          "(a fresh temp catalog is used if omitted).")
     args = ap.parse_args()
-    with tempfile.TemporaryDirectory() as catalog, tempfile.TemporaryDirectory() as work:
-        db = jammi.connect(args.target or f"file://{catalog}")
-        # closed BEFORE `catalog` is removed: a live embedded engine keeps
-        # writing its catalog, so a cleanup racing it fails with ENOTEMPTY
-        # (Errno 39 on Linux). Drop is not a release here.
-        try:
-            emit(db, Path(work))
-        finally:
-            db.close()
+    with (
+        tempfile.TemporaryDirectory() as catalog,
+        tempfile.TemporaryDirectory() as work,
+        jammi.connect(args.target or f"file://{catalog}") as db,
+    ):
+        emit(db, Path(work))
 
 
 if __name__ == "__main__":

@@ -35,7 +35,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{now_sortable, BackendError, BackendKind, Row, SqlValue, TxOptions};
-use super::lease::{lease_deadline_expr, lease_expired_clause, stale_before_clause};
+use super::lease::{
+    instance_liveness_margin, lease_deadline_expr, lease_expired_clause, stale_before_clause,
+};
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
 use crate::error::{JammiError, Result};
@@ -1678,7 +1680,7 @@ impl Catalog {
                     // a still-pending acceleration_report (esc-075) — see
                     // `JobRecord::acceleration_report`'s lifecycle section.
                     {
-                        let margin = lease.saturating_mul(2);
+                        let margin = instance_liveness_margin(lease);
                         let mut params: Vec<SqlValue<'static>> = vec![
                             SqlValue::TextOwned(failed.clone()),
                             SqlValue::TextOwned(inline_error.clone()),

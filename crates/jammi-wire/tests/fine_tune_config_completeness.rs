@@ -3,17 +3,13 @@
 //! Every field of [`FineTuneConfig`] is named below — no `..` — so a field
 //! appended to the struct fails THIS FILE to compile until it is bound (and
 //! used) here too. This is the lever the descriptor's canonical-encoding
-//! producer (`jammi-ai`'s `spec_canonical`, CONTRACT U3) depends on: a
+//! producer (`jammi-ai`'s `spec_canonical`) depends on: a
 //! `FineTuneConfig` field that could silently escape a no-`..` destructuring
 //! could silently escape the canonical encoding the fine-tune producer's
 //! identity hash folds, two differently-configured runs colliding on one
 //! hash. Proving the lever independently of that producer (rather than only
 //! inside it) means a future field addition is caught here even before the
 //! producer itself is touched.
-//!
-//! CONTRACT U3 names the `TrainingCommon` / `TrainingSpec` half of this same
-//! completeness burden as `jammi-ai`'s to cover; this file is the `jammi-wire`
-//! half over `FineTuneConfig` alone.
 
 use jammi_wire::fine_tune::{
     ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,

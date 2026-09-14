@@ -170,12 +170,25 @@ differed from that target, by exactly the resolutions below.
 
 `cargo build --tests --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo fmt --all -- --check`, `cargo test --workspace --no-fail-fast` (hermetic; no `JAMMI_TEST_PG_URL`),
-and every `ci.yml` guard-matrix command (86 entries, run through PyYAML) on both `main` and this head.
-The rigor record concatenates the three units' gate-state rows and the closers taken at this head:
-a `pressure-tester` pass over this consolidation and an `oracle` PASS (the oracle record's `head_sha` tree
-equals the head outside `docs/rigor/**`). No further adversarial round was opened on the consolidated head:
-each unit's closing audit ended with its findings filed (#573, #574, #566, #562) under the program's closing
-rule, and the consolidation's own changes are the ten resolutions above.
+and the `ci.yml` guard matrix (86 commands, extracted with PyYAML), run in a detached probe worktree at each
+head. **Stated as measured, not as claimed:** the first local matrix run reported 86/86 green while having
+executed only 21 commands — a guard read the runner's own stdin and swallowed the remaining command list —
+and CI at `4bbc4a9a` caught what it had skipped (the citation resolver: 17 `path:line` citations the moved
+code left stale in `docs/maintainer/MAINTAINER-GUIDE.md` and two `jammi-ai` test doc comments, re-resolved
+at `fb7da367`). With the runner fixed (`</dev/null` per command), `main` @ `4c31ef9e` ran 86/86 with one
+failure and this head ran 86/86 with one failure — the same one: the matrix entry that carries a GitHub
+`${{ ... }}` expression the shell cannot expand; run with CI's own `JAMMI_CI_UNIT_HEAD_SHA`/`_BASE_SHA` set,
+`ci/scripts/perf/test_frontend_ab_artifact.py` passes at this head (exit 0). CI's own run of the full matrix
+at `fb7da367` is green except the two guards that read the committed rigor and oracle records, which are
+green once those records land.
+
+The rigor record concatenates the three units' gate-state rows and the closers taken on the consolidated
+head: a `pressure-tester` pass over this consolidation (REFINE at `c0ec5027`: every C1–C9 premise
+reproduced; its one block — this record's own omission of C10 — and two attribution advisories fixed at
+`4bbc4a9a`) and an `oracle` PASS (the oracle record's `head_sha` tree equals the head outside
+`docs/rigor/**`). No further adversarial round was opened on the consolidated head: each unit's closing
+audit ended with its findings filed (#573, #574, #566, #562) under the program's closing rule, and the
+consolidation's own changes are the ten resolutions above.
 
 ## Residuals recorded UNCOVERED
 

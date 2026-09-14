@@ -1185,3 +1185,168 @@ async fn holding_chunk_k_while_asking_for_k_plus_1_does_not_hang() {
         result.unwrap().unwrap();
     }
 }
+
+/// A tiny 7-row `anchor, positive` table, materialised and streamed —
+/// `train_count = 7` is NOT a multiple of `W·B` for any of `W ∈ {1, 2, 4}` at
+/// `per_rank_batch = 3` (mirrors `data.rs`'s unit-level
+/// `partition_rule_multiset_matches_the_w1_batch_with_zero_row_ranks`
+/// fixture exactly, so the two tests probe the SAME property on the two
+/// arms).
+async fn stream_seven_row_pairs_loader(dir: &TempDir) -> TrainingDataLoader {
+    let path = dir.path().join("seven_pairs.csv");
+    let mut lines = String::from("anchor,positive\n");
+    for i in 0..7 {
+        lines.push_str(&format!("a{i},p{i}\n"));
+    }
+    std::fs::write(&path, lines).unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "seven-pairs",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", path.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+    let (table, _eager) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "seven-pairs",
+        &columns,
+        ModelTask::TextEmbedding,
+        "pairs",
+    )
+    .await
+    .unwrap();
+    assert_eq!(table.record.row_count, 7);
+    TrainingDataLoader::from_training_set_stream(
+        session,
+        table,
+        columns,
+        ModelTask::TextEmbedding,
+        TrainingFormat::Pairs,
+        StreamConfig {
+            batch: 3,
+            prefetch: 2,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Item 1 (CONTRACT-U2b-fix1.md fold): the multiset oracle (b) — pinned at
+/// the unit level for a `TextRows` loader by `data.rs`'s
+/// `partition_rule_multiset_matches_the_w1_batch_with_zero_row_ranks` — runs
+/// on the `Stream` arm too. The `Stream` arm accepts only rank 0 of world 1
+/// (`text_chunk_for_rank`'s `spec.world != 1 || spec.rank != 0` refusal —
+/// U4b owns the per-rank stream a genuinely larger world needs), so at W = 1
+/// this asserts the SAME property the `TextRows` oracle pins — every step's
+/// `Stream` chunk equals an INDEPENDENT eager reference over the identical
+/// rows, and a step past the train prefix is the well-formed zero-row K2
+/// edge — while at W ∈ {2, 4} this asserts the TYPED refusal fires instead
+/// of silently reading rank 0's rows for every rank.
+///
+/// RED at 92531ce2: this test does not exist there — neither the W=1 Stream
+/// vs. eager-reference parity nor the W>1 typed-refusal assertion was ever
+/// driven against a genuine `Stream` loader (the existing unit-level oracle
+/// only drives `TextRows`). The Stream arm's `world != 1` refusal ALREADY
+/// exists at 92531ce2 (it predates this fold) — this test is what proves it
+/// dying when removed (see the sibling `world_refusal_dies_if_removed`
+/// mutation note below), not a claim that the refusal itself is new here.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_arm_multiset_matches_the_w1_batch_and_refuses_world_greater_than_one() {
+    let dir = TempDir::new().unwrap();
+    let loader = stream_seven_row_pairs_loader(&dir).await;
+
+    // Independent W=1 reference: the SAME 7 rows, built straight from
+    // literals rather than read back through any producer/reader path the
+    // Stream arm itself uses — a genuinely independent oracle.
+    let reference = TrainingDataLoader::from_pairs(
+        (0..7).map(|i| (format!("a{i}"), format!("p{i}"))).collect(),
+    );
+
+    fn anchors_of(chunk: &jammi_ai::fine_tune::data::TextChunk) -> Vec<String> {
+        match chunk {
+            jammi_ai::fine_tune::data::TextChunk::Pairs { anchors, .. } => anchors.clone(),
+            other => panic!("expected a Pairs chunk, got {other:?}"),
+        }
+    }
+
+    let w1 = PartitionSpec {
+        rank: 0,
+        world: 1,
+        batch: 3,
+        rule: PartitionRule::BlockByGlobalBatch,
+    };
+    let (stream_chunks, reference_chunks) = tokio::task::spawn_blocking(move || {
+        let mut stream_chunks = Vec::new();
+        let mut reference_chunks = Vec::new();
+        // Steps 0, 1, 2 hold real rows (3, 3, 1); step 3 is the zero-row K2
+        // edge, asserted explicitly right after the loop.
+        for step in 0..3usize {
+            let s = loader.text_chunk_for_rank(&w1, step).unwrap();
+            let r = reference.text_chunk_for_rank(&w1, step).unwrap();
+            stream_chunks.push(anchors_of(&s));
+            reference_chunks.push(anchors_of(&r));
+        }
+        let past_end = loader.text_chunk_for_rank(&w1, 3).unwrap();
+        assert!(
+            past_end.row_count() == 0,
+            "a step past the 7-row train prefix at batch 3 must be the well-formed zero-row \
+             K2 edge on the Stream arm too, got {} rows",
+            past_end.row_count()
+        );
+        (stream_chunks, reference_chunks)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        stream_chunks, reference_chunks,
+        "the Stream arm's W=1 rows must equal the independent eager reference's, step for step"
+    );
+    assert!(
+        stream_chunks.iter().any(|c| c.len() < 3),
+        "train_count=7 at batch=3 must hit a short (not-a-multiple-of-B) step for this \
+         property to be non-trivial, and none did"
+    );
+
+    // W ∈ {2, 4}: the Stream arm refuses rather than silently reading rank
+    // 0's rows for every rank — U4b's per-rank stream is what a genuinely
+    // larger world needs; this unit does not invent that capability. The
+    // refusal fires BEFORE any I/O (checked ahead of the stream's internal
+    // state), so ONE loader instance safely serves every (world, rank) pair
+    // below — a fresh session per check is unnecessary and would only add
+    // I/O this assertion does not need.
+    let refusal_dir = TempDir::new().unwrap();
+    let refusal_loader = stream_seven_row_pairs_loader(&refusal_dir).await;
+    for world in [2usize, 4usize] {
+        for rank in 0..world {
+            let spec = PartitionSpec {
+                rank,
+                world,
+                batch: 3,
+                rule: PartitionRule::BlockByGlobalBatch,
+            };
+            match refusal_loader.text_chunk_for_rank(&spec, 0) {
+                Err(e) => assert!(
+                    e.to_string().contains("supports only rank 0 of world 1"),
+                    "world={world} rank={rank}: expected the typed Stream-arm world refusal, \
+                     got: {e}"
+                ),
+                Ok(_) => panic!(
+                    "world={world} rank={rank}: the Stream arm must refuse W>1 rather than \
+                     silently reading rank 0's rows for every rank"
+                ),
+            }
+        }
+    }
+}

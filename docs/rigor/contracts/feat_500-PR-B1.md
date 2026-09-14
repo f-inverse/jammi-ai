@@ -607,7 +607,7 @@ agent read it verbatim, quoted here inside a fence rather than retyped as a bare
 Measured with this exact function, compiled verbatim (not a
 transcription), over both `src` trees at this head: 22 code lines get
 blanked as if they were comments and 12 real `//` comment lines are left
-completely unblanked, across `storage/config.rs:555`/`:619`,
+completely unblanked, across `crates/jammi-db/src/storage/config.rs` (its two single-line raw strings),
 `config/tests.rs`, `config/secret.rs`, and `sql/ident.rs` -- the complete
 set.
 ```

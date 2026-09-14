@@ -522,21 +522,28 @@ mod tests {
     // ─── `fine_tune_spec_canonical` / `fine_tune_spec_from_canonical` ──────
 
     /// Every field [`fine_tune_spec_canonical`] folds, carried as a fixture
-    /// whose shape the tests below destructure WITHOUT `..` — a field added
-    /// to `TrainingSpec::FineTune`/`TrainingCommon` fails to compile here
-    /// instead of silently escaping the canonical encoding (K7, restated over
-    /// the `jammi-ai`-owned producer; `ProducingDescriptor::FineTune`'s own
-    /// completeness test in `jammi-db` covers the descriptor's own fields).
+    /// whose shape [`canonical_of`] destructures WITHOUT `..` — a field added
+    /// to `TrainingSpec::FineTune`'s own top level fails to compile here
+    /// (`ProducingDescriptor::FineTune`'s own completeness test in `jammi-db`
+    /// covers the descriptor's own fields). `common` holds the REAL
+    /// [`TrainingCommon`] rather than a hand-copied mirror of its fields: a
+    /// mirror struct can drift from the type it stands in for — adding a
+    /// field to `TrainingCommon` compiles a hand-copied proxy clean, so a new
+    /// hash-relevant field can silently never enter the fine-tune definition
+    /// hash (K7's own failure mode, caught by an executed falsification: a
+    /// field added to the real `TrainingCommon`, with every real
+    /// construction site fixed, must fail to compile HERE until named).
+    /// Composing the real type instead makes [`canonical_of`]'s destructure
+    /// of `common` the single completeness check for both the top-level spec
+    /// fields and every `TrainingCommon` field, restated over the
+    /// `jammi-ai`-owned producer (K7).
     #[derive(Clone)]
     struct CanonicalFields {
         source: String,
         columns: Vec<String>,
         method: FineTuneMethod,
         task: ModelTask,
-        base_model: String,
-        config: FineTuneConfig,
-        world_size: u32,
-        cache: CachePolicy,
+        common: TrainingCommon,
     }
 
     /// A base fixture whose every field is a non-default, distinguishable
@@ -548,27 +555,34 @@ mod tests {
             columns: vec!["abstract".into(), "claims".into()],
             method: FineTuneMethod::Lora,
             task: ModelTask::TextEmbedding,
-            base_model: "local:tiny".into(),
-            config: FineTuneConfig {
-                lora_rank: 8,
-                keep_last_n_checkpoints: Some(3),
-                ..FineTuneConfig::default()
+            common: TrainingCommon {
+                base_model: "local:tiny".into(),
+                config: FineTuneConfig {
+                    lora_rank: 8,
+                    keep_last_n_checkpoints: Some(3),
+                    ..FineTuneConfig::default()
+                },
+                world_size: 2,
+                cache: CachePolicy::Bypass,
             },
-            world_size: 2,
-            cache: CachePolicy::Bypass,
         }
     }
 
-    /// Exhaustive destructuring (no `..`): a field added to `CanonicalFields`
-    /// (and thus to the type it mirrors) fails to compile here until it is
-    /// bound and either folded into the call below or explicitly excluded
-    /// with a stated reason, matching `cache`'s own binding.
+    /// Exhaustive destructuring (no `..`) over the REAL [`TrainingCommon`]: a
+    /// field added to that type fails to compile here until it is bound and
+    /// either folded into the call below or explicitly excluded with a
+    /// stated reason, matching `cache`'s own binding — see
+    /// [`CanonicalFields`]'s own doc for why this is composed over the real
+    /// type rather than a hand-copied mirror.
     fn canonical_of(f: &CanonicalFields) -> String {
         let CanonicalFields {
             source,
             columns,
             method,
             task,
+            common,
+        } = f.clone();
+        let TrainingCommon {
             base_model,
             config,
             world_size,
@@ -576,7 +590,7 @@ mod tests {
             // call-time dial, never part of the identity (see
             // `cache_never_moves_the_canonical_string` below).
             cache: _,
-        } = f.clone();
+        } = common;
         fine_tune_spec_canonical(
             &source,
             &columns,
@@ -613,9 +627,9 @@ mod tests {
             ("columns (new member)", |f| f.columns.push("extra".into())),
             ("columns (order)", |f| f.columns.reverse()),
             ("task", |f| f.task = ModelTask::Classification),
-            ("base_model", |f| f.base_model = "local:other".into()),
-            ("config", |f| f.config.lora_rank = 99),
-            ("world_size", |f| f.world_size = 4),
+            ("base_model", |f| f.common.base_model = "local:other".into()),
+            ("config", |f| f.common.config.lora_rank = 99),
+            ("world_size", |f| f.common.world_size = 4),
         ];
         for (name, mutate) in mutations {
             let mut mutated = base.clone();
@@ -648,9 +662,9 @@ mod tests {
     #[test]
     fn cache_never_moves_the_canonical_string() {
         let mut use_cache = canonical_fields();
-        use_cache.cache = CachePolicy::Use;
+        use_cache.common.cache = CachePolicy::Use;
         let mut bypass = canonical_fields();
-        bypass.cache = CachePolicy::Bypass;
+        bypass.common.cache = CachePolicy::Bypass;
         assert_eq!(canonical_of(&use_cache), canonical_of(&bypass));
         // A precise key check, not a bare substring: `FineTuneConfig` has its
         // own, unrelated `cached` (GradCache) field, whose serialized key
@@ -672,9 +686,9 @@ mod tests {
     #[test]
     fn keep_last_n_checkpoints_never_moves_the_canonical_string() {
         let mut none = canonical_fields();
-        none.config.keep_last_n_checkpoints = None;
+        none.common.config.keep_last_n_checkpoints = None;
         let mut some = canonical_fields();
-        some.config.keep_last_n_checkpoints = Some(7);
+        some.common.config.keep_last_n_checkpoints = Some(7);
         assert_eq!(canonical_of(&none), canonical_of(&some));
         assert!(
             canonical_of(&none).contains(r#""keep_last_n_checkpoints":null"#),

@@ -86,6 +86,34 @@ async fn session_over(dir: &TempDir, csv_fixture: &str) -> Arc<InferenceSession>
 /// Run the parity fixture to completion and return every published adapter
 /// file's fingerprint, keyed by file name (so a file appearing or disappearing
 /// moves the oracle as loudly as a byte change does).
+/// Fingerprint every file the published model prefix holds, keyed by file
+/// name — the print set the byte-for-byte pinned fixtures in this file
+/// compare against. One reader for every pin, so the exclusion below is
+/// applied once, never re-derived per fixture.
+///
+/// `materialization.json` embeds `produced_at` (wall-clock) and `produced_by`
+/// (a per-process run id) — never byte-stable across runs by design
+/// (provenance metadata, not the reproducibility anchor; see
+/// `MaterializationManifest`'s own doc), so it can never join a
+/// byte-for-byte pinned fixture the way the other files here can. Excluded
+/// from the print set rather than pinned or ignored silently: this comment
+/// is the record of why the file every fine-tune now publishes is absent
+/// from each `*_ADAPTER_PRINTS` fixture.
+fn pinned_prints(dir: &std::path::Path) -> BTreeMap<String, String> {
+    let mut prints = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "materialization.json" {
+                continue;
+            }
+            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
+        }
+    }
+    prints
+}
+
 async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String, String> {
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session)
         .expect("default worker intervals are valid");
@@ -115,27 +143,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         .await
         .expect("the published adapter fetches and verifies");
 
-    let mut prints = BTreeMap::new();
-    for entry in std::fs::read_dir(local.dir()).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // #500: `materialization.json` embeds `produced_at`
-            // (wall-clock) and `produced_by` (a per-process run id) — never
-            // byte-stable across runs by design (provenance metadata, not the
-            // reproducibility anchor; see `MaterializationManifest`'s own
-            // doc), so it can never join a byte-for-byte pinned fixture the
-            // way the other files here can. Excluded from the print set
-            // rather than pinned or ignored silently: this comment is the
-            // record of why the file this fine-tune now publishes is absent
-            // from `PARITY_ADAPTER_PRINTS`.
-            if name == "materialization.json" {
-                continue;
-            }
-            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
-        }
-    }
-    prints
+    pinned_prints(local.dir())
 }
 
 /// (c) Refactor parity — a PINNED oracle, not a RED-at-base one.
@@ -301,14 +309,7 @@ async fn run_regression_parity_fixture(
         .await
         .expect("the published adapter fetches and verifies");
 
-    let mut prints = BTreeMap::new();
-    for entry in std::fs::read_dir(local.dir()).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
-        }
-    }
+    let prints = pinned_prints(local.dir());
     prints
 }
 
@@ -401,14 +402,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         .await
         .expect("the published GradCache adapter fetches and verifies");
 
-    let mut prints = BTreeMap::new();
-    for entry in std::fs::read_dir(local.dir()).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
-        }
-    }
+    let prints = pinned_prints(local.dir());
     println!("GRADCACHE_ADAPTER_PRINTS = {prints:#?}");
     let expected: BTreeMap<String, String> = GRADCACHE_ADAPTER_PRINTS
         .iter()

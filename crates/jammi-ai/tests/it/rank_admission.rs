@@ -564,11 +564,14 @@ fn every_durable_training_submit_edge_calls_the_one_admission_function() {
     let edges: &[(&str, &str)] = &[
         (
             "crates/jammi-ai/src/session.rs",
+            // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "async fn submit_fine_tune_spec_deduped(",
         ),
+        // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
         ("crates/jammi-ai/src/jobs.rs", "pub async fn enqueue("),
         (
             "crates/jammi-ai/src/pipeline/context_predictor.rs",
+            // kernel-oracles: fn-in-literal reviewed: the edge function's own signature text, searched for verbatim below — not code in this file
             "pub(crate) async fn train_context_predictor_deduped(",
         ),
     ];

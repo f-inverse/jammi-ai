@@ -235,38 +235,43 @@ refusal, disclosing which determinant failed to no one.
 ### 1.6 Enumerating-caller oracles (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs`, at c1d918b4)
 
 Two grep-shaped, MASKED, code-only assertions over the **whole tracked tree** (`git ls-files`,
-never a hand-rolled walk — `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:59-75`):
+never a hand-rolled walk —
+`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::git_ls_files`):
 - `only_the_gang_run_rank_handler_calls_get_job_for_rank`
-  (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:257-283`): the token
+  (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::only_the_gang_run_rank_handler_calls_get_job_for_rank`): the token
   `get_job_for_rank(` occurs, as CODE (comments and string/char literals masked first,
-  `mask_non_code`, `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:80-198`; an
+  `mask_non_code`, `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::mask_non_code`; an
   identifier-boundary check, `contains_code_token`,
-  `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:199-229`, so a longer identifier
+  `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::contains_code_token`, so a longer identifier
   merely ending in the token — this file's own test-fn names — is not mistaken for a call), only
   in `crates/jammi-db/src/catalog/jobs_repo.rs` (the definition), `crates/jammi-server/src/grpc/gang.rs`
   (the one production caller), and `crates/jammi-db/tests/it/gang_rank_admission.rs` (jammi-db's
   own unit tests) — a fixed allowlist checked BOTH directions (no unexpected hit; no stale
   allowlist entry that no longer hits).
-- `only_resolve_training_set_identity_calls_get_result_table_for_tenant`
-  (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:291-318`): same shape for
-  `get_result_table_for_tenant(`, allowed only in `crates/jammi-db/src/catalog/result_repo.rs`
-  (definition), `crates/jammi-server/src/grpc/gang.rs` (the one production caller), and
-  `crates/jammi-server/tests/it/gang_service.rs` (this crate's own b1' tests, rulings 4/5,
-  exercising the raw verb directly).
+- `only_resolve_training_set_identity_calls_get_result_table_for_tenant` — deleted with the
+  world>1 conjunct (Addendum 2; #566), not merely retired: the gang `RunRank` handler no longer
+  reaches `get_result_table_for_tenant` at all (Addendum 2 §B1), so there is no gang-adjacent
+  caller surface left for this oracle to enumerate. `get_result_table_for_tenant`'s own
+  strict-predicate property is now tested directly in `jammi-db`
+  (`crates/jammi-db/tests/it/result_tables.rs::get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant`),
+  independent of any caller built on top of it.
 
-Both oracles are **measured claims**, not prose: `impossibility_claims` (§6, below) states "no
-caller other than the gang `RunRank` handler resolves `get_job_for_rank`/`get_result_table_for_tenant`"
-with this executed enumeration as the refutation attempt — not an assertion nobody tried to break.
+The surviving oracle is a **measured claim**, not prose: `impossibility_claims` (§6, below) states
+"no caller other than the gang `RunRank` handler calls `get_job_for_rank`" with this executed
+enumeration as the refutation attempt — not an assertion nobody tried to break. (The paired
+`get_result_table_for_tenant` claim this section originally measured alongside it is deleted with
+the oracle that measured it — Addendum 2 §B1; #566.)
 
-Masking self-tests (never load-bearing on the two oracles above passing today, but load-bearing on
-those oracles never *silently* stopping being oracles): `mask_non_code_hides_comments_and_strings_but_not_code`
-(`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:328-368`) and
+Masking self-tests (never load-bearing on the oracle above passing today, but load-bearing on that
+oracle never *silently* stopping being one): `mask_non_code_hides_comments_and_strings_but_not_code`
+(`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::mask_non_code_hides_comments_and_strings_but_not_code`) and
 `contains_code_token_rejects_a_same_tokened_longer_identifier`
-(`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:375-401`). Fixture strings in both are
-annotated `// kernel-oracles: fn-in-literal reviewed: …` — the c1d918b4 follow-up commit's own
-concern: a string literal fixture containing the substring `fn ... {` looks, to a naive scanner,
-like a function declaration; these comments record that each such fixture was reviewed and is
-intentional scaffolding, not a real declaration `check_kernel_oracles.py` should flag.
+(`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::contains_code_token_rejects_a_same_tokened_longer_identifier`).
+Fixture strings in both are annotated `// kernel-oracles: fn-in-literal reviewed: …` — the
+c1d918b4 follow-up commit's own concern: a string literal fixture containing the substring
+`fn ... {` looks, to a naive scanner, like a function declaration; these comments record that each
+such fixture was reviewed and is intentional scaffolding, not a real declaration
+`check_kernel_oracles.py` should flag.
 
 ### 1.7 Mount, observability, tenant-isolation allowlist
 
@@ -381,8 +386,8 @@ c1d918b4.
 | `get_job_for_rank_returns_none_for_an_absent_job` / `_reflects_a_live_claim` / `_treats_a_null_lease_as_not_live` / `_treats_an_expired_lease_as_not_live` / `_returns_the_filled_pair` (`crates/jammi-db/tests/it/gang_rank_admission.rs:62-175`) | The five row-predicate edges at the DB layer directly, including the lease-boundary pair (NULL vs. expired, both `lease_live == false`) | None of these five drive the wire; the wire-level lease determinant is proven ONCE end-to-end (`run_rank_refuses_when_lease_expired`) and not re-proven per lease sub-case through gRPC |
 | `fill_training_set_identity_first_call_fills` / `_second_call_same_values_reuses` / `_concurrent_racer_reuses_never_overwrites` (`crates/jammi-db/tests/it/gang_rank_admission.rs:181-282`) / `_moved_claim_aborts_without_a_terminal_write` (`crates/jammi-db/tests/it/gang_rank_admission.rs:287-334`) / `_matching_claim_different_pair_aborts` (`crates/jammi-db/tests/it/gang_rank_admission.rs:341-…`) | Filled / Reused (idempotent retry) / Reused (genuine `tokio::spawn` race, asserting exactly one `Filled` and one `Reused` outcome) / Aborted-on-moved-claim (no terminal write, status untouched) / Aborted-on-differing-pair (isolates "different pair" from "claim moved" — a shape this program's own CAS can never construct via its own writes, since the predicate always requires the pair NULL first, so this row is manufactured directly) | The concurrent racer test proves the DB-level CAS is race-safe; it does not drive two concurrent `RunRank` calls through the wire (no such concurrent-caller path exists at U5a-1 — the CAS's own caller, U5b-1b-ii's materialization step, is not built yet) |
 | `fresh_instance_true_for_a_recently_seen_instance` / `_false_for_an_absent_instance` / `_false_for_a_stale_instance` / `_true_just_inside_the_liveness_margin` (`crates/jammi-db/tests/it/gang_instance_freshness.rs:63-125`) | The margin's own boundary (`2×lease` exactly, both sides) | Does not go through `GangServer::run_rank`'s own freshness call — that is `run_rank_refuses_when_coordinator_not_fresh`, above, which does not re-probe the exact `2×` boundary (only absent/stale, not the borderline-inside case) |
-| `only_the_gang_run_rank_handler_calls_get_job_for_rank` / `only_resolve_training_set_identity_calls_get_result_table_for_tenant` (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:257-318`) | No caller of either verb exists outside the named allowlist, TODAY, over the whole tracked tree | Cannot prove no FUTURE caller will be added silently — it re-fails the moment one is, which is the property it actually offers (a standing tripwire, not a proof about the future) |
-| `mask_non_code_hides_comments_and_strings_but_not_code` / `contains_code_token_rejects_a_same_tokened_longer_identifier` (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:328-401`) | The two oracles above cannot be defeated by a comment, a string literal, or a same-tokened longer identifier (this file's own test-fn names) | Does not cover every conceivable Rust lexical edge case (e.g., a token split across a raw-string continuation) — masks line comments, block comments (non-nested), plain and raw string/char literals only, matching the `whose_fault_gate.rs` precedent's own stated limit |
+| `only_the_gang_run_rank_handler_calls_get_job_for_rank` (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::only_the_gang_run_rank_handler_calls_get_job_for_rank`) | No caller of `get_job_for_rank` exists outside the named allowlist, TODAY, over the whole tracked tree | Cannot prove no FUTURE caller will be added silently — it re-fails the moment one is, which is the property it actually offers (a standing tripwire, not a proof about the future); `only_resolve_training_set_identity_calls_get_result_table_for_tenant`, this row's original pair, is deleted with the world>1 conjunct (Addendum 2; #566) |
+| `mask_non_code_hides_comments_and_strings_but_not_code` / `contains_code_token_rejects_a_same_tokened_longer_identifier` (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::mask_non_code_hides_comments_and_strings_but_not_code` / `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::contains_code_token_rejects_a_same_tokened_longer_identifier`) | The oracle above cannot be defeated by a comment, a string literal, or a same-tokened longer identifier (this file's own test-fn names) | Does not cover every conceivable Rust lexical edge case (e.g., a token split across a raw-string continuation) — masks line comments, block comments (non-nested), plain and raw string/char literals only, matching the `whose_fault_gate.rs` precedent's own stated limit |
 | `wire_surface_equals_the_frozen_baseline` / `manifest_format_version_is_frozen` (`crates/jammi-server/tests/it/api_freeze.rs:82-104`) | The compiled descriptor set matches the baseline set-equal (as SETS, order-independent) | Does not check message/field shape (the freeze guard's own stated limit, §1.1) |
 | `gang_service_is_unimplemented_on_the_public_listener` (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:3316-3346`) | The public listener refuses `Unimplemented` for `GangService/RunRank`; the allowlist entry's own `why` text carries the required I-GANG sentence | Does not test any OTHER method on a hypothetical future `GangService` extension — only `RunRank`, the only rpc that exists |
 | `allowlist_and_cases_partition_the_wire_surface` (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:3181-3210`) | Every case + both allowlists partition the wire surface with NO overlap | Does not itself prove either allowlist's `why` text is accurate — that is the two `*_is_unimplemented_on_the_public_listener` tests' job |
@@ -412,17 +417,18 @@ c1d918b4.
   (`crates/jammi-db/tests/it/gang_instance_freshness.rs:110-125`, staleness `50s` against
   `lease=30s`, margin `60s`) would flip to `false` under a `margin = lease` (30s) mutation, since
   `50s > 30s`. Both together bound the factor from two independent test files, not one.
-- **Planted code caller.** The enumerating-caller oracles' own allowlist-both-directions shape
-  (§1.6) IS the executed mutation-detector: adding any new call site to either verb, anywhere in
-  the tracked tree outside the three-entry allowlist, flips
-  `only_the_gang_run_rank_handler_calls_get_job_for_rank` /
-  `only_resolve_training_set_identity_calls_get_result_table_for_tenant` from green to a named
+- **Planted code caller.** The enumerating-caller oracle's own allowlist-both-directions shape
+  (§1.6) IS the executed mutation-detector: adding any new call site to `get_job_for_rank`,
+  anywhere in the tracked tree outside the allowlist, flips
+  `only_the_gang_run_rank_handler_calls_get_job_for_rank` from green to a named
   failure identifying the offending file — exercised at authorship time by temporarily adding a
   throwaway `get_job_for_rank(` call to a fourth file and observing the named failure (the standard
-  `whose_fault_gate.rs`-precedent methodology this oracle file's own doc comments cite,
-  `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:6-11`), then reverting it; the
+  `whose_fault_gate.rs`-precedent methodology this oracle file's own module-level doc comment
+  cites, `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs`), then reverting it; the
   c1d918b4 follow-up commit is the fixture-review pass that confirmed every remaining `fn`-shaped
   string literal in the masking self-tests is reviewed scaffolding, not a missed real call site.
+  (The paired `only_resolve_training_set_identity_calls_get_result_table_for_tenant` oracle this
+  paragraph originally also named is deleted with the world>1 conjunct — Addendum 2; #566.)
 - **Claimant / attempt / lease / not-found / not-fresh conjuncts.** Each has its OWN isolated test
   (§3 table) that holds every other conjunct at its satisfied value and flips exactly one — the
   mutation is the test fixture's own single changed field (wrong `claimed_by`, wrong `attempts`,
@@ -464,16 +470,18 @@ c1d918b4.
 `impossibility_claims`:
 - "no caller other than the gang `RunRank` handler calls `get_job_for_rank`" — executed
   enumeration: `only_the_gang_run_rank_handler_calls_get_job_for_rank`,
-  `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:257-283` (at c1d918b4), scanning
-  `git ls-files` over the whole tracked tree, masked to code only. Result set at c1d918b4: exactly
-  `crates/jammi-db/src/catalog/jobs_repo.rs`, `crates/jammi-server/src/grpc/gang.rs`,
-  `crates/jammi-db/tests/it/gang_rank_admission.rs`.
+  `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs::only_the_gang_run_rank_handler_calls_get_job_for_rank`
+  (at c1d918b4), scanning `git ls-files` over the whole tracked tree, masked to code only. Result
+  set at c1d918b4: exactly `crates/jammi-db/src/catalog/jobs_repo.rs`,
+  `crates/jammi-server/src/grpc/gang.rs`, `crates/jammi-db/tests/it/gang_rank_admission.rs`.
 - "no caller other than the gang `RunRank` handler resolves `training_set_location`" (i.e. calls
-  `get_result_table_for_tenant`) — executed enumeration:
-  `only_resolve_training_set_identity_calls_get_result_table_for_tenant`,
-  `crates/jammi-server/tests/it/gang_rank_admission_oracle.rs:291-318` (at c1d918b4). Result set:
-  exactly `crates/jammi-db/src/catalog/result_repo.rs`, `crates/jammi-server/src/grpc/gang.rs`,
-  `crates/jammi-server/tests/it/gang_service.rs`.
+  `get_result_table_for_tenant`) — the oracle that measured this claim,
+  `only_resolve_training_set_identity_calls_get_result_table_for_tenant`, is deleted with the
+  world>1 conjunct (Addendum 2; #566): the gang `RunRank` handler no longer calls
+  `get_result_table_for_tenant` at all in this unit (Addendum 2 §B1), so there is no
+  gang-adjacent caller surface left to enumerate here; the verb's own strict-predicate property is
+  tested directly in `jammi-db`
+  (`crates/jammi-db/tests/it/result_tables.rs::get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant`).
 - "the write-once training-set pair is ever set with one column null and the other not" —
   executed attempt: `a_raw_single_column_write_is_refused_by_the_schema_check`
   (`crates/jammi-db/tests/it/gang_rank_admission.rs:387-412`) and
@@ -771,11 +779,22 @@ variant's own doc comment and in
 `docs/plans/67-distributed-training/UNITS.md` § U5a-2, as `HostAdmission`'s
 to build, filed at <https://github.com/f-inverse/jammi-ai/issues/566>.
 `crates/jammi-server/tests/it/gang_service.rs::every_gang_refusal_reason`
-derives its ten-element witness list from an exhaustive match with no
-wildcard arm over `GangRefusalReason`'s real variant set — a future variant
-fails that file to compile, naming the missing arm, until it is added both
-to the witness list and the match — and the pairwise non-disclosure oracle
-that consumes it now drives all ten scenarios.
+forces every `GangRefusalReason` variant into `assert_every_variant_is_a_witness`'s
+own exhaustive match, which has no wildcard arm over the enum's real variant
+set: a future variant fails that file to compile, naming the missing match
+arm, until a matching arm is added. That match re-validates each of
+`WITNESSES`'s own hand-listed entries one way — every witness IS a real
+variant — but does not, by itself, force a new variant INTO `WITNESSES`:
+executed check — adding a variant with only its match arm, never adding it
+to `WITNESSES`, compiles this file and the suite passes, silently excluding
+the new determinant from both the pairwise non-disclosure oracle and the
+`test-hooks` reason-distinguishing oracle. (If a concurrent commit changes
+`every_gang_refusal_reason` to DERIVE `WITNESSES` from the match itself —
+rather than a hand-listed array the match merely re-validates — the
+stronger "fails until added to both" claim holds again; stated here in the
+weaker, currently-true form until that lands.) The pairwise non-disclosure
+oracle that consumes `WITNESSES` today drives the ten scenarios that are in
+it.
 
 ### B2. `world_size` is a row fact, never a fault, at decode time
 

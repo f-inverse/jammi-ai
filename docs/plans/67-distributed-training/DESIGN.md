@@ -116,16 +116,26 @@ new field fails compilation instead of escaping the hash; U4b extends it with th
 fields.
 
 The catalog name `jammi:fine-tuned:{job_id}` stays as the handle and re-claim idempotency key
-(`worker.rs:1176-1184`). The `model_materialization` migration (numbered at
-rebase) adds nullable
-`models.definition_hash`, `models.input_anchors`, `models.manifest_path` (append-only, K5;
-nullable because `ContextPredictor` has no materialization; the probe never matches NULL). The
-manifest is written last into the artifact prefix by the coordinator before the finalize CAS.
-`CachePolicy::Use` probes by definition hash + anchors; on a hit the job completes by
-registering **its own name** pointing at the reused prefix (two rows, one prefix); a prefix is
-reaped only when no model row references it (reconcile attribution,
+(`worker.rs:1176-1184`). The `model_materialization` migration (033) adds nullable
+`models.definition_hash`, `models.input_anchors` (append-only, K5; nullable because
+`ContextPredictor` has no materialization; the probe never matches NULL —
+`find_models_by_definition`/`probe_model_by_definition` additionally restrict to
+`artifact_path IS NOT NULL`, the SERVABLE set, P3'). A third column, `models.manifest_path`,
+was in this migration's first cut but had no production reader — the sidecar's path is always
+the fixed name `materialization.json` under the model's artifact prefix, never a recorded
+column — and was dropped before the migration merged (P7, U3 fix round 1; K5's append-only
+rule binds the merged ledger, not a not-yet-shipped body). The manifest is written last into
+the artifact prefix by the coordinator before the finalize CAS, and the two catalog columns
+are written only after that CAS has already committed this attempt's `artifact_path` (P3':
+no unfinalized row is ever a cache-hit candidate). `CachePolicy::Use` probes by definition
+hash (the anchors leg was removed as redundant, P5: the training-set digest is already
+inside the hash); on a hit the job completes by registering **its own name** pointing at the
+reused prefix (two rows, one prefix, reported on the job's own result via `cache_outcome`,
+P6); a prefix is reaped only when no model row references it (reconcile attribution,
 `crates/jammi-db/src/store/reconcile.rs:14-17`). The recompute replay arm
-(`pipeline/recompute.rs`, K1) for `FineTune` is **retrain**.
+(`pipeline/recompute.rs`, K1) for `FineTune` is **retrain**. `cache = Use` is refused, typed,
+for the `graph_fine_tune` kind (P4): that kind's model carries no materialization to probe
+or record.
 
 ## 4. The gang
 

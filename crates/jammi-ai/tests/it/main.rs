@@ -4,6 +4,7 @@ mod asof_scale;
 mod asof_verb;
 mod backends;
 mod cache_staleness;
+mod call_graph_gate;
 mod channel_contract;
 mod common;
 mod compute_precision;

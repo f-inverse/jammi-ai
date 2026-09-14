@@ -171,6 +171,23 @@ tracing-subscriber.workspace = true
 # `gen-tonic` for the generated server trait + tonic-prost codec; `trace` for
 # the trace-service message types. Test-only.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
+# `tests/it/call_graph_gate.rs` (#500 U2a fix round 7): a real Rust AST call
+# graph over `crates/jammi-ai/src` and `crates/jammi-db/src`, replacing the
+# line-regex fixed point (`session_binding_reachable_names`/`callee_names`)
+# the round-6 audit found unsound — free-function, `Self::`, `crate::`/
+# `super::`, method and closure calls all need genuine parsing, not text
+# search. Already a transitive dependency (proc-macro derives pull it), so
+# this direct dev-only edge moves no version in `Cargo.lock`. `full` for
+# whole-file / expression / item parsing (a proc-macro-only build normally
+# only needs the derive-input subset); `visit` for the `syn::visit::Visit`
+# trait the call-graph walk implements. Test-only: no production code depends
+# on `syn`.
+syn = { version = "2", features = ["full", "visit"] }
+# The literal-token scan inside a macro invocation (`format!("CREATE TABLE
+# {name}")`'s string argument, which `syn` stores as an opaque `TokenStream`
+# rather than a parsed expression) walks `proc_macro2::TokenTree` directly.
+# Same reasoning as `syn` above: already transitively locked, dev-only.
+proc-macro2 = "1"
 
 [features]
 default = ["local"]

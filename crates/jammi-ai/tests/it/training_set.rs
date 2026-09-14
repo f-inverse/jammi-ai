@@ -254,6 +254,23 @@ async fn refactor_parity() {
 /// regression_targets`) and the `Regression` `TextChunk` decode
 /// (`worker::build_training_data_loader`'s regression arm) through paths
 /// [`refactor_parity`]'s contrastive fixture never exercises at all.
+///
+/// Platform-specific like [`PARITY_ADAPTER_PRINTS`]: the Linux set is what the
+/// CI hermetic lane produced for this fixture (recorded from its run at the
+/// PR-B2 head where the Apple Silicon pin first met Linux; the next CI run
+/// re-verifies it, a drifting print failing there), the other set is from the
+/// Apple Silicon host the fixture was first pinned on.
+#[cfg(target_os = "linux")]
+const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
+    ("adapter.safetensors", "1888:89f81b61ca42fde5"),
+    ("adapter_config.json", "284:6d66bd5b8594e1fa"),
+    ("checkpoint_1.safetensors", "1888:758cae962d0ae1b5"),
+    ("checkpoint_2.safetensors", "1888:6e8e9e39f9914524"),
+    ("checkpoint_3.safetensors", "1888:89f81b61ca42fde5"),
+    ("checkpoint_best.safetensors", "1888:89f81b61ca42fde5"),
+    ("manifest.json", "676:c2c59e89853c592b"),
+];
+#[cfg(not(target_os = "linux"))]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
     ("adapter_config.json", "284:6d66bd5b8594e1fa"),
@@ -353,6 +370,18 @@ async fn regression_refactor_parity() {
 async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     use jammi_ai::fine_tune::EmbeddingLoss;
 
+    // Platform-specific like `PARITY_ADAPTER_PRINTS`: the Linux set from the
+    // CI hermetic lane at the PR-B2 head, the other from the Apple Silicon
+    // host the fixture was first pinned on.
+    #[cfg(target_os = "linux")]
+    const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
+        ("adapter.safetensors", "1184:aff14fbe59384868"),
+        ("adapter_config.json", "143:1feeeb6239c3fd30"),
+        ("checkpoint_1.safetensors", "1184:aff14fbe59384868"),
+        ("checkpoint_best.safetensors", "1184:aff14fbe59384868"),
+        ("manifest.json", "452:464c50f3532a2f94"),
+    ];
+    #[cfg(not(target_os = "linux"))]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
         ("adapter.safetensors", "1184:36a3ebd09680e266"),
         ("adapter_config.json", "143:1feeeb6239c3fd30"),

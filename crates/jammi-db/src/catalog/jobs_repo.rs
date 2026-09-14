@@ -1967,7 +1967,8 @@ impl Catalog {
     /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
     /// not consult it at all: tenant is returned as a plain column for the
-    /// CALLER to derive/pin, per §I1's "tenant is derived from the row").
+    /// CALLER to derive/pin, per `docs/rigor/contracts/feat_500-C-U5a-1.md`
+    /// §2 (P3) — "tenant is derived, never accepted").
     /// ONE statement: the row's `status`/`claimed_by`/`attempts`/pair
     /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
     /// remaining window, from which [`RankAdmissionRow::lease_live`] is

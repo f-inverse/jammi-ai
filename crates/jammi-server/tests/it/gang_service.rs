@@ -137,7 +137,8 @@ async fn submit_and_claim(
     i64::from(claimed.attempts)
 }
 
-/// §W1 K2: `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG (which
+/// Wire-level K2 (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2):
+/// `world == 0` is refused `INVALID_ARGUMENT`, before I-GANG (which
 /// needs no row read at all here — no `jobs` row could ever satisfy this
 /// wire-level edge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -202,7 +203,8 @@ async fn run_rank_increments_gang_requests_metric() {
     );
 }
 
-/// §W1 K2: `rank >= world` is refused `INVALID_ARGUMENT` — the boundary case
+/// Wire-level K2 (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2):
+/// `rank >= world` is refused `INVALID_ARGUMENT` — the boundary case
 /// (`rank == world`), not just a wildly out-of-range one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_rank_at_world_boundary() {
@@ -328,8 +330,8 @@ async fn run_rank_refuses_when_job_not_running() {
 
     let server = start_no_worker_server().await;
     // Freshness satisfied — this determinant is isolated from "coordinator
-    // not fresh" (a separate conjunct, §I1), never a confound this test
-    // would accidentally also exercise.
+    // not fresh" (a separate conjunct, `docs/rigor/contracts/feat_500-C-U5a-1.md`
+    // §1.5), never a confound this test would accidentally also exercise.
     server
         .engine
         .catalog()
@@ -1044,7 +1046,8 @@ async fn run_rank_refuses_world_gt_one_when_caller_world_matches_the_row() {
 /// `world` — this unit ships the `world_size == 1` lattice only — so this
 /// direction's control is distinguishable ONLY via the `test-hooks` reason,
 /// never the wire status/message (both refuse `FAILED_PRECONDITION` with the
-/// identical fixed message, by design, §I1 Non-disclosure).
+/// identical fixed message, by design — non-disclosure,
+/// `docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2)).
 ///
 /// **Direction (b)** (`assign.world` ABOVE `row.world_size`): the row's own
 /// `world_size` is `1` (`WORLD1_SPEC`), so its control (`assign.world`
@@ -1184,12 +1187,12 @@ async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
 /// Derived from an EXHAUSTIVE match over a witness of each variant, never a
 /// hardcoded `[..; N]` array: `assert_every_variant_is_a_witness`'s own
 /// match has NO wildcard arm, so a new `GangRefusalReason` variant fails
-/// THIS FILE to compile — naming the missing arm — until it is added both
-/// there and to `WITNESSES` below. A hardcoded fixed-length array could
-/// silently omit a new variant (the array type only checks the COUNT, never
-/// which variants); this cannot, since the match's exhaustiveness is
-/// checked against the enum's REAL variant set, not against whatever this
-/// function happens to list.
+/// THIS FILE to compile — naming the missing arm — until a matching arm is
+/// added there; the exhaustive match forces every variant into a scenario
+/// arm. `WITNESSES` below is a separate list that match does NOT force to
+/// grow — a fixed arm-list gap the compiler catches is not the same as a
+/// witness-list gap it does not; adding the new arm without also adding the
+/// variant to `WITNESSES` still compiles.
 fn every_gang_refusal_reason() -> Vec<jammi_server::grpc::gang::GangRefusalReason> {
     use jammi_server::grpc::gang::GangRefusalReason as R;
 

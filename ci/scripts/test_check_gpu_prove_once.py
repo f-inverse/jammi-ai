@@ -6,7 +6,7 @@ lanes).
 Drives the real `run_gate()`/`check_p1_p2()`/`check_promotion_table()`/
 `check_p4()`/`check_p5()`/`check_p6_discovery()`/`check_promoting_if()`/
 `reconstruct_if_expr()`/`split_top_level()`/`read_top_level_on_block()`/
-`read_jobs_block_or_fail()`/`job_invokes_publish_primitive_recursive()`
+`jobs_or_fail()`/`job_invokes_publish_primitive_recursive()`
 entry points against synthetic fixture trees (never a hand-built stand-in
 for the parsers themselves) — including a fixture reproducing the PRE-FIX
 shape (esc-084: three publishers `uses:` a renting reusable), which must
@@ -448,10 +448,14 @@ class PaidPodLaneTest(unittest.TestCase):
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
         self.assertIn("workflow_call", "\n".join(findings))
 
-    def test_quoted_on_block_is_unreadable_not_a_pass(self):
+    def test_quoted_on_block_is_read_exactly_like_bare_on(self):
+        # A quoted "on": key is valid, unambiguous YAML (GitHub's own
+        # documented way to avoid the YAML 1.1 boolean-resolution gotcha)
+        # -- it must read IDENTICALLY to the bare form, never be refused:
+        # the same fixture with the SAME triggers passes clean either way.
         broken = GANG_YML_GOOD.replace("\non:\n", '\n"on":\n')
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
-        self.assertIn("cannot read", "\n".join(findings))
+        self.assertEqual(findings, [], findings)
 
     def test_quoted_push_key_still_fails_p7(self):
         # X1 (closing audit #3, F1): the CHILD key regex used to be
@@ -483,16 +487,17 @@ class PaidPodLaneTest(unittest.TestCase):
         joined = "\n".join(findings)
         self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
 
-    def test_unreadable_child_line_under_on_is_refused_not_dropped(self):
-        # A line at the `on:` block's own child indentation that matches
-        # none of `key:`/`"key":`/`'key':` (e.g. a merge key or a list item
-        # where a mapping is expected) is "cannot examine", never silently
-        # skipped the way a mis-shaped key used to be.
+    def test_merge_key_with_an_undefined_alias_is_refused_not_dropped(self):
+        # A genuine YAML merge key (`<<: *anchors`) referencing an anchor
+        # that is never defined anywhere in the document is a real YAML
+        # syntax error (an undefined alias) -- refused loud through the
+        # shared loader, never silently skipped the way a mis-shaped key
+        # used to be.
         broken = GANG_YML_GOOD.replace(
             "on:\n  workflow_dispatch:", "on:\n  <<: *anchors\n  workflow_dispatch:"
         )
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
-        self.assertIn("cannot examine", "\n".join(findings))
+        self.assertIn("cannot parse YAML", "\n".join(findings))
 
     def test_two_invokers_of_the_gang_driver_fail(self):
         second = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: second-gang-renter")
@@ -1423,12 +1428,21 @@ class OnBlockDoctrineTest(unittest.TestCase):
         findings = cgo.check_p1_p2(texts)
         self.assertTrue(any("workflow_call" in f and "on: block carries" in f for f in findings))
 
-    def test_quoted_on_block_is_unreadable_not_a_pass(self):
-        bad = PROVE_YML_GOOD.replace("on:\n  workflow_dispatch:", '"on":\n  workflow_dispatch:')
+    def test_quoted_on_block_is_read_exactly_like_bare_on(self):
+        # A quoted "on": key is valid, unambiguous YAML (quoting is GitHub's
+        # own documented way to avoid the YAML 1.1 boolean-resolution
+        # gotcha) -- it must read IDENTICALLY to the bare form, never be
+        # refused. Swap in a push: trigger so a wrongly-silent misread
+        # (treating it as carrying no triggers at all) would also go
+        # undetected -- P1 must still catch it as a bad_trigger.
+        bad = PROVE_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:", '"on":\n  workflow_dispatch:\n  push:\n    tags: ["v*"]'
+        )
         texts = _positive_texts()
         texts["gpu-prove.yml"] = bad
         findings = cgo.check_p1_p2(texts)
-        self.assertTrue(any("cannot read" in f for f in findings))
+        self.assertFalse(any("cannot read" in f for f in findings), findings)
+        self.assertTrue(any("push" in f and "on: block carries" in f for f in findings), findings)
 
     def test_quoted_inline_on_push_fails_p1(self):
         # Same evasion as P7's gang-row sibling test, against the prove
@@ -1443,12 +1457,20 @@ class OnBlockDoctrineTest(unittest.TestCase):
         findings = cgo.check_p1_p2(texts)
         self.assertTrue(any("push" in f and "on: block carries" in f for f in findings), findings)
 
-    def test_flow_style_on_block_is_unreadable_not_a_pass(self):
-        bad = PROVE_YML_GOOD.replace("on:\n  workflow_dispatch:\n  pull_request:\n    types: [labeled]\n  schedule:\n    - cron: \"47 3 * * *\"", "on: { workflow_dispatch: null }")
+    def test_flow_style_on_block_is_read_exactly_like_block_style(self):
+        # A flow-style on: {...} mapping is valid, unambiguous YAML -- it
+        # must be read correctly, never refused. Include a push: trigger so
+        # a silent misread (crediting it with no triggers) would still be
+        # caught by P1's own bad_trigger check.
+        bad = PROVE_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:\n  pull_request:\n    types: [labeled]\n  schedule:\n    - cron: \"47 3 * * *\"",
+            'on: { workflow_dispatch: null, push: { tags: ["v*"] } }',
+        )
         texts = _positive_texts()
         texts["gpu-prove.yml"] = bad
         findings = cgo.check_p1_p2(texts)
-        self.assertTrue(any("cannot read" in f for f in findings))
+        self.assertFalse(any("cannot read" in f for f in findings), findings)
+        self.assertTrue(any("push" in f and "on: block carries" in f for f in findings), findings)
 
     def test_uses_local_reference_to_prove_workflow_fails(self):
         caller = "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n    uses: ./.github/workflows/gpu-prove.yml\n"
@@ -2020,34 +2042,56 @@ class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
 class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
     """F2 audit fix: an unreadable `on:`/`jobs:` block is a FAIL LOUD, never
     a silent skip -- same doctrine P1 already holds `gpu-prove.yml`'s `on:`
-    to, now applied across P6's full-tree scan."""
+    to, now applied across P6's full-tree scan. A quoted `"on":`/`"jobs":`
+    key, a flow-style `jobs: {...}` mapping, and a non-canonically-indented
+    (but still consistent) `jobs:` block are all real, valid YAML -- each is
+    read CORRECTLY, never refused; only a genuinely unparseable document
+    (duplicate keys, a YAML syntax error, ...) is the loud refusal."""
 
-    def test_quoted_on_block_fails_loud(self):
+    def test_quoted_on_block_is_correctly_read_and_still_discovers_the_job(self):
         bad = '"on":\n  push:\n    tags: ["v*"]\n\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n'
         findings = cgo.check_p6_discovery({**_positive_texts(), "bad.yml": "name: bad\n\n" + bad})
-        self.assertTrue(any("bad.yml" in f and "cannot read" in f for f in findings), findings)
+        self.assertFalse(any("bad.yml" in f and "cannot read" in f for f in findings), findings)
+        self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
 
-    def test_quoted_jobs_block_fails_loud(self):
+    def test_quoted_jobs_block_is_correctly_read_and_still_discovers_the_job(self):
         bad = (
             "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\n"
             '"jobs":\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n'
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "bad.yml": bad})
-        self.assertTrue(any("bad.yml" in f and "cannot read" in f for f in findings), findings)
+        self.assertFalse(any("bad.yml" in f and "cannot read" in f for f in findings), findings)
+        self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
 
-    def test_flow_style_jobs_block_fails_loud(self):
-        bad = "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs: { x: { runs-on: ubuntu-latest } }\n"
+    def test_flow_style_jobs_block_is_correctly_read_and_still_discovers_the_job(self):
+        bad = "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs: { x: { runs-on: ubuntu-latest, steps: [ { run: 'npm publish' } ] } }\n"
         findings = cgo.check_p6_discovery({**_positive_texts(), "bad.yml": bad})
-        self.assertTrue(any("bad.yml" in f and "flow-style" in f for f in findings), findings)
+        self.assertFalse(any("bad.yml" in f and "flow-style" in f for f in findings), findings)
+        self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
 
-    def test_non_canonical_four_space_job_indent_fails_loud(self):
+    def test_non_canonical_four_space_job_indent_is_correctly_read(self):
         bad = (
             "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
             "    x:\n        runs-on: ubuntu-latest\n        steps:\n          - run: npm publish\n"
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "bad.yml": bad})
+        self.assertFalse(any("bad.yml" in f and "non-canonical" in f for f in findings), findings)
+        self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
+
+    def test_duplicate_top_level_jobs_key_fails_loud(self):
+        # A genuinely unparseable document -- a duplicate top-level `jobs:`
+        # key -- IS the loud refusal this class actually guards; the four
+        # cases above are all valid YAML and must never be confused with
+        # this one.
+        bad = (
+            "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\n"
+            "jobs:\n  x:\n    runs-on: ubuntu-latest\n\n"
+            "jobs:\n  y:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "bad.yml": bad})
         self.assertTrue(
-            any("bad.yml" in f and "non-canonical indentation" in f for f in findings), findings
+            any("bad.yml" in f and "cannot parse YAML" in f and "duplicate key" in f for f in findings),
+            findings,
         )
 
     def test_on_with_trailing_comment_is_correctly_read_not_a_false_fail(self):

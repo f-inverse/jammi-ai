@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """GPU-prove-once guard (esc-084, issue #454; #454 follow-up, operator
 direction 2026-09-03: every release publisher, not only the CUDA lanes) —
-hermetic, static, no build, no GPU, no PyYAML.
+hermetic, static, no build, no GPU. Reads workflow YAML through
+`check_execution_surface_reachability.py`'s shared PyYAML-backed loader
+(a declared prerequisite of this gate, installed by `.docker/ci.Dockerfile`).
 
 **Guarded property**: a release commit is proven ONCE per shipped arch, and
 EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io, npm,
@@ -192,9 +194,12 @@ string):
      gives the workflow scan), so its own suite injects a fifth renting
      driver, or a new deploy wrapper, without touching this tree.
 
-Mechanism: comment-stripped line scan plus a minimal indentation-based
-`jobs:` block splitter (no PyYAML, this repo's own gate convention). Every
-check function takes an explicit `workflows_dir`/`manifest_path` so
+Mechanism: comment-stripped line/regex scanning for `if:`/`needs:`/step
+shapes over job-body text spans, where those spans come from the ONE real
+YAML parse `check_execution_surface_reachability.py` exposes
+(`job_source_spans`/`jobs_or_fail`) -- never a second, independently-
+drifting `jobs:` header regex. Every check function takes an explicit
+`workflows_dir`/`manifest_path` so
 `test_check_gpu_prove_once.py` can drive them against synthetic fixture
 trees, including a fixture reproducing the PRE-FIX shape (esc-084: three
 publishers `uses:` a renting reusable).
@@ -225,7 +230,11 @@ MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 sys.path.insert(0, str(REPO_ROOT / "ci" / "scripts"))
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
 import gpu_prove_verdict  # noqa: E402
+import check_execution_surface_reachability as exec_mod  # noqa: E402
 from check_execution_surface_reachability import (  # noqa: E402
+    WorkflowLoadError,
+    job_source_spans,
+    jobs_or_fail,
     read_top_level_on_block,
     read_top_level_on_block_from_path,
 )
@@ -389,72 +398,15 @@ def resolve_workflow(workflow_texts: dict[str, str], name: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# jobs: block splitter -- minimal, indentation-based (no PyYAML).
+# jobs: block spans -- `jobs_or_fail`/`job_source_spans` (imported above)
+# are the ONE reader, shared with `check_execution_surface_reachability.py`
+# itself: derived from the REAL parsed document (`yaml.compose`'s own node
+# marks), never a second, independently-drifting regex header match. An
+# unreadable/unparseable `jobs:` block (quoted, flow-style, a genuine YAML
+# syntax error anywhere in the file, ...) is a named FAIL, never a silent
+# "this file has zero jobs" -- the same doctrine `read_top_level_on_block`
+# already holds `on:` to.
 # --------------------------------------------------------------------------- #
-def split_top_level_jobs(text: str) -> dict[str, tuple[int, int]]:
-    """{job_id: (start_line, end_line_exclusive)} of RAW 0-based line
-    indices for each job directly under a top-level `jobs:` at 2-space
-    indent. A job's body runs from its own header line through the line
-    before the next 2-space-indented key, or EOF."""
-    lines = text.splitlines()
-    jobs_line = None
-    # F2 audit fix: comment-tolerant (`jobs:  # comment` reads identically
-    # to a bare `jobs:`) -- an exact `== "jobs:"` match used to miss this
-    # and silently read the file as having zero jobs.
-    jobs_header_re = re.compile(r"^jobs:\s*(#.*)?$")
-    for i, line in enumerate(lines):
-        if jobs_header_re.match(line):
-            jobs_line = i
-            break
-    if jobs_line is None:
-        return {}
-    job_re = re.compile(r"^  ([A-Za-z0-9_.-]+):\s*(#.*)?$")
-    starts: list[tuple[str, int]] = []
-    for i in range(jobs_line + 1, len(lines)):
-        line = lines[i]
-        if line.strip() == "" or line.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\S", line):  # dedent back to a top-level (0-indent) key -- jobs: block ended
-            break
-        m = job_re.match(line)
-        if m:
-            starts.append((m.group(1), i))
-    jobs: dict[str, tuple[int, int]] = {}
-    for idx, (name, start) in enumerate(starts):
-        end = starts[idx + 1][1] if idx + 1 < len(starts) else len(lines)
-        jobs[name] = (start, end)
-    return jobs
-
-
-def read_jobs_block_or_fail(text: str) -> tuple[dict[str, tuple[int, int]] | None, str | None]:
-    """(jobs, error). F2 audit fix: P6 scans EVERY workflow file (no
-    trigger filter), so a `jobs:` block it cannot read must FAIL LOUD --
-    the same doctrine `read_top_level_on_block` already holds `on:` to --
-    never silently read as "this file has zero jobs". A quoted `"jobs":`/
-    `'jobs':` key or a flow-style `jobs: {...}` is unreadable outright; a
-    `jobs:` header that IS found but under which `split_top_level_jobs`
-    recognizes zero job entries (e.g. every job header shifted to a
-    non-canonical 4-space indent) is refused too -- a real workflow file
-    always has at least one job, so an empty result here means "could not
-    be parsed", never "legitimately zero jobs"."""
-    lines = text.splitlines()
-    for line in lines:
-        stripped = line.strip()
-        if re.match(r'^"jobs":', stripped) or re.match(r"^'jobs':", stripped):
-            return None, 'jobs: block is quoted ("jobs": / \'jobs\':) -- cannot read'
-    jobs_header_found = False
-    for line in lines:
-        if re.match(r"^jobs:\s*(\{|\[)", line):
-            return None, "jobs: is flow-style -- cannot read"
-        if re.match(r"^jobs:\s*(#.*)?$", line):
-            jobs_header_found = True
-            break
-    if not jobs_header_found:
-        return None, "no top-level jobs: block found"
-    jobs = split_top_level_jobs(text)
-    if not jobs:
-        return None, "jobs: block found but no job entries recognized under it (non-canonical indentation?)"
-    return jobs, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1319,7 +1271,10 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
         if text is None:
             findings.append(f"P3: row `{key}`: workflow file {row.workflow} is missing")
             continue
-        jobs = split_top_level_jobs(text)
+        jobs, jobs_err = jobs_or_fail(text)
+        if jobs_err is not None:
+            findings.append(f"P3: row `{key}`: {row.workflow}: {jobs_err}")
+            continue
         lines = text.splitlines()
 
         promo_range = jobs.get(row.promoting_job)
@@ -1525,7 +1480,14 @@ def _local_reusable_workflow_targets(job_body: str) -> list[str]:
 def _workflow_job_bodies(text: str) -> dict[str, str]:
     stripped = drop_comment_lines(text)
     lines = stripped.splitlines()
-    jobs = split_top_level_jobs(stripped)
+    try:
+        jobs = job_source_spans(stripped)
+    except WorkflowLoadError:
+        # Best-effort recursive helper (see `job_invokes_publish_primitive_
+        # recursive`): a target workflow this cannot parse yields no bodies
+        # here, but is still scanned (and FAILs loud) in its own right as a
+        # top-level entry of `check_p6_discovery`'s own loop.
+        return {}
     return {name: "\n".join(lines[s:e]) for name, (s, e) in jobs.items()}
 
 
@@ -1589,7 +1551,7 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
             continue
         if on_keys == ["workflow_call"]:
             continue
-        jobs, jobs_err = read_jobs_block_or_fail(text)
+        jobs, jobs_err = jobs_or_fail(text)
         if jobs_err is not None:
             findings.append(f"P6: {name}: {jobs_err}")
             continue
@@ -1858,7 +1820,10 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
 
     stripped_text = drop_comment_lines(text)
     lines = stripped_text.splitlines()
-    jobs = split_top_level_jobs(stripped_text)
+    jobs, jobs_err = jobs_or_fail(stripped_text)
+    if jobs_err is not None:
+        findings.append(f"P5: {resolved}: {jobs_err}")
+        return findings
 
     valid_found = False
     for job_start, job_end in jobs.values():
@@ -1998,6 +1963,17 @@ def _cli_read_on_block(path: Path) -> int:
 
 
 def main() -> int:
+    # A missing PyYAML install is a GATE PREREQUISITE failure, never a
+    # finding and never a pass -- checked before EITHER CLI form runs, and
+    # returning a distinct code (3, never 2 -- `--read-on-block`'s own
+    # usage-error arm already returns that) so it is never mistaken for a
+    # normal usage error either.
+    if exec_mod.yaml is None:
+        print(
+            f"gpu-prove-once: {exec_mod._MISSING_PYYAML_MESSAGE.format(exec_mod._YAML_IMPORT_ERROR)}",
+            file=sys.stderr,
+        )
+        return 3
     argv = sys.argv[1:]
     if argv and argv[0] == "--read-on-block":
         if len(argv) != 2:

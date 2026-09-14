@@ -447,10 +447,13 @@ fi
 # Read through the SAME `on:` block reader `check_gpu_prove_once.py`'s own
 # P7 (push:/workflow_call: absence) reads through -- shelled out to via its
 # `--read-on-block` CLI, never a second, independently-drifting regex. A
-# text grep for `schedule:` is evaded by a quoted `"schedule":` key or a
-# flow-style `on: {...}` map, and reports "no schedule key" on a file it
-# could not even open; the shared reader instead quote-normalizes child
-# keys and FAILS LOUD (never "absent") on anything it cannot examine.
+# text grep for `schedule:` is evaded by a quoted `"schedule":` key, a
+# folded/literal block scalar, or a flow-style `on: {...}` map, and reports
+# "no schedule key" on a file it could not even open; the shared reader is
+# a real YAML parse -- every one of those shapes is read CORRECTLY (never
+# refused merely for being an unusual spelling), and only a genuinely
+# unparseable/ambiguous document (a YAML syntax error, a duplicate key)
+# FAILS LOUD (never "absent") on anything it cannot examine.
 # ============================================================================
 gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML" 2>&1)"
 gang_on_rc=$?
@@ -474,16 +477,44 @@ else
   bad "G7: expected a quoted \"schedule\": key to be read as schedule; got rc=${g7q_rc} keys=${g7q_keys}"
 fi
 
-# G7 fixture: a FLOW-STYLE on: {...} map cannot be examined -- refused, not
-# read as "no schedule key present".
+# G7 fixture: a FLOW-STYLE on: {...} map is real, valid YAML -- read
+# CORRECTLY (workflow_dispatch, never schedule), never refused.
 g7_flow="$SANDBOX/g7-flow-style.yml"
 printf 'on: {workflow_dispatch: {}}\n' > "$g7_flow"
 g7f_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_flow" 2>&1)"
 g7f_rc=$?
-if [ "$g7f_rc" -ne 0 ] && [[ "$g7f_out" == *"flow-style"* ]]; then
-  ok "G7: a flow-style on: {...} map is refused as unreadable, naming the shape (cannot examine, never a silent pass)"
+if [ "$g7f_rc" -eq 0 ] && [[ "$g7f_out" == "workflow_dispatch" ]]; then
+  ok "G7: a flow-style on: {...} map is read correctly (workflow_dispatch, no schedule key)"
 else
-  bad "G7: expected a flow-style on: map to be refused naming 'flow-style'; got rc=${g7f_rc} out=${g7f_out}"
+  bad "G7: expected a flow-style on: map to read as workflow_dispatch; got rc=${g7f_rc} out=${g7f_out}"
+fi
+
+# G7 fixture: a FOLDED block scalar on: >-\n  push is real, valid YAML --
+# read CORRECTLY as the single trigger key `push` (the round-5 audit's own
+# headline finding: the hand reader this replaced returned the literal
+# token `>-` here, confidently and wrongly, rc=0).
+g7_folded="$SANDBOX/g7-folded-scalar.yml"
+printf 'on: >-\n  push\n' > "$g7_folded"
+g7fo_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_folded" 2>&1)"
+g7fo_rc=$?
+if [ "$g7fo_rc" -eq 0 ] && [[ "$g7fo_out" == "push" ]]; then
+  ok "G7: a folded block scalar (on: >-\\n  push) is read correctly as 'push', never the literal '>-' token"
+else
+  bad "G7: expected a folded block scalar on: to read as 'push'; got rc=${g7fo_rc} out=${g7fo_out}"
+fi
+
+# G7 fixture: a genuinely unparseable document -- two top-level on: blocks
+# (a duplicate key, since both spellings resolve to the SAME YAML 1.1
+# boolean key) -- IS the loud refusal; never confused with a merely
+# unusual-looking but valid shape like the two cases above.
+g7_dup="$SANDBOX/g7-duplicate-on.yml"
+printf 'on:\n  workflow_dispatch:\non:\n  schedule:\n    - cron: "30 8 * * *"\n' > "$g7_dup"
+g7d2_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_dup" 2>&1)"
+g7d2_rc=$?
+if [ "$g7d2_rc" -ne 0 ] && [[ "$g7d2_out" == *"duplicate key"* ]]; then
+  ok "G7: two top-level on: blocks (a duplicate key) is refused loud naming 'duplicate key'"
+else
+  bad "G7: expected two top-level on: blocks to be refused naming 'duplicate key'; got rc=${g7d2_rc} out=${g7d2_out}"
 fi
 
 # G7 fixture: a mode-000 (unreadable) FILE is FAIL, never "no schedule key".
@@ -538,19 +569,20 @@ else
 fi
 
 # G7 fixture: `on: &trig` immediately preceding a LIVE `schedule:` cron
-# child is refused loud -- a naive `grep -qx schedule` on the reader's own
-# output, or a text grep for `schedule:` directly, would both miss a real
-# cron re-add hidden behind an anchor; the shared reader must refuse to
-# examine the anchored value rather than silently reporting "no schedule
-# key present".
+# child is real, valid YAML (an anchor on the on: value, resolved by the
+# real parser exactly as GitHub itself would) -- a naive `grep -qx
+# schedule` on the reader's own output, or a text grep for `schedule:`
+# directly, would both miss a real cron re-add hidden behind an anchor; the
+# shared reader instead reads straight through the anchor and correctly
+# reports `schedule` as present.
 g7_anchor="$SANDBOX/g7-anchored-cron.yml"
 printf 'on: &trig\n  schedule:\n    - cron: "30 8 * * *"\n' > "$g7_anchor"
 g7a_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_anchor" 2>&1)"
 g7a_rc=$?
-if [ "$g7a_rc" -ne 0 ] && [[ "$g7a_out" == *"anchor"* ]]; then
-  ok "G7: on: &trig with a live schedule: cron child is refused loud (cannot examine, never 'no schedule key')"
+if [ "$g7a_rc" -eq 0 ] && [[ "$g7a_out" == "schedule" ]]; then
+  ok "G7: on: &trig with a live schedule: cron child is read correctly as carrying 'schedule' (anchors resolved, never a silent 'no schedule key')"
 else
-  bad "G7: expected on: &trig + live cron to be refused naming 'anchor'; got rc=${g7a_rc} out=${g7a_out}"
+  bad "G7: expected on: &trig + live cron to read as 'schedule'; got rc=${g7a_rc} out=${g7a_out}"
 fi
 
 # ============================================================================

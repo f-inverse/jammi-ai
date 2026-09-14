@@ -736,10 +736,10 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     "model_id", "artifact_path", "metrics", "cache_outcome"}` (`metrics` the
     raw JSON text of the run-summary blob, or `None` when the run recorded
     none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
-    is always `"computed"` today — model-level cache reuse for a `FineTune`
-    job is refused at submit
-    (`InferenceSession::submit_fine_tune_spec_deduped`), so the
-    `"reused:{model_id}"` form this field's vocabulary reserves is not yet
+    is always `"computed"` — model-level cache reuse for a `FineTune` job is
+    refused on every durable submit edge
+    (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
+    `"reused:{model_id}"` form this field's vocabulary reserves is not
     reachable; see https://github.com/f-inverse/jammi-ai/issues/562 — the
     same vocabulary the `table` variant already carries). A compute kind's
     `table` variant projects to `{"kind": "table", "table", "cache_outcome"}`.

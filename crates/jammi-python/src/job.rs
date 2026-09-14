@@ -221,11 +221,11 @@ impl PyJob {
     /// "artifact_path", "metrics", "cache_outcome"}` for a training kind
     /// (`metrics` is the raw JSON text of the run-summary blob, or `None`
     /// when the run recorded none — read [`Self::metrics`] for the parsed
-    /// form; `cache_outcome` is always `"computed"` today — model-level
-    /// cache reuse for a `FineTune` job is refused at submit
-    /// (`InferenceSession::submit_fine_tune_spec_deduped`), so the
+    /// form; `cache_outcome` is always `"computed"` — model-level cache
+    /// reuse for a `FineTune` job is refused on every durable submit edge
+    /// (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
     /// `"reused:{model_id}"` form this field's vocabulary reserves is not
-    /// yet reachable; see
+    /// reachable; see
     /// <https://github.com/f-inverse/jammi-ai/issues/562>), or `{"kind":
     /// "table", "table", "cache_outcome"}` for a compute kind. This dict is
     /// the generic `serde_json` projection of the engine's own

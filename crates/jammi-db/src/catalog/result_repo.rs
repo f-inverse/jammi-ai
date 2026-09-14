@@ -1879,9 +1879,13 @@ mod tests {
         );
     }
 
-    /// The refusal names the offending value AND every accepted spelling, so a
-    /// kind that exists in the enum can never be missing from the message a
-    /// reader is handed.
+    /// The refusal names the offending value and every entry of
+    /// [`ResultTableKind::ALL`], the hand-listed array checked above — not
+    /// necessarily every variant of the enum. A variant named in
+    /// `ResultTableKind::all`'s pattern but left out of `ALL` would be
+    /// missing from this message exactly as it is missing from the round-trip
+    /// test above; see
+    /// <https://github.com/f-inverse/jammi-ai/issues/550>.
     #[test]
     fn an_unknown_result_table_kind_is_refused_naming_every_accepted_spelling() {
         let err = ResultTableKind::try_from_db_str("embedding_index")

@@ -216,9 +216,9 @@ async fn refactor_parity() {
     );
 }
 
-/// U2b acceptance (c) — the regression fixture, extending [`refactor_parity`]
-/// (which only covers the contrastive shape) with the SAME pinned-oracle
-/// discipline over `task=regression`.
+/// U2b's refactor-parity criterion, the regression shape — the fixture
+/// extends [`refactor_parity`] (which only covers the contrastive shape)
+/// with the SAME pinned-oracle discipline over `task=regression`.
 ///
 /// Pinned at THIS unit's own base (`4e27156a`, U2b's dispatch base — U2a and
 /// U4a already landed, so `task=regression` already routed through the
@@ -318,7 +318,7 @@ async fn regression_refactor_parity() {
     );
 }
 
-/// U2b acceptance (d): GradCache (`FineTuneConfig::cached = true`) at `W=1`
+/// U2b's GradCache criterion: GradCache (`FineTuneConfig::cached = true`) at `W=1`
 /// on the eager `TextRows` path, digest-pinned like [`refactor_parity`]'s
 /// adapter bytes (this file's own FNV-1a [`fingerprint`], for the reason
 /// stated there: neither `sha2` nor `DefaultHasher` can back a constant

@@ -923,8 +923,8 @@ impl TrainingDataLoader {
 mod tests {
     use super::*;
 
-    /// Item 2 (CONTRACT-U2b-fix1.md fold): a `Precomputed` loader has no
-    /// row-level partition, so `text_chunk_for_rank` refuses it outright
+    /// A `Precomputed` loader has no row-level partition, so
+    /// `text_chunk_for_rank` refuses it outright
     /// rather than attempting to slice pre-built tensor batches by row. Dies
     /// if the refusal is removed (the `LoaderData::Precomputed(_) => Err(...)`
     /// arm at `text_chunk_for_rank`'s match) — the call would then need to

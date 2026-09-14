@@ -493,9 +493,9 @@ pub(crate) fn softplus_std_for_test(raw: f64) -> f64 {
     STD_FLOOR + sp
 }
 
-/// K3's own standalone oracle (CONTRACT-U2b-fix1.md F7): before this module
-/// existed, the whole-prefix-vs-loss-scale claim had only the end-to-end
-/// byte-parity pin as a witness. This proves the mechanism directly: the
+/// K3's own standalone oracle: before this module existed, the
+/// whole-prefix-vs-loss-scale claim had only the end-to-end byte-parity pin
+/// as a witness. This proves the mechanism directly: the
 /// scaler [`TrainingLoop::run`] builds once before the loop
 /// (`train_loader.regression_targets()`, then [`TargetScaler::from_targets`])
 /// is a function of the WHOLE train prefix's targets, never of how many

@@ -172,18 +172,19 @@ async fn materialize_and_read(
     Ok((table, batches))
 }
 
-/// The reader-class allow-list: every production (non-test) call site that
-/// reaches a training-set table's relation KEY in this crate, keyed by
-/// `path:function` rather than `path:line` — a line number drifts under an
-/// unrelated edit, a function name does not — with the ONE property each
-/// entry must hold: it applies [`training_set_order_by`] itself. A caller
-/// that reads a relation by name without doing so loses the committed order
-/// silently on a multi-row-group table scanned by more than one partition.
+/// The reader-class allow-list: every call site in this crate, outside test
+/// code, that reaches a training-set table's relation KEY through one of the
+/// three named routes below, keyed by `path:function` rather than
+/// `path:line` — a line number drifts under an unrelated edit, a function
+/// name does not — with the ONE property each entry must hold: it applies
+/// [`training_set_order_by`] itself. A caller that reads a relation by name
+/// without doing so loses the committed order silently on a multi-row-group
+/// table scanned by more than one partition.
 ///
-/// # The class this scan covers: every ROUTE to the relation key, not one name
+/// # The three named routes this scan covers
 ///
 /// [`TrainingSetTable::sql_relation`] is not the only way to reach the
-/// registered name — the scan matches every route:
+/// registered name — the scan matches three named routes:
 /// - `.sql_relation(` — the dot-call form.
 /// - `sql_relation(&` — the UFCS form (`TrainingSetTable::sql_relation(&t)`).
 /// - `registered_name(` — [`TrainingSetTable::registered_name`], the
@@ -420,8 +421,8 @@ mod reader_class_allow_list {
 mod tests {
     use super::*;
 
-    /// CONTRACT-U2b-fix1.md item 3: [`training_set_spec`] is a thin
-    /// pass-through, so it must name the exact same [`TrainingSetSpec::
+    /// [`training_set_spec`] is a thin pass-through, so it must name the
+    /// exact same [`TrainingSetSpec::
     /// definition_hash`] as a hand-built struct literal over the identical
     /// seven fields — the "unification must not change any hash" property,
     /// pinned directly rather than by re-running a whole fixture through the

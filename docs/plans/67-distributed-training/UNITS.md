@@ -386,8 +386,16 @@ re-verification) on top of it.
   relaxed `get_result_table` read), `crates/jammi-db/src/catalog/schema.rs` +
   `migrations.rs` (migration adding `jobs.training_set_ref`/
   `training_set_location`, both nullable TEXT, a paired-nullability `CHECK`
-  constraint — numbered 033 on this branch's base; PR-C1's rebase onto `main`
-  renumbers it to 034, since PR-B2 owns 033 there). (docs-ci)
+  constraint — numbered 033 (`jobs_training_set_identity`) on this branch's
+  base; when PR-B2's `033_model_materialization` is on `main` first, PR-C1's
+  rebase renumbers `033_jobs_training_set_identity` to 034 (three pin sites +
+  the ordered-after oracle: the tuple in `catalog/migrations.rs`'s const
+  list, the `MIGRATION_033_JOBS_TRAINING_SET_IDENTITY` constant name in
+  `catalog/schema.rs`, `EXPECTED_MIGRATION_NAMES` in
+  `tests/it/migrations.rs:23-54`, and
+  `migration_033_is_ordered_after_032_and_pins_the_pair_at_the_schema_edge`'s
+  own `position("033_jobs_training_set_identity")` literal,
+  `tests/it/migrations.rs:1572-1746`). (docs-ci)
   `crates/jammi-server/tests/it/api_freeze_baseline.txt` +  `api_freeze.rs`
   (`PACKAGE jammi.v1.gang` / `RPC GangService/RunRank`),
   `tenant_isolation_oracle.rs` (`GANG_LISTENER_ALLOWLIST`, never appended to

@@ -3103,24 +3103,28 @@ its own status:
    `InvalidArgument("world must be greater than zero")`; `rank >= world` →
    `InvalidArgument("rank must be less than world")`.
 2. **I-GANG, a row predicate AND a host-local verify — two conjuncts, the
-   ROW-keyed lattice (fix round 1, R2).** (a) `Catalog::get_job_for_rank(job_id)`
+   ROW-keyed lattice.** (a) `Catalog::get_job_for_rank(job_id)`
    (`crates/jammi-db/src/catalog/jobs_repo.rs`, primary-key-only, no tenant
-   predicate, never admin scope) returns a row iff: `status = 'running'`;
-   `claimed_by = assign.coordinator_instance_id`; `attempts ==
-   assign.attempt`; the lease is live (the negation of
-   `lease_expired_clause`, `crates/jammi-db/src/catalog/lease.rs` — a NULL
-   lease column reads not-live, never live-by-default). The ROW's OWN
+   predicate, never admin scope) returns the row by primary key alone — it
+   decides nothing itself and returns `Ok(None)` only when no job with that
+   id exists. Every determinant is decided by the CALLER, the
+   `GangServer::run_rank` handler: `status = 'running'`; `claimed_by =
+   assign.coordinator_instance_id`; `attempts == assign.attempt`; the lease
+   is live (the negation of `lease_expired_clause`,
+   `crates/jammi-db/src/catalog/lease.rs` — a NULL lease column reads
+   not-live, never live-by-default). The ROW's OWN
    `RankAdmissionRow::world_size` (decoded from the job's `spec` JSON, never
-   the caller's `Assign.world`) then decides two more conjuncts inside the
-   `GangServer::run_rank` handler itself, never inside `get_job_for_rank`'s
-   own statement: `assign.world != row.world_size` is itself a refusal (a
-   caller-keyed gate lets a `world_size > 1` job admit under a
-   caller-supplied `world = 1`, skipping (b) entirely — the closing-audit #1
-   F1 finding this row-keyed lattice closes); and, only when `row.world_size
-   > 1` (by then known to equal `assign.world`), `training_set_ref`/
-   `training_set_location` must both be non-null. Any conjunct false, or the
-   row absent, refuses. (b) For `row.world_size > 1` only, AFTER (a)
-   succeeds: `resolve_training_set_identity_classified`
+   the caller's `Assign.world`) then decides two more conjuncts, likewise
+   inside the handler, never inside `get_job_for_rank`'s own statement:
+   `assign.world != row.world_size` is itself a refusal — a caller-keyed
+   gate (deciding the pair conjunct on `assign.world` rather than
+   `row.world_size`) would let a `world_size > 1` job admit under a
+   caller-supplied `world = 1`, skipping (b) entirely, which is why the gate
+   is keyed on the row and not the caller's claim; and, only when
+   `row.world_size > 1` (by then known to equal `assign.world`),
+   `training_set_ref`/`training_set_location` must both be non-null. Any
+   conjunct false, or the row absent, refuses. (b) For `row.world_size > 1`
+   only, AFTER (a) succeeds: `resolve_training_set_identity_classified`
    (`crates/jammi-server/src/grpc/gang.rs`) performs its own host-local
    sidecar verify — `Catalog::get_result_table_for_tenant` (the STRICT
    tenant predicate `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`,
@@ -3148,6 +3152,31 @@ its own status:
    rung still ends `Unimplemented("gang admission is not implemented on
    this build")`: the handler has decided every I-GANG determinant but has
    no admission session to hand the call to.
+
+**Non-disclosure and the `test-hooks` seam.** A
+table-driven oracle asserts the rung-4 `Status` (code and message bytes) is
+byte-identical across every determinant above, so no leaking message ever
+distinguishes them on the wire. Behind `#[cfg(feature = "test-hooks")]`
+only, `GangServer::last_refusal_reason()` / `refusal_reason_handle()`
+(`crates/jammi-server/src/grpc/gang.rs`) expose which `GangRefusalReason`
+variant a call actually refused for — a test-only introspection point, never
+response text; the plain `cargo test -p jammi-server --test it` lane cannot
+observe it, and the `--features test-hooks` lane executes a strictly larger
+determinant-covering case count as a result.
+
+**A genuine catalog fault during admission is `Unavailable`, not
+`FailedPrecondition`.** `admission_catalog_fault`
+(`crates/jammi-server/src/grpc/gang.rs`) maps `Catalog::get_job_for_rank`
+erroring, or `Catalog::get_result_table_for_tenant` erroring inside the
+`world_size > 1` sidecar lookup, to `Status::unavailable(..)` — a transient,
+retriable status distinct from every rung-4 `FailedPrecondition` refusal
+above, which is a genuine, non-retriable row fact. This is the ADMISSION-time
+classification only; `Catalog::fresh_instance` erroring and
+`ResultStore::read_materialization_manifest` erroring are unchanged
+(the latter's admission-time "unresolvable/unverifiable" collapse to
+`FailedPrecondition` stands, §W2 Resolution). The mid-stream re-verification
+three-way split (`Refuted`/`Unavailable`/`StoreUnavailable`) is U5a-2's,
+built once an admitted `HostAdmission` session exists to re-verify inside.
 
 **Tenant handling.** Tenant is derived from the `jobs` row `get_job_for_rank`
 returns, never from caller metadata — a caller naming a different tenant is

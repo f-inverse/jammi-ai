@@ -54,25 +54,27 @@ those still in force are restated here in their v4 form. Principle in parenthese
 **Substrate (the jobs fleet)**
 
 26. **The claimant is the coordinator.** A training-kind job is claimed by a `JobWorker` through
-    `claim_next` (`jobs_repo.rs:658-719`); that process is rank 0 and holds the only lease
-    (`heartbeat_job`, `jobs_repo.rs:772`). Kinds eligible for `world_size > 1`: `fine_tune` and
+    `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`); that process is rank 0 and holds the only lease
+    (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for `world_size > 1`: `fine_tune` and
     `graph_fine_tune`; `context_predictor` is refused at `world_size > 1` (K2, typed, at submit).
 27. **A peer is a fleet worker with a busy slot.** A peer is a `JobWorker` process whose
     `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank` takes the
     worker's single job slot: a `JobSlot` mutex the claim loop takes **before** `claim_next`,
-    **holds across** the inline `run_claimed_job` (`worker.rs:355`), and **releases before** the
-    idle sleep (`:363`) — so a peer never claims while it runs a rank, never aborts a claim
+    **holds across** the inline `run_claimed_job_under`, and **releases before** the
+    idle sleep — all three in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until` —
+    so a peer never claims while it runs a rank, never aborts a claim
     transaction (OPS D6), never receives a rank while training its own job, and is reachable
     whenever idle. Handler order: same `job_id` with a lesser attempt → abort that runner and
     take the slot; lesser-or-equal attempt → refuse; otherwise try-lock; busy → typed
     `Unavailable`, and the coordinator picks another member or fails the attempt. No new worker
     state. (B1; OPS D6.)
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
-    sketch (`DIST-DATA-PLANE.md:208-215`), not a plannable unit, so **U5b-1a** lands the
+    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#5-8-unit-2-membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
+    not a plannable unit, so **U5b-1a** lands the
     substrate it sketches: `[server] peer_advertise` (validate: `peer_advertise ⇒ peer_bind ⇒
     result_root`), the canonicalized `instances.peer_addr`/`result_root` columns (migration,
-    numbered at rebase), the `upsert_instance` signature and the session write site
-    (`session.rs:247-251`). DIST's `RendezvousPlacement` builds on it later. Peers are resolved
+    numbered at rebase), the `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_instance` signature and the session write site
+    (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`, its `upsert_instance` call site). DIST's `RendezvousPlacement` builds on it later. Peers are resolved
     from the catalog: `workers.kinds` ∋ kind, `instances.peer_addr` set, `last_seen_at` within
     U5a-1's `instance_liveness_margin()` (merge order pinned: U5a-1 lands before U5b-1a, which
     only consumes the margin), draining/warming and root-divergent instances excluded, and —
@@ -98,19 +100,21 @@ those still in force are restated here in their v4 form. Principle in parenthese
     `workers.devices` rides in it, since U8b is its first reader). U5b-0's per-row-group leaf
     digests are a sidecar-object change and append no migration. No plan reserves a number: each
     PR takes the next free number at rebase and updates **both pin sites** — the const list in
-    `crates/jammi-db/src/catalog/migrations.rs` and `EXPECTED_MIGRATION_NAMES` in
-    `crates/jammi-db/tests/it/migrations.rs:23-54` (exact-equality asserts) — and OPS's
-    relative-position oracle; the second merger renumbers (K5). Three 68 units (OPS, GRAPH,
-    DELTA) also append one each.
+    `crates/jammi-db/src/catalog/migrations.rs` and
+    `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES` (exact-equality
+    asserts) — and OPS's relative-position oracle; the second merger renumbers (K5). Three 68
+    units (OPS, GRAPH, DELTA) also append one each.
 31. **The training set is not this attempt's partial result.** U2a materializes it with
     `job_attempt: None`: it is a shared producer output reused by definition hash, not an
     attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
     reached. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
-    jobs CAS, `result_repo.rs:99-130`) but outside OPS's linked release sweep, so a crashed or
+    jobs CAS, `crates/jammi-db/src/catalog/result_repo.rs::Catalog::release_building_tables_of_claimant`)
+    but outside OPS's linked release sweep, so a crashed or
     released coordinator leaves a live `building` row: the successor (or a second job over the
     same training set) that finds a live same-named `building` row **backs off** — returns the
-    `BackOff` disposition (`jobs.rs:248-261`), leaving the job `running` for the next tick — and
-    reclaims it through `claim_expired_building_table` (`store/mod.rs:1443-1470`) once the
+    `BackOff` disposition (`crates/jammi-ai/src/jobs.rs::PartialResultDisposition::BackOff`), leaving the job `running` for the next tick — and
+    reclaims it through `claim_expired_building_table`
+    (`crates/jammi-db/src/catalog/result_repo.rs::Catalog::claim_expired_building_table`) once the
     lease expires. The model artifact remains the job's result through `finish_job_with_model`.
 32. **Row order from the catalog is never trusted.** No 67 query consumes `RETURNING` order;
     every listing sorts in Rust (68 cross-cutting fact).
@@ -124,7 +128,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     rewrites the claim loop U5a's `JobSlot` wraps and GRAPH rewrites `claim_next`.
 34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
     `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
-    tenant predicate, never admin scope (`get_job` is tenant-filtered, `jobs_repo.rs:580-596`,
+    tenant predicate, never admin scope (`get_job` is tenant-filtered, `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::get_job`,
     and D7 forbids `with_admin_scope` on the peer path), reachable only from the gang handler —
     verifies `status = 'running'`, `claimed_by = coordinator_instance_id`, lease live, and
     **derives the tenant from the row** (`jobs.tenant_id`), pinning every subsequent catalog
@@ -141,12 +145,12 @@ those still in force are restated here in their v4 form. Principle in parenthese
 
 **Operability (68 OPS)**
 
-36. **An aborted attempt lands no terminal write.** `fail_job` is terminal (`jobs_repo.rs:
-    1057-1100`: `status = 'failed'`, no attempt bump); the only requeue path on the fleet is the
-    leave-`running`-for-reclaim arm (`worker.rs:670-676`) → reclaim arm 1a → `attempts + 1` at
+36. **An aborted attempt lands no terminal write.** `fail_job` is terminal
+    (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::fail_job`: `status = 'failed'`, no attempt bump); the only requeue path on the fleet is the
+    leave-`running`-for-reclaim arm (`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_claimed_job_under`, the lease-lost arm) → reclaim arm 1a → `attempts + 1` at
     the successor's claim. So on any rank failure the coordinator cancels every rank, aborts the
     attempt (no publish, no finalize), flips its hold's `lost` flag (the cancel flag *is*
-    `hold.lost_flag()`, `worker.rs:531-547`) so its own run exits through that arm, and the job
+    `hold.lost_flag()`, `JobWorker::run_claimed_job_under`) so its own run exits through that arm, and the job
     is requeued by reclaim within the remaining lease window (≤ `[lease] duration_secs`, 30 s
     default) — no new verb. **A released rank is a release, not a failure**: DRAIN/RELEASE on a
     peer host ends the rank with `RankEvent::Released`; the coordinator first calls OPS's
@@ -156,7 +160,8 @@ those still in force are restated here in their v4 form. Principle in parenthese
 37. **The watchdog is allowed under the actuator rule.** It is per attempt, bounded by the
     attempt's lifetime, created by the claimant for the job it holds, and only retires that
     attempt (requeue is the pre-existing reclaim semantics) — the lease keeper's shape, not a
-    standing loop. The rule (`recompute.rs:29-35`; 68 DIST D5) has no constitution ID; a
+    standing loop. The rule (`crates/jammi-ai/src/pipeline/recompute.rs`'s module doc, "the
+    engine ships the actuator; it never ships the control loop that pulls it"; 68 DIST D5) has no constitution ID; a
     human-merged constitution row is a proposed follow-on, not assumed.
 
 **The Ballista extension (U8a, U8b)**
@@ -190,7 +195,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     5).** `expire_dead_executors` (started unconditionally in `SchedulerServer::init`) sweeps
     Ballista executor heartbeats — the same class as `reclaim_expired_jobs` and `prune_instances`
     the fleet already runs each tick — but the same loop also posts `ExecutorLost`
-    (`scheduler_server/mod.rs:395`) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
+    (Ballista's `scheduler/src/scheduler_server/mod.rs`, read from source 2026-09-10) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
     **without consulting `task_max_failures`**. With both retry knobs at 0, a `GangExec` on a
@@ -233,7 +238,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     through the Ballista path per device kind.
 45. **Naming pre-swept.** New pub items: `JammiCodec`, `JammiExecutionEngine`, `CatalogClusterState`,
     `CatalogJobState`, `DevicePlacement`, `BallistaConfig`, `GangExec`, `JobSlot`, `RankEvent::Released`
-    — none carries the seven governance stems (`check_no_consumer_names.py:78-80`); trait-impl
+    — none carries the seven governance stems (`ci/scripts/check_no_consumer_names.py::GOVERNANCE_VERBS`); trait-impl
     methods such as `create_query_stage_exec` are not `pub` declarations and are not scanned.
 
 **Still in force from v3.1 (restated)**: the eager loader and per-batch converters ship in U2b

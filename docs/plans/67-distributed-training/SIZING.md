@@ -23,7 +23,7 @@ seven crates. It is merged; every 68 unit cuts after it and so does every 67 uni
   U5b-1a, `jobs_assembly_failures_next_after` U5b-1b-ii, `compute_cluster_state` U8b); U5b-0's
   per-row-group leaf digests are a sidecar-object change and append none. No number is
   reserved — each PR takes the next free at rebase and updates both pin sites
-  (`catalog/migrations.rs` const list; `tests/it/migrations.rs:23-54` `EXPECTED_MIGRATION_NAMES`)
+  (`catalog/migrations.rs` const list; `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`)
   plus OPS's relative-position oracle; the second merger renumbers.
 
 ```

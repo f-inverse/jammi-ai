@@ -85,10 +85,15 @@
 # A nonzero exit that is none of the above, with the suite's own groups
 # otherwise green, is this driver's OWN post-run check refusing the leg:
 # rsync's own exit code when the artifact pull fails (a suite that passed
-# but left no retrievable evidence proves nothing reviewable), or 1 when the
-# pulled artifact tree or this run's own log carries the shape of a leaked
-# NCCL id (see the id-secrecy scan below) — a leg with evidence that reads
-# but cannot be trusted is never read as a pass either.
+# but left no retrievable evidence proves nothing reviewable), or 1 when a
+# run of >=128 contiguous hex characters turns up in the pulled artifact
+# tree or this run's own log (see the id-secrecy scan below). The id
+# crosses hosts ONLY hex-encoded (CONTRACT-U7b-v9.md's C1), and this scan
+# covers EVERY carrier the driver can read back, text or binary; the id's
+# raw 128-byte form is unrecognisable to this scan by construction (no
+# driver-side value to compare against), and base64 is out of scope by the
+# same construction — a leg with evidence that reads but cannot be trusted
+# is never read as a pass either.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -146,9 +151,14 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # JAMMI_GANG_ARTIFACT_DIR — the ONE contract between this driver and U4b's
 # test code. The NCCL id (128 opaque bytes minted by rank 0, nccl.rs's own
 # "opaque secret ... travel to the peers out of band") rides NO path under
-# either directory: it is a capability, never evidence, and this driver's
-# post-pull scan below refuses a leg whose pulled artifact tree or own log
-# ever carries one.
+# either directory: it is a capability, never evidence. This driver's
+# post-pull scan below scans EVERY carrier it can read back — text or
+# binary — in the pulled artifact tree or own log for a run of >=128
+# contiguous hex characters (the id crosses hosts ONLY hex-encoded,
+# CONTRACT-U7b-v9.md's C1, never nccl.rs) and refuses the leg on a hit; the
+# id's raw 128-byte form is unrecognisable to this scan by construction (no
+# driver-side value to compare against), and base64 is out of scope by the
+# same construction.
 GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 
@@ -352,23 +362,33 @@ else
   echo "::warning::no live pod (RP_HOST/RP_PORT unset) -- skipping the artifact pull."
 fi
 
-# The NCCL id (128 opaque bytes minted by rank 0, hex-encoded when it
-# crosses a filesystem boundary per nccl.rs's own doc comment -- 256 hex
-# characters at full length) must never reach a committed artifact or a CI
-# log: it is the capability to join this gang, not evidence of one. This
+# The NCCL id (128 opaque bytes minted by rank 0) crosses hosts ONLY
+# hex-encoded -- CONTRACT-U7b-v9.md's C1, never nccl.rs's own doc comment
+# (which names only the byte count, not the wire encoding) -- 256 hex
+# characters at full length. It must never reach a committed artifact or a
+# CI log: it is the capability to join this gang, not evidence of one. This
 # lane mints/ships no id today (that lands with U7b-C's two-process
 # bootstrap); the id file's own committed contract, fixed here BEFORE that
 # mechanism exists, is that it rides OUTSIDE
 # ${GANG_REMOTE_ARTIFACT_DIR}/${GANG_ARTIFACT_DIR} -- never inside the
 # directory this driver pulls back and a human later commits. This scan is
-# the backstop against that contract being violated by a future mistake: it
-# refuses the leg if a run of at least 128 CONTIGUOUS hex characters (half a
-# full id's length, and comfortably clear of a sha256 digest's 64 -- this
-# lane's own build/clone steps legitimately print those) ever turns up in
-# the pulled artifact tree or in this run's own log, regardless of how it
-# got there. 128 is also chosen to stay under this grep's own repetition-
-# count ceiling (some grep builds refuse a bound above 255) with headroom.
-id_leak="$(grep -rIlE '[0-9a-fA-F]{128,}' "$GANG_ARTIFACT_DIR" "$LOG" 2>/dev/null || true)" # tripwire-ok: grep's own exit 1 on "no match anywhere" IS the pass condition; a match is reported on the next line, and both paths exist by construction at this point, so an unreadable path is never the reason this stays silent.
+# the backstop against that contract being violated by a future mistake.
+#
+# Delivered scope, stated exactly: the scan covers EVERY carrier this
+# driver can read back -- text or binary alike (no `-I`/binary-skip flag) --
+# across the whole pulled artifact tree and this run's own log, refusing
+# the leg if a run of at least 128 CONTIGUOUS hex characters (half a full
+# id's length, and comfortably clear of a sha256 digest's 64 -- this lane's
+# own build/clone steps legitimately print those) ever turns up in either,
+# regardless of how it got there. The id's OTHER representation -- 128 raw,
+# unencoded bytes, which C1's hex-encoding crossing never produces in the
+# first place -- is UNRECOGNISABLE to this content-blind regex by
+# construction: no driver-side value is known to compare against. Base64 is
+# out of scope by the same construction: no driver-side value is known to
+# decode-and-compare against either, and C1's crossing never produces one.
+# 128 is also chosen to stay under this grep's own repetition-count ceiling
+# (some grep builds refuse a bound above 255) with headroom.
+id_leak="$(grep -rlE '[0-9a-fA-F]{128,}' "$GANG_ARTIFACT_DIR" "$LOG" 2>/dev/null || true)" # tripwire-ok: grep's own exit 1 on "no match anywhere" IS the pass condition; a match is reported on the next line, and both paths exist by construction at this point, so an unreadable path is never the reason this stays silent. No `-I`: this scan must see binary carriers too (Q2), so a binary-looking file is scanned, not skipped.
 if [ -n "$id_leak" ]; then
   echo "::error::gang leg: a run of >=128 contiguous hex characters (the shape of a hex-encoded NCCL id, which is 256 at full length) was found in: ${id_leak} -- the id is an opaque secret and must never reach a committed artifact or a CI log; refusing to report this leg as evidence" >&2
   [ "$rc" -eq 0 ] && rc=1

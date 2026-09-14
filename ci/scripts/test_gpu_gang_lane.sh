@@ -450,13 +450,30 @@ fi
 # text grep for `schedule:` is evaded by a quoted `"schedule":` key, a
 # folded/literal block scalar, or a flow-style `on: {...}` map, and reports
 # "no schedule key" on a file it could not even open; the shared reader is
-# a real YAML parse -- every one of those shapes (and any other
-# unusual-but-valid spelling) is read EXACTLY as GitHub Actions itself
-# reads it, never refused merely for being unusual. A genuinely
-# unparseable/ambiguous document -- a YAML syntax error, a duplicate key,
-# OR an anchor/alias/tag anywhere in the file (GitHub's own parser rejects
-# all three, so this reader refuses them too, loudly, naming the exact
-# construct) -- FAILS LOUD (never "absent") on anything it cannot examine.
+# a real YAML parse and is bound here to its own fixture-backed battery
+# (`check_execution_surface_reachability.py --self-test`), never a claim
+# beyond it: every shape that battery pins as an ACCEPTED read -- bare,
+# single- and double-quoted, and commented inline scalars; folded (`>-`)
+# and literal (`|`) block scalars; flow and block sequences and mappings;
+# a quoted top-level `"on":`/`'on':` key; a leading `---` doc marker; the
+# YAML-1.1 `True:` alias for the bare `on:` boolean key; `on :` with
+# leading whitespace before the colon; a BOM and/or CRLF line endings; a
+# quoted child key; re-dedented sibling children; and a fake `on:`/`push:`
+# pair embedded inside an unrelated `run:` block scalar, which is never
+# mistaken for the real key -- is read correctly, never refused merely for
+# being unusual. Two DIFFERENT genuine-refusal classes are both fixture-
+# backed and both FAIL LOUD (never "absent") rather than silently reading
+# `[]`: a document this parser cannot compose at all (a YAML syntax error,
+# tab indentation, an inconsistently dedented sibling, a duplicate
+# top-level key, or a null/empty `on:` value); and an ANCHOR, ALIAS
+# (including a `<<:` merge key), or explicit TAG anywhere in the `on:`
+# value -- each of these is otherwise-valid YAML that GitHub Actions'
+# OWN parser documents as rejected in a workflow file, so this reader
+# refuses it too, loudly, naming the exact construct, never describing it
+# as "unparseable" or "ambiguous" (it is neither -- `yaml.safe_load` reads
+# it fine; GitHub's own parser is what refuses it). Any workflow shape
+# outside this enumerated, fixture-backed battery is untested by this gate
+# and this comment makes no claim about it.
 # ============================================================================
 gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML" 2>&1)"
 gang_on_rc=$?

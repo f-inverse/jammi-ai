@@ -28,11 +28,22 @@ RUN yum install -y sqlite-libs \
 # This base image's `/usr/bin/python3` carries no `pip` at all -- a bare
 # `pip install` here fails with "No module named pip" (reproduced against
 # `quay.io/pypa/manylinux_2_28_x86_64` directly). `ensurepip --upgrade`
-# installs pip from the WHEEL BUNDLED ON DISK inside Python's own stdlib
-# `ensurepip` package (every CPython interpreter ships one) -- it has NO
-# network path, verified on both `quay.io/pypa/manylinux_2_28_x86_64` and
-# `..._aarch64`, so this bootstrap step is offline and not optional, never
-# a fetch that could fail or be skipped on a network-isolated build.
+# installs pip from a wheel already ON DISK -- but that wheel is NOT
+# stdlib-bundled: this distro's `ensurepip` ships with no `_bundled/`
+# directory at all (`ensurepip._WHEEL_PKG_DIR` points to it instead) and
+# the wheel actually used lives at the DISTRO's own
+# `/usr/share/python3.12-wheels/pip-23.2.1-py3-none-any.whl` on both
+# `quay.io/pypa/manylinux_2_28_x86_64` and `..._aarch64` (verified by
+# running `python3 -m ensurepip --upgrade` under `--network none` on both
+# arches). This bootstrap step is offline today because THIS distro's
+# package layout puts a wheel there, never because CPython's stdlib
+# guarantees one -- a base-image bump that drops or relocates that distro
+# package would silently make this step either fail or need network,
+# without this comment claiming a stdlib guarantee that does not exist.
+# The real guard against that drift is downstream: the `import yaml` gate
+# prerequisite check (`_pyyaml_prerequisite_rc()`) fails loud, by name, the
+# instant a rebuilt image no longer has PyYAML importable -- it is what
+# actually protects the gates, not an assumption about this RUN line.
 RUN python3 -m ensurepip --upgrade \
     && python3 -m pip install --no-cache-dir 'PyYAML==6.*'
 

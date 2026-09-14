@@ -456,6 +456,17 @@ def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], re
         result.fail(f"{path}: omits {len(missing)} file(s) the union of open second-round BLOCK "
                     f"row(s) require, e.g. {sorted(missing)[:3]}")
 
+    # Fix round 5 Z7: `unit_branch`/`residual_risk` presence, pair-reuse
+    # denial and the execution-class requirement all run through the ONE
+    # shared validator reader 1 (the hook) calls — never re-implemented
+    # here, which is exactly how this file's own earlier gaps (accepting
+    # an all-inspector record, a reused (command, hash) pair, a row with
+    # no `residual_risk`/`unit_branch` at all) went uncaught.
+    shape_why = mod._r12_anticipation_rejection([r for _, r in art_rows], [], check_attacks=True,
+                                                 required_files=set())
+    if shape_why is not None:
+        result.fail(f"{path}: {shape_why}")
+
     # Re-execution against a REAL, independently checked-out `pre_fix_sha`
     # — ADVISORY ONLY, per M3': never a hard fail.
     for lineno, row in art_rows:
@@ -638,22 +649,41 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
     and value only — never re-executed (these are already CI jobs
     elsewhere in `.github/workflows/`).
 
-    Fix round 4 Z2: the governing row is selected ORDER-INDEPENDENTLY,
-    never by `rows[-1]` (append position). `cmd_export_anticipation`
-    dumps every `<slug>.anticipation.*.json` artifact still on disk,
-    `sorted(sdir.iterdir())` — i.e. sorted by FILENAME, a tip sha, which
-    is pseudorandom hex and carries no chronological meaning; an older
-    round's artifact can sort AFTER a newer round's and land on the last
-    line of the committed export. `_row_head`/`_row_ts` below select the
-    row whose own `head_sha` matches this checkout's actual `HEAD` when
-    one does (the case where the export was captured at the exact commit
-    reader 3 is validating); when none does — the common case, since a
-    pre-fix witness by construction predates the commit it is validated
-    against — every row is eligible. Within whichever pool applies, the
-    GREATEST `ts` (the row's own recorded export time) governs, never the
-    row nearest the end of the file."""
+    Fix round 4 Z2 / fix round 5 Z5: the governing row is selected ORDER-
+    INDEPENDENTLY, never by `rows[-1]` (append position). `cmd_export_
+    anticipation` dumps every `<slug>.anticipation.*.json` artifact still
+    on disk, `sorted(sdir.iterdir())` — i.e. sorted by FILENAME, a tip
+    sha, which is pseudorandom hex and carries no chronological meaning;
+    an older round's artifact can sort AFTER a newer round's and land on
+    the last line of the committed export. Since fix round 5, the SAME
+    exporter stamps `ts` (the artifact FILE's own mtime) and `head_sha`
+    (the artifact's own `pre_fix_sha`) on every row it emits — so
+    `_row_head`/`_row_ts` below select the row whose own `head_sha`
+    matches this checkout's actual `HEAD` when one does (the case where
+    the export was captured at the exact commit reader 3 is validating);
+    when none does — the common case, since a pre-fix witness by
+    construction predates the commit it is validated against — every row
+    is eligible. Within whichever pool applies, the GREATEST `ts`
+    governs, never the row nearest the end of the file — and when the
+    pool holds >=2 candidate rows and ANY of them lacks `ts` (a
+    hand-typed or pre-Z5 record, never one the real exporter produced),
+    this FAILS LOUDLY naming the ambiguity rather than silently falling
+    back to `rows[0]`/append order.
+
+    Fix round 5 Z7: the gates SHAPE/VALUE check itself is the SAME shared
+    `_r12_gates_shape_rejection` reader 1 and reader 2 call — never a
+    second, independently hand-rolled implementation that can drift from
+    theirs (this is exactly the bug three earlier readers of this file
+    found: a hand-rolled loop here accepted `{"rc": "1"}`/`{"rc": true}`/
+    non-dict `gates` entries that the shared function has always denied)."""
     ok_req, req_text = _git(cwd, "show", "HEAD:ci/lead-gate-required-commands.txt")
-    if not ok_req or not req_text.strip():
+    if not ok_req:
+        # Fix round 5 Z4: MISSING is a hard FAIL here, never a silent
+        # return — a missing committed gate-command list must never
+        # disarm item 8a with zero CI signal.
+        result.fail("ci/lead-gate-required-commands.txt does not read at HEAD in this checkout — "
+                    "item 8a's committed, human-amend-only gate-command list must be present "
+                    "(esc-lead-gate-R12 fix round 5 Z4)")
         return
     required_commands: list[str] = []
     for line in req_text.splitlines():
@@ -664,11 +694,19 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         if command:
             required_commands.append(command)
     if not required_commands:
+        # Fix round 5 Z4: EMPTY/all-comment is likewise a hard FAIL.
+        result.fail("ci/lead-gate-required-commands.txt exists but names no command line (empty "
+                    "or all-comment) — item 8a's gate-command list must never silently disarm "
+                    "(esc-lead-gate-R12 fix round 5 Z4)")
         return
     path = f"docs/rigor/{unit_slug}.anticipation.jsonl"
     ok, text = _git(cwd, "show", f"HEAD:{path}")
     if not ok or not text.strip():
-        return  # check_anticipation_witnesses already fails this shape when it is armed
+        # No anticipation record for THIS unit at all -- structurally
+        # nothing to check item 8a against; `check_anticipation_witnesses`
+        # already fails the missing-record shape when IT is armed (an open
+        # second-round BLOCK), which is the only case that requires one.
+        return
     rows: list[dict] = []
     for line in text.splitlines():
         if not line.strip():
@@ -695,26 +733,22 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
 
     matching = [r for r in rows if head_now and _row_head(r) == head_now]
     pool = matching if matching else rows
+
+    if len(pool) >= 2 and any(not (isinstance(r.get("ts"), str) and r.get("ts")) for r in pool):
+        result.fail(
+            f"{path}: {len(pool)} candidate anticipation row(s) carry no reliable ordering "
+            "evidence (at least one has no `ts`) -- the GOVERNING row is AMBIGUOUS; re-export "
+            "with `lead-gate-lib.py --export-anticipation` (which stamps `ts`/`head_sha` on "
+            "every row since fix round 5) and commit the result (esc-lead-gate-R12 fix round 5 Z5)"
+        )
+        return
     governing = max(pool, key=_row_ts)
 
-    gates = governing.get("gates")
-    if not isinstance(gates, dict):
-        result.fail(f"{path}: the governing row carries no `gates` object, but "
-                    f"ci/lead-gate-required-commands.txt commits {len(required_commands)} "
-                    "line(s) (esc-lead-gate-R12 item 8a)")
-        return
-    missing = [c for c in required_commands if c not in gates]
-    if missing:
-        result.fail(f"{path}: the governing row's `gates` omits {len(missing)} committed command(s), "
-                    f"e.g. {missing[:3]} (esc-lead-gate-R12 item 8a)")
-    for c in required_commands:
-        entry = gates.get(c)
-        if not isinstance(entry, dict):
-            continue
-        rc = entry.get("rc")
-        if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
-            result.fail(f"{path}: the governing row's `gates`[{c!r}] recorded rc={rc} (non-zero) — "
-                        "the committed record must reflect a green fix (esc-lead-gate-R12 item 8a)")
+    mod = _lib_module()
+    gates_why = mod._r12_gates_shape_rejection(f"{path}: the governing row", governing.get("gates"),
+                                                required_commands, judge_rc=True)
+    if gates_why is not None:
+        result.fail(gates_why)
 
 
 def check_allowlist_only_shrinks(cwd: Path = REPO_ROOT) -> int:
@@ -815,6 +849,8 @@ def _sh(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
+_RR_BASELINE_REQUIRED_COMMAND = "python3 ci/scripts/check_swarm_bijection.py"
+
 _FIXTURE_ENV = {
     "GIT_AUTHOR_NAME": "rigor-fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
     "GIT_COMMITTER_NAME": "rigor-fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
@@ -857,6 +893,15 @@ def _pr_repo(tmp: Path) -> tuple[Path, Path]:
     lib_text = LEAD_GATE_LIB.read_text() if LEAD_GATE_LIB.exists() else _MINIMAL_SLUGIFY_STUB
     (work / ".claude" / "hooks" / "lead-gate-lib.py").write_text(lib_text)
     (work / "ci" / "scripts" / "check_rigor_record.py").write_text(Path(__file__).read_text())
+    # Fix round 5 Z4: a missing/empty/all-comment required-commands file is
+    # now a hard FAIL in `check_required_gates` whenever an anticipation
+    # record exists at all -- every fixture gets a baseline, non-empty file
+    # by default so unrelated fixtures never incidentally exercise item
+    # 8a's own FAIL arm; `_rr_gates_commit` (RR14-17) overwrites this with
+    # its own custom line, and RR12c/d/e/g/h's own anticipation rows carry
+    # a matching `gates` entry.
+    (work / "ci" / "lead-gate-required-commands.txt").write_text(
+        f"{_RR_BASELINE_REQUIRED_COMMAND}  # measured ~0.0s\n")
     subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "scaffold"], check=True, env=env)
     subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"], check=True)
@@ -1154,8 +1199,9 @@ def fixture_rr12c_shape_allows_despite_unresolvable_pre_fix_sha() -> None:
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
             "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
-            "attacks": {"a.py": {"command": "printf 'ok\\n'", "hash": witness}},
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": witness}},
             "residual_risk": "fixture residual",
+            "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
@@ -1186,8 +1232,9 @@ def fixture_rr12d_real_reproducing_witness_allows() -> None:
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
             "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
-            "attacks": {"a.py": {"command": "printf 'ok\\n'", "hash": witness}},
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": witness}},
             "residual_risk": "fixture residual",
+            "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
@@ -1218,8 +1265,9 @@ def fixture_rr12e_real_nonreproducing_witness_warns_never_fails() -> None:
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
             "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
-            "attacks": {"a.py": {"command": "printf 'ok\\n'", "hash": "0" * 64}},
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "0" * 64}},
             "residual_risk": "fixture residual",
+            "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
@@ -1279,6 +1327,7 @@ def fixture_rr12g_tracked_bash_path_allows() -> None:
             "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
             "attacks": {"a.py": {"command": "bash probe.sh", "hash": witness}},
             "residual_risk": "fixture residual",
+            "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
@@ -1309,6 +1358,7 @@ def fixture_rr12h_untracked_bash_path_fails_shape() -> None:
             "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
             "attacks": {"a.py": {"command": "bash probe.sh", "hash": "a" * 64}},
             "residual_risk": "fixture residual",
+            "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
         })
         _commit(work, "ci: touch a gate script", {
             "ci/scripts/probe.py": "print('x')\n",
@@ -1352,7 +1402,7 @@ def _rr_gates_commit(work: Path, extra_files: dict[str, str], gates: dict | None
                              "class_enumeration": ["a.py:1"]})
     art: dict = {
         "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
-        "attacks": {"a.py": {"command": "printf ok", "hash": "a" * 64}},
+        "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
         "residual_risk": "fixture residual",
     }
     if gates is not None:
@@ -1402,44 +1452,116 @@ def fixture_rr16_nonzero_rc_fails() -> None:
         _assert(any("recorded rc=1" in f for f in r.failures), "RR16", f"{r.failures}")
 
 
+def _real_anticipation_export(work: Path, slug: str, artifacts: list[dict],
+                               mtimes: list[float]) -> str:
+    """Fix round 5 Z5: runs the REAL `lead-gate-lib.py --export-anticipation`
+    entry point (a subprocess, `CLAUDE_PROJECT_DIR=work` — the exact
+    command the lead runs) against real `.jammi/gate-state/<slug>.
+    anticipation.<tip>.json` artifact files, one per `artifacts[i]`, whose
+    mtime is set to `mtimes[i]` — proving the fixture exercises the
+    EXPORTED shape (real `ts`/`head_sha` stamped from the artifact file's
+    own mtime/`pre_fix_sha`), never a hand-typed simulation of it."""
+    sdir = work / ".jammi" / "gate-state"
+    sdir.mkdir(parents=True, exist_ok=True)
+    for art, mtime in zip(artifacts, mtimes):
+        tip = art["pre_fix_sha"]
+        p = sdir / f"{slug}.anticipation.{tip}.json"
+        p.write_text(json.dumps(art))
+        os.utime(p, (mtime, mtime))
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(work)
+    proc = subprocess.run(
+        [sys.executable, str(work / ".claude" / "hooks" / "lead-gate-lib.py"),
+         "--export-anticipation", slug],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    _assert(proc.returncode == 0, "real export setup", f"--export-anticipation failed: {proc.stderr}")
+    return proc.stdout
+
+
 def fixture_rr17_interleaved_export_selects_by_ts_not_position() -> None:
-    """fix round 4 Z2: `cmd_export_anticipation` sorts artifacts by
-    FILENAME (a tip sha -- pseudorandom hex, no chronological meaning),
-    so an OLDER round's row can land on the LAST line of the committed
-    export while a NEWER, green row sits earlier in the file. The
-    governing row must be the one with the greatest `ts`, never the one
-    nearest the end of the file: here the newer (rc=0) row is listed
-    FIRST and the older (rc=1) row is listed LAST -- `rows[-1]` would
-    wrongly select the older, broken row and FAIL; the fix ALLOWS."""
+    """fix round 4 Z2 / fix round 5 Z5: `cmd_export_anticipation` sorts
+    artifacts by FILENAME (a tip sha -- pseudorandom hex, no chronological
+    meaning), so an OLDER round's row can land on the LAST line of the
+    committed export while a NEWER, green row sits earlier in the file.
+    Exercises the REAL exporter (`_real_anticipation_export`) against two
+    real artifact files whose mtimes are set OLDER-first/NEWER-second in
+    wall-clock time but whose FILENAMES sort in the OPPOSITE order (the
+    older, broken `rc=1` artifact's tip sorts AFTER the newer, green
+    `rc=0` artifact's tip) -- the governing row must be the one with the
+    greatest `ts` (the real, exported mtime), never the one nearest the
+    end of the file; the fix ALLOWS."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         sha0 = _sh(work, "rev-parse", "HEAD")
         sha1 = _commit(work, "seed an intermediate ancestor tip", {"docs/README-fixture2.md": "seed2\n"})
+        # tip_new sorts BEFORE tip_old alphabetically ("0..." < "f...") --
+        # the OPPOSITE of chronological order, exactly fix round 4 F1's
+        # own bug shape (an older round's artifact filename can sort
+        # AFTER a newer one).
+        tip_new, tip_old = "0" * 40, "f" * 40
+        art_new = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": tip_new,
+                   "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                   "residual_risk": "fixture residual",
+                   "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+        art_old = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": tip_old,
+                   "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                   "residual_risk": "fixture residual",
+                   "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+        now = time.time()
+        exported = _real_anticipation_export(work, "feat_rr-fixture", [art_old, art_new],
+                                              [now - 3600.0, now])
         pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
         block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
-        row_new = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": sha1,
-                   "head_sha": sha1, "ts": "2026-01-02T00:00:00Z",
-                   "attacks": {"a.py": {"command": "printf ok", "hash": "a" * 64}},
-                   "residual_risk": "fixture residual",
-                   "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
-        row_old = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": sha0,
-                   "head_sha": sha0, "ts": "2026-01-01T12:00:00Z",
-                   "attacks": {"a.py": {"command": "printf ok", "hash": "a" * 64}},
-                   "residual_risk": "fixture residual",
-                   "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
         files = {
             "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
             "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
-            "docs/rigor/feat_rr-fixture.anticipation.jsonl": json.dumps(row_new) + "\n" + json.dumps(row_old) + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": exported,
             "docs/README-fixture.md": "line one\n",
             "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
         }
-        _commit(work, "ci: touch a gate script (interleaved export, older head last)", files)
+        _commit(work, "ci: touch a gate script (interleaved REAL export, older head last)", files)
         r = _run_check_in(work)
-        _assert(r.ok(), "RR17", f"the greatest-ts row (rc=0) must govern despite the older-ts "
-                                  f"row (rc=1) being appended LAST: {r.failures}")
+        _assert(r.ok(), "RR17", f"the greatest-ts (real, exported) row (rc=0) must govern despite "
+                                  f"the older-ts row (rc=1) sorting LAST by filename: {r.failures}")
+
+
+def fixture_rr18_ambiguous_pool_without_ts_fails_loudly() -> None:
+    """fix round 5 Z5: the PRE-fix-round-5 shape -- two candidate rows,
+    NEITHER carrying `ts`/`head_sha` at all (what `cmd_export_anticipation`
+    produced before it started stamping them) -- is now a LOUD FAIL naming
+    the ambiguity, never a silent `rows[0]`/append-order pick. RED at
+    daebd948 by the executed probe: the old code's `max(pool, key=_row_ts)`
+    with an all-empty `_row_ts` silently returned the FIRST row for every
+    such pool, regardless of which one was actually current."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        row_a = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+                 "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                 "residual_risk": "fixture residual",
+                 "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+        row_b = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40,
+                 "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                 "residual_risk": "fixture residual",
+                 "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+        files = {
+            "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": json.dumps(row_a) + "\n" + json.dumps(row_b) + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        }
+        _commit(work, "ci: touch a gate script (no ts on either row)", files)
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR18", "two ts-less candidate rows must FAIL loudly, never silently "
+                                     "pick one")
+        _assert(any("AMBIGUOUS" in f for f in r.failures), "RR18", f"{r.failures}")
 
 
 RR_FIXTURES = [
@@ -1467,6 +1589,7 @@ RR_FIXTURES = [
     ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
     ("RR16", fixture_rr16_nonzero_rc_fails),
     ("RR17", fixture_rr17_interleaved_export_selects_by_ts_not_position),
+    ("RR18", fixture_rr18_ambiguous_pool_without_ts_fails_loudly),
 ]
 
 

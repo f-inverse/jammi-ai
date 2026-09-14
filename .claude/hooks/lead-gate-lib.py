@@ -2182,19 +2182,17 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
     if not (isinstance(relay_ub, str) and relay_ub.strip() and slugify(relay_ub) == unit_slug):
         return f"anticipation artifact {path.name} `unit_branch` does not name this unit"
 
-    residual_risk = data.get("residual_risk")
-    if not isinstance(residual_risk, str) or not residual_risk.strip():
-        return (f"anticipation artifact {path.name} carries no non-empty `residual_risk` — the "
-                 "one field where the lead admits an unclosed site: which case does the attack "
-                 "you just ran NOT cover? (esc-lead-gate-R12 item 8c)")
-
-    # item 8a: SHAPE only — every committed required-commands line named
-    # verbatim with an integer `rc`; the VALUE of `rc` is never judged
-    # here (the pre-fix tip is expected to be broken).
-    gates_why = _r12_gates_shape_rejection(path.name, data.get("gates"), _r12_required_commands(),
-                                            judge_rc=False)
-    if gates_why is not None:
-        return gates_why
+    # Fix round 5 Z7: residual_risk (item 8c) and item 8a's gates SHAPE
+    # (the VALUE of `rc` is never judged here — the pre-fix tip is
+    # expected to be broken) both run through the ONE shared anticipation
+    # validator every R12 reader now calls — never re-implemented per
+    # reader.
+    required_commands, required_commands_deny_reason = _r12_required_commands_or_deny()
+    shape_why = _r12_anticipation_rejection([data], required_commands, check_attacks=False,
+                                             gates_row=data, judge_gates_rc=False,
+                                             required_commands_deny_reason=required_commands_deny_reason)
+    if shape_why is not None:
+        return shape_why
 
     # M1' ordering evidence: the tip has not moved since this decision
     # began, the resolved worktree's own HEAD equals it, and the tree is
@@ -2239,29 +2237,21 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
                  f"BLOCK(s)' own finding_locations/class_enumeration name, e.g. "
                  f"{sorted(missing_files)[:3]} (esc-lead-gate-R12)")
 
+    # Every entry is individually validated (shape, denylist, RE-EXECUTED,
+    # hash-matched) FIRST, in file order — a SPECIFIC per-entry failure
+    # (hash mismatch, VACUOUS, a denylist hit) must be reported before any
+    # aggregate judgement about the artifact's commands AS A SET. Only
+    # once every entry individually passes does the shared shape validator
+    # (Fix round 5 Z7 — the SAME function reader 3 calls, over the SAME
+    # `attacks`, without ever re-executing) judge the pair-reuse and
+    # execution-class-requirement arms that only make sense in aggregate.
     seen_pairs: dict[tuple[str, str], str] = {}
-    all_inspector = True
-    any_execution_class = False
     for f in sorted(by_file):
-        err, command, is_inspector = _r12_validate_and_run_entry(
+        err, _command, _is_inspector = _r12_validate_and_run_entry(
             path.name, f, attacks.get(f), cwd, attack_deadline, seen_pairs)
         if err is not None:
             return err
-        all_inspector = all_inspector and is_inspector
-        if command is not None and _r12_is_execution_class(command):
-            any_execution_class = True
-    if all_inspector:
-        return (f"anticipation artifact {path.name} carries only inspector-class commands "
-                 "(sed/grep/cat/head/awk/rg/wc/tail/ls) — at least one attack must be "
-                 "execution-class (sh|bash <tracked path>, cargo, python3, pytest, make) "
-                 "(esc-lead-gate-R12)")
-    if not any_execution_class:
-        return (f"anticipation artifact {path.name} carries no execution-class attack — "
-                 "esc-lead-gate-R12 F2: at least one command's first token must actually be "
-                 "cargo/python3/pytest/make or a `sh|bash <tracked path>` invocation; a "
-                 "placeholder command (e.g. printf/echo) is neither inspector-class nor "
-                 "execution-class and proves nothing about the mechanism (esc-lead-gate-R12)")
-    return None
+    return _r12_anticipation_rejection([data], [], check_attacks=True, required_files=set(by_file))
 
 
 def _post_fix_attacks_rejection(row: dict, data: dict, project_dir: str, cwd: str,
@@ -2366,15 +2356,20 @@ def _r12_required_commands_path() -> Path:
     return repo_root() / _R12_REQUIRED_COMMANDS_FILENAME
 
 
-def _r12_required_commands() -> list[str]:
-    """item 8a: the committed, human-amend-only list of gate commands, one
-    per line, `#`-comment/blank lines skipped, a trailing `  # ...`
-    annotation stripped from each command line. `[]` when the file is
-    missing — armed by the DATA, an HONEST default: no committed file
-    means no gate obligation, never a crash."""
+def _r12_required_commands_or_deny() -> tuple[list[str], str | None]:
+    """item 8a, fix round 5 Z4: `ci/lead-gate-required-commands.txt` is a
+    gate file IN FACT (human-amend-only, ratcheted, SWARM_GATE_TOUCHED-
+    guarded), so a MISSING, EMPTY or all-comment file is now a hard DENY
+    — never the honest-but-silently-disarming `[]` fix round 3 returned
+    (which let deleting or emptying this committed file weaken item 8a
+    with ZERO CI signal: every reader simply stopped requiring anything).
+    Returns `(commands, deny_reason)`; `deny_reason` is `None` ONLY when
+    the file exists and names at least one real command line."""
     path = _r12_required_commands_path()
     if not path.exists():
-        return []
+        return [], (f"{_R12_REQUIRED_COMMANDS_FILENAME} does not exist — item 8a's committed, "
+                     "human-amend-only gate-command list must be present (esc-lead-gate-R12 "
+                     "fix round 5 Z4)")
     out: list[str] = []
     for line in path.read_text().splitlines():
         stripped = line.strip()
@@ -2383,7 +2378,23 @@ def _r12_required_commands() -> list[str]:
         command = stripped.split("  #", 1)[0].rstrip()
         if command:
             out.append(command)
-    return out
+    if not out:
+        return [], (f"{_R12_REQUIRED_COMMANDS_FILENAME} exists but names no command line (empty "
+                     "or all-comment) — item 8a's gate-command list must never silently disarm "
+                     "(esc-lead-gate-R12 fix round 5 Z4)")
+    return out, None
+
+
+def _r12_required_commands() -> list[str]:
+    """item 8a: the committed, human-amend-only list of gate commands, one
+    per line, `#`-comment/blank lines skipped, a trailing `  # ...`
+    annotation stripped from each command line. `[]` when the file is
+    missing/empty/all-comment — the DENIAL for those states is a separate,
+    LOUD concern (`_r12_required_commands_or_deny`, fix round 5 Z4); this
+    accessor stays for callers that only need the plain list (e.g. a
+    self-test asserting shape over the real file)."""
+    commands, _deny_reason = _r12_required_commands_or_deny()
+    return commands
 
 
 def _r12_gates_shape_rejection(artifact_name: str, gates: object, required_commands: list[str],
@@ -2415,6 +2426,134 @@ def _r12_gates_shape_rejection(artifact_name: str, gates: object, required_comma
         if judge_rc and rc != 0:
             return (f"{artifact_name} `gates`[{c!r}] recorded rc={rc} (non-zero) — every "
                      "committed gate must be green at fix_head (esc-lead-gate-R12 item 8a)")
+    return None
+
+
+def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], *,
+                                 check_attacks: bool,
+                                 required_files: set[str] | None = None,
+                                 gates_row: dict | None = None,
+                                 judge_gates_rc: bool = False,
+                                 required_commands_deny_reason: str | None = None) -> str | None:
+    """esc-lead-gate-R12 fix round 5 Z7: the ONE anticipation-record
+    shape validator shared by READER 1 (the hook, at dispatch — a
+    singleton `rows=[<the live artifact>]`, called twice: once for
+    `residual_risk`/`gates`, once more with `check_attacks=True` for the
+    attacks shape/coverage, matching its own pre-existing check ORDER
+    exactly) and READER 3 (`check_rigor_record.py`, every row the
+    committed `docs/rigor/<slug>.anticipation.jsonl` carries, loaded from
+    THIS module by path so the two validators can never drift). `rows`
+    is never empty when called — the caller already denied on a missing/
+    unparseable record before reaching here.
+
+    Checks, in order:
+      1. every row's `unit_branch` is a non-empty string, and every row's
+         `residual_risk` is a non-empty string (item 8c) — a GENERIC
+         non-empty check; reader 1 additionally requires its own
+         `unit_branch` to match the dispatching unit's own slug, a
+         stronger check it makes itself, before ever reaching here.
+      2. `gates_row` (the SINGLE governing row — a checklist against one
+         moment in time, never a union), when given, has `gates` shape-
+         complete against `required_commands` (item 8a, via the ALREADY-
+         shared `_r12_gates_shape_rejection`); `rc`'s VALUE is judged
+         only when `judge_gates_rc`.
+      3. (only when `check_attacks`) every attacks[*] entry, across the
+         union of every row, is shape-valid (`command` non-empty, `hash`
+         a valid 64-hex digest) — SHAPE only, never re-executed (a caller
+         needing live re-execution, e.g. reader 1's real dispatch path,
+         does that itself afterward via `_r12_validate_and_run_entry`).
+      4. no (command, hash) pair repeats across ANY two keys in ANY row
+         — a templated attack proves nothing about a per-site
+         examination.
+      5. at least one command, across the union, is EXECUTION-class
+         (never only inspector-class) — enforced only when at least one
+         attacks entry exists across `rows`.
+      6. `required_files` (when non-empty) is fully covered by the union
+         of every row's own `attacks` keys — the omits-a-command arm: an
+         anticipation record that never attacks a required file at all
+         denies here, identically in EITHER reader."""
+    for row in rows:
+        unit_branch = row.get("unit_branch")
+        if not (isinstance(unit_branch, str) and unit_branch.strip()):
+            return "anticipation record carries a row with no non-empty `unit_branch` (esc-lead-gate-R12)"
+        residual_risk = row.get("residual_risk")
+        if not (isinstance(residual_risk, str) and residual_risk.strip()):
+            return ("anticipation record carries no non-empty `residual_risk` — the one field "
+                    "where the lead admits an unclosed site: which case does the attack you just "
+                    "ran NOT cover? (esc-lead-gate-R12 item 8c)")
+
+    if gates_row is not None:
+        # Fix round 5 Z4: a MISSING/EMPTY/all-comment committed
+        # required-commands file is a hard DENY here — never silently
+        # treated as "no gate obligation" (which is what an empty
+        # `required_commands` list, on its own, would otherwise mean).
+        if required_commands_deny_reason is not None:
+            return required_commands_deny_reason
+        gates_why = _r12_gates_shape_rejection("the governing anticipation row", gates_row.get("gates"),
+                                                required_commands, judge_rc=judge_gates_rc)
+        if gates_why is not None:
+            return gates_why
+
+    if not check_attacks:
+        return None
+
+    covered: set[str] = set()
+    all_inspector = True
+    any_execution_class = False
+    any_entry = False
+    for row in rows:
+        attacks = row.get("attacks")
+        if not isinstance(attacks, dict):
+            continue
+        # Pair-reuse is scoped to WITHIN this ONE row — a templated attack
+        # is two keys of the SAME artifact sharing one (command, hash);
+        # two DIFFERENT rounds' rows (reader 3's `rows` spans every
+        # exported round) legitimately re-attacking the same file the
+        # same way is not that smell, and reader 1 only ever validates a
+        # singleton `rows=[data]` anyway, so this is a no-op narrowing
+        # for reader 1's own call.
+        seen_pairs: dict[tuple[str, str], str] = {}
+        for key, entry in attacks.items():
+            if not isinstance(entry, dict):
+                return f"anticipation record attacks[{key!r}] is not an object (esc-lead-gate-R12)"
+            command = entry.get("command")
+            if not isinstance(command, str) or not command.strip():
+                return f"anticipation record attacks[{key!r}] has no `command` (esc-lead-gate-R12)"
+            recorded_hash = entry.get("hash")
+            if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):
+                return f"anticipation record attacks[{key!r}] has no valid `hash` (esc-lead-gate-R12)"
+            pair = (command, recorded_hash)
+            if pair in seen_pairs:
+                return (f"anticipation record attacks[{key!r}] and attacks[{seen_pairs[pair]!r}] "
+                        "reuse the IDENTICAL (command, hash) pair — a templated attack is not a "
+                        "per-site examination (esc-lead-gate-R12)")
+            seen_pairs[pair] = key
+            any_entry = True
+            covered.add(_key_to_file(key))
+            if _r12_is_execution_class(command):
+                any_execution_class = True
+            if not _r12_is_inspector_only(command):
+                all_inspector = False
+
+    if required_files:
+        missing = required_files - covered
+        if missing:
+            return (f"anticipation record omits {len(missing)} file(s) the open BLOCK(s)' own "
+                     f"finding_locations/class_enumeration name, e.g. {sorted(missing)[:3]} "
+                     "(esc-lead-gate-R12)")
+
+    if any_entry:
+        if all_inspector:
+            return ("anticipation record carries only inspector-class commands "
+                     "(sed/grep/cat/head/awk/rg/wc/tail/ls) — at least one attack must be "
+                     "execution-class (sh|bash <tracked path>, cargo, python3, pytest, make) "
+                     "(esc-lead-gate-R12)")
+        if not any_execution_class:
+            return ("anticipation record carries no execution-class attack — esc-lead-gate-R12 F2: "
+                     "at least one command's first token must actually be cargo/python3/pytest/"
+                     "make or a `sh|bash <tracked path>` invocation; a placeholder command (e.g. "
+                     "printf/echo) is neither inspector-class nor execution-class and proves "
+                     "nothing about the mechanism (esc-lead-gate-R12)")
     return None
 
 
@@ -3361,7 +3500,18 @@ def cmd_export_anticipation(argv: list[str]) -> int:
     closed-world gate lattice at `_unit_rows_by_agent_type`/`normalize_
     verdict`; this export is read-only evidence for
     `ci/scripts/check_rigor_record.py`, never gate state). A pure READ: no
-    stdin, no payload, never touches `decide_pre` or any gate decision."""
+    stdin, no payload, never touches `decide_pre` or any gate decision.
+
+    Fix round 5 Z5: every exported row is stamped with `ts` (ISO-8601 UTC,
+    derived from the artifact FILE's own mtime — the moment the lead's
+    attack actually ran and wrote it, never the export's own wall-clock)
+    and `head_sha` (the artifact's own `pre_fix_sha`, i.e. the tip its
+    filename already encodes — the artifact IS keyed by this tip, so no
+    extra bookkeeping is needed to know it). These two fields are what let
+    `check_rigor_record.py`'s governing-row selection be ORDER-INDEPENDENT
+    (select by `head_sha` match, else by the greatest `ts`) instead of by
+    append/sort position, which the artifact's OWN filename (a content
+    hash, not a timestamp) cannot support."""
     if len(argv) < 3 or not argv[2].strip():
         sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-anticipation <unit_slug>\n")
         return 2
@@ -3382,6 +3532,14 @@ def cmd_export_anticipation(argv: list[str]) -> int:
             row = dict(data)
             row.pop("verdict", None)
             row["agent_type"] = "lead-anticipation"
+            try:
+                mtime = entry.stat().st_mtime
+                row["ts"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:  # R12-RESIDUAL: requires the artifact file to vanish between the `iterdir()` listing and this `stat()` call, a TOCTOU race not exercised by a fast self-test fixture
+                row["ts"] = now_iso()
+            pre_fix_sha = data.get("pre_fix_sha")
+            if isinstance(pre_fix_sha, str) and pre_fix_sha:
+                row["head_sha"] = pre_fix_sha
             sys.stdout.write(json.dumps(row, sort_keys=True))
             sys.stdout.write("\n")
             n += 1

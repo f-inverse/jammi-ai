@@ -325,6 +325,17 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
 # the run's duration and `.cleanup()`-ed at process exit via `atexit` — a
 # self-test run leaves nothing behind, deliberately, rather than trusting
 # whatever ran it to sweep `/tmp` afterward.
+# Fix round 5 Z4: `ci/lead-gate-required-commands.txt` missing/empty is now
+# a hard DENY in reader 1/2 (never a silent "no obligation"), so `_temp_repo`
+# commits a baseline, never-executed line by this name on EVERY fixture's
+# seed commit; `_write_anticipation_exact`/`_write_relay_exact` default
+# `gates` to a matching single-entry `rc: 0` object (the `_GATES_AUTO`
+# sentinel below, distinct from an explicit `gates=None`, which still means
+# "omit the `gates` key entirely" — the handful of item-8a fixtures that
+# test THAT specific arm pass `gates=None` explicitly).
+_BASELINE_REQUIRED_COMMAND = "python3 ci/scripts/check_swarm_bijection.py"
+_GATES_AUTO = object()
+
 _TEMP_DIRS: list[tempfile.TemporaryDirectory] = []
 
 
@@ -406,6 +417,15 @@ def _temp_repo(unit_branch: str) -> Path:
     # hook runs in already gitignores `.jammi/` for the same reason.
     (root / ".gitignore").write_text(".jammi/\n")
     (root / "SEED.md").write_text("seed\n")
+    # Fix round 5 Z4: `ci/lead-gate-required-commands.txt` missing/empty is
+    # now a hard DENY in reader 1/2 (never a silent "no obligation") — every
+    # fixture gets a baseline, non-empty file by default so unrelated
+    # fixtures never incidentally exercise item 8a's own DENY arm; a
+    # dedicated fixture that wants the missing/empty/all-comment case
+    # `unlink()`s or overwrites this file itself.
+    (root / "ci").mkdir(parents=True, exist_ok=True)
+    (root / "ci" / "lead-gate-required-commands.txt").write_text(
+        f"{_BASELINE_REQUIRED_COMMAND}  # measured ~0.0s\n")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "seed")
     _git(root, "checkout", "-q", "-b", unit_branch)
@@ -556,18 +576,24 @@ def _anticipation_path_exact(root: Path, unit_branch: str, tip_sha: str) -> Path
 def _write_anticipation_exact(root: Path, unit_branch: str, tip_sha: str, attacks: dict,
                                residual_risk: str | None = "fixture residual risk placeholder",
                                covers: list[str] | None = None,
-                               gates: dict | None = None) -> Path:
+                               gates: dict | None = _GATES_AUTO) -> Path:
     """M1' schema: `{unit_branch, pre_fix_sha, covers, attacks, residual_risk}`
     — `attacks` is keyed PER FILE (`{file: {command, hash}}`), never per
     raw `path:line` finding key. `gates` (esc-lead-gate-R12 fix round 3
-    item 8a) is OMITTED unless a caller supplies one -- every EXISTING
-    fixture keeps its byte-identical shape."""
+    item 8a) DEFAULTS to `_GATES_AUTO` — a single, green entry matching
+    `_temp_repo`'s own baseline `ci/lead-gate-required-commands.txt` line
+    (fix round 5 Z4 made a missing/incomplete `gates` object a hard DENY
+    whenever that file is committed, which it now always is by default) —
+    an EXPLICIT `gates=None` still omits the key entirely, for the small
+    number of fixtures that test item 8a's own missing-`gates` arm."""
     path = _anticipation_path_exact(root, unit_branch, tip_sha)
     artifact = {"unit_branch": unit_branch, "pre_fix_sha": tip_sha, "attacks": attacks}
     if covers is not None:
         artifact["covers"] = covers
     if residual_risk is not None:
         artifact["residual_risk"] = residual_risk
+    if gates is _GATES_AUTO:
+        gates = {_BASELINE_REQUIRED_COMMAND: {"rc": 0}}
     if gates is not None:
         artifact["gates"] = gates
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -652,7 +678,14 @@ def _write_relay_exact(root: Path, row: dict, sites: dict[str, str] | None = Non
     real shape). A fixture that means to test R12 itself passes an
     explicit `attacks_post` dict (or `None` to omit it deliberately)."""
     path = _relay_path_exact(root, row)
-    artifact = {"unit_branch": row["unit_branch"], "agent_type": row["agent_type"], "block_ts": row["ts"]}
+    # Fix round 5 Z4: `_relay_rejection` judges the relay's OWN `gates`
+    # UNCONDITIONALLY (never scoped to R12-anticipation units) against
+    # whatever `ci/lead-gate-required-commands.txt` names — `_temp_repo`'s
+    # baseline file default means every relay needs a matching green entry
+    # unless a caller's own `override` replaces it (item 8a's own fixtures
+    # already do, via `override={"gates": ...}`).
+    artifact = {"unit_branch": row["unit_branch"], "agent_type": row["agent_type"], "block_ts": row["ts"],
+                "gates": {_BASELINE_REQUIRED_COMMAND: {"rc": 0}}}
     if fix_head is not None:
         artifact["fix_head"] = fix_head
     if sites is not None:
@@ -2366,6 +2399,9 @@ def fixture_r12e5_empty_derived_set_unresolvable_main_denies() -> None:
     _git(root, "init", "-q", "-b", "trunk")
     _git(root, "config", "commit.gpgsign", "false")
     (root / ".gitignore").write_text(".jammi/\n")
+    (root / "ci").mkdir(parents=True, exist_ok=True)
+    (root / "ci" / "lead-gate-required-commands.txt").write_text(
+        f"{_BASELINE_REQUIRED_COMMAND}  # measured ~0.0s\n")
     (root / "a.py").write_text("a = 1\n")
     (root / "b.py").write_text("b = 1\n")
     _git(root, "add", "-A")
@@ -2491,6 +2527,7 @@ def fixture_r12f5_attacks_field_missing_denies() -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "unit_branch": unit, "pre_fix_sha": row["head_sha"], "residual_risk": "fixture",
+        "gates": {_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
         # `attacks` deliberately omitted.
     }))
     p = _r12_dispatch(root, unit)
@@ -3840,24 +3877,18 @@ def _g20_28_arm() -> tuple[list[str], int]:
 import ast  # noqa: E402  (kept local to this section, mirrors the module's own late imports)
 
 _R12_SWEEP_FUNCS = {
-    # esc-lead-gate-R12 fix round 3 item 10 (kept current): every function
-    # in the `# R12-BEGIN`/`# R12-END` sentinel region (25 total as of fix
-    # round 3 — the 20 from fix round 2, plus item 8's seven new functions:
-    # `_r12_required_commands_path`, `_r12_required_commands`,
-    # `_r12_gates_shape_rejection`, `_mutations_rejection`,
-    # `_r12_new_test_surfaces`, `_r12_previous_relay_row`,
-    # `_exclusions_rejection`), not a hand-picked subset. A
-    # function with no CONDITIONAL non-`None`/non-fallthrough return
-    # (`_new_attack_deadline`, `_derived_attack_keys`, `_key_to_file`,
-    # `anticipation_artifact_path`, `_witness_hash`, `_r12_normalize_output`,
-    # `_r12_is_inspector_only`, `_r12_is_execution_class`,
-    # `_r12_targeted_open_blocks`, `_r12_required_by_file`,
-    # `_r12_required_commands_path`, `_r12_required_commands`,
-    # `_r12_new_test_surfaces`, `_r12_previous_relay_row`) contributes ZERO
+    # esc-lead-gate-R12 fix round 5 Z6: this set is EQUAL to the top-level
+    # `FunctionDef` set of the `# R12-BEGIN`/`# R12-END` sentinel region
+    # (nested defs excluded) — a self-test fixture (`R12sweepast`) asserts
+    # that equality BY AST against the real file, so this comment names no
+    # count that can go stale: a function added to the region and omitted
+    # here fails `--self-test` immediately, never merely "was covered by
+    # fewer fixtures than it should have been." A function with no
+    # CONDITIONAL non-`None`/non-fallthrough return contributes ZERO
     # positions automatically — `_r12_deny_if_positions` only counts a
-    # `Return` inside an `If`, so listing them here is harmless and keeps
-    # this set a straightforward, auditable ENUMERATION of the region
-    # rather than a hand-picked subset.
+    # `Return` inside an `If` — so listing every such function here too is
+    # harmless and keeps this set a straightforward, auditable ENUMERATION
+    # of the region rather than a hand-picked subset.
     "_install_self_alarm", "_new_attack_deadline", "_derived_attack_keys",
     "_key_to_file", "anticipation_artifact_path", "_r12_normalize_output", "_witness_hash",
     "_run_attack_command", "_resolve_worktree_cwd", "_r12_attack_command_denied",
@@ -3865,7 +3896,8 @@ _R12_SWEEP_FUNCS = {
     "_r12_required_by_file", "_r12_changed_file_set", "_r12_validate_and_run_entry",
     "_r12_empty_set_rejection", "_pre_fix_anticipation_rejection",
     "_post_fix_attacks_rejection", "_r12_find_pre_fix_artifact",
-    "_r12_required_commands_path", "_r12_required_commands", "_r12_gates_shape_rejection",
+    "_r12_required_commands_path", "_r12_required_commands_or_deny", "_r12_required_commands",
+    "_r12_gates_shape_rejection", "_r12_anticipation_rejection",
     "_mutations_rejection", "_r12_new_test_surfaces", "_r12_previous_relay_row",
     "_exclusions_rejection",
 }
@@ -3882,8 +3914,11 @@ def _r12_deny_if_positions(source: str, begin: int, end: int) -> list[tuple[int,
     """`[(lineno, col_offset), ...]` of every distinct `If` node whose body
     contains a deny-shaped `Return` (a `Return` whose value is NOT the bare
     `None` constant) inside one of `_R12_SWEEP_FUNCS`, within the sentinel
-    line range — de-duplicated, order-preserving. Deliberately does not
-    walk into a NESTED FunctionDef (there are none inside these four)."""
+    line range — de-duplicated, order-preserving. `ast.walk(node)` DOES
+    descend into a NESTED FunctionDef (`_install_self_alarm`'s own
+    `_handler`, e.g.) — there is no special-casing to exclude one; a deny
+    arm inside a nested def is swept exactly like one at the enclosing
+    function's own top level."""
     tree = ast.parse(source)
     parent_of: dict[ast.AST, ast.AST] = {}
     positions: list[tuple[int, int]] = []
@@ -3911,6 +3946,49 @@ def _r12_deny_if_positions(source: str, begin: int, end: int) -> list[tuple[int,
                     seen.add(pos)
                     positions.append(pos)
     return positions
+
+
+def _r12_top_level_region_funcs(source: str, begin: int, end: int) -> set[str]:
+    """The top-level `FunctionDef` NAME set inside the `[begin, end]` line
+    range — module-level defs only (nested defs, e.g. `_install_self_
+    alarm`'s own `_handler`, are excluded: they are swept as PART OF their
+    enclosing top-level def, never listed separately)."""
+    tree = ast.parse(source)
+    return {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and begin <= n.lineno <= end}
+
+
+def fixture_r12sweepast_sweep_funcs_equals_the_sentinel_region() -> None:
+    """esc-lead-gate-R12 fix round 5 Z6: `_R12_SWEEP_FUNCS` must equal —
+    by AST, against the REAL file, never a hand-counted comment — the
+    top-level `FunctionDef` set of the `# R12-BEGIN`/`# R12-END` sentinel
+    region (nested defs excluded). RED by construction: inserts a new
+    top-level def into a SYNTHETIC copy of the region and confirms the
+    (deliberately unmodified) `_R12_SWEEP_FUNCS` no longer equals it —
+    proving this fixture would actually catch a region def silently added
+    without updating the set, not merely that the two currently agree by
+    accident."""
+    source = LEAD_GATE_LIB.read_text()
+    begin, end = _r12_sentinel_line_range(source)
+    real = _r12_top_level_region_funcs(source, begin, end)
+    _assert(real == _R12_SWEEP_FUNCS, "R12sweepast",
+            f"_R12_SWEEP_FUNCS must equal the sentinel region's own top-level FunctionDef set: "
+            f"missing={real - _R12_SWEEP_FUNCS}, extra={_R12_SWEEP_FUNCS - real}")
+
+    # The RED half: a synthetic copy of the region with ONE new top-level
+    # def inserted must no longer equal the (real, unmodified) set.
+    lines = source.splitlines()
+    anchor = next(i for i, l in enumerate(lines) if l.strip() == "# R12-BEGIN")
+    mutated_lines = lines[:anchor + 1] + [
+        "def _r12_sweepast_canary_new_def():", "    return None", "",
+    ] + lines[anchor + 1:]
+    mutated_source = "\n".join(mutated_lines)
+    m_begin, m_end = _r12_sentinel_line_range(mutated_source)
+    mutated_real = _r12_top_level_region_funcs(mutated_source, m_begin, m_end)
+    _assert(mutated_real != _R12_SWEEP_FUNCS, "R12sweepast",
+            "inserting a new top-level def into the sentinel region must break the equality "
+            "this fixture asserts — it did not, so this fixture cannot actually catch that case")
+    _assert("_r12_sweepast_canary_new_def" in mutated_real, "R12sweepast setup",
+            "the synthetic insertion did not land inside the mutated sentinel range")
 
 
 class _R12NeuterIf(ast.NodeTransformer):
@@ -3992,7 +4070,7 @@ def run_r12_deny_coverage_sweep(fixtures: list[tuple[str, object]],
     # that can by definition never die, and would misleadingly VALIDATE a
     # mutant hooks dir that the rest of the subset never actually
     # exercised.
-    _R12_MUTATION_BLIND = {"R12D1", "R12alarm", "R12timeout", "R12alarmkill"}
+    _R12_MUTATION_BLIND = {"R12D1", "R12alarm", "R12timeout", "R12alarmkill", "R12sweepast"}
     r12_fixtures = [(n, f) for n, f in fixtures if n.startswith("R12") and n not in _R12_MUTATION_BLIND]
     per_arm: dict[tuple[int, int], list[str]] = {}
     for pos in positions:
@@ -4156,7 +4234,7 @@ def fixture_r12g1_pre_fix_missing_gates_denies() -> None:
     a = _auto_r12_attack("a.py")
     _write_anticipation_exact(root, unit, row["head_sha"], {
         "a.py": {"command": a["command"], "hash": a["hash"]},
-    })
+    }, gates=None)
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12G1", f"a missing `gates` object must deny, got {p.returncode}: {p.stderr}")
     _assert("no `gates` object" in p.stderr, "R12G1", p.stderr)
@@ -4197,7 +4275,8 @@ def fixture_r12g3_relay_missing_gates_denies() -> None:
     post_hash = _r12_hash(0, "FIXED\n", "")
     _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
                         fix_head=fix_head,
-                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}})
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}},
+                        override={"gates": None})
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12g3"}}, root)
     _assert(p.returncode == 2, "R12G3", f"relay missing `gates` must deny, got {p.returncode}: {p.stderr}")
@@ -4745,6 +4824,7 @@ FIXTURES = [
     ("R12norm", fixture_r12norm_no_rm_in_any_deny_text),
     ("R12phase", fixture_r12phase_slow_attack_does_not_exhaust_next_git_phase),
     ("R12residual", fixture_r12residual_marker_parsing),
+    ("R12sweepast", fixture_r12sweepast_sweep_funcs_equals_the_sentinel_region),
     ("R12norm2", fixture_r12norm2_cargo_timing_normalized),
     ("R12alarmkill", fixture_r12alarmkill_self_alarm_kills_inflight_attack_process_group),
     # R12sweepmeta is deliberately NOT here — like the sweep itself (see

@@ -14,6 +14,7 @@
 //! pre-contract table (honest `MissingManifest`). The SIGKILL crash-injection
 //! peer lives in `materialization_crash_recovery.rs` (feature `test-hooks`).
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
@@ -32,6 +33,7 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, CacheOutcome, PinnedSource, ResultStore, TrainingSetSpec};
+use jammi_db::TenantId;
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -1648,5 +1650,146 @@ async fn delete_registered_model_if_unfinalized_removes_only_the_unfinalized_arm
     assert!(
         !deleted,
         "a row that never existed is a no-op, not an error"
+    );
+}
+
+fn tenant_a() -> TenantId {
+    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap()
+}
+
+fn tenant_b() -> TenantId {
+    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
+}
+
+/// A tenant that never registers a row of its own — exercises the "sees only
+/// the global row" arm.
+fn tenant_c_no_own_row() -> TenantId {
+    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9c").unwrap()
+}
+
+/// A tenant whose own row is hash-bearing but never finalized — exercises the
+/// P3 fall-through-to-global arm.
+fn tenant_d_unservable_own_row() -> TenantId {
+    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9d").unwrap()
+}
+
+/// The read-side tenant convention `find_models_by_definition` /
+/// `probe_model_by_definition` use — `(tenant_id = $2 OR tenant_id IS NULL)`,
+/// the same relaxed READ predicate every other catalog probe over a
+/// nullable-tenant column uses (mirrors `get_model`/`get_model_version`'s
+/// global-base-model resolution): a NULL-tenant model row is a cache-hit
+/// CANDIDATE FOR EVERY TENANT, while a tenant-owned row is visible only to
+/// that exact tenant. The WRITE side stays strict
+/// (`record_model_materialization`'s `tenant_id = $t OR (tenant_id IS NULL
+/// AND $t IS NULL)`), so a tenant can only ever populate its own scope or —
+/// via an unscoped session — the global one; this test only pins the READ
+/// fan-out, not a new write path.
+///
+/// Four rows share ONE `definition_hash`/anchor set: a NULL-tenant (global)
+/// row, tenant A's own finalized row, tenant B's own finalized row, and
+/// tenant D's own row (hash-bearing, never finalized — `artifact_path IS
+/// NULL`, only reachable by bypassing the guarded write, exactly like
+/// [`a_hash_bearing_row_with_null_artifact_path_is_never_servable`]). The
+/// global row is registered FIRST so its `created_at` can never be later
+/// than the tenant rows' (removing any dependency on clock resolution for
+/// the entries that must NOT tie-break in its favour), and its catalog name
+/// is chosen to sort lexicographically BEFORE every tenant-qualified
+/// `catalog_pk` (which always begins with the tenant's UUID, `"0…"`), so
+/// [`Catalog::probe_model_by_definition`]'s deterministic `catalog_pk`
+/// DESCENDING tie-break can never pick it over a genuinely competing
+/// same-tenant row.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn probe_model_by_definition_tenant_fan_out(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let base = fresh_catalog_or_skip!(backend, dir);
+    let anchors = vec![InputAnchor::result_digest(
+        "training-set",
+        &ArtifactDigest::of_bytes(b"rows"),
+    )];
+    let anchors_json = serde_json::to_string(&anchors).unwrap();
+    let shared_hash = "hash-tenant-fan-out";
+
+    // The global row FIRST — its catalog name sorts before any tenant UUID
+    // prefix ("!" is `0x21`, strictly less than the `"0"` every tenant UUID
+    // in this test starts with).
+    let name_global = unique_model_name(&dir, "!global-fallback");
+    register_finalized_model(&base, &name_global, 1, "models/global/artifact").await;
+    base.record_model_materialization(&name_global, 1, shared_hash, &anchors_json)
+        .await
+        .unwrap();
+
+    let cat_a = base.pinned_to_tenant(Some(tenant_a()));
+    let name_a = unique_model_name(&dir, "tenant-a-own");
+    register_finalized_model(&cat_a, &name_a, 1, "models/a/artifact").await;
+    cat_a
+        .record_model_materialization(&name_a, 1, shared_hash, &anchors_json)
+        .await
+        .unwrap();
+
+    let cat_b = base.pinned_to_tenant(Some(tenant_b()));
+    let name_b = unique_model_name(&dir, "tenant-b-own");
+    register_finalized_model(&cat_b, &name_b, 1, "models/b/artifact").await;
+    cat_b
+        .record_model_materialization(&name_b, 1, shared_hash, &anchors_json)
+        .await
+        .unwrap();
+
+    let cat_d = base.pinned_to_tenant(Some(tenant_d_unservable_own_row()));
+    let name_d = unique_model_name(&dir, "tenant-d-unservable-own");
+    register_bare_model(&cat_d, &name_d, 1).await;
+    stamp_definition_hash_bypassing_the_finalize_guard(&cat_d, &name_d, 1, shared_hash).await;
+    stamp_input_anchors_bypassing_the_finalize_guard(&cat_d, &name_d, 1, &anchors_json).await;
+
+    // Tenant A sees ITS OWN row — never tenant B's, and never merely the
+    // global fallback while its own servable row exists.
+    let found_a = cat_a
+        .probe_model_by_definition(shared_hash, &anchors)
+        .await
+        .unwrap()
+        .expect("tenant A has a servable candidate");
+    assert_eq!(found_a.model_id, name_a, "tenant A must see its own row");
+    assert_ne!(
+        found_a.model_id, name_b,
+        "tenant A must never see tenant B's row"
+    );
+
+    // Tenant B, symmetrically, sees its own row and never A's.
+    let found_b = cat_b
+        .probe_model_by_definition(shared_hash, &anchors)
+        .await
+        .unwrap()
+        .expect("tenant B has a servable candidate");
+    assert_eq!(found_b.model_id, name_b, "tenant B must see its own row");
+    assert_ne!(
+        found_b.model_id, name_a,
+        "tenant B must never see tenant A's row"
+    );
+
+    // A tenant with no row of its own falls through to the global row.
+    let cat_c = base.pinned_to_tenant(Some(tenant_c_no_own_row()));
+    let found_c = cat_c
+        .probe_model_by_definition(shared_hash, &anchors)
+        .await
+        .unwrap()
+        .expect("a tenant with no own row still sees the global candidate");
+    assert_eq!(
+        found_c.model_id, name_global,
+        "a tenant with no own row must fall through to the NULL-tenant row"
+    );
+
+    // Tenant D's own row exists (same hash, same anchors) but is unservable
+    // (P3: artifact_path IS NULL) -- it must never be the hit, and D must
+    // still fall through to the global row rather than getting a miss.
+    let found_d = cat_d
+        .probe_model_by_definition(shared_hash, &anchors)
+        .await
+        .unwrap()
+        .expect("an unservable own row must fall through to the global candidate, not miss");
+    assert_eq!(
+        found_d.model_id, name_global,
+        "P3's servability predicate must exclude tenant D's own unfinalized row \
+         and fall through to the global one"
     );
 }

@@ -468,6 +468,23 @@ impl Catalog {
     ///   excluded from the candidate set rather than merely filtered
     ///   downstream. A miss caused by this predicate is exactly that: a
     ///   miss, never an error, so the caller trains.
+    ///
+    /// **Tenant fan-out convention.** `(tenant_id = $2 OR tenant_id IS
+    /// NULL)` is the same relaxed READ convention every other nullable-
+    /// tenant catalog probe uses ([`Self::get_model`]/[`Self::get_model_version`]'s
+    /// global-base-model resolution, [`Catalog::find_ready_result_tables_by_definition`]):
+    /// a `NULL`-tenant model row is a cache-hit CANDIDATE FOR EVERY TENANT —
+    /// a global fine-tune output is reusable by any caller, exactly like a
+    /// global base model is loadable by any caller — while a tenant-owned
+    /// row is visible only to that exact tenant, never a peer's. When a
+    /// caller's own row exists but is unservable (P3), the caller falls
+    /// through to a matching global row rather than missing outright; when
+    /// a caller has no own row at all, the global row is the only candidate.
+    /// This is a READ-side relaxation only: the WRITE side
+    /// ([`Self::record_model_materialization`]) stays STRICT
+    /// (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`), so a tenant
+    /// session can never populate another tenant's row, only its own or —
+    /// from an explicitly unscoped session — the global one.
     pub async fn find_models_by_definition(
         &self,
         definition_hash: &str,

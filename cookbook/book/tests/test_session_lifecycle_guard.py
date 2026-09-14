@@ -1,28 +1,37 @@
 """The runtime rail's own non-vacuity test for ``conftest.py``'s
 ``_no_leaked_sessions`` autouse guard.
 
-The runtime guard is the control for every embedded/remote session shape in
-this suite. This file is the committed proof that it bites: a test which
-actually leaves a session open is actually failed, BY NAME, at teardown — on
-both transports. It runs as a real pytest session rather
-than a unit test of a helper function, because the guard's own subject is
-"how does the outer pytest run report a leak" — there is no smaller unit that
-exercises it honestly. A static shape gate over the rest of `cookbook/**` is
-filed as issue #539.
+The runtime guard is the control for every session shape in this suite —
+every transport, every construction route, and every way a test's code could
+have bound the name it called through. This file is the committed proof that
+it bites: a test which actually leaves a session open is actually failed, BY
+NAME, at teardown, regardless of transport or binding shape. It runs as a
+real pytest session rather than a unit test of a helper function, because
+the guard's own subject is "how does the outer pytest run report a leak" —
+there is no smaller unit that exercises it honestly. A static gate over the
+rest of `cookbook/**` (the non-pytest lanes: scripts, recipes, quickstart,
+the executed chapter cells) is filed as issue #539.
 
-The throwaway suite runs against the REAL ``conftest.py`` next to this file
+The throwaway suites run against the REAL ``conftest.py`` next to this file
 (read from disk, not reimplemented), in an isolated subprocess (`pytester`,
-enabled in that conftest via ``pytest_plugins = ["pytester"]``): the guard
-monkeypatches ``jammi.connect`` and ``<backend class>.close`` for the
-DURATION of one test, so running it out-of-process is what lets this file's
-own test collection stay unaffected by that patching.
+enabled in that conftest via ``pytest_plugins = ["pytester"]``). Nothing in
+the guard patches any module attribute or class method any more (see
+`clients/python/jammi/_sessions.py` and `conftest.py`'s own docstring): it
+subscribes to that module's `observe()` events for the duration of a test, so
+running it out-of-process is not load-bearing for isolation the way it used
+to be — it stays, because it is still the only honest way to assert what the
+OUTER pytest run reports (exit code, ERROR summary, message text) rather than
+a helper function's return value.
 
 A leaked session needs no live counterpart to prove the point: the embedded
 arm holds a real catalog on ``tmp_path`` (never removed here — no assertion
 in this file depends on a race with `rmtree`, only on the guard's own
 teardown report), and the remote arm's gRPC channel is LAZY (documented in
 `conftest.py`'s own ``remote`` fixture) — connecting and never closing it
-needs no server, and is exactly the shape the guard exists to catch.
+needs no server. Every alias/construction-shape test below also uses the lazy
+remote target for the same reason: the shape under test is how the NAME was
+bound, not which transport it opened, so there is no need to pay for a real
+embedded engine per shape.
 """
 
 from __future__ import annotations
@@ -39,7 +48,12 @@ _THROWAWAY_SUITE = '''
 import jammi
 
 def test_leaked_embedded_session_is_failed_by_name(tmp_path):
-    """Opens an embedded session by hand and never closes it."""
+    """Opens an embedded session by hand and never closes it. This is the
+    bare-`jammi.connect(...)`-statement shape: the returned session is bound
+    to nothing at all, so CPython collects it by refcount at the end of this
+    very statement, before the test body even reaches its next line -- and
+    the registry guard still catches it, because it observes the register
+    event as it fires, not a later liveness snapshot."""
     jammi.connect(f"file://{tmp_path}")
 
 def test_leaked_remote_session_is_failed_by_name():
@@ -68,7 +82,7 @@ def test_leaked_session_fails_by_name_on_both_transports(pytester: pytest.Pytest
     fixture that checks its exit state. That is a taxonomy distinction, not a
     lesser guarantee: the run's exit code is still non-zero (CI still fails),
     the short summary still names the exact node id under `ERROR`, and the
-    guard's own message still carries the transport target -- asserted below,
+    guard's own message still carries the target label -- asserted below,
     not assumed from the category label.
     """
     pytester.makeconftest(_CONFTEST)
@@ -88,12 +102,14 @@ def test_leaked_session_fails_by_name_on_both_transports(pytester: pytest.Pytest
     result.stdout.fnmatch_lines(
         ["*ERROR*test_leaked_remote_session_is_failed_by_name*"]
     )
-    # The two leak messages name the transport target, not just "a session":
-    # `request.node.nodeid left 1 jammi session(s) open: file://... /
-    # grpc://127.0.0.1:8081` (conftest.py's own message format).
+    # The two leak messages name the target label, not just "a session": the
+    # embedded label is the artifact_dir it was opened on, the remote label
+    # is the endpoint `RemoteDatabase.__init__` was given (no scheme --
+    # `_sessions.register` is called with `endpoint`, not the original
+    # `target` string; see `_database.py`'s own `open_remote`).
     full = "\n".join(result.outlines)
     assert full.count("left 1 jammi session(s) open") == 2
-    assert "grpc://127.0.0.1:8081" in full
+    assert "127.0.0.1:8081" in full
 
 
 def test_leaked_session_reports_exactly_once_by_name(pytester: pytest.Pytester):
@@ -116,3 +132,245 @@ def test_leaked_embedded_session_is_failed_by_name(tmp_path):
     full = "\n".join(result.outlines)
     assert full.count("left 1 jammi session(s) open") == 1
     assert full.count("test_leaked_embedded_session_is_failed_by_name") >= 1
+
+
+# --------------------------------------------------------------------------- #
+# Every import-time binding shape and construction route audit #5 executed.
+#
+# Under the OLD guard (a5baa38d), which monkeypatched the `jammi.connect`
+# MODULE ATTRIBUTE for the duration of a test, every one of these binds its
+# name at IMPORT time -- before that patch is ever installed -- so the
+# tracking wrapper is never the function actually called, and the leak passes
+# silently. Reproduced by execution (report): checking out that commit's
+# conftest.py into an isolated pytester run with each of these same shapes
+# shows `N passed, 0 errors` -- every leak invisible. The registry guard
+# below does not read a bound name at all; it observes the register/close
+# EVENT the session's own `__init__`/`close()` fire, so no binding shape
+# changes what it sees.
+# --------------------------------------------------------------------------- #
+
+_SHAPES_SUITE = '''
+import importlib
+
+import grpc
+
+import jammi
+from jammi import EmbeddedBackend, RemoteDatabase
+
+# shape: class-body alias
+class _ClassBodyHolder:
+    connect = jammi.connect
+
+# shape: try:-nested `from jammi import connect`
+try:
+    from jammi import connect as _try_nested_connect
+except ImportError:  # pragma: no cover - jammi is always importable here
+    _try_nested_connect = None
+
+# shape: if:-nested `from jammi import connect`
+if True:
+    from jammi import connect as _if_nested_connect
+
+# shape: parenthesised multi-line import
+from jammi import (
+    connect as _paren_multiline_connect,
+)
+
+# shape: `from jammi import *` -- binds the bare name `connect`. Captured
+# immediately under its own name: a later plain `from jammi import connect`
+# (below) rebinds that same bare name, and the registry guard does not care
+# which shape a session was opened through -- only this suite's own
+# bookkeeping needs the two kept distinguishable.
+from jammi import *  # noqa: F401,F403
+_star_import_connect = connect
+
+# shape: `import jammi as j` + `connect = j.connect`
+import jammi as _j_alias
+_module_alias_connect = _j_alias.connect
+
+# shape: `getattr(jammi, "connect")`
+_getattr_connect = getattr(jammi, "connect")
+
+# shape: `importlib.import_module("jammi").connect`
+_importlib_connect = importlib.import_module("jammi").connect
+
+# shape: tuple-unpack
+(_tuple_unpack_connect,) = (jammi.connect,)
+
+# shape: default-arg -- the default is evaluated ONCE, at `def` time, so this
+# is an import-time binding of the underlying function even though the name
+# `connect` here is a parameter, not a module global.
+def _default_arg_fn(url, connect=jammi.connect):
+    return connect(url)
+
+# shape: `from jammi import connect as c`
+from jammi import connect as _import_as_c
+
+# shape: `_connect = jammi.connect`
+_connect = jammi.connect
+
+# shape: plain column-zero `from jammi import connect`
+from jammi import connect
+
+
+_TARGET = "grpc://127.0.0.1:8081"  # lazy channel -- no server needed to leak it
+
+
+def test_shape_class_body_alias():
+    _ClassBodyHolder.connect(_TARGET)
+
+def test_shape_try_nested_import():
+    _try_nested_connect(_TARGET)
+
+def test_shape_if_nested_import():
+    _if_nested_connect(_TARGET)
+
+def test_shape_paren_multiline_import():
+    _paren_multiline_connect(_TARGET)
+
+def test_shape_star_import():
+    _star_import_connect(_TARGET)
+
+def test_shape_module_alias_then_attr():
+    _module_alias_connect(_TARGET)
+
+def test_shape_getattr():
+    _getattr_connect(_TARGET)
+
+def test_shape_importlib_import_module():
+    _importlib_connect(_TARGET)
+
+def test_shape_tuple_unpack():
+    _tuple_unpack_connect(_TARGET)
+
+def test_shape_default_arg():
+    _default_arg_fn(_TARGET)
+
+def test_shape_import_as_c():
+    _import_as_c(_TARGET)
+
+def test_shape_underscore_bare_alias():
+    _connect(_TARGET)
+
+def test_shape_plain_column_zero_import():
+    connect(_TARGET)
+
+def test_shape_local_dropped_at_frame_exit():
+    """Distinct from the bare-statement shape (see the throwaway suite
+    above): `db` is a real local binding, so it stays alive for the whole
+    test body and is only collected when THIS FRAME's locals are torn down
+    at return -- after the test body, but still before this fixture's own
+    teardown runs its check."""
+    db = jammi.connect(_TARGET)
+    assert db is not None
+
+def test_shape_direct_embedded_construction(tmp_path):
+    """Bypasses `jammi.connect` (and `_open_embedded`) entirely: constructs
+    the resource-owning class itself. Registration happens in
+    `EmbeddedBackend.__init__`, so this is visible regardless."""
+    import jammi_native
+
+    native = jammi_native.open_local(artifact_dir=str(tmp_path), config=None)
+    EmbeddedBackend(native, label=str(tmp_path))
+
+def test_shape_direct_remote_construction():
+    """Bypasses `jammi.connect` (and `open_remote`) entirely: constructs
+    `RemoteDatabase` itself over a lazy channel."""
+    channel = grpc.insecure_channel("127.0.0.1:8081")
+    RemoteDatabase(
+        channel,
+        session_id="direct-construction-shape",
+        endpoint="127.0.0.1:8081",
+        tls=False,
+        auth_metadata=None,
+    )
+
+def test_shape_closing_control_passes():
+    """Not every one of these bound names leaks: closing through one of them
+    (the plain import) still passes -- the guard does not blanket-fail every
+    test in this suite, only the ones that actually leave a session open."""
+    db = connect(_TARGET)
+    db.close()
+'''
+
+# Every leaking test defined in `_SHAPES_SUITE`, by name -- the 13 import-time
+# binding shapes from audit #5, plus the two direct-construction routes and
+# the local-dropped-at-frame-exit shape (16 total). `test_shape_closing_control_passes`
+# is deliberately excluded: it must NOT appear in the ERROR summary.
+_LEAKING_SHAPE_TESTS = (
+    "test_shape_class_body_alias",
+    "test_shape_try_nested_import",
+    "test_shape_if_nested_import",
+    "test_shape_paren_multiline_import",
+    "test_shape_star_import",
+    "test_shape_module_alias_then_attr",
+    "test_shape_getattr",
+    "test_shape_importlib_import_module",
+    "test_shape_tuple_unpack",
+    "test_shape_default_arg",
+    "test_shape_import_as_c",
+    "test_shape_underscore_bare_alias",
+    "test_shape_plain_column_zero_import",
+    "test_shape_local_dropped_at_frame_exit",
+    "test_shape_direct_embedded_construction",
+    "test_shape_direct_remote_construction",
+)
+
+
+def test_every_alias_and_construction_shape_leaks_by_name(pytester: pytest.Pytester):
+    """Every shape audit #5 found (13 import-time bindings), plus a local
+    dropped at frame exit and both backends' direct construction, is FAILED
+    BY NAME under the current registry-based guard -- and the one test that
+    actually closes its session is not.
+
+    This is the completeness claim for Z2: the registry observes the
+    CONSTRUCTOR, not a name a caller happened to call through, so there is no
+    binding shape left to enumerate against -- `_no_leaked_sessions` no
+    longer has a "how was `connect` spelled" precondition at all.
+    """
+    pytester.makeconftest(_CONFTEST)
+    pytester.makepyfile(test_the_shapes_suite=_SHAPES_SUITE)
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    result.assert_outcomes(
+        passed=len(_LEAKING_SHAPE_TESTS) + 1,  # every CALL phase passes
+        errors=len(_LEAKING_SHAPE_TESTS),  # every leaking test's teardown errors
+        failed=0,
+    )
+    assert result.ret != 0
+
+    full = "\n".join(result.outlines)
+    for name in _LEAKING_SHAPE_TESTS:
+        result.stdout.fnmatch_lines([f"*ERROR*{name}*"])
+        assert name in full
+
+    # The closing control's name must NOT appear anywhere under an ERROR line.
+    error_lines = [line for line in result.outlines if "ERROR" in line]
+    assert not any("test_shape_closing_control_passes" in line for line in error_lines)
+
+
+def test_leaked_session_in_a_tests_subdirectory_module_is_failed_by_name(
+    pytester: pytest.Pytester,
+):
+    """The guard reaches a module in a SUBDIRECTORY of the test root too --
+    it is not scoped to `.py` files directly under one directory (that was
+    the deleted static alias gate's own stated scope limit; the registry
+    guard has no such limit because it is not walking files at all, it is an
+    autouse fixture that applies wherever pytest collects a test)."""
+    pytester.makeconftest(_CONFTEST)
+    nested = pytester.mkpydir("nested_suite")
+    (nested / "test_nested_leak.py").write_text(
+        '''
+import jammi
+
+def test_leak_in_a_subdirectory_module():
+    jammi.connect("grpc://127.0.0.1:8081")
+'''
+    )
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    result.assert_outcomes(passed=1, errors=1, failed=0)
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["*ERROR*test_leak_in_a_subdirectory_module*"])

@@ -15,9 +15,24 @@ Two mechanisms, because one alone is a promise rather than a rail:
   closes the session in its own finalizer, which runs before any of that. So the
   close-then-remove ordering is structural here, not a convention.
 
-* :func:`_no_leaked_sessions` — the rail. An autouse guard that tracks every
-  ``jammi.connect(...)`` a test makes and FAILS the test if any of those
-  sessions is still open when the test returns. A seventh site that opens a
+* :func:`_no_leaked_sessions` — the rail. An autouse guard that subscribes to
+  the client's own session registry (``jammi.observe``, see
+  ``clients/python/jammi/_sessions.py``) for the duration of a test and fails
+  it BY NAME if any session registered during the test never unregistered.
+  The registry fires its events from inside the ``__init__`` of every
+  resource-owning session class (``EmbeddedBackend``, ``RemoteDatabase``) and
+  from ``close()`` — the ONE seam every construction route passes through, so
+  it is independent of how a test bound the name it called through (a plain
+  ``jammi.connect(...)`` call, an aliased import, direct backend
+  construction — see that module's docstring for the full enumeration this
+  guard no longer needs to reason about). It also sees a session that was
+  NEVER closed even after the object itself is garbage-collected, because the
+  events are delivered synchronously at register/unregister time, not read
+  off a liveness snapshot: a session dropped by refcount inside the test body
+  (a bare ``jammi.connect(...)`` statement, or a local gone at frame exit) is
+  reclaimed before any teardown code runs, so a snapshot taken only at
+  teardown would never see it open at all — the events already fired by
+  then, and this fixture already recorded them. A seventh site that opens a
   session by hand and forgets to close it does not quietly race the cleanup
   again; it fails, by name, on the first run.
 
@@ -28,21 +43,20 @@ nothing at any bounded moment — ``close()`` is the only awaited release (see
 inside its directory, so a ``shutil.rmtree`` racing it fails with ``OSError:
 [Errno 39] Directory not empty`` between its ``scandir`` and its ``rmdir``.
 
-Known limit, stated rather than assumed: the guard tracks the ``jammi.connect``
-*module attribute*, so a test that bound ``from jammi import connect`` at import
-time would slip past it. ``test_session_alias_gate.py`` is the standing gate for
-that one precondition, over every ``.py`` module directly under this ``tests/``
-directory (including this conftest and the gate module itself). This runtime
-guard, plus that alias gate, is the sole rail for every session shape in this
-suite's pytest lanes; neither reaches the non-pytest lanes (scripts, recipes,
-quickstart, the executed chapter cells) — a static gate over those is filed as
-issue #539.
+Known limit, stated rather than assumed: this guard sees exactly what the
+client's registry sees — every session any constructor route registers. That
+is every route today: ``jammi.connect`` and direct ``EmbeddedBackend`` /
+``RemoteDatabase`` construction all call the registry's ``register()`` as the
+last statement of their own ``__init__`` (see ``_sessions.py``), so within
+this process no import-time binding shape and no construction path escapes
+it — there is no separate module-attribute patch left to alias around, and so
+no standing enumerating gate over binding shapes is needed here. What this
+guard does NOT reach is the non-pytest lanes (scripts, recipes, quickstart,
+the executed chapter cells) — a static gate over those is filed as issue
+#539.
 """
 
 from __future__ import annotations
-
-import functools
-from typing import Any
 
 import pytest
 
@@ -102,9 +116,18 @@ def _no_leaked_sessions(request):
     """esc-112 fix (`closes_escape: esc-112`): fail a test that leaves a jammi
     session open.
 
-    Autouse fixtures are set up before the test's own fixtures and finalized
-    after them, so this runs its check *after* :func:`embedded` / :func:`remote`
-    have closed theirs — the two mechanisms compose rather than collide.
+    Subscribes to `jammi.observe()` for the duration of the test: every
+    session ANY construction route registers fires `on_register(handle,
+    label)` synchronously, and its `close()` fires `on_unregister(handle,
+    label)` — both independent of whether this fixture (or anything else)
+    still holds a reference to the session object. A handle that registered
+    during the test and never unregistered is a leak, reported by its label,
+    whether or not the session object itself is still reachable: a session
+    that was never `close()`d is a leak even if it was collected by refcount
+    the moment the test dropped its last reference.
+
+    Unsubscribes in `finally`, before anything else, so this fixture's own
+    teardown never races a later listener call against the diff below.
     """
     if jammi is None:  # pragma: no cover - lean install
         yield
@@ -114,56 +137,34 @@ def _no_leaked_sessions(request):
     # the guard warns there and fails only when the test itself passed.
     # `session.testsfailed` is pytest's own running count and needs no hook.
     failed_before = request.session.testsfailed
-    opened: list[tuple[Any, str]] = []  # strong refs: ids must not be recycled
-    closed_ids: set[int] = set()
-    patched: dict[type, Any] = {}
-    real_connect = jammi.connect
+    registered: dict[int, str] = {}
+    unregistered: set[int] = set()
 
-    def _probe_close(cls: type) -> None:
-        if cls in patched:
-            return
-        original = cls.close
-        patched[cls] = original
+    def _on_register(handle: int, label: str) -> None:
+        registered[handle] = label
 
-        @functools.wraps(original)
-        def _close(self, *args, **kwargs):
-            closed_ids.add(id(self))
-            return original(self, *args, **kwargs)
+    def _on_unregister(handle: int, label: str) -> None:  # noqa: ARG001
+        unregistered.add(handle)
 
-        cls.close = _close  # type: ignore[method-assign]
-
-    @functools.wraps(real_connect)
-    def _tracking_connect(target, *args, **kwargs):
-        session = real_connect(target, *args, **kwargs)
-        _probe_close(type(session))
-        opened.append((session, str(target)))
-        return session
-
-    jammi.connect = _tracking_connect  # type: ignore[assignment]
+    unsubscribe = jammi.observe(_on_register, _on_unregister)
     try:
         yield
     finally:
-        jammi.connect = real_connect  # type: ignore[assignment]
-        leaked = [(s, t) for s, t in opened if id(s) not in closed_ids]
-        # Close them regardless: an unreleased catalog is this process's to hold,
-        # and leaving it open would let one test's defect surface as another
-        # test's failure.
-        for session, _ in leaked:
-            for cls, original in patched.items():
-                if isinstance(session, cls):
-                    try:
-                        original(session)
-                    except Exception:  # noqa: BLE001 - best-effort release
-                        pass
-                    break
-        for cls, original in patched.items():
-            cls.close = original  # type: ignore[method-assign]
+        unsubscribe()
+        leaked: dict[int, str] = {
+            handle: label
+            for handle, label in registered.items()
+            if handle not in unregistered
+        }
 
         if leaked:
-            targets = ", ".join(sorted(t for _, t in leaked))
+            names = ", ".join(
+                f"{label!r} (handle {handle})"
+                for handle, label in sorted(leaked.items(), key=lambda kv: kv[1])
+            )
             message = (
                 f"{request.node.nodeid} left {len(leaked)} jammi session(s) open: "
-                f"{targets}. Close every session in the test (or take one from the "
+                f"{names}. Close every session in the test (or take one from the "
                 "`embedded` / `remote` fixture): an embedded engine holds its catalog "
                 "until close() returns, so a directory removed under a live session "
                 "races it (OSError: [Errno 39] Directory not empty)."

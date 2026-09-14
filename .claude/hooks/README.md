@@ -103,18 +103,18 @@ body inside an already-covered file is not separately re-armed beyond that file'
 required key. A lead can still write a weak attack; what it cannot do is write
 nothing, or write it AFTER a fix already landed, and pass.
 **(2c) Required gates, mutations, exclusions (esc-lead-gate-R12, fix round 3, item
-8a/8b/8c; hardened fix round 5) — three companion checks beside (2b)'s pre/post-fix
+8a/8b/8c) — three companion checks beside (2b)'s pre/post-fix
 attack pair, each armed strictly by the DATA, never merely by a unit being open.**
 `ci/lead-gate-required-commands.txt` (`_R12_REQUIRED_COMMANDS_FILENAME`,
 human-amend-only, `SWARM_GATE_TOUCHED`-guarded, shrink-only-ratcheted) is a committed
 list of cheap, already-existing gate commands, one per line, `#`-comment/blank lines
 skipped, a trailing `  # measured ~Xs` annotation stripped from each
 (`_r12_required_commands_or_deny`) — a MISSING, EMPTY, or all-comment file is now a
-hard DENY in the hook and a hard FAIL in reader 3 (fix round 5 Z4): the old `[]`
+hard DENY in the hook and a hard FAIL in reader 3: the old `[]`
 "honest default" silently meant "no gate obligation" and let the file's own
 existence/length be weakened with zero CI signal; that silent path is closed. Every
 SHAPE check below runs through the ONE shared validator, `_r12_anticipation_
-rejection` (fix round 5 Z7) — never a second, per-reader reimplementation; reader 3
+rejection` — never a second, per-reader reimplementation; reader 3
 imports and calls this SAME function, so a fix here fixes every reader identically.
 **8a, gates.** `_r12_gates_shape_rejection` requires `gates` to be a dict naming
 EVERY required command VERBATIM, each an object with an integer `rc`; called with
@@ -134,11 +134,11 @@ an ACCEPTED mutation (`rc_before == 0 ∧ rc_after != 0 ∧ marker_after` matche
 committed TEST-failure marker — `"test result: FAILED"`, `"FAIL —"`, `"= FAILURES ="`
 — distinct from a build-failure marker) OR an explicit non-empty `uncovered` reason
 (R11's own disposition precedent), and every `uncovered` reason in the array is
-NORMALIZED-DISTINCT from its siblings (fix round 5 Z11 — three identical excuses is
+NORMALIZED-DISTINCT from its siblings (three identical excuses is
 one real disposition). No hash-reproduction here — like `gates`, a lead-attested
 record, never re-executed by the hook. `--export-anticipation` (below) ALSO dumps any
 `<slug>.relay.*.json` carrying a non-empty `mutations`/`exclusions` as a distinct
-`lead-relay-attestation` row (fix round 5 Z8) — these fields otherwise live ONLY in
+`lead-relay-attestation` row — these fields otherwise live ONLY in
 the gitignored relay artifact, invisible to a human reviewing the committed diff at
 merge; this is a SHAPE export (verbatim, never re-derived), not a re-execution.
 Filed as its own, separately-scoped unit (not yet implemented): a CI-side derivation
@@ -155,8 +155,8 @@ whitespace repetition) both from every sibling entry in the SAME relay (a
 within-relay duplicate denies, naming both keys) and from the unit's own PREVIOUS
 relay of the SAME `agent_type` (`_r12_previous_relay_row`, the earlier `ts` — a
 cross-relay duplicate, an exclusion repeated verbatim across rounds, also denies);
-when the ledger records a previous relay but its own artifact is gone from disk
-(fix round 5 Z9), that is ALSO a DENY, naming the missing witness — never a silent
+when the ledger records a previous relay but its own artifact is gone from disk,
+that is ALSO a DENY, naming the missing witness — never a silent
 "nothing to compare against, so it passes" (the SAME shape the pre-fix witness arm
 already takes). This is the anti-templating cousin of `_claims_rejection`'s own
 uncovered-reason check. LIMIT, stated as plainly as R11's own: this cannot prove an
@@ -174,7 +174,7 @@ the row with the GREATEST `ts` governs, never the row nearest the end of the fil
 (`cmd_export_anticipation` sorts the artifacts it dumps by FILENAME — a tip sha,
 pseudorandom hex with no chronological meaning — so an older round's row can sort
 after a newer one and land on the file's last line); BOTH `ts` and `head_sha` are
-stamped by the exporter itself (fix round 5 Z5 — from the artifact file's own mtime
+stamped by the exporter itself (from the artifact file's own mtime
 and its own `pre_fix_sha`, never hand-typed), and when the candidate pool holds two
 or more rows and ANY lacks `ts`, Reader 3 FAILS LOUDLY naming the ambiguity rather
 than guessing. Reader 3 never re-executes these commands; they are already CI jobs

@@ -27,13 +27,13 @@ seven crates. It is merged; every 68 unit cuts after it and so does every 67 uni
 ```
 #501 (merged) → PR-A [U1] ∥ K (#502, in CI) ∥ DIST-1, OPS, GRAPH, DELTA (68)
         → PR-B [U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact]          (needs PR-A only)
-        → PR-C(67) [U7b ∥ U5a → U6 → U5b-1 → U5b-2 → artifact]         (needs DIST-1, OPS, GRAPH)
+        → PR-C(67) [U7b ∥ U5a → U5b-1 → U5b-2 → artifact]              (needs DIST-1, OPS, GRAPH)
         → PR-D [U8a → U8b → U9a → U9b]                                  (needs K, OPS; admin merge)
 ```
 
 Serial edges: #501 → U1 → everything; U2a → U2b, U3; U4a → U2b (the `world` argument);
-U2b + U3 + U4a → U4b; U4a + DIST-1 + OPS + GRAPH → U5a; U2b + U5a → U6; U4b + U5a + U6 → U5b-1;
-U5b-1 + OPS → U5b-2; U1 + U5b-1 + U6 + S6 → U8a; U8a + S6 → U8b; all → U9a; K + OPS → U9b.
+U2b + U3 + U4a → U4b; U4a + DIST-1 + OPS + GRAPH → U5a; U4b + U5a → U5b-1;
+U5b-1 + OPS → U5b-2; U1 + U5b-1 + S6 → U8a; U8a + S6 → U8b; all → U9a; K + OPS → U9b.
 
 ## Alternatives added in v4
 
@@ -66,7 +66,7 @@ U5b-1 + OPS → U5b-2; U1 + U5b-1 + U6 + S6 → U8a; U8a + S6 → U8b; all → U
 
 Co-ownership (order = merge order): `crates/jammi-ai/src/fine_tune/worker.rs` — **OPS C2 rewrites
 the claim loop and GRAPH rewrites `claim_next`; both merge before any 67 unit that touches the
-loop** (U5a `JobSlot`, U5b-1 coordinator, U5b-2 abort path); U2a/U2b/U3/U4b/U6 edit other
+loop** (U5a `JobSlot`, U5b-1 coordinator, U5b-2 abort path); U2a/U2b/U3/U4b edit other
 regions and may precede them. `crates/jammi-ai/src/session.rs` (DIST c1/c2 `build_result_store`
 + `open_with_placement`, OPS C2 release/worker gate, U4a device-plural session and the
 `TrainingCommon` sites, U5b-1 `peer_addr` write). `crates/jammi-db/src/config/mod.rs` (DIST

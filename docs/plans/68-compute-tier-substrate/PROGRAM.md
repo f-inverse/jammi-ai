@@ -11,7 +11,7 @@ files. Base: `main` @ `4ecc0230` (PR #501, the jobs fleet, merged). PR-K = #502 
 | 0 | spikes S1, S3, S4, S5, S6 (67); PR-K #502 CI | — | S3 on `main`; S4 spends money (human-approved); S6 gates U8a and U8b |
 | 1 | **PR-A** (67 U1, DataFusion 54) ∥ **K** (#502) ∥ **DELTA** ∥ **GRAPH** ∥ **DIST-1** ∥ **OPS** | #501 | disjoint seams except the migration pin sites and `worker.rs` (OPS C2, GRAPH `claim_next`); rebase whoever lands second |
 | 2 | **PR-B** (67 U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact) | PR-A | independent of every 68 unit; U2a/U2b/U3/U4b edit `worker.rs` regions OPS C2 does not (`run_spec`, `publish_and_finalize`, head-target arm) — if OPS lands first, rebase |
-| 3 | **PR-C(67)** (U7b ∥ U5a → U6 → U5b-1 → U5b-2 → artifact) | DIST-1, OPS, GRAPH, PR-B | U5a's `JobSlot` wraps the loop OPS C2 rewrites and the `claim_next` GRAPH rewrites; U5b-1 builds the membership substrate DIST §5.8 sketches; U5b-2 uses OPS's `release_job_lease` |
+| 3 | **PR-C(67)** (U7b ∥ U5a → U5b-1 → U5b-2 → artifact) | DIST-1, OPS, GRAPH, PR-B | U5a's `JobSlot` wraps the loop OPS C2 rewrites and the `claim_next` GRAPH rewrites; U5b-1 builds the membership substrate DIST §5.8 sketches; U5b-2 uses OPS's `release_job_lease` |
 | 4 | **PR-D** (U8a → U8b → U9a → U9b) | K, OPS, PR-C(67) | admin merge (domain-card edit); `distributed.yml` three-process arm green before merge |
 | later | DIST-2 `RendezvousPlacement` (68) on U5b-1's substrate; DIST-3 `datafusion-distributed` behind the DF-55 gate | PR-C(67); flight-sql-server on DF 55 | 68's, unchanged |
 

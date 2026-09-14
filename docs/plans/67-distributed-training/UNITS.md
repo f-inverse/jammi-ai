@@ -185,28 +185,27 @@ per-step `$?`. Naming per README ruling 23.
 ## U5a — `GangService` on `peer_bind`; I-GANG authorization (PR-C commit 2)
 
 - **files_in_scope**: (wire-server) `crates/jammi-wire/proto/jammi/v1/gang.proto`
-  (`RunRank(RankAssignment) returns (stream RankEvent)` with `RankEvent::Released`;
-  `FetchPartition(PartitionRequest) returns (stream ArrowIpc)`), `crates/jammi-wire/build.rs:22-33`,
+  (`RunRank(RankAssignment) returns (stream RankEvent)` with `RankEvent::Released`),
+  `crates/jammi-wire/build.rs:22-33`,
   `crates/jammi-wire/src/{lib.rs, gang.rs}`, `crates/jammi-server/src/grpc/gang.rs` (handler on
   the **peer listener** — 68 DIST D7's routes built outside `assemble_grpc_chain`; the I-GANG
   verification through `get_job_for_rank`, `status = 'running'`, `claimed_by`, live lease, tenant
   derived from the row and pinned; peer addresses resolved from `instances.peer_addr` by
-  instance id; `FetchPartition` belongs-to-job check; handler order fence-then-slot; #485
+  instance id; handler order fence-then-slot; #485
   bounds), (db) `crates/jammi-db/src/catalog/jobs_repo.rs` (`get_job_for_rank(job_id)`: primary
   key, no tenant predicate, never admin scope; `list_gang_members(kind)`), `crates/jammi-server/src/runtime.rs` (mount on the peer
   routes), `crates/jammi-server/tests/it/{api_freeze_baseline.txt (RPC + PACKAGE lines),
   api_freeze.rs (package count prose), tenant_isolation_oracle.rs (`GANG_LISTENER_ALLOWLIST`,
-  unioned into `covered_on_wire` and the partition assertion; public-listener `UNIMPLEMENTED`
-  probe), gang_partition.rs, gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot`: taken before
+  unioned into `covered_on_wire`; public-listener `UNIMPLEMENTED`
+  probe), gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot`: taken before
   `claim_next` (`wt-C: worker.rs:346`), held across `run_claimed_job` (`:355`), released before
   the idle sleep (`:363`)). (db) `config/mod.rs` (`rank_timeout_secs`
   if not already in U4a).
 - **invariants_to_preserve**: B5 (I-GANG written invariant; no double binder — never mounted under
   `TenantResolverLayer`), K2, B1 (no `stage`/`register` stems), B6, OPS D6 (no abort while a claim
   may be in flight — the slot is taken outside the transaction).
-- **acceptance**: (a) the streamed bytes of partition r equal the local read of partition r (RED
-  at base); (b) `RunRank` for a job not running / not claimed by the named instance / lease
-  expired / wrong `FetchPartition` table is refused with a typed status (RED at base); (c) fence
+- **acceptance**: (b) `RunRank` for a job not running / not claimed by the named instance / lease
+  expired is refused with a typed status (RED at base); (c) fence
   before slot: a greater attempt for the job whose stale runner holds the slot aborts it and
   takes the slot; lesser-or-equal refused (RED at base); (d) a peer busy with its *own* claimed
   job refuses with `Unavailable`; an idle peer accepts; the claim loop never claims while a rank
@@ -218,21 +217,13 @@ per-step `$?`. Naming per README ruling 23.
   `peer_bind` listener — a hard precondition, no fallback), **68 OPS and GRAPH merged** (they
   rewrite the claim loop and `claim_next` that `JobSlot` wraps). **size**: L.
 
-## U6 — Partition-aware inference operator; distributed frozen forward (PR-C commit 3)
+**Partition-aware inference operator.** Out of scope for this plan; filed as GitHub issue #540.
+The head target's frozen forward is a per-batch call inside the trainer
+(`project_frozen_embedding`, from `encode_texts`/`encode_media`), not a table produced by
+`InferenceExec` over a partitioned input, so there is no partition set for a fan-out operator to
+act on (DESIGN.md §5).
 
-- **files_in_scope** (ai-core): `operator/inference_exec.rs` (inherit input partitioning),
-  `operator/runner.rs` (one load per process), `pipeline/embedding.rs` (stream into the sink;
-  fan-out through `FetchPartition`), `fine_tune/worker.rs::run_fine_tune_blocking` head-target
-  arm (`worker.rs:2375`), tests. (db) `store/result_sink.rs` (partition-ordered append).
-- **invariants_to_preserve**: K4 (4-partition table == 1-partition table, bytes), K1, B3, B6.
-- **acceptance**: (a) byte parity across partition counts (RED at base); (b) resident batches
-  ≤ a bound (RED at base: `collect`). The two-worker `FetchPartition` leg is U5b's acceptance
-  (e), because the harness, `tests/distributed/main.rs` and the `distributed.yml` matrix are
-  U5b's.
-- **lane**: hermetic. **depends_on**: U2b, U5a. **size**: L (operator repartitioning, peer
-  fan-out client, ordered sink).
-
-## U5b-1 — Coordinator; `Peer` collective; membership substrate; determinism (PR-C commit 4)
+## U5b-1 — Coordinator; `Peer` collective; membership substrate; determinism (PR-C commit 3)
 
 - **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs` (coordinator
   on the `JobWorker`: members via `list_gang_members`, id mint, dispatch by instance id),
@@ -251,13 +242,11 @@ per-step `$?`. Naming per README ruling 23.
   W=2 `Local` run (RED at base; rank 0 is always in-process); (b) `list_gang_members` excludes a
   stale instance, an instance without `peer_addr`, and a worker whose kinds contain only
   `graph_fine_tune` when `fine_tune` is asked (RED at base); (c) `peer_advertise` without
-  `peer_bind` or without `result_root` is refused at load (RED at base); (d) two workers compute
-  disjoint halves of a head-target feature table via `FetchPartition` and the merged table
-  equals the single-worker table (U6's operator; RED at base). Test target: `distributed`.
+  `peer_bind` or without `result_root` is refused at load (RED at base). Test target: `distributed`.
 - **lane**: hermetic + distributed (dispatched manually; deterministic leg green before merge).
-  **depends_on**: U4b, U5a, U6, S1. **size**: L.
+  **depends_on**: U4b, U5a, S1. **size**: L.
 
-## U5b-2 — Watchdog; abort with no terminal write; released-vs-failed; chaos (PR-C commit 5)
+## U5b-2 — Watchdog; abort with no terminal write; released-vs-failed; chaos (PR-C commit 4)
 
 - **files_in_scope** (ai-core): `fine_tune/worker.rs` (watchdog; attempt abort by flipping the
   hold's `lost` flag so the run exits through the leave-for-reclaim arm, `wt-C: worker.rs:670-676`;
@@ -309,10 +298,11 @@ per-step `$?`. Naming per README ruling 23.
 - **acceptance**: hermetic: codec round-trip for every operator (RED at base); config: `[ballista]`
   parses, unset = no roles, `scheduler_bind == peer_bind/flight_listen/health_listen` refused (RED
   at base). Distributed (three processes, one binary): (a) an embedding job via
-  `submit_physical_plan` across two executors → bytes identical to U6's peer path (RED at base);
-  (b) a W=2 gang job through the scheduler → bytes identical to U5b's, never task-retried (RED at
+  `submit_physical_plan` across two executors → bytes identical to the same query's
+  single-executor plan (RED at base: no `jammi-ballista` crate exists to submit through); (b) a
+  W=2 gang job through the scheduler → bytes identical to U5b's, never task-retried (RED at
   base); (c) killing an executor mid-gang fails the job and requeues it through jammi's lease path.
-- **lane**: hermetic + distributed. **depends_on**: U1, U5b-1, U6, S6. **size**: L.
+- **lane**: hermetic + distributed. **depends_on**: U1, U5b-1, S6. **size**: L.
 
 ## U8b — Catalog-backed cluster state; device-aware placement (PR-D commit 2; the completion gate)
 

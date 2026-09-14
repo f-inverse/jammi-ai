@@ -33,8 +33,11 @@ floats per representation column (anchor, positive, optional negative) plus the 
 (b) the adapter gradients (rank-8 matrices). At W=4, B=32, d=768, f32: about 0.4 MB per
 column and single-digit MB for the adapter gradients. Both are small enough that the exact CPU
 collective is viable far beyond a test twin; NCCL matters when the tensors already live on
-GPUs. The frozen-forward-as-distributed-stage applies to the **projection-head** target
-(`crates/jammi-ai/src/fine_tune/target.rs:249`) and to evaluation.
+GPUs. The **projection-head** target (`TrainingTarget::ProjectionHead`,
+`crates/jammi-ai/src/fine_tune/target.rs`) runs the same per-batch pattern: `encode_texts`/
+`encode_media` call `project_frozen_embedding` inline, per batch, to run the frozen tower
+forward before the head's own LoRA layer projects it — never a separate stage or a materialized
+table (§5) — and evaluation uses the identical call.
 
 ## 2. The training set is a producer
 
@@ -170,11 +173,9 @@ lease, then **derives the tenant from the row** (`jobs.tenant_id`) and pins ever
 catalog read to it. Nothing dialable travels on the wire: the assignment carries
 `peers[rank → instance_id]`; each peer resolves addresses through `instances.peer_addr` and
 refuses a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the only
-out-of-band value). `FetchPartition` takes a result-table id and partition index and verifies the table
-belongs to the job's training set (the analogue of D7's segment-belongs-to-table check). The
-RPCs sit in their own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
+out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
 "served only on peer_bind; tenant derived from the verified job row; deliberately not
-caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and their
+caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
 `api_freeze_baseline.txt` lines land in the same commit. Peers fence on **`job_id`**: a `RunRank`
 at attempt N aborts every local runner of that job with attempt < N; a lesser or equal attempt is
 refused; `(job_id, rank)` is the runner's identity only. Mutual transport auth stays the
@@ -258,16 +259,22 @@ shared with plan 65's rekey — `None` is a distinct key value, never a wildcard
 both the entries map and the single-flight `in_flight` map (`cache.rs:43-45`); `Local` ranks
 are threads pinned to devices.
 
-## 5. The distributed frozen forward (head target) and the partition-aware operator
+## 5. The distributed frozen forward (head target)
 
-For `ProjectionHead` training the tower is frozen, so the features are an `Embedding` result
-table over the training set — the existing embedding producer (`pipeline/embedding.rs`), which
-today collects every batch before writing (`embedding.rs:184-191`) and drives `InferenceExec`
-at partition 0 only (`inference_exec.rs:144`). U6 makes `InferenceExec` inherit its input's
-partitioning, streams batches into the `ResultSink` in partition order, and lets the
-coordinator fan partitions out to peers via `FetchPartition` so each peer computes a disjoint
-slice with the model loaded once per process. The table must be byte-identical to the
-single-process table (K4 shape).
+For `ProjectionHead` training the tower is frozen, but the frozen forward is not a producer
+table: `encode_texts`/`encode_media` (`trainer.rs`) call `project_frozen_embedding` inline, per
+training batch, to run the frozen tower and hand the pooled output to the head's own LoRA layer
+— nothing under `fine_tune/` drives `InferenceExec` or reads an `Embedding` result table for this
+path. At `world_size > 1` each rank runs its own slice's frozen forward inside the normal step,
+and the head's output is a gather point like any other target's (§4's gather rule); no partition
+set exists to fan out over, so there is no peer-to-peer fetch of a shared table. The gang has one
+output artifact, written once by rank 0 — the lease holder — at the finalize CAS (§3; the resume
+checkpoint is likewise lease-holder-only, `crates/jammi-db/src/store/artifact.rs:298-322`), never
+assembled from separate per-peer outputs. Peers exchange data only through the collective (§4's `Peer`
+implementation over the `RunRank` stream); there is no second peer-to-peer surface. A
+partition-aware inference operator that streams `InferenceExec` across partitions and fans a
+table out to peers is a distinct, unscheduled piece of work — GitHub issue #540 — because nothing
+in this design produces a table for it to partition.
 
 ## 6. Oracles
 
@@ -282,7 +289,7 @@ single-process table (K4 shape).
 | **Gang failure**: kill −9 a peer → job requeued, completed by a new gang from the checkpoint, exactly one model, no orphan prefix promoted; kill −9 the coordinator → same via lease; split-brain: attempt N+1 dispatched while N is live on the peer → N aborted, N+1 runs | property | distributed lane |
 | **Authorization**: `RunRank` for a job not running / not claimed by the caller / lease expired is refused | property | server it-suite |
 | **Cache reuse**: same spec on the same training-set digest with `CachePolicy::Use` → no second training; two model rows, one prefix; reaping respects references | property | hermetic |
-| **Distributor-agnosticism**: same operators through a Ballista scheduler + 2 executors hosted by the jammi binary → identical bytes to the peer path | byte | U8 |
+| **Distributor-agnosticism**: an embedding job through a Ballista scheduler + 2 executors hosted by the jammi binary → identical bytes to the same query's single-executor plan; a gang job through the scheduler → identical bytes to U5b's peer-based run | byte | U8 |
 
 ## 7. Configuration and placement
 
@@ -340,7 +347,7 @@ topological order; `jammi-ballista` is inserted before `jammi-server` in the sam
 not touched.
 
 **Oracles.** Codec round-trip for every operator; an embedding job via `submit_physical_plan`
-across two executors byte-identical to U6's peer path; a W=2 gang job through the scheduler
+across two executors byte-identical to the same query's single-executor plan; a W=2 gang job through the scheduler
 byte-identical to U5b's and never task-retried; killing an executor mid-gang fails the job and
 requeues it through jammi's lease path — holds only with U8b's bind-time re-launch guard in
 place (README r42; without it, Ballista re-launches the gang task on its own, S6 probe 5); U8b:

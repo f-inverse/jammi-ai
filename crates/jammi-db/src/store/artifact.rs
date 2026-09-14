@@ -278,6 +278,13 @@ impl ArtifactStore {
     /// [`crate::store::ResultStore::read_materialization_manifest`]. Returns
     /// `Ok(None)` when no sidecar exists (a model that predates this
     /// contract, or one with no materialization at all).
+    ///
+    /// The sidecar's path is always DERIVED here — `self.child(prefix,
+    /// MATERIALIZATION_NAME)`, the fixed relative name under the given
+    /// artifact prefix — never read back from a catalog column. `models` has
+    /// no `manifest_path` column (P7, #500): a prior migration draft added
+    /// one, but nothing ever read it, so the migration was rewritten before
+    /// merge to drop it rather than ship a column with no reader.
     pub async fn read_model_materialization(
         &self,
         prefix: &StorageUrl,

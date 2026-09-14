@@ -645,8 +645,10 @@ pub enum ProducingDescriptor {
     /// [`Self::TrainingSet`], keyed under the catalog name
     /// `jammi:fine-tuned:{job_id}` (the handle and re-claim idempotency key).
     /// Recorded on the `models` row via the `model_materialization` migration
-    /// (`models.definition_hash` / `input_anchors_json` / `manifest_path`,
-    /// mirroring the `result_tables` columns migration 021 added). Replay
+    /// (`models.definition_hash` / `input_anchors_json`, mirroring the
+    /// `result_tables` columns migration 021 added); the `.materialization.json`
+    /// sidecar path is derived from the artifact prefix, never recorded as a
+    /// third column. Replay
     /// (`pipeline::recompute`, K1) for this variant is **retrain**, never a
     /// re-derivation from the recorded fields.
     ///

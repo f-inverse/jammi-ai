@@ -560,9 +560,9 @@ impl OssServer {
         // paths. Its routes are a plain `tonic::service::Routes`, so a second
         // internal service is mounted beside `PeerService` on the SAME
         // `Routes` here: `GangService` (see
-        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.7/§2 (P3) — tenant
-        // derived from the verified job row, never the caller; the public
-        // listener answers UNIMPLEMENTED for its paths too). The registry is
+        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.7 and Addendum 3 —
+        // no tenant value is read on that path at W=1, never the caller's;
+        // the public listener answers UNIMPLEMENTED for its paths too). The registry is
         // cloned now because `MetricsLayer::new(self.metrics)` moves the
         // `Arc` into the public chain below.
         // `test-hooks` only: a handle onto the SAME `GangServer` instance's

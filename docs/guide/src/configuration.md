@@ -184,8 +184,10 @@ preload_models = [
 # coordinator -- the owner/member trusts the channel; the peer side binds no
 # tenant and enforces only that each requested segment belongs to the named
 # table (the coordinator resolved that table through its own tenant-scoped
-# catalog read before fanning out); the gang side derives tenant from the
-# verified job row, never the caller. Bind it on a private interface behind
+# catalog read before fanning out); the gang side reads no tenant value at
+# all today -- never the caller's, and the admission row it reads carries no
+# tenant column (tenant-scoped resolution is U5a-2's, #566). Bind it on a
+# private interface behind
 # network policy / mTLS from the runtime: on a routable interface without
 # them it exposes cross-tenant reads. See security.md "The peer listener"
 # and "The gang listener".

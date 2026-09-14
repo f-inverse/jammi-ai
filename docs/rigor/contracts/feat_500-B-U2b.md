@@ -172,9 +172,16 @@ differed from that target, by exactly the resolutions below.
   guarantee in `docs/guide/src/security.md`. No mechanism changed: the exemption's text and its
   assertion in `crates/jammi-server/tests/it/tenant_isolation_oracle.rs` now state the ground the path
   has (served only on `peer_bind`; no tenant value read at W=1; status-only responses; derivation is
-  U5a-2's, #566), and every sentence that stated the derivation as fact is corrected (`gang.rs`,
-  `gang.proto`, `api_freeze_baseline.txt`, `security.md`, `api-stability.md`, `MAINTAINER-GUIDE.md`,
-  plan DESIGN/README, U5a-1's contract Addendum 3). Property: the committed exemption names a property
+  U5a-2's, #566), and the sentences that stated the derivation as a present fact are corrected at the
+  sites two oracle passes enumerated — pass one: `gang.rs`, `gang.proto`, `api_freeze_baseline.txt`,
+  `security.md`, `api-stability.md`, `MAINTAINER-GUIDE.md` §2.8a, plan DESIGN/README, U5a-1's contract
+  (Addendum 3); pass two, missed by a line-based sweep because the sentences wrap: `runtime.rs`'s
+  gang mount comment, the doc comment of `gang_service_is_unimplemented_on_the_public_listener`,
+  `configuration.md`'s `peer_bind` paragraph, `deploy-server.md`'s gang paragraph. The plan's target
+  design (DESIGN § 4, README ruling 26) keeps the derivation as the design, beside the stated W=1
+  divergence. Sweep method for the record: a whitespace-tolerant regex over every tracked file for
+  "verified job row", "deriv… tenant from", "tenant … derived from", "tenant derivation" and "pins
+  every catalog access", each hit read in context. Property: the committed exemption names a property
   an executed test proves (`gang_service_is_unimplemented_on_the_public_listener`), and the residual
   it leaves (a liveness oracle over another tenant's job for a `peer_bind` caller) is stated on #566.
 

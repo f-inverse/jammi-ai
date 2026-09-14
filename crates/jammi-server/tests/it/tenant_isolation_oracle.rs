@@ -3319,9 +3319,9 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
 /// (`OssServer::bind`), beside `PeerServiceServer`, and is never added to the
 /// public `Routes`. This is the invariant that makes
 /// [`GANG_LISTENER_ALLOWLIST`] sound — a tenant-bearing caller cannot reach
-/// the gang admission handler through the public tenant layer; I-GANG's own
-/// tenant derivation (from the verified job row) is the only tenant
-/// authority a gang rpc is ever decided under.
+/// the gang admission handler through the public tenant layer, and on the
+/// listener it IS reachable from, no tenant value is read at W=1 (the
+/// allowlist entry's own text; tenant-scoped resolution is U5a-2's, #566).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gang_service_is_unimplemented_on_the_public_listener() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;

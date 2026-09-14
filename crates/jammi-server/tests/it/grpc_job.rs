@@ -190,7 +190,7 @@ async fn start_training_runs_to_completion_over_the_wire() {
     let _ = server.handle.await;
 }
 
-/// P6 (U3 fix round 1) end to end: `ModelResult.cache_outcome` round-trips
+/// End to end: `ModelResult.cache_outcome` round-trips
 /// through the SERVER's own wire conversion
 /// (`crates/jammi-server/src/grpc/job.rs`,
 /// `job_status_response_from_record`), not merely through the engine's

@@ -610,7 +610,7 @@ impl Catalog {
     /// over the EXACT same input anchors — the model peer of
     /// [`crate::store::ResultStore::probe_cache_record`]'s `result_tables`
     /// probe, restated over `models` because a fine-tuned model is not a
-    /// `result_tables` row (K7 reuse rule: definition hash AND pinned equal
+    /// `result_tables` row (the reuse rule: definition hash AND pinned equal
     /// anchors; a plain/unpinned source is never reused).
     ///
     /// `NULL` never matches: [`Self::find_models_by_definition`]'s own

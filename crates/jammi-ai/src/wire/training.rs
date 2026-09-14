@@ -223,7 +223,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
 
 /// Which of the two LoRA fine-tune kinds is decoding through
 /// [`lora_common_from_proto`] — the ONE place that can still see which kind
-/// requested a policy it cannot honour (P4, U3 fix round 1), the same "last
+/// requested a policy it cannot honour, the same "last
 /// edge that can still see it" reasoning [`training_spec_from_proto`]'s own
 /// `ContextPredictor` world_size refusal already uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,14 +850,12 @@ mod tests {
         );
     }
 
-    /// The cache field rides on the request like `world_size`, not the kind
-    /// — there is only one place to put it — but P4 (fix round 1) means the
-    /// two LoRA kinds do NOT honour it identically: `cache = USE` on a
+    /// The cache field rides on the request like `world_size`, but the two
+    /// LoRA kinds do NOT honour it identically: `TrainingSpec::GraphFineTune`
+    /// has no `cache` field to decode onto, so `cache = USE` on a
     /// `graph_fine_tune` job is refused, typed, at this same decode (a graph
     /// fine-tune carries no `ProducingDescriptor::FineTune` materialization
-    /// to probe or record — `worker.rs`'s own `materialization_source: None`
-    /// for this kind). This replaces the prior version of this test, which
-    /// asserted the CARRY; asserting the refusal is the correctness bar now.
+    /// to probe or record). Asserting the refusal is the correctness bar.
     #[test]
     fn graph_fine_tune_refuses_cache_use() {
         use jammi_wire::proto::inference::CachePolicy as ProtoCachePolicy;

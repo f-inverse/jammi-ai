@@ -124,7 +124,7 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
 
     // The FIRST submission is honestly always a miss (nothing to reuse yet):
     // it must train for real — its own result carries metrics and reports
-    // `cache_outcome: "computed"` (P6: asserted directly, not inferred).
+    // `cache_outcome: "computed"` (asserted directly, not inferred).
     let (first_model_id, first_trained, first_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
     assert!(
@@ -135,7 +135,7 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
 
     // The SECOND submission (same spec, same training-set digest) must be a
     // cache HIT: its own result carries no metrics, and its `cache_outcome`
-    // names the FIRST submission's own model id (P6) — the trainer never ran.
+    // names the FIRST submission's own model id — the trainer never ran.
     let (second_model_id, second_trained, second_cache_outcome) =
         submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
     assert!(
@@ -180,7 +180,7 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
     assert!(first.definition_hash.is_some());
     assert_eq!(first.definition_hash, second.definition_hash);
     assert_eq!(first.input_anchors_json, second.input_anchors_json);
-    // P5 (fix round 1): the `FineTune` materialization records NO input
+    // The `FineTune` materialization records NO input
     // anchor — the training-set digest it would otherwise have carried is
     // already inside `definition_hash` (`ProducingDescriptor::FineTune::
     // training_set_artifact_digest`), so a separate anchor was redundant,
@@ -189,8 +189,8 @@ async fn cache_use_trains_once_and_shares_one_prefix_across_two_model_rows() {
     // the digest actually names) was a false attestation. Pinned directly,
     // not merely "equal to each other": both rows must carry the empty set.
     assert_eq!(first.input_anchors_json.as_deref(), Some("[]"));
-    // `manifest_path` is not a `models` column (P7, migration 033 rewritten
-    // before merge): the sidecar path is always DERIVED from `artifact_path`
+    // `manifest_path` is not a `models` column: the sidecar path is always
+    // DERIVED from `artifact_path`
     // (`ArtifactStore::read_model_materialization`'s own doc), so the two
     // rows agreeing on `artifact_path` above already implies they agree on
     // the derived sidecar path — there is no separate column left to compare.
@@ -240,7 +240,7 @@ async fn cache_bypass_never_reuses() {
     );
 }
 
-/// P1' (fix round 1, BLOCK #1 finding F1): a cache HIT whose finalize CAS
+/// A cache HIT whose finalize CAS
 /// loses the lease race must never delete the REUSED prefix — that prefix is
 /// a DIFFERENT, already-servable model's committed artifact, not this
 /// attempt's own bytes. Drives the real worker exactly like

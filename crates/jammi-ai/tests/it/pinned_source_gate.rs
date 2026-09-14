@@ -108,7 +108,7 @@
 //! was checked and contains no such nesting today, but a future one would
 //! have its interior treated as code); a function-pointer type parameter
 //! written with unconventional spacing (`fn (i32) -> bool`, a space after
-//! `fn`) would be mistaken for a function item — checked: `grep -rn "fn (["
+//! `fn`) would be mistaken for a function item — checked: `grep -rn 'fn (\['
 //! crates/jammi-db/src crates/jammi-ai/src` finds none; and detectors 2 and
 //! 4 do not follow a value ACROSS function boundaries (a helper that reads
 //! `.current_version` — off a parameter for pattern 2, off a self-fetched
@@ -419,51 +419,26 @@ fn mask_non_code(text: &str) -> String {
 /// callers today, with two different scopes: [`fine_tune_ddl_relation_binding_hits`],
 /// scoped to `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
 /// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]). Not
-/// recognising raw strings is a LIVE desync today, not a disclosed-but-inert
-/// limit: this scanner pairs the FIRST `"` it meets with the NEXT `"` it
-/// meets, with no notion of an `r#`/`r##` delimiter or of the hash count a
-/// raw string's real closing quote must match, so a raw string whose own
-/// content contains a plain `"`-quoted substring can flip this function's
-/// "inside a string" bookkeeping out of step with the real token boundaries
-/// for the rest of the line — sometimes for the rest of the file, since the
-/// `"`-handling sub-loop above has no `\n` stop condition and searches across
-/// newlines for its (wrong) closing quote. Two triggers reproduce this today,
-/// each traced by hand and confirmed by an independent byte-for-byte re-run
-/// of this exact function (checked against the real compiled version, not a
-/// transcription) over the current tree: (1) a JSON-blob raw string whose
-/// quoted keys/values give the naive pairing enough real quotes to land, mid-
-/// line, on a position this scanner now (wrongly) treats as CODE —
-/// `storage/config.rs:555` and `:619` each land exactly on the `//` of the
-/// fixture's `"endpoint":"https://..."`, so the line-comment branch above
-/// fires there and blanks everything from that `//` to the end of the
-/// physical line, INCLUDING real JSON content that was never a comment; (2)
-/// `\"` inside a raw string, which is two literal characters to Rust (never
-/// an escape), is still treated by this function's `"`-handling as an
-/// escaped quote — `config/secret.rs:449`'s
-/// `r#"secret = "{ file = \"/run/secrets/x\" }""#` desyncs there, and
-/// because the resulting mis-paired "string" search has no per-line stop
-/// condition it runs on past the end of that statement, past the enclosing
-/// `mod tests`, until it happens on the next literal `"` later in the file —
-/// every REAL `//` line comment it crosses in between is treated as still
-/// being "inside a string" and is therefore never blanked, the opposite
-/// failure from (1). Both triggers are exercised in this tree today, not
-/// hypothetically: the same byte-for-byte re-run, over `storage/config.rs`,
-/// `config/tests.rs`, `config/secret.rs`, and `sql/ident.rs`, finds 22 lines
-/// where this function blanks real code/string content that a raw-string-
-/// aware masker would have left alone (trigger (1); `storage/config.rs:555`/
-/// `:619` plus 20 lines in `config/tests.rs`'s TOML fixtures), and 12 lines
-/// where a real `//` line comment is left completely unblanked because the
-/// scan was still, wrongly, inside a pseudo-string when it reached them
-/// (trigger (2); `config/secret.rs:455`-`456`, `sql/ident.rs:94`, and nine
-/// lines in `config/tests.rs`). The `grep -rn 'r#*".*\(//\|/\*\)'
+/// recognising raw strings or char literals is a LIVE desync today, not a
+/// disclosed-but-inert limit: this scanner pairs the FIRST `"` it meets with
+/// the NEXT `"` it meets, with no notion of an `r#`/`r##` delimiter or of
+/// the hash count a raw string's real closing quote must match, so its
+/// "inside a string" bookkeeping can invert and run across lines — this is
+/// not one enumerable mechanism, so no fixed list of triggers is claimed
+/// here. Measured with this exact function, compiled verbatim (not a
+/// transcription), over both `src` trees at this head: 22 code lines get
+/// blanked as if they were comments and 12 real `//` comment lines are left
+/// completely unblanked, across `storage/config.rs:555`/`:619`,
+/// `config/tests.rs`, `config/secret.rs`, and `sql/ident.rs` — the complete
+/// set. The `grep -rn 'r#*".*\(//\|/\*\)'
 /// crates/jammi-db/src crates/jammi-ai/src` command finds exactly the two
-/// SINGLE-LINE raw strings that cause trigger (1) — `storage/config.rs:555`
-/// and `:619` — and nothing else, but that describes the one grep, not the
-/// tree: a delimiter-aware scan of `config/tests.rs` alone finds 12 further
-/// raw strings that span MULTIPLE physical lines (TOML fixtures quoting
-/// `postgres://`, `nats://`, and `https://` URLs), invisible to a single-
-/// line pattern by construction — the grep is a description of what it
-/// matches, not a completeness instrument over what raw strings exist. The
+/// SINGLE-LINE raw strings responsible for part of the code-blanking above —
+/// `storage/config.rs:555` and `:619` — and nothing else, but that describes
+/// the one grep, not the tree: a delimiter-aware scan of `config/tests.rs`
+/// alone finds 12 further raw strings that span MULTIPLE physical lines
+/// (URL-carrying TOML fixtures), invisible to a single-line pattern by
+/// construction — the grep is a description of what it matches, not a
+/// completeness instrument over what raw strings exist. The
 /// consequence for this function's callers: a DDL-shaped string literal
 /// sitting on a desynced line is invisible to [`ddl_literal_occurrences`] —
 /// a FIFTH residual alongside the four the "literal-occurrence gate" section
@@ -3196,9 +3171,10 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // none of them under `crates/jammi-db/src`), or in a third crate, both
 // count the same way. A fifth gap sits inside the scan itself, not at its
 // boundary: [`mask_comments_only`]'s masking step desyncs on a raw string
-// today (its own doc above states the two live triggers and the file/line
-// evidence), so a DDL literal sitting on a desynced line is invisible to
-// [`ddl_literal_occurrences`] regardless of which directory it lives in.
+// today (its own doc above states the raw-string/char-literal residual
+// and the file/line evidence), so a DDL literal sitting on a desynced
+// line is invisible to [`ddl_literal_occurrences`] regardless of which
+// directory it lives in.
 // None of these five gaps (per-site counts, split literals, `include_str!`
 // targets, anything outside `SURFACE_DIRS` including `tests/it/`, the
 // masking step's raw-string desync) is closed here; the rebuild that would
@@ -3548,10 +3524,10 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    `register_table` immediately above -- same disclosure, both commands stated \
                    exactly: `grep -rn '\\.deregister_table(' crates/jammi-db/src crates/jammi-ai/src` \
                    (the two `src` trees) finds nothing, and the repo-wide \
-                   `grep -rn '\\.deregister_table(' --include='*.rs' crates/` finds only two lines, \
-                   both inside this very file's own prose quoting the verb in backticks (this entry \
-                   and the doc paragraph above it) -- no real call site exists anywhere in the tree, \
-                   under `src`, under `tests/it/`, or elsewhere; it exists to satisfy the trait.",
+                   `grep -rn '\\.deregister_table(' --include='*.rs' crates/` finds no call site -- \
+                   every hit it returns is this file's own prose, quoting the verb in backticks -- no \
+                   real call site exists anywhere in the tree, under `src`, under `tests/it/`, or \
+                   elsewhere; it exists to satisfy the trait.",
     },
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",

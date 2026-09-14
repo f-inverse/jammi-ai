@@ -470,6 +470,18 @@ class PaidPodLaneTest(unittest.TestCase):
         joined = "\n".join(findings)
         self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
 
+    def test_quoted_inline_on_push_fails_p7(self):
+        # Round-4 audit RED: the inline-value arm returned the raw text as
+        # the trigger key, so `on: "push"` produced a key list of
+        # `['"push"']` -- never equal to the bare string `"push"` P7
+        # compares against -- and this exact evasion passed silently.
+        broken = GANG_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:\n  pull_request:\n    types: [labeled]\n", 'on: "push"\n'
+        )
+        findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
+        joined = "\n".join(findings)
+        self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
+
     def test_unreadable_child_line_under_on_is_refused_not_dropped(self):
         # A line at the `on:` block's own child indentation that matches
         # none of `key:`/`"key":`/`'key':` (e.g. a merge key or a list item
@@ -1417,6 +1429,19 @@ class OnBlockDoctrineTest(unittest.TestCase):
         findings = cgo.check_p1_p2(texts)
         self.assertTrue(any("cannot read" in f for f in findings))
 
+    def test_quoted_inline_on_push_fails_p1(self):
+        # Same evasion as P7's gang-row sibling test, against the prove
+        # workflow's own on: block instead.
+        bad = PROVE_YML_GOOD.replace(
+            "on:\n  workflow_dispatch:\n  pull_request:\n    types: [labeled]\n"
+            '  schedule:\n    - cron: "47 3 * * *"\n',
+            'on: "push"\n',
+        )
+        texts = _positive_texts()
+        texts["gpu-prove.yml"] = bad
+        findings = cgo.check_p1_p2(texts)
+        self.assertTrue(any("push" in f and "on: block carries" in f for f in findings), findings)
+
     def test_flow_style_on_block_is_unreadable_not_a_pass(self):
         bad = PROVE_YML_GOOD.replace("on:\n  workflow_dispatch:\n  pull_request:\n    types: [labeled]\n  schedule:\n    - cron: \"47 3 * * *\"", "on: { workflow_dispatch: null }")
         texts = _positive_texts()
@@ -2097,6 +2122,20 @@ class ReadOnBlockFromPathTest(unittest.TestCase):
                 keys, err = cgo.read_top_level_on_block_from_path(p)
             finally:
                 os.chmod(p, 0o644)
+        self.assertIsNone(keys)
+        self.assertIsNotNone(err)
+        self.assertIn("cannot read file", err)
+
+    def test_non_utf8_file_is_a_named_cannot_read_fail_not_an_uncaught_traceback(self):
+        # Round-4 audit RED: `read_top_level_on_block_from_path` caught only
+        # `OSError` -- a non-UTF-8 workflow file raises `UnicodeDecodeError`
+        # (not an `OSError` subclass) straight past this function as an
+        # uncaught traceback instead of the named "cannot read file" FAIL
+        # every other read error already gets.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "not-utf8.yml"
+            p.write_bytes(b"on:\n  push:\n  \xff\xfe not valid utf-8 \x80\x81\n")
+            keys, err = cgo.read_top_level_on_block_from_path(p)
         self.assertIsNone(keys)
         self.assertIsNotNone(err)
         self.assertIn("cannot read file", err)

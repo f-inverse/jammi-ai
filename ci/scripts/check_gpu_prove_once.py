@@ -225,6 +225,10 @@ MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 sys.path.insert(0, str(REPO_ROOT / "ci" / "scripts"))
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
 import gpu_prove_verdict  # noqa: E402
+from check_execution_surface_reachability import (  # noqa: E402
+    read_top_level_on_block,
+    read_top_level_on_block_from_path,
+)
 
 # Repo-relative PATH, not a basename (P7's identity discipline applies here
 # too): every real invocation site spells the full `ci/scripts/...` path
@@ -645,87 +649,14 @@ def check_promoting_if(expr: str, gate_job: str, tag_family: str | None = None) 
 
 
 # --------------------------------------------------------------------------- #
-# on: block reader (P1's fail-loud-on-unreadable rule). SHARED: this is the
-# one reader `check_p7_paid_pod_lanes` (push/workflow_call absence) and
-# `test_gpu_gang_lane.sh`'s G7 (schedule absence) both read the `on:` block
-# through -- G7 shells out to this module's `--read-on-block` CLI (below)
-# rather than carrying a second, independently-drifting regex.
+# on: block reader (P1's fail-loud-on-unreadable rule). SHARED: `read_top_
+# level_on_block`/`read_top_level_on_block_from_path` live in
+# `check_execution_surface_reachability.py` (imported above) -- the ONE
+# reader `check_p7_paid_pod_lanes` (push/workflow_call absence), P5, P6, and
+# `test_gpu_gang_lane.sh`'s G7 (schedule absence, via this module's own
+# `--read-on-block` CLI below) all read the `on:` block through, never a
+# second, independently-drifting copy.
 # --------------------------------------------------------------------------- #
-_ON_CHILD_KEY_RE = re.compile(r'^(?:"([A-Za-z0-9_]+)"|\'([A-Za-z0-9_]+)\'|([A-Za-z0-9_]+)):')
-
-
-def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
-    """(trigger_keys, error). A quoted `"on":`/`'on':` or flow-style
-    `on: {...}` is a "cannot read" FAIL, never a silent pass. Child keys
-    are read quote-normalized -- `push:`, `"push":` and `'push':` are the
-    SAME key -- and a line at the child keys' own indentation that matches
-    none of those three shapes is itself a "cannot examine" FAIL naming the
-    unreadable line, never a silently dropped key (a deeper-indented line
-    is nested content under a child key and is skipped, never examined as
-    a sibling).
-    """
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        if re.match(r'^"on":', stripped) or re.match(r"^'on':", stripped):
-            return None, 'on: block is quoted ("on": / \'on\':) -- cannot read'
-        if not line.startswith("on:"):
-            continue
-        # F2 audit fix: strip a trailing inline comment (`on:  # comment`)
-        # before deciding whether the line carries an inline value -- a
-        # bare `on:` with a trailing comment must be read exactly like a
-        # bare `on:` (look at the child keys below), never misread as a
-        # single literal trigger key of `"# comment"`.
-        rest = re.sub(r"\s*#.*$", "", line[len("on:") :]).strip()
-        if rest == "":
-            keys: list[str] = []
-            child_indent: int | None = None
-            for j in range(i + 1, len(lines)):
-                l2 = lines[j]
-                if l2.strip() == "" or l2.strip().startswith("#"):
-                    continue
-                indent = len(l2) - len(l2.lstrip(" "))
-                if indent == 0:
-                    break
-                if child_indent is None:
-                    child_indent = indent
-                if indent > child_indent:
-                    continue  # nested content under a child key -- not a sibling
-                if indent < child_indent:
-                    break  # dedented past the on: block
-                m2 = _ON_CHILD_KEY_RE.match(l2.strip())
-                if m2:
-                    keys.append(next(g for g in m2.groups() if g is not None))
-                else:
-                    return None, (
-                        f"on: block child line is unreadable -- cannot examine: {l2.strip()!r}"
-                    )
-            return keys, None
-        if rest.startswith("{") or rest.startswith("["):
-            return None, "on: is flow-style -- cannot read"
-        return [rest], None
-    return None, "no top-level on: block found"
-
-
-def read_top_level_on_block_from_path(path: Path) -> tuple[list[str] | None, str | None]:
-    """(trigger_keys, error). Wraps `read_top_level_on_block` with the
-    FILE-level fail-loud rule: every read error on the workflow file --
-    missing, a directory, permission denied, not valid UTF-8 -- is a named
-    FAIL, never `([], None)` / "no key", for EVERY euid. A missing path or
-    a directory path raises `FileNotFoundError`/`IsADirectoryError` (both
-    `OSError`) regardless of the caller's privilege, so those two cases
-    hold even for a root caller; a permission-denied path is bypassed by
-    root's own DAC override and can only be exercised as a caller that is
-    genuinely not root -- callers of this function must not assume the
-    permission-denied arm ran under every euid, only that it is the same
-    named FAIL when it does."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        return None, f"cannot read file {path}: {exc}"
-    return read_top_level_on_block(text)
 
 
 # --------------------------------------------------------------------------- #

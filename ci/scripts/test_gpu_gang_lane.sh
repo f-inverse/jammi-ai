@@ -452,7 +452,7 @@ fi
 # could not even open; the shared reader instead quote-normalizes child
 # keys and FAILS LOUD (never "absent") on anything it cannot examine.
 # ============================================================================
-gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML")"
+gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML" 2>&1)"
 gang_on_rc=$?
 if [ "$gang_on_rc" -ne 0 ]; then
   bad "G7: cannot examine gpu-gang.yml's on: block -- $gang_on_keys"
@@ -521,6 +521,36 @@ if [ "$g7d_rc" -ne 0 ] && [[ "$g7d_out" == *"cannot read file"* ]]; then
   ok "G7: a directory path is FAILed by name, never read as 'no schedule key' (euid-independent)"
 else
   bad "G7: expected a directory path to FAIL naming 'cannot read file'; got rc=${g7d_rc} out=${g7d_out}"
+fi
+
+# G7 fixture: a non-UTF-8 FILE is FAIL, never an uncaught traceback and
+# never "no schedule key" -- the reader's file-level wrapper catches
+# UnicodeDecodeError beside OSError, so a non-UTF-8 workflow file is the
+# same named "cannot read file" FAIL, never an uncaught traceback.
+g7_badenc="$SANDBOX/g7-not-utf8.yml"
+printf 'on:\n  push:\n  \xff\xfe not valid utf-8 \x80\x81\n' > "$g7_badenc"
+g7e_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_badenc" 2>&1)"
+g7e_rc=$?
+if [ "$g7e_rc" -ne 0 ] && [[ "$g7e_out" == *"cannot read file"* ]] && [[ "$g7e_out" != *"Traceback"* ]]; then
+  ok "G7: a non-UTF-8 file is FAILed by name ('cannot read file'), never an uncaught traceback"
+else
+  bad "G7: expected a non-UTF-8 file to FAIL naming 'cannot read file' with no traceback; got rc=${g7e_rc} out=${g7e_out}"
+fi
+
+# G7 fixture: `on: &trig` immediately preceding a LIVE `schedule:` cron
+# child is refused loud -- a naive `grep -qx schedule` on the reader's own
+# output, or a text grep for `schedule:` directly, would both miss a real
+# cron re-add hidden behind an anchor; the shared reader must refuse to
+# examine the anchored value rather than silently reporting "no schedule
+# key present".
+g7_anchor="$SANDBOX/g7-anchored-cron.yml"
+printf 'on: &trig\n  schedule:\n    - cron: "30 8 * * *"\n' > "$g7_anchor"
+g7a_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_anchor" 2>&1)"
+g7a_rc=$?
+if [ "$g7a_rc" -ne 0 ] && [[ "$g7a_out" == *"anchor"* ]]; then
+  ok "G7: on: &trig with a live schedule: cron child is refused loud (cannot examine, never 'no schedule key')"
+else
+  bad "G7: expected on: &trig + live cron to be refused naming 'anchor'; got rc=${g7a_rc} out=${g7a_out}"
 fi
 
 # ============================================================================

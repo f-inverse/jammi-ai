@@ -910,10 +910,19 @@ def _first_indent(lines: list[str]) -> int | None:
     return None
 
 
+_BLOCK_ENTRY_KEY_RE = re.compile(
+    r'^\s*(?:"([A-Za-z0-9_.-]+)"|\'([A-Za-z0-9_.-]+)\'|([A-Za-z0-9_.-]+)):\s*(.*)$'
+)
+
+
 def _split_block_entries(block: str) -> dict[str, str]:
     """Split a block-mapping's text into `{key: body_text}` at the block's
     OWN first-observed indentation level. `key` allows hyphens/digits/dots
-    (job ids like `dep-direction`, keys like `continue-on-error`)."""
+    (job ids like `dep-direction`, keys like `continue-on-error`), spelled
+    bare OR quoted (`push:`/`"push":`/`'push':` are the SAME key — the
+    quote-normalization `parse_on_block`'s own `on:`-block reading needs so
+    a quoted `"pull_request":` trigger is never silently invisible to
+    `is_merge_path`)."""
     lines = block.splitlines()
     base_indent = _first_indent(lines)
     if base_indent is None:
@@ -927,17 +936,140 @@ def _split_block_entries(block: str) -> dict[str, str]:
             continue
         indent = len(line) - len(line.lstrip())
         if indent == base_indent:
-            m = re.match(r"^\s*([A-Za-z0-9_.-]+):\s*(.*)$", line)
+            m = _BLOCK_ENTRY_KEY_RE.match(line)
             if not m:
                 current_key = None
                 continue
-            current_key = m.group(1)
+            current_key = next(g for g in m.groups()[:3] if g is not None)
             entries[current_key] = [line]
         elif indent > base_indent and current_key is not None:
             entries[current_key].append(line)
         else:
             current_key = None
     return {k: "\n".join(v) for k, v in entries.items()}
+
+
+# --------------------------------------------------------------------------- #
+# THE `on:`-block trigger-key reader. This is the ONE place in the whole
+# `ci/scripts` tree that reads an `on:` block down to its top-level trigger
+# KEYS (never the fuller `parse_on_block` field shape above, which stays a
+# separate, Rule-1-specific reader over the SAME underlying block-splitting
+# primitives) — `check_gpu_prove_once.py`'s P1, P5, P6, P7 and its
+# `--read-on-block` CLI (which `test_gpu_gang_lane.sh`'s G7 shells out to)
+# all import this function, never a second, independently-drifting copy.
+#
+# Quote-normalized at EVERY arm: the top-level key (`on:`/`"on":`/`'on':`),
+# every block child key (`push:`/`"push":`/`'push':`), and the inline
+# scalar value (`on: "push"` reads identically to `on: push`). Every shape
+# this reader does not understand — a YAML anchor/alias/tag anywhere in the
+# `on:` value, a flow-style mapping/sequence, tab indentation, an
+# inconsistently dedented sibling, a byte-order mark, `on :` (whitespace
+# before the colon), or a truly empty `on:` block — is a LOUD "cannot
+# read"/"cannot examine" refusal, never `[]` and never a raw, unnormalized
+# token returned as if it were a real trigger key.
+# --------------------------------------------------------------------------- #
+_ON_CHILD_KEY_RE = re.compile(r'^(?:"([A-Za-z0-9_]+)"|\'([A-Za-z0-9_]+)\'|([A-Za-z0-9_]+)):')
+
+
+def _dequote_scalar(value: str) -> str:
+    """Strip one matching pair of surrounding quotes (`"push"` / `'push'`)
+    off an inline scalar — `on: "push"` and `on: push` read as the SAME
+    single trigger key, never as the raw quoted text `'"push"'`, which
+    never equals the bare string a caller compares a trigger name against
+    (a raw-quoted key would be silently invisible to every check that
+    gates on a specific trigger name)."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
+def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
+    """(trigger_keys, error). See the module section doc above for the
+    full refusal list. `error` is non-None on every shape this reader
+    cannot examine; `trigger_keys` is a definite, exhaustive list only when
+    `error` is None — never a partial list silently missing a key this
+    reader could not parse."""
+    if text.startswith("﻿"):
+        return None, "on: block: the file begins with a byte-order mark (BOM) -- cannot examine"
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if re.match(r'^"on":', stripped) or re.match(r"^'on':", stripped):
+            return None, 'on: block is quoted ("on": / \'on\':) -- cannot read'
+        if re.match(r"^on\s+:", line):
+            return None, "on: key has whitespace before the colon (on :) -- cannot read"
+        if not line.startswith("on:"):
+            continue
+        # A trailing inline comment (`on:  # comment`) must read exactly
+        # like a bare `on:` (look at the child keys below), never misread
+        # as a single literal trigger key of `"# comment"`.
+        rest = re.sub(r"\s*#.*$", "", line[len("on:") :]).strip()
+        if rest != "":
+            if rest.startswith("{") or rest.startswith("["):
+                return None, "on: is flow-style -- cannot read"
+            if rest.startswith("&") or rest.startswith("*"):
+                return None, "on: carries a YAML anchor/alias (&/*) -- cannot read"
+            if rest.startswith("!"):
+                return None, "on: carries a YAML tag (!) -- cannot read"
+            return [_dequote_scalar(rest)], None
+        keys: list[str] = []
+        child_indent: int | None = None
+        for j in range(i + 1, len(lines)):
+            l2 = lines[j]
+            if l2.strip() == "" or l2.strip().startswith("#"):
+                continue
+            leading = l2[: len(l2) - len(l2.lstrip(" \t"))]
+            if "\t" in leading:
+                return None, "on: block uses tab indentation -- cannot examine"
+            indent = len(l2) - len(l2.lstrip(" "))
+            if indent == 0:
+                break
+            if child_indent is None:
+                child_indent = indent
+            if indent > child_indent:
+                continue  # nested content under a child key -- not a sibling
+            if indent < child_indent:
+                return None, (
+                    f"on: block child is dedented inconsistently -- cannot examine: {l2.strip()!r}"
+                )
+            stripped2 = l2.strip()
+            if stripped2.startswith(("&", "*", "!")):
+                return None, (
+                    f"on: block child carries a YAML anchor/alias/tag -- cannot examine: {stripped2!r}"
+                )
+            m2 = _ON_CHILD_KEY_RE.match(stripped2)
+            if m2:
+                keys.append(next(g for g in m2.groups() if g is not None))
+            else:
+                return None, f"on: block child line is unreadable -- cannot examine: {stripped2!r}"
+        if not keys:
+            return None, "on: block is empty -- cannot examine"
+        return keys, None
+    return None, "no top-level on: block found"
+
+
+def read_top_level_on_block_from_path(path: Path) -> tuple[list[str] | None, str | None]:
+    """(trigger_keys, error). Wraps `read_top_level_on_block` with the
+    FILE-level fail-loud rule: every read error on the workflow file --
+    missing, a directory, permission denied, not valid UTF-8 -- is a named
+    FAIL, never `([], None)` / "no key", for EVERY euid. A missing path or
+    a directory path raises `FileNotFoundError`/`IsADirectoryError` (both
+    `OSError`) regardless of the caller's privilege, so those two cases
+    hold even for a root caller; a permission-denied path is bypassed by
+    root's own DAC override and can only be exercised as a caller that is
+    genuinely not root -- callers of this function must not assume the
+    permission-denied arm ran under every euid, only that it is the same
+    named FAIL when it does. A file that is not valid UTF-8 is the SAME
+    named FAIL (`UnicodeDecodeError` is not an `OSError` subclass -- caught
+    separately so a non-UTF-8 workflow file does not raise past this
+    function as an uncaught traceback)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"cannot read file {path}: {exc}"
+    return read_top_level_on_block(text)
 
 
 def _sub_entries(entries: dict[str, str], key: str) -> dict[str, str]:
@@ -2381,6 +2513,100 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     ok, _reason = is_merge_path(call_only)
     if ok:
         failures.append("self-test FAILED: a workflow_call-only on: block was classified as merge-path")
+
+    # A quoted `"pull_request":` trigger is recognized as a qualifying
+    # merge-path lane exactly like the bare form -- `_split_block_entries`'s
+    # child-key regex accepts a quoted key too, so `is_merge_path` never
+    # reads a quoted `"push":`/`"pull_request":` `on:` block as having NO
+    # qualifying trigger.
+    quoted_pr = parse_on_block('on:\n  "pull_request":\n    branches: [main]\n')
+    ok, _reason = is_merge_path(quoted_pr)
+    if not ok:
+        failures.append(f'self-test FAILED: a quoted "pull_request": trigger was not classified as merge-path: {_reason}')
+
+    # --- `read_top_level_on_block`: the single `on:`-block trigger-key
+    # reader check_gpu_prove_once.py's P1, P5, P6, P7 and its
+    # `--read-on-block` CLI all import. Every shape this reader refuses is
+    # asserted to REFUSE (never `[]`, never a raw, unnormalized token);
+    # every shape it accepts is asserted to read the SAME normalized keys a
+    # bare, unquoted `on:` block would. ----------------------------------
+    def _want_ok(label: str, text: str, want_keys: list[str]) -> None:
+        keys, err = read_top_level_on_block(text)
+        if err is not None or keys != want_keys:
+            failures.append(f"self-test FAILED (on: reader, {label}): expected {want_keys}, got keys={keys} err={err!r}")
+
+    def _want_refused(label: str, text: str, want_substr: str) -> None:
+        keys, err = read_top_level_on_block(text)
+        if keys is not None or err is None or want_substr not in err:
+            failures.append(f"self-test FAILED (on: reader, {label}): expected a refusal naming {want_substr!r}, got keys={keys} err={err!r}")
+
+    # 1. bare inline scalar.
+    _want_ok("bare inline", "on: push\n", ["push"])
+    # 2. quoted inline scalar (double AND single) -- normalizes to the SAME
+    #    bare key, never the raw quoted text.
+    _want_ok("double-quoted inline", 'on: "push"\n', ["push"])
+    _want_ok("single-quoted inline", "on: 'push'\n", ["push"])
+    # 3. a YAML anchor on the `on:` value -- refused, never silently
+    #    misread as a literal trigger key of `&trig`.
+    _want_refused("anchor", "on: &trig\n  push:\n    branches: [main]\n", "anchor")
+    # 4. a YAML tag on the `on:` value -- refused the same way.
+    _want_refused("tag", "on: !!str push\n", "tag")
+    # 5. CRLF line endings must not confuse the reader -- `str.splitlines()`
+    #    already treats `\r\n` as one line terminator, so this must read
+    #    exactly like the LF form, never a refusal.
+    _want_ok("CRLF", "on:\r\n  push:\r\n    branches: [main]\r\n", ["push"])
+    # 6. a byte-order mark at the start of the file -- refused.
+    _want_refused("BOM", "\ufeffon:\n  push:\n", "byte-order mark")
+    # 7. tab-indented children -- refused, never silently misread as
+    #    column 0 (which would wrongly end the on: block with zero keys).
+    _want_refused("tab indentation", "on:\n  push:\n\tworkflow_dispatch:\n", "tab")
+    # 8. a leading YAML document-start marker (`---`) must not confuse the
+    #    line scan -- the `on:` block after it reads normally.
+    _want_ok("document-start marker", "---\non:\n  push:\n", ["push"])
+    # 9. a literal `true:` top-level key (never coerced from/confused with
+    #    `on:`) is correctly reported as "no on: block found" -- this
+    #    reader is a textual match on `on:`, never a YAML 1.1 boolean
+    #    resolver, and must not overreach into treating `true:` as a
+    #    spelling of `on:`.
+    keys, err = read_top_level_on_block("true:\n  push:\n")
+    if keys is not None or err is None or "no top-level on: block found" not in err:
+        failures.append(f"self-test FAILED (on: reader, true: key): expected 'no top-level on: block found', got keys={keys} err={err!r}")
+    # 10. a trailing inline comment on a bare `on:` reads identically to a
+    #     bare `on:` with no comment.
+    _want_ok("trailing comment", "on:  # release triggers\n  push:\n", ["push"])
+    # 11. an inconsistently DEDENTED sibling (partial dedent, not all the
+    #     way to column 0) is refused, never silently truncating the key
+    #     list with no error.
+    _want_refused(
+        "dedented sibling",
+        "on:\n  push:\n    branches: [main]\n workflow_dispatch:\n",
+        "dedent",
+    )
+    # 12. hyphenated keys still parse through `_split_block_entries`'s
+    #     quote-aware regex -- a bare-hyphenated key (job ids like
+    #     `dep-direction`) is accepted exactly as a quoted key is.
+    hyphen_entries = _split_block_entries("dep-direction:\n  runs-on: ubuntu-latest\n")
+    if "dep-direction" not in hyphen_entries:
+        failures.append(f"self-test FAILED: _split_block_entries lost a bare hyphenated key after quote-widening: {sorted(hyphen_entries)}")
+    # 13. a quoted CHILD key (`"push":`) reads as the same normalized key
+    #     as the bare form.
+    _want_ok("quoted child key", 'on:\n  "push":\n    branches: [main]\n', ["push"])
+    # 14. a truly empty `on:` block (no children at all) is refused, never
+    #     silently read as `[]` (zero legitimate triggers is not a real
+    #     GitHub Actions workflow shape).
+    _want_refused("empty on:", "on:\njobs:\n  x:\n    runs-on: ubuntu-latest\n", "empty")
+    # 15. `on :` (whitespace before the colon) is refused by name, not
+    #     merely swallowed into the generic "no top-level on: block found".
+    _want_refused("on : (space before colon)", "on :\n  push:\n", "whitespace before the colon")
+    # 16. `on: &trig` immediately preceding a LIVE `schedule:` cron child is
+    #     refused loud (the exact shape a real `gpu-gang.yml` re-add behind
+    #     an anchor would evade a naive `grep -q schedule:` on) -- never
+    #     silently read as "no schedule key present".
+    _want_refused(
+        "anchored on: with a live schedule child",
+        'on: &trig\n  schedule:\n    - cron: "30 8 * * *"\n',
+        "anchor",
+    )
 
     # --- docs.yml's own shape: a comment line NESTED inside a block `paths:`
     # list must not truncate the list (the F1-adjacent bug this repo's own

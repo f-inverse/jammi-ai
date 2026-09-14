@@ -1876,14 +1876,46 @@ The wire mirror is one shared module: `crates/jammi-ai/src/wire/cache.rs` decode
 enum **once** in `jammi.v1.inference`
 (`crates/jammi-wire/proto/jammi/v1/inference.proto`) and the producer RPCs carry it as a
 field (e.g. `crates/jammi-wire/proto/jammi/v1/pipeline.proto`). `SubmitJobRequest.cache`
-(tag 10, `crates/jammi-wire/proto/jammi/v1/job.proto`) imports the same enum for the two
-LoRA fine-tune kinds rather than declaring a second wire vocabulary for the identical
-concept; `crates/jammi-ai/src/wire/training.rs` decodes it into `TrainingCommon.cache`,
-the call-time dial `ProducingDescriptor::FineTune`'s **model-level** reuse probe
+(tag 10, `crates/jammi-wire/proto/jammi/v1/job.proto`) imports the same enum rather than
+declaring a second wire vocabulary for the identical concept;
+`crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it into
+`TrainingCommon.cache`, the call-time dial `ProducingDescriptor::FineTune`'s
+**model-level** reuse probe
 (`Catalog::probe_model_by_definition`, keyed on the model's definition hash + input
 anchors — see the `FineTune` entry above) reads, distinct from the *result-table*
-`probe_cache_record` path the producers above use. The Python client carries it as the
-`cache=` kwarg on `fine_tune` / `fine_tune_graph`, beside `world_size`, on both transports.
+`probe_cache_record` path the producers above use.
+
+**`cache = Use` is scoped to the column-source `FineTune` kind only.**
+`ProducingDescriptor::FineTune` (and every probe/record mechanism built on it,
+`Catalog::probe_model_by_definition` / `record_model_materialization`) covers only that
+kind — a `GraphFineTune` job's `FineTuneRun::materialization_source` is `None`
+(`crates/jammi-ai/src/fine_tune/worker.rs`: the graph arm carries no materialization to
+probe or record). `lora_common_from_proto` therefore refuses `cache = USE` for
+`GraphFineTune` with a typed `InvalidArgument` at decode — the one place that can still
+see both the kind and the requested value, mirroring the `ContextPredictor` `world_size`
+refusal in the same module. `Bypass`/unset is unaffected on either kind: a graph
+fine-tune always trains, exactly as it did before this field existed. The Python client
+still carries `cache=` as a kwarg on both `fine_tune` and `fine_tune_graph` (beside
+`world_size`, on both transports); only `fine_tune`'s `"use"` is ever honored; the
+identical kwarg on `fine_tune_graph` is refused, not silently dropped.
+
+**Reuse is best-effort, never mutual exclusion.** The probe and the training run it
+gates are not serialized against a second, concurrent submission of the same
+definition: two `cache = Use` jobs racing on the same training-set digest + spec can
+both miss the probe (neither's row is committed yet) and both train, publishing two
+prefixes and two model rows — each independently servable and each independently
+reusable by a later probe — rather than one job blocking on the other.
+
+**The reuse-locality assumption.** `MaterializationEnv.device`
+(`crates/jammi-db/src/store/manifest.rs`) folds `ComputeDevice::Cuda { ordinal }` /
+`Metal { ordinal }` / `Cpu` — a device **ordinal**, not a host or machine identity. The
+probe's definition hash therefore treats any two invocations reporting the same ordinal
+as numerically interchangeable, including across two different physical hosts that both
+happen to enumerate a GPU at ordinal `0`: a model trained on one host's ordinal `0` can
+be served by a probe resolved on another host's ordinal `0`. This is sound for a fleet of
+like-for-like accelerators (the deployment shape every `FineTune` job runs under today)
+and would need a real per-host or per-device identity folded into `ComputeDevice` before
+it could hold across heterogeneous hardware.
 
 #### The staleness/lineage sensing model (`store/freshness.rs`)
 

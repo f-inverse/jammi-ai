@@ -222,7 +222,7 @@ impl PyJob {
     /// (`metrics` is the raw JSON text of the run-summary blob, or `None`
     /// when the run recorded none — read [`Self::metrics`] for the parsed
     /// form; `cache_outcome` is `"computed"`, or `"reused:{model_id}"` for a
-    /// `FineTune` model-level cache hit — P6, U3 fix round 1), or `{"kind":
+    /// `FineTune` model-level cache hit), or `{"kind":
     /// "table", "table", "cache_outcome"}` for a compute kind. This dict is
     /// the generic `serde_json` projection of the engine's own
     /// `jammi_ai::jobs::JobResult` (via `serializable_to_pydict`) — a field

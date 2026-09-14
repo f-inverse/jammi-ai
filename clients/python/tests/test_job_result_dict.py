@@ -1,7 +1,7 @@
 """Hermetic tests for `_job_result_to_dict` (`jammi/_database.py`) — the
 projection `RemoteJob.wait()` returns.
 
-P6 (U3 fix round 1): `ModelResult.cache_outcome` (`crates/jammi-wire/proto/
+`ModelResult.cache_outcome` (`crates/jammi-wire/proto/
 jammi/v1/job.proto`) is a training kind's peer of `TableResult.cache_outcome`,
 which this projection already carried. The embedded `Job.wait()`
 (`crates/jammi-python/src/job.rs`) reaches the SAME key for free — it is a

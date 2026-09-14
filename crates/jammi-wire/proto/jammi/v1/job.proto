@@ -153,11 +153,11 @@ message SubmitJobRequest {
   // refused at submit with a typed error rather than silently clamped.
   uint32 world_size = 9;
   // Opt-in model-level cache reuse, scoped to the column-source `fine_tune`
-  // kind ONLY (P4, U3 fix round 1): probe the base model + training-set
-  // definition for an exact prior materialisation and register the caller's
-  // own name against the reused artifact prefix instead of retraining.
-  // Mirrors the engine's `TrainingCommon.cache` field for field, the same
-  // shared `CachePolicy` enum every other result-table producer verb carries
+  // kind ONLY: probe the base model + training-set definition for an exact
+  // prior materialisation and register the caller's own name against the
+  // reused artifact prefix instead of retraining.
+  // Mirrors the engine's `TrainingSpec::FineTune.cache` field for field, the
+  // same shared `CachePolicy` enum every other result-table producer verb carries
   // (`jammi.v1.inference.CachePolicy` — imported rather than redeclared, so
   // this and every other producer's cache dial share one wire vocabulary).
   // UNSPECIFIED maps to the engine default (`Bypass`, always train), matching
@@ -210,8 +210,8 @@ message ModelResult {
   // Run-metrics JSON, present once the run recorded any (issue #441).
   optional string metrics_json = 3;
   // `"computed"`, or `"reused:{model_id}"` for a `FineTune` model-level cache
-  // hit (P6, U3 fix round 1) — mirrors `TableResult.cache_outcome`'s
-  // vocabulary field for field, so a reuse is OBSERVABLE on every training
+  // hit — mirrors `TableResult.cache_outcome`'s vocabulary field for field,
+  // so a reuse is OBSERVABLE on every training
   // kind's terminal result, never merely inferred from an absent
   // `metrics_json`. Every non-`FineTune` training kind (which has no
   // model-level cache to reuse) always carries `"computed"`.

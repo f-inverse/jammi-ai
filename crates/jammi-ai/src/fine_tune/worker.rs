@@ -1334,14 +1334,14 @@ impl JobWorker {
         // path: the finalize CAS is the sole writer of `artifact_path`, so a
         // loser's (or zombie's) register can never set the served pointer.
         //
-        // U3: `dir` is `None` for exactly one case — a `CachePolicy::Use`
+        // `dir` is `None` for exactly one case — a `CachePolicy::Use`
         // model-level cache HIT (`FineTuneMaterializationOutcome::Reused`).
         // Nothing new is published; the prefix is the ALREADY-committed one
         // the matched row serves, so this job's own name is finalized
         // pointing at the SAME prefix (two model rows, one prefix) rather
         // than writing (and then having to reclaim) a duplicate copy. The
         // ownership of that fact travels in the TYPE from here on
-        // ([`PublishedPrefix`], P1') rather than being re-derived from
+        // ([`PublishedPrefix`]) rather than being re-derived from
         // `dir.is_some()` at each later call site.
         let attempt_str = attempt.to_string();
         let prefix: PublishedPrefix = match &dir {
@@ -1401,7 +1401,7 @@ impl JobWorker {
             // The model row could not be registered. A FRESH prefix we just
             // wrote is orphaned — best-effort GC it via `abandon_unfinalized_attempt`,
             // whose own `PublishedPrefix::delete_if_owned` can never touch a
-            // REUSED prefix (P1') — it is owned by its own original model
+            // REUSED prefix — it is owned by its own original model
             // row.
             abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version).await;
             if dir.is_some() {
@@ -1419,15 +1419,15 @@ impl JobWorker {
             return;
         }
 
-        // U3 fix round 1 (P3'): the model-level materialization SIDECAR
-        // OBJECT (`materialization.json`'s bytes) is still written into the
+        // The model-level materialization SIDECAR OBJECT
+        // (`materialization.json`'s bytes) is still written into the
         // prefix here, BEFORE the finalize CAS below — mirroring
         // `ArtifactStore::put_artifact`'s own "manifest.json last"
         // discipline. The CATALOG COLUMNS
         // (`definition_hash`/`input_anchors_json`) are a different matter:
         // `Catalog::record_model_materialization`'s own ordering guard now
         // REFUSES to write them until the finalize CAS has already
-        // committed `artifact_path` for this row (P3', matching
+        // committed `artifact_path` for this row (matching
         // `record_model_materialization`'s own doc), so calling it here —
         // before that CAS ever runs — would refuse every single time for a
         // fresh run. The two pieces of information that call needs are
@@ -1569,7 +1569,7 @@ impl JobWorker {
         // The tagged terminal payload `jobs.result` carries the model
         // metrics blob: the generalised `jobs` schema has no dedicated
         // metrics column, so it folds into `result` instead (see
-        // `crate::jobs::JobResult::Model`). P6 (fix round 1): `cache_outcome`
+        // `crate::jobs::JobResult::Model`). `cache_outcome`
         // makes a reuse OBSERVABLE on this job's own result, the same
         // contract `JobResult::Table::cache_outcome` already keeps for a
         // compute kind — never merely inferred from an absent `metrics`.
@@ -1625,7 +1625,7 @@ impl JobWorker {
             .await
         {
             Ok(true) => {
-                // P3': record the materialization summary ONLY now that the
+                // Record the materialization summary ONLY now that the
                 // finalize CAS above has actually committed `artifact_path`
                 // for THIS row — `record_model_materialization`'s own
                 // ordering guard requires exactly this fact, and refuses
@@ -1685,9 +1685,9 @@ impl JobWorker {
                 // Lost the lease before finalizing: our CAS matched zero rows, so
                 // we committed neither the job status nor any served path. Our
                 // prefix is never the committed pointer (and, if it is a
-                // `Reused` one, was never OUR bytes to begin with — P1') —
+                // `Reused` one, was never OUR bytes to begin with) —
                 // GC it best-effort and reap this attempt's own unfinalized
-                // row (P3') so no hash-less zombie survives; leave the job
+                // row so no hash-less zombie survives; leave the job
                 // for reclaim (the re-claiming worker writes its own prefix
                 // and its CAS commits it).
                 abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
@@ -2107,9 +2107,8 @@ impl JobWorker {
                     common,
                     loader,
                     // `ProducingDescriptor::FineTune` covers only the
-                    // column-source `FineTune` kind at this commit (its own
-                    // doc); a graph fine-tune's model row carries no
-                    // materialization.
+                    // column-source `FineTune` kind (its own doc); a graph
+                    // fine-tune's model row carries no materialization.
                     materialization_source: None,
                     // `TrainingSpec::GraphFineTune` has no `cache` field at
                     // all — see `FineTuneRun::cache`'s own doc for why
@@ -2323,10 +2322,9 @@ impl JobWorker {
                 base_model_id: canonical_model_id,
                 world_size: common.world_size,
             };
-            // U3 fix round 1, P5 (BLOCK #1 finding F5): NO input anchor is
-            // recorded for the `FineTune` materialization — removed, not
-            // reshaped into a new kind, because the prior anchor was both a
-            // FALSE ATTESTATION and REDUNDANT.
+            // NO input anchor is recorded for the `FineTune` materialization
+            // — removed, not reshaped into a new kind, because the prior
+            // anchor was both a FALSE ATTESTATION and REDUNDANT.
             //
             // False attestation: the prior anchor paired the fine-tune's own
             // registered SOURCE name (`src.source`, e.g. `"training"` — a
@@ -3485,9 +3483,9 @@ pub(crate) enum FineTuneMaterializationOutcome {
     /// never ran. This job completes by registering its OWN model name
     /// pointing at the REUSED prefix — two model rows sharing one prefix —
     /// with the SAME definition hash / input anchors the reused row already
-    /// carries (copied, not recomputed). No `manifest_path` field: P7
-    /// (fix round 1) drops that column from `models` entirely — the
-    /// sidecar path is always DERIVED from `artifact_path` (mirroring
+    /// carries (copied, not recomputed). No `manifest_path` field: `models`
+    /// carries no such column — the sidecar path is always DERIVED from
+    /// `artifact_path` (mirroring
     /// `ArtifactStore::read_model_materialization`'s own doc), never
     /// carried as a separate value.
     Reused {
@@ -3495,7 +3493,7 @@ pub(crate) enum FineTuneMaterializationOutcome {
         /// finalized pointing at the SAME prefix, never a new one.
         artifact_path: String,
         /// The reused row's own catalog model id — folded into this job's
-        /// own `JobResult::Model::cache_outcome` (P6) so a reuse is
+        /// own `JobResult::Model::cache_outcome` so a reuse is
         /// OBSERVABLE (which row's bytes were reused), never merely
         /// inferred from an absent metrics field.
         reused_model_id: String,
@@ -3664,16 +3662,17 @@ impl PrefixReferences for ResultStore {
 }
 
 /// Ownership of the prefix [`JobWorker::publish_and_finalize`] is about to
-/// finalize against (U3 fix round 1, P1', BLOCK #1 finding F1): whether this
-/// attempt wrote these bytes itself (`Owned`, safe to reclaim on any abort
+/// finalize against: whether this attempt wrote these bytes itself (`Owned`,
+/// safe to reclaim on any abort
 /// before the finalize CAS commits) or the prefix is a PRIOR attempt's
 /// already-committed artifact this attempt is merely finalizing a SECOND
 /// model row to point at (`Reused`, a `CachePolicy::Use` cache hit —
 /// [`FineTuneMaterializationOutcome::Reused`]).
 ///
 /// The distinction is a TYPE, not a `dir.is_some()` boolean re-checked at
-/// every call site, precisely because F1 was three call sites that forgot
-/// to re-check it: [`Self::delete_if_owned`] is the ONLY way to delete a
+/// every call site: a boolean re-checked at each site is exactly the kind of
+/// invariant a new call site can silently forget to re-check.
+/// [`Self::delete_if_owned`] is the ONLY way to delete a
 /// prefix through this type, and it is structurally incapable of deleting a
 /// `Reused` one — a `Reused` prefix is owned by whichever model row(s)
 /// already reference it (`store::reconcile`'s attribution), and deleting it
@@ -3739,12 +3738,13 @@ impl PublishedPrefix {
 }
 
 /// Every exit arm between a successful `register_model` and a WON finalize
-/// CAS (U3 fix round 1, P1'+P3' combined cleanup) must leave behind neither
+/// CAS must leave behind neither
 /// this attempt's own unpublished bytes (`prefix`, reclaimed iff `Owned` —
 /// see [`PublishedPrefix`]'s own doc) nor the unfinalized `models` row
 /// `register_model` just created: a row still carrying `artifact_path IS
-/// NULL` when this attempt gives up is exactly the poisoned-zombie shape P3
-/// exists to keep unreachable from the SERVABLE set, and
+/// NULL` when this attempt gives up is exactly the poisoned-zombie shape the
+/// probe's servability predicate exists to keep unreachable from the
+/// SERVABLE set, and
 /// [`jammi_db::catalog::Catalog::delete_registered_model_if_unfinalized`]'s
 /// own guard (`artifact_path IS NULL`) means calling this can never delete a
 /// row a WINNING finalize CAS (this attempt's or a peer's) already

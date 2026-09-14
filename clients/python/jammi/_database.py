@@ -737,7 +737,7 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     raw JSON text of the run-summary blob, or `None` when the run recorded
     none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
     is `"computed"`, or `"reused:{model_id}"` for a `FineTune` model-level
-    cache hit — P6, U3 fix round 1, the same vocabulary the `table` variant
+    cache hit — the same vocabulary the `table` variant
     already carries). A compute kind's `table` variant projects to
     `{"kind": "table", "table", "cache_outcome"}`.
     """

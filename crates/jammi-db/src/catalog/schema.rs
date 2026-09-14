@@ -1140,7 +1140,7 @@ ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE index_segments ADD COLUMN version INTEGER;
 "#;
 
-/// Migration 033 (U3, #500) — the `model_materialization` contract columns.
+/// Migration 033 (#500) — the `model_materialization` contract columns.
 ///
 /// A fine-tuned model is a producer like any other
 /// ([`crate::store::manifest::ProducingDescriptor::FineTune`]): `definition_hash`
@@ -1148,18 +1148,13 @@ ALTER TABLE index_segments ADD COLUMN version INTEGER;
 /// to `result_tables`, restated on `models` because a fine-tuned model's row
 /// lives there instead.
 ///
-/// This migration is UNMERGED as of the P7 fix round: it originally also
-/// added a `manifest_path` column to record the model's `materialization.json`
-/// sidecar's location, but that column had no production reader — the sidecar
-/// path is always the fixed name `materialization.json` under the model's
-/// artifact prefix (`ArtifactStore::MATERIALIZATION_NAME`) — no leading dot,
-/// unlike a result table's `{table}.materialization.json` sidecar, because a
-/// model prefix has no stem to suffix — exactly the way
-/// `materialization_sidecar_path` derives the `result_tables` sidecar from a
-/// sibling path rather than a recorded column. Because the migration had not
-/// merged to `main`, K5's append-only rule binds the ledger, not this not-yet-
-/// shipped body, so the column is dropped here rather than added in 034 and
-/// deprecated.
+/// No `manifest_path` column: the sidecar path is always the fixed name
+/// `materialization.json` under the model's artifact prefix
+/// (`ArtifactStore::MATERIALIZATION_NAME`) — no leading dot, unlike a result
+/// table's `{table}.materialization.json` sidecar, because a model prefix
+/// has no stem to suffix — exactly the way `materialization_sidecar_path`
+/// derives the `result_tables` sidecar from a sibling path rather than a
+/// recorded column.
 ///
 /// Both remaining columns are NULLABLE: `ContextPredictor` has no
 /// materialization at all, and a directly-registered base model (never
@@ -1170,7 +1165,7 @@ ALTER TABLE index_segments ADD COLUMN version INTEGER;
 /// cache-hit candidate — no separate guard is needed for THAT case. A row
 /// that does carry `definition_hash` but has not yet been committed by the
 /// finalize CAS (`artifact_path IS NULL`) is excluded by a second, load-
-/// bearing predicate on the same query (P3: the servable set), so a
+/// bearing predicate on the same query (the servable set), so a
 /// losing/zombie attempt's row can never poison a cache probe even before
 /// [`crate::catalog::model_repo::Catalog::delete_registered_model_if_unfinalized`]
 /// reaps it. The index mirrors migration 022's

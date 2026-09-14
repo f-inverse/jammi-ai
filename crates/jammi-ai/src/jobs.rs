@@ -235,7 +235,7 @@ pub enum JobResult {
         /// Run-metrics JSON, or `None` when the run recorded none.
         metrics: Option<String>,
         /// `"computed"`, or `"reused:{model_id}"` for a `FineTune` model-
-        /// level cache hit (P6, U3 fix round 1) — the same
+        /// level cache hit — the same
         /// `"computed"`/`"reused:{name}"` vocabulary
         /// [`Self::Table::cache_outcome`] already carries, so a reuse is
         /// OBSERVABLE on the job's own result, never merely inferred from

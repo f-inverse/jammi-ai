@@ -1653,7 +1653,7 @@ mod world_size_tests {
     }
 }
 
-/// `ModelResult.cache_outcome` (P6, U3 fix round 1) decodes off
+/// `ModelResult.cache_outcome` decodes off
 /// `DataClient::job_status` the same way `TableResult.cache_outcome`
 /// already does: `job_status` returns the raw wire [`JobStatusResponse`]
 /// verbatim (no dedicated per-field accessor on either arm of the `result`

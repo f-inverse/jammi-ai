@@ -1551,15 +1551,13 @@ async fn migration_032_creates_result_table_versions(
     assert_eq!(dflt, 0, "next_version defaults to 0");
 }
 
-/// U3 (#500) — migration `033_model_materialization` is present and ordered
+/// Migration `033_model_materialization` (#500) is present and ordered
 /// AFTER `032_result_table_versions` (K5: relative position, never
-/// `.last()`, so the lead's renumber-on-second-merge keeps this green), adds
+/// `.last()`, so a renumber on a later merge keeps this green), adds
 /// the two NULLABLE `models` columns (`definition_hash`,
 /// `input_anchors_json`), and the `idx_models_definition_hash` cache-lookup
-/// index — on both backends. `manifest_path` is deliberately absent (P7): the
-/// migration was unmerged when the fix round dropped it, so K5's append-only
-/// rule binds the ledger, not this column, and the sidecar path stays derived
-/// from the artifact prefix rather than recorded.
+/// index — on both backends. `manifest_path` is deliberately absent: the
+/// sidecar path stays derived from the artifact prefix rather than recorded.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",

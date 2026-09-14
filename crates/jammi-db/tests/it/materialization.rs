@@ -980,9 +980,8 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert_ne!(other_format.table_name(), first.table_name());
 }
 
-/// The uniqueness oracle
-/// `pinned_source_gate::IN_TREE_SESSION_BINDING_ALLOWLIST`'s doc names for
-/// the one reviewed in-tree binder fine_tune/ reaches
+/// The uniqueness oracle `call_graph_gate::FINE_TUNE_REACHABLE_BINDING_ALLOWLIST`'s
+/// doc names for the fresh path fine_tune/ reaches
 /// (`ResultStore::materialize_training_set` -> `create_table`,
 /// `store/mod.rs:1183`): a BURST of concurrent `create_table` calls over the
 /// identical definition must never collide on one table name.

@@ -28,8 +28,10 @@ per-step `$?`. Naming per README ruling 23.
 
 ## U7a — `gpu-gang.yml` pod leg (PR-B commit 1)
 
-- **files_in_scope** (docs-ci): `.github/workflows/gpu-gang.yml` (label `run-gang`, nightly,
-  manual; never `push`/`workflow_call`), `ci/scripts/runpod_lib.sh` (`gpuCount` becomes a
+- **files_in_scope** (docs-ci): `.github/workflows/gpu-gang.yml` (label `run-gang` or manual
+  `workflow_dispatch` only — never `push`/`workflow_call`; U7b-A1-pull deletes the `schedule:`
+  block for the window before U7b-A3 re-adds it 6-hourly alongside that unit's never-vacuous
+  writer, so no cron of any kind fires this lane between the two), `ci/scripts/runpod_lib.sh` (`gpuCount` becomes a
   parameter of the shared deploy payload, default 1 — three-lane blast radius: gpu-prove,
   gpu-perf-ab, gpu-dev), `ci/scripts/runpod_gpu_gang.sh` (pod leg: 1 pod × 2 GPU
   A100-SXM4-80GB), `ci/scripts/execution_surface_reachability_allowlist.txt` (every `cargo`
@@ -103,26 +105,70 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: hermetic (+ pod leg smoke). **depends_on**: S1. **size**: L. No loader contact;
   U2b takes `world` as a partition-rule argument fed from this field (U4a → U2b).
 
-## U2b — Streaming loader; partition rule; scaler; whole-set arms (PR-B commit 4)
+## U2b — Eager loader; partition rule; scaler; whole-set arms (PR-B commit 4)
 
-- **files_in_scope** (ai-core): `fine_tune/data.rs` (stream + per-batch converters for every
-  format; the tests-only `Precomputed` arm unchanged), `fine_tune/trainer.rs` (epoch loop over
-  the stream; `batches_per_epoch = ceil(train_count / (W·B))` and every step quantity indexed
-  by global batch, at W=1), `fine_tune/worker.rs::run_spec` (`PartitionSpec { rank, world,
-  batch, rule }`), `fine_tune/regression_loss.rs` (scaler from ONE collected `Vec<f32>` of the
-  train prefix, `from_targets` once),
-  `fine_tune/hard_negative_miner.rs` and `fine_tune/gradcache.rs` (stream-sourced, W=1-only),
-  `fine_tune/batch_bucket.rs` (rung pinning option), tests. (db) `store/mod.rs` reader slicing.
+The streaming arm this unit originally carried is EXCISED (design fix round 3, second BLOCK on
+the residency mechanism, pre-committed stop rule fired): PR-B2 ships the eager `TextRows` path
+only. A residency-bounded, per-rank streaming reader is its own unit, **U2c** (below), filed as
+issue #544 and scheduled before U4b binds a per-rank reader to it.
+
+- **files_in_scope** (ai-core): `fine_tune/data.rs` (per-batch converters over the eager
+  `TextRows` path read back through `read_back_sql`/`read_back_range_sql` — both apply
+  `training_set_order_by`; the tests-only `Precomputed` arm unchanged; a reader-class allow-list
+  oracle enumerates every reader of `sql_relation()` and asserts each either applies the order
+  or pins `target_partitions = 1`), `fine_tune/trainer.rs` (the epoch loop over `TextRows`,
+  byte-identical to its pre-U2b shape; `batches_per_epoch = ceil(train_count / (W·B))` and every
+  step quantity indexed by global batch, at W=1), `fine_tune/worker.rs::run_spec`
+  (`PartitionSpec { rank, world, batch, rule }`), `fine_tune/regression_loss.rs` (scaler from
+  ONE collected `Vec<f32>` of the train prefix, `from_targets` once), `fine_tune/hard_negative_miner.rs`
+  and `fine_tune/gradcache.rs` (whole-prefix consumers of the eager loader, W=1-only),
+  `fine_tune/batch_bucket.rs` (rung pinning option), the one `TrainingSetSpec` constructor
+  shared by every construction site (or a field-by-field oracle asserting the sites agree),
+  tests. (db) `store/mod.rs` reader slicing; `store/writer.rs`'s row-group count made injectable
+  under `test-hooks` (default 65 536, never in a release build) so a multi-row-group fixture is
+  cheap to reproduce.
 - **invariants_to_preserve**: K3 (scaler over the train prefix, bit-identical), K2, B6.
-- **acceptance**: (a) resident-row high-water mark ≤ `batch × prefetch` (+ the named 4-byte
-  per row scaler exemption) on a fixture larger than the bound, on every non-whole-set arm
-  (RED at base); (b) partition rule: for W ∈ {1,2,4} the multiset of rows over ranks at each
+- **acceptance**: (a) partition rule: for W ∈ {1,2,4} the multiset of rows over ranks at each
   global step equals the W=1 batch, on a fixture whose `train_count` is not a multiple of W·B
-  (RED at base); (c) refactor parity holds on every cookbook fixture including regression;
-  (d) mining/GradCache runs at W=1 produce bytes identical to base; (e) order: the streamed
-  row order equals the committed materialization order for `target_partitions ∈ {1, N}` from
-  the row-group reader, with no blocking sort (RED at base).
-- **lane**: hermetic + cookbook. **depends_on**: U2a, U4a (the `world` argument). **size**: XL.
+  (RED at base); (b) refactor parity holds on every cookbook fixture including regression; (c)
+  mining/GradCache runs at W=1 produce bytes identical to base; (d) order: `read_back_sql`/
+  `read_back_range_sql` apply the canonical order on a multi-row-group fixture at
+  `execution_threads > 1` (RED at base for an unordered scan), and the reader-class oracle
+  covers every reader of `sql_relation()`; (e) the one `TrainingSetSpec` constructor is shared
+  by every construction site, asserted by a byte-parity test. This unit's acceptance carries no
+  residency-bound row — that criterion moved to U2c.
+- **lane**: hermetic + cookbook. **depends_on**: U2a, U4a (the `world` argument). **size**: L.
+
+## U2c — Streaming training-set loader with a residency bound (PR-B2, before U4b's commit; wave 3; issue #544)
+
+Excised from U2b by that unit's fix round 3 (a second BLOCK on the residency mechanism: a lease
+held across the excised `BatchChunker`'s carry-over deadlocked at `prefetch = 2` on any
+multi-row-group table). Rebuilt here against issue #544's constraints, never carried over
+verbatim from the excised arm.
+
+- **files_in_scope** (ai-core): `fine_tune/data.rs` (a per-rank `StreamSource` over the table's
+  row groups, sliced by U2b's partition rule; the residency-accounting types re-designed against
+  this unit's own contract — never the excised `BatchChunker`/`ChunkLease`/`ResidencyBound`/
+  `StreamConfig` shapes carried over unchanged), `fine_tune/trainer.rs` (the per-rank stream
+  consumer U4b's rank body binds to), tests. (db) `store/mod.rs` reader slicing over the
+  multi-row-group fixture; `store/writer.rs`'s injectable row-group knob (shared with U2b).
+- **invariants_to_preserve**: K3 (the scaler stays U2b's whole-prefix, one-pass reduction —
+  never itself streamed), K2, B6.
+- **acceptance**: (a) the residency bound is a property over EVERY resident population —
+  decoded rows, rows in flight to the consumer, AND the stream's own carry-over/decode-handoff
+  transients — never a flat `batch × prefetch` term alone; on a multi-row-group fixture with a
+  consumer holding each chunk ≥ 50 ms the high-water mark stays within the stated bound (RED at
+  base: U2c does not exist); (b) liveness is a property over EVERY held lease, not only the
+  steady-state case: the same multi-row-group fixture completes within a wall-clock timeout with
+  no deadlock, at every named prefetch value — this is the regression pin for the excised arm's
+  `prefetch = 2` deadlock; (c) the reader is per-rank: a `StreamSource` sliced by the partition
+  rule, never a whole-table stream shared across ranks; (d) every wired refusal (a chunk-length
+  mismatch, `ResidencyBound::new(0)`, a `prefetch` floor, …) has a BEHAVIOURAL oracle — a dying
+  test exercised through the loader's public path, never a deletable dead branch.
+- **lane**: hermetic + cookbook. **depends_on**: U2a, U2b, U4a. **size**: M. Scheduled BEFORE
+  U4b binds a per-rank reader to it — **U4b depends_on U2c** — even though its own base is the
+  PR-B2 branch after U2b/U3 land (before U4b's own commit); the implementation wave is 3 (built
+  concurrently with PR-C(67) once PR-B1 merges).
 
 ## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B commit 5, concurrent with U2b)
 
@@ -167,7 +213,8 @@ per-step `$?`. Naming per README ruling 23.
   completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden. (pod leg,
   `Nccl`, 2×A100): (a) as a digest pair + per-step delta against the pre-registered ε, (c)
   with GPU ε; artifact committed as PR-B commit 7.
-- **lane**: hermetic + gpu-gang pod leg. **depends_on**: U2b, U3, U4a, S1. **size**: XL (the
+- **lane**: hermetic + gpu-gang pod leg. **depends_on**: U2b, U2c (the per-rank residency-bounded
+  stream this unit's rank body binds to), U3, U4a, S1. **size**: XL (the
   plan's mathematical core; five hermetic oracles).
 
 ## U7b — cluster leg + cluster reap (PR-C commit 1)
@@ -225,26 +272,161 @@ act on (DESIGN.md §5).
 
 ## U5b-1 — Coordinator; `Peer` collective; membership substrate; determinism (PR-C commit 3)
 
-- **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs` (coordinator
-  on the `JobWorker`: members via `list_gang_members`, id mint, dispatch by instance id),
-  `session.rs` (`instances.peer_addr` write site, `wt-C: session.rs:247-251`),
-  `tests/distributed/{main.rs, harness.rs (peer TOML with `peer_bind`/`peer_advertise`),
-  gang_deterministic.rs, gang_forward.rs}`, `.github/workflows/distributed.yml` (test names).
-  (db) `config/mod.rs` (`[server] peer_advertise`; validate `peer_advertise ⇒ peer_bind ⇒
-  storage.result_root`), `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr`, number at
-  rebase, both pin sites), `catalog/jobs_repo.rs` (`upsert_instance` gains `peer_addr`;
-  `list_gang_members(kind)`: `workers ⋈ instances`, kinds split on `,` in Rust, `peer_addr` set,
-  `last_seen_at` within `[lease] duration_secs`, sorted in Rust). (docs-ci) configuration.md for
-  `peer_advertise`. This is the substrate 68 DIST §5.8 sketches; DIST's `RendezvousPlacement`
-  builds on it later (recorded in `68-compute-tier-substrate/README.md` §Folded from 67 and `PROGRAM.md`).
-- **invariants_to_preserve**: K4 real, B4, K2 (validate chain), K5, B6.
-- **acceptance**: (a) K4 real: 2 processes, W=2, `Peer` → bytes identical to the single-process
-  W=2 `Local` run (RED at base; rank 0 is always in-process); (b) `list_gang_members` excludes a
-  stale instance, an instance without `peer_addr`, and a worker whose kinds contain only
-  `graph_fine_tune` when `fine_tune` is asked (RED at base); (c) `peer_advertise` without
-  `peer_bind` or without `result_root` is refused at load (RED at base). Test target: `distributed`.
-- **lane**: hermetic + distributed (dispatched manually; deterministic leg green before merge).
-  **depends_on**: U4b, U5a, S1. **size**: L.
+Split into five units by capability (design round 4 REFINE, 19 findings folded): the membership
+substrate, the row-group attestation inventory, the `Peer` collective + round protocol, the
+coordinator, and the `world_size == 1` rank body. Two merge orders are pinned: **U5a-1 lands
+before U5b-1a** (U5a-1 creates `instance_liveness_margin()`; U5b-1a only consumes it — U5a-1/
+U5a-2 are the wire-server unit's own internal split, `CONTRACT-U5a-v10.md`) and **U4b lands
+before U5b-1b-ii** (`spec.rs`'s admission fields are co-owned; the `[worker] world_size` →
+`[worker] local_ranks` rename lands in U4b S8, and U5b-1b-ii rebases onto U4b's
+`admit_and_place`). "U5b-1" stays the name for the whole capability; each acceptance/oracle
+reference to "U5b-1's peer-based run" below means the assembled behaviour of all five units.
+
+### U5b-1a — Membership substrate (PR-C commit 3a)
+
+- **files_in_scope**: (db) `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr_result_root`
+  migration, number at rebase, three pin sites incl. an ordered-after oracle on both backends),
+  `catalog/jobs_repo.rs` (`upsert_instance` gains `peer_addr` + a canonicalized `result_root`;
+  `list_gang_members(GangListing { kind, self_instance, canonical_root, window })` excludes
+  self, stale (freshness via U5a-1's `instance_liveness_margin()`, consumed here, never
+  recomputed), draining/warming, other-kind (kinds split on `,`, matched as whole tokens), and
+  root-divergent instances; sorted in Rust), `config/mod.rs` (`[server] peer_advertise` validated
+  at load — requires `peer_bind` and `[storage] result_root`; `canonicalize_result_root(url)`:
+  scheme-aliased, trailing slash trimmed, a non-existent or relative `file://` root refused at
+  load with the row never written). (docs-ci) `docs/guide/src/{configuration.md, security.md,
+  deploy-server.md, reference-topologies.md}`.
+- **invariants_to_preserve**: B6, K2 (validate chain), K5 (migration, three pin sites).
+- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, other-kind and
+  root-divergent instance on both backends, plus one fresh multi-kind worker included (RED at
+  base); (b) `peer_advertise` without `peer_bind`, without `result_root`, or with a non-existent
+  or relative `file://` root is refused at load, each its own typed error (RED at base); (c) the
+  migration's ordered-after oracle on both backends.
+- **lane**: hermetic + distributed. **depends_on**: **U5a-1** (creates
+  `instance_liveness_margin()`; merge order pinned, U5a-1 lands first), PR-B1. **size**: M.
+
+### U5b-0 — Partitioned attestation inventory (PR-C, new db unit)
+
+- **files_in_scope** (db): `store/manifest.rs` (`MaterializationManifest` gains `leaves:
+  Vec<LeafDigest { row_group: u32, digest: ArtifactDigest }>`; `manifest.artifact` becomes the
+  FOLD over `leaves` in row-group order — never a second, independently-computed whole-artifact
+  digest; `MANIFEST_VERSION` bump), the training-set materialization writer (one leaf per row
+  group, written as each row group is written), the freshness/probe readers that consume
+  `MaterializationManifest` (an old sidecar with no `leaves` field is a CACHE MISS —
+  re-materialize — never a whole-artifact read accepted in its place).
+- **invariants_to_preserve**: K5 (append-only manifest shape), B6.
+- **acceptance**: (a) leaf count == row-group count, asserted via a pyarrow/parquet metadata
+  oracle over a fixture with N row groups (RED at base: no `leaves` field exists); (b)
+  `manifest.artifact` == the stated fold of `leaves`, recomputed independently by the test; (c)
+  an old-format sidecar round-trips through the freshness/probe reader as a MISS, never a hit
+  that treats the whole artifact as one leaf.
+- **lane**: hermetic. **depends_on**: none; base `main` after PR-B2. **size**: S. U5b-1b-i
+  depends_on this unit (its per-partition verify reads the leaf inventory); U5a-1's own
+  admission-time sidecar VERIFY is unaffected — it stays whole-artifact/admission-time-only.
+
+### U5b-1b-i — The `Peer` collective + round protocol (PR-C commit 3b-i)
+
+- **files_in_scope**: (ai-core) `fine_tune/collective/mod.rs` (the lifted `Descriptor` — verb,
+  world, root, counts, per-tensor signature, a new extensible `agreement` slot bound to U4b's
+  canonical key-name digest), `fine_tune/collective/local.rs` (the `Descriptor` struct and
+  `agrees_with` move to `mod.rs`, re-exported), `fine_tune/collective/peer.rs` (NEW — chunking/
+  reassembly, dtype/residency oracles, a `BlockingCall` witness token minted only at the
+  `spawn_blocking` boundary as a REQUIRED argument of every `Collective` verb — a call from a
+  runtime-worker thread is a COMPILE error, never a runtime refusal — and the two-phase round
+  protocol: a round applies on a rank only after `RoundCommit`, sent after the coordinator
+  observes W ACKs; a fault before the W-th ACK leaves no rank applied), a per-partition
+  incremental verify in the rank's read path (reads U5b-0's leaf inventory one row group at a
+  time — bounded memory, never whole-artifact buffering; a failure here is MEMBER-scoped,
+  `StoreUnavailable`, never an assembly refutation), `tests/distributed/{main.rs, harness.rs}`
+  (two-process harness driving `Peer` directly — no job, no claim). (wire-server)
+  `crates/jammi-wire/proto/jammi/v1/gang.proto` (additive: `RoundDescriptor` — a closed `verb`
+  enum, a wrapped `Counts` message, an exhaustive `DType` match — plus `RoundAck`/`RoundCommit`),
+  `crates/jammi-server/src/runtime.rs` (the peer-only listener's `Routes`, built outside
+  `assemble_grpc_chain`, gain `.max_decoding_message_size(max_message_bytes)` from the SAME
+  `[server.limits]` value the public chain already applies), `limits.rs` (its decode-cap
+  invariant restated to quantify over every listener, not only the public chain).
+- **invariants_to_preserve**: K4 real, K2 (every numeric wire edge), B5, B6, `api_freeze`
+  additive-only.
+- **acceptance**: (a) the `Peer` fold over the wire equals `Local`'s fold over fixed tensor
+  inputs, byte-for-byte, at f32/f16/bf16 (RED at base: `Peer` does not exist); (b) Peer-W2
+  adapter bytes equal Local-W2 on a regression and a contrastive fixture; (c) every round wait
+  on every rank expires at the gang deadline naming the round; a disconnect between publish and
+  the last ACK leaves no rank applied for that round and the fault names it; (d) a gang message
+  of `max_message_bytes − 1` bytes decodes on the peer listener (RED at base: no explicit cap —
+  the peer Routes decodes at tonic's 4 MiB default) and one of `max_message_bytes + 1` is
+  refused naming the CONFIGURED cap on both listeners; (e) a descriptor disagreement (root,
+  counts, the `agreement` slot, an unknown wire `verb`) is a typed refusal naming both sides;
+  (f) a corrupted leaf is caught before any collective step, MEMBER-scoped, `StoreUnavailable`,
+  never counted against assembly; (g) a `Collective` verb called from a runtime-worker thread is
+  a compile error (`trybuild`).
+- **lane**: hermetic + distributed. **depends_on**: U5a-1 (frozen `RoundContribution`/
+  `RoundResult`), U5b-0 (the leaf inventory its verify reads); does NOT depend on U5b-1a — the
+  harness drives `Peer` directly. **size**: L.
+
+### U5b-1b-ii — The coordinator: membership → assignment → dispatch → assembly (PR-C commit 3b-ii)
+
+- **files_in_scope**: (ai-core) `fine_tune/worker.rs` (the coordinator/assembly body; the
+  assembly cooldown/counter SPLIT — `next_assembly_after` written on every non-proceeding
+  attempt as `backoff(k)`, `assembly_failures` counting only the terminal-refusal class over a
+  TOTAL reason table — `Refuted`/all-root-divergent counted and cooled down; `Unavailable`/
+  `StoreUnavailable`/short-listing cooled but not counted; `NoBody`/`Drain`/`Cancelled` neither;
+  a success resets the counter), `fine_tune/spec.rs` (`RankAdmission`'s `world_size > devices`
+  check REPLACED by `world_size > serveable_world`, sourced from a NEW `[distributed]
+  max_world_size` — **co-owned with U4b: merge order pinned, U4b lands first**, since the
+  `[worker] world_size` → `[worker] local_ranks` rename lands in U4b S8, and this unit rebases
+  onto U4b's `admit_and_place`). (db) `config/mod.rs` (`[distributed] max_world_size`, default
+  1, loads independently of `[worker] local_ranks` — no cross-check between the two knobs),
+  `catalog/migrations.rs` (`jobs_assembly_failures_next_after` migration, three pin sites),
+  `catalog/jobs_repo.rs` (`claim_next`'s CANDIDATE subselect gains the cooldown term on the SAME
+  backend clock the lease columns use, never the outer UPDATE guard or a process clock; the
+  counter+cooldown UPDATE; the `training_set_ref`/`training_set_location` CAS call site and its
+  ABORT arm — a moved claim exits without a write). (wire-server) `grpc/gang.rs` (the dispatch
+  entrypoint into the coordinator body).
+- **invariants_to_preserve**: K2, K4, K5 (migration), OPS D10 (a member-scoped or transient
+  assembly outcome costs zero net attempts).
+- **acceptance**: (a) a higher-priority job inside its cooldown does not block a lower-priority
+  ready job on either backend (RED at base: no cooldown term exists); (b) a skewed process
+  clock never changes when a cooldown expires (RED at base); (c) one row per reason in the total
+  counting table (RED at base); (d) a `world_size` within `serveable_world` but beyond this
+  host's own devices submits and is decided by assembly, never a submit-time refusal; a
+  `world_size > serveable_world` refuses at submit with no catalog read (RED at base: no
+  `serveable_world`/`max_world_size` exist); (e) rank assignment is a pure function of the
+  sorted membership listing — no substitution: a member answering `Unavailable` ends the
+  CURRENT attempt (cooled down, not counted), the NEXT attempt re-lists; (f) the CAS pair is
+  never set partially; a moved claim aborts with no write, a concurrent CAS sees zero rows and
+  REUSEs.
+- **lane**: hermetic + server it-suite. **depends_on**: U5b-1a (`list_gang_members`,
+  `canonicalize_result_root`), U5b-1b-i (the `Peer` collective it dispatches to), U4b (`spec.rs`
+  co-ownership, merge order pinned), U5a-1, U5a-2. **size**: L.
+
+### U5b-1b-iii — The `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin (PR-C commit 3b-iii)
+
+- **files_in_scope** (ai-core): `fine_tune/worker.rs` (every job-row-writing site on the run
+  path reparameterized on RUNNER ROLE in one diff — the lease-hold registration/renewal,
+  `in_flight` counting, the `Releasing` self-release arm, the acceleration-report write, EVERY
+  `record_failed` call site (a DERIVED enumeration — `grep -n 'record_failed(' worker.rs` minus
+  doc lines — never a hand list; a missed site is a COMPILE error, the runner-role parameter is
+  REQUIRED), and `finish_job_with_model`'s call site; the enumerating doc table regenerated as a
+  per-site table in the same diff), `fine_tune/trainer.rs` (`save_resume_checkpoint`/its write —
+  the runner-role gate for resume-checkpoint writing lives HERE, never inside `store/artifact.rs`,
+  which stays role-agnostic), the `RankEvent::Outcome` producer at the rank body's natural end
+  (built in the SAME diff as U5b-1b-ii's terminal write on receipt — never shipped alone).
+- **invariants_to_preserve**: K4 (`W == 1` stays byte-identical to today's loop path), B6, the
+  single-writer rule (the gang's output is one artifact written by the lease holder; no per-rank
+  fragment, no peer-side write into the artifact prefix).
+- **acceptance**: a per-determinant table (never "the mutation fails a test") — each derived
+  `record_failed` site, `finish_job_with_model`'s call site, `in_flight` counting, the
+  `Releasing` arm, the acceleration-report write, and the resume-checkpoint pin, exercised once
+  under the loop-claiming role (a regression oracle, unchanged behaviour) and once under the
+  coordinator/rank role (RED at base: no runner-role parameter exists — a missed site is silent,
+  not a compile error); `RankEvent::Outcome` end-to-end reaches the same terminal state as
+  today's loop-claimed run, byte-for-byte, via a hermetic two-member `Local` gang (`W == 1`
+  itself never traverses the coordinator — a pinned row); `W > 1` resume is refused at assembly
+  with a typed reason (resume-state broadcast across ranks is its own follow-up, issue #543,
+  never built here).
+- **lane**: hermetic. **depends_on**: U5b-1b-ii (`Outcome`'s only consumer is that unit's
+  terminal write on receipt; they land together, never `Outcome` shipped alone). **size**: L
+  (the largest unit in the split — eleven `record_failed` sites × two runner roles × the K4
+  byte-identity oracle).
 
 ## U5b-2 — Watchdog; abort with no terminal write; released-vs-failed; chaos (PR-C commit 4)
 
@@ -264,7 +446,8 @@ act on (DESIGN.md §5).
   expiry (RED at base); (c) cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest pair +
   deltas against the pre-registered ε; artifact as PR-C commit 6. Test targets: `distributed`;
   `gpu_capability` for the cluster leg.
-- **lane**: distributed (chaos advisory as today) + gpu-gang cluster leg. **depends_on**: U5b-1,
+- **lane**: distributed (chaos advisory as today) + gpu-gang cluster leg. **depends_on**:
+  U5b-1b-ii, U5b-1b-iii (the coordinator/rank-body split it wraps a watchdog around),
   **68 OPS merged** (`release_job_lease`, drain hooks, C2's loop shape). **size**: L.
 
 ## U8a — `jammi-ballista`: crate, codecs, execution engine, role knobs (PR-D commit 1)
@@ -302,7 +485,8 @@ act on (DESIGN.md §5).
   single-executor plan (RED at base: no `jammi-ballista` crate exists to submit through); (b) a
   W=2 gang job through the scheduler → bytes identical to U5b's, never task-retried (RED at
   base); (c) killing an executor mid-gang fails the job and requeues it through jammi's lease path.
-- **lane**: hermetic + distributed. **depends_on**: U1, U5b-1, S6. **size**: L.
+- **lane**: hermetic + distributed. **depends_on**: U1, U5b-1b-ii, U5b-1b-iii (the full U5b-1
+  coordinator/rank-body split), S6. **size**: L.
 
 ## U8b — Catalog-backed cluster state; device-aware placement (PR-D commit 2; the completion gate)
 

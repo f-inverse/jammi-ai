@@ -696,12 +696,13 @@ pub enum ProducingDescriptor {
     /// The fused-kernel admission profile is likewise an environment fact,
     /// not a spec knob: [`MaterializationEnv::kernel_admission_profile`].
     ///
-    /// `world_size` is the ONE topology field that exists on
-    /// `TrainingCommon` at this commit (README r29); U4b's gang mechanism
-    /// adds per-rank batch, partition-rule version, collective backend, and
-    /// reduction policy as NEW named fields on this variant — the
-    /// completeness test's exhaustive destructuring (no `..`) fails to
-    /// compile the moment they land until each is bound and mutated, so the
+    /// `world_size` is the only topology field `TrainingCommon` carries;
+    /// distributed (gang) training adds per-rank batch, partition-rule
+    /// version, collective backend, and reduction policy as new named
+    /// fields on this variant when it lands (see
+    /// `docs/plans/67-distributed-training/UNITS.md`) — the completeness
+    /// test's exhaustive destructuring (no `..`) fails to compile the
+    /// moment they land until each is bound and mutated, so the
     /// determinant set can never silently grow unaccounted-for.
     FineTune {
         /// The training-set table's own [`DefinitionHash`], hex — binds this
@@ -741,7 +742,7 @@ pub enum ProducingDescriptor {
         /// other model-invoking variant.
         base_model_id: String,
         /// Data-parallel rank count this fine-tune trained over
-        /// (`TrainingCommon::world_size`, README r29) — the summation order
+        /// (`TrainingCommon::world_size`) — the summation order
         /// and batch layout depend on it, so two runs of the same spec at
         /// different world sizes are two different definitions.
         world_size: u32,
@@ -2507,11 +2508,11 @@ mod tests {
         );
     }
 
-    /// Every field of [`ProducingDescriptor::FineTune`] that exists at this
-    /// commit, carried as a fixture whose shape the completeness test below
-    /// destructures WITHOUT `..` — a field added to the variant (U4b's
-    /// topology fields) fails to compile here instead of silently escaping
-    /// the definition hash (K7).
+    /// Every field [`ProducingDescriptor::FineTune`] currently carries,
+    /// captured as a fixture whose shape the completeness test below
+    /// destructures WITHOUT `..` — a field added to the variant (e.g. new
+    /// distributed-training topology fields) fails to compile here instead
+    /// of silently escaping the definition hash (K7).
     #[derive(Clone)]
     struct FineTuneFields {
         training_set_definition_hash: String,

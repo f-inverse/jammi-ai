@@ -1,6 +1,6 @@
 """`jammi.open_sessions()` — the live-session registry — enumerated by route.
 
-Issue #536, Z1: the client itself knows every live session, so no external
+Issue #536: the client itself knows every live session, so no external
 patch of `jammi.connect` is needed to catch a leak; a registry populated in the
 shared constructor of every resource-owning session class answers "what is
 open right now" regardless of how the caller imported or bound `connect`.
@@ -21,15 +21,14 @@ Every route that constructs a NEW resource-owning session is exercised here:
 (see `_embedded._TenantScope.__enter__` and `RemoteDatabase.tenant_scope`), so
 it is not its own route and is not separately exercised here.
 
-Round 5 — Z1' extends this module: a snapshot diff over `open_sessions()`
-(the `WeakSet` view above) cannot see the leak shape that matters most — a
-bare `jammi.connect("grpc://…")` statement, or a local dropped at a test
-frame's own exit, is refcount-collected before any `finally`/fixture-teardown
-code runs, so it is already gone from the `WeakSet` by the time a diff looks.
-`observe()` / `open_session_labels()` below are the EVENT- and LEDGER-backed
-views that see a session for as long as it is registered, independent of
-whether anything still holds a reference to it — the property a leak guard
-actually needs.
+A snapshot diff over `open_sessions()` (the `WeakSet` view above) cannot see
+the leak shape that matters most — a bare `jammi.connect("grpc://…")`
+statement, or a local dropped at a test frame's own exit, is
+refcount-collected before any `finally`/fixture-teardown code runs, so it is
+already gone from the `WeakSet` by the time a diff looks. `observe()` /
+`open_session_labels()` below are the EVENT- and LEDGER-backed views that see
+a session for as long as it is registered, independent of whether anything
+still holds a reference to it — the property a leak guard actually needs.
 """
 
 from __future__ import annotations
@@ -174,7 +173,7 @@ def test_two_sessions_open_at_once_are_both_listed():
     assert b not in live
 
 
-# --- Round 5 (Z1'): the registry observes EVENTS, by handle and label -------
+# --- The registry observes EVENTS, by handle and label, independent of reachability ---
 #
 # `jammi.open_sessions()` (above) is a `WeakSet` snapshot: it cannot see a
 # session that is refcount-collected before anything ever diffs it. These

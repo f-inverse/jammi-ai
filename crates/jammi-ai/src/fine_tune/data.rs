@@ -2071,6 +2071,12 @@ impl TrainingDataLoader {
     /// handle; never touches the bounded residency machinery
     /// (`ResidencyBound`) `run_epoch_stream` uses for the main loop.
     fn stream_drain_all(&self, src: &StreamSource) -> Result<Vec<TrainingRow>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if std::env::var(Self::FORCE_STREAM_DRAIN_ERROR_ENV).is_ok_and(|v| !v.trim().is_empty()) {
+            return Err(JammiError::FineTune(
+                "test-hooks: forced I/O failure in the streamed whole-set drain".into(),
+            ));
+        }
         let format = self.format;
         let task = src.task;
         let columns = src.columns.clone();
@@ -2089,6 +2095,16 @@ impl TrainingDataLoader {
             Ok(rows)
         })
     }
+
+    /// Only read under `feature = "test-hooks"` (or in this crate's own unit
+    /// tests); a release build has no such knob. Set to any non-empty value
+    /// to make [`Self::stream_drain_all`]'s NEXT call fail with a typed
+    /// error shaped like a genuine I/O failure, deterministically — the
+    /// `clone_text_loader` fold (CONTRACT-U2b-fix1.md) needs a way to force
+    /// an OPERATIONAL failure out of the `Stream` arm's whole-set drain
+    /// without racing real I/O.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub const FORCE_STREAM_DRAIN_ERROR_ENV: &str = "JAMMI_TEST_FORCE_STREAM_DRAIN_ERROR";
 
     /// Test-only counting seam: the residency bound's own
     /// [`ResidencyBound::high_water_mark`] for the current (or last-run) per-epoch

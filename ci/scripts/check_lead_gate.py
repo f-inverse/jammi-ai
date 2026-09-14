@@ -150,6 +150,30 @@ Required fixtures (RED when the corresponding hook arm is removed):
       execution-class command's own wall-clock timing text (a cargo/
       libtest "finished in X.XXs" summary line) must never be the thing
       that makes reader 2's pre/post differential "pass".
+  esc-lead-gate-R12 fix round 3, item 8 (the fold-9 replacement).
+      8a (R12G1-R12G5): `ci/lead-gate-required-commands.txt` is committed,
+      human-amend-only, one command per line with a measured runtime
+      annotation. Reader 1 (`_r12_gates_shape_rejection`, `judge_rc=False`)
+      requires the pre-fix anticipation artifact's own `gates` object to
+      name every committed line VERBATIM with an integer `rc` — SHAPE
+      only, the VALUE never judged (the pre-fix tip is expected broken).
+      Reader 2 (`judge_rc=True`) requires the relay's own `gates` to ALSO
+      show `rc == 0` for every line. Reader 3 (`check_rigor_record.py`'s
+      `check_required_gates`, RR14-RR16) fails the COMMITTED anticipation
+      export's LATEST row on a missing line or a non-zero `rc` — never
+      re-executes the gates (already CI jobs elsewhere). 8b (R12M8b1-
+      R12M8b5): `_mutations_rejection`, armed by the DATA — the fix's own
+      diff adds a new definition in a file the BLOCK's own
+      finding_locations also names — requires the relay's `mutations`
+      array to carry 1-3 LABELED-sample rows, each either an ACCEPTED
+      mutation (`rc_before==0 ∧ rc_after!=0 ∧ marker_after` names a
+      committed TEST-failure marker) or an explicit `uncovered` reason.
+      8c (R12X1-R12X3): `_exclusions_rejection`, armed by the fix's diff
+      adding a NEW TEST definition (`_r12_new_test_surfaces`, a heuristic
+      filter over `_parse_new_surfaces`) — requires the relay's own
+      `exclusions` object to name, for each, a non-empty case the attack
+      does NOT cover, normalized-distinct from its siblings and from the
+      unit's own previous relay of the same agent_type.
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`
@@ -531,19 +555,38 @@ def _anticipation_path_exact(root: Path, unit_branch: str, tip_sha: str) -> Path
 
 def _write_anticipation_exact(root: Path, unit_branch: str, tip_sha: str, attacks: dict,
                                residual_risk: str | None = "fixture residual risk placeholder",
-                               covers: list[str] | None = None) -> Path:
+                               covers: list[str] | None = None,
+                               gates: dict | None = None) -> Path:
     """M1' schema: `{unit_branch, pre_fix_sha, covers, attacks, residual_risk}`
     — `attacks` is keyed PER FILE (`{file: {command, hash}}`), never per
-    raw `path:line` finding key."""
+    raw `path:line` finding key. `gates` (esc-lead-gate-R12 fix round 3
+    item 8a) is OMITTED unless a caller supplies one -- every EXISTING
+    fixture keeps its byte-identical shape."""
     path = _anticipation_path_exact(root, unit_branch, tip_sha)
     artifact = {"unit_branch": unit_branch, "pre_fix_sha": tip_sha, "attacks": attacks}
     if covers is not None:
         artifact["covers"] = covers
     if residual_risk is not None:
         artifact["residual_risk"] = residual_risk
+    if gates is not None:
+        artifact["gates"] = gates
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(artifact))
     return path
+
+
+def _write_required_commands_file(root: Path, commands: list[str]) -> None:
+    """esc-lead-gate-R12 fix round 3 item 8a: commits a real
+    `ci/lead-gate-required-commands.txt` (the SAME relative path
+    `_r12_required_commands_path()` resolves under `CLAUDE_PROJECT_DIR`)
+    naming `commands` verbatim, one per line, each with a trailing
+    `# measured ~0.0s` annotation -- a fixture-scoped stand-in for the
+    real repo's own committed file, never touching it."""
+    p = root / "ci" / "lead-gate-required-commands.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("".join(f"{c}  # measured ~0.0s\n" for c in commands))
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add ci/lead-gate-required-commands.txt")
 
 
 def _auto_r12_attack(key: str) -> dict:
@@ -2680,6 +2723,26 @@ def _r12_post_setup(unit: str):
     return root, row, cmd, pre_hash
 
 
+def _r12_gates_post_setup(unit: str, required_commands: list[str]):
+    """esc-lead-gate-R12 fix round 3 item 8a/8b/8c: the SAME shape as
+    `_r12_post_setup`, but `ci/lead-gate-required-commands.txt` is
+    committed BEFORE the seed commit (and so before the BLOCK's own
+    head_sha) — the required-commands file must NEVER itself appear in
+    the fix's own `block_sha..fix_head` diff, or F3's own widening would
+    require covering it as an attacks_post/gates site too, which is not
+    what these fixtures mean to exercise."""
+    root = _temp_repo(unit)
+    if required_commands:
+        _write_required_commands_file(root, required_commands)
+    (root / "state.txt").write_text("BROKEN\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed state.txt = BROKEN/v1")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["state.txt:1"], ["state.txt:1"])
+    cmd = "head -1 state.txt"
+    pre_hash = _r12_hash(0, "BROKEN\n", "")
+    return root, row, cmd, pre_hash
+
+
 def _r12f1_two_block_setup(unit: str):
     """esc-lead-gate-R12 fix round 2 F1 setup: TWO open BLOCKs of different
     types at DIFFERENT shas on the same unit (an older adversarial-audit,
@@ -3777,20 +3840,24 @@ def _g20_28_arm() -> tuple[list[str], int]:
 import ast  # noqa: E402  (kept local to this section, mirrors the module's own late imports)
 
 _R12_SWEEP_FUNCS = {
-    # esc-lead-gate-R12 fix round 2 item 10: every function in the
-    # `# R12-BEGIN`/`# R12-END` sentinel region (20 total as of fix round
-    # 2 — the 17 fix round 1 introduced, plus `_r12_is_execution_class`
-    # (F2), `_r12_find_pre_fix_artifact` (F1) and `_r12_normalize_output`
-    # (item 12)), not merely the four `str | None`-returning core
-    # mechanism helpers fix round 1 introduced. A function with no
-    # CONDITIONAL non-`None`/non-fallthrough return (`_new_attack_deadline`,
-    # `_derived_attack_keys`, `_key_to_file`, `anticipation_artifact_path`,
-    # `_witness_hash`, `_r12_normalize_output`, `_r12_is_inspector_only`,
-    # `_r12_is_execution_class`, `_r12_targeted_open_blocks`,
-    # `_r12_required_by_file`) contributes ZERO positions automatically —
-    # `_r12_deny_if_positions` only counts a `Return` inside an `If`, so
-    # listing them here is harmless and keeps this set a straightforward,
-    # auditable ENUMERATION of the region rather than a hand-picked subset.
+    # esc-lead-gate-R12 fix round 3 item 10 (kept current): every function
+    # in the `# R12-BEGIN`/`# R12-END` sentinel region (25 total as of fix
+    # round 3 — the 20 from fix round 2, plus item 8's seven new functions:
+    # `_r12_required_commands_path`, `_r12_required_commands`,
+    # `_r12_gates_shape_rejection`, `_mutations_rejection`,
+    # `_r12_new_test_surfaces`, `_r12_previous_relay_row`,
+    # `_exclusions_rejection`), not a hand-picked subset. A
+    # function with no CONDITIONAL non-`None`/non-fallthrough return
+    # (`_new_attack_deadline`, `_derived_attack_keys`, `_key_to_file`,
+    # `anticipation_artifact_path`, `_witness_hash`, `_r12_normalize_output`,
+    # `_r12_is_inspector_only`, `_r12_is_execution_class`,
+    # `_r12_targeted_open_blocks`, `_r12_required_by_file`,
+    # `_r12_required_commands_path`, `_r12_required_commands`,
+    # `_r12_new_test_surfaces`, `_r12_previous_relay_row`) contributes ZERO
+    # positions automatically — `_r12_deny_if_positions` only counts a
+    # `Return` inside an `If`, so listing them here is harmless and keeps
+    # this set a straightforward, auditable ENUMERATION of the region
+    # rather than a hand-picked subset.
     "_install_self_alarm", "_new_attack_deadline", "_derived_attack_keys",
     "_key_to_file", "anticipation_artifact_path", "_r12_normalize_output", "_witness_hash",
     "_run_attack_command", "_resolve_worktree_cwd", "_r12_attack_command_denied",
@@ -3798,6 +3865,9 @@ _R12_SWEEP_FUNCS = {
     "_r12_required_by_file", "_r12_changed_file_set", "_r12_validate_and_run_entry",
     "_r12_empty_set_rejection", "_pre_fix_anticipation_rejection",
     "_post_fix_attacks_rejection", "_r12_find_pre_fix_artifact",
+    "_r12_required_commands_path", "_r12_required_commands", "_r12_gates_shape_rejection",
+    "_mutations_rejection", "_r12_new_test_surfaces", "_r12_previous_relay_row",
+    "_exclusions_rejection",
 }
 
 
@@ -4071,7 +4141,525 @@ def fixture_r12sweepmeta_sweep_flags_a_genuinely_silent_arm() -> None:
             "may be broken (everything would look like a survivor for the wrong reason)")
 
 
+# ==========================================================================
+# esc-lead-gate-R12 fix round 3, item 8 (the fold-9 replacement: 8a/8b/8c).
+# ==========================================================================
+
+def fixture_r12g1_pre_fix_missing_gates_denies() -> None:
+    """item 8a: a required-commands file is committed, but the
+    anticipation artifact carries no `gates` object at all -- Reader 1
+    denies on SHAPE, never touching the value of any `rc`."""
+    unit = "feat/r12g1"
+    root = _temp_repo(unit)
+    _write_required_commands_file(root, ["python3 ci/probe_r12g1.py"])
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+    })
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12G1", f"a missing `gates` object must deny, got {p.returncode}: {p.stderr}")
+    _assert("no `gates` object" in p.stderr, "R12G1", p.stderr)
+
+
+def fixture_r12g2_pre_fix_gates_shape_only_allows_nonzero_rc() -> None:
+    """item 8a: Reader 1 never judges the VALUE of `rc` -- a `gates` entry
+    recorded `rc=1` (as if the required command is currently failing on
+    the BROKEN pre-fix tip) still allows, as long as the SHAPE (every
+    committed line, verbatim, each an object with an integer `rc`) is
+    complete."""
+    unit = "feat/r12g2"
+    root = _temp_repo(unit)
+    _write_required_commands_file(root, ["python3 ci/probe_r12g2.py"])
+    (root / "probe_r12g2.sh").write_text("#!/bin/sh\nprintf ok\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "add probe_r12g2.sh")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    cmd = "bash probe_r12g2.sh"
+    h = _r12_hash(0, "ok", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": cmd, "hash": h},
+    }, gates={"python3 ci/probe_r12g2.py": {"rc": 1}})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 0, "R12G2",
+            f"a shape-complete gates object with a non-zero rc must still allow pre-fix, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12g3_relay_missing_gates_denies() -> None:
+    """item 8a: reader 2 (the relay) denies when a required-commands file
+    is committed but the relay carries no `gates` object at all."""
+    root, row, cmd, pre_hash = _r12_gates_post_setup("feat/r12g3", ["python3 ci/scripts/probe.py"])
+    _write_anticipation_exact(root, "feat/r12g3", row["head_sha"], {"state.txt": {"command": cmd, "hash": pre_hash}})
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12g3"}}, root)
+    _assert(p.returncode == 2, "R12G3", f"relay missing `gates` must deny, got {p.returncode}: {p.stderr}")
+    _assert("no `gates` object" in p.stderr, "R12G3", p.stderr)
+
+
+def fixture_r12g4_relay_gates_nonzero_rc_denies() -> None:
+    """item 8a: reader 2 REQUIRES `rc == 0` for every committed line at
+    fix_head -- a relay `gates` entry recording a non-zero rc denies,
+    even though it has the right shape."""
+    root, row, cmd, pre_hash = _r12_gates_post_setup("feat/r12g4", ["python3 ci/scripts/probe.py"])
+    _write_anticipation_exact(root, "feat/r12g4", row["head_sha"], {"state.txt": {"command": cmd, "hash": pre_hash}})
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}},
+                        override={"gates": {"python3 ci/scripts/probe.py": {"rc": 1}}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12g4"}}, root)
+    _assert(p.returncode == 2, "R12G4", f"a non-zero post-fix gate rc must deny, got {p.returncode}: {p.stderr}")
+    _assert("recorded rc=1" in p.stderr, "R12G4", p.stderr)
+
+
+def fixture_r12g5_relay_gates_rc_zero_allows() -> None:
+    """item 8a: the satisfiable case -- every committed line present with
+    `rc == 0` allows (the whole relay's other obligations being
+    otherwise satisfied)."""
+    root, row, cmd, pre_hash = _r12_gates_post_setup("feat/r12g5", ["python3 ci/scripts/probe.py"])
+    _write_anticipation_exact(root, "feat/r12g5", row["head_sha"], {"state.txt": {"command": cmd, "hash": pre_hash}})
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}},
+                        override={"gates": {"python3 ci/scripts/probe.py": {"rc": 0}}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/r12g5"}}, root)
+    _assert(p.returncode == 0, "R12G5", f"a fully green gates object must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12g6_pre_fix_gates_partial_completeness_denies() -> None:
+    """item 8a: TWO committed lines, but the artifact's `gates` names only
+    ONE -- partial completeness (distinct from R12G1's totally-missing
+    `gates` object)."""
+    unit = "feat/r12g6"
+    root = _temp_repo(unit)
+    _write_required_commands_file(root, ["python3 ci/probe_a.py", "python3 ci/probe_b.py"])
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+    }, gates={"python3 ci/probe_a.py": {"rc": 0}})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12G6", f"partial gates completeness must deny, got {p.returncode}: {p.stderr}")
+    _assert("omits" in p.stderr and "committed command" in p.stderr, "R12G6", p.stderr)
+
+
+def fixture_r12g7_pre_fix_gates_entry_not_object_denies() -> None:
+    """item 8a: a `gates` value that is not an object at all."""
+    unit = "feat/r12g7"
+    root = _temp_repo(unit)
+    _write_required_commands_file(root, ["python3 ci/probe_a.py"])
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+    }, gates={"python3 ci/probe_a.py": "not-an-object"})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12G7", f"a non-object gates entry must deny, got {p.returncode}: {p.stderr}")
+    _assert("is not an object" in p.stderr, "R12G7", p.stderr)
+
+
+def fixture_r12g8_pre_fix_gates_no_integer_rc_denies() -> None:
+    """item 8a: a `gates` entry with no integer `rc` field."""
+    unit = "feat/r12g8"
+    root = _temp_repo(unit)
+    _write_required_commands_file(root, ["python3 ci/probe_a.py"])
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {
+        "a.py": {"command": a["command"], "hash": a["hash"]},
+    }, gates={"python3 ci/probe_a.py": {"note": "forgot rc"}})
+    p = _r12_dispatch(root, unit)
+    _assert(p.returncode == 2, "R12G8", f"a gates entry with no integer rc must deny, got {p.returncode}: {p.stderr}")
+    _assert("carries no integer `rc`" in p.stderr, "R12G8", p.stderr)
+
+
+def _r12_mutations_setup(unit: str):
+    """A block row whose own `finding_locations` names `bar.py`, and a fix
+    that adds a REAL new definition (`def helper():`) in that SAME file --
+    the DATA-armed condition item 8b's `_mutations_rejection` requires."""
+    root = _temp_repo(unit)
+    (root / "bar.py").write_text("x = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed bar.py")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["bar.py:1"], ["bar.py:1"])
+    _write_anticipation_exact(root, unit, row["head_sha"], {"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, "x = 1\n", "")}})
+    (root / "bar.py").write_text("x = 1\n\n\ndef helper():\n    return x\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: bar.py adds helper()")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    return root, row, fix_head
+
+
+def fixture_r12m8b1_missing_mutations_denies() -> None:
+    """item 8b: armed by the DATA -- the fix adds a new definition
+    (`helper()`) in `bar.py`, a file the BLOCK's own finding_locations
+    also names -- and the relay carries no `mutations` array at all."""
+    unit = "feat/r12m8b1"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    post_hash = _r12_hash(0, "x = 1", "")
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12M8b1", f"a missing `mutations` array must deny, got {p.returncode}: {p.stderr}")
+    _assert("no `mutations` array" in p.stderr, "R12M8b1", p.stderr)
+
+
+def fixture_r12m8b2_too_many_mutations_denies() -> None:
+    """item 8b: `mutations` is capped at K<=3, a LABELED sample."""
+    unit = "feat/r12m8b2"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    rows = [{"site": f"bar.py:{i}", "command": "true", "rc_before": 0, "rc_after": 1,
+             "marker_after": "test result: FAILED"} for i in range(4)]
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": rows})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12M8b2", f"more than 3 mutation rows must deny, got {p.returncode}: {p.stderr}")
+    _assert("K<=3" in p.stderr, "R12M8b2", p.stderr)
+
+
+def fixture_r12m8b3_accepted_mutation_allows() -> None:
+    """item 8b: the satisfiable ACCEPT case -- `rc_before == 0`,
+    `rc_after != 0`, and `marker_after` names a committed TEST-failure
+    marker."""
+    unit = "feat/r12m8b3"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    rows = [{"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 1,
+             "marker_after": "test result: FAILED. 0 passed; 1 failed"}]
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": rows})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 0, "R12M8b3", f"an accepted mutation row must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12m8b4_uncovered_mutation_allows() -> None:
+    """item 8b: an explicit `uncovered` reason (R11's own disposition
+    precedent) satisfies the obligation without an accepted mutation."""
+    unit = "feat/r12m8b4"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    rows = [{"site": "bar.py:4", "command": "true", "uncovered": "no test harness reaches this call site directly"}]
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": rows})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 0, "R12M8b4", f"an uncovered mutation row must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12m8b5_rejected_mutation_denies() -> None:
+    """item 8b: a mutation row that neither satisfies the ACCEPT rule
+    (here: `rc_after == 0`, no actual break) NOR carries an `uncovered`
+    reason denies."""
+    unit = "feat/r12m8b5"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    rows = [{"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 0,
+             "marker_after": "test result: ok"}]
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": rows})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12M8b5", f"a rejected mutation row with no uncovered reason must deny, got {p.returncode}: {p.stderr}")
+    _assert("does not satisfy the ACCEPT rule" in p.stderr, "R12M8b5", p.stderr)
+
+
+def _r12m8b_shape_case(label: str, row_value: object, expected_text: str) -> None:
+    """Shared shape-defect case for the M8b6-M8b12 fixtures below -- ONE
+    malformed `mutations[0]` value each, asserting the SPECIFIC deny text
+    `_mutations_rejection` names for that determinant."""
+    unit = f"feat/{label.lower()}"
+    root, row, fix_head = _r12_mutations_setup(unit)
+    _write_relay_exact(root, row, sites={"bar.py:1": "fixed"}, probe=["c.py:9", "bar.py"],
+                        fix_head=fix_head,
+                        attacks_post={"bar.py": {"command": "cat bar.py", "hash": _r12_hash(0, (root / "bar.py").read_text(), "")}},
+                        override={"mutations": [row_value]})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, label, f"a malformed mutation row ({label}) must deny, got {p.returncode}: {p.stderr}")
+    _assert(expected_text in p.stderr, label, p.stderr)
+
+
+def fixture_r12m8b6_mutation_entry_not_object_denies() -> None:
+    """item 8b: `mutations[0]` is not an object at all."""
+    _r12m8b_shape_case("R12M8b6", "not-a-dict", "is not an object")
+
+
+def fixture_r12m8b7_mutation_missing_site_denies() -> None:
+    """item 8b: `mutations[0]` carries no `site`."""
+    _r12m8b_shape_case("R12M8b7", {"command": "true", "rc_before": 0, "rc_after": 1,
+                                    "marker_after": "test result: FAILED"}, "carries no `site`")
+
+
+def fixture_r12m8b8_mutation_missing_command_denies() -> None:
+    """item 8b: `mutations[0]` carries no `command`."""
+    _r12m8b_shape_case("R12M8b8", {"site": "bar.py:4", "rc_before": 0, "rc_after": 1,
+                                    "marker_after": "test result: FAILED"}, "carries no `command`")
+
+
+def fixture_r12m8b9_mutation_empty_uncovered_denies() -> None:
+    """item 8b: `mutations[0]`'s `uncovered` field is present but empty."""
+    _r12m8b_shape_case("R12M8b9", {"site": "bar.py:4", "command": "true", "uncovered": "   "},
+                        "`uncovered` is present but empty")
+
+
+def fixture_r12m8b10_mutation_missing_rc_before_denies() -> None:
+    """item 8b: `mutations[0]` carries no integer `rc_before`."""
+    _r12m8b_shape_case("R12M8b10", {"site": "bar.py:4", "command": "true", "rc_after": 1,
+                                     "marker_after": "test result: FAILED"}, "carries no integer `rc_before`")
+
+
+def fixture_r12m8b11_mutation_missing_rc_after_denies() -> None:
+    """item 8b: `mutations[0]` carries no integer `rc_after`."""
+    _r12m8b_shape_case("R12M8b11", {"site": "bar.py:4", "command": "true", "rc_before": 0,
+                                     "marker_after": "test result: FAILED"}, "carries no integer `rc_after`")
+
+
+def fixture_r12m8b12_mutation_missing_marker_after_denies() -> None:
+    """item 8b: `mutations[0]` carries no `marker_after`."""
+    _r12m8b_shape_case("R12M8b12", {"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 1},
+                        "carries no `marker_after`")
+
+
+def _r12_exclusions_setup(unit: str):
+    """A fix that adds a REAL new TEST definition (`tests/test_x.py`'s
+    `def test_thing():`) -- the DATA-armed condition item 8c's
+    `_exclusions_rejection` requires (via `_r12_new_test_surfaces`)."""
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}})
+    (root / "tests").mkdir(parents=True, exist_ok=True)
+    (root / "tests" / "test_x.py").write_text("def test_thing():\n    assert True\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: add tests/test_x.py")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    return root, row, fix_head
+
+
+def fixture_r12x1_missing_exclusions_denies() -> None:
+    """item 8c: the fix's own diff adds a new test definition
+    (`test_thing`), and the relay carries no `exclusions` object at all."""
+    unit = "feat/r12x1"
+    root, row, fix_head = _r12_exclusions_setup(unit)
+    a = _auto_r12_attack("a.py")
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head,
+                        attacks_post={"a.py": {"command": a["command"], "hash": a["hash"]}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12X1", f"missing `exclusions` must deny, got {p.returncode}: {p.stderr}")
+    _assert("no `exclusions` object" in p.stderr, "R12X1", p.stderr)
+
+
+def fixture_r12x2_exclusions_present_allows() -> None:
+    """item 8c: the satisfiable case -- a non-empty exclusion named for
+    the new test definition."""
+    unit = "feat/r12x2"
+    root, row, fix_head = _r12_exclusions_setup(unit)
+    a = _auto_r12_attack("a.py")
+    key = [k for k, v in _parse_new_surfaces_of(root, row["head_sha"], fix_head).items() if "test_thing" in v][0]
+    test_content = (root / "tests" / "test_x.py").read_text()
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_x.py": {"command": "cat tests/test_x.py", "hash": _r12_hash(0, test_content, "")},
+                        },
+                        override={"exclusions": {key: "does not cover an assertion failure, only that the function runs"}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 0, "R12X2", f"a real exclusion must allow, got {p.returncode}: {p.stderr}")
+
+
+def fixture_r12x3_empty_exclusion_denies() -> None:
+    """item 8c: an `exclusions` entry present but empty denies."""
+    unit = "feat/r12x3"
+    root, row, fix_head = _r12_exclusions_setup(unit)
+    a = _auto_r12_attack("a.py")
+    key = [k for k, v in _parse_new_surfaces_of(root, row["head_sha"], fix_head).items() if "test_thing" in v][0]
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head,
+                        attacks_post={"a.py": {"command": a["command"], "hash": a["hash"]}},
+                        override={"exclusions": {key: "   "}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12X3", f"an empty exclusion must deny, got {p.returncode}: {p.stderr}")
+    _assert("is empty" in p.stderr, "R12X3", p.stderr)
+
+
+def _r12_exclusions_two_setup(unit: str):
+    """The SAME shape as `_r12_exclusions_setup`, but the fix adds TWO new
+    test definitions (`test_thing`/`test_other`) -- needed for the
+    partial-completeness (R12X4) and within-relay-duplicate (R12X5)
+    cases, neither of which a single new test definition can exercise."""
+    root = _temp_repo(unit)
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    a = _auto_r12_attack("a.py")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"a.py": {"command": a["command"], "hash": a["hash"]}})
+    (root / "tests").mkdir(parents=True, exist_ok=True)
+    (root / "tests" / "test_x.py").write_text("def test_thing():\n    assert True\n\n\ndef test_other():\n    assert True\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: add tests/test_x.py with two tests")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    return root, row, fix_head
+
+
+def fixture_r12x4_exclusions_partial_completeness_denies() -> None:
+    """item 8c: TWO new test definitions, but `exclusions` names only
+    ONE -- distinct from R12X1's totally-missing `exclusions` object."""
+    unit = "feat/r12x4"
+    root, row, fix_head = _r12_exclusions_two_setup(unit)
+    a = _auto_r12_attack("a.py")
+    surfaces = _parse_new_surfaces_of(root, row["head_sha"], fix_head)
+    thing_key = [k for k, v in surfaces.items() if "test_thing" in v][0]
+    test_content = (root / "tests" / "test_x.py").read_text()
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_x.py": {"command": "cat tests/test_x.py", "hash": _r12_hash(0, test_content, "")},
+                        },
+                        override={"exclusions": {thing_key: "does not cover an assertion failure"}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12X4", f"partial exclusions completeness must deny, got {p.returncode}: {p.stderr}")
+    _assert("omits" in p.stderr and "new test definition" in p.stderr, "R12X4", p.stderr)
+
+
+def fixture_r12x5_exclusions_duplicate_within_relay_denies() -> None:
+    """item 8c: two new test definitions, both given the IDENTICAL
+    (normalized) exclusion text -- a templated disposition, never a
+    per-test examination."""
+    unit = "feat/r12x5"
+    root, row, fix_head = _r12_exclusions_two_setup(unit)
+    a = _auto_r12_attack("a.py")
+    surfaces = _parse_new_surfaces_of(root, row["head_sha"], fix_head)
+    thing_key = [k for k, v in surfaces.items() if "test_thing" in v][0]
+    other_key = [k for k, v in surfaces.items() if "test_other" in v][0]
+    test_content = (root / "tests" / "test_x.py").read_text()
+    same_text = "does not cover an assertion failure"
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_x.py": {"command": "cat tests/test_x.py", "hash": _r12_hash(0, test_content, "")},
+                        },
+                        override={"exclusions": {thing_key: same_text, other_key: same_text}})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12X5", f"a duplicated within-relay exclusion must deny, got {p.returncode}: {p.stderr}")
+    _assert("IDENTICAL exclusion" in p.stderr, "R12X5", p.stderr)
+
+
+def fixture_r12x6_exclusions_duplicate_across_previous_relay_denies() -> None:
+    """item 8c: the unit's own SECOND adversarial-audit round adds a new
+    test definition and names the IDENTICAL (normalized) exclusion text
+    the FIRST round's own accepted relay already used -- a templated
+    exclusion carried across rounds, never a per-round examination."""
+    unit = "feat/r12x6"
+    root, row1, fix_head1 = _r12_exclusions_setup(unit)
+    a = _auto_r12_attack("a.py")
+    surfaces1 = _parse_new_surfaces_of(root, row1["head_sha"], fix_head1)
+    key1 = [k for k, v in surfaces1.items() if "test_thing" in v][0]
+    test_content1 = (root / "tests" / "test_x.py").read_text()
+    same_text = "does not cover an assertion failure, only that the function runs"
+    _write_relay_exact(root, row1, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_x.py"],
+                        fix_head=fix_head1,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_x.py": {"command": "cat tests/test_x.py", "hash": _r12_hash(0, test_content1, "")},
+                        },
+                        override={"exclusions": {key1: same_text}})
+    p1 = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p1.returncode == 0, "R12X6 setup", f"the FIRST round's relay must itself allow, got {p1.returncode}: {p1.stderr}")
+
+    row2 = _write_block_row(root, unit, "a2", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    (root / "tests" / "test_y.py").write_text("def test_second():\n    assert True\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: add tests/test_y.py")
+    fix_head2 = _git(root, "rev-parse", "HEAD")
+    surfaces2 = _parse_new_surfaces_of(root, row2["head_sha"], fix_head2)
+    key2 = [k for k, v in surfaces2.items() if "test_second" in v][0]
+    test_content2 = (root / "tests" / "test_y.py").read_text()
+    _write_relay_exact(root, row2, sites={"a.py:1": "fixed"}, probe=["c.py:9", "tests/test_y.py"],
+                        fix_head=fix_head2,
+                        attacks_post={
+                            "a.py": {"command": a["command"], "hash": a["hash"]},
+                            "tests/test_y.py": {"command": "cat tests/test_y.py", "hash": _r12_hash(0, test_content2, "")},
+                        },
+                        override={"exclusions": {key2: same_text}})
+    p2 = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p2.returncode == 2, "R12X6", f"a cross-relay duplicated exclusion must deny, got {p2.returncode}: {p2.stderr}")
+    _assert("PREVIOUS relay" in p2.stderr, "R12X6", p2.stderr)
+
+
+def _parse_new_surfaces_of(root: Path, base_sha: str, head_sha: str) -> dict[str, str]:
+    """Test-harness helper: the SAME `_parse_new_surfaces` the hook itself
+    uses, applied to a real `-U0` diff in `root` -- used only to derive
+    the EXACT key a fixture must name in `exclusions`, never duplicating
+    the hook's own detection logic."""
+    mod = _r12_mod()
+    diff_out = _git(root, "diff", "-U0", "--end-of-options", base_sha, head_sha)
+    return mod._parse_new_surfaces(diff_out)
+
+
 FIXTURES = [
+    ("R12G1", fixture_r12g1_pre_fix_missing_gates_denies),
+    ("R12G2", fixture_r12g2_pre_fix_gates_shape_only_allows_nonzero_rc),
+    ("R12G3", fixture_r12g3_relay_missing_gates_denies),
+    ("R12G4", fixture_r12g4_relay_gates_nonzero_rc_denies),
+    ("R12G5", fixture_r12g5_relay_gates_rc_zero_allows),
+    ("R12G6", fixture_r12g6_pre_fix_gates_partial_completeness_denies),
+    ("R12G7", fixture_r12g7_pre_fix_gates_entry_not_object_denies),
+    ("R12G8", fixture_r12g8_pre_fix_gates_no_integer_rc_denies),
+    ("R12M8b1", fixture_r12m8b1_missing_mutations_denies),
+    ("R12M8b2", fixture_r12m8b2_too_many_mutations_denies),
+    ("R12M8b3", fixture_r12m8b3_accepted_mutation_allows),
+    ("R12M8b4", fixture_r12m8b4_uncovered_mutation_allows),
+    ("R12M8b5", fixture_r12m8b5_rejected_mutation_denies),
+    ("R12M8b6", fixture_r12m8b6_mutation_entry_not_object_denies),
+    ("R12M8b7", fixture_r12m8b7_mutation_missing_site_denies),
+    ("R12M8b8", fixture_r12m8b8_mutation_missing_command_denies),
+    ("R12M8b9", fixture_r12m8b9_mutation_empty_uncovered_denies),
+    ("R12M8b10", fixture_r12m8b10_mutation_missing_rc_before_denies),
+    ("R12M8b11", fixture_r12m8b11_mutation_missing_rc_after_denies),
+    ("R12M8b12", fixture_r12m8b12_mutation_missing_marker_after_denies),
+    ("R12X1", fixture_r12x1_missing_exclusions_denies),
+    ("R12X2", fixture_r12x2_exclusions_present_allows),
+    ("R12X3", fixture_r12x3_empty_exclusion_denies),
+    ("R12X4", fixture_r12x4_exclusions_partial_completeness_denies),
+    ("R12X5", fixture_r12x5_exclusions_duplicate_within_relay_denies),
+    ("R12X6", fixture_r12x6_exclusions_duplicate_across_previous_relay_denies),
     ("G1", fixture_g1_first_round_never_gated),
     ("G2", fixture_g2_second_round_denied_worktree),
     ("G3", fixture_g3_second_round_denied_full_sha),

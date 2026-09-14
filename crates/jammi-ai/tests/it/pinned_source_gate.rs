@@ -418,21 +418,59 @@ fn mask_non_code(text: &str) -> String {
 /// literals are not specially recognised here. This function has TWO
 /// callers today, with two different scopes: [`fine_tune_ddl_relation_binding_hits`],
 /// scoped to `crates/jammi-ai/src/fine_tune/**`, and [`ddl_literal_occurrences`],
-/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]). Checked
-/// against BOTH callers' surfaces, not just the narrower one: `grep -rn
-/// 'r#*".*\(//\|/\*\)' crates/jammi-db/src crates/jammi-ai/src` finds exactly
-/// two raw strings containing `//` or `/*` in either crate's tracked `src`
-/// tree, both JSON fixtures in `storage/config.rs` (an `https://` URL inside
-/// a quoted field) — and in both, the surrounding double quotes still pair
-/// up the same way a plain `"..."` string's would, so this function's
-/// ordinary `"`-handling already walks past the embedded `//` correctly by
-/// construction of that JSON, not because raw strings are recognised. This
-/// is still a disclosed, checked-today limit rather than a silent one, but
-/// it now rests on the CONTENT of two specific files staying quote-balanced,
-/// not on the absence of any raw string at all; a future raw string whose
-/// quoted content is not symmetrically paired could desync this scan's
-/// notion of "inside a string" and, from that point on in the file,
-/// misclassify code as a comment (suppressing it here) or vice versa.
+/// unscoped over both crates' whole `src` trees ([`SURFACE_DIRS`]). Not
+/// recognising raw strings is a LIVE desync today, not a disclosed-but-inert
+/// limit: this scanner pairs the FIRST `"` it meets with the NEXT `"` it
+/// meets, with no notion of an `r#`/`r##` delimiter or of the hash count a
+/// raw string's real closing quote must match, so a raw string whose own
+/// content contains a plain `"`-quoted substring can flip this function's
+/// "inside a string" bookkeeping out of step with the real token boundaries
+/// for the rest of the line — sometimes for the rest of the file, since the
+/// `"`-handling sub-loop above has no `\n` stop condition and searches across
+/// newlines for its (wrong) closing quote. Two triggers reproduce this today,
+/// each traced by hand and confirmed by an independent byte-for-byte re-run
+/// of this exact function (checked against the real compiled version, not a
+/// transcription) over the current tree: (1) a JSON-blob raw string whose
+/// quoted keys/values give the naive pairing enough real quotes to land, mid-
+/// line, on a position this scanner now (wrongly) treats as CODE —
+/// `storage/config.rs:555` and `:619` each land exactly on the `//` of the
+/// fixture's `"endpoint":"https://..."`, so the line-comment branch above
+/// fires there and blanks everything from that `//` to the end of the
+/// physical line, INCLUDING real JSON content that was never a comment; (2)
+/// `\"` inside a raw string, which is two literal characters to Rust (never
+/// an escape), is still treated by this function's `"`-handling as an
+/// escaped quote — `config/secret.rs:449`'s
+/// `r#"secret = "{ file = \"/run/secrets/x\" }""#` desyncs there, and
+/// because the resulting mis-paired "string" search has no per-line stop
+/// condition it runs on past the end of that statement, past the enclosing
+/// `mod tests`, until it happens on the next literal `"` later in the file —
+/// every REAL `//` line comment it crosses in between is treated as still
+/// being "inside a string" and is therefore never blanked, the opposite
+/// failure from (1). Both triggers are exercised in this tree today, not
+/// hypothetically: the same byte-for-byte re-run, over `storage/config.rs`,
+/// `config/tests.rs`, `config/secret.rs`, and `sql/ident.rs`, finds 22 lines
+/// where this function blanks real code/string content that a raw-string-
+/// aware masker would have left alone (trigger (1); `storage/config.rs:555`/
+/// `:619` plus 20 lines in `config/tests.rs`'s TOML fixtures), and 12 lines
+/// where a real `//` line comment is left completely unblanked because the
+/// scan was still, wrongly, inside a pseudo-string when it reached them
+/// (trigger (2); `config/secret.rs:455`-`456`, `sql/ident.rs:94`, and nine
+/// lines in `config/tests.rs`). The `grep -rn 'r#*".*\(//\|/\*\)'
+/// crates/jammi-db/src crates/jammi-ai/src` command finds exactly the two
+/// SINGLE-LINE raw strings that cause trigger (1) — `storage/config.rs:555`
+/// and `:619` — and nothing else, but that describes the one grep, not the
+/// tree: a delimiter-aware scan of `config/tests.rs` alone finds 12 further
+/// raw strings that span MULTIPLE physical lines (TOML fixtures quoting
+/// `postgres://`, `nats://`, and `https://` URLs), invisible to a single-
+/// line pattern by construction — the grep is a description of what it
+/// matches, not a completeness instrument over what raw strings exist. The
+/// consequence for this function's callers: a DDL-shaped string literal
+/// sitting on a desynced line is invisible to [`ddl_literal_occurrences`] —
+/// a FIFTH residual alongside the four the "literal-occurrence gate" section
+/// below already names, tracked on the same issue,
+/// <https://github.com/f-inverse/jammi-ai/issues/554> (amended with this
+/// residual; the rebuild that closes it replaces this hand-rolled masking
+/// with a real tokenizer that knows raw-string hash counts).
 fn mask_comments_only(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -3150,15 +3188,27 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // arguments on separate lines, or pulled in through `include_str!`, is
 // invisible to it -- the same two shapes the deleted AST gate also missed,
 // carried over rather than closed by this replacement. And it is scoped to
-// exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living in any
-// third crate is outside its universe entirely. None of these four gaps
-// (per-site counts, split literals, `include_str!` targets, other crates)
-// is closed here; the rebuild that would close them is
-// <https://github.com/f-inverse/jammi-ai/issues/554>.
+// exactly [`SURFACE_DIRS`]: a registration verb or DDL literal living
+// anywhere outside those two `src` trees is outside its universe entirely --
+// under `tests/it/` in either crate (e.g. the five `.register_table(`
+// calls this file's own review list keys to
+// `crates/jammi-db/tests/it/materialization.rs:565/:616/:669/:671/:1024`,
+// none of them under `crates/jammi-db/src`), or in a third crate, both
+// count the same way. A fifth gap sits inside the scan itself, not at its
+// boundary: [`mask_comments_only`]'s masking step desyncs on a raw string
+// today (its own doc above states the two live triggers and the file/line
+// evidence), so a DDL literal sitting on a desynced line is invisible to
+// [`ddl_literal_occurrences`] regardless of which directory it lives in.
+// None of these five gaps (per-site counts, split literals, `include_str!`
+// targets, anything outside `SURFACE_DIRS` including `tests/it/`, the
+// masking step's raw-string desync) is closed here; the rebuild that would
+// close them is <https://github.com/f-inverse/jammi-ai/issues/554>.
 //
 // What this gate DOES buy over the deleted call-graph gate is recall over
 // call SHAPE, not occurrence count or literal assembly: every function, in
-// either crate's whole tree, whose own body contains at least one line
+// either crate's `src` tree ([`SURFACE_DIRS`] -- never the whole
+// repository; `tests/it/` and any third crate are the gap named above),
+// whose own body contains at least one line
 // matching one of the 24 patterns or the DDL shape is found and reviewed
 // here, whether or not anything under `fine_tune/` can reach it -- a site
 // with zero real callers (e.g. a trait method a language feature requires
@@ -3460,12 +3510,19 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
                    `ResultTableSchemaProvider`, not a call site written in this crate: the only \
                    in-tree paths that dispatch to it are DataFusion's own `SessionContext::register_table` \
                    top-level API and `CREATE TABLE` DDL execution, when the target schema resolves \
-                   to this provider (i.e. after `install_result_schema` runs). Checked, not assumed \
-                   (`grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src`): there \
-                   are FIVE 2-argument `.register_table(name, provider)` calls in either crate's \
-                   tracked source, ALL in `crates/jammi-db/tests/it/materialization.rs` (`:565`, \
-                   `:616`, `:669`, `:671`, `:1024`) -- not this file, `result_schema.rs`. Of those \
-                   five, only the one at `:1024`, inside \
+                   to this provider (i.e. after `install_result_schema` runs). Checked, not assumed, \
+                   and the command run is stated exactly because an earlier draft of this entry got \
+                   it wrong: `grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src` \
+                   -- the two `src` trees [`SURFACE_DIRS`] scans -- returns exactly ONE hit, the \
+                   4-argument `.register_table(ctx, &record.table_name, &url, owner)` call at \
+                   `store/mod.rs:2724`; it does NOT find the five 2-argument \
+                   `.register_table(name, provider)` calls, because all five live under \
+                   `crates/jammi-db/tests/it/materialization.rs`, outside both `src` trees entirely. \
+                   The command that actually produces the five is repo-wide: \
+                   `grep -rn '\\.register_table(' --include='*.rs' crates/` returns \
+                   `materialization.rs:565/:616/:669/:671/:1024` (plus that same `store/mod.rs:2724` \
+                   line, and several prose mentions of the verb inside this very file that are text, \
+                   not call sites). Of those five 2-argument calls, only the one at `:1024`, inside \
                    `install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither`, \
                    actually dispatches to THIS implementation: it is the only one of the five whose \
                    `ctx` already had `install_result_schema` called on it earlier in the same \
@@ -3488,9 +3545,13 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
         function: "deregister_table",
         ordinal: 1,
         property: "the `SchemaProvider::deregister_table` trait-method DECLARATION, the inverse of \
-                   `register_table` immediately above -- same disclosure: no in-tree call reaches \
-                   it (`grep -rn '\\.deregister_table(' crates/jammi-db/src crates/jammi-ai/src` \
-                   finds nothing), it exists to satisfy the trait.",
+                   `register_table` immediately above -- same disclosure, both commands stated \
+                   exactly: `grep -rn '\\.deregister_table(' crates/jammi-db/src crates/jammi-ai/src` \
+                   (the two `src` trees) finds nothing, and the repo-wide \
+                   `grep -rn '\\.deregister_table(' --include='*.rs' crates/` finds only two lines, \
+                   both inside this very file's own prose quoting the verb in backticks (this entry \
+                   and the doc paragraph above it) -- no real call site exists anywhere in the tree, \
+                   under `src`, under `tests/it/`, or elsewhere; it exists to satisfy the trait.",
     },
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/store/mod.rs",

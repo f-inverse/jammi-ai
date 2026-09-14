@@ -2403,6 +2403,7 @@ impl JobWorker {
         let params = RunFineTuneParams {
             catalog: Arc::clone(catalog),
             artifact_store: session.artifact_store(),
+            result_store: session.result_store(),
             artifact_dir: session.inner_config().artifact_dir.clone(),
             job_id: job_id.to_string(),
             worker_id: self.worker_id.clone(),
@@ -4769,6 +4770,10 @@ async fn mark_acceleration_undetermined(
 struct RunFineTuneParams {
     catalog: Arc<Catalog>,
     artifact_store: Arc<ArtifactStore>,
+    /// The guarded port the trainer's mid-run retention prune deletes an
+    /// over-the-cap epoch checkpoint through — see
+    /// `crate::fine_tune::trainer::TrainingLoop::result_store`'s own doc.
+    result_store: Arc<ResultStore>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
     worker_id: String,
@@ -4807,6 +4812,7 @@ fn run_fine_tune_blocking(
     let RunFineTuneParams {
         catalog,
         artifact_store,
+        result_store,
         artifact_dir,
         job_id,
         worker_id,
@@ -4943,7 +4949,8 @@ fn run_fine_tune_blocking(
         .device(device.clone())
         .cancel(cancel)
         .tenant(tenant)
-        .artifact_store(Arc::clone(&artifact_store));
+        .artifact_store(Arc::clone(&artifact_store))
+        .result_store(result_store);
     if let Some(restored) = resume {
         builder = builder.resume(restored);
     }

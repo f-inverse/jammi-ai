@@ -10,7 +10,8 @@ use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 use jammi_db::catalog::Catalog;
-use jammi_db::store::ArtifactStore;
+use jammi_db::storage::StorageError;
+use jammi_db::store::{ArtifactStore, ResultStore};
 use jammi_db::tenant::TenantId;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
 // `evaluate_held_out`'s `batch_partition_sha256` (H1, unit 63) — the same
@@ -383,6 +384,17 @@ pub struct TrainingLoop {
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
+    /// The guarded port [`Self::save_epoch_checkpoint`]'s mid-run retention
+    /// prune deletes an over-the-cap checkpoint through —
+    /// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`], never
+    /// the unguarded [`ArtifactStore::delete_epoch_checkpoint`] directly (a
+    /// retained checkpoint gets its own `models` row the winning finalize
+    /// CAS inserts, so an unguarded delete could remove bytes a live row
+    /// still names). `None` alongside a `Some` [`Self::artifact_store`] AND
+    /// `config.keep_last_n_checkpoints` is refused at
+    /// [`TrainingLoopBuilder::build`] — production always sets both
+    /// together (`InferenceSession::result_store` is infallible).
+    result_store: Option<Arc<ResultStore>>,
     /// The job's tenant (`record.tenant_id` in the production worker path) —
     /// the first prefix segment (`jammi_db::store::layout::TenantSegment` via
     /// [`ArtifactStore`]) every checkpoint this loop writes lands under.
@@ -451,6 +463,8 @@ pub struct TrainingLoopBuilder {
     device: Device,
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
+    /// See [`TrainingLoop::result_store`]. Defaults to `None`.
+    result_store: Option<Arc<ResultStore>>,
     resume: Option<RestoredCheckpoint>,
     /// See [`TrainingLoop::tenant`]. Defaults to `None`.
     tenant: Option<TenantId>,
@@ -477,6 +491,7 @@ impl TrainingLoopBuilder {
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
+            result_store: None,
             resume: None,
             tenant: None,
         }
@@ -498,6 +513,17 @@ impl TrainingLoopBuilder {
     /// trainer-internal test).
     pub fn artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Set the guarded [`ResultStore`] the mid-run retention prune deletes
+    /// an over-the-cap checkpoint through (`TrainingLoop::result_store`'s own
+    /// doc) — required whenever [`Self::artifact_store`] is set AND
+    /// `config.keep_last_n_checkpoints` opts into mid-run retention pruning
+    /// (checked at [`Self::build`]); the production worker path always
+    /// supplies it (`InferenceSession::result_store`).
+    pub fn result_store(mut self, store: Arc<ResultStore>) -> Self {
+        self.result_store = Some(store);
         self
     }
 
@@ -598,6 +624,22 @@ impl TrainingLoopBuilder {
         let artifact_dir = self.artifact_dir.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: artifact_dir required".into())
         })?;
+        // The mid-run retention prune's guarded delete needs BOTH a store to
+        // publish checkpoints to AND the guarded port to delete one through
+        // — refused HERE, at construction, rather than discovered mid-run as
+        // a silently-skipped guard consult. A run with no `artifact_store`
+        // (checkpointing disabled entirely) or no retention configured needs
+        // neither.
+        if self.artifact_store.is_some()
+            && self.config.keep_last_n_checkpoints.is_some()
+            && self.result_store.is_none()
+        {
+            return Err(JammiError::FineTune(
+                "TrainingLoopBuilder: result_store required when artifact_store is set and \
+                 keep_last_n_checkpoints opts into mid-run retention pruning"
+                    .into(),
+            ));
+        }
         // Audit advisory (post-4aa1303 round): a whole-run, one-time check
         // — not a hot-path cost — that no two of this target's dropout
         // layers hash to the same `layer_id` (see the method's own doc).
@@ -623,6 +665,7 @@ impl TrainingLoopBuilder {
             device: self.device,
             cancel: self.cancel,
             artifact_store: self.artifact_store,
+            result_store: self.result_store,
             resume: self.resume,
             tenant: self.tenant,
             epoch_checkpoints: Vec::new(),
@@ -3682,26 +3725,27 @@ impl TrainingLoop {
     /// On success, appends `(epoch, artifact_prefix)` to
     /// [`Self::epoch_checkpoints`] and then enforces
     /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
-    /// cap, the OLDEST surviving entry's bytes are best-effort deleted from
-    /// the store right here — safe, because no catalog row exists for it yet
-    /// (the worker's finalize registers rows only for the trailing retention
-    /// window, unit 348 F2) — and dropped from the vector ONLY on a
-    /// SUCCESSFUL delete. The delete is `.ok()`-inspected (not `?`),
-    /// matching every other GC in this codebase (`TrainingWorker::
-    /// publish_and_finalize`'s prefix deletes): a transient storage failure
-    /// pruning an old, already-superseded checkpoint must never abort the
-    /// run — that would fail a job over a housekeeping op unrelated to
-    /// whether training itself succeeded. On a FAILED delete the entry is
+    /// cap, the OLDEST surviving entry is deleted through
+    /// [`Self::delete_epoch_checkpoint_guarded`] — the guarded
+    /// [`ResultStore::delete_unreferenced_prefix`] port, never the unguarded
+    /// [`ArtifactStore::delete_epoch_checkpoint`] directly, since a RETAINED
+    /// checkpoint gets its own `models` row (the winning finalize CAS
+    /// inserts one per retained checkpoint) whose bytes an unguarded delete
+    /// could remove out from under it — and dropped from the vector ONLY on
+    /// a SUCCESSFUL delete. Neither a transient storage failure NOR a
+    /// `Referenced` refusal aborts the run — a housekeeping op unrelated to
+    /// whether training itself succeeded — but the two are logged
+    /// differently: `Referenced` is expected and retained, never escalated;
+    /// any other failure warns, naming the job/attempt/epoch, so a
+    /// persistently broken store is never silent. Either way the entry is
     /// deliberately LEFT in the vector (not removed) and the retry loop
-    /// BREAKS rather than hot-looping on the same failing delete: the next
-    /// epoch boundary's call re-enters this same loop and retries the
-    /// identical oldest entry first (FIFO order is unchanged by a failed
-    /// attempt). A `tracing::warn!` fires on every failed prune, naming the
-    /// job/attempt/epoch, so a persistently broken store is never silent —
-    /// and `TrainingWorker::publish_and_finalize`'s winner arm is the
-    /// backstop that reclaims a persistently-failed prune's bytes at
-    /// termination (unit 348 F2) rather than letting it leak forever if this
-    /// attempt's retries never succeed before the run ends.
+    /// BREAKS rather than hot-looping: the next epoch boundary's call
+    /// re-enters this same loop and retries the identical oldest entry first
+    /// (FIFO order is unchanged by a failed or refused attempt).
+    /// `TrainingWorker::publish_and_finalize`'s winner arm is the backstop
+    /// that reclaims a persistently-failed prune's bytes at termination
+    /// (unit 348 F2) rather than letting it leak forever if this attempt's
+    /// retries never succeed before the run ends.
     ///
     /// Uses [`Self::EPOCH_CHECKPOINT_SCRATCH`], ONE scratch subdirectory
     /// reused across every epoch this attempt saves (the `_resume_scratch`
@@ -3738,33 +3782,98 @@ impl TrainingLoop {
                 // Retention is FIFO over this attempt's own epoch order: the
                 // vector is always epoch-ascending (each save appends), so
                 // index 0 is the oldest surviving entry. Peek it (do not pop
-                // yet) so a failed delete leaves it exactly where a retry
-                // will find it again.
+                // yet) so a failed or refused delete leaves it exactly where
+                // a retry will find it again.
                 let (oldest_epoch, _) = self.epoch_checkpoints[0];
-                let deleted = tokio::runtime::Handle::current()
-                    .block_on(store.delete_epoch_checkpoint(
-                        self.tenant.as_ref(),
-                        &self.job_id,
-                        &self.worker_id,
-                        &self.attempt,
-                        oldest_epoch,
-                    ))
-                    .is_ok();
-                if !deleted {
-                    tracing::warn!(
-                        job_id = %self.job_id,
-                        attempt = %self.attempt,
-                        epoch = oldest_epoch,
-                        "epoch-checkpoint retention prune failed; retrying at the next epoch \
-                         boundary (the finalize-winner's sweep reclaims it if retries never \
-                         succeed before the run ends)"
-                    );
+                if !self.delete_epoch_checkpoint_guarded(&store, oldest_epoch) {
                     break;
                 }
                 self.epoch_checkpoints.remove(0);
             }
         }
         Ok(())
+    }
+
+    /// Delete the mid-run prune's oldest surviving epoch checkpoint through
+    /// the guarded [`ResultStore::delete_unreferenced_prefix`] port — never
+    /// the unguarded [`ArtifactStore::delete_epoch_checkpoint`] primitive
+    /// directly. Every `models/**` byte-deleter in this crate reaches the
+    /// store this way; a RETAINED checkpoint's own `models` row (the winning
+    /// finalize CAS inserts one per retained checkpoint) means an unguarded
+    /// delete here could remove bytes that row still names.
+    ///
+    /// Returns whether the entry was actually deleted (and may be dropped
+    /// from [`Self::epoch_checkpoints`]). `false` covers two DIFFERENT
+    /// outcomes, logged differently: a
+    /// [`jammi_db::storage::StorageError::Referenced`] refusal — a live
+    /// `models` row still names this exact checkpoint — is EXPECTED and
+    /// retained, never escalated (one `tracing::info!`, never a warning);
+    /// any other failure (a missing [`Self::result_store`] handle, a
+    /// transient storage error) warns, naming the job/attempt/epoch, so a
+    /// persistently broken store is never silent — matching the prior
+    /// unguarded behaviour's own warning for that case.
+    fn delete_epoch_checkpoint_guarded(&self, store: &Arc<ArtifactStore>, epoch: usize) -> bool {
+        let Some(result_store) = &self.result_store else {
+            tracing::warn!(
+                job_id = %self.job_id,
+                attempt = %self.attempt,
+                epoch,
+                "epoch-checkpoint retention prune: no guarded result-store handle configured; \
+                 retrying at the next epoch boundary (the finalize-winner's sweep reclaims it \
+                 if retries never succeed before the run ends)"
+            );
+            return false;
+        };
+        let prefix = match store.epoch_checkpoint_prefix(
+            self.tenant.as_ref(),
+            &self.job_id,
+            &self.worker_id,
+            &self.attempt,
+            epoch,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %self.job_id,
+                    attempt = %self.attempt,
+                    epoch,
+                    error = %e,
+                    "epoch-checkpoint retention prune failed; retrying at the next epoch \
+                     boundary (the finalize-winner's sweep reclaims it if retries never \
+                     succeed before the run ends)"
+                );
+                return false;
+            }
+        };
+        match tokio::runtime::Handle::current()
+            .block_on(result_store.delete_unreferenced_prefix(&prefix))
+        {
+            Ok(()) => true,
+            Err(JammiError::Storage(StorageError::Referenced { prefix, count })) => {
+                tracing::info!(
+                    job_id = %self.job_id,
+                    attempt = %self.attempt,
+                    epoch,
+                    prefix,
+                    count,
+                    "epoch-checkpoint retention prune: still referenced by a live models row; \
+                     retained (not an error), retrying at the next epoch boundary"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %self.job_id,
+                    attempt = %self.attempt,
+                    epoch,
+                    error = %e,
+                    "epoch-checkpoint retention prune failed; retrying at the next epoch \
+                     boundary (the finalize-winner's sweep reclaims it if retries never \
+                     succeed before the run ends)"
+                );
+                false
+            }
+        }
     }
 
     /// Restore weights, optimizer moments (BY NAME), the scaler, and the dropout
@@ -10093,8 +10202,9 @@ mod epoch_checkpoint_retention_failure {
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::config::AnnIndexConfig;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::ArtifactStore;
+    use jammi_db::store::{ArtifactStore, ResultStore};
 
     /// The require-gate polarity every `chmod` permission-fault probe in this
     /// crate shares (esc-089): `probe` performs the fault-injection
@@ -10149,6 +10259,7 @@ mod epoch_checkpoint_retention_failure {
         keep: u32,
         artifact_dir: &std::path::Path,
         store: Arc<ArtifactStore>,
+        result_store: Arc<ResultStore>,
         catalog: Arc<jammi_db::catalog::Catalog>,
     ) -> TrainingLoop {
         let varmap = VarMap::new();
@@ -10166,6 +10277,7 @@ mod epoch_checkpoint_retention_failure {
             .catalog(catalog)
             .artifact_dir(artifact_dir.to_path_buf())
             .artifact_store(store)
+            .result_store(result_store)
             .build()
             .unwrap()
     }
@@ -10175,8 +10287,10 @@ mod epoch_checkpoint_retention_failure {
         let root_dir = tempfile::tempdir().unwrap().keep();
         let cache_dir = tempfile::tempdir().unwrap().keep();
         let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let store =
-            Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache_dir).unwrap());
+        let store = Arc::new(
+            ArtifactStore::with_root(root.clone(), StorageRegistry::new(), cache_dir.clone())
+                .unwrap(),
+        );
         let artifact_dir = tempfile::tempdir().unwrap().keep();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
         // The only async step — done here, before the blocking closure.
@@ -10185,12 +10299,33 @@ mod epoch_checkpoint_retention_failure {
                 .await
                 .unwrap(),
         );
+        // Rooted at the SAME `root`/registry/cache_dir as `store` above, so
+        // the guard consult and the delete it may perform act on the exact
+        // same physical bytes — no `models` row ever names this test's
+        // prefix, so every consult below answers "not referenced" and the
+        // real (chmod-gated) delete is what actually fails.
+        let result_store = Arc::new(
+            ResultStore::with_root(
+                root,
+                StorageRegistry::new(),
+                Arc::clone(&catalog),
+                AnnIndexConfig::default(),
+                cache_dir,
+            )
+            .unwrap(),
+        );
 
         let root_dir_for_blocking = root_dir.clone();
         tokio::task::spawn_blocking(move || {
             let device = Device::Cpu;
-            let mut loop_ =
-                minimal_loop_with_store(&device, 1, &artifact_dir, Arc::clone(&store), catalog);
+            let mut loop_ = minimal_loop_with_store(
+                &device,
+                1,
+                &artifact_dir,
+                Arc::clone(&store),
+                result_store,
+                catalog,
+            );
 
             // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
             loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
@@ -10295,20 +10430,19 @@ mod epoch_checkpoint_retention_failure {
     }
 }
 
-/// #500: [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune
-/// (`~:3745`) deletes only through `self.attempt` — never through the
-/// guarded `PrefixReferences` port every OTHER `models/**` byte-deleter in
-/// `crate::fine_tune::worker` now consults, because `TrainingLoop` is
-/// deliberately catalog-free at run time (`TrainingLoopBuilder::build`'s own
-/// doc: the catalog is presence-validated at construction and then
-/// dropped — "no reader of a catalog handle inside the run"). The exemption
-/// is not asserted in prose alone: this module drives the real prune
-/// through a RESUMED attempt (a second, independent `TrainingLoop` sharing
-/// the same `job_id`/`worker_id` but a fresh `attempt`) against a `models`
-/// row that names a PREVIOUS attempt's epoch-checkpoint prefix — the exact
-/// shape a real resumed run's earlier, still-servable retained checkpoint
-/// would have — and proves the prune never reaches it, because the prune's
-/// own prefix construction is keyed on `self.attempt` alone.
+/// [`TrainingLoop::save_epoch_checkpoint`]'s mid-run retention prune deletes
+/// only through `self.attempt`'s own prefix — never a previous attempt's —
+/// AND, independently, through the guarded
+/// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`] port. This
+/// module drives the real prune through a RESUMED attempt (a second,
+/// independent `TrainingLoop` sharing the same `job_id`/`worker_id` but a
+/// fresh `attempt`) against a `models` row that names a PREVIOUS attempt's
+/// epoch-checkpoint prefix — the exact shape a real resumed run's earlier,
+/// still-servable retained checkpoint would have — and proves the prune
+/// never reaches it, because the prune's own prefix construction is keyed on
+/// `self.attempt` alone: the guard consult it now also makes is scoped to
+/// THIS attempt's own (unregistered, hence unreferenced) checkpoint, never
+/// the previous attempt's registered one.
 #[cfg(test)]
 mod epoch_checkpoint_retention_isolation {
     use std::sync::Arc;
@@ -10320,22 +10454,24 @@ mod epoch_checkpoint_retention_isolation {
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::config::AnnIndexConfig;
     use jammi_db::model_task::ModelTask;
     use jammi_db::storage::{StorageRegistry, StorageUrl};
-    use jammi_db::store::ArtifactStore;
+    use jammi_db::store::{ArtifactStore, ResultStore};
 
     const HIDDEN: usize = 4;
 
     /// Build a loop for `attempt`, sharing `job_id`/`worker_id`/`store`/
-    /// `catalog` with every other attempt this test builds — the SAME
-    /// shape a real lease-reclaim resume uses (one job, one worker id, a
-    /// fresh attempt counter), so the two loops' epoch-checkpoint prefixes
-    /// differ ONLY in the attempt segment.
+    /// `result_store`/`catalog` with every other attempt this test builds —
+    /// the SAME shape a real lease-reclaim resume uses (one job, one worker
+    /// id, a fresh attempt counter), so the two loops' epoch-checkpoint
+    /// prefixes differ ONLY in the attempt segment.
     fn loop_for_attempt(
         device: &Device,
         attempt: &str,
         artifact_dir: &std::path::Path,
         store: Arc<ArtifactStore>,
+        result_store: Arc<ResultStore>,
         catalog: Arc<jammi_db::catalog::Catalog>,
     ) -> TrainingLoop {
         let varmap = VarMap::new();
@@ -10353,6 +10489,7 @@ mod epoch_checkpoint_retention_isolation {
             .catalog(catalog)
             .artifact_dir(artifact_dir.to_path_buf())
             .artifact_store(store)
+            .result_store(result_store)
             .build()
             .unwrap()
     }
@@ -10372,8 +10509,10 @@ mod epoch_checkpoint_retention_isolation {
         let root_dir = tempfile::tempdir().unwrap().keep();
         let cache_dir = tempfile::tempdir().unwrap().keep();
         let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
-        let store =
-            Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache_dir).unwrap());
+        let store = Arc::new(
+            ArtifactStore::with_root(root.clone(), StorageRegistry::new(), cache_dir.clone())
+                .unwrap(),
+        );
         let artifact_dir = tempfile::tempdir().unwrap().keep();
         let checkpoint_dir = tempfile::tempdir().unwrap().keep();
         let catalog_dir = tempfile::tempdir().unwrap().keep();
@@ -10381,6 +10520,19 @@ mod epoch_checkpoint_retention_isolation {
             jammi_db::catalog::Catalog::open(&catalog_dir)
                 .await
                 .unwrap(),
+        );
+        // Rooted at the SAME `root`/registry/cache_dir as `store` above —
+        // see `epoch_checkpoint_retention_failure`'s own `result_store` for
+        // why this is safe to build as a second handle onto the same bytes.
+        let result_store = Arc::new(
+            ResultStore::with_root(
+                root,
+                StorageRegistry::new(),
+                Arc::clone(&catalog),
+                AnnIndexConfig::default(),
+                cache_dir,
+            )
+            .unwrap(),
         );
 
         // The PREVIOUS attempt ("0"): writes epoch 0, which this test
@@ -10391,10 +10543,12 @@ mod epoch_checkpoint_retention_isolation {
             let device = Device::Cpu;
             let artifact_dir = artifact_dir.clone();
             let store = Arc::clone(&store);
+            let result_store = Arc::clone(&result_store);
             let catalog = Arc::clone(&catalog);
             let checkpoint_dir = checkpoint_dir.clone();
             move || {
-                let mut prev = loop_for_attempt(&device, "0", &artifact_dir, store, catalog);
+                let mut prev =
+                    loop_for_attempt(&device, "0", &artifact_dir, store, result_store, catalog);
                 prev.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
                 prev.epoch_checkpoints[0].1.clone()
             }
@@ -10424,9 +10578,11 @@ mod epoch_checkpoint_retention_isolation {
         tokio::task::spawn_blocking({
             let device = Device::Cpu;
             let store = Arc::clone(&store);
+            let result_store = Arc::clone(&result_store);
             let catalog = Arc::clone(&catalog);
             move || {
-                let mut resumed = loop_for_attempt(&device, "1", &artifact_dir, store, catalog);
+                let mut resumed =
+                    loop_for_attempt(&device, "1", &artifact_dir, store, result_store, catalog);
                 resumed.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
                 resumed.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
                 assert_eq!(
@@ -10457,6 +10613,184 @@ mod epoch_checkpoint_retention_isolation {
             .unwrap()
             .expect("the previous attempt's checkpoint row must still exist");
         assert_eq!(row.artifact_path.as_deref(), Some(prev_prefix.as_str()));
+    }
+}
+
+/// The mid-run retention prune's OWN guard consult — as opposed to
+/// [`epoch_checkpoint_retention_isolation`]'s proof that the guard is never
+/// even ASKED about a different attempt's prefix — is exercised here
+/// directly: a `models` row naming THIS attempt's own oldest checkpoint
+/// prefix (the exact shape a winning finalize CAS produces for a checkpoint
+/// still inside the retention window, registered here before the row's own
+/// finalize would normally run — the mid-run prune cannot tell the
+/// difference) makes the prune refuse to delete it, and removing that row
+/// lets the very next retry reclaim it.
+#[cfg(test)]
+mod epoch_checkpoint_retention_guard {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::lora::build_distribution_head;
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::config::AnnIndexConfig;
+    use jammi_db::model_task::ModelTask;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::{ArtifactStore, ResultStore};
+
+    const HIDDEN: usize = 4;
+
+    fn loop_with_stores(
+        device: &Device,
+        artifact_dir: &std::path::Path,
+        store: Arc<ArtifactStore>,
+        result_store: Arc<ResultStore>,
+        catalog: Arc<jammi_db::catalog::Catalog>,
+    ) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let config = FineTuneConfig {
+            keep_last_n_checkpoints: Some(1),
+            ..Default::default()
+        };
+        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("f2-guard-job".into())
+            .worker_id("f2-guard-worker".into())
+            .attempt("0".into())
+            .catalog(catalog)
+            .artifact_dir(artifact_dir.to_path_buf())
+            .artifact_store(store)
+            .result_store(result_store)
+            .build()
+            .unwrap()
+    }
+
+    /// RED at the unguarded primitive (executed and reverted against a live
+    /// worktree, never shipped): calling `ArtifactStore::delete_epoch_checkpoint`
+    /// directly instead of going through `delete_epoch_checkpoint_guarded`
+    /// deletes epoch_0's bytes even with the referencing row in place —
+    /// this test then fails on the `store.fetch_artifact` assertion below.
+    #[tokio::test]
+    async fn the_mid_run_prune_consults_the_guard_and_keeps_a_referenced_checkpoint() {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        let store = Arc::new(
+            ArtifactStore::with_root(root.clone(), StorageRegistry::new(), cache_dir.clone())
+                .unwrap(),
+        );
+        let artifact_dir = tempfile::tempdir().unwrap().keep();
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(
+            jammi_db::catalog::Catalog::open(&artifact_dir)
+                .await
+                .unwrap(),
+        );
+        let result_store = Arc::new(
+            ResultStore::with_root(
+                root,
+                StorageRegistry::new(),
+                Arc::clone(&catalog),
+                AnnIndexConfig::default(),
+                cache_dir,
+            )
+            .unwrap(),
+        );
+
+        // One continuous loop drives all three epoch boundaries, exactly
+        // like a real run — the catalog register/delete calls in between
+        // are made through `Handle::current().block_on`, the same way
+        // `save_epoch_checkpoint` itself reaches the store from inside this
+        // `spawn_blocking` closure.
+        tokio::task::spawn_blocking(move || {
+            let device = Device::Cpu;
+            let mut loop_ = loop_with_stores(
+                &device,
+                &artifact_dir,
+                Arc::clone(&store),
+                result_store,
+                Arc::clone(&catalog),
+            );
+
+            // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+            let epoch0_prefix = loop_.epoch_checkpoints[0].1.clone();
+            let epoch0_prefix_url = StorageUrl::parse(&epoch0_prefix).unwrap();
+
+            // A `models` row naming epoch_0's own prefix — the shape a
+            // winning finalize CAS would have produced for a checkpoint
+            // still inside the retention window.
+            tokio::runtime::Handle::current()
+                .block_on(catalog.register_model(
+                    jammi_db::catalog::model_repo::RegisterModelParams {
+                        model_id: "f2-guard-job:epoch_0",
+                        version: 1,
+                        model_type: "fine-tuned",
+                        backend: "candle",
+                        task: ModelTask::TextEmbedding,
+                        base_model_id: None,
+                        artifact_path: Some(&epoch0_prefix),
+                        config_json: None,
+                    },
+                ))
+                .unwrap();
+
+            // Epoch 1: writes (len 2 > keep 1); retention tries to prune
+            // epoch_0 — REFUSED (the row above still names it exactly). The
+            // entry must stay tracked, not be dropped, and its bytes
+            // survive.
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+            assert_eq!(
+                loop_
+                    .epoch_checkpoints
+                    .iter()
+                    .map(|(e, _)| *e)
+                    .collect::<Vec<_>>(),
+                vec![0, 1],
+                "a referenced checkpoint must stay tracked, never dropped, while a live \
+                 models row still names it"
+            );
+            assert!(
+                tokio::runtime::Handle::current()
+                    .block_on(store.fetch_artifact(&epoch0_prefix_url))
+                    .is_ok(),
+                "epoch_0's bytes must survive while a live models row still names its exact \
+                 prefix"
+            );
+
+            // Remove the referencing row: the NEXT retry reclaims it.
+            tokio::runtime::Handle::current()
+                .block_on(catalog.delete_model("f2-guard-job:epoch_0", Some(1), false, 0))
+                .unwrap();
+
+            // Epoch 2: retention retries the oldest entry first — epoch_0,
+            // now unreferenced, is reclaimed; epoch_1 (over the keep=1 cap)
+            // is retried immediately after in the same `while` pass.
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 2).unwrap();
+            assert_eq!(
+                loop_
+                    .epoch_checkpoints
+                    .iter()
+                    .map(|(e, _)| *e)
+                    .collect::<Vec<_>>(),
+                vec![2],
+                "once the referencing row is gone, retention catches back up to exactly the \
+                 retained window"
+            );
+            assert!(
+                tokio::runtime::Handle::current()
+                    .block_on(store.fetch_artifact(&epoch0_prefix_url))
+                    .is_err(),
+                "epoch_0's bytes must be reclaimed once no live models row names them"
+            );
+        })
+        .await
+        .unwrap();
     }
 }
 

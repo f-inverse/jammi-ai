@@ -2,9 +2,9 @@
 ``_no_leaked_sessions`` autouse guard.
 
 The runtime guard is the control for every embedded/remote session shape in
-this suite. Nothing committed proved that it bites: that a test which
+this suite. This file is the committed proof that it bites: a test which
 actually leaves a session open is actually failed, BY NAME, at teardown — on
-both transports. This file is that proof, run as a real pytest session rather
+both transports. It runs as a real pytest session rather
 than a unit test of a helper function, because the guard's own subject is
 "how does the outer pytest run report a leak" — there is no smaller unit that
 exercises it honestly. A static shape gate over the rest of `cookbook/**` is

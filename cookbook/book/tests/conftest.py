@@ -30,10 +30,13 @@ inside its directory, so a ``shutil.rmtree`` racing it fails with ``OSError:
 
 Known limit, stated rather than assumed: the guard tracks the ``jammi.connect``
 *module attribute*, so a test that bound ``from jammi import connect`` at import
-time would slip past it. No module in this test suite binds it that way today
-(checked by hand, not by a standing gate); this runtime guard is the sole rail
-for every session shape in this suite, and nothing here fails that particular
-binding by name — a static gate over it is filed as issue #539.
+time would slip past it. ``test_session_alias_gate.py`` is the standing gate for
+that one precondition, over every ``.py`` module directly under this ``tests/``
+directory (including this conftest and the gate module itself). This runtime
+guard, plus that alias gate, is the sole rail for every session shape in this
+suite's pytest lanes; neither reaches the non-pytest lanes (scripts, recipes,
+quickstart, the executed chapter cells) — a static gate over those is filed as
+issue #539.
 """
 
 from __future__ import annotations

@@ -25,20 +25,15 @@
 #       Plus the unescaped-backtick/`$(` static guard on that heredoc, the
 #       same class the prove suite catches (an unescaped pair is evaluated
 #       LOCALLY, on the runner, before a byte reaches ssh).
-#   G5  the post-run artifact retrieval (U7b-A1-pull P1/P2), driven as the
+#   G5  the post-run artifact retrieval (U7b-A1-pull P1), driven as the
 #       EXPANDED LOCAL TEXT the driver really runs after the remote heredoc
 #       exits (extracted the same way G3 extracts the remote text, but from
 #       the driver's own local block, under a real `rsync` shim on PATH so
 #       no network call is made): a failed pull JOINS the leg's own `rc`
-#       (never a silently-warned second exit path), and a run of >=128
-#       contiguous hex characters (the shape of a hex-encoded NCCL id,
-#       256 at full length) found in the pulled
-#       artifact dir OR the run's own log fails the leg too — a clean pull
-#       with a clean artifact/log stays silent. Boundary fixtures pin the
-#       128 threshold on both sides (64/127 do not trip, 128 does), a
-#       256-hex id split 128/128 across two lines (each half already meets
-#       the threshold), and a 200-hex run behind a leading NUL byte (a
-#       binary-looking carrier, only caught because the scan drops `-I`).
+#       (never a silently-warned second exit path) — a clean pull stays
+#       silent. The id-secrecy scan is EXCISED from this unit (closing
+#       audit #2, the pre-committed stop rule) and rebuilt in U7b-C beside
+#       the crossing it backstops; it is no longer exercised here.
 #   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
 #       the `<<REMOTE` heredoc body, beside the existing env block; removing
 #       either is a mutation this case catches.
@@ -346,28 +341,29 @@ else
 fi
 
 # ============================================================================
-# G5: the post-run artifact retrieval is FATAL on a failed pull, and the
-# id-secrecy scan over the pulled artifact dir + this run's own log is a
-# backstop (U7b-A1-pull P1/P2). Extracted from the driver's OWN local text
-# the same way G3 extracts the remote heredoc's, and eval'd directly in this
-# function's shell (never inside a `$(...)` capture, which would discard the
-# `rc` mutation the arms make — the same reason G3's run_arms does not
-# capture its own eval).
+# G5: the post-run artifact retrieval is FATAL on a failed pull (U7b-A1-pull
+# P1). Extracted from the driver's OWN local text the same way G3 extracts
+# the remote heredoc's, and eval'd directly in this function's shell (never
+# inside a `$(...)` capture, which would discard the `rc` mutation the arms
+# make -- the same reason G3's run_arms does not capture its own eval). The
+# id-secrecy scan that used to live in this same block is EXCISED from
+# A1-pull (closing audit #2, the pre-committed stop rule fired) and rebuilt
+# in U7b-C beside the crossing it backstops -- it is not exercised here.
 # ============================================================================
 retrieval_start_ln="$(grep -n '^mkdir -p "\$GANG_ARTIFACT_DIR"$' "$GANG_SH" | head -1 | cut -d: -f1)"
-retrieval_end_ln="$(grep -n '^# --- end artifact retrieval and id-secrecy check ---$' "$GANG_SH" | head -1 | cut -d: -f1)"
+retrieval_end_ln="$(grep -n '^# --- end artifact retrieval ---$' "$GANG_SH" | head -1 | cut -d: -f1)"
 if [ -n "$retrieval_start_ln" ] && [ -n "$retrieval_end_ln" ]; then
   retrieval_body="$(sed -n "${retrieval_start_ln},${retrieval_end_ln}p" "$GANG_SH")"
-  ok "G5: extracted the artifact-retrieval + id-secrecy block from the driver (lines ${retrieval_start_ln}-${retrieval_end_ln})"
+  ok "G5: extracted the artifact-retrieval block from the driver (lines ${retrieval_start_ln}-${retrieval_end_ln})"
 else
-  bad "G5: could not locate the artifact-retrieval + id-secrecy block in the driver (anchors moved or were deleted)"
+  bad "G5: could not locate the artifact-retrieval block in the driver (anchors moved or were deleted)"
   retrieval_body=""
 fi
 
 RSYNC_BIN="$SANDBOX/rsync-bin"
 mkdir -p "$RSYNC_BIN"
 
-run_retrieval() { # $1=initial rc  $2=rsync exit code  $3=artifact content(none|clean|leak|hex64|hex127|hex128|hex256split|nulprefix200)  $4=log content(clean|leak) -> "rc|stderr"
+run_retrieval() { # $1=initial rc  $2=rsync exit code  $3=artifact content(none|clean) -> "rc|stderr"
   cat >"$RSYNC_BIN/rsync" <<RS
 #!/usr/bin/env bash
 exit $2
@@ -379,23 +375,10 @@ RS
   rm -rf "$GANG_ARTIFACT_DIR"; mkdir -p "$GANG_ARTIFACT_DIR"
   case "$3" in
     clean) echo '{"world":2}' > "$GANG_ARTIFACT_DIR/gang.json" ;;
-    leak) python3 -c "print('a' * 256)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
     none) : ;;
-    # G5 boundary fixtures (U7b-A1-pull fix round 1, Q3): the 128-hex
-    # threshold's own boundary, on both sides, plus the two shapes that
-    # exercise "every carrier" (a run split across two lines; a run behind
-    # a leading NUL byte, which only trips with -I dropped).
-    hex64) python3 -c "print('a' * 64)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
-    hex127) python3 -c "print('a' * 127)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
-    hex128) python3 -c "print('a' * 128)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
-    hex256split) python3 -c "print('a' * 128); print('a' * 128)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
-    nulprefix200) python3 -c "import sys; sys.stdout.buffer.write(b'\x00' + b'a' * 200 + b'\n')" > "$GANG_ARTIFACT_DIR/gang.json" ;;
   esac
   local LOG="$SANDBOX/g5-retrieval.log"
-  case "$4" in
-    clean) echo "ordinary run output, no secrets" > "$LOG" ;;
-    leak) python3 -c "print('b' * 256)" > "$LOG" ;;
-  esac
+  echo "ordinary run output, no secrets" > "$LOG"
 
   # shellcheck disable=SC2034  # read only inside the eval'd retrieval_body below, which shellcheck cannot see into
   local RP_HOST="203.0.113.1" RP_PORT="22"
@@ -410,83 +393,25 @@ RS
   printf '%s|%s' "$rc" "$(cat "$SANDBOX/g5.out")"
 }
 
-res="$(run_retrieval 0 0 clean clean)"
+res="$(run_retrieval 0 0 clean)"
 if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" == *"pulled the gang artifact"* ]] && [[ "${res#*|}" != *"::error::"* ]]; then
-  ok "G5: a clean pull with a clean artifact/log stays rc=0, no error"
+  ok "G5: a clean pull with a clean artifact stays rc=0, no error"
 else
   bad "G5: expected a silent rc=0 pull; got $res"
 fi
 
-res="$(run_retrieval 0 17 none clean)"
+res="$(run_retrieval 0 17 none)"
 if [ "${res%%|*}" -eq 17 ] && [[ "${res#*|}" == *"gang artifact pull failed"* ]]; then
   ok "G5: a FAILED pull (rsync rc=17) with rc=0 so far joins the leg's own rc -> 17, never a silent warning"
 else
   bad "G5: expected rc=17 + 'gang artifact pull failed'; got $res"
 fi
 
-res="$(run_retrieval 5 17 none clean)"
+res="$(run_retrieval 5 17 none)"
 if [ "${res%%|*}" -eq 5 ] && [[ "${res#*|}" == *"gang artifact pull failed"* ]]; then
   ok "G5: a failed pull on an ALREADY-failing leg (rc=5) reports the pull failure but never overwrites the leg's own rc"
 else
   bad "G5: expected rc=5 (unchanged) + the pull-failed message; got $res"
-fi
-
-res="$(run_retrieval 0 0 leak clean)"
-if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
-  ok "G5: a 256-hex-char run in the PULLED ARTIFACT dir fails the leg (rc=1), naming the id-secrecy reason"
-else
-  bad "G5: expected rc=1 + the id-secrecy message from a leaked artifact; got $res"
-fi
-
-res="$(run_retrieval 0 0 clean leak)"
-if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
-  ok "G5: a 256-hex-char run in the RUN'S OWN LOG fails the leg (rc=1), naming the id-secrecy reason"
-else
-  bad "G5: expected rc=1 + the id-secrecy message from a leaked log; got $res"
-fi
-
-res="$(run_retrieval 0 0 clean clean)"
-if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
-  ok "G5: a clean artifact and log never trip the id-secrecy scan (not blanket-refusing)"
-else
-  bad "G5: expected the id-secrecy scan to stay silent on clean input; got $res"
-fi
-
-# --- G5 boundary fixtures (U7b-A1-pull fix round 1, Q3): the 128-hex
-# threshold has no boundary oracle until these five exist. ---
-res="$(run_retrieval 0 0 hex64 clean)"
-if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
-  ok "G5 boundary: a 64-hex run (a sha256 digest's own length) does NOT trip the scan"
-else
-  bad "G5 boundary: expected a 64-hex run to stay silent; got $res"
-fi
-
-res="$(run_retrieval 0 0 hex127 clean)"
-if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
-  ok "G5 boundary: a 127-hex run (one short of the threshold) does NOT trip the scan"
-else
-  bad "G5 boundary: expected a 127-hex run to stay silent; got $res"
-fi
-
-res="$(run_retrieval 0 0 hex128 clean)"
-if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
-  ok "G5 boundary: a 128-hex run (exactly the threshold) DOES trip the scan"
-else
-  bad "G5 boundary: expected a 128-hex run to trip the scan; got $res"
-fi
-
-res="$(run_retrieval 0 0 hex256split clean)"
-if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
-  ok "G5 boundary: a 256-hex id split 128/128 across two lines DOES trip the scan (each half already meets the threshold)"
-else
-  bad "G5 boundary: expected a 256-hex id split across two lines to trip the scan; got $res"
-fi
-
-res="$(run_retrieval 0 0 nulprefix200 clean)"
-if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
-  ok "G5 boundary: a 200-hex run behind a leading NUL byte DOES trip the scan (proves -I is gone: a binary-looking carrier is still scanned)"
-else
-  bad "G5 boundary: expected a 200-hex run behind a leading NUL byte to trip the scan; got $res"
 fi
 
 # ============================================================================

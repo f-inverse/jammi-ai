@@ -161,7 +161,7 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn 2
 # both-device-model validation) -- see that script's own module doc. ---
 cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-clone build leg (`build_clone`, `CARGO_TARGET_DIR=\"$target\" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow (gpu-perf-ab.yml is dispatch/label-only); needs the CUDA toolchain. The SAME literal tuple covers BOTH the parent and comparison clone builds (`$clone` is a `build_clone` function parameter, called twice with different arguments -- one literal occurrence in the source).
 
-# --- ci/scripts/runpod_gpu_gang.sh — the gpu-gang POD leg (plan 67 U7a).
+# --- ci/scripts/runpod_gpu_gang.sh — the gpu-gang POD leg.
 # One pod, two A100s, the distributed fine-tune (gang) tests in jammi-ai's
 # `gpu_capability` target. Its `gang-build` compile-check tuple is
 # byte-identical to the prove lane's own and is covered by that row above

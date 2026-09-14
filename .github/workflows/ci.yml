@@ -1711,7 +1711,7 @@ jobs:
           # list.
           - name: gpu prove lane suite
             cmd: bash ci/scripts/test_gpu_prove_lane.sh
-          # The gang-lane fixture suite (plan 67 U7a): drives the REAL
+          # The gang-lane fixture suite: drives the REAL
           # `rp_gang_verdict` over every rc arm, the GANG_GROUPS closure, the
           # two never-vacuous arms of the `gang-proof` group as the EXPANDED
           # remote text the driver really sends, and the lane's cost bound —

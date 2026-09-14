@@ -12,7 +12,7 @@
 # candidate before any PCIe one — spike S4 rented a 2-GPU A100-SXM4-80GB
 # SECURE pod at $3.18/h while the PCIe pool returned zero 2-GPU capacity.
 #
-# COST BOUND (human-approved, plan 67 U7a). Two bounds, each stated with
+# COST BOUND (human-approved). Two bounds, each stated with
 # the mechanism that enforces it — none of this is prose:
 #
 #   (i) TERMINATE-SUCCEEDS (the ordinary path). rp_deploy_live walks the
@@ -47,11 +47,11 @@
 # RP_TTL_HOURS/RP_TIMEOUT deliberately, re-approving the bound), never
 # something this script raises on its own.
 #
-# WHAT IT PROVES: the gang tests U4b adds to `jammi-ai`'s `gpu_capability`
-# target, selected by the `gang_` name filter named here (GANG_TEST_FILTER)
-# so the filter lives in exactly one place. Until U4b lands that filter
-# matches NOTHING, and a name filter matching zero tests exits 0 with
-# "running 0 tests ... test result: ok" — a false green. This driver reads
+# WHAT IT PROVES: the gang tests in `jammi-ai`'s `gpu_capability` target,
+# selected by the `gang_` name filter named here (GANG_TEST_FILTER) so the
+# filter lives in exactly one place. A name filter matching zero tests
+# exits 0 with "running 0 tests ... test result: ok" — a false green. This
+# driver reads
 # that case as a FAILURE with its own named reason (the same never-vacuous
 # rule runpod_gpu_prove.sh's `capability-surface-proof` group applies, and
 # the same doctrine `check_gpu_prove_once.py` states for the prove lane):
@@ -136,15 +136,15 @@ GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
 GANG_DEPLOY_ARCH=a100
 NATIVE_COMPUTE_CAP=80
 
-# The ONE place the gang test-name filter lives. U4b's tests are named
+# The ONE place the gang test-name filter lives. The gang tests are named
 # `gang_*` in `jammi-ai`'s `gpu_capability` target; a rename moves this line
 # and nothing else.
 GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 
 # Where the gang tests write their evidence JSON on the pod, and where this
 # driver pulls it to locally. The remote path is passed to the tests as
-# JAMMI_GANG_ARTIFACT_DIR — the ONE contract between this driver and U4b's
-# test code. The NCCL id (128 opaque bytes minted by rank 0, nccl.rs's own
+# JAMMI_GANG_ARTIFACT_DIR — the ONE contract between this driver and the
+# gang test code. The NCCL id (128 opaque bytes minted by rank 0, nccl.rs's own
 # "opaque secret ... travel to the peers out of band") rides NO path under
 # either directory: it is a capability, never evidence. The id-secrecy scan
 # that backstops that contract ships with the cluster leg
@@ -177,8 +177,8 @@ rp_gang_verdict() {
   declare -A grc_map=()
   local line
   # `|| [ -n "$line" ]`: an abrupt ssh cut leaves an unterminated final
-  # line, and a bare `while read` loop drops it (the same BLOCK 3 fix
-  # `rp_prove_verdict` carries). `rp_parse_prove_marker` (runpod_lib.sh) is
+  # line, which a bare `while read` loop drops -- `rp_prove_verdict`
+  # carries the identical guard. `rp_parse_prove_marker` (runpod_lib.sh) is
   # the ONE shared grammar both drivers and the live-stream bookkeeping use.
   while IFS= read -r line || [ -n "$line" ]; do
     if rp_parse_prove_marker "$line"; then

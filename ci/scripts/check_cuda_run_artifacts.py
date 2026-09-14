@@ -951,7 +951,7 @@ def check_oracle_separation(data: dict) -> list[str]:
 # byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD across
 # A100s, with no env pins — and merely RECORDED above that, because nothing
 # has established byte-identity for a reduction whose NCCL pin set is
-# untested at world >= 3 (README r16/§Spikes). A state defined by missing
+# untested at world >= 3. A state defined by missing
 # evidence gets no definite consequence: the gate does not decide the
 # higher-world case in either direction.
 # --------------------------------------------------------------------------- #
@@ -1306,7 +1306,7 @@ GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
         f"ASSERTED on a {GANG_VERDICT_PASS!r} verdict at `world` {GANG_DIGEST_EQUALITY_WORLD} (the "
         "regime spike S5 measured byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD "
         "on A100s with no env pins) and merely RECORDED above that world — the NCCL pin set is "
-        "untested at world >= 3 (README r16), and a state defined by missing evidence gets no "
+        "untested at world >= 3, and a state defined by missing evidence gets no "
         f"definite consequence. A {GANG_VERDICT_FAIL!r} verdict records its pair as measured",
     ),
     (

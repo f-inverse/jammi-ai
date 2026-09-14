@@ -120,7 +120,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // U3 (#500): `.materialization.json` embeds `produced_at`
+            // #500: `materialization.json` embeds `produced_at`
             // (wall-clock) and `produced_by` (a per-process run id) — never
             // byte-stable across runs by design (provenance metadata, not the
             // reproducibility anchor; see `MaterializationManifest`'s own

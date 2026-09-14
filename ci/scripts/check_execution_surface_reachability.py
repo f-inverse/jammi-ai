@@ -644,8 +644,22 @@ def job_source_spans(text: str) -> dict[str, tuple[int, int]]:
         job_id = str(key_node.value)
         start = key_node.start_mark.line
         if value_node.end_mark.line <= start:
+            # W10 audit fix: `jobs:` ITSELF is block-style here (the
+            # top-level flow-style shape is the SEPARATE refusal above,
+            # `:639-640`) -- what this line actually found is a single
+            # job's own VALUE not occupying a line span of its own: either
+            # an inline flow mapping/sequence written entirely on the
+            # key's own line (`a: { runs-on: u }`), or a job id with no
+            # body at all (`b:` followed by nothing). Both make "the line
+            # span between this job's header and the next" meaningless the
+            # same way the top-level flow-style shape does, but neither IS
+            # a flow-style `jobs:` mapping -- naming the wrong construct
+            # here previously read as a correct-looking message for an
+            # incorrect diagnosis.
             raise WorkflowLoadError(
-                f"jobs: is flow-style -- cannot examine (job {job_id!r} does not occupy its own line span)"
+                f"job {job_id!r} does not occupy its own line span in a block-style jobs: "
+                "mapping -- cannot examine (its value is either empty or written entirely "
+                "on the key's own line)"
             )
         starts.append((job_id, start))
     spans: dict[str, tuple[int, int]] = {}
@@ -2814,11 +2828,45 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         "on:\n  push:\njobs:\n  x:\n    runs-on: u\n\njobs:\n  y:\n    runs-on: u\n",
         "duplicate key",
     )
+    # W10 audit fix: `jobs:` is BLOCK-style in both of these (unlike the
+    # "flow-style jobs: mapping" case above) -- what makes each one
+    # unexaminable is a single JOB's own value not occupying its own line
+    # span. The refusal must name that construct, never "flow-style" (the
+    # WRONG diagnosis this line used to give both shapes).
+    _want_jobs_refused(
+        "block jobs: with one job's value inline on its own key's line",
+        "on:\n  push:\njobs:\n  a: { runs-on: u, steps: [ { run: 'npm publish' } ] }\n",
+        "does not occupy its own line span in a block-style jobs: mapping",
+    )
+    _want_jobs_refused(
+        "block jobs: with a later empty-bodied job id",
+        "on:\n  push:\njobs:\n  a:\n    runs-on: u\n    steps:\n      - run: npm publish\n  b:\n",
+        "does not occupy its own line span in a block-style jobs: mapping",
+    )
+    for _label, _text in (
+        (
+            "block jobs: with one job's value inline on its own key's line",
+            "on:\n  push:\njobs:\n  a: { runs-on: u, steps: [ { run: 'npm publish' } ] }\n",
+        ),
+        (
+            "block jobs: with a later empty-bodied job id",
+            "on:\n  push:\njobs:\n  a:\n    runs-on: u\n    steps:\n      - run: npm publish\n  b:\n",
+        ),
+    ):
+        _jobs, _err = jobs_or_fail(_text)
+        if _err is not None and "flow-style" in _err:
+            failures.append(
+                f"self-test FAILED (jobs: reader, {_label}): refusal wrongly names 'flow-style' for a "
+                f"block-style jobs: mapping, got err={_err!r}"
+            )
     # The P6-shape end-to-end regression (a flow-style `jobs:` mapping whose
     # real publisher job is not the last entry, previously read as `[]`/
     # no-finding while crediting a DIFFERENT job with the missing job's own
     # text) is covered in `test_check_gpu_prove_once.py`'s own suite, which
-    # owns `check_p6_discovery` -- not re-derived here.
+    # owns `check_p6_discovery` -- not re-derived here. The W10 "reusable
+    # this delegates into but cannot examine is a finding, never `{}`"
+    # property is ALSO owned there (`check_p6_discovery` is the only
+    # consumer of the recursive helper this fixes).
 
     # --- gate prerequisite: a missing PyYAML install is ONE distinct
     # message, never a finding and never a pass -- simulated by

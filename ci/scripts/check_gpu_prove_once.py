@@ -1478,16 +1478,19 @@ def _local_reusable_workflow_targets(job_body: str) -> list[str]:
 
 
 def _workflow_job_bodies(text: str) -> dict[str, str]:
+    """{job_id: body} for every job under `text`'s own top-level `jobs:`.
+    W10 audit fix: a target this cannot parse/compose is NEVER swallowed
+    into `{}` here -- `job_source_spans`'s own `WorkflowLoadError` is left
+    to propagate to the caller (`job_invokes_publish_primitive_recursive`),
+    which names the RESOLVED PATH of the reusable this body came from before
+    re-raising; `check_p6_discovery` is the one place that turns it into a
+    FINDING. A workflow reached ONLY through a caller's `uses:` (a
+    `workflow_call`-only reusable, P6's own top-level loop skips scanning it
+    directly by design) would otherwise have no other path to examination at
+    all -- swallowing its load error here made it invisible everywhere."""
     stripped = drop_comment_lines(text)
     lines = stripped.splitlines()
-    try:
-        jobs = job_source_spans(stripped)
-    except WorkflowLoadError:
-        # Best-effort recursive helper (see `job_invokes_publish_primitive_
-        # recursive`): a target workflow this cannot parse yields no bodies
-        # here, but is still scanned (and FAILs loud) in its own right as a
-        # top-level entry of `check_p6_discovery`'s own loop.
-        return {}
+    jobs = job_source_spans(stripped)
     return {name: "\n".join(lines[s:e]) for name, (s, e) in jobs.items()}
 
 
@@ -1504,7 +1507,17 @@ def job_invokes_publish_primitive_recursive(
     `push: true`); a job that merely delegates to it is still a promoting
     job for P6's purposes. `_visited` guards a workflow-`uses:`-cycle from
     recursing forever (never expected in this repo's tree, but a guard, not
-    an assumption)."""
+    an assumption).
+
+    W10 audit fix: a reusable this delegates into but cannot load/compose
+    (its own `jobs:` is flow-style, a job value that does not occupy its
+    own line span, an anchor/alias/tag, a syntax error, ...) raises
+    `WorkflowLoadError` -- RE-RAISED here with the resolved reusable's own
+    path folded into the message, never caught and treated as "no
+    primitive found". `check_p6_discovery` is the one place that turns this
+    into a named finding; every OTHER caller of this function must let it
+    propagate too, for the same reason `on_err`/`jobs_err` are never
+    discarded at the top level."""
     direct = job_invokes_publish_primitive(job_body)
     if direct is not None:
         return direct
@@ -1513,7 +1526,13 @@ def job_invokes_publish_primitive_recursive(
         if resolved is None or resolved in _visited:
             continue
         target_text = workflow_texts[resolved]
-        for sub_body in _workflow_job_bodies(target_text).values():
+        try:
+            sub_bodies = _workflow_job_bodies(target_text)
+        except WorkflowLoadError as exc:
+            raise WorkflowLoadError(
+                f"uses local reusable workflow {resolved!r}, whose jobs: cannot be examined: {exc}"
+            ) from exc
+        for sub_body in sub_bodies.values():
             found = job_invokes_publish_primitive_recursive(
                 sub_body, workflow_texts, _visited=_visited | {resolved}
             )
@@ -1559,7 +1578,19 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
         lines = text.splitlines()
         for job_name, (start, end) in jobs.items():
             body = drop_comment_lines("\n".join(lines[start:end]))
-            primitive = job_invokes_publish_primitive_recursive(body, workflow_texts)
+            # W10 audit fix: a reusable this job's `uses:` reaches but that
+            # cannot be loaded/composed is a named FINDING here -- never a
+            # silent "no primitive found". This is the ONLY place in the
+            # tree that would otherwise ever examine a `workflow_call`-only
+            # reusable (the loop above skips scanning it as its own
+            # top-level entry, by design); swallowing the load error inside
+            # the recursive helper made such a reusable invisible to P6
+            # entirely, regardless of what its own `jobs:` actually did.
+            try:
+                primitive = job_invokes_publish_primitive_recursive(body, workflow_texts)
+            except WorkflowLoadError as exc:
+                findings.append(f"P6: {name}'s job `{job_name}` {exc}")
+                continue
             if primitive is None:
                 continue
             if (name, job_name) not in listed_resolved:

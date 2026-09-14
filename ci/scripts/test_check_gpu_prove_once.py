@@ -2040,6 +2040,101 @@ class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
         )
 
 
+def _reusable_caller_and_target(reusable_jobs_text: str) -> dict[str, str]:
+    """A caller workflow whose ONE job's entire body is `uses: ./.github/
+    workflows/_reuse.yml`, plus that reusable itself: `workflow_call`-only,
+    `on:` block valid, `jobs:` block given verbatim by the caller so each
+    W10 shape can substitute its own unexaminable `jobs:` text. Merged into
+    `_positive_texts()` by every W10 case below -- never used standalone,
+    since `check_p6_discovery` also needs the real tree's own positive rows
+    to stay clean."""
+    caller = (
+        "name: caller\n\non:\n  push:\n    branches: [main]\n\n"
+        "jobs:\n  call-it:\n    uses: ./.github/workflows/_reuse.yml\n"
+    )
+    reusable = f"name: reuse\n\non:\n  workflow_call:\n\n{reusable_jobs_text}"
+    return {"caller.yml": caller, "_reuse.yml": reusable}
+
+
+class UnexaminableLocalReusableIsAFindingNeverASilentPassTest(unittest.TestCase):
+    """W10 audit fix: `check_p6_discovery`'s recursive `uses:` discovery
+    used to swallow a target reusable's own `WorkflowLoadError` into `{}`
+    (`_workflow_job_bodies`'s `except WorkflowLoadError: return {}`) -- the
+    reusable is `workflow_call`-only, so P6's own top-level loop `continue`s
+    past scanning it directly (by design, the same "never independently
+    starts" doctrine `gpu-prove.yml` gets); a caller reaching it through
+    `uses:` was therefore the ONLY path to ever examining it, and that path
+    was silently discarding the refusal. All three shapes below are RED at
+    bbeace32 (0 findings); GREEN once the swallow is replaced by a named
+    finding citing the reusable and the refusal reason. The block-style
+    CONTROL (a reusable this reader CAN examine, whose job is a genuine,
+    unlisted npm-publish primitive) must keep finding exactly the existing
+    "not listed in PROMOTION_TABLE" row -- this fix must never turn an
+    examinable reusable into a false refusal."""
+
+    def test_flow_style_jobs_mapping_in_the_reusable_is_a_finding(self):
+        texts = {
+            **_positive_texts(),
+            **_reusable_caller_and_target(
+                "jobs: { publisher: { runs-on: ubuntu-latest, "
+                "steps: [ { run: 'npm publish' } ] } }\n"
+            ),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f or "_reuse.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_reuse.yml" in f and "call-it" in f for f in mine), mine)
+
+    def test_inline_one_line_job_value_in_a_block_style_jobs_is_a_finding(self):
+        texts = {
+            **_positive_texts(),
+            **_reusable_caller_and_target(
+                "jobs:\n  publisher: {runs-on: ubuntu-latest, "
+                "steps: [ { run: 'npm publish' } ] }\n"
+            ),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f or "_reuse.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_reuse.yml" in f and "call-it" in f for f in mine), mine)
+        # The refusal must name the actual construct, never mislabel a
+        # block-style jobs: mapping as flow-style.
+        self.assertFalse(any("jobs: is flow-style" in f for f in mine), mine)
+
+    def test_later_empty_bodied_job_id_in_a_block_style_jobs_is_a_finding(self):
+        texts = {
+            **_positive_texts(),
+            **_reusable_caller_and_target(
+                "jobs:\n  publisher:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - run: npm publish\n  empty-job:\n"
+            ),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f or "_reuse.yml" in f]
+        self.assertGreaterEqual(len(mine), 1, findings)
+        self.assertTrue(any("_reuse.yml" in f and "call-it" in f for f in mine), mine)
+        self.assertFalse(any("jobs: is flow-style" in f for f in mine), mine)
+
+    def test_control_examinable_reusable_still_finds_only_the_unlisted_row(self):
+        texts = {
+            **_positive_texts(),
+            **_reusable_caller_and_target(
+                "jobs:\n  publisher:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - run: npm publish\n"
+            ),
+        }
+        findings = cgo.check_p6_discovery(texts)
+        mine = [f for f in findings if "caller.yml" in f or "_reuse.yml" in f]
+        self.assertEqual(len(mine), 1, mine)
+        self.assertTrue(
+            any(
+                "caller.yml" in f and "call-it" in f and "not listed in PROMOTION_TABLE" in f
+                for f in mine
+            ),
+            mine,
+        )
+
+
 class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
     """F2 audit fix: an unreadable `on:`/`jobs:` block is a FAIL LOUD, never
     a silent skip -- same doctrine P1 already holds `gpu-prove.yml`'s `on:`

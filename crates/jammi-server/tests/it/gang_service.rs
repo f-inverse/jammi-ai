@@ -1381,22 +1381,59 @@ async fn refusal_scenario(
             assign_frame_full("nd-job-coord-not-fresh", attempt, 0, 1, "nd-coord-stale")
         }
         GangRefusalReason::WorldMismatch => {
+            // Strengthened (lead mutation `if false && assign.world !=
+            // row.world_size` survived against the original fixture here):
+            // the row must be OTHERWISE ADMISSIBLE at its own `world_size`
+            // (2) — own tenant, `ready`, digest-verified pair, fresh
+            // coordinator, exactly `run_rank_world_two_own_tenant_
+            // training_set_reaches_unimplemented`'s own fixture shape —
+            // so the mismatch conjunct is the ONLY arm that can refuse
+            // `assign.world = 1` against it. The original fixture (no
+            // tenant, no pair) let the deleted-gate mutation survive: with
+            // the mismatch conjunct gone, the SAME request fell into the
+            // `row.world_size > 1` block and was refused by the UNFILLED
+            // PAIR conjunct instead — the SAME fixed message, so the
+            // pairwise/RPC-level oracles could not tell which arm refused.
+            let tenant = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e15").unwrap();
+            let source_id = format!(
+                "gang_nd_world_mismatch_{}",
+                jammi_test_utils::unique_suffix()
+            );
+            let (table, digest) =
+                materialize_ready_table_for_tenant(&server, tenant, &source_id).await;
             server
                 .engine
                 .catalog()
                 .upsert_instance("nd-coord-world-mismatch", Some("l"), Some("h"))
                 .await
                 .unwrap();
-            let attempt = submit_and_claim(
+            let attempt = submit_and_claim_for_tenant(
                 &server,
+                tenant,
                 "nd-job-world-mismatch",
                 "nd-coord-world-mismatch",
                 std::time::Duration::from_secs(30),
                 WORLD2_SPEC,
             )
             .await;
-            // The row's own `world_size` is 2 (`WORLD2_SPEC`); the caller
-            // names `world = 1` — case (f).
+            server
+                .engine
+                .catalog()
+                .fill_training_set_identity(
+                    "nd-job-world-mismatch",
+                    "nd-coord-world-mismatch",
+                    attempt as u32,
+                    &digest,
+                    &table,
+                )
+                .await
+                .unwrap();
+            // The row's own `world_size` is 2 (`WORLD2_SPEC`) and is
+            // otherwise fully admissible at world 2 (see the control call
+            // `run_rank_refuses_when_assign_world_mismatches_row_world_size`
+            // drives against this SAME row, below); the caller names
+            // `world = 1` — case (f). This is the ONLY conjunct that can
+            // refuse this row.
             assign_frame_full(
                 "nd-job-world-mismatch",
                 attempt,
@@ -1586,16 +1623,77 @@ async fn run_rank_refuses_world_gt_one_when_training_set_digest_mismatches() {
 /// R2's new determinant — case (f): `assign.world` disagreeing with the
 /// ROW's own `world_size` (`WORLD2_SPEC`'s `2` here, named `world = 1`) is
 /// itself a refusal, the SAME fixed message every other I-GANG determinant
-/// refuses with. The pair stays unfilled in this fixture (irrelevant — the
-/// mismatch conjunct runs BEFORE the `row.world_size > 1` gate, so this
-/// refuses regardless of pair state).
+/// refuses with.
+///
+/// The row `refusal_scenario`'s `WorldMismatch` arm builds is OTHERWISE
+/// ADMISSIBLE at its own `world_size` (own tenant, `ready`, digest-verified
+/// pair, fresh coordinator) — so the mismatch conjunct is the ONLY arm that
+/// can refuse `assign.world = 1` against it (a lead mutation,
+/// `if false && assign.world != row.world_size`, survived against an
+/// earlier fixture with no training-set pair filled: with the mismatch
+/// conjunct gone, that request fell into the `row.world_size > 1` block and
+/// was refused by the unfilled-pair conjunct instead, the SAME fixed
+/// message, so the oracle could not tell which arm actually refused). The
+/// control below drives the SAME row a second time at `assign.world = 2`
+/// (matching its own `world_size`) and asserts it reaches `UNIMPLEMENTED` —
+/// proving world 1 above refused for the mismatch alone, never because this
+/// row was unresolvable for some other reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
     use jammi_server::grpc::gang::GangRefusalReason;
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 
-    let (_server, status) = refusal_scenario(GangRefusalReason::WorldMismatch).await;
+    let (server, status) = refusal_scenario(GangRefusalReason::WorldMismatch).await;
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert_eq!(status.message(), "gang admission refused");
+    #[cfg(feature = "test-hooks")]
+    {
+        assert_eq!(
+            server.gang_last_refusal_reason(),
+            Some(GangRefusalReason::WorldMismatch),
+            "the served GangServer must record WorldMismatch, not some other determinant, \
+             for this exact request"
+        );
+    }
+
+    // Control: the SAME row (same job, same claim, same genuinely-verified
+    // pair), driven a SECOND time on this SAME server, at `assign.world = 2`
+    // (matching the row's own `world_size`) — admits all the way to f1'
+    // `UNIMPLEMENTED`, `run_rank_world_two_own_tenant_training_set_reaches_
+    // unimplemented`'s own outcome (case c). `run_rank` never mutates the
+    // `jobs` row (a read-only classification), so re-driving the identical
+    // job here is sound: nothing about the row's own state changed between
+    // the two calls. `attempt = 1`: `refusal_scenario`'s `WorldMismatch` arm
+    // calls `submit_and_claim_for_tenant` exactly once on a freshly
+    // submitted job with no prior claim — `Catalog::claim_next`'s first
+    // (and only) claim always lands at `attempts = 1` (documented on
+    // `submit_and_claim`/`submit_and_claim_for_tenant` above: "always `1`,
+    // the first claim"). Reading the row back via `get_job_for_rank` here
+    // instead would ADD a second call site outside this crate's own
+    // `RunRank` handler — `only_the_gang_run_rank_handler_calls_get_job_
+    // for_rank` (`gang_rank_admission_oracle.rs`) enumerates every caller of
+    // that primary-key-only, non-tenant-scoped verb and would (correctly)
+    // fail on exactly that.
+    let attempt = 1;
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "nd-job-world-mismatch",
+        attempt,
+        0,
+        2,
+        "nd-coord-world-mismatch",
+    ));
+    let control_err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("no HostAdmission session exists yet to admit into");
+    assert_eq!(
+        control_err.code(),
+        tonic::Code::Unimplemented,
+        "the SAME row at its own world_size must admit, proving world 1 above refused for \
+         the mismatch alone"
+    );
 }
 
 /// The full set of I-GANG determinants [`refusal_scenario`] can drive,

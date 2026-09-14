@@ -2385,18 +2385,6 @@ def _r12_required_commands_or_deny() -> tuple[list[str], str | None]:
     return out, None
 
 
-def _r12_required_commands() -> list[str]:
-    """item 8a: the committed, human-amend-only list of gate commands, one
-    per line, `#`-comment/blank lines skipped, a trailing `  # ...`
-    annotation stripped from each command line. `[]` when the file is
-    missing/empty/all-comment — the DENIAL for those states is a separate,
-    LOUD concern (`_r12_required_commands_or_deny`, fix round 5 Z4); this
-    accessor stays for callers that only need the plain list (e.g. a
-    self-test asserting shape over the real file)."""
-    commands, _deny_reason = _r12_required_commands_or_deny()
-    return commands
-
-
 def _r12_gates_shape_rejection(artifact_name: str, gates: object, required_commands: list[str],
                                 *, judge_rc: bool) -> str | None:
     """item 8a: `None` iff `gates` is a dict naming EVERY command in
@@ -2514,13 +2502,13 @@ def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], 
         # for reader 1's own call.
         seen_pairs: dict[tuple[str, str], str] = {}
         for key, entry in attacks.items():
-            if not isinstance(entry, dict):  # R12-RESIDUAL: reader 1 only ever reaches this on a key OUTSIDE `by_file` (a real per-file entry is already validated by `_r12_validate_and_run_entry`'s OWN identical check first) — narrow; exercised for a REQUIRED key via reader 1's real loop, and for reader 3 via its own committed-record fixtures, invisible to this check_lead_gate.py-scoped sweep
+            if not isinstance(entry, dict):  # R12-RESIDUAL: reader 1 only ever reaches this on a key OUTSIDE `by_file` (a real per-file entry is already validated by `_r12_validate_and_run_entry`'s OWN identical check first) — narrow; exercised for a REQUIRED key via reader 1's real loop, and for reader 3 via its own RR27 fixture (fix round 6 Z14 deleted reader 3's earlier inline duplicate of this exact check, which had been shadowing it), invisible to this check_lead_gate.py-scoped sweep
                 return f"anticipation record attacks[{key!r}] is not an object (esc-lead-gate-R12)"
             command = entry.get("command")
-            if not isinstance(command, str) or not command.strip():  # R12-RESIDUAL: same narrowing as the arm above — only reachable via a key OUTSIDE `by_file` from reader 1's own call
+            if not isinstance(command, str) or not command.strip():  # R12-RESIDUAL: same narrowing as the arm above — only reachable via a key OUTSIDE `by_file` from reader 1's own call; exercised for reader 3 via its own RR28 fixture (fix round 6 Z14)
                 return f"anticipation record attacks[{key!r}] has no `command` (esc-lead-gate-R12)"
             recorded_hash = entry.get("hash")
-            if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):  # R12-RESIDUAL: same narrowing as the two arms above
+            if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):  # R12-RESIDUAL: same narrowing as the two arms above; exercised for reader 3 via its own RR29 fixture (fix round 6 Z14)
                 return f"anticipation record attacks[{key!r}] has no valid `hash` (esc-lead-gate-R12)"
             pair = (command, recorded_hash)
             if pair in seen_pairs:  # R12-RESIDUAL: reader 1's real per-file loop already threads its OWN `seen_pairs` across `by_file` (`_r12_validate_and_run_entry`'s identical check fires first there); this arm fires only when a pair repeats via a key OUTSIDE `by_file`, exercised by check_rigor_record.py's own RR23 fixture (reader 3 has no `by_file` restriction at all), invisible to this sweep
@@ -2944,8 +2932,20 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
     # esc-lead-gate-R12 fix round 3 item 8a — UNIVERSAL, never scoped to
     # only R12-anticipation-covered units: the relay's own `gates` object
     # must name every committed `ci/lead-gate-required-commands.txt` line
-    # with `rc == 0` at fix_head.
-    gates_post_why = _r12_gates_shape_rejection("relay", data.get("gates"), _r12_required_commands(),
+    # with `rc == 0` at fix_head. Fix round 6 Z13: this MUST go through the
+    # same `_r12_required_commands_or_deny()` reader 1 already uses, never
+    # the collapsing `_r12_required_commands()` accessor (`[]` on a
+    # missing/empty/all-comment file) — that collapse fed straight into
+    # `_r12_gates_shape_rejection`'s own `if not required_commands: return
+    # None` early-out, so a relay with NO `gates` object at all was
+    # ALLOWED the instant the committed required-commands file vanished or
+    # was emptied, even though the identical relay DENIES with the file
+    # present. A missing/empty/all-comment file is a hard DENY for every
+    # relay here too, `gates` or not.
+    required_commands, required_commands_deny_reason = _r12_required_commands_or_deny()
+    if required_commands_deny_reason is not None:
+        return required_commands_deny_reason
+    gates_post_why = _r12_gates_shape_rejection("relay", data.get("gates"), required_commands,
                                                  judge_rc=True)
     if gates_post_why is not None:
         return gates_post_why
@@ -3535,7 +3535,18 @@ def cmd_export_anticipation(argv: list[str]) -> int:
     `check_rigor_record.py`'s governing-row selection be ORDER-INDEPENDENT
     (select by `head_sha` match, else by the greatest `ts`) instead of by
     append/sort position, which the artifact's OWN filename (a content
-    hash, not a timestamp) cannot support."""
+    hash, not a timestamp) cannot support.
+
+    Fix round 6 Z12: this command writes TWO files, never one. stdout (the
+    operator redirects it into `docs/rigor/<slug>.anticipation.jsonl`)
+    carries ONLY `lead-anticipation` rows. Any relay's non-empty
+    `mutations`/`exclusions` — the lead's own attestations — are written
+    DIRECTLY, by this command, to `docs/rigor/<slug>.attestation.jsonl`
+    (`agent_type: "lead-relay-attestation"`, also no `verdict` key), never
+    interleaved into the anticipation stream: two distinct row kinds
+    committed as one file let an attestation row become the anticipation
+    stream's own "governing" row, hiding a real `gates` object entirely —
+    the bug `check_rigor_record.py`'s reader 3 now REFUSES on sight."""
     if len(argv) < 3 or not argv[2].strip():
         sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-anticipation <unit_slug>\n")
         return 2
@@ -3568,18 +3579,29 @@ def cmd_export_anticipation(argv: list[str]) -> int:
             sys.stdout.write("\n")
             n += 1
 
-    # Fix round 5 Z8: `mutations`/`exclusions` are the lead's OWN
-    # attestations, written into the (gitignored, CI-invisible) RELAY
-    # artifact — `.claude/hooks/README.md`/`lead.md`'s own "the control is
-    # the human at merge, reading the exported record" sentence was false
-    # until this export actually carried them anywhere a human reviewing a
-    # diff could see them. Every `<slug>.relay.*.json` that carries a
-    # non-empty `mutations` or `exclusions` field is exported too — a
-    # SEPARATE sentinel `agent_type` (never `lead-anticipation`, so
-    # reader 3's own selection logic above is untouched), DELIBERATELY NO
-    # `verdict` key for the same closed-world-lattice reason as above.
+    # Fix round 5 Z8 / fix round 6 Z12: `mutations`/`exclusions` are the
+    # lead's OWN attestations, written into the (gitignored, CI-invisible)
+    # RELAY artifact — `.claude/hooks/README.md`/`lead.md`'s own "the
+    # control is the human at merge, reading the exported record" sentence
+    # was false until this export actually carried them anywhere a human
+    # reviewing a diff could see them. Every `<slug>.relay.*.json` that
+    # carries a non-empty `mutations` or `exclusions` field is exported —
+    # but Z12 (closing audit #4) found that dumping these `lead-relay-
+    # attestation` rows into the SAME STDOUT STREAM the operator redirects
+    # into `docs/rigor/<slug>.anticipation.jsonl` put TWO ROW KINDS in ONE
+    # committed file: neither reader-3 site filtered by `agent_type`, so an
+    # attestation row (no `residual_risk`, no `gates`) could become the
+    # governing row `check_required_gates` selects, or deny `check_
+    # anticipation_witnesses` outright. PROPERTY (Z12): every committed
+    # rigor stream carries exactly ONE row kind. Attestation rows are
+    # therefore written to their OWN committed stream, `docs/rigor/<slug>.
+    # attestation.jsonl` — a SEPARATE FILE, written directly here (never via
+    # stdout, since one redirect cannot populate two distinct committed
+    # artifacts) — DELIBERATELY NO `verdict` key for the same closed-world-
+    # lattice reason as above.
     m = 0
     relay_prefix = f"{slug}.relay."
+    attestation_rows: list[dict] = []
     if sdir.exists():
         for entry in sorted(sdir.iterdir()):
             if not (entry.name.startswith(relay_prefix) and entry.name.endswith(".json")):
@@ -3615,11 +3637,16 @@ def cmd_export_anticipation(argv: list[str]) -> int:
             fix_head = data.get("fix_head")
             if isinstance(fix_head, str) and fix_head:
                 row["head_sha"] = fix_head
-            sys.stdout.write(json.dumps(row, sort_keys=True))
-            sys.stdout.write("\n")
+            attestation_rows.append(row)
             m += 1
-    sys.stderr.write(f"lead-gate-lib: exported {n} anticipation row(s) and {m} relay-attestation "
-                      f"row(s) for {slug!r}\n")
+    attestation_path = repo_root() / "docs" / "rigor" / f"{slug}.attestation.jsonl"
+    if attestation_rows:
+        attestation_path.parent.mkdir(parents=True, exist_ok=True)
+        attestation_path.write_text(
+            "".join(json.dumps(r, sort_keys=True) + "\n" for r in attestation_rows))
+    sys.stderr.write(
+        f"lead-gate-lib: exported {n} anticipation row(s) to stdout and {m} relay-attestation "
+        f"row(s) to {attestation_path} for {slug!r}\n")
     return 0
 
 

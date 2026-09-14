@@ -350,6 +350,42 @@ def _r12_second_round_block_rows(mod, rows: list[dict]) -> list[dict]:
     return out
 
 
+def _r12_reject_foreign_anticipation_rows(path: str, rows: list[tuple[int, dict]],
+                                           result: Result) -> list[tuple[int, dict]]:
+    """esc-lead-gate-R12 fix round 6 Z12: PROPERTY — a committed
+    `docs/rigor/<slug>.anticipation.jsonl` carries EXACTLY ONE row kind,
+    `agent_type == "lead-anticipation"`. Since fix round 5 Z8,
+    `cmd_export_anticipation` also emitted the lead's OWN mutations/
+    exclusions attestations (`agent_type == "lead-relay-attestation"`) —
+    and, until fix round 6, into this SAME stdout stream the operator
+    redirects into this SAME file. Neither reader-3 call site filtered by
+    `agent_type`: an attestation row (no `residual_risk`, no `gates`)
+    could become the "governing" row `check_required_gates` selects
+    (hiding a real `gates` object behind "no `gates` object"), or simply
+    deny `check_anticipation_witnesses` outright ("no non-empty
+    `residual_risk`"). Since fix round 6, attestation rows export to
+    their OWN stream (`<slug>.attestation.jsonl`) — so any row of a
+    different kind found HERE is a foreign row: a stale pre-fix-round-6
+    export still committed, or a hand-edit. This function REFUSES it with
+    a loud, NAMED FAIL — never silently ignores it (which would let a
+    tampered/legacy row go undetected) and never silently SELECTS it (the
+    fix round 5/6 bug this replaces) — and returns only the rows that
+    pass the filter for the caller's own downstream checks."""
+    kept: list[tuple[int, dict]] = []
+    for lineno, row in rows:
+        agent_type = row.get("agent_type")
+        if agent_type != "lead-anticipation":
+            result.fail(
+                f"{path}:{lineno}: row carries agent_type={agent_type!r}, not "
+                "`lead-anticipation` -- a foreign row (e.g. a `lead-relay-attestation` row, "
+                "which exports to its own `<slug>.attestation.jsonl` stream) does not belong "
+                "in the anticipation stream; it is REFUSED here, never ignored and never "
+                "selected as governing (esc-lead-gate-R12 fix round 6 Z12)")
+            continue
+        kept.append((lineno, row))
+    return kept
+
+
 def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], result: Result) -> None:
     """esc-lead-gate-R12 READER 3 (fix round 1, M3'): a committed-record
     SHAPE check, HARD-FAILED on shape alone. ARMED whenever the exported
@@ -419,6 +455,12 @@ def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], re
             continue
         art_rows.append((i + 1, parsed))
 
+    # esc-lead-gate-R12 fix round 6 Z12: PROPERTY -- this stream carries
+    # exactly ONE row kind (`agent_type == "lead-anticipation"`). A
+    # foreign row is REFUSED here, loudly and by name, never ignored and
+    # never selected.
+    art_rows = _r12_reject_foreign_anticipation_rows(path, art_rows, result)
+
     if not art_rows:
         result.fail(f"{path}: carries no parseable anticipation row")
         return
@@ -440,18 +482,28 @@ def check_anticipation_witnesses(cwd: Path, unit_slug: str, rows: list[dict], re
                 result.warn(f"{path}:{lineno}: pre_fix_sha {pre_fix_sha} does not resolve in this "
                             "checkout (advisory — a shallow clone or an amend can cause this; "
                             "re-execution below is reported not_re_executed)")
+        # Fix round 6 Z14: `entry` shape (an object, a non-empty `command`,
+        # a valid 64-hex `hash`) is NEVER re-checked here — that is
+        # EXACTLY the shared validator's own job (`_r12_anticipation_
+        # rejection`, called once below over the whole `art_rows` union),
+        # and a second, independently maintained copy of those three checks
+        # is precisely how this file's own earlier drift went uncaught: a
+        # hand-rolled duplicate that happens to agree with the shared
+        # function is not a second examination, and neutering the SHARED
+        # arm at that point killed nothing because THIS loop's own copy
+        # had already produced the identical `result.fail` first, on every
+        # input. `_r12_attack_command_denied` (the denylist re-check) is
+        # the ONE thing this loop still does that the shared validator
+        # does not — it needs a real, dict-shaped entry with a real string
+        # `command` to run at all, so it silently skips a malformed entry
+        # here (the shared call below is what NAMES the malformed shape).
         for file_key, entry in attacks.items():
             covered_files.add(file_key)
             if not isinstance(entry, dict):
-                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] is not an object")
                 continue
             command = entry.get("command")
-            recorded_hash = entry.get("hash")
-            if not isinstance(command, str) or not command.strip():
-                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] has no `command`")
+            if not (isinstance(command, str) and command.strip()):
                 continue
-            if not (isinstance(recorded_hash, str) and re.fullmatch(r"[0-9a-f]{64}", recorded_hash)):
-                result.fail(f"{path}:{lineno}: attacks[{file_key!r}] has no valid `hash`")
             deny = mod._r12_attack_command_denied(
                 command, str(cwd),
                 require_tracked_at=pre_fix_sha if sha_resolvable else None,
@@ -621,9 +673,11 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
         # ADVISORY.
         check_anticipation_witnesses(cwd, unit_slug, [r for r in rows if isinstance(r, dict)], result)
 
-        # esc-lead-gate-R12 fix round 3 item 8a READER 3 — armed only when
-        # ci/lead-gate-required-commands.txt is itself committed at HEAD;
-        # shape+value only, never re-executed.
+        # esc-lead-gate-R12 fix round 3 item 8a READER 3 — armed
+        # UNCONDITIONALLY (fix round 5 Z4 made a missing/empty/all-comment
+        # `ci/lead-gate-required-commands.txt` a hard FAIL here, never a
+        # silent skip when it is absent); shape+value only, never
+        # re-executed.
         check_required_gates(cwd, unit_slug, result)
 
     contract_paths = [p for p in changed if _matches_contract_glob(p)]
@@ -714,8 +768,8 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         # already fails the missing-record shape when IT is armed (an open
         # second-round BLOCK), which is the only case that requires one.
         return
-    rows: list[dict] = []
-    for line in text.splitlines():
+    raw_rows: list[tuple[int, dict]] = []
+    for i, line in enumerate(text.splitlines()):
         if not line.strip():
             continue
         try:
@@ -723,7 +777,16 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
-            rows.append(parsed)
+            raw_rows.append((i + 1, parsed))
+    if not raw_rows:
+        return
+
+    # esc-lead-gate-R12 fix round 6 Z12: same property as `check_
+    # anticipation_witnesses` — reject (never silently select) a foreign
+    # row BEFORE it can become "the governing row", which is exactly how a
+    # `lead-relay-attestation` row (no `gates` object at all) used to hide
+    # the real one.
+    rows = [r for _, r in _r12_reject_foreign_anticipation_rows(path, raw_rows, result)]
     if not rows:
         return
 
@@ -749,7 +812,23 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
             "every row since fix round 5) and commit the result (esc-lead-gate-R12 fix round 5 Z5)"
         )
         return
-    governing = max(pool, key=_row_ts)
+
+    # Fix round 6 Z15: an EQUAL greatest `ts` across >=2 pool rows used to
+    # resolve by append position (`max()` returns the FIRST maximal
+    # element) — an executed probe found two rows with identical `ts`, the
+    # `rc=0` row first, silently governed and shadowed a genuinely
+    # `rc=1` sibling. A tie is exactly as AMBIGUOUS as a missing `ts`.
+    max_ts = max(_row_ts(r) for r in pool)
+    tied = [r for r in pool if _row_ts(r) == max_ts]
+    if len(tied) >= 2:
+        result.fail(
+            f"{path}: {len(tied)} candidate anticipation row(s) share the SAME greatest `ts` "
+            f"({max_ts!r}) -- the GOVERNING row is AMBIGUOUS on a tie, exactly as it is when "
+            "`ts` is missing entirely; re-export so each round's row carries a distinguishing "
+            "`ts` (esc-lead-gate-R12 fix round 6 Z15)"
+        )
+        return
+    governing = tied[0]
 
     mod = _lib_module()
     gates_why = mod._r12_gates_shape_rejection(f"{path}: the governing row", governing.get("gates"),
@@ -1262,7 +1341,7 @@ def fixture_rr12c_shape_allows_despite_unresolvable_pre_fix_sha() -> None:
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
             "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": witness}},
             "residual_risk": "fixture residual",
             "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
@@ -1295,7 +1374,7 @@ def fixture_rr12d_real_reproducing_witness_allows() -> None:
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha, "agent_type": "lead-anticipation",
             "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": witness}},
             "residual_risk": "fixture residual",
             "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
@@ -1328,7 +1407,7 @@ def fixture_rr12e_real_nonreproducing_witness_warns_never_fails() -> None:
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha, "agent_type": "lead-anticipation",
             "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "0" * 64}},
             "residual_risk": "fixture residual",
             "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
@@ -1388,7 +1467,7 @@ def fixture_rr12g_tracked_bash_path_allows() -> None:
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha, "agent_type": "lead-anticipation",
             "attacks": {"a.py": {"command": "bash probe.sh", "hash": witness}},
             "residual_risk": "fixture residual",
             "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
@@ -1419,7 +1498,7 @@ def fixture_rr12h_untracked_bash_path_fails_shape() -> None:
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
         anticipation_row = json.dumps({
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha,
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": pre_fix_sha, "agent_type": "lead-anticipation",
             "attacks": {"a.py": {"command": "bash probe.sh", "hash": "a" * 64}},
             "residual_risk": "fixture residual",
             "gates": {_RR_BASELINE_REQUIRED_COMMAND: {"rc": 0}},
@@ -1494,7 +1573,7 @@ def _rr_gates_commit(work: Path, extra_files: dict[str, str], gates: dict | None
                              "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                              "class_enumeration": ["a.py:1"]})
     art: dict = {
-        "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+        "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
         "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
         "residual_risk": "fixture residual",
     }
@@ -1549,14 +1628,27 @@ def fixture_rr16_nonzero_rc_fails() -> None:
 
 
 def _real_anticipation_export(work: Path, slug: str, artifacts: list[dict],
-                               mtimes: list[float]) -> str:
+                               mtimes: list[float],
+                               relay_artifacts: list[dict] | None = None) -> str:
     """Fix round 5 Z5: runs the REAL `lead-gate-lib.py --export-anticipation`
     entry point (a subprocess, `CLAUDE_PROJECT_DIR=work` — the exact
     command the lead runs) against real `.jammi/gate-state/<slug>.
     anticipation.<tip>.json` artifact files, one per `artifacts[i]`, whose
     mtime is set to `mtimes[i]` — proving the fixture exercises the
     EXPORTED shape (real `ts`/`head_sha` stamped from the artifact file's
-    own mtime/`pre_fix_sha`), never a hand-typed simulation of it."""
+    own mtime/`pre_fix_sha`), never a hand-typed simulation of it.
+
+    Fix round 6 Z12: `relay_artifacts` (each a full relay-shaped dict
+    carrying `agent_type`/`block_ts`/`fix_head` and a non-empty
+    `mutations`/`exclusions`) are ALSO written to real
+    `.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json` files,
+    at the SAME path shape `relay_artifact_path` itself uses (loaded from
+    `work`'s own copy of the real module), before the real export runs —
+    so a fixture can exercise the exporter's real TWO-STREAM split
+    (this function still returns only stdout, the anticipation stream;
+    the attestation stream it writes DIRECTLY to `docs/rigor/<slug>.
+    attestation.jsonl` under `work`, which the caller reads itself) rather
+    than a hand-typed simulation of the mixed shape."""
     sdir = work / ".jammi" / "gate-state"
     sdir.mkdir(parents=True, exist_ok=True)
     for art, mtime in zip(artifacts, mtimes):
@@ -1564,6 +1656,12 @@ def _real_anticipation_export(work: Path, slug: str, artifacts: list[dict],
         p = sdir / f"{slug}.anticipation.{tip}.json"
         p.write_text(json.dumps(art))
         os.utime(p, (mtime, mtime))
+    if relay_artifacts:
+        mod = _lib_module()
+        for relay in relay_artifacts:
+            p = mod.relay_artifact_path(sdir, slug, relay.get("agent_type", "adversarial-audit"),
+                                         relay.get("block_ts", "2026-01-01T00:00:00Z"))
+            p.write_text(json.dumps(relay))
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(work)
     proc = subprocess.run(
@@ -1638,11 +1736,11 @@ def fixture_rr18_ambiguous_pool_without_ts_fails_loudly() -> None:
         block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                                  "class_enumeration": ["a.py:1"]})
-        row_a = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+        row_a = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
                  "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
                  "residual_risk": "fixture residual",
                  "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
-        row_b = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40,
+        row_b = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40, "agent_type": "lead-anticipation",
                  "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
                  "residual_risk": "fixture residual",
                  "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
@@ -1677,7 +1775,7 @@ def fixture_rr20_omits_a_required_file_fails() -> None:
                                  "verdict": "BLOCK", "finding_locations": ["a.py:1", "b.py:1"],
                                  "class_enumeration": ["a.py:1", "b.py:1"]})
         anticipation_row = json.dumps({
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
             "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
             "residual_risk": "fixture residual",
         })
@@ -1694,13 +1792,17 @@ def fixture_rr20_omits_a_required_file_fails() -> None:
 
 
 def _rr_anticipation_commit(work: Path, art: dict) -> None:
-    """Shared setup for RR21-24: one open second-round BLOCK naming a
-    single required file (`a.py`), and `art` written verbatim as the
-    anticipation record's own (only) row."""
+    """Shared setup for RR21-24/RR27-29: one open second-round BLOCK naming
+    a single required file (`a.py`), and `art` written verbatim as the
+    anticipation record's own (only) row — `agent_type` defaults to
+    `lead-anticipation` (the real exporter's own stamp, esc-lead-gate-R12
+    fix round 6 Z12) unless a caller deliberately overrides it."""
     pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
     block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                              "verdict": "BLOCK", "finding_locations": ["a.py:1"],
                              "class_enumeration": ["a.py:1"]})
+    art = dict(art)
+    art.setdefault("agent_type", "lead-anticipation")
     _commit(work, "ci: touch a gate script", {
         "ci/scripts/probe.py": "print('x')\n",
         "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
@@ -1772,6 +1874,186 @@ def fixture_rr24_inspector_only_fails() -> None:
         _assert(any("inspector-class" in f for f in r.failures), "RR24", f"{r.failures}")
 
 
+def fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only() -> None:
+    """esc-lead-gate-R12 fix round 6 Z12: the production-shaped case — ONE
+    real anticipation artifact and ONE real relay artifact carrying
+    non-empty `mutations`/`exclusions`, both on disk, exported through the
+    REAL `--export-anticipation` entry point (`_real_anticipation_export`'s
+    relay-artifact arm). RED at 3273f51b: the pre-fix exporter interleaved
+    BOTH row kinds into the SAME stdout stream this fixture redirects into
+    `docs/rigor/<slug>.anticipation.jsonl` — the attestation row's own
+    missing `residual_risk` denied `check_anticipation_witnesses`
+    ("no non-empty `residual_risk`"), and its greatest-`ts` position could
+    govern `check_required_gates`, hiding the real `gates` object entirely
+    ("the governing row carries no `gates` object"). GREEN after the fix:
+    the exporter SPLITS the two row kinds into two files — the
+    anticipation stream carries ONLY the `lead-anticipation` row, reader 3
+    ALLOWS, and `docs/rigor/<slug>.attestation.jsonl` exists on disk with
+    the relay's own `mutations`/`exclusions` verbatim."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        art = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+               "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+               "residual_risk": "fixture residual",
+               "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+        relay = {"agent_type": "adversarial-audit", "block_ts": "2026-01-01T00:01:00Z",
+                 "unit_branch": "feat/rr-fixture", "fix_head": "f" * 40,
+                 "mutations": [{"site": "bar.py:4", "command": "true", "rc_before": 0,
+                                 "rc_after": 1, "marker_after": "test result: FAILED"}],
+                 "exclusions": {"tests/test_z.py::test_new": "does not cover X"}}
+        now = time.time()
+        exported = _real_anticipation_export(work, "feat_rr-fixture", [art], [now], relay_artifacts=[relay])
+        files = {
+            "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": exported,
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        }
+        _commit(work, "ci: touch a gate script (mixed anticipation + attestation, real export)", files)
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR25", f"reader 3 must select the anticipation row only and ALLOW: {r.failures}")
+        exported_rows = [json.loads(line) for line in exported.splitlines() if line.strip()]
+        _assert(bool(exported_rows) and all(row.get("agent_type") == "lead-anticipation" for row in exported_rows),
+                "RR25", f"the anticipation stdout stream must carry ONLY lead-anticipation rows: {exported_rows}")
+        attestation_path = work / "docs" / "rigor" / "feat_rr-fixture.attestation.jsonl"
+        _assert(attestation_path.exists(), "RR25",
+                f"the exporter must write a SEPARATE {attestation_path} for the relay's own attestation")
+        attestation_rows = [json.loads(line) for line in attestation_path.read_text().splitlines() if line.strip()]
+        _assert(len(attestation_rows) == 1, "RR25", f"expected exactly 1 attestation row: {attestation_rows}")
+        _assert(attestation_rows[0].get("agent_type") == "lead-relay-attestation", "RR25", f"{attestation_rows[0]}")
+        _assert(attestation_rows[0].get("mutations") == relay["mutations"], "RR25", f"{attestation_rows[0]}")
+        _assert(attestation_rows[0].get("exclusions") == relay["exclusions"], "RR25", f"{attestation_rows[0]}")
+
+
+def fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly() -> None:
+    """esc-lead-gate-R12 fix round 6 Z12: a HAND-PLANTED foreign row — the
+    shape a stale pre-fix-round-6 export or a hand-edit could still commit
+    — sitting in the anticipation stream ALONGSIDE a real anticipation
+    row. Reader 3 must NAME it and FAIL, never silently ignore it (which
+    would leave a tampered/legacy row undetected) and never silently
+    SELECT it (the RED-time bug RR25 exercises via the real export path)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+        block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                                 "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                                 "class_enumeration": ["a.py:1"]})
+        anticipation_row = json.dumps({
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+            "gates": {"python3 ci/scripts/probe.py": {"rc": 0}},
+            "ts": "2026-01-01T00:02:00Z", "head_sha": "d" * 40,
+        })
+        foreign_row = json.dumps({
+            "agent_type": "lead-relay-attestation", "unit_branch": "feat/rr-fixture",
+            "mutations": [{"site": "bar.py:4", "command": "true", "rc_before": 0,
+                            "rc_after": 1, "marker_after": "test result: FAILED"}],
+            "ts": "2026-01-01T00:03:00Z", "head_sha": "d" * 40,
+        })
+        _commit(work, "ci: touch a gate script (hand-planted foreign row)", {
+            "ci/scripts/probe.py": "print('x')\n",
+            "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+            "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+            "docs/rigor/feat_rr-fixture.anticipation.jsonl": anticipation_row + "\n" + foreign_row + "\n",
+            "docs/README-fixture.md": "line one\n",
+            "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR26", "a foreign row in the anticipation stream must FAIL")
+        _assert(any("lead-relay-attestation" in f and "not `lead-anticipation`" in f for f in r.failures),
+                "RR26", f"{r.failures}")
+
+
+def fixture_rr27_attacks_entry_not_object_fails() -> None:
+    """fix round 6 Z14: `attacks["a.py"]` is a STRING, not an object — the
+    shared validator's own arm, now the ONLY implementation of this check
+    since Z14 deleted reader 3's inline duplicate (which used to catch
+    this first and shadow the shared arm from ever being reached)."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": "not-an-object"},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR27", "a non-object attacks entry must FAIL")
+        _assert(any("is not an object" in f for f in r.failures), "RR27", f"{r.failures}")
+
+
+def fixture_rr28_attacks_entry_no_command_fails() -> None:
+    """fix round 6 Z14: `attacks["a.py"]` carries no `command` at all —
+    same shared arm, same replaced duplicate."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"hash": "a" * 64}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR28", "an attacks entry with no `command` must FAIL")
+        _assert(any("has no `command`" in f for f in r.failures), "RR28", f"{r.failures}")
+
+
+def fixture_rr29_attacks_entry_invalid_hash_fails() -> None:
+    """fix round 6 Z14: `attacks["a.py"]["hash"]` is not a valid 64-hex
+    digest — same shared arm, same replaced duplicate."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_anticipation_commit(work, {
+            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "not-a-valid-hash"}},
+            "residual_risk": "fixture residual",
+        })
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR29", "an attacks entry with an invalid `hash` must FAIL")
+        _assert(any("has no valid `hash`" in f for f in r.failures), "RR29", f"{r.failures}")
+
+
+def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
+    """fix round 6 Z15: TWO candidate rows share the IDENTICAL greatest
+    `ts` — an executed probe found `max(pool, key=_row_ts)` resolves a tie
+    by APPEND POSITION (the FIRST maximal element), so an `rc=0` row
+    listed first silently governed and shadowed a genuinely `rc=1`
+    sibling recorded at the exact same instant. A tie is exactly as
+    AMBIGUOUS as a missing `ts` and must FAIL the same way, in BOTH
+    orders."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    row_ok = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40, "agent_type": "lead-anticipation",
+              "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+              "residual_risk": "fixture residual", "ts": "2026-01-01T00:02:00Z", "head_sha": "0" * 40,
+              "gates": {"python3 ci/scripts/probe.py": {"rc": 0}}}
+    row_broken = {"unit_branch": "feat/rr-fixture", "pre_fix_sha": "f" * 40, "agent_type": "lead-anticipation",
+                  "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
+                  "residual_risk": "fixture residual", "ts": "2026-01-01T00:02:00Z", "head_sha": "f" * 40,
+                  "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
+    for order_name, ordered in (("ok-first", [row_ok, row_broken]), ("broken-first", [row_broken, row_ok])):
+        with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+            _origin, work = _pr_repo(Path(td))
+            _commit(work, f"ci: touch a gate script (tied ts, {order_name})", {
+                "ci/scripts/probe.py": "print('x')\n",
+                "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+                "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+                "docs/rigor/feat_rr-fixture.anticipation.jsonl":
+                    "\n".join(json.dumps(r) for r in ordered) + "\n",
+                "docs/README-fixture.md": "line one\n",
+                "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+            })
+            r = _run_check_in(work)
+            _assert(not r.ok(), "RR30", f"a tied greatest-ts pool ({order_name}) must FAIL loudly")
+            _assert(any("AMBIGUOUS" in f and "tie" in f for f in r.failures), "RR30", f"{order_name}: {r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -1804,6 +2086,12 @@ RR_FIXTURES = [
     ("RR16", fixture_rr16_nonzero_rc_fails),
     ("RR17", fixture_rr17_interleaved_export_selects_by_ts_not_position),
     ("RR18", fixture_rr18_ambiguous_pool_without_ts_fails_loudly),
+    ("RR25", fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only),
+    ("RR26", fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly),
+    ("RR27", fixture_rr27_attacks_entry_not_object_fails),
+    ("RR28", fixture_rr28_attacks_entry_no_command_fails),
+    ("RR29", fixture_rr29_attacks_entry_invalid_hash_fails),
+    ("RR30", fixture_rr30_tied_ts_governing_row_fails_loudly),
 ]
 
 

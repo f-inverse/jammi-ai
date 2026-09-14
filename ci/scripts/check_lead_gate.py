@@ -3919,7 +3919,7 @@ _R12_SWEEP_FUNCS = {
     "_r12_required_by_file", "_r12_changed_file_set", "_r12_validate_and_run_entry",
     "_r12_empty_set_rejection", "_pre_fix_anticipation_rejection",
     "_post_fix_attacks_rejection", "_r12_find_pre_fix_artifact",
-    "_r12_required_commands_path", "_r12_required_commands_or_deny", "_r12_required_commands",
+    "_r12_required_commands_path", "_r12_required_commands_or_deny",
     "_r12_gates_shape_rejection", "_r12_anticipation_rejection",
     "_mutations_rejection", "_r12_new_test_surfaces", "_r12_previous_relay_row",
     "_exclusions_rejection",
@@ -4303,6 +4303,80 @@ def fixture_r12reqempty_allcomment_required_commands_file_denies() -> None:
     p = _r12_dispatch(root, unit)
     _assert(p.returncode == 2, "R12reqempty", f"an all-comment required-commands file must deny, got {p.returncode}: {p.stderr}")
     _assert("names no command line" in p.stderr, "R12reqempty", p.stderr)
+
+
+def fixture_r12reqmiss2_relay_missing_required_commands_file_denies() -> None:
+    """fix round 6 Z13 (Z4's other half, closing audit #4): R12reqmiss
+    exercises READER 1 (the pre-fix dispatch); this fixture exercises
+    READER 2 (the relay/re-audit path), which used to call the
+    COLLAPSING `_r12_required_commands()` accessor (`[]` on a missing
+    file) and fed that straight into `_r12_gates_shape_rejection`'s own
+    `if not required_commands: return None` early-out — a relay with NO
+    `gates` object at all was ALLOWED the instant the committed required-
+    commands file was deleted, even though the IDENTICAL relay DENIES
+    (R12G3) when the file is present. RED at 3273f51b by the executed
+    probe: `p.returncode == 0` (ALLOW) with the file unlinked. GREEN after
+    migrating reader 2 to `_r12_required_commands_or_deny()`, matching
+    reader 1's own posture: a missing file denies EVERY relay, `gates` or
+    not."""
+    unit = "feat/r12reqmiss2"
+    root = _temp_repo(unit)
+    (root / "ci" / "lead-gate-required-commands.txt").unlink()
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "remove required-commands file")
+    (root / "state.txt").write_text("BROKEN\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed state.txt = BROKEN/v1")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["state.txt:1"], ["state.txt:1"])
+    cmd = "head -1 state.txt"
+    pre_hash = _r12_hash(0, "BROKEN\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"state.txt": {"command": cmd, "hash": pre_hash}})
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}},
+                        override={"gates": None})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12reqmiss2",
+            f"a relay must deny when the required-commands file is missing, got {p.returncode}: {p.stderr}")
+    _assert("does not exist" in p.stderr, "R12reqmiss2", p.stderr)
+
+
+def fixture_r12reqempty2_relay_allcomment_required_commands_file_denies() -> None:
+    """fix round 6 Z13: the SAME reader-2 migration, the all-comment case.
+    RED at 3273f51b by the executed probe: `p.returncode == 0` (ALLOW)
+    with the file emptied to all-comment."""
+    unit = "feat/r12reqempty2"
+    root = _temp_repo(unit)
+    (root / "ci" / "lead-gate-required-commands.txt").write_text("# nothing but comments\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "empty out the required-commands file")
+    (root / "state.txt").write_text("BROKEN\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed state.txt = BROKEN/v1")
+    row = _write_block_row(root, unit, "a1", "adversarial-audit", ["state.txt:1"], ["state.txt:1"])
+    cmd = "head -1 state.txt"
+    pre_hash = _r12_hash(0, "BROKEN\n", "")
+    _write_anticipation_exact(root, unit, row["head_sha"], {"state.txt": {"command": cmd, "hash": pre_hash}})
+    (root / "state.txt").write_text("FIXED\nv1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix: state.txt line 1 = FIXED")
+    fix_head = _git(root, "rev-parse", "HEAD")
+    post_hash = _r12_hash(0, "FIXED\n", "")
+    _write_relay_exact(root, row, sites={"state.txt:1": "fixed"}, probe=["c.py:9", "state.txt"],
+                        fix_head=fix_head,
+                        attacks_post={"state.txt": {"command": cmd, "hash": post_hash}},
+                        override={"gates": None})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {unit}"}}, root)
+    _assert(p.returncode == 2, "R12reqempty2",
+            f"a relay must deny when the required-commands file is all-comment, got {p.returncode}: {p.stderr}")
+    _assert("names no command line" in p.stderr, "R12reqempty2", p.stderr)
 
 
 def fixture_r12norm2_cargo_timing_normalized() -> None:
@@ -4969,7 +5043,15 @@ def fixture_r12x8_export_carries_relay_mutations_and_exclusions() -> None:
     attestations, and `.claude/hooks/README.md`/`lead.md`'s own claim
     ("the human reads them in the exported record") was false until this
     export actually carried them anywhere a human reviewing a committed
-    diff could see them."""
+    diff could see them.
+
+    Fix round 6 Z12: this row is written to its OWN committed stream,
+    `docs/rigor/<slug>.attestation.jsonl` -- NEVER interleaved into
+    stdout (the anticipation stream), which is what let an attestation
+    row become the "governing" row `check_rigor_record.py`'s reader 3
+    could select, hiding a real `gates` object. Asserts BOTH shapes: the
+    stdout anticipation stream carries no attestation row at all, and the
+    attestation FILE carries exactly the one this relay produced."""
     unit = "feat/r12x8"
     root, row, fix_head = _r12_mutations_setup(unit)
     mutation_rows = [{"site": "bar.py:4", "command": "true", "rc_before": 0, "rc_after": 1,
@@ -4990,9 +5072,15 @@ def fixture_r12x8_export_carries_relay_mutations_and_exclusions() -> None:
     )
     _assert(proc.returncode == 0, "R12X8", f"--export-anticipation must exit 0: {proc.stderr}")
     exported_rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
-    attestations = [r for r in exported_rows if r.get("agent_type") == "lead-relay-attestation"]
+    _assert(all(r.get("agent_type") == "lead-anticipation" for r in exported_rows), "R12X8",
+            f"the anticipation stdout stream must carry NO lead-relay-attestation row: {exported_rows}")
+    attestation_path = root / "docs" / "rigor" / f"{_slug(unit)}.attestation.jsonl"
+    _assert(attestation_path.exists(), "R12X8",
+            f"expected a SEPARATE {attestation_path} for the relay's own attestation")
+    attestations = [json.loads(line) for line in attestation_path.read_text().splitlines() if line.strip()]
     _assert(len(attestations) == 1, "R12X8",
-            f"expected exactly 1 lead-relay-attestation row, got {len(attestations)}: {exported_rows}")
+            f"expected exactly 1 lead-relay-attestation row, got {len(attestations)}: {attestations}")
+    _assert(attestations[0].get("agent_type") == "lead-relay-attestation", "R12X8", f"{attestations[0]}")
     _assert(attestations[0].get("mutations") == mutation_rows, "R12X8",
             f"exported row must carry the relay's own `mutations` verbatim: {attestations[0]}")
     _assert(attestations[0].get("exclusions") == {"tests/test_z.py::test_new": "does not cover X"}, "R12X8",
@@ -5131,6 +5219,8 @@ FIXTURES = [
     ("R12reqfile", fixture_r12reqfile_real_file_shape),
     ("R12reqmiss", fixture_r12reqmiss_missing_required_commands_file_denies),
     ("R12reqempty", fixture_r12reqempty_allcomment_required_commands_file_denies),
+    ("R12reqmiss2", fixture_r12reqmiss2_relay_missing_required_commands_file_denies),
+    ("R12reqempty2", fixture_r12reqempty2_relay_allcomment_required_commands_file_denies),
     ("R12sweepast", fixture_r12sweepast_sweep_funcs_equals_the_sentinel_region),
     ("R12norm2", fixture_r12norm2_cargo_timing_normalized),
     ("R12alarmkill", fixture_r12alarmkill_self_alarm_kills_inflight_attack_process_group),

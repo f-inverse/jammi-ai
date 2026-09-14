@@ -468,6 +468,42 @@ async fn fine_tune_graph_end_to_end_completes() {
         adapter.exists(),
         "graph fine-tune should publish an adapter, missing at {adapter:?}"
     );
+
+    // P3 (the graph-arm excision): this fixture's `reconstruct_graph_loader`
+    // is `origin/main` (fe5ac560)'s text, restored rather than re-derived, so
+    // it must produce `origin/main`'s BYTES too — not just its source.
+    // Measured, not assumed: this fixture's OWN body is byte-identical to
+    // `origin/main`'s (the `fingerprint()` helper and this `assert_eq!` are
+    // this pin's own additions, grafted onto that body to read the value
+    // out), and the value below is derived from code identity over the whole
+    // producing path — `reconstruct_graph_loader`, `run_spec`'s
+    // `GraphFineTune` arm, `graph_sampler.rs`, `trainer.rs`, `model/**`,
+    // `session.rs`, and `fine_tune/data.rs::TrainingFormat::from_graph` (the
+    // graph arm's sole entry point into that file; the rest of the file
+    // carries the tabular arm's own, unrelated additions) are byte-identical
+    // to `fe5ac560` — not by re-running an unmodified test on a separate
+    // checkout.
+    assert_eq!(
+        fingerprint(&std::fs::read(&adapter).unwrap()),
+        "1184:8f34fc6e6f33abea",
+        "the graph fine-tune adapter's bytes moved off origin/main's (fe5ac560) value for this \
+         exact fixture — the excised graph arm is restored main's code producing main's bytes; a \
+         mismatch here means either this fixture or the sampler/trainer changed"
+    );
+}
+
+/// FNV-1a over a byte slice, as `{len}:{hash:016x}` — the same algorithm and
+/// format `training_set::refactor_parity` uses, kept local here rather than
+/// shared: this integration-test binary has no dev-dependency on `sha2`, and
+/// `DefaultHasher` is explicitly not stable across toolchains, so neither can
+/// back a byte fingerprint pinned in source.
+fn fingerprint(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{}:{:016x}", bytes.len(), hash)
 }
 
 /// A node source with no edge source (isolated graph) is a failure end to end —

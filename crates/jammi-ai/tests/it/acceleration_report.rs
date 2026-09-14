@@ -1400,8 +1400,8 @@ fn assert_terminal_report_is_undetermined(
 ///   intended, inside `train_fine_tune`'s `model_cache().get_or_load`, AFTER
 ///   the claim and well before any probe.
 /// - **3 — loader reconstruction error.** A job whose spec names a source
-///   table this session never registered, so `read_source_columns`'s SQL
-///   fails.
+///   table this session never registered, so the training-set producer's
+///   source resolution fails.
 /// - **1/2 — no / undeserialisable `training_spec`.** Covered by
 ///   [`pre_device_resolution_failure_reports_undetermined_acceleration`]
 ///   above, which additionally pins the MORE specific

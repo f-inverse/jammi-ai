@@ -55,5 +55,6 @@ mod storage_root;
 #[cfg(feature = "telemetry-otlp")]
 mod telemetry_otlp;
 mod tower_adapters;
+mod training_set;
 mod uat_workflows;
 mod utf8view_columns;

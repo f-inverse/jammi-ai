@@ -66,3 +66,17 @@
 # mechanism on three independent grounds by the discipline auditor; see
 # issue #508 for the full ruling.
 register_content_hash_udf	crates/jammi-ai/src/query/content_hash_udf.rs	c0e1faec00a3de0d59499801755e705579dbe202	#508	Installs a Datafusion scalar UDF into the query session's function catalog so SQL statements can invoke it by name.
+#
+# `register_content_hash_udf` (second row, DIFFERENT declaring_path — rule 7
+# scopes by the exact pair) — the identifier is not a declaration here at
+# all: it is text inside a synthetic-surface fixture STRING in
+# `falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed`,
+# deliberately reproducing the real reviewed site's source text (the fn at
+# `crates/jammi-ai/src/query/content_hash_udf.rs`) so the literal-occurrence
+# gate's own falsification control has a realistic verb to find. Renaming
+# the fixture string would blunt that control. Ruled MECHANISM (no
+# consumer name, not governance) by the lead at the U2a closing audit
+# (2026-09-14, audit #8, stop rule); see issue #554 for the ruling
+# (https://github.com/f-inverse/jammi-ai/issues/554). Flagged for human
+# review at PR-B1 admin-merge, per this file's human-amend-only status.
+register_content_hash_udf	crates/jammi-ai/tests/it/pinned_source_gate.rs	6668d09bf5de82da1842297da0872fd5b1f5a8c7	#554	Appears only inside a string-literal test fixture reproducing the real registration site's source text for a falsification assertion, never as a compiled declaration in this file.

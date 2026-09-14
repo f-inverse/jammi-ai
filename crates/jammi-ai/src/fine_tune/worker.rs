@@ -97,11 +97,12 @@ use jammi_db::store::ArtifactStore;
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
-use crate::fine_tune::data::TrainingDataLoader;
+use crate::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
+use crate::fine_tune::training_set;
 use crate::fine_tune::FineTuneConfig;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
@@ -947,7 +948,7 @@ impl JobWorker {
     /// |---|---|---|
     /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
     /// | 2 | undeserialisable `training_spec` | same as 1 |
-    /// | 3 | source SQL / loader reconstruction error (`read_source_columns`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
     /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
     /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
     /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |
@@ -1824,15 +1825,36 @@ impl JobWorker {
                 common,
                 ..
             } => {
-                // Re-run the source SQL and rebuild the loader from the persisted
-                // columns — the same loader the submitting `fine_tune` built, but
-                // reconstructed on this worker with no carryover.
-                let batches = self
-                    .read_source_columns(session, &source, &columns)
-                    .await
-                    .map_err(WorkerJobError::from)?;
+                // Materialise the projected rows into an immutable
+                // `TrainingSet` result table (or reuse the one that already
+                // carries this definition), then read that table back in its
+                // committed order. The rows a run trains on are a durable,
+                // attested artifact, not this worker's private scan.
+                let detected =
+                    detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
+                let (_table, batches) = training_set::materialize_projection(
+                    session,
+                    &source,
+                    &columns,
+                    task,
+                    detected.format_tag(),
+                )
+                .await
+                .map_err(WorkerJobError::from)?;
                 let loader = build_training_data_loader(&batches, &columns, task)
                     .map_err(WorkerJobError::from)?;
+                // The tag the table was WRITTEN under and the shape its loader
+                // reports come from one classifier, so a mismatch is a broken
+                // engine invariant rather than a caller error — and it must be
+                // loud: it would mean two formats sharing one definition hash.
+                if loader.format().format_tag() != detected.format_tag() {
+                    return Err(WorkerJobError::from(JammiError::Other(format!(
+                        "training set was committed as format '{}' but its loader reports \
+                         '{}': the column classifier and the loader disagree",
+                        detected.format_tag(),
+                        loader.format().format_tag()
+                    ))));
+                }
                 let run = FineTuneRun {
                     task,
                     common,
@@ -1893,38 +1915,6 @@ impl JobWorker {
                     .map_err(|e| classify(cancel, e))
             }
         }
-    }
-
-    /// Re-run `SELECT columns FROM source` for a tabular fine-tune.
-    ///
-    /// A deterministic `ORDER BY` over the **full projected column tuple** pins
-    /// the row order. Without it, DataFusion gives no row-order guarantee
-    /// (multi-file / multi-partition scans reorder run-to-run), which would
-    /// perturb both the batching and the `TargetScaler` μ/σ reduction — breaking
-    /// bit-reproducibility. The projected columns are exactly the columns that
-    /// feed training, so the order is a *total* function of the trainable data:
-    /// the only rows that can tie are byte-identical on every selected column,
-    /// and such rows are interchangeable for both batching and the (commutative)
-    /// mean/std reduction. DataFusion may permute a tie group arbitrarily, but
-    /// that permutation cannot change any training output, so the result is a
-    /// pure function of the row multiset. (No engine-wide stable row-identity
-    /// column exists on an arbitrary registered source table, so ordering by the
-    /// projected tuple is the strongest total key available here.)
-    async fn read_source_columns(
-        &self,
-        session: &Arc<InferenceSession>,
-        source: &str,
-        columns: &[String],
-    ) -> Result<Vec<RecordBatch>> {
-        let table_name = session.find_table_name(source)?;
-        let quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
-        let select = quoted.join(", ");
-        let order_by = quoted.join(", ");
-        let query = format!(
-            "SELECT {select} FROM {} ORDER BY {order_by}",
-            source_relation(source, &table_name)
-        );
-        session.sql(&query).await
     }
 
     /// Re-read the node/edge sources and rebuild the deterministic graph sampler,
@@ -3502,11 +3492,58 @@ fn extract_numeric_column(
 /// differs, so the caller's chosen task is the discriminator, not a parallel
 /// set of column names, and not a byte-header sniff (an encoded WAV and an
 /// encoded PNG are both binary blobs).
-fn build_training_data_loader(
-    batches: &[RecordBatch],
-    columns: &[String],
-    task: ModelTask,
-) -> Result<TrainingDataLoader> {
+/// The training format a projection's COLUMN NAMES and the job's task fix,
+/// before a single row is read — everything the training-set producer must know
+/// to name the table it is about to write.
+///
+/// The data-derived parameters of [`TrainingFormat`] (`Classification`'s
+/// `num_classes`, `Ner`'s `num_labels`) are absent by construction: they are
+/// counts of what the rows turned out to contain, which is not knowable at the
+/// point the table is named, and which the canonical tag drops for exactly that
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedFormat {
+    Contrastive,
+    Pairs,
+    Triplet,
+    MediaTriplet,
+    Classification,
+    Regression,
+}
+
+impl DetectedFormat {
+    /// The canonical tag this shape records. Every arm names the
+    /// [`TrainingFormat`] variant the loader will build and reads the tag off
+    /// [`TrainingFormat::format_tag`] — the mapping lives in exactly one place,
+    /// so the tag a table is written under and the tag its loader reports can
+    /// never be spelled differently.
+    fn format_tag(self) -> &'static str {
+        match self {
+            Self::Contrastive => TrainingFormat::Contrastive.format_tag(),
+            Self::Pairs => TrainingFormat::Pairs.format_tag(),
+            Self::Triplet => TrainingFormat::Triplet.format_tag(),
+            Self::MediaTriplet => TrainingFormat::MediaTriplet.format_tag(),
+            // `num_classes` is a function of the rows and the tag discards it
+            // (see `format_tag`), so every value names the same tag; the zero
+            // is a neutral placeholder that never leaves this expression.
+            Self::Classification => TrainingFormat::Classification { num_classes: 0 }.format_tag(),
+            Self::Regression => TrainingFormat::Regression.format_tag(),
+        }
+    }
+}
+
+/// Detect the training format from the projected column names and the job's
+/// task — the SINGLE classifier, shared by the producer (which needs the format
+/// tag before it writes the table) and by [`build_training_data_loader`] (which
+/// needs the shape to read it back). Two copies of these predicates would let a
+/// table be written under one format and read under another.
+///
+/// The arm ORDER is part of the contract: media triplets are recognised before
+/// text ones (the columns are identical; only `task` distinguishes an encoded
+/// blob from a string), and regression is tested before classification and
+/// gated on `task == Regression`, so a numeric outcome can never fall into the
+/// classification path and be gathered as a class index.
+fn detect_training_format(columns: &[String], task: ModelTask) -> Result<DetectedFormat> {
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
 
     let has_contrastive = col_names.contains(&"text_a")
@@ -3521,167 +3558,19 @@ fn build_training_data_loader(
         && col_names.contains(&"positive")
         && !col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
-    // Regression shares the `text` anchor with classification but reads a
-    // numeric `target` column instead of a string `label`. The two text-outcome
-    // formats are disambiguated by `task`, not by column names, exactly as the
-    // audio-triplet path is task-gated below: the regression arm is gated on
-    // `task == Regression` and ordered before classification, and classification
-    // is gated on `task != Regression`. So `task=regression` is authoritative —
-    // it can never fall into the classification path (which would gather a
-    // numeric outcome as a class index and CUDA-assert), and a `label`-only
-    // source under `task=regression` produces a typed "needs a numeric target"
-    // error rather than a device-side assert.
     let has_regression = col_names.contains(&"text") && col_names.contains(&"target");
 
     if has_triplet && matches!(task, ModelTask::AudioEmbedding | ModelTask::ImageEmbedding) {
-        return build_media_triplet_loader(batches, task);
-    }
-
-    if has_contrastive {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let a_col = batch
-                .column_by_name("text_a")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
-            let b_col = batch
-                .column_by_name("text_b")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
-            let s_col = batch
-                .column_by_name("score")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
-
-            let a_vals = extract_string_column(a_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
-            let b_vals = extract_string_column(b_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
-            let s_arr = s_col
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .map(|arr| {
-                    (0..arr.len())
-                        .map(|i| arr.value(i) as f32)
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| {
-                    s_col
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                })
-                .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
-
-            for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
-                rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
-            }
-        }
-        Ok(TrainingDataLoader::from_contrastive(rows))
+        Ok(DetectedFormat::MediaTriplet)
+    } else if has_contrastive {
+        Ok(DetectedFormat::Contrastive)
     } else if has_triplet {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let neg_vals = batch
-                .column_by_name("negative")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-
-            for i in 0..batch.num_rows() {
-                rows.push((
-                    anchor_vals[i].clone(),
-                    pos_vals[i].clone(),
-                    neg_vals[i].clone(),
-                ));
-            }
-        }
-        Ok(TrainingDataLoader::from_triplets(rows))
+        Ok(DetectedFormat::Triplet)
     } else if has_pairs {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
-                         this source has the anchor/positive PAIR shape, which is read as text \
-                         for every task. Image/audio training reads encoded media bytes only \
-                         from the anchor/positive/negative TRIPLET shape under \
-                         task=image_embedding/audio_embedding — add a 'negative' column. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns, \
-                         and this source has the anchor/positive PAIR shape, which is read as \
-                         text for every task. Image/audio training reads encoded media bytes \
-                         only from the anchor/positive/negative TRIPLET shape under \
-                         task=image_embedding/audio_embedding — add a 'negative' column. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for i in 0..batch.num_rows() {
-                rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
-            }
-        }
-        Ok(TrainingDataLoader::from_pairs(rows))
+        Ok(DetectedFormat::Pairs)
     } else if task == ModelTask::Regression {
-        // Regression: a string `text` column and a numeric `target` column. The
-        // target is read into `f32` (handling int64/float64/float32/… via
-        // `extract_numeric_column`); nulls and NaNs are rejected citing the row
-        // rather than coerced, since a coerced `0.0` would silently corrupt the
-        // scaler's μ/σ. A `task=regression` request with no usable `target`
-        // column is a typed error here, never a fall-through to classification.
+        // A `task=regression` request with no usable `target` column is a typed
+        // error here, never a fall-through to classification.
         if !has_regression {
             return Err(JammiError::FineTune(format!(
                 "task=regression needs a string 'text' column and a numeric 'target' column, \
@@ -3689,70 +3578,9 @@ fn build_training_data_loader(
                  is distinct: name the numeric outcome column 'target'.)"
             )));
         }
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let target_col = batch
-                .column_by_name("target")
-                .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
-            let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                JammiError::FineTune(match e {
-                    NumericColumnError::NotNumeric => format!(
-                        "regression 'target' is not a numeric column (its Arrow type is {})",
-                        target_col.data_type()
-                    ),
-                    NumericColumnError::Null(i) => format!(
-                        "regression 'target' has a null at row {i}; a null target cannot be \
-                         coerced (it would corrupt the scaler) — remove or fill the row"
-                    ),
-                    NumericColumnError::Nan(i) => format!(
-                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
-                         (it would corrupt the scaler) — remove or fix the row"
-                    ),
-                })
-            })?;
-            for i in 0..batch.num_rows() {
-                rows.push((text_vals[i].clone(), target_vals[i]));
-            }
-        }
-        Ok(TrainingDataLoader::from_regression(rows))
+        Ok(DetectedFormat::Regression)
     } else if has_classification {
-        let mut label_set = std::collections::BTreeSet::new();
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let label_vals = batch
-                .column_by_name("label")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
-            for i in 0..batch.num_rows() {
-                label_set.insert(label_vals[i].clone());
-                rows.push((text_vals[i].clone(), label_vals[i].clone()));
-            }
-        }
-        let label_to_idx: std::collections::HashMap<String, u32> = label_set
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (l.clone(), i as u32))
-            .collect();
-        let num_classes = label_to_idx.len();
-        let indexed_rows: Vec<(String, u32)> = rows
-            .into_iter()
-            .map(|(text, label)| {
-                let idx = label_to_idx[&label];
-                (text, idx)
-            })
-            .collect();
-        Ok(TrainingDataLoader::from_classification(
-            indexed_rows,
-            num_classes,
-        ))
+        Ok(DetectedFormat::Classification)
     } else {
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
@@ -3762,6 +3590,236 @@ fn build_training_data_loader(
              same (anchor, positive, negative) columns with binary cells and \
              task=image_embedding/audio_embedding."
         )))
+    }
+}
+
+fn build_training_data_loader(
+    batches: &[RecordBatch],
+    columns: &[String],
+    task: ModelTask,
+) -> Result<TrainingDataLoader> {
+    let detected = detect_training_format(columns, task)?;
+
+    // Exhaustive on every `DetectedFormat` arm — no `_`, so a seventh variant
+    // is a compile error here rather than a silent fall-through to whatever
+    // arm happened to be last.
+    match detected {
+        DetectedFormat::MediaTriplet => build_media_triplet_loader(batches, task),
+        DetectedFormat::Contrastive => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let a_col = batch
+                    .column_by_name("text_a")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
+                let b_col = batch
+                    .column_by_name("text_b")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
+                let s_col = batch
+                    .column_by_name("score")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
+
+                let a_vals = extract_string_column(a_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_a' is not a string column".into())
+                })?;
+                let b_vals = extract_string_column(b_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_b' is not a string column".into())
+                })?;
+                let s_arr = s_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .map(|arr| {
+                        (0..arr.len())
+                            .map(|i| arr.value(i) as f32)
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        s_col
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float32Array>()
+                            .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
+                    })
+                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
+
+                for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
+                    rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
+                }
+            }
+            Ok(TrainingDataLoader::from_contrastive(rows))
+        }
+        DetectedFormat::Triplet => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let schema_info = || {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let anchor_vals = batch
+                    .column_by_name("anchor")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+                let pos_vals = batch
+                    .column_by_name("positive")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'positive' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+                let neg_vals = batch
+                    .column_by_name("negative")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+
+                for i in 0..batch.num_rows() {
+                    rows.push((
+                        anchor_vals[i].clone(),
+                        pos_vals[i].clone(),
+                        neg_vals[i].clone(),
+                    ));
+                }
+            }
+            Ok(TrainingDataLoader::from_triplets(rows))
+        }
+        DetectedFormat::Pairs => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let schema_info = || {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let anchor_vals = batch
+                    .column_by_name("anchor")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
+                         this source has the anchor/positive PAIR shape, which is read as text \
+                         for every task. Image/audio training reads encoded media bytes only \
+                         from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+                let pos_vals = batch
+                    .column_by_name("positive")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Missing/invalid 'positive' column: task {task} expects text columns, \
+                         and this source has the anchor/positive PAIR shape, which is read as \
+                         text for every task. Image/audio training reads encoded media bytes \
+                         only from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
+                            schema_info()
+                        ))
+                    })?;
+                for i in 0..batch.num_rows() {
+                    rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
+                }
+            }
+            Ok(TrainingDataLoader::from_pairs(rows))
+        }
+        DetectedFormat::Regression => {
+            // Regression: a string `text` column and a numeric `target` column. The
+            // target is read into `f32` (handling int64/float64/float32/… via
+            // `extract_numeric_column`); nulls and NaNs are rejected citing the row
+            // rather than coerced, since a coerced `0.0` would silently corrupt the
+            // scaler's μ/σ.
+            let mut rows = Vec::new();
+            for batch in batches {
+                let text_vals = batch
+                    .column_by_name("text")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let target_col = batch
+                    .column_by_name("target")
+                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+                let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
+                    JammiError::FineTune(match e {
+                        NumericColumnError::NotNumeric => format!(
+                            "regression 'target' is not a numeric column (its Arrow type is {})",
+                            target_col.data_type()
+                        ),
+                        NumericColumnError::Null(i) => format!(
+                            "regression 'target' has a null at row {i}; a null target cannot be \
+                         coerced (it would corrupt the scaler) — remove or fill the row"
+                        ),
+                        NumericColumnError::Nan(i) => format!(
+                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
+                         (it would corrupt the scaler) — remove or fix the row"
+                    ),
+                    })
+                })?;
+                for i in 0..batch.num_rows() {
+                    rows.push((text_vals[i].clone(), target_vals[i]));
+                }
+            }
+            Ok(TrainingDataLoader::from_regression(rows))
+        }
+        DetectedFormat::Classification => {
+            let mut label_set = std::collections::BTreeSet::new();
+            let mut rows = Vec::new();
+            for batch in batches {
+                let text_vals = batch
+                    .column_by_name("text")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let label_vals = batch
+                    .column_by_name("label")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+                for i in 0..batch.num_rows() {
+                    label_set.insert(label_vals[i].clone());
+                    rows.push((text_vals[i].clone(), label_vals[i].clone()));
+                }
+            }
+            let label_to_idx: std::collections::HashMap<String, u32> = label_set
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (l.clone(), i as u32))
+                .collect();
+            let num_classes = label_to_idx.len();
+            let indexed_rows: Vec<(String, u32)> = rows
+                .into_iter()
+                .map(|(text, label)| {
+                    let idx = label_to_idx[&label];
+                    (text, idx)
+                })
+                .collect();
+            Ok(TrainingDataLoader::from_classification(
+                indexed_rows,
+                num_classes,
+            ))
+        }
     }
 }
 

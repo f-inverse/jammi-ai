@@ -43,6 +43,7 @@ use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
+use crate::grpc::gang::GangServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::job::JobServer;
 use crate::grpc::peer::PeerServer;
@@ -51,6 +52,7 @@ use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
+use crate::grpc::proto::gang::gang_service_server::GangServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::job::job_service_server::JobServiceServer;
 use crate::grpc::proto::peer::peer_service_server::PeerServiceServer;
@@ -556,15 +558,21 @@ impl OssServer {
         // never wrapped by the `TenantResolverLayer`, never advertised by
         // `GetServerInfo`. The public listener answers UNIMPLEMENTED for its
         // paths. Its routes are a plain `tonic::service::Routes`, so a second
-        // internal service can be mounted beside `PeerService` here later. The
-        // registry is cloned now because `MetricsLayer::new(self.metrics)`
-        // moves the `Arc` into the public chain below.
+        // internal service is mounted beside `PeerService` on the SAME
+        // `Routes` here: `GangService` (`CONTRACT-U5a.md` §W1/§I1 — tenant
+        // derived from the verified job row, never the caller; the public
+        // listener answers UNIMPLEMENTED for its paths too). The registry is
+        // cloned now because `MetricsLayer::new(self.metrics)` moves the
+        // `Arc` into the public chain below.
         let peer = match self.peer_addr {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
                 let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
                     Arc::clone(&self.session),
-                )));
+                )))
+                .add_service(GangServiceServer::new(GangServer::new(Arc::clone(
+                    &self.session,
+                ))));
                 Some((listener, routes, Arc::clone(&self.metrics)))
             }
             None => None,

@@ -1738,7 +1738,7 @@ def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
     a reusable's own jobs from its caller (never opening the delegate at
     all was the prior design's own escape: a cross-repo `uses:` reference
     was invisible to it) is filed as
-    https://github.com/f-inverse/jammi-ai/issues/<ISSUE_NUMBER>, which
+    https://github.com/f-inverse/jammi-ai/issues/561, which
     this rule's own fail-closed shape supersedes until that issue lands.
     A workflow whose OWN `on:` block is `workflow_call`-only is inert
     without a caller and is skipped here so it is never double-tabled

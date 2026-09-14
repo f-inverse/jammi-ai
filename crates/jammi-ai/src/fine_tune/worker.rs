@@ -3457,8 +3457,7 @@ async fn publish_artifact(
 }
 
 /// The tally [`JobWorker::gc_epoch_checkpoints_by_index`] returns: how many
-/// indices it was asked to sweep, how many it actually deleted (implied —
-/// `attempted - retained - failed`), how many it left in place because the
+/// indices it was asked to sweep, how many it left in place because the
 /// guarded [`PrefixReferences`] port reported a live `models` row still
 /// naming that exact checkpoint, and how many it could not delete for any
 /// other reason. Every field is a plain count, never a row identity — the

@@ -201,6 +201,23 @@ def _closed_via_finally(
     return False
 
 
+# A bare `with (` opener: the parenthesized multi-line form (`with (\n    A as
+# a,\n    B as b,\n):`). Its items are CONTINUATION lines -- their own
+# indentation is not what governs the block Python actually opens; the `):`
+# closer sits back at the `with` line's own column. A `TemporaryDirectory`
+# item inside this header must be tainted at the HEADER's indent, not the
+# item's, or the block body (indented past the header, same as or past the
+# items) never reads as "inside" it once the generic dedent-based taint-expiry
+# check is applied to the `):` closer line itself (whose indent equals the
+# item's-if-mistaken column) before that body is ever reached.
+_PAREN_WITH_OPEN = re.compile(r"^with\s*\(\s*$")
+_PAREN_WITH_CLOSE = re.compile(r"^\)\s*:")
+# A malformed/unrecognized header should not blind the scan for the rest of
+# the file: bail out of "inside a parenthesized header" bookkeeping past this
+# many lines without a closer (every real site in this tree closes within 6).
+_PAREN_WITH_MAX_LINES = 20
+
+
 def _offending_sites(text: str) -> list[tuple[int, str, str]]:
     """Sites in one file where an embedded engine is opened on a temp directory
     and never closed ON EVERY EXIT PATH. Returns (line number, handle, directory
@@ -212,14 +229,47 @@ def _offending_sites(text: str) -> list[tuple[int, str, str]]:
     `X = tempfile.mkdtemp()` in another function is therefore not confused with
     it — that is a leak, but nothing removes its directory, so it is not this
     race and this gate does not speak to it.
+
+    The parenthesized multi-line `with (...)：` form is parsed as ONE
+    statement whose block indent is the `with` line's own column -- not the
+    indent of whichever item line a `TemporaryDirectory(...)` happens to sit
+    on -- so a `TemporaryDirectory` opened as a with-item there taints the
+    body at the right scope even when a later edit turns its sibling connect
+    item into a bare, un-closed assignment statement.
     """
     lines = text.splitlines()
     sites: list[tuple[int, str, str]] = []
     tainted: dict[str, int] = {}  # name -> indent of the `with` that binds it
+    in_paren_header = False
+    paren_header_indent = 0
+    paren_header_started_at = 0
     for lineno, line in enumerate(lines, 1):
-        if line.strip():
-            here = _indent(line)
+        stripped = line.strip()
+        here = _indent(line) if stripped else None
+
+        if in_paren_header:
+            # Continuation lines of a parenthesized `with (`: no dedent-based
+            # taint expiry (their own indent does not govern the block), and
+            # only a `TemporaryDirectory` with-item is looked for -- a
+            # `= jammi.connect(...)` assignment cannot appear here (a
+            # with-item is `EXPR as NAME`, never an `=` binding).
+            temp = _TEMPDIR.search(line)
+            if temp:
+                tainted[temp.group(1)] = paren_header_indent
+            if stripped and _PAREN_WITH_CLOSE.match(stripped) and here <= paren_header_indent:
+                in_paren_header = False
+            elif lineno - paren_header_started_at > _PAREN_WITH_MAX_LINES:
+                in_paren_header = False  # malformed/unrecognized: stop guessing
+            continue
+
+        if stripped:
             tainted = {n: i for n, i in tainted.items() if here > i}
+
+        if _PAREN_WITH_OPEN.match(stripped):
+            in_paren_header = True
+            paren_header_indent = here
+            paren_header_started_at = lineno
+            continue
 
         temp = _TEMPDIR.search(line)
         if temp:
@@ -331,6 +381,33 @@ def test_the_gate_sees_the_shape_it_claims_to_see():
         '        handle.set_tenant("x")\n'
     )
     assert _offending_sites(nested_with) == []
+
+    # R1 addendum (a hole the static gate itself missed on the first fix
+    # round's own output): a PARENTHESIZED multi-line `with (` header is one
+    # statement whose block indent is the `with` line's own column, not
+    # whichever item line a `TemporaryDirectory` happens to sit on. Exact
+    # regression shape: `build_segmented_ann_cache.py`'s with-item connect
+    # replaced by a bare assignment as the first body statement, no close --
+    # RED. A multi-line header where BOTH items stay with-items -- GREEN.
+    paren_with_regressed_to_bare_assignment = (
+        'def emit(fixtures_root):\n'
+        '    with (\n'
+        '        tempfile.TemporaryDirectory(prefix="jammi_segmented_ann_") as artifact_dir,\n'
+        '    ):\n'
+        '        db = jammi.connect(f"file://{artifact_dir}")\n'
+        '        db.set_tenant("x")\n'
+    )
+    assert [s[1] for s in _offending_sites(paren_with_regressed_to_bare_assignment)] == ["db"]
+
+    paren_with_item_control = (
+        'def emit(fixtures_root):\n'
+        '    with (\n'
+        '        tempfile.TemporaryDirectory(prefix="jammi_segmented_ann_") as artifact_dir,\n'
+        '        jammi.connect(f"file://{artifact_dir}") as db,\n'
+        '    ):\n'
+        '        db.set_tenant("x")\n'
+    )
+    assert _offending_sites(paren_with_item_control) == []
 
     # Retained regressions from the taint tracker itself (aliasing, the
     # `--target` fallback shape, directory taint, and cross-function scope

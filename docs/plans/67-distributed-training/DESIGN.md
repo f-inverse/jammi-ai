@@ -99,7 +99,7 @@ later.
 | training-set definition hash + artifact digest + row count | the data and its order |
 | **canonical serialization of the whole `TrainingSpec` variant** — `FineTuneConfig` (`crates/jammi-wire/src/fine_tune.rs:237-445`: LoRA rank/alpha/dropout, `use_rslora`, `rank_pattern`, `init_lora_weights`, lr, epochs, batch, `max_seq_length`, losses, `matryoshka_dims`, `quantile_levels`, `validation_fraction`, early stopping, `cached`, `hard_negatives`, …), `TrainingCommon`, method, task, seed | everything the trainer reads |
 | base model identity (`ModelIdentity`: id, backend, precision, content digest, quantization) | the frozen weights |
-| backbone dtype; fused-kernel admission profile | bits per op |
+| backbone dtype; fused-kernel admission profile (declared, UNCOVERED — see below) | bits per op |
 | `world_size`, per-rank batch, partition rule version, collective backend, reduction policy | the summation order and the batch layout |
 | `MaterializationEnv` (engine version, device kind, model identities) | as for every producer |
 
@@ -116,26 +116,51 @@ new field fails compilation instead of escaping the hash; U4b extends it with th
 fields.
 
 The catalog name `jammi:fine-tuned:{job_id}` stays as the handle and re-claim idempotency key
-(`worker.rs:1176-1184`). The `model_materialization` migration (033) adds nullable
-`models.definition_hash`, `models.input_anchors` (append-only, K5; nullable because
-`ContextPredictor` has no materialization; the probe never matches NULL —
+(`training_job.rs:87`; called from `worker.rs:2275`; the id format is documented again on
+`ModelRegistration::model_id`, `worker.rs:3456`). The `model_materialization` migration (033)
+adds nullable `models.definition_hash`, `models.input_anchors` (append-only, K5; nullable
+because `ContextPredictor` has no materialization; the probe never matches NULL —
 `find_models_by_definition`/`probe_model_by_definition` additionally restrict to
-`artifact_path IS NOT NULL`, the SERVABLE set, P3'). A third column, `models.manifest_path`,
-was in this migration's first cut but had no production reader — the sidecar's path is always
-the fixed name `materialization.json` under the model's artifact prefix, never a recorded
-column — and was dropped before the migration merged (P7, U3 fix round 1; K5's append-only
-rule binds the merged ledger, not a not-yet-shipped body). The manifest is written last into
-the artifact prefix by the coordinator before the finalize CAS, and the two catalog columns
-are written only after that CAS has already committed this attempt's `artifact_path` (P3':
-no unfinalized row is ever a cache-hit candidate). `CachePolicy::Use` probes by definition
-hash (the anchors leg was removed as redundant, P5: the training-set digest is already
-inside the hash); on a hit the job completes by registering **its own name** pointing at the
-reused prefix (two rows, one prefix, reported on the job's own result via `cache_outcome`,
-P6); a prefix is reaped only when no model row references it (reconcile attribution,
-`crates/jammi-db/src/store/reconcile.rs:14-17`). The recompute replay arm
-(`pipeline/recompute.rs`, K1) for `FineTune` is **retrain**. `cache = Use` is refused, typed,
-for the `graph_fine_tune` kind (P4): that kind's model carries no materialization to probe
-or record.
+`artifact_path IS NOT NULL`, the SERVABLE set). No `models.manifest_path` column: the
+sidecar's path is always the fixed name `materialization.json` under the model's artifact
+prefix, never a recorded column. The manifest is written last into the artifact prefix by
+the coordinator before the finalize CAS, and the two catalog columns are written only after
+that CAS has already committed this attempt's `artifact_path` — no unfinalized row is ever a
+cache-hit candidate.
+
+`cache` lives on `TrainingSpec::FineTune` itself, not `TrainingCommon` — `TrainingSpec::
+GraphFineTune` has no `cache` field at all, so `lora_common_from_proto` refuses `cache = Use`
+for that kind, typed, at decode (the one place that can still see both the kind and the
+requested value). A stray `cache` key found under `graph_fine_tune` in a persisted
+`jobs.spec` row is dropped at deserialize rather than refused, since the type has nowhere to
+put it; a hard error on unknown keys across the persisted-row format is a separate reshape
+(<https://github.com/f-inverse/jammi-ai/issues/548>). `CachePolicy::Use` probes by definition
+hash (the anchors leg was removed as redundant: the training-set digest is already inside the
+hash); on a hit the job completes by registering **its own name** pointing at the reused
+prefix (two rows, one prefix, reported on the job's own result via `cache_outcome`). An unset
+`cache` field encodes identically on both transports: the Rust client omits the field (rather
+than assigning the enum's `Bypass` discriminant) so an explicit `Bypass` and an unset field put
+the SAME bytes on the wire, matching the embedded Python encoding.
+
+Deleting a model row is always allowed, even one sharing a reused prefix with another — there
+is no catalog edge enforcing which row is the original
+(<https://github.com/f-inverse/jammi-ai/issues/547>). The underlying bytes are reclaimed only
+when no live `models` row, in any tenant, still names the prefix:
+`ResultStore::prefix_is_referenced` is an admin-scoped whole-catalog scan of
+`models.artifact_path` that `ResultStore::delete_unreferenced_prefix` consults before every
+`models/`-prefix byte-delete (reconcile's own reap and the worker's abandon path both reach
+it), refusing typed (`StorageError::Referenced { prefix, count }`) while any row
+still references the prefix; reconcile's attribution set is built from the same admin-scoped
+scan, never the tenant-scoped `list_models`, and a prefix it finds still referenced this way is
+reported (with its count) via `ReconcileReport.referenced`/`referenced_count`
+(`crates/jammi-db/src/store/reconcile.rs`), carried on the wire (`catalog.proto`, tags 15/16).
+
+The fused-kernel admission profile the training loop actually resolves (fused vs. eager per
+operator) is declared on `MaterializationEnv` but UNCOVERED: nothing writes a real value into
+it, so it does not yet distinguish two runs that differ only in that outcome
+(<https://github.com/f-inverse/jammi-ai/issues/546>).
+
+The recompute replay arm (`pipeline/recompute.rs`, K1) for `FineTune` is **retrain**.
 
 ## 4. The gang
 

@@ -125,3 +125,30 @@ async fn fresh_instance_true_just_inside_the_liveness_margin() {
         "50s ago is inside the 2x30s=60s margin and must still read as fresh"
     );
 }
+
+/// The boundary just OUTSIDE the margin reads stale — the tight twin of
+/// [`fresh_instance_true_just_inside_the_liveness_margin`] above. Mutation
+/// proof: widen `instance_liveness_margin` (or an equivalent inline
+/// `lease.saturating_mul(2)`) by so much as 2 extra seconds and this test
+/// dies while the just-inside case stays green, since 61s ago would then
+/// fall back inside the (now 62s) margin.
+#[tokio::test]
+async fn fresh_instance_false_just_outside_the_liveness_margin() {
+    let (_dir, catalog) = base_catalog().await;
+    catalog
+        .upsert_instance("inst-just-outside", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let lease = Duration::from_secs(30);
+    // instance_liveness_margin(lease) == 2 * 30s == 60s; 61s ago is 1s past
+    // that margin — the tightest stale case short of the exact boundary.
+    force_stale_instance(&catalog, "inst-just-outside", Duration::from_secs(61)).await;
+    let fresh = catalog
+        .fresh_instance("inst-just-outside", lease)
+        .await
+        .unwrap();
+    assert!(
+        !fresh,
+        "61s ago is 1s past the 2x30s=60s margin and must read as stale"
+    );
+}

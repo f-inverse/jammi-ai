@@ -2463,18 +2463,32 @@ fn allowlists_match_current_hits_exactly() {
 // directly, no table) and the follow-on unit that gives it a table of its
 // own is <https://github.com/f-inverse/jammi-ai/issues/538>.
 //
-// This is the standing oracle for that: NOTHING under
-// `crates/jammi-ai/src/fine_tune/**` may claim (or release) a name on the
-// shared session at all, ever, because the session is not a per-call
-// namespace — any token that is not unique per CALL (not per job, not per
-// spec) collides under reclaim. Unlike every allowlist above, there is no
-// allowance list here: the target count is zero, unconditionally, so a
-// future re-introduction of session-scoped registration under `fine_tune/`
-// fails this test rather than needing a reviewed entry.
+// This is the standing oracle for the DIRECT half of that: no file under
+// `crates/jammi-ai/src/fine_tune/**` may itself WRITE a call to one of the
+// verbs below, ever, because the session is not a per-call namespace — any
+// token that is not unique per CALL (not per job, not per spec) collides
+// under reclaim. Unlike every allowlist above, there is no allowance list
+// for THIS half: the target count is zero, unconditionally, so a future
+// re-introduction of a direct session-scoped call under `fine_tune/` fails
+// this test rather than needing a reviewed entry.
 //
-// **Round 5 (this fix) — the escape.** The original two-literal detector
-// (`register_table(`/`deregister_table(`) went GREEN with
-// `ctx.register_batch("lead_probe", b)` appended to `fine_tune/data.rs`,
+// **This is a claim about literal call sites, not about the tree's runtime
+// behaviour.** Round 5's audit found the true property this file exists to
+// protect is that every name `fine_tune/` ever causes to be bound on the
+// shared session — direct or several calls removed — is unique per CALL
+// over an IMMUTABLE artifact; a zero-direct-hits count is sufficient for a
+// tree with no reviewed indirection, but `training_set.rs`'s own call into
+// `ResultStore::materialize_training_set` (which binds a name two calls
+// further in) is exactly such an indirection, and no amount of widening the
+// literal set below could ever make a directory-scoped scan see it. That
+// half is `IN_TREE_SESSION_BINDING_ALLOWLIST` and
+// [`fine_tune_in_tree_session_binding_matches_allowlist_exactly`], further
+// down this file — a SEPARATE, call-graph-derived oracle, not a hand-waved
+// exception to this one.
+//
+// **Round 5 — the DataFusion-wrapper escape, closed.** The original
+// two-literal detector (`register_table(`/`deregister_table(`) went GREEN
+// with `ctx.register_batch("lead_probe", b)` appended to `fine_tune/data.rs`,
 // because `SessionContext::register_batch` (DataFusion 54.1.0,
 // `execution/context/mod.rs:537`) is a one-line wrapper —
 // `MemTable::try_new(..)` then `self.register_table(table_ref, Arc::new(table))`
@@ -2484,7 +2498,38 @@ fn allowlists_match_current_hits_exactly() {
 // `register_table`/`deregister_table`"; it is, per the audit's own words, "a
 // per-call resource bound to the shared SessionContext under a token that is
 // not unique per call" — and `SessionContext` exposes many more verbs shaped
-// exactly like that.
+// exactly like that. Round 5 widened the literal set to cover every such
+// `SessionContext` verb (below).
+//
+// **Round 6 — the class round 5 left open, closed by three separate
+// mechanisms, because it is three separate shapes, not one wider literal
+// set.** The round-5 audit found this test's own DOC claimed "everything
+// under fine_tune/ claims nothing on the shared session" while
+// `training_set.rs:141`'s tabular arm plainly does, and probed three shapes
+// invisible to a `SessionContext`-only, directory-scoped literal scan no
+// matter how many `register_`/`deregister_` verbs it knew:
+//   (i) `CatalogProvider::register_schema`/`deregister_schema` — not a
+//       `SessionContext` method at all, reached as
+//       `ctx.catalog(name).unwrap().register_schema(..)`. Closed by widening
+//       [`PAIRED_REGISTRATION_VERBS`] (below) to cover it, since it is a
+//       plain literal call-site pattern like every other entry there.
+//   (ii) A DDL literal (`CREATE VIEW`/`CREATE TABLE`/`CREATE EXTERNAL
+//       TABLE`/`CREATE SCHEMA`) handed to `SessionContext::sql` as a raw SQL
+//       string — invisible to ANY verb-literal scan because the keyword
+//       lives INSIDE a string literal, which [`mask_non_code`] blanks by
+//       design. Closed by a SEPARATE detector,
+//       [`fine_tune_ddl_relation_binding_hits`], that scans the ORIGINAL,
+//       unmasked text the same way [`session_registration_literal_sites`]
+//       already does for `"jammi.{`.
+//   (iii) An in-tree wrapper DEFINED OUTSIDE `fine_tune/` (the audit's probe
+//       D: a helper in `crates/jammi-ai/src/pipeline/mod.rs` calling
+//       `ctx.register_table(..)`, itself called from `fine_tune/data.rs`) —
+//       invisible to a directory-scoped scan no matter how many verbs it
+//       knows, because the LITERAL call site never appears inside
+//       `fine_tune/**` at all. This is not a wider literal set's job: it is
+//       a call-graph reachability question, closed by
+//       [`session_binding_reachable_names`] and the pinned
+//       [`IN_TREE_SESSION_BINDING_ALLOWLIST`], not by this test.
 //
 // **The whole verb surface, enumerated from the pinned source
 // (`datafusion = "54.1"`, locked at `54.1.0` in `Cargo.lock`;
@@ -2537,6 +2582,20 @@ fn allowlists_match_current_hits_exactly() {
 //   - `register_higher_order_function`/`deregister_higher_order_function`
 //     (`mod.rs:1630,1675`) — same shape as `register_udf`, one indirection
 //     further (`HigherOrderUDF`'s own name).
+//   - `register_schema`/`deregister_schema`
+//     (`datafusion-catalog-54.1.0/src/catalog.rs:121,142`) — round 6. NOT a
+//     `SessionContext` method itself: a `CatalogProvider` trait method,
+//     reached from a `fine_tune/` caller as
+//     `ctx.catalog(name).unwrap().register_schema(schema_name, provider)`.
+//     `register_schema`'s own doc states the collision outcome directly ("If
+//     a schema of the same name existed before, it is replaced in the
+//     catalog and returned"), the identical silent-overwrite shape
+//     `register_catalog`/`register_udf` already have above;
+//     `deregister_schema` is its inverse. `ResultStore::
+//     install_result_schema` (`crates/jammi-db/src/store/mod.rs:1105`) calls
+//     exactly this verb — which is why this literal set had to widen past
+//     `SessionContext`'s own surface rather than staying a pure enumeration
+//     of it.
 //
 // OUT — no caller-chosen per-resource token exists at all, so there is no
 // name a `fine_tune/` arm could pick non-uniquely and no reclaim-shaped
@@ -2559,10 +2618,13 @@ fn allowlists_match_current_hits_exactly() {
 //     caller-supplied string; nothing under `fine_tune/` picks the Rust
 //     TYPE it instantiates per job or per spec.
 
-/// DataFusion `SessionContext` verbs (54.1.0) with BOTH a `register_`/
-/// `deregister_` form, both binding the shared session under the SAME
-/// caller-chosen token — see the module-level comment above this section for
-/// why each of these seven is IN scope.
+/// Verbs (54.1.0) with BOTH a `register_`/`deregister_` form, both binding
+/// the shared session under the SAME caller-chosen token — see the
+/// module-level comment above this section for why each of these eight is
+/// IN scope. Seven are `SessionContext` methods; `schema` (round 6) is a
+/// `CatalogProvider` method reached through `ctx.catalog(..)` rather than
+/// called on `SessionContext` directly — this array polices literal call
+/// SHAPES, not one specific receiver type.
 const PAIRED_REGISTRATION_VERBS: &[&str] = &[
     "table",
     "object_store",
@@ -2571,6 +2633,7 @@ const PAIRED_REGISTRATION_VERBS: &[&str] = &[
     "udaf",
     "udwf",
     "higher_order_function",
+    "schema",
 ];
 
 /// DataFusion `SessionContext` verbs (54.1.0) with only a `register_` form
@@ -2627,7 +2690,7 @@ fn included_registration_literals() -> Vec<String> {
 /// `deregister_X(` call as a `register_X(` hit too — the SAME reasoning the
 /// original two-verb version used for `table`, now applied per paired verb.
 /// Checked exhaustively rather than assumed: no other pair among the full
-/// 22-literal surface is a substring of another (see
+/// 24-literal surface is a substring of another (see
 /// [`falsification_no_included_literal_is_a_substring_of_another_unless_the_declared_pair`],
 /// below), so no other verb needs this ordering.
 fn fine_tune_session_registration_hits(
@@ -2661,23 +2724,89 @@ fn fine_tune_session_registration_hits(
     hits
 }
 
+/// SQL DDL literal keywords that bind a NEW relation into the session's
+/// catalog when executed through `SessionContext::sql` — the string-literal
+/// analogue of a `register_`/`deregister_` verb call, round 6. Invisible to
+/// [`fine_tune_session_registration_hits`] because the keyword lives INSIDE
+/// a string literal, which [`mask_non_code`] blanks by design (the same
+/// reason [`session_registration_literal_sites`] scans the ORIGINAL,
+/// unmasked text for `"jammi.{` rather than the masked surface, above).
+/// Checked case-sensitively: every DDL site in this codebase's own SQL is
+/// written upper-case (`grep -rn 'CREATE (VIEW\|TABLE\|SCHEMA)' crates/jammi-db/src`),
+/// so a lower-case `create table` in prose is never mistaken for a call
+/// site. `CREATE EXTERNAL TABLE` is listed separately from `CREATE TABLE`:
+/// neither is a substring of the other (`EXTERNAL ` sits between them), so
+/// there is no `register_X`/`deregister_X`-shaped ordering hazard here.
+const DDL_RELATION_BINDING_LITERALS: &[&str] = &[
+    "CREATE VIEW",
+    "CREATE EXTERNAL TABLE",
+    "CREATE TABLE",
+    "CREATE SCHEMA",
+];
+
+/// Every non-comment-line occurrence of a [`DDL_RELATION_BINDING_LITERALS`]
+/// literal under `crates/jammi-ai/src/fine_tune/**`, on the ORIGINAL
+/// (unmasked) text — see that constant's doc for why unmasked. A `//`-led
+/// comment line is skipped the same way
+/// [`session_registration_literal_sites`] skips one, so a doc comment
+/// mentioning `CREATE TABLE` in prose (this module's own doc, or
+/// `training_set.rs`'s) is never mistaken for a call site.
+fn fine_tune_ddl_relation_binding_hits(
+    surface: &[(String, String)],
+) -> Vec<(String, usize, String)> {
+    let mut hits = Vec::new();
+    for (file, text) in surface {
+        if !file.starts_with("crates/jammi-ai/src/fine_tune/") {
+            continue;
+        }
+        for (line_idx, line) in text.lines().enumerate() {
+            let line_no = line_idx + 1;
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for lit in DDL_RELATION_BINDING_LITERALS {
+                if line.contains(lit) {
+                    hits.push((file.clone(), line_no, (*lit).to_string()));
+                }
+            }
+        }
+    }
+    hits
+}
+
 /// RED at `fe96bf39` (the excised commit's parent): `training_set.rs` had a
 /// `ctx.register_table(relation.as_str(), ...)` call and `DeregisterOnDrop`'s
 /// `self.ctx.deregister_table(...)` — two hits under the original two-verb
 /// detector. GREEN once the guard and its `MemTable` machinery are removed
 /// and the graph arm reverts to sampling in memory: zero hits,
-/// unconditionally, no allowlist — now checked against the full 22-literal
-/// verb surface above, not only `register_table`/`deregister_table`.
+/// unconditionally, no allowlist — now checked against the full 24-literal
+/// verb surface above (`fine_tune_session_registration_hits`) PLUS the DDL
+/// surface (`fine_tune_ddl_relation_binding_hits`, round 6).
+///
+/// **This test's property is DIRECT call sites only.** It says nothing about
+/// whether a name gets bound INDIRECTLY, through an in-tree function defined
+/// outside `fine_tune/` — that half is a separate, call-graph-derived
+/// property, [`fine_tune_in_tree_session_binding_matches_allowlist_exactly`],
+/// pinned in its own test with its own allowlist. The module-level comment
+/// above (`#500 U2a fix round 4, P2`) states why the split is real rather
+/// than an oversight: a directory-scoped literal scan structurally cannot
+/// see a call that never appears inside `fine_tune/**`, no matter how many
+/// verbs it knows.
 #[test]
 fn no_session_registration_under_fine_tune() {
     let surface = scan_surface();
-    let hits = fine_tune_session_registration_hits(&surface);
+    let verb_hits = fine_tune_session_registration_hits(&surface);
+    let ddl_hits = fine_tune_ddl_relation_binding_hits(&surface);
     assert!(
-        hits.is_empty(),
-        "everything under crates/jammi-ai/src/fine_tune (recursively) must claim nothing on the \
-         shared session — the `SessionContext` is not a per-call namespace, and any name that is \
-         not unique per CALL collides under reclaim (see \
-         https://github.com/f-inverse/jammi-ai/issues/538). Found: {hits:?}"
+        verb_hits.is_empty() && ddl_hits.is_empty(),
+        "no file under crates/jammi-ai/src/fine_tune (recursively) may DIRECTLY write a call to \
+         a session-binding verb (a `SessionContext`/`CatalogProvider` register_/deregister_ verb) \
+         or a DDL literal that binds a relation (CREATE VIEW/TABLE/EXTERNAL TABLE/SCHEMA) — the \
+         shared session is not a per-call namespace, and any name that is not unique per CALL \
+         collides under reclaim (see https://github.com/f-inverse/jammi-ai/issues/538). This is a \
+         DIRECT-call-site property only; the one reviewed INDIRECT binder this tree ships \
+         (`ResultStore::materialize_training_set`) is a separate, pinned property — see \
+         IN_TREE_SESSION_BINDING_ALLOWLIST. verb hits: {verb_hits:?}; DDL hits: {ddl_hits:?}"
     );
 }
 
@@ -2693,8 +2822,8 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
     let included = included_registration_literals();
     assert_eq!(
         included.len(),
-        22,
-        "expected 7 paired verbs * 2 forms + 8 unpaired verbs = 22 literals; the module-level \
+        24,
+        "expected 8 paired verbs * 2 forms + 8 unpaired verbs = 24 literals; the module-level \
          doc's IN enumeration and PAIRED_REGISTRATION_VERBS/UNPAIRED_REGISTRATION_VERBS have \
          drifted apart if this count changes without both being updated together"
     );
@@ -2781,7 +2910,7 @@ fn falsification_fine_tune_session_registration_is_detected_and_scoped() {
 /// caller set — see [`included_registration_literals`]'s doc): the ONE
 /// ordering hazard `fine_tune_session_registration_hits` corrects for
 /// (`"register_X("` is a substring of `"deregister_X("`) is the ONLY such
-/// hazard among the full 22-literal surface, checked exhaustively rather
+/// hazard among the full 24-literal surface, checked exhaustively rather
 /// than assumed — a future addition to either verb array that silently
 /// introduces a SECOND hazard (e.g. two unpaired verbs where one's literal
 /// is a substring of the other's) would go undetected by the per-verb
@@ -2809,4 +2938,477 @@ fn falsification_no_included_literal_is_a_substring_of_another_unless_the_declar
             }
         }
     }
+}
+
+/// Round 6, the audit's own probe A, reproduced verbatim under `fine_tune/`
+/// and run through the real detector — not merely the generic per-verb
+/// falsification loop above, which never spells `ctx.catalog(..).unwrap()`
+/// as the receiver: `CatalogProvider::register_schema` is reached exactly
+/// this way, never as a bare `SessionContext` method, so this is the shape
+/// that mattered.
+#[test]
+fn falsification_probe_a_catalog_register_schema_is_caught() {
+    let src = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the round-5 audit's probe A — synthetic producer text fed to `fine_tune_session_registration_hits`, not real code in this file
+        "async fn probe(ctx: &SessionContext, name: &str) {\n",
+        "    ctx.catalog(\"datafusion\").unwrap().register_schema(name, \
+         std::sync::Arc::new(MemorySchemaProvider::new())).unwrap();\n",
+        "}\n",
+    );
+    let hits = fine_tune_session_registration_hits(&[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+        src.to_string(),
+    )]);
+    assert!(
+        hits.iter().any(|(_, _, lit)| lit == "register_schema("),
+        "the round-5 audit's probe A (`ctx.catalog(..).unwrap().register_schema(..)`) must be \
+         caught now that `schema` is in PAIRED_REGISTRATION_VERBS, got {hits:?}"
+    );
+}
+
+/// Round 6, the audit's own probe B, reproduced verbatim under `fine_tune/`
+/// and run through the DDL detector — the shape no verb-literal scan could
+/// ever catch, because the binding text lives inside a string literal.
+#[test]
+fn falsification_probe_b_create_view_ddl_is_caught() {
+    let src = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the round-5 audit's probe B — synthetic producer text fed to `fine_tune_ddl_relation_binding_hits`, not real code in this file
+        "async fn probe(ctx: &SessionContext, name: &str) {\n",
+        "    ctx.sql(&format!(\"CREATE VIEW {name} AS SELECT 1\")).await.unwrap();\n",
+        "}\n",
+    );
+    let hits = fine_tune_ddl_relation_binding_hits(&[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+        src.to_string(),
+    )]);
+    assert!(
+        hits.iter().any(|(_, _, lit)| lit == "CREATE VIEW"),
+        "the round-5 audit's probe B (a `CREATE VIEW` DDL string) must be caught by the unmasked \
+         DDL scan, got {hits:?}"
+    );
+}
+
+/// Every [`DDL_RELATION_BINDING_LITERALS`] shape is caught on its own
+/// falsification line, scoped to `fine_tune/`; a comment naming all four
+/// (never issuing one) and a hit outside `fine_tune/` must both be silent —
+/// the same three controls [`falsification_fine_tune_session_registration_is_detected_and_scoped`]
+/// runs for the verb-literal surface, run here for the DDL surface.
+#[test]
+fn falsification_every_ddl_literal_is_detected_and_scoped() {
+    for lit in DDL_RELATION_BINDING_LITERALS {
+        let src = format!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `fine_tune_ddl_relation_binding_hits` — synthetic producer text, not real code in this file
+            "async fn probe(ctx: &SessionContext) {{\n    ctx.sql(\"{lit} t AS SELECT 1\").await.unwrap();\n}}\n"
+        );
+        let hits = fine_tune_ddl_relation_binding_hits(&[(
+            "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+            src,
+        )]);
+        assert!(
+            hits.iter().any(|(_, _, l)| l == lit),
+            "{lit} must be caught on its own falsification line, got {hits:?}"
+        );
+    }
+
+    let mut comment_src = String::new();
+    for lit in DDL_RELATION_BINDING_LITERALS {
+        comment_src.push_str(&format!("// see {lit} for context\n"));
+    }
+    let comment_hits = fine_tune_ddl_relation_binding_hits(&[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs".to_string(),
+        comment_src,
+    )]);
+    assert!(
+        comment_hits.is_empty(),
+        "a comment naming a DDL literal must not count as a call site, got {comment_hits:?}"
+    );
+
+    let outside_hits = fine_tune_ddl_relation_binding_hits(&[(
+        "crates/jammi-ai/src/pipeline/embedding.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for the directory-scoping control on `fine_tune_ddl_relation_binding_hits` — synthetic producer text, not real code in this file
+            "async fn probe(ctx: &SessionContext) {\n",
+            "    ctx.sql(\"CREATE VIEW t AS SELECT 1\").await.unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    )]);
+    assert!(
+        outside_hits.is_empty(),
+        "a DDL hit outside fine_tune/ must not be counted, got {outside_hits:?}"
+    );
+}
+
+// ── #500 U2a fix round 6, P2 continued — the in-tree indirection the ────────
+// direct-verb scan cannot see, closed by a call-graph-derived allowlist
+// rather than by a wider literal set (see the module comment above,
+// "Round 6 ... (iii)").
+
+/// Every registration-verb literal from [`PAIRED_REGISTRATION_VERBS`] /
+/// [`UNPAIRED_REGISTRATION_VERBS`] present in `body` (already masked) —
+/// unscoped by file or line, used only to SEED
+/// [`session_binding_reachable_names`]'s fixed point below. The per-line,
+/// per-file version that polices `fine_tune/` itself is
+/// [`fine_tune_session_registration_hits`]; this is the same literal set,
+/// asked of an arbitrary function body instead of a directory-scoped
+/// surface.
+fn body_contains_registration_literal(body: &str) -> bool {
+    for verb in PAIRED_REGISTRATION_VERBS {
+        if body.contains(&format!("register_{verb}("))
+            || body.contains(&format!("deregister_{verb}("))
+        {
+            return true;
+        }
+    }
+    for verb in UNPAIRED_REGISTRATION_VERBS {
+        if body.contains(&format!("register_{verb}(")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every `.ident(` call TARGET name in `body` (already masked) — a
+/// NAME-level call-graph edge set, deliberately unresolved: two functions
+/// sharing a name are indistinguishable to this scan, so a caller of "the
+/// wrong" one is still marked reaching if the RIGHT one binds. This can only
+/// make [`session_binding_reachable_names`]'s reachable set LARGER than the
+/// true one, never smaller — the safe direction for a defect gate, the same
+/// direction [`callers_of`]'s own doc already accepts (a caller sharing the
+/// callee's own name is counted, never excluded).
+fn callee_names(body: &str) -> BTreeSet<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let n = chars.len();
+    let mut names = BTreeSet::new();
+    let mut i = 0usize;
+    while i < n {
+        if chars[i] == '.' {
+            let start = i + 1;
+            let mut j = start;
+            while j < n && is_ident_char(chars[j]) {
+                j += 1;
+            }
+            if j > start && j < n && chars[j] == '(' {
+                names.insert(chars[start..j].iter().collect());
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Every function NAME defined anywhere in `surface` that binds a name on
+/// the shared `SessionContext` — directly (its own body contains one of the
+/// [`PAIRED_REGISTRATION_VERBS`]/[`UNPAIRED_REGISTRATION_VERBS`] literals) or
+/// TRANSITIVELY, through any chain of in-`surface` calls.
+/// `ResultStore::register_table` itself binds nothing by the direct literal
+/// scan alone — it calls `install_result_schema`, which does
+/// (`catalog.register_schema(..)`, `store/mod.rs:1105`); a one-hop scan
+/// would miss `register_table` entirely, exactly the class of miss round 5
+/// fixed for DataFusion's OWN wrappers (`register_batch`), generalized here
+/// to jammi's own.
+///
+/// Computed to a fixed point over EVERY function in `surface` — the caller
+/// chooses `surface`, and [`fine_tune_in_tree_session_binding_matches_allowlist_exactly`]
+/// below passes this the surface with every `fine_tune/**` file EXCLUDED, so
+/// a purely in-tree fine_tune forwarding call (`materialize_projection` ->
+/// `materialize_and_read`) can never itself land in this set: only a name
+/// DEFINED and binding OUTSIDE `fine_tune/` ever can. That is what makes
+/// [`fine_tune_in_tree_session_binding_hits`]'s one-hop check below correct:
+/// a hit can only ever be the first `fine_tune/` region that crosses the
+/// boundary, never a same-tree forwarder one hop further in.
+fn session_binding_reachable_names(surface: &[(String, String)]) -> BTreeSet<String> {
+    struct Node {
+        name: String,
+        callees: BTreeSet<String>,
+        binds: bool,
+    }
+    let mut nodes = Vec::new();
+    for (_, text) in surface {
+        let masked = mask_non_code(text);
+        for region in find_fn_regions(&masked) {
+            let body = region.body.clone().unwrap_or_default();
+            nodes.push(Node {
+                binds: body_contains_registration_literal(&body),
+                callees: callee_names(&body),
+                name: region.name,
+            });
+        }
+    }
+    let mut reach: BTreeSet<String> = nodes
+        .iter()
+        .filter(|n| n.binds)
+        .map(|n| n.name.clone())
+        .collect();
+    loop {
+        let mut changed = false;
+        for node in &nodes {
+            if reach.contains(&node.name) {
+                continue;
+            }
+            if node.callees.iter().any(|c| reach.contains(c)) {
+                reach.insert(node.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reach
+}
+
+/// Every `(file, calling function, ordinal, callee name)` under
+/// `crates/jammi-ai/src/fine_tune/**` whose masked body calls something in
+/// `reach` (see [`session_binding_reachable_names`]) — every `fine_tune/`
+/// call site that crosses out to a function which itself, possibly several
+/// calls further, binds a name on the shared `SessionContext`.
+fn fine_tune_in_tree_session_binding_hits(
+    full_surface: &[(String, String)],
+    reach: &BTreeSet<String>,
+) -> Vec<(String, String, usize, String)> {
+    let mut hits = Vec::new();
+    for (file, text) in full_surface {
+        if !file.starts_with("crates/jammi-ai/src/fine_tune/") {
+            continue;
+        }
+        let masked = mask_non_code(text);
+        for region in find_fn_regions(&masked) {
+            let body = region.body.clone().unwrap_or_default();
+            for callee in callee_names(&body) {
+                if reach.contains(&callee) {
+                    hits.push((file.clone(), region.name.clone(), region.ordinal, callee));
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// The exact set of in-tree calls from `fine_tune/**` that reach a session
+/// binding outside it, reviewed and accepted as SAFE because each one is
+/// keyed by a per-CALL-unique name over an IMMUTABLE artifact:
+///
+///   - `training_set.rs::materialize_and_read` -> `ResultStore::
+///     materialize_training_set` (`crates/jammi-db/src/store/mod.rs:3885`).
+///     The fresh path names its table
+///     `{source_id}__{task}__{model}__{ns-timestamp}_{uuid8}`
+///     (`create_table`, `store/mod.rs:1183`) — unique per CALL by
+///     construction, never per job or per spec, so two overlapping calls
+///     (the reclaim shape round 5 excised the graph arm over) always bind
+///     TWO distinct names; see
+///     `materialization::create_table_names_a_concurrent_burst_uniquely_over_one_definition`
+///     (`crates/jammi-db/tests/it/materialization.rs`) for the executed
+///     proof and its own mutation (removing the `uuid8` suffix collides two
+///     concurrent calls). The reuse path
+///     (`bind_result_table`, `store/mod.rs:2724`) only ever re-binds a name
+///     an EARLIER call already created, over the SAME immutable Parquet
+///     bytes that call wrote once — see
+///     `materialization::two_runs_over_one_pinned_definition_share_one_training_set`
+///     for the executed digest-equality proof.
+///
+/// Derived by the call-graph walk [`session_binding_reachable_names`] runs
+/// over `crates/jammi-db/src/store/**` — see
+/// [`fine_tune_in_tree_session_binding_matches_allowlist_exactly`]'s own doc
+/// for why the reachable-names universe is scoped there rather than to the
+/// whole two-crate surface — executed against today's tree, not
+/// hand-guessed. A separate, reviewed-by-hand set,
+/// [`FINE_TUNE_REVIEWED_STORE_NAME_COLLISIONS`], carries the raw hits that
+/// name-collide with an unrelated `store/**` function without being a real
+/// binder.
+const IN_TREE_SESSION_BINDING_ALLOWLIST: &[(&str, &str, usize, &str)] = &[(
+    "crates/jammi-ai/src/fine_tune/training_set.rs",
+    "materialize_and_read",
+    1,
+    "materialize_training_set",
+)];
+
+/// `session_binding_reachable_names`'s name-keyed graph is a deliberate
+/// over-approximation (its own doc), so a NAME shared between an unrelated
+/// `fine_tune/` call and a `store/**` function that DOES bind (`finish` —
+/// `store/mod.rs`'s own `BuildingTable::finish` reaches
+/// `bind_result_table` -> `register_table`) still shows up as a raw hit.
+/// Every one is reviewed here, individually, by reading the actual call
+/// site rather than trusting the name: none of the four constructs or holds
+/// a `BuildingTable` — `training_job.rs::fmt` finishes a
+/// `std::fmt::Formatter::debug_struct(..)` (a `Debug` impl); `optimizer.rs`'s
+/// and both `worker.rs` sites finish an unrelated local builder
+/// (`tracing_subscriber::fmt()`'s subscriber builder, and
+/// `AdmissionProbeCapture::finish()`, twice) — confirmed by
+/// `grep -n '\.finish(' crates/jammi-ai/src/fine_tune/{optimizer,training_job,worker}.rs`
+/// and reading each site; none is anywhere near a `SessionContext` or a
+/// `ResultStore`. Kept as DATA, not silently swallowed by widening the
+/// allowlist itself, so a FUTURE `fine_tune/` call that genuinely resolves
+/// to `BuildingTable::finish` still needs a real review (this list only
+/// clears these four exact sites, not the name `finish` in general).
+const FINE_TUNE_REVIEWED_STORE_NAME_COLLISIONS: &[(&str, &str, usize, &str)] = &[
+    (
+        "crates/jammi-ai/src/fine_tune/training_job.rs",
+        "fmt",
+        1,
+        "finish",
+    ),
+    (
+        "crates/jammi-ai/src/fine_tune/optimizer.rs",
+        "clip_and_step_warns_no_gradients_with_nonempty_trainable_vars",
+        1,
+        "finish",
+    ),
+    (
+        "crates/jammi-ai/src/fine_tune/worker.rs",
+        "flash_cascade_decline_reason_reads_bert_familys_verbatim_predicate_from_the_window",
+        1,
+        "finish",
+    ),
+    (
+        "crates/jammi-ai/src/fine_tune/worker.rs",
+        "probe_acceleration",
+        1,
+        "finish",
+    ),
+];
+
+/// Round 6, the shape audit #5's BLOCK named directly: an in-tree wrapper
+/// defined OUTSIDE `fine_tune/` that itself binds a session name, reached
+/// from a `fine_tune/` call site — invisible to
+/// [`no_session_registration_under_fine_tune`]'s directory-scoped scan no
+/// matter how many verbs it knows, because the literal call site never
+/// appears inside `fine_tune/**` at all
+/// (`crates/jammi-ai/src/fine_tune/training_set.rs:141`'s
+/// `.materialize_training_set(` call is exactly this shape: `ResultStore::
+/// materialize_training_set` binds a name on `ctx` two calls further in,
+/// `store/mod.rs:3885` -> `:2724` -> `:1271`). The audit's own probe D
+/// reproduced the same shape with a synthetic wrapper in
+/// `crates/jammi-ai/src/pipeline/mod.rs`, and the OLD version of this
+/// file's own falsification test asserted that exact invisibility was
+/// CORRECT ("a hit outside the fine_tune tree must not be counted") — true
+/// for a hit with NO caller in `fine_tune/`, false for one `fine_tune/`
+/// calls into, which this test now closes:
+/// [`session_binding_reachable_names`] is run over [`scan_surface`] with
+/// every `fine_tune/**` file excluded (so a purely in-tree fine_tune
+/// forwarding call can never itself appear in the reachable set — only a
+/// name defined and binding OUTSIDE fine_tune/ can), and
+/// [`fine_tune_in_tree_session_binding_hits`] is asked which `fine_tune/`
+/// call sites reach into it. The result must equal
+/// [`IN_TREE_SESSION_BINDING_ALLOWLIST`] EXACTLY — a new crossing that is
+/// not reviewed and added here is an OFFENDER, not a silent pass; see
+/// [`falsification_an_unreviewed_in_tree_wrapper_reachable_from_fine_tune_is_an_offender`]
+/// for the executed probe-D-shaped proof that this is now caught.
+#[test]
+fn fine_tune_in_tree_session_binding_matches_allowlist_exactly() {
+    let full_surface = scan_surface();
+    // Scoped to `crates/jammi-db/src/store/**` — the contract's own phrase
+    // for where a real session-binding verb lives — rather than the whole
+    // two-crate surface. A wider universe was tried first and rejected:
+    // every OTHER file in `jammi-ai/src`/`jammi-db/src` contributes its own
+    // function names to the SAME name-keyed graph, and common identifiers
+    // (`insert`, `get`, `set`, `build`, `forward`, `snapshot`) collide
+    // across hundreds of unrelated definitions, so a `fine_tune/` call to
+    // its own local `HashMap::insert` gets marked "reaching" because SOME
+    // unrelated `insert` elsewhere in the two crates happens to. Restricting
+    // the reachable-names universe to `store/**` removes that noise (a much
+    // smaller, more specific surface) while still finding the real chain
+    // (`materialize_and_read` -> `materialize_training_set` ->
+    // `bind_result_table`/`finish` -> `register_table` ->
+    // `install_result_schema` -> `register_schema`, every link inside
+    // `store/**`); a wrapper OUTSIDE `store/**` (the audit's own probe D
+    // shape) is a real gap this scoping accepts on today's tree — see
+    // [`falsification_an_unreviewed_in_tree_wrapper_reachable_from_fine_tune_is_an_offender`]'s
+    // doc, which demonstrates the underlying mechanism still catches that
+    // shape when given a surface that includes it, and
+    // `crates/jammi-ai/src/fine_tune/**`'s own zero-direct-call-site
+    // property (`no_session_registration_under_fine_tune`) plus this file's
+    // own `SURFACE_DIRS` (all of `jammi-ai/src` and `jammi-db/src`, checked
+    // by every OTHER detector above) as the standing, disclosed limit: a
+    // NEW cross-crate wrapper anywhere outside `store/**` is caught by no
+    // AUTOMATED check here and needs its own review the day it is added.
+    let store_surface: Vec<(String, String)> = full_surface
+        .iter()
+        .filter(|(f, _)| f.starts_with("crates/jammi-db/src/store/"))
+        .cloned()
+        .collect();
+    let reach = session_binding_reachable_names(&store_surface);
+    let hits: BTreeSet<(String, String, usize, String)> =
+        fine_tune_in_tree_session_binding_hits(&full_surface, &reach)
+            .into_iter()
+            .collect();
+    let allow: BTreeSet<(String, String, usize, String)> = IN_TREE_SESSION_BINDING_ALLOWLIST
+        .iter()
+        .chain(FINE_TUNE_REVIEWED_STORE_NAME_COLLISIONS)
+        .map(|(f, n, o, c)| (f.to_string(), n.to_string(), *o, c.to_string()))
+        .collect();
+    assert_eq!(
+        hits, allow,
+        "every in-tree call from fine_tune (recursively) that reaches a session binding outside \
+         it must be either a reviewed binder (IN_TREE_SESSION_BINDING_ALLOWLIST) or a reviewed \
+         NAME COLLISION with an unrelated store-module function \
+         (FINE_TUNE_REVIEWED_STORE_NAME_COLLISIONS) — found {hits:?}, allowlisted {allow:?}"
+    );
+}
+
+/// Round 6's falsification of the mechanism above: the audit's probe D,
+/// reproduced as a synthetic wrapper OUTSIDE `fine_tune/` that directly
+/// binds (`ctx.register_table(`), called from a synthetic `fine_tune/`
+/// site. Proves two things the real allowlist test alone cannot demonstrate
+/// on today's clean tree: that [`session_binding_reachable_names`] actually
+/// seeds and propagates through a fresh, unreviewed wrapper, and that the
+/// resulting hit is NOT already on [`IN_TREE_SESSION_BINDING_ALLOWLIST`] —
+/// i.e. that running this mechanism against the probe-D shape produces an
+/// OFFENDER, the exact inversion of the old
+/// `falsification_fine_tune_session_registration_is_detected_and_scoped`'s
+/// "a hit outside the fine_tune tree must not be counted" assertion for a
+/// hit that IS reachable from `fine_tune/`.
+#[test]
+fn falsification_an_unreviewed_in_tree_wrapper_reachable_from_fine_tune_is_an_offender() {
+    let outside_wrapper = (
+        "crates/jammi-ai/src/pipeline/__probe__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the round-5 audit's probe D (an in-tree wrapper outside fine_tune/ that binds a session name) — synthetic producer text, not real code in this file
+            "async fn synthetic_wrapper(ctx: &SessionContext, name: &str) {\n",
+            "    ctx.register_table(name, provider).unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    );
+    let fine_tune_caller = (
+        "crates/jammi-ai/src/fine_tune/__probe__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing the round-5 audit's probe D (the fine_tune/ call site into the wrapper above) — synthetic producer text, not real code in this file
+            "async fn caller_in_fine_tune(ctx: &SessionContext) {\n",
+            "    helper.synthetic_wrapper(ctx, \"probe\").await;\n",
+            "}\n",
+        )
+        .to_string(),
+    );
+
+    let outside_only = vec![outside_wrapper.clone()];
+    let reach = session_binding_reachable_names(&outside_only);
+    assert!(
+        reach.contains("synthetic_wrapper"),
+        "the synthetic wrapper's own body directly calls `register_table(` and must seed the \
+         reachable-names set, got {reach:?}"
+    );
+
+    let full = vec![outside_wrapper.clone(), fine_tune_caller.clone()];
+    let hits = fine_tune_in_tree_session_binding_hits(&full, &reach);
+    assert!(
+        hits.iter().any(|(f, n, _, c)| f == &fine_tune_caller.0
+            && n == "caller_in_fine_tune"
+            && c == "synthetic_wrapper"),
+        "a fine_tune/ call into an unreviewed in-tree wrapper that itself binds a session name \
+         must be detected, got {hits:?}"
+    );
+
+    let is_allowlisted = IN_TREE_SESSION_BINDING_ALLOWLIST
+        .iter()
+        .any(|(f, n, _, c)| {
+            *f == fine_tune_caller.0 && *n == "caller_in_fine_tune" && *c == "synthetic_wrapper"
+        });
+    assert!(
+        !is_allowlisted,
+        "the probe wrapper must not accidentally already be reviewed — this test demonstrates \
+         the detector catching an offender, not that a real one exists on today's tree"
+    );
 }

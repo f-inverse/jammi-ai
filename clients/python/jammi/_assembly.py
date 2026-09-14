@@ -612,7 +612,7 @@ def build_fine_tune_request(
     process and leaves the wire field unset — see :func:`_wire_world_size`.
     `cache` opts into model-level cache reuse (``"use"``) or keeps the engine's
     default recompute (``"bypass"``, the default when omitted) — see
-    :func:`_cache_policy_value`.
+    :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)
@@ -714,7 +714,8 @@ def build_fine_tune_graph_request(
     this job cooperatively; `1` (the default) is a single process and leaves the
     wire field unset — see :func:`_wire_world_size`. `cache` opts into
     model-level cache reuse (``"use"``) or keeps the engine's default recompute
-    (``"bypass"``, the default when omitted) — see :func:`_cache_policy_value`.
+    (``"bypass"``, the default when omitted) — see
+    :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)

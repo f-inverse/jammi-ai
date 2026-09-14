@@ -170,6 +170,22 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 /// converged final adapter might wash out still moves `checkpoint_1`. All eight
 /// files were byte-stable across repeated base runs before being pinned — a
 /// fingerprint that drifts run-to-run would make this oracle noise, not a pin.
+/// The bytes are platform-specific (the trainer's float paths differ between
+/// x86_64 Linux and Apple Silicon), so the pin is recorded per platform: the
+/// Linux set from the CI hermetic lane (byte-identical across three runs), the
+/// other from the Apple Silicon host the fixture was first pinned on.
+#[cfg(target_os = "linux")]
+const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
+    ("adapter.safetensors", "1184:787adf352b68fb17"),
+    ("adapter_config.json", "143:1feeeb6239c3fd30"),
+    ("checkpoint_1.safetensors", "1184:d83c85d26607a38e"),
+    ("checkpoint_2.safetensors", "1184:f7bde961f55483ad"),
+    ("checkpoint_3.safetensors", "1184:9ac2f77cffec75b7"),
+    ("checkpoint_4.safetensors", "1184:787adf352b68fb17"),
+    ("checkpoint_best.safetensors", "1184:787adf352b68fb17"),
+    ("manifest.json", "788:4b17c3b421cd2a8f"),
+];
+#[cfg(not(target_os = "linux"))]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
     ("adapter.safetensors", "1184:1495533e3a6c48bd"),
     ("adapter_config.json", "143:1feeeb6239c3fd30"),

@@ -483,9 +483,18 @@ async fn fine_tune_graph_end_to_end_completes() {
     // carries the tabular arm's own, unrelated additions) are byte-identical
     // to `fe5ac560` — not by re-running an unmodified test on a separate
     // checkout.
+    // The bytes are platform-specific (x86_64 Linux vs Apple Silicon float
+    // paths), so the pin carries one value per platform: Linux from the CI
+    // hermetic lane (identical across three runs), the other from the Apple
+    // Silicon host the fixture was first pinned on.
+    let expected = if cfg!(target_os = "linux") {
+        "1184:a5ada07e134f0b21"
+    } else {
+        "1184:8f34fc6e6f33abea"
+    };
     assert_eq!(
         fingerprint(&std::fs::read(&adapter).unwrap()),
-        "1184:8f34fc6e6f33abea",
+        expected,
         "the graph fine-tune adapter's bytes moved off origin/main's (fe5ac560) value for this \
          exact fixture — the excised graph arm is restored main's code producing main's bytes; a \
          mismatch here means either this fixture or the sampler/trainer changed"

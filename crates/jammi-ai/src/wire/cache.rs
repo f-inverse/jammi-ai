@@ -32,14 +32,26 @@ pub fn cache_outcome_to_proto(outcome: &CacheOutcome) -> i32 {
     }
 }
 
-/// Encode the engine [`CachePolicy`] into the wire enum. Total — the engine
-/// type has no unspecified variant — so a send-side caller always emits a
-/// concrete `USE`/`BYPASS`, never `UNSPECIFIED` (that value exists only so a
-/// caller that omits the field gets the engine default on decode).
+/// Encode the engine [`CachePolicy`] into the wire enum.
+///
+/// `Bypass` (the engine default) encodes as `UNSPECIFIED` (`0`), NOT the
+/// explicit `BYPASS` variant: a caller that never touches the request's
+/// `cache` field (every non-Rust client, and the Rust client's own
+/// default-constructed request) leaves the wire field at proto3's implicit
+/// zero value, which is `UNSPECIFIED`. Before this, the engine's own re-encode
+/// of a `Bypass` spec (`recompute`'s replay, `training_spec_to_proto`) emitted
+/// the explicit `BYPASS = 2` while every other writer of an unset policy
+/// emitted `0` — two different wire encodings of the identical decoded
+/// value. `Use` still encodes to the explicit `USE` variant (there is no
+/// "unspecified but reused" state to collapse it into). [`cache_policy_from_proto`]
+/// already decodes both `UNSPECIFIED` and `BYPASS` to [`CachePolicy::Bypass`],
+/// so this is a NEVER-ROUNDTRIPS-DIFFERENTLY change: decode is unaffected,
+/// only which of the two equally-valid encodings of `Bypass` this function
+/// itself chooses to emit.
 pub fn cache_policy_to_proto(policy: CachePolicy) -> pb::CachePolicy {
     match policy {
         CachePolicy::Use => pb::CachePolicy::Use,
-        CachePolicy::Bypass => pb::CachePolicy::Bypass,
+        CachePolicy::Bypass => pb::CachePolicy::Unspecified,
     }
 }
 
@@ -91,5 +103,28 @@ mod tests {
             let encoded = cache_policy_to_proto(policy) as i32;
             assert_eq!(cache_policy_from_proto(encoded).unwrap(), policy);
         }
+    }
+
+    /// One spec has one wire encoding, on both sides of the transport: a
+    /// client that never sets the request's `cache` field transmits proto3's
+    /// implicit zero value (`UNSPECIFIED`), and the engine's OWN re-encode of
+    /// a `Bypass` spec (`training_spec_to_proto`'s remote-send path, a
+    /// recompute replay) must emit the SAME `0`, not the explicit,
+    /// distinguishable `BYPASS = 2`. Before this, the engine encoded `Bypass`
+    /// as `2` while an unset field was `0` — two different bytes on the wire
+    /// for what decodes to the identical engine value.
+    #[test]
+    fn engine_re_encode_of_bypass_matches_an_unset_clients_wire_bytes() {
+        let engine_encoded = cache_policy_to_proto(CachePolicy::Bypass) as i32;
+        assert_eq!(
+            engine_encoded, 0,
+            "Bypass must re-encode to the wire's implicit unset value (0), matching a client \
+             that never touches the `cache` field, got {engine_encoded}"
+        );
+        assert_eq!(
+            engine_encoded,
+            pb::CachePolicy::Unspecified as i32,
+            "0 must be exactly UNSPECIFIED, never the explicit BYPASS variant"
+        );
     }
 }

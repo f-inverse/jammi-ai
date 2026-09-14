@@ -93,7 +93,8 @@ use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::store::ArtifactStore;
+use jammi_db::storage::StorageError;
+use jammi_db::store::{ArtifactStore, ResultStore};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
@@ -1244,6 +1245,12 @@ impl JobWorker {
         artifact: TrainedArtifact,
     ) {
         let store = session.artifact_store();
+        // The guarded port every abandon-path byte-delete in this function
+        // reaches through (P1 design, #500) — never the unguarded
+        // `ArtifactStore::delete_artifact_prefix` directly. See
+        // `PrefixReferences`'s own doc.
+        let result_store = session.result_store();
+        let refs: &dyn PrefixReferences = &*result_store;
         // `catalog` is `pinned_to_tenant(record.tenant_id)` — its
         // `current_tenant()` reliably reports the JOB's tenant regardless of
         // any task-local scope, so every artifact key this function writes
@@ -1335,8 +1342,7 @@ impl JobWorker {
             // whose own `PublishedPrefix::delete_if_owned` can never touch a
             // REUSED prefix (P1') — it is owned by its own original model
             // row.
-            abandon_unfinalized_attempt(&store, catalog, &prefix, &model_id, register.version)
-                .await;
+            abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version).await;
             if dir.is_some() {
                 Self::gc_epoch_checkpoints(
                     &store,
@@ -1389,7 +1395,7 @@ impl JobWorker {
                     Ok(m) => m,
                     Err(e) => {
                         abandon_unfinalized_attempt(
-                            &store,
+                            refs,
                             catalog,
                             &prefix,
                             &model_id,
@@ -1414,7 +1420,7 @@ impl JobWorker {
                     Ok(j) => j,
                     Err(e) => {
                         abandon_unfinalized_attempt(
-                            &store,
+                            refs,
                             catalog,
                             &prefix,
                             &model_id,
@@ -1521,7 +1527,7 @@ impl JobWorker {
         let result_json = match serde_json::to_string(&job_result) {
             Ok(j) => j,
             Err(e) => {
-                abandon_unfinalized_attempt(&store, catalog, &prefix, &model_id, register.version)
+                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
                     .await;
                 Self::gc_epoch_checkpoints(
                     &store,
@@ -1623,7 +1629,7 @@ impl JobWorker {
                 // row (P3') so no hash-less zombie survives; leave the job
                 // for reclaim (the re-claiming worker writes its own prefix
                 // and its CAS commits it).
-                abandon_unfinalized_attempt(&store, catalog, &prefix, &model_id, register.version)
+                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
                     .await;
                 Self::gc_epoch_checkpoints(
                     &store,
@@ -1641,7 +1647,7 @@ impl JobWorker {
                 );
             }
             Err(e) => {
-                abandon_unfinalized_attempt(&store, catalog, &prefix, &model_id, register.version)
+                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
                     .await;
                 Self::gc_epoch_checkpoints(
                     &store,
@@ -1949,6 +1955,7 @@ impl JobWorker {
                 method,
                 task,
                 common,
+                cache,
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
@@ -2018,6 +2025,7 @@ impl JobWorker {
                     common,
                     loader,
                     materialization_source,
+                    cache,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -2044,6 +2052,12 @@ impl JobWorker {
                     // doc); a graph fine-tune's model row carries no
                     // materialization.
                     materialization_source: None,
+                    // `TrainingSpec::GraphFineTune` has no `cache` field at
+                    // all (P4 design, #500 fix round 3) — see
+                    // `FineTuneRun::cache`'s own doc for why `Bypass` states
+                    // the true behaviour here rather than a value that
+                    // merely happens to be inert.
+                    cache: jammi_db::store::CachePolicy::Bypass,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -2258,6 +2272,7 @@ impl JobWorker {
             common,
             loader,
             materialization_source,
+            cache,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
@@ -2287,11 +2302,13 @@ impl JobWorker {
         if let Some(src) = &materialization_source {
             let canonical_model_id = model_source.to_string();
             let device = session.compute_device();
-            // P2': the fused-kernel admission profile — see
-            // `kernel_admission_profile`'s own doc for why this call, made
-            // BEFORE training to key the probe below, is guaranteed to
-            // agree with the SECOND call made after training completes
-            // (the value actually threaded into the recorded manifest).
+            // The fused-kernel admission profile is UNCOVERED at this
+            // commit (#546): `MaterializationEnv::kernel_admission_profile`
+            // stays declared and hash-affecting the moment a real value is
+            // written, but nothing here writes one — see that field's own
+            // doc for why (a re-derived prediction, not the training loop's
+            // actual per-op admission outcome, was excised rather than
+            // shipped as a false sense of coverage).
             let env = jammi_db::store::manifest::MaterializationEnv::new(
                 device.clone(),
                 vec![jammi_db::store::manifest::ModelIdentity {
@@ -2301,8 +2318,7 @@ impl JobWorker {
                     content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
                     quantization: guard.model.quantization(),
                 }],
-            )
-            .with_kernel_admission_profile(kernel_admission_profile(&device));
+            );
             let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
                 &src.source,
                 &src.columns,
@@ -2365,7 +2381,7 @@ impl JobWorker {
                 .map_err(jammi_db::store::manifest_to_jammi)
                 .map_err(WorkerJobError::from)?;
 
-            if common.cache == jammi_db::store::CachePolicy::Use {
+            if cache == jammi_db::store::CachePolicy::Use {
                 if let Some(hit) = catalog
                     .probe_model_by_definition(definition_hash.as_str(), &inputs)
                     .await
@@ -2510,32 +2526,6 @@ impl JobWorker {
                 )));
             }
         };
-
-        // P2': "the profile is recorded AFTER training… the descriptor is
-        // finalized post-run" — re-derive `kernel_admission_profile` now
-        // that training has actually completed, and thread THIS value (not
-        // the one captured before training, above) into what actually gets
-        // persisted. `kernel_admission_profile`'s own doc states why the two
-        // calls are guaranteed to agree for one process; a `Reused` outcome
-        // never reaches here (it short-circuits with an early return above,
-        // before the trainer ever runs), so the match's other arm is dead
-        // code kept only for the enum's exhaustiveness.
-        let pending_materialization = pending_materialization.map(|outcome| match outcome {
-            FineTuneMaterializationOutcome::Fresh {
-                descriptor,
-                mut env,
-                inputs,
-            } => {
-                env.kernel_admission_profile =
-                    Some(kernel_admission_profile(&session.compute_device()));
-                FineTuneMaterializationOutcome::Fresh {
-                    descriptor,
-                    env,
-                    inputs,
-                }
-            }
-            reused @ FineTuneMaterializationOutcome::Reused { .. } => reused,
-        });
 
         // Hand the worker's unified finalize the trained adapter files (in their
         // tempdir) plus the model-registration descriptor. The worker publishes
@@ -3344,6 +3334,16 @@ struct FineTuneRun {
     /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
     /// carries `None` here at this commit.
     materialization_source: Option<FineTuneMaterializationSource>,
+    /// The reuse dial `TrainingSpec::FineTune` carries at its own top level
+    /// (P4 design, #500 fix round 3 — moved off `TrainingCommon`, so
+    /// `TrainingSpec::GraphFineTune` cannot represent one at all). Always
+    /// [`jammi_db::store::CachePolicy::Bypass`] for the graph kind, which
+    /// never sets [`Self::materialization_source`] either — the probe below
+    /// only ever runs inside that `Some` arm, so this value is structurally
+    /// unreachable for a graph run regardless of what it is set to; `Bypass`
+    /// states the true, unconditional behaviour rather than a value that
+    /// happens to be inert here.
+    cache: jammi_db::store::CachePolicy,
 }
 
 /// The `ProducingDescriptor::FineTune`-specific inputs a `TrainingSpec::FineTune`
@@ -3527,6 +3527,38 @@ async fn publish_artifact(
         .await
 }
 
+/// The narrow port the worker's abandon path reaches the ONE guarded
+/// `models/**` byte-delete through (P1 design, #500 fix round 3): never the
+/// unguarded [`ArtifactStore::delete_artifact_prefix`] primitive directly.
+/// Implemented by [`ResultStore`], whose
+/// [`ResultStore::delete_unreferenced_prefix`] consults the admin-scoped
+/// [`ResultStore::prefix_is_referenced`] predicate — ANY live `models` row,
+/// in ANY tenant — before ever reaching the unguarded primitive, refusing
+/// (typed) when the count is non-zero. Naming the port as a trait rather
+/// than threading `&ResultStore` bare keeps this module's byte-deleting
+/// surface to exactly the one method a new call site can reach — it cannot
+/// accidentally call `reconcile`, `pin_current_version`, or any other
+/// `ResultStore` API through this handle.
+#[async_trait::async_trait]
+trait PrefixReferences: Send + Sync {
+    /// See [`ResultStore::delete_unreferenced_prefix`]'s own doc for the
+    /// full contract; this is a straight pass-through.
+    async fn delete_unreferenced_prefix(
+        &self,
+        prefix: &jammi_db::storage::StorageUrl,
+    ) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl PrefixReferences for ResultStore {
+    async fn delete_unreferenced_prefix(
+        &self,
+        prefix: &jammi_db::storage::StorageUrl,
+    ) -> Result<()> {
+        ResultStore::delete_unreferenced_prefix(self, prefix).await
+    }
+}
+
 /// Ownership of the prefix [`JobWorker::publish_and_finalize`] is about to
 /// finalize against (U3 fix round 1, P1', BLOCK #1 finding F1): whether this
 /// attempt wrote these bytes itself (`Owned`, safe to reclaim on any abort
@@ -3543,7 +3575,11 @@ async fn publish_artifact(
 /// already reference it (`store::reconcile`'s attribution), and deleting it
 /// out from under a concurrent reader of that OTHER, unrelated, already-
 /// servable row would be exactly the hazard the pre-existing `:1334`-style
-/// guard was invented for, restated so it cannot be forgotten again.
+/// guard was invented for, restated so it cannot be forgotten again. Even
+/// the `Owned` arm no longer trusts its own ownership claim unconditionally
+/// (P1 design): it deletes only through [`PrefixReferences`], which itself
+/// refuses if some OTHER live `models` row has, in the meantime, come to
+/// name the exact same prefix.
 enum PublishedPrefix {
     /// This attempt's own freshly-published bytes.
     Owned(jammi_db::storage::StorageUrl),
@@ -3566,10 +3602,34 @@ impl PublishedPrefix {
     }
 
     /// Best-effort delete iff this attempt owns the bytes (see the type's
-    /// own doc for why a `Reused` prefix is never touched here).
-    async fn delete_if_owned(&self, store: &ArtifactStore) {
+    /// own doc for why a `Reused` prefix is never touched here), routed
+    /// EXCLUSIVELY through the guarded [`PrefixReferences`] port (P1
+    /// design, #500 fix round 3) — never the unguarded
+    /// [`ArtifactStore::delete_artifact_prefix`] primitive. A
+    /// [`jammi_db::error::JammiError::Storage`]`(`[`StorageError::Referenced`]`)`
+    /// refusal means some OTHER live `models` row names these exact bytes:
+    /// logged with the prefix and the referencing count, never escalated —
+    /// the bytes belong to that other row now, and this attempt's own
+    /// row-level cleanup (see [`abandon_unfinalized_attempt`]) proceeds
+    /// regardless.
+    async fn delete_if_owned(&self, refs: &dyn PrefixReferences) {
         if let PublishedPrefix::Owned(url) = self {
-            store.delete_artifact_prefix(url).await.ok();
+            if let Err(e) = refs.delete_unreferenced_prefix(url).await {
+                match e {
+                    JammiError::Storage(StorageError::Referenced { prefix, count }) => {
+                        tracing::warn!(
+                            prefix,
+                            count,
+                            "abandon: this attempt's own prefix is still referenced by another \
+                             live models row; leaving the bytes in place"
+                        );
+                    }
+                    other => tracing::debug!(
+                        error = %other,
+                        "abandon: best-effort prefix delete failed"
+                    ),
+                }
+            }
         }
     }
 }
@@ -3588,15 +3648,19 @@ impl PublishedPrefix {
 /// one where no row was ever the risk (it is then simply a no-op `false`).
 /// Best-effort on both halves: an error here is logged, never escalated,
 /// since the caller's own terminal classification (this function's return)
-/// is what the job's outcome hinges on, not this cleanup.
+/// is what the job's outcome hinges on, not this cleanup. The row-level
+/// cleanup below runs UNCONDITIONALLY, even when [`PublishedPrefix::
+/// delete_if_owned`] refuses to touch the bytes because another live row
+/// now names them — the bytes are the other row's business, but this
+/// attempt's own zombie row is still this attempt's to reap.
 async fn abandon_unfinalized_attempt(
-    store: &ArtifactStore,
+    refs: &dyn PrefixReferences,
     catalog: &Arc<Catalog>,
     prefix: &PublishedPrefix,
     model_id: &str,
     version: i32,
 ) {
-    prefix.delete_if_owned(store).await;
+    prefix.delete_if_owned(refs).await;
     if let Err(e) = catalog
         .delete_registered_model_if_unfinalized(model_id, version)
         .await
@@ -3608,76 +3672,6 @@ async fn abandon_unfinalized_attempt(
             "failed to reap an unfinalized model row after an abandoned finalize attempt"
         );
     }
-}
-
-/// The fixed op name [`kernel_admission_profile`] folds — the exact
-/// declared determinant the campaign audit named as write-never
-/// (`adamw.rs`'s per-`Var` `fused_admission_predicate`,
-/// [`jammi_kernels::admission::admit`]'s own domain check). A single named
-/// constant (family J: fixed, not derived by iterating some collection in
-/// whatever order it happens to enumerate) so the profile string's byte
-/// layout never depends on anything but this op's own admission facts.
-const ADMISSION_PROFILE_OP: &str = "adamw_step_fused";
-
-/// The [`jammi_db::store::manifest::MaterializationEnv::kernel_admission_profile`]
-/// this run's `adamw_step_fused` optimizer-step kernel dispatch resolves to
-/// (U3 fix round 1, P2', BLOCK #1 finding F2: the field was write-never, so
-/// two builds that differ only in what they admit shared one definition
-/// hash and a `CachePolicy::Use` probe silently reused an artifact trained
-/// under different kernel numerics).
-///
-/// Every input this folds — device support
-/// ([`jammi_kernels::admission::device_is_supported`]'s own CPU-always /
-/// CUDA-iff-this-build's-`cuda`-feature rule, mirrored here over the
-/// db-local [`jammi_db::store::manifest::ComputeDevice`] rather than a
-/// `candle_core::Device` this module has no reason to construct just to ask
-/// this one question), [`jammi_kernels::admission::admission_mode`] (the
-/// `JAMMI_KERNELS_STRICT` switch), and
-/// [`jammi_kernels::admission::disabled_ops_requested`] (`JAMMI_KERNELS_DISABLE`,
-/// exact-name or the `"all"` wildcard, mirroring `admission::op_is_disabled`'s
-/// own two-arm membership test) — is fixed once per PROCESS: an environment
-/// variable read at first use (both via a `OnceLock`), or the device this
-/// job trains on, never anything that changes mid-run. `adamw_step_fused`'s
-/// remaining domain legs (`F32`, mutual contiguity, one shared shape across
-/// `theta`/the two moment buffers/`grad`) are satisfied unconditionally by
-/// every LoRA adapter `Var` and its freshly zero-initialized moment buffers
-/// this crate constructs, so device support is the only leg that VARIES
-/// across the environments this determinant exists to distinguish (a build
-/// with/without the `cuda` feature, a CPU vs CUDA deployment, an
-/// operator-set disable/strict override) — folding the other three would be
-/// constant, unvarying padding on every call this crate makes.
-///
-/// Called from [`JobWorker::train_fine_tune`] BOTH before training (to key
-/// the `CachePolicy::Use` probe) and again after training completes (P2':
-/// "recorded after training… the descriptor is finalized post-run" — the
-/// value [`FineTuneMaterializationOutcome::Fresh::env`] is actually
-/// recorded under). Because every input is process-fixed, the two calls are
-/// GUARANTEED to return the identical string for one process; the second
-/// call is what is actually threaded into the recorded manifest, honouring
-/// the ruling literally rather than assuming the guarantee without ever
-/// re-deriving it.
-fn kernel_admission_profile(device: &jammi_db::store::manifest::ComputeDevice) -> String {
-    use jammi_db::store::manifest::ComputeDevice;
-
-    let device_supported = match device {
-        ComputeDevice::Cpu => true,
-        ComputeDevice::Cuda { .. } => cfg!(feature = "cuda"),
-        ComputeDevice::Metal { .. } => false,
-    };
-    let disabled = jammi_kernels::admission::disabled_ops_requested();
-    let op_disabled = disabled
-        .iter()
-        .any(|op| op == ADMISSION_PROFILE_OP || op == "all");
-    format!(
-        "{ADMISSION_PROFILE_OP}={};mode={:?};disabled=[{}]",
-        if device_supported && !op_disabled {
-            "fused"
-        } else {
-            "eager"
-        },
-        jammi_kernels::admission::admission_mode(),
-        disabled.join(",")
-    )
 }
 
 /// The terminal classification of a worker's run of one job.
@@ -6263,54 +6257,6 @@ mod tests {
 
     use super::*;
 
-    /// P2' (fix round 1, BLOCK #1 finding F2): the kernel admission profile
-    /// the `FineTune` producer folds into `MaterializationEnv` differs
-    /// across device support — the exact "two runs under different
-    /// admission hash differently" property the campaign audit demanded
-    /// (`kernel_admission_profile`'s own doc: device support is the one leg
-    /// that VARIES across the environments this determinant exists to
-    /// distinguish, since Metal is never device-supported regardless of
-    /// build features — a device leg this test can exercise deterministically
-    /// on any host).
-    #[test]
-    fn kernel_admission_profile_differs_across_device_support() {
-        use jammi_db::store::manifest::ComputeDevice;
-
-        let cpu = kernel_admission_profile(&ComputeDevice::Cpu);
-        assert!(
-            cpu.starts_with("adamw_step_fused=fused;"),
-            "CPU is always device-supported: {cpu}"
-        );
-
-        let metal = kernel_admission_profile(&ComputeDevice::Metal { ordinal: 0 });
-        assert!(
-            metal.starts_with("adamw_step_fused=eager;"),
-            "Metal is never device-supported: {metal}"
-        );
-        assert_ne!(
-            cpu, metal,
-            "two device environments that admit `adamw_step_fused` differently must produce \
-             two different profile strings — the exact property \
-             `MaterializationEnv::kernel_admission_profile` exists to fold into the definition \
-             hash"
-        );
-    }
-
-    /// Calling [`kernel_admission_profile`] twice for the SAME device
-    /// (mirroring the two real call sites in `train_fine_tune` — before and
-    /// after training, P2') is guaranteed to agree, since every input it
-    /// folds is fixed once per process (that function's own doc) — the
-    /// "before and after agree" half the acceptance oracle relies on for
-    /// reuse to work at all within one environment.
-    #[test]
-    fn kernel_admission_profile_is_stable_across_repeated_calls() {
-        use jammi_db::store::manifest::ComputeDevice;
-
-        let a = kernel_admission_profile(&ComputeDevice::Cpu);
-        let b = kernel_admission_profile(&ComputeDevice::Cpu);
-        assert_eq!(a, b, "every input this profile folds is process-fixed");
-    }
-
     /// Campaign #446 finding 3, the honest-negative half:
     /// [`reason_from_probe_window`] returns the window's OWN verbatim
     /// predicate for an op it recorded, and [`REASON_UNAVAILABLE`] — never a
@@ -7945,6 +7891,132 @@ mod tests {
             .await
             .expect("a second stop_and_join must not hang")
             .expect("a second stop_and_join on an already-joined worker is Ok");
+    }
+
+    /// P1 design (#500 fix round 3): `PublishedPrefix::delete_if_owned`'s
+    /// `Owned` arm routes through the SAME guarded [`PrefixReferences`] port
+    /// as every other `models/**` byte-delete — it does not trust its own
+    /// ownership claim unconditionally. Real traffic can never make two
+    /// attempts collide on the SAME prefix (`job_id` uniqueness), so this
+    /// fabricates the collision directly, the same way the db-side audit's
+    /// executed probe did (a global prefix + a second tenant's row naming
+    /// it): a SECOND tenant's already-servable model row is made to name the
+    /// exact bytes this attempt is about to abandon as `Owned`. Oracle:
+    /// the bytes survive, the typed refusal is observed directly, and the
+    /// abandoning attempt's OWN unfinalized row is still reaped (the two
+    /// halves of `abandon_unfinalized_attempt` are independent).
+    ///
+    /// Mutation: reverting [`PublishedPrefix::delete_if_owned`] to call the
+    /// unguarded `ArtifactStore::delete_artifact_prefix` directly kills this
+    /// test (the reuser's bytes are deleted out from under it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abandon_never_deletes_an_owned_prefix_a_second_tenants_row_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+
+        // The bytes an in-flight attempt is about to abandon as `Owned`.
+        let prefix = session
+            .artifact_store()
+            .put_artifact(
+                None,
+                &["fake-owned-attempt"],
+                &[(
+                    "adapter.bin".to_string(),
+                    bytes::Bytes::from_static(b"weights"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // A SECOND TENANT's already-servable row names the SAME prefix.
+        let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
+        let catalog_b = Arc::new(session.catalog().pinned_to_tenant(Some(tenant_b)));
+        catalog_b
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "reuser-model",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: Some(prefix.as_str()),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        // The abandoning attempt's own unfinalized row (`artifact_path`
+        // NULL) — the row `abandon_unfinalized_attempt`'s OTHER half must
+        // still reap regardless of what the byte-delete half does.
+        let owner_catalog = Arc::new(session.catalog().pinned_to_tenant(None));
+        owner_catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "abandoning-attempt",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        // Typed error observed DIRECTLY: the guard refuses before any
+        // abandon path ever runs.
+        let result_store = session.result_store();
+        let err = result_store
+            .delete_unreferenced_prefix(&prefix)
+            .await
+            .expect_err("a live models row in another tenant names this prefix");
+        match err {
+            jammi_db::error::JammiError::Storage(jammi_db::storage::StorageError::Referenced {
+                count,
+                ..
+            }) => assert_eq!(count, 1, "exactly one live row names this prefix"),
+            other => panic!("expected StorageError::Referenced, got {other:?}"),
+        }
+
+        // Drive the real abandon path with an `Owned` prefix pointed at the
+        // colliding bytes.
+        let refs: &dyn PrefixReferences = &*result_store;
+        abandon_unfinalized_attempt(
+            refs,
+            &owner_catalog,
+            &PublishedPrefix::Owned(prefix.clone()),
+            "abandoning-attempt",
+            1,
+        )
+        .await;
+
+        // The reuser's bytes survive.
+        session
+            .artifact_store()
+            .fetch_artifact(&prefix)
+            .await
+            .expect("the reuser's bytes must survive an Owned-arm abandon");
+
+        // The reuser's row is untouched.
+        let reuser = catalog_b
+            .get_model("reuser-model")
+            .await
+            .unwrap()
+            .expect("the reuser's row must still exist");
+        assert_eq!(reuser.artifact_path.as_deref(), Some(prefix.as_str()));
+
+        // This attempt's OWN row-level cleanup still completed — the bytes
+        // being refused does not block the (independent) row reap.
+        assert!(
+            owner_catalog
+                .get_model("abandoning-attempt")
+                .await
+                .unwrap()
+                .is_none(),
+            "the abandoning attempt's own unfinalized row must still be reaped even though its \
+             bytes were refused"
+        );
     }
 
     /// Contract `CONTRACT-OPS-fix4.md` M5: `confirms_release()` checks

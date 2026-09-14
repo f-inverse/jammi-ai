@@ -281,10 +281,9 @@ impl ArtifactStore {
     ///
     /// The sidecar's path is always DERIVED here — `self.child(prefix,
     /// MATERIALIZATION_NAME)`, the fixed relative name under the given
-    /// artifact prefix — never read back from a catalog column. `models` has
-    /// no `manifest_path` column (P7, #500): a prior migration draft added
-    /// one, but nothing ever read it, so the migration was rewritten before
-    /// merge to drop it rather than ship a column with no reader.
+    /// artifact prefix — never read back from a catalog column: `models`
+    /// carries no `manifest_path` column, so there is no separate pointer
+    /// that could drift out of sync with where the sidecar actually lives.
     pub async fn read_model_materialization(
         &self,
         prefix: &StorageUrl,
@@ -357,6 +356,19 @@ impl ArtifactStore {
     }
 
     /// Best-effort delete of every object under an artifact prefix.
+    ///
+    /// This is the UNGUARDED primitive: it carries no reference check of its
+    /// own (`ArtifactStore` stays catalog-free), so it must never be called
+    /// directly on a prefix a live `models` row might still name.
+    /// Reachable from production code ONLY through two routes: (1)
+    /// [`crate::store::ResultStore::delete_unreferenced_prefix`], which
+    /// consults [`crate::store::ResultStore::prefix_is_referenced`] first
+    /// and refuses, typed, before ever reaching this call — the sanctioned
+    /// route for a worker's abandon path (a losing cache-hit attempt, a
+    /// zombie's orphaned prefix); and (2) [`Self::delete_resume_checkpoint`]
+    /// / the epoch-checkpoint delete, whose own docs state why THEIR
+    /// prefixes (`_resume/`, `checkpoints/epoch_N/`) never need the guard —
+    /// no `models` row ever names either namespace.
     ///
     /// Used to GC a losing attempt's orphaned prefix. Reads the manifest to learn
     /// the keys and deletes each (plus the manifest); a 404 is not an error — the
@@ -433,6 +445,13 @@ impl ArtifactStore {
     /// the finalize-CAS winner only: the resume state is dead the moment the job
     /// is `completed`, and the prefix is bounded to one bundle per job
     /// (overwrite-in-place), so this is the single point that reclaims it.
+    ///
+    /// Calls the unguarded [`Self::delete_artifact_prefix`] directly, with
+    /// no [`crate::store::ResultStore::prefix_is_referenced`] consult: the
+    /// `_resume/` prefix is a namespace no `models` row's `artifact_path`
+    /// ever equals (it is never a served commit pointer, only a
+    /// crash-recovery side channel — see this type's own module docs), so
+    /// the guard has nothing to check.
     pub async fn delete_resume_checkpoint(
         &self,
         tenant: Option<&TenantId>,
@@ -477,6 +496,13 @@ impl ArtifactStore {
     /// attempt as, not an error). This lets a caller derive and sweep a whole
     /// `[0, epochs)` range without first knowing how far training actually
     /// got: indices past the run's real progress are simply no-ops.
+    ///
+    /// Calls the unguarded [`Self::delete_artifact_prefix`] directly, with
+    /// no [`crate::store::ResultStore::prefix_is_referenced`] consult: an
+    /// epoch-checkpoint prefix (`checkpoints/epoch_{N}/`) is a namespace no
+    /// `models` row's `artifact_path` ever equals (a served model points at
+    /// its winning attempt's TOP-level bundle, never at one epoch's
+    /// intermediate checkpoint), so the guard has nothing to check.
     pub async fn delete_epoch_checkpoint(
         &self,
         tenant: Option<&TenantId>,
@@ -1195,7 +1221,7 @@ mod tests {
         assert_eq!(m1.combined_hash(), m2.combined_hash());
     }
 
-    // ─── U3 (#500): the model `materialization.json` attestation ───────────
+    // ─── The model `materialization.json` attestation ──────────────────────
 
     fn fine_tune_descriptor() -> crate::store::manifest::ProducingDescriptor {
         crate::store::manifest::ProducingDescriptor::FineTune {
@@ -1224,11 +1250,10 @@ mod tests {
         )
     }
 
-    /// RED at base: before this unit, `ArtifactStore` has no
-    /// `write_model_materialization` at all — no `materialization.json` is
-    /// ever written into a model artifact prefix. This proves the mechanism
-    /// now exists, is readable back byte-for-byte, and folds the RIGHT
-    /// artifact digest (the bundle's `combined_hash`, not an arbitrary one).
+    /// `write_model_materialization` writes `materialization.json` into a
+    /// model artifact prefix, readable back byte-for-byte, folding the
+    /// RIGHT artifact digest (the bundle's `combined_hash`, not an
+    /// arbitrary one).
     #[tokio::test]
     async fn write_model_materialization_round_trips_and_folds_the_bundle_digest() {
         let cache = tempfile::tempdir().unwrap();

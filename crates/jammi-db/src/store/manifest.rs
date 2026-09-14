@@ -218,6 +218,22 @@ pub struct MaterializationEnv {
     /// contract [`ModelIdentity::quantization`] keeps — so this field's
     /// addition changes not one byte of any [`DefinitionHash`] computed
     /// before it existed.
+    ///
+    /// **No production caller writes this field.** `jammi-db` cannot itself
+    /// observe a training loop's per-op fused/eager admission outcomes (it
+    /// depends on no `jammi-kernels` type), so populating it is entirely the
+    /// producing caller's responsibility, and the `FineTune` producer in
+    /// `jammi-ai` does not call [`Self::with_kernel_admission_profile`]. The
+    /// kernel-admission determinant of a fine-tuned model's produced bytes is
+    /// therefore UNCOVERED by [`DefinitionHash`] at this base: two runs whose
+    /// fused/eager admission genuinely differs (e.g. a build-feature or
+    /// hardware difference that changes which ops fuse) can hash identically.
+    /// Folding a real, per-op admission outcome into this field is tracked at
+    /// <https://github.com/f-inverse/jammi-ai/issues/546>. The field stays
+    /// declared, `serde`-default and skip-if-`None`, and its builder
+    /// (below) is exercised by this crate's own hash-completeness tests —
+    /// setting it DOES move [`DefinitionHash`] — so the seam is ready the
+    /// moment #546 lands a real write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_admission_profile: Option<String>,
 }

@@ -1,18 +1,21 @@
 //! `GangService` — the coordinator-to-member admission wire for a multi-host
 //! gang run (`CONTRACT-U5a.md`, U5a-1).
 //!
-//! U5a-1 freezes the wire (`jammi.v1.gang`, see `gang.proto`) and this
-//! handler's own decidable-without-a-database-verb surface: reading the
-//! first inbound `Assign` under a fixed bound and refusing the wire-level K2
-//! edges (`world == 0`, `rank >= world`) before any row is ever read. §I1's
-//! own row predicate (`get_job_for_rank`) and the write-once CAS pair
-//! (§W2 Fill) are a later step's within this same unit (the migration adding
-//! `jobs.training_set_ref`/`training_set_location` does not exist yet on
-//! this branch) — until that step wires them in here, every wire-valid call
-//! is refused `Unimplemented`, matching f1': "having no `HostAdmission`
-//! session to hand the call to, returns `Unimplemented`". `HostAdmission`
-//! itself (the admit-and-hold session, drain, re-verification) is U5a-2's,
-//! built on top of this handler once it exists.
+//! U5a-1 freezes the wire (`jammi.v1.gang`, see `gang.proto`), the wire-level
+//! K2 edges (`world == 0`, `rank >= world`) decided before any row is ever
+//! read, and this handler's own full I-GANG decision (§I1): `get_job_for_rank`
+//! for the row predicate, `resolve_training_set_identity` for the
+//! `world_size > 1` sidecar verify, and `fresh_instance` for the
+//! coordinator's own liveness. Every determinant collapses to the SAME
+//! `FailedPrecondition` status with a FIXED message (§I1 Non-disclosure) —
+//! the listener discloses neither a job's existence, claimant, nor attempt.
+//! Having decided every determinant and found no reason to refuse, this
+//! handler still has no `HostAdmission` session to hand the call to (U5a-2
+//! builds that), so it ends `Unimplemented` — f1': "a call satisfying EVERY
+//! I-GANG determinant still reaches the handler ... and, having no
+//! `HostAdmission` session to hand the call to, returns `Unimplemented`."
+//! `HostAdmission` itself (the admit-and-hold session, drain,
+//! re-verification) is U5a-2's, built on top of this handler once it exists.
 //!
 //! Served only on the internal `[server] peer_bind` listener, mounted beside
 //! `PeerService` (`OssServer::bind`) — never on the public listener, never
@@ -26,8 +29,9 @@ use std::time::Duration;
 
 use futures::Stream;
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::jobs_repo::RankAdmissionRow;
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::ResultStore;
 use jammi_db::tenant_scope::TenantBinding;
@@ -40,6 +44,18 @@ use crate::grpc::proto::gang::gang_service_server::GangService;
 use crate::grpc::proto::gang::{rank_control, RankControl, RankEvent};
 use crate::grpc::wire::map_engine_error;
 
+/// §I1 Non-disclosure: every I-GANG refusal — row absent, wrong status,
+/// wrong claimant, wrong attempt, lease not live, the training-set pair
+/// missing/unresolved for `world_size > 1`, or the coordinator's own
+/// `instances` row not fresh — collapses to this ONE status with this ONE
+/// fixed message. Never interpolate a job id, a claimant, or a reason into
+/// it: that is exactly the disclosure this property forbids.
+const I_GANG_REFUSAL_MESSAGE: &str = "gang admission refused";
+
+fn i_gang_refused() -> Status {
+    Status::failed_precondition(I_GANG_REFUSAL_MESSAGE)
+}
+
 /// The fixed bound for the first inbound `Assign` frame (§H3 step 1: "a
 /// silent client is dropped at that bound"). A handler-local constant, not a
 /// config knob, sized to one round trip — not `[lease] heartbeat_secs` or
@@ -49,25 +65,18 @@ const FIRST_ASSIGN_BOUND: Duration = Duration::from_secs(10);
 /// Server-side handler for the gang admission surface. Holds the shared
 /// engine session for its catalog + result store — the same handle
 /// [`crate::grpc::peer::PeerServer`] holds for the owner side of the
-/// distributed data plane.
-///
-/// The `session` field is unread by [`GangServer::run_rank`] on THIS branch:
-/// §I1's row predicate (`get_job_for_rank`) does not exist yet (the migration
-/// adding `jobs.training_set_ref`/`training_set_location` is this unit's
-/// still-pending db step), so nothing here yet derives a job's tenant to
-/// pass into [`resolve_training_set_identity`]. Held now (never constructed
-/// lazily later) so `run_rank`'s signature and this struct's shape do not
-/// change again once that wiring lands — the same reason
-/// [`crate::grpc::peer::PeerServer`] holds its session even for the requests
-/// its own tenant-free handler never reads a tenant from.
-#[allow(dead_code)]
+/// distributed data plane — and the `[lease]` window this deployment runs
+/// with, needed for [`jammi_db::catalog::Catalog::fresh_instance`]'s own
+/// `instance_liveness_margin` computation (§I1) without reaching back into
+/// `InferenceSession` for a config accessor this crate does not own.
 pub struct GangServer {
     session: Arc<InferenceSession>,
+    lease: Duration,
 }
 
 impl GangServer {
-    pub fn new(session: Arc<InferenceSession>) -> Self {
-        Self { session }
+    pub fn new(session: Arc<InferenceSession>, lease: Duration) -> Self {
+        Self { session, lease }
     }
 }
 
@@ -117,13 +126,61 @@ impl GangService for GangServer {
             return Err(Status::invalid_argument("rank must be less than world"));
         }
 
-        // §I1's row predicate (`get_job_for_rank`) and §W2's write-once pair
-        // need the `jobs.training_set_ref`/`training_set_location` columns,
-        // which this branch's migration does not add — that is this unit's
-        // NEXT step. Nothing calls `resolve_training_set_identity` from here
-        // yet; the seam it will be wired through (once a job row and its
-        // derived tenant are in hand) is that function, below.
-        let _ = assign;
+        // §I1(a): the row predicate. Primary-key-only, no tenant predicate —
+        // `Catalog::get_job_for_rank` never reads `assign.job_id`'s tenant
+        // from the caller (I-GANG: tenant is derived from the row itself,
+        // below).
+        let catalog = self.session.catalog();
+        let row: RankAdmissionRow = match catalog.get_job_for_rank(&assign.job_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(i_gang_refused()),
+            Err(e) => return Err(map_engine_error(e)),
+        };
+
+        let running = row.status == JobStatus::Running.to_string();
+        let claimant_matches =
+            row.claimed_by.as_deref() == Some(assign.coordinator_instance_id.as_str());
+        let attempt_matches = i64::from(row.attempts) == assign.attempt;
+        if !running || !claimant_matches || !attempt_matches || !row.lease_live {
+            return Err(i_gang_refused());
+        }
+
+        // §I1(b), only for `world_size > 1`: the pair must be filled, and
+        // its sidecar must verify — a separate, host-local step, never
+        // folded into `get_job_for_rank`'s own statement (§I1).
+        if assign.world > 1 {
+            let (Some(training_set_ref), Some(training_set_location)) = (
+                row.training_set_ref.as_deref(),
+                row.training_set_location.as_deref(),
+            ) else {
+                return Err(i_gang_refused());
+            };
+            if resolve_training_set_identity(
+                self.session.result_store().as_ref(),
+                row.tenant_id,
+                training_set_ref,
+                training_set_location,
+            )
+            .await
+            .is_err()
+            {
+                return Err(i_gang_refused());
+            }
+        }
+
+        // §I1: the coordinator's own `instances` row must be fresh.
+        match catalog
+            .fresh_instance(&assign.coordinator_instance_id, self.lease)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(i_gang_refused()),
+            Err(e) => return Err(map_engine_error(e)),
+        }
+
+        // Every I-GANG determinant is satisfied. This unit has no
+        // `HostAdmission` session to hand the call to (U5a-2 builds that) —
+        // f1'.
         Err(Status::unimplemented(
             "gang admission is not implemented on this build",
         ))

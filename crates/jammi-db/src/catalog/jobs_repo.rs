@@ -224,18 +224,46 @@ pub struct RankAdmissionRow {
     /// and the sidecar verify entirely — a hazard this field's row-keying
     /// closes.
     ///
-    /// Decoded via `world_size_from_spec_json` (module-private): a top-level `world_size`
-    /// key, or (the shape `jammi-ai`'s `TrainingCommon` actually persists) a
-    /// `world_size` key nested one level under `common`. Absent either way
-    /// ⇒ `1` (the single-rank default every job kind that never names a rank
-    /// count implicitly is — `jammi-db` cannot depend on `jammi-ai` to read
-    /// its serde default directly, so this mirrors it independently). A
-    /// `world_size` key present but not a valid non-negative rank count
-    /// (non-numeric, negative, fractional, or overflowing `u32`) is a typed
-    /// `BackendError::TypeConversion` — never silently coerced to `1`.
-    pub world_size: u32,
+    /// Decoded via `world_size_from_spec_json` (module-private): a top-level
+    /// `world_size` key, or (the shape `jammi-ai`'s `TrainingCommon` actually
+    /// persists) a `world_size` key nested one level under `common`. Absent
+    /// either way ⇒ [`WorldSizeFact::Decoded`]`(1)` (the single-rank default
+    /// every job kind that never names a rank count implicitly is —
+    /// `jammi-db` cannot depend on `jammi-ai` to read its serde default
+    /// directly, so this mirrors it independently). A `world_size` key
+    /// present but not a valid non-negative rank count (non-numeric,
+    /// negative, fractional, or overflowing `u32`), or `spec` text that is
+    /// not valid JSON at all, is [`WorldSizeFact::Undecodable`] — a ROW FACT
+    /// about the content this claimant wrote, never a fault of the read that
+    /// found it: [`Catalog::get_job_for_rank`] still returns `Ok(Some(row))`
+    /// with every other column populated, and the caller (the gang admission
+    /// handler) decides how to refuse it. `Err` from `get_job_for_rank`
+    /// means the read itself faulted (no such row reachable at all), never
+    /// that this row's content failed to decode.
+    pub world_size: WorldSizeFact,
     pub training_set_ref: Option<String>,
     pub training_set_location: Option<String>,
+}
+
+/// The outcome of decoding [`RankAdmissionRow::world_size`] from a job's
+/// `spec` JSON — a row FACT the caller matches on, never a sentinel integer
+/// and never an `Option` (whose `None` would read as "absent" rather than
+/// "present but unreadable"). A row whose spec does not decode a
+/// `world_size` is exactly as real a row as one that does: `Undecodable`
+/// carries no further detail (the caller refuses the row outright; the
+/// decode failure's own text is not part of the I-GANG row predicate), and
+/// deciding what to do with it is the caller's (the gang admission
+/// handler's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldSizeFact {
+    /// The row's own rank count, decoded successfully — including the
+    /// absent-field default, `WORLD_SIZE_IF_ABSENT`.
+    Decoded(u32),
+    /// The row's `spec` column did not decode a `world_size`: either the
+    /// text is not valid JSON at all, or a `world_size` key (top-level or
+    /// nested under `common`) is present but not a valid non-negative rank
+    /// count. The row otherwise exists and every other column is populated.
+    Undecodable,
 }
 
 /// The single-rank default this module stamps when a job's `spec` JSON names
@@ -253,32 +281,29 @@ const WORLD_SIZE_IF_ABSENT: u32 = 1;
 /// `world_size` key nested one level under `common` (the shape
 /// `TrainingCommon` actually persists for the two fine-tune spec variants),
 /// so a future producer that flattens the field is read the same way a
-/// current nested one is. Neither key present ⇒ [`WORLD_SIZE_IF_ABSENT`].
-/// The key present but not decodable as a `u32` (a string, a negative
-/// number, a fraction, or a value overflowing `u32`) ⇒
-/// [`BackendError::TypeConversion`] — a caller that reads this row is never
-/// handed a silently-defaulted `1` for a spec that named something else.
-/// Spec text that is not valid JSON at all is the SAME typed error: a job
-/// row's `spec` column is the worker's own reconstruction input, so a value
-/// that fails to parse is exactly as much a decode fault as a malformed
-/// `world_size` field inside it.
-fn world_size_from_spec_json(spec: &str) -> std::result::Result<u32, BackendError> {
-    let value: serde_json::Value =
-        serde_json::from_str(spec).map_err(|e| BackendError::TypeConversion {
-            column: "spec".to_string(),
-            detail: format!("spec is not valid JSON: {e}"),
-        })?;
+/// current nested one is. Neither key present ⇒
+/// [`WorldSizeFact::Decoded`]`(`[`WORLD_SIZE_IF_ABSENT`]`)`. The key present
+/// but not decodable as a `u32` (a string, a negative number, a fraction, or
+/// a value overflowing `u32`), or `spec` text that is not valid JSON at all,
+/// ⇒ [`WorldSizeFact::Undecodable`] — infallible: a job row's `spec` column
+/// is the worker's own reconstruction input, so a value that fails to parse
+/// or names something un-decodable is a fact about THIS row's content, never
+/// a fault of the read that found it, and this function never returns an
+/// `Err` a caller could conflate with a genuine backend/driver failure.
+fn world_size_from_spec_json(spec: &str) -> WorldSizeFact {
+    let value: serde_json::Value = match serde_json::from_str(spec) {
+        Ok(v) => v,
+        Err(_) => return WorldSizeFact::Undecodable,
+    };
     let field = value
         .get("world_size")
         .or_else(|| value.get("common").and_then(|c| c.get("world_size")));
     match field {
-        None => Ok(WORLD_SIZE_IF_ABSENT),
-        Some(v) => {
-            serde_json::from_value::<u32>(v.clone()).map_err(|e| BackendError::TypeConversion {
-                column: "spec".to_string(),
-                detail: format!("spec.world_size is not a valid rank count: {e}"),
-            })
-        }
+        None => WorldSizeFact::Decoded(WORLD_SIZE_IF_ABSENT),
+        Some(v) => match serde_json::from_value::<u32>(v.clone()) {
+            Ok(n) => WorldSizeFact::Decoded(n),
+            Err(_) => WorldSizeFact::Undecodable,
+        },
     }
 }
 
@@ -1948,7 +1973,12 @@ impl Catalog {
     /// remaining window, from which [`RankAdmissionRow::lease_live`] is
     /// derived — never a second round trip, and never the caller's OWN
     /// clock standing in for the remaining-window computation (see that
-    /// function's docs). `Ok(None)` when no such job exists.
+    /// function's docs). `Ok(None)` when no such job exists. `Err` means the
+    /// read itself faulted — never that the row's `spec` failed to decode a
+    /// `world_size`: that outcome is a ROW FACT, represented in
+    /// [`RankAdmissionRow::world_size`] as [`WorldSizeFact::Undecodable`],
+    /// and still returned `Ok(Some(row))` with every other column populated
+    /// (see that type's docs).
     ///
     /// This method decides NOTHING beyond that lookup — it is a plain
     /// row-by-primary-key read, never itself the I-GANG decider. Every
@@ -1993,7 +2023,7 @@ impl Catalog {
                         );
                         tx.query_opt(&sql, &params, |row| {
                             let spec: String = row.get("spec")?;
-                            let world_size = world_size_from_spec_json(&spec)?;
+                            let world_size = world_size_from_spec_json(&spec);
                             let tenant_id = row
                                 .try_get::<String>("tenant_id")?
                                 .map(|s| {

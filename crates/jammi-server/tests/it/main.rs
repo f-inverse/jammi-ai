@@ -4,6 +4,7 @@ mod common;
 mod composability_seam;
 mod flight_annotate;
 mod flight_tenant;
+mod gang_service;
 mod grpc_byo_auth;
 mod grpc_embedding;
 // The client/server-topology GPU proof: compiled only under `live-gpu-tests`,

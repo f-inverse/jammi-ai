@@ -2185,7 +2185,16 @@ def _pre_fix_anticipation_rejection(sdir: Path, unit_slug: str, unit_branch: str
     residual_risk = data.get("residual_risk")
     if not isinstance(residual_risk, str) or not residual_risk.strip():
         return (f"anticipation artifact {path.name} carries no non-empty `residual_risk` — the "
-                 "one field where the lead admits an unclosed site (esc-lead-gate-R12)")
+                 "one field where the lead admits an unclosed site: which case does the attack "
+                 "you just ran NOT cover? (esc-lead-gate-R12 item 8c)")
+
+    # item 8a: SHAPE only — every committed required-commands line named
+    # verbatim with an integer `rc`; the VALUE of `rc` is never judged
+    # here (the pre-fix tip is expected to be broken).
+    gates_why = _r12_gates_shape_rejection(path.name, data.get("gates"), _r12_required_commands(),
+                                            judge_rc=False)
+    if gates_why is not None:
+        return gates_why
 
     # M1' ordering evidence: the tip has not moved since this decision
     # began, the resolved worktree's own HEAD equals it, and the tree is
@@ -2343,6 +2352,228 @@ def _post_fix_attacks_rejection(row: dict, data: dict, project_dir: str, cwd: st
                 "post-fix hash — the fix did not observably move anything these attacks "
                 "measure (esc-lead-gate-R12)"
             )
+    return None
+
+
+# ==========================================================================
+# esc-lead-gate-R12 fix round 3, item 8 (the fold-9 replacement: 8a/8b/8c).
+# ==========================================================================
+
+_R12_REQUIRED_COMMANDS_FILENAME = "ci/lead-gate-required-commands.txt"
+
+
+def _r12_required_commands_path() -> Path:
+    return repo_root() / _R12_REQUIRED_COMMANDS_FILENAME
+
+
+def _r12_required_commands() -> list[str]:
+    """item 8a: the committed, human-amend-only list of gate commands, one
+    per line, `#`-comment/blank lines skipped, a trailing `  # ...`
+    annotation stripped from each command line. `[]` when the file is
+    missing — armed by the DATA, an HONEST default: no committed file
+    means no gate obligation, never a crash."""
+    path = _r12_required_commands_path()
+    if not path.exists():
+        return []
+    out: list[str] = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        command = stripped.split("  #", 1)[0].rstrip()
+        if command:
+            out.append(command)
+    return out
+
+
+def _r12_gates_shape_rejection(artifact_name: str, gates: object, required_commands: list[str],
+                                *, judge_rc: bool) -> str | None:
+    """item 8a: `None` iff `gates` is a dict naming EVERY command in
+    `required_commands` VERBATIM, each mapping to an object with an
+    integer `rc`. `judge_rc=True` (Reader 2's post-fix posture) ALSO
+    requires `rc == 0` for every line; `judge_rc=False` (Reader 1's
+    pre-fix posture) never inspects the VALUE of `rc` — a lead-attested
+    checklist against the tip BEFORE the fix, whose own rc is not itself
+    a defect. The hook never runs these commands itself (see the
+    committed file's own header for the honest-limit statement)."""
+    if not required_commands:
+        return None
+    if not isinstance(gates, dict):
+        return (f"{artifact_name} carries no `gates` object, but {len(required_commands)} "
+                f"committed gate command(s) are required (esc-lead-gate-R12 item 8a)")
+    missing = [c for c in required_commands if c not in gates]
+    if missing:
+        return (f"{artifact_name} `gates` omits {len(missing)} committed command(s), e.g. "
+                f"{missing[:3]} (esc-lead-gate-R12 item 8a)")
+    for c in required_commands:
+        entry = gates.get(c)
+        if not isinstance(entry, dict):
+            return f"{artifact_name} `gates`[{c!r}] is not an object (esc-lead-gate-R12 item 8a)"
+        rc = entry.get("rc")
+        if not isinstance(rc, int) or isinstance(rc, bool):
+            return f"{artifact_name} `gates`[{c!r}] carries no integer `rc` (esc-lead-gate-R12 item 8a)"
+        if judge_rc and rc != 0:
+            return (f"{artifact_name} `gates`[{c!r}] recorded rc={rc} (non-zero) — every "
+                     "committed gate must be green at fix_head (esc-lead-gate-R12 item 8a)")
+    return None
+
+
+_R12_TEST_FAILURE_MARKERS = ("test result: FAILED", "FAIL —", "= FAILURES =")
+
+
+def _mutations_rejection(row: dict, data: dict, new_surfaces: dict[str, str] | None) -> str | None:
+    """item 8b: scoped to call sites in files the open BLOCK's own
+    `finding_locations` name — armed by the DATA, never merely by
+    `finding_locations` being non-empty (which is true of nearly every
+    BLOCK and would require a `mutations` row on units whose fix never
+    touched a finding's own file at all): the fix's own diff must ADD at
+    least one new definition (`new_surfaces`, the hook's own derived
+    enumeration, reduced to files) inside a file `finding_locations` also
+    names. `None` iff the relay's `mutations` array then carries 1..3 rows
+    — LABELED a sample, never exhaustive — each shaped `{site, command,
+    rc_before, rc_after, marker_after}` with EITHER an ACCEPTED mutation
+    (`rc_before == 0 ∧ rc_after != 0 ∧ marker_after` matches a committed
+    TEST-failure marker, distinct from a build-failure marker) OR an
+    explicit `uncovered` reason (R11's own disposition precedent, see
+    `_claims_rejection`). NO hash-reproduction here — like `gates`, this
+    is a lead-attested record, never re-executed by the hook."""
+    finding_files = {_key_to_file(s) for s in (row.get("finding_locations") or []) if isinstance(s, str)}
+    new_surface_files = {_key_to_file(k) for k in (new_surfaces or {}).keys()}
+    scoped_files = finding_files & new_surface_files
+    if not scoped_files:
+        return None
+    mutations = data.get("mutations")
+    if not isinstance(mutations, list) or not mutations:
+        return (f"relay carries no `mutations` array, but the fix's own diff adds a new "
+                f"definition in {sorted(scoped_files)[:3]} — a file the BLOCK's own "
+                "finding_locations also names — esc-lead-gate-R12 item 8b: record 1-3 "
+                "lead-chosen mutation rows (a sample, never exhaustive)")
+    if len(mutations) > 3:
+        return (f"relay `mutations` carries {len(mutations)} row(s) — esc-lead-gate-R12 item 8b "
+                "caps this at K<=3, a LABELED sample, never an exhaustive sweep")
+    for i, entry in enumerate(mutations):
+        if not isinstance(entry, dict):
+            return f"relay `mutations`[{i}] is not an object (esc-lead-gate-R12 item 8b)"
+        site = entry.get("site")
+        if not isinstance(site, str) or not site.strip():
+            return f"relay `mutations`[{i}] carries no `site` (esc-lead-gate-R12 item 8b)"
+        command = entry.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return f"relay `mutations`[{i}] carries no `command` (esc-lead-gate-R12 item 8b)"
+        uncovered = entry.get("uncovered")
+        if uncovered is not None:
+            if not isinstance(uncovered, str) or not uncovered.strip():
+                return f"relay `mutations`[{i}] `uncovered` is present but empty (esc-lead-gate-R12 item 8b)"
+            continue
+        rc_before = entry.get("rc_before")
+        rc_after = entry.get("rc_after")
+        marker_after = entry.get("marker_after")
+        if not (isinstance(rc_before, int) and not isinstance(rc_before, bool)):
+            return f"relay `mutations`[{i}] carries no integer `rc_before` (esc-lead-gate-R12 item 8b)"
+        if not (isinstance(rc_after, int) and not isinstance(rc_after, bool)):
+            return f"relay `mutations`[{i}] carries no integer `rc_after` (esc-lead-gate-R12 item 8b)"
+        if not (isinstance(marker_after, str) and marker_after.strip()):
+            return f"relay `mutations`[{i}] carries no `marker_after` (esc-lead-gate-R12 item 8b)"
+        accepted = (rc_before == 0 and rc_after != 0
+                    and any(m in marker_after for m in _R12_TEST_FAILURE_MARKERS))
+        if not accepted:
+            return (f"relay `mutations`[{i}] does not satisfy the ACCEPT rule (rc_before==0, "
+                     "rc_after!=0, marker_after names a committed TEST-failure marker) and "
+                     "carries no `uncovered` reason either (esc-lead-gate-R12 item 8b)")
+    return None
+
+
+def _r12_new_test_surfaces(new_surfaces: dict[str, str] | None) -> dict[str, str]:
+    """item 8c: the SUBSET of `_parse_new_surfaces`' own enumeration
+    (already the hook's derived, never lead-supplied, new-definition map)
+    whose file path or definition name looks like a TEST — the file path
+    contains "test" (case-insensitive) or the definition's own name
+    starts with `test_`/`fixture_` or contains "test". A heuristic,
+    stated as one: this can under- or over-include relative to a human's
+    own judgment of "is this a test", the same class of limit
+    `_parse_new_surfaces` itself already carries for "is this a
+    definition"."""
+    out: dict[str, str] = {}
+    for key, name in (new_surfaces or {}).items():
+        file_part = _key_to_file(key)
+        looks_like_test_file = "test" in file_part.lower()
+        looks_like_test_name = isinstance(name, str) and (
+            name.startswith("test_") or name.startswith("fixture_") or "test" in name.lower()
+        )
+        if looks_like_test_file or looks_like_test_name:
+            out[key] = name
+    return out
+
+
+def _r12_previous_relay_row(sdir: Path, unit_slug: str, row: dict) -> dict | None:
+    """item 8c: the unit's own PREVIOUS row of the SAME `agent_type` (an
+    earlier `ts`) — used only to compare `exclusions` text across rounds,
+    never to gate anything else. `None` when there is no earlier row."""
+    agent_type = row.get("agent_type") or ""
+    cur_ts = row.get("ts") or ""
+    if not agent_type or not cur_ts:
+        return None
+    path = sdir / f"{unit_slug}.jsonl"
+    candidates = [r for r in read_rows(path)
+                  if r.get("agent_type") == agent_type and isinstance(r.get("ts"), str) and r["ts"] < cur_ts]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: r["ts"])
+
+
+def _exclusions_rejection(new_test_surfaces: dict[str, str], data: dict, unit_slug: str,
+                           sdir: Path, row: dict) -> str | None:
+    """item 8c: `None` iff every NEW test definition the fix's own diff
+    adds (`new_test_surfaces`, derived from `_parse_new_surfaces`, never
+    lead-supplied) carries a non-empty entry in the relay's `exclusions`
+    object, each NORMALIZED-DISTINCT from its siblings in THIS relay and
+    from the unit's own PREVIOUS relay of the SAME agent_type (an earlier
+    `ts`) — the anti-templating cousin of `_claims_rejection`'s own
+    uncovered-reason check. LIMIT, stated as plainly as R11's own: this
+    cannot prove an exclusion is TRUE, only that two are not one."""
+    if not new_test_surfaces:
+        return None
+    exclusions = data.get("exclusions")
+    if not isinstance(exclusions, dict):
+        return (f"relay carries no `exclusions` object, but the fix's own diff adds "
+                f"{len(new_test_surfaces)} new test definition(s), e.g. "
+                f"{list(new_test_surfaces)[:3]} — esc-lead-gate-R12 item 8c: each must name "
+                "the case the attack you just ran does NOT cover")
+    missing = [k for k in new_test_surfaces if k not in exclusions]
+    if missing:
+        return (f"relay `exclusions` omits {len(missing)} new test definition(s) the fix's own "
+                f"diff adds, e.g. {missing[:3]} (esc-lead-gate-R12 item 8c)")
+    normalized: dict[str, str] = {}
+    for key in new_test_surfaces:
+        reason = exclusions.get(key)
+        if not isinstance(reason, str) or not reason.strip():
+            return (f"relay `exclusions`[{key!r}] is empty — esc-lead-gate-R12 item 8c: name "
+                     "the case this test does NOT cover")
+        normalized[key] = _probe_normalize(reason)
+    seen: dict[str, str] = {}
+    for key, norm in normalized.items():
+        if norm in seen:
+            return (f"relay `exclusions`[{key!r}] and `exclusions`[{seen[norm]!r}] carry the "
+                     "IDENTICAL exclusion (normalized) — a templated exclusion is not a "
+                     "per-test examination (esc-lead-gate-R12 item 8c)")
+        seen[norm] = key
+    prev_row = _r12_previous_relay_row(sdir, unit_slug, row)
+    if prev_row is not None:
+        prev_path = relay_artifact_path(sdir, unit_slug, prev_row.get("agent_type") or "",
+                                         prev_row.get("ts") or "")
+        if prev_path.exists():
+            try:
+                prev_data = json.loads(prev_path.read_text())
+            except Exception:
+                prev_data = None
+            if isinstance(prev_data, dict) and isinstance(prev_data.get("exclusions"), dict):
+                prev_norms = {_probe_normalize(v) for v in prev_data["exclusions"].values() if isinstance(v, str)}
+                for key, norm in normalized.items():
+                    if norm in prev_norms:
+                        return (f"relay `exclusions`[{key!r}] repeats the IDENTICAL exclusion "
+                                 "(normalized) from this unit's own PREVIOUS relay — a templated "
+                                 "exclusion carried across rounds is not a per-round examination "
+                                 "(esc-lead-gate-R12 item 8c)")
     return None
 # R12-END
 
@@ -2546,6 +2777,26 @@ def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
                                     deadline=deadline)
     if claims_why is not None:
         return claims_why
+
+    # esc-lead-gate-R12 fix round 3 item 8a — UNIVERSAL, never scoped to
+    # only R12-anticipation-covered units: the relay's own `gates` object
+    # must name every committed `ci/lead-gate-required-commands.txt` line
+    # with `rc == 0` at fix_head.
+    gates_post_why = _r12_gates_shape_rejection("relay", data.get("gates"), _r12_required_commands(),
+                                                 judge_rc=True)
+    if gates_post_why is not None:
+        return gates_post_why
+
+    # item 8b — armed by the DATA: a new definition in a file the BLOCK's
+    # own finding_locations also names.
+    mutations_why = _mutations_rejection(row, data, new_surfaces)
+    if mutations_why is not None:
+        return mutations_why
+
+    # item 8c — armed by the fix's own diff adding a new TEST definition.
+    exclusions_why = _exclusions_rejection(_r12_new_test_surfaces(new_surfaces), data, unit_slug, sdir, row)
+    if exclusions_why is not None:
+        return exclusions_why
 
     # esc-lead-gate-R12 READER 2 (M4', fix round 2 F1/F3) — the post-fix
     # differential. Runs in the SAME resolved worktree the fix landed in

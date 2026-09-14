@@ -115,6 +115,37 @@ pub fn read_back_range_sql(
     )
 }
 
+/// The single constructor every production call site in this crate builds a
+/// [`TrainingSetSpec`] through (CONTRACT-U2b-fix1.md's unification fold): a
+/// future field added to the spec is added in exactly ONE place, rather than
+/// re-derived at each of the (until this commit) three independent struct
+/// literals in [`materialize_projection`], `data.rs`'s `from_source_stream`
+/// and `pipeline/recompute.rs`'s `recompute_training_set`.
+///
+/// A thin pass-through by design — it changes nothing about what a caller
+/// supplies, only WHERE the seven fields are named — so it cannot move a
+/// [`TrainingSetSpec::definition_hash`]; pinned by `training_set_spec_matches_
+/// a_hand_built_spec_byte_for_byte` below.
+pub(crate) fn training_set_spec<'a>(
+    source_id: &'a str,
+    source_sql: &'a str,
+    columns: &'a [String],
+    task: ModelTask,
+    format: &'a str,
+    inputs: Vec<InputAnchor>,
+    device: jammi_db::store::manifest::ComputeDevice,
+) -> TrainingSetSpec<'a> {
+    TrainingSetSpec {
+        source_id,
+        source_sql,
+        columns,
+        task,
+        format,
+        inputs,
+        device,
+    }
+}
+
 /// Materialise `columns` of a registered `source` as a training set, then read
 /// the committed rows back in order.
 ///
@@ -139,23 +170,21 @@ pub async fn materialize_projection(
     );
     materialize_and_read(
         session,
-        TrainingSetSpec {
+        training_set_spec(
             source_id,
-            source_sql: &source_sql,
+            &source_sql,
             columns,
             task,
             format,
             // The source has no version surface to pin, so it is anchored at
             // the instant it was read — the same honest anchor the embedding
-            // producer records for the same reason, constructed here rather
-            // than behind a helper so the anchor value never travels apart
-            // from the read it describes.
-            inputs: vec![InputAnchor::unpinned_at_instant(
+            // producer records for the same reason.
+            vec![InputAnchor::unpinned_at_instant(
                 source_id,
                 chrono::Utc::now().to_rfc3339(),
             )],
-            device: session.compute_device(),
-        },
+            session.compute_device(),
+        ),
     )
     .await
 }
@@ -365,3 +394,50 @@ mod reader_class_allow_list {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CONTRACT-U2b-fix1.md item 3: [`training_set_spec`] is a thin
+    /// pass-through, so it must name the exact same [`TrainingSetSpec::
+    /// definition_hash`] as a hand-built struct literal over the identical
+    /// seven fields — the "unification must not change any hash" property,
+    /// pinned directly rather than by re-running a whole fixture through the
+    /// engine.
+    #[test]
+    fn training_set_spec_matches_a_hand_built_spec_byte_for_byte() {
+        let columns = vec!["anchor".to_string(), "positive".to_string()];
+        let inputs = vec![InputAnchor::unpinned_at_instant(
+            "training",
+            "2024-01-01T00:00:00Z".to_string(),
+        )];
+        let device = jammi_db::store::manifest::ComputeDevice::Cpu;
+
+        let via_helper = training_set_spec(
+            "training",
+            "SELECT anchor, positive FROM training",
+            &columns,
+            ModelTask::TextEmbedding,
+            "pairs",
+            inputs.clone(),
+            device.clone(),
+        );
+        let hand_built = TrainingSetSpec {
+            source_id: "training",
+            source_sql: "SELECT anchor, positive FROM training",
+            columns: &columns,
+            task: ModelTask::TextEmbedding,
+            format: "pairs",
+            inputs,
+            device,
+        };
+        assert_eq!(
+            via_helper.definition_hash().unwrap(),
+            hand_built.definition_hash().unwrap(),
+            "training_set_spec must be a pure pass-through: it cannot move the definition hash \
+             relative to constructing the SAME fields directly"
+        );
+    }
+
+}

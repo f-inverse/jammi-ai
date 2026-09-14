@@ -523,15 +523,15 @@ impl InferenceSession {
             .result_store()
             .materialize_training_set(
                 self.context(),
-                jammi_db::store::TrainingSetSpec {
-                    source_id: &table.source_id,
-                    source_sql: &source,
-                    columns: &columns,
+                crate::fine_tune::training_set::training_set_spec(
+                    &table.source_id,
+                    &source,
+                    &columns,
                     task,
-                    format: &format,
+                    &format,
                     inputs,
-                    device: self.compute_device(),
-                },
+                    self.compute_device(),
+                ),
             )
             .await?;
         Ok((

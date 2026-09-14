@@ -1428,7 +1428,6 @@ impl TrainingDataLoader {
     ) -> Result<Self> {
         use jammi_db::sql::{quote_ident, source_relation};
         use jammi_db::store::manifest::InputAnchor;
-        use jammi_db::store::TrainingSetSpec;
 
         let table_name = session.find_table_name(source_id)?;
         let projection = columns
@@ -1440,22 +1439,22 @@ impl TrainingDataLoader {
             "SELECT {projection} FROM {}",
             source_relation(source_id, &table_name)
         );
-        let spec = TrainingSetSpec {
+        let spec = super::training_set::training_set_spec(
             source_id,
-            source_sql: &source_sql,
-            columns: &columns,
+            &source_sql,
+            &columns,
             task,
-            format: format.format_tag(),
+            format.format_tag(),
             // The source has no version surface to pin, so it is anchored at
             // the instant it was read — the same honest anchor
             // `training_set::materialize_projection` records for the same
             // reason.
-            inputs: vec![InputAnchor::unpinned_at_instant(
+            vec![InputAnchor::unpinned_at_instant(
                 source_id,
                 chrono::Utc::now().to_rfc3339(),
             )],
-            device: session.compute_device(),
-        };
+            session.compute_device(),
+        );
         let table = session
             .result_store()
             .materialize_training_set(session.context(), spec)

@@ -41,6 +41,12 @@ from typing import Any
 
 import pytest
 
+# Enables the `pytester` fixture: `test_session_lifecycle_guard.py` runs a
+# throwaway pytest session, through THIS conftest, in a subprocess — the
+# non-vacuity control for the runtime rail below (the static shape gate
+# already has its own in `test_session_lifecycle_shape.py`).
+pytest_plugins = ["pytester"]
+
 try:  # the suite also runs where the [embedded] extra is absent
     import jammi
 except ImportError:  # pragma: no cover - exercised only on a lean install
@@ -89,7 +95,8 @@ def remote():
 
 @pytest.fixture(autouse=True)
 def _no_leaked_sessions(request):
-    """Fail a test that leaves a jammi session open.
+    """esc-112 fix (`closes_escape: esc-112`): fail a test that leaves a jammi
+    session open.
 
     Autouse fixtures are set up before the test's own fixtures and finalized
     after them, so this runs its check *after* :func:`embedded` / :func:`remote`

@@ -113,13 +113,22 @@ skipped, a trailing `  # measured ~Xs` annotation stripped from each
 hard DENY in the hook and a hard FAIL in reader 3: the old `[]`
 "honest default" silently meant "no gate obligation" and let the file's own
 existence/length be weakened with zero CI signal; that silent path is closed. Every
-SHAPE check below runs through the ONE shared validator, `_r12_anticipation_
-rejection` — never a second, per-reader reimplementation; reader 3
-imports and calls this SAME function, so a fix here fixes every reader identically.
-Its three attacks[*]-entry-shape deny texts (not an object / no `command` / no valid
-`hash`) each carry the `anticipation-validator:` provenance marker, so a fixture
-asserting on the marked text can never be satisfied by an independent
-re-implementation elsewhere in either reader.
+SHAPE check below is INTENDED to run through the ONE shared validator,
+`_r12_anticipation_rejection` — reader 3 imports and calls this SAME function, so a
+fix there fixes reader 3 identically. Its three attacks[*]-entry-shape deny texts
+(not an object / no `command` / no valid `hash`) carry an `anticipation-validator:`
+provenance marker — a harmless label naming which function produced the text, NOT a
+claim of uniqueness: `_r12_validate_and_run_entry` (this same file, reader 1's own
+per-file loop) already re-implements the identical three checks with its own,
+unmarked deny texts, and `check_rigor_record.py`'s own structural detector
+(`RR31`) only ever scans check_rigor_record.py, never this file. This gap — the
+shared validator is NOT provably the only implementation of these three checks — is
+recorded, not hidden: this unit's own committed
+`docs/rigor/lead-gate-r12-anticipation.anticipation.jsonl` names it in `residual_risk`
+(the one field an anticipation row already carries for exactly this admission —
+"which case does the attack you just ran NOT cover?"), citing
+`_r12_validate_and_run_entry` (`lead-gate-lib.py` ~:2072-2079) as the known,
+unmarked second implementation.
 **8a, gates.** `_r12_gates_shape_rejection` requires `gates` to be a dict naming
 EVERY required command VERBATIM, each an object with an integer `rc`; called with
 `judge_rc=False` at Reader 1 (the pre-fix anticipation artifact — shape only, the
@@ -181,17 +190,23 @@ row's `gates` shape/value. The governing row is selected ORDER-INDEPENDENTLY: a 
 whose own `head_sha` matches this checkout's actual `HEAD` is preferred; when none
 does — the common case, since a pre-fix witness by construction predates the commit
 Reader 3 validates against — every row is eligible; within whichever pool applies,
-the row naming the GREATEST `ts` INSTANT governs, never the row nearest the end of
+the row naming the GREATEST `ts` TEXT governs, never the row nearest the end of
 the file (`cmd_export_anticipation` sorts the artifacts it dumps by FILENAME — a tip
 sha, pseudorandom hex with no chronological meaning — so an older round's row can
 sort after a newer one and land on the file's last line); BOTH `ts` and `head_sha`
 are stamped by the exporter itself (from the artifact file's own mtime
-and its own `pre_fix_sha`, never hand-typed). `ts` is parsed as an instant
-(`datetime.fromisoformat`, a trailing `Z` accepted as `+00:00`); an unparseable `ts`
-is refused exactly like a missing one. When the candidate pool holds two or more
-rows and ANY of them has no parseable `ts` instant, OR two or more rows NAME THE
-SAME INSTANT — even in different text, e.g. a trailing `Z` against an explicit
-`+00:00` offset — Reader 3 FAILS LOUDLY naming the ambiguity rather than guessing.
+and its own `pre_fix_sha`, never hand-typed). `ts` is compared as a plain STRING,
+never parsed as a `datetime` — an executed probe found a mixed-awareness pool (one
+row's `ts` with no UTC offset beside another's `...Z`/`...+00:00`) crashes `max()`
+with `TypeError: can't compare offset-naive and offset-aware datetimes` and ABORTS
+the run instead of failing loudly, so nothing on this selection path ever parses
+`ts`. When the candidate pool holds two or more rows and ANY of them lacks a
+non-empty string `ts`, OR two or more rows share the IDENTICAL `ts` TEXT, Reader 3
+FAILS LOUDLY, naming the tied rows' own line numbers, rather than guessing. The SAME
+instant named in different text (a trailing `Z` vs an explicit `+00:00` offset) is
+NOT caught by this text compare — that narrower case, and `_r12_previous_relay_row`'s
+own identical text-ordering limit, are filed at
+https://github.com/f-inverse/jammi-ai/issues/557.
 Reader 3 never re-executes these commands; they are already CI jobs
 elsewhere in `.github/workflows/`. HONEST LIMITS, stated as plainly as (2b)'s own:
 `gates`/`mutations`/`exclusions` are LEAD-ATTESTED, never re-executed by the hook.

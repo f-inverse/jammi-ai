@@ -118,7 +118,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -723,17 +722,33 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
     the last line of the committed export. Since fix round 5, the SAME
     exporter stamps `ts` (the artifact FILE's own mtime) and `head_sha`
     (the artifact's own `pre_fix_sha`) on every row it emits — so
-    `_row_head`/`_row_ts` below select the row whose own `head_sha`
+    `_row_head`/`_row_ts_text` below select the row whose own `head_sha`
     matches this checkout's actual `HEAD` when one does (the case where
     the export was captured at the exact commit reader 3 is validating);
     when none does — the common case, since a pre-fix witness by
     construction predates the commit it is validated against — every row
-    is eligible. Within whichever pool applies, the GREATEST `ts`
-    governs, never the row nearest the end of the file — and when the
-    pool holds >=2 candidate rows and ANY of them lacks `ts` (a
-    hand-typed or pre-Z5 record, never one the real exporter produced),
-    this FAILS LOUDLY naming the ambiguity rather than silently falling
-    back to `rows[0]`/append order.
+    is eligible. Within whichever pool applies, the row naming the
+    GREATEST `ts` TEXT governs, never the row nearest the end of the
+    file — and when the pool holds >=2 candidate rows and ANY of them
+    lacks a non-empty string `ts` (a hand-typed or pre-Z5 record, never
+    one the real exporter produced), OR two or more rows share the
+    IDENTICAL `ts` text, this FAILS LOUDLY, naming the tied rows' own
+    line numbers, rather than silently falling back to `rows[0]`/append
+    order.
+
+    Fix round 7 Z19 (narrowing fix round 6 Z17): the tie compare is `ts`
+    TEXT ONLY — never a parsed `datetime` instant. An executed probe
+    found `_row_instant`'s own mixed-awareness pool (one row's `ts` with
+    no UTC offset at all beside another's `...Z`/`...+00:00`) raised
+    `TypeError: can't compare offset-naive and offset-aware datetimes` at
+    `max()` and ABORTED the whole run — never the promised AMBIGUOUS
+    FAIL. Comparing `ts` as TEXT can never raise that way. The
+    instant-aware tie this narrowing gives up (two rows naming the SAME
+    instant in different text, e.g. `...Z` vs `...+00:00`, which a text
+    compare treats as UNEQUAL and lets whichever sorts later silently
+    govern) is filed at https://github.com/f-inverse/jammi-ai/issues/557
+    together with `_r12_previous_relay_row`'s own identical text-ordering
+    limit in `lead-gate-lib.py`.
 
     Fix round 5 Z7: the gates SHAPE/VALUE check itself is the SAME shared
     `_r12_gates_shape_rejection` reader 1 and reader 2 call — never a
@@ -790,8 +805,8 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
     # row BEFORE it can become "the governing row", which is exactly how a
     # `lead-relay-attestation` row (no `gates` object at all) used to hide
     # the real one.
-    rows = [r for _, r in _r12_reject_foreign_anticipation_rows(path, raw_rows, result)]
-    if not rows:
+    rows_with_lineno = _r12_reject_foreign_anticipation_rows(path, raw_rows, result)
+    if not rows_with_lineno:
         return
 
     ok_head, head_now_raw = _git(cwd, "rev-parse", "HEAD")
@@ -801,54 +816,51 @@ def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
         h = r.get("head_sha")
         return h if isinstance(h, str) and h else None
 
-    def _row_instant(r: dict) -> datetime | None:
-        """fix round 6 Z15/Z17: `ts` is compared as an INSTANT, never as
-        TEXT — `datetime.fromisoformat`, a trailing `Z` accepted as
-        `+00:00` (`fromisoformat` itself rejects a bare `Z` on Python
-        versions below 3.11). `None` for a missing OR an unparseable
-        `ts` — refused identically either way, never distinguished."""
+    def _row_ts_text(r: dict) -> str | None:
+        """fix round 7 Z19 (narrowing fix round 6 Z17): `ts` is compared
+        as TEXT ONLY — no `datetime` parse anywhere on this selection
+        path, so no offset-naive/offset-aware comparison can ever raise.
+        `None` for a missing, empty, or non-string `ts`."""
         ts = r.get("ts")
-        if not isinstance(ts, str) or not ts:
-            return None
-        normalized = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
-        try:
-            return datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
+        return ts if isinstance(ts, str) and ts else None
 
-    matching = [r for r in rows if head_now and _row_head(r) == head_now]
-    pool = matching if matching else rows
+    matching = [(ln, r) for ln, r in rows_with_lineno if head_now and _row_head(r) == head_now]
+    pool = matching if matching else rows_with_lineno
 
-    if len(pool) >= 2 and any(_row_instant(r) is None for r in pool):
+    if len(pool) >= 2 and any(_row_ts_text(r) is None for _, r in pool):
+        pool_lines = ", ".join(str(ln) for ln, _ in pool)
         result.fail(
-            f"{path}: {len(pool)} candidate anticipation row(s) carry no reliable ordering "
-            "evidence (at least one has no parseable `ts` instant) -- the GOVERNING row is "
-            "AMBIGUOUS; re-export with `lead-gate-lib.py --export-anticipation` (which stamps "
-            "`ts`/`head_sha` on every row since fix round 5) and commit the result "
+            f"{path}: {len(pool)} candidate anticipation row(s) (lines {pool_lines}) carry no "
+            "reliable ordering evidence (at least one has no non-empty `ts`) -- the GOVERNING "
+            "row is AMBIGUOUS; re-export with `lead-gate-lib.py --export-anticipation` (which "
+            "stamps `ts`/`head_sha` on every row since fix round 5) and commit the result "
             "(esc-lead-gate-R12 fix round 5 Z5)"
         )
         return
 
-    # Fix round 6 Z15/Z17: an EQUAL greatest `ts` INSTANT across >=2 pool
-    # rows used to resolve by append position (`max()` returns the FIRST
-    # maximal element) — an executed probe found two rows with identical
-    # `ts`, the `rc=0` row first, silently governed and shadowed a
-    # genuinely `rc=1` sibling. Comparing as TEXT also missed the case
-    # where two rows name the SAME instant in different text (a trailing
-    # `Z` vs an explicit `+00:00` offset) -- the compare is by INSTANT, so
-    # that pair ties too. A tie is exactly as AMBIGUOUS as a missing `ts`.
-    instants = [(_row_instant(r), r) for r in pool]
-    max_instant = max(inst for inst, _ in instants)
-    tied = [r for inst, r in instants if inst == max_instant]
+    # Fix round 6 Z15, narrowed at fix round 7 Z19: an EQUAL greatest
+    # `ts` TEXT across >=2 pool rows used to resolve by append position
+    # (`max()` returns the FIRST maximal element) — an executed probe
+    # found two rows with identical `ts`, the `rc=0` row first, silently
+    # governed and shadowed a genuinely `rc=1` sibling. A tie is exactly
+    # as AMBIGUOUS as a missing `ts`. (The instant-aware tie — the SAME
+    # instant in different text — is filed at
+    # https://github.com/f-inverse/jammi-ai/issues/557; a `datetime`
+    # parse here once crashed `max()` on a mixed naive/aware pool
+    # instead of failing loudly.)
+    max_ts = max(_row_ts_text(r) for _, r in pool)
+    tied = [(ln, r) for ln, r in pool if _row_ts_text(r) == max_ts]
     if len(tied) >= 2:
+        tied_lines = ", ".join(str(ln) for ln, _ in tied)
         result.fail(
-            f"{path}: {len(tied)} candidate anticipation row(s) name the SAME greatest `ts` "
-            f"instant ({max_instant.isoformat()!r}) -- the GOVERNING row is AMBIGUOUS on a tie, "
+            f"{path}: {len(tied)} candidate anticipation row(s) (lines {tied_lines}) share the "
+            f"SAME greatest `ts` text ({max_ts!r}) -- the GOVERNING row is AMBIGUOUS on a tie, "
             "exactly as it is when `ts` is missing entirely; re-export so each round's row "
-            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15/Z17)"
+            "carries a distinguishing `ts` (esc-lead-gate-R12 fix round 6 Z15, narrowed at fix "
+            "round 7 Z19)"
         )
         return
-    governing = tied[0]
+    governing = tied[0][1]
 
     mod = _lib_module()
     gates_why = mod._r12_gates_shape_rejection(f"{path}: the governing row", governing.get("gates"),
@@ -1990,75 +2002,22 @@ def fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly() -> None:
                 "RR26", f"{r.failures}")
 
 
-def fixture_rr27_attacks_entry_not_object_fails() -> None:
-    """fix round 7 Z16: `attacks["a.py"]` is a STRING, not an object — the
-    shared validator's own arm, now the ONLY implementation of this check
-    (fix round 6 Z14 deleted reader 3's inline duplicate, which used to
-    catch this first and shadow the shared arm from ever being reached).
-    Asserts on the `anticipation-validator:` PROVENANCE MARKER
-    `_r12_anticipation_rejection` alone stamps on its three attacks[*]-
-    entry-shape deny texts — a re-introduced duplicate elsewhere can never
-    reproduce this exact marked text, so this fixture cannot be satisfied
-    by a shadowing copy the way the generic substring it used to assert
-    on ("is not an object") could."""
-    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
-        _origin, work = _pr_repo(Path(td))
-        _rr_anticipation_commit(work, {
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
-            "attacks": {"a.py": "not-an-object"},
-            "residual_risk": "fixture residual",
-        })
-        r = _run_check_in(work)
-        _assert(not r.ok(), "RR27", "a non-object attacks entry must FAIL")
-        _assert(any("anticipation-validator:" in f and "is not an object" in f for f in r.failures),
-                "RR27", f"{r.failures}")
-
-
-def fixture_rr28_attacks_entry_no_command_fails() -> None:
-    """fix round 7 Z16: `attacks["a.py"]` carries no `command` at all —
-    same shared arm, same replaced duplicate, same `anticipation-
-    validator:` marker asserted (see RR27)."""
-    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
-        _origin, work = _pr_repo(Path(td))
-        _rr_anticipation_commit(work, {
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
-            "attacks": {"a.py": {"hash": "a" * 64}},
-            "residual_risk": "fixture residual",
-        })
-        r = _run_check_in(work)
-        _assert(not r.ok(), "RR28", "an attacks entry with no `command` must FAIL")
-        _assert(any("anticipation-validator:" in f and "has no `command`" in f for f in r.failures),
-                "RR28", f"{r.failures}")
-
-
-def fixture_rr29_attacks_entry_invalid_hash_fails() -> None:
-    """fix round 7 Z16: `attacks["a.py"]["hash"]` is not a valid 64-hex
-    digest — same shared arm, same replaced duplicate, same `anticipation-
-    validator:` marker asserted (see RR27)."""
-    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
-        _origin, work = _pr_repo(Path(td))
-        _rr_anticipation_commit(work, {
-            "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
-            "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "not-a-valid-hash"}},
-            "residual_risk": "fixture residual",
-        })
-        r = _run_check_in(work)
-        _assert(not r.ok(), "RR29", "an attacks entry with an invalid `hash` must FAIL")
-        _assert(any("anticipation-validator:" in f and "has no valid `hash`" in f for f in r.failures),
-                "RR29", f"{r.failures}")
-
-
 def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
-    """fix round 6 Z15/Z17: TWO candidate rows share the SAME greatest `ts`
-    INSTANT — an executed probe found `max(pool, key=_row_ts)` resolves a
-    tie by APPEND POSITION (the FIRST maximal element), so an `rc=0` row
-    listed first silently governed and shadowed a genuinely `rc=1`
-    sibling recorded at the exact same instant. A tie is exactly as
-    AMBIGUOUS as a missing `ts` and must FAIL the same way, in BOTH
-    orders, AND when the two rows name the identical instant in DIFFERENT
-    TEXT (a trailing `Z` vs an explicit `+00:00` offset) — the compare is
-    by INSTANT, never by string equality; RED at da30f0b2 by the executed
-    probe against a text compare (quoted in the commit message)."""
+    """fix round 6 Z15, narrowed at fix round 7 Z19: TWO candidate rows
+    share the SAME greatest `ts` TEXT — an executed probe found
+    `max(pool, key=_row_ts)` resolves a tie by APPEND POSITION (the FIRST
+    maximal element), so an `rc=0` row listed first silently governed and
+    shadowed a genuinely `rc=1` sibling recorded at the identical `ts`. A
+    tie is exactly as AMBIGUOUS as a missing `ts` and must FAIL the same
+    way, in BOTH orders. (Fix round 6 Z17 once compared `ts` as a parsed
+    `datetime` INSTANT instead of text, to also catch the SAME instant
+    named in different text — but an executed probe found a mixed naive/
+    aware pool crashes `max()` with `TypeError: can't compare offset-naive
+    and offset-aware datetimes`, aborting the run instead of failing
+    loudly; fix round 7 Z19 narrowed the compare back to TEXT and filed
+    the instant-aware case at
+    https://github.com/f-inverse/jammi-ai/issues/557 — this fixture no
+    longer asserts that case.)"""
     pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
     block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
                              "verdict": "BLOCK", "finding_locations": ["a.py:1"],
@@ -2071,14 +2030,7 @@ def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
                   "attacks": {"a.py": {"command": "python3 -c \"print('ok')\"", "hash": "a" * 64}},
                   "residual_risk": "fixture residual", "ts": "2026-01-01T00:02:00Z", "head_sha": "f" * 40,
                   "gates": {"python3 ci/scripts/probe.py": {"rc": 1}}}
-    # Fix round 6 Z17: the SAME instant (2026-01-01T00:02:00 UTC) as
-    # `row_ok`, named in a DIFFERENT text form -- a naive string compare
-    # (`_row_ts(r) == max_ts`) sees these as UNEQUAL and would silently let
-    # whichever sorts last govern; the instant compare must still tie them.
-    row_broken_offset = dict(row_broken, ts="2026-01-01T00:02:00+00:00",
-                              pre_fix_sha="e" * 40, head_sha="e" * 40)
-    for order_name, ordered in (("ok-first", [row_ok, row_broken]), ("broken-first", [row_broken, row_ok]),
-                                 ("same-instant-different-text", [row_ok, row_broken_offset])):
+    for order_name, ordered in (("ok-first", [row_ok, row_broken]), ("broken-first", [row_broken, row_ok])):
         with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
             _origin, work = _pr_repo(Path(td))
             _commit(work, f"ci: touch a gate script (tied ts, {order_name})", {
@@ -2096,21 +2048,28 @@ def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
 
 
 # ==========================================================================
-# fix round 7 Z16(a): a STRUCTURAL fixture (modeled on check_lead_gate.py's
-# `R12sweepast`) asserting, by AST against the REAL file, that NO
-# FunctionDef in check_rigor_record.py — other than the call site that
-# invokes the shared validator (`_r12_anticipation_rejection`, imported by
-# path from lead-gate-lib.py) — independently RE-IMPLEMENTS one of the
-# three attacks[*]-entry-shape arms AND itself reports a failure for it.
-# The property distinguishes a re-implementation from a residual guard:
-# `check_anticipation_witnesses` still carries its own `isinstance(entry,
-# dict): continue` (it needs a real dict-shaped entry to run its OWN,
-# different, denylist re-check) — that guard SKIPS silently and reports
-# nothing, so it is not the smell. Fix round 6 Z14's deleted duplicate
-# additionally called `result.fail(...)` inside the identical guard,
-# reporting the SAME shape failure the shared validator already reports —
-# THAT combination (a shape test bound to a `.fail(...)` call) is what
-# this fixture forbids.
+# fix round 7 Z16(a), narrowed at fix round 7 Z20: a STRUCTURAL fixture
+# (modeled on check_lead_gate.py's `R12sweepast`) that scans, by AST
+# against the REAL file, every top-level FunctionDef in
+# check_rigor_record.py for an `if` whose body calls `result.fail(...)`
+# and whose test is an entry-shape check (an isinstance(x, dict) test over
+# an attacks/mutations/exclusions loop variable, a `command`-presence
+# test, or a `hash` fullmatch test). This is a NAMED, NARROW detector of
+# the ONE duplicate shape fix round 6 Z14 deleted from
+# `check_anticipation_witnesses` (a shape test bound to its own
+# `result.fail(...)` call) — it is NOT a proof that the shared validator
+# (`_r12_anticipation_rejection` in lead-gate-lib.py) is the only
+# implementation of these checks anywhere. An executed audit found two
+# gaps this detector cannot see: (1) a wholesale copy of the shared
+# validator's own function body, pasted into this file, RETURNS deny text
+# rather than calling `.fail(...)` — the same shape as the real function
+# it copies — and trips no arm here; (2) `lead-gate-lib.py`'s OWN
+# `_r12_validate_and_run_entry` (~:2072-2079) already re-implements the
+# identical three checks, in the OTHER file this detector never scans, and
+# always has. Z14's "the shared validator is the only implementation"
+# property is therefore recorded, not claimed proven: this unit's own
+# committed docs/rigor/lead-gate-r12-anticipation.anticipation.jsonl names
+# it in `residual_risk` (see the docs, and RR31's own docstring, below).
 # ==========================================================================
 
 def _rr_for_loop_vars_over_r12_dicts(fn: ast.FunctionDef) -> set[str]:
@@ -2152,10 +2111,17 @@ def _rr_get_key_assigned_vars(fn: ast.FunctionDef, key: str) -> set[str]:
 
 
 def _rr_entry_shape_duplicate_violations(source: str) -> list[str]:
-    """Fix round 7 Z16(a): `[]` iff no FunctionDef in `source` other than
-    the shared-validator call site re-implements AND REPORTS one of the
-    three attacks[*]-entry-shape arms. Each violation names the enclosing
-    function, the source line, and which arm it duplicates."""
+    """Fix round 7 Z16(a), narrowed at Z20: `[]` iff no top-level
+    FunctionDef in `source` contains an `if` whose test is an
+    attacks/mutations/exclusions entry-shape check (isinstance-dict/
+    `command`-presence/`hash`-fullmatch) AND whose body calls
+    `result.fail(...)`. Each violation names the enclosing function, the
+    source line, and which arm it duplicates. This is a detector of ONE
+    duplicate SHAPE (a shape test bound to its own `.fail(...)` call) —
+    it does not see a duplicate that RETURNS deny text instead of calling
+    `.fail(...)` directly (a wholesale copy of the shared validator's own
+    function body would return, not fail, and passes this detector), and
+    it never scans lead-gate-lib.py at all."""
     tree = ast.parse(source)
     violations: list[str] = []
     for fn in tree.body:
@@ -2219,15 +2185,26 @@ _RR_Z14_DUPLICATE_REPLACEMENT = (
 )
 
 
-def fixture_rr31_shared_validator_is_sole_entry_shape_reporter() -> None:
-    """fix round 7 Z16(a): STRUCTURAL — asserts, by AST against the REAL
-    file, that `_rr_entry_shape_duplicate_violations` finds NOTHING in the
-    current source (the shared validator, `_r12_anticipation_rejection` in
-    lead-gate-lib.py, is the only place that reports an attacks[*]-entry-
-    shape failure). RED half executed against fix round 6 Z14's own
-    deleted duplicate, reinserted into a SYNTHETIC copy of this file's real
-    source (never the file on disk): confirms this detector is not merely
-    vacuously empty by accident."""
+def fixture_rr31_no_fail_reporting_entry_shape_duplicate() -> None:
+    """fix round 7 Z16(a), narrowed at Z20: STRUCTURAL — asserts, by AST
+    against the REAL file, that `_rr_entry_shape_duplicate_violations`
+    finds NOTHING in `check_rigor_record.py`'s own current source. Its
+    universe, stated honestly: top-level FunctionDefs of THIS file whose
+    `if` body calls `result.fail(...)` over an entry-shape test — a
+    detector of the ONE duplicate shape fix round 6 deleted (a shape test
+    bound to its own `.fail(...)` call), never a proof that the shared
+    validator (`_r12_anticipation_rejection` in lead-gate-lib.py) is the
+    ONLY implementation of these checks. It does not see a duplicate that
+    RETURNS deny text instead of calling `.fail(...)` (a wholesale copy of
+    the shared validator's own body would), and it never scans
+    lead-gate-lib.py — which already carries its own second
+    implementation of these three checks in `_r12_validate_and_run_entry`
+    (~:2072-2079); this unit's own committed
+    docs/rigor/lead-gate-r12-anticipation.anticipation.jsonl names that gap
+    in `residual_risk`, recorded rather than hidden. RED half executed
+    against fix round 6 Z14's own deleted duplicate, reinserted into a
+    SYNTHETIC copy of this file's real source (never the file on disk):
+    confirms this detector is not merely vacuously empty by accident."""
     source = Path(__file__).read_text()
     violations = _rr_entry_shape_duplicate_violations(source)
     _assert(not violations, "RR31", f"a duplicate entry-shape reporter re-appeared: {violations}")
@@ -2275,11 +2252,8 @@ RR_FIXTURES = [
     ("RR18", fixture_rr18_ambiguous_pool_without_ts_fails_loudly),
     ("RR25", fixture_rr25_mixed_stream_via_real_export_selects_anticipation_only),
     ("RR26", fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly),
-    ("RR27", fixture_rr27_attacks_entry_not_object_fails),
-    ("RR28", fixture_rr28_attacks_entry_no_command_fails),
-    ("RR29", fixture_rr29_attacks_entry_invalid_hash_fails),
     ("RR30", fixture_rr30_tied_ts_governing_row_fails_loudly),
-    ("RR31", fixture_rr31_shared_validator_is_sole_entry_shape_reporter),
+    ("RR31", fixture_rr31_no_fail_reporting_entry_shape_duplicate),
 ]
 
 

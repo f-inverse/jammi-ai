@@ -234,22 +234,31 @@ same class of limit `_parse_new_surfaces` itself already carries.
 
 Reader 3's SHAPE checks (unit_branch/residual_risk presence, attack pair-reuse, the
 execution-class requirement, the omits-a-command arm, and the gates governing row's shape/
-value) run through the SAME shared validator Reader 1 calls — never a second, independently
-maintained implementation. Governing-row selection is order-independent BY CONSTRUCTION,
-never by an impossibility claim: `cmd_export_anticipation` stamps `ts` (the artifact file's
-own mtime) and `head_sha` (its own `pre_fix_sha`) on every row it emits, and selection is by
-`head_sha` match against the checkout's own `HEAD`, else by the row naming the greatest `ts`
-INSTANT (`ts` parsed with `datetime.fromisoformat`, a trailing `Z` accepted as `+00:00`) —
-never by position in the file, so an older round's row sorting after a newer one in the export
-(which sorts by filename, a tip sha with no chronological meaning) cannot stand in for the
-fix's own verified state. When the candidate pool holds two or more rows and any has no
-parseable `ts` instant (missing or unparseable — refused identically; a shape the real
-exporter no longer produces, but a hand-typed or pre-fix-round-5 record still can), OR when
-two or more rows NAME THE SAME INSTANT — even in different text, e.g. a trailing `Z` against
-an explicit `+00:00` offset — (a tie is exactly as ambiguous as a missing `ts`, and resolving
-it by append position or by string equality alone silently shadows a genuinely different
-sibling row), selection FAILS LOUDLY naming the ambiguity rather than falling back to append
-order.
+value) run through the SAME shared validator Reader 1 calls for these arms; `_r12_validate_
+and_run_entry` (Reader 1's own per-file loop, same file) is a KNOWN, unmarked SECOND
+implementation of the three attacks[*]-entry-shape checks specifically — Reader 3's own
+structural detector (`RR31`) cannot see it (it never scans lead-gate-lib.py), so this property
+is recorded, not claimed proven: this unit's own committed
+`docs/rigor/lead-gate-r12-anticipation.anticipation.jsonl` names it in `residual_risk`,
+citing `_r12_validate_and_run_entry` (`lead-gate-lib.py` ~:2072-2079) as the known,
+unmarked second implementation.
+Governing-row selection is order-independent BY CONSTRUCTION, never by an impossibility claim:
+`cmd_export_anticipation` stamps `ts` (the artifact file's own mtime) and `head_sha` (its own
+`pre_fix_sha`) on every row it emits, and selection is by `head_sha` match against the
+checkout's own `HEAD`, else by the row naming the greatest `ts` TEXT (compared as a plain
+string, never parsed as a `datetime` — an executed probe found a mixed-awareness pool crashes
+`max()` with `TypeError: can't compare offset-naive and offset-aware datetimes` and ABORTS the
+run instead of failing loudly, so the compare stays text-only) — never by position in the file,
+so an older round's row sorting after a newer one in the export (which sorts by filename, a tip
+sha with no chronological meaning) cannot stand in for the fix's own verified state. When the
+candidate pool holds two or more rows and any lacks a non-empty string `ts` (a shape the real
+exporter no longer produces, but a hand-typed or pre-fix-round-5 record still can), OR when two
+or more rows share the IDENTICAL `ts` TEXT (a tie is exactly as ambiguous as a missing `ts`, and
+resolving it by append position silently shadows a genuinely different sibling row), selection
+FAILS LOUDLY, naming the tied rows' own line numbers, rather than falling back to append order.
+The SAME instant named in different text (a trailing `Z` vs an explicit `+00:00` offset) is NOT
+caught by this text compare — that narrower case, and `_r12_previous_relay_row`'s own identical
+text-ordering limit, are filed at https://github.com/f-inverse/jammi-ai/issues/557.
 
 **Item 8's acceptance oracle, stated as a split (fix round 5, acceptance #2).** Item 8's
 fixture set carries 24 DENY oracles (RED at the base commit, each by one mutation) and 6

@@ -5068,8 +5068,9 @@ def fixture_r12x8_export_emits_no_attestation_row_or_file() -> None:
     )
     _assert(proc.returncode == 0, "R12X8", f"--export-anticipation must exit 0: {proc.stderr}")
     exported_rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
-    _assert(all(r.get("agent_type") == "lead-anticipation" for r in exported_rows), "R12X8",
-            f"the anticipation stdout stream must carry NO lead-relay-attestation row: {exported_rows}")
+    _assert(bool(exported_rows) and all(r.get("agent_type") == "lead-anticipation" for r in exported_rows),
+            "R12X8", f"the anticipation stdout stream must carry >=1 row and NO "
+            f"lead-relay-attestation row: {exported_rows}")
     attestation_path = root / "docs" / "rigor" / f"{_slug(unit)}.attestation.jsonl"
     _assert(not attestation_path.exists(), "R12X8",
             f"the exporter must write NO attestation file at all (Z8's export half is reverted): "

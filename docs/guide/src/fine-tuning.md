@@ -273,17 +273,21 @@ print(f"Model: {result['model_id']}")
 
 A hit registers THIS job's own model id pointing at the SAME already-published
 artifact prefix an earlier run published — no bytes are retrained or recopied. Both
-model ids stay independently servable; the earlier one can be deleted without
-disturbing this one (the prefix is reclaimed only once no model row references it).
+model ids stay independently servable; either can be deleted without disturbing
+the other — the underlying prefix is reclaimed only once no live model row still
+names it, and a delete attempted while one still does is refused, typed, naming
+the prefix and the referencing count. A dedicated catalog edge recording which
+row is the original and which is the reuse is not enforced
+(<https://github.com/f-inverse/jammi-ai/issues/547>).
 
 ### Rust
 
 The embedded surface's cache dial lives on `jammi_wire::request::FineTuneRequest`
 (submitted through `InferenceSession::submit_fine_tune`), not on the loose
 `InferenceSession::fine_tune`/`fine_tune_graph` methods shown above, which always
-train (`cache: CachePolicy::Bypass`, unconditionally, at this commit). The remote
+train (`cache: CachePolicy::Bypass`, unconditionally). The remote
 `jammi_client::DataClient::submit_fine_tune` carries the same field. Neither Rust
-surface returns `cache_outcome` from `TrainingJob::wait()` today — only `model_id()`
+surface returns `cache_outcome` from `TrainingJob::wait()` — only `model_id()`
 is exposed there; read the outcome from the Python binding (either transport), or
 from the remote `jammi_client::DataClient::job_status` call.
 
@@ -293,10 +297,15 @@ The probe (`Catalog::probe_model_by_definition`) matches on an EXACT combination
 the training set's definition hash + artifact digest + row count, the base model's
 identity, the whole canonical `TrainingSpec::FineTune` spec (every hyperparameter,
 the method, the task, the seed, `world_size`), and the execution environment (the
-engine version, the compute device, every invoked model's identity, and the
-fused-kernel admission profile the training loop actually resolved). Any one
+engine version, the compute device, and every invoked model's identity). Any one
 determinant differing — a different `lora_rank`, a different `world_size`, a
 different device — misses the probe, and the job trains.
+
+The fused-kernel admission profile the training loop actually resolves (fused vs.
+eager per operator) is declared as part of the environment record but is UNCOVERED
+by the probe: nothing writes a real value into it, so two runs whose only
+difference is that admission outcome hash identically and are treated as the same
+definition (<https://github.com/f-inverse/jammi-ai/issues/546>).
 
 ### `cache = Use` is scoped to the column-source kind
 
@@ -304,7 +313,14 @@ different device — misses the probe, and the job trains.
 refused, typed (`jammi.errors.InvalidArgument` on both transports): a graph
 fine-tune's model carries no materialization to probe or record. `cache="bypass"`
 (the default) is unaffected — a graph fine-tune always trains, whether or not
-`cache` is named.
+`cache` is named. `TrainingSpec::GraphFineTune` carries no `cache` field at all —
+the request-time refusal is the only place the wire's value is ever read for this
+kind. A stray `cache` key found under `graph_fine_tune` in a persisted `jobs.spec`
+row (the row is engine-written from an already-decoded spec, so this only arises
+from a hand-edited row) is silently dropped at deserialize rather than refused,
+since the type has nowhere to put it; making an unexpected key a hard error across
+the persisted-row format is a separate reshape
+(<https://github.com/f-inverse/jammi-ai/issues/548>).
 
 ### Two caveats
 

@@ -916,10 +916,10 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     // `Reused` outcome carries the IDENTICAL path by construction
     // (`second.table_name() == first.table_name()`, asserted above), so two
     // `read_materialization_manifest` calls against that one shared path
-    // compare a file with itself regardless of what reuse actually did — a
-    // tautology a round-7 audit found here. Querying through two distinct
-    // `SessionContext`s is the only way to exercise `bind_result_table`'s
-    // OWN rebind twice with an independent read each time.
+    // compare a file with itself regardless of what reuse actually did.
+    // Querying through two distinct `SessionContext`s is the only way to
+    // exercise `bind_result_table`'s OWN rebind twice with an independent
+    // read each time.
     let order_by = jammi_db::store::training_set_order_by(&columns);
     let first_rows = first_ctx
         .sql(&format!(
@@ -992,23 +992,25 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 /// nanosecond timestamp: "two tokio tasks call create_table within the same
 /// nanosecond". Two sequential calls almost always differ in wall-clock
 /// nanoseconds on their own, proving nothing about the suffix; a `tokio::
-/// join!` of exactly two also did not reproduce a collision under the
+/// join!` of exactly two also does not reproduce a collision under the
 /// mutation below on this host (`chrono::Utc::now()`'s effective resolution
-/// is finer than the gap between two cooperatively-scheduled calls). **The
-/// real discriminator is OS-thread PARALLELISM (`tokio::spawn` onto a
-/// multi-worker runtime), not the width 64 specifically**: a `tokio::spawn`
-/// burst of only TWO tasks on the same `worker_threads = 8` runtime also
-/// reproduces the race under the mutation below, non-deterministically —
-/// measured on this host at 4/30, 0/30, 5/30 and 8/30 collisions over four
-/// independent 30-run batches (17/120 overall, ~14%) — because a 2-way race
-/// only SOMETIMES lands both `chrono::Utc::now()` reads in the same
-/// nanosecond bucket on two separate OS threads, while a 64-way burst across
-/// 8 OS threads collides on every run measured (below): width increases the
-/// COLLISION PROBABILITY of the same underlying race, it is not itself a
-/// separate necessary condition. `join!`'s zero-collision result is
-/// consistent with this: two COOPERATIVELY SCHEDULED tasks on one OS thread
-/// (Tokio's own `join!` never spawns a second OS-thread-parallel task) never
-/// race on wall-clock reads at all, regardless of count.
+/// is finer than the gap between two cooperatively-scheduled calls), because
+/// two COOPERATIVELY SCHEDULED tasks on one OS thread (Tokio's own `join!`
+/// never spawns a second OS-thread-parallel task) never race on wall-clock
+/// reads at all, regardless of count. **The discriminator this test exists
+/// to exercise is OS-thread PARALLELISM (`tokio::spawn` onto a multi-worker
+/// runtime), not the width 64 specifically**: a `tokio::spawn` burst of
+/// only TWO tasks on the same `worker_threads = 8` runtime also reproduces
+/// the race under the mutation below, non-deterministically — two threads
+/// racing a `chrono::Utc::now()` read only SOMETIMES land in the same
+/// nanosecond bucket, so a 2-way burst's collision rate on any given host or
+/// load regime is not a number this test can pin (it has been measured at
+/// materially different rates across load regimes on this host, so no rate
+/// is stated here). The 64-way burst below is the WITNESS this doc relies on
+/// instead — see the RED-mutation result just below for its own measured
+/// determinism — because 64 concurrent OS-thread-parallel reads make the
+/// SAME per-pair race the 2-way case only sometimes hits overwhelmingly
+/// likely to land at least once.
 ///
 /// Executed as the contract's own RED-first mutation, not merely asserted:
 /// removing the `_{suffix}` segment from `create_table`'s name builder
@@ -1024,10 +1026,10 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 /// **This test is itself timing-sensitive, disclosed rather than hidden.**
 /// Measured on this host: the `sqlite` arm ALONE (its own process, its own
 /// `--test it -- create_table_names_a_concurrent_burst_uniquely_over_one_definition`
-/// invocation) fails deterministically under the mutation above, 5/5 runs. A
-/// round-7 audit run found the SAME `sqlite` arm can PASS once when co-run
-/// immediately after the `postgres` arm inside one `--test-threads=1`
-/// process — a warmed-up tokio thread pool (already-spun-up worker threads,
+/// invocation) fails deterministically under the mutation above, 5/5 runs.
+/// The SAME `sqlite` arm can also PASS once when co-run immediately after
+/// the `postgres` arm inside one `--test-threads=1` process — a warmed-up
+/// tokio thread pool (already-spun-up worker threads,
 /// different scheduling latency than a cold start) narrows the race window
 /// below what 64 concurrent `chrono::Utc::now()` reads reliably hit. Call
 /// the `sqlite` arm ALONE before treating a single co-run pass as this

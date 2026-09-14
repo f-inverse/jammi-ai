@@ -660,13 +660,8 @@ zero tests exits 0 with "running 0 tests" — the driver reads that as a
 FAILURE, by name, and equally refuses a run that wrote no artifact. A leg with
 no test is a leg with no proof.
 
-**Triggers.** The `run-gang` PR label, a nightly cron at 08:30 UTC, and manual
-dispatch — never a push, never `workflow_call`, and no workflow may `uses:` it.
-The cron sits after the only other renting cron in the repo: `gpu-prove.yml`
-fires at 03:47 UTC and its concurrent legs run under a 190-minute budget, so its
-rentals are done by 06:57, leaving a 93-minute margin. That margin is measured
-against a nominal start; GitHub delays scheduled runs under load, so it is a
-margin and not a guarantee of disjointness. The never-in-an-automated-path
+**Triggers.** The `run-gang` PR label and manual dispatch — never a push, never
+`workflow_call`, and no workflow may `uses:` it. The never-in-an-automated-path
 doctrine is `gpu-prove.yml`'s own, and
 `ci/scripts/check_gpu_prove_once.py`'s P7 rule pins it for every renting lane —
 over a driver set *derived* from `runpod_lib.sh`'s deploy closure, with

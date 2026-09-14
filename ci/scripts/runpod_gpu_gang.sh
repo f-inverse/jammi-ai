@@ -82,6 +82,13 @@
 # wrong tree (the pod's own PROVE_SHA disagreed with PROVE_EXPECT_SHA); 97 =
 # the rented pod is not the device this leg asked for (wrong arch, or fewer
 # GPUs than RP_GPU_COUNT); 124 = budget cut with a gating group unresolved.
+# A nonzero exit that is none of the above, with the suite's own groups
+# otherwise green, is this driver's OWN post-run check refusing the leg:
+# rsync's own exit code when the artifact pull fails (a suite that passed
+# but left no retrievable evidence proves nothing reviewable), or 1 when the
+# pulled artifact tree or this run's own log carries the shape of a leaked
+# NCCL id (see the id-secrecy scan below) — a leg with evidence that reads
+# but cannot be trusted is never read as a pass either.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -137,7 +144,11 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # Where the gang tests write their evidence JSON on the pod, and where this
 # driver pulls it to locally. The remote path is passed to the tests as
 # JAMMI_GANG_ARTIFACT_DIR — the ONE contract between this driver and U4b's
-# test code.
+# test code. The NCCL id (128 opaque bytes minted by rank 0, nccl.rs's own
+# "opaque secret ... travel to the peers out of band") rides NO path under
+# either directory: it is a capability, never evidence, and this driver's
+# post-pull scan below refuses a leg whose pulled artifact tree or own log
+# ever carries one.
 GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 
@@ -232,6 +243,15 @@ export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse, ~+33% wall on this image)
 export CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
 export JAMMI_GANG_ARTIFACT_DIR=${GANG_REMOTE_ARTIFACT_DIR}
+# This is the ONE place a missing/broken CUDA device or a single-visible-
+# device host must hard-fail rather than skip: a silent skip here would let
+# this paid two-GPU leg report a false green with no gang ever proven.
+# gang_nccl.rs's own serial_cuda_device_or_require / second_cuda_device_or_
+# require read these two atoms and panic when the matching var is set and
+# this leg's own device acquisition fails; the single-GPU prove lane never
+# sets either, so a one-device host there still skips with its reason.
+export JAMMI_REQUIRE_CUDA=1
+export JAMMI_REQUIRE_CUDA_GANG=1
 # CUBLAS_WORKSPACE_CONFIG is deliberately NOT pinned here: spike S5 measured
 # it as a kernel-SELECTION input that must merely be CONSISTENT across the
 # ranks of one gang (which it is — one pod, one environment, ranks spawned
@@ -309,23 +329,53 @@ raw_rc="${PIPESTATUS[0]}"
 rp_gang_verdict "$raw_rc" "$LOG"
 rc=$?
 
-rm -f "$LOG"
-
 # --- artifact retrieval, before the EXIT trap (rp_cleanup, installed by
-# rp_init) tears the pod down. Best-effort and UNCONDITIONAL: a failed run's
-# own artifact is exactly the evidence a non-reproducible gang needs to
-# leave behind, and this driver is the last thing able to reach it. Mirrors
+# rp_init) tears the pod down. UNCONDITIONAL: a failed run's own artifact is
+# exactly the evidence a non-reproducible gang needs to leave behind, and
+# this driver is the last thing able to reach it. Mirrors
 # runpod_gpu_howwell.sh's own rsync invocation rather than inventing a
-# second retrieval mechanism.
+# second retrieval mechanism. FATAL, not best-effort: a pull failure joins
+# this leg's own rc exactly the way raw_rc already does above, never a
+# second, independent exit path — a suite that passed but left no
+# retrievable evidence has proven nothing that can be reviewed or committed.
 mkdir -p "$GANG_ARTIFACT_DIR"
 if [ -n "${RP_HOST:-}" ] && [ -n "${RP_PORT:-}" ]; then
-  rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
-    "root@${RP_HOST}:${GANG_REMOTE_ARTIFACT_DIR}/" "${GANG_ARTIFACT_DIR}/" \
-    && echo "=== pulled the gang artifact -> ${GANG_ARTIFACT_DIR} ===" \
-    || echo "::warning::gang artifact pull failed -- ${rc} above is still authoritative; the pod is torn down on this script's own exit, so this evidence is now unrecoverable for this invocation."
+  if rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+    "root@${RP_HOST}:${GANG_REMOTE_ARTIFACT_DIR}/" "${GANG_ARTIFACT_DIR}/"; then
+    echo "=== pulled the gang artifact -> ${GANG_ARTIFACT_DIR} ==="
+  else
+    pull_rc=$?
+    echo "::error::gang artifact pull failed (rsync rc=${pull_rc}) -- a leg that cannot retrieve its own evidence has proven nothing reviewable or committable, and the pod is torn down on this script's own exit, so this evidence is now unrecoverable for this invocation." >&2
+    [ "$rc" -eq 0 ] && rc="$pull_rc"
+  fi
 else
   echo "::warning::no live pod (RP_HOST/RP_PORT unset) -- skipping the artifact pull."
 fi
+
+# The NCCL id (128 opaque bytes minted by rank 0, hex-encoded when it
+# crosses a filesystem boundary per nccl.rs's own doc comment -- 256 hex
+# characters at full length) must never reach a committed artifact or a CI
+# log: it is the capability to join this gang, not evidence of one. This
+# lane mints/ships no id today (that lands with U7b-C's two-process
+# bootstrap); the id file's own committed contract, fixed here BEFORE that
+# mechanism exists, is that it rides OUTSIDE
+# ${GANG_REMOTE_ARTIFACT_DIR}/${GANG_ARTIFACT_DIR} -- never inside the
+# directory this driver pulls back and a human later commits. This scan is
+# the backstop against that contract being violated by a future mistake: it
+# refuses the leg if a run of at least 128 CONTIGUOUS hex characters (half a
+# full id's length, and comfortably clear of a sha256 digest's 64 -- this
+# lane's own build/clone steps legitimately print those) ever turns up in
+# the pulled artifact tree or in this run's own log, regardless of how it
+# got there. 128 is also chosen to stay under this grep's own repetition-
+# count ceiling (some grep builds refuse a bound above 255) with headroom.
+id_leak="$(grep -rIlE '[0-9a-fA-F]{128,}' "$GANG_ARTIFACT_DIR" "$LOG" 2>/dev/null || true)" # tripwire-ok: grep's own exit 1 on "no match anywhere" IS the pass condition; a match is reported on the next line, and both paths exist by construction at this point, so an unreadable path is never the reason this stays silent.
+if [ -n "$id_leak" ]; then
+  echo "::error::gang leg: a run of >=128 contiguous hex characters (the shape of a hex-encoded NCCL id, which is 256 at full length) was found in: ${id_leak} -- the id is an opaque secret and must never reach a committed artifact or a CI log; refusing to report this leg as evidence" >&2
+  [ "$rc" -eq 0 ] && rc=1
+fi
+# --- end artifact retrieval and id-secrecy check ---
+
+rm -f "$LOG"
 
 echo "=== GPU gang leg exit=${rc} (raw=${raw_rc}) ==="
 exit "$rc"

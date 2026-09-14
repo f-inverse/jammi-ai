@@ -45,7 +45,7 @@ name: GPU gang (RunPod)
 # workflow — the same operator direction gpu-prove.yml's own header records
 # (GPU minutes cost money; capacity is intermittent), doubled here because
 # each run rents two GPUs. It fires on: the `run-gang` PR label (opt-in per
-# PR), a nightly cron, and manual dispatch — deliberately NO `push:` and NO
+# PR) and manual dispatch — deliberately NO `push:` and NO
 # `workflow_call:` trigger, and no workflow may `uses:` it, so nothing ever
 # auto-starts it and no publisher can put a paid leg in its promotion path.
 # `ci/scripts/check_gpu_prove_once.py`'s paid-pod-lane rule pins this `on:`
@@ -63,17 +63,6 @@ on:
   workflow_dispatch:
   pull_request:
     types: [labeled]
-  schedule:
-    # Nightly at 08:30 UTC. The ONE other cron in this repo that rents is
-    # gpu-prove.yml's `47 3 * * *`: its legs run concurrently under a
-    # 190-minute job budget, so its rentals are done by 06:57 UTC. 08:30
-    # leaves a 93-minute margin. (gpu-perf-ab.yml and gpu-howwell.yml have
-    # no cron at all; gpu-reap.yml's hourly sweep only terminates.) The
-    # margin is against gpu-prove's NOMINAL start: GitHub delays scheduled
-    # runs under load, sometimes by tens of minutes, and a delay on the
-    # gpu-prove side moves its window later — 93 minutes is a margin, not a
-    # guarantee of disjointness.
-    - cron: "30 8 * * *"
 
 # Least privilege: this lane only reads the checkout; the RunPod side is
 # driven by the RUNPOD_API_KEY secret, not the GitHub token.
@@ -83,8 +72,8 @@ permissions:
 jobs:
   gpu-gang:
     name: GPU gang on RunPod (1 pod x 2 A100)
-    # Label event only runs for the `run-gang` label; dispatch/schedule
-    # always run. Same shape as gpu-prove.yml's own `run-gpu` gate.
+    # Label event only runs for the `run-gang` label; dispatch always runs.
+    # Same shape as gpu-prove.yml's own `run-gpu` gate.
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-gang'
     runs-on: ubuntu-latest
     # Concurrency is on the JOB (not the workflow) and NEVER cancels.

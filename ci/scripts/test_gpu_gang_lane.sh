@@ -25,6 +25,24 @@
 #       Plus the unescaped-backtick/`$(` static guard on that heredoc, the
 #       same class the prove suite catches (an unescaped pair is evaluated
 #       LOCALLY, on the runner, before a byte reaches ssh).
+#   G5  the post-run artifact retrieval (U7b-A1-pull P1/P2), driven as the
+#       EXPANDED LOCAL TEXT the driver really runs after the remote heredoc
+#       exits (extracted the same way G3 extracts the remote text, but from
+#       the driver's own local block, under a real `rsync` shim on PATH so
+#       no network call is made): a failed pull JOINS the leg's own `rc`
+#       (never a silently-warned second exit path), and a run of >=128
+#       contiguous hex characters (the shape of a hex-encoded NCCL id,
+#       256 at full length) found in the pulled
+#       artifact dir OR the run's own log fails the leg too — a clean pull
+#       with a clean artifact/log stays silent.
+#   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
+#       the `<<REMOTE` heredoc body, beside the existing env block; removing
+#       either is a mutation this case catches.
+#   G7  NO `schedule:` key exists anywhere in the committed `gpu-gang.yml`
+#       (U7b-A1-pull P5) — re-adding one (any cron) is a mutation this case
+#       catches. This row is itself deleted the moment U7b-A3 re-adds the
+#       schedule block with its own never-vacuous writer; a permanent
+#       "no schedule" assertion would then reject the correct end state.
 #   G4  the cost bound is what the MECHANISM produces: the `$/run` figure
 #       printed in `gpu-gang.yml`, in the driver's own header and in
 #       `docs/maintainer/dev-gpu.md` is re-derived here from the `a100`
@@ -321,6 +339,134 @@ if [ "${res%%|*}" -eq 0 ] && [ -z "${res#*|}" ]; then
   ok "G3: a real pass with a written artifact stays 0 (the arms are not blanket-refusing)"
 else
   bad "G3: expected a silent grc=0; got $res"
+fi
+
+# ============================================================================
+# G5: the post-run artifact retrieval is FATAL on a failed pull, and the
+# id-secrecy scan over the pulled artifact dir + this run's own log is a
+# backstop (U7b-A1-pull P1/P2). Extracted from the driver's OWN local text
+# the same way G3 extracts the remote heredoc's, and eval'd directly in this
+# function's shell (never inside a `$(...)` capture, which would discard the
+# `rc` mutation the arms make — the same reason G3's run_arms does not
+# capture its own eval).
+# ============================================================================
+retrieval_start_ln="$(grep -n '^mkdir -p "\$GANG_ARTIFACT_DIR"$' "$GANG_SH" | head -1 | cut -d: -f1)"
+retrieval_end_ln="$(grep -n '^# --- end artifact retrieval and id-secrecy check ---$' "$GANG_SH" | head -1 | cut -d: -f1)"
+if [ -n "$retrieval_start_ln" ] && [ -n "$retrieval_end_ln" ]; then
+  retrieval_body="$(sed -n "${retrieval_start_ln},${retrieval_end_ln}p" "$GANG_SH")"
+  ok "G5: extracted the artifact-retrieval + id-secrecy block from the driver (lines ${retrieval_start_ln}-${retrieval_end_ln})"
+else
+  bad "G5: could not locate the artifact-retrieval + id-secrecy block in the driver (anchors moved or were deleted)"
+  retrieval_body=""
+fi
+
+RSYNC_BIN="$SANDBOX/rsync-bin"
+mkdir -p "$RSYNC_BIN"
+
+run_retrieval() { # $1=initial rc  $2=rsync exit code  $3=artifact content(none|clean|leak)  $4=log content(clean|leak) -> "rc|stderr"
+  cat >"$RSYNC_BIN/rsync" <<RS
+#!/usr/bin/env bash
+exit $2
+RS
+  chmod +x "$RSYNC_BIN/rsync"
+
+  local rc="$1"
+  local GANG_ARTIFACT_DIR="$SANDBOX/g5-pulled"
+  rm -rf "$GANG_ARTIFACT_DIR"; mkdir -p "$GANG_ARTIFACT_DIR"
+  case "$3" in
+    clean) echo '{"world":2}' > "$GANG_ARTIFACT_DIR/gang.json" ;;
+    leak) python3 -c "print('a' * 256)" > "$GANG_ARTIFACT_DIR/gang.json" ;;
+    none) : ;;
+  esac
+  local LOG="$SANDBOX/g5-retrieval.log"
+  case "$4" in
+    clean) echo "ordinary run output, no secrets" > "$LOG" ;;
+    leak) python3 -c "print('b' * 256)" > "$LOG" ;;
+  esac
+
+  # shellcheck disable=SC2034  # read only inside the eval'd retrieval_body below, which shellcheck cannot see into
+  local RP_HOST="203.0.113.1" RP_PORT="22"
+  # shellcheck disable=SC2034  # same: read only inside the eval'd retrieval_body
+  local RP_SSHO=(-o StrictHostKeyChecking=no)
+  # shellcheck disable=SC2034  # same: read only inside the eval'd retrieval_body
+  local GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
+  local old_path="$PATH"
+  PATH="$RSYNC_BIN:$PATH"
+  eval "$retrieval_body" > "$SANDBOX/g5.out" 2>&1
+  PATH="$old_path"
+  printf '%s|%s' "$rc" "$(cat "$SANDBOX/g5.out")"
+}
+
+res="$(run_retrieval 0 0 clean clean)"
+if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" == *"pulled the gang artifact"* ]] && [[ "${res#*|}" != *"::error::"* ]]; then
+  ok "G5: a clean pull with a clean artifact/log stays rc=0, no error"
+else
+  bad "G5: expected a silent rc=0 pull; got $res"
+fi
+
+res="$(run_retrieval 0 17 none clean)"
+if [ "${res%%|*}" -eq 17 ] && [[ "${res#*|}" == *"gang artifact pull failed"* ]]; then
+  ok "G5: a FAILED pull (rsync rc=17) with rc=0 so far joins the leg's own rc -> 17, never a silent warning"
+else
+  bad "G5: expected rc=17 + 'gang artifact pull failed'; got $res"
+fi
+
+res="$(run_retrieval 5 17 none clean)"
+if [ "${res%%|*}" -eq 5 ] && [[ "${res#*|}" == *"gang artifact pull failed"* ]]; then
+  ok "G5: a failed pull on an ALREADY-failing leg (rc=5) reports the pull failure but never overwrites the leg's own rc"
+else
+  bad "G5: expected rc=5 (unchanged) + the pull-failed message; got $res"
+fi
+
+res="$(run_retrieval 0 0 leak clean)"
+if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
+  ok "G5: a 256-hex-char run in the PULLED ARTIFACT dir fails the leg (rc=1), naming the id-secrecy reason"
+else
+  bad "G5: expected rc=1 + the id-secrecy message from a leaked artifact; got $res"
+fi
+
+res="$(run_retrieval 0 0 clean leak)"
+if [ "${res%%|*}" -eq 1 ] && [[ "${res#*|}" == *"hex-encoded NCCL id"* ]]; then
+  ok "G5: a 256-hex-char run in the RUN'S OWN LOG fails the leg (rc=1), naming the id-secrecy reason"
+else
+  bad "G5: expected rc=1 + the id-secrecy message from a leaked log; got $res"
+fi
+
+res="$(run_retrieval 0 0 clean clean)"
+if [ "${res%%|*}" -eq 0 ] && [[ "${res#*|}" != *"hex-encoded"* ]]; then
+  ok "G5: a clean artifact and log never trip the id-secrecy scan (not blanket-refusing)"
+else
+  bad "G5: expected the id-secrecy scan to stay silent on clean input; got $res"
+fi
+
+# ============================================================================
+# G6: the two JAMMI_REQUIRE_* exports (U7b-A1-pull P3) are present in the
+# expanded <<REMOTE heredoc body, beside the existing env block.
+# ============================================================================
+if [[ "$remote_text" == *"export JAMMI_REQUIRE_CUDA=1"* ]] && [[ "$remote_text" == *"export JAMMI_REQUIRE_CUDA_GANG=1"* ]]; then
+  ok "G6: the expanded remote heredoc exports both JAMMI_REQUIRE_CUDA=1 and JAMMI_REQUIRE_CUDA_GANG=1"
+else
+  bad "G6: the expanded remote heredoc is missing one or both JAMMI_REQUIRE_* exports"
+fi
+
+require_env_mutation="$(printf '%s\n' "$remote_text" | grep -c '^export JAMMI_REQUIRE_CUDA')"
+if [ "$require_env_mutation" -eq 2 ]; then
+  ok "G6: exactly two JAMMI_REQUIRE_CUDA* export lines (removing either is the mutation this case catches)"
+else
+  bad "G6: expected exactly 2 JAMMI_REQUIRE_CUDA* export lines; found ${require_env_mutation}"
+fi
+
+# ============================================================================
+# G7: NO schedule: key anywhere in the committed gpu-gang.yml (U7b-A1-pull
+# P5). This row is itself deleted the moment U7b-A3 re-adds the schedule
+# block with its own never-vacuous writer, in the same diff as that writer —
+# a permanent "no schedule" assertion would then reject the correct end
+# state this repo is meant to reach.
+# ============================================================================
+if grep -n '^\s*schedule:' "$GANG_YML" >/dev/null 2>&1; then
+  bad "G7: gpu-gang.yml carries a schedule: key -- between U7b-A1-pull's merge and U7b-A3's re-add, NO cron of any kind may fire this paid two-GPU lane"
+else
+  ok "G7: gpu-gang.yml carries no schedule: key (hermetic, source-text check)"
 fi
 
 # ============================================================================

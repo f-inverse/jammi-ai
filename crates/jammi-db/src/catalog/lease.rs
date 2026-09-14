@@ -258,7 +258,15 @@ pub fn lease_remaining_seconds_expr(
 ) -> String {
     match kind {
         BackendKind::Postgres => {
-            format!("EXTRACT(EPOCH FROM ({col}::timestamptz - now()))")
+            // Postgres's `EXTRACT(...)` returns `numeric`, never `float8` —
+            // an explicit `::double precision` cast is required so every
+            // reader that decodes this column as `Option<f64>`
+            // (`Catalog::get_job_for_rank`'s row mapper) gets the SQL type
+            // it asked for; without it sqlx's Postgres decoder refuses the
+            // row with a `ColumnDecode` error (a genuine backend/driver
+            // fault, never a content defect) on every call, not just a
+            // malformed one.
+            format!("EXTRACT(EPOCH FROM ({col}::timestamptz - now()))::double precision")
         }
         BackendKind::Sqlite => {
             params.push(SqlValue::TextOwned(lease_now()));
@@ -358,7 +366,7 @@ mod tests {
             lease_remaining_seconds_expr("lease_expires_at", BackendKind::Postgres, &mut params);
         assert_eq!(
             expr,
-            "EXTRACT(EPOCH FROM (lease_expires_at::timestamptz - now()))"
+            "EXTRACT(EPOCH FROM (lease_expires_at::timestamptz - now()))::double precision"
         );
         assert!(
             params.is_empty(),

@@ -56,7 +56,7 @@ per-step `$?`. Naming per README ruling 23.
   `::result_table_kind_from_proto` (the two exhaustive
   `ResultTableKind` mirrors). (ai-core) `fine_tune/worker.rs::run_spec` (materialize-or-reuse,
   then read the table back through `session.sql` over the registered `jammi.{name}` result
-  table — `crates/jammi-db/src/store/mod.rs::TrainingSetTable::registered_name`/`::sql_relation`
+  table — `crates/jammi-db/src/store/mod.rs::ResultStore::register_table`
   and `crates/jammi-ai/src/session.rs::infer_ordered_read_back_sql` precedent — with the canonical `ORDER BY`
   re-applied, into today's loader: a compiling intermediate), `fine_tune/graph_sampler.rs`
   (pairs → table), `pipeline/recompute.rs` (arm = re-materialize). (docs-ci) the
@@ -84,7 +84,7 @@ per-step `$?`. Naming per README ruling 23.
   refusals below are testable at this commit; queued specs still deserialize), every
   `TrainingCommon { .. }` construction site (`crates/jammi-ai/src/wire/training.rs::lora_common_from_proto`,
   `crates/jammi-ai/src/session.rs::InferenceSession::fine_tune`,
-  `InferenceSession::submit_fine_tune`, `InferenceSession::fine_tune_graph`, the `tests/it` sites), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`).
+  `InferenceSession::fine_tune_graph`, the `tests/it` sites), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`).
   (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
   (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.

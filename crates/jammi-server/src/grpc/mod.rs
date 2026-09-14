@@ -25,6 +25,7 @@ pub mod audit;
 pub mod catalog;
 pub mod embedding;
 pub mod eval;
+pub mod gang;
 pub mod inference;
 pub mod job;
 pub mod peer;

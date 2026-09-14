@@ -224,5 +224,9 @@ consolidation's own changes are the eleven resolutions above.
 - `RunRank` at W=1 reads no tenant value, so a `peer_bind` caller holding another tenant's job coordinates learns
   whether that job is admissible (`Unimplemented`) or not (`FailedPrecondition`) — a liveness signal, no row
   content, within I-PEER's trust; closed by U5a-2's tenant-scoped resolution (#566). See C11.
+- `docs/plans/67-distributed-training/UNITS.md` § U5a-1's `invariants_to_preserve` glosses I-GANG as "tenant from the
+  row" without the W=1 divergence clause adjacent (the same block states the W=1 lattice and #566 a few lines
+  above); the third oracle pass classified it design-intent, not a present-fact claim. Left as the plan's
+  statement of the target design.
 - The kernel-admission profile determinant (#546), the model→prefix ownership edge (#547), the untagged
   `JobSpec` (#548), and the W=1 mining parity oracle (#551) stand as filed by the units.

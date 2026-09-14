@@ -517,101 +517,108 @@ agent writing this addendum, cited by crate-qualified `path::item`.
 
 ### A1. The lattice is keyed on the row's own `world_size`, never `assign.world`
 
-`RankAdmissionRow` (`crates/jammi-db/src/catalog/jobs_repo.rs:207-239`) carries
-`world_size: u32` (`:236`), decoded by `world_size_from_spec_json`
-(`crates/jammi-db/src/catalog/jobs_repo.rs:265-283`, module-private) from the
-job's own `spec` JSON: a top-level `world_size` key, or one nested under
-`common` (`:271-273`); absent either way ⇒ `WORLD_SIZE_IF_ABSENT = 1`
-(`:247`, `:275`); present but not decodable as a `u32` ⇒
-`BackendError::TypeConversion` (`:277-280`), never a silent `1`. Pinned by
-three oracles in `crates/jammi-db/tests/it/gang_rank_admission.rs`:
-`get_job_for_rank_reflects_the_row_world_size` (`:181-211`, a spec naming
-`world_size: 2` round-trips `2`), `get_job_for_rank_defaults_world_size_when_absent_from_spec`
-(`:217-238`, a spec naming nothing round-trips `1`), and
-`get_job_for_rank_malformed_world_size_is_a_typed_error` (`:243-271`, a
-non-numeric `world_size` is a typed `Err`, never a silent `1`).
+`crates/jammi-db/src/catalog/jobs_repo.rs::RankAdmissionRow` carries the
+field `world_size: u32`, decoded by the module-private
+`crates/jammi-db/src/catalog/jobs_repo.rs::world_size_from_spec_json` from
+the job's own `spec` JSON: a top-level `world_size` key, or one nested under
+`common`; absent either way ⇒ the const
+`crates/jammi-db/src/catalog/jobs_repo.rs::WORLD_SIZE_IF_ABSENT` (`= 1`);
+present but not decodable as a `u32` ⇒ `BackendError::TypeConversion`, never
+a silent `1`. Pinned by three oracles in
+`crates/jammi-db/tests/it/gang_rank_admission.rs`:
+`get_job_for_rank_reflects_the_row_world_size` (a spec naming `world_size: 2`
+round-trips `2`), `get_job_for_rank_defaults_world_size_when_absent_from_spec`
+(a spec naming nothing round-trips `1`), and
+`get_job_for_rank_malformed_world_size_is_a_typed_error` (a non-numeric
+`world_size` is a typed `Err`, never a silent `1`).
 
-`Catalog::get_job_for_rank` (`crates/jammi-db/src/catalog/jobs_repo.rs:1967-2029`)
-is primary-key-only (`WHERE job_id = $N`, `:1991`) and decides nothing beyond
-that lookup — its own doc comment (`:1952-1962`) states explicitly that every
-determinant the returned row feeds, including `world_size`, is the CALLER's
+`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::get_job_for_rank` is
+primary-key-only (`WHERE job_id = $N`) and decides nothing beyond that
+lookup — its own doc comment states explicitly that every determinant the
+returned row feeds, including `world_size`, is the CALLER's
 (`GangServer::run_rank`) to decide, never a caller-supplied `Assign.world`
 standing in for it.
 
-`GangServer::run_rank` (`crates/jammi-server/src/grpc/gang.rs:260-412`) keys
-the lattice on `row.world_size`: after the row's `status`/`claimed_by`/
-`attempts`/`lease_live` conjuncts (`:319-334`), `assign.world != row.world_size`
-is itself a refusal with the SAME fixed message (`:345-348`, comment states
-why: keying the pair conjunct on `assign.world` instead would let a
-`world_size > 1` job admit under a caller-supplied `world = 1`, skipping the
-pair conjunct and the sidecar verify entirely). Only once that conjunct holds
-does `row.world_size > 1` gate the training-set pair conjunct and the sidecar
-verify (`:355-391`) — never `assign.world`.
+`crates/jammi-server/src/grpc/gang.rs::GangServer::run_rank` (~150-line
+`impl GangService` method) keys the lattice on `row.world_size`: after the
+row's `status`/`claimed_by`/`attempts`/`lease_live` conjuncts,
+`assign.world != row.world_size` is itself a refusal with the SAME fixed
+message (an inline comment states why: keying the pair conjunct on
+`assign.world` instead would let a `world_size > 1` job admit under a
+caller-supplied `world = 1`, skipping the pair conjunct and the sidecar
+verify entirely). Only once that conjunct holds does `row.world_size > 1`
+gate the training-set pair conjunct and the sidecar verify — never
+`assign.world`.
 
 The pairwise conjunct (`world > 1`) is described the same way in
-`docs/maintainer/MAINTAINER-GUIDE.md:3024-3045` (2.8a): "the ROW-keyed
-lattice" — rewritten by this round from the pinned contract's assign-keyed
-description; `get_job_for_rank`'s own entry (`:3025-3029`) states it "decides
-nothing itself and returns `Ok(None)` only when no job with that id exists."
+`docs/maintainer/MAINTAINER-GUIDE.md#28a-gangservice-multi-host-gang-admission-i-gang`
+("2.8a"): "the ROW-keyed lattice" — rewritten by this round from the pinned
+contract's assign-keyed description; that same section's `get_job_for_rank`
+entry states it "decides nothing itself and returns `Ok(None)` only when no
+job with that id exists."
 
 ### A2. `TrainingSetOutcome` and the six RPC oracles a–f
 
-`resolve_training_set_identity_classified` (`crates/jammi-server/src/grpc/gang.rs:527-568`)
-classifies into `TrainingSetOutcome` (`crates/jammi-server/src/grpc/gang.rs:490-516`:
-`Verified`, `AdminScopeRefused`, `OtherTenant`, `NotReady`, `DigestMismatch`).
-`resolve_training_set_identity` (`:458-482`) is a thin wire wrapper collapsing
-every non-`Verified` outcome to the fixed `FailedPrecondition` (§I1
-Non-disclosure), except `AdminScopeRefused`'s own message
-(`:473-475`, a distinct wire message this outcome alone carries — a resolution
+`crates/jammi-server/src/grpc/gang.rs::resolve_training_set_identity_classified`
+classifies into `crates/jammi-server/src/grpc/gang.rs::TrainingSetOutcome`
+(`Verified`, `AdminScopeRefused`, `OtherTenant`, `NotReady`,
+`DigestMismatch`). `crates/jammi-server/src/grpc/gang.rs::resolve_training_set_identity`
+is a thin wire wrapper collapsing every non-`Verified` outcome to the fixed
+`FailedPrecondition` (§I1 Non-disclosure), except `AdminScopeRefused`'s own
+message (a distinct wire message this outcome alone carries — a resolution
 wrapped in `with_admin_scope`, never reachable through `run_rank`'s own
-tenant-derived path in production, per `TrainingSetOutcome::AdminScopeRefused`'s
-own doc, `:494-499`).
+tenant-derived path in production, per the `TrainingSetOutcome::AdminScopeRefused`
+variant's own doc comment).
 
 The six determinants R2 named, through the wire, by test name (all
 `crates/jammi-server/tests/it/gang_service.rs`):
-- (a) pair NULL at `world_size` 2 → `run_rank_refuses_world_gt_one_when_training_set_pair_missing`
-  (`:1177-1212`).
-- (b) pair set, another tenant's / NULL-tenant row → `run_rank_refuses_a_training_set_another_tenant_owns`
-  (`:966-1048`) and `run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job`
-  (`:1049-1119`).
-- (c) own tenant + Ready + digest match → `run_rank_world_two_own_tenant_training_set_reaches_unimplemented`
-  (`:1120-1176`).
-- (d) own tenant + digest MISMATCH → `run_rank_refuses_world_gt_one_when_training_set_digest_mismatches`
-  (`:1578-1584`).
-- (e) own tenant + status not Ready → `run_rank_refuses_world_gt_one_when_training_set_not_ready`
-  (`:1566-1572`).
-- (f) `assign.world` (1) ≠ `row.world_size` (2) → `run_rank_refuses_when_assign_world_mismatches_row_world_size`
-  (`:1593-1599`).
+- (a) pair NULL at `world_size` 2 →
+  `run_rank_refuses_world_gt_one_when_training_set_pair_missing`.
+- (b) pair set, another tenant's / NULL-tenant row →
+  `run_rank_refuses_a_training_set_another_tenant_owns` and
+  `run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job`.
+- (c) own tenant + Ready + digest match →
+  `run_rank_world_two_own_tenant_training_set_reaches_unimplemented`.
+- (d) own tenant + digest MISMATCH →
+  `run_rank_refuses_world_gt_one_when_training_set_digest_mismatches`.
+- (e) own tenant + status not Ready →
+  `run_rank_refuses_world_gt_one_when_training_set_not_ready`.
+- (f) `assign.world` (1) ≠ `row.world_size` (2) →
+  `run_rank_refuses_when_assign_world_mismatches_row_world_size`.
 
 ### A3. Non-disclosure: `GangRefusalReason`, the pairwise oracle, the test-hooks seam
 
-`GangRefusalReason` (`crates/jammi-server/src/grpc/gang.rs:98-130`) names
-eleven determinants (`NotRunning`, `WrongClaimant`, `WrongAttempt`,
-`LeaseDead`, `NotFound`, `WorldMismatch`, `TrainingSetPairMissing`,
+`crates/jammi-server/src/grpc/gang.rs::GangRefusalReason` names eleven
+determinants (`NotRunning`, `WrongClaimant`, `WrongAttempt`, `LeaseDead`,
+`NotFound`, `WorldMismatch`, `TrainingSetPairMissing`,
 `TrainingSetOtherTenant`, `TrainingSetNotReady`, `TrainingSetDigestMismatch`,
-`CoordinatorNotFresh`) — defined unconditionally (`:97`, no `#[cfg]`);
-`GangServer::record_refusal` (`:182-187`) stamps one at every refusal site and
-is a no-op outside `test-hooks` (only the STORAGE field, `:158-159`, and the
-GETTER, `:196-199`, are gated). The pairwise non-disclosure oracle,
+`CoordinatorNotFresh`) — defined unconditionally (no `#[cfg]` on the enum
+itself); `crates/jammi-server/src/grpc/gang.rs::GangServer::record_refusal`
+stamps one at every refusal site and is a no-op outside `test-hooks` (only
+the `GangServer::last_refusal` field and the `GangServer::last_refusal_reason`
+getter are gated). The pairwise non-disclosure oracle,
 `run_rank_refusal_is_non_disclosing_across_every_determinant`
-(`crates/jammi-server/tests/it/gang_service.rs:1632-1652`), drives all eleven
-scenarios (`every_gang_refusal_reason`, `:1605-1620`) via the shared fixture
-builder `refusal_scenario` (`:1270-1560`) and asserts `(code, message)` pairwise
-identical across every pair. The `test-hooks`-only reason-distinguishing
-oracle, `run_rank_last_refusal_reason_distinguishes_every_determinant`
-(`crates/jammi-server/tests/it/gang_service.rs:1665-1679`, `#[cfg(feature =
-"test-hooks")]` at `:1665`), drives the SAME eleven scenarios and asserts the
-served instance's recorded reason matches, through
-`PeerEngineServer::gang_last_refusal_reason` (`crates/jammi-server/tests/it/common/grpc.rs:755-757`),
-which reads `GangRefusalHandle::get` (`crates/jammi-server/src/grpc/gang.rs:219-227`) —
-a handle `GangServer::refusal_reason_handle` (`:210-212`) clones out of the SAME
-`Arc<Mutex<..>>` (`:159`) the mounted, serving instance mutates, cloned BEFORE
-`GangServer` moves by value into `GangServiceServer::new`
-(`crates/jammi-server/src/runtime.rs:596-604`, inside `OssServer::bind`,
-`:553`) — threaded as `Option<GangRefusalHandle>` through `BoundServer`
-(`:722`, field `:755`, getter `gang_refusal_handle` `:970-972`) into
-`PeerEngineServer` (`crates/jammi-server/tests/it/common/grpc.rs:722`, field
-`:747`).
+(`crates/jammi-server/tests/it/gang_service.rs`), drives all eleven scenarios
+(the `every_gang_refusal_reason` helper, same file) via the shared fixture
+builder `refusal_scenario` (~290-line fixture builder, same file) and
+asserts `(code, message)` pairwise identical across every pair. The
+`test-hooks`-only reason-distinguishing oracle,
+`run_rank_last_refusal_reason_distinguishes_every_determinant`
+(`crates/jammi-server/tests/it/gang_service.rs`, `#[cfg(feature =
+"test-hooks")]`), drives the SAME eleven scenarios and asserts the served
+instance's recorded reason matches, through
+`crates/jammi-server/tests/it/common/grpc.rs::PeerEngineServer::gang_last_refusal_reason`,
+which reads `crates/jammi-server/src/grpc/gang.rs::GangRefusalHandle::get` —
+a handle `crates/jammi-server/src/grpc/gang.rs::GangServer::refusal_reason_handle`
+clones out of the SAME `Arc<Mutex<..>>` the mounted, serving instance
+mutates, cloned BEFORE `GangServer` moves by value into
+`GangServiceServer::new` (inside
+`crates/jammi-server/src/runtime.rs::OssServer::bind`) — threaded as
+`Option<GangRefusalHandle>` through
+`crates/jammi-server/src/runtime.rs::BoundServer` (field
+`gang_refusal_handle`, getter `BoundServer::gang_refusal_handle`) into
+`crates/jammi-server/tests/it/common/grpc.rs::PeerEngineServer` (field
+`gang_refusal_handle`).
 
 The plain `cargo test -p jammi-server --test it -- gang` lane executes 27
 gang-named cases; the `--features test-hooks` lane executes 28 — one more,
@@ -621,47 +628,50 @@ compiles it away otherwise). The 27/28 split is over every test-fn whose
 qualified name contains `gang`: 22 plain + 1 `test-hooks`-gated in
 `gang_service.rs`, 4 in `gang_rank_admission_oracle.rs`, and 1
 (`gang_service_is_unimplemented_on_the_public_listener`,
-`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:3316-3346`) in
+`crates/jammi-server/tests/it/tenant_isolation_oracle.rs`) in
 `tenant_isolation_oracle.rs` — 22+4+1 = 27 plain, +1 test-hooks-only = 28.
 
 ### A4. Admission catalog faults → `Unavailable`; no injectable fault seam
 
-`admission_catalog_fault` (`crates/jammi-server/src/grpc/gang.rs:248-254`)
-maps a genuine catalog fault to `Status::unavailable(..)`, never
+`crates/jammi-server/src/grpc/gang.rs::admission_catalog_fault` maps a
+genuine catalog fault to `Status::unavailable(..)`, never
 `map_engine_error`'s generic mapping. Two call sites: `get_job_for_rank`
-erroring (`crates/jammi-server/src/grpc/gang.rs:316`, `Err(e) =>
-admission_catalog_fault(e)`) and `get_result_table_for_tenant` erroring inside
-`resolve_training_set_identity_classified` (`:541`, `.map_err(admission_catalog_fault)`).
-No test in this tree exercises either call site's error arm — `grep -rn
-admission_catalog_fault crates/jammi-server/tests/` (confirmed at `77c15f10`)
-returns no hits — because no fault-injection seam exists in `jammi-db`'s
-catalog backend reachable from this crate's `it` harness without touching
-`jammi-db`, out of this round's wire-server scope; the mapping is stated, not
-tested, matching `docs/maintainer/MAINTAINER-GUIDE.md:3086-3098`'s own
-wording ("A genuine catalog fault during admission is `Unavailable`, not
+erroring inside `crates/jammi-server/src/grpc/gang.rs::GangServer::run_rank`
+(`Err(e) => admission_catalog_fault(e)`) and `get_result_table_for_tenant`
+erroring inside
+`crates/jammi-server/src/grpc/gang.rs::resolve_training_set_identity_classified`
+(`.map_err(admission_catalog_fault)`). No test in this tree exercises either
+call site's error arm — `grep -rn admission_catalog_fault
+crates/jammi-server/tests/` (confirmed at this commit) returns no hits —
+because no fault-injection seam exists in `jammi-db`'s catalog backend
+reachable from this crate's `it` harness without touching `jammi-db`, out of
+this round's wire-server scope; the mapping is stated, not tested, matching
+`docs/maintainer/MAINTAINER-GUIDE.md#28a-gangservice-multi-host-gang-admission-i-gang`'s
+own wording ("A genuine catalog fault during admission is `Unavailable`, not
 `FailedPrecondition`").
 
 ### A5. `RunRank` on the streaming-path allowlist, its own `MethodClass` arm
 
-`RUN_RANK_PATH = "/jammi.v1.gang.GangService/RunRank"` (`crates/jammi-server/src/limits.rs:179`);
-`is_streaming_path` (`:183-185`) recognizes it as a third server-streaming
-path beside `WAIT_JOB_PATH`/`SUBSCRIBE_PATH`, pinned equal to the
-descriptor-derived server-streaming set by
-`is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set`
-(`crates/jammi-server/src/limits.rs:1764-1809`, deriving the set from
-`jammi_wire::FILE_DESCRIPTOR_SET`'s `MethodDescriptorProto::server_streaming`
-flag). `MethodClass::call`'s own arm for `path == RUN_RANK_PATH`
-(`crates/jammi-server/src/limits.rs:766-772`) applies ONLY the `deadline`
-treatment every streaming path gets (`wait_timeout_secs`, `:734-756`) — no
-stream-count budget (no `server.limits.max_*` knob exists for it, per the arm's
-own comment `:758-765`), never falling into `Subscribe`'s or `WaitJob`'s
-budget. In production this arm never runs: `GangService` is mounted only on
-the internal `[server] peer_bind` listener, built LAYER-FREE — its own `Server`
-carries only `MetricsLayer` (`crates/jammi-server/src/runtime.rs:1059-1076`,
-inside `serve_with_shutdown`; comment `:1048-1057` states "No tenant layer, no
-gRPC-web framing, no `[server.limits]` stack"), never `MethodClassLayer` —
-matching `crates/jammi-server/src/limits.rs:83-99`'s own module-doc statement
-of this fact.
+`crates/jammi-server/src/limits.rs::RUN_RANK_PATH` is
+`"/jammi.v1.gang.GangService/RunRank"`;
+`crates/jammi-server/src/limits.rs::is_streaming_path` recognizes it as a
+third server-streaming path beside `WAIT_JOB_PATH`/`SUBSCRIBE_PATH`, pinned
+equal to the descriptor-derived server-streaming set by
+`crates/jammi-server/src/limits.rs::is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set`,
+deriving the set from `jammi_wire::FILE_DESCRIPTOR_SET`'s
+`MethodDescriptorProto::server_streaming` flag.
+`crates/jammi-server/src/limits.rs::MethodClass::call`'s own arm for `path ==
+RUN_RANK_PATH` applies ONLY the `deadline` treatment every streaming path
+gets (`wait_timeout_secs`) — no stream-count budget (no `server.limits.max_*`
+knob exists for it, per that arm's own comment), never falling into
+`Subscribe`'s or `WaitJob`'s budget. In production this arm never runs:
+`GangService` is mounted only on the internal `[server] peer_bind` listener,
+built LAYER-FREE — the peer-listener arm inside
+`crates/jammi-server/src/runtime.rs::BoundServer::serve_with_signals` builds
+its `Server` carrying only `MetricsLayer` (a comment there states "No tenant
+layer, no gRPC-web framing, no `[server.limits]` stack"), never
+`MethodClassLayer` — matching `crates/jammi-server/src/limits.rs`'s own
+module doc (immediately above `is_streaming_path`) statement of this fact.
 
 ### A6. Stated limits carried forward unchanged by this round
 
@@ -669,60 +679,60 @@ of this fact.
   session to hold and re-verify (§5, above) — this round only changed WHICH
   field gates it (the row's `world_size`, never `assign.world`); U5a-2's scope
   is otherwise unchanged.
-- `lease.rs`'s SQLite `julianday` arm carries roughly sub-100-microsecond
-  rounding relative to `lease_expired_clause`'s exact string compare
-  (`crates/jammi-db/src/catalog/lease.rs:244-252`, the doc this round added to
-  `lease_remaining_seconds_expr`, `:253-270`) — negligible at deployment lease
-  scales, stated honestly rather than claimed bit-exact.
+- `crates/jammi-db/src/catalog/lease.rs::lease_remaining_seconds_expr`'s
+  SQLite `julianday` arm carries roughly sub-100-microsecond rounding
+  relative to `lease_expired_clause`'s exact string compare (documented on
+  that same function) — negligible at deployment lease scales, stated
+  honestly rather than claimed bit-exact.
 - The migration renumber is conditional on PR-B2, never unconditional: `033`
   is `jobs_training_set_identity`'s number "on this branch's base" only
-  (`docs/plans/67-distributed-training/UNITS.md:255-265`); when PR-B2's
-  `033_model_materialization` lands on `main` first, this unit's own migration
-  renumbers to `034` at rebase, at three pin sites — the tuple in
-  `crates/jammi-db/src/catalog/migrations.rs:114-115`, the doc comment and
-  constant name `MIGRATION_034_JOBS_TRAINING_SET_IDENTITY` at
-  `crates/jammi-db/src/catalog/schema.rs:1143-1165`, and
-  `EXPECTED_MIGRATION_NAMES` at `crates/jammi-db/tests/it/migrations.rs:23-54`
-  — plus the ordered-after oracle,
+  (`docs/plans/67-distributed-training/UNITS.md` § U5a-1); when PR-B2's
+  `033_model_materialization` lands on `main` first, this unit's own
+  migration renumbers to `034` at rebase, at three pin sites — the tuple in
+  `crates/jammi-db/src/catalog/migrations.rs`, the doc comment and constant
+  `crates/jammi-db/src/catalog/schema.rs::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY`,
+  and the const
+  `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES` — plus
+  the ordered-after oracle,
   `migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge`
-  (`crates/jammi-db/tests/it/migrations.rs:1572-1745`), whose own
-  `position("034_jobs_training_set_identity")` literal moves with the rename.
+  (`crates/jammi-db/tests/it/migrations.rs`), whose own
+  `position("034_jobs_training_set_identity")` literal moves with the
+  rename.
 
 ### A7. Mutations executed, as properties, by named test killed
 
 - **A caller-keyed gate (`assign.world` instead of `row.world_size`)** flips
   `run_rank_refuses_when_assign_world_mismatches_row_world_size`
-  (`crates/jammi-server/tests/it/gang_service.rs:1593-1599`) from refused to
-  admitted (the row's own `world_size = 2`, `assign.world = 1`, no longer
-  caught).
+  (`crates/jammi-server/tests/it/gang_service.rs`) from refused to admitted
+  (the row's own `world_size = 2`, `assign.world = 1`, no longer caught).
 - **Deleting the `row.world_size > 1` block entirely** flips at least three
-  tests green-to-broken:
-  `run_rank_refuses_world_gt_one_when_training_set_pair_missing` (`:1177`),
-  `run_rank_refuses_world_gt_one_when_training_set_not_ready` (`:1566`), and
-  `run_rank_refuses_world_gt_one_when_training_set_digest_mismatches`
-  (`:1578`) — each fixture's pair/status/digest fault is never reached, so
-  the call instead admits (`Unimplemented`) where it must refuse.
+  tests green-to-broken (all `crates/jammi-server/tests/it/gang_service.rs`):
+  `run_rank_refuses_world_gt_one_when_training_set_pair_missing`,
+  `run_rank_refuses_world_gt_one_when_training_set_not_ready`, and
+  `run_rank_refuses_world_gt_one_when_training_set_digest_mismatches` — each
+  fixture's pair/status/digest fault is never reached, so the call instead
+  admits (`Unimplemented`) where it must refuse.
 - **The sidecar verify made vacuously `Ok(TrainingSetOutcome::Verified)`**
   kills `run_rank_refuses_world_gt_one_when_training_set_digest_mismatches`
-  (`:1578-1584`) specifically — a genuine digest mismatch would no longer
-  refuse.
+  specifically — a genuine digest mismatch would no longer refuse.
 - **The `Ready` conjunct dropped** (`ResultTableStatus::Ready` check removed
-  from `resolve_training_set_identity_classified`,
-  `crates/jammi-server/src/grpc/gang.rs:544-546`) kills
-  `run_rank_refuses_world_gt_one_when_training_set_not_ready` (`:1566-1572`)
+  from
+  `crates/jammi-server/src/grpc/gang.rs::resolve_training_set_identity_classified`)
+  kills `run_rank_refuses_world_gt_one_when_training_set_not_ready`
   specifically.
 - **`row.tenant_id` forced to `None`** (or the strict predicate's tenant bind
   dropped) kills `run_rank_refuses_a_training_set_another_tenant_owns`
-  (`:966-1048`) — a NULL-tenant caller would then resolve a real tenant's row.
+  (`crates/jammi-server/tests/it/gang_service.rs`) — a NULL-tenant caller
+  would then resolve a real tenant's row.
 - **A leaking refusal message** (any one `GangRefusalReason` arm's status
   interpolating a job id, claimant, or reason into `I_GANG_REFUSAL_MESSAGE`)
   kills `run_rank_refusal_is_non_disclosing_across_every_determinant`
-  (`crates/jammi-server/tests/it/gang_service.rs:1632-1652`), naming the exact
+  (`crates/jammi-server/tests/it/gang_service.rs`), naming the exact
   differing pair.
 - **A `world_size` decode that silently coerces a malformed value to `1`**
   kills `get_job_for_rank_malformed_world_size_is_a_typed_error`
-  (`crates/jammi-db/tests/it/gang_rank_admission.rs:243-271`); **a decode that
+  (`crates/jammi-db/tests/it/gang_rank_admission.rs`); **a decode that
   defaults an ABSENT field to anything but `1`** kills
-  `get_job_for_rank_defaults_world_size_when_absent_from_spec` (`:217-238`);
+  `get_job_for_rank_defaults_world_size_when_absent_from_spec` (same file);
   **a decode that fails to read a genuinely present `world_size`** kills
-  `get_job_for_rank_reflects_the_row_world_size` (`:181-211`).
+  `get_job_for_rank_reflects_the_row_world_size` (same file).

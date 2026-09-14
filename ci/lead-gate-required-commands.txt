@@ -1,0 +1,24 @@
+# esc-lead-gate-R12 fix round 3, item 8a. One command per line (a leading
+# `#` is a comment/blank line, skipped) — human-amend-only, like every
+# other gate file (.claude/hooks/**, ci/scripts/check_*.py). Every command
+# line ends with a trailing `# measured ~Xs` annotation — a real wall-
+# clock sample this file's own committer took, never a guess; a self-test
+# (ci/scripts/check_lead_gate.py) asserts every line names a git-TRACKED
+# script and carries this annotation.
+#
+# The hook (`lead-gate-lib.py`) NEVER executes these commands itself.
+# Reader 1 (pre-fix, at implementer dispatch) requires the anticipation
+# artifact's own `gates` object to name every line here VERBATIM, each with
+# an `rc` field — SHAPE only; the recorded `rc` is a LEAD-ATTESTED
+# checklist, never judged by the hook (the pre-fix tip is expected to be
+# BROKEN, so a non-zero rc there is not itself a defect). Reader 2 (the
+# closing relay, post-fix) requires the relay's OWN `gates` object to name
+# every line here with `rc == 0` — the fix must leave every committed gate
+# green. Reader 3 (`ci/scripts/check_rigor_record.py`) fails the committed
+# record's SHAPE (every line present) and, for the record's OWN post-fix
+# `gates`, fails on any non-zero `rc` — it does NOT re-execute these
+# commands (they are already CI jobs elsewhere in `.github/workflows/`).
+python3 ci/scripts/check_swarm_bijection.py  # measured ~0.07s
+python3 ci/scripts/check_no_consumer_names.py  # measured ~1.81s
+python3 ci/scripts/check_doc_parity.py  # measured ~0.04s
+python3 ci/scripts/check_constitution_anchors.py  # measured ~0.04s

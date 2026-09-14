@@ -70,6 +70,19 @@ pub use jammi_numerics::ComputePrecision;
 /// typed [`ManifestError`] before the version is even read. Either rejection is
 /// clean (the signal to re-emit); a reader must never silently trust a
 /// version-mismatched or shape-mismatched manifest.
+///
+/// **An ADDITIVE new [`ProducingDescriptor`] variant does not bump this
+/// number** — [`ProducingDescriptor::TrainingSet`] landed without one. A
+/// variant an older reader's `enum` definition does not know is rejected
+/// serde-first, the same way a since-added FIELD is: deserializing an
+/// unrecognised tagged-enum variant fails before `manifest_version` is even
+/// read, so an older build can never silently misinterpret a newer
+/// descriptor shape as one of its own known variants. What DOES bump this
+/// number is a change to an EXISTING variant's determinant set (a field
+/// added, removed, or reinterpreted within a variant the older reader
+/// already knows) — that shape still deserializes under the old
+/// definition, so nothing else would catch the older reader comparing a
+/// stale hash computed over a different determinant set.
 pub const MANIFEST_VERSION: u32 = 3;
 
 /// The row-order rule version 1 of the training-set producer commits and

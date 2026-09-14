@@ -95,14 +95,17 @@ be a call to `crates/jammi-kernels/src/admission.rs`'s own `admit`/
   site.
 * A **method call** — the matched name immediately preceded (ignoring
   whitespace) by `.`, e.g. `RankAdmission::new().admit(spec)`. Every name
-  this scan looks for is a FREE function, never a method, on any type in
-  `crates/` (same premise as above), so `.admit(`/`.admit_cascade(`/
-  `.op_disabled(` can never resolve to a call of the scanned API —
-  excluding it is not a widening of what this scan misses, it is
-  narrowing the scan to calls the excluded syntax cannot possibly be.
-  A bare, undotted `admit(...)`/`admit_cascade(...)`/`op_disabled(...)`
-  call is unaffected and, if its op-key argument is not a literal, is
-  still reported unresolved exactly as before.
+  this scan looks for is a FREE function in `admission.rs` (same premise
+  as above), and a free function can never be invoked with receiver-dot
+  syntax — that stays true regardless of whether some OTHER type defines
+  its own method sharing the name (`TrainingSpec`'s own `admit` does), so
+  `.admit(`/`.admit_cascade(`/`.op_disabled(` can never resolve to a call
+  of `admission.rs`'s free functions specifically — excluding it is not a
+  widening of what this scan misses, it is narrowing the scan to calls the
+  excluded syntax cannot possibly be. A bare, undotted
+  `admit(...)`/`admit_cascade(...)`/`op_disabled(...)` call is unaffected
+  and, if its op-key argument is not a literal, is still reported
+  unresolved exactly as before.
 
 SCAN ROOTS: `crates/jammi-encoders/src/`, `crates/jammi-lora/src/`,
 `crates/jammi-ai/src/fine_tune/` — every `crates/jammi-bench/src/
@@ -629,9 +632,9 @@ class DiscoverLiveStandaloneOpKeysTests(unittest.TestCase):
             self.assertEqual(unresolved, [])
 
     def test_a_fn_definition_shaped_like_a_call_is_never_a_call_site(self):
-        """`crates/jammi-ai/src/fine_tune/spec.rs:196`'s own shape: `pub fn
-        admit(&self, spec: &TrainingSpec) -> Result<()> {` is a METHOD
-        DEFINITION on `TrainingSpec` (or any other type), not a call to
+        """The shape `crates/jammi-ai/src/fine_tune/spec.rs`'s own `TrainingSpec::admit`
+        method carries: `pub fn admit(&self, spec: &TrainingSpec) -> Result<()> {` is a
+        METHOD DEFINITION on `TrainingSpec` (or any other type), not a call to
         `admission.rs`'s free `admit` — `_CALL_RE` matches its signature
         textually, but a definition is never a call site. The real, later
         free-function call in the same file must still resolve normally."""
@@ -673,11 +676,15 @@ class DiscoverLiveStandaloneOpKeysTests(unittest.TestCase):
         """`admit`/`admit_cascade`/`op_disabled` are FREE functions in
         `crates/jammi-kernels/src/admission.rs`
         (`AdmissionRsFreeFunctionPremiseTests` below grounds this
-        mechanically); no method of any of those names exists anywhere in
-        `crates/`. A free function can never be invoked with receiver-dot
-        syntax, so `.admit(`/`.admit_cascade(`/`.op_disabled(` is provably
-        not a call to the scanned API -- excluded entirely, not reported
-        unresolved even though its own argument (`spec`) is a variable."""
+        mechanically, scoped to that one file). A free function can never
+        be invoked with receiver-dot syntax, and that stays true regardless
+        of whether some OTHER type defines its own method sharing one of
+        these names (`TrainingSpec::admit`, this fixture's own premise,
+        does -- with live call sites of its own outside these scan roots),
+        so `.admit(`/`.admit_cascade(`/`.op_disabled(` is provably not a
+        call to `admission.rs`'s free functions specifically -- excluded
+        entirely here, not reported unresolved even though its own
+        argument (`spec`) is a variable."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "fake.rs")
             with open(path, "w", encoding="utf-8") as fh:

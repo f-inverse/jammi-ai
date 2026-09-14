@@ -16,6 +16,21 @@
 //! claimant, wrong attempt, lease not live), and f1': a call satisfying
 //! EVERY determinant still ends `UNIMPLEMENTED` — this unit has no
 //! `HostAdmission` session to hand it to (U5a-2 builds that).
+//!
+//! The final group drives `RunRank` itself with `world_size > 1` — the ONLY
+//! path through this handler that ever reads a tenant-scoped catalog row
+//! (§I1(b), threading `row.tenant_id` into `resolve_training_set_identity`).
+//! Every `world_size == 1` test above (and the two direct unit tests at the
+//! top of this file, which call `resolve_training_set_identity` directly,
+//! never through the RPC) leaves this block cold. These tests drive it
+//! through the wire: a job's own `training_set_location` naming a
+//! `result_tables` row registered under ANOTHER tenant, or under NO tenant
+//! while the job is tenant-bound, must refuse `FAILED_PRECONDITION` without
+//! disclosing the other tenant's row; a pair that genuinely resolves for the
+//! job's OWN tenant must still reach the handler's own f1' `UNIMPLEMENTED`
+//! terminal (proving the sidecar path was actually decided, not merely
+//! "always denies"); and the pair missing entirely at `world_size > 1` must
+//! refuse the same way.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -750,4 +765,396 @@ async fn run_rank_refuses_when_claimed_by_a_different_coordinator() {
         .await
         .expect_err("a caller naming a different coordinator than claimed_by must be refused");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+// ---------------------------------------------------------------------------
+// §I1(b) (world_size > 1), through the RPC: the ONLY tenant-scoped catalog
+// read `run_rank` ever performs. No test above ever sets `world > 1` on a
+// row that reaches this block (the lone `world == 2` frame, above, is
+// refused at the §W1 K2 edge before any row is read) — these tests are the
+// first to drive it.
+// ---------------------------------------------------------------------------
+
+/// A job submitted under an explicit tenant scope — mirroring
+/// [`submit_and_claim`], but pinning the row's own `tenant_id` the way a
+/// genuine tenant-bound submission would, via `with_tenant_scoped`
+/// (`submit_job`'s own ambient `current_tenant()` picks it up) — then
+/// claimed exactly like [`submit_and_claim`]. `claim_next` itself carries no
+/// tenant predicate at all (the production worker claims globally, then
+/// reads tenant off the claimed row), so the claim step runs unscoped.
+/// Returns the claimed `attempts` value.
+async fn submit_and_claim_for_tenant(
+    server: &crate::common::grpc::PeerEngineServer,
+    tenant: TenantId,
+    job_id: &str,
+    coordinator_instance_id: &str,
+    lease: std::time::Duration,
+) -> i64 {
+    use jammi_db::catalog::jobs_repo::SubmitJobParams;
+    use jammi_db::catalog::status::JobExecution;
+
+    let job_id_owned = job_id.to_string();
+    server
+        .engine
+        .with_tenant_scoped(tenant, move |scope| {
+            let job_id = job_id_owned.clone();
+            async move {
+                scope
+                    .catalog()
+                    .submit_job(SubmitJobParams {
+                        job_id: &job_id,
+                        kind: "fine_tune",
+                        execution: JobExecution::Queued,
+                        spec: "{}",
+                        model_ref: None,
+                        output_model_id: None,
+                        model_source: None,
+                        priority: 0,
+                    })
+                    .await
+                    .unwrap()
+            }
+        })
+        .await;
+    let claimed = server
+        .engine
+        .catalog()
+        .claim_next(coordinator_instance_id, &["fine_tune"], lease)
+        .await
+        .unwrap()
+        .expect("must claim the only queued job");
+    i64::from(claimed.attempts)
+}
+
+/// Materializes a REAL `ready` `result_tables` row (Parquet + sidecar
+/// manifest, the identical fixture shape
+/// `resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_resolve`
+/// uses above) under `tenant`, and returns the `(training_set_location,
+/// training_set_ref)` pair a genuine coordinator's
+/// `fill_training_set_identity` call would carry: the table name, and the
+/// digest read back from the SAME sidecar `resolve_training_set_identity`
+/// itself verifies against.
+async fn materialize_ready_table_for_tenant(
+    server: &crate::common::grpc::PeerEngineServer,
+    tenant: TenantId,
+    source_id: &str,
+) -> (String, String) {
+    use datafusion::prelude::SessionContext;
+    use jammi_db::store::manifest::{
+        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
+        ModelContentDigest, ModelIdentity, ProducingDescriptor,
+    };
+    use jammi_db::store::EmbeddingTableSpec;
+
+    let descriptor = ProducingDescriptor::Embedding {
+        model_id: "rt-base".into(),
+        task: ModelTask::TextEmbedding,
+        source_id: source_id.to_string(),
+        columns: vec!["body".into()],
+        key_column: "_row_id".into(),
+        dimensions: 4,
+    };
+    let env = MaterializationEnv::new(
+        ComputeDevice::Cpu,
+        vec![ModelIdentity {
+            model_id: "rt-base".into(),
+            backend: "candle".into(),
+            compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("gang-fixture-digest".into()),
+            quantization: None,
+        }],
+    );
+    let ctx = SessionContext::new();
+    let source_id_owned = source_id.to_string();
+    let engine_for_scope = Arc::clone(&server.engine);
+    let record = server
+        .engine
+        .with_tenant_scoped(tenant, move |_scope| async move {
+            let store = engine_for_scope.result_store();
+            store
+                .materialize_embedding_table(
+                    &ctx,
+                    EmbeddingTableSpec {
+                        source_id: &source_id_owned,
+                        model_id: "rt-base",
+                        derived_from: None,
+                        dimensions: 4,
+                        key_column: None,
+                        text_columns: None,
+                    },
+                    &[],
+                    Materialization::new(
+                        &descriptor,
+                        &env,
+                        vec![InputAnchor::mutable_version(&source_id_owned, 1)],
+                    ),
+                    None,
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+    let store = server.engine.result_store();
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let manifest = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("finish() must have written the sidecar");
+    (record.table_name.clone(), manifest.artifact.0.clone())
+}
+
+/// §I1(b) tenant isolation: `training_set_location` names a `result_tables`
+/// row that genuinely resolves and verifies — but for ANOTHER tenant than
+/// the one `get_job_for_rank` resolves the calling job under. Refused
+/// `FAILED_PRECONDITION`, the SAME status and (§I1 Non-disclosure) the SAME
+/// fixed message every other I-GANG determinant refuses with — the response
+/// discloses neither the other tenant's id nor its table name. Mutation
+/// proof: deleting `run_rank`'s entire `if assign.world > 1 { .. }` block
+/// (the only tenant-scoped catalog read this handler performs) leaves the
+/// full `jammi-server` `it` suite green — this test, driving the RPC at
+/// `world == 2` on a filled pair, is what catches that deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_a_training_set_another_tenant_owns() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    let tenant_owner = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e01").unwrap();
+    let tenant_caller = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e02").unwrap();
+    let source_id = format!(
+        "gang_cross_tenant_src_{}",
+        jammi_test_utils::unique_suffix()
+    );
+    let (table, digest) =
+        materialize_ready_table_for_tenant(&server, tenant_owner, &source_id).await;
+
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-cross-tenant", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim_for_tenant(
+        &server,
+        tenant_caller,
+        "job-cross-tenant",
+        "coord-cross-tenant",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let outcome = server
+        .engine
+        .catalog()
+        .fill_training_set_identity(
+            "job-cross-tenant",
+            "coord-cross-tenant",
+            attempt as u32,
+            &digest,
+            &table,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            jammi_db::catalog::jobs_repo::TrainingSetFillOutcome::Filled
+        ),
+        "the fixture's own CAS must land cleanly on a freshly claimed row"
+    );
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-cross-tenant",
+        attempt,
+        0,
+        2,
+        "coord-cross-tenant",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("a training set owned by another tenant must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "gang admission refused",
+        "the fixed §I1 Non-disclosure message, never a distinguishing reason"
+    );
+    assert!(
+        !err.message().contains(&table) && !err.message().contains(&tenant_owner.to_string()),
+        "the refusal must disclose neither the other tenant's table name nor its id, got: {}",
+        err.message()
+    );
+}
+
+/// §I1(b) tenant isolation, the NULL-tenant variant: `training_set_location`
+/// names a `result_tables` row created with NO tenant scope active (as if a
+/// coordinator materialized it outside any tenant binding) while the
+/// calling job IS tenant-bound. The strict resolver
+/// (`get_result_table_for_tenant`) never matches a NULL-tenant row for a
+/// real tenant (the same property the direct unit test at the top of this
+/// file proves against the resolver alone) — refused `FAILED_PRECONDITION`
+/// through the RPC too, never resolving the orphaned row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    let tenant_caller = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e03").unwrap();
+    let table = format!("gang_null_tenant_rpc_{}", jammi_test_utils::unique_suffix());
+    // Created with NO tenant scope active, exactly like this file's
+    // `strict_resolver_never_matches_a_null_tenant_row_for_a_real_tenant` —
+    // the row's `tenant_id` lands NULL.
+    server
+        .engine
+        .catalog()
+        .create_result_table(null_tenant_row(&table))
+        .await
+        .unwrap();
+
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-null-tenant", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim_for_tenant(
+        &server,
+        tenant_caller,
+        "job-null-tenant-table",
+        "coord-null-tenant",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    server
+        .engine
+        .catalog()
+        .fill_training_set_identity(
+            "job-null-tenant-table",
+            "coord-null-tenant",
+            attempt as u32,
+            "any-digest",
+            &table,
+        )
+        .await
+        .unwrap();
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-null-tenant-table",
+        attempt,
+        0,
+        2,
+        "coord-null-tenant",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("a NULL-tenant training set must be refused for a tenant-bound job");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "gang admission refused");
+}
+
+/// f1' at `world_size > 1`: a training-set pair that genuinely resolves and
+/// verifies for the job's OWN tenant (materialized and filled under the SAME
+/// tenant `get_job_for_rank` resolves the job under) still reaches this
+/// unit's own terminal — `UNIMPLEMENTED`, never `FAILED_PRECONDITION`.
+/// Without this test, the three refusal tests above could all pass for the
+/// wrong reason (a handler that unconditionally refuses every `world_size >
+/// 1` call, tenant match or not) — this is the admitting case that proves
+/// the tenant-scoped path was actually DECIDED, not skipped to an easy
+/// refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_world_two_own_tenant_training_set_reaches_unimplemented() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    let tenant = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e04").unwrap();
+    let source_id = format!("gang_own_tenant_src_{}", jammi_test_utils::unique_suffix());
+    let (table, digest) = materialize_ready_table_for_tenant(&server, tenant, &source_id).await;
+
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-own-tenant", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    let attempt = submit_and_claim_for_tenant(
+        &server,
+        tenant,
+        "job-own-tenant-table",
+        "coord-own-tenant",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    server
+        .engine
+        .catalog()
+        .fill_training_set_identity(
+            "job-own-tenant-table",
+            "coord-own-tenant",
+            attempt as u32,
+            &digest,
+            &table,
+        )
+        .await
+        .unwrap();
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-own-tenant-table",
+        attempt,
+        0,
+        2,
+        "coord-own-tenant",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("no HostAdmission session exists yet to admit into");
+    assert_eq!(err.code(), tonic::Code::Unimplemented);
+}
+
+/// §I1(b): at `world_size > 1`, the training-set pair itself missing
+/// (never filled) is refused `FAILED_PRECONDITION` — isolated from every
+/// other I-GANG determinant, which all hold (a genuine claim, live lease,
+/// fresh coordinator).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_refuses_world_gt_one_when_training_set_pair_missing() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = start_no_worker_server().await;
+    server
+        .engine
+        .catalog()
+        .upsert_instance("coord-no-pair", Some("label"), Some("host"))
+        .await
+        .unwrap();
+    // `submit_and_claim` never fills the training-set pair — it stays NULL.
+    let attempt = submit_and_claim(
+        &server,
+        "job-no-pair",
+        "coord-no-pair",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame_full(
+        "job-no-pair",
+        attempt,
+        0,
+        2,
+        "coord-no-pair",
+    ));
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("world_size > 1 with an unset training-set pair must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "gang admission refused");
 }

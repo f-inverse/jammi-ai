@@ -1246,7 +1246,7 @@ impl JobWorker {
     ) {
         let store = session.artifact_store();
         // The guarded port every abandon-path byte-delete in this function
-        // reaches through (P1 design, #500) — never the unguarded
+        // reaches through — never the unguarded
         // `ArtifactStore::delete_artifact_prefix` directly. See
         // `PrefixReferences`'s own doc.
         let result_store = session.result_store();
@@ -2053,10 +2053,9 @@ impl JobWorker {
                     // materialization.
                     materialization_source: None,
                     // `TrainingSpec::GraphFineTune` has no `cache` field at
-                    // all (P4 design, #500 fix round 3) — see
-                    // `FineTuneRun::cache`'s own doc for why `Bypass` states
-                    // the true behaviour here rather than a value that
-                    // merely happens to be inert.
+                    // all — see `FineTuneRun::cache`'s own doc for why
+                    // `Bypass` states the true behaviour here rather than a
+                    // value that merely happens to be inert.
                     cache: jammi_db::store::CachePolicy::Bypass,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
@@ -2302,13 +2301,13 @@ impl JobWorker {
         if let Some(src) = &materialization_source {
             let canonical_model_id = model_source.to_string();
             let device = session.compute_device();
-            // The fused-kernel admission profile is UNCOVERED at this
-            // commit (#546): `MaterializationEnv::kernel_admission_profile`
-            // stays declared and hash-affecting the moment a real value is
-            // written, but nothing here writes one — see that field's own
-            // doc for why (a re-derived prediction, not the training loop's
-            // actual per-op admission outcome, was excised rather than
-            // shipped as a false sense of coverage).
+            // The fused-kernel admission profile is UNCOVERED here
+            // (#546): `MaterializationEnv::kernel_admission_profile` stays
+            // declared and hash-affecting the moment a real value is
+            // written, but nothing here writes one — a re-derived
+            // prediction is not the training loop's actual per-op admission
+            // outcome, and shipping one would be a false sense of coverage
+            // (see that field's own doc).
             let env = jammi_db::store::manifest::MaterializationEnv::new(
                 device.clone(),
                 vec![jammi_db::store::manifest::ModelIdentity {
@@ -3334,9 +3333,9 @@ struct FineTuneRun {
     /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
     /// carries `None` here at this commit.
     materialization_source: Option<FineTuneMaterializationSource>,
-    /// The reuse dial `TrainingSpec::FineTune` carries at its own top level
-    /// (P4 design, #500 fix round 3 — moved off `TrainingCommon`, so
-    /// `TrainingSpec::GraphFineTune` cannot represent one at all). Always
+    /// The reuse dial `TrainingSpec::FineTune` carries at its own top
+    /// level, not on `TrainingCommon` — `TrainingSpec::GraphFineTune`
+    /// cannot represent one at all. Always
     /// [`jammi_db::store::CachePolicy::Bypass`] for the graph kind, which
     /// never sets [`Self::materialization_source`] either — the probe below
     /// only ever runs inside that `Some` arm, so this value is structurally
@@ -3528,7 +3527,7 @@ async fn publish_artifact(
 }
 
 /// The narrow port the worker's abandon path reaches the ONE guarded
-/// `models/**` byte-delete through (P1 design, #500 fix round 3): never the
+/// `models/**` byte-delete through — never the
 /// unguarded [`ArtifactStore::delete_artifact_prefix`] primitive directly.
 /// Implemented by [`ResultStore`], whose
 /// [`ResultStore::delete_unreferenced_prefix`] consults the admin-scoped
@@ -3575,9 +3574,10 @@ impl PrefixReferences for ResultStore {
 /// already reference it (`store::reconcile`'s attribution), and deleting it
 /// out from under a concurrent reader of that OTHER, unrelated, already-
 /// servable row would be exactly the hazard the pre-existing `:1334`-style
-/// guard was invented for, restated so it cannot be forgotten again. Even
-/// the `Owned` arm no longer trusts its own ownership claim unconditionally
-/// (P1 design): it deletes only through [`PrefixReferences`], which itself
+/// guard was invented for, restated so it cannot be forgotten again.
+///
+/// The `Owned` arm does not trust its own ownership claim unconditionally
+/// either: it deletes only through [`PrefixReferences`], which itself
 /// refuses if some OTHER live `models` row has, in the meantime, come to
 /// name the exact same prefix.
 enum PublishedPrefix {
@@ -3603,9 +3603,8 @@ impl PublishedPrefix {
 
     /// Best-effort delete iff this attempt owns the bytes (see the type's
     /// own doc for why a `Reused` prefix is never touched here), routed
-    /// EXCLUSIVELY through the guarded [`PrefixReferences`] port (P1
-    /// design, #500 fix round 3) — never the unguarded
-    /// [`ArtifactStore::delete_artifact_prefix`] primitive. A
+    /// EXCLUSIVELY through the guarded [`PrefixReferences`] port — never
+    /// the unguarded [`ArtifactStore::delete_artifact_prefix`] primitive. A
     /// [`jammi_db::error::JammiError::Storage`]`(`[`StorageError::Referenced`]`)`
     /// refusal means some OTHER live `models` row names these exact bytes:
     /// logged with the prefix and the referencing count, never escalated —
@@ -7893,15 +7892,14 @@ mod tests {
             .expect("a second stop_and_join on an already-joined worker is Ok");
     }
 
-    /// P1 design (#500 fix round 3): `PublishedPrefix::delete_if_owned`'s
-    /// `Owned` arm routes through the SAME guarded [`PrefixReferences`] port
-    /// as every other `models/**` byte-delete — it does not trust its own
-    /// ownership claim unconditionally. Real traffic can never make two
-    /// attempts collide on the SAME prefix (`job_id` uniqueness), so this
-    /// fabricates the collision directly, the same way the db-side audit's
-    /// executed probe did (a global prefix + a second tenant's row naming
-    /// it): a SECOND tenant's already-servable model row is made to name the
-    /// exact bytes this attempt is about to abandon as `Owned`. Oracle:
+    /// `PublishedPrefix::delete_if_owned`'s `Owned` arm routes through the
+    /// SAME guarded [`PrefixReferences`] port as every other `models/**`
+    /// byte-delete — it does not trust its own ownership claim
+    /// unconditionally. Real traffic can never make two attempts collide on
+    /// the SAME prefix (`job_id` uniqueness), so this fabricates the
+    /// collision directly (a global prefix a second tenant's row also
+    /// names): a SECOND tenant's already-servable model row is made to name
+    /// the exact bytes this attempt is about to abandon as `Owned`. Oracle:
     /// the bytes survive, the typed refusal is observed directly, and the
     /// abandoning attempt's OWN unfinalized row is still reaped (the two
     /// halves of `abandon_unfinalized_attempt` are independent).

@@ -71,10 +71,10 @@ pub enum TrainingSpec {
         /// `cache` field already carries for every compute kind.
         ///
         /// Lives HERE — on the `FineTune` variant, not on [`TrainingCommon`]
-        /// — because only this kind has a materialization to probe (P4
-        /// design, #500 fix round 3): [`TrainingSpec::GraphFineTune`] carries
-        /// no `cache` field at all, so a cache policy for the graph kind is
-        /// UNREPRESENTABLE rather than merely unused.
+        /// — because only this kind has a materialization to probe:
+        /// [`TrainingSpec::GraphFineTune`] carries no `cache` field at all,
+        /// so a cache policy for the graph kind is UNREPRESENTABLE rather
+        /// than merely unused.
         ///
         /// A CALL-TIME dial, never a determinant of the trained model's
         /// identity: like a `ComputeSpec`'s `cache` never rides in the
@@ -120,10 +120,10 @@ pub enum TrainingSpec {
 /// Base-model and optimisation knobs common to the two LoRA fine-tune kinds. The
 /// predictor kind carries its budget inside its own `predictor_spec`, so this is
 /// shared only by the fine-tune variants. `cache` (the model-level reuse dial)
-/// is NOT here (P4 design, #500 fix round 3): it lives directly on
-/// [`TrainingSpec::FineTune`], the only kind with a materialization to probe,
-/// so a cache policy for [`TrainingSpec::GraphFineTune`] is unrepresentable
-/// rather than merely unused.
+/// is NOT here: it lives directly on [`TrainingSpec::FineTune`], the only kind
+/// with a materialization to probe, so a cache policy for
+/// [`TrainingSpec::GraphFineTune`] is unrepresentable rather than merely
+/// unused.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingCommon {
     /// Base model id the adapter / head is trained over.
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(common.world_size, 4);
     }
 
-    /// The HONEST persisted-row oracle (P4 design, #500 fix round 3): a
+    /// The persisted-row oracle stated honestly: a
     /// `graph_fine_tune` row is engine-written from a decoded spec, so a
     /// stray top-level `cache` key under it can only arrive via a
     /// hand-edited `jobs.spec` row — never a real submit path, since
@@ -623,9 +623,10 @@ mod tests {
     /// Composing the real type instead makes [`canonical_of`]'s destructure
     /// of `common` the single completeness check for both the top-level spec
     /// fields and every `TrainingCommon` field, restated over the
-    /// `jammi-ai`-owned producer (K7). `cache` is a top-level field of this
-    /// fixture (not nested in `common`) since P4 moved it onto
-    /// `TrainingSpec::FineTune` directly.
+    /// `jammi-ai`-owned producer (K7).
+    ///
+    /// `cache` is a top-level field of this fixture, not nested in `common`,
+    /// matching where it lives on `TrainingSpec::FineTune` itself.
     #[derive(Clone)]
     struct CanonicalFields {
         source: String,

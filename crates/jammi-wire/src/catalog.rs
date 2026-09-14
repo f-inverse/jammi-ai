@@ -566,15 +566,13 @@ pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileRepor
 /// side. Total: every wire field maps straight onto the engine struct, no
 /// fallible decode.
 ///
-/// COMPILE-FORCED STOP-GAP (#500 U3, ai-core, out of `crates/jammi-wire`
-/// scope): the db step landed [`ReconcileReport::referenced`] /
-/// [`ReconcileReport::referenced_count`] without a matching `pb::
-/// ReconcileReport` wire field, so this decode cannot recover them — they
-/// are filled with the empty/zero value here rather than left as a
-/// compile error blocking every crate downstream of `jammi-wire`. A remote
-/// client therefore never observes a referenced-but-unreclaimed key a
-/// report found; wire-server owns adding the real proto field and wiring it
-/// through both directions.
+/// [`ReconcileReport::referenced`] / [`ReconcileReport::referenced_count`]
+/// have no matching `pb::ReconcileReport` wire field, so this decode cannot
+/// recover them — they are filled with the empty/zero value here rather
+/// than refusing to compile every crate downstream of `jammi-wire`. A
+/// remote client therefore never observes a referenced-but-unreclaimed key
+/// a report found; adding the real proto field and wiring it through both
+/// directions closes this gap.
 pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileReport {
     ReconcileReport {
         scope: report.scope,

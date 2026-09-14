@@ -119,11 +119,10 @@ those still in force are restated here in their v4 form. Principle in parenthese
     read to it. Nothing dialable travels on the wire: the assignment carries
     `peers[rank → instance_id]` and each peer resolves addresses through `instances.peer_addr`,
     refusing a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the
-    only out-of-band value). `FetchPartition` verifies the named table belongs to the job's
-    training set (the analogue of D7's segment-belongs-to-table check). The RPCs get their own
+    only out-of-band value). `RunRank` gets its own
     `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text: "served only on
     peer_bind; tenant derived from the verified job row; deliberately not caller-scoped"),
-    unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and their
+    unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
     `api_freeze_baseline.txt` lines land in the same commit. (B5; D7's single-binder rule.)
 35. **Attempt fence on `job_id`**: a `RunRank` at attempt N aborts every local runner of that
     job at attempt < N; lesser-or-equal refused.
@@ -230,7 +229,7 @@ mining/GradCache W=1-only with the `mine`/`cached` predicate (r2); split, order 
 rule with zero-row ranks and the global-batch formula (r3); scaler from one collected `Vec`
 (r4); model identity with the opaque canonical encoding (r5); the gather rule with per-arm
 gather points (r6); lockstep control flow (r7); resume with per-rank `dropout_positions` (r8);
-descriptors not physical plans before Ballista (r10); U6's partition-aware operator (r12); one
+descriptors not physical plans before Ballista (r10); one
 trainer, four collectives (r13); the shared `CacheKey` (r14); K4 is remote-equals-embedded
 (r15); GPU byte oracles downgraded until S5 (r16); DataFusion 54 first (r19, ordering amended
 in r46); committed-artifact convention (r20); StatefulSet consequence, now owned by U9 after
@@ -257,11 +256,10 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | B | 7 | — | pod-leg artifact | gpu-gang | U4b |
 | C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
-| C | 3 | U6 | Partition-aware inference operator | hermetic | U2b, U5a |
-| C | 4 | U5b-1 | Coordinator; `Peer` collective; membership substrate (`peer_advertise`, `instances.peer_addr`, `list_gang_members`); determinism; two-worker forward leg | distributed | U4b, U5a, U6, S1 |
-| C | 5 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg | distributed + cluster leg | U5b-1, 68 OPS |
-| C | 6 | — | cluster-leg artifact | gpu-gang | U5b-2 |
-| D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b-1, U6, S6 |
+| C | 3 | U5b-1 | Coordinator; `Peer` collective; membership substrate (`peer_advertise`, `instances.peer_addr`, `list_gang_members`); determinism | distributed | U4b, U5a, S1 |
+| C | 4 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg | distributed + cluster leg | U5b-1, 68 OPS |
+| C | 5 | — | cluster-leg artifact | gpu-gang | U5b-2 |
+| D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b-1, S6 |
 | D | 2 | U8b | `CatalogClusterState`/`CatalogJobState`, `DevicePlacement`, `compute_cluster_state` migration (+ `workers.devices`), gang as one placed task | distributed | U8a, S6 |
 | D | 3 | U9a | Docs (guide, maintainer, CHANGELOG) | docs gates | all |
 | D | 4 | U9b | shape-d overlay → StatefulSet + headless service + `nvidia.com/gpu: N` (after 68 K, keeping OPS C6's grace) | kubeconform + kind smoke | 68 K, 68 OPS |
@@ -312,7 +310,7 @@ with the OpenTelemetry family #501 added.
    an admin merge too;
    U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
 6. PR-C(67) after DIST unit 1, OPS and GRAPH merge (they rewrite the claim loop and
-   `claim_next`). U7b ∥ U5a; U6; U5b-1; U5b-2; `distributed.yml` dispatched manually,
+   `claim_next`). U7b ∥ U5a; U5b-1; U5b-2; `distributed.yml` dispatched manually,
    deterministic leg green before merge.
 7. PR-D after 68 K: U8a, U8b (the completion gate), U9a, U9b. `distributed.yml` dispatched
    manually with the three-process arm green before merge. PR-D edits a swarm domain card, so it

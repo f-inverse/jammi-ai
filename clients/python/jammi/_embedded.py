@@ -53,6 +53,8 @@ import pyarrow as pa
 
 from ._capability import Capability
 from .errors import NotSupportedOnBackend
+from ._sessions import register as _register_session
+from ._sessions import unregister as _unregister_session
 from ._assembly import (
     build_add_channel_columns_request,
     build_asof_join_request,
@@ -128,6 +130,11 @@ class EmbeddedBackend:
     def __init__(self, native: object) -> None:
         # Held by composition; every verb delegates to it explicitly.
         self._native = native
+        # The ONE registration point for every embedded session: `_open_embedded`
+        # (the `file://` dispatch factory) and any direct construction both run
+        # this `__init__`, so both are visible to `jammi.open_sessions()` from
+        # here — see `_sessions`.
+        _register_session(self)
 
     # --- Capability contract ----------------------------------------------------
     #
@@ -217,6 +224,7 @@ class EmbeddedBackend:
         claiming process's to open. See :func:`jammi.connect`.
         """
         self._native.close(release)
+        _unregister_session(self)
 
     def __enter__(self) -> "EmbeddedBackend":
         return self

@@ -603,6 +603,11 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
         # ADVISORY.
         check_anticipation_witnesses(cwd, unit_slug, [r for r in rows if isinstance(r, dict)], result)
 
+        # esc-lead-gate-R12 fix round 3 item 8a READER 3 — armed only when
+        # ci/lead-gate-required-commands.txt is itself committed at HEAD;
+        # shape+value only, never re-executed.
+        check_required_gates(cwd, unit_slug, result)
+
     contract_paths = [p for p in changed if _matches_contract_glob(p)]
     if not contract_paths:
         result.fail("diff arms (touches crates/**/ci/**/.github/workflows/**) but adds/modifies no "
@@ -620,6 +625,67 @@ def run_check(cwd: Path = REPO_ROOT) -> Result:
             check_not_near_identical(cwd, cp, text, all_contracts, result)
 
     return result
+
+
+def check_required_gates(cwd: Path, unit_slug: str, result: Result) -> None:
+    """esc-lead-gate-R12 fix round 3 item 8a, READER 3: when the repo
+    commits `ci/lead-gate-required-commands.txt` (human-amend-only; this
+    unit's own diff need not touch it), the exported anticipation
+    record's LATEST row (append-order — the one closest to the point the
+    round closed) must carry a `gates` object naming EVERY committed line
+    VERBATIM, each with an integer `rc`, and every `rc` must be `0` — the
+    COMMITTED record is expected to reflect the fix's own verified state,
+    never the transient broken-tip snapshots recorded mid-round. Shape
+    and value only — never re-executed (these are already CI jobs
+    elsewhere in `.github/workflows/`)."""
+    ok_req, req_text = _git(cwd, "show", "HEAD:ci/lead-gate-required-commands.txt")
+    if not ok_req or not req_text.strip():
+        return
+    required_commands: list[str] = []
+    for line in req_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        command = stripped.split("  #", 1)[0].rstrip()
+        if command:
+            required_commands.append(command)
+    if not required_commands:
+        return
+    path = f"docs/rigor/{unit_slug}.anticipation.jsonl"
+    ok, text = _git(cwd, "show", f"HEAD:{path}")
+    if not ok or not text.strip():
+        return  # check_anticipation_witnesses already fails this shape when it is armed
+    rows: list[dict] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    if not rows:
+        return
+    latest = rows[-1]
+    gates = latest.get("gates")
+    if not isinstance(gates, dict):
+        result.fail(f"{path}: the LATEST row carries no `gates` object, but "
+                    f"ci/lead-gate-required-commands.txt commits {len(required_commands)} "
+                    "line(s) (esc-lead-gate-R12 item 8a)")
+        return
+    missing = [c for c in required_commands if c not in gates]
+    if missing:
+        result.fail(f"{path}: the LATEST row's `gates` omits {len(missing)} committed command(s), "
+                    f"e.g. {missing[:3]} (esc-lead-gate-R12 item 8a)")
+    for c in required_commands:
+        entry = gates.get(c)
+        if not isinstance(entry, dict):
+            continue
+        rc = entry.get("rc")
+        if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
+            result.fail(f"{path}: the LATEST row's `gates`[{c!r}] recorded rc={rc} (non-zero) — "
+                        "the committed record must reflect a green fix (esc-lead-gate-R12 item 8a)")
 
 
 def check_allowlist_only_shrinks(cwd: Path = REPO_ROOT) -> int:
@@ -1247,6 +1313,66 @@ def fixture_rr13_r12_grandfather_only_shrinks() -> None:
             R12_GRANDFATHER_PATH = real_path
 
 
+def _rr_gates_commit(work: Path, extra_files: dict[str, str], gates: dict | None) -> None:
+    """Shared setup for RR14-RR16: a committed `ci/lead-gate-required-
+    commands.txt` (one line) plus an anticipation record whose single row
+    carries `gates` (or omits it, when `gates is None`)."""
+    pressure_row = json.dumps({"ts": "2026-01-01T00:00:00Z", "agent_type": "pressure-tester", "verdict": "PROCEED"})
+    block_row = json.dumps({"ts": "2026-01-01T00:01:00Z", "agent_type": "adversarial-audit",
+                             "verdict": "BLOCK", "finding_locations": ["a.py:1"],
+                             "class_enumeration": ["a.py:1"]})
+    art: dict = {
+        "unit_branch": "feat/rr-fixture", "pre_fix_sha": "0" * 40,
+        "attacks": {"a.py": {"command": "printf ok", "hash": "a" * 64}},
+        "residual_risk": "fixture residual",
+    }
+    if gates is not None:
+        art["gates"] = gates
+    files = {
+        "ci/lead-gate-required-commands.txt": "python3 ci/scripts/probe.py  # measured ~0.1s\n",
+        "docs/rigor/feat_rr-fixture.jsonl": pressure_row + "\n" + block_row + "\n",
+        "docs/rigor/feat_rr-fixture.anticipation.jsonl": json.dumps(art) + "\n",
+        "docs/README-fixture.md": "line one\n",
+        "docs/plans/99-fixture/proposals/contract.md": _VALID_CONTRACT,
+    }
+    files.update(extra_files)
+    _commit(work, "ci: touch a gate script", files)
+
+
+def fixture_rr14_missing_gates_fails() -> None:
+    """item 8a READER 3: `ci/lead-gate-required-commands.txt` is
+    committed, but the exported anticipation record's row carries no
+    `gates` object at all -- HARD FAIL."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_gates_commit(work, {}, gates=None)
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR14", "a missing `gates` object must FAIL when required-commands.txt is committed")
+        _assert(any("carries no `gates` object" in f for f in r.failures), "RR14", f"{r.failures}")
+
+
+def fixture_rr15_complete_gates_rc_zero_allows() -> None:
+    """item 8a READER 3: the satisfiable case -- every committed line
+    present with `rc == 0` ALLOWS."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_gates_commit(work, {}, gates={"python3 ci/scripts/probe.py": {"rc": 0}})
+        r = _run_check_in(work)
+        _assert(r.ok(), "RR15", f"a fully green gates object must ALLOW: {r.failures}")
+
+
+def fixture_rr16_nonzero_rc_fails() -> None:
+    """item 8a READER 3: a `gates` entry recording a non-zero `rc` in the
+    COMMITTED record HARD FAILS -- the exported record is expected to
+    reflect the fix's own verified state."""
+    with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
+        _origin, work = _pr_repo(Path(td))
+        _rr_gates_commit(work, {}, gates={"python3 ci/scripts/probe.py": {"rc": 1}})
+        r = _run_check_in(work)
+        _assert(not r.ok(), "RR16", "a non-zero committed rc must FAIL")
+        _assert(any("recorded rc=1" in f for f in r.failures), "RR16", f"{r.failures}")
+
+
 RR_FIXTURES = [
     ("RR1", fixture_rr1_not_armed_docs_only),
     ("RR2", fixture_rr2_armed_no_record),
@@ -1268,6 +1394,9 @@ RR_FIXTURES = [
     ("RR12g", fixture_rr12g_tracked_bash_path_allows),
     ("RR12h", fixture_rr12h_untracked_bash_path_fails_shape),
     ("RR13", fixture_rr13_r12_grandfather_only_shrinks),
+    ("RR14", fixture_rr14_missing_gates_fails),
+    ("RR15", fixture_rr15_complete_gates_rc_zero_allows),
+    ("RR16", fixture_rr16_nonzero_rc_fails),
 ]
 
 

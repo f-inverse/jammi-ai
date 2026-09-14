@@ -187,3 +187,38 @@ See `.claude/agents/lead.md`'s "Anticipate before the fix, not after" paragraph 
 `.claude/hooks/README.md`'s "(2b)" paragraph for the operator-facing statement of the same
 mechanism, and `.jammi/escapes.jsonl`'s `esc-lead-gate-R12-anticipate-before-the-fix` row for
 the ledgered symptom/control pair this proposal answers.
+
+## Fix round 3, item 8 (the fold-9 replacement) — a new obligation triple, not a new reader
+
+Three companion checks land alongside the existing pre-fix/post-fix artifact pair, each
+armed strictly by the DATA (never merely by a unit being open):
+
+- **8a, gates.** `ci/lead-gate-required-commands.txt` is a committed, human-amend-only list of
+  cheap, already-existing gate commands. Reader 1 requires the pre-fix artifact's own `gates`
+  object to name every committed line VERBATIM with an integer `rc` — SHAPE only, the VALUE
+  never judged (the pre-fix tip is expected broken). Reader 2 requires the SAME shape from the
+  relay, PLUS `rc == 0` for every line. Reader 3 (`check_rigor_record.py`) hard-fails the
+  COMMITTED anticipation export's LATEST row on a missing line or a non-zero `rc` — the
+  committed record is expected to reflect the fix's own verified state, never a mid-round
+  broken-tip snapshot; it never re-executes the gates (they are CI jobs elsewhere).
+- **8b, mutations.** Armed when the fix's own diff adds a new definition inside a file the
+  BLOCK's own `finding_locations` also names. The relay's `mutations` array carries 1-3
+  LABELED-sample rows, each either an ACCEPTED case (`rc_before==0 ∧ rc_after!=0 ∧
+  marker_after` names a committed TEST-failure marker, distinct from a build-failure marker)
+  or an explicit `uncovered` reason. No hash-reproduction — like `gates`, a lead-attested
+  record.
+- **8c, exclusions.** Armed when the fix's own diff adds a new TEST definition (a heuristic
+  filter over the SAME `_parse_new_surfaces` enumeration reader 2 already uses to widen its
+  own required set). The relay's `exclusions` object must name, per new test, a non-empty
+  case the attack does NOT cover, normalized-distinct from its siblings and from the unit's
+  own previous relay of the same agent_type — the anti-templating cousin of R11's own
+  uncovered-claim check.
+
+HONEST LIMITS, stated as plainly as the pair above: `gates`/`mutations` are LEAD-ATTESTED,
+never re-executed by the hook — the control is the human at merge, reading the exported
+record, same as R11's own `claims` disposition and the "attack quality" limit already named
+for the pre/post-fix pair. `_r12_new_test_surfaces`'s "looks like a test" filter can under- or
+over-include relative to a human's own judgment, the same class of limit `_parse_new_surfaces`
+itself already carries. Reader 3's `check_required_gates` treats the anticipation export's
+LAST line as authoritative for `rc` value — correct for the normal export-at-merge workflow,
+but not itself verified against an interleaved multi-row export order.

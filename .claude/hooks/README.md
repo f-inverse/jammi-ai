@@ -136,12 +136,24 @@ committed TEST-failure marker — `"test result: FAILED"`, `"FAIL —"`, `"= FAI
 (R11's own disposition precedent), and every `uncovered` reason in the array is
 NORMALIZED-DISTINCT from its siblings (three identical excuses is
 one real disposition). No hash-reproduction here — like `gates`, a lead-attested
-record, never re-executed by the hook. `--export-anticipation` (below) ALSO dumps any
+record, never re-executed by the hook. `--export-anticipation` (below) ALSO writes any
 `<slug>.relay.*.json` carrying a non-empty `mutations`/`exclusions` as a distinct
 `lead-relay-attestation` row — these fields otherwise live ONLY in
 the gitignored relay artifact, invisible to a human reviewing the committed diff at
 merge; this is a SHAPE export (verbatim, never re-derived), not a re-execution.
-Filed as its own, separately-scoped unit (not yet implemented): a CI-side derivation
+**Fix round 6 Z12 — two files, one row kind each.** `docs/rigor/<slug>.anticipation
+.jsonl` (stdout, redirected by the operator) carries ONLY `lead-anticipation` rows;
+`lead-relay-attestation` rows are written DIRECTLY by the exporter to their OWN
+committed stream, `docs/rigor/<slug>.attestation.jsonl` — never interleaved into the
+anticipation stream, which is exactly what let an attestation row (no `residual_risk`,
+no `gates`) become the "governing" row Reader 3's gates check selected, or deny
+Reader 3's shape check outright. Reader 3 additionally REFUSES — a loud, named FAIL,
+never a silent ignore or a silent select — any row it still finds in the anticipation
+stream whose `agent_type` is not `lead-anticipation` (a stale pre-fix-round-6 export
+still committed, or a hand-edit); the shared validator (`_r12_anticipation_rejection`)
+receives anticipation rows only. Filed as its own, separately-scoped unit (not yet
+implemented, tracked at
+https://github.com/f-inverse/jammi-ai/issues/557): a CI-side derivation
 of the REQUIRED non-test call-site set from `base...HEAD` and a hard requirement that
 every such site carries its own `mutations` row in the exported record. **8c,
 exclusions.** `_r12_new_test_surfaces` narrows `new_surfaces` to entries that LOOK
@@ -161,8 +173,9 @@ that is ALSO a DENY, naming the missing witness — never a silent
 already takes). This is the anti-templating cousin of `_claims_rejection`'s own
 uncovered-reason check. LIMIT, stated as plainly as R11's own: this cannot prove an
 exclusion is TRUE, only that two are not one. **Reader 3**
-(`ci/scripts/check_rigor_record.py`, armed only when
-`ci/lead-gate-required-commands.txt` is itself committed at HEAD) hard-fails the
+(`ci/scripts/check_rigor_record.py`, armed UNCONDITIONALLY — a missing, empty, or
+all-comment `ci/lead-gate-required-commands.txt` is itself a hard FAIL here, never a
+silent skip) hard-fails the
 committed `docs/rigor/<slug>.anticipation.jsonl` export on the SAME shared checks
 Reader 1 makes (`unit_branch`/`residual_risk` presence, attack pair-reuse WITHIN a
 row, the execution-class requirement, the omits-a-command arm) plus the GOVERNING
@@ -176,12 +189,15 @@ pseudorandom hex with no chronological meaning — so an older round's row can s
 after a newer one and land on the file's last line); BOTH `ts` and `head_sha` are
 stamped by the exporter itself (from the artifact file's own mtime
 and its own `pre_fix_sha`, never hand-typed), and when the candidate pool holds two
-or more rows and ANY lacks `ts`, Reader 3 FAILS LOUDLY naming the ambiguity rather
-than guessing. Reader 3 never re-executes these commands; they are already CI jobs
+or more rows and ANY lacks `ts`, OR two or more rows share the SAME greatest `ts`
+(fix round 6 Z15 — a tie is exactly as ambiguous as a missing `ts`), Reader 3 FAILS
+LOUDLY naming the ambiguity rather than guessing. Reader 3 never re-executes these commands; they are already CI jobs
 elsewhere in `.github/workflows/`. HONEST LIMITS, stated as plainly as (2b)'s own:
 `gates`/`mutations`/`exclusions` are LEAD-ATTESTED, never re-executed by the hook —
-the control is the human at merge, reading the exported record (which, since fix
-round 5, is where `mutations`/`exclusions` are actually visible at all).
+the control is the human at merge, reading the exported record: `gates` in
+`docs/rigor/<slug>.anticipation.jsonl`, `mutations`/`exclusions` in their own
+`docs/rigor/<slug>.attestation.jsonl` (fix round 6 Z12) — the ONLY place any of these
+fields is visible at all outside the gitignored state directory.
 **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
 `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
 (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE

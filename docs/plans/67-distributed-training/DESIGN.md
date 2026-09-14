@@ -123,7 +123,7 @@ built here). The gather primitive (§4) is what lifts this later.
 **Crate layering.** `jammi-db` depends on no jammi crate but `jammi-numerics`
 (`crates/jammi-db/Cargo.toml:44`), and every existing variant holds primitives and db-local
 types (`manifest.rs:305-345`). `FineTuneConfig` is `jammi-wire`, `TrainingSpec`/`TrainingCommon`
-are `jammi-ai` (`spec.rs:33-63`), `TrainingFormat` is `jammi-ai` (`data.rs:59`). So both new
+are `jammi-ai` (`crates/jammi-ai/src/fine_tune/spec.rs:33-63`), `TrainingFormat` is `jammi-ai` (`data.rs:59`). So both new
 variants carry an **opaque, versioned canonical encoding** — `spec_canonical: String`
 (sorted-key canonical JSON) with `spec_schema_version: u32` — produced by `jammi-ai` from the
 owning types, plus db-local primitives (`ModelTask`, ids, digests, the topology fields).
@@ -266,7 +266,7 @@ peer tier costs zero net attempts (OPS D10). Coordinator death expires the lease
 same-named `building` training-set row left by a crashed coordinator is met with the `BackOff`
 disposition and reclaimed through `claim_expired_building_table` after expiry (README r31). The per-attempt watchdog is the lease keeper's
 shape — bounded by the attempt it belongs to, retiring only that attempt — and is allowed under
-the actuator rule (`recompute.rs:29-35`; 68 DIST D5).
+the actuator rule (`crates/jammi-ai/src/pipeline/recompute.rs:29-35`; 68 DIST D5).
 Either way the next attempt resumes from the job-level resume checkpoint
 (`{tenant}/{job_id}/_resume/`, `artifact.rs:300-323`), which a zombie writer cannot regress
 (the write is gated on the held lease, `trainer.rs:3601`). No per-task retry anywhere.
@@ -274,7 +274,7 @@ Either way the next attempt resumes from the job-level resume checkpoint
 **Device-plural session.** `[gpu] devices = [..]` gives one `GpuScheduler` per device and a
 `ModelCache` keyed by a `CacheKey { model_id, device, task: Option<_>, backend: Option<_> }`
 shared with plan 65's rekey — `None` is a distinct key value, never a wildcard — applied to
-both the entries map and the single-flight `in_flight` map (`cache.rs:43-45`); `Local` ranks
+both the entries map and the single-flight `in_flight` map (`crates/jammi-ai/src/model/cache.rs:43-45`); `Local` ranks
 are threads pinned to devices.
 
 ## 5. The distributed frozen forward (head target)

@@ -54,7 +54,7 @@ scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arit
 | # | Finding | Disposition |
 |---|---|---|
 | 1 | "Sum, don't average" is exact only if no trainable parameter consumes gathered remote slots; classification applies the head inside the loss (`trainer.rs:2676-2679`) | Invariant stated; per-arm gather points (logits for classification; head output for regression; encoder outputs otherwise). README r6; DESIGN §4; U4b (b) adds classification + quantile regression |
-| 2 | Refusal predicate `refresh_every > 0` is true by default (`fine_tune.rs:212-231`) — every W>1 job would be refused | Predicate is `hard_negatives.mine` or `cached`. README r2; DESIGN §2; U4a |
+| 2 | Refusal predicate `refresh_every > 0` is true by default (`crates/jammi-wire/src/fine_tune.rs:212-231`) — every W>1 job would be refused | Predicate is `hard_negatives.mine` or `cached`. README r2; DESIGN §2; U4a |
 | 3 | Per-rank dropout RNG (`resume.rs:107`) unmodelled — resume of a gang not reproducible | Per-rank `dropout_positions` gathered to rank 0; seed `f(seed, rank)`; oracle across a resume. README r8; DESIGN §4, §6; U4b |
 | 4 | Descriptor cannot hold `jammi-wire`/`jammi-ai` types (`jammi-db` depends on `jammi-numerics` only) | Opaque versioned canonical encoding; completeness test in the owning crate. README r5; DESIGN §3; U2a/U3 |
 | 5 | `batches_per_epoch` ambiguous between B and W·B; LR horizon and trailing scale follow | `ceil(train_count / (W·B))`; every step quantity indexed by global batch; U2b lands it. README r3/r7; DESIGN §2 |
@@ -85,9 +85,9 @@ scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arit
 | A14 | S4 cost/approval and ledger path not on the README | Added; `runpod_lib.sh:1263` fixed |
 
 Verified by the lead before folding: `trainer.rs:2676-2679` (classify inside loss), `:2245`
-(regression head pre-loss), `fine_tune.rs:212-231` (`mine: false`, `refresh_every: 1`),
+(regression head pre-loss), `crates/jammi-wire/src/fine_tune.rs:212-231` (`mine: false`, `refresh_every: 1`),
 `:590-601` (`refresh_every == 0` refused when mining), `trainer.rs:1451` (`.mine` gate),
-`data.rs:439-442`/`:493-497` (Precomputed tests-only, batch split), `cache.rs:43-45`
+`data.rs:439-442`/`:493-497` (Precomputed tests-only, batch split), `crates/jammi-ai/src/model/cache.rs:43-45`
 (`in_flight` keyed by id), `resume.rs:107`, `crates/jammi-db/Cargo.toml:44`,
 `trainer.rs:843-852`, `jammi-wire/src/embedding.rs:95-101`, `embedding.proto:108-109`,
 `check_doc_parity.py:127-136`, `execution_surface_reachability_allowlist.txt` (162 lines),
@@ -104,7 +104,7 @@ mechanism change; folded into v3.1 and verified by the lead by grep (no round 4)
 | 1 | U6 → U5b edge present in UNITS only; README table/hand-off and SIZING still said `U6 ∥ U5b` | README unit table, hand-off step 6, SIZING schedule/edges/alternative 6 corrected |
 | 2 | Reachability allowlist missing from U7b scope/acceptance and the co-ownership row | Added to U7b; row extended |
 | 3 | `TrainingCommon.world_size` in U4a without its construction sites, serde default, or the wire field | `#[serde(default)]` = 1 (D10); construction sites (`wire/training.rs:176`, `session.rs:1172`, `:1300`, `tests/it`) and `training.proto`/`jammi-wire/src/training.rs` in U4a with wire-server co-owner; README r17 |
-| A4 | Citations: `fine_tune.rs:237-267` → `:237-445`; `runpod_lib.sh:1263` → `:1264`; `optimizer.rs:612` (correct as cited) | Corrected |
+| A4 | Citations: `crates/jammi-wire/src/fine_tune.rs:237-267` → `:237-445`; `runpod_lib.sh:1263` → `:1264`; `optimizer.rs:612` (correct as cited) | Corrected |
 | A5 | U5b omitted `tests/distributed/main.rs`; U4b listed `store/manifest.rs` under ai-core | Corrected |
 | A6 | U4a → U2b edge (the `world` argument) unstated | Stated in README table, U2b, SIZING edges |
 

@@ -3156,7 +3156,7 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
     );
 }
 
-// ── #500 U2a fix round 7 -- the INDIRECT half moved to a real call graph ----
+// ── The literal-occurrence gate replaces call-graph reachability. ─────────
 //
 // The two checks above (`no_session_registration_under_fine_tune` and its
 // falsifications) are the DIRECT-call-site layer: no file under
@@ -3166,17 +3166,531 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 //
 // The INDIRECT half -- an in-tree function defined OUTSIDE `fine_tune/` that
 // itself binds a session/catalog name, reached through some chain of in-tree
-// calls `fine_tune/` makes -- is `crates/jammi-ai/tests/it/call_graph_gate.rs`.
-// A name-keyed, line-regex fixed point (`session_binding_reachable_names`,
-// `callee_names`) used to live here; a closing audit found it unsound on
-// three independent axes (a reach universe scoped to
-// `crates/jammi-db/src/store/**` only, so a real binder defined anywhere else
-// in either crate was invisible; edges only for `.ident(` method-call text,
-// so a free-function call, a `Self::`/`crate::`/`super::`-qualified call, or
-// a call inside a closure produced no edge at all; and a DDL string-literal
-// scan that missed `CREATE OR REPLACE` and lower-case SQL and could flag text
-// inside a block comment). `call_graph_gate.rs` replaces it with a real `syn`
-// AST parse of every tracked file under `SURFACE_DIRS`, so an edge is a
-// genuine `Expr::Call`/`Expr::MethodCall`/string-literal token the Rust
-// grammar itself recognises -- comments and non-literal text are never part
-// of the parsed tree, so they can never be mistaken for one.
+// calls `fine_tune/` makes -- is no longer answered by tracing a call graph
+// at all. A `syn`-based AST call graph that used to live at
+// `crates/jammi-ai/tests/it/call_graph_gate.rs` missed a registration verb
+// reached through a function-pointer argument, `.map(Self::f)`, a call
+// inside a macro invocation such as `assert!`/`tokio::select!`, or a
+// fn-pointer struct field, and missed a DDL keyword sitting in a module-level
+// `const SQL = "..."`, split across two `format!`/`concat!` arguments, or
+// pulled in via `include_str!` -- a SOUNDNESS gap in what any finite set of
+// AST node-kind handlers can promise to cover exhaustively. That gate is
+// deleted, along with its `syn`/`proc-macro2` dev-dependencies (no
+// production code ever depended on either). The dependency-closure/
+// reachability question it existed to answer is its own unit,
+// <https://github.com/f-inverse/jammi-ai/issues/549>.
+//
+// **What replaces it.** Rather than trace which binder a `fine_tune/` call
+// can REACH, this gate reviews EVERY occurrence of a registration verb or a
+// DDL-shaped string literal ANYWHERE under both [`SURFACE_DIRS`] -- not only
+// `crates/jammi-ai/src/fine_tune/**`, which
+// [`fine_tune_session_registration_hits`]/[`fine_tune_ddl_relation_binding_hits`]
+// above already police as the cheap, zero-tolerance DIRECT layer. A caller
+// set enumerated by a call graph can always miss an edge the parser's shape
+// coverage didn't anticipate (this file's own history: line-regex, then
+// AST, both found unsound); an occurrence enumerated by `git ls-files` over
+// two whole directories cannot miss a SITE the same way -- every place
+// either pattern appears in tracked source is found and reviewed, whether or
+// not anything under `fine_tune/` can reach it. What this trades away is
+// precision, not recall: a site with zero real callers (e.g. a trait method
+// a language feature requires but nothing in-tree invokes) is still listed
+// and reviewed here, the same as a site with a hundred callers -- see each
+// entry's own prose for which case it is.
+
+/// One occurrence a review has cleared: the registration-verb call/
+/// declaration or DDL-shaped string literal at `(file, function, ordinal)` --
+/// never a declaration LINE, which drifts under an unrelated edit above it
+/// (see [`assign_ordinals`]'s doc) -- carries a `property`, the reviewed,
+/// human-written account of what this site actually does and why a second
+/// call/occurrence at the same site can never silently corrupt state. Every
+/// field is read: `file`/`function`/`ordinal` key the comparison against the
+/// live scan ([`registration_verb_occurrences_are_all_reviewed`],
+/// [`ddl_literal_occurrences_are_all_reviewed`]); `property` is asserted
+/// non-trivial by [`every_reviewed_registration_site_states_its_property`]
+/// and printed in every failure message via `#[derive(Debug)]` -- no field
+/// here is decorative the way the deleted call-graph gate's `#[allow(dead_code)]`
+/// `arm`/`reason` fields were.
+#[derive(Debug)]
+struct ReviewedRegistrationSite {
+    file: &'static str,
+    function: &'static str,
+    ordinal: usize,
+    property: &'static str,
+}
+
+impl ReviewedRegistrationSite {
+    fn key(&self) -> (String, String, usize) {
+        (
+            self.file.to_string(),
+            self.function.to_string(),
+            self.ordinal,
+        )
+    }
+}
+
+/// The same "smallest enclosing region wins" attribution
+/// [`session_registration_literal_sites`] and [`callers_of`] already use, cut
+/// out as a shared helper for the two whole-surface scans below (both scan
+/// UNFILTERED by directory, unlike those two, which is the entire point: the
+/// occurrence, not the reachability, is what is being enumerated here).
+fn attribute_hit_to_enclosing_fn(regions: &[FnRegion], line_no: usize) -> (String, usize) {
+    let mut best: Option<&FnRegion> = None;
+    for region in regions {
+        if region.line <= line_no && line_no <= region.end_line {
+            let is_smaller = match best {
+                None => true,
+                Some(b) => (region.end_line - region.line) < (b.end_line - b.line),
+            };
+            if is_smaller {
+                best = Some(region);
+            }
+        }
+    }
+    best.map(|r| (r.name.clone(), r.ordinal))
+        .unwrap_or_else(|| ("<module-scope>".to_string(), 0))
+}
+
+/// Every occurrence, anywhere under [`SURFACE_DIRS`] (both crates, every
+/// directory -- not scoped to `fine_tune/`), of a
+/// [`PAIRED_REGISTRATION_VERBS`]/[`UNPAIRED_REGISTRATION_VERBS`] call-site
+/// PATTERN, attributed to its enclosing function. Deliberately a superset of
+/// "genuine calls": the same substring match `fine_tune_session_registration_hits`
+/// uses also matches the verb's own `fn register_x(`/`fn deregister_x(`
+/// DECLARATION line, which this file's hand-rolled scan cannot distinguish
+/// from a call site without becoming a real parser -- disclosed, not hidden:
+/// [`REGISTRATION_VERB_SITES`]'s entries for `store/mod.rs::register_table`
+/// and `store/result_schema.rs::{register_table,deregister_table}` say so
+/// directly.
+fn registration_verb_occurrences(
+    surface: &[(String, String)],
+) -> BTreeSet<(String, String, usize)> {
+    let mut hits = BTreeSet::new();
+    for (file, text) in surface {
+        let masked = mask_non_code(text);
+        let regions = find_fn_regions(&masked);
+        for (line_idx, line) in masked.lines().enumerate() {
+            let line_no = line_idx + 1;
+            let mut hit_here = false;
+            for verb in PAIRED_REGISTRATION_VERBS {
+                if line.contains(format!("deregister_{verb}(").as_str())
+                    || line.contains(format!("register_{verb}(").as_str())
+                {
+                    hit_here = true;
+                }
+            }
+            for verb in UNPAIRED_REGISTRATION_VERBS {
+                if line.contains(format!("register_{verb}(").as_str()) {
+                    hit_here = true;
+                }
+            }
+            if hit_here {
+                let (name, ordinal) = attribute_hit_to_enclosing_fn(&regions, line_no);
+                hits.insert((file.clone(), name, ordinal));
+            }
+        }
+    }
+    hits
+}
+
+/// Every [`ddl_statement_shape`] occurrence anywhere under [`SURFACE_DIRS`]
+/// (both crates, every directory), on [`mask_comments_only`]'s output (string
+/// content visible, comments blanked -- the same reasoning
+/// [`fine_tune_ddl_relation_binding_hits`] already documents), attributed to
+/// its enclosing function.
+fn ddl_literal_occurrences(surface: &[(String, String)]) -> BTreeSet<(String, String, usize)> {
+    let mut hits = BTreeSet::new();
+    for (file, text) in surface {
+        let regions = find_fn_regions(&mask_non_code(text));
+        let masked_comments = mask_comments_only(text);
+        for (line_idx, line) in masked_comments.lines().enumerate() {
+            if !ddl_statement_shape(line) {
+                continue;
+            }
+            let line_no = line_idx + 1;
+            let (name, ordinal) = attribute_hit_to_enclosing_fn(&regions, line_no);
+            hits.insert((file.clone(), name, ordinal));
+        }
+    }
+    hits
+}
+
+/// Every occurrence of a [`PAIRED_REGISTRATION_VERBS`]/
+/// [`UNPAIRED_REGISTRATION_VERBS`] call-site pattern under [`SURFACE_DIRS`]
+/// TODAY, transcribed by running [`registration_verb_occurrences`] against
+/// `scan_surface()` with an empty allowlist and reading each hit's real call
+/// site (never a guess) -- 17 entries.
+const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/content_hash_udf.rs",
+        function: "register_content_hash_udf",
+        ordinal: 1,
+        property: "register_udf(..) under the UDF's own FIXED `.name()` (`jammi_content_hash`), \
+                   called once per session at construction (`InferenceSession`'s own \
+                   `with_observer`/`wrap_with` chain) -- a session-wide singleton, never a \
+                   per-job/per-call resource; a second call on the same session silently \
+                   overwrites the first (`register_udf`'s own doc), which is fine here because \
+                   every call registers the identical function.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/content_hash_udf.rs",
+        function: "udf_hashes_the_runner_rendering",
+        ordinal: 1,
+        property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
+                   the test -- never the shared production session, so there is no reclaim-shaped \
+                   collision surface here at all.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "empty_group_is_null_vector",
+        ordinal: 1,
+        property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
+                   the test -- same as `content_hash_udf.rs::udf_hashes_the_runner_rendering`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "grouped_reduction_per_group",
+        ordinal: 1,
+        property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
+                   the test.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "register_vector_agg_udafs",
+        ordinal: 1,
+        property: "register_udaf(..) three times (`vector_mean`/`vector_sum`/`vector_max`), each \
+                   under that UDAF's own FIXED `.name()`, called once per session at construction \
+                   (`InferenceSession::register_query_functions`'s own call) -- the same \
+                   session-wide singleton shape as `register_content_hash_udf`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "run_reduce",
+        ordinal: 1,
+        property: "a unit-test helper's own `SessionContext::new()`, local and discarded at the \
+                   end of each call.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/query/vector_agg_udaf.rs",
+        function: "wrong_argument_type_is_planning_error",
+        ordinal: 1,
+        property: "a unit test's own `SessionContext::new()`, local and discarded at the end of \
+                   the test.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-ai/src/session.rs",
+        function: "register_query_functions",
+        ordinal: 1,
+        property: "register_udtf(..) under the FIXED `AnnotateTableFunction::NAME` -- this \
+                   function's own doc: \"must be called once per session, after the session is \
+                   behind an Arc\" -- a session-construction-time singleton, never called from \
+                   `fine_tune/` or per job.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/session.rs",
+        function: "build",
+        ordinal: 1,
+        property: "register_catalog(\"mutable\", ..) under the FIXED literal name \"mutable\", \
+                   once at session-build time -- a session-construction-time singleton.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/session.rs",
+        function: "register_source_tables",
+        ordinal: 1,
+        property: "register_catalog(source_id, ..) keyed by the data SOURCE's own stable, \
+                   admin-configured identifier, called once per configured source at session \
+                   build/reload time -- never per fine_tune call, never per job; two DIFFERENT \
+                   sources never share a `source_id`, and re-registering the SAME source's \
+                   catalog at reload time is a deliberate refresh of that source's own tables.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/source/file_format.rs",
+        function: "register_driver_for_url",
+        ordinal: 1,
+        property: "register_object_store(..) keyed by the URL's own scheme+authority, with the \
+                   driver resolved through `StorageRegistry::driver_for`'s per-(scheme,root) \
+                   cache -- the identical idempotent-rebind shape reviewed for \
+                   `store/mod.rs::build_result_table_provider` below, executed by \
+                   `store::tests::register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "bind_result_table",
+        ordinal: 1,
+        property: "binds by calling `self.register_table(..)` -- jammi's OWN 4-argument method, a \
+                   name collision this substring scan cannot itself tell apart from DataFusion's \
+                   `SessionContext::register_table`, but the resolution IS the real one here: \
+                   `bind_result_table` rebinds a `table_name` an EARLIER call already created, \
+                   over that call's own already-written, immutable Parquet bytes -- every call for \
+                   the same `table_name` rebinds the identical artifact. EXECUTED oracle: \
+                   `crates/jammi-db/tests/it/materialization.rs::two_runs_over_one_pinned_definition_share_one_training_set`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "build_result_table_provider",
+        ordinal: 1,
+        property: "for a non-file/-memory URL, calls `ctx.runtime_env().register_object_store(&parsed, driver)` \
+                   keyed by the URL's own scheme+authority, where `driver` is \
+                   `StorageRegistry::driver_for`'s CACHED value for that key -- two calls for one \
+                   URL rebind the identical driver, and DataFusion's own `register_object_store` \
+                   signature (`Option<Arc<dyn ObjectStore>>`, no `Result`) cannot error on either \
+                   call. EXECUTED oracle (NEW): \
+                   `crates/jammi-db/src/store/mod.rs::tests::register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither` \
+                   -- pins the exact primitive this function calls; the function's own cloud-scheme \
+                   branch cannot be driven end-to-end in this crate's default test build, disclosed \
+                   in that test's own doc.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "install_result_schema",
+        ordinal: 1,
+        property: "calls `catalog.register_schema(&catalog_opts.default_schema, ..)` under the \
+                   session's FIXED default-schema name -- this function's own doc: \"Idempotent: \
+                   re-installing the same provider preserves the tables it already holds\" -- \
+                   every call binds the SAME `Arc<ResultTableSchemaProvider>` under the same \
+                   constant key, never a per-call one. EXECUTED oracle (NEW): \
+                   `crates/jammi-db/tests/it/materialization.rs::install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither`.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "register_table",
+        ordinal: 1,
+        // kernel-oracles: fn-in-literal reviewed: the property string below names the literal shape `fn register_table(` in prose, describing a real declaration elsewhere in this file — not a fn-keyword desync in this line
+        property: "this hit is the `fn register_table(` DECLARATION line, not a call site (see \
+                   `registration_verb_occurrences`'s own doc on this scan's inability to tell the \
+                   two apart). The function itself never calls a `register_table`/`deregister_table` \
+                   verb directly; it calls `build_result_table_provider` + `install_result_schema` \
+                   (both reviewed above) then `self.result_schema.add_result_table(..)` -- a \
+                   DISTINCT, non-trait method (its own name does not match this gate's verb \
+                   pattern) keyed by the caller-supplied `jammi.{name}` string, which is always \
+                   `record.table_name` -- unique per table by construction \
+                   (`create_table_names_a_concurrent_burst_uniquely_over_one_definition`, \
+                   `materialization.rs`), so two DIFFERENT names never collide here.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/result_schema.rs",
+        function: "register_table",
+        ordinal: 1,
+        property: "this hit is the `SchemaProvider::register_table` trait-method DECLARATION for \
+                   `ResultTableSchemaProvider`, not a call site written in this crate: the only \
+                   in-tree paths that dispatch to it are DataFusion's own `SessionContext::register_table` \
+                   top-level API and `CREATE TABLE` DDL execution, when the target schema resolves \
+                   to this provider (i.e. after `install_result_schema` runs). Checked, not assumed \
+                   (`grep -rn '\\.register_table(' crates/jammi-db/src crates/jammi-ai/src`): the \
+                   ONLY 2-argument `.register_table(name, provider)` call anywhere in either crate's \
+                   tracked source is this file's OWN new test fixture, \
+                   `materialization.rs::install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither` \
+                   (which registers a `rows` fixture through it deliberately, to prove the \
+                   \"preserves the tables it already holds\" property survives a second install) -- \
+                   no PRODUCTION call reaches this implementation today. Its own body inserts \
+                   UNCONDITIONALLY and returns the displaced provider on a name collision (a \
+                   SILENT overwrite, closing audit #3's own finding, `CONTRACT-U2a-fix1.md` round \
+                   3) -- moot for `fine_tune/` (#549 is the tracked follow-on for a table of its \
+                   own), since no in-tree caller picks a per-job/per-call name through this path.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/result_schema.rs",
+        function: "deregister_table",
+        ordinal: 1,
+        property: "the `SchemaProvider::deregister_table` trait-method DECLARATION, the inverse of \
+                   `register_table` immediately above -- same disclosure: no in-tree call reaches \
+                   it (`grep -rn '\\.deregister_table(' crates/jammi-db/src crates/jammi-ai/src` \
+                   finds nothing), it exists to satisfy the trait.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mod.rs",
+        function: "register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither",
+        ordinal: 1,
+        property: "the unit test that is `build_result_table_provider`'s own \
+                   EXECUTED oracle above -- it calls `ctx.runtime_env().register_object_store(..)` \
+                   directly, twice, against an in-memory driver and a raw `url::Url`, on a session \
+                   this test owns and discards at its end; not the shared production session, no \
+                   reclaim-shaped collision surface.",
+    },
+];
+
+/// Every [`ddl_statement_shape`] occurrence under [`SURFACE_DIRS`] TODAY,
+/// transcribed the same way [`REGISTRATION_VERB_SITES`] was -- 5 entries.
+const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/catalog/migrations.rs",
+        function: "<module-scope>",
+        ordinal: 0,
+        property: "the ordered `MIGRATIONS` table naming each migration's SQL constant -- the DDL \
+                   text itself lives in `catalog/schema.rs` (reviewed below); this file only lists \
+                   the constants. Every migration executes through `CatalogBackend`'s own SQL \
+                   connection (SQLite/Postgres), never through a DataFusion `SessionContext::sql` \
+                   call -- outside the shape this gate's property (a DataFusion catalog bind) \
+                   describes, enumerated and reviewed anyway per this gate's completeness \
+                   requirement. Unreachable from any DataFusion `SessionContext`, and so from \
+                   `fine_tune/`, regardless.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/catalog/schema.rs",
+        function: "<module-scope>",
+        ordinal: 0,
+        property: "the migration SQL constants themselves (`CREATE TABLE sources`, \
+                   `result_tables`, etc.) -- same disclosure as `catalog/migrations.rs`: executed \
+                   only through `CatalogBackend`'s own connection, never a DataFusion \
+                   `SessionContext::sql` call, so this gate's property does not describe them; \
+                   listed and reviewed for completeness.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/postgres.rs",
+        function: "create_table_ddl",
+        ordinal: 1,
+        property: "builds a `CREATE TABLE ..` STRING for the companion \"mutable table\" Postgres \
+                   backend, executed through that backend's own direct SQL connection -- never a \
+                   DataFusion `SessionContext::sql` call, and never reachable from `fine_tune/` by \
+                   any real call regardless (it targets an entirely separate SQL backend from the \
+                   DataFusion catalog this gate's property is about).",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/sqlite.rs",
+        function: "create_table_ddl",
+        ordinal: 1,
+        property: "the SQLite arm of the same \"mutable table\" backend -- same disclosure as the \
+                   Postgres arm above.",
+    },
+    ReviewedRegistrationSite {
+        file: "crates/jammi-db/src/store/mutable/sqlite.rs",
+        function: "create_table_ddl_emits_implicit_tenant_id",
+        ordinal: 1,
+        property: "a unit test asserting on the built DDL STRING's own content \
+                   (`ddl.starts_with(\"CREATE TABLE \\\"widgets\\\"\")`) -- the DDL text lives in a \
+                   test assertion, never executed as SQL by this test at all.",
+    },
+];
+
+/// Both directions of the comparison every allowlist in this file already
+/// checks (`allowlists_match_current_hits_exactly`'s own discipline, applied
+/// here to the two whole-surface scans): an occurrence with no reviewed entry
+/// is UNREVIEWED (fails naming the site); a reviewed entry whose site no
+/// longer produces a hit is STALE (also fails -- an allowance is never
+/// permanent slack a later, different site can spend).
+fn assert_occurrences_reviewed(
+    found: &BTreeSet<(String, String, usize)>,
+    allow: &BTreeSet<(String, String, usize)>,
+    what: &str,
+) {
+    let unreviewed: Vec<_> = found.difference(allow).collect();
+    assert!(
+        unreviewed.is_empty(),
+        "{what}: unreviewed occurrence(s) {unreviewed:?} -- add a reviewed entry naming the \
+         (file, function, ordinal) and its property, or remove the offending call/literal."
+    );
+    let stale: Vec<_> = allow.difference(found).collect();
+    assert!(
+        stale.is_empty(),
+        "{what}: reviewed entr(y/ies) {stale:?} no longer produce a hit -- shrink the allowlist \
+         to match reality."
+    );
+}
+
+#[test]
+fn registration_verb_occurrences_are_all_reviewed() {
+    let surface = scan_surface();
+    let found = registration_verb_occurrences(&surface);
+    let allow: BTreeSet<_> = REGISTRATION_VERB_SITES
+        .iter()
+        .map(ReviewedRegistrationSite::key)
+        .collect();
+    assert_occurrences_reviewed(&found, &allow, "registration verb");
+}
+
+#[test]
+fn ddl_literal_occurrences_are_all_reviewed() {
+    let surface = scan_surface();
+    let found = ddl_literal_occurrences(&surface);
+    let allow: BTreeSet<_> = DDL_LITERAL_SITES
+        .iter()
+        .map(ReviewedRegistrationSite::key)
+        .collect();
+    assert_occurrences_reviewed(&found, &allow, "DDL literal");
+}
+
+/// No field on [`ReviewedRegistrationSite`] is decorative: `property` is read
+/// here directly, never merely present for a human to skim.
+#[test]
+fn every_reviewed_registration_site_states_its_property() {
+    for entry in REGISTRATION_VERB_SITES
+        .iter()
+        .chain(DDL_LITERAL_SITES.iter())
+    {
+        assert!(
+            entry.property.trim().len() > 20,
+            "{}::{} (ordinal {}) must state its reviewed property in prose, got {:?}",
+            entry.file,
+            entry.function,
+            entry.ordinal,
+            entry.property
+        );
+    }
+}
+
+/// The name-keyed collision control this literal gate needs: a NEW verb
+/// occurrence in a NEW file is found by the scan and is NOT already on the
+/// reviewed list -- exactly the mutation "a planted `ctx.register_table(`
+/// appears in a new file under store/" that a fixed allowlist must not
+/// silently absorb.
+#[test]
+fn falsification_new_verb_occurrence_in_a_new_file_is_flagged() {
+    let surface = vec![(
+        "crates/jammi-db/src/store/__probe_new_registration_site__.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture for `registration_verb_occurrences` -- synthetic producer text, not real code in this file
+            "fn planted_caller(ctx: &SessionContext, provider: Arc<dyn TableProvider>) {\n",
+            "    ctx.register_table(\"planted\", provider).unwrap();\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let found = registration_verb_occurrences(&surface);
+    let allow: BTreeSet<_> = REGISTRATION_VERB_SITES
+        .iter()
+        .map(ReviewedRegistrationSite::key)
+        .collect();
+    let key = (
+        "crates/jammi-db/src/store/__probe_new_registration_site__.rs".to_string(),
+        "planted_caller".to_string(),
+        1usize,
+    );
+    assert!(
+        found.contains(&key),
+        "a register_table( call in a new file must be found by the scan, got {found:?}"
+    );
+    assert!(
+        !allow.contains(&key),
+        "the planted site must not already be on the reviewed list -- this control is vacuous \
+         otherwise"
+    );
+}
+
+/// Non-vacuousness for [`registration_verb_occurrences_are_all_reviewed`]:
+/// reproduce ONE real hit on a minimal synthetic surface (rather than the
+/// real, 600+-file `scan_surface()`, so this control is fast and
+/// self-contained) and show [`assert_occurrences_reviewed`]'s own comparison
+/// reports it unreviewed when the allowlist omits it -- i.e. removing a
+/// reviewed entry from the real list would turn the real test RED, executed
+/// here against a stand-in rather than by literally mutating the const (the
+/// same class of control this file's other `falsification_*` tests use).
+#[test]
+fn falsification_removing_a_reviewed_entry_leaves_its_site_unreviewed() {
+    let surface = vec![(
+        "crates/jammi-ai/src/query/content_hash_udf.rs".to_string(),
+        concat!(
+            // kernel-oracles: fn-in-literal reviewed: falsification fixture reproducing a real reviewed site -- synthetic producer text, not read from the real file
+            "pub fn register_content_hash_udf(ctx: &SessionContext) {\n",
+            "    ctx.register_udf(ScalarUDF::new_from_impl(ContentHashUdf::default()));\n",
+            "}\n",
+        )
+        .to_string(),
+    )];
+    let found = registration_verb_occurrences(&surface);
+    let empty_allow: BTreeSet<(String, String, usize)> = BTreeSet::new();
+    let unreviewed: Vec<_> = found.difference(&empty_allow).collect();
+    assert!(
+        !unreviewed.is_empty(),
+        "an allowlist missing a real hit's entry must report it unreviewed, not silently pass -- \
+         found {found:?} against an empty allowlist"
+    );
+}

@@ -4354,4 +4354,80 @@ mod tests {
         assert_eq!(order_rule, TRAINING_SET_ORDER_RULE_V1);
         assert_eq!(order_rule, "full_tuple_v1");
     }
+
+    /// `build_result_table_provider`'s reviewed property
+    /// (`crates/jammi-ai/tests/it/pinned_source_gate.rs`'s literal-occurrence
+    /// gate, `build_result_table_provider` entry): for a non-`file`/`memory`
+    /// URL, it calls `ctx.runtime_env().register_object_store(&parsed,
+    /// driver)` keyed by the URL's own scheme+authority, where `driver` is
+    /// `StorageRegistry::driver_for`'s CACHED value (already proven identical
+    /// across two calls for the same key by `storage::registry::tests::
+    /// caches_drivers_per_root`) — so two calls for one URL register the
+    /// SAME driver twice, never two different ones, and DataFusion's own
+    /// `register_object_store` signature (`Option<Arc<dyn ObjectStore>>`, no
+    /// `Result`) cannot error on either call.
+    ///
+    /// **What this test cannot exercise, disclosed rather than papered
+    /// over.** `build_result_table_provider` itself only reaches this line
+    /// for a `Scheme::S3`/`Gcs`/`Azure`/`R2` URL, and `StorageRegistry::
+    /// driver_for` refuses every one of those (`StorageError::
+    /// SchemeNotEnabled`) unless the matching `storage-{s3,gcs,azure,r2}`
+    /// feature is compiled in — none of which any CI lane enables for
+    /// `jammi-db`'s `--lib`/default `--test it` runs (checked:
+    /// `.github/workflows/ci.yml` runs this crate's unit tests only under
+    /// `default`, `test-hooks`, `postgres`, or `live-postgres-tests`). This
+    /// test therefore pins the exact DataFusion primitive the function calls
+    /// on that line, with a real (in-memory, hermetic) driver and a real
+    /// non-file/-memory `url::Url`, rather than driving the private
+    /// end-to-end function through a cloud scheme this crate's own test
+    /// matrix never compiles.
+    #[tokio::test]
+    async fn register_object_store_twice_for_one_url_rebinds_the_same_driver_and_errors_on_neither()
+    {
+        let ctx = SessionContext::new();
+        let driver: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let parsed = ::url::Url::parse("s3://build-result-table-provider-probe/").unwrap();
+
+        // Call 1 — nothing registered yet, so DataFusion returns `None`.
+        let previous_1 = ctx
+            .runtime_env()
+            .register_object_store(&parsed, Arc::clone(&driver));
+        assert!(
+            previous_1.is_none(),
+            "the first registration for a fresh URL must displace nothing"
+        );
+
+        // Call 2 — the SAME url, the SAME driver Arc, exactly the shape
+        // `build_result_table_provider` performs on every call for a URL
+        // whose driver `StorageRegistry` already cached: this must not
+        // panic or otherwise fail (there is no `Result` to check — the
+        // property under test is that the call completes and the resolved
+        // store afterwards is still the identical driver, not a silent
+        // no-op or a corrupted registry entry).
+        let previous_2 = ctx
+            .runtime_env()
+            .register_object_store(&parsed, Arc::clone(&driver));
+        assert!(
+            previous_2.as_ref().is_some_and(|p| Arc::ptr_eq(p, &driver)),
+            "the second registration for the SAME url must report displacing the FIRST call's \
+             own driver, proving the same key was rebound rather than a distinct entry created"
+        );
+
+        // Resolve through the exact key datafusion's own object-store planning
+        // uses (`ObjectStoreUrl`, `impl AsRef<url::Url>` — a bare `url::Url`
+        // does not itself implement that bound) and confirm the identical
+        // driver both calls registered is still what answers.
+        let store_url =
+            datafusion::execution::object_store::ObjectStoreUrl::parse(parsed.as_str()).unwrap();
+        let resolved = ctx
+            .runtime_env()
+            .object_store(&store_url)
+            .expect("the url must resolve after two registrations, not merely one");
+        assert!(
+            Arc::ptr_eq(&resolved, &driver),
+            "after two calls for one URL, the resolved driver must still be the identical \
+             instance both calls registered — never a different, silently-swapped-in one"
+        );
+    }
 }

@@ -980,7 +980,73 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert_ne!(other_format.table_name(), first.table_name());
 }
 
-/// The uniqueness oracle `call_graph_gate::FINE_TUNE_REACHABLE_BINDING_ALLOWLIST`'s
+/// `ResultStore::install_result_schema`'s reviewed property
+/// (`crates/jammi-ai/tests/it/pinned_source_gate.rs`'s literal-occurrence
+/// gate, `install_result_schema` entry): its own doc says "Idempotent:
+/// re-installing the same provider preserves the tables it already holds."
+/// Two calls on ONE `SessionContext` — an explicit one here, then the
+/// implicit second one `materialize_training_set`'s own write path makes
+/// through `bind_result_table` -> `register_table` -> `install_result_schema`
+/// — must both succeed (no error on either), and the table the SECOND call's
+/// write registers must still resolve afterwards through the SAME session:
+/// "preserves the tables it already holds", executed rather than merely
+/// quoted from the doc comment.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn install_result_schema_twice_on_one_session_binds_the_same_schema_and_errors_on_neither(
+    backend: BackendKind,
+) {
+    use datafusion::datasource::MemTable;
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), catalog);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "install-schema-twice");
+    let ctx = SessionContext::new();
+
+    // Call 1: explicit, on an otherwise-untouched session. The fixture table
+    // is registered AFTER this call, so it lands on `store`'s own
+    // `ResultTableSchemaProvider` (the provider `install_result_schema`
+    // installs as the session's default schema) rather than the plain
+    // `MemorySchemaProvider` a session starts with — the shape a real caller
+    // hits, since `install_result_schema` REPLACES whatever default schema
+    // was there before (`register_schema`'s own documented "replaced"
+    // semantics), which would otherwise silently drop a table registered
+    // before this call rather than after it.
+    store.install_result_schema(&ctx).unwrap();
+    let mem_table = MemTable::try_new(
+        ts_schema(),
+        vec![vec![ts_batch(&[(Some("q1"), Some("a1"))])]],
+    )
+    .unwrap();
+    ctx.register_table("rows", Arc::new(mem_table)).unwrap();
+
+    // Call 2: implicit, inside `materialize_training_set`'s own write path,
+    // on the SAME session — must not error even though the schema name is
+    // already occupied by call 1's own provider, and must not drop the
+    // fixture table call 1's registration landed on (the SAME `Arc` both
+    // calls install, per `install_result_schema`'s own "idempotent" doc).
+    let table = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "install-schema-twice"))
+        .await
+        .unwrap();
+
+    // The table call 2 registered still resolves through the session both
+    // calls shared — the "preserves the tables it already holds" half, not
+    // merely the "doesn't error" half.
+    let rows = ctx
+        .sql(&format!("SELECT * FROM {}", table.sql_relation()))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+/// The uniqueness oracle `pinned_source_gate::REGISTRATION_VERB_SITES`'s
 /// doc names for the fresh path fine_tune/ reaches
 /// (`ResultStore::materialize_training_set` -> `create_table`,
 /// `store/mod.rs:1183`): a BURST of concurrent `create_table` calls over the

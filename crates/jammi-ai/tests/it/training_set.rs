@@ -481,7 +481,7 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
 /// Corrected (b) — two fine-tune JOBS over the same plain source, columns,
 /// task and format materialise TWO training-set tables, never one.
 ///
-/// `CONTRACT-U2a.md`'s original (b) ("two jobs over the same
+/// An earlier draft's (b) case ("two jobs over the same
 /// source/columns/task/format reuse ONE table") was refuted by the lead's own
 /// K7 ruling: reuse requires pinned EQUAL anchors, and a registered source
 /// exposes no version surface, so the engine anchors it

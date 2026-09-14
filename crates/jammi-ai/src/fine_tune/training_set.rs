@@ -172,7 +172,7 @@ async fn materialize_and_read(
     Ok((table, batches))
 }
 
-/// The reader-class allow-list: every call site in this crate, outside test
+/// The reader-class allow-list: every call site in the workspace, outside test
 /// code, that reaches a training-set table's relation KEY through one of the
 /// three named routes below, keyed by `path:function` rather than
 /// `path:line` — a line number drifts under an unrelated edit, a function

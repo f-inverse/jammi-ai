@@ -2586,22 +2586,33 @@ async fn register_single_row_on_a_global_prefix(
     (prefix_dir, prefix_url)
 }
 
-/// Mutation-kill target for "the reap-site consult is deleted": a stray file
-/// the manifest does NOT name, sitting directly under a job-level prefix a
-/// live row's `artifact_path` EQUALS exactly. Before this round, such a file
-/// fell straight through to the ordinary age-gated orphan arm regardless of
-/// the job's reference status (`reconcile.rs`'s own long-standing comment:
-/// "a valid manifest exists but does not name this key: falls through to the
-/// orphan-candidate arm below"). The up-front attribution set
-/// (`matched_artifact_prefix`) still correctly identifies the ENCLOSING
-/// prefix as referenced — this case is not about the admin-scoped scan at
-/// all — but ONLY the reap-site's fresh `prefix_is_referenced` consult
-/// (called unconditionally for every `models/`-namespaced key that reaches
-/// this point, not merely when no prefix matched at all) reports it as
-/// `referenced` and skips the delete; deleting that consult call falls this
-/// exact file straight back through to the orphan arm and it gets reclaimed.
+/// Mutation-kill target for "the reap-site consult is deleted" AND for "the
+/// reap-site consult asks about the job-level prefix instead of the exact
+/// object key": a stray file the manifest does NOT name, sitting under the
+/// PRODUCTION three-segment attempt prefix (`{job}/{worker}/{attempt}` —
+/// the real shape every fine-tune worker registers; a bare job-level
+/// `artifact_path` is a shape no production writer ever builds) a live
+/// row's `artifact_path` EQUALS exactly, one level ABOVE the stray file
+/// itself (which is therefore a strict DESCENDANT of it, never equal to
+/// it). Before this round, such a file fell straight through to the
+/// ordinary age-gated orphan arm regardless of the job's reference status
+/// (`reconcile.rs`'s own long-standing comment: "a valid manifest exists
+/// but does not name this key: falls through to the orphan-candidate arm
+/// below"). The up-front attribution set (`matched_artifact_prefix`) still
+/// correctly identifies the ENCLOSING prefix as referenced — this case is
+/// not about the admin-scoped scan at all — but ONLY the reap-site's fresh
+/// `prefix_is_referenced` consult (called unconditionally for every
+/// `models/`-namespaced key that reaches this point, not merely when no
+/// prefix matched at all) reports it as `referenced` and skips the delete.
+/// Two independent mutations each kill this test: reverting the consult's
+/// argument back to the coarser job-level prefix (which the production
+/// three-segment `artifact_path` can never equal, so the consult decides
+/// nothing), or reverting the predicate itself to equality-only (which the
+/// stray file's key, a strict descendant of `artifact_path`, can never
+/// satisfy) — either falls this exact file straight back through to the
+/// orphan arm and it gets reclaimed.
 #[tokio::test]
-async fn a_stray_file_under_a_referenced_job_level_prefix_survives_via_the_reap_site_consult() {
+async fn a_stray_file_under_a_referenced_attempt_level_prefix_survives_via_the_reap_site_consult() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -2615,12 +2626,12 @@ async fn a_stray_file_under_a_referenced_job_level_prefix_survives_via_the_reap_
     )];
     let prefix_url = store
         .artifact_store()
-        .put_artifact(None, &[&job_id], &bundle)
+        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
         .await
         .unwrap();
     catalog
         .register_model(RegisterModelParams {
-            model_id: "job-level-model",
+            model_id: "attempt-level-model",
             version: 1,
             model_type: "lora",
             backend: "candle",
@@ -2637,9 +2648,12 @@ async fn a_stray_file_under_a_referenced_job_level_prefix_survives_via_the_reap_
         .join("jammi_db")
         .join("models")
         .join("_global")
-        .join(&job_id);
+        .join(&job_id)
+        .join("worker-1")
+        .join("0");
     // A stray file the manifest does not name, directly under the SAME
-    // job-level directory the model's `artifact_path` EQUALS exactly.
+    // attempt-level directory the model's `artifact_path` EQUALS exactly —
+    // the stray file's own key is therefore a strict DESCENDANT of it.
     std::fs::write(prefix_dir.join("debug_dump.tmp"), b"leftover").unwrap();
     backdate_dir(&prefix_dir, Duration::from_secs(3600));
 
@@ -2673,13 +2687,20 @@ async fn a_stray_file_under_a_referenced_job_level_prefix_survives_via_the_reap_
 /// `Catalog::list_models`": a tenant-A row naming a DEEPER, attempt-level
 /// prefix (`{job_id}/{worker_id}/{attempt}` — the real production shape
 /// `worker.rs` registers, `[job_id, worker_id, attempt]`) rather than a
-/// bare job-level one. The reap-site consult's own job-level (TWO-segment)
-/// exact match can never equal this row's actual (deeper) `artifact_path`,
-/// so it structurally CANNOT protect this prefix; only the admin-scoped,
-/// arbitrary-depth `artifact_prefixes` containment check (built from
-/// `Catalog::list_model_artifact_paths_all_tenants`) can. Reverting that
-/// build to the tenant-scoped `Catalog::list_models` under an UNBOUND pass
-/// makes the tenant-A row invisible again, with no fallback this time.
+/// bare job-level one. This prefix is protected in DEPTH here: the
+/// up-front, admin-scoped, arbitrary-depth `artifact_prefixes` containment
+/// check (built from `Catalog::list_model_artifact_paths_all_tenants`)
+/// already matches the object by prefix before the reap-site is ever
+/// reached, AND the reap-site's own per-object `prefix_is_referenced`
+/// consult (asking about this object's exact key, whose immediate
+/// containing directory equals the row's `artifact_path`) would
+/// independently protect it too — see the attempt-level stray-file test
+/// above for that layer isolated on its own. This test isolates the
+/// FIRST layer: reverting the attribution-set build to the tenant-scoped
+/// `Catalog::list_models` under an UNBOUND pass makes the tenant-A row
+/// invisible to it, with no admin-scoped attribution fallback this time
+/// (the reap-site's own consult is unaffected by that particular mutation,
+/// since it issues an independent, freshly-scoped read).
 #[tokio::test]
 async fn a_tenant_row_naming_a_deep_attempt_level_prefix_survives_an_unbound_reconcile_pass() {
     let dir = tempdir().unwrap();
@@ -3050,13 +3071,20 @@ async fn delete_unreferenced_prefix_refuses_a_referenced_prefix_and_deletes_an_u
     );
 }
 
-/// (e) `prefix_is_referenced` is EQUALITY, never containment: a resume
-/// checkpoint prefix living BELOW a referenced model's own artifact prefix
-/// is a strict descendant, never equal to it, so `delete_resume_checkpoint`
-/// (which never consults the guard at all) still succeeds even while the
-/// model's own top-level prefix stays referenced and protected.
+/// (e) `_resume/` is proven, not merely asserted, to sit outside every
+/// guard: it is a SIBLING of a job's attempt-level artifact path
+/// (`{job}/_resume` vs. the production `{job}/{worker}/{attempt}`),
+/// neither an ancestor nor a descendant of it — nor of an even deeper
+/// retained-checkpoint prefix under the SAME attempt — so
+/// `prefix_is_referenced` answers `0` for it even once BOTH the job's
+/// served bundle and a retained epoch checkpoint are registered as live
+/// `models` rows for the SAME job. `delete_resume_checkpoint`'s total
+/// exemption from the guard (it never consults `prefix_is_referenced` at
+/// all) is therefore never masking an actual reference: there is none to
+/// mask, under the containment-aware predicate or otherwise.
 #[tokio::test]
-async fn a_resume_checkpoint_under_a_referenced_model_prefix_is_not_protected_by_equality() {
+async fn a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate()
+{
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -3068,10 +3096,11 @@ async fn a_resume_checkpoint_under_a_referenced_model_prefix_is_not_protected_by
         "adapter.safetensors".to_string(),
         bytes::Bytes::from_static(b"weights"),
     )];
-    // The model's own top-level (job-level) artifact prefix.
+    // Production shape: the served bundle lives at the attempt-level
+    // three-segment prefix, never a bare job-level one.
     let prefix_url = store
         .artifact_store()
-        .put_artifact(None, &[&job_id], &bundle)
+        .put_artifact(None, &[&job_id, "worker-1", "0"], &bundle)
         .await
         .unwrap();
     catalog
@@ -3088,34 +3117,84 @@ async fn a_resume_checkpoint_under_a_referenced_model_prefix_is_not_protected_by
         .await
         .unwrap();
 
-    // A resume checkpoint under the SAME job — a strict descendant of the
-    // referenced prefix, never equal to it.
+    // A retained epoch checkpoint under the SAME attempt — its own row, at
+    // its own (even deeper) prefix.
+    let epoch_bundle = vec![(
+        "adapter.safetensors".to_string(),
+        bytes::Bytes::from_static(b"epoch-weights"),
+    )];
+    store
+        .artifact_store()
+        .put_epoch_checkpoint(None, &job_id, "worker-1", "0", 0, &epoch_bundle)
+        .await
+        .unwrap();
+    let epoch_prefix_url = store
+        .artifact_store()
+        .epoch_checkpoint_prefix(None, &job_id, "worker-1", "0", 0)
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "checkpointed-model:epoch_0",
+            version: 1,
+            model_type: "lora",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(epoch_prefix_url.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    // A resume checkpoint under the SAME job — a SIBLING of the
+    // attempt-level prefix and of the epoch checkpoint's deeper prefix,
+    // never an ancestor or descendant of either.
     let resume_bundle = vec![(
         "resume_state.json".to_string(),
         bytes::Bytes::from_static(b"{}"),
     )];
-    store
+    let resume_url = store
         .artifact_store()
         .put_resume_checkpoint(None, &job_id, &resume_bundle)
         .await
         .unwrap();
 
-    // The model's own prefix is referenced: the guarded delete refuses it.
+    // Both the served bundle and the retained epoch checkpoint are
+    // referenced: the guarded delete refuses each, each by exactly its OWN
+    // row — the checkpoint's row is two segments below the served prefix
+    // (past `checkpoints/epoch_0`), never its immediate containing
+    // directory, so the served row's equality match does not ALSO count
+    // here; the predicate deliberately stops at one level.
     assert!(matches!(
         store.delete_unreferenced_prefix(&prefix_url).await,
         Err(jammi_db::error::JammiError::Storage(
             jammi_db::storage::StorageError::Referenced { count: 1, .. }
         ))
     ));
+    assert!(matches!(
+        store.delete_unreferenced_prefix(&epoch_prefix_url).await,
+        Err(jammi_db::error::JammiError::Storage(
+            jammi_db::storage::StorageError::Referenced { count: 1, .. }
+        ))
+    ));
 
-    // The resume checkpoint — a strict descendant, never equal — is NOT
-    // protected by the same equality predicate: its own (unguarded) delete
-    // still succeeds.
+    // The resume prefix is referenced by NEITHER row, even under the
+    // containment-aware predicate: it is never an ancestor or descendant
+    // of either.
+    assert_eq!(
+        store.prefix_is_referenced(&resume_url).await.unwrap(),
+        0,
+        "a resume checkpoint prefix must never be reported referenced: it is a sibling, not an \
+         ancestor or descendant, of any attempt-level or checkpoint artifact_path"
+    );
+
+    // `delete_resume_checkpoint` never consults the guard at all — proven
+    // above to have nothing to consult anyway — so it still succeeds.
     store
         .artifact_store()
         .delete_resume_checkpoint(None, &job_id)
         .await
-        .expect("a checkpoint prefix is a descendant, never equal, so it is never protected");
+        .expect("a resume checkpoint prefix is never referenced, guarded or not");
 
     let resume_dir = dir
         .path()
@@ -3128,13 +3207,18 @@ async fn a_resume_checkpoint_under_a_referenced_model_prefix_is_not_protected_by
         !resume_dir.join("manifest.json").exists(),
         "the resume checkpoint must actually be gone"
     );
-    // The model's own top-level bundle is untouched.
+    // Both sibling bundles are untouched.
     let prefix_dir = dir
         .path()
         .join("jammi_db")
         .join("models")
         .join("_global")
-        .join(&job_id);
+        .join(&job_id)
+        .join("worker-1")
+        .join("0");
     assert!(prefix_dir.join("adapter.safetensors").exists());
     assert!(prefix_dir.join("manifest.json").exists());
+    let epoch_dir = prefix_dir.join("checkpoints").join("epoch_0");
+    assert!(epoch_dir.join("adapter.safetensors").exists());
+    assert!(epoch_dir.join("manifest.json").exists());
 }

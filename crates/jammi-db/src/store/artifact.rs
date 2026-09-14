@@ -359,23 +359,32 @@ impl ArtifactStore {
     ///
     /// This is the UNGUARDED primitive: it carries no reference check of its
     /// own (`ArtifactStore` stays catalog-free), so it must never be called
-    /// directly on a prefix a live `models` row might still name.
-    /// Reachable from production code ONLY through two routes: (1)
+    /// on a prefix a live `models` row might still name — either itself or
+    /// as that row's immediate containing directory — without the caller
+    /// having already consulted
+    /// [`crate::store::ResultStore::prefix_is_referenced`] on that EXACT
+    /// prefix.
+    ///
+    /// Sanctioned routes: (1)
     /// [`crate::store::ResultStore::delete_unreferenced_prefix`], which
     /// consults [`crate::store::ResultStore::prefix_is_referenced`] first
-    /// and refuses, typed, before ever reaching this call — the sanctioned
-    /// route for a worker's abandon path (a losing cache-hit attempt, a
-    /// zombie's orphaned prefix); and (2) [`Self::delete_resume_checkpoint`]
-    /// / the epoch-checkpoint delete, whose own docs state why THEIR
-    /// prefixes (`_resume/`, `checkpoints/epoch_N/`) never need the guard —
-    /// no `models` row ever names either namespace.
+    /// and refuses, typed, before ever reaching this call — the route for a
+    /// worker's abandon path (a losing cache-hit attempt, a zombie's
+    /// orphaned prefix) and for a retained epoch checkpoint (a checkpoint's
+    /// own row means its caller must consult the guard on the checkpoint's
+    /// exact prefix, then call [`Self::delete_epoch_checkpoint`] only once
+    /// unreferenced — this type stays catalog-free, so it cannot perform
+    /// that consult itself); and (2) [`Self::delete_resume_checkpoint`],
+    /// whose own doc states why its `_resume/` prefix is proven to need no
+    /// guard at all (a namespace no `models` row's `artifact_path` can ever
+    /// name, equal or as an immediate containing directory).
     ///
     /// Used to GC a losing attempt's orphaned prefix. Reads the manifest to learn
     /// the keys and deletes each (plus the manifest); a 404 is not an error — the
     /// caller is paving over already-cleaned or never-completed state. A missing
     /// manifest means the attempt never completed its write; nothing durable to
     /// reclaim, so that is a no-op too.
-    pub async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
+    pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
         let handle = self.handle(prefix)?;
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
         let manifest = if handle.exists(&manifest_path).await? {
@@ -446,12 +455,20 @@ impl ArtifactStore {
     /// is `completed`, and the prefix is bounded to one bundle per job
     /// (overwrite-in-place), so this is the single point that reclaims it.
     ///
-    /// Calls the unguarded [`Self::delete_artifact_prefix`] directly, with
+    /// Calls the unguarded `Self::delete_artifact_prefix` directly, with
     /// no [`crate::store::ResultStore::prefix_is_referenced`] consult: the
     /// `_resume/` prefix is a namespace no `models` row's `artifact_path`
-    /// ever equals (it is never a served commit pointer, only a
-    /// crash-recovery side channel — see this type's own module docs), so
-    /// the guard has nothing to check.
+    /// ever names — equal or as an immediate containing directory —
+    /// because it is a SIBLING of every attempt-level path a served or
+    /// checkpoint row names
+    /// (`{job}/_resume` vs. `{job}/{worker}/{attempt}[/checkpoints/epoch_N]`),
+    /// never a served commit pointer itself, only a crash-recovery side
+    /// channel (see this type's own module docs). Proven by an executed
+    /// test, not asserted: `tests/it/reconcile.rs`'s
+    /// `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`
+    /// registers a job's served AND retained-checkpoint rows and asserts
+    /// [`crate::store::ResultStore::prefix_is_referenced`] still answers
+    /// `0` for the same job's resume prefix.
     pub async fn delete_resume_checkpoint(
         &self,
         tenant: Option<&TenantId>,
@@ -489,20 +506,51 @@ impl ArtifactStore {
         .await
     }
 
+    /// The exact prefix [`Self::put_epoch_checkpoint`] publishes to and
+    /// [`Self::delete_epoch_checkpoint`] deletes, computed without touching
+    /// storage — the SAME segment construction both of those methods use,
+    /// so a caller can never drift into asking
+    /// [`crate::store::ResultStore::prefix_is_referenced`] about a
+    /// different key than the one it is actually about to delete. This is
+    /// the port a caller MUST consult before calling
+    /// [`Self::delete_epoch_checkpoint`]: unlike [`Self::delete_resume_checkpoint`],
+    /// an epoch checkpoint is NOT exempt from the guard — a RETAINED
+    /// checkpoint gets its own `models` row whose `artifact_path` EQUALS
+    /// this exact prefix (the winning finalize CAS inserts one such row per
+    /// retained checkpoint), so an unguarded delete here can remove bytes a
+    /// live row still names.
+    pub fn epoch_checkpoint_prefix(
+        &self,
+        tenant: Option<&TenantId>,
+        job_id: &str,
+        worker_id: &str,
+        attempt: &str,
+        epoch: usize,
+    ) -> Result<StorageUrl> {
+        let segment = epoch_segment(epoch);
+        self.prefix_url(
+            tenant,
+            &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
+        )
+    }
+
     /// Best-effort GC of ONE epoch-checkpoint prefix
     /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{epoch}/`), tolerant
     /// of an epoch that was never actually written (no manifest — the same
-    /// no-op [`Self::delete_artifact_prefix`] already treats a never-completed
+    /// no-op `Self::delete_artifact_prefix` already treats a never-completed
     /// attempt as, not an error). This lets a caller derive and sweep a whole
     /// `[0, epochs)` range without first knowing how far training actually
     /// got: indices past the run's real progress are simply no-ops.
     ///
-    /// Calls the unguarded [`Self::delete_artifact_prefix`] directly, with
-    /// no [`crate::store::ResultStore::prefix_is_referenced`] consult: an
-    /// epoch-checkpoint prefix (`checkpoints/epoch_{N}/`) is a namespace no
-    /// `models` row's `artifact_path` ever equals (a served model points at
-    /// its winning attempt's TOP-level bundle, never at one epoch's
-    /// intermediate checkpoint), so the guard has nothing to check.
+    /// Calls the unguarded `Self::delete_artifact_prefix` directly, with
+    /// NO [`crate::store::ResultStore::prefix_is_referenced`] consult of
+    /// its own: this type stays catalog-free by design, so it cannot
+    /// perform that consult itself. A retained checkpoint's own row means
+    /// its `artifact_path` CAN equal this exact prefix — the caller MUST
+    /// compute the same prefix via [`Self::epoch_checkpoint_prefix`] and
+    /// consult [`crate::store::ResultStore::prefix_is_referenced`] on it
+    /// before calling this method; this is no longer an exempt namespace
+    /// (see [`Self::delete_resume_checkpoint`] for the one that still is).
     pub async fn delete_epoch_checkpoint(
         &self,
         tenant: Option<&TenantId>,
@@ -511,11 +559,7 @@ impl ArtifactStore {
         attempt: &str,
         epoch: usize,
     ) -> Result<()> {
-        let segment = epoch_segment(epoch);
-        let prefix = self.prefix_url(
-            tenant,
-            &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
-        )?;
+        let prefix = self.epoch_checkpoint_prefix(tenant, job_id, worker_id, attempt, epoch)?;
         self.delete_artifact_prefix(&prefix).await
     }
 

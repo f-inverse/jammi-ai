@@ -494,22 +494,57 @@ impl Catalog {
     /// rows, admin-scoped BY CONSTRUCTION exactly like
     /// [`Self::list_model_artifact_paths_all_tenants`] (see that method's
     /// doc for why no tenant predicate is issued here) — whose
-    /// `artifact_path` equals `prefix` EXACTLY.
+    /// `artifact_path` names `key_or_prefix` as ITSELF or as its
+    /// IMMEDIATE containing directory.
     ///
-    /// Equality, never containment: a checkpoint (`_resume/`,
-    /// `checkpoints/epoch_N/`) or any other object living BELOW a model's
-    /// `artifact_path` is a strict path DESCENDANT of it, never equal to
-    /// it, so it can never itself satisfy this predicate — those two
-    /// namespaces stay on [`crate::store::ArtifactStore::delete_artifact_prefix`]'s
-    /// unguarded primitive (see that method's doc for why).
+    /// A row's `artifact_path` is a FLAT directory of files (every
+    /// `put_artifact` bundle this store ever writes — served, resume, or
+    /// epoch-checkpoint — is a flat file list, never a bundle nested inside
+    /// its own subdirectories), so a byte a row's own publish is
+    /// responsible for is either the row's `artifact_path` itself (an
+    /// epoch checkpoint published UNDER a served attempt's prefix is
+    /// itself registered as its OWN row whose `artifact_path` EQUALS that
+    /// exact checkpoint prefix — the winning finalize CAS inserts one such
+    /// row per RETAINED checkpoint) or a plain file directly inside it
+    /// (e.g. `{attempt}/adapter.safetensors`, whose CONTAINING directory
+    /// equals the row's `artifact_path`). The predicate checks both shapes
+    /// in one query — `artifact_path = $1 OR artifact_path = $2`, where
+    /// `$2` is `key_or_prefix`'s own immediate parent directory (computed
+    /// in Rust, `rsplit_once('/')`, never a SQL `LIKE`/`SUBSTR` walk) —
+    /// and DELIBERATELY stops at one level: an ANCESTOR further up (e.g.
+    /// the served attempt's row, relative to an UNRETAINED epoch
+    /// checkpoint nested two segments deeper under
+    /// `checkpoints/epoch_N/`) is NEVER treated as referencing it. Each
+    /// independently-registered nested artifact carries its OWN row when
+    /// retained; an ancestor's row is never inherited protection for a
+    /// SEPARATE artifact merely because it happens to sit somewhere below
+    /// it in the physical layout — the whole reason an unretained epoch
+    /// checkpoint must stay reclaimable even while its enclosing served
+    /// attempt is very much alive and referenced. Indexed by
+    /// `idx_models_artifact_path` (migration 033) — this predicate issues
+    /// exactly ONE indexed lookup (matching either of two exact values)
+    /// per candidate object or prefix a caller is about to delete, an
+    /// acceptable cost for a byte-deleter that already performs its own
+    /// I/O per candidate.
+    ///
+    /// `_resume/` is the one namespace this predicate is never expected to
+    /// match: it is a SIBLING of a job's attempt-level artifact paths
+    /// (`{job}/_resume` vs. `{job}/{worker}/{attempt}`), so neither
+    /// `key_or_prefix` nor its immediate parent can ever equal a served or
+    /// checkpoint row's `artifact_path` — proven by an executed test, see
+    /// `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`
+    /// in `tests/it/reconcile.rs`.
     ///
     /// Discloses a COUNT ONLY — never row ids, model names, or tenant ids
     /// — so a tenant-bound caller consulting this predicate (through
     /// [`crate::store::ResultStore::prefix_is_referenced`]) learns only
     /// "referenced" vs. "not", never by whom.
-    pub async fn count_models_naming_prefix_all_tenants(&self, prefix: &str) -> Result<i64> {
-        let sql = "SELECT COUNT(*) AS n FROM models WHERE artifact_path = $1";
-        let prefix = prefix.to_string();
+    pub async fn count_models_naming_prefix_all_tenants(&self, key_or_prefix: &str) -> Result<i64> {
+        let parent = key_or_prefix
+            .rsplit_once('/')
+            .map(|(parent, _leaf)| parent.to_string());
+        let sql = "SELECT COUNT(*) AS n FROM models WHERE artifact_path = $1 OR artifact_path = $2";
+        let key_or_prefix = key_or_prefix.to_string();
         Ok(self
             .backend()
             .transaction(
@@ -519,9 +554,11 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query_opt(sql, &[SqlValue::TextOwned(prefix)], |row| {
-                            row.get::<i64>("n")
-                        })
+                        tx.query_opt(
+                            sql,
+                            &[SqlValue::TextOwned(key_or_prefix), SqlValue::from(parent)],
+                            |row| row.get::<i64>("n"),
+                        )
                         .await
                         .map(|opt| opt.unwrap_or(0))
                     })

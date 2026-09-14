@@ -693,8 +693,14 @@ pub enum ProducingDescriptor {
     /// the SAME uniform path [`Self::Embedding`]/[`Self::Inference`] already
     /// use for the model they invoke — so `base_model_id` (below) is the
     /// db-local mirror of `env.models[0].model_id`, not a second identity.
-    /// The fused-kernel admission profile is likewise an environment fact,
-    /// not a spec knob: [`MaterializationEnv::kernel_admission_profile`].
+    /// The fused-kernel admission profile is an environment fact, not a
+    /// spec knob, when it IS folded — but for this variant it is not: the
+    /// `FineTune` producer never calls
+    /// [`MaterializationEnv::with_kernel_admission_profile`], so
+    /// [`MaterializationEnv::kernel_admission_profile`] stays `None` here
+    /// and the real per-op fused/eager admission outcome is UNCOVERED by
+    /// this variant's [`DefinitionHash`] (that field's own doc carries the
+    /// tracking issue).
     ///
     /// `world_size` is the only topology field `TrainingCommon` carries;
     /// distributed (gang) training adds per-rank batch, partition-rule

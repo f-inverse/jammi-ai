@@ -62,7 +62,7 @@ handler):
 | `jammi.v1.embedding` | embedding generation, query encode, search |
 | `jammi.v1.error` | the typed wire-error message (no rpcs) |
 | `jammi.v1.eval` | the evaluation rpcs |
-| `jammi.v1.gang` | the coordinator-to-member gang-admission seam for a multi-host training run (`GangService.RunRank`) — served **only on `peer_bind`**, never on the public listener; tenant is derived from the verified job row, never the caller (see [Security Posture](./security.md#the-gang-listener-i-gang)) |
+| `jammi.v1.gang` | the coordinator-to-member gang-admission seam for a multi-host training run (`GangService.RunRank`) — served **only on `peer_bind`**, never on the public listener; no tenant value is read on this path at W=1 — tenant-scoped resolution is U5a-2's, #566 (see [Security Posture](./security.md#the-gang-listener-i-gang)) |
 | `jammi.v1.inference` | bulk inference + predict |
 | `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`) |
 | `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |

@@ -116,14 +116,21 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
 
 - **Every client of `peer_bind` is a jammi coordinator**, the same trust I-PEER
   states — no separate authentication for the gang seam.
-- **Tenant is derived from the job row, never the caller.** A `RunRank` call
-  carries only job coordinates (`job_id`, `attempt`, `rank`, `world`,
-  `coordinator_instance_id`); the member resolves the tenant from the `jobs`
-  row itself and pins every catalog access to it — caller-supplied tenant
-  metadata is ignored.
+- **No tenant value is read — not the caller's, and at W=1 not the row's.** A
+  `RunRank` call carries only job coordinates (`job_id`, `attempt`, `rank`,
+  `world`, `coordinator_instance_id`); caller-supplied tenant metadata is never
+  read, ambient admin scope is refused before any row is read, and the admission
+  row the member reads (`Catalog::get_job_for_rank`, primary key only) carries no
+  tenant column. Deriving the tenant from the `jobs` row and pinning the
+  training-set lookups to it is the world>1 conjunct U5a-2 builds
+  (<https://github.com/f-inverse/jammi-ai/issues/566>); until then a
+  coordinator on `peer_bind` holding another tenant's job coordinates can learn
+  only whether that job is admissible (`Unimplemented`) or not (the fixed
+  `FailedPrecondition`) — a liveness signal, no row content, bounded by I-PEER's
+  own trust statement above.
 - **Non-disclosure on refusal.** Every admission determinant — job not found,
-  not running, wrong claimant, wrong attempt, lease not live, training-set
-  identity unresolved or unverified, coordinator not fresh — collapses to the
+  not running, wrong claimant, wrong attempt, lease not live, world size not
+  one or undecodable, coordinator not fresh — collapses to the
   SAME status (`FAILED_PRECONDITION`) with a fixed message. The listener
   discloses neither a job's existence, its claimant, nor its attempt; tests
   distinguish determinants through a test-only seam, never response text.

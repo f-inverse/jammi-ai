@@ -36,11 +36,12 @@
 //! **A catalog fault during admission is `Unavailable`, never
 //! `FailedPrecondition`**: see `admission_catalog_fault`.
 //!
-//! **I-GANG derives tenant from the row, never ambient admin scope**
-//! (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3)) — this handler
+//! **I-GANG refuses ambient admin scope, and reads no tenant value at W=1**
+//! (`docs/rigor/contracts/feat_500-C-U5a-1.md` Addendum 3) — this handler
 //! refuses outright, before any row is even read, whenever
 //! [`TenantBinding::is_admin_scope`] is ambient: see
-//! [`GangRefusalReason::AdminScope`].
+//! [`GangRefusalReason::AdminScope`]. The row predicate itself carries no
+//! tenant column; tenant-scoped resolution is U5a-2's (#566).
 //!
 //! **`test-hooks` non-disclosure introspection**: behind
 //! `#[cfg(feature = "test-hooks")]`, `GangServer::last_refusal_reason`
@@ -53,9 +54,12 @@
 //!
 //! Served only on the internal `[server] peer_bind` listener, mounted beside
 //! `PeerService` (`OssServer::bind`) — never on the public listener, never
-//! wrapped by the tenant-binding layer. Tenant is derived from the verified
-//! `jobs` row, never the caller (I-GANG) — this handler never reads a
-//! `SessionTenant` extension the way the tenant-wrapped services do.
+//! wrapped by the tenant-binding layer. No tenant value is read on this path
+//! at W=1 — not from the caller (this handler never reads a `SessionTenant`
+//! extension the way the tenant-wrapped services do) and not from the row
+//! (`Catalog::get_job_for_rank` has no tenant column); the responses are
+//! status codes only. The exemption `tenant_isolation_oracle.rs` carries for
+//! this rpc states exactly that ground.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -108,8 +112,8 @@ fn i_gang_refused() -> Status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GangRefusalReason {
     /// [`TenantBinding::is_admin_scope`] was ambient when this call reached
-    /// the handler — I-GANG derives tenant from the row, never ambient admin
-    /// scope, so this is decided before any row is even read.
+    /// the handler — I-GANG refuses ambient admin scope outright, so this is
+    /// decided before any row is even read.
     AdminScope,
     /// No row exists for `assign.job_id`.
     NotFound,
@@ -315,22 +319,21 @@ impl GangService for GangServer {
             return Err(Status::invalid_argument("rank must be less than world"));
         }
 
-        // I-GANG derives tenant from the row, never ambient admin scope
-        // (docs/rigor/contracts/feat_500-C-U5a-1.md §2 (P3)) — this holds
-        // for the WHOLE handler, not merely a
-        // tenant-scoped catalog read it might one day perform: a call
-        // reaching this handler while wrapped in admin scope is refused
-        // outright, before any row is even read, the same fixed way every
-        // other determinant refuses.
+        // I-GANG refuses ambient admin scope
+        // (docs/rigor/contracts/feat_500-C-U5a-1.md Addendum 3) — this holds
+        // for the WHOLE handler, not merely a tenant-scoped catalog read a
+        // later unit performs: a call reaching this handler while wrapped in
+        // admin scope is refused outright, before any row is even read, the
+        // same fixed way every other determinant refuses.
         if TenantBinding::is_admin_scope() {
             self.record_refusal(GangRefusalReason::AdminScope);
             return Err(i_gang_refused());
         }
 
-        // The row predicate: primary-key-only, no tenant predicate —
-        // `Catalog::get_job_for_rank` never reads `assign.job_id`'s tenant
-        // from the caller (I-GANG: tenant is derived from the row itself,
-        // below).
+        // The row predicate: primary-key-only, no tenant predicate and no
+        // tenant column — at W=1 nothing on this path reads a tenant value,
+        // from the caller or from the row (I-GANG; the tenant-scoped
+        // resolution is U5a-2's, #566).
         let catalog = self.session.catalog();
         let row: RankAdmissionRow = match catalog.get_job_for_rank(&assign.job_id).await {
             Ok(Some(row)) => row,

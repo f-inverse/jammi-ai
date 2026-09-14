@@ -167,11 +167,21 @@ const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
 ];
 
 /// Rpcs served ONLY on the internal `[server] peer_bind` listener, beside
-/// `PeerService` — but NEVER appended to [`PEER_LISTENER_ALLOWLIST`], whose
-/// own doc explicitly calls its bucket "deliberately tenant-free". Gang
-/// admission is the OPPOSITE shape: I-GANG derives tenant from the verified
-/// `jobs` row (never the caller), so this bucket carries its own sentence
-/// rather than reusing the peer bucket's "deliberately tenant-free" one.
+/// `PeerService` — but NEVER appended to [`PEER_LISTENER_ALLOWLIST`], so the
+/// ground of each exemption stays stated per bucket. At the W=1 lattice this
+/// unit ships, `RunRank` reads NO tenant value at all: `Catalog::get_job_for_rank`
+/// is a primary-key row predicate with no tenant column, ambient admin scope
+/// is refused before any row is read, and the handler's only outputs are
+/// status codes. That is the whole ground of this exemption — not a
+/// derivation of tenant from the row, which nothing on this path performs.
+/// Tenant-scoped resolution (the world>1 training-set identity by the row's
+/// tenant) is U5a-2's to build (#566); when it lands, this sentence and its
+/// assertion below change to the derivation claim WITH a cross-tenant-denial
+/// case, never before. Residual stated, not hidden: a caller on `peer_bind`
+/// holding another tenant's `(job_id, coordinator_instance_id, attempt)` can
+/// distinguish `Unimplemented` (every determinant satisfied) from the fixed
+/// `FailedPrecondition`, a liveness oracle over that row — bounded by the
+/// listener's I-PEER trust (every client of `peer_bind` is a coordinator).
 ///
 /// The exemption's premise — that this path is NOT reachable on the public
 /// listener — is proven in this file by
@@ -181,7 +191,7 @@ const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
 const GANG_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[(
     "GangService",
     "RunRank",
-    "served only on peer_bind; tenant derived from the verified job row, never the caller",
+    "served only on peer_bind; reads no tenant value at W=1 (primary-key row predicate, ambient admin scope refused before any read, status-only responses); tenant-scoped resolution is U5a-2's (#566)",
 )];
 
 // ---------------------------------------------------------------------------
@@ -3341,8 +3351,10 @@ async fn gang_service_is_unimplemented_on_the_public_listener() {
     for (service, rpc, why) in GANG_LISTENER_ALLOWLIST {
         assert!(
             why.contains("served only on peer_bind")
-                && why.contains("tenant derived from the verified job row"),
-            "{service}/{rpc}: the allowlist entry must carry the I-GANG text"
+                && why.contains("reads no tenant value at W=1")
+                && why.contains("#566"),
+            "{service}/{rpc}: the allowlist entry must state the ground it actually has — no tenant \
+             value read at W=1, the derivation being U5a-2's (#566)"
         );
     }
 }

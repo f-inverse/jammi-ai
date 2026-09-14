@@ -146,9 +146,9 @@ those still in force are restated here in their v4 form. Principle in parenthese
     `peers[rank → instance_id]` and each peer resolves addresses through `instances.peer_addr`,
     refusing a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the
     only out-of-band value). `RunRank` gets its own
-    `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text: "served only on
-    peer_bind; tenant derived from the verified job row; deliberately not caller-scoped"),
-    unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
+    `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (its text states the ground
+    the shipped W=1 lattice actually has — no tenant value read on the path; the derivation claim
+    returns with U5a-2's cross-tenant-denial case, #566), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
     `api_freeze_baseline.txt` lines land in the same commit. (B5; D7's single-binder rule.)
 35. **Attempt fence on `job_id`**: a `RunRank` at attempt N aborts every local runner of that
     job at attempt < N; lesser-or-equal refused.

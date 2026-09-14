@@ -143,7 +143,7 @@ beside the call, not inside the repo method.
 
 ### 1.3 `Catalog::get_job_for_rank` (`crates/jammi-db/src/catalog/jobs_repo.rs`, at c1d918b4)
 
-`RankAdmissionRow` (`crates/jammi-db/src/catalog/jobs_repo.rs:207-221`): `status`, `tenant_id`,
+`RankAdmissionRow` (`crates/jammi-db/src/catalog/jobs_repo.rs:207-221`; superseded — Addendum 3): `status`, `tenant_id`,
 `claimed_by`, `attempts`, `lease_live` (bool), `remaining` (`Duration`), `training_set_ref`,
 `training_set_location`. `SELECT_COLS` (`crates/jammi-db/src/catalog/jobs_repo.rs:223-227`) is the
 catalog's canonical `jobs` column list, extended with the pair at its tail.
@@ -293,7 +293,8 @@ wire-level K2 edge, before I-GANG ever runs). Documented at `docs/guide/src/oper
 (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:181-185`) is its own bucket, deliberately
 **not** appended to `PEER_LISTENER_ALLOWLIST`
 (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:156-167`, whose own doc calls that bucket
-"deliberately tenant-free" — the opposite shape from I-GANG, which derives tenant from the row).
+"deliberately tenant-free" — at this head the opposite shape from I-GANG, which derived tenant from the row;
+superseded — Addendum 3).
 `covered_on_wire` (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:3119-3137`) and
 `allowlist_and_cases_partition_the_wire_surface`
 (`crates/jammi-server/tests/it/tenant_isolation_oracle.rs:3181-3210`) both union the new bucket in;
@@ -337,7 +338,8 @@ happen to name.
 **P3 — Tenant is derived, never accepted.** No code path in `run_rank` or
 `resolve_training_set_identity` reads a tenant value from `RankControl`/`Assign` (neither message
 declares one, §1.1) or from any per-call caller metadata; the only tenant value used is
-`row.tenant_id`, read from `get_job_for_rank`'s own row.
+`row.tenant_id`, read from `get_job_for_rank`'s own row. (Superseded — Addendum 3: at the shipped
+W=1 lattice no tenant value is read at all.)
 
 **P4 — The training-set identity pair is one fact.** For every `UPDATE jobs` statement this
 program issues against `training_set_ref`/`training_set_location` (the CAS at
@@ -859,3 +861,30 @@ which remained load-bearing at the reduced base. This unit ships the
 fixed way — plus the wire surface, the migration, and the write-once
 identity CAS as a db-layer primitive with no wire-path caller yet. Filed at
 <https://github.com/f-inverse/jammi-ai/issues/566>.
+
+## Addendum 3 — the tenant ground at the consolidated head (PR-B2)
+
+Addendum 2 recorded the resolver's deletion but not its consequence for the tenant claim: the
+same round removed `tenant_id` from `RankAdmissionRow` and from `get_job_for_rank`'s `SELECT`
+(`crates/jammi-db/src/catalog/jobs_repo.rs::RankAdmissionRow` — `status`, `claimed_by`, `attempts`,
+`world_size`, `lease_live`, `remaining`; no tenant column), and deleted the two cross-tenant `RunRank`
+oracles that had proven §2 P3. The phase-5 oracle on the consolidated head hard-blocked the
+`GANG_LISTENER_ALLOWLIST` exemption for stating a derivation nothing on the path performs.
+
+**The property as shipped.** At the W=1 lattice `RunRank` reads no tenant value: not the caller's (no
+`SessionTenant` extension is read; ambient admin scope is refused before any row is read) and not the
+row's (the predicate is primary-key-only with no tenant column); the handler's only outputs are status
+codes. The exemption's ground is therefore the listener's — served only on `peer_bind` beside
+`PeerService`, proven by
+`crates/jammi-server/tests/it/tenant_isolation_oracle.rs::gang_service_is_unimplemented_on_the_public_listener`
+— and its text and assertion now say so; the derivation claim returns with U5a-2's world>1 conjunct
+(#566) together with a cross-tenant-denial case, never before.
+
+**Residual, stated.** A coordinator on `peer_bind` holding another tenant's `(job_id,
+coordinator_instance_id, attempt)` can distinguish `Unimplemented` (every determinant satisfied) from
+the fixed `FailedPrecondition`: a liveness oracle over that row, no row content. Bounded by I-PEER's
+trust statement (every client of `peer_bind` is a coordinator) and closed by #566's tenant-scoped
+resolution. Every published sentence that stated the derivation as a present fact (`gang.proto`,
+`api_freeze_baseline.txt`, `docs/guide/src/security.md`, `api-stability.md`, `MAINTAINER-GUIDE.md`
+§2.8a, the plan's DESIGN/README) is corrected to this addendum's statement.
+

@@ -3110,8 +3110,9 @@ its own status:
    `InvalidArgument("world must be greater than zero")`; `rank >= world` →
    `InvalidArgument("rank must be less than world")`.
 2. **Ambient admin scope.** `TenantBinding::is_admin_scope()` — I-GANG
-   derives tenant from the row, never ambient admin scope, so this is
-   decided before any row is even read.
+   refuses ambient admin scope outright, so this is decided before any row
+   is even read. No tenant value is read on this path at W=1 (the admission
+   row carries no tenant column); tenant-scoped resolution is U5a-2's (#566).
 3. **I-GANG, the row predicate.** `Catalog::get_job_for_rank(job_id)`
    (`crates/jammi-db/src/catalog/jobs_repo.rs`, primary-key-only, no tenant
    predicate, never admin scope) returns the row by primary key alone — it
@@ -3187,10 +3188,15 @@ property and its rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
 (`Refuted`/`Unavailable`/`StoreUnavailable`) is likewise built with
 `HostAdmission` once an admitted session exists to re-verify inside.
 
-**Tenant handling.** Tenant is derived from the `jobs` row `get_job_for_rank`
-returns, never from caller metadata — a caller naming a different tenant is
-silently ignored, not refused. A NULL row tenant is not specially refused
-(the catalog's existing unscoped-read shape).
+**Tenant handling.** No tenant value is read on this path at W=1: caller
+metadata is never read (a caller naming a different tenant is silently
+ignored, not refused), ambient admin scope is refused before any row is
+read, and the row `get_job_for_rank` returns carries no tenant column.
+Deriving the tenant from the `jobs` row and pinning the training-set lookups
+to it is U5a-2's world>1 conjunct (#566); the `GANG_LISTENER_ALLOWLIST`
+exemption states exactly this ground, and the residual it leaves — a
+`peer_bind` caller can learn whether another tenant's job is admissible — is
+recorded on #566.
 
 **Observability.** `jammi_gang_requests_total{rpc="RunRank"}`
 (`crates/jammi-server/src/routes/health.rs`) counts every `RunRank` call

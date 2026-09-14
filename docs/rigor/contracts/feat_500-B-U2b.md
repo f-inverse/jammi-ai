@@ -165,6 +165,18 @@ differed from that target, by exactly the resolutions below.
   unaffected; `Bypass` is the serde default (`#[serde(default)]` on the field, `#[default]` on the enum) a
   row persisted before the field existed decodes to, so `get_job_for_rank` reads U3's `TrainingCommon` shape
   either way — the parity test executes green at this head.
+- C11 The `GangService/RunRank` tenant-isolation exemption — found by the phase-5 oracle on the
+  consolidated head (HARD_BLOCK), not by any unit: U5a-1's round-2 excision removed `tenant_id` from the
+  admission row and deleted the two cross-tenant oracles, leaving `GANG_LISTENER_ALLOWLIST`'s sentence
+  ("tenant derived from the verified job row") a claim nothing on the path performs, published as a
+  guarantee in `docs/guide/src/security.md`. No mechanism changed: the exemption's text and its
+  assertion in `crates/jammi-server/tests/it/tenant_isolation_oracle.rs` now state the ground the path
+  has (served only on `peer_bind`; no tenant value read at W=1; status-only responses; derivation is
+  U5a-2's, #566), and every sentence that stated the derivation as fact is corrected (`gang.rs`,
+  `gang.proto`, `api_freeze_baseline.txt`, `security.md`, `api-stability.md`, `MAINTAINER-GUIDE.md`,
+  plan DESIGN/README, U5a-1's contract Addendum 3). Property: the committed exemption names a property
+  an executed test proves (`gang_service_is_unimplemented_on_the_public_listener`), and the residual
+  it leaves (a liveness oracle over another tenant's job for a `peer_bind` caller) is stated on #566.
 
 ## Gates at the final head
 
@@ -188,7 +200,7 @@ reproduced; its one block — this record's own omission of C10 — and two attr
 `4bbc4a9a`) and an `oracle` PASS (the oracle record's `head_sha` tree equals the head outside
 `docs/rigor/**`). No further adversarial round was opened on the consolidated head: each unit's closing
 audit ended with its findings filed (#573, #574, #566, #562) under the program's closing rule, and the
-consolidation's own changes are the ten resolutions above.
+consolidation's own changes are the eleven resolutions above.
 
 ## Residuals recorded UNCOVERED
 
@@ -202,5 +214,8 @@ consolidation's own changes are the ten resolutions above.
   by touching the mechanism. (`main`'s own `jammi-ai` `it` suite fails
   `acceleration_report::probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_deterministic` on this
   machine; that test is untouched by this PR and passes at this head.)
+- `RunRank` at W=1 reads no tenant value, so a `peer_bind` caller holding another tenant's job coordinates learns
+  whether that job is admissible (`Unimplemented`) or not (`FailedPrecondition`) — a liveness signal, no row
+  content, within I-PEER's trust; closed by U5a-2's tenant-scoped resolution (#566). See C11.
 - The kernel-admission profile determinant (#546), the model→prefix ownership edge (#547), the untagged
   `JobSpec` (#548), and the W=1 mining parity oracle (#551) stand as filed by the units.

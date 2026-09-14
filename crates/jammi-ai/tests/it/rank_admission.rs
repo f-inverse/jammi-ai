@@ -35,6 +35,7 @@
 //! (`crates/jammi-server/tests/it/grpc_remote_compute.rs`), where a real
 //! client is available.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use jammi_ai::fine_tune::spec::{RankAdmission, TrainingCommon, TrainingSpec};
@@ -227,6 +228,60 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         job_count(&wide).await,
         wide_before + 1,
         "the admitted submission must enqueue exactly one row"
+    );
+}
+
+/// `cache = Use` on `TrainingSpec::FineTune` is refused on BOTH embedded
+/// submit entrances, not just the per-verb one: `InferenceSession::enqueue`
+/// takes an already-built spec, bypassing every per-verb entry point, and
+/// must still refuse it before writing a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fine_tune_cache_use_is_refused_through_enqueue_too() {
+    let (session, _dir) = session_with_devices(1).await;
+    let before = job_count(&session).await;
+
+    let spec = TrainingSpec::FineTune {
+        source: "patents".into(),
+        columns: vec!["abstract".into()],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        common: TrainingCommon {
+            base_model: "local:tiny".into(),
+            config: FineTuneConfig::default(),
+            world_size: 1,
+        },
+        cache: jammi_db::store::CachePolicy::Use,
+    };
+
+    let per_verb = session
+        .run_training_spec(spec.clone())
+        .await
+        .expect_err("cache = Use must be refused through the per-verb funnel");
+    assert!(
+        matches!(per_verb, JammiError::Config(_)),
+        "the refusal must be typed, got {per_verb:?}"
+    );
+
+    let generic = match session.enqueue(JobSpec::Training(Box::new(spec)), 0).await {
+        Ok(handle) => panic!(
+            "the generic enqueue entrance admitted a cache=Use job {}",
+            handle.job_id
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(generic, JammiError::Config(_)),
+        "the generic entrance must refuse the same way, got {generic:?}"
+    );
+    assert_eq!(
+        generic.to_string(),
+        per_verb.to_string(),
+        "one rule, one message, whichever entrance the spec came through"
+    );
+    assert_eq!(
+        job_count(&session).await,
+        before,
+        "a refused submission must enqueue nothing, through either entrance"
     );
 }
 
@@ -477,4 +532,93 @@ fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictor
         min_task_count: 2,
         seed: 7,
     }
+}
+
+/// Structural oracle: the CLOSED set of durable submit edges for a
+/// `TrainingSpec` — `InferenceSession::submit_fine_tune_spec_deduped`,
+/// `InferenceSession::enqueue`, and
+/// `pipeline::context_predictor::InferenceSession::train_context_predictor_deduped`
+/// — each calls `crate::fine_tune::spec::admit_training_spec`, the ONE
+/// function holding the rank admission, the per-kind validation, and the
+/// `cache = Use` refusal. This is deliberately source-level, not behavioural
+/// only: a re-implementation of the SAME checks inline at an edge, without
+/// going through the shared function, would pass every behavioural oracle
+/// above yet violate the property this test exists to pin — "ONE admission
+/// function", not merely "equivalent behaviour, duplicated". A fourth edge
+/// added later without updating this list is a loud failure here, not a
+/// silently-unadmitted spec.
+///
+/// Mutation (executed and reverted, never shipped — see this round's
+/// report): deleting the `admit_training_spec` call from `enqueue` drops
+/// the call count to 2 and this test fails, naming the file.
+#[test]
+fn every_durable_training_submit_edge_calls_the_one_admission_function() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/jammi-ai has two ancestors: crates/, then the repo root")
+        .to_path_buf();
+
+    // The stated, closed universe: (path relative to the repo root, the
+    // function whose body must call the admission fn).
+    let edges: &[(&str, &str)] = &[
+        (
+            "crates/jammi-ai/src/session.rs",
+            "async fn submit_fine_tune_spec_deduped(",
+        ),
+        ("crates/jammi-ai/src/jobs.rs", "pub async fn enqueue("),
+        (
+            "crates/jammi-ai/src/pipeline/context_predictor.rs",
+            "pub(crate) async fn train_context_predictor_deduped(",
+        ),
+    ];
+
+    // The call site every edge below must use, verbatim — the fully
+    // qualified path, never a bare `admit_training_spec(` (which would also
+    // match the function's OWN definition, `fn admit_training_spec(`).
+    const CALL: &str = "fine_tune::spec::admit_training_spec(";
+
+    let mut total_calls = 0usize;
+    for (path, fn_sig) in edges {
+        let full = root.join(path);
+        let src =
+            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+        let fn_start = src.find(fn_sig).unwrap_or_else(|| {
+            panic!("{path} no longer defines `{fn_sig}` — this oracle's edge list is stale")
+        });
+        // The function body: from the signature to the next line holding
+        // only a closing brace at the SAME (four-space method) indent —
+        // exact enough for these three concretely-indented methods, and any
+        // false match only widens the search window, never narrows it past
+        // the real body.
+        let after_sig = &src[fn_start..];
+        let body_end = after_sig.find("\n    }\n").unwrap_or(after_sig.len());
+        let body = &after_sig[..body_end];
+        let calls_in_body = body.matches(CALL).count();
+        assert!(
+            calls_in_body >= 1,
+            "{path}'s `{fn_sig}` must call `{CALL}` before writing a jobs row \
+             (found {calls_in_body} calls in its body)"
+        );
+        total_calls += calls_in_body;
+    }
+
+    // Nothing outside the three edges above calls it either — a stray
+    // fourth call site would mean an edge this list has not named.
+    let mut whole_crate_calls = 0usize;
+    for (path, _) in edges {
+        let full = root.join(path);
+        let src = std::fs::read_to_string(&full).unwrap();
+        whole_crate_calls += src.matches(CALL).count();
+    }
+    assert_eq!(
+        whole_crate_calls, total_calls,
+        "a call to the admission function exists outside the three named edge \
+         bodies — either a new edge needs adding to this oracle's list, or a \
+         call site drifted outside its edge's own function"
+    );
+    assert_eq!(
+        total_calls, 3,
+        "expected exactly one admission call per edge across the three-edge universe, got {total_calls}"
+    );
 }

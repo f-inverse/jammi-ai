@@ -1891,11 +1891,12 @@ declaring a second wire vocabulary for the identical concept;
 `crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it and returns it
 alongside `TrainingCommon` (never folded into that type — only the `FineTune` decode arm
 threads it onto `TrainingSpec::FineTune.cache`). Model-level cache reuse is not yet
-supported for `TrainingSpec::FineTune`: `Use` is refused, typed, at submit
-(`InferenceSession::submit_fine_tune_spec_deduped`,
-<https://github.com/f-inverse/jammi-ai/issues/562>) rather than probed against a recorded
-materialization, a different mechanism from the *result-table* `probe_cache_record` path
-the producers above use.
+supported for `TrainingSpec::FineTune`: `Use` is refused, typed, by `admit_training_spec`
+— the one admission every durable submit edge for a training spec applies before a `jobs`
+row is written (`InferenceSession::submit_fine_tune_spec_deduped`, `InferenceSession::enqueue`,
+and `train_context_predictor_deduped`; <https://github.com/f-inverse/jammi-ai/issues/562>)
+rather than probed against a recorded materialization, a different mechanism from the
+*result-table* `probe_cache_record` path the producers above use.
 
 **`cache = Use` is refused on both fine-tune kinds.** `cache` lives on
 `TrainingSpec::FineTune` itself; `TrainingSpec::GraphFineTune` carries no `cache` field at
@@ -2015,7 +2016,7 @@ CI if the guide and the code diverge:
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.
-- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); model-level cache reuse is not yet supported for this kind — `TrainingSpec::FineTune.cache = Use` is refused, typed, at submit (`InferenceSession::submit_fine_tune_spec_deduped`, <https://github.com/f-inverse/jammi-ai/issues/562>), and `Bypass` (the only value a submitted job can carry past that refusal) always trains; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
+- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); model-level cache reuse is not yet supported for this kind — `TrainingSpec::FineTune.cache = Use` is refused, typed, by `admit_training_spec`, the one admission every durable submit edge for a training spec applies (<https://github.com/f-inverse/jammi-ai/issues/562>), and `Bypass` (the only value a submitted job can carry past that refusal) always trains; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
 <!-- END PRODUCING-DESCRIPTOR-VARIANTS -->
 
 #### The recompute verb — descriptor replay + bounded cascade (`pipeline/recompute.rs`)

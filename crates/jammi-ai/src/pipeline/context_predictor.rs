@@ -554,13 +554,14 @@ impl InferenceSession {
         spec: &ContextPredictorTrainConfig,
         idempotency_key: Option<&str>,
     ) -> Result<crate::fine_tune::training_job::TrainingJob> {
-        spec.validate()?;
-
         let job_id = uuid::Uuid::new_v4().to_string();
         let training_spec = TrainingSpec::ContextPredictor {
             source: source_id.to_string(),
             predictor_spec: spec.clone(),
         };
+        // One of the three durable submit edges for a `TrainingSpec` — see
+        // `admit_training_spec`'s own doc for the other two.
+        crate::fine_tune::spec::admit_training_spec(self.jammi_config(), &training_spec)?;
         // `model_ref`/`output_model_id` come from the one derivation every
         // training submitter shares (`InferenceSession::training_job_links`):
         // the source's embedding model's PK, and the predictor's own id.

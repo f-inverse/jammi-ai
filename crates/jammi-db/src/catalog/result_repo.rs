@@ -1834,11 +1834,49 @@ impl Catalog {
 mod tests {
     use super::*;
 
+    /// The compiler anchor for [`ResultTableKind::ALL`]: an exhaustive match
+    /// with NO `_` arm, mapping each variant to its position in that array. A
+    /// variant added to the enum without also being added HERE fails to
+    /// COMPILE — the property [`every_result_table_kind_round_trips_through_its_db_string`]'s
+    /// old doc incorrectly attributed to its own injectivity assertion, which
+    /// ranges only over `ALL` and so can say nothing about a variant `ALL`
+    /// never lists in the first place (four variants existed in `ALL` and the
+    /// enum alike when that claim was written; it was never executed against
+    /// a fifth).
+    fn enumeration_index(kind: ResultTableKind) -> usize {
+        match kind {
+            ResultTableKind::Model => 0,
+            ResultTableKind::NeighborGraph => 1,
+            ResultTableKind::AsofJoin => 2,
+            ResultTableKind::TrainingSet => 3,
+        }
+    }
+
+    /// [`ResultTableKind::ALL`] is exactly the whole enum, checked against
+    /// [`enumeration_index`] rather than assumed: every index the anchor can
+    /// return is occupied by exactly one `ALL` entry, so `ALL` has no hole a
+    /// variant could hide in AND carries no duplicate.
+    #[test]
+    fn result_table_kind_all_is_the_whole_enum() {
+        let mut occupied: Vec<usize> = ResultTableKind::ALL
+            .iter()
+            .map(|k| enumeration_index(*k))
+            .collect();
+        occupied.sort_unstable();
+        assert_eq!(
+            occupied,
+            (0..ResultTableKind::ALL.len()).collect::<Vec<_>>(),
+            "ResultTableKind::ALL is missing a variant, or lists one twice"
+        );
+    }
+
     /// Family M: `as_db_str` and `try_from_db_str` are inverse over the WHOLE
     /// enum. The set ranged over is [`ResultTableKind::ALL`], which the
     /// `as_db_str` match is exhaustive against — so a kind added to the enum
-    /// without a spelling fails to compile, and one added without being listed
-    /// in `ALL` fails the injectivity assertion below.
+    /// without a spelling fails to compile — and which
+    /// [`result_table_kind_all_is_the_whole_enum`] separately proves is
+    /// itself complete, so ranging over `ALL` here is ranging over the whole
+    /// enum.
     #[test]
     fn every_result_table_kind_round_trips_through_its_db_string() {
         for kind in ResultTableKind::ALL {

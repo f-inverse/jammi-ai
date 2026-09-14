@@ -243,6 +243,76 @@ A projection that yields no rows is refused with a typed `EmptyTrainingSet`
 error before any catalog row or byte exists, so a run never trains on an empty
 set in silence.
 
+## Reusing a prior run (`cache = Use`)
+
+`fine_tune` (the column-source kind only — see below) accepts an opt-in cache dial,
+the same `cache` knob the compute verbs (`generate_embeddings`, `infer`, …) carry.
+`cache="use"` probes for an exact prior materialisation before training; the default,
+`cache="bypass"` (or omitting `cache` entirely), always trains.
+
+### Python
+
+```python
+job = db.fine_tune(
+    source="training",
+    base_model="sentence-transformers/all-MiniLM-L6-v2",
+    columns=["text_a", "text_b", "score"],
+    method="lora",
+    task="embedding",
+    cache="use",
+)
+result = job.wait()
+print(result["cache_outcome"])  # "computed", or "reused:<earlier-model-id>"
+print(f"Model: {result['model_id']}")
+```
+
+A hit registers THIS job's own model id pointing at the SAME already-published
+artifact prefix an earlier run published — no bytes are retrained or recopied. Both
+model ids stay independently servable; the earlier one can be deleted without
+disturbing this one (the prefix is reclaimed only once no model row references it).
+
+### Rust
+
+The embedded surface's cache dial lives on `jammi_wire::request::FineTuneRequest`
+(submitted through `InferenceSession::submit_fine_tune`), not on the loose
+`InferenceSession::fine_tune`/`fine_tune_graph` methods shown above, which always
+train (`cache: CachePolicy::Bypass`, unconditionally, at this commit). The remote
+`jammi_client::DataClient::submit_fine_tune` carries the same field. Neither Rust
+surface returns `cache_outcome` from `TrainingJob::wait()` today — only `model_id()`
+is exposed there; read the outcome from the Python binding (either transport), or
+from the remote `jammi_client::DataClient::job_status` call.
+
+### What the probe keys on
+
+The probe (`Catalog::probe_model_by_definition`) matches on an EXACT combination:
+the training set's definition hash + artifact digest + row count, the base model's
+identity, the whole canonical `TrainingSpec::FineTune` spec (every hyperparameter,
+the method, the task, the seed, `world_size`), and the execution environment (the
+engine version, the compute device, every invoked model's identity, and the
+fused-kernel admission profile the training loop actually resolved). Any one
+determinant differing — a different `lora_rank`, a different `world_size`, a
+different device — misses the probe, and the job trains.
+
+### `cache = Use` is scoped to the column-source kind
+
+`fine_tune_graph` accepts the same `cache=` keyword, but a `cache="use"` request is
+refused, typed (`jammi.errors.InvalidArgument` on both transports): a graph
+fine-tune's model carries no materialization to probe or record. `cache="bypass"`
+(the default) is unaffected — a graph fine-tune always trains, whether or not
+`cache` is named.
+
+### Two caveats
+
+- **Best-effort, not exclusion.** Two `cache="use"` jobs submitted for the same
+  spec close enough together can both miss the probe (neither's row is committed
+  yet) and both train — reuse skips a redundant run whenever it lands after an
+  earlier one has already published, not always.
+- **Reuse assumes a like-for-like fleet.** The probe folds the compute device's
+  ordinal (e.g. "CUDA device 0"), never a host or machine identity, so a model
+  trained on one host's GPU 0 can be served in place of a fresh run resolved to a
+  different host's GPU 0. This is sound for a fleet of interchangeable accelerators;
+  it is not a guarantee across heterogeneous hardware.
+
 ## Encoder-adapters fine-tuning (PEFT-style adapter injection)
 
 The default flow above trains a single low-rank **projection head** sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **encoder adapters** — LoRA injected into named linear layers *inside* the encoder stack, matching the PEFT convention.

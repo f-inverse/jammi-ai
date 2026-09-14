@@ -1183,4 +1183,30 @@ ALTER TABLE models ADD COLUMN definition_hash TEXT;
 ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
 CREATE INDEX idx_models_definition_hash ON models(definition_hash);
 CREATE INDEX idx_models_artifact_path ON models(artifact_path);
+/// Migration 034 (`CONTRACT-U5a.md` §W2 Routing, U5a-1): the gang's
+/// training-set identity pair on `jobs` — the `ArtifactDigest` of the
+/// coordinator's materialized `TrainingSet` (`training_set_ref`) and the
+/// `result_tables` NAME it materialized under (`training_set_location`),
+/// job-scoped (never attempt-scoped), written/consulted only for
+/// `world_size > 1`. Both columns start `NULL` on every existing and new
+/// row; a `world_size == 1` job never touches them, so this migration
+/// changes zero observable behaviour for every row it does not itself write.
+///
+/// **The pair is one fact, not two independently nullable columns (§W2
+/// Fill's stop rule).** A `CHECK` constraint pins this at the schema edge —
+/// preferred over "the only writer is the CAS" (Greenfield: a schema
+/// constraint that makes the wrong shape UNREPRESENTABLE beats a mechanism
+/// that merely avoids constructing it) — because both backends support a
+/// same-table-column `CHECK` referenced from an `ALTER TABLE ADD COLUMN`
+/// statement: SQLite (bundled `libsqlite3-sys` 0.30, SQLite ≥ 3.31) lifted
+/// its historical "no other columns" restriction on an added column's
+/// `CHECK` expression years ago, and Postgres has never had that
+/// restriction. The constraint fires on every `UPDATE` that would leave the
+/// pair split, not just on `INSERT` — a raw single-column write (never a
+/// call site this program makes; the CAS is the only writer, §W2 Fill) is
+/// refused by the database itself, not merely by convention.
+pub(super) const MIGRATION_034_JOBS_TRAINING_SET_IDENTITY: &str = r#"
+ALTER TABLE jobs ADD COLUMN training_set_ref TEXT;
+ALTER TABLE jobs ADD COLUMN training_set_location TEXT
+    CHECK ((training_set_ref IS NULL) = (training_set_location IS NULL));
 "#;

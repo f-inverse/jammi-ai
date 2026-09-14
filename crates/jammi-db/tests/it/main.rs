@@ -21,6 +21,7 @@ mod eval_per_query;
 mod exact_search;
 mod foundation;
 mod freshness;
+mod gang_rank_admission;
 mod index;
 mod jobs_queue;
 mod lease_keeper;

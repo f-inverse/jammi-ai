@@ -151,6 +151,20 @@ pub struct JobRecord {
     /// never fabricated into a state. Each terminal reason is distinct, so
     /// the retired marker names WHICH edge retired it.
     pub acceleration_report: Option<String>,
+    /// `CONTRACT-U5a.md` §W2: the `ArtifactDigest` of the coordinator's
+    /// materialized `TrainingSet` — job-scoped, write-once (see
+    /// [`Catalog::fill_training_set_identity`]), `NULL` until filled and for
+    /// every `world_size == 1` job. Never `Some` while
+    /// [`Self::training_set_location`] is `None`, or vice versa — enforced
+    /// by migration 033's `CHECK` constraint at the schema edge, not merely
+    /// by convention.
+    pub training_set_ref: Option<String>,
+    /// `CONTRACT-U5a.md` §W2: the `result_tables` NAME the coordinator
+    /// materialized the training set under — the one coordinate a rank
+    /// resolves with a single tenant-pinned lookup
+    /// (`Catalog::get_result_table_for_tenant`). See
+    /// [`Self::training_set_ref`]'s pairing note.
+    pub training_set_location: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -165,10 +179,52 @@ impl JobRecord {
     }
 }
 
+/// The outcome of [`Catalog::fill_training_set_identity`]'s write-once CAS
+/// (`CONTRACT-U5a.md` §W2 Fill).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingSetFillOutcome {
+    /// This call's own statement won the CAS: the pair is now set to the
+    /// values it passed.
+    Filled,
+    /// Zero rows updated, but a re-read under the SAME `claimed_by`/
+    /// `attempts` found the pair already set to the SAME values this call
+    /// passed — a concurrent racer (or a retried caller) observing its own
+    /// would-be write, never a second write.
+    Reused,
+    /// Zero rows updated, and the re-read found either a different
+    /// `claimed_by`/`attempts` (the claim moved) or a different pair value —
+    /// the attempt ends here with NO terminal write (§W2's "No
+    /// supersession"), a normal event, not a failure.
+    Aborted,
+}
+
+/// The row [`Catalog::get_job_for_rank`] returns — every field
+/// `CONTRACT-U5a.md` §I1(a)'s I-GANG predicate needs, computed in ONE
+/// statement. Tenant is a plain column here (never consulted against
+/// [`TenantBinding::is_admin_scope`] or [`Catalog::current_tenant`]) — the
+/// CALLER derives and pins it, per §I1's "tenant is derived from the row".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankAdmissionRow {
+    pub status: String,
+    pub tenant_id: Option<TenantId>,
+    pub claimed_by: Option<String>,
+    pub attempts: u32,
+    /// `NOT(lease_expired_clause)`, computed against the SAME clock
+    /// [`super::lease::lease_remaining_seconds_expr`] used for
+    /// [`Self::remaining`] — `false` for a `NULL` lease column (no
+    /// live-by-default), matching `lease.rs`'s own stated semantics.
+    pub lease_live: bool,
+    /// The remaining lease window, floored at zero once expired (or absent).
+    pub remaining: Duration,
+    pub training_set_ref: Option<String>,
+    pub training_set_location: Option<String>,
+}
+
 const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, partial_result, \
      result, error, progress_rows_done, progress_rows_total, progress_phase, cancel_requested, \
      model_ref, output_model_id, model_source, claimed_by, attempts, releases, \
-     lease_expires_at, priority, claimable, acceleration_report, created_at, updated_at";
+     lease_expires_at, priority, claimable, acceleration_report, \
+     training_set_ref, training_set_location, created_at, updated_at";
 
 /// The explicit submission-time marker [`Catalog::submit_job`] writes into
 /// `acceleration_report`: the job exists but no claimant has yet computed an
@@ -271,6 +327,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
         priority: row.get("priority")?,
         claimable: row.get("claimable")?,
         acceleration_report: row.try_get("acceleration_report")?,
+        training_set_ref: row.try_get("training_set_ref")?,
+        training_set_location: row.try_get("training_set_location")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -1722,6 +1780,178 @@ impl Catalog {
             })
             .await
             .map_err(Into::into)
+    }
+
+    /// `CONTRACT-U5a.md` §W2 Fill: the write-once CAS for the training-set
+    /// identity pair. ONE statement sets BOTH `training_set_ref` and
+    /// `training_set_location`, guarded on `job_id`, the CALLER'S OWN
+    /// `claimed_by`/`attempts`, and the pair still being unset —
+    /// `training_set_ref IS NULL AND training_set_location IS NULL`. A
+    /// concurrent second coordinator's CAS (the same attempt, racing this
+    /// one) sees zero rows updated and re-reads: if the pair landed with
+    /// the SAME values under the SAME claim, this is [`TrainingSetFillOutcome::Reused`]
+    /// (the loser observes its own would-be write already there, never a
+    /// second write); if the claim moved (a different `claimed_by`/
+    /// `attempts`) or the pair holds different values, this is
+    /// [`TrainingSetFillOutcome::Aborted`] — a normal event, not a failure,
+    /// and NO terminal write follows from it (§W2's "No supersession").
+    ///
+    /// The pair is one fact, not two independently nullable columns
+    /// (migration 033's `CHECK` constraint pins this at the schema edge);
+    /// this is the ONLY method in this crate that writes either column.
+    pub async fn fill_training_set_identity(
+        &self,
+        job_id: &str,
+        claimed_by: &str,
+        attempts: u32,
+        training_set_ref: &str,
+        training_set_location: &str,
+    ) -> Result<TrainingSetFillOutcome> {
+        let job_id = job_id.to_string();
+        let claimed_by = claimed_by.to_string();
+        let training_set_ref = training_set_ref.to_string();
+        let training_set_location = training_set_location.to_string();
+        let attempts_i = attempts as i64;
+        let now = now_sortable();
+
+        Ok(self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    let updated = tx
+                        .execute(
+                            "UPDATE jobs SET training_set_ref = $1, training_set_location = $2, \
+                                 updated_at = $3 \
+                             WHERE job_id = $4 AND claimed_by = $5 AND attempts = $6 \
+                               AND training_set_ref IS NULL AND training_set_location IS NULL",
+                            &[
+                                SqlValue::TextOwned(training_set_ref.clone()),
+                                SqlValue::TextOwned(training_set_location.clone()),
+                                SqlValue::TextOwned(now),
+                                SqlValue::TextOwned(job_id.clone()),
+                                SqlValue::TextOwned(claimed_by.clone()),
+                                SqlValue::Int(attempts_i),
+                            ],
+                        )
+                        .await?;
+                    if updated == 1 {
+                        return Ok(TrainingSetFillOutcome::Filled);
+                    }
+
+                    // Zero rows: re-read by primary key alone (this is an
+                    // internal consistency check on a job id the caller
+                    // already holds, not a tenant-scoped external read) and
+                    // decide REUSE vs ABORT.
+                    let row = tx
+                        .query_opt(
+                            "SELECT claimed_by, attempts, training_set_ref, training_set_location \
+                             FROM jobs WHERE job_id = $1",
+                            &[SqlValue::TextOwned(job_id)],
+                            |row| {
+                                Ok((
+                                    row.try_get::<String>("claimed_by")?,
+                                    row.get::<i32>("attempts")? as u32,
+                                    row.try_get::<String>("training_set_ref")?,
+                                    row.try_get::<String>("training_set_location")?,
+                                ))
+                            },
+                        )
+                        .await?;
+                    Ok(match row {
+                        Some((cb, att, Some(tsref), Some(tsloc)))
+                            if cb.as_deref() == Some(claimed_by.as_str())
+                                && att == attempts
+                                && tsref == training_set_ref
+                                && tsloc == training_set_location =>
+                        {
+                            TrainingSetFillOutcome::Reused
+                        }
+                        _ => TrainingSetFillOutcome::Aborted,
+                    })
+                })
+            })
+            .await?)
+    }
+
+    /// `CONTRACT-U5a.md` §I1(a): the row `GangService::run_rank`'s I-GANG
+    /// decision reads. Primary-key only (`WHERE job_id = $1`) — no tenant
+    /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
+    /// not consult it at all: tenant is returned as a plain column for the
+    /// CALLER to derive/pin, per §I1's "tenant is derived from the row").
+    /// ONE statement: the row's `status`/`claimed_by`/`attempts`/pair
+    /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
+    /// remaining window, from which [`RankAdmissionRow::lease_live`] is
+    /// derived — never a second round trip, and never the caller's OWN
+    /// clock standing in for the remaining-window computation (see that
+    /// function's docs). `Ok(None)` when no such job exists.
+    ///
+    /// **Enumerating-caller oracle** (`crates/jammi-server/tests/it/
+    /// gang_rank_admission_oracle.rs`): the only call site outside this
+    /// crate's own tests is the gang `RunRank` handler.
+    pub async fn get_job_for_rank(&self, job_id: &str) -> Result<Option<RankAdmissionRow>> {
+        let job_id = job_id.to_string();
+        let kind = self.backend().backend_kind();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let remaining_expr = super::lease::lease_remaining_seconds_expr(
+                            "lease_expires_at",
+                            kind,
+                            &mut params,
+                        );
+                        params.push(SqlValue::TextOwned(job_id));
+                        let job_bind = params.len();
+                        let sql = format!(
+                            "SELECT status, tenant_id, claimed_by, attempts, \
+                                 training_set_ref, training_set_location, \
+                                 {remaining_expr} AS remaining_secs \
+                             FROM jobs WHERE job_id = ${job_bind}"
+                        );
+                        tx.query_opt(&sql, &params, |row| {
+                            let tenant_id = row
+                                .try_get::<String>("tenant_id")?
+                                .map(|s| {
+                                    s.parse::<TenantId>().map_err(|e| {
+                                        BackendError::TypeConversion {
+                                            column: "tenant_id".to_string(),
+                                            detail: e.to_string(),
+                                        }
+                                    })
+                                })
+                                .transpose()?;
+                            let remaining_secs: Option<f64> = row.try_get("remaining_secs")?;
+                            // NULL (no lease) is treated exactly like an
+                            // expired one -- zero remaining, never live --
+                            // matching `lease_expired_clause`'s own `col IS
+                            // NULL` arm (`lease.rs`'s module docs: NULL means
+                            // remaining 0, never live-by-default).
+                            let remaining = remaining_secs
+                                .map(|s| Duration::from_secs_f64(s.max(0.0)))
+                                .unwrap_or(Duration::ZERO);
+                            let lease_live = remaining_secs.is_some_and(|s| s >= 0.0);
+                            Ok(RankAdmissionRow {
+                                status: row.get("status")?,
+                                tenant_id,
+                                claimed_by: row.try_get("claimed_by")?,
+                                attempts: row.get::<i32>("attempts")? as u32,
+                                lease_live,
+                                remaining,
+                                training_set_ref: row.try_get("training_set_ref")?,
+                                training_set_location: row.try_get("training_set_location")?,
+                            })
+                        })
+                        .await
+                    })
+                },
+            )
+            .await?)
     }
 
     /// Upsert this process's `instances` row: insert on first call

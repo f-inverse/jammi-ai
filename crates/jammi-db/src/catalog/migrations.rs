@@ -113,6 +113,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "033_model_materialization",
         schema::MIGRATION_033_MODEL_MATERIALIZATION,
+        "034_jobs_training_set_identity",
+        schema::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY,
     ),
 ];
 

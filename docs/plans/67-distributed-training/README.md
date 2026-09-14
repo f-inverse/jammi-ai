@@ -57,17 +57,20 @@ those still in force are restated here in their v4 form. Principle in parenthese
     `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`); that process is rank 0 and holds the only lease
     (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for `world_size > 1`: `fine_tune` and
     `graph_fine_tune`; `context_predictor` is refused at `world_size > 1` (K2, typed, at submit).
-27. **A peer is a fleet worker with a busy slot.** A peer is a `JobWorker` process whose
-    `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank` takes the
-    worker's single job slot: a `JobSlot` mutex the claim loop takes **before** `claim_next`,
-    **holds across** the inline `run_claimed_job_under`, and **releases before** the
-    idle sleep — all three in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until` —
-    so a peer never claims while it runs a rank, never aborts a claim
-    transaction (OPS D6), never receives a rank while training its own job, and is reachable
-    whenever idle. Handler order: same `job_id` with a lesser attempt → abort that runner and
-    take the slot; lesser-or-equal attempt → refuse; otherwise try-lock; busy → typed
-    `Unavailable`, and the coordinator picks another member or fails the attempt. No new worker
-    state. (B1; OPS D6.)
+27. **A peer is a fleet worker with a spare admission holder.** A peer is a `JobWorker` process
+    whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`
+    contends for `HostAdmission`'s single per-process holder cell — `Free` / `ClaimProbe` /
+    `JobRun` / `Rank{job_id, attempt}`, every transition a `send_if_modified` CAS, no lock held
+    across an `.await`. The claim loop acquires the holder (`Free → ClaimProbe`, `worker.rs:880`)
+    immediately before `claim_next`, and `claim_next`'s `Some(record)` arm flips it
+    `ClaimProbe → JobRun` under the same lock (`worker.rs:898`) — so a peer never claims while it
+    runs a rank, never aborts a claim transaction (OPS D6), never receives a rank while running
+    its own claimed job, and is reachable whenever idle. An admitted rank CASes `Free →
+    Rank{job_id, attempt}`; a busy holder (`JobRun` or another `Rank`) refuses `Unavailable` —
+    TRANSIENT, no assembly budget consumed, and the coordinator retries after ≥ one heartbeat or
+    picks another member. Inline `run_now` (`jobs.rs:710`, `ComputeSpec` only) never touches the
+    holder — it deliberately runs beside a loop-claimed job or an admitted rank, never excluded
+    by either. No new worker state beyond the holder cell itself. (B1; OPS D6.)
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
     sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-unit-2--membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
     not a plannable unit, so **U5b-1a** lands the

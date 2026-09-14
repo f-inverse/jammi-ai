@@ -36,6 +36,9 @@ fn fine_tune_spec_world_two() -> TrainingSpec {
             config: FineTuneConfig::default(),
             world_size: 2,
         },
+        // The policy field U3 put on this variant; this test decodes only
+        // `world_size`, so the value is the default every submit edge takes.
+        cache: jammi_db::store::CachePolicy::Bypass,
     }
 }
 

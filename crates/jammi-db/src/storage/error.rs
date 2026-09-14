@@ -81,12 +81,12 @@ pub enum StorageError {
     },
 
     /// A live `models` row — in some tenant scope, not necessarily the
-    /// caller's own — still names this prefix as its `artifact_path`
-    /// EXACTLY, so the guarded delete path
+    /// caller's own — still names this prefix as its `artifact_path`,
+    /// either exactly or as its immediate containing directory, so the
+    /// guarded delete path
     /// ([`crate::store::ResultStore::delete_unreferenced_prefix`]) refused
-    /// to remove it. Never surfaced by
-    /// [`crate::store::ArtifactStore::delete_artifact_prefix`] itself, which
-    /// stays the unguarded primitive.
+    /// to remove it. Never surfaced by `ArtifactStore::delete_artifact_prefix`
+    /// itself, which stays the unguarded primitive.
     ///
     /// Carries a COUNT only — never row ids, model names, or tenant ids —
     /// since the caller asking to delete `prefix` may itself be

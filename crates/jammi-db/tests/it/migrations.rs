@@ -1555,9 +1555,10 @@ async fn migration_032_creates_result_table_versions(
 /// AFTER `032_result_table_versions` (K5: relative position, never
 /// `.last()`, so a renumber on a later merge keeps this green), adds
 /// the two NULLABLE `models` columns (`definition_hash`,
-/// `input_anchors_json`), and the `idx_models_definition_hash` cache-lookup
-/// index — on both backends. `manifest_path` is deliberately absent: the
-/// sidecar path stays derived from the artifact prefix rather than recorded.
+/// `input_anchors_json`), the `idx_models_definition_hash` cache-lookup
+/// index, and the `idx_models_artifact_path` reference-guard index — on
+/// both backends. `manifest_path` is deliberately absent: the sidecar path
+/// stays derived from the artifact prefix rather than recorded.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -1682,44 +1683,46 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
          the sidecar path is derived from the artifact prefix, never recorded); got {columns:?}"
     );
 
-    let index_present = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    match kind {
-                        BackendKind::Sqlite => {
-                            tx.query::<_, i64>(
-                                "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
-                                 AND name='idx_models_definition_hash' AND tbl_name='models'",
-                                &[],
-                                |row| row.get("one"),
-                            )
-                            .await
+    for index_name in ["idx_models_definition_hash", "idx_models_artifact_path"] {
+        let index_present = backend
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        match kind {
+                            BackendKind::Sqlite => {
+                                tx.query::<_, i64>(
+                                    &format!(
+                                        "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
+                                         AND name='{index_name}' AND tbl_name='models'"
+                                    ),
+                                    &[],
+                                    |row| row.get("one"),
+                                )
+                                .await
+                            }
+                            BackendKind::Postgres => {
+                                tx.query::<_, i64>(
+                                    &format!(
+                                        "SELECT 1::bigint AS one FROM pg_indexes \
+                                         WHERE tablename = 'models' AND indexname = '{index_name}'"
+                                    ),
+                                    &[],
+                                    |row| row.get("one"),
+                                )
+                                .await
+                            }
                         }
-                        BackendKind::Postgres => {
-                            tx.query::<_, i64>(
-                                "SELECT 1::bigint AS one FROM pg_indexes WHERE tablename = 'models' \
-                                 AND indexname = 'idx_models_definition_hash'",
-                                &[],
-                                |row| row.get("one"),
-                            )
-                            .await
-                        }
-                    }
-                })
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        index_present.len(),
-        1,
-        "idx_models_definition_hash must exist on models"
-    );
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(index_present.len(), 1, "{index_name} must exist on models");
+    }
 
     // A pre-migration-shaped row (NULL definition_hash) is never matched by
     // an equality probe -- the SQL-level half of "NULL never matches" the

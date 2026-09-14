@@ -1497,6 +1497,127 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
     assert!(!again, "a completed job cannot be finished again");
 }
 
+/// A RETAINED epoch checkpoint's own row makes its EXACT prefix referenced
+/// — `delete_epoch_checkpoint`'s former exemption (no `models` row ever
+/// equals an epoch-checkpoint prefix) is false the moment
+/// `finish_job_with_model` commits such a row (`jobs_repo.rs` INSERTs one
+/// `models` row per RETAINED checkpoint whose `artifact_path` EQUALS the
+/// checkpoint's own prefix, never a bare job-level one) — while an
+/// UNRETAINED epoch (no row was ever inserted for it) stays unreferenced
+/// and reclaimable — even while its enclosing served attempt is itself
+/// very much referenced, since the predicate deliberately stops at ONE
+/// containing-directory level and never inherits an ancestor's protection
+/// for an independently-registrable nested artifact. Also exercises the
+/// immediate-parent leg of the same predicate: an object living directly
+/// INSIDE the served bundle (never itself a row) counts as referenced
+/// too.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn a_retained_epoch_checkpoints_own_row_makes_its_exact_prefix_referenced(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let job_id = format!("epoch-ref-{}", run_suffix());
+    let model = format!("jammi:fine-tuned:{job_id}");
+    let epoch_0 = format!("{model}:epoch_0");
+    let served_prefix = "file:///artifacts/epoch-ref/worker-1/0";
+    let retained_prefix = "file:///artifacts/epoch-ref/worker-1/0/checkpoints/epoch_0";
+    let unretained_prefix = "file:///artifacts/epoch-ref/worker-1/0/checkpoints/epoch_1";
+
+    catalog
+        .submit_job(job_params_with_output(&job_id, &model))
+        .await
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: &model,
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base::1"),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .claim_next("worker-1", KINDS, Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("claims the job");
+
+    let retained_rows = [EpochCheckpointRow {
+        model_id: &epoch_0,
+        model_type: "fine-tuned",
+        task: ModelTask::TextEmbedding,
+        base_model_id: Some("q-base"),
+        artifact_path: retained_prefix,
+    }];
+    let finished = catalog
+        .finish_job_with_model(FinishJobWithModelParams {
+            job_id: &job_id,
+            instance_id: "worker-1",
+            attempts: 1,
+            result: r#"{"k":1}"#,
+            output_model_id: &model,
+            output_model_version: 1,
+            artifact_path: served_prefix,
+            epoch_checkpoints: &retained_rows,
+        })
+        .await
+        .unwrap();
+    assert!(finished, "the sole attempt finishes the job");
+
+    // The retained checkpoint's own row makes its EXACT prefix referenced
+    // — the equality leg of the predicate. The served bundle's row is a
+    // more distant ancestor (two segments up, past `checkpoints/epoch_0`),
+    // never an immediate containing directory of `retained_prefix`, so it
+    // does NOT also count here — the predicate is deliberately ONE level.
+    assert_eq!(
+        catalog
+            .count_models_naming_prefix_all_tenants(retained_prefix)
+            .await
+            .unwrap(),
+        1,
+        "a retained epoch checkpoint's own row must make its exact prefix referenced"
+    );
+    // An epoch that was never retained (no row was ever inserted for it)
+    // stays unreferenced and reclaimable.
+    assert_eq!(
+        catalog
+            .count_models_naming_prefix_all_tenants(unretained_prefix)
+            .await
+            .unwrap(),
+        0,
+        "an unretained epoch checkpoint must stay unreferenced and reclaimable"
+    );
+    // The served bundle's own top-level prefix is also referenced.
+    assert_eq!(
+        catalog
+            .count_models_naming_prefix_all_tenants(served_prefix)
+            .await
+            .unwrap(),
+        1
+    );
+    // An object living directly INSIDE that served bundle — never itself a
+    // row — is referenced too: the immediate-parent leg of the predicate.
+    assert_eq!(
+        catalog
+            .count_models_naming_prefix_all_tenants(&format!("{served_prefix}/adapter.safetensors"))
+            .await
+            .unwrap(),
+        1,
+        "an object living inside a referenced bundle must count as referenced too \
+         (immediate-parent leg)"
+    );
+}
+
 /// B5 hardening regression (unit 348), ported: the finish-with-model CAS's
 /// model-row `UPDATE` must be scoped by `name AND version AND tenant`, never
 /// `name` alone — three rows share the name "acme/tuned": (tenant-a, v1),

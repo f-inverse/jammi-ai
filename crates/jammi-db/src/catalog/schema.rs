@@ -1171,8 +1171,16 @@ ALTER TABLE index_segments ADD COLUMN version INTEGER;
 /// reaps it. The index mirrors migration 022's
 /// `idx_result_tables_definition_hash` for the same probe's hot-path
 /// predicate.
+///
+/// `idx_models_artifact_path` backs
+/// [`crate::catalog::model_repo::Catalog::count_models_naming_prefix_all_tenants`]'s
+/// per-object "does any live row name this key or an ancestor of it"
+/// consult — every `models/`-namespaced byte-delete runs this query once
+/// per candidate, so it needs an index exactly like the definition-hash
+/// probe above does.
 pub(super) const MIGRATION_033_MODEL_MATERIALIZATION: &str = r#"
 ALTER TABLE models ADD COLUMN definition_hash TEXT;
 ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
 CREATE INDEX idx_models_definition_hash ON models(definition_hash);
+CREATE INDEX idx_models_artifact_path ON models(artifact_path);
 "#;

@@ -30,8 +30,11 @@ inside its directory, so a ``shutil.rmtree`` racing it fails with ``OSError:
 
 Known limit, stated rather than assumed: the guard tracks the ``jammi.connect``
 *module attribute*, so a test that bound ``from jammi import connect`` at import
-time would slip past it. That shape is not merely discouraged — it is failed, by
-name, by ``test_session_lifecycle_shape.py::test_tests_call_connect_through_the_module``.
+time would slip past it. No module in this test suite binds it that way today
+(checked by hand, not by a standing gate); a static gate that would have
+failed such a binding by name was excised (its close oracle was unsound — see
+issue #539) rather than repaired, so this limit is currently undetected rather
+than merely discouraged.
 """
 
 from __future__ import annotations
@@ -43,8 +46,7 @@ import pytest
 
 # Enables the `pytester` fixture: `test_session_lifecycle_guard.py` runs a
 # throwaway pytest session, through THIS conftest, in a subprocess — the
-# non-vacuity control for the runtime rail below (the static shape gate
-# already has its own in `test_session_lifecycle_shape.py`).
+# non-vacuity control for the runtime rail below.
 pytest_plugins = ["pytester"]
 
 try:  # the suite also runs where the [embedded] extra is absent

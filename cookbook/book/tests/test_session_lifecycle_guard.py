@@ -1,9 +1,13 @@
-"""The runtime half of the session-lifecycle rail bites — a committed
-non-vacuity test for ``conftest.py``'s ``_no_leaked_sessions`` autouse guard.
+"""The runtime rail's own non-vacuity test for ``conftest.py``'s
+``_no_leaked_sessions`` autouse guard.
 
-``test_session_lifecycle_shape.py`` proves the STATIC gate is not vacuous (its
-own self-tests, on synthetic source text). Nothing committed proved the same
-for the RUNTIME rail: that a test which actually leaves a session open is
+The session-lifecycle rail had a static half too — an enumerating textual
+shape gate over `cookbook/**` — but a third audit found its with-item-only
+close oracle unsound on several with-item shapes it could not tell from a
+real close, and the real control-flow analysis that would fix it soundly is
+filed as its own unit (issue #539); the static gate was excised rather than
+narrowed again. The runtime guard here is what remains, and nothing committed
+proved that it bites: that a test which actually leaves a session open is
 actually failed, BY NAME, at teardown — on both transports. This file is that
 proof, run as a real pytest session rather than a unit test of a helper
 function, because the guard's own subject is "how does the outer pytest run

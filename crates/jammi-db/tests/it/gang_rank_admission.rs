@@ -2,16 +2,22 @@
 //! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A1) and
 //! `Catalog::fill_training_set_identity` (the training-set identity
 //! write-once CAS). `Catalog::fresh_instance`'s own
-//! tests live in `gang_instance_freshness.rs`. Every test runs on a fresh
+//! tests live in `gang_instance_freshness.rs`. Most tests run on a fresh
 //! SQLite catalog (a private tempdir per test; the gang admission surface has
 //! no Postgres-only behaviour these primitives need to exercise beyond what
-//! `jobs_queue.rs` already covers for the shared lease/reclaim machinery).
+//! `jobs_queue.rs` already covers for the shared lease/reclaim machinery),
+//! except `world_size` decoding (a targeted JSON field read with no
+//! backend-specific SQL of its own, but still worth the same
+//! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses, per
+//! the round-2 fold) — those cases also run a `::postgres` arm gated by
+//! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
+//! is unset.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_db::catalog::backend::TxOptions;
-use jammi_db::catalog::jobs_repo::{SubmitJobParams, TrainingSetFillOutcome};
+use jammi_db::catalog::backend::{BackendKind, TxOptions};
+use jammi_db::catalog::jobs_repo::{SubmitJobParams, TrainingSetFillOutcome, WorldSizeFact};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
@@ -37,7 +43,7 @@ fn job_params(job_id: &str) -> SubmitJobParams<'_> {
 
 async fn base_catalog() -> (tempfile::TempDir, Arc<Catalog>) {
     let dir = tempdir().unwrap();
-    let session = make_test_session(jammi_db::catalog::backend::BackendKind::Sqlite, dir.path())
+    let session = make_test_session(BackendKind::Sqlite, dir.path())
         .await
         .expect("sqlite session always available");
     let catalog = Arc::clone(session.catalog());
@@ -55,6 +61,55 @@ async fn base_catalog() -> (tempfile::TempDir, Arc<Catalog>) {
         .await
         .unwrap();
     (dir, catalog)
+}
+
+/// Clear every row from `jobs`/`instances`/`workers` so the global claim
+/// scan in [`Catalog::claim_next`] sees only the rows a test creates itself
+/// — the same shape as `jobs_queue.rs`'s own `reset_queue`. Needed because
+/// the Postgres lane shares ONE live database across the whole run
+/// (`jammi_test_utils::make_test_session`'s own docs); the SQLite lane gets
+/// a fresh tempdir per test regardless, so running the reset there too keeps
+/// one path for both backends. CI runs the Postgres lane under
+/// `--test-threads=1`, so the reset-then-populate sequence here is
+/// serialised and cannot race a sibling test.
+async fn reset_queue(catalog: &Catalog) {
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("DELETE FROM jobs", &[]).await?;
+                tx.execute("DELETE FROM workers", &[]).await?;
+                tx.execute("DELETE FROM instances", &[]).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// Parameterized counterpart of [`base_catalog`] for the `world_size`
+/// decoding oracles, which also run a `::postgres` arm. Returns `None`
+/// (never a panic) when `kind = Postgres` and `JAMMI_TEST_PG_URL` is unset,
+/// so callers skip exactly like `migrations.rs`'s own parameterized tests.
+async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(kind, dir.path()).await?;
+    let catalog = Arc::clone(session.catalog());
+    reset_queue(&catalog).await;
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "q-base",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    Some((dir, catalog))
 }
 
 // ---------------------------------------------------------------------------
@@ -207,17 +262,28 @@ async fn get_job_for_rank_reflects_the_row_world_size() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.world_size, 2,
+        row.world_size,
+        WorldSizeFact::Decoded(2),
         "the row's own world_size must round-trip"
     );
 }
 
 /// A spec naming no `world_size` at all (`job_params`'s `"{}"`, every
 /// existing fixture in this file) reads back `1` — the single-rank default,
-/// never an error and never left undefined.
+/// never an error and never left undefined. Parameterized (sqlite/postgres,
+/// the `migrations.rs` shape): the postgres arm skips (never fails) when
+/// `JAMMI_TEST_PG_URL` is unset.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
 #[tokio::test]
-async fn get_job_for_rank_defaults_world_size_when_absent_from_spec() {
-    let (_dir, catalog) = base_catalog().await;
+async fn get_job_for_rank_defaults_world_size_when_absent_from_spec(kind: BackendKind) {
+    let Some((_dir, catalog)) = base_catalog_kind(kind).await else {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    };
     catalog
         .submit_job(job_params("job-world-absent"))
         .await
@@ -234,16 +300,28 @@ async fn get_job_for_rank_defaults_world_size_when_absent_from_spec() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.world_size, 1,
+        row.world_size,
+        WorldSizeFact::Decoded(1),
         "a spec naming no world_size must default to 1, never fail and never default to 0"
     );
 }
 
 /// A `world_size` field present but not a valid rank count (a string, here)
-/// is a typed error, never silently coerced to `1`.
+/// is a ROW FACT (`WorldSizeFact::Undecodable`), never a fault: the read
+/// still succeeds (`Ok(Some(row))`) and every OTHER column round-trips
+/// exactly as it would for a decodable row. Parameterized (sqlite/postgres);
+/// the postgres arm skips (never fails) when `JAMMI_TEST_PG_URL` is unset.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
 #[tokio::test]
-async fn get_job_for_rank_malformed_world_size_is_a_typed_error() {
-    let (_dir, catalog) = base_catalog().await;
+async fn get_job_for_rank_malformed_world_size_is_undecodable_not_a_fault(kind: BackendKind) {
+    let Some((_dir, catalog)) = base_catalog_kind(kind).await else {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    };
     catalog
         .submit_job(SubmitJobParams {
             job_id: "job-world-malformed",
@@ -263,15 +341,97 @@ async fn get_job_for_rank_malformed_world_size_is_a_typed_error() {
         .unwrap()
         .unwrap();
 
-    let err = catalog
+    let row = catalog
         .get_job_for_rank("job-world-malformed")
         .await
-        .expect_err("a non-numeric world_size must be a typed error, never a silent 1");
-    let message = err.to_string();
-    assert!(
-        message.contains("world_size") || message.contains("spec"),
-        "the error must name what failed to decode, got: {message}"
+        .expect("a non-numeric world_size must be a row fact, never an Err")
+        .expect("the row exists");
+    assert_eq!(
+        row.world_size,
+        WorldSizeFact::Undecodable,
+        "a non-numeric world_size must decode to Undecodable, never a silent 1"
     );
+    assert_eq!(row.status, "running", "every other column stays populated");
+    assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
+    assert_eq!(row.attempts, 1);
+    assert_eq!(row.training_set_ref, None);
+    assert_eq!(row.training_set_location, None);
+}
+
+/// Spec text that is not valid JSON at all (so it is not even representable
+/// as any JSON object) is the SAME row fact as a malformed field —
+/// `Undecodable`, never a fault — with every other column still populated.
+/// Parameterized (sqlite/postgres); the postgres arm skips (never fails)
+/// when `JAMMI_TEST_PG_URL` is unset.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn get_job_for_rank_spec_not_json_is_undecodable_not_a_fault(kind: BackendKind) {
+    let Some((_dir, catalog)) = base_catalog_kind(kind).await else {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    };
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: "job-world-not-json",
+            kind: KIND,
+            execution: JobExecution::Queued,
+            spec: "not-even-json",
+            model_ref: Some("q-base::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    catalog
+        .claim_next("coord-1", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let row = catalog
+        .get_job_for_rank("job-world-not-json")
+        .await
+        .expect("spec text that fails to parse must be a row fact, never an Err")
+        .expect("the row exists");
+    assert_eq!(row.world_size, WorldSizeFact::Undecodable);
+    assert_eq!(row.status, "running", "every other column stays populated");
+    assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
+    assert_eq!(row.attempts, 1);
+}
+
+/// A genuine driver-level fault (the table this read depends on is gone) is
+/// still `Err` — distinguishing "the row's content did not decode" from
+/// "the read itself faulted" is the whole point of `WorldSizeFact`.
+#[tokio::test]
+async fn get_job_for_rank_driver_fault_still_surfaces_as_err() {
+    let (_dir, catalog) = base_catalog().await;
+    catalog
+        .submit_job(job_params("job-driver-fault"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next("coord-1", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move { tx.execute("DROP TABLE jobs", &[]).await })
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .get_job_for_rank("job-driver-fault")
+        .await
+        .expect_err("a dropped table must still surface as a genuine Err, not a row fact");
 }
 
 // ---------------------------------------------------------------------------

@@ -1441,7 +1441,8 @@ impl Catalog {
     /// admin scope, regardless of which tenant it passes, guards that at its
     /// own call site rather than relying on this method to refuse.
     ///
-    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §W2 Resolution: a rank
+    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.2 ("Ruling 5
+    /// (strict-predicate verb, never the relaxed read)"): a rank
     /// resolving its job's training-set identity through
     /// [`Self::get_result_table`] could resolve a NULL-tenant table of the
     /// same name belonging to no tenant (or the wrong one) whenever one

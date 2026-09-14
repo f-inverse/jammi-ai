@@ -490,20 +490,64 @@ else:  # pragma: no cover -- exercised via simulated import below
     _NoDuplicateKeysSafeLoader = None  # type: ignore[assignment]
 
 
+def _assert_no_github_incompatible_yaml(text: str) -> None:
+    """GitHub Actions' own workflow-file parser does not accept YAML
+    anchors, aliases (including merge keys, which are always defined via an
+    alias), or explicit tags (`!!str`, a custom `!foo`, ...) -- resolving
+    one of these here would let this reader parse a document GitHub itself
+    refuses to run at all. Walks the raw PARSER EVENT stream (`yaml.parse`,
+    never a resolved node or constructed doc) because an event's `.tag` is
+    `None` for every implicitly-typed scalar/mapping/sequence -- including a
+    QUOTED scalar -- and is only ever set to a real tag string when the
+    source text carried an EXPLICIT tag; a composed `Node`'s own `.tag`
+    cannot make that distinction; the two paths would resolve `!!str push`
+    and a bare `push` to the SAME `tag:yaml.org,2002:str`. Raises
+    `WorkflowLoadError`, naming the exact construct, the moment one is
+    seen -- before either `load_workflow_text` or `job_source_spans` trusts
+    any parse of this text."""
+    if yaml is None:
+        raise WorkflowLoadError(_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR))
+    try:
+        events = yaml.parse(text, Loader=yaml.SafeLoader)
+        for event in events:
+            if isinstance(event, yaml.AliasEvent):
+                raise WorkflowLoadError(
+                    "YAML anchors/aliases/tags are not accepted by GitHub Actions -- "
+                    f"cannot examine: alias *{event.anchor}"
+                )
+            anchor = getattr(event, "anchor", None)
+            if anchor:
+                raise WorkflowLoadError(
+                    "YAML anchors/aliases/tags are not accepted by GitHub Actions -- "
+                    f"cannot examine: anchor &{anchor}"
+                )
+            tag = getattr(event, "tag", None)
+            if tag is not None:
+                raise WorkflowLoadError(
+                    "YAML anchors/aliases/tags are not accepted by GitHub Actions -- "
+                    f"cannot examine: explicit tag {tag}"
+                )
+    except yaml.YAMLError as exc:
+        raise WorkflowLoadError(f"cannot parse YAML: {exc}") from exc
+
+
 def load_workflow_text(text: str) -> dict:
     """The workflow document, fully parsed (`yaml.load` under
     `_NoDuplicateKeysSafeLoader`) and validated as a top-level mapping with
     at most one spelling of the `on:` trigger key. Raises `WorkflowLoadError`
     -- never returns a partial or empty dict standing in for a refusal --
     on: a missing PyYAML install; any YAML syntax error (tab indentation, an
-    inconsistent dedent, an undefined alias, ...); a document whose top
-    level is not a mapping; a duplicate mapping key at any level; or a
-    document carrying both a boolean-resolved `on` key and a literal `"on"`
-    string key (ambiguous -- GitHub's own YAML 1.1 boolean-resolution
-    gotcha, the reason some workflow authors quote `on:` in the first
-    place)."""
+    inconsistent dedent, an undefined alias, ...); an anchor, alias
+    (including a merge key), or explicit tag anywhere in the document
+    (GitHub's own parser rejects all three -- see
+    `_assert_no_github_incompatible_yaml`); a document whose top level is
+    not a mapping; a duplicate mapping key at any level; or a document
+    carrying both a boolean-resolved `on` key and a literal `"on"` string
+    key (ambiguous -- GitHub's own YAML 1.1 boolean-resolution gotcha, the
+    reason some workflow authors quote `on:` in the first place)."""
     if yaml is None:
         raise WorkflowLoadError(_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR))
+    _assert_no_github_incompatible_yaml(text)
     try:
         doc = yaml.load(text, Loader=_NoDuplicateKeysSafeLoader)
     except yaml.YAMLError as exc:
@@ -531,6 +575,28 @@ def load_workflow_from_path(path: Path) -> dict:
     return load_workflow_text(text)
 
 
+def _assert_no_duplicate_keys_in_node_tree(node) -> None:
+    """The composed-node equivalent of `_no_duplicate_keys_construct_mapping`
+    -- needed because `yaml.compose` never invokes a loader's constructors
+    (duplicate-key refusal at CONSTRUCTION time, which `load_workflow_text`
+    gets for free from `_NoDuplicateKeysSafeLoader`, does not cover a
+    caller that only composes, like `job_source_spans`). Walks EVERY
+    mapping node in the tree, at every nesting level, so a duplicate job id
+    nested under `jobs:` is caught exactly like a duplicate top-level
+    `jobs:` key -- one guard, not two independently-drifting ones."""
+    if isinstance(node, yaml.MappingNode):
+        seen: set[str] = set()
+        for key_node, value_node in node.value:
+            key = key_node.value if isinstance(key_node, yaml.ScalarNode) else repr(key_node.value)
+            if key in seen:
+                raise WorkflowLoadError(f"cannot parse YAML: found duplicate key: {key!r}")
+            seen.add(key)
+            _assert_no_duplicate_keys_in_node_tree(value_node)
+    elif isinstance(node, yaml.SequenceNode):
+        for child in node.value:
+            _assert_no_duplicate_keys_in_node_tree(child)
+
+
 def job_source_spans(text: str) -> dict[str, tuple[int, int]]:
     """{job_id: (start_line, end_line_exclusive)} of RAW 0-based line
     indices for each job directly under the workflow's own top-level
@@ -540,21 +606,29 @@ def job_source_spans(text: str) -> dict[str, tuple[int, int]]:
     line through the line before the next job's header, or EOF. Returns
     `{}` when there is no top-level `jobs:` mapping at all (the caller
     decides whether that is itself a refusal -- see `jobs_or_fail`).
-    Raises `WorkflowLoadError` on anything unparseable, exactly like
-    `load_workflow_text` -- a caller that already holds a validated `doc`
-    for this SAME text still gets a consistent, error-free composition
-    here; duplicate-key refusal itself only fires through
-    `load_workflow_text`'s own construction pass, so a caller relying on
-    THAT refusal must call it (or `jobs_or_fail`, which does) on this same
-    text first."""
+    Raises `WorkflowLoadError`, self-sufficiently -- never relying on a
+    caller having gone through `load_workflow_text` first -- on: a missing
+    PyYAML install; an anchor/alias/tag anywhere in the text
+    (`_assert_no_github_incompatible_yaml`); a YAML syntax error; a
+    duplicate mapping key at ANY level, including two top-level `jobs:`
+    blocks and two job ids inside the same `jobs:` mapping
+    (`_assert_no_duplicate_keys_in_node_tree`, composed-node based, since
+    `yaml.compose` never runs a loader's constructors); and a flow-style
+    `jobs:` mapping, or any job entry whose own node does not occupy at
+    least one full line of its own -- both shapes make "the line span
+    between this job's header and the next" meaningless, and a real
+    GitHub Actions workflow's `jobs:` block is always block-style in this
+    repo (never silently degraded to a zero-length or wrong-job span)."""
     if yaml is None:
         raise WorkflowLoadError(_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR))
+    _assert_no_github_incompatible_yaml(text)
     try:
         root = yaml.compose(text, Loader=yaml.SafeLoader)
     except yaml.YAMLError as exc:
         raise WorkflowLoadError(f"cannot parse YAML: {exc}") from exc
     if root is None or not isinstance(root, yaml.MappingNode):
         return {}
+    _assert_no_duplicate_keys_in_node_tree(root)
     jobs_node = None
     for key_node, value_node in root.value:
         if isinstance(key_node, yaml.ScalarNode) and key_node.value == "jobs":
@@ -562,8 +636,18 @@ def job_source_spans(text: str) -> dict[str, tuple[int, int]]:
             break
     if jobs_node is None or not isinstance(jobs_node, yaml.MappingNode):
         return {}
+    if jobs_node.flow_style:
+        raise WorkflowLoadError("jobs: is flow-style -- cannot examine")
     total_lines = len(text.splitlines())
-    starts = [(str(key_node.value), key_node.start_mark.line) for key_node, _ in jobs_node.value]
+    starts: list[tuple[str, int]] = []
+    for key_node, value_node in jobs_node.value:
+        job_id = str(key_node.value)
+        start = key_node.start_mark.line
+        if value_node.end_mark.line <= start:
+            raise WorkflowLoadError(
+                f"jobs: is flow-style -- cannot examine (job {job_id!r} does not occupy its own line span)"
+            )
+        starts.append((job_id, start))
     spans: dict[str, tuple[int, int]] = {}
     for idx, (job_id, start) in enumerate(starts):
         end = starts[idx + 1][1] if idx + 1 < len(starts) else total_lines
@@ -573,11 +657,14 @@ def job_source_spans(text: str) -> dict[str, tuple[int, int]]:
 
 def jobs_or_fail(text: str) -> tuple[dict[str, tuple[int, int]] | None, str | None]:
     """(job_source_spans, error). The SAME fail-loud doctrine
-    `read_top_level_on_block` holds `on:` to, now for `jobs:`: an
-    unparseable document is a named FAIL, never a silent `{}` standing in
-    for "this file has zero jobs"; a `jobs:` block recognized as truly
-    empty is refused the same way -- a real GitHub Actions workflow always
-    has at least one job."""
+    `read_top_level_on_block` holds `on:` to, now for `jobs:`:
+    `job_source_spans` is self-sufficient (it raises `WorkflowLoadError` on
+    every unparseable/flow-style/duplicate-key shape itself -- see its own
+    docstring); this wrapper adds only the "truly zero job entries" case on
+    top, an unparseable document is a named FAIL, never a silent `{}`
+    standing in for "this file has zero jobs"; a `jobs:` block recognized
+    as truly empty is refused the same way -- a real GitHub Actions
+    workflow always has at least one job."""
     try:
         jobs = job_source_spans(text)
     except WorkflowLoadError as exc:
@@ -1081,13 +1168,19 @@ def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
     """(trigger_keys, error). `error` is non-None on every shape this
     reader cannot examine (a missing PyYAML install, unparseable YAML, a
     duplicate key, an ambiguous `on`/`"on"` collision, a `null`/empty/
-    wrongly-typed `on:` value); `trigger_keys` is a definite, exhaustive
-    list only when `error` is None — never a partial list silently missing
-    a key this reader could not parse. Every other shape -- a folded/
-    literal block scalar, a flow mapping/sequence, an anchor/alias/tag/
-    merge key, `on :` (whitespace before the colon), a quoted `"on":`
-    key, a BOM, CRLF line endings -- is real, valid YAML and is read
-    exactly as GitHub itself would read it."""
+    wrongly-typed `on:` value, an anchor/alias/tag anywhere in the
+    document); `trigger_keys` is a definite, exhaustive list only when
+    `error` is None — never a partial list silently missing a key this
+    reader could not parse. A folded/literal block scalar, a flow
+    mapping/sequence, `on :` (whitespace before the colon), a quoted
+    `"on":` key, a BOM, and CRLF line endings are all real, valid YAML and
+    are read exactly as GitHub itself would read them. An anchor, alias
+    (including a merge key, which is always defined via an alias), or an
+    explicit YAML tag is a DIFFERENT case: this is real, valid YAML too,
+    but GitHub Actions' own workflow parser does not accept any of the
+    three in a workflow file, so this reader refuses them outright
+    (naming the exact construct) rather than silently resolve a document
+    GitHub itself would refuse to run."""
     try:
         doc = load_workflow_text(text)
     except WorkflowLoadError as exc:
@@ -2587,13 +2680,15 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     # (`load_workflow_text`), so they can no longer disagree with each
     # other -- asserted below as an explicit AGREEMENT check over the whole
     # battery, not just each reader's own expectation. Real, valid YAML
-    # (folded/literal block scalars, flow mappings/sequences, anchors/
-    # aliases/merge keys, tags, a BOM, CRLF, `on :` whitespace, a quoted
-    # `"on":` key) is read exactly as GitHub itself would read it -- never
-    # refused merely for being an unusual-looking spelling; only a
-    # genuinely unparseable or ambiguous document (a YAML syntax error, a
-    # duplicate key, a null/empty/wrongly-typed `on:` value, an `on`/`"on"`
-    # collision) is a loud refusal. ---------------------------------------
+    # (folded/literal block scalars, flow mappings/sequences, a BOM, CRLF,
+    # `on :` whitespace, a quoted `"on":` key) is read exactly as GitHub
+    # itself would read it -- never refused merely for being an
+    # unusual-looking spelling; a genuinely unparseable or ambiguous
+    # document (a YAML syntax error, a duplicate key, a null/empty/
+    # wrongly-typed `on:` value, an `on`/`"on"` collision) is a loud
+    # refusal, and so -- a DIFFERENT case, real valid YAML that GitHub's
+    # own parser still does not accept in a workflow file -- is any
+    # anchor, alias (including a merge key), or explicit tag. ------------
     def _want_ok(label: str, text: str, want_keys: list[str]) -> None:
         keys, err = read_top_level_on_block(text)
         if err is not None or keys != want_keys:
@@ -2619,10 +2714,18 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     _want_ok("block sequence", "on:\n  - push\n  - pull_request\njobs: {}\n", ["push", "pull_request"])
     _want_ok("quoted top-level on (double)", '"on":\n  push:\njobs: {}\n', ["push"])
     _want_ok("quoted top-level on (single)", "'on':\n  push:\njobs: {}\n", ["push"])
-    _want_refused("merge key with an undefined alias", "on:\n  <<: *base\n  push:\njobs: {}\n", "cannot parse YAML")
+    _want_refused(
+        "merge key with an undefined alias",
+        "on:\n  <<: *base\n  push:\njobs: {}\n",
+        "not accepted by GitHub Actions",
+    )
     _want_ok("comment then a child key", "on:\n  # a comment\n  push:\n    branches: [main]\njobs: {}\n", ["push"])
     _want_refused("two on: blocks (duplicate top-level key)", "on:\n  workflow_dispatch:\non:\n  push:\njobs: {}\n", "duplicate key")
-    _want_ok("child value carries an anchor", "on:\n  push: &p\n    branches: [main]\njobs: {}\n", ["push"])
+    _want_refused(
+        "child value carries an anchor",
+        "on:\n  push: &p\n    branches: [main]\njobs: {}\n",
+        "not accepted by GitHub Actions",
+    )
     _want_ok("leading doc-start marker + comment", "# lead comment\n---\non:\n  push:\njobs: {}\n", ["push"])
     # `True:` resolves to the SAME YAML 1.1 boolean key `on:` does -- a
     # workflow author who forgot to quote `on:` and typed `true:` instead
@@ -2632,8 +2735,16 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     _want_ok("BOM + CRLF", "\ufeffon:\r\n  push:\r\njobs: {}\r\n", ["push"])
     _want_ok("CRLF only", "on:\r\n  push:\r\n    branches: [main]\r\njobs: {}\r\n", ["push"])
     _want_refused("empty on: (null value)", "on:\njobs: {}\n", "empty")
-    _want_ok("anchor on the whole on: value + a live schedule child", 'on: &trig\n  schedule:\n    - cron: "0 0 * * *"\njobs: {}\n', ["schedule"])
-    _want_ok("YAML tag forcing a string", "on: !!str push\njobs: {}\n", ["push"])
+    _want_refused(
+        "anchor on the whole on: value + a live schedule child",
+        'on: &trig\n  schedule:\n    - cron: "0 0 * * *"\njobs: {}\n',
+        "not accepted by GitHub Actions",
+    )
+    _want_refused(
+        "YAML tag forcing a string",
+        "on: !!str push\njobs: {}\n",
+        "not accepted by GitHub Actions",
+    )
     _want_ok("quoted child key", 'on:\n  "pull_request":\n    branches: [main]\njobs: {}\n', ["pull_request"])
     _want_refused("tab indentation", "on:\n\tpush:\njobs: {}\n", "cannot parse YAML")
     _want_refused("inconsistently dedented sibling", "on:\n    push:\n  pull_request:\njobs: {}\n", "cannot parse YAML")
@@ -2671,6 +2782,43 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
                 f"self-test FAILED (reader agreement, {label}): one reader refused and the other did "
                 f"not -- on_err={err!r} parse_err={perr!r}"
             )
+
+    # --- `job_source_spans`/`jobs_or_fail`: a flow-style `jobs:` mapping
+    # previously collapsed to zero-length or wrong-job spans instead of
+    # refusing (a real, reproduced regression: a `jobs: {sneaky: {...},
+    # tail: {...}}` shape left `sneaky`'s own body empty and credited
+    # `tail` with `sneaky`'s text); a duplicate job id, or two top-level
+    # `jobs:` blocks, silently shadowed the earlier entry. All three are
+    # now a named, loud refusal, never a partial or wrong-attributed
+    # result. -------------------------------------------------------------
+    def _want_jobs_refused(label: str, text: str, want_substr: str) -> None:
+        jobs, err = jobs_or_fail(text)
+        if jobs is not None or err is None or want_substr not in err:
+            failures.append(
+                f"self-test FAILED (jobs: reader, {label}): expected a refusal naming {want_substr!r}, "
+                f"got jobs={jobs} err={err!r}"
+            )
+
+    _want_jobs_refused(
+        "flow-style jobs: mapping",
+        "on:\n  push:\njobs: { a: { runs-on: u }, b: { runs-on: u } }\n",
+        "flow-style",
+    )
+    _want_jobs_refused(
+        "duplicate job id under jobs:",
+        "on:\n  push:\njobs:\n  x:\n    runs-on: u\n  x:\n    runs-on: u\n",
+        "duplicate key",
+    )
+    _want_jobs_refused(
+        "two top-level jobs: blocks",
+        "on:\n  push:\njobs:\n  x:\n    runs-on: u\n\njobs:\n  y:\n    runs-on: u\n",
+        "duplicate key",
+    )
+    # The P6-shape end-to-end regression (a flow-style `jobs:` mapping whose
+    # real publisher job is not the last entry, previously read as `[]`/
+    # no-finding while crediting a DIFFERENT job with the missing job's own
+    # text) is covered in `test_check_gpu_prove_once.py`'s own suite, which
+    # owns `check_p6_discovery` -- not re-derived here.
 
     # --- gate prerequisite: a missing PyYAML install is ONE distinct
     # message, never a finding and never a pass -- simulated by

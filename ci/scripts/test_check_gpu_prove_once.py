@@ -488,16 +488,17 @@ class PaidPodLaneTest(unittest.TestCase):
         self.assertIn("gpu-gang.yml's on: block carries ['push']", joined)
 
     def test_merge_key_with_an_undefined_alias_is_refused_not_dropped(self):
-        # A genuine YAML merge key (`<<: *anchors`) referencing an anchor
-        # that is never defined anywhere in the document is a real YAML
-        # syntax error (an undefined alias) -- refused loud through the
-        # shared loader, never silently skipped the way a mis-shaped key
-        # used to be.
+        # A genuine YAML merge key (`<<: *anchors`) is refused loud through
+        # the shared loader: GitHub Actions' own parser does not accept a
+        # YAML alias in a workflow file at all (a merge key is always
+        # defined via one), so this is a named refusal by construction --
+        # never silently skipped, and never dependent on whether the
+        # referenced anchor happens to be defined anywhere in the document.
         broken = GANG_YML_GOOD.replace(
             "on:\n  workflow_dispatch:", "on:\n  <<: *anchors\n  workflow_dispatch:"
         )
         findings = cgo.check_p7_paid_pod_lanes(self._texts(**{"gpu-gang.yml": broken}))
-        self.assertIn("cannot parse YAML", "\n".join(findings))
+        self.assertIn("not accepted by GitHub Actions", "\n".join(findings))
 
     def test_two_invokers_of_the_gang_driver_fail(self):
         second = GANG_YML_GOOD.replace("name: GPU gang (RunPod)", "name: second-gang-renter")
@@ -2043,10 +2044,16 @@ class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
     """F2 audit fix: an unreadable `on:`/`jobs:` block is a FAIL LOUD, never
     a silent skip -- same doctrine P1 already holds `gpu-prove.yml`'s `on:`
     to, now applied across P6's full-tree scan. A quoted `"on":`/`"jobs":`
-    key, a flow-style `jobs: {...}` mapping, and a non-canonically-indented
-    (but still consistent) `jobs:` block are all real, valid YAML -- each is
-    read CORRECTLY, never refused; only a genuinely unparseable document
-    (duplicate keys, a YAML syntax error, ...) is the loud refusal."""
+    key and a non-canonically-indented (but still consistent) `jobs:` block
+    are real, valid YAML -- each is read CORRECTLY, never refused. A
+    flow-style `jobs: {...}` mapping is a DIFFERENT case: real, valid YAML
+    that this reader still refuses, because a job's own line span is
+    meaningless once every job lives on the same physical line -- the
+    shape previously collapsed to a zero-length or wrong-job span instead
+    (a real job's own text silently credited to a DIFFERENT job's name),
+    which is the fail-open this refusal closes. A genuinely unparseable
+    document (duplicate keys, a YAML syntax error, an anchor/alias/tag,
+    ...) is the same loud refusal."""
 
     def test_quoted_on_block_is_correctly_read_and_still_discovers_the_job(self):
         bad = '"on":\n  push:\n    tags: ["v*"]\n\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n'
@@ -2063,11 +2070,20 @@ class UnreadableOnOrJobsBlockFailsLoudTest(unittest.TestCase):
         self.assertFalse(any("bad.yml" in f and "cannot read" in f for f in findings), findings)
         self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
 
-    def test_flow_style_jobs_block_is_correctly_read_and_still_discovers_the_job(self):
-        bad = "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs: { x: { runs-on: ubuntu-latest, steps: [ { run: 'npm publish' } ] } }\n"
+    def test_flow_style_jobs_block_is_a_named_refusal_never_a_silent_or_misattributed_pass(self):
+        # A flow-style `jobs:` mapping with TWO entries reproduces the real
+        # regression: `job_source_spans` used to collapse the FIRST entry
+        # (the real publisher, `sneaky`) to a zero-length span and credit
+        # the LAST entry (`tail`, inert) with its text instead -- a silent
+        # `[]`/no-finding for the actual publisher, never a loud refusal.
+        bad = (
+            "name: bad\n\non:\n  push:\n    tags: [\"v*\"]\n\n"
+            "jobs: { sneaky: { runs-on: ubuntu-latest, steps: [ { run: 'npm publish' } ] }, "
+            "tail: { runs-on: ubuntu-latest } }\n"
+        )
         findings = cgo.check_p6_discovery({**_positive_texts(), "bad.yml": bad})
-        self.assertFalse(any("bad.yml" in f and "flow-style" in f for f in findings), findings)
-        self.assertTrue(any("bad.yml" in f and "x" in f for f in findings), findings)
+        self.assertTrue(any("bad.yml" in f and "flow-style" in f for f in findings), findings)
+        self.assertFalse(any("bad.yml" in f and "tail" in f for f in findings), findings)
 
     def test_non_canonical_four_space_job_indent_is_correctly_read(self):
         bad = (

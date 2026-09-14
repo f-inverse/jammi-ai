@@ -569,20 +569,24 @@ else
 fi
 
 # G7 fixture: `on: &trig` immediately preceding a LIVE `schedule:` cron
-# child is real, valid YAML (an anchor on the on: value, resolved by the
-# real parser exactly as GitHub itself would) -- a naive `grep -qx
-# schedule` on the reader's own output, or a text grep for `schedule:`
-# directly, would both miss a real cron re-add hidden behind an anchor; the
-# shared reader instead reads straight through the anchor and correctly
-# reports `schedule` as present.
+# child is real, valid YAML, but GitHub Actions' own workflow parser does
+# not accept a YAML anchor in a workflow file at all -- the shared reader
+# refuses it outright, naming the construct, rather than silently resolve
+# a document GitHub itself would refuse to run. This is a NAMED refusal,
+# never a silent "no schedule key": a `grep -qx schedule` on the reader's
+# own output (which never prints on a refusal) or a text grep for
+# `schedule:` directly would both still find the live cron text in the
+# raw file even though this reader correctly refuses to examine it --
+# the two checks answer different questions, and this fixture is only
+# about the reader's own refusal.
 g7_anchor="$SANDBOX/g7-anchored-cron.yml"
 printf 'on: &trig\n  schedule:\n    - cron: "30 8 * * *"\n' > "$g7_anchor"
 g7a_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_anchor" 2>&1)"
 g7a_rc=$?
-if [ "$g7a_rc" -eq 0 ] && [[ "$g7a_out" == "schedule" ]]; then
-  ok "G7: on: &trig with a live schedule: cron child is read correctly as carrying 'schedule' (anchors resolved, never a silent 'no schedule key')"
+if [ "$g7a_rc" -ne 0 ] && [[ "$g7a_out" == *"not accepted by GitHub Actions"* ]] && [[ "$g7a_out" == *"anchor"* ]]; then
+  ok "G7: on: &trig is a named refusal (GitHub Actions does not accept YAML anchors), never a silent 'no schedule key' or a resolved read"
 else
-  bad "G7: expected on: &trig + live cron to read as 'schedule'; got rc=${g7a_rc} out=${g7a_out}"
+  bad "G7: expected on: &trig to be refused naming 'anchor'/'not accepted by GitHub Actions'; got rc=${g7a_rc} out=${g7a_out}"
 fi
 
 # ============================================================================

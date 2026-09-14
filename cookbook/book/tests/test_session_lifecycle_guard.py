@@ -14,14 +14,14 @@ the executed chapter cells) is filed as issue #539.
 
 The throwaway suites run against the REAL ``conftest.py`` next to this file
 (read from disk, not reimplemented), in an isolated subprocess (`pytester`,
-enabled in that conftest via ``pytest_plugins = ["pytester"]``). Nothing in
-the guard patches any module attribute or class method any more (see
+enabled in that conftest via ``pytest_plugins = ["pytester"]``). The guard
+patches no module attribute and no class method (see
 `clients/python/jammi/_sessions.py` and `conftest.py`'s own docstring): it
-subscribes to that module's `observe()` events for the duration of a test, so
-running it out-of-process is not load-bearing for isolation the way it used
-to be — it stays, because it is still the only honest way to assert what the
-OUTER pytest run reports (exit code, ERROR summary, message text) rather than
-a helper function's return value.
+subscribes to that module's `observe()` events for the duration of a test.
+Running it out-of-process is not load-bearing for isolation on that account —
+it stays because it is still the only honest way to assert what the OUTER
+pytest run reports (exit code, ERROR summary, message text) rather than a
+helper function's return value.
 
 A leaked session needs no live counterpart to prove the point: the embedded
 arm holds a real catalog on ``tmp_path`` (never removed here — no assertion
@@ -137,16 +137,14 @@ def test_leaked_embedded_session_is_failed_by_name(tmp_path):
 # --------------------------------------------------------------------------- #
 # Every import-time binding shape and construction route audit #5 executed.
 #
-# Under the OLD guard (a5baa38d), which monkeypatched the `jammi.connect`
-# MODULE ATTRIBUTE for the duration of a test, every one of these binds its
-# name at IMPORT time -- before that patch is ever installed -- so the
-# tracking wrapper is never the function actually called, and the leak passes
-# silently. Reproduced by execution (report): checking out that commit's
-# conftest.py into an isolated pytester run with each of these same shapes
-# shows `N passed, 0 errors` -- every leak invisible. The registry guard
-# below does not read a bound name at all; it observes the register/close
-# EVENT the session's own `__init__`/`close()` fire, so no binding shape
-# changes what it sees.
+# A guard that tracks leaks by patching the `jammi.connect` MODULE ATTRIBUTE
+# for the duration of a test cannot see any of these: each one binds its own
+# name at IMPORT time, before any such patch could be installed, so the
+# tracking wrapper is never the function actually called and the leak passes
+# silently -- an enumeration problem with no upper bound on binding shapes.
+# The registry guard below pins the opposite property directly: it reads no
+# bound name at all, only the register/close EVENT the session's own
+# `__init__`/`close()` fire, so no binding shape changes what it sees.
 # --------------------------------------------------------------------------- #
 
 _SHAPES_SUITE = '''
@@ -442,3 +440,80 @@ def test_leak_in_a_subdirectory_module():
     result.assert_outcomes(passed=1, errors=1, failed=0)
     assert result.ret != 0
     result.stdout.fnmatch_lines(["*ERROR*test_leak_in_a_subdirectory_module*"])
+
+
+# --------------------------------------------------------------------------- #
+# F1: capability detection -- a jammi client without the session registry.
+# --------------------------------------------------------------------------- #
+
+# A minimal stand-in for a pre-registry `jammi` client: exposes `connect` but
+# no `observe` / `open_sessions`, simulating exactly what the nightly
+# release-recipe leg installs (`.github/workflows/cookbook-render.yml`'s
+# `pip install jammi-ai[embedded]` from PyPI, which lags HEAD by
+# construction -- see conftest.py's own "Capability, not a flag" paragraph).
+_FAKE_PRE_REGISTRY_JAMMI = '''
+__version__ = "0.1.0-fake-pre-registry"
+
+
+class _FakeSession:
+    def list_sources(self):
+        return []
+
+    def close(self):
+        pass
+
+
+def connect(target):
+    return _FakeSession()
+'''
+
+_THROWAWAY_SUITE_FOR_FAKE_CLIENT = '''
+import jammi
+
+
+def test_uses_embedded_fixture(embedded):
+    assert embedded.list_sources() == []
+
+
+def test_opens_and_closes_cleanly():
+    db = jammi.connect("grpc://127.0.0.1:8081")
+    db.close()
+
+
+def test_leaks_but_the_rail_is_inactive():
+    """With the registry absent there is nothing to observe: this leak is
+    invisible by construction (the known limit conftest.py states), not by
+    a bug -- the point of this test is that the run still reports the
+    capability gap once, not this leak."""
+    jammi.connect("grpc://127.0.0.1:8081")
+'''
+
+
+def test_rail_inactive_without_the_registry_warns_once_and_runs_clean(
+    pytester: pytest.Pytester,
+):
+    """F1: a `jammi` client that predates the session registry (`.observe`
+    absent) must not error every test at setup -- against the guard before
+    this capability arm existed, this exact fixture (a fake `jammi` package
+    with `connect` but no `observe`) failed every test's setup with
+    `AttributeError: module 'jammi' has no attribute 'observe'` (the
+    nightly release-recipe leg's own symptom, reproduced by execution while
+    developing this fix). The capability arm detects the missing registry
+    at import and yields instead of subscribing, and the session-scoped
+    fixture reports the gap exactly once.
+    """
+    pytester.makeconftest(_CONFTEST)
+    fake_jammi = pytester.mkpydir("jammi")
+    (fake_jammi / "__init__.py").write_text(_FAKE_PRE_REGISTRY_JAMMI)
+    pytester.makepyfile(test_the_throwaway_suite=_THROWAWAY_SUITE_FOR_FAKE_CLIENT)
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    # No setup errors: every test's CALL phase runs, including the one that
+    # leaks -- the rail cannot see it, and must not crash trying.
+    result.assert_outcomes(passed=3, errors=0, failed=0, warnings=1)
+    assert result.ret == 0, "a client without the registry must not fail the run"
+
+    full = "\n".join(result.outlines)
+    assert full.count("session-leak rail inactive") == 1
+    assert "0.1.0-fake-pre-registry" in full

@@ -24,17 +24,16 @@ Two mechanisms, because one alone is a promise rather than a rail:
   from ``close()`` — the ONE seam every construction route passes through, so
   it is independent of how a test bound the name it called through (a plain
   ``jammi.connect(...)`` call, an aliased import, direct backend
-  construction — see that module's docstring for the full enumeration this
-  guard no longer needs to reason about). It also sees a session that was
-  NEVER closed even after the object itself is garbage-collected, because the
-  events are delivered synchronously at register/unregister time, not read
-  off a liveness snapshot: a session dropped by refcount inside the test body
-  (a bare ``jammi.connect(...)`` statement, or a local gone at frame exit) is
-  reclaimed before any teardown code runs, so a snapshot taken only at
-  teardown would never see it open at all — the events already fired by
-  then, and this fixture already recorded them. A seventh site that opens a
-  session by hand and forgets to close it does not quietly race the cleanup
-  again; it fails, by name, on the first run.
+  construction — see that module's docstring for the full enumeration). It
+  also sees a session that was NEVER closed even after the object itself is
+  garbage-collected, because the events are delivered synchronously at
+  register/unregister time, not read off a liveness snapshot: a session
+  dropped by refcount inside the test body (a bare ``jammi.connect(...)``
+  statement, or a local gone at frame exit) is reclaimed before any teardown
+  code runs, so a snapshot taken only at teardown would never see it open at
+  all — the events already fired by then, and this fixture already recorded
+  them. A session opened by hand and forgotten fails, by name, on the first
+  run.
 
 Why a *closed* session and not merely a dropped one: the embedded engine holds
 its catalog through SQLite's ``unix-excl`` VFS, so dropping the handle releases
@@ -43,20 +42,45 @@ nothing at any bounded moment — ``close()`` is the only awaited release (see
 inside its directory, so a ``shutil.rmtree`` racing it fails with ``OSError:
 [Errno 39] Directory not empty`` between its ``scandir`` and its ``rmdir``.
 
-Known limit, stated rather than assumed: this guard sees exactly what the
-client's registry sees — every session any constructor route registers. That
-is every route today: ``jammi.connect`` and direct ``EmbeddedBackend`` /
-``RemoteDatabase`` construction all call the registry's ``register()`` as the
-last statement of their own ``__init__`` (see ``_sessions.py``), so within
-this process no import-time binding shape and no construction path escapes
-it — there is no separate module-attribute patch left to alias around, and so
-no standing enumerating gate over binding shapes is needed here. What this
-guard does NOT reach is the non-pytest lanes (scripts, recipes, quickstart,
-the executed chapter cells) — a static gate over those is filed as issue
-#539.
+Capability, not a flag: the rail also depends on the installed client having
+a registry to subscribe to. Three states, checked once at import: ``jammi``
+absent (a lean install — the affordance fixtures skip, and the rail is a
+no-op); ``jammi`` present without ``jammi.observe`` (a client built before
+the registry shipped — this happens whenever a lane installs a previously
+published wheel rather than HEAD source, e.g. the nightly release-recipe leg
+in ``.github/workflows/cookbook-render.yml``, which pins nothing and so
+tracks the last PyPI release): the rail is INACTIVE for the WHOLE session —
+every test still runs, but none of them is checked for a leak — and exactly
+ONE ``pytest.PytestWarning`` names the installed version at session start, so
+that silence is never silent; ``jammi`` present with ``jammi.observe``: the
+rail below runs as documented.
+
+Known limit, stated rather than assumed: the client's own registry
+(``clients/python/jammi/_sessions.py``) sees every session any constructor
+route registers, independent of how the caller bound the name it called
+through — ``jammi.connect`` and direct ``EmbeddedBackend`` /
+``RemoteDatabase`` construction both call the registry's ``register()`` as
+the last statement of their own ``__init__``, so no import-time binding shape
+and no construction path escapes the REGISTRY. This fixture, however, only
+WATCHES the registry for the span of one test: it subscribes at that test's
+own setup and reads the diff in its own ``finally``, before any coarser
+fixture tears down. So the window this guard actually covers is a single
+test's own fixture window, and the suite rule is that a test-opened session
+is closed by that SAME test. A session registered before this fixture
+subscribes — at import time, or in a module- or session-scoped fixture's own
+setup — is outside the window and invisible to it; and a session that spans
+tests (opened by one test, left open past that test's own teardown, and only
+closed later by a different test or a coarser fixture) is reported, if it is
+reported at all, against the test that OPENED it, never the one that
+eventually closes it. That gap — plus the registry ledger's unbounded size
+and its ``label=""`` default — is filed as issue #552. What this guard does
+NOT reach at all is the non-pytest lanes (scripts, recipes, quickstart, the
+executed chapter cells) — a static gate over those is filed as issue #539.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import pytest
 
@@ -69,6 +93,11 @@ try:  # the suite also runs where the [embedded] extra is absent
     import jammi
 except ImportError:  # pragma: no cover - exercised only on a lean install
     jammi = None  # type: ignore[assignment]
+
+# Capability, not a flag (see module docstring): a `jammi` without the
+# session registry cannot run the rail, whether or not it is installed at
+# all. Checked once, here, rather than per test.
+_RAIL_ACTIVE = jammi is not None and getattr(jammi, "observe", None) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +140,26 @@ def remote():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _warn_if_rail_inactive() -> None:
+    """Session-start capability check (see module docstring's "Capability,
+    not a flag" paragraph): if `jammi` is installed but predates the session
+    registry, the leak rail is off for the whole run, and that has to be
+    visible rather than a silent no-op repeated on every test.
+    """
+    if jammi is not None and not _RAIL_ACTIVE:
+        version = getattr(jammi, "__version__", "unknown")
+        warnings.warn(
+            f"session-leak rail inactive: this jammi client (version "
+            f"{version}) predates the session registry (`jammi.observe` is "
+            "absent); no session leak will be reported for this run. "
+            "Installing from a previously published wheel rather than HEAD "
+            "source is expected to lag like this.",
+            pytest.PytestWarning,
+            stacklevel=1,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _no_leaked_sessions(request):
     """esc-112 fix (`closes_escape: esc-112`): fail a test that leaves a jammi
@@ -129,7 +178,10 @@ def _no_leaked_sessions(request):
     Unsubscribes in `finally`, before anything else, so this fixture's own
     teardown never races a later listener call against the diff below.
     """
-    if jammi is None:  # pragma: no cover - lean install
+    if not _RAIL_ACTIVE:  # lean install, or a client without the registry
+        # `jammi` absent: nothing to observe. `jammi` present but without
+        # `.observe`: `_warn_if_rail_inactive` already warned once for the
+        # whole session; there is nothing this per-test fixture can check.
         yield
         return
 

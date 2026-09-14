@@ -900,6 +900,32 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
     assert_eq!(second.table_name(), first.table_name());
     assert_eq!(second.definition_hash, first.definition_hash);
 
+    // The reuse path (`ResultStore::bind_result_table`, the in-tree binder
+    // `fine_tune/training_set.rs` reaches through `materialize_training_set`
+    // — see `pinned_source_gate::IN_TREE_SESSION_BINDING_ALLOWLIST`'s doc)
+    // must rebind the SAME immutable artifact bytes it wrote once, not
+    // merely the same name: an explicit digest check, not an inference from
+    // name equality.
+    let first_manifest = store
+        .read_materialization_manifest(
+            &jammi_db::storage::StorageUrl::parse(&first.record.parquet_path).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("a computed training set carries a materialization attestation");
+    let second_manifest = store
+        .read_materialization_manifest(
+            &jammi_db::storage::StorageUrl::parse(&second.record.parquet_path).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("a reused training set's record still resolves an attestation");
+    assert_eq!(
+        first_manifest.artifact, second_manifest.artifact,
+        "the reuse path must rebind the identical immutable artifact digest, not merely the \
+         same name"
+    );
+
     // One table, not two.
     let tables = catalog
         .find_result_tables(&source, None, None)
@@ -926,6 +952,65 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
         .unwrap();
     assert!(matches!(other_format.outcome, CacheOutcome::Computed));
     assert_ne!(other_format.table_name(), first.table_name());
+}
+
+/// The uniqueness oracle
+/// `pinned_source_gate::IN_TREE_SESSION_BINDING_ALLOWLIST`'s doc names for
+/// the one reviewed in-tree binder fine_tune/ reaches
+/// (`ResultStore::materialize_training_set` -> `create_table`,
+/// `store/mod.rs:1183`): a BURST of concurrent `create_table` calls over the
+/// identical definition must never collide on one table name.
+///
+/// A burst of 64, real OS threads (`worker_threads = 8`), not two sequential
+/// awaited calls — `create_table`'s own doc (`store/mod.rs:1178-1181`)
+/// states the reason the name carries a `uuid8` suffix on top of the
+/// nanosecond timestamp: "two tokio tasks call create_table within the same
+/// nanosecond". Two sequential calls almost always differ in wall-clock
+/// nanoseconds on their own, proving nothing about the suffix; a `tokio::
+/// join!` of exactly two also did not reproduce a collision under the
+/// mutation below on this host (`chrono::Utc::now()`'s effective resolution
+/// is finer than the gap between two cooperatively-scheduled calls) — a
+/// 64-way burst across 8 OS threads does, reliably.
+///
+/// Executed as the contract's own RED-first mutation, not merely asserted:
+/// removing the `_{suffix}` segment from `create_table`'s name builder
+/// (`store/mod.rs:1183`, `format!("{source_id}__{task_str}__{sanitized}__
+/// {timestamp}_{suffix}")` -> `format!("{source_id}__{task_str}__
+/// {sanitized}__{timestamp}")`) turns this test RED with the OBSERVED
+/// failure `BackendDriver(Constraint { table: "<unknown>", detail: "UNIQUE
+/// constraint failed: result_tables.table_name" })` — the catalog's own
+/// unique constraint on `table_name` catching the collision the suffix
+/// exists to prevent, not merely a `HashSet` bookkeeping assertion in this
+/// test.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn create_table_names_a_concurrent_burst_uniquely_over_one_definition(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let source = unique_source(&dir, "concurrent");
+
+    let mut handles = Vec::new();
+    for _ in 0..64 {
+        let store = store.clone();
+        let source = source.clone();
+        handles.push(tokio::spawn(async move {
+            create_building_for(&store, &source)
+                .await
+                .table_name()
+                .to_string()
+        }));
+    }
+    let mut names = std::collections::HashSet::new();
+    for h in handles {
+        let name = h.await.unwrap();
+        assert!(
+            names.insert(name.clone()),
+            "two concurrent create_table calls over the identical definition collided on {name} \
+             — the uuid8 suffix (store/mod.rs:1181) is exactly what prevents this"
+        );
+    }
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]

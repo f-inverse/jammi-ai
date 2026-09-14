@@ -474,10 +474,9 @@ impl InferenceSession {
     ///   producer in this tree names one today: `materialize_projection` (the
     ///   only [`ProducingDescriptor::TrainingSet`] producer) always reads a
     ///   durable registered source, and the graph arm samples in memory and
-    ///   never writes a `TrainingSet` table at all (a per-call session
-    ///   registration for it was tried and excised —
-    ///   <https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it a
-    ///   table of its own). This refusal stays because the planner error is
+    ///   never writes a `TrainingSet` table at all
+    ///   (<https://github.com/f-inverse/jammi-ai/issues/538> tracks giving it
+    ///   a table of its own). This refusal stays because the planner error is
     ///   the honest response to ANY table whose recorded source is not
     ///   durable, not because one is expected today.
     async fn recompute_training_set(

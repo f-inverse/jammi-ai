@@ -2474,7 +2474,7 @@ def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], 
          denies here, identically in EITHER reader."""
     for row in rows:
         unit_branch = row.get("unit_branch")
-        if not (isinstance(unit_branch, str) and unit_branch.strip()):
+        if not (isinstance(unit_branch, str) and unit_branch.strip()):  # R12-RESIDUAL: unreachable from reader 1's own call — its stronger pre-check (unit_branch must ALSO slugify to match the dispatching unit) already denies before this generic non-empty check is ever reached; exercised instead by check_rigor_record.py's own RR21 fixture, which the check_lead_gate.py-scoped sweep cannot see
             return "anticipation record carries a row with no non-empty `unit_branch` (esc-lead-gate-R12)"
         residual_risk = row.get("residual_risk")
         if not (isinstance(residual_risk, str) and residual_risk.strip()):
@@ -2514,16 +2514,16 @@ def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], 
         # for reader 1's own call.
         seen_pairs: dict[tuple[str, str], str] = {}
         for key, entry in attacks.items():
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict):  # R12-RESIDUAL: reader 1 only ever reaches this on a key OUTSIDE `by_file` (a real per-file entry is already validated by `_r12_validate_and_run_entry`'s OWN identical check first) — narrow; exercised for a REQUIRED key via reader 1's real loop, and for reader 3 via its own committed-record fixtures, invisible to this check_lead_gate.py-scoped sweep
                 return f"anticipation record attacks[{key!r}] is not an object (esc-lead-gate-R12)"
             command = entry.get("command")
-            if not isinstance(command, str) or not command.strip():
+            if not isinstance(command, str) or not command.strip():  # R12-RESIDUAL: same narrowing as the arm above — only reachable via a key OUTSIDE `by_file` from reader 1's own call
                 return f"anticipation record attacks[{key!r}] has no `command` (esc-lead-gate-R12)"
             recorded_hash = entry.get("hash")
-            if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):
+            if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):  # R12-RESIDUAL: same narrowing as the two arms above
                 return f"anticipation record attacks[{key!r}] has no valid `hash` (esc-lead-gate-R12)"
             pair = (command, recorded_hash)
-            if pair in seen_pairs:
+            if pair in seen_pairs:  # R12-RESIDUAL: reader 1's real per-file loop already threads its OWN `seen_pairs` across `by_file` (`_r12_validate_and_run_entry`'s identical check fires first there); this arm fires only when a pair repeats via a key OUTSIDE `by_file`, exercised by check_rigor_record.py's own RR23 fixture (reader 3 has no `by_file` restriction at all), invisible to this sweep
                 return (f"anticipation record attacks[{key!r}] and attacks[{seen_pairs[pair]!r}] "
                         "reuse the IDENTICAL (command, hash) pair — a templated attack is not a "
                         "per-site examination (esc-lead-gate-R12)")
@@ -2537,7 +2537,7 @@ def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], 
 
     if required_files:
         missing = required_files - covered
-        if missing:
+        if missing:  # R12-RESIDUAL: unreachable from reader 1's own second call — its OWN inline `missing_files` check (run before this function is ever called on the non-empty by_file path) already guarantees `required_files ⊆ covered` by construction; exercised instead by check_rigor_record.py's own RR20 fixture (reader 3 has no such pre-check), invisible to this check_lead_gate.py-scoped sweep
             return (f"anticipation record omits {len(missing)} file(s) the open BLOCK(s)' own "
                      f"finding_locations/class_enumeration name, e.g. {sorted(missing)[:3]} "
                      "(esc-lead-gate-R12)")

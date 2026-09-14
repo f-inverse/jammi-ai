@@ -174,6 +174,104 @@ async fn get_job_for_rank_returns_the_filled_pair() {
     assert_eq!(row.training_set_location.as_deref(), Some("table-y"));
 }
 
+/// R1 (fix round 1, F1): the row's OWN `world_size`, decoded from `spec`
+/// JSON, never the caller's `Assign.world`. A spec whose `common.world_size`
+/// names 2 must read back 2 through `get_job_for_rank`.
+#[tokio::test]
+async fn get_job_for_rank_reflects_the_row_world_size() {
+    let (_dir, catalog) = base_catalog().await;
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: "job-world-2",
+            kind: KIND,
+            execution: JobExecution::Queued,
+            spec: r#"{"common":{"world_size":2}}"#,
+            model_ref: Some("q-base::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    catalog
+        .claim_next("coord-1", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let row = catalog
+        .get_job_for_rank("job-world-2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.world_size, 2,
+        "the row's own world_size must round-trip"
+    );
+}
+
+/// A spec naming no `world_size` at all (`job_params`'s `"{}"`, every
+/// existing fixture in this file) reads back `1` — the single-rank default,
+/// never an error and never left undefined.
+#[tokio::test]
+async fn get_job_for_rank_defaults_world_size_when_absent_from_spec() {
+    let (_dir, catalog) = base_catalog().await;
+    catalog
+        .submit_job(job_params("job-world-absent"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next("coord-1", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let row = catalog
+        .get_job_for_rank("job-world-absent")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.world_size, 1,
+        "a spec naming no world_size must default to 1, never fail and never default to 0"
+    );
+}
+
+/// A `world_size` field present but not a valid rank count (a string, here)
+/// is a typed error, never silently coerced to `1`.
+#[tokio::test]
+async fn get_job_for_rank_malformed_world_size_is_a_typed_error() {
+    let (_dir, catalog) = base_catalog().await;
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: "job-world-malformed",
+            kind: KIND,
+            execution: JobExecution::Queued,
+            spec: r#"{"common":{"world_size":"two"}}"#,
+            model_ref: Some("q-base::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    catalog
+        .claim_next("coord-1", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let err = catalog
+        .get_job_for_rank("job-world-malformed")
+        .await
+        .expect_err("a non-numeric world_size must be a typed error, never a silent 1");
+    let message = err.to_string();
+    assert!(
+        message.contains("world_size") || message.contains("spec"),
+        "the error must name what failed to decode, got: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `Catalog::fill_training_set_identity` (§W2 Fill)
 // ---------------------------------------------------------------------------

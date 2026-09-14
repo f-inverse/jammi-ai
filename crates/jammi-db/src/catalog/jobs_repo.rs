@@ -216,8 +216,70 @@ pub struct RankAdmissionRow {
     pub lease_live: bool,
     /// The remaining lease window, floored at zero once expired (or absent).
     pub remaining: Duration,
+    /// The ROW's own rank count, decoded from the SAME `spec` JSON the
+    /// claiming worker reconstructs its run from — never the caller's own
+    /// `Assign.world`. A gang admission gate keyed on the caller's claim
+    /// instead of this field lets a `world_size > 1` job admit under a
+    /// caller-supplied `world = 1`, skipping the training-set pair conjunct
+    /// and the sidecar verify entirely (the closing-audit #1 F1 finding this
+    /// field closes).
+    ///
+    /// Decoded via `world_size_from_spec_json` (module-private): a top-level `world_size`
+    /// key, or (the shape `jammi-ai`'s `TrainingCommon` actually persists) a
+    /// `world_size` key nested one level under `common`. Absent either way
+    /// ⇒ `1` (the single-rank default every job kind that never names a rank
+    /// count implicitly is — `jammi-db` cannot depend on `jammi-ai` to read
+    /// its serde default directly, so this mirrors it independently). A
+    /// `world_size` key present but not a valid non-negative rank count
+    /// (non-numeric, negative, fractional, or overflowing `u32`) is a typed
+    /// `BackendError::TypeConversion` — never silently coerced to `1`.
+    pub world_size: u32,
     pub training_set_ref: Option<String>,
     pub training_set_location: Option<String>,
+}
+
+/// The single-rank default this module stamps when a job's `spec` JSON names
+/// no `world_size` at all — every non-training job kind, and every training
+/// spec predating the field. Mirrors (independently: `jammi-db` must not
+/// depend on `jammi-ai`) the wire default `jammi_ai::fine_tune::spec::
+/// TrainingCommon`'s own `#[serde(default = "default_world_size")]` hook
+/// falls back to when its JSON carries no count.
+const WORLD_SIZE_IF_ABSENT: u32 = 1;
+
+/// Decodes [`RankAdmissionRow::world_size`] from a job's raw `spec` JSON — a
+/// targeted field read, not a typed deserialization of the whole spec
+/// (`jammi-db` does not know, and must not depend on, `jammi-ai`'s
+/// `TrainingSpec` shape). Checks a top-level `world_size` key first, then a
+/// `world_size` key nested one level under `common` (the shape
+/// `TrainingCommon` actually persists for the two fine-tune spec variants),
+/// so a future producer that flattens the field is read the same way a
+/// current nested one is. Neither key present ⇒ [`WORLD_SIZE_IF_ABSENT`].
+/// The key present but not decodable as a `u32` (a string, a negative
+/// number, a fraction, or a value overflowing `u32`) ⇒
+/// [`BackendError::TypeConversion`] — a caller that reads this row is never
+/// handed a silently-defaulted `1` for a spec that named something else.
+/// Spec text that is not valid JSON at all is the SAME typed error: a job
+/// row's `spec` column is the worker's own reconstruction input, so a value
+/// that fails to parse is exactly as much a decode fault as a malformed
+/// `world_size` field inside it.
+fn world_size_from_spec_json(spec: &str) -> std::result::Result<u32, BackendError> {
+    let value: serde_json::Value =
+        serde_json::from_str(spec).map_err(|e| BackendError::TypeConversion {
+            column: "spec".to_string(),
+            detail: format!("spec is not valid JSON: {e}"),
+        })?;
+    let field = value
+        .get("world_size")
+        .or_else(|| value.get("common").and_then(|c| c.get("world_size")));
+    match field {
+        None => Ok(WORLD_SIZE_IF_ABSENT),
+        Some(v) => {
+            serde_json::from_value::<u32>(v.clone()).map_err(|e| BackendError::TypeConversion {
+                column: "spec".to_string(),
+                detail: format!("spec.world_size is not a valid rank count: {e}"),
+            })
+        }
+    }
 }
 
 const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, partial_result, \
@@ -1874,7 +1936,9 @@ impl Catalog {
     }
 
     /// `CONTRACT-U5a.md` §I1(a): the row `GangService::run_rank`'s I-GANG
-    /// decision reads. Primary-key only (`WHERE job_id = $1`) — no tenant
+    /// decision reads (a `jammi-server` type this crate has no visibility
+    /// into — named here only in prose, never as an intra-doc link).
+    /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
     /// not consult it at all: tenant is returned as a plain column for the
     /// CALLER to derive/pin, per §I1's "tenant is derived from the row").
@@ -1884,6 +1948,18 @@ impl Catalog {
     /// derived — never a second round trip, and never the caller's OWN
     /// clock standing in for the remaining-window computation (see that
     /// function's docs). `Ok(None)` when no such job exists.
+    ///
+    /// This method decides NOTHING beyond that lookup — it is a plain
+    /// row-by-primary-key read, never itself the I-GANG decider. Every
+    /// determinant the returned [`RankAdmissionRow`] feeds (`status`,
+    /// `claimed_by`, `attempts`, `lease_live`, and — critically —
+    /// [`RankAdmissionRow::world_size`], the ROW's own rank count, never a
+    /// caller-supplied `Assign.world`) is decided by the caller
+    /// (`GangService::run_rank`, the gang admission handler). A gate keyed
+    /// on the caller's own claim about `world` rather than this field's
+    /// value lets a mismatched claim skip the `world_size > 1` conjuncts
+    /// entirely — the row is the only authority; the caller is never trusted
+    /// to state its own admission class.
     ///
     /// **Enumerating-caller oracle** (`crates/jammi-server/tests/it/
     /// gang_rank_admission_oracle.rs`): the only call site outside this
@@ -1909,12 +1985,14 @@ impl Catalog {
                         params.push(SqlValue::TextOwned(job_id));
                         let job_bind = params.len();
                         let sql = format!(
-                            "SELECT status, tenant_id, claimed_by, attempts, \
+                            "SELECT status, tenant_id, claimed_by, attempts, spec, \
                                  training_set_ref, training_set_location, \
                                  {remaining_expr} AS remaining_secs \
                              FROM jobs WHERE job_id = ${job_bind}"
                         );
                         tx.query_opt(&sql, &params, |row| {
+                            let spec: String = row.get("spec")?;
+                            let world_size = world_size_from_spec_json(&spec)?;
                             let tenant_id = row
                                 .try_get::<String>("tenant_id")?
                                 .map(|s| {
@@ -1943,6 +2021,7 @@ impl Catalog {
                                 attempts: row.get::<i32>("attempts")? as u32,
                                 lease_live,
                                 remaining,
+                                world_size,
                                 training_set_ref: row.try_get("training_set_ref")?,
                                 training_set_location: row.try_get("training_set_location")?,
                             })

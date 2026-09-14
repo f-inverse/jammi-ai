@@ -240,6 +240,16 @@ pub fn stale_before_clause(
 /// timestamp; Postgres: outright wrong, since only the database's `now()`
 /// avoids replica skew — see this module's own docs) once bound to a
 /// remaining-window value read back from a row a caller then acts on.
+///
+/// Honesty about the two backends' agreement: on Postgres this expression's
+/// sign and [`lease_expired_clause`]'s boolean are exactly consistent (both
+/// compare the SAME `col::timestamptz` against the SAME `now()` call within
+/// one statement). On SQLite, `julianday(...)`'s floating-point day count
+/// carries roughly sub-100-microsecond rounding at typical lease-scale
+/// magnitudes relative to [`lease_expired_clause`]'s exact string compare
+/// (`col < $bound`, `LEASE_TS_FORMAT`'s fixed-width text, byte-for-byte) —
+/// negligible next to any `[lease] heartbeat_secs`/`duration_secs` a
+/// deployment runs, but not bit-exact the way the Postgres arm is.
 pub fn lease_remaining_seconds_expr(
     col: &str,
     kind: BackendKind,

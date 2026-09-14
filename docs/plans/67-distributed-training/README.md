@@ -54,8 +54,9 @@ those still in force are restated here in their v4 form. Principle in parenthese
 **Substrate (the jobs fleet)**
 
 26. **The claimant is the coordinator.** A training-kind job is claimed by a `JobWorker` through
-    `claim_next` (`jobs_repo.rs:658-719`); that process is rank 0 and holds the only lease
-    (`heartbeat_job`, `jobs_repo.rs:772`). Kinds eligible for `world_size > 1`: `fine_tune` and
+    `crates/jammi-db/src/catalog/jobs_repo.rs::claim_next` (~:833); that process is rank 0 and
+    holds the only lease (`crates/jammi-db/src/catalog/jobs_repo.rs::heartbeat_job`, ~:971). Kinds
+    eligible for `world_size > 1`: `fine_tune` and
     `graph_fine_tune`; `context_predictor` is refused at `world_size > 1` (K2, typed, at submit).
 27. **A peer is a fleet worker with a spare admission holder.** A peer is a `JobWorker` process
     whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`

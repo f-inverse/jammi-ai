@@ -86,7 +86,7 @@ scaler call site and the mining-refresh check are in `TrainingLoop::run`), `Trai
 | A11 | PR bases unstated | Stated (SIZING, README hand-off) |
 | A12 | U3, U6 = M; U4b = L understated | L, L, XL |
 | A13 | GPU/gang test targets unnamed | Existing `gpu_capability` / `distributed` targets; no new `[[test]]` |
-| A14 | S4 cost/approval and ledger path not on the README | S4 cost/approval and the ledger path added to the README (`docs/plans/67-distributed-training/README.md#units-and-order` (~:281), cost/approval; `README.md#hand-off-how-a-fresh-lead-kicks-this-off` (~:307), ledger path); the same fold re-anchored README ruling 20's `runpod_lib.sh` citation 1264→1263 (abb96a93). At HEAD that citation is by construct — `runpod_lib.sh::_rp_deploy_payload`'s `gpuCount` field — no offset survives |
+| A14 | S4 cost/approval and ledger path not on the README | see `git log -S 'runpod_lib.sh' -- docs/plans/67-distributed-training/` (abb96a93, 9780d752) |
 
 Verified by the lead before folding: `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::compute_loss`
 and `TrainingLoop::compute_loss_per_example` (both the `Classification` arm, classify inside loss), `TrainingLoop::head_forward`
@@ -109,7 +109,7 @@ mechanism change; folded into v3.1 and verified by the lead by grep (no round 4)
 | 1 | U6 → U5b edge present in UNITS only; README table/hand-off and SIZING still said `U6 ∥ U5b` | README unit table, hand-off step 6, SIZING schedule/edges/alternative 6 corrected |
 | 2 | Reachability allowlist missing from U7b scope/acceptance and the co-ownership row | Added to U7b; row extended |
 | 3 | `TrainingCommon.world_size` in U4a without its construction sites, serde default, or the wire field | `#[serde(default)]` = 1 (D10); construction sites (`crates/jammi-ai/src/wire/training.rs::lora_common_from_proto`, `crates/jammi-ai/src/session.rs::InferenceSession::fine_tune`, `InferenceSession::fine_tune_graph`, `tests/it`) and `training.proto`/`jammi-wire/src/training.rs` in U4a with wire-server co-owner; README r17 |
-| A4 | Citations: `crates/jammi-wire/src/fine_tune.rs::FineTuneConfig` corrected from an undersized line range to the whole struct; `crates/jammi-ai/src/fine_tune/optimizer.rs::clip_and_step` (correct as cited); this fold also re-anchored README ruling 20's `runpod_lib.sh` citation back 1263→1264 (9780d752) | `FineTuneConfig` range corrected; `clip_and_step` confirmed; the `runpod_lib.sh` re-anchor is folded. At HEAD that citation is by construct — `runpod_lib.sh::_rp_deploy_payload`'s `gpuCount` field — no offset survives |
+| A4 | Citations: `crates/jammi-wire/src/fine_tune.rs::FineTuneConfig` corrected from an undersized line range to the whole struct; `crates/jammi-ai/src/fine_tune/optimizer.rs::clip_and_step` (correct as cited) | see `git log -S 'runpod_lib.sh' -- docs/plans/67-distributed-training/` (abb96a93, 9780d752) |
 | A5 | U5b omitted `tests/distributed/main.rs`; U4b listed `store/manifest.rs` under ai-core | Corrected |
 | A6 | U4a → U2b edge (the `world` argument) unstated | Stated in README table, U2b, SIZING edges |
 

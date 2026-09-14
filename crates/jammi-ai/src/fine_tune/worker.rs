@@ -6263,6 +6263,54 @@ mod tests {
 
     use super::*;
 
+    /// P2' (fix round 1, BLOCK #1 finding F2): the kernel admission profile
+    /// the `FineTune` producer folds into `MaterializationEnv` differs
+    /// across device support — the exact "two runs under different
+    /// admission hash differently" property the campaign audit demanded
+    /// (`kernel_admission_profile`'s own doc: device support is the one leg
+    /// that VARIES across the environments this determinant exists to
+    /// distinguish, since Metal is never device-supported regardless of
+    /// build features — a device leg this test can exercise deterministically
+    /// on any host).
+    #[test]
+    fn kernel_admission_profile_differs_across_device_support() {
+        use jammi_db::store::manifest::ComputeDevice;
+
+        let cpu = kernel_admission_profile(&ComputeDevice::Cpu);
+        assert!(
+            cpu.starts_with("adamw_step_fused=fused;"),
+            "CPU is always device-supported: {cpu}"
+        );
+
+        let metal = kernel_admission_profile(&ComputeDevice::Metal { ordinal: 0 });
+        assert!(
+            metal.starts_with("adamw_step_fused=eager;"),
+            "Metal is never device-supported: {metal}"
+        );
+        assert_ne!(
+            cpu, metal,
+            "two device environments that admit `adamw_step_fused` differently must produce \
+             two different profile strings — the exact property \
+             `MaterializationEnv::kernel_admission_profile` exists to fold into the definition \
+             hash"
+        );
+    }
+
+    /// Calling [`kernel_admission_profile`] twice for the SAME device
+    /// (mirroring the two real call sites in `train_fine_tune` — before and
+    /// after training, P2') is guaranteed to agree, since every input it
+    /// folds is fixed once per process (that function's own doc) — the
+    /// "before and after agree" half the acceptance oracle relies on for
+    /// reuse to work at all within one environment.
+    #[test]
+    fn kernel_admission_profile_is_stable_across_repeated_calls() {
+        use jammi_db::store::manifest::ComputeDevice;
+
+        let a = kernel_admission_profile(&ComputeDevice::Cpu);
+        let b = kernel_admission_profile(&ComputeDevice::Cpu);
+        assert_eq!(a, b, "every input this profile folds is process-fixed");
+    }
+
     /// Campaign #446 finding 3, the honest-negative half:
     /// [`reason_from_probe_window`] returns the window's OWN verbatim
     /// predicate for an op it recorded, and [`REASON_UNAVAILABLE`] — never a

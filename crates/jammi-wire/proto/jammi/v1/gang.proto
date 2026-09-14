@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package jammi.v1.gang;
+
+// GangService — the coordinator-to-member admission wire for a multi-host
+// gang run. One rpc, `RunRank`, bidi: a member opens the stream and sends
+// exactly one `Assign` naming its job coordinates (never training-set
+// identity, which lives on the `jobs` row and is resolved host-side, never
+// carried on the wire); the handler admits or refuses it, and an admitted
+// session is HELD under re-verification until it ends `Aborted{reason}`.
+//
+// No `FetchPartition`, no round messages: a rank reads its partition from the
+// shared object store using the row's own recorded training-set identity —
+// peer-local, never a wire fetch of bytes every member can already read. The
+// round protocol between admitted ranks is a later unit's, frozen there, not
+// here.
+//
+// Served ONLY on the internal `[server] peer_bind` listener, beside
+// `PeerService` — never on the public gRPC + Flight SQL listener (which
+// answers UNIMPLEMENTED for these paths), never wrapped by the tenant-binding
+// layer. Invariant I-GANG: tenant is derived from the verified `jobs` row,
+// never the caller — a caller-supplied tenant is ignored.
+//
+// Message shape and arity are frozen by review and by the contract of record
+// (CONTRACT-U5a.md), not by the api-freeze guard: that guard decodes only the
+// `PACKAGE`/`(Service, Method)` tokens, so later units MAY add fields or
+// oneof variants but MUST NOT rename or remove anything declared here.
+service GangService {
+  rpc RunRank(stream RankControl) returns (stream RankEvent);
+}
+
+// A control frame a rank sends on its `RunRank` stream.
+message RankControl {
+  oneof control {
+    Assign assign = 1;
+    Cancel cancel = 2;
+  }
+}
+
+// The job coordinates only. No training-set identity (resolved by the
+// handler from the `jobs` row) and no lease duration (the rank derives its
+// own admission window from the same row). A second `Assign` on an
+// already-admitted stream is a protocol violation.
+message Assign {
+  string job_id = 1;
+  int64 attempt = 2;
+  uint32 rank = 3;
+  uint32 world = 4;
+  string coordinator_instance_id = 5;
+}
+
+// End this rank's own session cooperatively.
+message Cancel {}
+
+// An event frame on a `RunRank` stream.
+message RankEvent {
+  oneof event {
+    Admitted admitted = 1;
+    Aborted aborted = 2;
+    Outcome outcome = 3;
+  }
+}
+
+// The rank was admitted: held under re-verification until it ends `Aborted`.
+message Admitted {}
+
+// Why a session ended without ever handing control to a rank body. Additive:
+// a later reason joins this set; none already declared is ever renamed or
+// removed.
+enum AbortReason {
+  ABORT_REASON_UNSPECIFIED = 0;
+  // This host is draining — the only host-initiated cut.
+  ABORT_REASON_DRAIN = 1;
+  // A row fact refuted admission (status, claimant, attempt, lease, or the
+  // training-set identity no longer holds) — assembly-scoped.
+  ABORT_REASON_REFUTED = 2;
+  // The rank itself sent `Cancel`.
+  ABORT_REASON_CANCELLED = 3;
+  // The admitted session reached its park bound with no body to run.
+  ABORT_REASON_NO_BODY = 4;
+  // This host's own object store faulted at re-verification — member-scoped,
+  // never counted against the assembly's attempt budget.
+  ABORT_REASON_STORE_UNAVAILABLE = 5;
+  // The catalog did not answer within tolerance — transient, assembly-scoped,
+  // never counted against the assembly's attempt budget.
+  ABORT_REASON_UNAVAILABLE = 6;
+}
+
+message Aborted {
+  AbortReason reason = 1;
+}
+
+// The terminal outcome of a rank body's natural end. Frozen here (additive,
+// costs nothing at the freeze gate — `api_freeze.rs` decodes only
+// `PACKAGE`/`RPC` tokens) though this rpc's own admission stage ships neither
+// this variant's producer (a rank body) nor its consumer (the coordinator's
+// terminal write on receipt).
+message Outcome {
+  oneof result {
+    TrainedOutcome trained = 1;
+    FailedOutcome failed = 2;
+  }
+}
+
+message TrainedOutcome {
+  string artifact_digest = 1;
+}
+
+message FailedOutcome {
+  string reason = 1;
+}

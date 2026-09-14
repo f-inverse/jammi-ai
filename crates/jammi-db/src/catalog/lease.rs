@@ -223,6 +223,42 @@ pub fn stale_before_clause(
     }
 }
 
+/// The SQL scalar expression for how many seconds remain in `col`'s lease
+/// window — negative once expired, `NULL` when `col` itself is `NULL` (no
+/// lease) — evaluated against the SAME clock [`lease_expired_clause`]
+/// compares against: the backend's OWN `now()` on Postgres (stable for the
+/// whole enclosing transaction, so a sibling `lease_expired_clause` call in
+/// the same statement agrees with this one even though each names `now()`
+/// independently), or the bound [`lease_now`] app-clock value on SQLite —
+/// bound HERE, once, since two independent [`lease_now`] reads do not carry
+/// Postgres's same-transaction guarantee.
+///
+/// `CONTRACT-U5a.md` §I1(a): `Catalog::get_job_for_rank` reads this alongside
+/// [`lease_expired_clause`]'s own negation in ONE statement, so "how much of
+/// the window remains" is never a caller-side subtraction against its OWN
+/// clock (SQLite: a replica-clock read no different from any other app-side
+/// timestamp; Postgres: outright wrong, since only the database's `now()`
+/// avoids replica skew — see this module's own docs) once bound to a
+/// remaining-window value read back from a row a caller then acts on.
+pub fn lease_remaining_seconds_expr(
+    col: &str,
+    kind: BackendKind,
+    params: &mut Vec<SqlValue<'static>>,
+) -> String {
+    match kind {
+        BackendKind::Postgres => {
+            format!("EXTRACT(EPOCH FROM ({col}::timestamptz - now()))")
+        }
+        BackendKind::Sqlite => {
+            params.push(SqlValue::TextOwned(lease_now()));
+            format!(
+                "((julianday({col}) - julianday(${})) * 86400.0)",
+                params.len()
+            )
+        }
+    }
+}
+
 /// The instance-liveness margin: `2 * lease`, against `instances.last_seen_at`
 /// (the DB clock via [`stale_before_clause`]) — the same tolerance
 /// `Catalog::reclaim_expired_jobs`'s inline-execution arm already computes
@@ -303,6 +339,33 @@ mod tests {
         let expr = lease_deadline_expr(BackendKind::Sqlite, Duration::from_secs(30), &mut params);
         assert_eq!(expr, "$1");
         assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn remaining_seconds_expr_postgres_binds_no_timestamp() {
+        let mut params = Vec::new();
+        let expr =
+            lease_remaining_seconds_expr("lease_expires_at", BackendKind::Postgres, &mut params);
+        assert_eq!(
+            expr,
+            "EXTRACT(EPOCH FROM (lease_expires_at::timestamptz - now()))"
+        );
+        assert!(
+            params.is_empty(),
+            "Postgres's remaining-seconds expression must bind no timestamp: {params:?}"
+        );
+    }
+
+    #[test]
+    fn remaining_seconds_expr_sqlite_binds_the_app_clock_once() {
+        let mut params = Vec::new();
+        let expr =
+            lease_remaining_seconds_expr("lease_expires_at", BackendKind::Sqlite, &mut params);
+        assert_eq!(
+            expr,
+            "((julianday(lease_expires_at) - julianday($1)) * 86400.0)"
+        );
+        assert_eq!(params.len(), 1, "one bind: lease_now(), the app clock");
     }
 
     #[test]

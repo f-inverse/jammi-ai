@@ -248,12 +248,17 @@ sampled in memory and trained on directly. Giving the graph arm a
 `TrainingSet` table of its own is tracked at
 <https://github.com/f-inverse/jammi-ai/issues/538>.
 
-## Reusing a prior run (`cache = Use`)
+## Model-level cache reuse (`cache = Use`) is not yet supported
 
-`fine_tune` (the column-source kind only — see below) accepts an opt-in cache dial,
-the same `cache` knob the compute verbs (`generate_embeddings`, `infer`, …) carry.
-`cache="use"` probes for an exact prior materialisation before training; the default,
-`cache="bypass"` (or omitting `cache` entirely), always trains.
+`fine_tune` (the column-source kind) and `fine_tune_graph` both accept the same
+opt-in `cache` dial the compute verbs (`generate_embeddings`, `infer`, …) carry,
+but neither honors `cache="use"`. It is refused, typed
+(`jammi.errors.InvalidArgument` on both transports): model-level cache reuse —
+binding a fine-tune job to an earlier run's already-published model instead of
+training — is not yet supported
+(<https://github.com/f-inverse/jammi-ai/issues/562>). `cache="bypass"` (the
+default, or omitting `cache` entirely) is unaffected on either kind: a fine-tune
+job always trains.
 
 ### Python
 
@@ -264,22 +269,11 @@ job = db.fine_tune(
     columns=["text_a", "text_b", "score"],
     method="lora",
     task="embedding",
-    cache="use",
 )
 result = job.wait()
-print(result["cache_outcome"])  # "computed", or "reused:<earlier-model-id>"
+print(result["cache_outcome"])  # always "computed"
 print(f"Model: {result['model_id']}")
 ```
-
-A hit registers THIS job's own model id pointing at the SAME already-published
-artifact prefix an earlier run published — no bytes are retrained or recopied. Both
-model ids stay independently servable; either can be deleted without disturbing
-the other — the underlying prefix is reclaimed only once no live model row names
-it as its own exact key or as its immediate containing directory, and a delete
-attempted while one still does is refused, typed, naming the prefix and the
-referencing count. A dedicated catalog edge recording which
-row is the original and which is the reuse is not enforced
-(<https://github.com/f-inverse/jammi-ai/issues/547>).
 
 ### Rust
 
@@ -287,53 +281,16 @@ The embedded surface's cache dial lives on `jammi_wire::request::FineTuneRequest
 (submitted through `InferenceSession::submit_fine_tune`), not on the loose
 `InferenceSession::fine_tune`/`fine_tune_graph` methods shown above, which always
 train (`cache: CachePolicy::Bypass`, unconditionally). The remote
-`jammi_client::DataClient::submit_fine_tune` carries the same field. Neither Rust
-surface returns `cache_outcome` from `TrainingJob::wait()` — only `model_id()`
-is exposed there; read the outcome from the Python binding (either transport), or
-from the remote `jammi_client::DataClient::job_status` call.
+`jammi_client::DataClient::submit_fine_tune` carries the same field, and `Use` is
+refused there too. Neither Rust surface returns `cache_outcome` from
+`TrainingJob::wait()` — only `model_id()` is exposed there.
 
-### What the probe keys on
-
-The probe (`Catalog::probe_model_by_definition`) matches on an EXACT combination:
-the training set's definition hash + artifact digest + row count, the base model's
-identity, the whole canonical `TrainingSpec::FineTune` spec (every hyperparameter,
-the method, the task, the seed, `world_size`), and the execution environment (the
-engine version, the compute device, and every invoked model's identity). Any one
-determinant differing — a different `lora_rank`, a different `world_size`, a
-different device — misses the probe, and the job trains.
-
-The fused-kernel admission profile the training loop actually resolves (fused vs.
-eager per operator) is declared as part of the environment record but is UNCOVERED
-by the probe: nothing writes a real value into it, so two runs whose only
-difference is that admission outcome hash identically and are treated as the same
-definition (<https://github.com/f-inverse/jammi-ai/issues/546>).
-
-### `cache = Use` is scoped to the column-source kind
-
-`fine_tune_graph` accepts the same `cache=` keyword, but a `cache="use"` request is
-refused, typed (`jammi.errors.InvalidArgument` on both transports): a graph
-fine-tune's model carries no materialization to probe or record. `cache="bypass"`
-(the default) is unaffected — a graph fine-tune always trains, whether or not
-`cache` is named. `TrainingSpec::GraphFineTune` carries no `cache` field at all —
-the request-time refusal is the only place the wire's value is ever read for this
-kind. A stray `cache` key found under `graph_fine_tune` in a persisted `jobs.spec`
-row (the row is engine-written from an already-decoded spec, so this only arises
-from a hand-edited row) is silently dropped at deserialize rather than refused,
-since the type has nowhere to put it; making an unexpected key a hard error across
-the persisted-row format is a separate reshape
+A stray `cache` key found under `graph_fine_tune` in a persisted `jobs.spec` row
+(the row is engine-written from an already-decoded spec, so this only arises from
+a hand-edited row) is silently dropped at deserialize rather than refused, since
+the type has nowhere to put it; making an unexpected key a hard error across the
+persisted-row format is a separate reshape
 (<https://github.com/f-inverse/jammi-ai/issues/548>).
-
-### Two caveats
-
-- **Best-effort, not exclusion.** Two `cache="use"` jobs submitted for the same
-  spec close enough together can both miss the probe (neither's row is committed
-  yet) and both train — reuse skips a redundant run whenever it lands after an
-  earlier one has already published, not always.
-- **Reuse assumes a like-for-like fleet.** The probe folds the compute device's
-  ordinal (e.g. "CUDA device 0"), never a host or machine identity, so a model
-  trained on one host's GPU 0 can be served in place of a fresh run resolved to a
-  different host's GPU 0. This is sound for a fleet of interchangeable accelerators;
-  it is not a guarantee across heterogeneous hardware.
 
 ## Encoder-adapters fine-tuning (PEFT-style adapter injection)
 

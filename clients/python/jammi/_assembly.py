@@ -610,8 +610,10 @@ def build_fine_tune_request(
     durable per-tenant contract (migration 030). `world_size` is the number of
     ranks that train this job cooperatively; `1` (the default) is a single
     process and leaves the wire field unset — see :func:`_wire_world_size`.
-    `cache` opts into model-level cache reuse (``"use"``) or keeps the engine's
-    default recompute (``"bypass"``, the default when omitted) — see
+    `cache="use"` is refused, typed (:class:`jammi.errors.InvalidArgument`):
+    model-level cache reuse is not yet supported
+    (<https://github.com/f-inverse/jammi-ai/issues/562>); `cache=None` or
+    ``"bypass"`` (the default) always trains — see
     :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
@@ -712,10 +714,10 @@ def build_fine_tune_graph_request(
     "declared" external edges teach the metric something new; "similarity" edges
     are a weak bootstrap only. `world_size` is the number of ranks that train
     this job cooperatively; `1` (the default) is a single process and leaves the
-    wire field unset — see :func:`_wire_world_size`. `cache` opts into
-    model-level cache reuse (``"use"``) or keeps the engine's default recompute
-    (``"bypass"``, the default when omitted) — see
-    :func:`_wire_cache_policy_for_submit_job`.
+    wire field unset — see :func:`_wire_world_size`. `cache="use"` is refused,
+    typed (:class:`jammi.errors.InvalidArgument`): a graph fine-tune carries no
+    materialization to probe or record; `cache=None` or ``"bypass"`` (the
+    default) is unaffected — see :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _wire_cache_policy_for_submit_job(cache)

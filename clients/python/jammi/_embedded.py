@@ -569,9 +569,11 @@ class EmbeddedBackend:
         (migration 030) the same way the remote arm's does. `world_size` is the
         number of ranks that train this job cooperatively; `1` (the default) is
         a single process, and a value below `1` is refused here with
-        :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
-        opts into model-level cache reuse (``"use"``) or keeps the engine's
-        default recompute (``"bypass"``, the default when omitted).
+        :class:`jammi.errors.InvalidArgument` rather than submitted.
+        `cache="use"` is refused, typed (:class:`jammi.errors.InvalidArgument`):
+        model-level cache reuse is not yet supported
+        (<https://github.com/f-inverse/jammi-ai/issues/562>); `cache=None` or
+        ``"bypass"`` (the default) always trains.
         """
         request = build_fine_tune_request(
             source=source,

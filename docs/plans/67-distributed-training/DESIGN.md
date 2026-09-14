@@ -134,28 +134,33 @@ for that kind, typed, at decode (the one place that can still see both the kind 
 requested value). A stray `cache` key found under `graph_fine_tune` in a persisted
 `jobs.spec` row is dropped at deserialize rather than refused, since the type has nowhere to
 put it; a hard error on unknown keys across the persisted-row format is a separate reshape
-(<https://github.com/f-inverse/jammi-ai/issues/548>). `CachePolicy::Use` probes by definition
-hash (the anchors leg was removed as redundant: the training-set digest is already inside the
-hash); on a hit the job completes by registering **its own name** pointing at the reused
-prefix (two rows, one prefix, reported on the job's own result via `cache_outcome`). An unset
-`cache` field encodes identically on both transports: the Rust client omits the field (rather
-than assigning the enum's `Bypass` discriminant) so an explicit `Bypass` and an unset field put
-the SAME bytes on the wire, matching the embedded Python encoding.
+(<https://github.com/f-inverse/jammi-ai/issues/548>). Model-level cache reuse is not
+implemented: `CachePolicy::Use` on the column-source `FineTune` kind is also refused, typed, at
+submit (`InferenceSession::submit_fine_tune_spec_deduped`) rather than probing by definition
+hash. The probe-by-definition design is filed as the property to implement — a hit
+registers **its own name** pointing at the reused prefix (two rows, one prefix, reported on
+the job's own result via `cache_outcome`), probing by definition hash alone (the anchors leg
+removed as redundant: the training-set digest is already inside the hash)
+(<https://github.com/f-inverse/jammi-ai/issues/562>). An unset `cache` field encodes
+identically on both transports: the Rust client omits the field (rather than assigning the
+enum's `Bypass` discriminant) so an explicit `Bypass` and an unset field put the SAME bytes on
+the wire, matching the embedded Python encoding.
 
-Deleting a model row is always allowed, even one sharing a reused prefix with another — there
-is no catalog edge enforcing which row is the original
+Deleting a model row is always allowed. Catalog referential integrity between two rows that
+might name the same prefix only becomes relevant once model-level reuse ships
 (<https://github.com/f-inverse/jammi-ai/issues/547>). The underlying bytes are reclaimed only
 when no live `models` row, in any tenant, names the object's exact key or its immediate
 containing directory as `artifact_path` — the guard rule every `models/` byte-delete this
 design's reclaim paths perform runs through: `ResultStore::prefix_is_referenced` is an
 admin-scoped whole-catalog scan of `models.artifact_path` that
 `ResultStore::delete_unreferenced_prefix` consults before every `models/`-prefix byte-delete
-(reconcile's own reap, the worker's abandon path, and the worker's epoch-checkpoint sweep all
-reach it), refusing typed (`StorageError::Referenced { prefix, count }`) while any row
-still references the prefix; reconcile's attribution set is built from the same admin-scoped
-scan, never the tenant-scoped `list_models`, and a prefix it finds still referenced this way is
-reported (with its count) via `ReconcileReport.referenced`/`referenced_count`
-(`crates/jammi-db/src/store/reconcile.rs`), carried on the wire (`catalog.proto`, tags 15/16).
+(reconcile's own reap, the worker's abandon path, the worker's epoch-checkpoint sweep, and the
+trainer's mid-run retention prune all reach it), refusing typed (`StorageError::Referenced
+{ prefix, count }`) while any row still references the prefix; reconcile's attribution set is
+built from the same admin-scoped scan, never the tenant-scoped `list_models`, and a prefix it
+finds still referenced this way is reported (with its count) via
+`ReconcileReport.referenced`/`referenced_count` (`crates/jammi-db/src/store/reconcile.rs`),
+carried on the wire (`catalog.proto`, tags 15/16).
 
 The fused-kernel admission profile the training loop actually resolves (fused vs. eager per
 operator) is declared on `MaterializationEnv` but UNCOVERED: nothing writes a real value into

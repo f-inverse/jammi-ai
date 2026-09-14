@@ -543,6 +543,155 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
         db.close()
 
 
+def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key_set(
+    tmp_path,
+):
+    """`test_embed_reconcile_both_arms_return_the_report_shape` above only ever
+    exercises the embedded `Database.reconcile` on an EMPTY, freshly-opened
+    engine, so the `referenced` / `referenced_count` fields (the reap-site
+    consult's own output — see `ResultStore::reconcile`'s doc and
+    `crates/jammi-db/tests/it/reconcile.rs::a_stray_file_under_a_referenced_attempt_level_prefix_survives_via_the_reap_site_consult`)
+    are asserted structurally (always `[]` / `0`) there, never EXECUTED on a
+    non-empty case through this binding.
+
+    This test reproduces that exact it-test's scenario through the embedded
+    engine's own on-disk layout instead: a `models` row is registered naming
+    an attempt-level artifact prefix (`models/_global/{job}/worker-1/0`, the
+    `[job_id, worker_id, attempt]` shape `worker.rs` registers in production),
+    a valid bundle (`adapter.safetensors` + `manifest.json`) is published
+    under it, and a STRAY file the manifest does not name is written directly
+    alongside it. `reconcile(apply=True)` must find that stray file, consult
+    `prefix_is_referenced` on its own key, and report it under `referenced` —
+    never reclaim it — the same live-through-containment case the Rust
+    it-test proves at the engine layer, now proven not to drop across this
+    binding's serde projection.
+
+    No embedded verb exists to register a model or publish an artifact
+    bundle directly, so both are constructed the same way the engine itself
+    would lay them out on disk: a raw `sqlite3` INSERT mirroring
+    `Catalog::register_model`'s own statement (the same close-before-inject
+    discipline `test_remote_and_embedded_job_metrics_agree_on_all_three_states`
+    already uses against the `jobs` table), and `manifest.json` written by
+    hand in the exact shape `ArtifactStore::put_artifact` produces. The
+    `reconcile` CALL ITSELF — the artifact under test — is the real,
+    compiled engine's, not a stand-in.
+
+    **Close-before-inject is not optional here, it is load-bearing**: the
+    SQLite catalog's own module doc
+    (`crates/jammi-db/src/catalog/backend_sqlite.rs`, "Residual, deliberately
+    not closed") names exactly this shape — a foreign SQLite library
+    instance (CPython's own `sqlite3`, linked against the platform
+    `libsqlite3`, as opposed to the engine's bundled amalgamation) writing to
+    `catalog.db` while an engine connection is ALSO open is an
+    out-of-contract topology: the engine's own `unix-excl` VFS keeps its
+    wal-index on the HEAP (never re-reading the on-disk `-wal`), so a raw
+    write landing while an engine `Database` is live is silently invisible to
+    it, never a loud failure. Every raw `sqlite3` write below therefore runs
+    with NO embedded engine connection open at all — verified upstream by
+    `test_remote_and_embedded_job_metrics_agree_on_all_three_states`'s own
+    docstring — and only the FRESH `db` opened after is ever used to read it.
+
+    Hermetic: opens a local engine (`file://`), contacts no server.
+    """
+    import hashlib
+    import json
+    import sqlite3
+    import uuid
+
+    from jammi._database import _reconcile_report_to_dict
+    from jammi._generated.jammi.v1 import catalog_pb2
+
+    # The remote projection's own key set — pinned here directly (not via
+    # `_RECONCILE_REPORT_DICT_KEYS`, which this test's non-empty case must
+    # agree with independently) so this test alone still catches a dropped
+    # `referenced` field even if the module-level constant above were wrong.
+    remote_keys = set(_reconcile_report_to_dict(catalog_pb2.ReconcileReport()))
+
+    # Bootstrap: open + immediately close, so `catalog.db` and the
+    # `jammi_db/` root exist (migrations applied) with NO engine connection
+    # left attached before the raw-sqlite3 injection below.
+    bootstrap_db = jammi.connect(f"file://{tmp_path}")
+    bootstrap_db.close()
+    del bootstrap_db
+
+    job_id = str(uuid.uuid4())  # attribution requires a canonical v4 UUID
+    prefix_dir = tmp_path / "jammi_db" / "models" / "_global" / job_id / "worker-1" / "0"
+    prefix_dir.mkdir(parents=True)
+
+    weights = b"weights"
+    (prefix_dir / "adapter.safetensors").write_bytes(weights)
+    manifest = {
+        "files": [
+            {
+                "name": "adapter.safetensors",
+                "sha256": hashlib.sha256(weights).hexdigest(),
+            }
+        ]
+    }
+    # Manifest LAST, mirroring `ArtifactStore::put_artifact`'s own write
+    # order — its presence is what marks the bundle complete.
+    (prefix_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    # A stray object the manifest does not name, directly under the SAME
+    # attempt-level directory the model row's `artifact_path` will EQUAL
+    # exactly — a strict descendant of it, never reclaimable through the
+    # ordinary age-gated orphan arm regardless of age; only the reap-site's
+    # own `prefix_is_referenced` consult on this exact key protects it.
+    (prefix_dir / "debug_dump.tmp").write_bytes(b"leftover")
+
+    artifact_path = f"file://{prefix_dir}"
+    catalog_db = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(catalog_db))
+    try:
+        conn.execute(
+            "INSERT INTO models "
+            "(model_id, name, model_type, task, backend, version, status, "
+            " metadata, artifact_path, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'registered', ?, ?, NULL)",
+            (
+                "attempt-level-model::1",  # untenanted `model_pk(None, name, version)`
+                "attempt-level-model",
+                "lora",
+                "text_embedding",
+                "candle",
+                1,
+                json.dumps({"base_model_id": None, "config_json": None}),
+                artifact_path,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Fresh db, opened only AFTER the raw-sqlite3 injection above is fully
+    # committed and its own connection fully closed.
+    db = jammi.connect(f"file://{tmp_path}")
+    try:
+        # `grace_secs` need only clear the deployment's configured lease
+        # duration (default 30s; `apply=True` refuses a shorter grace) — the
+        # reap-site's `referenced` consult itself runs before any age gate,
+        # so a fresh object still lands in `referenced`, never `orphans`.
+        report = db.reconcile(apply=True, grace_secs=3600, all=False)
+
+        assert set(report) == remote_keys, (
+            f"embed reconcile(apply=True) keys {set(report)} != the remote "
+            f"projection's {remote_keys}"
+        )
+        assert any(r.endswith("debug_dump.tmp") for r in report["referenced"]), (
+            f"the reap-site consult must name the stray file referenced: {report}"
+        )
+        assert report["referenced_count"] == len(report["referenced"]), (
+            f"referenced_count must be the true total: {report}"
+        )
+        assert report["truncated"] is False
+        assert all(not o.endswith("debug_dump.tmp") for o in report["orphans"]), (
+            f"a referenced stray file must never be reclaimed: {report}"
+        )
+        assert (prefix_dir / "debug_dump.tmp").exists()
+    finally:
+        db.close()
+
+
 def test_mutable_topic_verbs_have_identical_signatures_across_wheels():
     """The mutable-table + topic + pub/sub verbs carry the SAME call surface on the
     client's `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both
@@ -1388,6 +1537,7 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
                     "model_id": "irrelevant-for-this-test",
                     "artifact_path": "irrelevant-for-this-test",
                     "metrics": metrics_value,
+                    "cache_outcome": "computed",
                 }
             )
         )

@@ -69,7 +69,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     `Unavailable`, and the coordinator picks another member or fails the attempt. No new worker
     state. (B1; OPS D6.)
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
-    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#5-8-unit-2-membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
+    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-unit-2--membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
     not a plannable unit, so **U5b-1a** lands the
     substrate it sketches: `[server] peer_advertise` (validate: `peer_advertise ⇒ peer_bind ⇒
     result_root`), the canonicalized `instances.peer_addr`/`result_root` columns (migration,

@@ -239,3 +239,119 @@ async fn cache_bypass_never_reuses() {
         "two independent Bypass runs must never share a prefix"
     );
 }
+
+/// P1' (fix round 1, BLOCK #1 finding F1): a cache HIT whose finalize CAS
+/// loses the lease race must never delete the REUSED prefix — that prefix is
+/// a DIFFERENT, already-servable model's committed artifact, not this
+/// attempt's own bytes. Drives the real worker exactly like
+/// `fine_tune::worker_that_lost_lease_does_not_finalize`: the SECOND
+/// (cache-hit) submission's claim is stolen by a re-claiming worker before
+/// the stale claim's own `run_claimed_job` reaches finalize, so its CAS
+/// necessarily loses — `PublishedPrefix::delete_if_owned`'s own guard is the
+/// only thing standing between that loss and the FIRST job's prefix being
+/// deleted out from under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_lease_on_a_cache_hit_never_deletes_the_reused_prefix() {
+    use jammi_ai::fine_tune::worker::JobWorker;
+    use std::time::Duration;
+
+    let (session, _dir) = session_with_training_data().await;
+
+    // The FIRST submission trains for real; the SECOND will reuse its prefix.
+    let (first_model_id, first_trained, _) =
+        submit_and_run(&session, spec_with_cache(CachePolicy::Use)).await;
+    assert!(first_trained);
+    let first_before = session
+        .catalog()
+        .get_model(&first_model_id)
+        .await
+        .unwrap()
+        .expect("the first job's model row must exist");
+    let reused_prefix = first_before
+        .artifact_path
+        .clone()
+        .expect("the first job's model must be servable");
+
+    // The SECOND submission (same spec) is queued but not yet claimed.
+    let job = session
+        .run_training_spec(spec_with_cache(CachePolicy::Use))
+        .await
+        .unwrap();
+
+    let worker_a = JobWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = JobWorker::new(&session).expect("default worker intervals are valid");
+
+    // worker-a claims with a zero (already-expired) lease.
+    let stale_claim = session
+        .catalog()
+        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued cache=Use job");
+
+    // worker-b reclaims the expired lease and re-claims under a long one:
+    // worker-b now owns the job.
+    let actioned = session
+        .catalog()
+        .reclaim_expired_jobs(Duration::from_secs(60), 5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next(
+            worker_b.worker_id(),
+            &["fine_tune"],
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+
+    // worker-a runs its STALE claim to completion: this is a `Reused`
+    // outcome (a cache HIT, no training), so it reaches
+    // `publish_and_finalize` almost immediately — its finalize CAS then
+    // loses to worker-b.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+
+    let after_a = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(
+        after_a.status, "running",
+        "a worker that lost its lease must not finalize, even on a cache hit"
+    );
+
+    // THE PROPERTY: the FIRST job's model — the one the lost attempt's
+    // `Reused` prefix pointed at — is STILL SERVABLE. Pre-fix, worker-a's
+    // abort path unconditionally deleted `prefix` (the SAME reused prefix,
+    // since `dir` is `None` for a `Reused` outcome), destroying the first
+    // model's own committed bytes out from under it.
+    let first_after = session
+        .catalog()
+        .get_model(&first_model_id)
+        .await
+        .unwrap()
+        .expect("the reused model's row must still exist");
+    assert_eq!(
+        first_after.artifact_path.as_deref(),
+        Some(reused_prefix.as_str()),
+        "a lost-lease abort on a cache hit must never delete or unpoint the REUSED model's own \
+         prefix"
+    );
+
+    // The legitimate owner (worker-b) still finalizes correctly against the
+    // SAME reused prefix.
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+    let after_b = session.catalog().get_job(&job.job_id).await.unwrap();
+    assert_eq!(after_b.status, "completed");
+    let second = session
+        .catalog()
+        .get_model(&job.model_id)
+        .await
+        .unwrap()
+        .expect("the legitimate owner's model row must exist");
+    assert_eq!(
+        second.artifact_path.as_deref(),
+        Some(reused_prefix.as_str())
+    );
+}

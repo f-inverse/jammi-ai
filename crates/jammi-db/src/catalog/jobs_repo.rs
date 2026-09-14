@@ -151,7 +151,7 @@ pub struct JobRecord {
     /// never fabricated into a state. Each terminal reason is distinct, so
     /// the retired marker names WHICH edge retired it.
     pub acceleration_report: Option<String>,
-    /// `CONTRACT-U5a.md` §W2: the `ArtifactDigest` of the coordinator's
+    /// The `ArtifactDigest` of the coordinator's
     /// materialized `TrainingSet` — job-scoped, write-once (see
     /// [`Catalog::fill_training_set_identity`]), `NULL` until filled and for
     /// every `world_size == 1` job. Never `Some` while
@@ -159,7 +159,7 @@ pub struct JobRecord {
     /// by migration 033's `CHECK` constraint at the schema edge, not merely
     /// by convention.
     pub training_set_ref: Option<String>,
-    /// `CONTRACT-U5a.md` §W2: the `result_tables` NAME the coordinator
+    /// The `result_tables` NAME the coordinator
     /// materialized the training set under — the one coordinate a rank
     /// resolves with a single tenant-pinned lookup
     /// (`Catalog::get_result_table_for_tenant`). See
@@ -179,8 +179,7 @@ impl JobRecord {
     }
 }
 
-/// The outcome of [`Catalog::fill_training_set_identity`]'s write-once CAS
-/// (`CONTRACT-U5a.md` §W2 Fill).
+/// The outcome of [`Catalog::fill_training_set_identity`]'s write-once CAS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrainingSetFillOutcome {
     /// This call's own statement won the CAS: the pair is now set to the
@@ -193,16 +192,17 @@ pub enum TrainingSetFillOutcome {
     Reused,
     /// Zero rows updated, and the re-read found either a different
     /// `claimed_by`/`attempts` (the claim moved) or a different pair value —
-    /// the attempt ends here with NO terminal write (§W2's "No
-    /// supersession"), a normal event, not a failure.
+    /// the attempt ends here with NO terminal write ("no supersession"), a
+    /// normal event, not a failure.
     Aborted,
 }
 
-/// The row [`Catalog::get_job_for_rank`] returns — every field
-/// `CONTRACT-U5a.md` §I1(a)'s I-GANG predicate needs, computed in ONE
-/// statement. Tenant is a plain column here (never consulted against
-/// [`TenantBinding::is_admin_scope`] or [`Catalog::current_tenant`]) — the
-/// CALLER derives and pins it, per §I1's "tenant is derived from the row".
+/// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
+/// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
+/// computed in ONE statement. Tenant is a plain column here (never
+/// consulted against [`TenantBinding::is_admin_scope`] or
+/// [`Catalog::current_tenant`]) — the CALLER derives and pins it: tenant is
+/// derived from the row, never from caller metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmissionRow {
     pub status: String,
@@ -221,8 +221,8 @@ pub struct RankAdmissionRow {
     /// `Assign.world`. A gang admission gate keyed on the caller's claim
     /// instead of this field lets a `world_size > 1` job admit under a
     /// caller-supplied `world = 1`, skipping the training-set pair conjunct
-    /// and the sidecar verify entirely (the closing-audit #1 F1 finding this
-    /// field closes).
+    /// and the sidecar verify entirely — a hazard this field's row-keying
+    /// closes.
     ///
     /// Decoded via `world_size_from_spec_json` (module-private): a top-level `world_size`
     /// key, or (the shape `jammi-ai`'s `TrainingCommon` actually persists) a
@@ -1844,7 +1844,7 @@ impl Catalog {
             .map_err(Into::into)
     }
 
-    /// `CONTRACT-U5a.md` §W2 Fill: the write-once CAS for the training-set
+    /// The write-once CAS for the training-set
     /// identity pair. ONE statement sets BOTH `training_set_ref` and
     /// `training_set_location`, guarded on `job_id`, the CALLER'S OWN
     /// `claimed_by`/`attempts`, and the pair still being unset —
@@ -1856,7 +1856,7 @@ impl Catalog {
     /// second write); if the claim moved (a different `claimed_by`/
     /// `attempts`) or the pair holds different values, this is
     /// [`TrainingSetFillOutcome::Aborted`] — a normal event, not a failure,
-    /// and NO terminal write follows from it (§W2's "No supersession").
+    /// and NO terminal write follows from it ("no supersession").
     ///
     /// The pair is one fact, not two independently nullable columns
     /// (migration 033's `CHECK` constraint pins this at the schema edge);
@@ -1935,9 +1935,10 @@ impl Catalog {
             .await?)
     }
 
-    /// `CONTRACT-U5a.md` §I1(a): the row `GangService::run_rank`'s I-GANG
-    /// decision reads (a `jammi-server` type this crate has no visibility
-    /// into — named here only in prose, never as an intra-doc link).
+    /// The row `GangService::run_rank`'s I-GANG row predicate reads
+    /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1; `GangService` is a
+    /// `jammi-server` type this crate has no visibility into — named here
+    /// only in prose, never as an intra-doc link).
     /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
     /// not consult it at all: tenant is returned as a plain column for the
@@ -2089,7 +2090,7 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// `CONTRACT-U5a.md` §I1: is `instance_id`'s `instances` row FRESH —
+    /// Is `instance_id`'s `instances` row FRESH —
     /// present, and last seen within [`super::lease::instance_liveness_margin`]
     /// (`2 * lease`) on the DB clock? Primary-key lookup; `instances` carries
     /// no tenant column, so there is no tenant predicate to drop or keep.

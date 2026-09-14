@@ -565,9 +565,9 @@ impl OssServer {
         // listener answers UNIMPLEMENTED for its paths too). The registry is
         // cloned now because `MetricsLayer::new(self.metrics)` moves the
         // `Arc` into the public chain below.
-        // `test-hooks` only (fix round 1, R3): a handle onto the SAME
-        // `GangServer` instance's refusal-reason state actually mounted
-        // below, cloned out BEFORE that instance moves (by value) into
+        // `test-hooks` only: a handle onto the SAME `GangServer` instance's
+        // refusal-reason state actually mounted below, cloned out BEFORE
+        // that instance moves (by value) into
         // `GangServiceServer::new` — see `GangServer::refusal_reason_handle`.
         // Declared unconditionally as `None` so the `BoundServer { .. }`
         // literal below never needs its own `#[cfg]` branch on this binding;
@@ -744,8 +744,8 @@ pub struct BoundServer {
     worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
     /// The readiness probe, so a shutdown can flip `/readyz` to 503.
     readiness: Arc<ReadinessProbe>,
-    /// `test-hooks` only (fix round 1, R3): a handle onto the SAME
-    /// `GangServer` instance's refusal-reason state actually mounted on the
+    /// `test-hooks` only: a handle onto the SAME `GangServer` instance's
+    /// refusal-reason state actually mounted on the
     /// peer listener above — `None` when `[server] peer_bind` is unset (no
     /// `GangServer` exists to hold a handle onto). Lets an `it` test driving
     /// `RunRank` over the real network still observe, same-process, which
@@ -960,8 +960,8 @@ impl BoundServer {
         self.peer_addr
     }
 
-    /// `test-hooks` only (fix round 1, R3): a cheaply cloneable handle onto
-    /// the `GangServer` mounted on the internal peer listener's own
+    /// `test-hooks` only: a cheaply cloneable handle onto the `GangServer`
+    /// mounted on the internal peer listener's own
     /// refusal-reason state — `None` when `[server] peer_bind` is unset. A
     /// test harness clones this out BEFORE `serve_with_shutdown`/
     /// `serve_with_signals` consumes `self`, so it can keep observing the

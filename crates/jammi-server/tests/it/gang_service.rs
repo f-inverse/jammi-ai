@@ -1,25 +1,26 @@
-//! `GangService`'s U5a-1 slice.
+//! `GangService`'s admission-wire tests.
 //!
-//! The first two tests below prove the §W2 Resolution hazards directly
+//! The first two tests below prove the sidecar-verify hazards directly
 //! against `crate::grpc::gang::resolve_training_set_identity` and
-//! `jammi_db::Catalog::get_result_table_for_tenant` — the way §W2 Resolution
-//! states the property (a repo-level predicate plus an explicit guard at the
-//! resolution call site), matching `get_job_for_rank`'s own
+//! `jammi_db::Catalog::get_result_table_for_tenant` — the way the sidecar
+//! verify states the property (a repo-level predicate plus an explicit
+//! guard at the resolution call site), matching `get_job_for_rank`'s own
 //! enumerating-caller-oracle treatment elsewhere in this contract (see
-//! `docs/rigor/contracts/feat_500-C-U5a-1.md` §W2 Resolution).
+//! `docs/rigor/contracts/feat_500-C-U5a-1.md` § A2).
 //!
 //! The remaining tests drive the real `RunRank` rpc over the production
 //! `peer_bind` listener (`start_engine_server_with_peer_bind` /
-//! `start_no_worker_server`) — the wire-level K2 edges (§W1: `world == 0`,
+//! `start_no_worker_server`) — the wire-level K2 edges (`world == 0`,
 //! `rank >= world`, refused before I-GANG runs), every I-GANG determinant
-//! `get_job_for_rank` decides (§I1(a): job not found, not `running`, wrong
-//! claimant, wrong attempt, lease not live), and f1': a call satisfying
+//! `get_job_for_rank` decides (job not found, not `running`, wrong
+//! claimant, wrong attempt, lease not live); a call satisfying
 //! EVERY determinant still ends `UNIMPLEMENTED` — this unit has no
-//! `HostAdmission` session to hand it to (U5a-2 builds that).
+//! `HostAdmission` session to hand it to
+//! (docs/plans/67-distributed-training/UNITS.md § U5a-2 builds it).
 //!
 //! The final group drives `RunRank` itself with `world_size > 1` — the ONLY
 //! path through this handler that ever reads a tenant-scoped catalog row
-//! (§I1(b), threading `row.tenant_id` into `resolve_training_set_identity`).
+//! (threading `row.tenant_id` into `resolve_training_set_identity`).
 //! Every `world_size == 1` test above (and the two direct unit tests at the
 //! top of this file, which call `resolve_training_set_identity` directly,
 //! never through the RPC) leaves this block cold. These tests drive it
@@ -27,24 +28,24 @@
 //! `result_tables` row registered under ANOTHER tenant, or under NO tenant
 //! while the job is tenant-bound, must refuse `FAILED_PRECONDITION` without
 //! disclosing the other tenant's row; a pair that genuinely resolves for the
-//! job's OWN tenant must still reach the handler's own f1' `UNIMPLEMENTED`
+//! job's OWN tenant must still reach the handler's own `UNIMPLEMENTED`
 //! terminal (proving the sidecar path was actually decided, not merely
 //! "always denies"); and the pair missing entirely at `world_size > 1` must
 //! refuse the same way.
 //!
-//! **Fix round 1 (R2):** every `world_size > 1` test below is keyed on the
+//! Every `world_size > 1` test below is keyed on the
 //! ROW's own `world_size` (a spec naming `{"common":{"world_size":2}}`,
-//! `WORLD2_SPEC`), never on the caller's own `assign.world` — the closing
-//! audit's own F1 finding (a `world_size > 1` job admitted at a
-//! caller-supplied `world = 1` used to skip the pair conjunct and the
-//! sidecar verify entirely). `run_rank_refuses_when_assign_world_mismatches_row_world_size`
-//! is the NEW determinant this ruling adds: `assign.world != row.world_size`
-//! is itself a refusal. Two more `world_size > 1` cases this file did not
-//! cover before this round: a training-set row found for the job's OWN
-//! tenant but not `ready`, and one that IS `ready` but whose sidecar digest
-//! does not match — both refuse the same way as every other determinant.
+//! `WORLD2_SPEC`), never on the caller's own `assign.world` — a
+//! `world_size > 1` job admitted at a
+//! caller-supplied `world = 1` would otherwise skip the pair conjunct and
+//! the sidecar verify entirely. `run_rank_refuses_when_assign_world_mismatches_row_world_size`
+//! is the determinant that closes this: `assign.world != row.world_size`
+//! is itself a refusal. Also covered: a training-set row found for the
+//! job's OWN tenant but not `ready`, and one that IS `ready` but whose
+//! sidecar digest does not match — both refuse the same way as every other
+//! determinant.
 //!
-//! **Fix round 1 (R3):** `run_rank_refusal_is_non_disclosing_across_every_determinant`
+//! `run_rank_refusal_is_non_disclosing_across_every_determinant`
 //! is the ONE table-driven non-disclosure oracle — every I-GANG determinant
 //! refuses with the pairwise-identical `(code, message)`. The
 //! `test-hooks`-gated `run_rank_last_refusal_reason_distinguishes_every_determinant`
@@ -89,8 +90,8 @@ fn null_tenant_row<'a>(table: &'a str) -> CreateResultTableParams<'a> {
 
 /// The strict-predicate property: a NULL-tenant `result_tables` row exists
 /// (as if created by a coordinator outside any tenant scope); from tenant A,
-/// the RELAXED `get_result_table` (today's only other seam) returns it — the
-/// pre-existing hazard, unconditionally true at base — while the STRICT
+/// the RELAXED `get_result_table` (the other read seam) returns it — the
+/// hazard this predicate guards against — while the STRICT
 /// `get_result_table_for_tenant` refuses to match it, and
 /// `resolve_training_set_identity` built on the strict verb refuses
 /// `FAILED_PRECONDITION` rather than resolving the wrong tenant's table.
@@ -139,7 +140,7 @@ async fn strict_resolver_never_matches_a_null_tenant_row_for_a_real_tenant() {
     assert!(
         leaked.is_some(),
         "the relaxed `get_result_table` read must still see the NULL-tenant row \
-         (today's only seam) — the hazard this row demonstrates"
+         (the only relaxed seam) — the hazard this row demonstrates"
     );
 
     // The NEW strict verb, called with tenant A pinned EXPLICITLY (never
@@ -199,7 +200,7 @@ async fn resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_
     // A REAL ready table, sidecar and all — materialized for tenant B, so a
     // resolution naming tenant A has no legitimate way to reach it. Zero rows
     // keeps the fixture minimal: `finish` still writes the Parquet + the
-    // manifest sidecar and promotes the row to `ready` regardless of row
+    // manifest sidecar and marks the row `ready` regardless of row
     // count.
     let descriptor = ProducingDescriptor::Embedding {
         model_id: "rt-base".into(),
@@ -316,8 +317,8 @@ async fn resolution_site_refuses_under_admin_scope_even_when_the_raw_verb_would_
 }
 
 // ---------------------------------------------------------------------------
-// §W1 K2 (wire-level edges, decided before I-GANG runs) + the interim state
-// between U5a-1's own merge and the day `get_job_for_rank` lands.
+// Wire-level K2 edges (`world == 0`, `rank >= world`), decided before
+// I-GANG runs.
 // ---------------------------------------------------------------------------
 
 fn assign_frame(world: u32, rank: u32) -> jammi_wire::proto::gang::RankControl {
@@ -358,25 +359,25 @@ async fn start_no_worker_server() -> crate::common::grpc::PeerEngineServer {
 
 /// A job whose `spec` names no `world_size` at all — `RankAdmissionRow`
 /// decodes it to `1`, `jammi_db`'s own `WORLD_SIZE_IF_ABSENT` default (see
-/// `jobs_repo.rs`), the shape a non-training job kind (or a pre-R1 spec)
-/// persists.
+/// `jobs_repo.rs`), the shape a non-training job kind (or a spec predating
+/// `world_size`) persists.
 const WORLD1_SPEC: &str = "{}";
 
 /// A job whose `spec` names `world_size: 2` under the `common` key — the
 /// SAME shape `jammi-ai`'s `TrainingCommon` actually persists, and the SAME
 /// literal `crates/jammi-db/tests/it/gang_rank_admission.rs` uses for its own
 /// `get_job_for_rank_reflects_the_row_world_size` fixture. Every
-/// `world_size > 1` test in this file submits with THIS spec (fix round 1,
-/// R2) — never a `world_size == 1` spec paired with an `Assign.world == 2`,
-/// which the R2 world-mismatch conjunct now refuses before the pair conjunct
-/// or the sidecar verify ever runs.
+/// `world_size > 1` test in this file submits with THIS spec — never a
+/// `world_size == 1` spec paired with an `Assign.world == 2`, which the
+/// world-mismatch conjunct refuses before the pair conjunct or the sidecar
+/// verify ever runs.
 const WORLD2_SPEC: &str = r#"{"common":{"world_size":2}}"#;
 
 /// A job submitted and claimed on `server`'s own engine catalog directly
 /// (bypassing the wire `JobService`, matching `jobs_queue.rs`'s own fixture
 /// style — the gang admission surface reads the row, not the submission
-/// RPC), with `spec` controlling the row's own `world_size` (R2 — never the
-/// caller's `Assign.world`). `model_ref: None` avoids needing a registered
+/// RPC), with `spec` controlling the row's own `world_size` — never the
+/// caller's `Assign.world`. `model_ref: None` avoids needing a registered
 /// model FK target (the column is nullable). Returns the `attempts` value
 /// the claim landed at (always `1`, the first claim), for the caller to
 /// build a matching `Assign` frame with.
@@ -533,16 +534,17 @@ async fn run_rank_refuses_a_stream_closed_before_assign() {
 }
 
 // ---------------------------------------------------------------------------
-// §I1 (I-GANG, the full row predicate) + f1' (this unit's own terminal state)
+// I-GANG (the full row predicate) + the not-yet-implemented terminal state
 // ---------------------------------------------------------------------------
 
-/// f1' (this unit's own success path): a call satisfying EVERY I-GANG
+/// A call satisfying EVERY I-GANG
 /// determinant — the row is `running`, claimed by the caller's own
 /// `coordinator_instance_id`, at the matching `attempt`, under a live
 /// lease, and (`world_size == 1` here, so the training-set pair is not
 /// gated) the coordinator's own `instances` row is fresh — still reaches
 /// `UNIMPLEMENTED`: this unit has no `HostAdmission` session to hand the
-/// call to (U5a-2 builds that). Proves every determinant was actually
+/// call to (docs/plans/67-distributed-training/UNITS.md § U5a-2 builds it).
+/// Proves every determinant was actually
 /// DECIDED (not skipped) — a call that satisfies all of them does not stop
 /// short at some earlier, easier-to-satisfy refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -575,9 +577,9 @@ async fn run_rank_every_i_gang_determinant_satisfied_is_unimplemented() {
     assert_eq!(err.code(), tonic::Code::Unimplemented);
 }
 
-/// b1': a job id no row exists for is refused `FAILED_PRECONDITION` — the
+/// A job id no row exists for is refused `FAILED_PRECONDITION` — the
 /// SAME status and message every other I-GANG determinant refuses with
-/// (§I1 Non-disclosure), never a distinguishing "not found" text.
+/// (non-disclosure), never a distinguishing "not found" text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_when_job_not_found() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
@@ -593,7 +595,7 @@ async fn run_rank_refuses_when_job_not_found() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// b1': a `queued` (never claimed) row is refused `FAILED_PRECONDITION` —
+/// A `queued` (never claimed) row is refused `FAILED_PRECONDITION` —
 /// the "not `running`" determinant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_when_job_not_running() {
@@ -649,7 +651,7 @@ async fn run_rank_refuses_when_job_not_running() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// b1': a lease claimed for 1ms, then allowed to expire, is refused
+/// A lease claimed for 1ms, then allowed to expire, is refused
 /// `FAILED_PRECONDITION` — the "lease not live" determinant (never a
 /// `NULL`-vs-expired distinction the caller can observe).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -691,10 +693,10 @@ async fn run_rank_refuses_when_lease_expired() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// b1': every OTHER I-GANG determinant satisfied, but the coordinator's own
+/// Every OTHER I-GANG determinant satisfied, but the coordinator's own
 /// `instances` row was never upserted (absent) — refused
-/// `FAILED_PRECONDITION`, the "coordinator not fresh" determinant §I1 names
-/// beside the row predicate.
+/// `FAILED_PRECONDITION`, the "coordinator not fresh" determinant I-GANG
+/// names beside the row predicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_rank_refuses_when_coordinator_not_fresh() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
@@ -727,7 +729,7 @@ async fn run_rank_refuses_when_coordinator_not_fresh() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// b1': a caller naming the RIGHT coordinator but the WRONG attempt (a
+/// A caller naming the RIGHT coordinator but the WRONG attempt (a
 /// zombie of a prior attempt this job already moved past) is refused
 /// `FAILED_PRECONDITION` — the "wrong attempt" determinant, isolated from
 /// "not claimed" by using the SAME coordinator the row was actually claimed
@@ -768,7 +770,7 @@ async fn run_rank_refuses_when_attempt_does_not_match() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// b1': a job claimed by a DIFFERENT coordinator than the caller names is
+/// A job claimed by a DIFFERENT coordinator than the caller names is
 /// refused `FAILED_PRECONDITION` — the "not claimed [by this caller]"
 /// determinant. Caller-supplied identity is never trusted over the row's
 /// own `claimed_by` (I-GANG).
@@ -1107,7 +1109,7 @@ async fn run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job() {
     assert_eq!(err.message(), "gang admission refused");
 }
 
-/// f1' at `world_size > 1`: a training-set pair that genuinely resolves and
+/// At `world_size > 1`: a training-set pair that genuinely resolves and
 /// verifies for the job's OWN tenant (materialized and filled under the SAME
 /// tenant `get_job_for_rank` resolves the job under) still reaches this
 /// unit's own terminal — `UNIMPLEMENTED`, never `FAILED_PRECONDITION`.
@@ -1212,8 +1214,8 @@ async fn run_rank_refuses_world_gt_one_when_training_set_pair_missing() {
 }
 
 // ---------------------------------------------------------------------------
-// Fix round 1 (R2 new determinant + R3 non-disclosure oracle + `test-hooks`
-// seam).
+// The world-mismatch determinant, the non-disclosure oracle, and the
+// `test-hooks` seam.
 // ---------------------------------------------------------------------------
 
 /// A GENUINELY resolvable `result_tables` row for `tenant` — real Parquet,
@@ -1257,7 +1259,7 @@ async fn create_not_ready_but_verifiable_table_for_tenant(
 }
 
 /// Drives ONE `RunRank` call end-to-end for a NAMED
-/// [`jammi_server::grpc::gang::GangRefusalReason`] (fix round 1, R3) — every
+/// [`jammi_server::grpc::gang::GangRefusalReason`] — every
 /// scenario satisfies every OTHER I-GANG determinant, isolating the named
 /// one, the same discipline the individual determinant tests earlier in
 /// this file already follow, collected here ONCE so both the plain lane's
@@ -1620,7 +1622,7 @@ async fn run_rank_refuses_world_gt_one_when_training_set_digest_mismatches() {
     assert_eq!(status.message(), "gang admission refused");
 }
 
-/// R2's new determinant — case (f): `assign.world` disagreeing with the
+/// The world-mismatch determinant — case (f): `assign.world` disagreeing with the
 /// ROW's own `world_size` (`WORLD2_SPEC`'s `2` here, named `world = 1`) is
 /// itself a refusal, the SAME fixed message every other I-GANG determinant
 /// refuses with.
@@ -1658,7 +1660,7 @@ async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
 
     // Control: the SAME row (same job, same claim, same genuinely-verified
     // pair), driven a SECOND time on this SAME server, at `assign.world = 2`
-    // (matching the row's own `world_size`) — admits all the way to f1'
+    // (matching the row's own `world_size`) — admits all the way to
     // `UNIMPLEMENTED`, `run_rank_world_two_own_tenant_training_set_reaches_
     // unimplemented`'s own outcome (case c). `run_rank` never mutates the
     // `jobs` row (a read-only classification), so re-driving the identical
@@ -1717,7 +1719,7 @@ fn every_gang_refusal_reason() -> [jammi_server::grpc::gang::GangRefusalReason; 
     ]
 }
 
-/// R3: the ONE non-disclosure oracle. Every I-GANG determinant
+/// The ONE non-disclosure oracle. Every I-GANG determinant
 /// (not running / wrong claimant / wrong attempt / lease dead / not found /
 /// coordinator not fresh / world mismatch / pair NULL / other tenant /
 /// digest mismatch / not Ready — eleven total) refuses with the
@@ -1749,7 +1751,7 @@ async fn run_rank_refusal_is_non_disclosing_across_every_determinant() {
     }
 }
 
-/// `test-hooks` only (fix round 1, R3): drives the SAME eleven scenarios
+/// `test-hooks` only: drives the SAME eleven scenarios
 /// [`run_rank_refusal_is_non_disclosing_across_every_determinant`] does, but
 /// asserts `PeerEngineServer::gang_last_refusal_reason` names the EXACT
 /// determinant each one refused for — the seam that lets this lane

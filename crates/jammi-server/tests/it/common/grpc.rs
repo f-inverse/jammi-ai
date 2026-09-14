@@ -738,7 +738,7 @@ pub struct PeerEngineServer {
     /// RAII root of the engine's artifact dir when this fixture owns it;
     /// `None` when the caller supplied (and roots) a shared dir.
     pub _dir: Option<TempDir>,
-    /// `test-hooks` only (fix round 1, R3): a handle onto the SAME
+    /// `test-hooks` only: a handle onto the SAME
     /// `GangServer` instance's refusal-reason state actually serving on
     /// `peer_addr` above — `None` if `[server] peer_bind` were ever unset
     /// (it never is for this fixture). See
@@ -750,7 +750,7 @@ pub struct PeerEngineServer {
 #[cfg(feature = "test-hooks")]
 impl PeerEngineServer {
     /// Which `GangRefusalReason` the most recent `RunRank` call actually
-    /// served by this fixture refused for (fix round 1, R3) — same-process
+    /// served by this fixture refused for — same-process
     /// introspection, never anything the wire discloses.
     pub fn gang_last_refusal_reason(&self) -> Option<jammi_server::grpc::gang::GangRefusalReason> {
         self.gang_refusal_handle.as_ref().and_then(|h| h.get())
@@ -784,7 +784,7 @@ pub async fn start_engine_server_from_config(
     let peer_addr = bound
         .peer_addr()
         .expect("peer_bind is set, so the third listener is bound");
-    // `test-hooks` only (fix round 1, R3): clone the `GangServer`'s own
+    // `test-hooks` only: clone the `GangServer`'s own
     // refusal-reason handle out of `bound` BEFORE it moves into the spawned
     // serve task below — `serve_with_shutdown` consumes `self`, so this is
     // the last point a caller can reach it.

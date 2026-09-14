@@ -2,34 +2,34 @@
 //! gang run (see `docs/rigor/contracts/feat_500-C-U5a-1.md` for the
 //! committed mechanism contract this module implements).
 //!
-//! U5a-1 freezes the wire (`jammi.v1.gang`, see `gang.proto`), the wire-level
-//! K2 edges (`world == 0`, `rank >= world`) decided before any row is ever
-//! read, and this handler's own full I-GANG decision (§I1): `get_job_for_rank`
+//! This module freezes the wire (`jammi.v1.gang`, see `gang.proto`), the
+//! wire-level K2 edges (`world == 0`, `rank >= world`) decided before any row
+//! is ever read, and this handler's own full I-GANG decision: `get_job_for_rank`
 //! for the row predicate, `resolve_training_set_identity_classified` for the
 //! `world_size > 1` sidecar verify, and `fresh_instance` for the
 //! coordinator's own liveness. Every determinant collapses to the SAME
-//! `FailedPrecondition` status with a FIXED message (§I1 Non-disclosure) —
-//! the listener discloses neither a job's existence, claimant, nor attempt.
+//! `FailedPrecondition` status with a FIXED message (non-disclosure) — the
+//! listener discloses neither a job's existence, claimant, nor attempt.
 //! Having decided every determinant and found no reason to refuse, this
-//! handler still has no `HostAdmission` session to hand the call to (U5a-2
-//! builds that), so it ends `Unimplemented` — f1': "a call satisfying EVERY
-//! I-GANG determinant still reaches the handler ... and, having no
-//! `HostAdmission` session to hand the call to, returns `Unimplemented`."
+//! handler still has no `HostAdmission` session to hand the call to, so it
+//! ends `Unimplemented`: a call satisfying EVERY I-GANG determinant still
+//! reaches the handler ... and, having no `HostAdmission` session to hand
+//! the call to, returns `Unimplemented`.
 //! `HostAdmission` itself (the admit-and-hold session, drain,
-//! re-verification) is U5a-2's, built on top of this handler once it exists.
+//! re-verification) is built on top of this handler once it exists
+//! (docs/plans/67-distributed-training/UNITS.md § U5a-2).
 //!
-//! **The lattice is keyed on the ROW's own `world_size`** (fix round 1, R2),
-//! never the caller's `Assign.world`: `row.world_size > 1` gates the pair
-//! conjunct and the sidecar verify, and `assign.world != row.world_size` is
-//! itself an I-GANG refusal (the SAME fixed message as every other one) —
-//! see [`RankAdmissionRow::world_size`]'s own doc for why a caller-keyed gate
-//! is unsound (closing-audit #1 F1).
+//! **The lattice is keyed on the ROW's own `world_size`**, never the
+//! caller's `Assign.world`: `row.world_size > 1` gates the pair conjunct and
+//! the sidecar verify, and `assign.world != row.world_size` is itself an
+//! I-GANG refusal (the SAME fixed message as every other one) — see
+//! [`RankAdmissionRow::world_size`]'s own doc for why a caller-keyed gate is
+//! unsound.
 //!
 //! **A catalog fault during admission is `Unavailable`, never
-//! `FailedPrecondition`** (fix round 1, R4 wire part): see
-//! `admission_catalog_fault`.
+//! `FailedPrecondition`**: see `admission_catalog_fault`.
 //!
-//! **`test-hooks` non-disclosure introspection** (fix round 1, R3): behind
+//! **`test-hooks` non-disclosure introspection**: behind
 //! `#[cfg(feature = "test-hooks")]`, `GangServer::last_refusal_reason`
 //! exposes which [`GangRefusalReason`] variant the most recent call refused
 //! for — same-process, test-only, never reaching the wire — so the
@@ -81,14 +81,15 @@ fn i_gang_refused() -> Status {
     Status::failed_precondition(I_GANG_REFUSAL_MESSAGE)
 }
 
-/// Every I-GANG determinant a `RunRank` call can refuse for (fix round 1,
-/// R3's non-disclosure oracle + `test-hooks` seam). Every variant here
-/// refuses the wire with the exact SAME `I_GANG_REFUSAL_MESSAGE` — this
-/// enum exists so the `test-hooks` lane's `GangServer::last_refusal_reason`
-/// can distinguish them same-process, never so the wire can. Adding a
-/// determinant this handler decides without a matching variant here is
-/// exactly the coverage gap R3 closed: the pairwise non-disclosure oracle
-/// only proves what it can distinguish. Defined unconditionally (a plain
+/// Every I-GANG determinant a `RunRank` call can refuse for, kept
+/// distinguishable for the non-disclosure oracle's `test-hooks` seam. Every
+/// variant here refuses the wire with the exact SAME
+/// `I_GANG_REFUSAL_MESSAGE` — this enum exists so the `test-hooks` lane's
+/// `GangServer::last_refusal_reason` can distinguish them same-process,
+/// never so the wire can. Adding a determinant this handler decides without
+/// a matching variant here reopens exactly the coverage gap this enum
+/// closes: the pairwise non-disclosure oracle only proves what it can
+/// distinguish. Defined unconditionally (a plain
 /// enum costs nothing) so `GangServer::record_refusal`'s call sites never
 /// need their own `#[cfg]`; only the STORAGE ([`GangServer`]'s field) and the
 /// GETTER (`GangServer::last_refusal_reason`) are `test-hooks`-gated, so a
@@ -106,7 +107,7 @@ pub enum GangRefusalReason {
     LeaseDead,
     /// No row exists for `assign.job_id`.
     NotFound,
-    /// `assign.world != row.world_size` (R2).
+    /// `assign.world != row.world_size`.
     WorldMismatch,
     /// `row.world_size > 1` and the training-set pair
     /// (`training_set_ref`/`training_set_location`) was not filled.
@@ -121,16 +122,16 @@ pub enum GangRefusalReason {
     /// `status` was not `ready`.
     TrainingSetNotReady,
     /// The row was `ready`, but its sidecar manifest did not verify
-    /// `training_set_ref` (absent, unreadable, or a genuine mismatch — §W2
-    /// Resolution's own admission-time collapse).
+    /// `training_set_ref` (absent, unreadable, or a genuine mismatch — the
+    /// sidecar verify's own admission-time collapse).
     TrainingSetDigestMismatch,
     /// The coordinator's own `instances` row was absent or stale
     /// (`Catalog::fresh_instance` returned `false`).
     CoordinatorNotFresh,
 }
 
-/// The fixed bound for the first inbound `Assign` frame (§H3 step 1: "a
-/// silent client is dropped at that bound"). A handler-local constant, not a
+/// The fixed bound for the first inbound `Assign` frame: a silent client is
+/// dropped at that bound. A handler-local constant, not a
 /// config knob, sized to one round trip — not `[lease] heartbeat_secs` or
 /// any deployment-tunable value.
 const FIRST_ASSIGN_BOUND: Duration = Duration::from_secs(10);
@@ -145,7 +146,8 @@ const FIRST_ASSIGN_BOUND: Duration = Duration::from_secs(10);
 pub struct GangServer {
     session: Arc<InferenceSession>,
     lease: Duration,
-    /// The test-only introspection state R3's `test-hooks` seam reads
+    /// The test-only introspection state the non-disclosure oracle's
+    /// `test-hooks` seam reads
     /// ([`Self::last_refusal_reason`], [`Self::refusal_reason_handle`]).
     /// Absent entirely from a plain build — this field, and every write to
     /// it, compiles away, so a published `jammi-server` binary carries no
@@ -187,9 +189,10 @@ impl GangServer {
     }
 
     /// `test-hooks` only: which [`GangRefusalReason`] the most recent
-    /// `run_rank` call on this `GangServer` refused for, if any (fix round
-    /// 1, R3). `None` until the first refusal, or after a call that reached
-    /// `Unimplemented` (f1' is not itself a refusal — no reason is recorded
+    /// `run_rank` call on this `GangServer` refused for, if any. `None`
+    /// until the first refusal, or after a call that reached
+    /// `Unimplemented` (reaching the not-yet-implemented terminal state is
+    /// not itself a refusal — no reason is recorded
     /// for it, so a prior refusal's reason survives an admitting call,
     /// intentionally: this seam names the last determinant that actually
     /// refused, not "whether the most recent call was refused").
@@ -212,8 +215,7 @@ impl GangServer {
     }
 }
 
-/// `test-hooks` only (fix round 1, R3): see
-/// [`GangServer::refusal_reason_handle`].
+/// `test-hooks` only: see [`GangServer::refusal_reason_handle`].
 #[cfg(feature = "test-hooks")]
 #[derive(Clone)]
 pub struct GangRefusalHandle(Arc<Mutex<Option<GangRefusalReason>>>);
@@ -231,20 +233,20 @@ impl GangRefusalHandle {
 /// admission — `Catalog::get_job_for_rank`'s own read, or
 /// `Catalog::get_result_table_for_tenant`'s own read inside the
 /// `world_size > 1` sidecar lookup, ERRORING rather than simply finding no
-/// row — is `Unavailable`, never [`map_engine_error`]'s generic mapping
-/// (fix round 1, R4 wire part). A raw catalog-backend fault surfaces as
-/// `JammiError::BackendDriver`, an arm `map_engine_error` has no case for —
-/// it would fall through to that function's own `other => Internal` catch-all
-/// and never tell a retrying caller this was transient. This is the
-/// ADMISSION-time classification; the mid-stream three-way split between
-/// `Refuted` / `Unavailable` / `StoreUnavailable` at RE-VERIFICATION is
-/// §I3's own, U5a-2's to build once an admitted `HostAdmission` session
-/// exists to re-verify inside. Deliberately NOT applied to
+/// row — is `Unavailable`, never [`map_engine_error`]'s generic mapping. A
+/// raw catalog-backend fault surfaces as `JammiError::BackendDriver`, an arm
+/// `map_engine_error` has no case for — it would fall through to that
+/// function's own `other => Internal` catch-all and never tell a retrying
+/// caller this was transient. This is the ADMISSION-time classification; the
+/// mid-stream three-way split between `Refuted` / `Unavailable` /
+/// `StoreUnavailable` at RE-VERIFICATION is built with `HostAdmission`
+/// (docs/plans/67-distributed-training/UNITS.md § U5a-2) once an admitted
+/// session exists to re-verify inside. Deliberately NOT applied to
 /// `Catalog::fresh_instance`'s own read (out of this ruling's stated scope:
 /// "the `get_job_for_rank` / training-set lookup erroring") or to
-/// `ResultStore::read_materialization_manifest` erroring (§W2 Resolution's
-/// own admission-time collapse to `FailedPrecondition` for "unresolvable /
-/// unverifiable on this host", unchanged by this ruling).
+/// `ResultStore::read_materialization_manifest` erroring (the sidecar
+/// verify's own admission-time collapse to `FailedPrecondition` for
+/// "unresolvable / unverifiable on this host", unchanged by this ruling).
 fn admission_catalog_fault(err: JammiError) -> Status {
     tracing::warn!(
         error = %err,
@@ -263,7 +265,7 @@ impl GangService for GangServer {
     ) -> Result<Response<Self::RunRankStream>, Status> {
         let mut inbound = request.into_inner();
 
-        // §H3 step 1: await the first inbound frame inline, bounded. A
+        // Await the first inbound frame inline, bounded. A
         // silent client (nothing within the bound) is dropped without a
         // status frame — there is no admitted session yet for one to belong
         // to.
@@ -299,7 +301,7 @@ impl GangService for GangServer {
             return Err(Status::invalid_argument("rank must be less than world"));
         }
 
-        // §I1(a): the row predicate. Primary-key-only, no tenant predicate —
+        // The row predicate: primary-key-only, no tenant predicate —
         // `Catalog::get_job_for_rank` never reads `assign.job_id`'s tenant
         // from the caller (I-GANG: tenant is derived from the row itself,
         // below).
@@ -310,9 +312,9 @@ impl GangService for GangServer {
                 self.record_refusal(GangRefusalReason::NotFound);
                 return Err(i_gang_refused());
             }
-            // R4 (wire part): the row genuinely erroring (a catalog fault),
-            // never conflated with `Ok(None)` (no such row) — `Unavailable`,
-            // not the generic `map_engine_error` mapping.
+            // The row genuinely erroring (a catalog fault), never conflated
+            // with `Ok(None)` (no such row) — `Unavailable`, not the
+            // generic `map_engine_error` mapping.
             Err(e) => return Err(admission_catalog_fault(e)),
         };
 
@@ -333,8 +335,8 @@ impl GangService for GangServer {
             return Err(i_gang_refused());
         }
 
-        // R2 (fix round 1): the lattice is keyed on the ROW's own
-        // `world_size`, never the caller's `assign.world` — a caller naming
+        // The lattice is keyed on the ROW's own `world_size`, never the
+        // caller's `assign.world` — a caller naming
         // a `world` the row does not agree with is itself a refusal, with
         // the SAME fixed message every other I-GANG determinant refuses
         // with. This runs BEFORE the `row.world_size > 1` gate below so a
@@ -347,11 +349,11 @@ impl GangService for GangServer {
             return Err(i_gang_refused());
         }
 
-        // §I1(b), only for the ROW's own `world_size > 1` (R2 — never
+        // §I1(b), only for the ROW's own `world_size > 1` (never
         // `assign.world`, which is now known equal to `row.world_size` by
         // the conjunct above): the pair must be filled, and its sidecar must
         // verify — a separate, host-local step, never folded into
-        // `get_job_for_rank`'s own statement (§I1).
+        // `get_job_for_rank`'s own statement.
         if row.world_size > 1 {
             let (Some(training_set_ref), Some(training_set_location)) = (
                 row.training_set_ref.as_deref(),
@@ -382,10 +384,10 @@ impl GangService for GangServer {
                     self.record_refusal(GangRefusalReason::TrainingSetDigestMismatch);
                     return Err(i_gang_refused());
                 }
-                // R4 (wire part): the training-set catalog lookup itself
-                // erroring — `Unavailable`, propagated as-is (already
-                // classified by `admission_catalog_fault` inside), never
-                // collapsed into the fixed I-GANG refusal.
+                // The training-set catalog lookup itself erroring —
+                // `Unavailable`, propagated as-is (already classified by
+                // `admission_catalog_fault` inside), never collapsed into
+                // the fixed I-GANG refusal.
                 Err(e) => return Err(e),
             }
         }
@@ -403,16 +405,16 @@ impl GangService for GangServer {
             Err(e) => return Err(map_engine_error(e)),
         }
 
-        // Every I-GANG determinant is satisfied. This unit has no
-        // `HostAdmission` session to hand the call to (U5a-2 builds that) —
-        // f1'.
+        // Every I-GANG determinant is satisfied. This handler has no
+        // `HostAdmission` session to hand the call to yet
+        // (docs/plans/67-distributed-training/UNITS.md § U5a-2 builds it).
         Err(Status::unimplemented(
             "gang admission is not implemented on this build",
         ))
     }
 }
 
-/// §W2 Resolution: verify (never locate) the result table
+/// Verifies (never locates) the result table
 /// `training_set_location` names, for the tenant `get_job_for_rank`
 /// resolves the calling job under — the ONE tenant-pinned lookup a rank
 /// performs, no listing, no candidate search.
@@ -440,10 +442,11 @@ impl GangService for GangServer {
 /// the row not `ready`, the sidecar absent (`Ok(None)`), a digest mismatch,
 /// or [`ResultStore::read_materialization_manifest`] itself erroring (a
 /// network/backend fault reaching this host's own store) — into the ONE
-/// member-scoped `FailedPrecondition` §I4 already names for this class; the
+/// member-scoped `FailedPrecondition` already names for this class; the
 /// three-way split that distinguishes a `StoreUnavailable` re-verification
-/// end from a `Refuted` one is §I3's, mid-stream, once an admitted session
-/// (`HostAdmission`, U5a-2) exists to be mid-stream in.
+/// end from a `Refuted` one is mid-stream, once an admitted session
+/// (`HostAdmission`, docs/plans/67-distributed-training/UNITS.md § U5a-2)
+/// exists to be mid-stream in.
 ///
 /// This is the ONLY call site this program has for
 /// `Catalog::get_result_table_for_tenant` outside its own crate's tests
@@ -483,9 +486,9 @@ pub async fn resolve_training_set_identity(
 
 /// The classification [`resolve_training_set_identity`] (and
 /// [`GangServer::run_rank`], through it) collapses to `FailedPrecondition`
-/// for the wire (§I1 Non-disclosure; §I4's admission-time collapse) — kept
+/// for the wire (non-disclosure; the admission-time collapse) — kept
 /// distinguishable here (never on the wire) so `run_rank` can name the exact
-/// [`GangRefusalReason`] the `test-hooks` lane records (fix round 1, R3).
+/// [`GangRefusalReason`] the `test-hooks` lane records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrainingSetOutcome {
     /// The row resolved for this job's own tenant, is `ready`, and its
@@ -507,8 +510,8 @@ pub(crate) enum TrainingSetOutcome {
     NotReady,
     /// The row was `ready`, but its sidecar manifest did not verify
     /// `training_set_ref` — the URL failed to parse, the sidecar read
-    /// erred, no sidecar existed, or the digest genuinely mismatched. §W2
-    /// Resolution's own admission-time collapse: none of these are
+    /// erred, no sidecar existed, or the digest genuinely mismatched — this
+    /// verify's own admission-time collapse: none of these are
     /// distinguished here either (only RE-VERIFICATION, §I3, needs the
     /// three-way `Refuted`/`StoreUnavailable` split, once an admitted
     /// session exists to re-verify inside).
@@ -519,7 +522,7 @@ pub(crate) enum TrainingSetOutcome {
 /// for the two properties this implements: the explicit admin-scope guard,
 /// and the strict-predicate lookup). A genuine catalog fault reading
 /// `Catalog::get_result_table_for_tenant` (not merely finding no row) is
-/// `Err(Unavailable)` (R4 wire part, `admission_catalog_fault`) — the ONLY
+/// `Err(Unavailable)` (`admission_catalog_fault`) — the ONLY
 /// way this function returns `Err`; every other outcome, including every
 /// unresolvable/unverifiable one `ResultStore::read_materialization_manifest`
 /// itself erroring produces, is classified into a `TrainingSetOutcome`
@@ -552,7 +555,7 @@ pub(crate) async fn resolve_training_set_identity_classified(
         Err(_) => return Ok(TrainingSetOutcome::DigestMismatch),
     };
 
-    // Admission-time classification (§W2 Resolution): every unresolvable /
+    // Admission-time classification: every unresolvable /
     // unverifiable outcome — `Ok(None)` (no sidecar), a digest mismatch, or
     // the read itself erroring — collapses to the same `DigestMismatch`
     // classification (itself the same member-scoped `FailedPrecondition` on

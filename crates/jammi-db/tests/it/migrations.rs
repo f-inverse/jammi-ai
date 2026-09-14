@@ -1779,12 +1779,13 @@ async fn migration_033_is_ordered_after_032_and_adds_model_materialization_colum
     );
 }
 
-/// `CONTRACT-U5a.md` §W2 Routing — migration `034_jobs_training_set_identity`
+/// Migration `034_jobs_training_set_identity`
+/// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6)
 /// is present, ordered AFTER `033_model_materialization` (K5: relative
 /// position, never `.last()`), adds `jobs.training_set_ref` /
 /// `jobs.training_set_location` as nullable `TEXT` columns, and pins the
 /// pair's stop rule ("never one column without the other in the same
-/// statement", §W2 Fill) at the SCHEMA edge: a raw single-column write is
+/// statement") at the SCHEMA edge: a raw single-column write is
 /// refused by the `CHECK` constraint itself, on both backends — never left
 /// to "the only writer is the CAS" as the sole guarantee.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]

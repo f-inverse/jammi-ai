@@ -233,8 +233,9 @@ pub fn stale_before_clause(
 /// bound HERE, once, since two independent [`lease_now`] reads do not carry
 /// Postgres's same-transaction guarantee.
 ///
-/// `CONTRACT-U5a.md` §I1(a): `Catalog::get_job_for_rank` reads this alongside
-/// [`lease_expired_clause`]'s own negation in ONE statement, so "how much of
+/// `Catalog::get_job_for_rank` (`docs/rigor/contracts/feat_500-C-U5a-1.md` §
+/// A6) reads this alongside [`lease_expired_clause`]'s own negation in ONE
+/// statement, so "how much of
 /// the window remains" is never a caller-side subtraction against its OWN
 /// clock (SQLite: a replica-clock read no different from any other app-side
 /// timestamp; Postgres: outright wrong, since only the database's `now()`
@@ -273,9 +274,8 @@ pub fn lease_remaining_seconds_expr(
 /// (the DB clock via [`stale_before_clause`]) — the same tolerance
 /// `Catalog::reclaim_expired_jobs`'s inline-execution arm already computes
 /// inline for "owning instance dead". Named here so a second caller (a gang
-/// coordinator's own freshness check, `fresh_instance` — CONTRACT-U5a.md §I1)
-/// shares the SAME margin rather than re-deriving the `2 *` factor at its own
-/// call site.
+/// coordinator's own freshness check, `fresh_instance`) shares the SAME
+/// margin rather than re-deriving the `2 *` factor at its own call site.
 pub fn instance_liveness_margin(lease: Duration) -> Duration {
     lease.saturating_mul(2)
 }

@@ -490,7 +490,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 - **`Jammi::open(target) -> Result<Session>`** — `crates/jammi-ai/src/jammi.rs`
   (`Jammi::open`). Pure constructor: `Target::Local(config)` →
   `InferenceSession::open(config)` → `Session::with_configured_worker(engine)`
-  (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) — the
+  (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:158`)) — the
   worker is spawned only when the loaded config's `[worker] enabled` is
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
@@ -505,7 +505,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   thin `Arc<InferenceSession>` wrapper (re-exported as `crate::Session`,
   `crates/jammi-ai/src/lib.rs`). Three constructors with a load-bearing distinction:
   - `Session::with_configured_worker(engine) -> Result<Self>`
-    (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)):
+    (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:158`)):
     the **front-door** form (`Jammi::open` threads to this one, not to
     `with_embedded_worker`). Reads `WorkerConfig::enabled` (default
     `true`) off `engine`'s loaded config: `true` spawns the worker
@@ -515,7 +515,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
     when a worker is spawned. Returns `JammiError::Config` if `[worker]`
     timing violates worker invariants.
   - `Session::with_embedded_worker(engine) -> Result<Self>`
-    (`with_embedded_worker` (`crates/jammi-ai/src/local_session.rs:120`)):
+    (`with_embedded_worker` (`crates/jammi-ai/src/local_session.rs:122`)):
     the **explicit, spawn-regardless** form — carries `Some(worker)`
     **unconditionally**, whatever `[worker] enabled` says. For a caller
     that owns the claim decision itself out of band (test harnesses that must
@@ -3062,10 +3062,10 @@ describing a removed surface.
    `Arc<GpuScheduler>`), result store, ANN cache. **`ResultStore::recover` runs here,
    before `load_existing_tables`** [§3.7].
 3. → `Session::with_configured_worker(engine)`
-   (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) —
+   (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:158`)) —
    spawns via `with_embedded_worker` → `EmbeddedWorker::spawn`, storing it in
    `_worker` (RAII), only when `worker.enabled`
-   (`crates/jammi-ai/src/local_session.rs:157`) reads `true` (default `true`);
+   (`crates/jammi-ai/src/local_session.rs:159`) reads `true` (default `true`);
    `false` leaves `_worker` as `None` and nothing is spawned.
 4. A verb, e.g. `session.search(req)` — `crates/jammi-ai/src/local_session.rs`
    (`Session::search`): destructures `SearchRequest`, picks `engine.search` vs
@@ -3202,18 +3202,18 @@ retry loop re-taking the write lock:
   `estimate_memory` → **admission loop** (`try_acquire`; on `None` take the lock and
   `evict_one`; if nothing evictable, error) → `backend.load` → post-load catalog bookkeeping
   (`complete_generic_registration`,
-  `crates/jammi-ai/src/model/cache.rs:542`) → insert `CacheEntry` (permit moved in) → return
+  `crates/jammi-ai/src/model/cache.rs:659`) → insert `CacheEntry` (permit moved in) → return
   guard with refcount 1. The bookkeeping write is gated by an ALLOWLIST of the generic,
   non-terminal row kinds it exists to complete, `GENERIC_COMPLETABLE_TYPES`
-  (`crates/jammi-ai/src/model/cache.rs:549`, `&["local", "huggingface", "embedding"]`) — never a
+  (`crates/jammi-ai/src/model/cache.rs:666`, `&["local", "huggingface", "embedding"]`) — never a
   denylist of the terminal types to protect, which would fail open on every unenumerated
   `model_type` (`fine-tuned`, `context-predictor`, `bert`, `open_clip`, `clap_audio_model`, …). A
   catalog READ error also skips the write outright (`get_model_version`,
-  `crates/jammi-ai/src/model/cache.rs:559`, `warn!` and keep serving) rather than collapsing to
+  `crates/jammi-ai/src/model/cache.rs:676`, `warn!` and keep serving) rather than collapsing to
   "no row" and writing over an uninspected row; only when the read succeeds and the row is absent
   or already one of the completable kinds
-  (`can_complete`, `crates/jammi-ai/src/model/cache.rs:571`) does it proceed to `register_model`
-  (`crates/jammi-ai/src/model/cache.rs:596`), which completes a `local`/`huggingface` row or the
+  (`can_complete`, `crates/jammi-ai/src/model/cache.rs:688`) does it proceed to `register_model`
+  (`crates/jammi-ai/src/model/cache.rs:713`), which completes a `local`/`huggingface` row or the
   `embedding` FK placeholder — the one case where a `register_model` failure is still logged and
   swallowed rather than propagated. A fine-tuned id can reach this same call (`ModelSource::parse`'s
   HuggingFace fallback matches it like any other non-`local:` string), so without the allowlist
@@ -3302,7 +3302,7 @@ At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`
 maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 `Code::Internal`, and lets every unmatched variant — including the propagated
 `JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:290`). Because both reload surfaces raise the same
+(`crates/jammi-server/src/grpc/wire.rs:300`). Because both reload surfaces raise the same
 `JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either

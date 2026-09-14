@@ -80,6 +80,30 @@ reference, a method call, anything else) the site is UNRESOLVED, reported
 with its own `path:line`, never silently dropped and never mis-attributed
 to some OTHER literal found elsewhere in the same call.
 
+Two shapes that match `_CALL_RE` textually are excluded from the scan
+before the balanced-paren extraction above ever runs, because neither can
+be a call to `crates/jammi-kernels/src/admission.rs`'s own `admit`/
+`admit_cascade`/`op_disabled`:
+
+* A **definition** — the matched name immediately preceded (ignoring
+  whitespace) by the `fn` keyword, e.g. `pub fn admit(&self, spec:
+  &TrainingSpec)`. `admission.rs`'s three functions are the only
+  definitions of these names this scan's own premise depends on
+  (`AdmissionRsFreeFunctionPremiseTests` below grounds that premise
+  mechanically); any OTHER type is free to define its own method sharing
+  one of these names, and that method's signature line is not a call
+  site.
+* A **method call** — the matched name immediately preceded (ignoring
+  whitespace) by `.`, e.g. `RankAdmission::new().admit(spec)`. Every name
+  this scan looks for is a FREE function, never a method, on any type in
+  `crates/` (same premise as above), so `.admit(`/`.admit_cascade(`/
+  `.op_disabled(` can never resolve to a call of the scanned API —
+  excluding it is not a widening of what this scan misses, it is
+  narrowing the scan to calls the excluded syntax cannot possibly be.
+  A bare, undotted `admit(...)`/`admit_cascade(...)`/`op_disabled(...)`
+  call is unaffected and, if its op-key argument is not a literal, is
+  still reported unresolved exactly as before.
+
 SCAN ROOTS: `crates/jammi-encoders/src/`, `crates/jammi-lora/src/`,
 `crates/jammi-ai/src/fine_tune/` — every `crates/jammi-bench/src/
 finetune_step.rs`-adjacent crate a live standalone `admit`/`admit_cascade`/
@@ -141,6 +165,30 @@ _CALL_RE = re.compile(r"\b(admit|admit_cascade|op_disabled)\s*\(")
 _CFG_TEST_RE = re.compile(r"#\[cfg\(test\)\]")
 _COMMENT_LINE_RE = re.compile(r"^[ \t]*//")
 _LITERAL_ARG_RE = re.compile(r'^"([a-z0-9_]+)"$')
+
+# A `fn <name>(` DEFINITION -- any whitespace, with `pub`, `pub(crate)`,
+# `async`, `unsafe`, `const` (any order, any subset) preceding `fn` itself;
+# none of those qualifiers are checked directly because they sit BEFORE
+# `fn`, never adjacent to `<name>(`, so matching `fn\s*$` immediately
+# before the matched name already admits every qualified form.
+_DEFINITION_PREFIX_RE = re.compile(r"\bfn\s*$")
+# A `.<name>(` METHOD CALL -- the matched name immediately preceded
+# (ignoring whitespace) by `.`. See this module's own METHOD doc for why
+# this can never be a call to the scanned free functions.
+_METHOD_CALL_PREFIX_RE = re.compile(r"\.\s*$")
+
+
+def _is_definition_site(text, start):
+    """True if the `_CALL_RE` match starting at `start` is a `fn <name>(`
+    definition rather than a call -- see this module's own METHOD doc."""
+    return bool(_DEFINITION_PREFIX_RE.search(text[:start]))
+
+
+def _is_method_call_site(text, start):
+    """True if the `_CALL_RE` match starting at `start` is `.<name>(`
+    method-call syntax -- see this module's own METHOD doc for why this
+    can never invoke a free function."""
+    return bool(_METHOD_CALL_PREFIX_RE.search(text[:start]))
 
 # The op-key argument's own FIXED position in each call's argument list --
 # read directly off `admission.rs`'s own `pub fn` signatures
@@ -307,9 +355,12 @@ def discover_live_standalone_op_keys(roots):
         from the OP-KEY ARGUMENT'S OWN POSITION (see this module's own
         METHOD doc) of a real `admit(`/`admit_cascade(`/`op_disabled(`
         call, outside any `#[cfg(test)]` span, anywhere under `roots`.
-        Multiplicity is not itself meaningful (the SAME op key named at
-        several sites collapses to one set member), so this is never a
-        list.
+        A `fn <name>(` definition and a `.<name>(` method call are excluded
+        before this position-reading step runs at all (see this module's
+        own METHOD doc) — neither can be a call to `admission.rs`'s free
+        functions of those names. Multiplicity is not itself meaningful
+        (the SAME op key named at several sites collapses to one set
+        member), so this is never a list.
       * `unresolved_sites` — a `list[str]`, one `"path:line: <call
         text>"` entry per call whose OWN op-key-position argument is NOT
         a bare double-quoted literal (a variable, a `const` reference, an
@@ -334,6 +385,10 @@ def discover_live_standalone_op_keys(roots):
                 test_spans = _cfg_test_module_spans(text)
                 for match in _CALL_RE.finditer(text):
                     if _in_any_span(match.start(), test_spans):
+                        continue
+                    if _is_definition_site(text, match.start()) or _is_method_call_site(
+                        text, match.start()
+                    ):
                         continue
                     call_kind = match.group(1)
                     open_idx = text.index("(", match.start())
@@ -572,6 +627,136 @@ class DiscoverLiveStandaloneOpKeysTests(unittest.TestCase):
             keys, unresolved = discover_live_standalone_op_keys([tmp])
             self.assertEqual(keys, {"real_prod_op_after_the_doc_mention"})
             self.assertEqual(unresolved, [])
+
+    def test_a_fn_definition_shaped_like_a_call_is_never_a_call_site(self):
+        """`crates/jammi-ai/src/fine_tune/spec.rs:196`'s own shape: `pub fn
+        admit(&self, spec: &TrainingSpec) -> Result<()> {` is a METHOD
+        DEFINITION on `TrainingSpec` (or any other type), not a call to
+        `admission.rs`'s free `admit` — `_CALL_RE` matches its signature
+        textually, but a definition is never a call site. The real, later
+        free-function call in the same file must still resolve normally."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rs")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "impl TrainingSpec {\n"
+                    "    pub fn admit(&self, spec: &TrainingSpec) -> Result<()> {\n"
+                    "        Ok(())\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    'let outcome = admit(mode, "def_shape_real_op", pred, holds, counters)?;\n'
+                )
+            keys, unresolved = discover_live_standalone_op_keys([tmp])
+            self.assertEqual(keys, {"def_shape_real_op"})
+            self.assertEqual(unresolved, [])
+
+    def test_a_qualified_fn_definition_is_also_never_a_call_site(self):
+        """The same exclusion for every qualifier order `fn` can carry in
+        this codebase (`pub`, `pub(crate)`, `async`, `unsafe`, `const`) --
+        none of them sit adjacent to `<name>(`, so the bare `fn\\s*$`
+        lookbehind already covers all of them; this fixture pins that for
+        the two most common shapes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rs")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "pub(crate) async fn admit_cascade(op: &'static str) -> bool {\n"
+                    "    false\n"
+                    "}\n"
+                )
+            keys, unresolved = discover_live_standalone_op_keys([tmp])
+            self.assertEqual(keys, set())
+            self.assertEqual(unresolved, [])
+
+    def test_a_method_call_syntax_is_never_a_call_to_the_free_function(self):
+        """`admit`/`admit_cascade`/`op_disabled` are FREE functions in
+        `crates/jammi-kernels/src/admission.rs`
+        (`AdmissionRsFreeFunctionPremiseTests` below grounds this
+        mechanically); no method of any of those names exists anywhere in
+        `crates/`. A free function can never be invoked with receiver-dot
+        syntax, so `.admit(`/`.admit_cascade(`/`.op_disabled(` is provably
+        not a call to the scanned API -- excluded entirely, not reported
+        unresolved even though its own argument (`spec`) is a variable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rs")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("let r = RankAdmission::from_config(config).admit(spec);\n")
+            keys, unresolved = discover_live_standalone_op_keys([tmp])
+            self.assertEqual(keys, set())
+            self.assertEqual(unresolved, [])
+
+    def test_a_bare_free_call_with_a_variable_op_argument_is_still_unresolved(self):
+        """The honest-universe boundary the previous test must not widen:
+        an UNDOTTED, bare `admit(spec)` -- textually indistinguishable from
+        a real free-function call with too few arguments to resolve its
+        op-key position -- is still reported unresolved. Only the `.`-
+        prefixed method-call SHAPE is excluded, never a free call that
+        merely happens to take a variable argument."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rs")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("let r = admit(spec);\n")
+            keys, unresolved = discover_live_standalone_op_keys([tmp])
+            self.assertEqual(keys, set())
+            self.assertEqual(len(unresolved), 1)
+            self.assertIn("fake.rs:1", unresolved[0])
+
+
+class AdmissionRsFreeFunctionPremiseTests(unittest.TestCase):
+    """Grounds the premise `DiscoverLiveStandaloneOpKeysTests`'s method-call
+    exclusion (and this module's own METHOD doc) depends on: `admit`,
+    `admit_cascade` and `op_disabled` are each defined EXACTLY ONCE in
+    `crates/jammi-kernels/src/admission.rs`, and each as a TOP-LEVEL
+    (column-0) `pub fn` -- never a method on some `impl` block, anywhere in
+    that file. If a future commit adds a method named one of these three on
+    some `jammi-kernels` type, this test goes RED, because the method-call
+    exclusion above would then silently start skipping a real, in-scope
+    call site rather than a structurally-impossible one."""
+
+    ADMISSION_RS = os.path.join(REPO_ROOT, "crates", "jammi-kernels", "src", "admission.rs")
+
+    #: A top-level (no leading whitespace) `pub fn <name>(` definition line,
+    #: for exactly the three names this scan's exclusion trusts to be free
+    #: functions.
+    _TOP_LEVEL_PUB_FN_RE = {
+        name: re.compile(r"^pub fn " + re.escape(name) + r"\s*\(", re.MULTILINE)
+        for name in ("admit", "admit_cascade", "op_disabled")
+    }
+
+    def setUp(self):
+        with open(self.ADMISSION_RS, encoding="utf-8") as fh:
+            self.text = _strip_comment_lines(fh.read())
+
+    def test_each_scanned_name_is_defined_exactly_once_as_a_top_level_pub_fn(self):
+        for name, pattern in self._TOP_LEVEL_PUB_FN_RE.items():
+            with self.subTest(name=name):
+                matches = pattern.findall(self.text)
+                self.assertEqual(
+                    len(matches),
+                    1,
+                    f"expected exactly one top-level `pub fn {name}(` in {self.ADMISSION_RS}, "
+                    f"found {len(matches)} -- the method-call exclusion in "
+                    "discover_live_standalone_op_keys assumes this name is a free function "
+                    "defined nowhere else",
+                )
+
+    def test_no_method_of_any_scanned_name_exists_in_admission_rs(self):
+        # A method definition of the same name would read `fn <name>(` with
+        # LEADING WHITESPACE (indented inside an `impl` block), never at
+        # column 0. Any such occurrence besides the three top-level
+        # definitions above falsifies the "these are free functions only"
+        # premise.
+        for name in ("admit", "admit_cascade", "op_disabled"):
+            with self.subTest(name=name):
+                indented = re.findall(r"^[ \t]+fn " + re.escape(name) + r"\s*\(", self.text, re.MULTILINE)
+                self.assertEqual(
+                    indented,
+                    [],
+                    f"found an indented (method-shaped) `fn {name}(` in {self.ADMISSION_RS}: "
+                    f"{indented} -- this falsifies the free-function premise the method-call "
+                    "exclusion in discover_live_standalone_op_keys depends on",
+                )
 
 
 class RealSourceParityTests(unittest.TestCase):

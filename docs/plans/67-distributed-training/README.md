@@ -131,7 +131,7 @@ those still in force are restated here in their v4 form. Principle in parenthese
     1 merged is a hard precondition of U5a** (its listener commit is ~22 files on top of ~10;
     there is no verbatim-carry fallback). PR-C(67) also waits for OPS, because OPS C2 rewrites
     the claim loop U5a's `JobSlot` wraps. GRAPH is deferred to #515 and is not a precondition:
-    its `claim_next` rewrite (`jobs_repo.rs:711`) does not land in this wave, so U5a's `JobSlot`
+    its `claim_next` rewrite (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`) does not land in this wave, so U5a's `JobSlot`
     wraps `claim_next` as it stands on `main`.
 34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
     `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
@@ -206,12 +206,14 @@ those still in force are restated here in their v4 form. Principle in parenthese
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
     **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
-    (`query_stage_scheduler.rs:320-340`) only resets the freed/re-failed tasks; it posts no
+    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    `QueryStageSchedulerEvent::ExecutorLost` match arm) only resets the freed/re-failed tasks; it posts no
     `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
     automatic: `ReviveOffers` fires only from a later, independent event — a new executor
     registering under push-staged scheduling (`do_register_executor`, `scheduler_server/mod.rs:
     419`) or a subsequent `TaskUpdating` success under push-staged scheduling
-    (`query_stage_scheduler.rs:300-303`) — so with both retry knobs at 0, a `GangExec` on a killed
+    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    `QueryStageSchedulerEvent::TaskUpdating` match arm's `ReviveOffers` post) — so with both retry knobs at 0, a `GangExec` on a killed
     executor is picked up only if one of those triggers fires afterward; with no other executor
     registering and no other in-flight task reporting status, the freed task can sit unscheduled
     with nothing to revive it. U8b needs an explicit bind-time guard in

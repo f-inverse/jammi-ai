@@ -37,9 +37,13 @@ pub async fn run(
 /// prints — every field the report carries, none dropped, in the same order
 /// [`jammi_db::store::ReconcileReport`] declares them and the same field
 /// names the python client's `_reconcile_report_to_dict` projects (so a
-/// caller cross-referencing the two surfaces sees identical names). Kept
-/// separate from [`run`] so a unit test can exercise it against a
-/// hand-built report with no server round trip.
+/// caller cross-referencing the two surfaces sees identical names). The six
+/// `*_count` fields are the one exception to "own printed line": each is
+/// folded into the "… and N more" suffix of the list field immediately
+/// before it (via [`join_capped`]), so its value is never dropped even
+/// though it carries no separate label of its own. Kept separate from
+/// [`run`] so a unit test can exercise it against a hand-built report with
+/// no server round trip.
 fn render(report: &ReconcileReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -75,6 +79,7 @@ fn render(report: &ReconcileReport) -> String {
         "referenced:      {}",
         join_capped(&report.referenced, report.referenced_count)
     );
+    let _ = writeln!(out, "truncated:       {}", report.truncated);
     let _ = writeln!(out, "bytes_reclaimed: {}", report.bytes_reclaimed);
     out
 }
@@ -109,6 +114,69 @@ mod tests {
     #[test]
     fn default_grace_secs_matches_the_wire_default() {
         assert_eq!(DEFAULT_GRACE_SECS, 3600);
+    }
+
+    /// Pins the exact list of labels `render` prints, in order, against the
+    /// declared field list of `ReconcileReport` — the same list the module
+    /// doc comment on `render` claims and
+    /// `clients/python/jammi/_database.py::_reconcile_report_to_dict`
+    /// projects.
+    ///
+    /// `EXPECTED_LABELS` is `ReconcileReport`'s own field list, in the
+    /// struct's declared order, with the six `*_count` fields removed: by
+    /// design (see `join_capped`) those never get a printed line of their
+    /// own — their value is folded into the "… and N more" suffix of the
+    /// list field immediately before them — so they carry no distinct
+    /// label to assert against. Every OTHER field, including `truncated`,
+    /// gets its own line, spelled exactly like its struct field name. The
+    /// exhaustive destructure below (no `..`) makes a field added to or
+    /// removed from `ReconcileReport` a compile error right here, so this
+    /// list (kept literal, not derived, because `render`'s output is
+    /// line-labelled text, not a serialization) cannot silently drift out
+    /// of sync with the struct without forcing a conscious update to this
+    /// test.
+    #[test]
+    fn render_prints_every_declared_field_in_declaration_order() {
+        let report = ReconcileReport::default();
+        let ReconcileReport {
+            scope: _,
+            applied: _,
+            rows_failed: _,
+            rows_failed_count: _,
+            orphans: _,
+            orphan_count: _,
+            pending: _,
+            pending_count: _,
+            unattributed: _,
+            unattributed_count: _,
+            damaged: _,
+            damaged_count: _,
+            referenced: _,
+            referenced_count: _,
+            truncated: _,
+            bytes_reclaimed: _,
+        } = report;
+
+        const EXPECTED_LABELS: &[&str] = &[
+            "scope",
+            "applied",
+            "rows_failed",
+            "orphans",
+            "pending",
+            "unattributed",
+            "damaged",
+            "referenced",
+            "truncated",
+            "bytes_reclaimed",
+        ];
+
+        let out = render(&ReconcileReport::default());
+        let printed_labels: Vec<&str> = out
+            .lines()
+            .map(|line| line.split(':').next().unwrap().trim())
+            .collect();
+
+        assert_eq!(printed_labels, EXPECTED_LABELS);
     }
 
     /// A report whose `referenced` list is non-empty (objects the reap

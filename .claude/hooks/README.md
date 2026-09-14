@@ -116,6 +116,10 @@ existence/length be weakened with zero CI signal; that silent path is closed. Ev
 SHAPE check below runs through the ONE shared validator, `_r12_anticipation_
 rejection` — never a second, per-reader reimplementation; reader 3
 imports and calls this SAME function, so a fix here fixes every reader identically.
+Its three attacks[*]-entry-shape deny texts (not an object / no `command` / no valid
+`hash`) each carry the `anticipation-validator:` provenance marker, so a fixture
+asserting on the marked text can never be satisfied by an independent
+re-implementation elsewhere in either reader.
 **8a, gates.** `_r12_gates_shape_rejection` requires `gates` to be a dict naming
 EVERY required command VERBATIM, each an object with an integer `rc`; called with
 `judge_rc=False` at Reader 1 (the pre-fix anticipation artifact — shape only, the

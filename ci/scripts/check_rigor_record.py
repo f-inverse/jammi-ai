@@ -107,6 +107,7 @@ Modes:
 """
 from __future__ import annotations
 
+import ast
 import fnmatch
 import hashlib
 import importlib.util
@@ -1971,10 +1972,16 @@ def fixture_rr26_foreign_row_in_anticipation_stream_fails_loudly() -> None:
 
 
 def fixture_rr27_attacks_entry_not_object_fails() -> None:
-    """fix round 6 Z14: `attacks["a.py"]` is a STRING, not an object — the
+    """fix round 7 Z16: `attacks["a.py"]` is a STRING, not an object — the
     shared validator's own arm, now the ONLY implementation of this check
-    since Z14 deleted reader 3's inline duplicate (which used to catch
-    this first and shadow the shared arm from ever being reached)."""
+    (fix round 6 Z14 deleted reader 3's inline duplicate, which used to
+    catch this first and shadow the shared arm from ever being reached).
+    Asserts on the `anticipation-validator:` PROVENANCE MARKER
+    `_r12_anticipation_rejection` alone stamps on its three attacks[*]-
+    entry-shape deny texts — a re-introduced duplicate elsewhere can never
+    reproduce this exact marked text, so this fixture cannot be satisfied
+    by a shadowing copy the way the generic substring it used to assert
+    on ("is not an object") could."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         _rr_anticipation_commit(work, {
@@ -1984,12 +1991,14 @@ def fixture_rr27_attacks_entry_not_object_fails() -> None:
         })
         r = _run_check_in(work)
         _assert(not r.ok(), "RR27", "a non-object attacks entry must FAIL")
-        _assert(any("is not an object" in f for f in r.failures), "RR27", f"{r.failures}")
+        _assert(any("anticipation-validator:" in f and "is not an object" in f for f in r.failures),
+                "RR27", f"{r.failures}")
 
 
 def fixture_rr28_attacks_entry_no_command_fails() -> None:
-    """fix round 6 Z14: `attacks["a.py"]` carries no `command` at all —
-    same shared arm, same replaced duplicate."""
+    """fix round 7 Z16: `attacks["a.py"]` carries no `command` at all —
+    same shared arm, same replaced duplicate, same `anticipation-
+    validator:` marker asserted (see RR27)."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         _rr_anticipation_commit(work, {
@@ -1999,12 +2008,14 @@ def fixture_rr28_attacks_entry_no_command_fails() -> None:
         })
         r = _run_check_in(work)
         _assert(not r.ok(), "RR28", "an attacks entry with no `command` must FAIL")
-        _assert(any("has no `command`" in f for f in r.failures), "RR28", f"{r.failures}")
+        _assert(any("anticipation-validator:" in f and "has no `command`" in f for f in r.failures),
+                "RR28", f"{r.failures}")
 
 
 def fixture_rr29_attacks_entry_invalid_hash_fails() -> None:
-    """fix round 6 Z14: `attacks["a.py"]["hash"]` is not a valid 64-hex
-    digest — same shared arm, same replaced duplicate."""
+    """fix round 7 Z16: `attacks["a.py"]["hash"]` is not a valid 64-hex
+    digest — same shared arm, same replaced duplicate, same `anticipation-
+    validator:` marker asserted (see RR27)."""
     with tempfile.TemporaryDirectory(prefix="rr-fixture-") as td:
         _origin, work = _pr_repo(Path(td))
         _rr_anticipation_commit(work, {
@@ -2014,7 +2025,8 @@ def fixture_rr29_attacks_entry_invalid_hash_fails() -> None:
         })
         r = _run_check_in(work)
         _assert(not r.ok(), "RR29", "an attacks entry with an invalid `hash` must FAIL")
-        _assert(any("has no valid `hash`" in f for f in r.failures), "RR29", f"{r.failures}")
+        _assert(any("anticipation-validator:" in f and "has no valid `hash`" in f for f in r.failures),
+                "RR29", f"{r.failures}")
 
 
 def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
@@ -2052,6 +2064,152 @@ def fixture_rr30_tied_ts_governing_row_fails_loudly() -> None:
             r = _run_check_in(work)
             _assert(not r.ok(), "RR30", f"a tied greatest-ts pool ({order_name}) must FAIL loudly")
             _assert(any("AMBIGUOUS" in f and "tie" in f for f in r.failures), "RR30", f"{order_name}: {r.failures}")
+
+
+# ==========================================================================
+# fix round 7 Z16(a): a STRUCTURAL fixture (modeled on check_lead_gate.py's
+# `R12sweepast`) asserting, by AST against the REAL file, that NO
+# FunctionDef in check_rigor_record.py — other than the call site that
+# invokes the shared validator (`_r12_anticipation_rejection`, imported by
+# path from lead-gate-lib.py) — independently RE-IMPLEMENTS one of the
+# three attacks[*]-entry-shape arms AND itself reports a failure for it.
+# The property distinguishes a re-implementation from a residual guard:
+# `check_anticipation_witnesses` still carries its own `isinstance(entry,
+# dict): continue` (it needs a real dict-shaped entry to run its OWN,
+# different, denylist re-check) — that guard SKIPS silently and reports
+# nothing, so it is not the smell. Fix round 6 Z14's deleted duplicate
+# additionally called `result.fail(...)` inside the identical guard,
+# reporting the SAME shape failure the shared validator already reports —
+# THAT combination (a shape test bound to a `.fail(...)` call) is what
+# this fixture forbids.
+# ==========================================================================
+
+def _rr_for_loop_vars_over_r12_dicts(fn: ast.FunctionDef) -> set[str]:
+    """Loop target name(s) of every `for ... in <X>:` inside `fn` whose
+    iterated expression's own identifiers/string constants mention
+    `attacks`/`mutations`/`exclusions` (e.g. `for file_key, entry in
+    attacks.items():` — `entry` qualifies)."""
+    names: set[str] = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.For):
+            continue
+        iter_idents: set[str] = set()
+        for sub in ast.walk(node.iter):
+            if isinstance(sub, ast.Name):
+                iter_idents.add(sub.id)
+            elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                iter_idents.add(sub.value)
+        if not any(kw in ident for ident in iter_idents for kw in ("attacks", "mutations", "exclusions")):
+            continue
+        target = node.target
+        elts = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
+        names.update(e.id for e in elts if isinstance(e, ast.Name))
+    return names
+
+
+def _rr_get_key_assigned_vars(fn: ast.FunctionDef, key: str) -> set[str]:
+    """Name(s) assigned, anywhere in `fn`, from a bare `<expr>.get(<key>)`
+    call (e.g. `command = entry.get("command")`)."""
+    names: set[str] = set()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        val = node.value
+        if (isinstance(val, ast.Call) and isinstance(val.func, ast.Attribute) and val.func.attr == "get"
+                and val.args and isinstance(val.args[0], ast.Constant) and val.args[0].value == key):
+            names.add(node.targets[0].id)
+    return names
+
+
+def _rr_entry_shape_duplicate_violations(source: str) -> list[str]:
+    """Fix round 7 Z16(a): `[]` iff no FunctionDef in `source` other than
+    the shared-validator call site re-implements AND REPORTS one of the
+    three attacks[*]-entry-shape arms. Each violation names the enclosing
+    function, the source line, and which arm it duplicates."""
+    tree = ast.parse(source)
+    violations: list[str] = []
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        dict_loop_vars = _rr_for_loop_vars_over_r12_dicts(fn)
+        command_vars = _rr_get_key_assigned_vars(fn, "command")
+        hash_vars = _rr_get_key_assigned_vars(fn, "hash")
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.If):
+                continue
+            calls_fail = any(
+                isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "fail"
+                for stmt in node.body for sub in ast.walk(stmt)
+            )
+            if not calls_fail:
+                continue  # a residual SKIP-only guard is not this smell
+            test = node.test
+            inner = test.operand if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) else test
+            test_names = {n.id for n in ast.walk(test) if isinstance(n, ast.Name)}
+            if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "isinstance"
+                    and len(inner.args) == 2 and isinstance(inner.args[0], ast.Name)
+                    and inner.args[0].id in dict_loop_vars
+                    and isinstance(inner.args[1], ast.Name) and inner.args[1].id == "dict"):
+                violations.append(f"{fn.name}:{node.lineno}: isinstance({inner.args[0].id}, dict) guard over "
+                                   "an attacks/mutations/exclusions loop variable ALSO calls result.fail(...)")
+            if test_names & command_vars:
+                violations.append(f"{fn.name}:{node.lineno}: a `command`-presence test "
+                                   f"({sorted(test_names & command_vars)}) ALSO calls result.fail(...)")
+            has_fullmatch = any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                                 and sub.func.attr == "fullmatch" for sub in ast.walk(test))
+            if has_fullmatch and (test_names & hash_vars):
+                violations.append(f"{fn.name}:{node.lineno}: a `hash` fullmatch test "
+                                   f"({sorted(test_names & hash_vars)}) ALSO calls result.fail(...)")
+    return violations
+
+
+# The EXACT duplicate fix round 6 Z14 deleted from `check_anticipation_
+# witnesses` — reinserted TEMPORARILY, in a synthetic copy of the real
+# source only, to prove `_rr_entry_shape_duplicate_violations` actually
+# catches its return.
+_RR_Z14_DUPLICATE_ANCHOR = (
+    "            if not isinstance(entry, dict):\n"
+    "                continue\n"
+    "            command = entry.get(\"command\")\n"
+    "            if not (isinstance(command, str) and command.strip()):\n"
+    "                continue\n"
+)
+_RR_Z14_DUPLICATE_REPLACEMENT = (
+    "            if not isinstance(entry, dict):\n"
+    "                result.fail(f\"{path}:{lineno}: attacks[{file_key!r}] is not an object\")\n"
+    "                continue\n"
+    "            command = entry.get(\"command\")\n"
+    "            recorded_hash = entry.get(\"hash\")\n"
+    "            if not isinstance(command, str) or not command.strip():\n"
+    "                result.fail(f\"{path}:{lineno}: attacks[{file_key!r}] has no `command`\")\n"
+    "                continue\n"
+    "            if not (isinstance(recorded_hash, str) and re.fullmatch(r\"[0-9a-f]{64}\", recorded_hash)):\n"
+    "                result.fail(f\"{path}:{lineno}: attacks[{file_key!r}] has no valid `hash`\")\n"
+    "                continue\n"
+)
+
+
+def fixture_rr31_shared_validator_is_sole_entry_shape_reporter() -> None:
+    """fix round 7 Z16(a): STRUCTURAL — asserts, by AST against the REAL
+    file, that `_rr_entry_shape_duplicate_violations` finds NOTHING in the
+    current source (the shared validator, `_r12_anticipation_rejection` in
+    lead-gate-lib.py, is the only place that reports an attacks[*]-entry-
+    shape failure). RED half executed against fix round 6 Z14's own
+    deleted duplicate, reinserted into a SYNTHETIC copy of this file's real
+    source (never the file on disk): confirms this detector is not merely
+    vacuously empty by accident."""
+    source = Path(__file__).read_text()
+    violations = _rr_entry_shape_duplicate_violations(source)
+    _assert(not violations, "RR31", f"a duplicate entry-shape reporter re-appeared: {violations}")
+
+    mutated = source.replace(_RR_Z14_DUPLICATE_ANCHOR, _RR_Z14_DUPLICATE_REPLACEMENT, 1)
+    _assert(mutated != source, "RR31 setup",
+            "the fix round 6 Z14 duplicate-restoration anchor did not match the real file — "
+            "check_anticipation_witnesses' own residual loop must have moved")
+    mutated_violations = _rr_entry_shape_duplicate_violations(mutated)
+    _assert(bool(mutated_violations), "RR31",
+            "restoring fix round 6 Z14's deleted duplicate must make this detector non-empty — it did not")
 
 
 RR_FIXTURES = [
@@ -2092,6 +2250,7 @@ RR_FIXTURES = [
     ("RR28", fixture_rr28_attacks_entry_no_command_fails),
     ("RR29", fixture_rr29_attacks_entry_invalid_hash_fails),
     ("RR30", fixture_rr30_tied_ts_governing_row_fails_loudly),
+    ("RR31", fixture_rr31_shared_validator_is_sole_entry_shape_reporter),
 ]
 
 

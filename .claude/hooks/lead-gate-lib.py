@@ -2502,14 +2502,22 @@ def _r12_anticipation_rejection(rows: list[dict], required_commands: list[str], 
         # for reader 1's own call.
         seen_pairs: dict[tuple[str, str], str] = {}
         for key, entry in attacks.items():
+            # Each `.get(...)` below is guarded by its OWN `isinstance(entry, dict)`
+            # test (never a bare `entry.get(...)` relying on the arm just above
+            # having already returned) — a non-dict `entry` can never reach a
+            # dereference on it, by construction, regardless of which single arm
+            # a mutation neuters. The three deny texts below carry the
+            # `anticipation-validator:` marker — a provenance tag unique to THIS
+            # function, so a duplicate re-implementation elsewhere can never
+            # satisfy a fixture asserting on the marked text.
             if not isinstance(entry, dict):  # R12-RESIDUAL: reader 1 only ever reaches this on a key OUTSIDE `by_file` (a real per-file entry is already validated by `_r12_validate_and_run_entry`'s OWN identical check first) — narrow; exercised for a REQUIRED key via reader 1's real loop, and for reader 3 via its own RR27 fixture (fix round 6 Z14 deleted reader 3's earlier inline duplicate of this exact check, which had been shadowing it), invisible to this check_lead_gate.py-scoped sweep
-                return f"anticipation record attacks[{key!r}] is not an object (esc-lead-gate-R12)"
-            command = entry.get("command")
+                return f"anticipation-validator: attacks[{key!r}] is not an object (esc-lead-gate-R12)"
+            command = entry.get("command") if isinstance(entry, dict) else None
             if not isinstance(command, str) or not command.strip():  # R12-RESIDUAL: same narrowing as the arm above — only reachable via a key OUTSIDE `by_file` from reader 1's own call; exercised for reader 3 via its own RR28 fixture (fix round 6 Z14)
-                return f"anticipation record attacks[{key!r}] has no `command` (esc-lead-gate-R12)"
-            recorded_hash = entry.get("hash")
+                return f"anticipation-validator: attacks[{key!r}] has no `command` (esc-lead-gate-R12)"
+            recorded_hash = entry.get("hash") if isinstance(entry, dict) else None
             if not (isinstance(recorded_hash, str) and _OUTPUT_HASH_RE.fullmatch(recorded_hash)):  # R12-RESIDUAL: same narrowing as the two arms above; exercised for reader 3 via its own RR29 fixture (fix round 6 Z14)
-                return f"anticipation record attacks[{key!r}] has no valid `hash` (esc-lead-gate-R12)"
+                return f"anticipation-validator: attacks[{key!r}] has no valid `hash` (esc-lead-gate-R12)"
             pair = (command, recorded_hash)
             if pair in seen_pairs:  # R12-RESIDUAL: reader 1's real per-file loop already threads its OWN `seen_pairs` across `by_file` (`_r12_validate_and_run_entry`'s identical check fires first there); this arm fires only when a pair repeats via a key OUTSIDE `by_file`, exercised by check_rigor_record.py's own RR23 fixture (reader 3 has no `by_file` restriction at all), invisible to this sweep
                 return (f"anticipation record attacks[{key!r}] and attacks[{seen_pairs[pair]!r}] "

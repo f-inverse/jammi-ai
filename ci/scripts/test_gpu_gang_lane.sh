@@ -33,7 +33,7 @@
 #       (never a silently-warned second exit path) — a clean pull stays
 #       silent. The id-secrecy scan that backstops the NCCL id's
 #       out-of-band crossing ships with the cluster leg
-#       (docs/plans/67-distributed-training/UNITS.md § U7b), beside the
+#       (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the
 #       crossing it backstops; G5 does not exercise it.
 #   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
 #       the `<<REMOTE` heredoc body, beside the existing env block; removing
@@ -353,7 +353,7 @@ fi
 # inside a `$(...)` capture, which would discard the `rc` mutation the arms
 # make -- the same reason G3's run_arms does not capture its own eval). The
 # id-secrecy scan that backstops the NCCL id's out-of-band crossing ships
-# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b),
+# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)),
 # beside the crossing it backstops -- this function does not exercise it.
 # ============================================================================
 retrieval_start_ln="$(grep -n '^mkdir -p "\$GANG_ARTIFACT_DIR"$' "$GANG_SH" | head -1 | cut -d: -f1)"
@@ -671,6 +671,20 @@ if grep -qE '^\s*a100\)\s*cand=\(.*A100 80GB PCIe.*A100-SXM4-80GB' "$LIB_SH" \
   ok "G4: the shared a100 candidate list still carries all four PCIe+SXM4 entries (reordered above gpuCount 1, never narrowed)"
 else
   bad "G4: the a100 candidate list was narrowed (${a100_candidates} entries) — a multi-GPU rental reorders the search, it does not drop candidates"
+fi
+
+# ============================================================================
+# citation fixture: every "UNITS.md § U7b acceptance (id-secrecy)" citation
+# under ci/scripts resolves to a real UNITS.md line naming the obligation --
+# the id-secrecy scan's rebuild is SCHEDULED in the committed plan, never
+# named without anywhere for that name to resolve to.
+# ============================================================================
+UNITS_MD="$REPO_ROOT/docs/plans/67-distributed-training/UNITS.md"
+citation_sites="$(grep -rl 'UNITS.md § U7b acceptance (id-secrecy)' "$DIR" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$citation_sites" -ge 1 ] && grep -q 'id-secrecy' "$UNITS_MD"; then
+  ok "citation fixture: every 'UNITS.md § U7b acceptance (id-secrecy)' citation under ci/scripts resolves to a UNITS.md line naming id-secrecy (${citation_sites} site(s))"
+else
+  bad "citation fixture: no citation resolves -- ${citation_sites} site(s) under ci/scripts, UNITS.md id-secrecy line present=$(grep -q 'id-secrecy' "$UNITS_MD" && echo yes || echo no)"
 fi
 
 echo

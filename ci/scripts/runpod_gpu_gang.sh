@@ -87,7 +87,7 @@
 # rsync's own exit code when the artifact pull fails (a suite that passed
 # but left no retrievable evidence proves nothing reviewable). The
 # id-secrecy scan that backstops the NCCL id's out-of-band crossing ships
-# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b),
+# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)),
 # beside the crossing it protects — this driver mints/ships no id today.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -148,7 +148,7 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # "opaque secret ... travel to the peers out of band") rides NO path under
 # either directory: it is a capability, never evidence. The id-secrecy scan
 # that backstops that contract ships with the cluster leg
-# (docs/plans/67-distributed-training/UNITS.md § U7b), beside the crossing
+# (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)), beside the crossing
 # it protects; this driver mints/ships no id today.
 GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
@@ -364,7 +364,7 @@ fi
 # rides OUTSIDE ${GANG_REMOTE_ARTIFACT_DIR}/${GANG_ARTIFACT_DIR} -- never
 # inside the directory this driver pulls back and a human later commits.
 # The scan that backstops this contract against a future mistake ships
-# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b),
+# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b acceptance (id-secrecy)),
 # beside the id-ship crossing it protects.
 # --- end artifact retrieval ---
 

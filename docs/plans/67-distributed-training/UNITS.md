@@ -215,6 +215,10 @@ per-step `$?`. Naming per README ruling 23.
   (clusters enumerated and reaped), `gpu-gang.yml`.
 - **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring;
   `check_execution_surface_reachability.py` green with the cluster-leg tuples allowlisted.
+- **acceptance (id-secrecy)**: the NCCL id (the 128-byte secret that crosses hosts hex-encoded)
+  never appears in any carrier the leg retrieves from the pod — text or binary, at any mode,
+  through symlinks, inside any archive the leg itself produces; a carrier this scan cannot
+  examine refuses the leg by name, never a silent pass.
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
 - **cost ceiling**: ≤ 1 h × 4 GPU × $1.59 ≈ $6.4 per run; label-only until a flake-free streak.
 

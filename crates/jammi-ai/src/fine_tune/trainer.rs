@@ -386,11 +386,12 @@ pub struct TrainingLoop {
     artifact_store: Option<Arc<ArtifactStore>>,
     /// The guarded port [`Self::save_epoch_checkpoint`]'s mid-run retention
     /// prune deletes an over-the-cap checkpoint through —
-    /// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`], never
-    /// the unguarded [`ArtifactStore::delete_epoch_checkpoint`] directly (a
+    /// [`jammi_db::store::ResultStore::delete_unreferenced_prefix`], which
+    /// consults the live-`models`-row guard before ever deleting a byte (a
     /// retained checkpoint gets its own `models` row the winning finalize
-    /// CAS inserts, so an unguarded delete could remove bytes a live row
-    /// still names). `None` alongside a `Some` [`Self::artifact_store`] AND
+    /// CAS inserts, so a `Referenced` refusal there means the checkpoint
+    /// survives, never removed out from under a live row). `None` alongside
+    /// a `Some` [`Self::artifact_store`] AND
     /// `config.keep_last_n_checkpoints` is refused at
     /// [`TrainingLoopBuilder::build`] — production always sets both
     /// together (`InferenceSession::result_store` is infallible).
@@ -3727,11 +3728,11 @@ impl TrainingLoop {
     /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
     /// cap, the OLDEST surviving entry is deleted through
     /// [`Self::delete_epoch_checkpoint_guarded`] — the guarded
-    /// [`ResultStore::delete_unreferenced_prefix`] port, never the unguarded
-    /// [`ArtifactStore::delete_epoch_checkpoint`] directly, since a RETAINED
+    /// [`ResultStore::delete_unreferenced_prefix`] port, which consults the
+    /// live-`models`-row guard before ever deleting a byte, since a RETAINED
     /// checkpoint gets its own `models` row (the winning finalize CAS
-    /// inserts one per retained checkpoint) whose bytes an unguarded delete
-    /// could remove out from under it — and dropped from the vector ONLY on
+    /// inserts one per retained checkpoint) whose bytes a `Referenced`
+    /// refusal there leaves untouched — and dropped from the vector ONLY on
     /// a SUCCESSFUL delete. Neither a transient storage failure NOR a
     /// `Referenced` refusal aborts the run — a housekeeping op unrelated to
     /// whether training itself succeeded — but the two are logged
@@ -3795,12 +3796,12 @@ impl TrainingLoop {
     }
 
     /// Delete the mid-run prune's oldest surviving epoch checkpoint through
-    /// the guarded [`ResultStore::delete_unreferenced_prefix`] port — never
-    /// the unguarded [`ArtifactStore::delete_epoch_checkpoint`] primitive
-    /// directly. Every `models/**` byte-deleter in this crate reaches the
-    /// store this way; a RETAINED checkpoint's own `models` row (the winning
-    /// finalize CAS inserts one per retained checkpoint) means an unguarded
-    /// delete here could remove bytes that row still names.
+    /// the guarded [`ResultStore::delete_unreferenced_prefix`] port, which
+    /// consults the live-`models`-row guard before ever deleting a byte.
+    /// Every `models/**` byte-deleter in this crate reaches the store this
+    /// way; a RETAINED checkpoint's own `models` row (the winning finalize
+    /// CAS inserts one per retained checkpoint) means a `Referenced` refusal
+    /// there leaves that row's bytes untouched.
     ///
     /// Returns whether the entry was actually deleted (and may be dropped
     /// from [`Self::epoch_checkpoints`]). `false` covers two DIFFERENT

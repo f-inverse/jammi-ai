@@ -97,16 +97,18 @@ a single-line edit away from being false with every existing check still
 green. `book_provisioning_violations()` below pins them.
 
 Deliberately a comment-STRIPPED line scan (`workflow_run_text`'s own
-comment-vs-code rule, reused rather than reinvented), not a YAML parse. Two
-reasons, and the first is not the convenience one: that workflow ALREADY
-carries a comment reading "`target/release` goes on PATH exactly as
-`cookbook-render.yml` does". A scan over raw text would be satisfied by that
-sentence — it would assert that somebody once DESCRIBED the wiring, which is
-precisely the "discipline only" state this check exists to end, dressed up as
-a gate. Only a line that is part of a step body may satisfy a pin. The second
-reason is that no gate in this repo imports PyYAML today, and a gate that
-fails closed on a missing third-party import is a gate that fails closed for
-the wrong reason.
+comment-vs-code rule, reused rather than reinvented), not a YAML parse: that
+workflow ALREADY carries a comment reading "`target/release` goes on PATH
+exactly as `cookbook-render.yml` does". A scan over raw text would be
+satisfied by that sentence — it would assert that somebody once DESCRIBED
+the wiring, which is precisely the "discipline only" state this check
+exists to end, dressed up as a gate. Only a line that is part of a step
+body may satisfy a pin. (Some gates in this tree DO import PyYAML today —
+`check_execution_surface_reachability.py`'s shared workflow loader, and
+every gate built on it — with a missing install treated as its own
+distinct prerequisite failure, never a finding and never a pass; this
+gate's own comment-stripped scan needs no structured parse at all, so it
+carries no such dependency either way.)
 
 Fail-closed on absence: if the workflow file is gone (renamed, deleted), that
 is a violation, not a skip. A gate that silently passes when its subject

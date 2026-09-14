@@ -2398,6 +2398,19 @@ jobs:
       - name: Install safetensors (perf convert_legacy_bert_checkpoint suite only)
         if: matrix.name == 'perf convert_legacy_bert_checkpoint suite'
         run: python3 -m pip install --user safetensors
+      # `check_execution_surface_reachability.py`'s shared workflow loader
+      # (`on:`/`jobs:` YAML parsing, duplicate-key-refusing) is a declared
+      # PyYAML prerequisite -- this bare runner carries no container image
+      # (`.docker/ci.Dockerfile` pins it there instead), so the FIVE legs
+      # that actually call into that loader (directly, or via
+      # `check_gpu_prove_once.py`, which imports it, or via
+      # `test_gpu_gang_lane.sh`'s `--read-on-block` CLI shell-out) install
+      # it here -- the same `if:`-gated, leg-scoped exception the two
+      # installs above already establish, so every OTHER leg stays a bare,
+      # instant, no-install runner.
+      - name: Install PyYAML (execution-surface-reachability / gpu-prove-once / gpu-gang-lane legs only)
+        if: contains(fromJSON('["execution-surface reachability", "execution-surface reachability self-test", "gpu prove once", "gpu prove once suite", "gpu gang lane suite"]'), matrix.name)
+        run: python3 -m pip install --user 'PyYAML==6.*'
       - name: Run guard
         # `continue_on_error` is unset ('') for every leg except "doc
         # numbers have producers" (matrix.continue_on_error: "true" there) —

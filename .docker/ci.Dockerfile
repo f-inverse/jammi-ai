@@ -19,6 +19,14 @@ FROM ${BASE_IMAGE}
 RUN yum install -y sqlite-libs \
     && yum clean all
 
+# PyYAML: a declared prerequisite of `ci/scripts/check_execution_surface_
+# reachability.py`'s shared workflow loader (the `on:`/`jobs:` YAML parse
+# every gate built on it -- `check_gpu_prove_once.py`, `check_lint_surface_
+# closure.py` -- reads workflows through). A missing install is its own
+# distinct, named gate-prerequisite failure (never a silent finding), so it
+# is pinned here rather than assumed present in this manylinux base image.
+RUN python3 -m pip install --no-cache-dir 'PyYAML==6.*'
+
 # Per-arch download variables. TARGETARCH is set by buildx per platform
 # (`linux/amd64` -> `amd64`, `linux/arm64` -> `arm64`) and is NOT the same
 # spelling any of the four upstream releases use in their own asset names, so

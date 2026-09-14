@@ -722,9 +722,14 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   pass's own orphan accounting. `ReconcileReport { scope, applied,
   rows_failed, rows_failed_count, orphans, orphan_count, pending,
   pending_count, unattributed, unattributed_count, damaged, damaged_count,
-  truncated, bytes_reclaimed }`, every list sorted and capped at
-  `REPORT_LIST_CAP` (10,000 entries; `truncated` says whether any list hit the
-  cap, `*_count` is always the true total). `reconcile` runs under the
+  referenced, referenced_count, truncated, bytes_reclaimed }`, every list
+  sorted and capped at `REPORT_LIST_CAP` (10,000 entries; `truncated` says
+  whether any list hit the cap, `*_count` is always the true total).
+  `referenced` names a `models/`-namespaced object this pass's reap-site
+  consult of `ResultStore::prefix_is_referenced` found still referenced by
+  some live `models` row in some tenant scope — reported instead of
+  reclaimed, at any grace or `apply`, and never carrying row ids, model
+  names, or tenant ids, only the object key. `reconcile` runs under the
   store's own binding (tenant-bound → its `{seg}/`; unbound → `_global`
   only); `reconcile_all` wraps the WHOLE pass in
   `TenantBinding::admin_scope` and covers every tenant. Wire: `CatalogService.
@@ -1878,9 +1883,10 @@ enum **once** in `jammi.v1.inference`
 field (e.g. `crates/jammi-wire/proto/jammi/v1/pipeline.proto`). `SubmitJobRequest.cache`
 (tag 10, `crates/jammi-wire/proto/jammi/v1/job.proto`) imports the same enum rather than
 declaring a second wire vocabulary for the identical concept;
-`crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it into
-`TrainingCommon.cache`, the call-time dial `ProducingDescriptor::FineTune`'s
-**model-level** reuse probe
+`crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it and returns it
+alongside `TrainingCommon` (never folded into that type — only the `FineTune` decode arm
+threads it onto `TrainingSpec::FineTune.cache`), the call-time dial `ProducingDescriptor::
+FineTune`'s **model-level** reuse probe
 (`Catalog::probe_model_by_definition`, keyed on the model's definition hash + input
 anchors — see the `FineTune` entry above) reads, distinct from the *result-table*
 `probe_cache_record` path the producers above use.
@@ -1888,13 +1894,18 @@ anchors — see the `FineTune` entry above) reads, distinct from the *result-tab
 **`cache = Use` is scoped to the column-source `FineTune` kind only.**
 `ProducingDescriptor::FineTune` (and every probe/record mechanism built on it,
 `Catalog::probe_model_by_definition` / `record_model_materialization`) covers only that
-kind — a `GraphFineTune` job's `FineTuneRun::materialization_source` is `None`
-(`crates/jammi-ai/src/fine_tune/worker.rs`: the graph arm carries no materialization to
-probe or record). `lora_common_from_proto` therefore refuses `cache = USE` for
+kind — `cache` lives on `TrainingSpec::FineTune` itself; `TrainingSpec::GraphFineTune`
+carries no `cache` field at all, so a `GraphFineTune` job's `FineTuneRun::materialization_source`
+is unconditionally `None` (`crates/jammi-ai/src/fine_tune/worker.rs`: the graph arm carries no
+materialization to probe or record). `lora_common_from_proto` therefore refuses `cache = USE` for
 `GraphFineTune` with a typed `InvalidArgument` at decode — the one place that can still
 see both the kind and the requested value, mirroring the `ContextPredictor` `world_size`
 refusal in the same module. `Bypass`/unset is unaffected on either kind: a graph
-fine-tune always trains, exactly as it did before this field existed. The Python client
+fine-tune always trains, exactly as it did before this field existed. A stray `cache` key
+found under `graph_fine_tune` in a persisted `jobs.spec` row is silently dropped at
+deserialize rather than refused, since the type has nowhere to decode it onto (a hard error
+on unknown keys is a separate persisted-row reshape,
+https://github.com/f-inverse/jammi-ai/issues/548). The Python client
 still carries `cache=` as a kwarg on both `fine_tune` and `fine_tune_graph` (beside
 `world_size`, on both transports); only `fine_tune`'s `"use"` is ever honored; the
 identical kwarg on `fine_tune_graph` is refused, not silently dropped.
@@ -1906,16 +1917,31 @@ both miss the probe (neither's row is committed yet) and both train, publishing 
 prefixes and two model rows — each independently servable and each independently
 reusable by a later probe — rather than one job blocking on the other.
 
+**A catalog row may be deleted at any time; bytes are reclaimed only when
+unreferenced.** Deleting either of two model rows sharing a reused prefix is always
+allowed — there is no ownership edge between the two rows, and catalog referential
+integrity for that edge is a separate unit
+(https://github.com/f-inverse/jammi-ai/issues/547). The underlying bytes are a
+different matter: `ResultStore::prefix_is_referenced` is an admin-scoped (whole-catalog)
+scan of `models.artifact_path`, and `ResultStore::delete_unreferenced_prefix` consults it
+before every `models/`-prefix byte-delete this pass or the worker's own abandon path can
+reach, refusing typed (`StorageError::Referenced { prefix, count }`) while any live
+`models` row, in any tenant, still names the prefix. `reconcile`'s attribution set is
+built from the same admin-scoped scan (never the tenant-scoped `list_models`), so a
+tenant-bound reconcile pass can never reap a prefix a peer tenant's row still serves; a
+prefix this pass's ordinary orphan check would otherwise reclaim, but which that same
+admin-scoped consult still finds referenced, is reported in `ReconcileReport.referenced`
+(and counted in `referenced_count`) instead of deleted.
+
 **The reuse-locality assumption.** `MaterializationEnv.device`
 (`crates/jammi-db/src/store/manifest.rs`) folds `ComputeDevice::Cuda { ordinal }` /
 `Metal { ordinal }` / `Cpu` — a device **ordinal**, not a host or machine identity. The
 probe's definition hash therefore treats any two invocations reporting the same ordinal
 as numerically interchangeable, including across two different physical hosts that both
 happen to enumerate a GPU at ordinal `0`: a model trained on one host's ordinal `0` can
-be served by a probe resolved on another host's ordinal `0`. This is sound for a fleet of
-like-for-like accelerators (the deployment shape every `FineTune` job runs under today)
-and would need a real per-host or per-device identity folded into `ComputeDevice` before
-it could hold across heterogeneous hardware.
+be served by a probe resolved on another host's ordinal `0`. This is sound where
+accelerators are interchangeable; not a guarantee across heterogeneous hardware, which
+would need a real per-host or per-device identity folded into `ComputeDevice`.
 
 #### The staleness/lineage sensing model (`store/freshness.rs`)
 
@@ -1984,7 +2010,7 @@ CI if the guide and the code diverge:
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.
-- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); `TrainingCommon.cache = Use` probes for an exact prior materialisation by definition hash before training, `Bypass` (the default) trains unconditionally; replayed by retraining.
+- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); `TrainingSpec::FineTune.cache = Use` probes for an exact prior materialisation by definition hash before training, `Bypass` (the default) trains unconditionally; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
 <!-- END PRODUCING-DESCRIPTOR-VARIANTS -->
 
 #### The recompute verb — descriptor replay + bounded cascade (`pipeline/recompute.rs`)

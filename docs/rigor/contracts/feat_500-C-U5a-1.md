@@ -249,12 +249,12 @@ never a hand-rolled walk —
   own unit tests) — a fixed allowlist checked BOTH directions (no unexpected hit; no stale
   allowlist entry that no longer hits).
 - `only_resolve_training_set_identity_calls_get_result_table_for_tenant` — deleted with the
-  world>1 conjunct (Addendum 2; #566), not merely retired: the gang `RunRank` handler no longer
+  world>1 conjunct (Addendum 2; #566): the gang `RunRank` handler no longer
   reaches `get_result_table_for_tenant` at all (Addendum 2 §B1), so there is no gang-adjacent
-  caller surface left for this oracle to enumerate. `get_result_table_for_tenant`'s own
-  strict-predicate property is now tested directly in `jammi-db`
-  (`crates/jammi-db/tests/it/result_tables.rs::get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant`),
-  independent of any caller built on top of it.
+  caller surface left for this oracle to enumerate. `get_result_table_for_tenant` itself and the
+  strict-predicate test that measured it are deleted with that conjunct; the property and its
+  rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
+  <https://github.com/f-inverse/jammi-ai/issues/566>).
 
 The surviving oracle is a **measured claim**, not prose: `impossibility_claims` (§6, below) states
 "no caller other than the gang `RunRank` handler calls `get_job_for_rank`" with this executed
@@ -479,9 +479,10 @@ c1d918b4.
   `only_resolve_training_set_identity_calls_get_result_table_for_tenant`, is deleted with the
   world>1 conjunct (Addendum 2; #566): the gang `RunRank` handler no longer calls
   `get_result_table_for_tenant` at all in this unit (Addendum 2 §B1), so there is no
-  gang-adjacent caller surface left to enumerate here; the verb's own strict-predicate property is
-  tested directly in `jammi-db`
-  (`crates/jammi-db/tests/it/result_tables.rs::get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant`).
+  gang-adjacent caller surface left to enumerate here; `get_result_table_for_tenant` itself and
+  the strict-predicate test that measured it are deleted with the same conjunct, and the property
+  and its rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
+  <https://github.com/f-inverse/jammi-ai/issues/566>).
 - "the write-once training-set pair is ever set with one column null and the other not" —
   executed attempt: `a_raw_single_column_write_is_refused_by_the_schema_check`
   (`crates/jammi-db/tests/it/gang_rank_admission.rs:387-412`) and
@@ -793,7 +794,7 @@ the new determinant from both the pairwise non-disclosure oracle and the
 rather than a hand-listed array the match merely re-validates — the
 stronger "fails until added to both" claim holds again; stated here in the
 weaker, currently-true form until that lands.) The pairwise non-disclosure
-oracle that consumes `WITNESSES` today drives the ten scenarios that are in
+oracle that consumes `WITNESSES` drives the ten scenarios that are in
 it.
 
 ### B2. `world_size` is a row fact, never a fault, at decode time

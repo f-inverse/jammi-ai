@@ -8,10 +8,10 @@
 //! not apply: the gang `RunRank` handler does not reach that verb at all —
 //! this unit ships the `world_size == 1` lattice only — so there is no
 //! gang-adjacent caller surface left to enumerate here.
-//! `get_result_table_for_tenant`'s own strict-predicate property is
-//! `jammi-db`'s own tenant-isolation guard, tested directly there
-//! (`crates/jammi-db/tests/it/result_tables.rs`), independent of any
-//! caller built on top of it.
+//! `get_result_table_for_tenant` itself and the strict-predicate test that
+//! measured it are deleted with the world>1 conjunct; the property and its
+//! rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
+//! <https://github.com/f-inverse/jammi-ai/issues/566>).
 //!
 //! The scanned surface is derived from `git ls-files` (never a hand-rolled
 //! directory walk) over the whole tracked tree — `crates/**` and everything

@@ -3098,11 +3098,11 @@ handler never reaches `Catalog::get_result_table_for_tenant` or
 `ResultStore::read_materialization_manifest` at all — the training-set
 sidecar lookup they backed is `HostAdmission`'s to build from the filed
 property. No such wrapper exists in this crate.
-`Catalog::get_result_table_for_tenant`'s own strict-predicate
-property (a NULL-tenant row never matches a real tenant's lookup) is
-`jammi-db`'s own tenant-isolation guard, tested directly there
-(`crates/jammi-db/tests/it/result_tables.rs`), independent of any caller
-built on top of it. The mid-stream re-verification three-way split
+`Catalog::get_result_table_for_tenant` itself and the strict-predicate test
+that measured its NULL-tenant-row guarantee (a NULL-tenant row never
+matches a real tenant's lookup) are deleted with the world>1 conjunct; the
+property and its rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
+<https://github.com/f-inverse/jammi-ai/issues/566>). The mid-stream re-verification three-way split
 (`Refuted`/`Unavailable`/`StoreUnavailable`) is likewise built with
 `HostAdmission` once an admitted session exists to re-verify inside.
 

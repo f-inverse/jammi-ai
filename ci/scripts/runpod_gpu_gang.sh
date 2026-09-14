@@ -87,8 +87,8 @@
 # rsync's own exit code when the artifact pull fails (a suite that passed
 # but left no retrievable evidence proves nothing reviewable). The
 # id-secrecy scan that backstops the NCCL id's out-of-band crossing ships
-# with U7b-C, beside the crossing it protects — this driver mints/ships no
-# id today.
+# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b),
+# beside the crossing it protects — this driver mints/ships no id today.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -147,8 +147,9 @@ GANG_TEST_FILTER="${GANG_TEST_FILTER:-gang_}"
 # test code. The NCCL id (128 opaque bytes minted by rank 0, nccl.rs's own
 # "opaque secret ... travel to the peers out of band") rides NO path under
 # either directory: it is a capability, never evidence. The id-secrecy scan
-# that backstops that contract ships with U7b-C, beside the crossing it
-# protects; this driver mints/ships no id today.
+# that backstops that contract ships with the cluster leg
+# (docs/plans/67-distributed-training/UNITS.md § U7b), beside the crossing
+# it protects; this driver mints/ships no id today.
 GANG_REMOTE_ARTIFACT_DIR="/root/jammi-ai/.gang-artifact"
 GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 
@@ -356,14 +357,15 @@ else
 fi
 
 # The NCCL id (128 opaque bytes minted by rank 0) crosses hosts ONLY
-# hex-encoded (CONTRACT-U7b-v9.md's C1); it must never reach a committed
-# artifact or a CI log -- it is the capability to join this gang, not
-# evidence of one. This lane mints/ships no id today. The id file's own
+# hex-encoded; it must never reach a committed artifact or a CI log -- it
+# is the capability to join this gang, not evidence of one; the driver
+# never sees the id. This lane mints/ships no id today. The id file's own
 # committed contract, fixed here BEFORE that mechanism exists, is that it
 # rides OUTSIDE ${GANG_REMOTE_ARTIFACT_DIR}/${GANG_ARTIFACT_DIR} -- never
 # inside the directory this driver pulls back and a human later commits.
 # The scan that backstops this contract against a future mistake ships
-# with U7b-C, beside the id-ship crossing it protects.
+# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b),
+# beside the id-ship crossing it protects.
 # --- end artifact retrieval ---
 
 rm -f "$LOG"

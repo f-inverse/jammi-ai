@@ -31,9 +31,10 @@
 #       the driver's own local block, under a real `rsync` shim on PATH so
 #       no network call is made): a failed pull JOINS the leg's own `rc`
 #       (never a silently-warned second exit path) — a clean pull stays
-#       silent. The id-secrecy scan is EXCISED from this unit (closing
-#       audit #2, the pre-committed stop rule) and rebuilt in U7b-C beside
-#       the crossing it backstops; it is no longer exercised here.
+#       silent. The id-secrecy scan that backstops the NCCL id's
+#       out-of-band crossing ships with the cluster leg
+#       (docs/plans/67-distributed-training/UNITS.md § U7b), beside the
+#       crossing it backstops; G5 does not exercise it.
 #   G6  the two `JAMMI_REQUIRE_*` exports (U7b-A1-pull P3) are present in
 #       the `<<REMOTE` heredoc body, beside the existing env block; removing
 #       either is a mutation this case catches.
@@ -346,9 +347,9 @@ fi
 # the remote heredoc's, and eval'd directly in this function's shell (never
 # inside a `$(...)` capture, which would discard the `rc` mutation the arms
 # make -- the same reason G3's run_arms does not capture its own eval). The
-# id-secrecy scan that used to live in this same block is EXCISED from
-# A1-pull (closing audit #2, the pre-committed stop rule fired) and rebuilt
-# in U7b-C beside the crossing it backstops -- it is not exercised here.
+# id-secrecy scan that backstops the NCCL id's out-of-band crossing ships
+# with the cluster leg (docs/plans/67-distributed-training/UNITS.md § U7b),
+# beside the crossing it backstops -- this function does not exercise it.
 # ============================================================================
 retrieval_start_ln="$(grep -n '^mkdir -p "\$GANG_ARTIFACT_DIR"$' "$GANG_SH" | head -1 | cut -d: -f1)"
 retrieval_end_ln="$(grep -n '^# --- end artifact retrieval ---$' "$GANG_SH" | head -1 | cut -d: -f1)"

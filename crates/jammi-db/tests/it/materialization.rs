@@ -907,7 +907,7 @@ async fn two_runs_over_one_pinned_definition_share_one_training_set(backend: Bac
 
     // The reuse path (`ResultStore::bind_result_table`, the in-tree binder
     // `fine_tune/training_set.rs` reaches through `materialize_training_set`
-    // — see `call_graph_gate::FINE_TUNE_REACHABLE_BINDING_ALLOWLIST`'s doc)
+    // — see `pinned_source_gate::REGISTRATION_VERB_SITES`'s doc)
     // must rebind the SAME immutable artifact bytes it wrote once, not
     // merely the same name. Proven by reading the rows back through the
     // SECOND, INDEPENDENT `SessionContext` (`second_ctx`) `second` bound its

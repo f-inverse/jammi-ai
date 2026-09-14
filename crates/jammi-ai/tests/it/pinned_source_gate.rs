@@ -2468,10 +2468,14 @@ fn allowlists_match_current_hits_exactly() {
 // `training_set.rs`'s own call into `ResultStore::materialize_training_set`
 // (which binds a name several calls further in) is exactly the kind of
 // indirection no amount of widening the literal set below could ever make a
-// directory-scoped scan see. That half is the call-graph-derived reachability
-// gate, `crates/jammi-ai/tests/it/call_graph_gate.rs`
-// (`FINE_TUNE_REACHABLE_BINDING_ALLOWLIST`) — a SEPARATE oracle, not a
-// hand-waved exception to this one.
+// directory-scoped scan see. That half is answered by enumerating every
+// occurrence of these verbs anywhere under BOTH crates' `src` trees, not
+// merely `fine_tune/**` — [`registration_verb_occurrences_are_all_reviewed`]
+// and [`REGISTRATION_VERB_SITES`], further down this file — a SEPARATE
+// oracle, not a hand-waved exception to this one. Tracing which of those
+// sites a `fine_tune/` call can actually REACH (as opposed to reviewing every
+// site unconditionally, reachable or not) is a distinct question, filed as
+// <https://github.com/f-inverse/jammi-ai/issues/549>.
 //
 // **The DataFusion-wrapper shape this verb list closes.** A two-literal
 // detector naming only `register_table(`/`deregister_table(` misses
@@ -2506,11 +2510,13 @@ fn allowlists_match_current_hits_exactly() {
 //       `ctx.register_table(..)`, itself called from inside `fine_tune/`) —
 //       invisible to a directory-scoped scan no matter how many verbs it
 //       knows, because the LITERAL call site never appears inside
-//       `fine_tune/**` at all. This is not a wider literal set's job: it is
-//       a call-graph reachability question, closed by
-//       `crates/jammi-ai/tests/it/call_graph_gate.rs`'s AST-derived fixed
-//       point and its pinned `FINE_TUNE_REACHABLE_BINDING_ALLOWLIST`, not by
-//       this test.
+//       `fine_tune/**` at all. This is not a wider literal set's job for
+//       THIS test: the wrapper's own call site is reviewed by
+//       [`registration_verb_occurrences_are_all_reviewed`] instead, which
+//       scans BOTH crates' whole `src` trees rather than one directory;
+//       whether `fine_tune/` can actually reach that wrapper is a separate,
+//       unanswered question (<https://github.com/f-inverse/jammi-ai/issues/549>),
+//       not one this test or that whole-surface review resolves.
 //
 // **The whole verb surface, enumerated from the pinned source
 // (`datafusion = "54.1"`, locked at `54.1.0` in `Cargo.lock`;
@@ -2739,9 +2745,10 @@ const DDL_RELATION_BINDING_LITERALS: &[&str] = &[
 /// `datafusion-54.1.0/src/execution/context/mod.rs`'s `SessionContext::sql`
 /// DDL dispatch — which binds under exactly the same caller-chosen token the
 /// bare form does and so is not a distinct, safer shape). Used both by
-/// [`fine_tune_ddl_relation_binding_hits`] below (the direct-call-site layer)
-/// and by `call_graph_gate.rs`'s reachability walk (the indirect layer) — one
-/// shape definition, not two independently-drifting copies.
+/// [`fine_tune_ddl_relation_binding_hits`] below (the `fine_tune/`-scoped,
+/// direct-call-site layer) and by [`ddl_literal_occurrences`] (the
+/// whole-two-crate-surface layer) — one shape definition, not two
+/// independently-drifting copies.
 pub(crate) fn ddl_statement_shape(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // Split on anything that is neither alphanumeric nor `_`, not merely on
@@ -2820,15 +2827,18 @@ fn fine_tune_ddl_relation_binding_hits(
 /// verb surface above (`fine_tune_session_registration_hits`) PLUS the DDL
 /// surface (`fine_tune_ddl_relation_binding_hits`).
 ///
-/// **This test's property is DIRECT call sites only.** It says nothing about
-/// whether a name gets bound INDIRECTLY, through an in-tree function defined
-/// outside `fine_tune/` — that half is a separate, call-graph-derived
-/// property, `crates/jammi-ai/tests/it/call_graph_gate.rs`'s
-/// `fine_tune_reachable_bindings_match_allowlist_exactly`, pinned in its own
-/// test with its own allowlist. The module-level comment above states why
-/// the split is real rather than an oversight: a directory-scoped literal
-/// scan structurally cannot see a call that never appears inside
-/// `fine_tune/**`, no matter how many verbs it knows.
+/// **This test's property is DIRECT call sites under `fine_tune/**` only.**
+/// It says nothing about whether a name gets bound INDIRECTLY, through an
+/// in-tree function defined outside `fine_tune/` — that half is
+/// [`registration_verb_occurrences_are_all_reviewed`] /
+/// [`ddl_literal_occurrences_are_all_reviewed`], further down this file,
+/// which review every occurrence anywhere under both crates' `src` trees
+/// (never tracing whether `fine_tune/` can actually reach any given one —
+/// that reachability question is <https://github.com/f-inverse/jammi-ai/issues/549>).
+/// The module-level comment above states why the split is real rather than
+/// an oversight: a directory-scoped literal scan structurally cannot see a
+/// call that never appears inside `fine_tune/**`, no matter how many verbs
+/// it knows.
 #[test]
 fn no_session_registration_under_fine_tune() {
     let surface = scan_surface();
@@ -2841,9 +2851,9 @@ fn no_session_registration_under_fine_tune() {
          or a DDL literal that binds a relation (CREATE VIEW/TABLE/EXTERNAL TABLE/SCHEMA) — the \
          shared session is not a per-call namespace, and any name that is not unique per CALL \
          collides under reclaim (see https://github.com/f-inverse/jammi-ai/issues/538). This is a \
-         DIRECT-call-site property only; the reviewed INDIRECT bindings this tree ships \
-         (reached through `ResultStore::materialize_training_set`) are a separate, pinned \
-         property — see call_graph_gate::FINE_TUNE_REACHABLE_BINDING_ALLOWLIST. verb hits: \
+         DIRECT-call-site property only; the reviewed bindings anywhere under both crates' `src` \
+         trees (including those reached through `ResultStore::materialize_training_set`) are a \
+         separate, pinned property — see pinned_source_gate::REGISTRATION_VERB_SITES. verb hits: \
          {verb_hits:?}; DDL hits: {ddl_hits:?}"
     );
 }
@@ -3089,10 +3099,11 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // The INDIRECT half -- an in-tree function defined OUTSIDE `fine_tune/` that
 // itself binds a session/catalog name, reached through some chain of in-tree
 // calls `fine_tune/` makes -- is no longer answered by tracing a call graph
-// at all. A `syn`-based AST call graph that used to live at
-// `crates/jammi-ai/tests/it/call_graph_gate.rs` missed a registration verb
-// reached through a function-pointer argument, `.map(Self::f)`, a call
-// inside a macro invocation such as `assert!`/`tokio::select!`, or a
+// at all. A `syn`-based AST call-graph test file (deleted; it lived
+// alongside this one under `crates/jammi-ai/tests/it/`) missed a
+// registration verb reached through a function-pointer argument,
+// `.map(Self::f)`, a call inside a macro invocation such as
+// `assert!`/`tokio::select!`, or a
 // fn-pointer struct field, and missed a DDL keyword sitting in a module-level
 // `const SQL = "..."`, split across two `format!`/`concat!` arguments, or
 // pulled in via `include_str!` -- a SOUNDNESS gap in what any finite set of
@@ -3236,11 +3247,21 @@ fn ddl_literal_occurrences(surface: &[(String, String)]) -> BTreeSet<(String, St
     hits
 }
 
-/// Every occurrence of a [`PAIRED_REGISTRATION_VERBS`]/
+/// This list IS the gate's own output at this head, never a hand-typed
+/// guess: every occurrence of a [`PAIRED_REGISTRATION_VERBS`]/
 /// [`UNPAIRED_REGISTRATION_VERBS`] call-site pattern under [`SURFACE_DIRS`]
 /// TODAY, transcribed by running [`registration_verb_occurrences`] against
 /// `scan_surface()` with an empty allowlist and reading each hit's real call
-/// site (never a guess) -- 17 entries.
+/// site -- 18 entries: 17 on the production/test tree
+/// `registration_verb_occurrences` finds unassisted, plus the 18th being
+/// this file's own new `build_result_table_provider` oracle (the test
+/// itself calls `register_object_store` twice, which the same scan
+/// necessarily also finds since it is untracked-directory-agnostic). Kept in
+/// sync by [`registration_verb_occurrences_are_all_reviewed`]: an entry here
+/// whose site no longer produces a hit, or a hit with no entry here, both
+/// fail that test — this comment's own entry count is the only part of this
+/// relationship that is NOT machine-checked, so treat it as documentation
+/// for a human re-deriving the list, not as a fact the gate itself asserts.
 const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
     ReviewedRegistrationSite {
         file: "crates/jammi-ai/src/query/content_hash_udf.rs",
@@ -3430,8 +3451,10 @@ const REGISTRATION_VERB_SITES: &[ReviewedRegistrationSite] = &[
     },
 ];
 
-/// Every [`ddl_statement_shape`] occurrence under [`SURFACE_DIRS`] TODAY,
-/// transcribed the same way [`REGISTRATION_VERB_SITES`] was -- 5 entries.
+/// This list IS the gate's own output at this head, transcribed the same
+/// way [`REGISTRATION_VERB_SITES`] was: every [`ddl_statement_shape`]
+/// occurrence under [`SURFACE_DIRS`] TODAY -- 5 entries, kept in sync by
+/// [`ddl_literal_occurrences_are_all_reviewed`] the same way.
 const DDL_LITERAL_SITES: &[ReviewedRegistrationSite] = &[
     ReviewedRegistrationSite {
         file: "crates/jammi-db/src/catalog/migrations.rs",

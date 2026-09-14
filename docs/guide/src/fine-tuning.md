@@ -244,8 +244,7 @@ error before any catalog row or byte exists, so a run never trains on an empty
 set in silence.
 
 A graph fine-tune does not go through this table: its sampled pairs are
-sampled in memory and trained on directly, the way every fine-tune method
-worked before this section's mechanism existed; giving the graph arm a
+sampled in memory and trained on directly. Giving the graph arm a
 `TrainingSet` table of its own is tracked at
 <https://github.com/f-inverse/jammi-ai/issues/538>.
 

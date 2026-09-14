@@ -3156,10 +3156,8 @@ table) — and read back on the SAME `SessionContext` through `read_back_sql`,
 `SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
 reader's half of the full-tuple order contract. The `GraphFineTune` arm does not reach this
 producer: `reconstruct_graph_loader` re-samples the seeded pairs and builds the loader
-straight from them in memory (`TrainingDataLoader::from_graph`) — a per-call `MemTable`
-registration on the shared session was tried and excised (a lease-reclaim shape let two
-overlapping attempts of one job silently rebind each other's relation), so a graph training
-set's own result table is https://github.com/f-inverse/jammi-ai/issues/538.
+straight from them in memory (`TrainingDataLoader::from_graph`); a graph training set's own
+result table is https://github.com/f-inverse/jammi-ai/issues/538.
 Then `build_training_data_loader` →
 `train_fine_tune` → `run_fine_tune_blocking` (on the blocking pool, `catch_unwind`-wrapped):
 builds the `TrainingTarget` (empty `target_modules` → projection head; non-empty →

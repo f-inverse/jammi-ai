@@ -104,7 +104,7 @@ later.
 | `MaterializationEnv` (engine version, device kind, model identities) | as for every producer |
 
 **Crate layering.** `jammi-db` depends on no jammi crate but `jammi-numerics`
-(`crates/jammi-db/Cargo.toml:44`), and every existing variant holds primitives and db-local
+(`crates/jammi-db/Cargo.toml::[dependencies].jammi-numerics`), and every existing variant holds primitives and db-local
 types (`manifest.rs:305-345`). `FineTuneConfig` is `jammi-wire`, `TrainingSpec`/`TrainingCommon`
 are `jammi-ai` (`spec.rs:33-63`), `TrainingFormat` is `jammi-ai` (`data.rs:59`). So both new
 variants carry an **opaque, versioned canonical encoding** — `spec_canonical: String`
@@ -145,11 +145,13 @@ the SAME bytes on the wire, matching the embedded Python encoding.
 Deleting a model row is always allowed, even one sharing a reused prefix with another — there
 is no catalog edge enforcing which row is the original
 (<https://github.com/f-inverse/jammi-ai/issues/547>). The underlying bytes are reclaimed only
-when no live `models` row, in any tenant, still names the prefix:
-`ResultStore::prefix_is_referenced` is an admin-scoped whole-catalog scan of
-`models.artifact_path` that `ResultStore::delete_unreferenced_prefix` consults before every
-`models/`-prefix byte-delete (reconcile's own reap and the worker's abandon path both reach
-it), refusing typed (`StorageError::Referenced { prefix, count }`) while any row
+when no live `models` row, in any tenant, names the object's exact key or its immediate
+containing directory as `artifact_path` — the guard rule every `models/` byte-delete this
+design's reclaim paths perform runs through: `ResultStore::prefix_is_referenced` is an
+admin-scoped whole-catalog scan of `models.artifact_path` that
+`ResultStore::delete_unreferenced_prefix` consults before every `models/`-prefix byte-delete
+(reconcile's own reap, the worker's abandon path, and the worker's epoch-checkpoint sweep all
+reach it), refusing typed (`StorageError::Referenced { prefix, count }`) while any row
 still references the prefix; reconcile's attribution set is built from the same admin-scoped
 scan, never the tenant-scoped `list_models`, and a prefix it finds still referenced this way is
 reported (with its count) via `ReconcileReport.referenced`/`referenced_count`

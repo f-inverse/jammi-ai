@@ -269,9 +269,10 @@ print(f"Model: {result['model_id']}")
 A hit registers THIS job's own model id pointing at the SAME already-published
 artifact prefix an earlier run published — no bytes are retrained or recopied. Both
 model ids stay independently servable; either can be deleted without disturbing
-the other — the underlying prefix is reclaimed only once no live model row still
-names it, and a delete attempted while one still does is refused, typed, naming
-the prefix and the referencing count. A dedicated catalog edge recording which
+the other — the underlying prefix is reclaimed only once no live model row names
+it as its own exact key or as its immediate containing directory, and a delete
+attempted while one still does is refused, typed, naming the prefix and the
+referencing count. A dedicated catalog edge recording which
 row is the original and which is the reuse is not enforced
 (<https://github.com/f-inverse/jammi-ai/issues/547>).
 

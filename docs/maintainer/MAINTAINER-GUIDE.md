@@ -729,7 +729,12 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   consult of `ResultStore::prefix_is_referenced` found still referenced by
   some live `models` row in some tenant scope — reported instead of
   reclaimed, at any grace or `apply`, and never carrying row ids, model
-  names, or tenant ids, only the object key. `reconcile` runs under the
+  names, or tenant ids, only the object key. This is the ONE gate every
+  `models/` byte-delete this pass performs runs through right before
+  deleting: it asks whether some live `models` row, in any tenant, names
+  the object's exact key or its immediate containing directory as
+  `artifact_path` — one indexed COUNT lookup per candidate object, never a
+  walk of ancestors further up. `reconcile` runs under the
   store's own binding (tenant-bound → its `{seg}/`; unbound → `_global`
   only); `reconcile_all` wraps the WHOLE pass in
   `TenantBinding::admin_scope` and covers every tenant. Wire: `CatalogService.
@@ -1924,9 +1929,16 @@ integrity for that edge is a separate unit
 (https://github.com/f-inverse/jammi-ai/issues/547). The underlying bytes are a
 different matter: `ResultStore::prefix_is_referenced` is an admin-scoped (whole-catalog)
 scan of `models.artifact_path`, and `ResultStore::delete_unreferenced_prefix` consults it
-before every `models/`-prefix byte-delete this pass or the worker's own abandon path can
-reach, refusing typed (`StorageError::Referenced { prefix, count }`) while any live
-`models` row, in any tenant, still names the prefix. `reconcile`'s attribution set is
+before every `models/`-prefix byte-delete this pass, the worker's own abandon path, or
+the worker's epoch-checkpoint sweep (`JobWorker::gc_epoch_checkpoints_by_index`, which
+consults it on each index's own exact checkpoint prefix before ever deleting) can reach,
+refusing typed (`StorageError::Referenced { prefix, count }`) while any live `models` row,
+in any tenant, still names the prefix. The one stated exemption is `{job}/_resume`: a
+sibling of every attempt-level path, so no row's `artifact_path` can ever equal it or its
+immediate parent — proven by an executed test, not asserted, in
+`crates/jammi-db/tests/it/reconcile.rs`'s
+`a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`.
+`reconcile`'s attribution set is
 built from the same admin-scoped scan (never the tenant-scoped `list_models`), so a
 tenant-bound reconcile pass can never reap a prefix a peer tenant's row still serves; a
 prefix this pass's ordinary orphan check would otherwise reclaim, but which that same

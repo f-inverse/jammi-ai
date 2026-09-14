@@ -784,7 +784,9 @@ message ReconcileReport {
   // A `models/`-namespaced object this pass's reap-site consult of the
   // engine's referenced-prefix predicate found still referenced by some live
   // `models` row, in SOME tenant scope — reported instead of reclaimed, at
-  // any grace or `apply`. Distinct from `damaged` (a live row names the
+  // any grace or `apply`. The consult asks only whether the object's own key
+  // or its immediate containing directory is named by a live `models` row —
+  // never a broader job-level prefix. Distinct from `damaged` (a live row names the
   // prefix but its manifest is absent) — this field means the opposite
   // direction of evidence: the object itself looked unattributed, but a
   // fresh admin-scoped catalog consult still found a live reference. Never

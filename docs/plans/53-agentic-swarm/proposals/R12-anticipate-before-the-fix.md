@@ -198,7 +198,8 @@ armed strictly by the DATA (never merely by a unit being open):
   object to name every committed line VERBATIM with an integer `rc` — SHAPE only, the VALUE
   never judged (the pre-fix tip is expected broken). Reader 2 requires the SAME shape from the
   relay, PLUS `rc == 0` for every line. Reader 3 (`check_rigor_record.py`) hard-fails the
-  COMMITTED anticipation export's LATEST row on a missing line or a non-zero `rc` — the
+  COMMITTED anticipation export's GOVERNING row (selected order-independently, never by
+  position in the file — see below) on a missing line or a non-zero `rc` — the
   committed record is expected to reflect the fix's own verified state, never a mid-round
   broken-tip snapshot; it never re-executes the gates (they are CI jobs elsewhere).
 - **8b, mutations.** Armed when the fix's own diff adds a new definition inside a file the
@@ -219,6 +220,8 @@ never re-executed by the hook — the control is the human at merge, reading the
 record, same as R11's own `claims` disposition and the "attack quality" limit already named
 for the pre/post-fix pair. `_r12_new_test_surfaces`'s "looks like a test" filter can under- or
 over-include relative to a human's own judgment, the same class of limit `_parse_new_surfaces`
-itself already carries. Reader 3's `check_required_gates` treats the anticipation export's
-LAST line as authoritative for `rc` value — correct for the normal export-at-merge workflow,
-but not itself verified against an interleaved multi-row export order.
+itself already carries. Reader 3's `check_required_gates` selects the governing row
+order-independently — by `head_sha` match against the checkout's own `HEAD`, then by the
+greatest `ts` — never by position in the file, so an older round's row sorting after a newer
+one in the export (`cmd_export_anticipation` sorts by filename, a tip sha with no
+chronological meaning) cannot stand in for the fix's own verified state.

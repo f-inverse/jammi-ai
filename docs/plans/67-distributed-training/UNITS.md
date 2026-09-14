@@ -258,8 +258,7 @@ re-verification) on top of it.
   rebase renumbers `033_jobs_training_set_identity` to 034 (three pin sites +
   the ordered-after oracle: the tuple in `catalog/migrations.rs`'s const
   list, the `MIGRATION_033_JOBS_TRAINING_SET_IDENTITY` constant name in
-  `catalog/schema.rs`, `EXPECTED_MIGRATION_NAMES` in
-  `tests/it/migrations.rs:23-54`, and
+  `catalog/schema.rs`, the const `tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`, and
   `migration_033_is_ordered_after_032_and_pins_the_pair_at_the_schema_edge`'s
   own `position("033_jobs_training_set_identity")` literal,
   `tests/it/migrations.rs:1572-1746`). (docs-ci)

@@ -1799,8 +1799,10 @@ class RemoteDatabase:
         train this job cooperatively; `1` (the default) is a single process, and
         a value below `1` is refused here with
         :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
-        opts into model-level cache reuse (``"use"``) or keeps the engine's
-        default recompute (``"bypass"``, the default when omitted).
+        is accepted here but a graph fine-tune has no model-level materialization
+        to probe or record: ``"use"`` is refused with
+        :class:`jammi.errors.InvalidArgument`; ``"bypass"`` (the default when
+        omitted) is the only value this job kind honours — it always trains.
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,

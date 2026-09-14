@@ -126,7 +126,7 @@ issue #544 and scheduled before U4b binds a per-rank reader to it.
   shared by every construction site (or a field-by-field oracle asserting the sites agree),
   tests. (db) `store/mod.rs` reader slicing over the result-table `ListingTable` (no injectable
   row-group knob: `crates/jammi-db/src/storage/writer.rs:32`'s `set_max_row_group_row_count`
-  stays the hardcoded `65_536` it is today; a multi-row-group fixture is simply >65,536 rows
+  stays hardcoded at `65_536`; a multi-row-group fixture is simply >65,536 rows
   through that one writer).
 - **invariants_to_preserve**: K3 (scaler over the train prefix, bit-identical), K2, B6.
 - **acceptance**: (a) partition rule: for W ∈ {1,2,4} the multiset of rows over ranks at each
@@ -155,7 +155,7 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   `ListingOptions::with_file_sort_order`, rendered from the single source of truth
   `training_set_order_by` — never a third hand-spelling of the order, NULLS placement included),
   `storage/reader.rs` (the per-rank slicing reader the stream is built over), `config/mod.rs`
-  (`engine.memory_limit`, today DEAD — no `MemoryPool`/`RuntimeEnvBuilder` reads it — wired to a
+  (`engine.memory_limit`, DEAD — no `MemoryPool`/`RuntimeEnvBuilder` reads it — wired to a
   bounded `MemoryPool` on the session's `RuntimeEnv`, so exceeding the bound is a TYPED error,
   never an assertion over the loader's own counters), `tests/it/pinned_source_gate.rs`
   (`session_registration_literal_sites` gets its reviewed entry if the stream spells the
@@ -178,7 +178,7 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
 - **invariants_to_preserve**: K3 (the scaler stays U2b's whole-prefix, one-pass reduction —
   never itself streamed), K2, B6.
 - **acceptance**: (a) the provider's physical plan for `read_back_sql` contains NO `SortExec` at
-  `target_partitions` ∈ {1, N} (RED at base: the `SortExec` is present today); a mutation that
+  `target_partitions` ∈ {1, N} (RED at base: the `SortExec` is present); a mutation that
   declares NULLS LAST instead of the canonical placement kills this oracle; (b) the residency
   bound is stated as `live_bytes(rank) ≤ f(B, prefetch, carry_over) + Σ named_exemptions`, each
   exemption its own separately asserted term — the K3 scaler's one collected `Vec<f32>` over the
@@ -283,7 +283,7 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
 - **acceptance (schedule visibility)**: `check_gpu_prove_once.py`'s P1/P7 refuse a `schedule:`
   trigger on ANY paid lane workflow — pod or cluster — unless that workflow is on a reviewed cron
   allow-list with its own never-vacuous arm named; a planted cron on an
-  unallow-listed paid workflow is refused (RED at base: a planted cron passes today).
+  unallow-listed paid workflow is refused (RED at base: a planted cron passes unrefused).
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
 - **cost ceiling** (human-approved before first run, committed figures — never re-derived per
   run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md:300 — never the 2-GPU pod rate),
@@ -353,7 +353,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   migration, number at rebase, three pin sites incl. the ordered-after oracle in
   `crates/jammi-db/tests/it/migrations.rs` (added by U5a-1) — the same
   `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern
-  (`tests/it/migrations.rs:1284`, on `main` today) repeated for this migration, cited by
+  (`tests/it/migrations.rs:1284`, on `main`) repeated for this migration, cited by
   construct rather than by an offset on a branch this fold cannot read), `catalog/jobs_repo.rs`
   (`upsert_instance` gains `peer_addr` + a
   canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
@@ -365,7 +365,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   byte order on `instance_id`, sorted and compared in Rust — never a SQL `ORDER BY`, whose
   collation is backend-dependent; root divergence is likewise a byte-exact Rust comparison of the
   canonicalized string, never a SQL `=`; `prune_instances`' window (`session.rs:259-261`'s call
-  site, today exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
+  site, exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
   will return) moves to STRICTLY BEYOND the margin, so a member judged merely stale is never also
   eligible for deletion; the lease keeper's `Instance` arm (`lease_keeper.rs:765-771`, folded into
   the generic `Some(false) → lost` dispatch at `:826-827`) RE-UPSERTS the row on a failed touch
@@ -391,12 +391,12 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   return order permuted away from `instance_id` order — the returned list is still sorted (RED at
   base); (b) `peer_advertise` without `peer_bind`, or with a non-existent or relative `file://`
   root, is refused at load, each its own typed error; `peer_advertise` with `result_root` UNSET is
-  ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: today's refusal sentence is
-  dropped); (c) the migration's ordered-after oracle on both backends; (d) a config with
+  ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: the prior refusal sentence
+  is dropped); (c) the migration's ordered-after oracle on both backends; (d) a config with
   `peer_advertise` set (result root set OR unset) produces a non-NULL `peer_addr`/`canonical_root`
   `instances` row through the real session-construction path (`InferenceSession::open` /
   `open_with_placement`), never a direct db write (RED at base: no caller threads the new
-  arguments today); (e) `peer_addr_of` resolves a busy or other-kind fresh member and returns
+  arguments); (e) `peer_addr_of` resolves a busy or other-kind fresh member and returns
   `None` for a stale one; it is unreachable from any public RPC and ignores any caller tenant (the
   invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not exist); (f) two
   members whose canonicalized `result_root` strings are byte-identical but sit on different

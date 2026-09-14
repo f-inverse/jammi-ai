@@ -63,12 +63,12 @@ index by global batch, so W ranks take exactly the steps W=1 takes at batch W·B
 the formula at W=1.
 
 **Loader.** `TrainingDataLoader` (`data.rs:200`) reads the train prefix eagerly through
-`read_back_sql` (`training_set_order_by` applied — TODAY the result-table `ListingTable`
-(`store/mod.rs:3703`'s `build_result_table_provider`) declares NO file sort order (a plain
+`read_back_sql` (`training_set_order_by` applied — the result-table `ListingTable`
+(`store/mod.rs:3703`'s `build_result_table_provider`) declares no file sort order (a plain
 `ParquetReadOptions::default().to_listing_options(...)`), so `read_back_sql`'s `ORDER BY` plans a
-pipeline-breaking `SortExec` at `target_partitions` ∈ {1, N}; **U2c** is what declares the sort
-order — rendered from `training_set_order_by` via `ListingOptions::with_file_sort_order` — so
-DataFusion elides that `SortExec`; a reader-class allow-list oracle enumerates every reader of
+pipeline-breaking `SortExec` at `target_partitions` ∈ {1, N}; **U2c** declares the sort order —
+rendered from `training_set_order_by` via `ListingOptions::with_file_sort_order` — so DataFusion
+elides that `SortExec`; a reader-class allow-list oracle enumerates every reader of
 `sql_relation()`), converting
 rows into `TrainingRow`s per format; the partition rule (below) slices this in-memory sequence
 per rank. A residency-bounded per-rank stream over the table's row groups is NOT part of this

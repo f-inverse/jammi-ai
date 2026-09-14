@@ -461,22 +461,28 @@ internet; network policy or a firewall; or an authenticating reverse proxy) —
 or wire an authenticating `TenantResolver` in front — before exposing it
 beyond a trusted caller.
 
-**The peer listener (I-PEER).** `[server] peer_bind` — unset by default —
-opens a THIRD listener that serves `jammi.v1.peer.PeerService` to other
-replicas of the same deployment (segment search for the segments this replica
-owns; see [Beyond one node](./reference-topologies.md#beyond-one-node-retrieval)).
-It is deliberately outside the identity seam: the peer routes are built
-outside `assemble_grpc_chain`, are never wrapped by the `TenantResolverLayer`,
-never advertised by `GetServerInfo`, and the public listener answers
-`UNIMPLEMENTED` for their paths. The owner binds no tenant — the request
+**The peer listener (I-PEER / I-GANG).** `[server] peer_bind` — unset by
+default — opens a THIRD listener that serves `jammi.v1.peer.PeerService` to
+other replicas of the same deployment (segment search for the segments this
+replica owns; see [Beyond one node](./reference-topologies.md#beyond-one-node-retrieval))
+and `jammi.v1.gang.GangService` (`RunRank` — a coordinator admitting this
+replica into a multi-host training run; see [Security
+Posture](./security.md#the-gang-listener-i-gang)). Both are deliberately
+outside the identity seam: their routes are built outside
+`assemble_grpc_chain`, are never wrapped by the `TenantResolverLayer`, never
+advertised by `GetServerInfo`, and the public listener answers
+`UNIMPLEMENTED` for their paths. The peer owner binds no tenant — the request
 carries none — because tenant scope was already enforced by the coordinator
 (the replica that received the `Search`), which resolved the table through its
 own tenant-scoped catalog read before fanning out; the owner enforces only
-that every requested segment belongs to the named table. The invariant every
-deployment inherits: **every client of `peer_bind` is a jammi coordinator.**
-Bind it on a private interface behind network policy and, where the runtime
-provides it, mTLS; on a routable interface without them it exposes
-cross-tenant segment reads to anyone who can reach the port.
+that every requested segment belongs to the named table. The gang member
+likewise binds no caller-supplied tenant — it derives the tenant from the
+verified `jobs` row a `RunRank` call names. The invariant every deployment
+inherits: **every client of `peer_bind` is a jammi coordinator.** Bind it on a
+private interface behind network policy and, where the runtime provides it,
+mTLS; on a routable interface without them it exposes cross-tenant segment
+reads (I-PEER) and ungated gang admission (I-GANG) to anyone who can reach
+the port.
 
 ## Deploying as a container
 

@@ -148,6 +148,12 @@ pub struct MetricsRegistry {
     /// on the peer listener — the observable that a coordinator's fan-out
     /// actually reached this owner.
     pub peer_requests: IntCounterVec,
+    /// `GangService` requests served on this replica's `[server] peer_bind`
+    /// listener as a gang MEMBER, labelled by `rpc` (`RunRank`). Driven by
+    /// the whole-server [`crate::metrics_layer`] on the peer listener —
+    /// the observable that a coordinator's `RunRank` call actually reached
+    /// this member (`CONTRACT-U5a.md` §W1).
+    pub gang_requests: IntCounterVec,
 }
 
 /// The worker families and the `Weak` they are copied from on a scrape.
@@ -221,6 +227,16 @@ impl MetricsRegistry {
         )?;
         inner.register(Box::new(peer_requests.clone()))?;
 
+        let gang_requests = IntCounterVec::new(
+            Opts::new(
+                "jammi_gang_requests_total",
+                "Total number of jammi.v1.gang.GangService requests served on this replica's \
+                 [server] peer_bind listener, labelled by rpc.",
+            ),
+            &["rpc"],
+        )?;
+        inner.register(Box::new(gang_requests.clone()))?;
+
         Ok(Self {
             inner,
             grpc_requests,
@@ -231,6 +247,7 @@ impl MetricsRegistry {
             worker: OnceLock::new(),
             keeper: OnceLock::new(),
             peer_requests,
+            gang_requests,
         })
     }
 

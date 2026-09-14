@@ -389,6 +389,41 @@ async fn run_rank_refuses_world_zero() {
     );
 }
 
+/// Observability: `jammi_gang_requests_total{rpc="RunRank"}` counts a
+/// `RunRank` call reaching this member — the same shape `PeerService`'s own
+/// `jammi_peer_requests_total{rpc}` counter proves (`peer_service.rs`), and
+/// counted at the whole-server [`jammi_server::metrics_layer`] regardless of
+/// how the call is ultimately decided (this one is refused at the wire-level
+/// K2 edge, `world == 0`, before I-GANG ever runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_increments_gang_requests_metric() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+
+    let server = crate::common::grpc::start_engine_server_with_peer_bind().await;
+    assert_eq!(
+        server
+            .metrics
+            .gang_requests
+            .with_label_values(&["RunRank"])
+            .get(),
+        0,
+        "no RunRank call has reached this member yet"
+    );
+    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(assign_frame(0, 0));
+    let _ = client.run_rank(outbound).await;
+    assert_eq!(
+        server
+            .metrics
+            .gang_requests
+            .with_label_values(&["RunRank"])
+            .get(),
+        1,
+        "the call above must be counted regardless of its own refusal"
+    );
+}
+
 /// §W1 K2: `rank >= world` is refused `INVALID_ARGUMENT` — the boundary case
 /// (`rank == world`), not just a wildly out-of-range one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

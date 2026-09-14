@@ -67,7 +67,16 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # 12.6.3-runtime-ubi8`) is rejected too: that image ships the runtime package
 # only — no `nccl.h` and no `libnccl.so` development symlink — and link time
 # needs both.
-RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ \
+#
+# `rsync`: the GPU gang lane's rental pulls its NCCL/collective artifacts back
+# off the pod over `rsync`, and the rented pod image carries none — installing
+# it at rental time inside the pod is the fail-open shape this refuses to
+# repeat (`ci/scripts/runpod_lib.sh`'s `rp_bootstrap` backgrounds its own
+# tool install behind `|| echo "warn: ..."`, a warning a caller can silently
+# outrun). Resolved here, in the base-repo `dnf` call, before the pinned CUDA
+# repo is even added below, because this package carries no CUDA-minor
+# constraint of its own.
+RUN dnf install -y gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ rsync \
                    'dnf-command(config-manager)' \
     && dnf config-manager --add-repo \
        https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \

@@ -794,6 +794,130 @@ async fn hard_negative_mining_completes_through_the_streaming_loader_at_w1() {
     );
 }
 
+/// CONTRACT-U2b-fix1.md item 4: the GradCache UNCOVERED byte-parity claim
+/// gets a functional, digest-pinned fixture of its own. GradCache
+/// (`FineTuneConfig::cached = true`) is refused above `world_size = 1`
+/// (`spec.rs`'s `world_size > 1 && common.config.cached` check), so a W=1 run
+/// over the SAME streamed loader every other test in this file drives is the
+/// only shape GradCache can ever take at this unit — this is that shape,
+/// digest-pinned like `training_set::refactor_parity`'s adapter bytes (this
+/// test's own FNV-1a `fingerprint`, for the same reason that test states:
+/// `sha2` is not a dev-dependency and `DefaultHasher` is not toolchain-stable,
+/// so neither can back a constant pinned in source).
+///
+/// Fingerprinted at THIS unit's own head with the recipe that runs here: a
+/// `Pairs`-format projection (`anchor, positive` only) of the 15-row
+/// `training_triplets.csv` fixture, one epoch, rank-4 LoRA, GradCache on,
+/// MultipleNegativesRanking at its default temperature. Confirmed
+/// byte-stable across two repeated runs before being pinned.
+///
+/// **What this pin does NOT cover.** Only the functional/digest claim for
+/// THIS fixture is established. It is not a claim that GradCache is
+/// byte-identical to any pre-U2b baseline — U2b's own base (`4e27156a`)
+/// never routed GradCache through a hermetic, digest-pinned fixture at all
+/// (the base-comparison UNCOVERED claim `hard_negative_mining_completes_
+/// through_the_streaming_loader_at_w1`'s doc states stays UNCOVERED for that
+/// reason), so there is no base fixture to diff against.
+#[tokio::test(flavor = "multi_thread")]
+async fn gradcache_completes_through_the_streaming_loader_at_w1_with_a_pinned_adapter_digest() {
+    use std::collections::BTreeMap;
+
+    use jammi_ai::fine_tune::{EmbeddingLoss, FineTuneConfig, FineTuneMethod};
+
+    /// FNV-1a over a byte slice, as `{len}:{hash:016x}` — see `training_set::
+    /// fingerprint`'s doc for why this (not `sha2`, not `DefaultHasher`).
+    fn fingerprint(bytes: &[u8]) -> String {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{}:{:016x}", bytes.len(), hash)
+    }
+
+    const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
+        ("adapter.safetensors", "1184:36a3ebd09680e266"),
+        ("adapter_config.json", "143:1feeeb6239c3fd30"),
+        ("checkpoint_1.safetensors", "1184:36a3ebd09680e266"),
+        ("checkpoint_best.safetensors", "1184:36a3ebd09680e266"),
+        ("manifest.json", "452:42481add2507ae14"),
+    ];
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_triplets.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let job = session
+        .fine_tune(
+            "training",
+            &("local:".to_string() + &common::cookbook_fixture("tiny_bert").display().to_string()),
+            &["anchor".to_string(), "positive".to_string()],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 4,
+                lora_rank: 4,
+                warmup_steps: 0,
+                cached: true,
+                embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("a W=1 GradCache run over the streamed loader must complete");
+
+    let models = session.catalog().list_models().await.unwrap();
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the GradCache run registers its output model");
+    let prefix =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix)
+        .await
+        .expect("the published GradCache adapter fetches and verifies");
+
+    let mut prints = BTreeMap::new();
+    for entry in std::fs::read_dir(local.dir()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
+        }
+    }
+    let expected: BTreeMap<String, String> = GRADCACHE_ADAPTER_PRINTS
+        .iter()
+        .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        prints, expected,
+        "the GradCache adapter bytes moved from the pinned fixture"
+    );
+}
+
 /// The M1 oracle fold's trainer-level check: a REAL `TrainingLoop::run`, over
 /// the job path (`session.fine_tune`), takes exactly `batches_per_epoch(train,
 /// 1, batch)` optimizer steps on a table forced across several small row

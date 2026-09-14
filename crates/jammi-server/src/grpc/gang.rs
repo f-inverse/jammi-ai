@@ -222,11 +222,10 @@ impl GangService for GangServer {
 ///
 /// This is the ONLY call site this program has for
 /// `Catalog::get_result_table_for_tenant` outside its own crate's tests
-/// (`impossibility_claims`, below) — the gang `RunRank` handler is meant to
-/// be its sole caller, though nothing yet threads a job's derived tenant and
-/// `training_set_ref`/`training_set_location` pair into it from
-/// [`GangServer::run_rank`] (that wiring needs `get_job_for_rank`, this
-/// unit's next step).
+/// (`impossibility_claims`, below) — [`GangServer::run_rank`] is its sole
+/// caller, threading the job's own `tenant_id`, `training_set_ref`, and
+/// `training_set_location` straight from the row `get_job_for_rank`
+/// resolved, for `world_size > 1` runs only.
 pub async fn resolve_training_set_identity(
     store: &ResultStore,
     tenant: Option<TenantId>,

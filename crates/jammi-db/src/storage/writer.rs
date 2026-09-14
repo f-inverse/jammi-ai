@@ -11,39 +11,12 @@ use parquet::file::properties::WriterProperties;
 use super::error::StorageError;
 use super::object_store_handle::JammiObjectStore;
 
-/// The row-group row count every writer uses in a release build, and the
-/// default under `feature = "test-hooks"` when the override env var is
-/// unset or unparsable.
+/// The row-group row count every writer uses, in every build. A
+/// multi-row-group fixture is produced by writing more than this many rows
+/// through one writer, not by shrinking the threshold.
 const DEFAULT_MAX_ROW_GROUP_ROWS: usize = 65_536;
 
-/// Environment variable that overrides the writer's row-group row count.
-///
-/// Only read under `feature = "test-hooks"`; a release build has no such
-/// knob (see [`max_row_group_row_count`]).
-#[cfg(feature = "test-hooks")]
-pub const ROW_GROUP_ROWS_ENV: &str = "JAMMI_TEST_ROW_GROUP_ROWS";
-
-/// Row-group row count for a newly opened writer.
-///
-/// Fixed at [`DEFAULT_MAX_ROW_GROUP_ROWS`] in a release build — the on-disk
-/// layout every reader depends on. Under `feature = "test-hooks"`,
-/// `JAMMI_TEST_ROW_GROUP_ROWS` overrides it (falling back to the default
-/// when unset, empty, non-numeric, or zero) so a fixture of a few hundred
-/// rows can be split across several row groups — reproducing the
-/// multi-row-group class the streaming loader's oracles need without
-/// writing 65 536+ rows on every test run.
-#[cfg(feature = "test-hooks")]
-fn max_row_group_row_count() -> usize {
-    std::env::var(ROW_GROUP_ROWS_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MAX_ROW_GROUP_ROWS)
-}
-
-/// Row-group row count for a newly opened writer: always the fixed default
-/// outside `feature = "test-hooks"`.
-#[cfg(not(feature = "test-hooks"))]
+/// Row-group row count for a newly opened writer: always the fixed default.
 fn max_row_group_row_count() -> usize {
     DEFAULT_MAX_ROW_GROUP_ROWS
 }
@@ -151,94 +124,11 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
-    /// Outside `feature = "test-hooks"` there is no knob at all: the function
-    /// always returns the fixed release-build default.
+    /// The writer's row-group row count is the fixed default in every
+    /// build; a multi-row-group fixture is produced by writing more rows
+    /// through one writer, never by shrinking this threshold.
     #[test]
     fn default_row_group_row_count_is_65_536() {
         assert_eq!(max_row_group_row_count(), 65_536);
-    }
-
-    #[cfg(feature = "test-hooks")]
-    mod test_hooks_gated {
-        use super::*;
-        use std::sync::OnceLock;
-        use tokio::sync::Mutex;
-
-        fn single_int_col_schema() -> SchemaRef {
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
-        }
-
-        async fn num_row_groups(handle: &JammiObjectStore) -> usize {
-            let bytes = handle
-                .get_bytes(&handle.data_path().unwrap())
-                .await
-                .unwrap();
-            let builder =
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-                    .unwrap();
-            builder.metadata().num_row_groups()
-        }
-
-        // `JAMMI_TEST_ROW_GROUP_ROWS` is process-global; serialize the tests
-        // that mutate it with an async-aware mutex so the guard can be held
-        // across `.await` without tripping `clippy::await_holding_lock`, and a
-        // panicking test never poisons the lock for the rest of the suite
-        // (mirrors `crates/jammi-db/tests/it/audit.rs`'s `env_lock`).
-        fn env_lock() -> &'static Mutex<()> {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            LOCK.get_or_init(|| Mutex::new(()))
-        }
-
-        /// With the knob unset, `test-hooks` still falls back to the release
-        /// default — the feature alone does not change behaviour.
-        #[tokio::test]
-        async fn unset_override_falls_back_to_default() {
-            let _g = env_lock().lock().await;
-            std::env::remove_var(ROW_GROUP_ROWS_ENV);
-            assert_eq!(max_row_group_row_count(), 65_536);
-        }
-
-        /// A zero or non-numeric override is refused (falls back to the
-        /// default) rather than handed to the Parquet writer, which would
-        /// otherwise reject `Some(0)` at `open()` time.
-        #[tokio::test]
-        async fn zero_and_non_numeric_overrides_fall_back_to_default() {
-            let _g = env_lock().lock().await;
-            for bad in ["0", "not-a-number", ""] {
-                std::env::set_var(ROW_GROUP_ROWS_ENV, bad);
-                assert_eq!(max_row_group_row_count(), 65_536, "override = {bad:?}");
-            }
-            std::env::remove_var(ROW_GROUP_ROWS_ENV);
-        }
-
-        /// The property this fold exists for: a 200-row write with the knob
-        /// at 64 lands in exactly 4 row groups (64, 64, 64, 8), read back
-        /// from the Parquet footer.
-        #[tokio::test]
-        async fn override_splits_small_fixture_into_multiple_row_groups() {
-            let _g = env_lock().lock().await;
-            std::env::set_var(ROW_GROUP_ROWS_ENV, "64");
-
-            let registry = StorageRegistry::new();
-            let url = StorageUrl::memory("test-hooks/row-groups.parquet");
-            let driver = registry.driver_for(&url, None).unwrap();
-            let handle = JammiObjectStore::new(driver, url);
-
-            let schema = single_int_col_schema();
-            let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
-                .await
-                .unwrap();
-            let ids: Vec<i64> = (0..200).collect();
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
-                    .unwrap();
-            writer.write_batch(&batch).await.unwrap();
-            let rows = writer.close().await.unwrap();
-            assert_eq!(rows, 200);
-
-            let groups = num_row_groups(&handle).await;
-            std::env::remove_var(ROW_GROUP_ROWS_ENV);
-            assert_eq!(groups, 4, "expected ceil(200/64) = 4 row groups");
-        }
     }
 }

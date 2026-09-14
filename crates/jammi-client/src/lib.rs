@@ -457,13 +457,21 @@ impl DataClient {
                     .map(NonZeroU32::get)
                     .filter(|&ranks| ranks > 1)
                     .unwrap_or(0),
-                // Every concrete engine `CachePolicy` maps to a concrete wire
-                // value — never `UNSPECIFIED`; that variant exists only so a
-                // server-side decode of an absent field gets the engine
-                // default, which this always-set encode never needs.
+                // `Bypass` (the engine default) leaves the field OFF the
+                // encoding entirely — `UNSPECIFIED` is `0`, the implicit-
+                // presence enum's unset value, and `Bypass`/`UNSPECIFIED`
+                // decode identically (`crates/jammi-ai/src/wire/training.rs`,
+                // `unspecified_and_bypass_cache_both_decode_to_bypass`) — so a
+                // caller that never asks for reuse submits byte-for-byte the
+                // request it submitted before this field existed, matching
+                // the Python client's `_wire_cache_policy_for_submit_job`
+                // (`clients/python/jammi/_assembly.py`), which leaves the
+                // field unset the same way. Only `Use` costs a byte on the
+                // wire, the one case that changes what the engine does with
+                // the request.
                 cache: match cache {
                     CachePolicy::Use => ProtoCachePolicy::Use as i32,
-                    CachePolicy::Bypass => ProtoCachePolicy::Bypass as i32,
+                    CachePolicy::Bypass => ProtoCachePolicy::Unspecified as i32,
                 },
             })
             .await
@@ -587,7 +595,7 @@ impl DataClient {
         let mapped = stream.filter_map(|item| async move {
             match item {
                 Ok(event) => match event.event {
-                    Some(Event::Done(done)) => Some(Ok(done)),
+                    Some(Event::Done(done)) => Some(Ok(*done)),
                     // Progress frames carry no terminal payload for this
                     // simplified surface; a caller that needs progress reads
                     // `JobStatus.progress` directly.
@@ -1562,9 +1570,13 @@ mod world_size_tests {
     }
 
     /// UNSET (the default). `CachePolicy::Bypass` reaches the server as the
-    /// wire's `CACHE_POLICY_BYPASS`, matching how every caller that predates
-    /// this field is served: the request's default cache field decodes to
-    /// the engine's `Bypass`.
+    /// wire's `CACHE_POLICY_UNSPECIFIED` — the implicit-presence enum's `0`,
+    /// which the engine's own decode resolves to `Bypass` identically to an
+    /// explicit `CACHE_POLICY_BYPASS`
+    /// (`unspecified_and_bypass_cache_both_decode_to_bypass`,
+    /// `crates/jammi-ai/src/wire/training.rs`) — so this pins the DECODE
+    /// property, not the byte identity; see
+    /// [`a_bypass_cache_policy_leaves_the_field_off_the_wire`] for the bytes.
     #[tokio::test]
     async fn the_default_cache_policy_reaches_the_server_as_bypass() {
         let (client, submitted) = connected_client().await;
@@ -1577,7 +1589,230 @@ mod world_size_tests {
         let received = submitted.lock().unwrap().take().expect("handler ran");
         assert_eq!(
             received.cache,
-            jammi_wire::proto::inference::CachePolicy::Bypass as i32
+            jammi_wire::proto::inference::CachePolicy::Unspecified as i32
         );
+    }
+
+    /// UNSET, BYTES. `CachePolicy::Bypass` — the engine default — leaves the
+    /// `cache` field OFF the wire entirely: the request this client actually
+    /// puts on the wire is compared, byte for byte, against a reference
+    /// message assembled independently of `DataClient::submit_fine_tune`'s
+    /// own encode (`..Default::default()` never touches `cache`, so the
+    /// reference's field is `0` by construction, not by mirroring the
+    /// production code under test). A regression back to an explicit
+    /// `CACHE_POLICY_BYPASS` (`2`) diverges from this reference and fails —
+    /// the same no-regression property
+    /// `an_explicit_single_rank_encodes_as_the_unset_request` pins for
+    /// `world_size`, and the Python client's own golden-bytes oracle
+    /// (`clients/python/tests/test_cache_policy.py`,
+    /// `test_default_leaves_the_field_off_the_encoding_entirely`) pins for
+    /// `cache`.
+    #[tokio::test]
+    async fn a_bypass_cache_policy_leaves_the_field_off_the_wire() {
+        use jammi_wire::method_to_proto;
+        use jammi_wire::proto::inference::ModelTask as ProtoModelTask;
+        use jammi_wire::proto::job::submit_job_request::Spec;
+        use jammi_wire::proto::training::FineTuneSpec;
+
+        let (client, submitted) = connected_client().await;
+
+        client
+            .submit_fine_tune(cache_request(CachePolicy::Bypass))
+            .await
+            .expect("submit returns the double's handle");
+        let received = submitted.lock().unwrap().take().expect("handler ran");
+
+        // Built from the SAME source values `cache_request(None)`'s
+        // `request(None)` fixture carries, but never assigning `cache` at
+        // all — `..Default::default()` leaves it at the message's own
+        // zero-value default, independent of whatever
+        // `DataClient::submit_fine_tune` does.
+        let reference = SubmitJobRequest {
+            spec: Some(Spec::FineTune(FineTuneSpec {
+                source: "patents".to_string(),
+                columns: vec!["abstract".to_string()],
+                method: method_to_proto(FineTuneMethod::Lora) as i32,
+                task: ProtoModelTask::TextEmbedding as i32,
+            })),
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            received.encode_to_vec(),
+            reference.encode_to_vec(),
+            "an explicit `CachePolicy::Bypass` must put the SAME bytes on the wire as a \
+             reference message that never assigns `cache` at all (got cache = {} vs the \
+             reference's {})",
+            received.cache,
+            reference.cache,
+        );
+    }
+}
+
+/// `ModelResult.cache_outcome` (P6, U3 fix round 1) decodes off
+/// `DataClient::job_status` the same way `TableResult.cache_outcome`
+/// already does: `job_status` returns the raw wire [`JobStatusResponse`]
+/// verbatim (no dedicated per-field accessor on either arm of the `result`
+/// oneof — see [`DataClient::fine_tune_metrics`]'s doc), so a caller reads
+/// `resp.result`'s `Model` arm's `cache_outcome` directly, and this test
+/// pins that a genuine gRPC round trip (not a hand-built value) carries it.
+/// A `JobService` double, not a live engine, because reproducing an actual
+/// `FineTune` cache hit is this crate's OWN server-side concern
+/// (`crates/jammi-server/tests/it/grpc_job.rs`,
+/// `a_fine_tune_cache_hit_reports_cache_outcome_reused_over_the_wire`); this
+/// test's only determinant is the client's decode of a `JobStatusResponse`
+/// a handler already produced.
+#[cfg(test)]
+mod model_result_cache_outcome_tests {
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+
+    use futures::Stream;
+    use tokio::net::{TcpListener, TcpStream};
+    use tonic::transport::{Endpoint, Server};
+    use tonic::{Request, Response, Status};
+
+    use jammi_wire::proto::job::job_service_server::{JobService, JobServiceServer};
+    use jammi_wire::proto::job::{
+        job_status_response::Result as WireResult, CancelJobRequest, CancelJobResponse, JobEvent,
+        JobHandle, JobStatusRequest, JobStatusResponse, ListJobsRequest, ListJobsResponse,
+        ListWorkersRequest, ListWorkersResponse, ModelResult, PruneJobsRequest, PruneJobsResponse,
+        SubmitJobRequest, SubmitJobResponse,
+    };
+
+    use super::DataClient;
+
+    struct AcceptStream(TcpListener);
+
+    impl Stream for AcceptStream {
+        type Item = std::io::Result<TcpStream>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            use std::task::Poll;
+            match self.0.poll_accept(cx) {
+                Poll::Ready(Ok((stream, _peer))) => Poll::Ready(Some(Ok(stream))),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A `JobService` double whose only LIVE method is `job_status`, always
+    /// answering with a completed `FineTune` cache-hit result — every other
+    /// method is unreachable, so a wiring mistake panics loudly rather than
+    /// returning a plausible-looking placeholder.
+    struct CacheHitJobService;
+
+    #[tonic::async_trait]
+    impl JobService for CacheHitJobService {
+        type WaitJobStream = Pin<Box<dyn Stream<Item = Result<JobEvent, Status>> + Send + 'static>>;
+
+        async fn submit_job(
+            &self,
+            _request: Request<SubmitJobRequest>,
+        ) -> Result<Response<SubmitJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn job_status(
+            &self,
+            _request: Request<JobStatusRequest>,
+        ) -> Result<Response<JobStatusResponse>, Status> {
+            Ok(Response::new(JobStatusResponse {
+                status: "completed".to_string(),
+                kind: "fine_tune".to_string(),
+                progress: None,
+                error: String::new(),
+                output_model_id: "jammi:fine-tuned:second".to_string(),
+                result: Some(WireResult::Model(ModelResult {
+                    model_id: "jammi:fine-tuned:second".to_string(),
+                    artifact_path: "file:///artifacts/first".to_string(),
+                    metrics_json: None,
+                    cache_outcome: "reused:jammi:fine-tuned:first".to_string(),
+                })),
+                acceleration_report_json: None,
+            }))
+        }
+
+        async fn wait_job(
+            &self,
+            _request: Request<JobHandle>,
+        ) -> Result<Response<Self::WaitJobStream>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn list_jobs(
+            &self,
+            _request: Request<ListJobsRequest>,
+        ) -> Result<Response<ListJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: Request<CancelJobRequest>,
+        ) -> Result<Response<CancelJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn list_workers(
+            &self,
+            _request: Request<ListWorkersRequest>,
+        ) -> Result<Response<ListWorkersResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn prune_jobs(
+            &self,
+            _request: Request<PruneJobsRequest>,
+        ) -> Result<Response<PruneJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+    }
+
+    async fn connected_client() -> DataClient {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let svc = JobServiceServer::new(CacheHitJobService);
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(AcceptStream(listener))
+                .await
+                .expect("cache-hit server");
+        });
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+        DataClient::connect(endpoint)
+            .await
+            .expect("data client connect")
+    }
+
+    /// `DataClient::job_status` relays `ModelResult.cache_outcome` verbatim —
+    /// the wire text a genuine `JobService` handler produced, decoded off an
+    /// actual (loopback) gRPC round trip, not a hand-built value.
+    #[tokio::test]
+    async fn job_status_relays_the_model_cache_outcome_verbatim() {
+        let client = connected_client().await;
+
+        let resp = client
+            .job_status("job-2")
+            .await
+            .expect("job_status returns the double's response");
+
+        match resp.result {
+            Some(WireResult::Model(m)) => {
+                assert_eq!(m.cache_outcome, "reused:jammi:fine-tuned:first");
+            }
+            other => panic!("expected a Model result, got {other:?}"),
+        }
     }
 }

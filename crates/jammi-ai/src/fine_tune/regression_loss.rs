@@ -492,3 +492,111 @@ pub(crate) fn softplus_std_for_test(raw: f64) -> f64 {
     };
     STD_FLOOR + sp
 }
+
+/// K3's own standalone oracle (CONTRACT-U2b-fix1.md F7): before this module
+/// existed, the whole-prefix-vs-loss-scale claim had only the end-to-end
+/// byte-parity pin as a witness. This proves the mechanism directly: the
+/// scaler [`TrainingLoop::run`] builds once before the loop
+/// (`train_loader.regression_targets()`, then [`TargetScaler::from_targets`])
+/// is a function of the WHOLE train prefix's targets, never of how many
+/// ranks a run will later use to read batches from it, and never of a single
+/// rank's own slice.
+#[cfg(test)]
+mod target_scaler_tests {
+    use super::TargetScaler;
+    use crate::fine_tune::data::{TextChunk, TrainingDataLoader};
+    use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
+    use candle_core::{Device, Tensor};
+
+    fn regression_targets_of(chunk: &TextChunk) -> Vec<f32> {
+        match chunk {
+            TextChunk::Regression { targets, .. } => targets.clone(),
+            other => {
+                panic!("expected a Regression chunk, got a different TextChunk arm: {other:?}")
+            }
+        }
+    }
+
+    /// `from_targets` over exactly the train prefix yields identical
+    /// `(mean, std)` whether that prefix is read as a single `W=1` rank's
+    /// whole slice or as the UNION of a `W=2` run's two rank slices — the
+    /// scaler is reduced from every training target ONCE, before the loop,
+    /// never re-derived per rank — and DIFFERS when computed over just one
+    /// rank's own slice (negative control: proves the property is
+    /// non-vacuous, not an artefact of every slice landing on the same
+    /// `(mean, std)` regardless of content).
+    #[test]
+    fn from_targets_is_the_whole_train_prefix_not_a_ranks_slice() {
+        let train_count = 8usize;
+        let per_rank_batch = 4usize;
+        let loader = TrainingDataLoader::from_regression(
+            (0..train_count)
+                .map(|i| (format!("r{i}"), i as f32))
+                .collect(),
+        );
+        let device = Device::Cpu;
+
+        // The whole train prefix, read the SAME way the trainer reads it
+        // before the loop: `TrainingDataLoader::regression_targets`, no
+        // partition spec at all.
+        let whole_targets = loader.regression_targets().unwrap();
+        assert_eq!(whole_targets.len(), train_count);
+        let whole_tensor = Tensor::from_vec(whole_targets, (train_count,), &device).unwrap();
+        let scaler_whole = TargetScaler::from_targets(&whole_tensor).unwrap();
+
+        // W=1: one rank's slice at world=1 IS the entire prefix.
+        let w1_spec = PartitionSpec::for_test(0, 1, train_count, PartitionRule::BlockByGlobalBatch);
+        let w1_chunk = loader.text_chunk_for_rank(&w1_spec, 0).unwrap();
+        let w1_targets = regression_targets_of(&w1_chunk);
+        let w1_tensor = Tensor::from_vec(w1_targets, (train_count,), &device).unwrap();
+        let scaler_w1 = TargetScaler::from_targets(&w1_tensor).unwrap();
+        assert_eq!(
+            scaler_whole.mean(),
+            scaler_w1.mean(),
+            "W=1 mean must match the whole prefix"
+        );
+        assert_eq!(
+            scaler_whole.std(),
+            scaler_w1.std(),
+            "W=1 std must match the whole prefix"
+        );
+
+        // W=2: the UNION of both ranks' slices is the same train prefix —
+        // computing the scaler over that union (concatenated in rank order)
+        // must ALSO be byte-identical.
+        let rank0_spec =
+            PartitionSpec::for_test(0, 2, per_rank_batch, PartitionRule::BlockByGlobalBatch);
+        let rank1_spec =
+            PartitionSpec::for_test(1, 2, per_rank_batch, PartitionRule::BlockByGlobalBatch);
+        let rank0_chunk = loader.text_chunk_for_rank(&rank0_spec, 0).unwrap();
+        let rank1_chunk = loader.text_chunk_for_rank(&rank1_spec, 0).unwrap();
+        let rank0_targets = regression_targets_of(&rank0_chunk);
+        let mut w2_union = rank0_targets.clone();
+        w2_union.extend(regression_targets_of(&rank1_chunk));
+        assert_eq!(w2_union.len(), train_count);
+        let w2_tensor = Tensor::from_vec(w2_union, (train_count,), &device).unwrap();
+        let scaler_w2 = TargetScaler::from_targets(&w2_tensor).unwrap();
+        assert_eq!(
+            scaler_whole.mean(),
+            scaler_w2.mean(),
+            "W=2 union mean must match the whole prefix"
+        );
+        assert_eq!(
+            scaler_whole.std(),
+            scaler_w2.std(),
+            "W=2 union std must match the whole prefix"
+        );
+
+        // Negative control: a SINGLE rank's own slice (rank 0 of world=2,
+        // rows [0, 4)) must NOT reproduce the whole-prefix mean.
+        let rank0_tensor = Tensor::from_vec(rank0_targets, (per_rank_batch,), &device).unwrap();
+        let scaler_rank0 = TargetScaler::from_targets(&rank0_tensor).unwrap();
+        assert_ne!(
+            scaler_whole.mean(),
+            scaler_rank0.mean(),
+            "a rank's own slice must NOT reproduce the whole-prefix mean — otherwise this \
+             fixture cannot distinguish the correct (whole-prefix) computation from the \
+             incorrect (per-rank) one"
+        );
+    }
+}

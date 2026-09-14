@@ -172,13 +172,41 @@ async fn materialize_and_read(
     Ok((table, batches))
 }
 
-/// The reader-class allow-list: every production (non-test) call site of
-/// [`TrainingSetTable::sql_relation`] in this crate, keyed by `path:function`
-/// rather than `path:line` — a line number drifts under an unrelated edit, a
-/// function name does not — with the ONE property each entry must hold: it
-/// applies [`training_set_order_by`] itself. A caller that reads a relation
-/// by name without doing so loses the committed order silently on a
-/// multi-row-group table scanned by more than one partition.
+/// The reader-class allow-list: every production (non-test) call site that
+/// reaches a training-set table's relation KEY in this crate, keyed by
+/// `path:function` rather than `path:line` — a line number drifts under an
+/// unrelated edit, a function name does not — with the ONE property each
+/// entry must hold: it applies [`training_set_order_by`] itself. A caller
+/// that reads a relation by name without doing so loses the committed order
+/// silently on a multi-row-group table scanned by more than one partition.
+///
+/// # The class this scan covers: every ROUTE to the relation key, not one name
+///
+/// [`TrainingSetTable::sql_relation`] is not the only way to reach the
+/// registered name — the scan matches every route:
+/// - `.sql_relation(` — the dot-call form.
+/// - `sql_relation(&` — the UFCS form (`TrainingSetTable::sql_relation(&t)`).
+/// - `registered_name(` — [`TrainingSetTable::registered_name`], the
+///   UNQUOTED key `sql_relation` itself quotes. Its own doc says it is "NOT
+///   safe to interpolate into SQL as-is", but a caller that reaches for it
+///   directly (skipping the quoting) is still on the identical route to the
+///   same relation, and the order hazard is the same.
+///
+/// [`TrainingSetTable::table_name`] is deliberately NOT on this scan: it
+/// returns the bare catalog name with no `jammi.` schema prefix, so it
+/// cannot stand in for either route above without a caller re-deriving the
+/// missing prefix and quoting by hand — no such caller exists in this crate
+/// today, and one that started would be re-implementing
+/// `sql_relation`/`registered_name`, which brings it onto this scan the
+/// moment it calls either.
+///
+/// One exclusion, by construction rather than by allow-listing: `sql_relation`'s
+/// OWN body (`crates/jammi-db/src/store/mod.rs`) calls `registered_name()` on
+/// itself to build the string it then quotes — that call constructs an
+/// identifier, not a query, so there is no order to lose. The scan skips
+/// matches whose enclosing function IS `table_name`/`registered_name`/
+/// `sql_relation` in that one file (the accessors' own implementations),
+/// never a caller elsewhere.
 ///
 /// | `path:function`                                  | mechanism                          | behavioural order assertion |
 /// |---------------------------------------------------|-------------------------------------|------------------------------|
@@ -186,13 +214,13 @@ async fn materialize_and_read(
 ///
 /// This test finds every call site itself (never hand-transcribes the count)
 /// by walking every `crates/*/src/**/*.rs` file from the workspace root and
-/// grepping for the reader method's invocation syntax on a receiver — so a
-/// NEW caller anywhere in the workspace, not just this crate, fails it, and a
-/// call site that moves to a different function name (rename) requires a
-/// conscious edit to this allow-list rather than silently staying "covered".
-/// The needle is assembled at runtime (never spelled as one contiguous
-/// literal in this module's own source) so this scan does not match its own
-/// doc comments, messages, or the `const` below.
+/// grepping for each route's invocation syntax — so a NEW caller anywhere in
+/// the workspace, not just this crate, fails it, and a call site that moves
+/// to a different function name (rename) requires a conscious edit to this
+/// allow-list rather than silently staying "covered". Every needle is
+/// assembled at runtime (never spelled as one contiguous literal in this
+/// module's own source) so this scan does not match its own doc comments,
+/// messages, or the `const` below.
 #[cfg(test)]
 mod reader_class_allow_list {
     /// `(workspace-relative path, enclosing function name)` for every
@@ -202,12 +230,32 @@ mod reader_class_allow_list {
         "read_back_sql",
     )];
 
-    /// The invocation this scan looks for, assembled from two literal parts
-    /// so the exact contiguous text never appears once in this file (which
-    /// would otherwise match itself, its own doc comments, and its own
-    /// messages).
-    fn needle() -> String {
-        format!(".{}{}", "sql_relation", "()")
+    /// The accessors' own implementations (`crates/jammi-db/src/store/mod.rs`)
+    /// — excluded by construction, not by allow-listing, since a match there
+    /// is the method building its own return value, never a caller reaching
+    /// for the relation key. See the module doc's "One exclusion" note.
+    const ACCESSOR_IMPL_FILE: &str = "crates/jammi-db/src/store/mod.rs";
+    const ACCESSOR_IMPL_FNS: &[&str] = &["table_name", "registered_name", "sql_relation"];
+
+    /// Every route this scan matches, each assembled from separate literal
+    /// parts so the exact contiguous text never appears once in this file
+    /// (which would otherwise match itself, its own doc comments, and its
+    /// own messages).
+    fn needles() -> Vec<String> {
+        vec![
+            format!(".{}(", "sql_relation"),
+            format!("{}(&", "sql_relation"),
+            format!("{}(", "registered_name"),
+        ]
+    }
+
+    /// A route's own definition line (`fn sql_relation(` / `fn registered_name(`)
+    /// is not a call site — the return-type accessor being DEFINED, never
+    /// invoked. Distinct from [`ACCESSOR_IMPL_FNS`]'s exclusion, which covers
+    /// calls made FROM inside those functions' bodies.
+    fn is_definition_line(line: &str) -> bool {
+        line.contains(&format!("fn {}(", "sql_relation"))
+            || line.contains(&format!("fn {}(", "registered_name"))
     }
 
     fn workspace_root() -> std::path::PathBuf {
@@ -287,33 +335,44 @@ mod reader_class_allow_list {
     #[test]
     fn every_production_sql_relation_call_site_is_on_the_allow_list() {
         let root = workspace_root();
-        let needle = needle();
+        let needles = needles();
         let mut found: Vec<(String, String)> = Vec::new();
         for path in all_workspace_src_files(&root) {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let lines: Vec<&str> = text.lines().collect();
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             for (i, line) in lines.iter().enumerate() {
-                // Skip comment/doc lines outright — a mention of the reader
-                // method in prose is not an invocation of it.
+                // Skip comment/doc lines outright — a mention of a route in
+                // prose is not an invocation of it.
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
-                if line.contains(&needle) {
-                    let rel = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let func = enclosing_fn_name(&lines, i).unwrap_or_else(|| {
-                        panic!(
-                            "{rel}:{}: reader-method call with no enclosing `fn` found by this \
-                             scan — widen `regex_lite_find_fn`'s prefix list",
-                            i + 1
-                        )
-                    });
-                    found.push((rel, func));
+                // A route's own definition line is not a call site.
+                if is_definition_line(line) {
+                    continue;
                 }
+                if !needles.iter().any(|n| line.contains(n)) {
+                    continue;
+                }
+                let func = enclosing_fn_name(&lines, i).unwrap_or_else(|| {
+                    panic!(
+                        "{rel}:{}: reader-method call with no enclosing `fn` found by this \
+                         scan — widen `regex_lite_find_fn`'s prefix list",
+                        i + 1
+                    )
+                });
+                // The accessors' own bodies (`sql_relation` calling
+                // `registered_name` on itself) are excluded by construction —
+                // see the module doc's "One exclusion" note.
+                if rel == ACCESSOR_IMPL_FILE && ACCESSOR_IMPL_FNS.contains(&func.as_str()) {
+                    continue;
+                }
+                found.push((rel.clone(), func));
             }
         }
         found.sort();
@@ -327,10 +386,11 @@ mod reader_class_allow_list {
         let extra: Vec<_> = found.iter().filter(|e| !allowed.contains(e)).collect();
         assert!(
             extra.is_empty(),
-            "new caller(s) of `TrainingSetTable::sql_relation()` not on the reader-class \
-             allow-list — each one must either apply `training_set_order_by` or pin \
-             `target_partitions = 1` on an `ORDER BY`-free scan, then be added here with its \
-             own behavioural order assertion: {extra:?}"
+            "new caller(s) reaching a training-set table's relation key (via `sql_relation`, \
+             its UFCS form, or `registered_name`) not on the reader-class allow-list — each \
+             one must either apply `training_set_order_by` or pin `target_partitions = 1` on \
+             an `ORDER BY`-free scan, then be added here with its own behavioural order \
+             assertion: {extra:?}"
         );
         let missing: Vec<_> = allowed.iter().filter(|e| !found.contains(e)).collect();
         assert!(

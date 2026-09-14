@@ -178,13 +178,13 @@ fn lr_schedule_constant_after_warmup() {
 fn validation_split_fractions() {
     // 10% of 100 → 90 train, 10 val (guards round() vs floor())
     let loader = TrainingDataLoader::from_rows(100);
-    let (train, val) = loader.split(0.1).unwrap();
+    let (train, val) = loader.split(0.1);
     assert_eq!(train.len(), 90);
     assert_eq!(val.len(), 10);
 
     // Zero fraction → all in train, no validation (edge case: no divide-by-zero)
     let loader2 = TrainingDataLoader::from_rows(50);
-    let (t2, v2) = loader2.split(0.0).unwrap();
+    let (t2, v2) = loader2.split(0.0);
     assert_eq!(t2.len(), 50);
     assert_eq!(v2.len(), 0);
 }

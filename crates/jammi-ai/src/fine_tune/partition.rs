@@ -28,28 +28,51 @@ pub enum PartitionRule {
 
 /// `(rank, world, batch, rule)` — the per-run partition assignment.
 ///
-/// Fed `world` from `TrainingCommon::world_size` (U4a); at this commit
-/// [`super::worker`]'s `run_spec` always builds [`PartitionSpec::single_rank`]
-/// (rank 0 of world 1) regardless of the spec's `world_size` — U4b spawns the
-/// ranks that would make a larger world meaningful. `batch` is the PER-RANK
-/// batch size (`FineTuneConfig::batch_size`), never the global `W·B` batch.
+/// At this commit [`super::trainer::TrainingLoop`]'s production run loop
+/// always builds [`PartitionSpec::single_rank`] (rank 0 of world 1) — U4b is
+/// what would ever spawn more than one rank and make a larger world
+/// meaningful. `batch` is the PER-RANK batch size (`FineTuneConfig::
+/// batch_size`), never the global `W·B` batch.
+///
+/// Fields are PRIVATE: [`Self::single_rank`] is the only constructor reachable
+/// outside this module in a release build, so no code path can hand the
+/// trainer a `rank != 0` or `world != 1` spec at this commit. Tests that need
+/// an arbitrary `(rank, world)` assignment — to exercise the partition RULE
+/// itself, never the trainer — use the `#[cfg(test)]`-only `Self::for_test`
+/// instead, which does not exist in a release build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionSpec {
-    pub rank: usize,
-    pub world: usize,
-    pub batch: usize,
-    pub rule: PartitionRule,
+    rank: usize,
+    world: usize,
+    batch: usize,
+    rule: PartitionRule,
 }
 
 impl PartitionSpec {
-    /// The single-rank, single-process assignment this commit's worker
-    /// always builds: rank 0 of world 1.
-    pub fn single_rank(batch: usize) -> Self {
+    /// The single-rank, single-process assignment: rank 0 of world 1. The
+    /// ONLY way to build a [`PartitionSpec`] outside this module in a
+    /// release build — see the struct's own doc.
+    pub fn single_rank(batch: usize, rule: PartitionRule) -> Self {
         Self {
             rank: 0,
             world: 1,
             batch,
-            rule: PartitionRule::BlockByGlobalBatch,
+            rule,
+        }
+    }
+
+    /// Test-only constructor for an arbitrary `(rank, world)` assignment —
+    /// used to exercise the partition rule itself (the multiset oracle, the
+    /// K3 scaler oracle) at worlds a release build never reaches. Absent
+    /// from a release build, so it can never become a second production
+    /// route to a `rank != 0` / `world != 1` spec.
+    #[cfg(test)]
+    pub(crate) fn for_test(rank: usize, world: usize, batch: usize, rule: PartitionRule) -> Self {
+        Self {
+            rank,
+            world,
+            batch,
+            rule,
         }
     }
 
@@ -169,7 +192,7 @@ mod tests {
     /// v1 rule — what `run_spec` always builds at this commit.
     #[test]
     fn single_rank_is_rank_zero_of_world_one() {
-        let spec = PartitionSpec::single_rank(8);
+        let spec = PartitionSpec::single_rank(8, PartitionRule::BlockByGlobalBatch);
         assert_eq!(spec.rank, 0);
         assert_eq!(spec.world, 1);
         assert_eq!(spec.batch, 8);

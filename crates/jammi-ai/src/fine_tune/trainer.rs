@@ -363,16 +363,6 @@ pub struct TrainingLoop {
     /// regression loss into a z-space the zero-initialised head can reach, while
     /// the head itself stays in raw space — so serving needs no de-standardisation.
     target_scaler: Option<TargetScaler>,
-    /// The data-parallel world this run's step formula indexes by
-    /// (DESIGN.md §2: `batches_per_epoch = ceil(train_count / (W·B))`, every
-    /// step quantity indexed by the GLOBAL batch). Defaults to `1` — every
-    /// existing call site that never calls [`TrainingLoopBuilder::world_size`]
-    /// keeps today's per-rank-only formula byte-for-byte (the W=1 parity
-    /// oracle: [`super::partition::batches_per_epoch`] at `world = 1` equals
-    /// [`TrainingDataLoader::num_batches`] for every batch size). U2b lands
-    /// the formula at this fixed `1`; U4b is what would ever set it above 1,
-    /// once the worker actually spawns more than one rank.
-    world_size: usize,
     /// The task this run trains for. It is the DISCRIMINATOR for the media
     /// paths: a `MediaTriplet` chunk carries three binary columns whose
     /// modality the columns themselves cannot express (an encoded WAV and an
@@ -464,8 +454,6 @@ pub struct TrainingLoopBuilder {
     resume: Option<RestoredCheckpoint>,
     /// See [`TrainingLoop::tenant`]. Defaults to `None`.
     tenant: Option<TenantId>,
-    /// See [`TrainingLoop::world_size`]. Defaults to `1`.
-    world_size: usize,
 }
 
 impl TrainingLoopBuilder {
@@ -491,16 +479,7 @@ impl TrainingLoopBuilder {
             artifact_store: None,
             resume: None,
             tenant: None,
-            world_size: 1,
         }
-    }
-
-    /// Set the data-parallel world this run's global-batch step formula
-    /// indexes by. Omit it for a single-rank run (defaults to `1`, today's
-    /// only reachable value — see `TrainingLoop::world_size`).
-    pub fn world_size(mut self, world_size: usize) -> Self {
-        self.world_size = world_size;
-        self
     }
 
     /// Set the job's tenant — the first prefix segment every checkpoint this
@@ -640,7 +619,6 @@ impl TrainingLoopBuilder {
             training_mode: false,
             divergence_count: 0,
             target_scaler: None,
-            world_size: self.world_size.max(1),
             task: self.task,
             device: self.device,
             cancel: self.cancel,
@@ -833,7 +811,7 @@ impl TrainingLoop {
 
         // Split training/validation
         let total_rows = data_loader.len();
-        let (train_loader, val_loader) = data_loader.split(self.config.validation_fraction)?;
+        let (train_loader, val_loader) = data_loader.split(self.config.validation_fraction);
 
         // A validation split can come out empty even when `validation_fraction`
         // is non-zero, because the split rounds: `round(rows * fraction)` is 0
@@ -859,7 +837,7 @@ impl TrainingLoop {
         // (a regression run only). Computed from the train split — the val split
         // is held out — so every regression-loss call scores in a z-space the
         // zero-init head can reach, while the head stays in raw space.
-        self.target_scaler = match train_loader.regression_targets()? {
+        self.target_scaler = match train_loader.regression_targets() {
             Some(targets) if !targets.is_empty() => {
                 let n = targets.len();
                 let tensor = Tensor::from_vec(targets, (n,), &self.device)
@@ -881,8 +859,10 @@ impl TrainingLoop {
         // DESIGN.md §2: `batches_per_epoch = ceil(train_count / (W·B))`, every
         // step quantity (this, the LR horizon via `total_steps` below, and the
         // trailing-window scale via `EpochContext::batches_per_epoch`) indexed
-        // by the GLOBAL batch. At `self.world_size == 1` (every reachable
-        // value today) this is byte-identical to `train_loader.num_batches
+        // by the GLOBAL batch. `world` is fixed at `1` at this commit — the
+        // only value a [`super::partition::PartitionSpec::single_rank`] spec
+        // ever carries (U4b is what would ever spawn more than one rank) — so
+        // this is byte-identical to `train_loader.num_batches
         // (self.config.batch_size)` — the W=1 parity oracle
         // `partition::batches_per_epoch_at_world_one_matches_div_ceil` pins.
         //
@@ -895,11 +875,7 @@ impl TrainingLoop {
         let train_batches_per_epoch = if train_loader.is_precomputed() {
             train_loader.num_batches(self.config.batch_size)
         } else {
-            super::partition::batches_per_epoch(
-                train_loader.len(),
-                self.world_size,
-                self.config.batch_size,
-            )
+            super::partition::batches_per_epoch(train_loader.len(), 1, self.config.batch_size)
         };
         let total_steps = train_batches_per_epoch
             .div_ceil(self.config.gradient_accumulation_steps.max(1))
@@ -1230,9 +1206,11 @@ impl TrainingLoop {
                 // compute loss. Walks `epoch_loader` by PartitionSpec-selected
                 // GLOBAL step (DESIGN.md §2) rather than a pre-collected
                 // `Vec<TextChunk>` — one step's row slice is decoded at a
-                // time, never the whole epoch's chunks at once. At
-                // `self.world_size == 1` (every reachable value today,
-                // `rank = 0`) `rows_for_step` walks exactly the same `[s*B,
+                // time, never the whole epoch's chunks at once. The spec is
+                // always [`super::partition::PartitionSpec::single_rank`]
+                // (rank 0 of world 1, the only assignment reachable at this
+                // commit — U4b is what would ever spawn more than one rank),
+                // under which `rows_for_step` walks exactly the same `[s*B,
                 // (s+1)*B)` row slices `epoch_loader.chunks(batch_size)` would
                 // have collected, terminating at the same boundary — the
                 // first empty chunk, which falls exactly at
@@ -1248,12 +1226,10 @@ impl TrainingLoop {
                 // `total_optimizer_steps` doc above), and this loop must keep
                 // iterating exactly as many chunks as THIS epoch's loader
                 // actually holds, as `text_chunks` always did.
-                let partition_spec = super::partition::PartitionSpec {
-                    rank: 0,
-                    world: self.world_size,
-                    batch: self.config.batch_size,
-                    rule: super::partition::PartitionRule::BlockByGlobalBatch,
-                };
+                let partition_spec = super::partition::PartitionSpec::single_rank(
+                    self.config.batch_size,
+                    super::partition::PartitionRule::BlockByGlobalBatch,
+                );
                 let mut step = 0usize;
                 loop {
                     let chunk = epoch_loader.text_chunk_for_rank(&partition_spec, step)?;
@@ -1647,11 +1623,13 @@ impl TrainingLoop {
     /// used as the mining fall-back. Pairs become a `Pairs` loader; triplets
     /// keep their explicit negatives.
     ///
-    /// A loader with no in-batch-negative SHAPE at all (`is_precomputed()`, or
-    /// a format other than `Pairs`/`Triplet`/`Graph`) takes the empty-triplets
-    /// fallback directly, without ever calling `in_batch_negative_texts` —
-    /// every other loader genuinely has that shape, so an `Err` from there
-    /// propagates typed rather than folding into the same fallback.
+    /// Guarantees shape routing before any I/O: a loader with no
+    /// in-batch-negative SHAPE at all (`is_precomputed()`, or a format other
+    /// than `Pairs`/`Triplet`/`Graph`) takes the empty-triplets fallback
+    /// directly, without ever calling `in_batch_negative_texts`. Every format
+    /// admitted past that guard (`Pairs`, `Triplet`, and `Graph` — whose
+    /// `underlying()` is always `Pairs` or `Triplet`) is one
+    /// `in_batch_negative_texts` accepts, so its `Err` arm is unreachable here.
     ///
     /// Not `&self` — this never reads trainer state.
     fn clone_text_loader(loader: &TrainingDataLoader) -> Result<TrainingDataLoader> {
@@ -1663,7 +1641,10 @@ impl TrainingLoop {
         {
             return Ok(TrainingDataLoader::from_triplets(Vec::new()));
         }
-        match loader.in_batch_negative_texts()? {
+        match loader.in_batch_negative_texts().expect(
+            "the guard above admits only Pairs/Triplet/Graph, and Graph's underlying() is \
+             always Pairs or Triplet, so in_batch_negative_texts cannot return Err here",
+        ) {
             (anchors, positives, Some(negatives)) => {
                 let rows = anchors
                     .into_iter()
@@ -3252,7 +3233,7 @@ impl TrainingLoop {
                 accumulate(batch?, &mut total_loss, &mut count)?;
             }
         } else {
-            let text_chunks = val_loader.text_chunks(self.config.batch_size)?;
+            let text_chunks = val_loader.text_chunks(self.config.batch_size);
             for chunk in &text_chunks {
                 let batch = self.encode_chunk(chunk)?;
                 accumulate(batch, &mut total_loss, &mut count)?;
@@ -3487,7 +3468,7 @@ impl TrainingLoop {
                 consume(batch?)?;
             }
         } else {
-            for chunk in val_loader.text_chunks(batch_size)? {
+            for chunk in val_loader.text_chunks(batch_size) {
                 let batch = self.encode_chunk(&chunk)?;
                 consume(batch)?;
             }
@@ -11861,25 +11842,35 @@ mod encode_texts_bucketing_oracle {
         }
 
         // A rung strictly BELOW `unpinned_cols` but still `>=` the batch's
-        // natural width, so the pin does not become a truncation (the
-        // tokenizer's own `Some(effective_max)` cap already bounds the
-        // natural width; `MIN_BUCKET_LEN` is always `<= unpinned_cols`).
-        let lower_rung = crate::fine_tune::batch_bucket::MIN_BUCKET_LEN;
+        // natural width, so the pin does not become a truncation. The pin
+        // is the batch's own natural width itself — computed here from the
+        // SAME fixture via a separate, unbucketed `encode_batch` call (never
+        // hand-picked, e.g. `MIN_BUCKET_LEN`, which can fall BELOW the
+        // natural width for a given fixture and silently skip this arm) —
+        // so `lower_rung >= natural_cols` holds by construction (equality)
+        // and `lower_rung < unpinned_cols` follows from `bucket_seq_len`
+        // always rounding UP past a non-bucket-aligned natural width
+        // (asserted below, not merely assumed, so this arm can never
+        // silently not execute).
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let natural = tokenizer
             .encode_batch(&text_refs, Some(EFFECTIVE_MAX))
             .unwrap();
         let natural_cols = natural.input_ids[0].len();
-        if lower_rung >= natural_cols && lower_rung < unpinned_cols {
-            let (_lower_encoding, _rows, cols) =
-                super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, Some(lower_rung))
-                    .unwrap();
-            assert_eq!(
-                cols, lower_rung,
-                "a pinned rung must win even when it is BELOW what the batch's own \
-                 natural width would otherwise resolve to"
-            );
-        }
+        let lower_rung = natural_cols;
+        assert!(
+            lower_rung < unpinned_cols,
+            "fixture regression: natural_cols ({natural_cols}) must stay strictly below \
+             unpinned_cols ({unpinned_cols}) for this arm to exercise a genuine override, \
+             not a no-op pin"
+        );
+        let (_lower_encoding, _rows, cols) =
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, Some(lower_rung)).unwrap();
+        assert_eq!(
+            cols, lower_rung,
+            "a pinned rung must win even when it is BELOW what the batch's own \
+             natural width would otherwise resolve to"
+        );
     }
 
     /// (b) Output-invariance at the REAL call site: [`TrainingLoop::encode_

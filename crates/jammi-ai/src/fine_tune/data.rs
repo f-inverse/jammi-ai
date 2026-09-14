@@ -586,12 +586,12 @@ impl TrainingDataLoader {
     }
 
     /// Deterministic split: last `fraction` of data goes to validation.
-    pub fn split(&self, fraction: f64) -> Result<(TrainingDataLoader, TrainingDataLoader)> {
+    pub fn split(&self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
         match &self.data {
             LoaderData::TextRows(rows) => {
                 let val_count = (rows.len() as f64 * fraction).round() as usize;
                 let train_count = rows.len() - val_count;
-                Ok((
+                (
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::TextRows(rows[..train_count].to_vec()),
@@ -600,12 +600,12 @@ impl TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::TextRows(rows[train_count..].to_vec()),
                     },
-                ))
+                )
             }
             LoaderData::Precomputed(batches) => {
                 let val_count = (batches.len() as f64 * fraction).round() as usize;
                 let train_count = batches.len() - val_count;
-                Ok((
+                (
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::Precomputed(batches[..train_count].to_vec()),
@@ -614,7 +614,7 @@ impl TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::Precomputed(batches[train_count..].to_vec()),
                     },
-                ))
+                )
             }
         }
     }
@@ -642,13 +642,13 @@ impl TrainingDataLoader {
     /// batch of text data to be encoded through the base model.
     /// Only works for text-based loaders (from_contrastive/from_triplets/from_rows).
     /// Returns empty for precomputed loaders.
-    pub fn text_chunks(&self, batch_size: usize) -> Result<Vec<TextChunk>> {
+    pub fn text_chunks(&self, batch_size: usize) -> Vec<TextChunk> {
         match &self.data {
-            LoaderData::TextRows(rows) => Ok(rows
+            LoaderData::TextRows(rows) => rows
                 .chunks(batch_size)
                 .map(|chunk| self.rows_to_text_chunk(chunk))
-                .collect()),
-            LoaderData::Precomputed(_) => Ok(Vec::new()),
+                .collect(),
+            LoaderData::Precomputed(_) => Vec::new(),
         }
     }
 
@@ -838,23 +838,23 @@ impl TrainingDataLoader {
 
     /// Every regression target in this loader, in row order — the whole-dataset
     /// view the trainer reduces into a fixed target scaler once before the
-    /// loop (K3). `Ok(None)` for any non-regression loader (no targets to
+    /// loop (K3). `None` for any non-regression loader (no targets to
     /// standardise) and for the precomputed test path (which supplies
     /// head/target tensors directly, not text rows).
-    pub fn regression_targets(&self) -> Result<Option<Vec<f32>>> {
+    pub fn regression_targets(&self) -> Option<Vec<f32>> {
         if !matches!(self.format, TrainingFormat::Regression) {
-            return Ok(None);
+            return None;
         }
         match &self.data {
-            LoaderData::TextRows(rows) => Ok(Some(
+            LoaderData::TextRows(rows) => Some(
                 rows.iter()
                     .filter_map(|row| match row {
                         TrainingRow::Regression { target, .. } => Some(*target),
                         _ => None,
                     })
                     .collect(),
-            )),
-            LoaderData::Precomputed(_) => Ok(None),
+            ),
+            LoaderData::Precomputed(_) => None,
         }
     }
 
@@ -934,12 +934,7 @@ mod tests {
     fn precomputed_loader_refuses_text_chunk_for_rank() {
         use super::super::partition::{PartitionRule, PartitionSpec};
         let loader = TrainingDataLoader::from_precomputed(Vec::new());
-        let spec = PartitionSpec {
-            rank: 0,
-            world: 1,
-            batch: 4,
-            rule: PartitionRule::BlockByGlobalBatch,
-        };
+        let spec = PartitionSpec::for_test(0, 1, 4, PartitionRule::BlockByGlobalBatch);
         match loader.text_chunk_for_rank(&spec, 0) {
             Err(e) => assert!(
                 e.to_string().contains("no row-level partition"),
@@ -1096,7 +1091,7 @@ mod tests {
         assert!(matches!(loader.format(), TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
 
-        let chunks = loader.text_chunks(2).unwrap();
+        let chunks = loader.text_chunks(2);
         assert_eq!(chunks.len(), 2, "3 rows at batch 2 → two chunks");
         match &chunks[0] {
             TextChunk::Regression { texts, targets } => {
@@ -1120,7 +1115,7 @@ mod tests {
         let loader = TrainingDataLoader::from_regression(
             (0..10).map(|i| (format!("r{i}"), i as f32)).collect(),
         );
-        let (train, val) = loader.split(0.2).unwrap();
+        let (train, val) = loader.split(0.2);
         assert!(matches!(train.format(), TrainingFormat::Regression));
         assert!(matches!(val.format(), TrainingFormat::Regression));
         assert_eq!(train.len(), 8);
@@ -1158,12 +1153,12 @@ mod tests {
         }
 
         for &world in &[1usize, 2, 4] {
-            let w1_ref = PartitionSpec {
-                rank: 0,
-                world: 1,
-                batch: per_rank_batch * world,
-                rule: PartitionRule::BlockByGlobalBatch,
-            };
+            let w1_ref = PartitionSpec::for_test(
+                0,
+                1,
+                per_rank_batch * world,
+                PartitionRule::BlockByGlobalBatch,
+            );
             let mut zero_row_seen = false;
             let mut step = 0usize;
             loop {
@@ -1176,12 +1171,12 @@ mod tests {
 
                 let mut union = Vec::new();
                 for rank in 0..world {
-                    let spec = PartitionSpec {
+                    let spec = PartitionSpec::for_test(
                         rank,
                         world,
-                        batch: per_rank_batch,
-                        rule: PartitionRule::BlockByGlobalBatch,
-                    };
+                        per_rank_batch,
+                        PartitionRule::BlockByGlobalBatch,
+                    );
                     let chunk = loader.text_chunk_for_rank(&spec, step).unwrap();
                     let rank_anchors = anchors_of(&chunk);
                     if rank_anchors.is_empty() {
@@ -1221,12 +1216,8 @@ mod tests {
         );
         for world in [1usize, 2, 4] {
             for rank in 0..world {
-                let spec = PartitionSpec {
-                    rank,
-                    world,
-                    batch: 3,
-                    rule: PartitionRule::BlockByGlobalBatch,
-                };
+                let spec =
+                    PartitionSpec::for_test(rank, world, 3, PartitionRule::BlockByGlobalBatch);
                 // Step 10 is far past any row this 5-row fixture could ever
                 // reach at batch 3 for any tested world.
                 let chunk = loader.text_chunk_for_rank(&spec, 10).unwrap();

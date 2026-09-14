@@ -548,9 +548,9 @@ fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictor
 /// added later without updating this list is a loud failure here, not a
 /// silently-unadmitted spec.
 ///
-/// Mutation (executed and reverted, never shipped — see this round's
-/// report): deleting the `admit_training_spec` call from `enqueue` drops
-/// the call count to 2 and this test fails, naming the file.
+/// Mutation (executed and reverted, never shipped): deleting the
+/// `admit_training_spec` call from `enqueue` drops the call count to 2 and
+/// this test fails, naming the file.
 #[test]
 fn every_durable_training_submit_edge_calls_the_one_admission_function() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))

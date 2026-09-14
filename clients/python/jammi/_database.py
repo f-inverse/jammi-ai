@@ -729,10 +729,13 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     the terminal payload (K4).
 
     A training kind's `model` variant projects to `{"kind": "model",
-    "model_id", "artifact_path", "metrics"}` (`metrics` the raw JSON text of
-    the run-summary blob, or `None` when the run recorded none — read
-    `RemoteJob.metrics()` for the parsed form). A compute kind's `table`
-    variant projects to `{"kind": "table", "table", "cache_outcome"}`.
+    "model_id", "artifact_path", "metrics", "cache_outcome"}` (`metrics` the
+    raw JSON text of the run-summary blob, or `None` when the run recorded
+    none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
+    is `"computed"`, or `"reused:{model_id}"` for a `FineTune` model-level
+    cache hit — P6, U3 fix round 1, the same vocabulary the `table` variant
+    already carries). A compute kind's `table` variant projects to
+    `{"kind": "table", "table", "cache_outcome"}`.
     """
     which = resp.WhichOneof("result")
     if which == "model":
@@ -742,6 +745,7 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
             "model_id": m.model_id,
             "artifact_path": m.artifact_path,
             "metrics": m.metrics_json if m.HasField("metrics_json") else None,
+            "cache_outcome": m.cache_outcome,
         }
     if which == "table":
         t = resp.table

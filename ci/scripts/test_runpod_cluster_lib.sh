@@ -38,6 +38,25 @@
 #   (6) rp_cluster_sweep: a cluster with no usable createdAt (F3(b)) is
 #       rc=1 naming the cluster id, never a silent `continue` back to a
 #       green summary — an unexaminable resource is never "nothing to reap".
+#   (7) rp_cluster_create: 201 with an id, 201 with no id (named distinctly
+#       from an unparseable body), 201 unparseable, and a non-201 refusal —
+#       round-4 audit F2 (this function had zero non-comment invocations
+#       anywhere on this tree before this group existed).
+#   (8) rp_cluster_get: 200 valid, 200 missing the 'id' key, 200
+#       unparseable, 404, 500 — round-4 audit F2, same class as (7).
+#   (9) rp_cluster_sweep's post-delete re-enumeration is three-valued: an
+#       unparseable/empty/array second-GET body is rc=1 named "could NOT
+#       confirm ... is gone", never aliased onto "confirmed gone" by an
+#       uncaught Python exception's own default exit code — round-4 audit
+#       F1 — and a 429 on that SAME second GET (MOCK_CLUSTER_LIST_STATUS_2,
+#       never previously exercised by any fixture) is rc=1 named "could NOT
+#       re-enumerate ... after deleting".
+#  (10) rp_terminate: an unparseable podTerminate response body (an HTML
+#       error page) is a REFUSED terminate via rp_sweep, never a silent
+#       "swept" — round-4 audit advisory, elevated to a binding oracle.
+#  (11) rp_sweep: a pod with no usable createdAt is rc=1, naming the pod
+#       id, mirroring rp_cluster_sweep's own UNAGEABLE handling (6) —
+#       round-4 audit P-M1a; this used to be a silent `continue`.
 #
 # Every network-facing call (`curl` — both the GraphQL pod surface and the
 # REST v2 cluster surface) is mocked via a stub `curl` prepended onto PATH.
@@ -167,6 +186,7 @@ case "$payload" in
     n=$(( $(cat "${MOCK_TERM_COUNTER:-/dev/null}" 2>/dev/null || echo 0) + 1 ))
     [ -n "${MOCK_TERM_COUNTER:-}" ] && echo "$n" > "$MOCK_TERM_COUNTER"
     case "$payload" in
+      *"${MOCK_TERMINATE_HTML_ID:-__none__}"*) printf '%s' '<html><body>502 Bad Gateway</body></html>' ;;
       *"${MOCK_TERMINATE_REFUSE_ID:-__none__}"*) echo '{"errors":[{"message":"'"${MOCK_TERMINATE_REFUSE_REASON:-refused}"'"}]}' ;;
       *) echo '{"data":{"podTerminate":true}}' ;;
     esac ;;
@@ -547,6 +567,234 @@ JSON
     bad "G6: no pod outcome line (swept/refused/skipped) may appear — the whole pod sweep is skipped, not just the terminations: $out"
   else
     ok "G6: no per-pod outcome line appears — the entire pod sweep was skipped, not merely the terminations within it"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 7 — rp_cluster_create: every documented arm actually driven through
+# the stub (round-4 audit F2: this suite's own header named this function
+# since commit c1, but zero non-comment invocations existed anywhere on
+# this tree). The 201-with-no-id and 201-unparseable-body arms must be
+# named DIFFERENTLY (P-M1a): "no id" is a well-formed body missing a key,
+# "unparseable" is a body that could not be read at all.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  echo '{"id":"cl_new"}' > "$SANDBOX/g7-create-ok.json"
+  export MOCK_CLUSTER_CREATE_STATUS="201"
+  export MOCK_CLUSTER_CREATE_RESPONSE="$SANDBOX/g7-create-ok.json"
+  out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$out" = "cl_new" ]; then
+    ok "G7: rp_cluster_create prints the id on a 201 with an id"
+  else
+    bad "G7: expected rc=0 id=cl_new (got rc=$rc): $out"
+  fi
+)
+(
+  echo '{"name":"no-id-here"}' > "$SANDBOX/g7-create-noid.json"
+  export MOCK_CLUSTER_CREATE_STATUS="201"
+  export MOCK_CLUSTER_CREATE_RESPONSE="$SANDBOX/g7-create-noid.json"
+  out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "carried no id"; then
+    ok "G7: rp_cluster_create names a 201 with no id key ('carried no id')"
+  else
+    bad "G7: expected rc=1 'carried no id' (got rc=$rc): $out"
+  fi
+)
+(
+  echo 'not json at all' > "$SANDBOX/g7-create-badjson.json"
+  export MOCK_CLUSTER_CREATE_STATUS="201"
+  export MOCK_CLUSTER_CREATE_RESPONSE="$SANDBOX/g7-create-badjson.json"
+  out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "unparseable"; then
+    ok "G7: rp_cluster_create names a 201 unparseable body distinctly from 'no id' (F1's class)"
+  else
+    bad "G7: expected rc=1 naming 'unparseable' (got rc=$rc): $out"
+  fi
+)
+(
+  export MOCK_CLUSTER_CREATE_STATUS="422"
+  out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused"; then
+    ok "G7: rp_cluster_create refuses a non-201 status by name"
+  else
+    bad "G7: expected rc=1 'refused' on a non-201 (got rc=$rc): $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 8 — rp_cluster_get: every documented arm actually driven through
+# the stub (round-4 audit F2, same class as Group 7).
+# ═════════════════════════════════════════════════════════════════════════
+(
+  echo '{"id":"cl_x","name":"jammi-cluster-ttl8"}' > "$SANDBOX/g8-get-ok.json"
+  export MOCK_CLUSTER_GET_STATUS="200"
+  export MOCK_CLUSTER_GET_RESPONSE="$SANDBOX/g8-get-ok.json"
+  out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"id":"cl_x"'; then
+    ok "G8: rp_cluster_get prints the body on a 200 with an id"
+  else
+    bad "G8: expected rc=0 with the body (got rc=$rc): $out"
+  fi
+)
+(
+  echo '{"name":"no-id"}' > "$SANDBOX/g8-get-missing.json"
+  export MOCK_CLUSTER_GET_STATUS="200"
+  export MOCK_CLUSTER_GET_RESPONSE="$SANDBOX/g8-get-missing.json"
+  out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "missing the required 'id' key"; then
+    ok "G8: rp_cluster_get names a 200 missing the id key"
+  else
+    bad "G8: expected rc=1 'missing...id' (got rc=$rc): $out"
+  fi
+)
+(
+  echo 'not json' > "$SANDBOX/g8-get-badjson.json"
+  export MOCK_CLUSTER_GET_STATUS="200"
+  export MOCK_CLUSTER_GET_RESPONSE="$SANDBOX/g8-get-badjson.json"
+  out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "unparseable"; then
+    ok "G8: rp_cluster_get names a 200 unparseable body distinctly from 'missing key' (F1's class)"
+  else
+    bad "G8: expected rc=1 'unparseable' (got rc=$rc): $out"
+  fi
+)
+(
+  export MOCK_CLUSTER_GET_STATUS="404"
+  out="$(rp_cluster_get cl_missing 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused"; then
+    ok "G8: rp_cluster_get refuses a 404 by name"
+  else
+    bad "G8: expected rc=1 'refused' on 404 (got rc=$rc): $out"
+  fi
+)
+(
+  export MOCK_CLUSTER_GET_STATUS="500"
+  out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused"; then
+    ok "G8: rp_cluster_get refuses a 500 by name"
+  else
+    bad "G8: expected rc=1 'refused' on 500 (got rc=$rc): $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 9 — rp_cluster_sweep's post-delete re-enumeration is three-valued
+# (round-4 audit F1): the pre-fix version ran `json.load` with no
+# try/except at all, so an unparseable/empty/array second-GET body threw an
+# UNCAUGHT Python exception -- Python's own default exit code for an
+# uncaught exception is 1, colliding EXACTLY with the "confirmed gone" arm
+# and reading a malformed re-enumeration as a clean success (rc=0,
+# "terminated N orphaned cluster(s)", a traceback on stderr). Every case
+# here must be rc=1, named, and issue NO further DELETE beyond the one
+# already made for the genuinely-swept cluster. `MOCK_CLUSTER_LIST_STATUS_2`
+# / a malformed `MOCK_CLUSTER_LIST_RESPONSE_2` were never set by any
+# pre-existing fixture (round-4 audit's own citation).
+# ═════════════════════════════════════════════════════════════════════════
+for label_body in "unparseable:not json at all" "empty:" "array:[]"; do
+  label="${label_body%%:*}"
+  body_content="${label_body#*:}"
+(
+  printf '%s' "$body_content" > "$SANDBOX/g9-badbody-${label}.json"
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g3-list.json"
+  export MOCK_CLUSTER_LIST_RESPONSE_2="$SANDBOX/g9-badbody-${label}.json"
+  export MOCK_LIST_CALL_COUNTER="$SANDBOX/g9-list-counter-${label}"
+  export MOCK_DELETE_CALL_LOG="$SANDBOX/g9-delete-${label}.log"
+  rm -f "$MOCK_LIST_CALL_COUNTER" "$MOCK_DELETE_CALL_LOG"; : > "$MOCK_DELETE_CALL_LOG"
+  export MOCK_CLUSTER_DELETE_STATUS="204"
+  out="$(rp_cluster_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT confirm cluster cl-stale is gone"; then
+    ok "G9: a ${label} post-delete re-enumeration body is rc=1, named 'could NOT confirm ... is gone' (F1)"
+  else
+    bad "G9: expected rc=1 naming the unconfirmable delete for a ${label} body (got rc=$rc): $out"
+  fi
+  n_deletes=0
+  [ -f "$MOCK_DELETE_CALL_LOG" ] && n_deletes="$(wc -l < "$MOCK_DELETE_CALL_LOG" | tr -d ' ')"
+  if [ "$n_deletes" -eq 1 ]; then
+    ok "G9: a ${label} post-delete body issues exactly the ONE delete already made, never a retry"
+  else
+    bad "G9: expected exactly 1 DELETE call for a ${label} body (got ${n_deletes}): $(cat "$MOCK_DELETE_CALL_LOG")"
+  fi
+)
+done
+(
+  # A 429 on the SECOND (post-delete) GET specifically -- distinct from the
+  # already-covered 401/429/500 on the FIRST (pre-delete) GET (G3 above).
+  # The outer "status != 200" check already catches this; this proves it is
+  # actually wired to MOCK_CLUSTER_LIST_STATUS_2, never only STATUS_1.
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g3-list.json"
+  export MOCK_CLUSTER_LIST_STATUS_2="429"
+  export MOCK_LIST_CALL_COUNTER="$SANDBOX/g9-list-counter-429"
+  export MOCK_DELETE_CALL_LOG="$SANDBOX/g9-delete-429.log"
+  rm -f "$MOCK_LIST_CALL_COUNTER" "$MOCK_DELETE_CALL_LOG"; : > "$MOCK_DELETE_CALL_LOG"
+  export MOCK_CLUSTER_DELETE_STATUS="204"
+  out="$(rp_cluster_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT re-enumerate clusters after deleting"; then
+    ok "G9: a 429 on the post-delete re-enumeration is rc=1, named 'could NOT re-enumerate ... after deleting'"
+  else
+    bad "G9: expected rc=1 naming the failed re-enumeration on a 429 (got rc=$rc): $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 10 — rp_terminate: an unparseable podTerminate response body (an
+# HTML error page, e.g. a 502 from a misbehaving proxy) is a REFUSED
+# terminate, never a silent "swept" (round-4 audit advisory, elevated to a
+# binding oracle by P-M1a). The pre-fix version read ANY parse exception as
+# `sys.exit(0)` ("no errors" — success).
+# ═════════════════════════════════════════════════════════════════════════
+(
+  cat > "$SANDBOX/g10-account.json" <<JSON
+{"data":{"myself":{"pods":[
+  {"id":"pod-html","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","createdAt":"${stale_iso}","runtime":{"uptimeInSeconds":180000}}
+]}}}
+JSON
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g10-account.json"
+  export MOCK_TERMINATE_HTML_ID="pod-html"
+  export MOCK_TERM_COUNTER="$SANDBOX/g10-term-counter"
+  rm -f "$MOCK_TERM_COUNTER"
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ]; then
+    ok "G10: rp_sweep returns rc=1 when a podTerminate response is unparseable (never a silent swept)"
+  else
+    bad "G10: expected rc=1 on an unparseable podTerminate body (got rc=$rc): $out"
+  fi
+  if printf '%s' "$out" | grep -q "swept pod pod-html"; then
+    bad "G10: an unparseable podTerminate body must NEVER read as 'swept pod pod-html' (regression!)"
+  else
+    ok "G10: pod-html was never reported swept"
+  fi
+  if printf '%s' "$out" | grep -q "terminate refused:.*pod-html"; then
+    ok "G10: the unparseable body is reported as a refused terminate, naming pod-html"
+  else
+    bad "G10: expected 'terminate refused' naming pod-html: $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 11 — rp_sweep: a pod with no usable createdAt is rc=1, naming the
+# pod id — exactly like rp_cluster_sweep's own UNAGEABLE handling (G3
+# F3(b) above), round-4 audit P-M1a. Pre-fix, this was a silent `continue`
+# that let the sweep finish green (rc=0).
+# ═════════════════════════════════════════════════════════════════════════
+(
+  cat > "$SANDBOX/g11-account.json" <<'JSON'
+{"data":{"myself":{"pods":[
+  {"id":"pod-unageable","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","runtime":{"uptimeInSeconds":180000}}
+]}}}
+JSON
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g11-account.json"
+  export MOCK_TERM_COUNTER="$SANDBOX/g11-term-counter"
+  rm -f "$MOCK_TERM_COUNTER"
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-unageable"; then
+    ok "G11: an unageable pod (no usable createdAt) is rc=1, naming the pod id (pod-unageable)"
+  else
+    bad "G11: expected rc=1 naming pod-unageable (got rc=$rc): $out"
+  fi
+  if [ -s "$MOCK_TERM_COUNTER" ]; then
+    bad "G11: an unageable pod must never be terminated on a guess (regression!)"
+  else
+    ok "G11: the unageable pod was left alone, not terminated on a guess"
   fi
 )
 

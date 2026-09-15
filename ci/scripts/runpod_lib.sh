@@ -385,18 +385,25 @@ _rp_rest() {
   return "$rc"
 }
 
-# $1=podId. Returns 0 when the mutation's response carries no `errors`
-# (including a transport failure the body-parse itself cannot see — the
-# original, fully-silent contract, preserved for rp_cleanup's best-effort
-# EXIT-trap teardown, which has never checked this function's return code
-# and must not start failing loudly on a network hiccup mid-exit). Returns 1
-# when the body DOES carry `errors` — a NAMED, non-fatal condition from a
-# caller's point of view (e.g. a cluster-member pod: S4 measured it exposes
-# `actions: []`, so RunPod's own API is expected to refuse a podTerminate
-# against one) — and PRINTS the refusal reason to stdout, on the refusal arm
-# ONLY, so a caller that wants it (rp_sweep, below) can capture it via
+# $1=podId. Returns 0 when the mutation's response carries no `errors`.
+# Returns 1 — a REFUSAL — when the body DOES carry `errors` (e.g. a
+# cluster-member pod: S4 measured it exposes `actions: []`, so RunPod's own
+# API is expected to refuse a podTerminate against one), OR when the body
+# could not be parsed as a JSON object AT ALL (a transport hiccup, an HTML
+# error page, a truncated response): an unparseable body is a refusal too,
+# never a silent "no errors" success — round-4 audit's own advisory, closed
+# here: the pre-fix version read ANY parse exception as `sys.exit(0)`
+# ("success"), so an HTML 502 page from podTerminate was reported as a
+# genuinely SWEPT pod. PRINTS the refusal reason to stdout on the refusal
+# arm ONLY, so a caller that wants it (rp_sweep, below) can capture it via
 # `$(rp_terminate "$id")` while every OTHER existing caller (which never
-# captures this function's stdout) is unaffected either way.
+# captures this function's stdout) is unaffected either way. This function's
+# own callers (`rp_cleanup`'s EXIT-trap teardown, and the two capacity-
+# failover call sites in `rp_deploy_live`) never check its return code —
+# this change does not make a network hiccup mid-exit newly fatal there;
+# only rp_sweep, which already captures and reports this function's stdout
+# and rc, now correctly counts an unparseable body as a refused terminate
+# rather than a silent success.
 rp_terminate() {
   local id="${1:?rp_terminate needs a podId}" body reason rc
   body="$(rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${id}\\\"}) }\"}" 2>/dev/null)"
@@ -405,7 +412,11 @@ import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
+    print("podTerminate response was unparseable")
+    sys.exit(1)
+if not isinstance(d, dict):
+    print("podTerminate response was not a JSON object")
+    sys.exit(1)
 e = d.get("errors")
 if e:
     print(" ".join((e[0].get("message") or "unknown").split())[:200])
@@ -1447,10 +1458,14 @@ EOF
 # ═════════════════════════════════════════════════════════════════════════
 # Cluster primitives (RunPod REST v2, `https://api.runpod.io/v2/clusters`).
 # A cluster is a SEPARATE RunPod object type from a pod — a homogeneous
-# group of N member pods on one private overlay network, created and
-# destroyed as a unit. There is no GraphQL surface for it; every
-# `rp_cluster_*` function below goes over `_rp_rest`. See the module header
-# for the honest deadline model these primitives carry:
+# group of member pods on one private overlay network, created and
+# destroyed as a unit. This tooling's own primitive requests a FIXED shape,
+# never a caller-chosen one: exactly 2 member pods, 1 GPU each (P-M1d —
+# `_rp_cluster_payload`'s own doc below states the literal; a caller wanting
+# a different topology has no parameter to ask with). There is no GraphQL
+# surface for it; every `rp_cluster_*` function below goes over `_rp_rest`.
+# See the module header for the honest deadline model these primitives
+# carry:
 #
 #   A member pod's own in-pod `runpodctl remove pod` self-termination
 #   (`_rp_entrypoint_setup`, shared with the single-pod payload) is
@@ -1470,12 +1485,18 @@ EOF
 # The cluster create request body — REST v2's `CreateClusterRequest`, which
 # is `unevaluatedProperties: false` (RunPod's schema, read 2026-09-14): this
 # function emits EXACTLY the documented keys and no others, or the API
-# rejects the whole request. Shares `_rp_entrypoint_setup` with
-# `_rp_deploy_payload` (the SAME watchdog+sshd text on both legs — the class
-# this factoring closes: two subtly different "kill this thing" mechanisms
-# drifting apart unnoticed). $1=gpuTypeId $2=optional space-separated
-# dataCenterIds (omitted from the body entirely when empty — "let the
-# scheduler choose", the schema's own documented default).
+# rejects the whole request. `compute.gpuCountPerPod`/`compute.podCount`
+# below are a FIXED 2x1 request (2 pods x 1 GPU each) — this tooling's own
+# choice, not something the schema demands; there is no parameter on this
+# function or on `rp_cluster_create` for any other shape (P-M1d — a caller
+# wanting another topology has none to ask for; this fixed shape is what
+# the two-host NCCL bootstrap (M2) needs and all this primitive ships).
+# Shares `_rp_entrypoint_setup` with `_rp_deploy_payload` (the SAME
+# watchdog+sshd text on both legs — the class this factoring closes: two
+# subtly different "kill this thing" mechanisms drifting apart unnoticed).
+# $1=gpuTypeId $2=optional space-separated dataCenterIds (omitted from the
+# body entirely when empty — "let the scheduler choose", the schema's own
+# documented default).
 _rp_cluster_payload() {
   local gpu="${1:?_rp_cluster_payload needs a gpuTypeId}" dcs="${2:-}" setup
   setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
@@ -1500,11 +1521,23 @@ print(json.dumps(body))
 PY
 }
 
-# POST /v2/clusters. Prints the new cluster's id on success (201 + a
-# non-empty `id` in the body — the per-arm lattice `_rp_rest`'s own doc
-# describes). $1=gpuTypeId $2=optional space-separated dataCenterIds.
+# POST /v2/clusters. Always requests the FIXED 2 pods x 1 GPU shape
+# `_rp_cluster_payload` builds (its own doc) — there is no parameter for any
+# other shape; a caller wanting a different topology has none to ask for.
+# Prints the new cluster's id on success (201 + a non-empty `id` in the
+# body — the per-arm lattice `_rp_rest`'s own doc describes). $1=gpuTypeId
+# $2=optional space-separated dataCenterIds.
+#
+# The 201 body is judged THREE ways, never collapsed to two: "yes, an id"
+# (exit 0), "no, a well-formed body but no id key" (exit 1) and "could not
+# read the body at all" (exit 2, an unparseable/non-object JSON payload) —
+# round-4 audit F1's own class, closed here too: an uncaught `json.load`
+# exception previously fell through Python's own default exit 1, reading
+# IDENTICALLY to "no id key", so an HTML/empty/array 201 body was
+# misreported as "201 but the response body carried no id" rather than
+# named as unparseable.
 rp_cluster_create() {
-  local gpu="${1:?rp_cluster_create needs a gpuTypeId}" dcs="${2:-}" payload resp status body id
+  local gpu="${1:?rp_cluster_create needs a gpuTypeId}" dcs="${2:-}" payload resp status body id prc
   payload="$(_rp_cluster_payload "$gpu" "$dcs")" || { echo "::error::cluster create: could not build the request body" >&2; return 1; }
   resp="$(_rp_rest POST /v2/clusters "$payload")" \
     || { echo "::error::cluster create: REST request failed (transport)" >&2; return 1; }
@@ -1517,15 +1550,20 @@ import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
+i = d.get("id")
+if not i:
     sys.exit(1)
-print(d.get("id") or "")
+print(i)
 ' 2>/dev/null)"
-      if [ -z "$id" ]; then
-        echo "::error::cluster create: 201 but the response body carried no id: ${body}" >&2
-        return 1
-      fi
-      printf '%s\n' "$id"
-      return 0 ;;
+      prc=$?
+      case "$prc" in
+        0) printf '%s\n' "$id"; return 0 ;;
+        1) echo "::error::cluster create: 201 but the response body carried no id: ${body}" >&2; return 1 ;;
+        *) echo "::error::cluster create: 201 but the response body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
     *)
       echo "::error::cluster create refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
       return 1 ;;
@@ -1534,8 +1572,14 @@ print(d.get("id") or "")
 
 # GET /v2/clusters/{id}. Prints the raw Cluster body on success (200 + the
 # required `id` key present). $1=clusterId.
+#
+# The 200 body is judged three ways, matching rp_cluster_create's own class
+# above: "yes, an id" (exit 0), "no, a well-formed object but no id key"
+# (exit 1) and "could not read the body at all" (exit 2) — an unparseable
+# body is named UNPARSEABLE, never misreported as "missing the required
+# 'id' key" (round-4 audit F1's class).
 rp_cluster_get() {
-  local id="${1:?rp_cluster_get needs a cluster id}" resp status body
+  local id="${1:?rp_cluster_get needs a cluster id}" resp status body prc
   resp="$(_rp_rest GET "/v2/clusters/${id}")" \
     || { echo "::error::cluster get ${id}: REST request failed (transport)" >&2; return 1; }
   status="$(printf '%s\n' "$resp" | head -n1)"
@@ -1544,12 +1588,20 @@ rp_cluster_get() {
     200)
       printf '%s' "$body" | python3 -c '
 import sys, json
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
 sys.exit(0 if d.get("id") else 1)
-' 2>/dev/null \
-        || { echo "::error::cluster get ${id}: 200 but the body is missing the required 'id' key: ${body}" >&2; return 1; }
-      printf '%s\n' "$body"
-      return 0 ;;
+' 2>/dev/null
+      prc=$?
+      case "$prc" in
+        0) printf '%s\n' "$body"; return 0 ;;
+        1) echo "::error::cluster get ${id}: 200 but the body is missing the required 'id' key: ${body}" >&2; return 1 ;;
+        *) echo "::error::cluster get ${id}: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
     *)
       echo "::error::cluster get ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
       return 1 ;;
@@ -1560,8 +1612,14 @@ sys.exit(0 if d.get("id") else 1)
 # `Cluster.pods` summary. Prints one TAB-separated row per member:
 # `id  rank  ip  ssh_host:port  status` (rank/ip/ssh_host:port are empty
 # when not yet assigned — a member still provisioning). $1=clusterId.
+#
+# The 200 body is judged three ways, same class as rp_cluster_create/get
+# above: a well-formed object missing the required `pods` key (exit 1,
+# "missing the required key") is a DIFFERENT finding from a body that could
+# not even be parsed as a JSON object (exit 2, "unparseable") — round-4
+# audit F1's class.
 rp_cluster_pods() {
-  local id="${1:?rp_cluster_pods needs a cluster id}" resp status body
+  local id="${1:?rp_cluster_pods needs a cluster id}" resp status body prc
   resp="$(_rp_rest GET "/v2/clusters/${id}/pods")" \
     || { echo "::error::cluster pods ${id}: REST request failed (transport)" >&2; return 1; }
   status="$(printf '%s\n' "$resp" | head -n1)"
@@ -1570,10 +1628,17 @@ rp_cluster_pods() {
     200)
       printf '%s' "$body" | python3 -c '
 import sys, json
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
 pods = d.get("pods")
 if pods is None:
     sys.exit(1)
+if not isinstance(pods, list):
+    sys.exit(2)
 for p in pods:
     pid = p.get("id") or ""
     cl = p.get("cluster") or {}
@@ -1584,8 +1649,13 @@ for p in pods:
     hostport = ("%s:%s" % (ssh_direct["host"], ssh_direct["port"])) if ssh_direct else ""
     status = p.get("status") or ""
     print("\t".join([pid, rank, ip, hostport, status]))
-' || { echo "::error::cluster pods ${id}: 200 but the body is missing the required 'pods' key: ${body}" >&2; return 1; }
-      return 0 ;;
+'
+      prc=$?
+      case "$prc" in
+        0) return 0 ;;
+        1) echo "::error::cluster pods ${id}: 200 but the body is missing the required 'pods' key: ${body}" >&2; return 1 ;;
+        *) echo "::error::cluster pods ${id}: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
     *)
       echo "::error::cluster pods ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
       return 1 ;;
@@ -1595,8 +1665,13 @@ for p in pods:
 # GET /v2/clusters. Prints one TAB-separated row per cluster: `id  name
 # createdAt` (every cluster in the account, not filtered by prefix — a
 # caller filters, the same convention rp_sweep's own pod enumeration uses).
+#
+# The 200 body is judged three ways, same class as the primitives above: a
+# well-formed object missing the required `clusters` key (exit 1) is a
+# DIFFERENT finding from an unparseable body (exit 2) — round-4 audit F1's
+# class.
 rp_cluster_list() {
-  local resp status body
+  local resp status body prc
   resp="$(_rp_rest GET /v2/clusters)" \
     || { echo "::error::cluster list: REST request failed (transport)" >&2; return 1; }
   status="$(printf '%s\n' "$resp" | head -n1)"
@@ -1605,14 +1680,26 @@ rp_cluster_list() {
     200)
       printf '%s' "$body" | python3 -c '
 import sys, json
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
 cl = d.get("clusters")
 if cl is None:
     sys.exit(1)
+if not isinstance(cl, list):
+    sys.exit(2)
 for c in cl:
     print("\t".join([c.get("id") or "", c.get("name") or "", c.get("createdAt") or ""]))
-' || { echo "::error::cluster list: 200 but the body is missing the required 'clusters' key: ${body}" >&2; return 1; }
-      return 0 ;;
+'
+      prc=$?
+      case "$prc" in
+        0) return 0 ;;
+        1) echo "::error::cluster list: 200 but the body is missing the required 'clusters' key: ${body}" >&2; return 1 ;;
+        *) echo "::error::cluster list: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
     *)
       echo "::error::cluster list refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
       return 1 ;;
@@ -1680,11 +1767,16 @@ _rp_validate_force_hours() {
 # Every pod id that is a CLUSTER MEMBER right now, one per line — the
 # exclusion set rp_sweep consults before it ever calls `rp_terminate` on a
 # candidate: a cluster member is retired by deleting the CLUSTER
-# (rp_cluster_delete), never by terminating one of its own pods (S4: members
-# expose `actions: []`, so the account's own API is expected to refuse a
-# podTerminate against one anyway — this exclusion is belt-and-suspenders on
-# TOP of that refusal, not the only thing standing between rp_sweep and a
-# live member).
+# (rp_cluster_delete), never by terminating one of its own pods. This is
+# FAIL-CLOSED, NOT belt-and-suspenders (round-4 audit: reconciled with
+# rp_sweep's own identical doctrine statement, below, which this comment
+# previously contradicted): S4 measured that members expose `actions: []`,
+# a LISTING attribute, so RunPod's own API is EXPECTED to refuse a
+# podTerminate against one — but that refusal has never itself been
+# OBSERVED (no live cluster run has hit it yet), so it is not a confirmed
+# independent backstop this exclusion set sits on top of. If this
+# enumeration cannot be trusted, there is nothing else standing between
+# rp_sweep and a live member.
 #
 # Enumerates every RP_CLUSTER_PREFIX-named cluster (rp_cluster_list) then
 # every one's member pods (rp_cluster_pods). A failure at EITHER level is a
@@ -1818,13 +1910,28 @@ for c in clusters:
       return 1
     fi
     for id in $deleted_ids; do
+      # F1 (round-4 audit): the pre-fix version here ran `json.load` with no
+      # try/except at all, so an unparseable/empty/array second-GET body
+      # threw an UNCAUGHT exception -- Python's own default exit code for
+      # that is 1, colliding EXACTLY with the "confirmed gone" arm below and
+      # reading a malformed re-enumeration as a clean success (a traceback
+      # on stderr, "terminated N orphaned cluster(s)" on stdout, rc=0). The
+      # try/except AND the isinstance guards below make "could not read the
+      # answer" its own named exit (2), never aliased onto "the answer is
+      # no" (1) or "the answer is yes" (0) -- the SAME three-valued shape
+      # the pre-delete enumeration above already used.
       printf '%s' "$body" | python3 -c "
 import sys, json
-d = json.load(sys.stdin)
-cl = d.get('clusters')
-if cl is None:
+try:
+    d = json.load(sys.stdin)
+except Exception:
     sys.exit(2)
-sys.exit(0 if any(c.get('id') == '${id}' for c in cl) else 1)
+if not isinstance(d, dict):
+    sys.exit(2)
+cl = d.get('clusters')
+if not isinstance(cl, list):
+    sys.exit(2)
+sys.exit(0 if any(isinstance(c, dict) and c.get('id') == '${id}' for c in cl) else 1)
 "
       rc2=$?
       if [ "$rc2" -eq 1 ]; then
@@ -2640,8 +2747,19 @@ for p in me['pods']:
   while read -r id age why; do
     [ -n "$id" ] || continue
     if [ "$id" = "UNAGEABLE" ]; then
+      # CHANGE (round-4 audit, P-M1a): an unageable pod used to `continue`
+      # the loop and let the sweep finish green (rc=0, no return here) — the
+      # cluster arm's own UNAGEABLE handling (above) has always been rc=1,
+      # naming the resource and bailing immediately, never trusting the rest
+      # of this run's enumeration once one entry could not be judged. This
+      # makes the pod arm match: an unexaminable resource is BILLING with no
+      # deadline this sweep could establish, exactly the cluster doctrine —
+      # never "nothing to reap". The rest of this run's `out` list (any
+      # other genuinely reapable orphan) is left unswept THIS run, the same
+      # trade-off the cluster arm already makes; the next scheduled sweep
+      # picks it back up.
       echo "::error::pod ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
-      continue
+      return 1
     fi
     if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qxF -- "$id"; then
       echo "cluster member, skipped: ${id}"

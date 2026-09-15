@@ -346,8 +346,14 @@ makes that re-add a reviewed, human-visible act instead of a silent default.
   trigger without the allow-listed exception P8 names.
 - **invariants_to_preserve**: this unit's OWN obligation — U7a/PR-B1 already landed P7 (every
   paid pod lane held to P1's three sub-rules, over a renting closure derived from
-  `runpod_lib.sh`, with `rp_cluster_create` as a SECOND renting root — its only callers on this
-  tree are the library's own tests until U7b-A2b lands a driver); this unit extends `ci/scripts/
+  `runpod_lib.sh`, with `rp_cluster_create` as a SECOND renting root — it has no CALLER on this
+  tree, so it contributes no derived DRIVER for P7 to hold to a table row or to
+  `_check_derived_driver_cannot_rent`; the root is registered so the FIRST real caller is judged
+  the moment U7b-A2b's driver ships. Two tracked files word-match its literal name today and are
+  each cleared through that same predicate, neither exempted for being ours: the library's own
+  mocks-only test suite, which genuinely calls it, and `check_gpu_prove_once.py` itself, which
+  self-matches its own `RENTING_ROOTS` definition — see that file's own disclosure); this unit
+  extends `ci/scripts/
   check_gpu_prove_once.py` with a NEW arm, **P8** (schedule visibility): a `schedule:` trigger on
   ANY paid-lane workflow — pod or cluster — is refused unless that workflow is a reviewed key of
   `PAID_LANE_CRON_ALLOWLIST` naming its own never-vacuous arm — a rule this unit BUILDS, never one

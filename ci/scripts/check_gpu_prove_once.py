@@ -888,11 +888,35 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     # The distributed-training CLUSTER leg has NO driver row on this tree —
     # its two-host driver and workflow are filed (not yet shipped) as a
     # future unit. `rp_cluster_create` remains a second renting ROOT below
-    # (RENTING_ROOTS) even with no table row: its only callers on this tree
-    # are `runpod_lib.sh` itself and its mocks-only tests, so P7's
-    # completeness rule clears it through `_check_derived_driver_cannot_rent`
-    # (no workflow carries RUNPOD_API_KEY alongside either caller's path)
-    # rather than through a row — add the row back once a driver ships.
+    # (RENTING_ROOTS) even with no table row.
+    #
+    # THE TRUE REASON THIS CLEARS (round-4 audit F3: a prior revision of
+    # this comment claimed "P7's completeness rule clears it through
+    # `_check_derived_driver_cannot_rent`", which is not what actually
+    # happens): a ROOT is never itself subject to `_check_derived_driver_
+    # cannot_rent` -- that predicate only runs on DERIVED DRIVERS (other
+    # tracked files whose text mentions a closure member), and
+    # `rp_cluster_create` has no CALLER among them at all on this tree, so
+    # it contributes NO derived driver -- P7 has nothing to hold to a row or
+    # to that predicate for this leg. The root is registered precisely so
+    # the FIRST real caller becomes that judged driver, the moment U7b-A2b's
+    # driver ships.
+    #
+    # `derive_renting_drivers`'s own word-boundary scan DOES currently match
+    # the literal string "rp_cluster_create" in exactly two tracked files,
+    # for two unrelated reasons, and each is independently cleared through
+    # `_check_derived_driver_cannot_rent` the same way any other file would
+    # be (verified: zero findings, zero notes for both, `git log`-current
+    # tree) -- neither is exempted for being ours, matching this module's
+    # own stated design (see "WHAT THE DERIVATION DELIBERATELY DOES NOT DO"
+    # above): `ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only
+    # primitives suite -- a GENUINE call, once this fix round's own test
+    # coverage lands) and **this file, `check_gpu_prove_once.py`, itself**
+    # (a SELF-MATCH: `RENTING_ROOTS` below names `rp_cluster_create` as a
+    # Python string literal, so this rule's own source mentions its own
+    # root and gets derived as a "driver" of itself -- disclosed, not fixed,
+    # for the same reason `test_check_gpu_prove_once.py`'s pre-existing
+    # self-match on `_rp_deploy_payload` is disclosed rather than exempted).
 }
 
 # --------------------------------------------------------------------------- #
@@ -933,7 +957,16 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
 #     a file is cleared by the same machine predicate as any other (the
 #     workflow whose guard job runs it carries no `RUNPOD_API_KEY` at any
 #     scope), which is exactly the outcome an exemption list would have
-#     hidden.
+#     hidden. THIS FILE self-matches the same way (round-4 audit finding,
+#     verified: `derive_renting_drivers(load_script_texts(), closure)`
+#     includes `"ci/scripts/check_gpu_prove_once.py"` on this tree) —
+#     `RENTING_ROOTS` below names `_rp_deploy_payload`/`rp_cluster_create`
+#     as Python string literals, and this module's own comment-stripped
+#     text is scanned exactly like any other tracked `ci/scripts/**` file
+#     (it is not `RUNPOD_LIB_REL`, the one path this scan does exclude — see
+#     `derive_renting_drivers`'s own docstring). It is cleared the same way,
+#     for the same reason, and is deliberately NOT exempted either — see the
+#     `PAID_POD_LANE_TABLE` comment above this section for the full account.
 #
 # RESIDUALS, disclosed rather than assumed away. All three are
 # UNDER-approximations — the direction that can miss a renter — so they are

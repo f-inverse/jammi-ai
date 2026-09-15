@@ -1339,11 +1339,15 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # the same way, for the same reason.
                 "ci/scripts/test_check_gpu_prove_once.py",
                 "ci/scripts/test_pod_substrate.sh",
-                # test_runpod_cluster_lib.sh's own fixtures call
-                # `_rp_deploy_payload`/`rp_cluster_create` directly (Groups 1
-                # and 2 -- comparing the pod and cluster entrypoint text
-                # byte-for-byte); cleared the identical way, by ci.yml
-                # carrying no RUNPOD_API_KEY anywhere.
+                # test_runpod_cluster_lib.sh calls `_rp_deploy_payload`
+                # directly (Group 2 -- comparing the pod and cluster
+                # entrypoint text byte-for-byte) AND `rp_cluster_create`
+                # directly (Group 7, added in plan #500 U7b's round-4 fix:
+                # before that round this function had zero non-comment
+                # invocations anywhere on this tree -- only its own header
+                # comment named it, which `drop_comment_lines` strips, so it
+                # did not yet self-match); cleared the identical way, by
+                # ci.yml carrying no RUNPOD_API_KEY anywhere.
                 "ci/scripts/test_runpod_cluster_lib.sh",
             ],
         )

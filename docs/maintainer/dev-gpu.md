@@ -760,9 +760,14 @@ land it, or re-measure.
 
 ## The cluster leg — two hosts, one A100 each
 
-A CLUSTER is a SEPARATE RunPod object type from a pod: N member pods on one
+A CLUSTER is a SEPARATE RunPod object type from a pod: member pods on one
 private overlay network, created and destroyed as a unit — it is retired by
-deleting the CLUSTER, never by terminating one of its member pods. There is
+deleting the CLUSTER, never by terminating one of its member pods. This
+tooling's own `_rp_cluster_payload` requests a FIXED shape, never a
+caller-chosen one: exactly 2 member pods, 1 GPU each (`compute.
+gpuCountPerPod=1`, `compute.podCount=2` — this tooling's own choice, not
+something RunPod's schema demands; there is no parameter for any other
+shape). There is
 no GraphQL surface for it at all; every `rp_cluster_*` primitive in
 `ci/scripts/runpod_lib.sh` goes over RunPod's REST v2 (`_rp_rest`):
 `rp_cluster_create`, `rp_cluster_get`, `rp_cluster_pods` (members with
@@ -806,12 +811,18 @@ two-host test BY HAND with the primitives above:
    `gpu_capability` test target.
 4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,
    `JAMMI_GANG_TWO_HOSTS_WORLD=2`, `JAMMI_GANG_TWO_HOSTS_ID_FILE=<path>`,
-   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`, and run
-   `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test
-   gpu_capability gang_nccl_two_hosts -- --nocapture --test-threads=1`.
+   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`,
+   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1` — set on BOTH members (this leg's own
+   require flag: a missing device or an incomplete/malformed env is a hard
+   FAIL here, never the silent skip a by-hand run with a misconfigured host
+   would otherwise read as "did not get to run" rather than "failed") — and
+   run `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests
+   --test gpu_capability gang_nccl_two_hosts -- --nocapture
+   --test-threads=1`.
 5. Once rank 0's id file holds exactly 128 bytes, `scp` it to the member
    running rank 1 (mode 0600; delete the local copy once the id has
-   crossed) and start rank 1 with the SAME env, `JAMMI_GANG_TWO_HOSTS_RANK=1`.
+   crossed) and start rank 1 with the SAME env (including
+   `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1`), `JAMMI_GANG_TWO_HOSTS_RANK=1`.
 6. Read both `rank-<r>.json` reports back; `rp_cluster_delete` the cluster
    when done — do not rely on member self-removal alone (below).
 7. Treat the id as a secret throughout: it must never appear in a
@@ -849,14 +860,26 @@ the refusal fires before `producer.path` is ever compared).
 derives its renting-closure subject set from a REVIEWED ROOT LIST —
 `_rp_deploy_payload` for the pod surface, `rp_cluster_create` for the
 cluster surface — so a second renting mechanism gets a table row through
-the same derivation the pod legs always have the moment a driver names it;
-today `rp_cluster_create`'s only callers on this tree are `runpod_lib.sh`
-itself and its own mocks-only tests. P8 additionally demands that ANY paid
-pod lane's `schedule:` trigger, if one is ever added, is a reviewed
-`PAID_LANE_CRON_ALLOWLIST` entry naming its own never-vacuous arm — a lever
-that makes a future cron on a driver for this lane a deliberate, reviewed
-act rather than a silent default. Nothing about a release depends on this
-leg; the release verdict is the prove lane's.
+the same derivation the pod legs always have the moment a real DRIVER
+calls it. `rp_cluster_create` has no such caller on this tree today: it
+contributes no derived DRIVER, so P7's per-driver rules (a `PAID_POD_LANE_
+TABLE` row, or `_check_derived_driver_cannot_rent`) have nothing to hold to
+those rules yet — the root is registered precisely so the FIRST real
+caller becomes that judged driver, the moment U7b-A2b's driver ships. Two
+tracked files DO word-match the `rp_cluster_create` literal today and are
+each independently derived and cleared through the same predicate as any
+other file (neither is a renting driver and neither is exempted for being
+ours): `ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives
+suite, which genuinely calls it) and `ci/scripts/check_gpu_prove_once.py`
+itself (this very rule's own source names `rp_cluster_create` as a
+`RENTING_ROOTS` string literal, so the gate self-matches its own
+definition — see that file's own disclosure of this, alongside its
+pre-existing `test_check_gpu_prove_once.py` self-match). P8 additionally
+demands that ANY paid pod lane's `schedule:` trigger, if one is ever added,
+is a reviewed `PAID_LANE_CRON_ALLOWLIST` entry naming its own never-vacuous
+arm — a lever that makes a future cron on a driver for this lane a
+deliberate, reviewed act rather than a silent default. Nothing about a
+release depends on this leg; the release verdict is the prove lane's.
 
 **Known-unmeasured.** This leg proves world 2 only. Whether the NCCL pin set
 (`NCCL_SOCKET_IFNAME=ens1` and friends) that works at world 2 still suffices

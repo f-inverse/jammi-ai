@@ -1212,6 +1212,44 @@ JSON
 )
 
 # ═════════════════════════════════════════════════════════════════════════
+# Group 4c — rp_sweep (function-level, where Group 4/4b already drive the
+# pod sweep): a pod with NO usable `createdAt` is rc=1, naming the pod id,
+# never a silent `continue` back to a green summary — round-4 audit P-M1a,
+# mirroring rp_cluster_sweep's own pre-existing UNAGEABLE handling. Function-
+# level oracle for this same class also lives in test_runpod_cluster_lib.sh
+# Group 11 (via the mocks-only curl stub); this one drives the SAME rp_sweep
+# through THIS suite's own rp_gql-override harness, confirming the fix
+# holds under both mocking styles.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  export RUNPOD_API_KEY="dummy-key"
+  unset RP_SESSION
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  G4C_TERM="$SANDBOX/g4c-terminate.log"; : > "$G4C_TERM"
+  rp_terminate() { echo "$1" >> "$G4C_TERM"; }
+
+  cat > "$SANDBOX/g4c-account.json" <<'JSON'
+{"data":{"myself":{"pods":[
+  {"id":"pod-unageable","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","runtime":{"uptimeInSeconds":180000}}
+]}}}
+JSON
+  rp_gql() { cat "$SANDBOX/g4c-account.json"; }
+
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-unageable"; then
+    record PASS "group4c-unageable-pod-rc1-named"
+  else
+    record FAIL "group4c-unageable-pod-rc1-named (rc=$rc): $out"
+  fi
+  if [ -s "$G4C_TERM" ]; then
+    record FAIL "group4c-unageable-pod-never-terminated (regression!)"
+  else
+    record PASS "group4c-unageable-pod-never-terminated"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
 # Group 5 — RP_SSHO must pin every connection to the tooling's own key via
 # IdentitiesOnly=yes (2026-08-26 incident, ledger row 328): without it, an
 # ssh-agent holding many identities offers all of them before RP_SSH_KEY,

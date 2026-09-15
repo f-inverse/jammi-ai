@@ -27,6 +27,7 @@ The on-disk shape is `MaterializationManifest`:
 | Field | Meaning |
 |-------|---------|
 | `artifact` | The in-toto *subject* — SHA-256 over the Parquet object's bytes. The thing a verifier matches by digest. |
+| `leaves` | The keyed **inventory** of the artifact's parts, beside the subject, never in place of it: one leaf per Parquet row group (its index and byte range as the footer locates it, and the SHA-256 of exactly that range), or one per model-bundle file by name. A peer verifies ONE partition against its leaf without reading the rest (`ResultStore::verify_partitions` names the first divergent row group); bytes outside every row group — the footer, page indexes, bloom filters — belong to no leaf and are the whole-object `artifact` digest's to catch. |
 | `definition_hash` | SHA-256 of *how* the table was produced — the descriptor plus the environment (see below). |
 | `input_anchors` | The immutable state pointer of each input, in producer order. |
 | `produced_by` | The producing-run id — provenance, never the reproducibility anchor. |

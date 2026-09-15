@@ -1530,7 +1530,6 @@ pub enum ManifestError {
         /// The format version this build reads and writes.
         supported: u32,
     },
-    /// JSON (de)serialisation of a descriptor / environment / manifest failed.
     /// A sidecar at the current version with no `leaves` inventory — written
     /// before the inventory existed. The reader treats it as absent
     /// (re-materialise); it is never a hit and never a crash.
@@ -1542,6 +1541,7 @@ pub enum ManifestError {
     /// derived from (or verified against) its bytes.
     #[error("parquet footer unreadable: {0}")]
     ParquetFooter(String),
+    /// JSON (de)serialisation of a descriptor / environment / manifest failed.
     #[error("manifest serialisation error: {0}")]
     Serde(#[from] serde_json::Error),
     /// A storage read/write of the sidecar failed.

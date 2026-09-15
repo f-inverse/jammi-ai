@@ -168,8 +168,10 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   through the store's own key parser (one leading `/` stripped, a trailing
   one dropped, an empty segment refused — keys keep their case), the
   endpoint or account the store would dial (`[storage.cloud]`'s S3
-  `endpoint`, R2 account/endpoint, Azure `account_name`) is part of the
-  identity, a local root is created (as the store creates it at open) and
+  `endpoint`, R2 account/endpoint, Azure `account_name` — or, when the
+  config names none, the same environment variables the store's builder
+  reads: `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT`, `AZURE_STORAGE_ACCOUNT_NAME`)
+  is part of the identity, a local root is created (as the store creates it at open) and
   canonicalised on the owning host's filesystem (symlinks, `.`/`..`, the
   filesystem's own spelling), and an in-memory root is refused at
   registration as unshareable. Two members whose spellings

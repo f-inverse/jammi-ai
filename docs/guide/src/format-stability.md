@@ -23,7 +23,7 @@ are pinned identically.)
 
 | Format | On-disk file | Stability stamp | Reject semantics on load |
 |--------|--------------|-----------------|--------------------------|
-| Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Reject-newer** — `found > MANIFEST_VERSION` → `ManifestError::UnsupportedManifestVersion` |
+| Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Reject-newer** — `found > MANIFEST_VERSION` → `ManifestError::UnsupportedManifestVersion`. One older SHAPE is named on its own: an object at the current version with no `leaves` inventory (written before the inventory existed) is `ManifestError::PreLeavesSidecar`, which `ResultStore::read_materialization_manifest` reads as *absent* (re-materialise) — never a hit, and never how a newer version or a corrupt body is read |
 | ANN row map | `.rowmap` | leading `u32` version header | **Reject-newer** — `found > ROWMAP_VERSION` → `JammiError::IncompatibleFormat { artifact: "rowmap", .. }` |
 | ANN sidecar manifest | `.manifest.json` | `version` (`u32`) | **Reject-newer** — `found > ANN_MANIFEST_VERSION` → `JammiError::IncompatibleFormat { artifact: "ann-manifest", .. }` |
 | ANN binary threshold companion | `.threshold` | *none embedded* — required whenever the sidecar manifest's `scalar_kind` is `Binary`, confirmed by the manifest's `binary_threshold_kind` field | **Fail-loud, not versioned** — a missing `binary_threshold_kind`, a missing file, or a byte length not matching `dimensions` `f32`s → `JammiError::Other` |

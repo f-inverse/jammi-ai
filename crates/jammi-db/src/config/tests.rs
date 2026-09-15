@@ -3550,8 +3550,12 @@ fn from_config_root_identity_is_of_the_resolved_root_over_every_arm() {
             .expect("an advertising config registers a root");
         assert_eq!(
             root.identity(),
-            &crate::catalog::instance::RootIdentity::of(&resolved, cfg.storage.cloud.as_ref())
-                .unwrap(),
+            &crate::catalog::instance::RootIdentity::of(
+                &resolved,
+                cfg.storage.cloud.as_ref(),
+                &|k| std::env::var(k).ok()
+            )
+            .unwrap(),
             "arm {result_root:?}"
         );
     }

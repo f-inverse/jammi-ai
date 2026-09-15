@@ -1161,7 +1161,7 @@ async fn f5_a_nan_target_in_the_validation_suffix_refuses_before_step_zero_under
 /// SAME bound tenant, must train to completion through the `Streamed`
 /// source.
 ///
-/// RED at 0506b9460cfc7389164c440418a868e74dcfa325 (before this commit):
+/// RED at 7f493d871ad2d5272661fa2d05228bfd9be21a44 (before this commit):
 /// `job.wait()` returns `Err(FineTune("DataFusion error: Error during
 /// planning: table 'datafusion.public.jammi.training__text_embedding__
 /// training-set__…' not found"))` — `TrainingLoop::open_streamed_source`
@@ -1174,7 +1174,7 @@ async fn f5_a_nan_target_in_the_validation_suffix_refuses_before_step_zero_under
 /// hits. Source order matters: `worker_run_span_carries_job_and_tenant`
 /// (`fine_tune.rs`) binds its tenant AFTER its source is already added, so
 /// that source's result tables are GLOBAL (`owner = None`, always visible)
-/// and that test passes at 0506b946 regardless of the bug — this test binds
+/// and that test passes at 7f493d87 regardless of the bug — this test binds
 /// the tenant FIRST, so the training-set table is genuinely owner-gated.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]

@@ -948,6 +948,102 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     );
 }
 
+/// A training-set row whose `.materialization.json` sidecar is absent (a
+/// pre-migration-021 table — the same shape
+/// [`verdict_missing_manifest_for_a_pre_contract_table`] models for the
+/// verify path) still registers: `training_set_registration_sort_order`
+/// returns `Ok(None)` rather than refusing the row, because
+/// [`training_set_order_by`]'s explicit `ORDER BY` clause still sorts the
+/// read correctly — only the `SortExec`-free plan P1 claims is lost, not
+/// correctness. That silent fallback now STATES itself: a `tracing::warn!`
+/// naming the table fires on recovery's registration path
+/// (`load_existing_tables` -> `bind_result_table` ->
+/// `training_set_registration_sort_order`), captured here the same way
+/// `jammi-ai`'s `model::cache::tests::catalog_read_error_skips_bookkeeping_write`
+/// captures a `tracing::warn!` — a real `tracing_subscriber::fmt` subscriber
+/// writing into an in-memory buffer this test inspects, never a log-crate
+/// shim. Deleting the `warn!` call (reverting to a bare `Ok(None)`) turns
+/// this test red without changing any other assertion in this file.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: BackendKind) {
+    use std::io;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "no-sidecar");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+
+    // Simulate a pre-migration-021 row: bytes + a `ready` catalog row, but no
+    // manifest sidecar — the SAME corruption
+    // `recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished`
+    // applies to the verify path, applied here to the registration path.
+    delete_sidecar(&store, &materialized.record).await;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufferWriter(buffer.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Recovery's registration path re-reads the sidecar from a session that
+    // never saw the write, exactly `a_training_sets_registration_declares_
+    // its_order_so_the_read_back_plans_no_sort`'s recovery half above — but
+    // now with no sidecar to read.
+    let ctx2 = SessionContext::new();
+    store.load_existing_tables(&ctx2).await.unwrap();
+
+    // Registration still succeeds (correctness is preserved: the explicit
+    // `ORDER BY` still sorts the read).
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let rows = ctx2.sql(&query).await.unwrap().collect().await.unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(materialized.record.table_name.as_str()),
+        "the missing-sidecar warning must name the table, got: {log}"
+    );
+    assert!(
+        log.contains("no materialization manifest sidecar"),
+        "the missing-sidecar warning must state the reason, got: {log}"
+    );
+}
+
 /// #500 U2c c3c, P-M(i): the training-set WRITER's full-tuple sort plans at
 /// exactly ONE output partition and never builds a
 /// `SortPreservingMergeExec` — the SAME single-partition derivation

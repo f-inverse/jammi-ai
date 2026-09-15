@@ -2894,6 +2894,11 @@ impl ResultStore {
     ) -> Result<Option<Vec<Vec<SortExpr>>>> {
         let manifest = self.read_materialization_manifest(url).await?;
         let Some(manifest) = manifest else {
+            warn!(
+                table = record.table_name,
+                "training-set row carries no materialization manifest sidecar (a \
+                 pre-migration-021 table); registering without a declared sort order"
+            );
             return Ok(None);
         };
         match manifest.descriptor {

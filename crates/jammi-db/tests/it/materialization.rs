@@ -850,6 +850,104 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 }
 
+/// P1's registration-side wiring, over BOTH sites that build a TrainingSet
+/// table's provider: fresh materialization's own registration (inside
+/// `BuildingTable::finish`) and crash-recovery's (`ResultStore::load_existing_tables`,
+/// on an entirely fresh session that never saw the write) both declare the
+/// producer's committed order on the `ListingTable`, so the read-back query
+/// ([`training_set_order_by`]'s clause, applied over the SAME columns the
+/// table was materialised from) plans no `SortExec` — the table asserts its
+/// own order rather than the plan re-proving it by sorting.
+///
+/// The full fixture-based oracle (a multi-row-group, >1-file-group table, and
+/// the NULLS-LAST positive control that must reinstate `SortExec`) lives in
+/// `jammi-ai`'s `tests/it/training_set.rs` beside the row-order oracle
+/// (contract `feat_500-B-U2c` §9 "Fixture placement"): this test instead
+/// pins the two REGISTRATION call sites this unit's own code changed,
+/// independent of `jammi-ai`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(
+        4,
+        vec![
+            ts_batch(&[(Some("q2"), Some("a2"))]),
+            ts_batch(&[(Some("q1"), Some("a1"))]),
+        ],
+    );
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+
+    // Fresh materialization's own registration (inside `finish`) declared the
+    // committed order: the read-back plan carries no `SortExec`.
+    let plan = ctx
+        .sql(&query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(
+        !text.contains("SortExec"),
+        "fresh materialization's registration must declare the order (P1): {text}"
+    );
+
+    // The sort columns are nullable in the resolved schema -- otherwise NULLS
+    // FIRST is indistinguishable from NULLS LAST and "no SortExec" would be a
+    // vacuous claim about a schema that could not have forced one anyway.
+    let schema = plan.schema();
+    for column in &columns {
+        let field = schema.field_with_name(column).unwrap();
+        assert!(
+            field.is_nullable(),
+            "'{column}' must be nullable for the no-SortExec claim to be non-vacuous"
+        );
+    }
+
+    // Recovery's registration path (`load_existing_tables` -> the SAME
+    // `bind_result_table`) declares the identical order on a session that
+    // never ran the write -- reading the manifest sidecar back, not reusing
+    // any in-process state from the write above.
+    let ctx2 = SessionContext::new();
+    store.load_existing_tables(&ctx2).await.unwrap();
+    let plan2 = ctx2
+        .sql(&query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text2 = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan2.as_ref()).indent(true)
+    );
+    assert!(
+        !text2.contains("SortExec"),
+        "recovery's registration must declare the order (P1) too: {text2}"
+    );
+}
+
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]

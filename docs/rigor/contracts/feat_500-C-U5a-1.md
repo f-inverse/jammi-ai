@@ -453,8 +453,8 @@ c1d918b4.
   EMISSION (the reasons are frozen on the wire, §1.1, but nothing in this unit ever constructs
   one). Every call that clears I-GANG in this unit ends `Unimplemented` (§1.2 step 6), never
   `Admitted`.
-- **U5b-1a**: `instances.peer_addr`, `canonicalize_result_root`, `list_gang_members`, the coarse
-  root pre-filter at listing time.
+- **U5b-1a**: `instances.peer_addr`, `MemberRoot`/`resolved_result_root`, `list_gang_members`, the
+  coarse root pre-filter at listing time.
 - **U5b-1b-i/ii**: the round protocol, body-level byte attestation, the coordinator (membership →
   assignment → dispatch → assembly), `RankEvent::Outcome`'s producer and consumer, the
   `world_size == 1` rank body, the writer-role split, `[worker] assembly_attempts`.

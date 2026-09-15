@@ -528,23 +528,26 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   created fresh by `029`'s replayed DDL, so an omission there leaves the reopened table missing
   both columns, RED — cited by construct rather than by an offset on a branch this fold cannot
   read), `catalog/instance.rs` (NEW — `PeerAddr` moves here from `index::peer`, re-exported there
-  so the peer listener and the gang listener share ONE address type; `CanonicalRoot`;
-  `InstanceRegistration { instance_id, label, host, peer_addr: Option<PeerAddr>, canonical_root:
-  Option<CanonicalRoot>, worker: Mutex<Option<WorkerFacts>> }` — the ONE value every writer of the
+  so the peer listener and the gang listener share ONE address type; `MemberRoot` (the VERBATIM
+  configured result-table root — no filesystem access, no URL parsing, no scheme handling; two
+  DIFFERENT spellings of the same physical location are two DIFFERENT roots to this predicate);
+  `InstanceRegistration { instance_id, label, host, peer_addr: Option<PeerAddr>, member_root:
+  Option<MemberRoot>, worker: Mutex<Option<WorkerFacts>> }` — the ONE value every writer of the
   `instances`(+`workers`) row builds; `InstanceRegistration::from_config` is the ONE choke point:
   `peer_advertise` unset yields a non-member registration (NULLs, no filesystem check at all);
   `peer_advertise` set performs the WHOLE membership check (parses as `PeerAddr`, `peer_bind` is
-  set too, the root canonicalizes) — `ServerConfig::validate` is NOT the home, since it cannot see
-  `artifact_dir`), `catalog/jobs_repo.rs` (`upsert_instance`/`reregister_instance` accept ONLY an
-  `InstanceRegistration`; `peer_addr_of(instance_id, lease) -> Option<PeerAddr>` — the ONE
+  set too) and wraps the verbatim root (`MemberRoot::resolved`, over
+  `JammiConfig::resolved_result_root`) — `ServerConfig::validate` is NOT the home, since it cannot
+  see `artifact_dir`), `catalog/jobs_repo.rs` (`upsert_instance`/`reregister_instance` accept ONLY
+  an `InstanceRegistration`; `peer_addr_of(instance_id, lease) -> Option<PeerAddr>` — the ONE
   by-id resolution verb, fresh-only under the same margin, no kind/root/self filter — is the
   address-resolution surface DESIGN.md §4 names; `list_gang_members(GangListing { kind,
-  self_instance, canonical_root, lease })` excludes self, stale (freshness via U5a-1's
+  self_instance, member_root, lease })` excludes self, stale (freshness via U5a-1's
   `instance_liveness_margin()`, consumed here, never recomputed), draining/warming, no-`workers`-row
   (an INNER join), other-kind (kinds split on `,`, matched as whole tokens), and root-divergent
   instances; the member order is byte order on `instance_id`, sorted and compared in Rust — never
   a SQL `ORDER BY`, whose collation is backend-dependent; root divergence is likewise a byte-exact
-  Rust comparison of the canonicalized string, never a SQL `=`), `catalog/lease.rs`
+  Rust comparison of the verbatim `member_root` string, never a SQL `=`), `catalog/lease.rs`
   (`instance_prune_window(lease) = instance_liveness_margin(lease).saturating_add(lease)`, i.e.
   `3 × lease` — STRICTLY BEYOND the `2×` margin, so a member judged merely stale is never also
   eligible for deletion — `InferenceSession::wrap_with`'s `prune_instances` call site uses this
@@ -556,14 +559,17 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   that can never resurrect a pruned row, so a process whose row was pruned during a transient
   outage now rejoins on its next heartbeat with no restart), `config/mod.rs` (`[server]
   peer_advertise` — refused by `InstanceRegistration::from_config`, NOT `validate()` (which cannot
-  see `artifact_dir`): unset `peer_bind` is a named-key error; `canonical_result_root()`
-  canonicalizes the RESOLVED result-table root — `[storage] result_root` when set (the WHOLE
-  effective root, no leaf appended), else `{artifact_dir}/jammi_db` (leaf appended ONLY in this
-  default arm) — scheme-aliased, trailing slash trimmed, a missing or non-directory anchor refused
-  naming the offending key, with the row never written; canonical-root equality is NECESSARY,
-  never SUFFICIENT, for shared storage — sufficiency is established only by the attestation
-  VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and U5b-1b-i's per-partition inventory, never by
-  this predicate alone). (ai-core) `session.rs` (the ONLY production call site of
+  see `artifact_dir`): unset `peer_bind` is a named-key error; `resolved_result_root()` returns the
+  RESOLVED result-table root VERBATIM — `[storage] result_root` when set (the WHOLE effective
+  root, no leaf appended), else `{artifact_dir}/jammi_db` (leaf appended ONLY in this default arm,
+  a typed refusal naming `artifact_dir` on non-UTF-8) — no filesystem access, no URL parsing, no
+  scheme handling on the membership path; membership compares this string byte-for-byte — two
+  spellings of one location are two roots — necessary, never sufficient, for shared storage —
+  sufficiency is established only by the attestation VERIFY, U5a-1's whole-artifact sidecar /
+  U5b-0's and U5b-1b-i's per-partition inventory, never by this predicate alone; the spelling-fold
+  question is filed as its own unit, U5b-1a-A2 (see
+  `docs/plans/67-distributed-training/README.md` for its scope), and is NOT part of this
+  predicate). (ai-core) `session.rs` (the ONLY production call site of
   `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — builds the
   `InstanceRegistration` via `from_config` FIRST, before the lease keeper starts or the result
   store creates a directory; `InferenceSession::open_with_placement`'s shared-`artifact_dir`
@@ -577,19 +583,19 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 - **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, no-`workers`-row,
   other-kind and root-divergent instance on both backends, plus one fresh multi-kind worker
   included, from a DB return order permuted away from `instance_id` order — the returned list is
-  still sorted (RED at base); (b) `peer_advertise` without `peer_bind`, or with a missing or
-  non-directory result-root anchor, is refused by `InstanceRegistration::from_config` (called both
-  at `JammiConfig::load_from` and at `wrap_with`), each its own typed error; `peer_advertise` with
-  `result_root` UNSET is ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: the
-  prior refusal sentence is dropped); (c) the migration's ordered-after oracle on both backends;
+  still sorted (RED at base); (b) `peer_advertise` without `peer_bind` is refused by
+  `InstanceRegistration::from_config` (called both at `JammiConfig::load_from` and at
+  `wrap_with`), naming both keys; `peer_advertise` with `result_root` UNSET is ACCEPTED and the
+  row's `member_root` carries `{artifact_dir}/jammi_db` verbatim (RED at base: the prior refusal
+  sentence is dropped); (c) the migration's ordered-after oracle on both backends;
   (d) a config with `peer_advertise` set (result root set OR unset) produces a non-NULL
-  `peer_addr`/`canonical_root` `instances` row through the real session-construction path
+  `peer_addr`/`member_root` `instances` row through the real session-construction path
   (`InferenceSession::open` / `open_with_placement`), never a direct db write (RED at base: no
   caller threads the new arguments); (e) `peer_addr_of` resolves a busy or other-kind fresh member
   and returns `None` for a stale one; it is unreachable from any public RPC and ignores any caller
   tenant (the invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not
-  exist); (f) two members whose canonicalized `result_root` strings are byte-identical but sit on
-  different filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY,
+  exist); (f) two members whose `result_root` strings are byte-identical (the same spelling) but sit
+  on different filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY,
   never silently — root equality alone never green-lights a round; (g) a `2×`-lease heartbeat gap
   followed by recovery makes the member fresh again without a process restart, via the keeper's
   reregister of the WHOLE tuple on a failed touch (RED at base: `touch_instance` never resurrects a
@@ -690,7 +696,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   never set partially; a moved claim aborts with no write, a concurrent CAS sees zero rows and
   REUSEs.
 - **lane**: hermetic + server it-suite. **depends_on**: U5b-1a (`list_gang_members`,
-  `canonicalize_result_root`), U5b-1b-i (the `Peer` collective it dispatches to), U4b (`spec.rs`
+  `MemberRoot::resolved`), U5b-1b-i (the `Peer` collective it dispatches to), U4b (`spec.rs`
   co-ownership, merge order pinned), U5a-1, U5a-2. **size**: L.
 
 ### U5b-1b-iii — The `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin (PR-C commit 3b-iii)

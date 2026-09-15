@@ -3255,9 +3255,14 @@ choke point every writer of them funnels through.
   access and inspects `result_root`/`artifact_dir` not at all.
   `InstanceRegistration::from_config` runs `MembershipConfig::validate`,
   then, when membership applies, sets `member_root` to
-  `MemberRoot::new(config.resolved_result_root()?)` — the SAME string
-  `build_result_store` (`jammi-ai/src/session.rs`) hands to
-  `ResultStore::with_root`. **The membership path performs NO
+  `MemberRoot::resolved(config)` — the ONE production constructor, wrapping
+  `config.resolved_result_root()?` — the SAME string `build_result_store`
+  (`jammi-ai/src/session.rs`) hands to `ResultStore::with_root`.
+  `MemberRoot::new` (a bare-string wrap, no resolver call, no validation)
+  exists ONLY behind `feature = "test-hooks"`, for fixtures — a production
+  build never links it, so nothing outside `MemberRoot::resolved` can put an
+  arbitrary string in the `instances.result_root` column. **The membership
+  path performs NO
   interpretation of the root at all**: no URL parse, no scheme handling, no
   symlink resolution, no case folding — two spellings of one physical
   location (`gcs://b/p` vs `gs://b/p`, a trailing `/`, a case difference)

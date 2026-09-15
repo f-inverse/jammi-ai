@@ -1,16 +1,35 @@
 # CONTRACT — feat/500-C-U5b-1a: gang-membership substrate
 
 **Contract of record.** slug: `feat_500-C-U5b-1a` · branch `feat/500-C-U5b-1a`
-at `686d4aedfefb3693ee1b798a8749f63493df1acc` (the code commit, tagged
+at `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf` (the code commit, tagged
 throughout this revision as "commit 1") · this file is the committed
 mechanism contract `ci/scripts/check_rigor_record.py` requires under
 `docs/rigor/contracts/**` (its check 3) before this unit's rigor record at
-`docs/rigor/feat_500-C-U5b-1a.jsonl` (the lead's export) satisfies check 1/2.
-Source design contract: the lead's `CONTRACT-U5b-1a.md` v4 (scratchpad-only,
-never a repo path — it is not cited with a `path:line` token anywhere in this
-document, since it is not a tracked file at HEAD).
+`docs/rigor/feat_500-C-U5b-1a.jsonl` (the lead's export, committed LAST —
+after every closer whose rows it carries, as the final commit before the
+PR) satisfies check 1/2. Source design contract: the lead's
+`CONTRACT-U5b-1a.md` v4 (scratchpad-only, never a repo path — it is not
+cited with a `path:line` token anywhere in this document, since it is not a
+tracked file at HEAD).
 
-**P-X4 hardening (this revision, re-anchors "commit 1").** The prior commit
+**Round-5 doc-fold re-anchor (this revision).** "Commit 1" moves from
+`686d4aedfefb3693ee1b798a8749f63493df1acc` to
+`3b7c89d4125862ef0c7f9c5073dc80203b81f2cf`: the round-4 closing audit (§11)
+found the round-3 excision's documentation fold incomplete (no mechanism
+change), and this commit closes it — `WorkerFacts::kinds`'s and
+`upsert_worker`'s doc comments drop the "otherwise producer-encoded" hatch,
+`advertising_config`'s doc (`config/tests.rs`) now describes the shape its
+body builds, and `gang_membership.rs` gains the corrupted-`peer_addr`
+typed-error oracle on both read verbs. These are doc-comment/test-only
+insertions in `instance.rs` (+3 lines, before
+`MembershipConfig`/`InstanceRegistration`/`GangListing`/`GangMember`),
+`jobs_repo.rs` (+2 lines, before `prune_instances`), and `config/tests.rs`
+(+2 lines) — every
+`path:line`/`path:a-b` citation into those three files below was
+RE-DERIVED against THIS commit's tree (self-check, §11); citations by
+`path::construct` are unaffected (no construct was renamed or moved).
+
+**P-X4 hardening (round-3→4 revision, re-anchored "commit 1" then).** The prior commit
 1 (`bd21b79081935c942bbb65154f43ee09a790aa3f`) left `MemberRoot::new` `pub`
 with no `cfg` gate: P-X4's claim ("constructible in production ONLY from
 `resolved_result_root()`") held BY CONVENTION (the only call site in that
@@ -106,18 +125,18 @@ sufficient), or a spelling-identity predicate (filed as unit U5b-1a-A2, §6).
 - **`WorkerFacts`** (`crates/jammi-db/src/catalog/instance.rs::WorkerFacts`,
   declared `crates/jammi-db/src/catalog/instance.rs:152`) is the claim-loop
   half of a registration: `kinds: String` (the comma-joined kind set) and
-  `state: WorkerState`. Its doc states its SOLE owner is `JobWorker`/
-  `EmbeddedWorker` (`crates/jammi-ai/src/fine_tune/worker.rs`), confirmed at
-  §4 below.
+  `state: WorkerState`. Its doc states its SOLE owner is
+  `JobWorker`/`EmbeddedWorker` (`crates/jammi-ai/src/fine_tune/worker.rs`),
+  confirmed at §4 below.
 - **`InstanceRegistration`**
   (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration`, declared
-  `crates/jammi-db/src/catalog/instance.rs:173`): `instance_id`, `label`,
+  `crates/jammi-db/src/catalog/instance.rs:176`): `instance_id`, `label`,
   `host`, `peer_addr: Option<PeerAddr>`, `member_root: Option<MemberRoot>`,
   and `worker: Mutex<Option<WorkerFacts>>` — the claim-loop cell, mutated in
   place by its single owner rather than requiring a whole new registration
   per state change. `InstanceRegistration::new`
   (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration::new`,
-  `crates/jammi-db/src/catalog/instance.rs:191`) is the plain constructor
+  `crates/jammi-db/src/catalog/instance.rs:194`) is the plain constructor
   with no validation, used by `from_config` itself and by fixtures/tests
   (`crates/jammi-db/tests/it/gang_membership.rs`'s `seed_member` helper and
   direct-construction call sites, and
@@ -125,24 +144,24 @@ sufficient), or a spelling-identity predicate (filed as unit U5b-1a-A2, §6).
   `set_worker`/`worker_snapshot` are the cell's read/write pair
   (mutex-poisoning tolerant via `unwrap_or_else(|p| p.into_inner())`).
 - **`GangListing<'a>`** (`crates/jammi-db/src/catalog/instance.rs::
-  GangListing`, `crates/jammi-db/src/catalog/instance.rs:294`) and
+  GangListing`, `crates/jammi-db/src/catalog/instance.rs:297`) and
   **`GangMember`** (`crates/jammi-db/src/catalog/instance.rs::GangMember`,
-  `crates/jammi-db/src/catalog/instance.rs:313`) are `list_gang_members`'s
+  `crates/jammi-db/src/catalog/instance.rs:316`) are `list_gang_members`'s
   request/response shapes (§3).
 
 ## 2. The membership check: `MembershipConfig::validate`, `InstanceRegistration::from_config`, `resolved_result_root`
 
 **The round-3 design, in one paragraph.** `MembershipConfig::validate`
 (`crates/jammi-db/src/catalog/instance.rs::MembershipConfig::validate`,
-`crates/jammi-db/src/catalog/instance.rs:278-288`) is PURE and checks
+`crates/jammi-db/src/catalog/instance.rs:281-291`) is PURE and checks
 EXACTLY two things: `[server] peer_advertise` parses as a `PeerAddr`
-(`:286`), and `[server] peer_bind` is set too, else a typed
-`JammiError::Config` naming BOTH keys (`:282-284`). It inspects
+(`:290`), and `[server] peer_bind` is set too, else a typed
+`JammiError::Config` naming BOTH keys (`:285-287`). It inspects
 `result_root`/`artifact_dir` NOT AT ALL. `InstanceRegistration::from_config`
 (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration::from_config`,
-`crates/jammi-db/src/catalog/instance.rs:239-255`) runs `validate`; when
+`crates/jammi-db/src/catalog/instance.rs:242-258`) runs `validate`; when
 membership applies, it sets `member_root` to
-`MemberRoot::resolved(config)?` (`:248`), which is itself
+`MemberRoot::resolved(config)?` (`:251`), which is itself
 `Self(config.resolved_result_root()?)` — the SAME string
 `build_result_store` (`crates/jammi-ai/src/session.rs::build_result_store`,
 `crates/jammi-ai/src/session.rs:2418`) hands to `StorageUrl::parse` before
@@ -171,8 +190,8 @@ universal funnel: every `InferenceSession` constructor (`new`, `open`,
 `crates/jammi-ai/src/session.rs::InferenceSession::open`,
 `::open_with_placement`, and the private `::wrap`, all of which call
 `wrap_with` either directly or through `wrap`. `ServerConfig::validate` is
-NOT the home for either check: it has no access to `artifact_dir`/
-`storage.result_root`, which `resolved_result_root` needs.
+NOT the home for either check: it has no access to
+`artifact_dir`/`storage.result_root`, which `resolved_result_root` needs.
 
 **F1 narrative, corrected (round-3; the round-2 text propagated a wrong
 construct).** Rounds 1–2 narrated the pre-unit defect this way: on a
@@ -267,7 +286,7 @@ has a filesystem precondition to race.
   `self.kinds.join(",")`.
 - **`prune_instances(stale_after)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::prune_instances`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2540`): `DELETE FROM instances
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2542`): `DELETE FROM instances
   WHERE {stale}` — its own `workers` row cascades (`ON DELETE CASCADE`,
   `crates/jammi-db/src/catalog/schema.rs:1030`).
 
@@ -517,6 +536,8 @@ wave-3 precondition.
 | `crates/jammi-db/tests/it/gang_membership.rs::list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order` | Byte-order sort holds even off a descending-insertion-order raw SELECT, with a vacuity control | Does not test the postgres planner's own default order separately |
 | `crates/jammi-db/tests/it/gang_membership.rs::list_gang_members_is_identical_under_a_scoped_tenant_and_under_none` | Tenant-independence, mirroring `get_job_for_rank`'s own oracle | Does not test under `with_admin_scope` (no admin-scope predicate exists on this path) |
 | `crates/jammi-db/tests/it/gang_membership.rs::peer_addr_of_resolves_a_busy_or_other_kind_fresh_member` / three `::peer_addr_of_is_none_for_*` | No kind/state filter; three independent `None`-producing causes | Does not distinguish the three by return shape — all `None` |
+| `crates/jammi-db/tests/it/gang_membership.rs::peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr` (round-5) | A `peer_addr` corrupted out-of-band (never through `PeerAddr::parse`) surfaces the typed `JammiError::Catalog` naming the instance, never a panic and never a silent `None` | Does not test a corrupted `result_root` column (not parsed, so not applicable) |
+| `crates/jammi-db/tests/it/gang_membership.rs::list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr` (round-5) | The `list_gang_members` sibling: a matching, fresh, claiming candidate with a corrupted `peer_addr` surfaces the same typed error, never a silently-dropped candidate | Does not test two corrupted candidates in the same call (the first-encountered row's error suffices; row iteration order is not itself under test here) |
 | `crates/jammi-db/tests/it/gang_membership.rs::keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete` | P-M4 at the catalog layer, `peer_addr_of` too | Does not exercise the session-construction path (next file does) |
 | `crates/jammi-db/tests/it/gang_membership.rs::prune_window_does_not_prune_a_member_merely_stale_within_the_window` | Both boundary directions in one test | Does not test EXACTLY at the window boundary |
 | `crates/jammi-db/tests/it/member_root_constructor.rs::member_root_new_has_no_production_caller` | P-X4 (hardened, this revision): no `crates/<name>/src/**/*.rs` file in the whole workspace contains the literal call form `MemberRoot::new(` — a sanity floor on the walk itself (≥10 crates with a `src/` dir, ≥300 `.rs` files scanned) guards against a broken walk passing vacuously | Does not cover `benches/`/`examples/` (neither exists in this workspace today) or a call spelled through a type alias/re-export |
@@ -566,8 +587,8 @@ wave-3 precondition.
 - **The verbatim-identity property (round-3, replaces the round-2 mutation
   about the literal-`PathBuf`-vs-URL-reparse check, since that check no
   longer exists).** Re-introducing ANY scheme fold in
-  `InstanceRegistration::from_config` (`crates/jammi-db/src/catalog/
-  instance.rs:239-255`) — e.g. lower-casing or alias-folding the
+  `InstanceRegistration::from_config`
+  (`crates/jammi-db/src/catalog/instance.rs:242-258`) — e.g. lower-casing or alias-folding the
   `member_root` string before wrapping it — is exactly what
   `crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings`
   and `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_not_gang_members_of_each_other`
@@ -598,6 +619,56 @@ wave-3 precondition.
 
 ## 11. Report
 
+**Round-4 closing audit and the lead's stop-rule ruling (2026-09-15, from
+the source design contract `CONTRACT-U5b-1a.md` §11).** Round 4 executed
+every root-identity attack this unit's mechanism admits (config drift,
+store-vs-row string, reregister/keeper, tenant scope, Postgres vs SQLite,
+`MemberRoot::new` reachability under resolver 2, migration 035 bytes, the
+P-X3 grep, the worker cell's lattice, `PeerAddr` sealing) and refuted every
+one — the mechanism (§1–§5 above) stands unchanged since round 3. Round 4's
+three BLOCKs and citation round 4's three findings were ALL documentation
+of record, never the mechanism: the rigor record not yet committed (it is
+the lead's export, committed LAST — see below); the wrapped path token at
+(pre-fold) contract lines ~568–569 and its ~672 sibling, and an off-by-one
+in the `MembershipConfig::validate` citation of §2 (it named the wrong
+line for the `PeerAddr::parse` statement — corrected in §2 above, now
+`:290` in this revision's tree, after the round-5 code commit shifted the
+file by three lines); "canonical-root" wording surviving in
+`deploy-server.md`, `reference-topologies.md`, `UNITS.md` (the §U5b-1a spec
+and its `depends_on` line), `DESIGN.md`, `DIST-DATA-PLANE.md`, `DIST-r3.md`,
+and `feat_500-C-U5a-1.md`; the maintainer guide's `MemberRoot::new(...)`
+sentence (should read `MemberRoot::resolved(config)`). Advisories: the
+`kinds` "otherwise producer-encoded" hatch on `WorkerFacts`'s field doc in
+`instance.rs` (pre-fold, §1); the `advertising_config` fixture doc
+describing a shape its body does not build; no oracle existed yet for the
+corrupted-`peer_addr` typed-error arm
+on either read verb; the doc sweep was keyed on literal vocabulary rather
+than a machine check.
+
+**The lead's ruling:** the round-4 pre-committed stop rule ("a BLOCK on ANY
+finding touching the root column excises the column from the predicate")
+is read as applying ONLY to a MECHANISM finding on the column — none of
+round 4's findings was one; they are the round-3 excision's OWN
+documentation fold left incomplete (P-X3/P-X4 as stated require every doc
+site to carry the shipped words). The rule does NOT fire.
+
+**Pre-committed for round 5 (binding):** a BLOCK of ANY kind on this unit
+in round 5 — mechanism OR documentation of the root column — fires the
+stop rule: the `result_root` column leaves the membership predicate
+entirely (rows still carry it for display; the predicate becomes
+`kinds`+`state`+`peer_addr` only), and the whole root-identity question
+moves to U5b-1a-A2. There is no round 6.
+
+**This revision (round 5) closes every item round 4 found:** the kinds
+encoding is pinned at the writer with no "otherwise producer-encoded"
+hatch (`instance.rs`, `jobs_repo.rs`); the `advertising_config` doc
+describes its body; the corrupted-`peer_addr` arm is oracled on both read
+verbs (§8 table, this revision); every doc/plan/contract site named above
+is reworded to the shipped words (verbatim spelling, byte-equality,
+necessary-never-sufficient) — see the fold commit's own sweep output; the
+wrapped tokens and the `:139` off-by-one are corrected in THIS file,
+re-derived against commit 1's (re-anchored) tree.
+
 `impossibility_claims`:
 - "no caller other than `InstanceRegistration::from_config` builds a value
   `Catalog::upsert_instance`/`Catalog::reregister_instance` accept" — not
@@ -605,10 +676,17 @@ wave-3 precondition.
   rests on the two verbs' own signatures (`&InstanceRegistration`) rather
   than an executed grep-shaped enumeration — `uncovered`.
 - "a stored `peer_addr` that fails to parse is never silently treated as
-  absent" — executed check: both `peer_addr_of` and `list_gang_members`
-  return a typed `JammiError::Catalog` on a parse failure — verified by
-  direct read of both call sites; no test manufactures a corrupted row —
-  `uncovered` as a standing tripwire.
+  absent" — CLOSED (round-5): both `peer_addr_of` and `list_gang_members`
+  return a typed `JammiError::Catalog` naming the instance on a parse
+  failure, now with a manufactured corrupted row (an out-of-band `UPDATE
+  instances SET peer_addr = 'not an addr'`, never through `PeerAddr::
+  parse`) —
+  `crates/jammi-db/tests/it/gang_membership.rs::
+  peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr` and
+  `crates/jammi-db/tests/it/gang_membership.rs::
+  list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr`
+  (`test_case`-parameterized sqlite/postgres, `feature = "test-hooks"`) —
+  no longer `uncovered`.
 - "the `,` kind-encoding convention is honored by every real writer" —
   executed check: `crates/jammi-ai/src/fine_tune/worker.rs:822,827,851` are
   the ONLY three call sites of `self.kinds.join(",")` in this crate
@@ -622,28 +700,36 @@ wave-3 precondition.
   machinery pretending otherwise.
 
 `citations_reanchored`: every citation in §1–§5, §7–§9 of this revision was
-re-derived directly against the tree of `686d4aedfefb3693ee1b798a8749f63493df1acc`
-(commit 1, re-anchored — see the header's P-X4 hardening note) in this
-worktree by the writing agent; §6 (history) cites no construct at all, by
-design (see §6's own header).
+re-derived directly against the tree of `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf`
+(commit 1, re-anchored this round — see the header's round-5 doc-fold
+re-anchor note) in this worktree by the writing agent; §6 (history) cites
+no construct at all, by design (see §6's own header).
 
-**Self-check (round-2 addendum requirement; re-run for the P-X4 hardening
-re-anchor).** Before this revision was committed, every `path:line`/
-`path:a-b` token AND every `path::construct` token in §1–§5, §7–§9 (§6
-excluded, cites none) was extracted and checked against the tree of commit
-1: a `path:line` token's cited line(s) were printed and eyeballed against
-the identifier/claim the surrounding sentence names; a `path::construct`
-token's LAST path segment (after the final `::`) was grepped against the
-named file, confirming the construct's name still occurs there.
+**Self-check (round-2 addendum requirement; re-run for the round-5
+citation fold, at `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf`).** Before this
+revision was committed, every `path:line`/`path:a-b` token AND every
+`path::construct` token in §1–§5, §7–§9 (§6 excluded, cites none) was
+extracted and checked against the tree of commit 1: a `path:line` token's
+cited line(s) were printed and eyeballed against the identifier/claim the
+surrounding sentence names; a `path::construct` token's LAST path segment
+(after the final `::`) was grepped against the named file, confirming the
+construct's name still occurs there.
 
 ```
-python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f161bf-7977-4318-a34d-d2eec24a0620/scratchpad/logs/db-selfcheck-px4.py
+python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f161bf-7977-4318-a34d-d2eec24a0620/scratchpad/logs/db-selfcheck-r5.py
 ```
 
-(a scratch script, never committed). **Result: 86 `path::construct` tokens
-checked, 86 resolved (their last segment occurs in the named file); 55
-unique `path:line`/`path:a-b` tokens checked, 55 resolved (the named file
-has at least that many lines) — both counts 100%, zero unresolved.**
+(a scratch script, never committed, written fresh this round — the round-4
+`db-selfcheck-px4.py` script no longer exists in this scratchpad). **Result
+(at commit 1 = `3b7c89d4`): 63 `path::construct` tokens checked, 63
+resolved (their last segment occurs in the named file); 54 unique
+`path:line`/`path:a-b` tokens checked, 54 resolved (the named file has at
+least that many lines) — both counts 100%, zero unresolved.** (This
+round's regex-based extractor is narrower than round 4's — e.g. it does not
+independently resolve the bare `:N`/`:N-M` shorthand citations that inherit
+their file from the immediately preceding full `path:line` token, such as
+`:290`/`:285-287`/`:251` in §2 — those were checked by direct read instead,
+individually, as part of this round's line-shift re-derivation above.)
 
 ---
 
@@ -658,9 +744,10 @@ unconditionally via its self dev-dependency, so only the `jammi-db`-alone
 invocation needs the explicit flag both ways); `cargo test -p jammi-db -p
 jammi-ai` (the plain, `test-hooks`-off run: `gang_membership.rs` is
 `#[cfg(feature = "test-hooks")]`-gated at `tests/it/main.rs` and does not
-compile in this pass, same as `materialization_crash_recovery.rs`/
-`mutable_crash_recovery.rs`; `member_root_constructor.rs`'s enumerating
-oracle is unconditional and DOES run here) AND `cargo test -p jammi-db
+compile in this pass, same as
+`materialization_crash_recovery.rs`/`mutable_crash_recovery.rs`;
+`member_root_constructor.rs`'s enumerating oracle is unconditional and DOES
+run here) AND `cargo test -p jammi-db
 --features test-hooks --test it` (the lane `gang_membership.rs` actually
 runs in — `.github/workflows/ci.yml`'s "test-hooks lane" step, on every
 PR) and `cargo test --workspace` (a server-startup-adjacent config change —
@@ -669,7 +756,7 @@ live-postgres lane (`--features live-postgres-tests`, `JAMMI_TEST_PG_URL`
 set) for every `test_case`-parameterized test in
 `crates/jammi-db/tests/it/gang_membership.rs` and
 `crates/jammi-db/tests/it/migrations.rs`'s 035 oracle;
-`python3 ci/scripts/check_doc_parity.py`; `python3 ci/scripts/perf/
-check_citations.py`; `python3 ci/scripts/check_no_consumer_names.py`;
+`python3 ci/scripts/check_doc_parity.py`;
+`python3 ci/scripts/perf/check_citations.py`; `python3 ci/scripts/check_no_consumer_names.py`;
 `python3 ci/scripts/check_swarm_bijection.py`; `RUSTDOCFLAGS="-D warnings"
 cargo doc --no-deps -p jammi-db -p jammi-ai`.

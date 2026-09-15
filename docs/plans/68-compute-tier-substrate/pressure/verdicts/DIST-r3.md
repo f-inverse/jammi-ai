@@ -5,3 +5,14 @@ R10 → the peer RPC is declared in jammi.v1 (PeerService/SegmentSearch): api_fr
 R11 → PRECONDITION stated: N>1 placement requires a shared, replica-readable result_root (object store); with a local artifact_dir the ring is one node (AllLocal). Commit 3's shared local dir is a valid stand-in for "shared readable root". Ladder: per-RPC deadline (from the query timeout; default derived, e.g. min(request budget, 2 s) — state) → one retry at the next rendezvous candidate → local load IF the segment cache budget admits it (restores library parity: a server with locally readable segments answers) → typed UNAVAILABLE naming the segment. JammiError::Unavailable variant + wire arm + doc-parity entry named. Readiness unchanged (catalog ping only; a peer outage must not eject the fleet from the LB) + a jammi_peer_search_failures_total{reason} counter.
 R13 → migration number: the unit-2 migration takes the next free number at its rebase (renumber-on-second-merge rule, same as OPS/GRAPH/DELTA); unit 2 depends on PR-C; `instances.host` stays a label (documented meaning), peer_addr AND result_root are the new columns (shipped as U5b-1a's migration 035 — both nullable, no paired CHECK). peer_advertise = a new knob of a NEW class (membership identity in shared state, not locally detectable) — owned explicitly; shipped rule (`InstanceRegistration::from_config`, not `ServerConfig::validate`, which cannot see `artifact_dir`): peer_advertise ⇒ peer_bind, named-key error otherwise; `storage.result_root` UNSET is accepted and canonicalizes `{artifact_dir}/jammi_db` — never a refusal on that unset case, only on a missing/non-directory anchor.
 Stale sections to rewrite in v2: §5 Flight ticket + owner handler in flight.rs; §6 commit 2 (Flight files/DoGet/do_get_fallback); §5 failure modes; §5 latency; §5 search_unit/merge_units; §6 A2/A3 + invariants "B3 ticket"/"B5 D6"; D7; Q1/Q3/Q4 (decided).
+
+Dated correction (2026-09-15, U5b-1a round-3/round-4 closing audit, contract `feat_500-C-U5b-1a`
+§10): R13's clause above ("`storage.result_root` UNSET is accepted and canonicalizes
+`{artifact_dir}/jammi_db` — never a refusal on that unset case, only on a missing/non-directory
+anchor") did NOT ship as written. What shipped: `storage.result_root` UNSET is accepted and the
+member row carries `{artifact_dir}/jammi_db` VERBATIM (`JammiConfig::resolved_result_root`) — no
+canonicalization step exists on the membership path at all (no filesystem access, no URL parsing,
+no scheme handling, no symlink resolution), so there is no "missing/non-directory anchor" refusal
+either; the only refusal `resolved_result_root` raises is a non-UTF-8 `artifact_dir`. The
+canonicalization design this clause described is EXCISED (contract §10) and filed as its own
+unit, U5b-1a-A2 (`docs/plans/67-distributed-training/README.md`), not shipped by U5b-1a.

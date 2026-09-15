@@ -491,9 +491,11 @@ the port.
 `peer_bind` merely opening the listener: it is the `host:port` OTHER
 replicas dial, and setting it writes this process's `instances.peer_addr`/
 `result_root` columns (requires `peer_bind` to be set too, refused naming
-both keys otherwise). Canonical-root equality between two members is
-NECESSARY, never SUFFICIENT, for shared storage — two byte-identical roots
-on two filesystems are indistinguishable to the membership predicate; the
+both keys otherwise). Membership compares the configured root SPELLING
+byte-for-byte — spell the root IDENTICALLY on every replica; two spellings
+of one location are two roots. That byte-equality is NECESSARY, never
+SUFFICIENT, for shared storage — two byte-identical roots on two
+filesystems are indistinguishable to the membership predicate; the
 attestation VERIFY (a later unit) is what establishes sufficiency. The
 prune window a stale member's row survives before deletion is strictly
 beyond the liveness margin used to judge freshness (`3 × lease` vs. `2 ×

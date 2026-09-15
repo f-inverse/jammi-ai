@@ -318,8 +318,9 @@ for the failure ladder). Three facts fix the shape:
   than the window) rejoins the ring on its very next successful heartbeat,
   with no restart: the keeper's reregister re-upserts the whole membership
   tuple (the `instances` row and, if this process runs a claim loop, its
-  `workers` row) in one transaction. Canonical-root equality between two
-  members is necessary, never sufficient, for shared storage — the
+  `workers` row) in one transaction. Membership compares the configured root
+  SPELLING byte-for-byte — two spellings of one location are two roots — and
+  that equality is necessary, never sufficient, for shared storage — the
   attestation VERIFY a later unit owns is what establishes sufficiency.
 
 **A REFRESHED table's `Mixed` arm is not version-aware.** The single-node

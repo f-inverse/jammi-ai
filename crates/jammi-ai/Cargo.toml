@@ -39,13 +39,16 @@ candle-nn = { workspace = true, optional = true }
 # Optional/`local`-gated for the same reason `candle-core` is: it is only reachable through
 # the embedded engine's candle-backed fine-tune path.
 jammi-kernels = { workspace = true, optional = true }
-# `half::{f16,bf16}` is the `NcclType` this crate's own collective arm
-# (`fine_tune::collective::nccl`) names directly to dispatch its CUDA kernels
-# by dtype — the same crate candle-core itself depends on, but candle-core
-# does not re-export it. Gated on `cuda` alone (not `local`): the only
-# caller is the `#[cfg(feature = "cuda")]` `Nccl` arm, so an unconditional
-# dependency would widen the default build for nothing.
+# `half::{f16,bf16}` is the element type the collective's `Peer` arm
+# (`fine_tune::collective::peer`) reads out of a candle tensor and writes
+# into an Arrow IPC column (and the `NcclType` the CUDA arm dispatches its
+# kernels by) — the same crate candle-core and arrow both depend on (one
+# version in the lock, so the two agree on the type), but neither
+# re-exports it. Rides `local` like the rest of the embedded engine.
 half = { workspace = true, optional = true }
+# `ReceiverStream` — the `Peer` collective's outbound frames are an mpsc the
+# tonic client / server stream is built over (`fine_tune::collective::peer`).
+tokio-stream = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 # `HubSource`'s cache-root fallback (`model/hub.rs`, esc-096): when neither
 # `[models] hub_cache_dir` nor `HF_HOME` is set, the platform home directory
@@ -145,6 +148,15 @@ tracing-subscriber = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The compile-FAIL oracle for the collective's `BlockingCall` witness
+# (`tests/it/blocking_call.rs`): a `Collective` verb reached from a runtime
+# worker thread must not compile, and only `trybuild` can assert a
+# non-compilation.
+trybuild.workspace = true
+# A recording `ObjectStore` wrapper for the rank read-path oracle: proves
+# `verify_partition_leaves` issues one BOUNDED ranged read per leaf and
+# never an unbounded (whole-object) read.
+object_store.workspace = true
 # This crate's own test targets run with `test-hooks` on (the rendezvous
 # inside `jammi_ai::jobs::execute_compute`); a self dev-dependency is how a
 # package turns a feature on for its tests without a `--features` flag on
@@ -210,6 +222,8 @@ local = [
     "dep:prost",
     "dep:sha2",
     "dep:hex",
+    "dep:half",
+    "dep:tokio-stream",
     "jammi-lora/candle",
 ]
 live-hub-tests = []
@@ -300,7 +314,6 @@ cuda = [
     "jammi-encoders/cuda",
     "jammi-lora/cuda",
     "jammi-kernels/cuda",
-    "dep:half",
 ]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
 # Forwards to `jammi-encoders`'s and `jammi-kernels`'s own `flash-attn`

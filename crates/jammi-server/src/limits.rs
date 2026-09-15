@@ -48,13 +48,23 @@
 //!
 //! # N5 — the `message_size` counting rule
 //!
-//! Message-size enforcement is NOT a layer in this module at all: every
-//! mounted service is constructed with tonic's own
-//! `.max_decoding_message_size(limits.max_message_bytes)` (see
-//! `crate::runtime::assemble_grpc_chain`), and tonic's generated codec
-//! itself refuses an inbound message that exceeds that cap — BELOW every
-//! layer in this module, so no application code ever constructs that
-//! specific refusal. Verified against the vendored source
+//! Message-size enforcement is NOT a layer in this module at all: EVERY
+//! service mounted on EVERY listener of this process is constructed with
+//! tonic's own `.max_decoding_message_size(limits.max_message_bytes)` — the
+//! public chain's services in `crate::runtime::assemble_grpc_chain`, and
+//! the internal `peer_bind` listener's `PeerService` and `GangService` in
+//! `crate::runtime::OssServer::bind` — off the ONE `[server.limits]` value,
+//! so the invariant quantifies over listeners, not over the public chain
+//! alone: a message of exactly `max_message_bytes` encoded bytes decodes on
+//! any of them, and one of `max_message_bytes + 1` is refused naming that
+//! configured value on any of them (never tonic's 4 MiB default, which is
+//! what a service mounted without the setter would silently get). The
+//! coordinator side of a gang round applies the same value to its client's
+//! inbound decode (`jammi_ai::fine_tune::collective::CoordinatorLink::over_client`),
+//! the third decode site, so a round's chunks are bounded identically in
+//! both directions. tonic's generated codec itself refuses an inbound
+//! message that exceeds the cap — BELOW every layer in this module, so no
+//! application code ever constructs that specific refusal. Verified against the vendored source
 //! (`tonic-0.14.5/src/codec/decode.rs:185–195`, `Decoder::decode`): that
 //! rejection is `Status::out_of_range` (`OUT_OF_RANGE`, code 11) — NOT
 //! `RESOURCE_EXHAUSTED` as an unverified reading of the wire semantics might

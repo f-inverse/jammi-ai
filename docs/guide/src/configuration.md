@@ -271,8 +271,10 @@ preload_models = [
 # any of these is refused at the edge -- before any tenant-scoped catalog
 # read runs, so a refusal never leaks cross-tenant existence -- with a typed
 # gRPC status and a jammi_grpc_refused_total{reason} counter increment.
-# Maximum inbound message size, in bytes. Must be > 0. Default: 67108864
-# (64 MiB). There is no outbound cap.
+# Maximum inbound message size, in bytes, on EVERY listener: the public
+# chain and the internal `peer_bind` listener (a gang round's chunks are
+# sized to it). Must be > 0. Default: 67108864 (64 MiB). There is no
+# outbound cap.
 max_message_bytes = 67108864
 # Global cap on unary requests in flight across every connection.
 # 0 = unbounded. Default: 256.

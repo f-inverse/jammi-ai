@@ -601,10 +601,24 @@ impl OssServer {
                 {
                     gang_refusal_handle = Some(gang_server.refusal_reason_handle());
                 }
-                let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
-                    Arc::clone(&self.session),
-                )))
-                .add_service(GangServiceServer::new(gang_server));
+                // `[server.limits].max_message_bytes` bounds EVERY listener's
+                // inbound decode, this one included: the same per-service
+                // `max_decoding_message_size` setter `assemble_grpc_chain`
+                // applies to every public service (see `crate::limits`'s N5
+                // rustdoc). Without it tonic's own 4 MiB default would be
+                // this listener's cap regardless of the deployment's setting
+                // — a gang round's chunks are sized to the CONFIGURED value.
+                let max_message_bytes: usize =
+                    usize::try_from(self.session.inner_config().server.limits.max_message_bytes)
+                        .unwrap_or(usize::MAX);
+                let routes = tonic::service::Routes::new(
+                    PeerServiceServer::new(PeerServer::new(Arc::clone(&self.session)))
+                        .max_decoding_message_size(max_message_bytes),
+                )
+                .add_service(
+                    GangServiceServer::new(gang_server)
+                        .max_decoding_message_size(max_message_bytes),
+                );
                 Some((listener, routes, Arc::clone(&self.metrics)))
             }
             None => None,

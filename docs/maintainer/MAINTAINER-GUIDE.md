@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2082`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2100`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -3334,6 +3334,9 @@ listener only (`crates/jammi-server/src/runtime.rs`, `OssServer::bind`) —
 never on the public listener, never wrapped by `TenantResolverLayer`; the
 public listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`
 (`GANG_LISTENER_ALLOWLIST`, `crates/jammi-server/tests/it/tenant_isolation_oracle.rs`).
+Both services on that listener carry the `[server.limits] max_message_bytes`
+inbound decode cap, the same per-service setter the public chain applies
+(§2.8c, "The decode cap on every listener").
 
 **Two observables, split at admission.** BEFORE admission every determinant
 is the call's own result — `Err(Status)`: the ONE fixed `FailedPrecondition`
@@ -3658,6 +3661,154 @@ choke point every writer of them funnels through.
   `(margin, window]`) keeps its row through at least one more sweep, giving
   the keeper's reregister a chance to land before a prune sweep could ever
   reap it.
+
+### 2.8c The `Peer` collective and the round protocol
+
+The cross-process arm of the collective (`crates/jammi-ai/src/fine_tune/collective/peer.rs`,
+`Peer`): rank 0 is the coordinator, in the process that claimed the job;
+every other rank is a member on the far end of one admitted `RunRank`
+stream. It is the fourth `Collective` implementation beside `Noop`, `Local`
+and `Nccl`, selected by configuration like the others; the trainer holds a
+`&dyn Collective` and is never `cfg`-forked.
+
+**The blocking-call witness.** Every `Collective` verb takes a
+`&BlockingCall` (`crates/jammi-ai/src/fine_tune/collective/mod.rs`,
+`BlockingCall`): a thread-bound witness that the caller is on a thread that
+may block — a `spawn_blocking` thread or a plain OS thread, never a runtime
+worker. It has no public constructor; it is minted only inside the closures
+`BlockingCall::spawn_blocking` / `spawn_thread` / `spawn_scoped` run on the
+thread they create, and it is `!Send + !Sync`, so it cannot be carried into
+a `tokio::spawn`ed future or stored where a worker thread could reach it.
+`Peer` is the arm that needs it (its verbs drive stream I/O under
+`Handle::block_on`, a panic on a worker thread); the witness sits on the
+TRAIT, not on `Peer` alone, because the trainer never names `Peer` — a
+guarantee on `Peer`'s inherent methods would be invisible at the one call
+site that matters. `Noop`, `Local` and `Nccl` accept it and ignore it. The
+compile-time claim has an executed oracle: `crates/jammi-ai/tests/it/blocking_call.rs`
+runs `trybuild` over `crates/jammi-ai/tests/ui/` (a verb from a
+`tokio::spawn`ed future — `BlockingCall` is not `Send`; a verb with no
+witness to pass; the private constructor) and `tests/ui_pass/` (the same
+verb from `spawn_blocking` compiles).
+
+**The round descriptor.** `Descriptor` and `TensorSignature` live in
+`crates/jammi-ai/src/fine_tune/collective/mod.rs`, shared by `Local` and
+`Peer`: `round` (the round index, counted from 0 on every rank — `Local`
+stamps it under its rendezvous lock from the shared round's generation,
+`Peer` from each rank's own counter, and the wire carries it), `verb` (the
+closed `Verb` enum), `world`, `root`, `counts`, one signature per tensor
+(the trailing shape only for `all_gather`), and `agreement` — an opaque
+digest the caller binds per rank (`Local::with_agreement`,
+`Peer::with_agreement`; the trainer binds its canonical trainable-variable
+key-name digest, computed on its rank context). `Descriptor::agrees_with` is
+the derived equality — every field is a determinant, and the per-field
+mutation sweep in `local.rs` destructures the struct with no `..`, so a
+field added without an arm there fails to compile. A disagreement on any
+field is a typed refusal naming BOTH descriptors on EVERY rank: on `Local`
+before the rendezvous publishes, on `Peer` before the coordinator folds.
+
+**The wire.** `crates/jammi-wire/proto/jammi/v1/gang.proto`, additive
+arms on the frozen frames: `RankControl` (coordinator → member) gains
+`round_result`, `round_chunk`, `round_commit`, `round_fault`; `RankEvent`
+(member → coordinator) gains `round_contribution`, `round_chunk`,
+`round_ack`, `round_fault`. `RoundDescriptor` mirrors the Rust descriptor
+(`round`, the closed `RoundVerb` enum, `world`, `optional root`, a wrapped
+`Counts` message so absent and all-zero differ, `TensorSignature { dims,
+ElementType }`, `optional agreement`). `ElementType` is `F32`/`F16`/`BF16`;
+`RoundVerb`'s `UNSPECIFIED` and every value outside the set are refused
+naming both sides, never defaulted. Every numeric field is range-checked by
+its reader before use (K2: `world`, `root < world`, every count and dim as a
+`usize` with an overflow-checked element product, `chunk_count`, `index <
+chunk_count`, the reassembled byte length against the bound the descriptor
+implies). Nothing declared before is renamed or removed; the api-freeze
+guard decodes only `PACKAGE`/`RPC` tokens, and `api_freeze_baseline.txt` is
+unchanged (`crates/jammi-server/tests/it/api_freeze.rs`).
+
+**Rank-ordered coordinator-reduce.** Every member sends its contribution —
+its descriptor and its tensors as Arrow IPC (one length-prefixed IPC stream
+per tensor: f32 as a `Float32` column, f16 as `Float16`, bf16 as its
+`UInt16` bit pattern, exact; every other candle dtype is refused at the seam
+before a descriptor exists) — to the coordinator, which folds in RANK ORDER
+on its own device with the same operation sequence `Local` runs on rank 0's
+device (`Tensor::cat` of the slices, a left fold of `acc.add(term)`, `max`,
+the root's tensor), so the two arms are byte-identical over the same inputs
+(`fine_tune::collective::peer_tests::peer_fold_over_the_wire_equals_local_fold_byte_for_byte_at_f32_f16_bf16`,
+and over a real loopback stream
+`crates/jammi-ai/tests/it/peer_gang.rs`). A payload larger than
+`[server.limits] max_message_bytes` travels as `RoundChunk`s of at most
+`max_message_bytes − 64` bytes each and is reassembled against the byte
+bound the agreed descriptor implies; a peer announcing more is refused
+before the bytes are buffered.
+
+**The two-phase round.** A round `k` on a member: send the contribution;
+wait for the result; decode and HOLD it unapplied; send `RoundAck`; wait for
+`RoundCommit`; apply. On the coordinator: collect every member's
+contribution; refuse the round on every rank unless every descriptor
+equals rank 0's; fold; publish; wait for every member's ACK; send
+`RoundCommit` to every member; apply. A fault before the coordinator has
+observed the last ACK — a disconnect, a `RoundFault` from any rank, the
+gang deadline — leaves NO rank applied for `k`, and every rank's error
+names `k`. A fault DURING the commit fan-out is fatal on every rank too:
+the coordinator applies nothing, faults every member and refuses every
+later round; a member whose stream ended between its ACK and the commit
+applied nothing; a member the commit did reach applied `k` and returned
+`Ok` — that cannot be retracted — but its next contribution is answered by
+the coordinator's fault, so no rank ever continues past a round every rank
+did not apply. That one residual state is stated rather than inherited from
+the shared-memory arm's publish-then-fault. Every wait on every rank
+expires at the gang deadline (`Peer::with_timeout`, the same bound as the
+in-process rendezvous) with an error naming the round and what it waited
+for; a rank that refuses its own arguments faults its peers with a
+`RoundFault` before returning, so no peer waits out the deadline for a
+contribution that was never coming; a fault is permanent — every later verb
+on the faulted rank refuses quoting it, exactly as `Local` does.
+
+**Links and the server seam.** `Peer` never opens a stream. A `MemberLink`
+is the member's end of one admitted stream, a `CoordinatorLink` the
+coordinator's; both are built over channels
+(`MemberLink::from_channels`, `CoordinatorLink::from_channels`), which is
+what the hermetic oracles drive a whole gang through in one process, and
+`CoordinatorLink::over_client(channel, assign, max_message_bytes)` opens
+`RunRank` on a member, sends the `Assign`, requires `Admitted`, and caps
+the client's OWN inbound decode at the same `max_message_bytes` (tonic's
+default would otherwise cap that side at 4 MiB regardless of the
+deployment). In `jammi-server` the seam is
+`crates/jammi-server/src/grpc/gang_rounds.rs`: `member_link(events)` builds
+the member's link over an admitted session's own outbound event sender and
+returns the `RoundInbox` the session's hold loop delivers round frames to
+(`RoundInbox::is_round_frame`, `RoundInbox::deliver`, `RoundInbox::fail` for
+a transport error the loop read); `dial_member(addr, assign,
+max_message_bytes)` is the coordinator's dial over a `PeerAddr`. The hold
+loop itself — admission, the holder CAS, the `select!` whose inbound arm
+calls `deliver` — is `GangServer::run_rank`'s admitted-session machinery
+(§2.8a); `crates/jammi-server/tests/it/gang_rounds.rs` drives one real
+round through a hold-loop-shaped handler, the inbox and `dial_member`.
+
+**The decode cap on every listener.** `[server.limits] max_message_bytes`
+bounds every listener's inbound decode: the public chain's services in
+`assemble_grpc_chain` and the `peer_bind` listener's `PeerService` and
+`GangService` in `OssServer::bind` (`crates/jammi-server/src/runtime.rs`)
+carry the same per-service `max_decoding_message_size`, and the
+coordinator's client is the third site. Stated in `encoded_len()` terms and
+pinned (`crates/jammi-server/tests/it/gang_rounds.rs`): a frame of exactly
+`max_message_bytes` encoded bytes decodes on every listener and both
+peer-listener services, so does `n − 1`, and `n + 1` is refused
+`OUT_OF_RANGE` naming the configured value. `crates/jammi-server/src/limits.rs`'s
+N5 rustdoc quantifies the invariant over listeners.
+
+**The rank's read path.** Before its first collective a rank verifies the
+row groups of its partition against the attestation's leaf inventory
+(§2.6b's `LeafDigest`s): `verify_partition_leaves(handle, leaves)`
+(`crates/jammi-ai/src/fine_tune/collective/peer.rs`) reads one leaf at a
+time through `JammiObjectStore::get_range`
+(`crates/jammi-db/src/storage/object_store_handle.rs`) — memory is bounded
+by the largest row group, never the artifact — and `verify_leaves` is the
+same check over any ranged reader. A failure is
+`RankReadFault::StoreUnavailable`, MEMBER-scoped by construction (the enum
+has no assembly-scoped arm), named by the leaf, mapped to the wire's
+`ABORT_REASON_STORE_UNAVAILABLE` by `RankReadFault::abort_reason` — never
+counted against the assembly's attempt budget. The coordinator, on a
+member's `Aborted` before any contribution, faults the round naming the
+reason and folds nothing.
 
 ### 2.9 Numerics (`jammi-numerics`)
 

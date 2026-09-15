@@ -136,6 +136,23 @@ impl JammiObjectStore {
         Ok(())
     }
 
+    /// Read exactly `range` of `path` — one keyed part of an object (a
+    /// Parquet row group's byte range, as the attestation's leaf inventory
+    /// names it), never the whole object. The per-partition verify a gang
+    /// rank runs before its first collective reads one leaf at a time
+    /// through this, so its memory is bounded by the largest leaf, not the
+    /// artifact.
+    pub async fn get_range(
+        &self,
+        path: &ObjectPath,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, StorageError> {
+        self.driver
+            .get_range(path, range)
+            .await
+            .map_err(|e| StorageError::io(path.to_string(), e))
+    }
+
     /// Convenience: read `path` fully into memory.
     pub async fn get_bytes(&self, path: &ObjectPath) -> Result<Bytes, StorageError> {
         let result = self

@@ -10,7 +10,19 @@ use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, Tensor};
 
-use super::{Collective, Local, LocalGang, Noop};
+use super::{BlockingCall, Collective, Local, LocalGang, Noop};
+
+/// Run `f` on a fresh OS thread with a [`BlockingCall`] witness and join it:
+/// the test's own thread is a runtime-free OS thread too, but the witness
+/// has no constructor outside the three minting sites, so a test body that
+/// calls a verb directly routes through one of them.
+pub(super) fn witness<T: Send>(f: impl FnOnce(BlockingCall) -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        BlockingCall::spawn_scoped(scope, f)
+            .join()
+            .expect("witness thread")
+    })
+}
 
 /// The exact bits of a tensor's f32 elements, in memory order.
 ///
@@ -38,7 +50,7 @@ fn matrix(rows: usize, cols: usize, base: f32) -> Tensor {
 fn run_gang<T, F>(world: usize, body: F) -> Vec<T>
 where
     T: Send + 'static,
-    F: Fn(Local) -> T + Send + Sync + 'static,
+    F: Fn(Local, BlockingCall) -> T + Send + Sync + 'static,
 {
     let gang =
         LocalGang::with_timeout(vec![Device::Cpu; world], Duration::from_secs(30)).expect("gang");
@@ -47,7 +59,7 @@ where
         .map(|rank| {
             let local = gang.rank(rank).expect("rank handle");
             let body = Arc::clone(&body);
-            std::thread::spawn(move || body(local))
+            BlockingCall::spawn_thread(move |call| body(local, call))
         })
         .collect();
     handles
@@ -67,11 +79,11 @@ fn local_all_gather_at_equal_counts_is_the_rank_ordered_concatenation() {
 
     let per_rank = {
         let slices = slices.clone();
-        run_gang(2, move |local| {
+        run_gang(2, move |local, call| {
             let rank = local.rank() as usize;
             bits(
                 &local
-                    .all_gather(&slices[rank], &[2, 2])
+                    .all_gather(&call, &slices[rank], &[2, 2])
                     .expect("all_gather"),
             )
         })
@@ -98,10 +110,10 @@ fn local_all_gather_at_unequal_counts_including_a_zero_row_rank() {
 
     let per_rank = {
         let slices = slices.clone();
-        run_gang(3, move |local| {
+        run_gang(3, move |local, call| {
             let rank = local.rank() as usize;
             let gathered = local
-                .all_gather(&slices[rank], &counts)
+                .all_gather(&call, &slices[rank], &counts)
                 .expect("all_gather");
             (gathered.dims().to_vec(), bits(&gathered))
         })
@@ -123,9 +135,9 @@ fn local_all_gather_at_unequal_counts_including_a_zero_row_rank() {
 /// determinants (this rank's own count, a peer's) each raise their own error.
 #[test]
 fn local_all_gather_refuses_counts_that_contradict_the_ranks() {
-    let wrong_length = run_gang(2, move |local| {
+    let wrong_length = run_gang(2, move |local, call| {
         local
-            .all_gather(&matrix(1, 2, 0.0), &[1])
+            .all_gather(&call, &matrix(1, 2, 0.0), &[1])
             .expect_err("a one-entry count vector cannot describe a two-rank gang")
             .to_string()
     });
@@ -138,9 +150,9 @@ fn local_all_gather_refuses_counts_that_contradict_the_ranks() {
 
     // Determinant 2: this rank's OWN count contradicts the tensor it holds.
     // Checked before the rendezvous, so it needs no peer.
-    let own_count = run_gang(1, move |local| {
+    let own_count = run_gang(1, move |local, call| {
         local
-            .all_gather(&matrix(1, 2, 0.0), &[2])
+            .all_gather(&call, &matrix(1, 2, 0.0), &[2])
             .expect_err("a rank that holds one row cannot claim two")
             .to_string()
     });
@@ -154,14 +166,14 @@ fn local_all_gather_refuses_counts_that_contradict_the_ranks() {
     // self-consistent, so only the round descriptor's `counts` field catches
     // it — and it catches it on BOTH ranks, symmetrically, before either is
     // handed a result.
-    let disagreeing = run_gang(2, move |local| {
+    let disagreeing = run_gang(2, move |local, call| {
         let (rows, counts) = if local.rank() == 0 {
             (1usize, [1usize, 1])
         } else {
             (2, [1, 2])
         };
         local
-            .all_gather(&matrix(rows, 2, 0.0), &counts)
+            .all_gather(&call, &matrix(rows, 2, 0.0), &counts)
             .map(|_| String::new())
             .unwrap_or_else(|e| e.to_string())
     });
@@ -190,13 +202,15 @@ fn local_all_reduce_sum_folds_in_rank_order() {
         "the control: these terms must be order-sensitive, or the oracle below is vacuous"
     );
 
-    let per_rank = run_gang(3, move |local| {
+    let per_rank = run_gang(3, move |local, call| {
         let rank = local.rank() as usize;
         let mut tensors = vec![
             Tensor::from_vec(vec![terms[rank]], 1, &Device::Cpu).expect("tensor"),
             Tensor::from_vec(vec![terms[rank] * 2.0], 1, &Device::Cpu).expect("tensor"),
         ];
-        local.all_reduce_sum(&mut tensors).expect("all_reduce_sum");
+        local
+            .all_reduce_sum(&call, &mut tensors)
+            .expect("all_reduce_sum");
         tensors.iter().map(bits).collect::<Vec<_>>()
     });
 
@@ -221,13 +235,15 @@ fn local_all_reduce_sum_folds_in_rank_order() {
 #[test]
 fn local_collectives_are_deterministic_across_two_runs() {
     let once = || {
-        run_gang(3, move |local| {
+        run_gang(3, move |local, call| {
             let rank = local.rank() as usize;
             let gathered = local
-                .all_gather(&matrix(rank + 1, 2, rank as f32 * 10.0), &[1, 2, 3])
+                .all_gather(&call, &matrix(rank + 1, 2, rank as f32 * 10.0), &[1, 2, 3])
                 .expect("all_gather");
             let mut tensors = vec![matrix(2, 2, rank as f32 * 0.3)];
-            local.all_reduce_sum(&mut tensors).expect("all_reduce_sum");
+            local
+                .all_reduce_sum(&call, &mut tensors)
+                .expect("all_reduce_sum");
             (bits(&gathered), bits(&tensors[0]))
         })
     };
@@ -242,29 +258,29 @@ fn local_collectives_are_deterministic_across_two_runs() {
 /// seen by all, and every rank leaves the broadcast holding the root's bytes.
 #[test]
 fn local_flags_and_broadcast_agree_on_every_rank() {
-    let flags = run_gang(3, move |local| {
+    let flags = run_gang(3, move |local, call| {
         // Only rank 2 sees the divergence.
         let mine = if local.rank() == 2 { 0b100 } else { 0 };
-        local.all_reduce_max_flags(mine).expect("flags")
+        local.all_reduce_max_flags(&call, mine).expect("flags")
     });
     assert_eq!(flags, vec![0b100, 0b100, 0b100]);
 
     // Rank 0 broadcasts its own tensor, which the closure below builds as
     // `matrix(2, 2, 0.0)` — the reference is that tensor, not another one.
     let root_bits = bits(&matrix(2, 2, 0.0));
-    let broadcast = run_gang(3, move |local| {
+    let broadcast = run_gang(3, move |local, call| {
         let mut t = matrix(2, 2, local.rank() as f32 * 1000.0);
-        local.broadcast(&mut t, 0).expect("broadcast");
+        local.broadcast(&call, &mut t, 0).expect("broadcast");
         bits(&t)
     });
     for (rank, got) in broadcast.iter().enumerate() {
         assert_eq!(got, &root_bits, "rank {rank} must hold rank 0's bytes");
     }
 
-    let bad_root = run_gang(2, move |local| {
+    let bad_root = run_gang(2, move |local, call| {
         let mut t = matrix(1, 1, 0.0);
         local
-            .broadcast(&mut t, 5)
+            .broadcast(&call, &mut t, 5)
             .expect_err("a root outside the gang is refused")
             .to_string()
     });
@@ -285,12 +301,12 @@ fn local_barrier_releases_only_after_every_rank_arrives() {
     let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = {
         let arrived = Arc::clone(&arrived);
-        run_gang(4, move |local| {
+        run_gang(4, move |local, call| {
             // Stagger the arrivals so a barrier that released early would
             // almost certainly observe a count below four.
             std::thread::sleep(Duration::from_millis(10 * local.rank() as u64));
             arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            local.barrier().expect("barrier");
+            local.barrier(&call).expect("barrier");
             arrived.load(std::sync::atomic::Ordering::SeqCst)
         })
     };
@@ -307,15 +323,15 @@ fn local_barrier_releases_only_after_every_rank_arrives() {
 /// gather paired with a reduce and handed back as a meaningless result.
 #[test]
 fn local_refuses_a_round_whose_ranks_are_at_different_collectives() {
-    let messages = run_gang(2, move |local| {
+    let messages = run_gang(2, move |local, call| {
         if local.rank() == 0 {
             local
-                .all_reduce_max_flags(1)
+                .all_reduce_max_flags(&call, 1)
                 .map(|_| String::new())
                 .unwrap_or_else(|e| e.to_string())
         } else {
             local
-                .barrier()
+                .barrier(&call)
                 .map(|_| String::new())
                 .unwrap_or_else(|e| e.to_string())
         }
@@ -333,16 +349,18 @@ fn local_refuses_a_round_whose_ranks_are_at_different_collectives() {
 /// wedging its peers with no statement of what they are waiting for.
 #[test]
 fn local_rendezvous_expires_rather_than_parking_forever() {
-    let gang =
-        LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let error = rank0
-        .barrier()
-        .expect_err("rank 1 never arrives, so the round must expire");
-    assert!(
-        error.to_string().contains("timed out"),
-        "unexpected message: {error}"
-    );
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let error = rank0
+            .barrier(&call)
+            .expect_err("rank 1 never arrives, so the round must expire");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected message: {error}"
+        );
+    });
 }
 
 /// A gang needs at least one rank and a non-zero deadline: both are domain
@@ -363,43 +381,49 @@ fn local_gang_refuses_an_empty_device_list_and_a_zero_deadline() {
 /// gang shape it reports is the single rank.
 #[test]
 fn noop_is_the_identity_at_a_single_rank() {
-    let noop = Noop::new();
-    assert_eq!(noop.rank(), 0);
-    assert_eq!(noop.world(), 1);
+    witness(|call| {
+        let noop = Noop::new();
+        assert_eq!(noop.rank(), 0);
+        assert_eq!(noop.world(), 1);
 
-    let local = matrix(3, 4, 1.5);
-    let gathered = noop.all_gather(&local, &[3]).expect("all_gather");
-    assert_eq!(gathered.dims(), local.dims());
-    assert_eq!(bits(&gathered), bits(&local), "the gather is the input");
+        let local = matrix(3, 4, 1.5);
+        let gathered = noop.all_gather(&call, &local, &[3]).expect("all_gather");
+        assert_eq!(gathered.dims(), local.dims());
+        assert_eq!(bits(&gathered), bits(&local), "the gather is the input");
 
-    let before: Vec<Vec<u32>> = [matrix(2, 2, 3.0), matrix(1, 5, -2.0)]
-        .iter()
-        .map(bits)
-        .collect();
-    let mut tensors = vec![matrix(2, 2, 3.0), matrix(1, 5, -2.0)];
-    noop.all_reduce_sum(&mut tensors).expect("all_reduce_sum");
-    let after: Vec<Vec<u32>> = tensors.iter().map(bits).collect();
-    assert_eq!(after, before, "the reduce leaves every tensor untouched");
+        let before: Vec<Vec<u32>> = [matrix(2, 2, 3.0), matrix(1, 5, -2.0)]
+            .iter()
+            .map(bits)
+            .collect();
+        let mut tensors = vec![matrix(2, 2, 3.0), matrix(1, 5, -2.0)];
+        noop.all_reduce_sum(&call, &mut tensors)
+            .expect("all_reduce_sum");
+        let after: Vec<Vec<u32>> = tensors.iter().map(bits).collect();
+        assert_eq!(after, before, "the reduce leaves every tensor untouched");
 
-    for flags in [0u32, 1, 0xFFFF_FFFF] {
-        assert_eq!(noop.all_reduce_max_flags(flags).expect("flags"), flags);
-    }
+        for flags in [0u32, 1, 0xFFFF_FFFF] {
+            assert_eq!(
+                noop.all_reduce_max_flags(&call, flags).expect("flags"),
+                flags
+            );
+        }
 
-    let mut t = matrix(2, 3, 8.25);
-    let untouched = bits(&t);
-    noop.broadcast(&mut t, 0).expect("broadcast");
-    assert_eq!(bits(&t), untouched, "the broadcast leaves the tensor alone");
+        let mut t = matrix(2, 3, 8.25);
+        let untouched = bits(&t);
+        noop.broadcast(&call, &mut t, 0).expect("broadcast");
+        assert_eq!(bits(&t), untouched, "the broadcast leaves the tensor alone");
 
-    noop.barrier().expect("barrier");
+        noop.barrier(&call).expect("barrier");
 
-    // The single-rank topology does not excuse the domain checks: a partition
-    // rule that would be wrong at `world > 1` is wrong here too.
-    noop.all_gather(&matrix(3, 4, 0.0), &[3, 3])
-        .expect_err("a two-entry count vector cannot describe a gang of one");
-    noop.all_gather(&matrix(3, 4, 0.0), &[2])
-        .expect_err("a count that contradicts the local row count is refused");
-    noop.broadcast(&mut matrix(1, 1, 0.0), 1)
-        .expect_err("rank 1 is not a rank of a gang of one");
+        // The single-rank topology does not excuse the domain checks: a partition
+        // rule that would be wrong at `world > 1` is wrong here too.
+        noop.all_gather(&call, &matrix(3, 4, 0.0), &[3, 3])
+            .expect_err("a two-entry count vector cannot describe a gang of one");
+        noop.all_gather(&call, &matrix(3, 4, 0.0), &[2])
+            .expect_err("a count that contradicts the local row count is refused");
+        noop.broadcast(&call, &mut matrix(1, 1, 0.0), 1)
+            .expect_err("rank 1 is not a rank of a gang of one");
+    });
 }
 
 /// A single-rank [`Local`] gang and a [`Noop`] agree bit-for-bit — the
@@ -408,23 +432,26 @@ fn noop_is_the_identity_at_a_single_rank() {
 /// baseline for the multi-rank arms.
 #[test]
 fn a_single_rank_local_gang_matches_noop_bit_for_bit() {
-    let input = matrix(3, 2, 4.0);
-    let noop = Noop::new();
-    let noop_gathered = bits(&noop.all_gather(&input, &[3]).expect("all_gather"));
-    let mut noop_tensors = vec![matrix(2, 2, 1.0)];
-    noop.all_reduce_sum(&mut noop_tensors).expect("reduce");
+    witness(|call| {
+        let input = matrix(3, 2, 4.0);
+        let noop = Noop::new();
+        let noop_gathered = bits(&noop.all_gather(&call, &input, &[3]).expect("all_gather"));
+        let mut noop_tensors = vec![matrix(2, 2, 1.0)];
+        noop.all_reduce_sum(&call, &mut noop_tensors)
+            .expect("reduce");
 
-    let per_rank = run_gang(1, move |local| {
-        let gathered = local
-            .all_gather(&matrix(3, 2, 4.0), &[3])
-            .expect("all_gather");
-        let mut tensors = vec![matrix(2, 2, 1.0)];
-        local.all_reduce_sum(&mut tensors).expect("reduce");
-        (bits(&gathered), bits(&tensors[0]))
+        let per_rank = run_gang(1, move |local, call| {
+            let gathered = local
+                .all_gather(&call, &matrix(3, 2, 4.0), &[3])
+                .expect("all_gather");
+            let mut tensors = vec![matrix(2, 2, 1.0)];
+            local.all_reduce_sum(&call, &mut tensors).expect("reduce");
+            (bits(&gathered), bits(&tensors[0]))
+        });
+
+        assert_eq!(per_rank[0].0, noop_gathered);
+        assert_eq!(per_rank[0].1, bits(&noop_tensors[0]));
     });
-
-    assert_eq!(per_rank[0].0, noop_gathered);
-    assert_eq!(per_rank[0].1, bits(&noop_tensors[0]));
 }
 
 /// A gathered remote slot carries no gradient back to the peer that produced
@@ -432,13 +459,13 @@ fn a_single_rank_local_gang_matches_noop_bit_for_bit() {
 /// gradient of a trainable parameter would be `world` times too large.
 #[test]
 fn local_all_gather_keeps_only_the_local_slot_attached() {
-    let per_rank = run_gang(2, move |local| {
+    let per_rank = run_gang(2, move |local, call| {
         let rank = local.rank();
         // A trainable var per rank, so a gradient that crossed to the peer
         // would show up as a gradient for a var this rank never touched.
         let var = candle_core::Var::from_tensor(&matrix(1, 2, rank as f32 + 1.0)).expect("var");
         let mine = var.as_tensor().affine(2.0, 0.0).expect("affine");
-        let gathered = local.all_gather(&mine, &[1, 1]).expect("all_gather");
+        let gathered = local.all_gather(&call, &mine, &[1, 1]).expect("all_gather");
         let loss = gathered.sum_all().expect("sum");
         let grads = loss.backward().expect("backward");
         // Exactly one variable has a gradient here: this rank's own.
@@ -461,7 +488,7 @@ fn local_all_gather_keeps_only_the_local_slot_attached() {
 /// f32-only seam, and a bf16 adapter gradient reduces the same way.
 #[test]
 fn local_reduces_a_non_f32_dtype() {
-    let per_rank = run_gang(2, move |local| {
+    let per_rank = run_gang(2, move |local, call| {
         let rank = local.rank();
         let mut tensors = vec![
             Tensor::from_vec(vec![1u32 + rank, 10 + rank], 2, &Device::Cpu)
@@ -469,7 +496,7 @@ fn local_reduces_a_non_f32_dtype() {
                 .to_dtype(DType::U32)
                 .expect("dtype"),
         ];
-        local.all_reduce_sum(&mut tensors).expect("reduce");
+        local.all_reduce_sum(&call, &mut tensors).expect("reduce");
         tensors[0].to_vec1::<u32>().expect("u32 elements")
     });
     for got in &per_rank {
@@ -490,34 +517,36 @@ fn local_reduces_a_non_f32_dtype() {
 /// has failed, and told which collective it failed in.
 #[test]
 fn a_late_peer_cannot_complete_a_round_that_already_timed_out() {
-    let gang =
-        LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    // Rank 0 sets a control word its peer would see, and expires waiting.
-    let expired = rank0
-        .all_reduce_max_flags(0b1011)
-        .expect_err("rank 1 never arrives inside the deadline");
-    assert!(
-        expired.to_string().contains("timed out"),
-        "unexpected message: {expired}"
-    );
+        // Rank 0 sets a control word its peer would see, and expires waiting.
+        let expired = rank0
+            .all_reduce_max_flags(&call, 0b1011)
+            .expect_err("rank 1 never arrives inside the deadline");
+        assert!(
+            expired.to_string().contains("timed out"),
+            "unexpected message: {expired}"
+        );
 
-    // Rank 1 arrives after the deadline. `Ok(0b1011)` here would be rank 0's
-    // stale flags — a decision rank 0 is not making.
-    let late = rank1
-        .all_reduce_max_flags(0)
-        .expect_err("the round rank 1 would complete has already failed");
-    let message = late.to_string();
-    assert!(
-        message.contains("the gang has already failed"),
-        "the late peer must be told the gang failed, not handed a result: {message}"
-    );
-    assert!(
-        message.contains("all_reduce_max_flags") && message.contains("timed out"),
-        "the fault names the round it failed in: {message}"
-    );
+        // Rank 1 arrives after the deadline. `Ok(0b1011)` here would be rank 0's
+        // stale flags — a decision rank 0 is not making.
+        let late = rank1
+            .all_reduce_max_flags(&call, 0)
+            .expect_err("the round rank 1 would complete has already failed");
+        let message = late.to_string();
+        assert!(
+            message.contains("the gang has already failed"),
+            "the late peer must be told the gang failed, not handed a result: {message}"
+        );
+        assert!(
+            message.contains("all_reduce_max_flags") && message.contains("timed out"),
+            "the fault names the round it failed in: {message}"
+        );
+    });
 }
 
 /// Once a gang has faulted, EVERY collective on EVERY rank refuses — promptly
@@ -528,60 +557,65 @@ fn a_late_peer_cannot_complete_a_round_that_already_timed_out() {
 /// would put the sweep over the bound on its own.
 #[test]
 fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
-    let deadline = Duration::from_secs(2);
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], deadline).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let deadline = Duration::from_secs(2);
+        let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], deadline).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    // Fault the gang through the lockstep check rather than the deadline, so
-    // the deadline below is free to be long enough for a park to be visible.
-    let mismatched = std::thread::scope(|scope| {
-        let zero = scope.spawn(|| rank0.all_reduce_max_flags(1).map(|_| ()));
-        let one = scope.spawn(|| rank1.barrier());
-        [
-            zero.join().expect("rank 0 thread"),
-            one.join().expect("rank 1 thread"),
-        ]
-    });
-    assert!(
-        mismatched.iter().any(|r| r.as_ref().err().is_some_and(|e| e
-            .to_string()
-            .contains("disagree about what this round computes"))),
-        "the control: the gang must actually be faulted here, or the sweep below is vacuous"
-    );
+        // Fault the gang through the lockstep check rather than the deadline, so
+        // the deadline below is free to be long enough for a park to be visible.
+        let mismatched = std::thread::scope(|scope| {
+            let zero = BlockingCall::spawn_scoped(scope, |call| {
+                rank0.all_reduce_max_flags(&call, 1).map(|_| ())
+            });
+            let one = BlockingCall::spawn_scoped(scope, |call| rank1.barrier(&call));
+            [
+                zero.join().expect("rank 0 thread"),
+                one.join().expect("rank 1 thread"),
+            ]
+        });
+        assert!(
+            mismatched.iter().any(|r| r.as_ref().err().is_some_and(|e| e
+                .to_string()
+                .contains("disagree about what this round computes"))),
+            "the control: the gang must actually be faulted here, or the sweep below is vacuous"
+        );
 
-    let started = std::time::Instant::now();
-    for (who, rank) in [("rank 0", &rank0), ("rank 1", &rank1)] {
-        let mut sum = vec![matrix(1, 1, 0.0)];
-        let mut broadcast = matrix(1, 1, 0.0);
-        let attempts: [(&str, jammi_db::error::Result<()>); 5] = [
-            (
-                "all_gather",
-                rank.all_gather(&matrix(1, 2, 0.0), &[1, 1]).map(|_| ()),
-            ),
-            ("all_reduce_sum", rank.all_reduce_sum(&mut sum)),
-            (
-                "all_reduce_max_flags",
-                rank.all_reduce_max_flags(0).map(|_| ()),
-            ),
-            ("broadcast", rank.broadcast(&mut broadcast, 0)),
-            ("barrier", rank.barrier()),
-        ];
-        for (op, result) in attempts {
-            let error = result.expect_err(&format!(
-                "{who}'s {op} ran on a gang that has already failed"
-            ));
-            assert!(
-                error.to_string().contains("the gang has already failed"),
-                "{who}'s {op}: unexpected message: {error}"
-            );
+        let started = std::time::Instant::now();
+        for (who, rank) in [("rank 0", &rank0), ("rank 1", &rank1)] {
+            let mut sum = vec![matrix(1, 1, 0.0)];
+            let mut broadcast = matrix(1, 1, 0.0);
+            let attempts: [(&str, jammi_db::error::Result<()>); 5] = [
+                (
+                    "all_gather",
+                    rank.all_gather(&call, &matrix(1, 2, 0.0), &[1, 1])
+                        .map(|_| ()),
+                ),
+                ("all_reduce_sum", rank.all_reduce_sum(&call, &mut sum)),
+                (
+                    "all_reduce_max_flags",
+                    rank.all_reduce_max_flags(&call, 0).map(|_| ()),
+                ),
+                ("broadcast", rank.broadcast(&call, &mut broadcast, 0)),
+                ("barrier", rank.barrier(&call)),
+            ];
+            for (op, result) in attempts {
+                let error = result.expect_err(&format!(
+                    "{who}'s {op} ran on a gang that has already failed"
+                ));
+                assert!(
+                    error.to_string().contains("the gang has already failed"),
+                    "{who}'s {op}: unexpected message: {error}"
+                );
+            }
         }
-    }
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < deadline,
-        "the ten refusals took {elapsed:?}: at least one parked instead of refusing"
-    );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < deadline,
+            "the ten refusals took {elapsed:?}: at least one parked instead of refusing"
+        );
+    });
 }
 
 // ── The round descriptor: no rank returns `Ok` from a round any rank rejects ─
@@ -596,11 +630,11 @@ fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
 /// both ranks instead.
 #[test]
 fn broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
-    let results: Vec<std::result::Result<Vec<u32>, String>> = run_gang(2, move |local| {
+    let results: Vec<std::result::Result<Vec<u32>, String>> = run_gang(2, move |local, call| {
         let mut t = matrix(1, 1, local.rank() as f32 + 1.0);
         let root = local.rank(); // each rank names ITSELF the root
         local
-            .broadcast(&mut t, root)
+            .broadcast(&call, &mut t, root)
             .map(|_| bits(&t))
             .map_err(|e| e.to_string())
     });
@@ -630,14 +664,14 @@ fn broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
 /// publishing, both ranks are refused.
 #[test]
 fn all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
-    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
+    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local, call| {
         let (rows, counts) = if local.rank() == 0 {
             (1usize, [1usize, 1])
         } else {
             (2usize, [1usize, 2])
         };
         local
-            .all_gather(&matrix(rows, 2, 0.0), &counts)
+            .all_gather(&call, &matrix(rows, 2, 0.0), &counts)
             .map(|t| t.dims().to_vec())
             .map_err(|e| e.to_string())
     });
@@ -667,32 +701,34 @@ fn all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
 #[test]
 fn a_pre_rendezvous_domain_refusal_on_one_rank_faults_the_gang_before_its_peer_waits_out_the_deadline(
 ) {
-    let deadline = Duration::from_secs(4);
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], deadline).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let deadline = Duration::from_secs(4);
+        let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], deadline).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    // Rank 0's own domain check fails before it ever deposits into a round:
-    // a one-entry counts vector cannot describe a two-rank gang.
-    rank0
-        .all_gather(&matrix(1, 2, 0.0), &[1])
-        .expect_err("rank 0's own counts cannot describe this gang");
+        // Rank 0's own domain check fails before it ever deposits into a round:
+        // a one-entry counts vector cannot describe a two-rank gang.
+        rank0
+            .all_gather(&call, &matrix(1, 2, 0.0), &[1])
+            .expect_err("rank 0's own counts cannot describe this gang");
 
-    let started = Instant::now();
-    let peer = rank1
-        .barrier()
-        .expect_err("the gang is already faulted by rank 0's domain refusal");
-    let elapsed = started.elapsed();
-    assert!(
-        peer.to_string().contains("the gang has already failed"),
-        "rank 1 must be told the gang already failed, not handed a fresh timeout: {peer}"
-    );
-    assert!(
-        elapsed < deadline / 4,
-        "rank 1 waited {elapsed:?} for a fault that had already happened when it called \
-         barrier — a pre-rendezvous domain refusal on one rank must fault the gang promptly, \
-         not leave the peer to discover it only after its own deadline"
-    );
+        let started = Instant::now();
+        let peer = rank1
+            .barrier(&call)
+            .expect_err("the gang is already faulted by rank 0's domain refusal");
+        let elapsed = started.elapsed();
+        assert!(
+            peer.to_string().contains("the gang has already failed"),
+            "rank 1 must be told the gang already failed, not handed a fresh timeout: {peer}"
+        );
+        assert!(
+            elapsed < deadline / 4,
+            "rank 1 waited {elapsed:?} for a fault that had already happened when it called \
+             barrier — a pre-rendezvous domain refusal on one rank must fault the gang promptly, \
+             not leave the peer to discover it only after its own deadline"
+        );
+    });
 }
 
 /// `Shared::check_entry` runs BEFORE a collective's own domain checks: on a
@@ -703,32 +739,34 @@ fn a_pre_rendezvous_domain_refusal_on_one_rank_faults_the_gang_before_its_peer_w
 /// `Ok(())` unconditionally: the counts error would surface instead.
 #[test]
 fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
-    let gang =
-        LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_millis(50)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    // Fault the gang via a timeout: rank 1 never arrives.
-    rank0
-        .barrier()
-        .expect_err("rank 1 never arrives inside the deadline");
+        // Fault the gang via a timeout: rank 1 never arrives.
+        rank0
+            .barrier(&call)
+            .expect_err("rank 1 never arrives inside the deadline");
 
-    // Rank 1 now calls `all_gather` with counts that are ALSO independently
-    // wrong (a one-entry vector for a two-rank gang) — `check_entry` must
-    // refuse with the fault before that domain check ever runs.
-    let error = rank1
-        .all_gather(&matrix(1, 2, 0.0), &[1])
-        .expect_err("the gang is already faulted");
-    let message = error.to_string();
-    assert!(
-        message.contains("the gang has already failed"),
-        "a faulted gang must report the FAULT first, never a fresh domain error that masks \
-         it: {message}"
-    );
-    assert!(
-        !message.contains("counts has 1 entries"),
-        "the counts error must never surface once the gang is faulted: {message}"
-    );
+        // Rank 1 now calls `all_gather` with counts that are ALSO independently
+        // wrong (a one-entry vector for a two-rank gang) — `check_entry` must
+        // refuse with the fault before that domain check ever runs.
+        let error = rank1
+            .all_gather(&call, &matrix(1, 2, 0.0), &[1])
+            .expect_err("the gang is already faulted");
+        let message = error.to_string();
+        assert!(
+            message.contains("the gang has already failed"),
+            "a faulted gang must report the FAULT first, never a fresh domain error that masks \
+             it: {message}"
+        );
+        assert!(
+            !message.contains("counts has 1 entries"),
+            "the counts error must never surface once the gang is faulted: {message}"
+        );
+    });
 }
 
 // ── The shared seam: a 0-dim tensor is refused before any arm signs it ─────
@@ -749,45 +787,48 @@ fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
 /// never actually held.
 #[test]
 fn a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
-    // Noop (world = 1): the single-rank topology gets the same domain check.
-    let noop = Noop::new();
-    let scalar = Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar");
-    let error = noop
-        .all_gather(&scalar, &[0])
-        .expect_err("a 0-dim tensor has no row count to gather along");
-    assert!(
-        error.to_string().contains("0-dim"),
-        "unexpected message: {error}"
-    );
-
-    // Local (world = 2): the same 0-dim shape — rank 0 a 0-dim
-    // scalar, rank 1 a real 1-D `[0]` tensor, both claiming zero rows.
-    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
-        let counts = [0usize, 0];
-        let t = if local.rank() == 0 {
-            Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar")
-        } else {
-            Tensor::from_vec(Vec::<f32>::new(), (0,), &Device::Cpu).expect("1-D [0]")
-        };
-        local
-            .all_gather(&t, &counts)
-            .map(|g| g.dims().to_vec())
-            .map_err(|e| e.to_string())
-    });
-    for (rank, result) in results.iter().enumerate() {
-        let error = match result {
-            Err(error) => error,
-            Ok(dims) => panic!(
-                "rank {rank} returned Ok(dims = {dims:?}) — a 0-dim tensor must never be signed \
-                 as though it were a 1-D tensor of the same trailing shape (at c9d20550 this was \
-                 `[Ok([]), Ok([0])]`)"
-            ),
-        };
+    witness(|call| {
+        // Noop (world = 1): the single-rank topology gets the same domain check.
+        let noop = Noop::new();
+        let scalar = Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar");
+        let error = noop
+            .all_gather(&call, &scalar, &[0])
+            .expect_err("a 0-dim tensor has no row count to gather along");
         assert!(
-            error.contains("0-dim"),
-            "rank {rank}: unexpected message: {error}"
+            error.to_string().contains("0-dim"),
+            "unexpected message: {error}"
         );
-    }
+
+        // Local (world = 2): the same 0-dim shape — rank 0 a 0-dim
+        // scalar, rank 1 a real 1-D `[0]` tensor, both claiming zero rows.
+        let results: Vec<std::result::Result<Vec<usize>, String>> =
+            run_gang(2, move |local, call| {
+                let counts = [0usize, 0];
+                let t = if local.rank() == 0 {
+                    Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar")
+                } else {
+                    Tensor::from_vec(Vec::<f32>::new(), (0,), &Device::Cpu).expect("1-D [0]")
+                };
+                local
+                    .all_gather(&call, &t, &counts)
+                    .map(|g| g.dims().to_vec())
+                    .map_err(|e| e.to_string())
+            });
+        for (rank, result) in results.iter().enumerate() {
+            let error = match result {
+                Err(error) => error,
+                Ok(dims) => panic!(
+                    "rank {rank} returned Ok(dims = {dims:?}) — a 0-dim tensor must never be signed \
+                     as though it were a 1-D tensor of the same trailing shape (at c9d20550 this was \
+                     `[Ok([]), Ok([0])]`)"
+                ),
+            };
+            assert!(
+                error.contains("0-dim"),
+                "rank {rank}: unexpected message: {error}"
+            );
+        }
+    });
 }
 
 /// A second missing end-to-end oracle found while re-aiming the per-field
@@ -805,10 +846,10 @@ fn a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
 #[test]
 fn a_two_rank_all_gather_with_a_trailing_shape_mismatch_at_equal_counts_faults_both_ranks_symmetrically(
 ) {
-    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
+    let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local, call| {
         let cols = if local.rank() == 0 { 2 } else { 3 };
         local
-            .all_gather(&matrix(1, cols, 0.0), &[1, 1])
+            .all_gather(&call, &matrix(1, cols, 0.0), &[1, 1])
             .map(|t| t.dims().to_vec())
             .map_err(|e| e.to_string())
     });
@@ -838,10 +879,10 @@ fn a_two_rank_all_gather_with_a_trailing_shape_mismatch_at_equal_counts_faults_b
 #[test]
 fn reachability_a_three_rank_asymmetric_root_broadcast_never_panics() {
     let roots = [0u32, 1, 0];
-    let messages = run_gang(3, move |local| {
+    let messages = run_gang(3, move |local, call| {
         let mut t = matrix(1, 1, local.rank() as f32);
         local
-            .broadcast(&mut t, roots[local.rank() as usize])
+            .broadcast(&call, &mut t, roots[local.rank() as usize])
             .map(|_| String::new())
             .unwrap_or_else(|e| e.to_string())
     });
@@ -867,14 +908,14 @@ fn reachability_a_three_rank_asymmetric_root_broadcast_never_panics() {
 /// particular pair of lengths.
 #[test]
 fn reachability_a_two_rank_uneven_all_reduce_sum_list_never_panics() {
-    let messages = run_gang(2, move |local| {
+    let messages = run_gang(2, move |local, call| {
         let mut tensors = if local.rank() == 0 {
             vec![matrix(1, 1, 0.0), matrix(1, 1, 1.0)]
         } else {
             vec![matrix(1, 1, 0.0)]
         };
         local
-            .all_reduce_sum(&mut tensors)
+            .all_reduce_sum(&call, &mut tensors)
             .map(|_| String::new())
             .unwrap_or_else(|e| e.to_string())
     });
@@ -898,51 +939,54 @@ fn reachability_a_two_rank_uneven_all_reduce_sum_list_never_panics() {
 /// any later collective.
 #[test]
 fn broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically() {
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    let results = std::thread::scope(|scope| {
-        let root = scope.spawn(move || {
-            let mut t = matrix(2, 3, 0.0);
-            rank0
-                .broadcast(&mut t, 0)
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
+        let results = std::thread::scope(|scope| {
+            let root = BlockingCall::spawn_scoped(scope, move |call| {
+                let mut t = matrix(2, 3, 0.0);
+                rank0
+                    .broadcast(&call, &mut t, 0)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            let non_root = BlockingCall::spawn_scoped(scope, move |call| {
+                let mut t = matrix(1, 1, 0.0);
+                rank1
+                    .broadcast(&call, &mut t, 0)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            [
+                root.join().expect("root thread"),
+                non_root.join().expect("non-root thread"),
+            ]
         });
-        let non_root = scope.spawn(move || {
-            let mut t = matrix(1, 1, 0.0);
-            rank1
-                .broadcast(&mut t, 0)
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
-        });
-        [
-            root.join().expect("root thread"),
-            non_root.join().expect("non-root thread"),
-        ]
+
+        for (who, message) in [("root", &results[0]), ("non-root", &results[1])] {
+            assert!(
+                !message.is_empty(),
+                "{who} returned Ok from a broadcast the peer's shape disagreed with"
+            );
+            assert!(
+                message.contains("disagree about what this round computes"),
+                "{who}: unexpected message: {message}"
+            );
+        }
+
+        // The gang is left faulted: a fresh handle's next collective refuses.
+        let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+        let refused = after_fault
+            .barrier(&call)
+            .expect_err("the gang must stay faulted after the shape mismatch");
+        assert!(
+            refused.to_string().contains("the gang has already failed"),
+            "unexpected message: {refused}"
+        );
     });
-
-    for (who, message) in [("root", &results[0]), ("non-root", &results[1])] {
-        assert!(
-            !message.is_empty(),
-            "{who} returned Ok from a broadcast the peer's shape disagreed with"
-        );
-        assert!(
-            message.contains("disagree about what this round computes"),
-            "{who}: unexpected message: {message}"
-        );
-    }
-
-    // The gang is left faulted: a fresh handle's next collective refuses.
-    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
-    let refused = after_fault
-        .barrier()
-        .expect_err("the gang must stay faulted after the shape mismatch");
-    assert!(
-        refused.to_string().contains("the gang has already failed"),
-        "unexpected message: {refused}"
-    );
 }
 
 /// A third attempt to break "no rank can return `Ok` from a round any rank
@@ -956,7 +1000,7 @@ fn broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically(
 /// descriptor against rank 0's, so this must fault symmetrically too.
 #[test]
 fn a_third_attempt_two_ranks_agree_a_third_disagrees_on_dtype_still_faults_every_rank() {
-    let results: Vec<std::result::Result<(), String>> = run_gang(3, move |local| {
+    let results: Vec<std::result::Result<(), String>> = run_gang(3, move |local, call| {
         let dtype = if local.rank() == 2 {
             DType::F64
         } else {
@@ -964,7 +1008,7 @@ fn a_third_attempt_two_ranks_agree_a_third_disagrees_on_dtype_still_faults_every
         };
         let mut tensors = vec![Tensor::zeros((2, 2), dtype, &Device::Cpu).expect("tensor")];
         local
-            .all_reduce_sum(&mut tensors)
+            .all_reduce_sum(&call, &mut tensors)
             .map_err(|e| e.to_string())
     });
     for (rank, result) in results.iter().enumerate() {
@@ -995,51 +1039,54 @@ fn a_third_attempt_two_ranks_agree_a_third_disagrees_on_dtype_still_faults_every
 /// runs, and leaves the gang faulted for every collective after this one).
 #[test]
 fn a_two_rank_all_reduce_sum_with_a_per_tensor_shape_mismatch_faults_both_ranks_symmetrically() {
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    let results = std::thread::scope(|scope| {
-        let a = scope.spawn(move || {
-            let mut tensors = vec![matrix(2, 2, 0.0)];
-            rank0
-                .all_reduce_sum(&mut tensors)
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
+        let results = std::thread::scope(|scope| {
+            let a = BlockingCall::spawn_scoped(scope, move |call| {
+                let mut tensors = vec![matrix(2, 2, 0.0)];
+                rank0
+                    .all_reduce_sum(&call, &mut tensors)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            let b = BlockingCall::spawn_scoped(scope, move |call| {
+                let mut tensors = vec![matrix(2, 3, 0.0)];
+                rank1
+                    .all_reduce_sum(&call, &mut tensors)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            [
+                a.join().expect("rank 0 thread"),
+                b.join().expect("rank 1 thread"),
+            ]
         });
-        let b = scope.spawn(move || {
-            let mut tensors = vec![matrix(2, 3, 0.0)];
-            rank1
-                .all_reduce_sum(&mut tensors)
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
-        });
-        [
-            a.join().expect("rank 0 thread"),
-            b.join().expect("rank 1 thread"),
-        ]
+
+        for (rank, message) in results.iter().enumerate() {
+            assert!(
+                !message.is_empty(),
+                "rank {rank} returned Ok from a reduce the peer's shape disagreed with"
+            );
+            assert!(
+                message.contains("disagree about what this round computes"),
+                "rank {rank}: unexpected message: {message}"
+            );
+        }
+
+        // The gang is left faulted: a fresh handle's next collective refuses.
+        let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+        let refused = after_fault
+            .barrier(&call)
+            .expect_err("the gang must stay faulted after the shape mismatch");
+        assert!(
+            refused.to_string().contains("the gang has already failed"),
+            "unexpected message: {refused}"
+        );
     });
-
-    for (rank, message) in results.iter().enumerate() {
-        assert!(
-            !message.is_empty(),
-            "rank {rank} returned Ok from a reduce the peer's shape disagreed with"
-        );
-        assert!(
-            message.contains("disagree about what this round computes"),
-            "rank {rank}: unexpected message: {message}"
-        );
-    }
-
-    // The gang is left faulted: a fresh handle's next collective refuses.
-    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
-    let refused = after_fault
-        .barrier()
-        .expect_err("the gang must stay faulted after the shape mismatch");
-    assert!(
-        refused.to_string().contains("the gang has already failed"),
-        "unexpected message: {refused}"
-    );
 }
 
 // ── the verb field, pinned at EACH constructor ──────────
@@ -1079,49 +1126,52 @@ fn a_two_rank_all_reduce_sum_with_a_per_tensor_shape_mismatch_faults_both_ranks_
 /// assumed to kill this test.
 #[test]
 fn a_two_rank_all_gather_and_barrier_verb_mismatch_faults_both_ranks_symmetrically() {
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    let results = std::thread::scope(|scope| {
-        let gather = scope.spawn(move || {
-            rank0
-                .all_gather(&matrix(1, 2, 0.0), &[1, 1])
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
+        let results = std::thread::scope(|scope| {
+            let gather = BlockingCall::spawn_scoped(scope, move |call| {
+                rank0
+                    .all_gather(&call, &matrix(1, 2, 0.0), &[1, 1])
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            let barrier = BlockingCall::spawn_scoped(scope, move |call| {
+                rank1
+                    .barrier(&call)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            [
+                gather.join().expect("rank 0 thread"),
+                barrier.join().expect("rank 1 thread"),
+            ]
         });
-        let barrier = scope.spawn(move || {
-            rank1
-                .barrier()
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
-        });
-        [
-            gather.join().expect("rank 0 thread"),
-            barrier.join().expect("rank 1 thread"),
-        ]
+
+        for (rank, message) in results.iter().enumerate() {
+            assert!(
+                !message.is_empty(),
+                "rank {rank} returned Ok from a round rank {} was running a different collective in",
+                1 - rank
+            );
+            assert!(
+                message.contains("disagree about what this round computes"),
+                "rank {rank}: unexpected message: {message}"
+            );
+        }
+
+        let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+        let refused = after_fault
+            .barrier(&call)
+            .expect_err("the gang must stay faulted after the verb mismatch");
+        assert!(
+            refused.to_string().contains("the gang has already failed"),
+            "unexpected message: {refused}"
+        );
     });
-
-    for (rank, message) in results.iter().enumerate() {
-        assert!(
-            !message.is_empty(),
-            "rank {rank} returned Ok from a round rank {} was running a different collective in",
-            1 - rank
-        );
-        assert!(
-            message.contains("disagree about what this round computes"),
-            "rank {rank}: unexpected message: {message}"
-        );
-    }
-
-    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
-    let refused = after_fault
-        .barrier()
-        .expect_err("the gang must stay faulted after the verb mismatch");
-    assert!(
-        refused.to_string().contains("the gang has already failed"),
-        "unexpected message: {refused}"
-    );
 }
 
 /// `all_reduce_sum`'s constructor: the tensor slice is EMPTY, which is what
@@ -1130,98 +1180,104 @@ fn a_two_rank_all_gather_and_barrier_verb_mismatch_faults_both_ranks_symmetrical
 /// field.
 #[test]
 fn a_two_rank_all_reduce_sum_and_barrier_verb_mismatch_faults_both_ranks_symmetrically() {
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    let results = std::thread::scope(|scope| {
-        let reduce = scope.spawn(move || {
-            let mut tensors: Vec<Tensor> = Vec::new();
-            rank0
-                .all_reduce_sum(&mut tensors)
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
+        let results = std::thread::scope(|scope| {
+            let reduce = BlockingCall::spawn_scoped(scope, move |call| {
+                let mut tensors: Vec<Tensor> = Vec::new();
+                rank0
+                    .all_reduce_sum(&call, &mut tensors)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            let barrier = BlockingCall::spawn_scoped(scope, move |call| {
+                rank1
+                    .barrier(&call)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            [
+                reduce.join().expect("rank 0 thread"),
+                barrier.join().expect("rank 1 thread"),
+            ]
         });
-        let barrier = scope.spawn(move || {
-            rank1
-                .barrier()
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
-        });
-        [
-            reduce.join().expect("rank 0 thread"),
-            barrier.join().expect("rank 1 thread"),
-        ]
+
+        for (rank, message) in results.iter().enumerate() {
+            assert!(
+                !message.is_empty(),
+                "rank {rank} returned Ok from a round rank {} was running a different collective in",
+                1 - rank
+            );
+            assert!(
+                message.contains("disagree about what this round computes"),
+                "rank {rank}: unexpected message: {message}"
+            );
+        }
+
+        let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+        let refused = after_fault
+            .barrier(&call)
+            .expect_err("the gang must stay faulted after the verb mismatch");
+        assert!(
+            refused.to_string().contains("the gang has already failed"),
+            "unexpected message: {refused}"
+        );
     });
-
-    for (rank, message) in results.iter().enumerate() {
-        assert!(
-            !message.is_empty(),
-            "rank {rank} returned Ok from a round rank {} was running a different collective in",
-            1 - rank
-        );
-        assert!(
-            message.contains("disagree about what this round computes"),
-            "rank {rank}: unexpected message: {message}"
-        );
-    }
-
-    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
-    let refused = after_fault
-        .barrier()
-        .expect_err("the gang must stay faulted after the verb mismatch");
-    assert!(
-        refused.to_string().contains("the gang has already failed"),
-        "unexpected message: {refused}"
-    );
 }
 
 /// `broadcast`'s constructor: the mutation `verb: "barrier"` is executed and
 /// reported below rather than assumed to kill this test.
 #[test]
 fn a_two_rank_broadcast_and_barrier_verb_mismatch_faults_both_ranks_symmetrically() {
-    let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
-    let rank0 = gang.rank(0).expect("rank 0");
-    let rank1 = gang.rank(1).expect("rank 1");
+    witness(|call| {
+        let gang =
+            LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
+        let rank0 = gang.rank(0).expect("rank 0");
+        let rank1 = gang.rank(1).expect("rank 1");
 
-    let results = std::thread::scope(|scope| {
-        let broadcast = scope.spawn(move || {
-            let mut t = matrix(1, 1, 0.0);
-            rank0
-                .broadcast(&mut t, 0)
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
+        let results = std::thread::scope(|scope| {
+            let broadcast = BlockingCall::spawn_scoped(scope, move |call| {
+                let mut t = matrix(1, 1, 0.0);
+                rank0
+                    .broadcast(&call, &mut t, 0)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            let barrier = BlockingCall::spawn_scoped(scope, move |call| {
+                rank1
+                    .barrier(&call)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string())
+            });
+            [
+                broadcast.join().expect("rank 0 thread"),
+                barrier.join().expect("rank 1 thread"),
+            ]
         });
-        let barrier = scope.spawn(move || {
-            rank1
-                .barrier()
-                .map(|_| String::new())
-                .unwrap_or_else(|e| e.to_string())
-        });
-        [
-            broadcast.join().expect("rank 0 thread"),
-            barrier.join().expect("rank 1 thread"),
-        ]
+
+        for (rank, message) in results.iter().enumerate() {
+            assert!(
+                !message.is_empty(),
+                "rank {rank} returned Ok from a round rank {} was running a different collective in",
+                1 - rank
+            );
+            assert!(
+                message.contains("disagree about what this round computes"),
+                "rank {rank}: unexpected message: {message}"
+            );
+        }
+
+        let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
+        let refused = after_fault
+            .barrier(&call)
+            .expect_err("the gang must stay faulted after the verb mismatch");
+        assert!(
+            refused.to_string().contains("the gang has already failed"),
+            "unexpected message: {refused}"
+        );
     });
-
-    for (rank, message) in results.iter().enumerate() {
-        assert!(
-            !message.is_empty(),
-            "rank {rank} returned Ok from a round rank {} was running a different collective in",
-            1 - rank
-        );
-        assert!(
-            message.contains("disagree about what this round computes"),
-            "rank {rank}: unexpected message: {message}"
-        );
-    }
-
-    let after_fault = gang.rank(0).expect("rank 0 handle after the fault");
-    let refused = after_fault
-        .barrier()
-        .expect_err("the gang must stay faulted after the verb mismatch");
-    assert!(
-        refused.to_string().contains("the gang has already failed"),
-        "unexpected message: {refused}"
-    );
 }

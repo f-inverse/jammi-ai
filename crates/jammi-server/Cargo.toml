@@ -122,6 +122,11 @@ storage-cloud = ["jammi-db/storage-cloud"]
 test-hooks = ["jammi-ai/test-hooks"]
 
 [dev-dependencies]
+# The `gang_rounds` it-module drives one real collective round through this
+# crate's round seam and compares its tensors to the in-process fold; the
+# tensor type is candle's (already linked through `jammi-ai`'s default
+# `local` feature — this adds no new crate to the build).
+candle-core.workspace = true
 tokio.workspace = true
 jammi-test-utils.workspace = true
 # The shutdown oracles park the engine at documented rendezvous points

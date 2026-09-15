@@ -59,7 +59,7 @@ use candle_core::cuda::cudarc::nccl::{Comm, Id, NcclType, ReduceOp};
 use candle_core::cuda_backend::{CudaDType, CudaStorage};
 use candle_core::{CpuStorage, CustomOp1, DType, Device, Layout, Shape, Tensor};
 
-use super::{checked_gather_counts, checked_root, Collective};
+use super::{checked_gather_counts, checked_root, BlockingCall, Collective};
 
 /// The 128 opaque bytes that identify one NCCL communicator, minted by rank 0
 /// and carried to every peer out of band.
@@ -242,7 +242,7 @@ impl Nccl {
 }
 
 impl Collective for Nccl {
-    fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
+    fn all_gather(&self, _call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         let total = checked_gather_counts(self.rank, self.world, local, counts)?;
         let max_rows = counts.iter().copied().max().unwrap_or(0);
         if max_rows == 0 {
@@ -297,7 +297,7 @@ impl Collective for Nccl {
         Ok(out)
     }
 
-    fn all_reduce_sum(&self, tensors: &mut [Tensor]) -> Result<()> {
+    fn all_reduce_sum(&self, _call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
         for tensor in tensors.iter_mut() {
             let reduced = self.with_comm("all_reduce_sum", |comm| {
                 tensor
@@ -312,7 +312,7 @@ impl Collective for Nccl {
         Ok(())
     }
 
-    fn all_reduce_max_flags(&self, flags: u32) -> Result<u32> {
+    fn all_reduce_max_flags(&self, _call: &BlockingCall, flags: u32) -> Result<u32> {
         let local = Tensor::from_vec(vec![flags], 1, &self.device)
             .map_err(|e| JammiError::Gpu(format!("all_reduce_max_flags: {e}")))?;
         let maxed = self.with_comm("all_reduce_max_flags", |comm| {
@@ -332,7 +332,7 @@ impl Collective for Nccl {
             .ok_or_else(|| JammiError::Gpu("all_reduce_max_flags: empty result".into()))
     }
 
-    fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()> {
+    fn broadcast(&self, _call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
         checked_root(self.world, root)?;
         let out = self.with_comm("broadcast", |comm| {
             t.apply_op1_no_bwd(&NcclBroadcast {
@@ -345,10 +345,10 @@ impl Collective for Nccl {
         Ok(())
     }
 
-    fn barrier(&self) -> Result<()> {
+    fn barrier(&self, call: &BlockingCall) -> Result<()> {
         // NCCL has no barrier: the idiom is a one-element collective plus the
         // stream synchronization `with_comm` already performs.
-        self.all_reduce_max_flags(0)?;
+        self.all_reduce_max_flags(call, 0)?;
         Ok(())
     }
 

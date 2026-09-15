@@ -3,11 +3,32 @@
 //! One trait, one implementation per transport, selected by CONFIGURATION —
 //! `[worker] collective` and `[worker] world_size`, never a cargo feature. The
 //! trainer holds a `&dyn Collective` and is never `cfg`-forked: a single-rank
-//! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`] or —
-//! on a CUDA build, where the `nccl` submodule exists — an `nccl::Nccl`, and
-//! the trainer's own code is the same code in every case. (A link rather than
-//! a code span would resolve only on a CUDA build, and fail the docs lane on
+//! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`], a
+//! multi-host run holds a [`Peer`] (rank 0 in the coordinator's process, every
+//! other rank on the far end of one admitted `RunRank` stream), and — on a
+//! CUDA build, where the `nccl` submodule exists — an `nccl::Nccl`; the
+//! trainer's own code is the same code in every case. (A link rather than a
+//! code span would resolve only on a CUDA build, and fail the docs lane on
 //! every other.)
+//!
+//! # The blocking-call witness
+//!
+//! Every verb takes a [`BlockingCall`]: a thread-bound witness that the
+//! caller is on a thread that MAY block — a `spawn_blocking` thread or a
+//! plain OS thread — never a runtime worker thread. [`Peer`] drives async
+//! stream I/O under `Handle::block_on`, which is a panic on a worker thread;
+//! the witness turns that from a runtime failure into a COMPILE error: it has
+//! no public constructor, it is minted only inside the closures
+//! [`BlockingCall::spawn_blocking`] / [`BlockingCall::spawn_thread`] /
+//! [`BlockingCall::spawn_scoped`] run on the thread they create, and it is
+//! `!Send + !Sync`, so it cannot be carried into a `tokio::spawn`ed future
+//! or stored anywhere a worker thread could reach it. The witness lives on
+//! the TRAIT, not on `Peer` alone, because the trainer holds a `&dyn
+//! Collective` and never names `Peer`: a guarantee on `Peer`'s inherent
+//! methods would be invisible at the one call site that matters. [`Noop`],
+//! [`Local`] and `Nccl` accept the witness and ignore it — one ignored
+//! parameter each is the whole cost of a discipline that is compile-checked
+//! on every arm.
 //!
 //! # The five operations
 //!
@@ -42,43 +63,47 @@
 //!   These are decided from what THIS rank passed, so every arm decides them
 //!   the same way, through the same two helpers.
 //!
-//! # What only the host arms guarantee
+//! # What the arms that can see every rank's arguments guarantee
+//!
+//! A round is agreed on its [`Descriptor`], the round index included.
 //!
 //! A check on what a PEER passed needs the peer's arguments. [`Local`] has
-//! them — the rendezvous carries each rank's whole contribution — so a rank
-//! deposits a **descriptor** alongside it: the verb, and every argument other
-//! than the tensor bytes that determines the round's result (`root` for
-//! `broadcast`, the full `counts` vector for `all_gather`, one signature per
-//! tensor the verb carries — for `all_gather` the TRAILING shape only, since
-//! dim 0 is already the `counts` vector and legitimately differs by rank —
-//! and the world size). A round is published ONLY once every rank's
-//! descriptor for it is equal; on any disagreement BEFORE the round
-//! publishes, no rank is ever handed a result — every rank gets a typed error
-//! naming both descriptors, and the gang is faulted before any of them
-//! returns. So on [`Local`], **no rank can ever return `Ok` from a round any
-//! other rank rejects before that round publishes**: two ranks each naming
-//! themselves root, or deriving different partition counts, are a symmetric
-//! typed error on both, never an `Ok` on one and a wrong answer (or a
-//! different error) on the other. A rank-local failure AFTER a round has
-//! published (a `to_device` copy that fails, a concatenation the backend
-//! refuses) is a different case: the round has already handed every rank its
-//! agreed result, so that failure faults the gang for every collective AFTER
-//! this one, but it does not — and cannot — retract the `Ok` peers already
-//! hold for this one. [`Noop`] has no peer to disagree with (`world` is
-//! always 1), so this is vacuous there.
+//! them — the rendezvous carries each rank's whole contribution — and so
+//! does [`Peer`] — every member's contribution reaches the coordinator with
+//! its descriptor. On both, a rank deposits a [`Descriptor`] alongside its
+//! contribution: the verb, and every argument other than the tensor bytes
+//! that determines the round's result (`root` for `broadcast`, the full
+//! `counts` vector for `all_gather`, one signature per tensor the verb
+//! carries — for `all_gather` the TRAILING shape only, since dim 0 is
+//! already the `counts` vector and legitimately differs by rank — the world
+//! size, and the caller-bound [`Descriptor::agreement`] digest). A round is
+//! published ONLY once every rank's descriptor for it is equal; on any
+//! disagreement BEFORE the round publishes, no rank is ever handed a result
+//! — every rank gets a typed error naming both descriptors, and the gang is
+//! faulted before any of them returns. So on these arms, **no rank can ever
+//! return `Ok` from a round any other rank rejects before that round
+//! publishes**: two ranks each naming themselves root, or deriving different
+//! partition counts, are a symmetric typed error on both, never an `Ok` on
+//! one and a wrong answer (or a different error) on the other. A rank-local
+//! failure AFTER a round has published (a `to_device` copy that fails, a
+//! concatenation the backend refuses) is a different case: the round has
+//! already handed every rank its agreed result, so that failure faults the
+//! gang for every collective AFTER this one, but it does not — and cannot —
+//! retract the `Ok` peers already hold for this one. [`Noop`] has no peer to
+//! disagree with (`world` is always 1), so this is vacuous there.
 //!
-//! Publish-then-fault is a real state, not a
-//! theoretical one: a round can publish (every rank's descriptor agreed)
-//! and then fault before every rank has taken its result — a rank that
-//! already took the published value keeps its `Ok`, a rank that had not
-//! gets the gang's fault instead, and no rank is ever handed a wrong
-//! result. [`Local`] can afford to let that asymmetry stand because every
-//! rank is a thread of one process sharing one `Round`. The `Peer`
-//! collective rebuilds over the wire does not get that for free: a
-//! publish a peer has already ACKed and a fault raised immediately after
-//! is a real wire state (a message in flight, a peer that ACKed and then
-//! disconnected) that the wire protocol must decide explicitly, not
-//! inherit by writing the same shared-memory code over a socket.
+//! Publish-then-fault is a real state, not a theoretical one: a round can
+//! publish (every rank's descriptor agreed) and then fault before every rank
+//! has taken its result — a rank that already took the published value keeps
+//! its `Ok`, a rank that had not gets the gang's fault instead, and no rank
+//! is ever handed a wrong result. [`Local`] can afford to let that asymmetry
+//! stand because every rank is a thread of one process sharing one `Round`.
+//! [`Peer`] decides it explicitly with a two-phase round (see
+//! [`peer`]'s module doc): a result is held UNAPPLIED on every member until
+//! the coordinator, having observed every member's ACK, commits it — a fault
+//! before the last ACK leaves no rank applied, and the commit point (the last
+//! ACK observed by the coordinator) is the one state a later fault cannot
+//! retract.
 //!
 //! The `Nccl` arm has none of that. NCCL exchanges the buffers a collective
 //! names and nothing else: there is no counts exchange (by design — see
@@ -94,27 +119,233 @@
 //! walking the same canonical trainable-variable order, and not by this
 //! seam.
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use jammi_db::error::{JammiError, Result};
 
-use candle_core::Tensor;
+use candle_core::{DType, Tensor};
 
 pub mod local;
 #[cfg(feature = "cuda")]
 pub mod nccl;
 pub mod noop;
+pub mod peer;
 
+#[cfg(test)]
+mod peer_tests;
 #[cfg(test)]
 mod tests;
 
 pub use local::{Local, LocalGang};
 pub use noop::Noop;
+pub use peer::{CoordinatorLink, LinkFault, MemberLink, Peer, RankReadFault};
+
+/// A thread-bound witness that the current thread may block.
+///
+/// Minted ONLY inside the closure one of [`Self::spawn_blocking`],
+/// [`Self::spawn_thread`] or [`Self::spawn_scoped`] runs on the thread it
+/// creates — a tokio blocking-pool thread or a plain OS thread, never a
+/// runtime worker thread — and `!Send + !Sync`, so it cannot be moved into
+/// a `tokio::spawn`ed future, stored in a `Send` value, or otherwise reach a
+/// worker thread. Every [`Collective`] verb takes one; [`Peer`] is the arm
+/// that needs it (it blocks on stream I/O), and every arm is compile-checked
+/// by it: a verb called from a worker thread has no witness to pass.
+#[derive(Debug, Clone)]
+pub struct BlockingCall {
+    _thread_bound: PhantomData<*const ()>,
+}
+
+impl BlockingCall {
+    /// The one constructor, private: reachable only from the three minting
+    /// sites below, each of which is by construction on a thread that is not
+    /// a runtime worker.
+    fn mint() -> Self {
+        Self {
+            _thread_bound: PhantomData,
+        }
+    }
+
+    /// Run `f` on tokio's blocking pool with a fresh witness — the
+    /// production minting site: the worker's training thread is spawned
+    /// exactly here.
+    pub fn spawn_blocking<F, T>(f: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce(BlockingCall) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || f(Self::mint()))
+    }
+
+    /// Run `f` on a fresh OS thread with a fresh witness. An OS thread has
+    /// no runtime context of its own, so it can block; [`Peer`] blocks on
+    /// the [`tokio::runtime::Handle`] its links captured, which is allowed
+    /// from any thread that is not one of that runtime's workers.
+    pub fn spawn_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
+    where
+        F: FnOnce(BlockingCall) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::spawn(move || f(Self::mint()))
+    }
+
+    /// [`Self::spawn_thread`] inside a [`std::thread::scope`].
+    pub fn spawn_scoped<'scope, F, T>(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        f: F,
+    ) -> std::thread::ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce(BlockingCall) -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        scope.spawn(move || f(Self::mint()))
+    }
+}
+
+/// The five collectives, as a round's descriptor names them. CLOSED — the
+/// wire's `RoundVerb` mirrors it value for value, and a wire value outside
+/// this set is a refusal, never a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    AllGather,
+    AllReduceSum,
+    AllReduceMaxFlags,
+    Broadcast,
+    Barrier,
+}
+
+impl Verb {
+    /// The trait method's name — what every error message is prefixed with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllGather => "all_gather",
+            Self::AllReduceSum => "all_reduce_sum",
+            Self::AllReduceMaxFlags => "all_reduce_max_flags",
+            Self::Broadcast => "broadcast",
+            Self::Barrier => "barrier",
+        }
+    }
+}
+
+impl fmt::Display for Verb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One rank's declaration of what a round computes: the verb, and every
+/// per-call argument other than the tensor bytes that determines the round's
+/// result.
+///
+/// An arm that can see every rank's descriptor ([`Local`]'s rendezvous,
+/// [`Peer`]'s coordinator) publishes a round ONLY once every rank's
+/// descriptor for it is equal (checked by [`Descriptor::agrees_with`]); on
+/// any disagreement the round is never published, and every rank gets a
+/// typed error naming both descriptors instead. This is the ONE place a
+/// cross-rank agreement check lives — no verb's trait method runs its own
+/// peer-specific check outside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Descriptor {
+    /// The round this rank is entering, counted from 0 on every rank of the
+    /// gang. A determinant like every other field: the same verb and
+    /// arguments in a different round is a different round, so a
+    /// contribution that outlived its round can never agree with the round
+    /// being completed. [`Local`] stamps it under its rendezvous lock from
+    /// the shared round's generation; [`Peer`] stamps it from each rank's
+    /// own round counter, and the wire carries it.
+    pub round: u64,
+    /// The operation.
+    pub verb: Verb,
+    /// [`Collective::world`] as this rank sees it.
+    pub world: usize,
+    /// [`Collective::broadcast`]'s `root`; `None` for every other verb.
+    pub root: Option<u32>,
+    /// [`Collective::all_gather`]'s full `counts` vector; `None` for every
+    /// other verb.
+    pub counts: Option<Vec<usize>>,
+    /// One entry per tensor this call carries, in the order the verb defines
+    /// it: `all_gather`'s single `local`, `all_reduce_sum`'s slice in
+    /// canonical order, or `broadcast`'s `t`. Empty for
+    /// `all_reduce_max_flags` and `barrier`, which carry no tensor.
+    pub tensors: Vec<TensorSignature>,
+    /// An opaque digest the CALLER binds on its rank's collective (a trainer
+    /// binds the digest of its canonical trainable-variable key order —
+    /// `Local::with_agreement` / `Peer::with_agreement`); `None` when nothing
+    /// is bound. The collective computes nothing from it and compares it
+    /// like every other field, so two ranks bound to different values — or
+    /// one bound and one not — disagree.
+    pub agreement: Option<String>,
+}
+
+/// One tensor's shape and dtype, as far as a round's descriptor cares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorSignature {
+    pub dims: Vec<usize>,
+    pub dtype: DType,
+}
+
+impl TensorSignature {
+    /// The full shape and dtype of `t`.
+    pub fn of(t: &Tensor) -> Self {
+        Self {
+            dims: t.dims().to_vec(),
+            dtype: t.dtype(),
+        }
+    }
+
+    /// [`Self::of`] with dim 0 dropped: `all_gather`'s row count is already
+    /// the descriptor's [`Descriptor::counts`] and legitimately differs by
+    /// rank (a zero-row rank, an uneven partition), so only the TRAILING
+    /// shape is a determinant of agreement for a gathered tensor.
+    ///
+    /// Every caller reaches this only after [`checked_gather_counts`] has
+    /// already refused a 0-dim tensor for this exact call, so `dims` always
+    /// has at least one entry here. This does not fall back to signing an
+    /// empty trailing shape for a shape it cannot honestly sign — a 0-dim
+    /// tensor used to reach this via `unwrap_or_default()` and be signed
+    /// exactly like a 1-D tensor of the same (empty) trailing shape, which
+    /// was the defect.
+    pub fn of_gather_slice(t: &Tensor) -> Self {
+        let dims = t.dims();
+        let trailing = dims.get(1..).expect(
+            "checked_gather_counts already refused a 0-dim tensor before this call reaches \
+             of_gather_slice",
+        );
+        Self {
+            dims: trailing.to_vec(),
+            dtype: t.dtype(),
+        }
+    }
+}
+
+impl Descriptor {
+    /// `true` when every field this round's result depends on agrees with
+    /// `other`.
+    ///
+    /// Delegates to the derived [`PartialEq`] rather than repeating a
+    /// hand-written per-field comparison: [`Descriptor`] carries no field
+    /// that is not itself a determinant of a round's result (a different
+    /// root, a different partition, a different trainable-variable count, a
+    /// differently shaped or typed tensor, a different world size, or a
+    /// different caller-bound agreement — see the struct's own field docs),
+    /// so the derive already computes exactly the comparison this round
+    /// needs. A hand-written comparison is exactly what a NEW field could be
+    /// added without — silently exempting it from agreement;
+    /// `agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep`
+    /// in `local.rs` destructures [`Descriptor`] field-by-field with no `..`,
+    /// so a field added to the struct without a matching arm there fails to
+    /// COMPILE.
+    pub fn agrees_with(&self, other: &Descriptor) -> bool {
+        self == other
+    }
+}
 
 /// The gang's collective operations, as the trainer sees them.
 ///
-/// `Send + Sync` because the trainer runs on a worker thread and holds the
+/// `Send + Sync` because the trainer runs on a blocking thread and holds the
 /// implementation behind an `Arc`; the CUDA arm carries the single-thread
 /// discipline NCCL requires in its own documentation rather than in the
-/// trait's bounds.
+/// trait's bounds. Every verb takes a [`BlockingCall`] — see the module doc.
 pub trait Collective: Send + Sync {
     /// Concatenate every rank's slice of this step's batch along dim 0, in
     /// RANK ORDER, and return the identical tensor on every rank.
@@ -135,28 +366,28 @@ pub trait Collective: Send + Sync {
     /// the remote slots are detached, so no gradient crosses to a peer and
     /// the summed gradient of a trainable parameter is not `world` times too
     /// large.
-    fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor>;
+    fn all_gather(&self, call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor>;
 
     /// Replace each tensor with the rank-ordered sum of every rank's tensor
     /// at that index. The slice is the canonical trainable-variable order,
     /// identical on every rank, and every rank must pass the same length and
     /// the same per-index shape/dtype.
-    fn all_reduce_sum(&self, tensors: &mut [Tensor]) -> Result<()>;
+    fn all_reduce_sum(&self, call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()>;
 
     /// The bitwise-flag control word for the lockstep boundary: returns the
     /// maximum over every rank's `flags`, so a flag set on ANY rank is seen
     /// by all of them.
-    fn all_reduce_max_flags(&self, flags: u32) -> Result<u32>;
+    fn all_reduce_max_flags(&self, call: &BlockingCall, flags: u32) -> Result<u32>;
 
     /// Replace `t` with rank `root`'s `t`. `root` must be a rank of this
     /// gang. Every rank — root or not — passes a `t` of the same shape and
-    /// dtype: a host arm that can see every rank's arguments (`Local`)
+    /// dtype: an arm that can see every rank's arguments (`Local`, `Peer`)
     /// refuses a mismatch symmetrically on EVERY rank, never only on the
     /// non-root rank whose placeholder happened to differ from the root's.
-    fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()>;
+    fn broadcast(&self, call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()>;
 
     /// Return only once every rank has reached this call.
-    fn barrier(&self) -> Result<()>;
+    fn barrier(&self, call: &BlockingCall) -> Result<()>;
 
     /// This rank's index in `0..world`.
     fn rank(&self) -> u32;
@@ -166,9 +397,9 @@ pub trait Collective: Send + Sync {
 }
 
 /// Check `counts` against the gang's shape and the caller's own tensor —
-/// shared by every implementation (`Noop`, `Local`, `Nccl`) so ONE seam
-/// decides what a well-formed gather request is; no arm carries a scalar
-/// check of its own.
+/// shared by every implementation (`Noop`, `Local`, `Peer`, `Nccl`) so ONE
+/// seam decides what a well-formed gather request is; no arm carries a
+/// scalar check of its own.
 ///
 /// A 0-dim tensor (a scalar) has no row count to check against `counts` at
 /// all — `dims()` is empty, not `[0]` — so it is refused here, naming the
@@ -202,10 +433,11 @@ pub(crate) fn checked_gather_counts(
     // `rank` is never checked against `world` here: every arm's constructor
     // already guarantees `rank < world` before a `Collective` value exists at
     // all — `Noop` hardcodes rank 0 of world 1, `LocalGang::rank` refuses a
-    // rank outside the gang before handing out a `Local`, and
-    // `Nccl::from_rank` refuses the same before handing out an `Nccl`. So
-    // `counts.get(rank as usize)` returning `None` here is unreachable
-    // through any of the three arms today; it is still a typed error rather
+    // rank outside the gang before handing out a `Local`, `Peer::member`
+    // refuses the same before handing out a `Peer`, and `Nccl::from_rank`
+    // before handing out an `Nccl`. So `counts.get(rank as usize)` returning
+    // `None` here is unreachable
+    // through any of the four arms today; it is still a typed error rather
     // than an index panic, for defense in depth, and no second refusal site
     // for `world == 0` / `rank >= world` is added anywhere else in this
     // module — the length check above and this one are the only two.

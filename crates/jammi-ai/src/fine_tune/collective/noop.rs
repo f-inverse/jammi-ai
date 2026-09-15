@@ -4,7 +4,7 @@ use jammi_db::error::Result;
 
 use candle_core::Tensor;
 
-use super::{checked_gather_counts, checked_root, Collective};
+use super::{checked_gather_counts, checked_root, BlockingCall, Collective};
 
 /// The collective of a gang of one.
 ///
@@ -31,25 +31,25 @@ impl Noop {
 }
 
 impl Collective for Noop {
-    fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
+    fn all_gather(&self, _call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         checked_gather_counts(0, 1, local, counts)?;
         Ok(local.clone())
     }
 
-    fn all_reduce_sum(&self, _tensors: &mut [Tensor]) -> Result<()> {
+    fn all_reduce_sum(&self, _call: &BlockingCall, _tensors: &mut [Tensor]) -> Result<()> {
         Ok(())
     }
 
-    fn all_reduce_max_flags(&self, flags: u32) -> Result<u32> {
+    fn all_reduce_max_flags(&self, _call: &BlockingCall, flags: u32) -> Result<u32> {
         Ok(flags)
     }
 
-    fn broadcast(&self, _t: &mut Tensor, root: u32) -> Result<()> {
+    fn broadcast(&self, _call: &BlockingCall, _t: &mut Tensor, root: u32) -> Result<()> {
         checked_root(1, root)?;
         Ok(())
     }
 
-    fn barrier(&self) -> Result<()> {
+    fn barrier(&self, _call: &BlockingCall) -> Result<()> {
         Ok(())
     }
 

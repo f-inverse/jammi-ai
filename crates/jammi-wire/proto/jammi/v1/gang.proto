@@ -9,11 +9,16 @@ package jammi.v1.gang;
 // carried on the wire); the handler admits or refuses it, and an admitted
 // session is HELD under re-verification until it ends `Aborted{reason}`.
 //
-// No `FetchPartition`, no round messages: a rank reads its partition from the
-// shared object store using the row's own recorded training-set identity —
-// peer-local, never a wire fetch of bytes every member can already read. The
-// round protocol between admitted ranks is a later unit's, frozen there, not
-// here.
+// No `FetchPartition`: a rank reads its partition from the shared object
+// store using the row's own recorded training-set identity — peer-local,
+// never a wire fetch of bytes every member can already read.
+//
+// The ROUND PROTOCOL between admitted ranks rides the same stream, after
+// `Admitted`, as the `round_*` arms of both frames (see "The round protocol"
+// below): a member's contribution flows member → coordinator on `RankEvent`,
+// the coordinator's rank-ordered fold flows coordinator → member on
+// `RankControl`, and a round applies on a rank only after `RoundCommit`,
+// which the coordinator sends only after every member's `RoundAck`.
 //
 // Served ONLY on the internal `[server] peer_bind` listener, beside
 // `PeerService` — never on the public gRPC + Flight SQL listener (which
@@ -36,6 +41,17 @@ message RankControl {
   oneof control {
     Assign assign = 1;
     Cancel cancel = 2;
+    // The round protocol, coordinator → member (all after `Admitted`).
+    // The coordinator's rank-ordered fold of round `round`, followed by
+    // `chunk_count` `round_chunk` frames carrying its Arrow IPC bytes.
+    RoundPayload round_result = 3;
+    RoundChunk round_chunk = 4;
+    // The coordinator observed every member's `RoundAck` for this round:
+    // apply it. A member that never receives this for a round it ACKed
+    // applies nothing for that round.
+    RoundCommit round_commit = 5;
+    // The round is abandoned on every rank; `detail` is the gang's fault.
+    RoundFault round_fault = 6;
   }
 }
 
@@ -60,6 +76,16 @@ message RankEvent {
     Admitted admitted = 1;
     Aborted aborted = 2;
     Outcome outcome = 3;
+    // The round protocol, member → coordinator (all after `Admitted`).
+    // This member's contribution to round `round`, followed by
+    // `chunk_count` `round_chunk` frames carrying its Arrow IPC bytes.
+    RoundPayload round_contribution = 4;
+    RoundChunk round_chunk = 5;
+    // This member holds the coordinator's result for `round`, decoded and
+    // UNAPPLIED, and will apply it on `RoundCommit`.
+    RoundAck round_ack = 6;
+    // This member abandons the round; `detail` is why.
+    RoundFault round_fault = 7;
   }
 }
 
@@ -110,4 +136,135 @@ message TrainedOutcome {
 
 message FailedOutcome {
   string reason = 1;
+}
+
+// ── The round protocol ──────────────────────────────────────────────────────
+//
+// One collective on a gang of `world` ranks is one ROUND, numbered from 0 on
+// every rank. Rank 0 is the coordinator (in-process on the host that claimed
+// the job; W=1 never crosses the wire); every other rank is a member on the
+// far end of one admitted `RunRank` stream. A round on a member:
+//
+//   1. send `round_contribution` (this rank's `RoundDescriptor` + the
+//      contribution's Arrow IPC bytes as `chunk_count` `round_chunk`s);
+//   2. wait for `round_result` + its chunks — the coordinator's fold, in
+//      RANK ORDER, over every rank's contribution, published ONLY once every
+//      rank's descriptor for the round is equal to rank 0's;
+//   3. decode it, HOLD it unapplied, send `round_ack`;
+//   4. wait for `round_commit`, then apply.
+//
+// The coordinator sends `round_commit` only after it has observed every
+// member's `round_ack` (its own contribution is the W-th); a fault before
+// that — a disconnect, a `round_fault` from any rank, the gang deadline —
+// leaves NO rank applied for the round, and every rank's typed error names
+// it. A fault DURING the commit fan-out is fatal on every rank too: the
+// coordinator applies nothing, faults every member, and refuses every later
+// round; a member whose stream ends between its ACK and the commit applies
+// nothing; a member the commit did reach applied the round, and its next
+// contribution is refused by the faulted coordinator — so no rank ever
+// continues past a round every rank did not apply.
+//
+// Every numeric field here is range-checked by its reader before use (K2):
+// `world`, `root < world`, every `counts` value and every `dims` entry as a
+// `usize` with an overflow-checked element product, `chunk_count`, `index <
+// chunk_count`, and the reassembled byte length against the bound the
+// descriptor implies. An unknown `RoundVerb` or `DType` value (including the
+// zero `UNSPECIFIED`) is a typed refusal naming both sides, never a default.
+
+// The collective a round computes. CLOSED: a reader matches every value
+// exhaustively, and `ROUND_VERB_UNSPECIFIED` (or any value it does not
+// know) is refused, never treated as any verb.
+enum RoundVerb {
+  ROUND_VERB_UNSPECIFIED = 0;
+  ROUND_VERB_ALL_GATHER = 1;
+  ROUND_VERB_ALL_REDUCE_SUM = 2;
+  ROUND_VERB_ALL_REDUCE_MAX_FLAGS = 3;
+  ROUND_VERB_BROADCAST = 4;
+  ROUND_VERB_BARRIER = 5;
+}
+
+// The element type of one tensor a round carries. The `Peer` collective
+// carries exactly these three; every other element type is refused at the
+// seam before a descriptor is ever built.
+enum ElementType {
+  ELEMENT_TYPE_UNSPECIFIED = 0;
+  ELEMENT_TYPE_F32 = 1;
+  ELEMENT_TYPE_F16 = 2;
+  ELEMENT_TYPE_BF16 = 3;
+}
+
+// `all_gather`'s per-rank row counts, wrapped so `RoundDescriptor.counts`
+// distinguishes "this verb carries no counts" (absent) from "every rank
+// contributes zero rows" (present, all zero).
+message Counts {
+  repeated uint64 values = 1;
+}
+
+// One tensor's shape and element type as far as a round's descriptor cares:
+// the full shape for `all_reduce_sum` and `broadcast`; the TRAILING shape
+// (dim 0 dropped) for `all_gather`, whose dim 0 is already `counts`.
+message TensorSignature {
+  repeated uint64 dims = 1;
+  ElementType dtype = 2;
+}
+
+// One rank's declaration of what a round computes: the verb, and every
+// per-call argument other than the tensor bytes that determines the round's
+// result. The coordinator publishes a round ONLY once every rank's
+// descriptor equals its own; a disagreement is a typed refusal on EVERY
+// rank naming both descriptors, symmetric with the in-process collective.
+message RoundDescriptor {
+  // The round this rank is entering, counted from 0 on every rank. Agreed
+  // like every other field: a contribution from a stale round is a typed
+  // disagreement naming both descriptors, never folded.
+  uint64 round = 7;
+  RoundVerb verb = 1;
+  uint32 world = 2;
+  // `broadcast`'s root; absent for every other verb.
+  optional uint32 root = 3;
+  // `all_gather`'s full counts vector; absent for every other verb.
+  Counts counts = 4;
+  repeated TensorSignature tensors = 5;
+  // An opaque digest the caller binds on every rank (a trainer binds its
+  // canonical trainable-variable key order); absent when nothing is bound.
+  // Compared like every other field: a rank bound to a different value, or
+  // to none, disagrees.
+  optional string agreement = 6;
+}
+
+// A contribution (member → coordinator) or a result (coordinator →
+// member) for round `round`: the descriptor it was computed under, how many
+// `RoundChunk` frames follow, and — for `all_reduce_max_flags` only, which
+// carries no tensor — the control word. Every tensor's bytes travel in the
+// chunks, each at most the listener's `[server.limits] max_message_bytes`.
+message RoundPayload {
+  uint64 round = 1;
+  RoundDescriptor descriptor = 2;
+  uint32 chunk_count = 3;
+  uint32 flags = 4;
+}
+
+// One slice of a payload's Arrow IPC bytes: chunk `index` of the
+// `chunk_count` its `RoundPayload` announced, in order.
+message RoundChunk {
+  uint64 round = 1;
+  uint32 index = 2;
+  bytes ipc = 3;
+}
+
+// A member holds round `round`'s result, decoded and unapplied.
+message RoundAck {
+  uint64 round = 1;
+}
+
+// Every member ACKed round `round`: apply it.
+message RoundCommit {
+  uint64 round = 1;
+}
+
+// Round `round` is abandoned on every rank; `detail` is the gang's fault,
+// quoted by every later refusal on the rank that receives it.
+message RoundFault {
+  uint64 round = 1;
+  string detail = 2;
 }

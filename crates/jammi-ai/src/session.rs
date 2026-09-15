@@ -139,10 +139,11 @@ impl InferenceSession {
     /// becomes a full coordinator over the gRPC peer transport
     /// (`jammi_wire::peer::GrpcPeerTransport`, wired by the store builder).
     /// Precondition for any non-local placement: `storage.result_root` (or a
-    /// shared local `artifact_dir`) is a root every replica can read. When
-    /// `[server] peer_advertise` is set, this shared-root topology is exactly
-    /// what [`jammi_db::config::JammiConfig::canonical_result_root`]
-    /// canonicalizes and [`jammi_db::catalog::Catalog::list_gang_members`]
+    /// shared local `artifact_dir`) is a root every replica can read,
+    /// spelled IDENTICALLY on every replica. When `[server] peer_advertise`
+    /// is set, this shared-root topology is exactly what
+    /// [`jammi_db::config::JammiConfig::resolved_result_root`] yields
+    /// verbatim and [`jammi_db::catalog::Catalog::list_gang_members`]
     /// compares byte-for-byte across replicas — necessary, never sufficient,
     /// for shared storage (see
     /// [`jammi_db::catalog::instance::InstanceRegistration::from_config`]).
@@ -212,20 +213,18 @@ impl InferenceSession {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
 
-        // The ONE choke point (§8 B3), run FIRST — before the lease keeper
-        // starts, before the result store creates a single directory, before
-        // any other side effect: `peer_advertise` unset yields a non-member
-        // registration (`peer_addr`/`canonical_root` both `None`) with no
-        // filesystem/config check at all; `peer_advertise` set runs the
-        // WHOLE membership check (parses as a `PeerAddr`, `peer_bind` is
-        // set, the result root canonicalizes). A missing/non-directory
-        // anchor must be refused on the CONFIG as given, never on a
-        // directory `build_result_store` below would otherwise have already
-        // created for it — so this runs before that call, not merely before
-        // its own `upsert_instance` (still below, once the keeper is up).
-        // `wrap_with` is the universal funnel every `InferenceSession`
-        // constructor reaches, so a hand-built config (never routed through
-        // `JammiConfig::load_from`) is still covered here.
+        // The ONE choke point (contract §10, the round-3 excision), run
+        // FIRST — before the lease keeper starts, before the result store
+        // creates a single directory, before any other side effect:
+        // `peer_advertise` unset yields a non-member registration
+        // (`peer_addr`/`member_root` both `None`) with no filesystem/config
+        // check at all; `peer_advertise` set parses it as a `PeerAddr`,
+        // requires `peer_bind`, and carries `resolved_result_root()`
+        // VERBATIM as the member root — no filesystem access, no
+        // interpretation of the root at all. `wrap_with` is the universal
+        // funnel every `InferenceSession` constructor reaches, so a
+        // hand-built config (never routed through `JammiConfig::load_from`)
+        // is still covered here.
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
         let registration = Arc::new(
@@ -2411,10 +2410,11 @@ fn build_result_store(
     // tables are held under the same `[lease]` the training worker uses.
     let lease = inner.config().lease.intervals()?;
     // `resolved_result_root()` is the ONE `{artifact_dir}/jammi_db` (or
-    // explicit `storage.result_root`) derivation — the same string
-    // `canonical_result_root()` canonicalizes for gang membership — so this
-    // session's store is rooted at EXACTLY the root that predicate names,
-    // never a second, independently re-derived path.
+    // explicit `storage.result_root`) derivation — the SAME string a gang
+    // member's `instances.result_root` row carries verbatim
+    // (`InstanceRegistration::from_config`) — so this session's store is
+    // rooted at EXACTLY the root the membership predicate compares, never a
+    // second, independently re-derived path.
     let root = jammi_db::storage::StorageUrl::parse(&inner.config().resolved_result_root()?)?;
     // `local_cache_dir` is the PARENT of the two local caches
     // `ResultStore::with_root` derives (`{local_cache_dir}/index` — the ANN

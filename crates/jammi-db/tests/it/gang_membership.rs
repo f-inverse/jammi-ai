@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::instance::{
-    CanonicalRoot, GangListing, InstanceRegistration, PeerAddr, WorkerFacts,
+    GangListing, InstanceRegistration, MemberRoot, PeerAddr, WorkerFacts,
 };
 use jammi_db::catalog::jobs_repo::WorkerState;
 use jammi_db::catalog::lease::instance_prune_window;
@@ -21,7 +21,7 @@ use jammi_db::tenant::TenantId;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 
-/// The canonical root every "matching" fixture in this file shares.
+/// The member root every "matching" fixture in this file shares.
 const ROOT: &str = "file:///shared/jammi_db";
 const LEASE: Duration = Duration::from_secs(30);
 
@@ -91,7 +91,7 @@ async fn seed_member(
         Some("label"),
         Some("host"),
         Some(PeerAddr::parse(peer_addr).unwrap()),
-        Some(CanonicalRoot::new(root)),
+        Some(MemberRoot::new(root)),
     );
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
@@ -100,11 +100,11 @@ async fn seed_member(
         .unwrap();
 }
 
-fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a CanonicalRoot) -> GangListing<'a> {
+fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a MemberRoot) -> GangListing<'a> {
     GangListing {
         kind,
         self_instance,
-        canonical_root: root,
+        member_root: root,
         lease: LEASE,
     }
 }
@@ -152,7 +152,7 @@ async fn list_excludes_the_caller_itself(kind: BackendKind) {
         WorkerState::Claiming,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", &self_id, &root))
         .await
@@ -186,7 +186,7 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
     .await;
     // instance_liveness_margin(30s) == 60s; push well past it.
     force_stale_instance(&catalog, &id, Duration::from_secs(600)).await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -218,7 +218,7 @@ async fn list_excludes_a_draining_worker(kind: BackendKind) {
         WorkerState::Draining,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -250,7 +250,7 @@ async fn list_excludes_a_warming_worker(kind: BackendKind) {
         WorkerState::Warming,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -284,7 +284,7 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
         WorkerState::Claiming,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -296,8 +296,8 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
 }
 
 /// A root that differs only by CASE, or by a trailing `/`, is a byte-exact
-/// mismatch at this layer (this verb never re-canonicalizes) — both must be
-/// excluded.
+/// mismatch at this layer (this verb performs a plain Rust byte comparison,
+/// never any interpretation of the string) — both must be excluded.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -329,7 +329,7 @@ async fn list_excludes_a_root_divergent_by_case_or_trailing_slash(kind: BackendK
         WorkerState::Claiming,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -341,6 +341,72 @@ async fn list_excludes_a_root_divergent_by_case_or_trailing_slash(kind: BackendK
     assert!(
         members.iter().all(|m| m.instance_id != id_slash),
         "a trailing-slash-divergent root must never match byte-for-byte: {members:?}"
+    );
+}
+
+/// P-X2 (contract §10, the round-3 excision): `gcs://b/p` and `gs://b/p` are
+/// DIFFERENT `result_root` spellings — this verb performs no scheme
+/// aliasing, so a `gcs://`-rooted member is NOT a gang member of a caller
+/// listing under the `gs://` spelling of the identical bucket/prefix, or
+/// vice versa.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn gcs_and_gs_spelled_members_are_not_gang_members_of_each_other(kind: BackendKind) {
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = base_catalog_kind(kind)
+        .await
+        .expect("already skipped above when unconfigured");
+    let gcs_id = format!("gcs-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &gcs_id,
+        "10.0.0.10:9000",
+        "gcs://bucket/prefix",
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    let gs_id = format!("gs-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &gs_id,
+        "10.0.0.11:9000",
+        "gs://bucket/prefix",
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+
+    let gs_root = MemberRoot::new("gs://bucket/prefix");
+    let members_from_gs = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &gs_root))
+        .await
+        .unwrap();
+    assert!(
+        members_from_gs.iter().all(|m| m.instance_id != gcs_id),
+        "a gcs://-rooted member must never match a gs:// listing: {members_from_gs:?}"
+    );
+    assert!(
+        members_from_gs.iter().any(|m| m.instance_id == gs_id),
+        "the gs://-rooted member itself must still match: {members_from_gs:?}"
+    );
+
+    let gcs_root = MemberRoot::new("gcs://bucket/prefix");
+    let members_from_gcs = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &gcs_root))
+        .await
+        .unwrap();
+    assert!(
+        members_from_gcs.iter().all(|m| m.instance_id != gs_id),
+        "a gs://-rooted member must never match a gcs:// listing: {members_from_gcs:?}"
+    );
+    assert!(
+        members_from_gcs.iter().any(|m| m.instance_id == gcs_id),
+        "the gcs://-rooted member itself must still match: {members_from_gcs:?}"
     );
 }
 
@@ -356,14 +422,14 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
         .await
         .expect("already skipped above when unconfigured");
     let id = format!("nulladdr-{}", jammi_test_utils::unique_suffix());
-    // A non-member registration: no peer_addr, no canonical_root.
+    // A non-member registration: no peer_addr, no member_root.
     let reg = InstanceRegistration::new(&id, None, None, None, None);
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
         .upsert_worker(&id, "fine_tune", WorkerState::Claiming)
         .await
         .unwrap();
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -393,7 +459,7 @@ async fn list_excludes_a_member_with_peer_addr_set_but_result_root_null(kind: Ba
         .await
         .expect("already skipped above when unconfigured");
     let id = format!("addr-no-root-{}", jammi_test_utils::unique_suffix());
-    // peer_addr SET, canonical_root NULL — distinct from both-NULL above.
+    // peer_addr SET, member_root NULL — distinct from both-NULL above.
     let reg = InstanceRegistration::new(
         &id,
         Some("label"),
@@ -421,7 +487,7 @@ async fn list_excludes_a_member_with_peer_addr_set_but_result_root_null(kind: Ba
     )
     .await;
 
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -462,13 +528,13 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
         None,
         None,
         Some(PeerAddr::parse("10.0.0.1:9000").unwrap()),
-        Some(CanonicalRoot::new(ROOT)),
+        Some(MemberRoot::new(ROOT)),
     );
     catalog.upsert_instance(&reg).await.unwrap();
     // Deliberately no `upsert_worker` call: an `instances` row with no
     // `workers` row is a live process that never runs the claim loop, not a
     // fleet member (the INNER join, DESIGN.md § 4).
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -506,7 +572,7 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
         WorkerState::Claiming,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -586,7 +652,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
          vacuously; raw={raw:?}"
     );
 
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -627,7 +693,7 @@ async fn list_gang_members_is_identical_under_a_scoped_tenant_and_under_none(kin
         WorkerState::Claiming,
     )
     .await;
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let unscoped = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await
@@ -771,7 +837,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
         Some("label"),
         Some("host"),
         Some(PeerAddr::parse("10.0.0.9:9000").unwrap()),
-        Some(CanonicalRoot::new(ROOT)),
+        Some(MemberRoot::new(ROOT)),
     ));
     reg.set_worker(Some(WorkerFacts {
         kinds: "fine_tune".into(),
@@ -798,7 +864,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
     // One real keeper pass: wait a bit over one heartbeat tick.
     tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(500)).await;
 
-    let root = CanonicalRoot::new(ROOT);
+    let root = MemberRoot::new(ROOT);
     let members = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &root))
         .await

@@ -2075,7 +2075,7 @@ impl Catalog {
     /// Upsert this process's `instances` row from `reg`: insert on first
     /// call (`started_at` stamped once), refresh `label`/`host`/`peer_addr`/
     /// `result_root`/`last_seen_at` on every later call. `reg.peer_addr` /
-    /// `reg.canonical_root` write `NULL` for a process that never joins a
+    /// `reg.member_root` write `NULL` for a process that never joins a
     /// gang — `reg` (produced by
     /// [`InstanceRegistration::from_config`](super::instance::InstanceRegistration::from_config))
     /// is the ONLY shape this and [`Self::reregister_instance`] accept.
@@ -2084,7 +2084,7 @@ impl Catalog {
         let label = reg.label.clone();
         let host = reg.host.clone();
         let peer_addr = reg.peer_addr.as_ref().map(|p| p.as_str().to_string());
-        let result_root = reg.canonical_root.as_ref().map(|c| c.as_str().to_string());
+        let result_root = reg.member_root.as_ref().map(|c| c.as_str().to_string());
         let now = now_sortable();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
@@ -2128,7 +2128,7 @@ impl Catalog {
         let label = reg.label.clone();
         let host = reg.host.clone();
         let peer_addr = reg.peer_addr.as_ref().map(|p| p.as_str().to_string());
-        let result_root = reg.canonical_root.as_ref().map(|c| c.as_str().to_string());
+        let result_root = reg.member_root.as_ref().map(|c| c.as_str().to_string());
         let worker = reg.worker_snapshot();
         let now = now_sortable();
         self.backend()
@@ -2289,7 +2289,7 @@ impl Catalog {
     /// The gang-membership listing verb (DESIGN.md § 4, M3): every FRESH,
     /// `claiming` worker whose `kinds` contains `listing.kind` as a whole,
     /// trimmed, comma-split token, whose `result_root` matches
-    /// `listing.canonical_root` byte-for-byte, excluding `listing.
+    /// `listing.member_root` byte-for-byte, excluding `listing.
     /// self_instance` — sorted by `instance_id` BYTE ORDER, in Rust, never a
     /// SQL `ORDER BY` (backend-dependent collation). An INNER join on
     /// `workers`: a member is a fleet worker with a claim-loop slot, not
@@ -2362,7 +2362,7 @@ impl Catalog {
             {
                 continue;
             }
-            if row.result_root.as_bytes() != listing.canonical_root.as_str().as_bytes() {
+            if row.result_root.as_bytes() != listing.member_root.as_str().as_bytes() {
                 continue;
             }
             let peer_addr = PeerAddr::parse(&row.peer_addr).map_err(|e| {

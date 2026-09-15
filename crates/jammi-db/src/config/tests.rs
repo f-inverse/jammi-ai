@@ -3187,8 +3187,10 @@ fn load_of_a_pre_distributed_config_is_unchanged() {
     assert!(!cfg.worker.topology(&cfg.gpu).unwrap().is_distributed());
 }
 
-// ─── U5b-1a: `[server] peer_advertise`, `canonical_result_root`, and
-// `InstanceRegistration::from_config` ───────────────────────────────────────
+// ─── U5b-1a (contract §10, round-3 excision): `[server] peer_advertise` and
+// `InstanceRegistration::from_config` carrying `resolved_result_root()`
+// VERBATIM — no filesystem access, no URL parse, no scheme handling, no
+// interpretation of the root at all. ───────────────────────────────────
 
 #[test]
 fn server_peer_advertise_parses_and_defaults_unset() {
@@ -3212,7 +3214,9 @@ fn server_peer_advertise_parses_and_defaults_unset() {
 }
 
 /// A config with `peer_bind` unset and `peer_advertise` set to a directory
-/// under `artifact_dir` (the shared-topology default).
+/// under `artifact_dir` (the shared-topology default). `result_root` passes
+/// through `resolved_result_root()` UNCHANGED — this helper performs no
+/// interpretation of it either.
 fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>) -> JammiConfig {
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
@@ -3229,88 +3233,10 @@ fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>)
     }
 }
 
-// ─── F2: a RELATIVE `file://` anchor is refused when `peer_advertise` is
-// set — a relative path's meaning depends on the process's current
-// directory at whatever moment it is later resolved, never a property of
-// the config alone. ─────────────────────────────────────────────────────
-
-/// A relative `artifact_dir` (including the `.jammi` fallback
-/// `default_artifact_dir` returns when `ProjectDirs` is unavailable) is
-/// refused naming the key — this is a PURE check
-/// (`MembershipConfig::validate`, no filesystem access at all).
-#[test]
-fn membership_config_validate_refuses_a_relative_artifact_dir() {
-    let cfg = advertising_config(std::path::Path::new(".jammi"), None);
-    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("peer_advertise") && msg.contains("artifact_dir") && msg.contains("absolute"),
-        "{msg}"
-    );
-}
-
-/// A relative explicit `[storage] result_root` is refused naming ITS key,
-/// not `artifact_dir`'s.
-#[test]
-fn membership_config_validate_refuses_a_relative_result_root() {
-    let cfg = advertising_config(std::path::Path::new("/unused"), Some("relative/root"));
-    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("peer_advertise")
-            && msg.contains("storage.result_root")
-            && msg.contains("absolute"),
-        "{msg}"
-    );
-}
-
-/// P-B2's purity property survives a `chdir` BETWEEN load and materialize:
-/// with an ABSOLUTE anchor (F2 guarantees one — a relative anchor is
-/// refused before this could ever matter), `canonical_result_root()`'s
-/// output does not depend on the process's current directory at all.
-/// `std::env::set_current_dir` is PROCESS-GLOBAL — this test guards its own
-/// chdir window with a local mutex so two invocations (e.g. a retry) never
-/// race each other; it is otherwise the only test in this binary that
-/// touches the process's cwd.
-#[test]
-fn canonical_result_root_is_independent_of_a_chdir_between_load_and_materialize() {
-    static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = CWD_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-
-    let original_cwd = std::env::current_dir().unwrap();
-    let anchor_dir = tempfile::tempdir().unwrap();
-    let sibling_cwd = tempfile::tempdir().unwrap();
-    let cfg = advertising_config(anchor_dir.path(), None);
-
-    // "load": validate while still in the original cwd.
-    let membership_before = crate::catalog::instance::MembershipConfig::validate(&cfg)
-        .unwrap()
-        .unwrap();
-
-    std::env::set_current_dir(sibling_cwd.path()).unwrap();
-    let materialize_result = membership_before.materialize();
-    std::env::set_current_dir(&original_cwd).unwrap();
-
-    let canonical = materialize_result.unwrap();
-    let expected = format!(
-        "file://{}/jammi_db",
-        std::fs::canonicalize(anchor_dir.path())
-            .unwrap()
-            .to_string_lossy()
-    );
-    assert_eq!(
-        canonical.as_str(),
-        expected,
-        "the canonical root must be independent of the process cwd, given an absolute anchor"
-    );
-}
-
-// ─── F1: `load_from`-level oracles — every arm through the REAL public
-// loader, not only through the lower-level `MembershipConfig`/
-// `InstanceRegistration` unit calls above. ──────────────────────────────
-
-/// `load_from` refuses `peer_advertise` without `peer_bind`, naming both
-/// keys — the PURE half of the check runs at load.
+/// P-M5 (contract §10): `peer_advertise` without `peer_bind` is refused
+/// naming BOTH keys — the ONLY thing `MembershipConfig::validate` checks
+/// beyond parsing the address, exercised through the real `load_from`
+/// loader.
 #[test]
 fn load_from_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -3326,50 +3252,7 @@ fn load_from_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
-/// `load_from` refuses a RELATIVE `artifact_dir` when `peer_advertise` is
-/// set, naming the key — F2, exercised through the real loader.
-#[test]
-fn load_from_refuses_a_relative_artifact_dir_when_peer_advertise_is_set() {
-    let src = "artifact_dir = \".jammi\"\n[server]\npeer_bind = \"0.0.0.0:19203\"\n\
-               peer_advertise = \"127.0.0.1:19203\"\n";
-    let err = load_src(src).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("artifact_dir") && msg.contains("absolute"),
-        "{msg}"
-    );
-}
-
-/// The F1 oracle: `load_from` on a FRESH tempdir (the anchor genuinely does
-/// not exist yet) with `peer_advertise` set and `result_root` UNSET
-/// SUCCEEDS — the pure check never reads the filesystem, so it can never be
-/// STRICTER than the materializing backstop
-/// (`InstanceRegistration::from_config`, exercised end-to-end by
-/// `jammi-ai`'s `instance_identity.rs`) the way it was before F1: `load_from`
-/// used to call the (impure, existence-checking) `from_config` directly and
-/// refuse here, while `InferenceSession`'s own construction path silently
-/// accepted the SAME config because `JammiSession::new`'s catalog open had
-/// already `create_dir_all`'d the identical path first — two enforcement
-/// points, two different verdicts on one config.
-#[test]
-fn load_from_accepts_a_fresh_missing_anchor_when_peer_advertise_is_set() {
-    let base = tempfile::tempdir().unwrap();
-    let missing = base.path().join("does-not-exist-yet");
-    assert!(!missing.exists());
-    let src = format!(
-        "artifact_dir = {:?}\n[server]\npeer_bind = \"0.0.0.0:19201\"\n\
-         peer_advertise = \"127.0.0.1:19201\"\n",
-        missing.to_str().unwrap()
-    );
-    load_src(&src).expect("a missing (creatable, absolute) anchor must be accepted at load");
-    assert!(
-        !missing.exists(),
-        "load_from is PURE: it must never create a directory as a side effect of loading"
-    );
-}
-
-/// P-M5 restated over `InstanceRegistration::from_config`, arm 1: unset
-/// `peer_bind` is refused naming BOTH keys.
+/// The same P-M5 arm, over `InstanceRegistration::from_config` directly.
 #[test]
 fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     let cfg = JammiConfig {
@@ -3388,236 +3271,96 @@ fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
-/// F1: `from_config` MATERIALIZES a missing anchor — it is CREATED, never
-/// refused. Before the F1 fix, a fresh host's `artifact_dir` (genuinely
-/// absent at config-load time) was refused here, while `InferenceSession`'s
-/// own backstop silently accepted it because `JammiSession::new`'s own
-/// catalog open had ALREADY `create_dir_all`'d the same path before
-/// `from_config` ever ran — two enforcement points reaching different
-/// verdicts on one config. `from_config` creating it directly (idempotent
-/// with that same `create_dir_all`) closes the gap from this side.
+/// P-X1 (contract §10): `InstanceRegistration::from_config`'s `member_root`
+/// is the byte-for-byte output of `resolved_result_root()` — VERBATIM —
+/// over the whole arm list: unset, `file://`, `memory://`, `s3://`, both
+/// `gcs://` and `gs://` (two DIFFERENT strings — `Scheme`'s alias table is
+/// never reached on this path), both `abfss://` and `azure://`, an
+/// uppercase scheme, and a trailing `/`. `from_config` performs NO
+/// filesystem access and NO interpretation of the root: none of these arms
+/// error.
 #[test]
-fn from_config_creates_a_missing_artifact_dir_anchor() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("does-not-exist");
-    assert!(!missing.exists());
-    let cfg = advertising_config(&missing, None);
+fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
+    let arms: &[Option<&str>] = &[
+        None,
+        Some("file:///var/lib/jammi/jammi_db"),
+        Some("memory://x"),
+        Some("s3://bucket/prefix"),
+        Some("gcs://bucket/prefix"),
+        Some("gs://bucket/prefix"),
+        Some("abfss://bucket/prefix"),
+        Some("azure://bucket/prefix"),
+        Some("S3://BUCKET/PREFIX"),
+        Some("s3://bucket/prefix/"),
+    ];
+    for result_root in arms {
+        let cfg = advertising_config(std::path::Path::new("/srv/jammi"), *result_root);
+        let resolved = cfg.resolved_result_root().unwrap();
+        let reg =
+            crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+                .unwrap();
+        assert_eq!(
+            reg.member_root.as_ref().map(|r| r.as_str()),
+            Some(resolved.as_str()),
+            "arm {result_root:?}: the row must carry resolved_result_root() verbatim"
+        );
+        assert_eq!(
+            reg.peer_addr.as_ref().map(|p| p.as_str()),
+            Some("10.0.0.1:9000")
+        );
+    }
+
+    // The "/" ALONE arm: `artifact_dir` itself is the root filesystem path,
+    // `result_root` unset — still carried verbatim, with no special-casing.
+    let cfg = advertising_config(std::path::Path::new("/"), None);
+    let resolved = cfg.resolved_result_root().unwrap();
     let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
         .unwrap();
-    assert!(
-        missing.is_dir(),
-        "from_config must materialize the missing anchor as a directory"
-    );
-    let expected = format!(
-        "file://{}/jammi_db",
-        std::fs::canonicalize(&missing).unwrap().to_string_lossy()
-    );
-    assert_eq!(reg.canonical_root.unwrap().as_str(), expected);
+    assert_eq!(reg.member_root.unwrap().as_str(), resolved);
 }
 
-/// Arm 2 (the sibling): an anchor that exists but is a FILE, not a
-/// directory, is refused the same way.
+/// `gcs://b/p` and `gs://b/p` are DIFFERENT `member_root` strings — the
+/// membership path performs no scheme aliasing (contract §10 P-X2's
+/// `gang_membership.rs` case is the join-time counterpart of this).
 #[test]
-fn from_config_anchor_that_is_a_file_is_refused_naming_the_key() {
-    let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("not-a-dir");
-    std::fs::write(&file_path, b"x").unwrap();
-    let cfg = advertising_config(&file_path, None);
-    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
-        .unwrap_err();
-    assert!(err.to_string().contains("directory"), "{err}");
-}
-
-/// Arm 3: `result_root` UNSET canonicalizes `{artifact_dir}/jammi_db`.
-#[test]
-fn from_config_unset_result_root_canonicalizes_artifact_dir_jammi_db() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = advertising_config(dir.path(), None);
-    let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
-        .unwrap();
-    let expected = format!(
-        "file://{}/jammi_db",
-        std::fs::canonicalize(dir.path()).unwrap().to_string_lossy()
+fn from_config_never_aliases_gcs_and_gs_result_root_spellings() {
+    let cfg_gcs = advertising_config(std::path::Path::new("/unused"), Some("gcs://bucket/p"));
+    let cfg_gs = advertising_config(std::path::Path::new("/unused"), Some("gs://bucket/p"));
+    let reg_gcs =
+        crate::catalog::instance::InstanceRegistration::from_config(&cfg_gcs, "i1", None, None)
+            .unwrap();
+    let reg_gs =
+        crate::catalog::instance::InstanceRegistration::from_config(&cfg_gs, "i2", None, None)
+            .unwrap();
+    assert_ne!(
+        reg_gcs.member_root.unwrap().as_str(),
+        reg_gs.member_root.unwrap().as_str(),
+        "gcs:// and gs:// must remain two different roots on the membership path"
     );
-    assert_eq!(reg.canonical_root.unwrap().as_str(), expected);
-    assert_eq!(reg.peer_addr.unwrap().as_str(), "10.0.0.1:9000");
 }
 
-/// Arm 4: a library config (no `peer_advertise`) produces NULLs — `peer_addr`
-/// and `canonical_root` both absent, never an error.
+/// A library config (no `peer_advertise`) produces NULLs — `peer_addr` and
+/// `member_root` both absent, never an error.
 #[test]
 fn from_config_without_peer_advertise_is_a_library_registration_with_nulls() {
     let cfg = JammiConfig::default();
     let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
         .unwrap();
     assert!(reg.peer_addr.is_none());
-    assert!(reg.canonical_root.is_none());
+    assert!(reg.member_root.is_none());
     assert_eq!(reg.instance_id, "i1");
 }
 
-/// The pinned B2 property: `canonical_result_root()` returns the SAME
-/// string whether the leaf (`jammi_db`) is absent, present, or a symlink to
-/// elsewhere — the leaf itself is appended lexically and never resolved.
-#[test]
-fn canonical_result_root_is_identical_whether_the_leaf_is_absent_present_or_a_symlink() {
-    let dir = tempfile::tempdir().unwrap();
-    let before = advertising_config(dir.path(), None)
-        .canonical_result_root()
-        .unwrap()
-        .unwrap();
-
-    std::fs::create_dir_all(dir.path().join("jammi_db")).unwrap();
-    let present = advertising_config(dir.path(), None)
-        .canonical_result_root()
-        .unwrap()
-        .unwrap();
-    assert_eq!(before, present, "leaf present must fold to the same string");
-    std::fs::remove_dir(dir.path().join("jammi_db")).unwrap();
-
-    #[cfg(unix)]
-    {
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("jammi_db")).unwrap();
-        let symlinked = advertising_config(dir.path(), None)
-            .canonical_result_root()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            before, symlinked,
-            "a symlinked leaf must fold to the same string too — it is never itself resolved"
-        );
-    }
-}
-
-/// E3: two spellings of one anchor (`./`, `//`-collapsed via
-/// `fs::canonicalize`, a trailing `/`) fold to the identical canonical
-/// string.
-#[test]
-fn canonical_result_root_folds_dot_slash_and_trailing_slash_anchor_spellings() {
-    let dir = tempfile::tempdir().unwrap();
-    let plain = dir.path().to_str().unwrap().to_string();
-
-    let plain_root = advertising_config(std::path::Path::new("/unused"), Some(&plain))
-        .canonical_result_root()
-        .unwrap()
-        .unwrap();
-
-    let trailing = format!("{plain}/");
-    let trailing_root = advertising_config(std::path::Path::new("/unused"), Some(&trailing))
-        .canonical_result_root()
-        .unwrap()
-        .unwrap();
-    assert_eq!(plain_root, trailing_root, "a trailing '/' must fold");
-
-    let with_dot = format!("{plain}/.");
-    let dot_root = advertising_config(std::path::Path::new("/unused"), Some(&with_dot))
-        .canonical_result_root()
-        .unwrap()
-        .unwrap();
-    assert_eq!(plain_root, dot_root, "a trailing '/.' must fold");
-
-    let parent = dir.path().parent().unwrap().to_str().unwrap();
-    let leaf = dir.path().file_name().unwrap().to_str().unwrap();
-    let double_slash = format!("{parent}//{leaf}");
-    let double_slash_root =
-        advertising_config(std::path::Path::new("/unused"), Some(&double_slash))
-            .canonical_result_root()
-            .unwrap()
-            .unwrap();
-    assert_eq!(plain_root, double_slash_root, "a doubled '/' must fold");
-}
-
-/// `canonical_result_root()` is exactly `canon ∘ resolved`: for every arm
-/// the canonical string equals the canonicalized form of the EXACT
-/// effective root `resolved_result_root()` names — arm (a) (`result_root`
-/// unset) is `{artifact_dir}/jammi_db`; arm (b) (`result_root` set to a
-/// `file://`/bare path) is `result_root` VERBATIM, the same string
-/// `jammi_db::store::ResultStore::with_root` roots the store at, with no
-/// `jammi_db` suffix; arm (c) (`result_root` set to a cloud scheme) is
-/// `resolved_result_root()`'s string itself (no scheme lowercasing, §9) —
-/// never a string no store is rooted under.
-#[test]
-fn canonical_result_root_equals_the_canonicalized_effective_root_for_every_arm() {
-    // Arm (a): `result_root` unset.
-    let dir_a = tempfile::tempdir().unwrap();
-    let cfg_a = advertising_config(dir_a.path(), None);
-    assert_eq!(
-        cfg_a.resolved_result_root().unwrap(),
-        dir_a.path().join("jammi_db").to_string_lossy()
-    );
-    let canonical_a = cfg_a.canonical_result_root().unwrap().unwrap();
-    let expected_a = format!(
-        "file://{}",
-        std::fs::canonicalize(dir_a.path())
-            .unwrap()
-            .join("jammi_db")
-            .to_string_lossy()
-    );
-    assert_eq!(canonical_a.as_str(), expected_a);
-
-    // Arm (b): `result_root` explicitly set to an existing directory.
-    let dir_b = tempfile::tempdir().unwrap();
-    let root_b = dir_b.path().to_str().unwrap();
-    let cfg_b = advertising_config(std::path::Path::new("/unused"), Some(root_b));
-    assert_eq!(
-        cfg_b.resolved_result_root().unwrap(),
-        root_b,
-        "arm (b)'s effective root is result_root VERBATIM"
-    );
-    let canonical_b = cfg_b.canonical_result_root().unwrap().unwrap();
-    let expected_b = format!(
-        "file://{}",
-        std::fs::canonicalize(root_b).unwrap().to_string_lossy()
-    );
-    assert_eq!(canonical_b.as_str(), expected_b);
-    assert!(
-        !canonical_b.as_str().ends_with("jammi_db"),
-        "arm (b) must root at result_root verbatim, no jammi_db suffix: {canonical_b:?}"
-    );
-
-    // Arm (c): `result_root` explicitly set to a cloud scheme — no local
-    // filesystem step, so the canonical string is `resolved_result_root()`
-    // itself.
-    let root_c = "s3://bucket/prefix";
-    let cfg_c = advertising_config(std::path::Path::new("/unused"), Some(root_c));
-    assert_eq!(cfg_c.resolved_result_root().unwrap(), root_c);
-    let canonical_c = cfg_c.canonical_result_root().unwrap().unwrap();
-    assert_eq!(canonical_c.as_str(), root_c);
-}
-
-/// §9 (F-A1/F-A2 closed): `artifact_dir` is NEVER reinterpreted as a URL —
-/// a `file://`-spelled or a cloud-scheme-spelled `artifact_dir` is refused
-/// as RELATIVE (as a literal path string neither starts with `/`), naming
-/// `artifact_dir`, never silently accepted through a URL reparse.
-#[test]
-fn membership_config_validate_refuses_a_file_url_spelled_artifact_dir_as_relative() {
-    let cfg = advertising_config(std::path::Path::new("file:///var/lib/jammi"), None);
-    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("artifact_dir") && msg.contains("absolute"),
-        "{msg}"
-    );
-}
-
-#[test]
-fn membership_config_validate_refuses_a_cloud_url_spelled_artifact_dir_as_relative() {
-    let cfg = advertising_config(std::path::Path::new("s3://bucket/prefix"), None);
-    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("artifact_dir") && msg.contains("absolute"),
-        "{msg}"
-    );
-}
-
-/// A non-UTF-8 `artifact_dir` is refused naming the key — never a lossy
-/// fold on the compared value (F-A3). Built via `OsString::from_vec` (unix
-/// only — there is no portable way to construct an invalid-UTF-8 `PathBuf`
-/// elsewhere).
+/// A non-UTF-8 `artifact_dir` is refused naming the key by
+/// `resolved_result_root()` itself (never a lossy fold on the compared
+/// value) — `InstanceRegistration::from_config` propagates that refusal for
+/// the default (`result_root` unset) arm; `MembershipConfig::validate`
+/// itself never touches `artifact_dir` at all. Built via `OsString::
+/// from_vec` (unix only — there is no portable way to construct an
+/// invalid-UTF-8 `PathBuf` elsewhere).
 #[cfg(unix)]
 #[test]
-fn membership_config_validate_refuses_a_non_utf8_artifact_dir() {
+fn from_config_refuses_a_non_utf8_artifact_dir_via_resolved_result_root() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -3628,140 +3371,13 @@ fn membership_config_validate_refuses_a_non_utf8_artifact_dir() {
     assert!(bad_path.to_str().is_none(), "fixture must be non-UTF-8");
 
     let cfg = advertising_config(&bad_path, None);
-    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("artifact_dir") && msg.contains("UTF-8"),
         "{msg}"
     );
-}
-
-/// The ENOTDIR oracle: the anchor's PARENT segment is a plain FILE, so
-/// `create_dir_all` cannot create anything under it — a structural
-/// "not a directory" failure distinct from a permission fault, so this
-/// case is refused the SAME way whether CI runs as root or not (a
-/// permission-denied case would be bypassed by root; ENOTDIR never is).
-#[test]
-fn materialize_refuses_when_the_anchor_cannot_be_created_parent_is_a_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let parent_is_a_file = dir.path().join("not-a-dir");
-    std::fs::write(&parent_is_a_file, b"x").unwrap();
-    let anchor = parent_is_a_file.join("child"); // a path component IS a file
-    assert!(!anchor.exists());
-
-    let cfg = advertising_config(&anchor, None);
-    let err = cfg.canonical_result_root().unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("artifact_dir") && msg.contains("failed to create"),
-        "{msg}"
-    );
-}
-
-/// Arm (b)'s sibling of `from_config_creates_a_missing_artifact_dir_anchor`:
-/// a MISSING anchor is likewise CREATED, never refused, when the anchor is
-/// an EXPLICIT `result_root`, not only when it falls back to `artifact_dir`.
-#[test]
-fn canonical_result_root_creates_a_missing_explicit_result_root_anchor() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("does-not-exist");
-    assert!(!missing.exists());
-    let cfg = advertising_config(
-        std::path::Path::new("/unused"),
-        Some(missing.to_str().unwrap()),
-    );
-    let root = cfg.canonical_result_root().unwrap().unwrap();
-    assert!(
-        missing.is_dir(),
-        "canonical_result_root must materialize the missing anchor as a directory"
-    );
-    let expected = format!(
-        "file://{}",
-        std::fs::canonicalize(&missing).unwrap().to_string_lossy()
-    );
-    assert_eq!(root.as_str(), expected);
-}
-
-#[test]
-fn canonical_result_root_refuses_a_file_anchor_for_an_explicit_result_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("not-a-dir");
-    std::fs::write(&file_path, b"x").unwrap();
-    let cfg = advertising_config(
-        std::path::Path::new("/unused"),
-        Some(file_path.to_str().unwrap()),
-    );
-    let err = cfg.canonical_result_root().unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("result_root") && msg.contains("directory"),
-        "{msg}"
-    );
-}
-
-/// A `memory://` root is refused for a gang member.
-#[test]
-fn canonical_result_root_refuses_a_memory_scheme() {
-    let cfg = advertising_config(std::path::Path::new("/unused"), Some("memory://x"));
-    let err = cfg.canonical_result_root().unwrap_err();
-    assert!(err.to_string().contains("memory"), "{err}");
-}
-
-/// Cloud schemes: the scheme token is lowercased THEN folded through
-/// `Scheme`'s own alias table (`gcs`/`gs` and `abfss`/`azure` fold to the
-/// identical string), and a trailing `/` is trimmed — no `jammi_db` leaf is
-/// ever appended for a cloud scheme.
-#[test]
-fn canonical_result_root_parses_a_cloud_result_root_verbatim_no_scheme_lowercasing() {
-    let root_of = |root: &str| {
-        advertising_config(std::path::Path::new("/unused"), Some(root))
-            .canonical_result_root()
-            .unwrap()
-            .unwrap()
-    };
-    // No scheme lowercasing (contract §9): the lowercase spelling parses
-    // and round-trips verbatim.
-    assert_eq!(root_of("gs://bucket/prefix").as_str(), "gs://bucket/prefix");
-    assert_eq!(
-        root_of("azure://bucket/prefix").as_str(),
-        "azure://bucket/prefix"
-    );
-    assert_eq!(
-        root_of("s3://bucket/prefix/"),
-        root_of("s3://bucket/prefix"),
-        "trailing '/' trimmed"
-    );
-}
-
-/// §9: an UPPERCASE (or any non-lowercase) scheme token is refused —
-/// consistently — by `canonical_result_root` and by `StorageUrl::parse`
-/// itself (the SAME parser `build_result_store` uses for the identical
-/// string), never silently folded to the lowercase spelling.
-#[test]
-fn canonical_result_root_refuses_an_uppercase_cloud_scheme_consistently_with_the_store() {
-    let cfg = advertising_config(std::path::Path::new("/unused"), Some("GCS://bucket/prefix"));
-    let membership_err = cfg.canonical_result_root().unwrap_err();
-    let store_err = crate::storage::StorageUrl::parse("GCS://bucket/prefix").unwrap_err();
-    assert!(
-        membership_err.to_string().contains("unknown scheme"),
-        "{membership_err}"
-    );
-    assert!(
-        store_err.to_string().contains("unknown scheme"),
-        "the store's own parser must refuse the identical string the same way: {store_err}"
-    );
-}
-
-/// `canonical_result_root` is `Ok(None)` whenever `peer_advertise` is unset
-/// — a library process never computes it, whatever `result_root` says.
-#[test]
-fn canonical_result_root_is_none_when_peer_advertise_is_unset() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = JammiConfig {
-        artifact_dir: dir.path().to_path_buf(),
-        ..JammiConfig::default()
-    };
-    assert_eq!(cfg.canonical_result_root().unwrap(), None);
 }
 
 /// `JammiConfig::resolved_result_root` mirrors `ResultStore::new`'s own

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::catalog::instance::CanonicalRoot;
 pub use crate::catalog::lease::LeaseIntervals;
 use crate::error::{JammiError, Result};
 use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
@@ -2461,12 +2460,16 @@ fn describe_deserialize_error(
 }
 
 impl JammiConfig {
-    /// The result-table root this deployment resolves to, before any
-    /// canonicalization: the explicit `[storage] result_root` when set, else
-    /// `{artifact_dir}/jammi_db` — the SAME derivation
-    /// `jammi_db::store::ResultStore::new`'s local-root arm performs
-    /// (`artifact_dir.join("jammi_db")`), the ONE place that join happens so
-    /// nothing downstream re-derives it independently.
+    /// The result-table root this deployment resolves to, VERBATIM: the
+    /// explicit `[storage] result_root` when set, else `{artifact_dir}/
+    /// jammi_db` — the SAME derivation `jammi_db::store::ResultStore::new`'s
+    /// local-root arm performs (`artifact_dir.join("jammi_db")`), the ONE
+    /// place that join happens so nothing downstream re-derives it
+    /// independently. This string is exactly what a gang member's
+    /// `instances.result_root` column carries
+    /// ([`crate::catalog::instance::InstanceRegistration::from_config`]) —
+    /// no scheme folding, no symlink resolution, no reinterpretation of any
+    /// kind.
     ///
     /// # Errors
     ///
@@ -2487,41 +2490,6 @@ impl JammiConfig {
                     ))
                 })
             }
-        }
-    }
-
-    /// The canonical result root two gang members compare byte-for-byte —
-    /// `Ok(None)` when `[server] peer_advertise` is unset, so a library
-    /// process (and every deployment that never joins a gang) never
-    /// computes this. See
-    /// [`crate::catalog::instance::InstanceRegistration::from_config`] for
-    /// the WHOLE membership check this is one piece of, and
-    /// [`crate::catalog::instance::MembershipConfig`] for the PURE-validate /
-    /// MATERIALIZE split this function itself performs (validate, then
-    /// materialize — this is the convenience one-shot form; `load_from`
-    /// calls `MembershipConfig::validate` alone, never materializing).
-    ///
-    /// **This is `materialize ∘ validate`, over the EXACT same effective
-    /// root [`Self::resolved_result_root`] names** — never a string no store
-    /// is actually rooted under. `[storage] result_root` UNSET names
-    /// `{artifact_dir}/jammi_db`: `artifact_dir` is `MembershipConfig`'s
-    /// anchor as a LITERAL local path (never reinterpreted as a URL —
-    /// contract §9), created if absent, canonicalized, with `jammi_db`
-    /// appended lexically. `result_root` SET is the ONLY arm parsed as a
-    /// URL, VERBATIM (no scheme lowercasing — an uppercase scheme is
-    /// refused, consistently, by this check and by the store's own parse of
-    /// the identical string): `file://` names `result_root` VERBATIM (the
-    /// SAME string `jammi_db::store::ResultStore::with_root` roots the
-    /// store at — no `jammi_db` suffix, since `result_root` already names
-    /// the whole effective root); a cloud scheme is `Scheme`'s own
-    /// rendering, trailing-`/`-trimmed, with no local filesystem step at
-    /// all. A relative anchor (either arm's `file://` case) is refused at
-    /// `MembershipConfig::validate` before either arm's filesystem step
-    /// ever runs.
-    pub fn canonical_result_root(&self) -> Result<Option<CanonicalRoot>> {
-        match crate::catalog::instance::MembershipConfig::validate(self)? {
-            None => Ok(None),
-            Some(membership) => Ok(Some(membership.materialize()?)),
         }
     }
 
@@ -2584,19 +2552,17 @@ impl JammiConfig {
         // than at the first `jammi_ai::telemetry::otlp_layer` call.
         config.observability.validate()?;
         // Reject a `[server] peer_advertise` that cannot resolve a valid
-        // gang-membership shape (an unset `peer_bind`, an unparseable
-        // address, a malformed/`memory://` result root, or a RELATIVE
-        // `file://` anchor) at load time, naming the offending key — rather
-        // than only surfacing deep inside `InferenceSession::wrap_with`'s
-        // own registration call. `MembershipConfig::validate` is the PURE
-        // half of the check ONLY (no filesystem read/write): loading a
-        // config file must never itself create a directory as a side
-        // effect — that materialize step belongs to
-        // `InstanceRegistration::from_config` alone, which `wrap_with`
+        // gang-membership shape (an unset `peer_bind`, or an unparseable
+        // address) at load time, naming the offending key — rather than
+        // only surfacing deep inside `InferenceSession::wrap_with`'s own
+        // registration call. `MembershipConfig::validate` performs no
+        // filesystem access and no interpretation of the result root at
+        // all — the row carries `resolved_result_root()` verbatim (contract
+        // §10); `InstanceRegistration::from_config`, which `wrap_with`
         // calls (every `InferenceSession` constructor funnels through it),
-        // so a struct-literal config that skips `load_from` entirely is
-        // still covered there. The `Option` is discarded; this call is for
-        // its early-failure side effect only.
+        // is the ONLY other caller, so a struct-literal config that skips
+        // `load_from` entirely is still covered there. The `Option` is
+        // discarded; this call is for its early-failure side effect only.
         let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
         Ok(config)
     }

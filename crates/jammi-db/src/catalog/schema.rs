@@ -1215,8 +1215,10 @@ ALTER TABLE jobs ADD COLUMN training_set_location TEXT
 
 /// Migration 035 (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a):
 /// the gang-membership carrier on `instances` — `peer_addr` (the `host:port`
-/// this process's peer/gang listener is reachable at) and `result_root` (its
-/// canonicalized result-table root, `JammiConfig::canonical_result_root`).
+/// this process's peer/gang listener is reachable at) and `result_root` (the
+/// VERBATIM configured result-table root, `JammiConfig::resolved_result_root`
+/// — two spellings of one physical location are two different roots to the
+/// membership predicate that compares this column byte-for-byte).
 ///
 /// Both columns are NULLABLE, with a shared meaning: `NULL` = "this process
 /// never joins a gang" — every library/CLI process, and every server process

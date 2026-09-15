@@ -11,7 +11,7 @@ use std::time::Duration;
 use jammi_ai::fine_tune::worker::{EmbeddedWorker, COMPILED_KINDS};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
-use jammi_db::catalog::instance::{CanonicalRoot, GangListing, InstanceRegistration};
+use jammi_db::catalog::instance::{GangListing, InstanceRegistration, MemberRoot};
 use jammi_db::catalog::jobs_repo::WorkerRecord;
 use jammi_db::catalog::lease::{instance_liveness_margin, instance_prune_window};
 use jammi_db::catalog::Catalog;
@@ -272,7 +272,7 @@ async fn wait_until_gang_member(
     catalog: &Catalog,
     instance_id: &str,
     kind: &str,
-    canonical_root: &CanonicalRoot,
+    member_root: &MemberRoot,
     lease: Duration,
 ) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -281,7 +281,7 @@ async fn wait_until_gang_member(
             .list_gang_members(GangListing {
                 kind,
                 self_instance: "not-a-real-instance-id",
-                canonical_root,
+                member_root,
                 lease,
             })
             .await
@@ -311,17 +311,13 @@ async fn library_config_without_peer_advertise_writes_null_membership_columns() 
 /// `[server] peer_advertise` set, `[storage] result_root` UNSET: through the
 /// REAL `InferenceSession::open` construction (never a direct db write) the
 /// row carries a non-NULL `peer_addr`/`result_root`, and `result_root` is
-/// exactly `canonical_result_root()`'s own value (`canon(artifact_dir)/jammi_db`).
+/// exactly `resolved_result_root()`'s own value (`{artifact_dir}/jammi_db`)
+/// VERBATIM — contract §10, the round-3 excision.
 #[tokio::test]
 async fn peer_advertise_set_result_root_unset_produces_a_nonnull_row_via_open() {
     let dir = tempfile::TempDir::new().unwrap();
     let config = fast_peer_config(dir.path(), 19101);
-    let expected_root = config
-        .canonical_result_root()
-        .unwrap()
-        .expect("peer_advertise is set")
-        .as_str()
-        .to_string();
+    let expected_root = config.resolved_result_root().unwrap();
 
     let session = InferenceSession::open(config).await.unwrap();
     let row = instance_columns(session.catalog(), session.instance_id())
@@ -331,23 +327,19 @@ async fn peer_advertise_set_result_root_unset_produces_a_nonnull_row_via_open() 
     assert_eq!(row.1.as_deref(), Some(expected_root.as_str()));
 }
 
-/// `[server] peer_advertise` set, `[storage] result_root` SET (to an
-/// existing directory): through `InferenceSession::open_with_placement`
-/// the row carries a non-NULL `peer_addr`/`result_root`, with `result_root`
-/// exactly the canonicalized `result_root` (no `jammi_db` leaf appended —
-/// the B2 erratum arm).
+/// `[server] peer_advertise` set, `[storage] result_root` SET (to a path
+/// that does not even need to exist — the row carries the string verbatim,
+/// with no filesystem step at all): through
+/// `InferenceSession::open_with_placement` the row carries a non-NULL
+/// `peer_addr`/`result_root`, with `result_root` exactly `result_root`
+/// verbatim.
 #[tokio::test]
 async fn peer_advertise_set_result_root_set_produces_a_nonnull_row_via_open_with_placement() {
     let dir = tempfile::TempDir::new().unwrap();
     let root_dir = tempfile::TempDir::new().unwrap();
     let mut config = fast_peer_config(dir.path(), 19102);
     config.storage.result_root = Some(root_dir.path().to_string_lossy().into_owned());
-    let expected_root = config
-        .canonical_result_root()
-        .unwrap()
-        .expect("peer_advertise is set")
-        .as_str()
-        .to_string();
+    let expected_root = config.resolved_result_root().unwrap();
 
     let session =
         InferenceSession::open_with_placement(config, Arc::new(jammi_db::index::AllLocal))
@@ -361,7 +353,7 @@ async fn peer_advertise_set_result_root_set_produces_a_nonnull_row_via_open_with
 }
 
 /// `peer_advertise` without `peer_bind` fails session open with a typed
-/// error naming BOTH keys — before any row is written.
+/// error naming BOTH keys — before any row is written (§8 B3).
 #[tokio::test]
 async fn peer_advertise_without_peer_bind_fails_open_naming_both_keys() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -377,113 +369,6 @@ async fn peer_advertise_without_peer_bind_fails_open_naming_both_keys() {
     assert!(
         msg.contains("peer_advertise") && msg.contains("peer_bind"),
         "error must name both keys: {msg}"
-    );
-}
-
-/// F1 fix (the two enforcement points reaching the SAME verdict on one
-/// config): a MISSING (non-existent, but well-formed and absolute)
-/// `result_root` anchor with `peer_advertise` set is CREATED, never
-/// refused — `InstanceRegistration::from_config` MATERIALIZES it
-/// (idempotent with `JammiSession`'s own `create_dir_all` of `artifact_dir`,
-/// and with `ResultStore`'s later one of the SAME `result_root` path), the
-/// same way `JammiConfig::load_from` now accepts a missing anchor at load
-/// (`jammi-db`'s `config::tests::
-/// load_from_accepts_a_fresh_missing_anchor_when_peer_advertise_is_set`).
-/// Session open succeeds and writes a non-NULL `instances` row.
-#[tokio::test]
-async fn missing_result_root_anchor_is_created_and_session_open_succeeds() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let mut config = fast_peer_config(dir.path(), 19104);
-    let missing = dir.path().join("does-not-exist");
-    assert!(!missing.exists());
-    config.storage.result_root = Some(missing.to_string_lossy().into_owned());
-
-    let session = InferenceSession::new(config)
-        .await
-        .expect("a missing (creatable) result_root anchor must be accepted, not refused");
-    assert!(
-        missing.is_dir(),
-        "from_config must have materialized the missing anchor"
-    );
-    let row = instance_columns(session.catalog(), session.instance_id())
-        .await
-        .expect("the row must exist");
-    assert!(row.0.is_some(), "peer_addr must be non-NULL: {row:?}");
-    assert!(row.1.is_some(), "result_root must be non-NULL: {row:?}");
-}
-
-/// The F1 oracle, stated directly: `JammiConfig::load_from` on a config
-/// whose `artifact_dir` anchor does not exist yet (the fresh-host case)
-/// SUCCEEDS (the pure `MembershipConfig::validate` never reads the
-/// filesystem), AND `InferenceSession::open` on THAT SAME config writes the
-/// non-NULL member row — the two enforcement points agree, closing the gap
-/// where `load_from` used to be STRICTER (it called the impure, existence-
-/// checking `from_config` directly) than the session backstop (which
-/// silently accepted the same fresh anchor because `JammiSession::new`'s own
-/// catalog open had already `create_dir_all`'d it first).
-#[tokio::test]
-async fn load_from_and_session_open_agree_on_a_fresh_artifact_dir() {
-    let base = tempfile::TempDir::new().unwrap();
-    let missing = base.path().join("does-not-exist-yet");
-    assert!(!missing.exists());
-    let port = 19108u16;
-    let toml_path = base.path().join("jammi.toml");
-    // The `[artifact_dir]`-relative TOML file lives OUTSIDE `missing` (in
-    // `base`, which the tempdir already created), while `artifact_dir`
-    // itself names `missing` — genuinely absent until materialized.
-    std::fs::write(
-        &toml_path,
-        format!(
-            "artifact_dir = {:?}\n[server]\npeer_bind = \"0.0.0.0:{port}\"\n\
-             peer_advertise = \"127.0.0.1:{port}\"\n[lease]\nduration_secs = 3\n\
-             heartbeat_secs = 1\n",
-            missing.to_str().unwrap()
-        ),
-    )
-    .unwrap();
-
-    // The REAL public loader — `JammiConfig::load_from`, the exact sequence
-    // a production process runs — succeeds on the fresh anchor and creates
-    // nothing.
-    let config = jammi_db::config::JammiConfig::load_from(Some(&toml_path), std::iter::empty())
-        .expect("load_from must accept a fresh, absolute, well-formed anchor");
-    assert!(
-        !missing.exists(),
-        "load_from is PURE: it must never create a directory as a side effect of loading"
-    );
-
-    // The SAME config, opened as a real session: the materializing
-    // backstop creates the anchor and writes a non-NULL member row — the
-    // two enforcement points agree.
-    let session = InferenceSession::new(config).await.unwrap();
-    assert!(missing.is_dir(), "session open must materialize the anchor");
-    let row = instance_columns(session.catalog(), session.instance_id())
-        .await
-        .expect("the row must exist");
-    assert!(row.0.is_some(), "peer_addr must be non-NULL: {row:?}");
-    assert!(row.1.is_some(), "result_root must be non-NULL: {row:?}");
-}
-
-/// A `result_root` anchor that exists but is a FILE, not a directory, still
-/// fails session open with a typed error naming the key, and the
-/// `instances` row is NEVER written — the ONE case a missing/creatable
-/// anchor can never be confused with.
-#[tokio::test]
-async fn file_result_root_anchor_fails_open_and_writes_no_row() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let mut config = fast_peer_config(dir.path(), 19109);
-    let file_path = dir.path().join("not-a-dir");
-    std::fs::write(&file_path, b"x").unwrap();
-    config.storage.result_root = Some(file_path.to_string_lossy().into_owned());
-
-    let err = match InferenceSession::new(config).await {
-        Ok(_) => panic!("expected session open to fail"),
-        Err(e) => e,
-    };
-    assert!(matches!(err, JammiError::Config(_)), "{err:?}");
-    assert!(
-        err.to_string().contains("result_root") && err.to_string().contains("directory"),
-        "error must name the offending key: {err}"
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -507,6 +392,30 @@ async fn file_result_root_anchor_fails_open_and_writes_no_row() {
     catalog.close().await;
 }
 
+/// A `result_root` naming a path that does not exist yet is accepted the
+/// same as any other spelling: the row carries it verbatim. (The path IS
+/// created — but by the result store's own local-root `create_dir_all`,
+/// `ResultStore::with_root`, never by the membership check itself, which
+/// performs no filesystem access at all, contract §10.)
+#[tokio::test]
+async fn missing_result_root_path_is_accepted_verbatim_and_session_open_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = fast_peer_config(dir.path(), 19104);
+    let missing = dir.path().join("does-not-exist");
+    assert!(!missing.exists());
+    config.storage.result_root = Some(missing.to_string_lossy().into_owned());
+    let expected_root = config.resolved_result_root().unwrap();
+
+    let session = InferenceSession::new(config)
+        .await
+        .expect("a not-yet-existing result_root path must be accepted verbatim");
+    let row = instance_columns(session.catalog(), session.instance_id())
+        .await
+        .expect("the row must exist");
+    assert_eq!(row.0.as_deref(), Some("127.0.0.1:19104"));
+    assert_eq!(row.1.as_deref(), Some(expected_root.as_str()));
+}
+
 /// P-M4 (ai-level, §8 B1 restated): a session with `[worker] enabled` and
 /// `peer_advertise` set is a `list_gang_members` member (`kinds` + `state ==
 /// claiming`) once its claim loop warms up. Force-deleting its `instances`
@@ -519,7 +428,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
     let mut config = fast_peer_config(dir.path(), 19105);
     config.worker.enabled = true;
     let lease = config.lease.intervals().unwrap().lease();
-    let canonical_root = config.canonical_result_root().unwrap().unwrap();
+    let member_root = MemberRoot::new(config.resolved_result_root().unwrap());
     let kind = COMPILED_KINDS[0];
 
     let session = InferenceSession::open(config).await.unwrap();
@@ -529,7 +438,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
         session.catalog(),
         session.instance_id(),
         kind,
-        &canonical_root,
+        &member_root,
         lease,
     )
     .await;
@@ -552,7 +461,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
         session.catalog(),
         session.instance_id(),
         kind,
-        &canonical_root,
+        &member_root,
         lease,
     )
     .await;
@@ -581,7 +490,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
     let mut config = fast_peer_config(dir.path(), 19106);
     config.worker.enabled = true;
     let lease = config.lease.intervals().unwrap().lease();
-    let canonical_root = config.canonical_result_root().unwrap().unwrap();
+    let member_root = MemberRoot::new(config.resolved_result_root().unwrap());
     let kind = COMPILED_KINDS[0];
 
     let session = InferenceSession::open(config).await.unwrap();
@@ -590,7 +499,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
         session.catalog(),
         session.instance_id(),
         kind,
-        &canonical_root,
+        &member_root,
         lease,
     )
     .await;
@@ -619,7 +528,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
         .list_gang_members(GangListing {
             kind,
             self_instance: "not-a-real-instance-id",
-            canonical_root: &canonical_root,
+            member_root: &member_root,
             lease,
         })
         .await

@@ -2905,6 +2905,27 @@ table under the SAME pool still refuses, naming `training_set_eager`
 is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs`
 (`crates/jammi-ai/tests/it/training_set_stream.rs:777`).
 
+**A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
+blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
+captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:687`) on
+`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:2016`) is still
+executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
+(`crates/jammi-ai/src/fine_tune/trainer.rs:3512`) drives the stream's own `open` through
+`Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
+different OS thread — it does NOT inherit the async task's task-local (`current`
+(`crates/jammi-db/src/tenant_scope.rs:128`) on `TenantBinding` only ever reads the override
+installed on the CURRENT task, falling back to the session's sticky binding otherwise). So
+every query `TrainingSetStream::open` issues — the schema/null-NaN pre-pass, the ordered
+`read_back_sql` plan, the pump's own planning — re-enters `with_tenant_scoped` explicitly
+INSIDE that `block_on`'s own future, never relying on inheritance, covering every nested
+`.await` `open` makes. Tests of this behaviour must scope via `with_tenant_scoped` on BOTH the
+submit and the wait, matching production's per-request scoping exactly: the session's STICKY
+binding (`bind_tenant`/`with_tenant`) masks the bug class, because `current_tenant` on
+`TenantBinding` falls back to it whenever no task-local override is installed on the current
+task — including the `spawn_blocking` thread `block_on` runs on — so a sticky-bound session's
+blocking-thread call would "accidentally" resolve the right tenant even without the
+re-entry above.
+
 ### 2.7 Model lifecycle (`jammi-ai/model` + `jammi-db/catalog`)
 
 This section covers two distinct lifecycles that share the word "model" but never touch:

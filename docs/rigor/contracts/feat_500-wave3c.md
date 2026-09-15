@@ -34,9 +34,239 @@ plan rows carry a dated correction in the same commit.
 
 (folded at consolidation)
 
-## 3. U5b-1b-i
+## 3. U5b-1b-i (landed as one commit on this branch; original `7f653e20`)
 
-(folded at consolidation)
+The implementer's contract, folded by the lead after checking: the proto diff deletes no declaration (comment lines only) and `api_freeze_baseline.txt` is byte-identical; all five trait verbs take `&BlockingCall`; both peer-listener services and the client carry the decode cap; the trybuild scratch was deleted. The pressure round's blocks 5 and 6 are closed by the bound round index / fatal commit-phase fault and by the hermetic loopback target. Consolidation notes: the one cherry-pick conflict was a `worker.enabled` citation both units re-anchored, resolved against the combined `runtime.rs`; the trybuild oracle (247 s, 10 GB per cold run) is to be replaced by a `compile_fail` doctest carrying the same error codes at the consolidation build, per the implementer's own deviation 6.
+
+Branch `unit/u5b1bi` in `(the unit worktree)`, base `856ec8dd` (PR #580 tip), tip `7f653e2058eb50e57eb5dbe95b8e2a40becd7100`.
+Every path below is repo-relative to that worktree; every test named was executed on this branch
+(the Gates section has the commands, exit codes and counts) and every mutation listed was
+executed against the committed tip and reverted (`git checkout -- <file>`), its first red line
+quoted from the run.
+
+### 1. Scope shipped
+
+**ai-core (`crates/jammi-ai`)**
+- `src/fine_tune/collective/mod.rs` — `Descriptor`, `TensorSignature` and the closed `Verb` enum
+  lifted here (public), `Descriptor::agrees_with` = the derived equality; two NEW determinants:
+  `round: u64` (the round index — `Local` stamps it under its rendezvous lock from the shared
+  generation, `Peer` from its own counter, the wire carries it) and `agreement: Option<String>`
+  (the caller-bound opaque digest; `Local::with_agreement` / `Peer::with_agreement` bind it per
+  rank; U4b binds its canonical trainable-variable key-name digest; this unit carries and
+  compares it, binds nothing). `BlockingCall`: the `!Send + !Sync` witness with a PRIVATE
+  constructor and three minting sites (`spawn_blocking`, `spawn_thread`, `spawn_scoped`). The
+  `Collective` trait's five verbs take `call: &BlockingCall` — ON THE TRAIT (binding change 3):
+  the trainer holds `&dyn Collective` and never names `Peer`, so a witness on `Peer`'s inherent
+  methods would be invisible at the one call site that matters; `Noop`, `Local`, `Nccl` take and
+  ignore it. `pub mod peer` + re-exports (`Peer`, `MemberLink`, `CoordinatorLink`, `LinkFault`,
+  `RankReadFault`).
+- `src/fine_tune/collective/local.rs` — uses the lifted types; `Contribution::kind() -> Verb`;
+  `Local::with_agreement`; `Shared::exchange` stamps `descriptor.round = generation` under the
+  lock; every verb takes the witness; the white-box tests moved to the minting sites; the
+  per-field sweep gained `round` and `agreement` arms (`round: _`, `agreement: _` destructure —
+  a field added without an arm fails to compile); new `a_round_mismatch_disagrees`,
+  `an_agreement_mismatch_disagrees_including_bound_versus_unbound`.
+- `src/fine_tune/collective/noop.rs`, `nccl.rs` — the witness parameter (ignored). `nccl.rs`
+  compiles only under `cuda`; see Uncovered.
+- `src/fine_tune/collective/peer.rs` (NEW, ~2000 lines) — `Peer` (coordinator = rank 0 over
+  `Vec<CoordinatorLink>`, member = rank `1..world` over one `MemberLink`), `with_timeout`,
+  `with_agreement`, `device`; the two-phase round (`Peer::round` → `coordinate` / `participate`);
+  the rank-ordered fold on the coordinator's device with `Local`'s operation sequence; the Arrow
+  IPC codec (`encode_tensors` / `decode_tensors`: f32 `Float32`, f16 `Float16`, bf16 `UInt16`
+  bits; one length-prefixed IPC stream per tensor); chunking under `max_message_bytes − 64` and
+  reassembly against `reassembly_bound` (elements × size + 4 KiB per tensor); the wire
+  conversions with K2 range checks (`descriptor_to_wire` / `descriptor_from_wire`,
+  `verb_from_wire`, `dtype_to_wire` / `dtype_from_wire`); the links (`MemberLink::from_channels`,
+  `CoordinatorLink::from_channels`, `CoordinatorLink::over_client(channel, assign,
+  max_message_bytes)` — opens `RunRank`, sends `Assign`, requires `Admitted`, caps the CLIENT's
+  inbound decode at the same value); the rank read path (`RankReadFault::StoreUnavailable` +
+  `abort_reason()` → `AbortReason::StoreUnavailable`, `verify_leaves` over any ranged reader,
+  `verify_partition_leaves` over a `JammiObjectStore` one `get_range` per leaf).
+- `src/fine_tune/collective/peer_tests.rs` (NEW) — the in-process oracles: a channel-wired gang
+  with per-direction TAPS (forward / swallow / cut / close-inbound-then-forward / replace) so a
+  fault is injected at an exact frame; the `Local` twin for byte comparison; a recording
+  `object_store::ObjectStore` wrapper for the bounded-read oracle.
+- `src/fine_tune/collective/tests.rs` — existing tests under the witness (`run_gang` mints via
+  `BlockingCall::spawn_thread`; scoped spawns via `spawn_scoped`; test-thread bodies via a
+  scoped `witness` helper). All 47 pass unchanged in substance.
+- `tests/it/peer_gang.rs` (NEW) — two tasks over a REAL loopback tonic `RunRank` stream (a
+  hold-loop-shaped test `GangService`): fold parity at f32/f16/bf16 with chunking, the client
+  recv cap at `n−1`/`n`/`n+1` by `encoded_len()`, the wire deadline, the corrupted-leaf abort.
+- `tests/it/blocking_call.rs` + `tests/ui/*.rs` (+ `.stderr`) + `tests/ui_pass/*.rs` (NEW) — the
+  trybuild oracle.
+- `Cargo.toml` — `half` and `tokio-stream` move under/into `local` (bf16/f16 element type and
+  `ReceiverStream` are the `Peer` codec's and links'); dev-deps `trybuild` (workspace) and
+  `object_store` (the recording wrapper). `half` leaves the `cuda` list (it is unconditional now).
+
+**wire-server**
+- `crates/jammi-wire/proto/jammi/v1/gang.proto` — ADDITIVE ONLY: `RankControl` gains
+  `round_result = 3`, `round_chunk = 4`, `round_commit = 5`, `round_fault = 6`; `RankEvent` gains
+  `round_contribution = 4`, `round_chunk = 5`, `round_ack = 6`, `round_fault = 7`; new messages
+  `RoundDescriptor { round, verb: RoundVerb (closed), world, optional root, Counts counts,
+  repeated TensorSignature, optional agreement }`, `Counts`, `TensorSignature { dims,
+  ElementType }`, `RoundPayload { round, descriptor, chunk_count, flags }`, `RoundChunk`,
+  `RoundAck`, `RoundCommit`, `RoundFault { round, detail }`; enums `RoundVerb`, `ElementType`.
+  Nothing renamed or removed (`git diff 856ec8dd -- crates/jammi-wire/proto/jammi/v1/gang.proto`
+  shows additions only). `api_freeze_baseline.txt` is byte-unchanged and
+  `api_freeze::wire_surface_equals_the_frozen_baseline` passes (it decodes only PACKAGE/RPC).
+- `crates/jammi-server/src/runtime.rs` — `OssServer::bind`: BOTH peer-listener services carry
+  `.max_decoding_message_size(max_message_bytes)` from `self.session.inner_config().server.limits`
+  (per-service setter, binding change 5).
+- `crates/jammi-server/src/limits.rs` — N5 rustdoc restated to quantify over every listener
+  (public chain, `peer_bind`'s two services) and the coordinator's client as the third site.
+- `crates/jammi-server/src/grpc/gang_rounds.rs` (NEW; binding change 7) — the seam for U5a-2's
+  hold loop: `RoundInbox { is_round_frame, deliver, fail }`, `member_link(events) ->
+  (RoundInbox, MemberLink)` over the session's own `Sender<Result<RankEvent, Status>>`,
+  `dial_member(&PeerAddr, Assign, max_message_bytes) -> CoordinatorLink`. `GangServer::run_rank`
+  is NOT touched; the `select!` wiring is the lead's at consolidation.
+- `crates/jammi-server/tests/it/gang_rounds.rs` (NEW) — (d) on every listener and both
+  peer-listener services at `n−1`/`n`/`n+1` encoded bytes; one real round through
+  `RoundInbox::deliver` + `dial_member` vs `Local`.
+- `crates/jammi-server/Cargo.toml` — dev-dep `candle-core` (the seam test's tensors; already
+  linked through `jammi-ai`).
+
+**db** — `crates/jammi-db/src/storage/object_store_handle.rs`: `JammiObjectStore::get_range`
+(one ranged read; the read path's primitive). No catalog/schema change.
+
+**docs** — `docs/maintainer/MAINTAINER-GUIDE.md` § 2.8c (new: the witness, the descriptor, the
+wire, the reduce, the two-phase round, links and the server seam, the decode cap on every
+listener, the rank's read path) + one sentence in § 2.8a; a stale `worker.enabled` citation at
+guide line 498 re-anchored (my `runtime.rs` insertion moved it: `runtime.rs:2068` →
+`runtime.rs:2086`); `docs/guide/src/operability.md` (`max_message_bytes` row: every listener,
+`n` decodes / `n+1` refused), `docs/guide/src/configuration.md` (the key's comment).
+
+#### Deviations from UNITS.md / the brief (each with the reason and the code)
+
+1. **No change to `tests/distributed/{main.rs,harness.rs}`** (binding change 2). That target is
+   `required-features = ["live-distributed-tests"]` (`crates/jammi-ai/Cargo.toml`, the
+   `[[test]] name = "distributed"` block) and its harness needs Postgres + MinIO; nothing in this
+   unit is fleet-dependent. The two-process brief is met as TWO TASKS over a real loopback tonic
+   listener in the hermetic `it` target (`crates/jammi-ai/tests/it/peer_gang.rs`), which runs in
+   `cargo test -p jammi-ai --features test-hooks`. No test name was added to `distributed.yml`.
+2. **The wire dtype enum is `ElementType`, not `DType`.** prost strips only an enum-name-shaped
+   prefix (`D_TYPE_`), so `DType { DTYPE_F32 }` generated `DType::DtypeF32`; `ElementType {
+   ELEMENT_TYPE_F32 }` generates `ElementType::F32`. The Rust-side match over the WIRE enum is
+   literally exhaustive (`Ok(Unspecified) | Err(_)` refused). The match over candle's `DType` is
+   as exhaustive as Rust allows: `candle_core::DType` is `#[non_exhaustive]`
+   (`~/.cargo/registry/src/*/candle-core-0.11.0/src/dtype.rs`), so a `_` arm is MANDATORY; every
+   known variant is listed and the wildcard refuses a later-added one
+   (`peer.rs::dtype_to_wire`).
+3. **`Descriptor::agrees_with` returns `bool`** (was `Result<(), ()>` in local.rs): the type is
+   now public and clippy's `result_unit_err` refuses a public `Result<_, ()>`; the callers read
+   `if !a.agrees_with(&b)`.
+4. **The commit point** (binding change 1, as shipped): a fault before the coordinator observes
+   the last ACK leaves no rank applied; a fault DURING the commit fan-out is fatal on every rank
+   (coordinator applies nothing, faults every member, refuses every later round). The one
+   residual state: a member the commit did reach applied the round and returned `Ok` before the
+   fan-out failed — physically unretractable with a one-way commit — and its NEXT contribution
+   is refused by the coordinator's fault. So the shipped guarantee is "no rank ever CONTINUES
+   past a round every rank did not apply"; the lead's oracle (a fault between the fan-out to
+   rank 1 and rank 2 faults every rank and no next contribution is accepted) is executed
+   (`a_fault_during_the_commit_fan_out_is_fatal_on_every_rank_and_no_next_contribution_is_accepted`).
+   Stated in `peer.rs`'s module doc, `gang.proto`'s round-protocol comment and § 2.8c.
+5. **`MemberLink::over_stream` does not exist.** U5a-2's hold loop owns the inbound `Streaming` in
+   its `select!`; consuming it whole would be the wrong shape. The seam is `gang_rounds::member_link`
+   + `RoundInbox::deliver`, exercised by `crates/jammi-server/tests/it/gang_rounds.rs`.
+6. **The trybuild cost** (acceptance (g), as briefed): trybuild builds the ui cases in its own
+   target subdir (`<target>/tests/trybuild`), rebuilding the dependency tree — 247 s and 10 GB on
+   this host for the first run (incremental after). A `compile_fail` doctest would assert the same
+   error codes at zero extra build; I shipped trybuild because the brief and binding change 3 name
+   it. The lead may prefer the doctest form; the property is the same.
+7. **The trainer's call sites are untouched**: at `856ec8dd` no trainer code calls a `Collective`
+   verb (`grep -rn "\.all_gather(\|\.all_reduce_sum(\|\.barrier(" crates/jammi-ai/src` outside
+   `collective/` is empty), so the trait change breaks nothing in-tree; U4b's helper threads the
+   witness at consolidation (binding change 3).
+
+### 2. Properties
+
+| # | Property (quantified) | Executed oracle (path::name, lane) | Executed mutation → red |
+|---|---|---|---|
+| P1 (a) | For every verb, every rank and each of f32/f16/bf16, `Peer`'s result bits equal `Local`'s over the same inputs (world 3, unequal counts incl. a zero-row rank, mixed-dtype reduce, root=1 broadcast) | `fine_tune::collective::peer_tests::peer_fold_over_the_wire_equals_local_fold_byte_for_byte_at_f32_f16_bf16` (lib, test-hooks); over the real wire with chunking: `it::peer_gang::peer_fold_over_a_loopback_run_rank_stream_equals_local_at_f32_f16_bf16_with_chunking` | M1: the reduce fold skips rank 0's own contribution → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:264:5` — assertion `left == right` failed: every rank's result bits over the wire must equal the in-process fold's |
+| P1' | Two gangs over the same inputs produce identical bits | `peer_tests::peer_collectives_are_deterministic_across_two_gangs` | (covered by M1's class; a nondeterministic fold order would fail P1 against `Local`) |
+| P2 (b) | At W=2, for a contrastive stream (`[rows,8]` + `[rows]` gathers, f32+bf16 grads, flags, scaler broadcast) and a regression stream (`[rows,1]` + `[rows]`), over 2 steps with unequal counts, every rank's bytes equal `Local`'s | `peer_tests::peer_w2_fold_matches_local_w2_on_regression_and_contrastive_streams` — fold-level; the trainer-level row is DEFERRED to consolidation: the lead runs U4b's W=2 trainer parity oracle with `Peer` substituted for `Local` (its name is U4b's to report) | M2: the gather concatenates slices in reverse rank order → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:361:9` — assertion `left == right` failed: contrastive fixture: Peer-W2 bytes must equal Local-W2 on every rank at every step |
+| P3 (c) | Every round wait on every rank (coordinator for a contribution; member for the result; member for the commit) expires at the gang deadline with an error naming the round and what it waited for | `peer_tests::every_round_wait_on_every_rank_expires_at_the_gang_deadline_naming_the_round`; over the wire: `it::peer_gang::a_silent_member_over_the_wire_expires_the_coordinators_wait_at_the_deadline_naming_the_round` | M3: the timeout message drops `round {k}` → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:400:5` — the coordinator's wait must expire naming the round: Fine-tune error: barrier: timed out after 400ms waiting for rank 2's contribution — nothing applied |
+| P4 (c) | A member's stream ending between the coordinator's publish and the last ACK leaves NO rank applied for that round, every rank's fault names the round, and no rank waits out the deadline | `peer_tests::a_disconnect_between_publish_and_the_last_ack_leaves_no_rank_applied_and_names_the_round` | M4: the member applies the held result without waiting for the commit → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:489:18` — round 0 must not apply on any rank: () |
+| P5 (binding 1) | A fault during the commit fan-out (rank 2's stream gone between the fan-out to rank 1 and to rank 2) is fatal on every rank: the coordinator applies nothing, rank 2 applies nothing, rank 1 (reached) applied round 0, and NO rank's next contribution is accepted, promptly | `peer_tests::a_fault_during_the_commit_fan_out_is_fatal_on_every_rank_and_no_next_contribution_is_accepted` | M5: the coordinator ignores a failed commit send and applies → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:560:10` — the coordinator applies nothing: 4 |
+| P6 (e) | A `root` disagreement, a `counts` disagreement, an `agreement` disagreement (bound≠bound, bound vs unbound), an unknown wire `verb` (99) and a stale wire `round` are each a typed refusal on EVERY rank naming BOTH descriptors | `peer_tests::a_root_disagreement_…`, `…a_counts_disagreement_…`, `…an_agreement_slot_disagreement_…`, `…an_unknown_wire_verb_…`, `…a_contribution_from_a_stale_round_…` (all `…_naming_both_sides…`) | M6: `agrees_with` compares `verb` only → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:595:9` — counts: rank 0 was not refused symmetrically: Fine-tune error: all_gather: round 0: rank 1's contribution: tensor 0: 4 elements on the wire where the agreed shape [1, 2] holds 2; M7: `Peer` never signs its bound agreement → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:667:18` — the ranks bound different agreements: (); M8: an unknown wire verb defaults to `Barrier` → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:702:14` — an unknown wire verb is refused: (); M9: the wire `round` is ignored on decode → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:737:14` — a stale round never folds: () |
+| P7 | Every field of `Descriptor` is a determinant of agreement (`agrees_with` ≡ derived `==` over a per-field sweep incl. `round`, `agreement`; a field added without a sweep arm fails to compile) | `fine_tune::collective::local::descriptor_tests::{agrees_with_matches_derived_equality_over_a_per_field_mutation_sweep, a_round_mismatch_disagrees, an_agreement_mismatch_disagrees_including_bound_versus_unbound}` | M6 (above) also reds the sweep |
+| P8 | A rank's own argument refusal (a counts vector that cannot describe the gang) faults its peers with a `RoundFault` before returning, so the peer is refused in < deadline/4 | `peer_tests::a_domain_refusal_on_one_rank_faults_its_peers_before_the_deadline` | M20: the member's prepare-failure fault is not sent → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:767:5` — the coordinator waited 4.004808958s for a fault the member had already raised |
+| P9 | A dtype outside f32/f16/bf16 is refused at the seam on the calling rank (naming the dtype) before any descriptor exists, and its peers are faulted | `peer_tests::a_dtype_outside_f32_f16_bf16_is_refused_at_the_seam_and_faults_the_peers` | M19: f64 is carried as `F32` on the wire → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:793:9` — rank 0: unexpected: Fine-tune error: all_reduce_sum: round 0: timed out after 5s waiting for rank 1's contribution — nothing applied |
+| P10 | After any fault, every verb on every rank refuses promptly (< deadline/2) quoting the fault | `peer_tests::every_verb_after_a_fault_refuses_promptly_on_every_rank_quoting_the_fault` | M21: the fault is not recorded → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:835:13` — rank 0: unexpected: Fine-tune error: all_gather: round 1: faulted by a peer — broadcast: round 0: faulted by a peer — broadcast: round 0: rank 0's round descriptor is Descriptor { round: 0, verb: Broadcast, world: 2, root: Some(0), counts: None, tensors: [TensorSignature { dims: [1, 1], dtype: F32 }], agreement: None } but rank 1's is Descriptor { round: 0, verb: Broadcast, world: 2, root: Some(1), counts: None, tensors: [TensorSignature { dims: [1, 1], dtype: F32 }], agreement: None } — the ranks disagree about what this round computes, so no rank may be handed a result |
+| P11 | A tensor larger than `max_message_bytes` travels as ≥ ⌈size/cap⌉ chunks each ≤ `cap − 64` bytes and reassembles byte-exact (= `Local`) | `peer_tests::a_tensor_larger_than_the_message_cap_travels_in_chunks_under_the_cap_and_reassembles_exact`; over the real listener (4 KiB cap, 10 KiB gathers): `it::peer_gang::peer_fold_over_a_loopback_…_with_chunking` | M14: no chunking (one chunk) → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:879:5` — a 16 KiB tensor under a 1 KiB cap needs many chunks: [17228] |
+| P12 (K2) | A payload announcing more bytes than its agreed descriptor implies is refused at the first chunk past the bound, before buffering more | `peer_tests::a_payload_past_the_bound_its_descriptor_implies_is_refused_before_buffering` | M15: the bound check is dropped → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:932:5` — unexpected: Fine-tune error: all_reduce_sum: round 0: timed out after 5s waiting for chunk 64 of rank 1's contribution — nothing applied |
+| P13 | Every result lands on the rank's device; in `all_gather` only the rank's OWN slot carries a gradient (grad = own rows, never ×world) | `peer_tests::results_land_on_the_ranks_device_and_only_the_own_gather_slot_is_attached` | M16: the own slot is spliced in detached → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:965:9` — assertion `left == right` failed: rank 0's gradient must be its OWN slot's, never scaled by the world size |
+| P14 | A member's `Aborted{reason}` mid-round faults the coordinator naming the reason and the round | `peer_tests::a_member_that_aborts_its_session_faults_the_coordinator_naming_the_reason` | M23: the reason is not named → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:998:5` — unexpected: Fine-tune error: barrier: round 0: the member ended its session while waiting for rank 1's contribution — nothing applied |
+| P15 (f) | `verify_leaves` reads exactly one leaf's range per leaf in inventory order, never wider, stops at the first bad leaf; a corrupted row group is `RankReadFault::StoreUnavailable` naming that leaf, `abort_reason() == StoreUnavailable`, "member-scoped"; a read error and a short read are the same class | `peer_tests::verify_leaves_reads_exactly_one_leaf_range_at_a_time_and_names_a_corrupted_leaf_member_scoped` | M10: the digest is never compared → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:1114:6` — a corrupted leaf is caught: () |
+| P16 (f, bounded memory) | `verify_partition_leaves` over a `file://` `JammiObjectStore` issues one BOUNDED `get_opts` range per leaf, exactly the leaf's range, and never an unbounded (whole-object) read; a corrupted leaf is named | `peer_tests::verify_partition_leaves_over_a_file_store_reads_one_bounded_range_per_leaf_and_names_a_corrupted_leaf` (recording `ObjectStore` wrapper) | M11: whole-object `get_bytes` then slice → RED: `panicked at crates/jammi-ai/src/fine_tune/collective/peer_tests.rs:1248:5` — assertion `left == right` failed: every read is one leaf's bounded range |
+| P17 (f, end to end) | Over a real stream, a member that finds a corrupted leaf before its first collective ends the session `Aborted(StoreUnavailable)`; the coordinator's first round faults naming it, having folded nothing | `it::peer_gang::a_corrupted_leaf_is_caught_on_the_member_before_any_collective_and_ends_the_session_member_scoped` | covered by M10 (the member would verify clean and run the round → `expect_err` on the coordinator fails) — not separately executed |
+| P18 (d, listeners) | On the `peer_bind` listener (`GangService` AND `PeerService`) and on the public listener, a message of exactly `n = max_message_bytes` encoded bytes decodes, `n−1` decodes, `n+1` is `OUT_OF_RANGE` naming `the limit is: n bytes` (RED at base for the peer listener: no setter, tonic's 4 MiB default) | `jammi-server it::gang_rounds::a_frame_of_exactly_max_message_bytes_decodes_on_every_listener_and_one_more_byte_is_refused_naming_the_configured_cap` | M12: the `GangService` setter dropped → RED: `panicked at crates/jammi-server/tests/it/gang_rounds.rs:102:13` — assertion `left == right` failed: GangService: code: 'The system is not in a state required for the operation's execution', message: "gang admission refused"; M24: the `PeerService` setter dropped → RED: `panicked at crates/jammi-server/tests/it/gang_rounds.rs:123:13` — assertion `left == right` failed: PeerService: code: 'Client specified an invalid argument', message: "storage_precision is unspecified" |
+| P19 (d, client) | The coordinator's client decodes a member frame of exactly `n` and `n−1` encoded bytes and refuses `n+1` naming the configured cap (never tonic's default) | `it::peer_gang::the_client_recv_cap_is_the_configured_cap_at_n_minus_1_n_and_n_plus_1_encoded_bytes` | M13: the client setter dropped → RED: `panicked at crates/jammi-ai/tests/it/peer_gang.rs:359:13` — a 2049-byte frame over a 2048-byte cap must be refused naming the configured cap: Fine-tune error: barrier: round 0: faulted by a peer — xxx…(the 2043-byte padding detail; the frame DECODED under the dropped cap) |
+| P20 (seam) | A round frame delivered through `RoundInbox::deliver` reaches the member's `Peer` and `dial_member` builds the coordinator's link: one real round of gather/reduce/flags over a hold-loop-shaped handler equals `Local` | `jammi-server it::gang_rounds::a_round_delivered_through_the_inbox_and_dialed_through_dial_member_equals_local` | M17: `is_round_frame` excludes `RoundCommit` → RED: `panicked at crates/jammi-server/tests/it/gang_rounds.rs:222:38` — reduce: FineTune("all_reduce_sum: round 1: timed out after 20s waiting for rank 1's contribution — nothing applied") |
+| P21 (g) | A `Collective` verb reached from a runtime worker thread does not compile (a `BlockingCall` cannot cross into a `tokio::spawn`ed future; no witness exists to pass; the constructor is private), while the same verb from `spawn_blocking` compiles | `it::blocking_call::a_collective_verb_from_a_runtime_worker_thread_does_not_compile` (trybuild: `tests/ui/{verb_from_a_runtime_worker_thread, verb_without_a_witness, mint_outside_a_spawn_site}.rs` red with pinned `.stderr`; `tests/ui_pass/verb_from_spawn_blocking.rs` green) | M18: the witness made `Send` (`PhantomData<()>`) → RED: `panicked at /Users/vijaychakilam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/trybuild-1.0.121/src/run.rs:103:13` — 1 of 4 tests failed |
+| P22 (api_freeze) | The frozen wire surface is unchanged: `api_freeze_baseline.txt` byte-identical to base, the live descriptor equals it | `jammi-server it::api_freeze::wire_surface_equals_the_frozen_baseline`; `git diff 856ec8dd -- crates/jammi-server/tests/it/api_freeze_baseline.txt` is empty | not a mutation of mine; the oracle is the freeze guard's own (an added rpc reds it) |
+| P23 | The existing `Local`/`Noop` properties hold under the witness | `fine_tune::collective::tests` (47) + `local::{rendezvous_state_tests, constructor_verb_tests, descriptor_tests}` | unchanged oracles |
+
+### 3. Uncovered
+
+- **`Nccl` under the witness.** `crates/jammi-ai/src/fine_tune/collective/nccl.rs` is
+  `#[cfg(feature = "cuda")]`; this host (macOS, no CUDA toolchain) cannot compile it. The edit is
+  the signature-only witness parameter on the five verbs plus `barrier` forwarding `call` to
+  `all_reduce_max_flags`; UNCOVERED here — the CI gated-surface clippy step compiles it.
+- **`Local`'s stamp of `Descriptor::round`** (`Shared::exchange` sets `descriptor.round =
+  generation`): no oracle observes the stamped value on `Local` beyond the field being a
+  determinant (P7). The executed stale-round oracle on `Local` remains its generation check
+  (`a_round_holding_a_superseded_contribution_is_refused_by_the_rank_completing_it`).
+- **Real multi-host / GPU residency.** Every Peer oracle runs on `Device::Cpu` (loopback or
+  channels); a `to_device` failure on real hardware after a round published is the same class
+  `local.rs` labels UNCOVERED (U4b's pod leg / U7b-A2b live).
+- **Real listener admission.** `GangServer::run_rank` at this base admits nothing (ends
+  `Unimplemented`), so no oracle runs `Peer` through the REAL peer listener's handler; the
+  loopback handlers in `peer_gang.rs` / `gang_rounds.rs` mirror the hold loop's shape (admit,
+  deliver round frames, events on the response stream). The hold-loop `select!` wiring is U5a-2's
+  + the lead's at consolidation.
+- **P17's own mutation** was not executed separately (its refutation is M10's class); **P1'** and
+  **P22** likewise rest on the named oracles without a dedicated mutation.
+- **Trainer-level (b)** is DEFERRED to consolidation as stated in P2.
+
+### 4. Gates (trimmed set per the lead; every command run in this worktree with
+`CARGO_TARGET_DIR=…/targets/u5b1bi`)
+
+```
+cargo fmt --all -- --check
+  exit 0  
+cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings
+  exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.41s
+cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings
+  exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.48s
+cargo clippy -p jammi-db --all-targets --features test-hooks -- -D warnings
+  exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+cargo clippy -p jammi-wire --all-targets -- -D warnings
+  exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+cargo test -p jammi-ai --features test-hooks --lib collective   (tests.rs 47 + local white-box + peer_tests 23)
+  exit 0  ok. 69 passed; 0 failed; 0 ignored; 0 measured; 704 filtered out; finished in 1.21s;
+cargo test -p jammi-ai --features test-hooks --test it -- peer_gang blocking_call   (4 loopback + 1 trybuild)
+  exit 0  ok. 5 passed; 0 failed; 0 ignored; 0 measured; 584 filtered out; finished in 21.13s;
+cargo test -p jammi-server --features test-hooks --test it -- api_freeze tenant_isolation_oracle gang_service grpc_limits gang_rounds
+  exit 0  ok. 35 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 4.63s;
+python3 ci/scripts/perf/check_citations.py
+  exit 0  check-citations: 1038 file(s) scanned, all PATH:LINE citations resolve (HEAD for living files, each artifact's own recorded git_sha for committed evidence reachable from HEAD; 2 exempt as non-ancestor legacy evidence).
+python3 ci/scripts/check_no_consumer_names.py
+  exit 0  no-consumer-names: OK — no governance-verb leak in the diff, no philosophy leak-smell token in the engine tree, allowlist clean.
+python3 ci/scripts/check_dep_direction.py < <(cargo metadata --format-version 1 --locked)
+  exit 0  OK: 675 crates in the OSS default-members normal-dep closure; all are local workspace paths or crates.io
+bash ci/scripts/check_cookbook_one_way.sh
+  exit 0  one-way guard: clean — no crates/** reference to cookbook/book/.
+git status --short after every gate and mutation revert: 0 entries (0 = clean)
+git diff 856ec8dd -- crates/jammi-server/tests/it/api_freeze_baseline.txt: 0 lines
+gang.proto diff vs base: 162	5	crates/jammi-wire/proto/jammi/v1/gang.proto  (added/deleted lines: every deleted line is a rewritten comment line; no declaration removed — see the diff)
+```
+
+### 5. Commits (`git log --oneline 856ec8dd..HEAD`; the worktree's local `main` is not the base)
+
+```
+7f653e20 feat(collective): #500 U5b-1b-i — the Peer collective + round protocol
+```
+
 
 ## 4. U5a-2 (landed as three commits on this branch; originals `8332a289`, `db82aef9`, `54bbe341`)
 

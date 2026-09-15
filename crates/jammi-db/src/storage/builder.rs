@@ -461,7 +461,8 @@ impl BuilderSeeds {
 /// bare `std::env::var` outside its key tables — `AZURITE_BLOB_STORAGE_URL`,
 /// in the Azure emulator arm — is read the same way here (its default
 /// included), so the identity spells exactly the variables the driver
-/// spells and no others.
+/// spells and no others; and every value is read as the driver reads it
+/// (its boolean parser's five spellings, its URL parse).
 /// Sorted `(key, value)` pairs; empty when the service's default host is
 /// dialled. A scheme whose storage feature is compiled out has no
 /// determinants (`Ok(empty)`): such a build cannot dial the scheme at all
@@ -612,17 +613,29 @@ fn azure_determinants(
         .with_container_name(container);
     let builder = configure_azure(base, config);
     let mut pairs = Vec::new();
-    let flag = |key: K| builder.get_config_value(&key).as_deref() == Some("true");
+    // `get_config_value` returns the RAW string; `build()` reads it through
+    // object_store's own boolean parser, which is not public — so the
+    // parser is mirrored here, spelling for spelling, and the oracle below
+    // walks every spelling it accepts.
+    let flag = |key: K| {
+        builder
+            .get_config_value(&key)
+            .is_some_and(|v| driver_bool(&v))
+    };
     if flag(K::UseEmulator) {
         // `build()`'s emulator arm: the host is `AZURITE_BLOB_STORAGE_URL`
         // (a bare env read, default `http://127.0.0.1:10000`) and the
         // account, defaulting to the emulator's, is a path segment; the
         // endpoint and Fabric switch are ignored there.
         pairs.push(("use_emulator", "true".to_string()));
+        // The driver parses the URL (`url_from_env`), so `http://h:10000`
+        // and `http://h:10000/` are one host here as there; a value the
+        // driver could not parse is kept raw (the driver refuses to build).
+        let raw = present(seeds.raw("AZURITE_BLOB_STORAGE_URL"))
+            .unwrap_or_else(|| "http://127.0.0.1:10000".to_string());
         pairs.push((
             "emulator_url",
-            present(seeds.raw("AZURITE_BLOB_STORAGE_URL"))
-                .unwrap_or_else(|| "http://127.0.0.1:10000".to_string()),
+            url::Url::parse(&raw).map(|u| u.to_string()).unwrap_or(raw),
         ));
         pairs.push((
             "account",
@@ -645,6 +658,20 @@ fn azure_determinants(
         }
     }
     Ok(pairs)
+}
+
+/// object_store's boolean parser (`config.rs`, `impl Parse for bool`), which
+/// `build()` applies to every `ConfigValue<bool>` — `1`, `true`, `on`,
+/// `yes`, `y` in any case are true; everything else is false — mirrored
+/// because it is not public. Any spelling the driver takes as true must
+/// switch the identity's arm too, or two members at two hosts would derive
+/// one identity (the fourth oracle round's executed refutation).
+#[cfg(feature = "storage-azure")]
+fn driver_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes" | "y"
+    )
 }
 
 #[cfg(not(feature = "storage-azure"))]
@@ -855,7 +882,7 @@ mod tests {
             of(&[("AZURE_STORAGE_USE_EMULATOR", "true")]),
             vec![
                 ("account", "devstoreaccount1".to_string()),
-                ("emulator_url", "http://127.0.0.1:10000".to_string()),
+                ("emulator_url", "http://127.0.0.1:10000/".to_string()),
                 ("use_emulator", "true".to_string()),
             ]
         );
@@ -887,6 +914,57 @@ mod tests {
                 ("account", "acct".to_string()),
                 ("use_fabric_endpoint", "true".to_string())
             ]
+        );
+        // Every spelling object_store's boolean parser accepts (`1`, `true`,
+        // `on`, `yes`, `y`, any case) switches the arm exactly as `build()`
+        // does; a spelling it rejects does not.
+        for spelling in [
+            "1", "true", "on", "yes", "y", "TRUE", "True", "Yes", "ON", " y ",
+        ] {
+            assert_eq!(
+                of(&[
+                    ("AZURE_STORAGE_USE_EMULATOR", spelling),
+                    ("AZURITE_BLOB_STORAGE_URL", "http://host-a:10000"),
+                ]),
+                of(&[
+                    ("AZURE_STORAGE_USE_EMULATOR", "true"),
+                    ("AZURITE_BLOB_STORAGE_URL", "http://host-a:10000"),
+                ]),
+                "emulator spelling {spelling:?}"
+            );
+            assert_eq!(
+                of(&[
+                    ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                    ("AZURE_USE_FABRIC_ENDPOINT", spelling)
+                ]),
+                vec![
+                    ("account", "acct".to_string()),
+                    ("use_fabric_endpoint", "true".to_string())
+                ],
+                "fabric spelling {spelling:?}"
+            );
+        }
+        for spelling in ["0", "false", "off", "no", "n", ""] {
+            assert_eq!(
+                of(&[
+                    ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                    ("AZURE_USE_FABRIC_ENDPOINT", spelling)
+                ]),
+                vec![("account", "acct".to_string())],
+                "not-true spelling {spelling:?}"
+            );
+        }
+        // The emulator URL is parsed as the driver parses it: one host, with
+        // or without the trailing slash.
+        assert_eq!(
+            of(&[
+                ("AZURE_STORAGE_USE_EMULATOR", "1"),
+                ("AZURITE_BLOB_STORAGE_URL", "http://host-a:10000")
+            ]),
+            of(&[
+                ("AZURE_STORAGE_USE_EMULATOR", "1"),
+                ("AZURITE_BLOB_STORAGE_URL", "http://host-a:10000/")
+            ])
         );
     }
 

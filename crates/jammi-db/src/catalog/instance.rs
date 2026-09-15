@@ -226,7 +226,9 @@ impl std::fmt::Display for MemberRoot {
 ///   the Fabric switch, the GCS base URL. The identity spells exactly the
 ///   variables the driver spells — none through its key tables, and the one
 ///   bare read the driver makes (`AZURITE_BLOB_STORAGE_URL`) the same way
-///   — so a value the driver honours is never one the identity misses. Two
+///   — and reads every value as the driver reads it (its boolean parser's
+///   `1`/`true`/`on`/`yes`/`y` in any case; its URL parse), so a value the
+///   driver honours is never one the identity misses. Two
 ///   buckets of one name
 ///   behind two endpoints or
 ///   accounts are two locations. Bucket and container names

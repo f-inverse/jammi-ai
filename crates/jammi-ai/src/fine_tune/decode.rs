@@ -905,11 +905,16 @@ impl ChunkAccumulator {
 /// out. One decode per batch plus by-index cell reads is the shape the
 /// extractors' own doc ("applied to the whole batch once") describes.
 ///
-/// The type acceptance and every error message are the extractors' own (the
-/// text/media views are [`string_cells`]/[`binary_cells`], the numeric read
-/// is [`extract_numeric_column`]), so a chunk this produces from an Arrow
-/// batch and row set is byte-identical to the eager loader's over the same
-/// rows: both read the same cells through the same policy.
+/// The type acceptance is the extractors' own (the text/media views are
+/// [`string_cells`]/[`binary_cells`], the numeric read is
+/// [`extract_numeric_column`]), so a chunk this produces from an Arrow batch
+/// and row set is byte-identical to the eager loader's over the same rows:
+/// both read the same cells through the same policy, and both refuse the
+/// same columns. The refusal WORDING is this path's own: the eager
+/// `build_training_data_loader`'s Pairs/Triplet arms add operator guidance
+/// (the image/audio-triplet hint) that the stream's per-column message does
+/// not carry — a pre-existing divergence of the two entry points' prose, not
+/// of what they accept.
 pub(crate) enum DecodedBatch<'a> {
     Contrastive {
         texts_a: StringCells<'a>,

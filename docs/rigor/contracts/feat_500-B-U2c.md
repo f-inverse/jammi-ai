@@ -453,8 +453,17 @@ cargo doc --no-deps -p jammi-ai -p jammi-db` clean. What the unit tests
 exclude: the `Utf8View` family and the pump's flush placement — both
 exercised by the `it` suite above (DataFusion returns Parquet text as
 `Utf8View`; the 70,000-row fixture spans batch boundaries at every prefetch).
-The phase-5 oracle re-runs at this tip (a mechanism change after the
-recorded PASS makes that record stale by the gate's own rule).
+The phase-5 oracle re-ran at this tip (a mechanism change after the
+recorded PASS makes that record stale by the gate's own rule) and PASSED,
+with both pump flushes mutation-tested (deleting the batch-end flush fails
+P4/P5/P6.i; deleting the range-end flush fails nine oracles). Its one
+non-blocking observation is folded here: `DecodedBatch`'s doc claimed every
+refusal message equals the eager path's; the eager Pairs/Triplet arms carry
+an image/audio-triplet operator hint the stream's per-column message never
+had (unchanged from the per-row entry point this fold replaced). The doc
+now states the divergence as one of wording, not of acceptance; sharing one
+message constructor per column between both entry points is the fold that
+would close it and is left named, not done, in this unit.
 
 ## Gates run at contract time
 

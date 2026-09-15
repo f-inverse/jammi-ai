@@ -7847,6 +7847,254 @@ mod last_step_run_harness {
     }
 }
 
+/// U4b acceptance (d): lockstep, on a REAL two-rank `Local` gang driven
+/// through the full production `TrainingLoop::run` (not a hand-rolled
+/// per-step harness) — DESIGN.md §6's own lockstep oracle: "one rank's batch
+/// forced to diverge; one rank's batch yields no gradient for a Var; the
+/// gang completes".
+#[cfg(test)]
+mod gang_lockstep_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::partition::{PartitionRule, PartitionSpec};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::{AfterBackwardHook, RankContext, TrainingLoopBuilder, TrainingResult};
+    use crate::fine_tune::collective::LocalGang;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    fn gang_config(batch_size: usize) -> FineTuneConfig {
+        FineTuneConfig {
+            epochs: 1,
+            batch_size,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
+        )
+    }
+
+    /// A hook that REMOVES the first trainable var's gradient entirely on
+    /// optimizer step `step` (1-based) — the "a Var absent from one rank's
+    /// `GradStore`" case, distinct from [`poison_grad_at`]'s "present but
+    /// NaN" case: this rank's OWN accumulation genuinely never populates the
+    /// entry, exactly as if this step's loss legitimately never routed
+    /// through it.
+    fn remove_grad_at(step: usize) -> AfterBackwardHook {
+        Box::new(move |s, grads, vars| {
+            if s == step {
+                let t: &Tensor = &vars[0];
+                grads.remove(t);
+            }
+            Ok(())
+        })
+    }
+
+    /// A hook that replaces the first trainable var's gradient with NaN on
+    /// optimizer step `step` (1-based) — mirrors `last_step_run_harness::
+    /// poison_grad_at` (private to that module; redefined here rather than
+    /// exposed across modules for a single shared use).
+    fn poison_grad_at(step: usize) -> AfterBackwardHook {
+        Box::new(move |s, grads, vars| {
+            if s == step {
+                let t: &Tensor = &vars[0];
+                let nan = Tensor::full(f32::NAN, t.dims(), t.device())
+                    .map_err(|e| jammi_db::error::JammiError::FineTune(e.to_string()))?;
+                grads.insert(t, nan);
+            }
+            Ok(())
+        })
+    }
+
+    /// Run one rank of a 2-rank gang to completion, on its OWN dedicated
+    /// tokio runtime — mirrors `last_step_run_harness::run_text_loop`'s own
+    /// "own runtime, enter it, drive `run` synchronously" shape, needed
+    /// because each rank's `run()` reads its OWN catalog via
+    /// `Handle::current()` while ALSO rendezvousing with its peer through a
+    /// REAL `Local` collective on a separate OS thread.
+    fn run_gang_rank(
+        tag: String,
+        config: FineTuneConfig,
+        loader: TrainingDataLoader,
+        rank_ctx: RankContext,
+        hook: Option<AfterBackwardHook>,
+    ) -> jammi_db::error::Result<TrainingResult> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut loop_, _dir) = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id(tag.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .rank_context(rank_ctx);
+            (builder.build().unwrap(), dir)
+        });
+        loop_.after_backward = hook;
+        let _enter = rt.enter();
+        loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+    }
+
+    /// A gang whose gang-wide `train_count` (5) is NOT a multiple of `W·B`
+    /// (`W=2, B=1` → global batch 2): the LAST global step (index 2) is
+    /// `rows[4, 6)` clamped to `[4, 5)` — rank 0 holds 1 row, rank 1 holds
+    /// **zero** (DESIGN.md §2's own worked case). Neither rank installs a
+    /// gradient hook here — this oracle is the ZERO-ROW-RANK case alone.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, and reverted by hand — not left in
+    /// this tree): added `if chunk.row_count() == 0 { break; }` right after
+    /// building each step's chunk, restoring the pre-U4b "this rank's own
+    /// empty chunk ends the epoch" termination. Rank 1 then exits its loop
+    /// ONE STEP EARLIER than rank 0 (it sees the empty chunk at step 2 and
+    /// calls it end-of-epoch, so it never takes step 2's collective calls at
+    /// all), which deadlocks rank 0 forever waiting for rank 1 at that
+    /// step's `all_gather`/`all_reduce_max_flags`/`canonical_reduce`
+    /// rendezvous. Observed: the mutated test did not complete within 25 s
+    /// (vs. 0.34 s for all three tests in this module healthy) — a hang,
+    /// not merely a failure, exactly as this property predicts; not run to
+    /// `Local`'s own 120 s rendezvous-timeout resolution, since the
+    /// discriminating signal (no progress vs. sub-second completion) was
+    /// already unambiguous.
+    #[test]
+    fn a_zero_row_rank_the_gang_completes() {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 1, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("zero-row-rank-{rank}");
+            handles.push(std::thread::spawn(move || {
+                run_gang_rank(tag, gang_config(1), pairs(5), rank_ctx, None)
+            }));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let result = handle
+                .join()
+                .unwrap_or_else(|e| panic!("rank {rank} panicked: {e:?}"));
+            result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+        }
+    }
+
+    /// A Var absent from rank 1's `GradStore` at step 1 (this rank's own
+    /// accumulation genuinely never populates it, e.g. a batch whose loss
+    /// does not route through it) — rank 0's own accumulation is untouched.
+    /// The gang must still complete: `canonical_reduce`'s presence-set fix
+    /// means this reduces to rank 0's own (sole) contribution, never an
+    /// error and never a hang.
+    #[test]
+    fn a_var_absent_from_one_ranks_gradstore_the_gang_completes() {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("absent-var-rank-{rank}");
+            let hook: Option<AfterBackwardHook> = if rank == 1 {
+                Some(remove_grad_at(1))
+            } else {
+                None
+            };
+            handles.push(std::thread::spawn(move || {
+                run_gang_rank(tag, gang_config(2), pairs(4), rank_ctx, hook)
+            }));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let result = handle
+                .join()
+                .unwrap_or_else(|e| panic!("rank {rank} panicked: {e:?}"));
+            result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+        }
+    }
+
+    /// A divergence FORCED on rank 1 alone (a NaN gradient at step 1, via
+    /// the `after_backward` test seam — the only hermetic way to reach this
+    /// through the REAL `run`, since the gather already makes the two
+    /// ranks' forward losses agree in the honest case) must be seen, and
+    /// acted on IDENTICALLY, by BOTH ranks: `canonical_reduce`'s
+    /// `all_reduce_sum` propagates the NaN into the SAME reduced gradient on
+    /// every rank, so both end in the SAME typed non-finite-norm refusal at
+    /// the SAME step — never one rank erroring while its peer hangs or
+    /// silently trains on.
+    ///
+    /// RED-PROOF: this property is unreachable before U4b — `canonical_
+    /// reduce`/`RankContext` do not exist at base, so there is no second
+    /// rank for a poisoned gradient to propagate to at all.
+    #[test]
+    fn forced_divergence_on_one_rank_both_ranks_end_in_the_same_refusal() {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("forced-divergence-rank-{rank}");
+            let hook: Option<AfterBackwardHook> = if rank == 1 {
+                Some(poison_grad_at(1))
+            } else {
+                None
+            };
+            handles.push(std::thread::spawn(move || {
+                run_gang_rank(tag, gang_config(2), pairs(4), rank_ctx, hook)
+            }));
+        }
+        let results: Vec<jammi_db::error::Result<TrainingResult>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for (rank, result) in results.iter().enumerate() {
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "rank {rank} must refuse (a NaN gradient reduced across the gang must \
+                     poison every rank's post-reduce norm), got Ok"
+                ),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("non-finite total gradient norm") && msg.contains("step 1"),
+                "rank {rank}: expected the grad-norm refusal naming step 1, got: {msg}"
+            );
+        }
+    }
+}
+
 /// `refuse_nonfinite_params`'s fold over per-`Var` sums must be `+` (mutants
 /// sweep finding, P4b R3 finishing round). A finite/non-finite gate cannot
 /// distinguish `+`/`-`/`*` when the only corruption on offer is NaN — NaN

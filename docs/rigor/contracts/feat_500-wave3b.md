@@ -122,7 +122,7 @@ that is never used to root anything:
 | Property | Oracle (all GREEN at this head) |
 |---|---|
 | P-A1 alias fold and the store's own key normalisation on object stores (a key the store refuses is refused; keys the store equates are equated — the store's parser IS the oracle); bucket case, key case, bucket, backend stay distinct | `catalog::instance::root_identity_tests::object_store_aliases_and_the_stores_key_normalisation_fold`, `::a_key_the_store_refuses_is_refused_and_keys_the_store_equates_are_equated`, `::object_store_key_case_buckets_and_backends_stay_distinct` |
-| P-A1b the location determinants the store's builder dials are part of a cloud identity, read back from that builder: for S3/R2 the bucket endpoint `build()` dials — every endpoint spelling object_store accepts (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3` — the S3-specific one winning as `build()` dials it), virtual-hosted vs path style, S3 Express (a bucket without a zone suffix refused as the driver refuses), the region, config on top of the environment, an empty value unset; R2's configured endpoint and the stray `AWS_ENDPOINT_URL_S3` override; Azure account, endpoint (both spellings), the Fabric switch, and in emulator mode the Azurite host (`AZURITE_BLOB_STORAGE_URL`, its default, URL-parsed, the endpoint ignored as `build()` ignores it) — both switches read through every spelling the driver's boolean parser accepts and none it rejects; the GCS base URL | `catalog::instance::root_identity_tests::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity`, `::every_endpoint_spelling_the_store_honours_is_part_of_the_identity` (with `--features storage-cloud`); `storage::builder::tests::s3_determinants_are_the_bucket_endpoint_the_builder_dials`, `::r2_determinants_are_the_configured_endpoint_unless_the_s3_env_url_overrides_it`, `::azure_determinants_carry_account_endpoint_emulator_and_fabric_as_the_builder_reads_them`, `::gcs_determinants_carry_the_base_url_the_builder_reads` — run by the new `storage-cloud` step of ci.yml's hermetic job |
+| P-A1b the location determinants the store's builder dials are part of a cloud identity, read back from that builder: for S3/R2 the bucket endpoint `build()` dials — every endpoint spelling object_store accepts (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3` — the S3-specific one winning as `build()` dials it), virtual-hosted vs path style, S3 Express (a bucket without a zone suffix refused as the driver refuses), the region, config on top of the environment, an empty value unset — the one place the identity is not an input-for-input mirror of the driver (`present()` drops `""`; the driver stores `Some("")`), bounded in §7; R2's configured endpoint and the stray `AWS_ENDPOINT_URL_S3` override; Azure account, endpoint (both spellings), the Fabric switch, and in emulator mode the Azurite host (`AZURITE_BLOB_STORAGE_URL`, its default, URL-parsed, the endpoint ignored as `build()` ignores it) — both switches read through every spelling the driver's boolean parser accepts and none it rejects; the GCS base URL | `catalog::instance::root_identity_tests::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity`, `::every_endpoint_spelling_the_store_honours_is_part_of_the_identity` (with `--features storage-cloud`); `storage::builder::tests::s3_determinants_are_the_bucket_endpoint_the_builder_dials`, `::r2_determinants_are_the_configured_endpoint_unless_the_s3_env_url_overrides_it`, `::azure_determinants_carry_account_endpoint_emulator_and_fabric_as_the_builder_reads_them`, `::gcs_determinants_carry_the_base_url_the_builder_reads` — run by the new `storage-cloud` step of ci.yml's hermetic job |
 | P-A2 local roots: symlink ≡ target, `.`/`..`, trailing slash, `file://` ≡ bare, relative against cwd; the root is CREATED and its identity is stable afterwards, a case-divergent spelling settles to the on-disk one on a case-insensitive filesystem (two directories on a case-sensitive one); a root that cannot be created (a FILE where a directory is needed) is refused naming it; distinct dirs distinct | `::a_local_root_folds_symlinks_dot_segments_trailing_slashes_and_the_file_scheme`, `::a_local_root_is_created_and_a_case_divergent_spelling_settles_to_the_on_disk_one`, `::a_local_root_that_cannot_be_created_is_refused_naming_it`, `::a_relative_local_root_is_taken_against_the_working_directory`, `::distinct_local_roots_stay_distinct` |
 | P-A3 `memory://` and an unknown scheme refused naming the root | `::a_memory_root_and_an_unknown_scheme_are_refused_naming_the_root`; `config::tests::from_config_refuses_a_memory_result_root_for_a_member_only` (a library config with the same root is untouched; an upper-case scheme is refused on both paths) |
 | P-A4 the row carries the verbatim spelling AND `RootIdentity::of` of it, over every advertising arm | `config::tests::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm`, `::from_config_root_identity_is_of_the_resolved_root_over_every_arm`, `::from_config_never_aliases_gcs_and_gs_result_root_spellings_but_their_identities_are_one`; real sessions: `crates/jammi-ai/tests/it/storage_root.rs::member_row_matches_resolved_root_*` (identity column asserted), `::a_member_with_a_memory_result_root_is_refused_at_session_construction` |
@@ -232,3 +232,33 @@ bloom filters are covered only by the whole-object digest, by design.
 pointing at a local PostgreSQL 16 in the CI lane's shape; the phase-5 oracle
 dispatched after every other stage is green; only `docs/rigor/**` committed
 after it.
+
+## 7. Oracle residual at ae117388 — the empty-value fold (disclosed, bounded, not a block)
+
+The phase-5 oracle's PASS at `ae1173887a5844f07e34a8d92c8bcf2a6164e3f1`
+carried one residual divergence, executed against the real `AmazonS3`
+driver (probe `scratchpad/oracle-w3b/probe-empty`, static credentials):
+`present()` in `crates/jammi-db/src/storage/builder.rs` treats an
+empty-string value as unset, while `BuilderSeeds::from_vars` and the
+driver's `from_env` both store `Some("")`. So the identity merges two
+configurations the driver splits:
+
+| input | identity | what the driver dials |
+|---|---|---|
+| unset | `https://s3.us-east-1.amazonaws.com/data` | `https://s3.us-east-1.amazonaws.com/data/p/x` |
+| `AWS_ENDPOINT=""` | same as unset | panics in object_store `credential.rs` (`RelativeUrlWithoutBase`; its bucket endpoint is the relative `/data`) |
+| `AWS_REGION=""` | same as unset | `https://s3..amazonaws.com/data/p/x` — an empty DNS label, unresolvable |
+
+Bound: in every arm the divergent partner reaches no location at all
+(immediate panic or an unresolvable host), so it can neither read nor
+write another member's bytes; the failure is loud and instant. This is
+categorically unlike the HARD_BLOCK at 4df05aa3, where two working stores
+at two real key namespaces folded to one identity. The same filter sits at
+every `present()` site (S3 region and endpoint, GCS base URL, the Azure
+account, endpoint and emulator URL); an Azure `Some("")` endpoint makes
+`build()` fail outright, GCS likewise. P-A1b names this fold as the one
+non-mirror; the committed oracle
+`storage::builder::tests::s3_determinants_are_the_bucket_endpoint_the_builder_dials`
+pins it. Rebuilding the fold to store `""` as the driver does would make
+an unusable configuration a distinct gang of one, which changes nothing a
+member can observe; it is therefore not scheduled as a unit.

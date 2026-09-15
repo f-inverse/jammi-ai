@@ -212,6 +212,44 @@ string):
      gives the workflow scan), so its own suite injects a fifth renting
      driver, or a new deploy wrapper, without touching this tree.
 
+     P7's own RENTING_ROOTS is a REVIEWED LIST (`_rp_deploy_payload`,
+     `_rp_cluster_payload`'s own `rp_cluster_create` — the REST v2 cluster
+     surface's create entrypoint), not a single hard-coded name: the deploy
+     closure is the union of each root's own transitive callers PLUS the
+     roots themselves, so a second renting mechanism (the cluster leg) gets
+     a table row through the exact same derivation the pod leg always has,
+     rather than being invisible to P7 the way it would be if the closure
+     seed stayed pinned to the pod-only function. A self-test injects a
+     driver calling ONE of the roots directly and demands a row for it in
+     both directions (the addition never rots the real, already-registered
+     cluster row).
+
+  P8 (schedule visibility on every paid pod lane). A `schedule:` trigger on
+     a `PAID_POD_LANE_TABLE` workflow — or on any OTHER workflow that
+     mentions a RENTING_ROOTS-derived driver while its own comment-stripped
+     text also carries `RUNPOD_API_KEY` at any scope — is a FINDING unless
+     that workflow is a reviewed key of `PAID_LANE_CRON_ALLOWLIST` (a
+     `dict[str, tuple[str, str]]`: workflow -> (token, prose)). Each
+     allow-list entry's TOKEN must occur verbatim in the workflow's own
+     comment-stripped text OR in its `PAID_POD_LANE_TABLE` driver's
+     comment-stripped text (`gpu-prove.yml` -> `capability-surface-proof`,
+     found in `runpod_gpu_prove.sh`; `gpu-reap.yml` -> `rp_cluster_sweep`,
+     found in `gpu-dev.sh`'s reap arm) — an unresolvable token is a FAIL,
+     exactly like a dead waiver (a listed workflow carrying NO `schedule:`
+     at all). The `on:` block is read through the SAME
+     `read_top_level_on_block` every other rule in this file uses; an
+     unreadable block FAILs rather than silently passing.
+
+     WHY A SEPARATE ARM FROM P7: P7's own bad-triggers check already refuses
+     `push:`/`workflow_call:` on a paid lane's `on:` block unconditionally —
+     a schedule is different, because `gpu-prove.yml`'s own nightly cron
+     predates this rule and is a REVIEWED, never-vacuous cron (P1's own
+     capability-surface-build/-proof groups refuse a 0-test run). P8 is the
+     lever that makes ANY OTHER paid lane picking up a cron a reviewed,
+     human-visible act — a new row's `schedule:` is a FINDING until a human
+     adds it to the allow-list with its own never-vacuous arm named, never
+     an automatic pass by virtue of merely not being `push:`/`workflow_call:`.
+
 Mechanism: comment-stripped line/regex scanning for `if:`/`needs:`/step
 shapes over job-body text spans, where those spans come from the ONE real
 YAML parse `check_execution_surface_reachability.py` exposes
@@ -804,6 +842,11 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     # actually rents from this site today -- see `test_gpu_dev_lifecycle.sh`
     # for the lifecycle-safety assertions on what `reap` itself may do.
     "ci/scripts/gpu-dev.sh": "gpu-reap.yml",
+    # The distributed-training CLUSTER leg: 2 hosts x 1 GPU on one RunPod
+    # CLUSTER (REST v2) -- a second, independent renting mechanism from the
+    # pod leg's GraphQL `podFindAndDeployOnDemand`, derived into P7's
+    # subject set via RENTING_ROOTS below (never a hard-coded pod-only seed).
+    "ci/scripts/runpod_gpu_cluster.sh": "gpu-cluster.yml",
 }
 
 # --------------------------------------------------------------------------- #
@@ -892,7 +935,21 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
 # --------------------------------------------------------------------------- #
 SCRIPTS_ROOT = "ci/scripts/"
 RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
-DEPLOY_PAYLOAD_FN = "_rp_deploy_payload"
+
+# F9: the reviewed renting-root LIST P7's deploy closure is seeded from.
+# `_rp_deploy_payload` builds the GraphQL pod-creation payload;
+# `rp_cluster_create` is the REST v2 cluster surface's own create
+# entrypoint (there is no GraphQL mutation for a cluster at all -- see
+# runpod_lib.sh's own cluster-primitives header) -- a SECOND, independent
+# renting mechanism, not a call path through the first. The closure is each
+# root's transitive callers PLUS the roots themselves; a root name that
+# stops existing in runpod_lib.sh is caught the same way an empty closure
+# always was (see `derive_deploy_closure` below).
+RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create")
+# Retained as an alias: several comments/messages below still read most
+# naturally naming the ORIGINAL (and still first) root; nothing outside
+# this module depends on the name.
+DEPLOY_PAYLOAD_FN = RENTING_ROOTS[0]
 
 # The secret that turns a script that CAN deploy into a step that WILL: with
 # no `RUNPOD_API_KEY` anywhere in the invoking WORKFLOW, `rp_init` refuses
@@ -923,35 +980,45 @@ def _mentions(text: str, name: str) -> bool:
 
 
 def derive_deploy_closure(lib_text: str) -> tuple[frozenset[str], list[str]]:
-    """The deploy-capable function set: the TRANSITIVE CALLERS of
-    `_rp_deploy_payload` inside `runpod_lib.sh`. Returns
-    `(closure, findings)`; a non-empty `findings` means the closure could
-    not be computed and P7 has no subject set — a FAIL, never a skip."""
+    """The RENTING CLOSURE (F9): each `RENTING_ROOTS` entry's TRANSITIVE
+    CALLERS inside `runpod_lib.sh`, PLUS the roots themselves — a root is
+    something an external driver is known to call DIRECTLY (`rp_cluster_
+    create` has no wrapper the way `_rp_deploy_payload` has `rp_deploy_
+    live`/`rp_deploy_arch`), so excluding the roots from the matched set
+    would make P7 blind to a driver that calls a root with no wrapper in
+    between. Returns `(closure, findings)`; a non-empty `findings` means the
+    closure could not be computed and P7 has no subject set — a FAIL, never
+    a skip."""
     bodies = _bash_function_bodies(lib_text)
-    if DEPLOY_PAYLOAD_FN not in bodies:
+    missing_roots = [r for r in RENTING_ROOTS if r not in bodies]
+    if missing_roots:
         return frozenset(), [
-            f"P7: cannot derive the deploy closure — no `{DEPLOY_PAYLOAD_FN}() {{` definition in "
-            f"{RUNPOD_LIB_REL}. P7's subject set is computed from that function's transitive "
-            "callers; with no seed there is no set, and every renting driver would go unchecked"
+            f"P7: cannot derive the renting closure — no `{r}() {{` definition in {RUNPOD_LIB_REL} "
+            "(one of RENTING_ROOTS). P7's subject set is computed from each root's transitive "
+            "callers; with a missing seed there is no complete set, and every renting driver would "
+            "go unchecked"
+            for r in missing_roots
         ]
     members: set[str] = set()
     changed = True
     while changed:
         changed = False
-        targets = {DEPLOY_PAYLOAD_FN} | members
+        targets = set(RENTING_ROOTS) | members
         for name, body in bodies.items():
-            if name == DEPLOY_PAYLOAD_FN or name in members:
+            if name in RENTING_ROOTS or name in members:
                 continue
             if any(_mentions(body, t) for t in targets):
                 members.add(name)
                 changed = True
+    closure = members | set(RENTING_ROOTS)
     if not members:
         return frozenset(), [
-            f"P7: the deploy closure is EMPTY — nothing in {RUNPOD_LIB_REL} calls "
-            f"`{DEPLOY_PAYLOAD_FN}`. Either the payload builder was renamed (rename it here too) or "
-            "the deploy path moved; an empty closure would silently exempt every renting driver"
+            f"P7: the renting closure carries no CALLERS of {list(RENTING_ROOTS)} in {RUNPOD_LIB_REL} "
+            "beyond the roots themselves — either a root was renamed (rename it here too) or the "
+            "deploy path moved; an empty caller set would silently exempt every wrapper-based "
+            "renting driver"
         ]
-    return frozenset(members), []
+    return frozenset(closure), []
 
 
 def derive_renting_drivers(
@@ -1048,7 +1115,7 @@ def _check_derived_driver_cannot_rent(
         if RUNPOD_SECRET not in stripped:
             continue
         findings.append(
-            f"P7: {script_rel} calls runpod_lib.sh's deploy closure and its repo-relative path "
+            f"P7: {script_rel} calls runpod_lib.sh's renting closure and its repo-relative path "
             f"is mentioned in {name}, whose comment-stripped text also carries {RUNPOD_SECRET} "
             "somewhere (top-level env, job env, step env, with:, or a paths: filter — no verb "
             "parsing clears a mention under this rule) — that workflow can RENT with this "
@@ -1059,7 +1126,7 @@ def _check_derived_driver_cannot_rent(
         )
     if not mentioned_anywhere and notes is not None:
         notes.append(
-            f"P7 NOTE: {script_rel} calls runpod_lib.sh's deploy closure, but its repo-relative "
+            f"P7 NOTE: {script_rel} calls runpod_lib.sh's renting closure, but its repo-relative "
             "path is mentioned in no workflow file in this tree (comment-stripped, whole file) — "
             "so nothing here establishes that it can rent, and nothing establishes that it "
             "cannot. Reported, not judged: it is not a failure, and it is not cleared either"
@@ -1082,7 +1149,7 @@ def check_p7_paid_pod_lanes(
         lib_text = script_texts.get(RUNPOD_LIB_REL)
     if lib_text is None:
         findings.append(
-            f"P7: {RUNPOD_LIB_REL} is not in the scanned ci/scripts set — the deploy closure P7's "
+            f"P7: {RUNPOD_LIB_REL} is not in the scanned ci/scripts set — the renting closure P7's "
             "subject set is derived from cannot be computed, so no renting driver can be checked"
         )
         closure: frozenset[str] = frozenset()
@@ -1100,13 +1167,13 @@ def check_p7_paid_pod_lanes(
         # see the module doc's P7 "IDENTITY IS THE REPO-RELATIVE PATH"
         # paragraph. No `rsplit("/")` anywhere in this file.
         table_paths = set(PAID_POD_LANE_TABLE)
-        # Rot: a row whose driver no longer calls the deploy closure (it was
+        # Rot: a row whose driver no longer calls the renting closure (it was
         # rewritten, or the closure moved) is a row asserting a fact that
         # stopped being true.
         for rel in sorted(table_paths - set(derived)):
             findings.append(
                 f"P7: PAID_POD_LANE_TABLE row `{rel}` names a driver that does NOT call "
-                f"runpod_lib.sh's deploy closure ({sorted(closure)}) — the row asserts a paid pod "
+                f"runpod_lib.sh's renting closure ({sorted(closure)}) — the row asserts a paid pod "
                 "lane that no longer exists; delete the row, or restore the call"
             )
         # Completeness: a derived driver that is not a row must be provably
@@ -1170,7 +1237,7 @@ def check_p7_paid_pod_lanes(
                 findings.append(
                     f"P7: {resolved_workflow}'s on: block carries {bad_triggers} — a leg that RENTS "
                     "hardware is never started by a push and is never callable by another workflow "
-                    "(it fires on a label, a schedule, or a manual dispatch only)"
+                    "(it fires on a label, a manual dispatch, or an allow-listed cron)"
                 )
 
         # `uses:` (local or cross-repo) is read from the PARSED document
@@ -1193,6 +1260,110 @@ def check_p7_paid_pod_lanes(
                 f"P7: {name}: cannot examine its jobs: to check whether it uses: a paid pod lane "
                 f"workflow -- {err}"
             )
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# P8 (schedule visibility on every paid pod lane) -- see the module doc's P8
+# section for the full doctrine.
+# --------------------------------------------------------------------------- #
+# workflow -> (token, prose). The token must occur verbatim (comment-
+# stripped) in the workflow's own text OR in its PAID_POD_LANE_TABLE
+# driver's own text (F10) -- an unresolvable token is a FAIL, exactly like a
+# listed workflow carrying no schedule: at all.
+PAID_LANE_CRON_ALLOWLIST: dict[str, tuple[str, str]] = {
+    "gpu-prove.yml": (
+        "capability-surface-proof",
+        "runpod_gpu_prove.sh's never-vacuous capability-surface-build/-proof groups refuse a 0-test "
+        "run -- the nightly cron can never silently pass on an empty suite",
+    ),
+    "gpu-reap.yml": (
+        "rp_cluster_sweep",
+        "gpu-dev.sh's reap arm fails closed (non-zero) when it cannot enumerate pods OR clusters -- "
+        "the 6-hourly cron never reports 'nothing to reap' from an enumeration it could not make",
+    ),
+}
+
+
+def check_p8_schedule_visibility(
+    workflow_texts: dict[str, str],
+    script_texts: dict[str, str] | None = None,
+    lib_text: str | None = None,
+) -> list[str]:
+    """For every `PAID_POD_LANE_TABLE` workflow AND every OTHER workflow
+    that mentions a RENTING_ROOTS-derived driver while its own comment-
+    stripped text also carries `RUNPOD_SECRET` at any scope, a `schedule:`
+    key in its `on:` block (read via `read_top_level_on_block`) is a FINDING
+    unless the workflow is a reviewed key of `PAID_LANE_CRON_ALLOWLIST`
+    whose token resolves (F10). A listed workflow with NO `schedule:` at all
+    is a dead waiver (FAIL). An unreadable `on:` block FAILs, never a silent
+    skip."""
+    findings: list[str] = []
+
+    if script_texts is None:
+        script_texts = load_script_texts()
+    if lib_text is None:
+        lib_text = script_texts.get(RUNPOD_LIB_REL)
+
+    subjects: set[str] = set()
+    for workflow in PAID_POD_LANE_TABLE.values():
+        resolved = resolve_workflow(workflow_texts, workflow)
+        if resolved is not None:
+            subjects.add(resolved)
+
+    if lib_text is not None:
+        closure, _closure_findings = derive_deploy_closure(lib_text)
+        if closure:
+            derived = derive_renting_drivers(script_texts, closure)
+            for rel in derived:
+                for name in workflow_texts:
+                    stripped = drop_comment_lines(workflow_texts[name])
+                    if rel in stripped and RUNPOD_SECRET in stripped:
+                        subjects.add(name)
+
+    for name in sorted(PAID_LANE_CRON_ALLOWLIST):
+        if name in workflow_texts:
+            subjects.add(name)
+        else:
+            findings.append(
+                f"P8: PAID_LANE_CRON_ALLOWLIST names {name}, which does not exist in the workflow "
+                "tree -- remove the dead entry"
+            )
+
+    for name in sorted(subjects):
+        keys, err = read_top_level_on_block(workflow_texts[name])
+        if err is not None:
+            findings.append(f"P8: {name}: {err}")
+            continue
+        has_schedule = "schedule" in (keys or [])
+        allow = PAID_LANE_CRON_ALLOWLIST.get(name)
+        if has_schedule and allow is None:
+            findings.append(
+                f"P8: {name} carries a schedule: trigger with no PAID_LANE_CRON_ALLOWLIST entry -- a "
+                "cron on a leg that RENTS hardware is a reviewed, human-visible act, never a silent "
+                "default; add an allow-list row naming this cron's own never-vacuous arm, or remove "
+                "the schedule: trigger"
+            )
+        elif has_schedule and allow is not None:
+            token, _prose = allow
+            driver_rel = next(
+                (script for script, wf in PAID_POD_LANE_TABLE.items() if resolve_workflow(workflow_texts, wf) == name),
+                None,
+            )
+            own_text = drop_comment_lines(workflow_texts[name])
+            driver_text = drop_comment_lines(script_texts.get(driver_rel, "")) if driver_rel else ""
+            if token not in own_text and token not in driver_text:
+                findings.append(
+                    f"P8: {name}'s PAID_LANE_CRON_ALLOWLIST token {token!r} occurs in neither its own "
+                    f"comment-stripped text nor its driver's ({driver_rel}) -- an unresolvable token is "
+                    "a FAIL, exactly like a dead waiver"
+                )
+        elif not has_schedule and allow is not None:
+            findings.append(
+                f"P8: {name} is a PAID_LANE_CRON_ALLOWLIST entry but carries NO schedule: trigger at "
+                "all -- a dead waiver; remove the entry"
+            )
+
     return findings
 
 
@@ -2298,6 +2469,7 @@ def run_gate(
     findings: list[str] = []
     findings += check_p1_p2(workflow_texts)
     findings += check_p7_paid_pod_lanes(workflow_texts, script_texts, notes=notes)
+    findings += check_p8_schedule_visibility(workflow_texts, script_texts)
     findings += check_gate_file_absent(workflows_dir)
     findings += check_promotion_table(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
@@ -2355,11 +2527,13 @@ def main() -> int:
           "by the promoted commit, no publishing job in the tree is unlisted, every paid pod "
           "lane in PAID_POD_LANE_TABLE (keyed by repo-relative path, never a basename) has exactly "
           "one invoker whose on: block carries no push:/workflow_call: trigger and which nothing "
-          "uses:, and every renting driver DERIVED from runpod_lib.sh's own deploy closure is "
+          "uses:, and every renting driver DERIVED from runpod_lib.sh's own renting closure is "
           "either such a row or has its path mentioned in no workflow file whose comment-stripped "
           "text carries the secret at any scope (whole-file scope, no verb parsing clears an "
           "invocation) -- a driver mentioned in no workflow at all reported above as a NOTE rather "
-          "than cleared.")
+          "than cleared -- and every paid-lane-adjacent workflow's schedule: trigger, if any, is a "
+          "reviewed PAID_LANE_CRON_ALLOWLIST entry whose token resolves against its own text or its "
+          "driver's (P8).")
     return 0
 
 

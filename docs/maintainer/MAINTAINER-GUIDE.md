@@ -3242,37 +3242,62 @@ choke point every writer of them funnels through.
   `Display` only) and is the SAME type the peer listener uses
   (`index::peer` re-exports it) — the peer and gang listeners can never
   drift into two address types.
-- **The ONE choke point: `InstanceRegistration::from_config`**
-  (`catalog/instance.rs`). `peer_advertise` unset → a non-member
-  registration (`peer_addr`/`canonical_root` both `None`), no filesystem
-  check at all. `peer_advertise` set → the WHOLE membership check: it
-  parses as a `PeerAddr`, `peer_bind` is set too (else a typed error naming
-  both keys), and `JammiConfig::canonical_result_root()` resolves (else a
-  typed error naming the offending key). Two callers, both production:
-  `InferenceSession::wrap_with` (`session.rs`) calls it FIRST — before the
-  lease keeper starts, before the result store creates a directory, before
-  any other side effect — so a refusal never leaves a partially-built
-  session or a written row behind; `JammiConfig::load_from` (`config/mod.rs`)
-  calls it too, discarding the registration, purely so a bad
-  `peer_advertise` fails at config load rather than only deep inside
-  `wrap_with` — a struct-literal config that skips `load_from` is still
-  covered, since every `InferenceSession` constructor funnels through
-  `wrap_with`. `ServerConfig::validate` is NOT the home: it cannot see
-  `artifact_dir`, which the root canonicalization needs.
+- **PURE validate / MATERIALIZE split: `MembershipConfig::validate` and
+  `InstanceRegistration::from_config`** (`catalog/instance.rs`). Before this
+  split, `JammiConfig::load_from` called the SAME `from_config` the session
+  did, and `from_config`'s anchor check REQUIRED the anchor to already
+  exist — so on a genuinely fresh host `load_from` refused
+  (`{artifact_dir}` does not exist yet at config-load time) while
+  `InferenceSession::new` silently ACCEPTED the identical config, because
+  `JammiSession::new`'s own catalog open had already `create_dir_all`'d
+  `artifact_dir` as a side effect BEFORE `from_config` ever ran — two
+  enforcement points, two different verdicts on one config. The fix:
+  `MembershipConfig::validate(&JammiConfig) -> Result<Option<MembershipConfig>>`
+  is PURE — NO filesystem access at all: `peer_advertise` parses as a
+  `PeerAddr`; `peer_bind` is set too (else a typed error naming both keys);
+  a `file://` anchor is ABSOLUTE (a relative `artifact_dir` — including the
+  `.jammi` fallback `default_artifact_dir` returns when `ProjectDirs` is
+  unavailable — or a relative explicit `result_root` is refused naming the
+  key: a relative path's meaning depends on the process's cwd at whatever
+  moment it is later resolved, never a property of the config alone); a
+  cloud scheme folds through `Scheme`'s own alias table; `memory://` is
+  refused. `JammiConfig::load_from` calls ONLY `MembershipConfig::validate`
+  — loading a config file must never itself create a directory as a side
+  effect. `InstanceRegistration::from_config` = validate PLUS MATERIALIZE:
+  for a `file://` anchor, `create_dir_all`s it if absent (idempotent with
+  `JammiSession`'s own catalog-open `create_dir_all` of `artifact_dir`, and
+  with `ResultStore`'s later one of the same `result_root` path — refusing
+  naming the key if it exists as a non-directory or cannot be created),
+  `fs::canonicalize`s it, and appends the leaf rule.
+  `InferenceSession::wrap_with` (`session.rs`) calls `from_config` FIRST —
+  before the lease keeper starts, before the result store creates a
+  directory, before any other session-level side effect — but it is NOT
+  true that a refusal here leaves nothing behind: `wrap_with` receives an
+  ALREADY-CONSTRUCTED `JammiSession` (its catalog connection pool is open,
+  and `artifact_dir` already exists, both created by the caller before
+  `wrap_with` is ever invoked), and a `from_config` refusal returns an `Err`
+  without closing that connection — the caller must still `drop`/retry past
+  it (`jammi-ai`'s `instance_identity.rs` reopens the SAME catalog directory
+  in a bounded retry loop after a deliberately-failed construction,
+  specifically because the failed session's pool is not synchronously
+  released). `ServerConfig::validate` is NOT the home for any of this: it
+  cannot see `artifact_dir`, which the anchor needs.
 - **`JammiConfig::canonical_result_root()` / `resolved_result_root()`**
   (`config/mod.rs`): `resolved_result_root()` is the plain, uncanonicalized
   effective root (`storage.result_root` when set, else
   `{artifact_dir}/jammi_db` — the SAME derivation `ResultStore::new`'s
-  local-root arm performs). `canonical_result_root()` is `canon ∘ resolved`
-  — `Ok(None)` when `peer_advertise` is unset (a library process never
-  computes it, so an absent `jammi_db` directory can never refuse a library
-  load); otherwise the anchor (`result_root` itself when set, else
-  `artifact_dir`) MUST exist and MUST be a directory (refused, naming the
-  key, otherwise), `fs::canonicalize`d once, and — ONLY when `result_root`
-  is unset — the default leaf `jammi_db` is appended lexically (never
-  itself resolved); an explicit `result_root` IS the whole effective root,
-  no suffix. Cloud schemes: the scheme token is lowercased then folded
-  through `Scheme`'s own alias table before `StorageUrl::parse` (which is
+  local-root arm performs), fallible: it refuses naming `artifact_dir` when
+  the joined path is not valid UTF-8, rather than silently lossy-folding it.
+  `canonical_result_root()` is `materialize ∘ validate` (a convenience
+  one-shot wrapping `MembershipConfig::validate` + `MembershipConfig::
+  materialize`) — `Ok(None)` when `peer_advertise` is unset; otherwise the
+  anchor (`result_root` itself when set, else `artifact_dir`) is CREATED if
+  absent (never required to pre-exist — see the validate/materialize split
+  above), `fs::canonicalize`d once, and — ONLY when `result_root` is unset —
+  the default leaf `jammi_db` is appended lexically (never itself
+  resolved); an explicit `result_root` IS the whole effective root, no
+  suffix. Cloud schemes: the scheme token is lowercased then folded through
+  `Scheme`'s own alias table before `StorageUrl::parse` (which is
   case-sensitive); `memory://` is refused for a gang member; a trailing `/`
   is trimmed.
 - **The two read verbs** (`catalog/jobs_repo.rs`, both tenant-unscoped by

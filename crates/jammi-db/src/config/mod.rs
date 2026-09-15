@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::catalog::instance::CanonicalRoot;
 pub use crate::catalog::lease::LeaseIntervals;
 use crate::error::{JammiError, Result};
-use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config, Scheme, StorageUrl};
+use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 
 mod env_map;
 mod layers;
@@ -2467,135 +2467,56 @@ impl JammiConfig {
     /// `jammi_db::store::ResultStore::new`'s local-root arm performs
     /// (`artifact_dir.join("jammi_db")`), the ONE place that join happens so
     /// nothing downstream re-derives it independently.
-    pub fn resolved_result_root(&self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// [`JammiError::Config`] naming `artifact_dir` when its joined
+    /// `{artifact_dir}/jammi_db` path is not valid UTF-8 — never a silent
+    /// lossy fold (`Path::to_string_lossy`'s replacement-character
+    /// substitution), since that fold could make two genuinely different
+    /// paths compare equal downstream.
+    pub fn resolved_result_root(&self) -> Result<String> {
         match &self.storage.result_root {
-            Some(root) => root.clone(),
-            None => self
-                .artifact_dir
-                .join("jammi_db")
-                .to_string_lossy()
-                .into_owned(),
+            Some(root) => Ok(root.clone()),
+            None => {
+                let joined = self.artifact_dir.join("jammi_db");
+                joined.to_str().map(str::to_string).ok_or_else(|| {
+                    JammiError::Config(format!(
+                        "artifact_dir '{}' is not valid UTF-8",
+                        self.artifact_dir.display()
+                    ))
+                })
+            }
         }
     }
 
     /// The canonical result root two gang members compare byte-for-byte —
     /// `Ok(None)` when `[server] peer_advertise` is unset, so a library
     /// process (and every deployment that never joins a gang) never
-    /// computes this: an absent `jammi_db` directory can never refuse a
-    /// library load. See
+    /// computes this. See
     /// [`crate::catalog::instance::InstanceRegistration::from_config`] for
-    /// the WHOLE membership check this is one piece of.
+    /// the WHOLE membership check this is one piece of, and
+    /// [`crate::catalog::instance::MembershipConfig`] for the PURE-validate /
+    /// MATERIALIZE split this function itself performs (validate, then
+    /// materialize — this is the convenience one-shot form; `load_from`
+    /// calls `MembershipConfig::validate` alone, never materializing).
     ///
-    /// **This is `canon ∘ resolved`: the canonicalized form of the EXACT
-    /// same effective root [`Self::resolved_result_root`] names** — never a
-    /// string no store is actually rooted under. That splits into two arms
-    /// by whether `[storage] result_root` is set, because the two arms name
-    /// different roots:
-    ///
-    /// - **`result_root` UNSET** — the effective root is
-    ///   `{artifact_dir}/jammi_db`. The ANCHOR is `artifact_dir`: it MUST
-    ///   exist and MUST be a directory (a typed error naming the key
-    ///   otherwise), `std::fs::canonicalize`d ONCE (symlinks and `.`/`..`
-    ///   resolved, so `./root`, `//root//`, a trailing `/`, and a symlinked
-    ///   `artifact_dir` all fold to the identical string) — and the default
-    ///   leaf `jammi_db` is THEN appended LEXICALLY, never itself resolved,
-    ///   whether absent, present, or a symlink.
-    /// - **`result_root` SET, `file://` or a bare path** — the effective
-    ///   root is `result_root` VERBATIM (exactly what
-    ///   `jammi_db::store::ResultStore::with_root` roots the store at — no
-    ///   `jammi_db` suffix). The ANCHOR IS `result_root` itself: it MUST
-    ///   exist and MUST be a directory (same typed error, naming
-    ///   `result_root`), canonicalized the same way — and NO leaf is
-    ///   appended.
-    /// - **`result_root` SET, a cloud scheme** — the scheme token is
-    ///   lowercased, then folded through [`Scheme`]'s own alias table
-    ///   (`StorageUrl::parse` is case-sensitive, so lowercasing precedes
-    ///   it); `memory://` is refused for a gang member; a trailing `/` is
-    ///   trimmed. No leaf is appended — the object-store namespace is
-    ///   authoritative across every replica, exactly as `result_root`
-    ///   itself already is (no local filesystem check applies).
+    /// **This is `materialize ∘ validate`, over the EXACT same effective
+    /// root [`Self::resolved_result_root`] names** — never a string no store
+    /// is actually rooted under. `[storage] result_root` unset names
+    /// `{artifact_dir}/jammi_db` (the `artifact_dir` anchor, created if
+    /// absent, canonicalized, `jammi_db` appended lexically); SET names
+    /// `result_root` VERBATIM (the SAME string
+    /// `jammi_db::store::ResultStore::with_root` roots the store at — no
+    /// `jammi_db` suffix); a cloud scheme is lowercased, folded through
+    /// [`crate::storage::Scheme`]'s own alias table, and trailing-`/`-trimmed, with no local
+    /// filesystem step at all. A relative anchor (`file://` only) is refused
+    /// at `MembershipConfig::validate` before either arm's filesystem step
+    /// ever runs.
     pub fn canonical_result_root(&self) -> Result<Option<CanonicalRoot>> {
-        if self.server.peer_advertise.is_none() {
-            return Ok(None);
-        }
-        // Whether `result_root` is explicitly set decides BOTH the anchor
-        // (`result_root` itself vs. `artifact_dir`) and whether a `jammi_db`
-        // leaf is appended below — the two arms name genuinely different
-        // effective roots (`resolved_result_root`'s own two arms), never one
-        // formula with an optional suffix.
-        let result_root_set = self.storage.result_root.is_some();
-        let anchor_source = self
-            .storage
-            .result_root
-            .clone()
-            .unwrap_or_else(|| self.artifact_dir.to_string_lossy().into_owned());
-        let anchor_key = if result_root_set {
-            "storage.result_root"
-        } else {
-            "artifact_dir"
-        };
-        // Lowercase the scheme token BEFORE `StorageUrl::parse` (case-
-        // sensitive) so every cloud scheme spelling folds through `Scheme`'s
-        // own alias table; a bare path (no `://`) is left untouched —
-        // `StorageUrl::parse` normalises it to `file://` on its own.
-        let lowered = match anchor_source.split_once("://") {
-            Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
-            None => anchor_source.clone(),
-        };
-        let url = StorageUrl::parse(&lowered).map_err(|e| {
-            JammiError::Config(format!(
-                "server.peer_advertise requires a valid [{anchor_key}]: {e}"
-            ))
-        })?;
-        match url.scheme() {
-            Scheme::Memory => Err(JammiError::Config(
-                "server.peer_advertise cannot be combined with a memory:// result root".into(),
-            )),
-            Scheme::File => {
-                let anchor = Path::new(url.path());
-                let meta = std::fs::metadata(anchor).map_err(|e| {
-                    JammiError::Config(format!(
-                        "server.peer_advertise requires [{anchor_key}] '{}' to exist: {e}",
-                        anchor.display()
-                    ))
-                })?;
-                if !meta.is_dir() {
-                    return Err(JammiError::Config(format!(
-                        "server.peer_advertise requires [{anchor_key}] '{}' to be a directory",
-                        anchor.display()
-                    )));
-                }
-                let canonical_anchor = std::fs::canonicalize(anchor).map_err(|e| {
-                    JammiError::Config(format!(
-                        "server.peer_advertise: failed to canonicalize [{anchor_key}] '{}': {e}",
-                        anchor.display()
-                    ))
-                })?;
-                // The leaf is appended ONLY when `result_root` is unset —
-                // the effective root is then `{artifact_dir}/jammi_db`; a
-                // SET `result_root` already names the whole effective root
-                // (`ResultStore::with_root`'s verbatim usage), so the anchor
-                // canonicalized IS the answer, no suffix.
-                let full = if result_root_set {
-                    canonical_anchor
-                } else {
-                    canonical_anchor.join("jammi_db")
-                };
-                Ok(Some(CanonicalRoot::new(format!(
-                    "file://{}",
-                    full.to_string_lossy()
-                ))))
-            }
-            other_scheme => {
-                // Rebuild through the RESOLVED `Scheme`'s own `Display`
-                // (`s3`/`gs`/`azure`/`r2`) rather than the lowered input
-                // token verbatim, so two alias spellings of one scheme
-                // (`gcs://` and `gs://`, `abfss://` and `azure://`) fold to
-                // the IDENTICAL string, not merely both-lowercase distinct
-                // strings.
-                let path = url.path().trim_end_matches('/');
-                Ok(Some(CanonicalRoot::new(format!("{other_scheme}://{path}"))))
-            }
+        match crate::catalog::instance::MembershipConfig::validate(self)? {
+            None => Ok(None),
+            Some(membership) => Ok(Some(membership.materialize()?)),
         }
     }
 
@@ -2658,21 +2579,20 @@ impl JammiConfig {
         // than at the first `jammi_ai::telemetry::otlp_layer` call.
         config.observability.validate()?;
         // Reject a `[server] peer_advertise` that cannot resolve a valid
-        // gang-membership registration (an unset `peer_bind`, an
-        // unparseable address, or a result root that cannot be
-        // canonicalized) at load time, naming the offending key — rather
+        // gang-membership shape (an unset `peer_bind`, an unparseable
+        // address, a malformed/`memory://` result root, or a RELATIVE
+        // `file://` anchor) at load time, naming the offending key — rather
         // than only surfacing deep inside `InferenceSession::wrap_with`'s
-        // own registration call. The registration itself is discarded; this
-        // call is for the early-failure side effect only (a struct-literal
-        // config that skips `load_from` is still covered — `wrap_with`
-        // calls `InstanceRegistration::from_config` too, and every
-        // `InferenceSession` constructor funnels through `wrap_with`).
-        crate::catalog::instance::InstanceRegistration::from_config(
-            &config,
-            "config-validate",
-            None,
-            None,
-        )?;
+        // own registration call. `MembershipConfig::validate` is the PURE
+        // half of the check ONLY (no filesystem read/write): loading a
+        // config file must never itself create a directory as a side
+        // effect — that materialize step belongs to
+        // `InstanceRegistration::from_config` alone, which `wrap_with`
+        // calls (every `InferenceSession` constructor funnels through it),
+        // so a struct-literal config that skips `load_from` entirely is
+        // still covered there. The `Option` is discarded; this call is for
+        // its early-failure side effect only.
+        let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
         Ok(config)
     }
 

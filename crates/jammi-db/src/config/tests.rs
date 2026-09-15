@@ -3229,6 +3229,145 @@ fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>)
     }
 }
 
+// ─── F2: a RELATIVE `file://` anchor is refused when `peer_advertise` is
+// set — a relative path's meaning depends on the process's current
+// directory at whatever moment it is later resolved, never a property of
+// the config alone. ─────────────────────────────────────────────────────
+
+/// A relative `artifact_dir` (including the `.jammi` fallback
+/// `default_artifact_dir` returns when `ProjectDirs` is unavailable) is
+/// refused naming the key — this is a PURE check
+/// (`MembershipConfig::validate`, no filesystem access at all).
+#[test]
+fn membership_config_validate_refuses_a_relative_artifact_dir() {
+    let cfg = advertising_config(std::path::Path::new(".jammi"), None);
+    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("artifact_dir") && msg.contains("absolute"),
+        "{msg}"
+    );
+}
+
+/// A relative explicit `[storage] result_root` is refused naming ITS key,
+/// not `artifact_dir`'s.
+#[test]
+fn membership_config_validate_refuses_a_relative_result_root() {
+    let cfg = advertising_config(std::path::Path::new("/unused"), Some("relative/root"));
+    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise")
+            && msg.contains("storage.result_root")
+            && msg.contains("absolute"),
+        "{msg}"
+    );
+}
+
+/// P-B2's purity property survives a `chdir` BETWEEN load and materialize:
+/// with an ABSOLUTE anchor (F2 guarantees one — a relative anchor is
+/// refused before this could ever matter), `canonical_result_root()`'s
+/// output does not depend on the process's current directory at all.
+/// `std::env::set_current_dir` is PROCESS-GLOBAL — this test guards its own
+/// chdir window with a local mutex so two invocations (e.g. a retry) never
+/// race each other; it is otherwise the only test in this binary that
+/// touches the process's cwd.
+#[test]
+fn canonical_result_root_is_independent_of_a_chdir_between_load_and_materialize() {
+    static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CWD_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+    let original_cwd = std::env::current_dir().unwrap();
+    let anchor_dir = tempfile::tempdir().unwrap();
+    let sibling_cwd = tempfile::tempdir().unwrap();
+    let cfg = advertising_config(anchor_dir.path(), None);
+
+    // "load": validate while still in the original cwd.
+    let membership_before = crate::catalog::instance::MembershipConfig::validate(&cfg)
+        .unwrap()
+        .unwrap();
+
+    std::env::set_current_dir(sibling_cwd.path()).unwrap();
+    let materialize_result = membership_before.materialize();
+    std::env::set_current_dir(&original_cwd).unwrap();
+
+    let canonical = materialize_result.unwrap();
+    let expected = format!(
+        "file://{}/jammi_db",
+        std::fs::canonicalize(anchor_dir.path())
+            .unwrap()
+            .to_string_lossy()
+    );
+    assert_eq!(
+        canonical.as_str(),
+        expected,
+        "the canonical root must be independent of the process cwd, given an absolute anchor"
+    );
+}
+
+// ─── F1: `load_from`-level oracles — every arm through the REAL public
+// loader, not only through the lower-level `MembershipConfig`/
+// `InstanceRegistration` unit calls above. ──────────────────────────────
+
+/// `load_from` refuses `peer_advertise` without `peer_bind`, naming both
+/// keys — the PURE half of the check runs at load.
+#[test]
+fn load_from_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\npeer_advertise = \"127.0.0.1:19200\"\n",
+        dir.path().to_str().unwrap()
+    );
+    let err = load_src(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("peer_bind"),
+        "{msg}"
+    );
+}
+
+/// `load_from` refuses a RELATIVE `artifact_dir` when `peer_advertise` is
+/// set, naming the key — F2, exercised through the real loader.
+#[test]
+fn load_from_refuses_a_relative_artifact_dir_when_peer_advertise_is_set() {
+    let src = "artifact_dir = \".jammi\"\n[server]\npeer_bind = \"0.0.0.0:19203\"\n\
+               peer_advertise = \"127.0.0.1:19203\"\n";
+    let err = load_src(src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_dir") && msg.contains("absolute"),
+        "{msg}"
+    );
+}
+
+/// The F1 oracle: `load_from` on a FRESH tempdir (the anchor genuinely does
+/// not exist yet) with `peer_advertise` set and `result_root` UNSET
+/// SUCCEEDS — the pure check never reads the filesystem, so it can never be
+/// STRICTER than the materializing backstop
+/// (`InstanceRegistration::from_config`, exercised end-to-end by
+/// `jammi-ai`'s `instance_identity.rs`) the way it was before F1: `load_from`
+/// used to call the (impure, existence-checking) `from_config` directly and
+/// refuse here, while `InferenceSession`'s own construction path silently
+/// accepted the SAME config because `JammiSession::new`'s catalog open had
+/// already `create_dir_all`'d the identical path first — two enforcement
+/// points, two different verdicts on one config.
+#[test]
+fn load_from_accepts_a_fresh_missing_anchor_when_peer_advertise_is_set() {
+    let base = tempfile::tempdir().unwrap();
+    let missing = base.path().join("does-not-exist-yet");
+    assert!(!missing.exists());
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\npeer_bind = \"0.0.0.0:19201\"\n\
+         peer_advertise = \"127.0.0.1:19201\"\n",
+        missing.to_str().unwrap()
+    );
+    load_src(&src).expect("a missing (creatable, absolute) anchor must be accepted at load");
+    assert!(
+        !missing.exists(),
+        "load_from is PURE: it must never create a directory as a side effect of loading"
+    );
+}
+
 /// P-M5 restated over `InstanceRegistration::from_config`, arm 1: unset
 /// `peer_bind` is refused naming BOTH keys.
 #[test]
@@ -3249,19 +3388,31 @@ fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
     );
 }
 
-/// Arm 2: a missing anchor is refused naming the key.
+/// F1: `from_config` MATERIALIZES a missing anchor — it is CREATED, never
+/// refused. Before the F1 fix, a fresh host's `artifact_dir` (genuinely
+/// absent at config-load time) was refused here, while `InferenceSession`'s
+/// own backstop silently accepted it because `JammiSession::new`'s own
+/// catalog open had ALREADY `create_dir_all`'d the same path before
+/// `from_config` ever ran — two enforcement points reaching different
+/// verdicts on one config. `from_config` creating it directly (idempotent
+/// with that same `create_dir_all`) closes the gap from this side.
 #[test]
-fn from_config_missing_anchor_is_refused_naming_the_key() {
+fn from_config_creates_a_missing_artifact_dir_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist");
+    assert!(!missing.exists());
     let cfg = advertising_config(&missing, None);
-    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
-        .unwrap_err();
-    let msg = err.to_string();
+    let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap();
     assert!(
-        msg.contains("peer_advertise") && msg.contains("artifact_dir"),
-        "must name the key: {msg}"
+        missing.is_dir(),
+        "from_config must materialize the missing anchor as a directory"
     );
+    let expected = format!(
+        "file://{}/jammi_db",
+        std::fs::canonicalize(&missing).unwrap().to_string_lossy()
+    );
+    assert_eq!(reg.canonical_root.unwrap().as_str(), expected);
 }
 
 /// Arm 2 (the sibling): an anchor that exists but is a FILE, not a
@@ -3389,7 +3540,7 @@ fn canonical_result_root_equals_the_canonicalized_effective_root_for_both_arms()
     let dir_a = tempfile::tempdir().unwrap();
     let cfg_a = advertising_config(dir_a.path(), None);
     assert_eq!(
-        cfg_a.resolved_result_root(),
+        cfg_a.resolved_result_root().unwrap(),
         dir_a.path().join("jammi_db").to_string_lossy()
     );
     let canonical_a = cfg_a.canonical_result_root().unwrap().unwrap();
@@ -3407,7 +3558,7 @@ fn canonical_result_root_equals_the_canonicalized_effective_root_for_both_arms()
     let root_b = dir_b.path().to_str().unwrap();
     let cfg_b = advertising_config(std::path::Path::new("/unused"), Some(root_b));
     assert_eq!(
-        cfg_b.resolved_result_root(),
+        cfg_b.resolved_result_root().unwrap(),
         root_b,
         "arm (b)'s effective root is result_root VERBATIM"
     );
@@ -3423,24 +3574,28 @@ fn canonical_result_root_equals_the_canonicalized_effective_root_for_both_arms()
     );
 }
 
-/// Arm (b)'s sibling of the `from_config_missing_anchor_...` /
-/// `from_config_anchor_that_is_a_file_...` cases: a MISSING or non-directory
-/// anchor is refused the same way when the anchor is an EXPLICIT
-/// `result_root`, not only when it falls back to `artifact_dir`.
+/// Arm (b)'s sibling of `from_config_creates_a_missing_artifact_dir_anchor`:
+/// a MISSING anchor is likewise CREATED, never refused, when the anchor is
+/// an EXPLICIT `result_root`, not only when it falls back to `artifact_dir`.
 #[test]
-fn canonical_result_root_refuses_a_missing_anchor_for_an_explicit_result_root() {
+fn canonical_result_root_creates_a_missing_explicit_result_root_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist");
+    assert!(!missing.exists());
     let cfg = advertising_config(
         std::path::Path::new("/unused"),
         Some(missing.to_str().unwrap()),
     );
-    let err = cfg.canonical_result_root().unwrap_err();
-    let msg = err.to_string();
+    let root = cfg.canonical_result_root().unwrap().unwrap();
     assert!(
-        msg.contains("peer_advertise") && msg.contains("result_root"),
-        "must name the key: {msg}"
+        missing.is_dir(),
+        "canonical_result_root must materialize the missing anchor as a directory"
     );
+    let expected = format!(
+        "file://{}",
+        std::fs::canonicalize(&missing).unwrap().to_string_lossy()
+    );
+    assert_eq!(root.as_str(), expected);
 }
 
 #[test]
@@ -3519,7 +3674,7 @@ fn resolved_result_root_mirrors_the_two_derivation_sites() {
         ..JammiConfig::default()
     };
     assert_eq!(
-        unset.resolved_result_root(),
+        unset.resolved_result_root().unwrap(),
         dir.path().join("jammi_db").to_string_lossy().into_owned()
     );
     let set = JammiConfig {
@@ -3529,5 +3684,5 @@ fn resolved_result_root_mirrors_the_two_derivation_sites() {
         },
         ..JammiConfig::default()
     };
-    assert_eq!(set.resolved_result_root(), "r2://bucket/prefix");
+    assert_eq!(set.resolved_result_root().unwrap(), "r2://bucket/prefix");
 }

@@ -380,16 +380,101 @@ async fn peer_advertise_without_peer_bind_fails_open_naming_both_keys() {
     );
 }
 
-/// A missing (non-existent) `result_root` anchor with `peer_advertise` set
-/// fails session open with a typed error naming the key, and the
-/// `instances` row is NEVER written — checked by reopening the SAME
-/// catalog directory once construction has failed.
+/// F1 fix (the two enforcement points reaching the SAME verdict on one
+/// config): a MISSING (non-existent, but well-formed and absolute)
+/// `result_root` anchor with `peer_advertise` set is CREATED, never
+/// refused — `InstanceRegistration::from_config` MATERIALIZES it
+/// (idempotent with `JammiSession`'s own `create_dir_all` of `artifact_dir`,
+/// and with `ResultStore`'s later one of the SAME `result_root` path), the
+/// same way `JammiConfig::load_from` now accepts a missing anchor at load
+/// (`jammi-db`'s `config::tests::
+/// load_from_accepts_a_fresh_missing_anchor_when_peer_advertise_is_set`).
+/// Session open succeeds and writes a non-NULL `instances` row.
 #[tokio::test]
-async fn missing_result_root_anchor_fails_open_and_writes_no_row() {
+async fn missing_result_root_anchor_is_created_and_session_open_succeeds() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut config = fast_peer_config(dir.path(), 19104);
     let missing = dir.path().join("does-not-exist");
+    assert!(!missing.exists());
     config.storage.result_root = Some(missing.to_string_lossy().into_owned());
+
+    let session = InferenceSession::new(config)
+        .await
+        .expect("a missing (creatable) result_root anchor must be accepted, not refused");
+    assert!(
+        missing.is_dir(),
+        "from_config must have materialized the missing anchor"
+    );
+    let row = instance_columns(session.catalog(), session.instance_id())
+        .await
+        .expect("the row must exist");
+    assert!(row.0.is_some(), "peer_addr must be non-NULL: {row:?}");
+    assert!(row.1.is_some(), "result_root must be non-NULL: {row:?}");
+}
+
+/// The F1 oracle, stated directly: `JammiConfig::load_from` on a config
+/// whose `artifact_dir` anchor does not exist yet (the fresh-host case)
+/// SUCCEEDS (the pure `MembershipConfig::validate` never reads the
+/// filesystem), AND `InferenceSession::open` on THAT SAME config writes the
+/// non-NULL member row — the two enforcement points agree, closing the gap
+/// where `load_from` used to be STRICTER (it called the impure, existence-
+/// checking `from_config` directly) than the session backstop (which
+/// silently accepted the same fresh anchor because `JammiSession::new`'s own
+/// catalog open had already `create_dir_all`'d it first).
+#[tokio::test]
+async fn load_from_and_session_open_agree_on_a_fresh_artifact_dir() {
+    let base = tempfile::TempDir::new().unwrap();
+    let missing = base.path().join("does-not-exist-yet");
+    assert!(!missing.exists());
+    let port = 19108u16;
+    let toml_path = base.path().join("jammi.toml");
+    // The `[artifact_dir]`-relative TOML file lives OUTSIDE `missing` (in
+    // `base`, which the tempdir already created), while `artifact_dir`
+    // itself names `missing` — genuinely absent until materialized.
+    std::fs::write(
+        &toml_path,
+        format!(
+            "artifact_dir = {:?}\n[server]\npeer_bind = \"0.0.0.0:{port}\"\n\
+             peer_advertise = \"127.0.0.1:{port}\"\n[lease]\nduration_secs = 3\n\
+             heartbeat_secs = 1\n",
+            missing.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    // The REAL public loader — `JammiConfig::load_from`, the exact sequence
+    // a production process runs — succeeds on the fresh anchor and creates
+    // nothing.
+    let config = jammi_db::config::JammiConfig::load_from(Some(&toml_path), std::iter::empty())
+        .expect("load_from must accept a fresh, absolute, well-formed anchor");
+    assert!(
+        !missing.exists(),
+        "load_from is PURE: it must never create a directory as a side effect of loading"
+    );
+
+    // The SAME config, opened as a real session: the materializing
+    // backstop creates the anchor and writes a non-NULL member row — the
+    // two enforcement points agree.
+    let session = InferenceSession::new(config).await.unwrap();
+    assert!(missing.is_dir(), "session open must materialize the anchor");
+    let row = instance_columns(session.catalog(), session.instance_id())
+        .await
+        .expect("the row must exist");
+    assert!(row.0.is_some(), "peer_addr must be non-NULL: {row:?}");
+    assert!(row.1.is_some(), "result_root must be non-NULL: {row:?}");
+}
+
+/// A `result_root` anchor that exists but is a FILE, not a directory, still
+/// fails session open with a typed error naming the key, and the
+/// `instances` row is NEVER written — the ONE case a missing/creatable
+/// anchor can never be confused with.
+#[tokio::test]
+async fn file_result_root_anchor_fails_open_and_writes_no_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = fast_peer_config(dir.path(), 19109);
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, b"x").unwrap();
+    config.storage.result_root = Some(file_path.to_string_lossy().into_owned());
 
     let err = match InferenceSession::new(config).await {
         Ok(_) => panic!("expected session open to fail"),
@@ -397,13 +482,10 @@ async fn missing_result_root_anchor_fails_open_and_writes_no_row() {
     };
     assert!(matches!(err, JammiError::Config(_)), "{err:?}");
     assert!(
-        err.to_string().contains("result_root"),
+        err.to_string().contains("result_root") && err.to_string().contains("directory"),
         "error must name the offending key: {err}"
     );
 
-    // Reopen the SAME directory (retrying past the failed construction's
-    // best-effort, non-blocking lease-keeper teardown — `LeaseKeeper::drop`
-    // is flag-only, see its own doc) and assert no `instances` row exists.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let catalog = loop {
         match Catalog::open(dir.path()).await {
@@ -560,7 +642,17 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
 #[tokio::test]
 async fn a_row_stale_in_the_margin_to_window_gap_survives_a_boot_sweep() {
     let dir = tempfile::TempDir::new().unwrap();
-    let config = fast_peer_config(dir.path(), 19107);
+    let mut config = fast_peer_config(dir.path(), 19107);
+    // A3: `fast_peer_config`'s default 3 s lease left only ~1.5 s of real
+    // wall-clock slack between seeding the row and the boot sweep actually
+    // running (`InstanceRegistration::from_config`, the lease keeper start,
+    // the result store build/recover, the Hub source, …) — comfortably
+    // exceeded under load, flaking this test RED with no defect present.
+    // A longer lease widens the (margin, window] gap proportionally
+    // (`window - margin == lease`), and biasing `ago` a QUARTER of the gap
+    // past `margin` (rather than the midpoint) maximises the slack before
+    // `window` while staying safely past `margin` itself.
+    config.lease.duration_secs = 9;
     let lease = config.lease.intervals().unwrap().lease();
     let margin = instance_liveness_margin(lease);
     let window = instance_prune_window(lease);
@@ -569,13 +661,14 @@ async fn a_row_stale_in_the_margin_to_window_gap_survives_a_boot_sweep() {
         "the window must be strictly beyond the margin"
     );
 
-    // Seed a foreign row (no live process) directly, backdated to the
-    // midpoint of (margin, window] — stale under the margin, but not yet
-    // prune-eligible under the window.
+    // Seed a foreign row (no live process) directly, backdated to
+    // `margin + (window - margin) / 4` — stale under the margin, but with
+    // generous slack before `window` (with lease = 9 s: margin = 18 s,
+    // window = 27 s, ago = 20.25 s, ~6.75 s of slack).
     let catalog = Catalog::open(dir.path()).await.unwrap();
     let foreign = InstanceRegistration::new("foreign-instance", None, None, None, None);
     catalog.upsert_instance(&foreign).await.unwrap();
-    let ago = margin + (window - margin) / 2;
+    let ago = margin + (window - margin) / 4;
     force_stale_instance(&catalog, "foreign-instance", ago).await;
     catalog.close().await;
 

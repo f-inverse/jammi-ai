@@ -559,6 +559,18 @@ fn parse_worker_row(
     })
 }
 
+/// One `instances JOIN workers` candidate row, before
+/// [`Catalog::list_gang_members`]'s own Rust-side exclusion filters run —
+/// a named struct rather than a five-element tuple (A5: `clippy::
+/// type_complexity` is a signal to name the shape, not to suppress it).
+struct GangCandidateRow {
+    instance_id: String,
+    peer_addr: String,
+    result_root: String,
+    kinds: String,
+    state: String,
+}
+
 /// The `workers.state` vocabulary (migration 031, CHECK-constrained at the
 /// SQL edge): what THIS process's claim loop is doing right now, as another
 /// process can read it off the row (`ListWorkers`).
@@ -2298,8 +2310,7 @@ impl Catalog {
     pub async fn list_gang_members(&self, listing: GangListing<'_>) -> Result<Vec<GangMember>> {
         let kind = self.backend().backend_kind();
         let margin = instance_liveness_margin(listing.lease);
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, String, String, String)> = self
+        let rows: Vec<GangCandidateRow> = self
             .backend()
             .transaction(
                 TxOptions {
@@ -2320,13 +2331,13 @@ impl Catalog {
                                AND NOT ({stale})"
                         );
                         tx.query(&sql, &params, |row| {
-                            Ok((
-                                row.get::<String>("instance_id")?,
-                                row.get::<String>("peer_addr")?,
-                                row.get::<String>("result_root")?,
-                                row.get::<String>("kinds")?,
-                                row.get::<String>("state")?,
-                            ))
+                            Ok(GangCandidateRow {
+                                instance_id: row.get::<String>("instance_id")?,
+                                peer_addr: row.get::<String>("peer_addr")?,
+                                result_root: row.get::<String>("result_root")?,
+                                kinds: row.get::<String>("kinds")?,
+                                state: row.get::<String>("state")?,
+                            })
                         })
                         .await
                     })
@@ -2336,30 +2347,32 @@ impl Catalog {
 
         let claiming = WorkerState::Claiming.as_db_str();
         let mut members = Vec::new();
-        for (instance_id, peer_addr, result_root, kinds, state) in rows {
-            if instance_id == listing.self_instance {
+        for row in rows {
+            if row.instance_id == listing.self_instance {
                 continue;
             }
-            if state != claiming {
+            if row.state != claiming {
                 continue;
             }
-            if !kinds
+            if !row
+                .kinds
                 .split(',')
                 .map(str::trim)
                 .any(|token| token == listing.kind)
             {
                 continue;
             }
-            if result_root.as_bytes() != listing.canonical_root.as_str().as_bytes() {
+            if row.result_root.as_bytes() != listing.canonical_root.as_str().as_bytes() {
                 continue;
             }
-            let peer_addr = PeerAddr::parse(&peer_addr).map_err(|e| {
+            let peer_addr = PeerAddr::parse(&row.peer_addr).map_err(|e| {
                 JammiError::Catalog(format!(
-                    "instance '{instance_id}' has a corrupted peer_addr row: {e}"
+                    "instance '{}' has a corrupted peer_addr row: {e}",
+                    row.instance_id
                 ))
             })?;
             members.push(GangMember {
-                instance_id,
+                instance_id: row.instance_id,
                 peer_addr,
             });
         }

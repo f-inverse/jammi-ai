@@ -5,17 +5,27 @@
 //! canonicalized result-table root two gang members compare byte-for-byte —
 //! see [`crate::config::JammiConfig::canonical_result_root`]), [`WorkerFacts`]
 //! (the claim-loop half of a registration — owned exclusively by
-//! `JobWorker`, `crates/jammi-ai/src/worker.rs`), and
+//! `JobWorker`, `crates/jammi-ai/src/fine_tune/worker.rs`), and
 //! [`InstanceRegistration`] — the ONE value every writer of the `instances`
 //! (+ `workers`) row builds, through [`InstanceRegistration::from_config`].
 //! [`GangListing`] / [`GangMember`] are [`super::Catalog::list_gang_members`]'s
 //! request and response shapes.
+//!
+//! [`MembershipConfig::validate`] is the PURE half of the membership check
+//! (no filesystem access at all — [`crate::config::JammiConfig::load_from`]
+//! calls it); [`InstanceRegistration::from_config`] is validate PLUS
+//! MATERIALIZE (creates the local anchor directory when it is absent,
+//! idempotent with [`crate::store::ResultStore`]'s own later
+//! `create_dir_all` of the same path) — the split exists so loading a config
+//! file never itself creates a directory as a side effect.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use super::jobs_repo::WorkerState;
 use crate::error::{JammiError, Result};
+use crate::storage::{Scheme, StorageUrl};
 
 /// The address a coordinator dials a gang member / segment owner at
 /// (`host:port`, plaintext gRPC — transport encryption is the runtime's,
@@ -100,7 +110,8 @@ impl std::fmt::Display for CanonicalRoot {
 
 /// The claim-loop half of a registration: the `kinds` this worker claims and
 /// its lifecycle [`WorkerState`] — exactly the pair `Catalog::upsert_worker`
-/// writes. Owned exclusively by `JobWorker` (`crates/jammi-ai/src/worker.rs`):
+/// writes. Owned exclusively by `JobWorker`
+/// (`crates/jammi-ai/src/fine_tune/worker.rs`):
 /// `run_until` sets it (then issues the first `upsert_worker`), every
 /// `set_worker_state` writes the cell BEFORE the row, `delete_worker` clears
 /// it — so [`InstanceRegistration::worker`] always reflects what the row is
@@ -177,29 +188,95 @@ impl InstanceRegistration {
             .clone()
     }
 
-    /// The WHOLE membership check, in ONE place: `[server] peer_advertise`
-    /// parses as a [`PeerAddr`] AND `peer_bind` is set AND the result root
-    /// canonicalizes
-    /// ([`crate::config::JammiConfig::canonical_result_root`]) — or, with
-    /// `peer_advertise` unset, a non-member registration with NULL
+    /// The WHOLE membership check, in ONE place: [`MembershipConfig::validate`]
+    /// (PURE — `[server] peer_advertise` parses as a [`PeerAddr`], `peer_bind`
+    /// is set, the anchor is well-formed and absolute) PLUS MATERIALIZE (the
+    /// local anchor directory is created if absent, then canonicalized) — or,
+    /// with `peer_advertise` unset, a non-member registration with NULL
     /// `peer_addr`/`canonical_root`. The ONLY constructor
     /// [`super::Catalog::upsert_instance`]/[`super::Catalog::
     /// reregister_instance`] accept in production:
     /// `InferenceSession::wrap_with` calls it once per session (every
-    /// `InferenceSession` constructor funnels through `wrap_with`), and
-    /// [`crate::config::JammiConfig::load_from`] calls it too, discarding
-    /// the registration, purely for its early-failure side effect — so a
-    /// struct-literal config built without `load_from` is still covered, at
-    /// `wrap_with`. `[server] ServerConfig::validate` is NOT the home: it
-    /// cannot see `artifact_dir`, which the root canonicalization needs.
+    /// `InferenceSession` constructor funnels through `wrap_with`), running
+    /// BEFORE the result store (or anything else) creates a single
+    /// directory — its own `create_dir_all` of the anchor is idempotent with
+    /// the store's later one of the same path. [`crate::config::JammiConfig
+    /// ::load_from`] calls [`MembershipConfig::validate`] directly instead
+    /// (never this function): loading a config file must never itself create
+    /// a directory as a side effect, purely for the early-failure check — so
+    /// a struct-literal config built without `load_from` is still covered, at
+    /// `wrap_with`. `[server] ServerConfig::validate` is NOT the home either
+    /// way: it cannot see `artifact_dir`, which the anchor needs.
     pub fn from_config(
         config: &crate::config::JammiConfig,
         instance_id: impl Into<String>,
         label: Option<&str>,
         host: Option<&str>,
     ) -> Result<Self> {
-        let Some(advertise) = &config.server.peer_advertise else {
+        let Some(membership) = MembershipConfig::validate(config)? else {
             return Ok(Self::new(instance_id, label, host, None, None));
+        };
+        let peer_addr = membership.peer_addr.clone();
+        let canonical_root = membership.materialize()?;
+        Ok(Self::new(
+            instance_id,
+            label,
+            host,
+            Some(peer_addr),
+            Some(canonical_root),
+        ))
+    }
+}
+
+/// The local filesystem anchor a `file://` effective root resolves to, or an
+/// already scheme-folded cloud root string — [`MembershipConfig::validate`]'s
+/// PURE output, [`MembershipConfig::materialize`]'s input.
+#[derive(Debug, Clone)]
+enum EffectiveRoot {
+    /// An ABSOLUTE local path (validated, never yet touched on disk).
+    /// `append_leaf` is `true` only when this anchor is `artifact_dir`
+    /// itself (`[storage] result_root` unset) — the default `jammi_db` leaf
+    /// is then appended AFTER canonicalizing; a `result_root`-named anchor
+    /// (`append_leaf: false`) already names the whole effective root.
+    File { anchor: PathBuf, append_leaf: bool },
+    /// A fully scheme-folded, trailing-slash-trimmed cloud root
+    /// (`s3://…`/`gs://…`/`azure://…`/`r2://…`) — no local filesystem step
+    /// ever applies to this arm.
+    Cloud(String),
+}
+
+/// The PURE half of the membership check (contract `feat_500-C-U5b-1a` §8
+/// B3, split by the F1 fix): NO filesystem access of any kind.
+/// [`crate::config::JammiConfig::load_from`] calls [`Self::validate`]
+/// directly — never [`InstanceRegistration::from_config`], which
+/// additionally MATERIALIZES the anchor (a directory-creating side effect a
+/// config LOAD must never perform merely by being read). `Ok(None)` when
+/// `[server] peer_advertise` is unset — a library process never runs any of
+/// this.
+#[derive(Debug, Clone)]
+pub struct MembershipConfig {
+    peer_addr: PeerAddr,
+    effective_root: EffectiveRoot,
+}
+
+impl MembershipConfig {
+    /// Validate `config`'s membership shape with NO filesystem read/write:
+    /// `peer_advertise` parses as a [`PeerAddr`]; `peer_bind` is set (a typed
+    /// error naming BOTH keys otherwise); the effective root
+    /// ([`crate::config::JammiConfig::resolved_result_root`]'s own two arms)
+    /// has a well-formed, non-`memory://` scheme; a `file://` anchor is
+    /// ABSOLUTE — a relative `artifact_dir` (including the `.jammi` fallback
+    /// `default_artifact_dir` returns when `ProjectDirs` is unavailable) or a
+    /// relative explicit `[storage] result_root` is refused naming the key,
+    /// since a relative path's meaning depends on the process's current
+    /// directory at whatever moment it is later resolved — never a property
+    /// of the config alone. Cloud schemes are lowercased and folded through
+    /// [`Scheme`]'s own alias table here (`StorageUrl::parse` is
+    /// case-sensitive, so lowercasing precedes it) and a trailing `/` is
+    /// trimmed; `memory://` is refused for a gang member.
+    pub fn validate(config: &crate::config::JammiConfig) -> Result<Option<Self>> {
+        let Some(advertise) = &config.server.peer_advertise else {
+            return Ok(None);
         };
         if config.server.peer_bind.is_none() {
             return Err(JammiError::Config(
@@ -207,14 +284,130 @@ impl InstanceRegistration {
             ));
         }
         let peer_addr = PeerAddr::parse(advertise)?;
-        let canonical_root = config.canonical_result_root()?;
-        Ok(Self::new(
-            instance_id,
-            label,
-            host,
-            Some(peer_addr),
-            canonical_root,
-        ))
+
+        let result_root_set = config.storage.result_root.is_some();
+        let anchor_source = config
+            .storage
+            .result_root
+            .clone()
+            .unwrap_or_else(|| config.artifact_dir.to_string_lossy().into_owned());
+        let anchor_key = if result_root_set {
+            "storage.result_root"
+        } else {
+            "artifact_dir"
+        };
+        // Lowercase the scheme token BEFORE `StorageUrl::parse` (case-
+        // sensitive) so every cloud scheme spelling folds through `Scheme`'s
+        // own alias table; a bare path (no `://`) is left untouched —
+        // `StorageUrl::parse` normalises it to `file://` on its own.
+        let lowered = match anchor_source.split_once("://") {
+            Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+            None => anchor_source.clone(),
+        };
+        let url = StorageUrl::parse(&lowered).map_err(|e| {
+            JammiError::Config(format!(
+                "server.peer_advertise requires a valid [{anchor_key}]: {e}"
+            ))
+        })?;
+        let effective_root = match url.scheme() {
+            Scheme::Memory => {
+                return Err(JammiError::Config(
+                    "server.peer_advertise cannot be combined with a memory:// result root".into(),
+                ));
+            }
+            Scheme::File => {
+                let anchor = PathBuf::from(url.path());
+                if !anchor.is_absolute() {
+                    return Err(JammiError::Config(format!(
+                        "server.peer_advertise requires [{anchor_key}] '{}' to be absolute \
+                         when server.peer_advertise is set",
+                        anchor.display()
+                    )));
+                }
+                EffectiveRoot::File {
+                    anchor,
+                    append_leaf: !result_root_set,
+                }
+            }
+            other_scheme => {
+                // Rebuild through the RESOLVED `Scheme`'s own `Display`
+                // (`s3`/`gs`/`azure`/`r2`) rather than the lowered input
+                // token verbatim, so two alias spellings of one scheme
+                // (`gcs://` and `gs://`, `abfss://` and `azure://`) fold to
+                // the IDENTICAL string, not merely both-lowercase distinct
+                // strings.
+                let path = url.path().trim_end_matches('/');
+                EffectiveRoot::Cloud(format!("{other_scheme}://{path}"))
+            }
+        };
+        Ok(Some(Self {
+            peer_addr,
+            effective_root,
+        }))
+    }
+
+    /// MATERIALIZE: for a `file://` anchor, create it if absent
+    /// (`std::fs::create_dir_all` — the deployment's own directory, which
+    /// `ResultStore` creates moments later anyway, so this is idempotent
+    /// with that later call over the SAME path), refusing naming the key if
+    /// it exists as a non-directory or cannot be created; then
+    /// `std::fs::canonicalize`s it (symlinks and `.`/`..` resolved) and
+    /// appends the leaf rule (`EffectiveRoot::File::append_leaf`). A cloud
+    /// root needs no filesystem step at all. Consumes `self`: each validated
+    /// config is materialized exactly once per call site.
+    pub(crate) fn materialize(self) -> Result<CanonicalRoot> {
+        match self.effective_root {
+            EffectiveRoot::Cloud(s) => Ok(CanonicalRoot::new(s)),
+            EffectiveRoot::File {
+                anchor,
+                append_leaf,
+            } => {
+                let anchor_key = if append_leaf {
+                    "artifact_dir"
+                } else {
+                    "storage.result_root"
+                };
+                // Checked BEFORE `create_dir_all`: an anchor that already
+                // exists as a plain FILE gets the precise "must be a
+                // directory" refusal, rather than `create_dir_all`'s own
+                // (platform-dependent, less legible) `AlreadyExists`/`EEXIST`
+                // error text.
+                if let Ok(meta) = std::fs::metadata(&anchor) {
+                    if !meta.is_dir() {
+                        return Err(JammiError::Config(format!(
+                            "server.peer_advertise requires [{anchor_key}] '{}' to be a \
+                             directory",
+                            anchor.display()
+                        )));
+                    }
+                }
+                std::fs::create_dir_all(&anchor).map_err(|e| {
+                    JammiError::Config(format!(
+                        "server.peer_advertise: failed to create [{anchor_key}] '{}': {e}",
+                        anchor.display()
+                    ))
+                })?;
+                let canonical_anchor = std::fs::canonicalize(&anchor).map_err(|e| {
+                    JammiError::Config(format!(
+                        "server.peer_advertise: failed to canonicalize [{anchor_key}] '{}': {e}",
+                        anchor.display()
+                    ))
+                })?;
+                let full = if append_leaf {
+                    canonical_anchor.join("jammi_db")
+                } else {
+                    canonical_anchor
+                };
+                let full_str = full.to_str().ok_or_else(|| {
+                    JammiError::Config(format!(
+                        "server.peer_advertise: canonicalized [{anchor_key}] is not valid \
+                         UTF-8: {}",
+                        full.display()
+                    ))
+                })?;
+                Ok(CanonicalRoot::new(format!("file://{full_str}")))
+            }
+        }
     }
 }
 

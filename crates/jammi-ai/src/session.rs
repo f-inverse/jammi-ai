@@ -2415,7 +2415,7 @@ fn build_result_store(
     // `canonical_result_root()` canonicalizes for gang membership — so this
     // session's store is rooted at EXACTLY the root that predicate names,
     // never a second, independently re-derived path.
-    let root = jammi_db::storage::StorageUrl::parse(&inner.config().resolved_result_root())?;
+    let root = jammi_db::storage::StorageUrl::parse(&inner.config().resolved_result_root()?)?;
     // `local_cache_dir` is the PARENT of the two local caches
     // `ResultStore::with_root` derives (`{local_cache_dir}/index` — the ANN
     // segment cache, always local since USearch reads the local filesystem

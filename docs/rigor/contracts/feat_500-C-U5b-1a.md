@@ -1,7 +1,7 @@
 # CONTRACT — feat/500-C-U5b-1a: gang-membership substrate
 
 **Contract of record.** slug: `feat_500-C-U5b-1a` · branch `feat/500-C-U5b-1a`
-at `5e52ce403f193b9bc7b873db1176e4d6760952ba` · this file is the committed
+at `21a4bd0c3f193b9bc7b873db1176e4d6760952ba` · this file is the committed
 mechanism contract `ci/scripts/check_rigor_record.py` requires under
 `docs/rigor/contracts/**` (its check 3) before this unit's rigor record at
 `docs/rigor/feat_500-C-U5b-1a.jsonl` (the lead's export) satisfies check 1/2.
@@ -9,12 +9,12 @@ Source design contract: the lead's `CONTRACT-U5b-1a.md` v3 (scratchpad-only,
 never a repo path — it is not cited with a `path:line` token anywhere in this
 document, since it is not a tracked file at HEAD and any such token naming it
 would fail this checker's own cost-floor pass). Every citation below is a full
-repo-relative path, never a bare filename, tagged **(at 5e52ce40)**, and was
+repo-relative path, never a bare filename, tagged **(at 21a4bd0c)**, and was
 read directly against that commit in this worktree by the agent writing this
 file — not carried forward from the source contract's own (differently-based)
 line numbers.
 
-This document states the mechanism as it EXISTS at `5e52ce40` (CURRENT-STATE,
+This document states the mechanism as it EXISTS at `21a4bd0c` (CURRENT-STATE,
 per CLAUDE.md — no "this was added because..." framing beyond what a citation
 needs to be unambiguous).
 
@@ -39,96 +39,131 @@ root equality alone is never sufficient).
 
 ### 1.1 The carrier: `PeerAddr`, `CanonicalRoot`, `WorkerFacts`, `InstanceRegistration`
 
-`crates/jammi-db/src/catalog/instance.rs` (at 5e52ce40), a new module.
+`crates/jammi-db/src/catalog/instance.rs` (at 21a4bd0c), a new module.
 
-- **`PeerAddr`** (`crates/jammi-db/src/catalog/instance.rs:26`) is a sealed
+- **`PeerAddr`** (`crates/jammi-db/src/catalog/instance.rs:36`) is a sealed
   wrapper (`pub struct PeerAddr(String)`, private field): the only way to
-  build one is `PeerAddr::parse` (`crates/jammi-db/src/catalog/instance.rs:34-54`),
+  build one is `PeerAddr::parse` (`crates/jammi-db/src/catalog/instance.rs:44-64`),
   which `rsplit_once(':')`s the input so an IPv6 literal's own colons stay
   inside the host segment and only the LAST colon splits host from port
-  (`crates/jammi-db/src/catalog/instance.rs:35`), requires a non-empty host
-  (`:38-42`) and a port that parses as `u16` and is non-zero (`:43-52`).
-  `as_str()` (`:57-59`) and `Display` (`:62-66`) both return the validated
+  (`crates/jammi-db/src/catalog/instance.rs:45`), requires a non-empty host
+  (`:48-52`) and a port that parses as `u16` and is non-zero (`:53-62`).
+  `as_str()` (`:67-69`) and `Display` (`:72-76`) both return the validated
   wire form. This is the SAME type `crates/jammi-db/src/index/peer.rs`
   re-exports (per this module's own doc comment,
-  `crates/jammi-db/src/catalog/instance.rs:1-12`) — the peer listener and the
+  `crates/jammi-db/src/catalog/instance.rs:1-20`) — the peer listener and the
   gang listener dial the identical address type, so they can never drift into
   two.
-- **`CanonicalRoot`** (`crates/jammi-db/src/catalog/instance.rs:81-99`) wraps
-  an already-canonicalized root string; `Self::new` (`:85-87`) exists for
-  `JammiConfig::canonical_result_root` (§1.4) and fixtures, not as a
-  general-purpose constructor any caller may build an unvalidated string
-  through.
-- **`WorkerFacts`** (`crates/jammi-db/src/catalog/instance.rs:109-115`) is the
+- **`CanonicalRoot`** (`crates/jammi-db/src/catalog/instance.rs:91-103`) wraps
+  an already-canonicalized root string; `Self::new` (`:95-97`) exists for
+  `JammiConfig::canonical_result_root`/`MembershipConfig::materialize` (§1.2,
+  §1.4) and fixtures, not as a general-purpose constructor any caller may
+  build an unvalidated string through.
+- **`WorkerFacts`** (`crates/jammi-db/src/catalog/instance.rs:120-126`) is the
   claim-loop half of a registration: `kinds: String` (the comma-joined kind
-  set — see the doc comment at `:110-111`, discussed at §2 below) and
-  `state: WorkerState`. Its doc (`:101-107`) states its SOLE owner is
+  set — see the doc comment at `:121-122`, discussed at §2 below) and
+  `state: WorkerState`. Its doc (`:111-118`) states its SOLE owner is
   `JobWorker`/`EmbeddedWorker` (`crates/jammi-ai/src/fine_tune/worker.rs`),
   confirmed at §1.5.
-- **`InstanceRegistration`** (`crates/jammi-db/src/catalog/instance.rs:130-140`):
+- **`InstanceRegistration`** (`crates/jammi-db/src/catalog/instance.rs:141-151`):
   `instance_id`, `label`, `host`, `peer_addr: Option<PeerAddr>`,
   `canonical_root: Option<CanonicalRoot>`, and `worker:
   Mutex<Option<WorkerFacts>>` — the claim-loop cell, mutated in place by its
   single owner rather than requiring a whole new registration per state
-  change (doc, `:136-138`). `InstanceRegistration::new`
-  (`crates/jammi-db/src/catalog/instance.rs:149-164`) is the plain
+  change (doc, `:147-149`). `InstanceRegistration::new`
+  (`crates/jammi-db/src/catalog/instance.rs:160-175`) is the plain
   constructor with no validation, used by `from_config` itself and by
   fixtures/tests (confirmed in `crates/jammi-db/tests/it/gang_membership.rs:89-95`
   and `crates/jammi-ai/tests/it/instance_identity.rs`'s foreign-row fixture).
-  `set_worker`/`worker_snapshot` (`crates/jammi-db/src/catalog/instance.rs:168-178`)
+  `set_worker`/`worker_snapshot` (`crates/jammi-db/src/catalog/instance.rs:179-189`)
   are the cell's read/write pair (mutex-poisoning tolerant via
   `unwrap_or_else(|p| p.into_inner())`).
-- **`GangListing<'a>`** (`crates/jammi-db/src/catalog/instance.rs:223-237`)
-  and **`GangMember`** (`:242-245`) are `list_gang_members`'s request/response
+- **`GangListing<'a>`** (`crates/jammi-db/src/catalog/instance.rs:416-430`)
+  and **`GangMember`** (`:435-438`) are `list_gang_members`'s request/response
   shapes (§1.3).
 
-### 1.2 The ONE choke point: `InstanceRegistration::from_config`
+### 1.2 The PURE/MATERIALIZE split: `MembershipConfig::validate` and `InstanceRegistration::from_config`
 
-`crates/jammi-db/src/catalog/instance.rs:195-218` (at 5e52ce40):
+**F1 fix (this commit).** Before this split, `JammiConfig::load_from` called
+the SAME `InstanceRegistration::from_config` the session did, and
+`from_config`'s anchor check REQUIRED the anchor to already exist on disk —
+so on a genuinely fresh host (`artifact_dir` not yet created) `load_from`
+refused, while `InferenceSession::new`/`open` on the IDENTICAL config
+silently accepted it, because `JammiSession::new`'s own catalog open
+(`crates/jammi-db/src/session.rs::Catalog::open_with_tenant`'s
+`std::fs::create_dir_all(artifact_dir)`) had already created the anchor as a
+side effect BEFORE `wrap_with`'s `from_config` call ever ran — two
+enforcement points, two different verdicts on one config. The fix splits the
+check:
+
+`crates/jammi-db/src/catalog/instance.rs` (`MembershipConfig::validate`,
+`:277-348`) is PURE — no filesystem read/write of any kind:
 
 ```
-peer_advertise unset  => Self::new(instance_id, label, host, None, None)   // non-member
+peer_advertise unset  => Ok(None)                                          // non-member
 peer_advertise = addr => peer_bind must be Some, else JammiError::Config
-                         naming both keys (:204-208)
-                      => PeerAddr::parse(addr)?                            (:209)
-                      => config.canonical_result_root()?                  (:210)
-                      => Self::new(..., Some(peer_addr), canonical_root)  (:211-217)
+                         naming both keys
+                      => PeerAddr::parse(addr)?
+                      => the effective root's scheme parses, is not
+                         memory://, and (file:// only) its anchor is
+                         ABSOLUTE — else JammiError::Config naming the key (F2)
+                      => Ok(Some(MembershipConfig { peer_addr, effective_root }))
 ```
 
-This is the ONLY constructor `Catalog::upsert_instance` /
-`Catalog::reregister_instance` accept (enforced by their own signatures, §1.3
-— both take `&InstanceRegistration`, never raw fields). Two production
-callers, both confirmed by direct read:
+`JammiConfig::load_from` (`crates/jammi-db/src/config/mod.rs:2537-2597`)
+calls ONLY this (`:2595`), discarding the `Option` — loading a config file
+must never itself create a directory as a side effect, so a bad
+`peer_advertise`/`peer_bind` pair or a RELATIVE anchor is refused at load,
+naming the key, while a merely-MISSING (but absolute, well-formed) anchor is
+ACCEPTED — the pure check has nothing to say about existence at all.
 
-- `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`
-  (`crates/jammi-ai/src/session.rs:207-395`) calls it at
-  `crates/jammi-ai/src/session.rs:229-238`, BEFORE the lease keeper starts
-  (`:254-261`), before the result store creates any directory
-  (`:272-275`), and before any prune/reclaim sweep (`:329-361`) — the
-  comment block at `:215-228` states this ordering is deliberate: a
-  missing/non-directory anchor must be refused on the config AS GIVEN, never
-  on a directory `build_result_store` would otherwise have already created.
-  `wrap_with` is the universal funnel: every `InferenceSession` constructor
-  (`new`, `open`, `open_with_placement`) reaches it, confirmed by
-  `crates/jammi-ai/src/session.rs:154,204`, both of which call `wrap_with`
-  either directly or through `wrap`.
-- `crates/jammi-db/src/config/mod.rs::JammiConfig::load_from`
-  (`crates/jammi-db/src/config/mod.rs:2660-2675`) calls it too
-  (`:2670-2675`), discarding the returned registration — the comment at
-  `:2660-2669` states this is purely for the early-failure side effect, so a
-  bad `peer_advertise` fails at config load rather than only surfacing deep
-  inside `wrap_with`; a struct-literal config that skips `load_from` entirely
-  is still covered, since `wrap_with` calls `from_config` too.
+`InstanceRegistration::from_config` (`:210-228`) = `MembershipConfig::
+validate` PLUS `MembershipConfig::materialize` (`:358-411`): for a `file://`
+anchor, `std::fs::create_dir_all`s it if absent (idempotent with
+`JammiSession`'s own `create_dir_all` of `artifact_dir`, and with
+`ResultStore`'s later one of the same `result_root` path — refusing naming
+the key if it exists as a non-directory or cannot be created), then
+`std::fs::canonicalize`s it and applies the leaf rule; a cloud root needs no
+filesystem step. This is the ONLY constructor `Catalog::upsert_instance` /
+`Catalog::reregister_instance` accept (enforced by their own signatures,
+§1.3 — both take `&InstanceRegistration`, never raw fields).
 
-`ServerConfig::validate` (`crates/jammi-db/src/config/mod.rs:2017-2029`,
-the 3-way listener-collision check) is NOT the home for this check: it has no
-access to `artifact_dir`, which root canonicalization needs (stated at the
-`from_config` doc, `crates/jammi-db/src/catalog/instance.rs:180-194`, and at
-`crates/jammi-db/src/config/mod.rs:2660-2664`).
+`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`
+(`crates/jammi-ai/src/session.rs:207-395`) calls `from_config` at
+`crates/jammi-ai/src/session.rs:229-238`, BEFORE the lease keeper starts
+(`:254-261`), before the result store creates any directory (`:272-275`),
+and before any prune/reclaim sweep (`:329-361`) — but `wrap_with` receives an
+ALREADY-CONSTRUCTED `JammiSession` (`inner`, its parameter), whose catalog
+connection is already open and whose `artifact_dir` the caller's own
+`JammiSession::new` already created; a `from_config` refusal here returns
+`Err` without closing that connection, so "runs before wrap_with's own
+side effects" is not the same claim as "leaves nothing behind" (§2.8b A2 in
+`docs/maintainer/MAINTAINER-GUIDE.md` restates this precisely; `jammi-ai`'s
+`tests/it/instance_identity.rs::file_result_root_anchor_fails_open_and_writes_no_row`
+reopens the SAME catalog directory in a bounded retry loop after a
+deliberately-failed construction for exactly this reason). `wrap_with` is
+the universal funnel: every `InferenceSession` constructor (`new`, `open`,
+`open_with_placement`) reaches it, confirmed by
+`crates/jammi-ai/src/session.rs:128,149,200`, all of which call `wrap_with`
+either directly or through `wrap`.
+
+`ServerConfig::validate` (`crates/jammi-db/src/config/mod.rs:1991-2041`,
+the 3-way listener-collision check) is NOT the home for either half: it has
+no access to `artifact_dir`/`storage.result_root`, which the anchor check
+needs (`config: &JammiConfig`, `MembershipConfig::validate`'s own doc,
+`crates/jammi-db/src/catalog/instance.rs:263-276`, and
+`crates/jammi-db/src/config/mod.rs:2581-2591`).
+
+**P-B2 purity, restated.** Given an ABSOLUTE anchor (guaranteed by F2's
+check), `MembershipConfig::materialize`'s output depends on nothing but the
+config: `crates/jammi-db/src/config/tests.rs::
+canonical_result_root_is_independent_of_a_chdir_between_load_and_materialize`
+proves it survives a `std::env::set_current_dir` between `validate` and
+`materialize`.
 
 ### 1.3 The two read verbs and the two writers
 
-`crates/jammi-db/src/catalog/jobs_repo.rs` (at 5e52ce40):
+`crates/jammi-db/src/catalog/jobs_repo.rs` (at 21a4bd0c):
 
 - **`upsert_instance(&InstanceRegistration)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs:2070-2102`): one `INSERT ...
@@ -201,7 +236,7 @@ access to `artifact_dir`, which root canonicalization needs (stated at the
   phrase is NOT tightened by this unit (the verb itself performs no
   separator validation); what IS pinned is that the sole production
   producer, `JobWorker::run_until`/`EmbeddedWorker::begin_drain`
-  (`crates/jammi-ai/src/fine_tune/worker.rs:822,827,851,856`), always calls
+  (`crates/jammi-ai/src/fine_tune/worker.rs:822,827,851`), always calls
   `self.kinds.join(",")`, so `list_gang_members`'s comma-split-whole-token
   match (`:2346-2352` above) is exercised against a comma-joined string in
   every real deployment, never merely asserted possible.
@@ -214,7 +249,7 @@ access to `artifact_dir`, which root canonicalization needs (stated at the
 
 ### 1.4 `[server] peer_advertise` and `JammiConfig::canonical_result_root`
 
-`crates/jammi-db/src/config/mod.rs` (at 5e52ce40):
+`crates/jammi-db/src/config/mod.rs` (at 21a4bd0c):
 
 - **`ServerConfig::peer_advertise: Option<String>`**
   (`crates/jammi-db/src/config/mod.rs:1636`, doc `:1617-1635`): "the address
@@ -226,38 +261,32 @@ access to `artifact_dir`, which root canonicalization needs (stated at the
   naming BOTH keys)". This doc wording is itself the "refused at load"
   language corrected to name the constructor (§8 B3's binding fold, source
   contract).
-- **`resolved_result_root(&self) -> String`**
-  (`crates/jammi-db/src/config/mod.rs:2470-2479`): `storage.result_root`
-  when `Some`, else `self.artifact_dir.join("jammi_db")` (`:2473-2477`) — the
-  SAME derivation `ResultStore::new`'s local-root arm performs (doc,
-  `:2464-2469`).
+- **`resolved_result_root(&self) -> Result<String>`**
+  (`crates/jammi-db/src/config/mod.rs:2478-2491`): `storage.result_root`
+  when `Some`, else `self.artifact_dir.join("jammi_db")`'s UTF-8 string
+  (`:2480-2489`) — the SAME derivation `ResultStore::new`'s local-root arm
+  performs (doc, `:2464-2469`). A1 fix: fallible — refuses naming
+  `artifact_dir` when the joined path is not valid UTF-8 (`:2483-2488`),
+  never `Path::to_string_lossy`'s silent replacement-character fold (which
+  could make two genuinely different paths compare equal downstream).
 - **`canonical_result_root(&self) -> Result<Option<CanonicalRoot>>`**
-  (`crates/jammi-db/src/config/mod.rs:2517-2600`): `Ok(None)` immediately
-  when `self.server.peer_advertise.is_none()` (`:2518-2520`). Otherwise:
-  `result_root_set = self.storage.result_root.is_some()` (`:2526`) decides
-  BOTH the anchor (`result_root` itself when set, else `artifact_dir`,
-  `:2527-2536`) and whether a `jammi_db` leaf is appended below — the two
-  arms name genuinely different effective roots (doc, `:2521-2525`). The
-  scheme token is lowercased before `StorageUrl::parse` (case-sensitive)
-  so every alias spelling folds (`:2537-2544`); `Scheme::Memory` is refused
-  (`:2551-2553`); `Scheme::File` (`:2554-2588`) requires
-  `std::fs::metadata(anchor)` to succeed (`:2556-2561`, a typed error naming
-  `anchor_key` on failure) AND `meta.is_dir()` (`:2562-2567`), THEN
-  `std::fs::canonicalize`s the anchor ONCE (`:2568-2573`), THEN appends the
-  `jammi_db` leaf lexically ONLY when `result_root` is unset
-  (`:2574-2583`, the B2-erratum arm: `if result_root_set { canonical_anchor
-  } else { canonical_anchor.join("jammi_db") }`) — an explicit `result_root`
-  is the WHOLE effective root, no suffix. Every other (cloud) scheme
-  (`:2589-2598`) trims a trailing `/` and rebuilds through the resolved
-  `Scheme`'s own `Display` (never the lowered input token verbatim), so two
-  alias spellings of one scheme fold to the identical string, with no leaf
-  appended for any cloud scheme.
-- **`JammiConfig::load_from`**'s `from_config` call is at
-  `crates/jammi-db/src/config/mod.rs:2670-2675` (§1.2).
+  (`crates/jammi-db/src/config/mod.rs:2516-2530`): a thin convenience
+  wrapper — `MembershipConfig::validate(self)?` (`:2517`), then, if
+  `Some`, `.materialize()?` (`:2519`) — over the split §1.2 states in full;
+  `Ok(None)` when `peer_advertise` is unset. `resolved_result_root`'s two
+  arms are still the effective root this canonicalizes: `{artifact_dir}/
+  jammi_db` (the `artifact_dir` anchor, created if absent, canonicalized,
+  leaf appended lexically) when `result_root` is unset, `result_root`
+  VERBATIM (the SAME string `ResultStore::with_root` roots the store at —
+  no suffix) when set; a cloud scheme is lowercased, folded through
+  `Scheme`'s own alias table, and trailing-`/`-trimmed.
+- **`JammiConfig::load_from`**'s `MembershipConfig::validate` call is at
+  `crates/jammi-db/src/config/mod.rs:2595` (§1.2) — NOT `from_config`, per
+  the F1 fix: the PURE half only.
 
 ### 1.5 The claim-loop's ownership of the worker half
 
-`crates/jammi-ai/src/fine_tune/worker.rs` (at 5e52ce40):
+`crates/jammi-ai/src/fine_tune/worker.rs` (at 21a4bd0c):
 
 - **`JobWorker::run_until`** (`crates/jammi-ai/src/fine_tune/worker.rs:805-…`):
   sets the registration's worker cell to `Some(WorkerFacts { kinds:
@@ -296,7 +325,7 @@ access to `artifact_dir`, which root canonicalization needs (stated at the
 
 ### 1.6 The prune window and the keeper's reregister
 
-`crates/jammi-db/src/catalog/lease.rs` (at 5e52ce40):
+`crates/jammi-db/src/catalog/lease.rs` (at 21a4bd0c):
 
 - **`instance_liveness_margin(lease) -> Duration`**
   (`crates/jammi-db/src/catalog/lease.rs:287-289`): `lease.saturating_mul(2)`
@@ -398,38 +427,62 @@ standing (`crates/jammi-ai/tests/it/instance_identity.rs:553-591`,
 
 **P-M5 (over the constructor, restated).** `peer_advertise` without
 `peer_bind` → typed error naming both keys
-(`crates/jammi-db/src/config/tests.rs:3234-3252`,
-`crates/jammi-ai/tests/it/instance_identity.rs:365-381`, through the REAL
-`InferenceSession::new`); a missing anchor → typed error naming the key
-(`crates/jammi-db/src/config/tests.rs:3253-3268`,
-`crates/jammi-ai/tests/it/instance_identity.rs:387-426`, which additionally
+(`crates/jammi-db/src/config/tests.rs:3373-3397`, and at `load_from`
+directly, `:3314-3329`,
+`crates/jammi-ai/tests/it/instance_identity.rs:366-392`, through the REAL
+`InferenceSession::new`); a RELATIVE anchor (F2, the sibling fix in this
+same commit) → typed error naming the key, both `artifact_dir` and an
+explicit `result_root`, PURE (no filesystem access)
+(`crates/jammi-db/src/config/tests.rs:3242-3274`, and at `load_from`
+directly, `:3331-3352`); a MISSING (but absolute, well-formed) anchor →
+CREATED, never refused — F1's own fix, replacing the "must already exist"
+sentence this contract stated before this commit
+(`crates/jammi-db/src/config/tests.rs:3399-3418,3580-3599`, and at
+`load_from` directly, `:3354-3371`, which additionally asserts the
+directory is NOT created — the pure half never touches the filesystem —
+`crates/jammi-ai/tests/it/instance_identity.rs:394-423`, through the REAL
+`InferenceSession::new`, which DOES materialize it); a non-directory
+(FILE) anchor → refused naming the key, for both `artifact_dir` and an
+explicit `result_root`
+(`crates/jammi-db/src/config/tests.rs:3420-3430,3601-3617`,
+`crates/jammi-ai/tests/it/instance_identity.rs:472-515`, which additionally
 reopens the SAME catalog directory after the failed construction and asserts
-ZERO `instances` rows — the failed check runs before any write); a
-non-directory anchor → the same refusal
-(`crates/jammi-db/src/config/tests.rs:3269-3280`); `result_root` UNSET →
-accepted, canonicalizing `{artifact_dir}/jammi_db`
-(`crates/jammi-db/src/config/tests.rs:3281-3296`,
-`crates/jammi-ai/tests/it/instance_identity.rs:315-332`, through the REAL
+ZERO `instances` rows — the failed check runs before any write); `result_root`
+UNSET → accepted, canonicalizing `{artifact_dir}/jammi_db`
+(`crates/jammi-db/src/config/tests.rs:3432-3446`,
+`crates/jammi-ai/tests/it/instance_identity.rs:316-332`, through the REAL
 `InferenceSession::open`); `result_root` SET (an existing directory) →
 accepted, canonicalizing THAT root VERBATIM, no `jammi_db` leaf
-(`crates/jammi-ai/tests/it/instance_identity.rs:339-361`, through
+(`crates/jammi-ai/tests/it/instance_identity.rs:340-361`, through
 `InferenceSession::open_with_placement`); a library config (no
 `peer_advertise`) → NULLs, never an error
-(`crates/jammi-db/src/config/tests.rs:3297-3309`,
-`crates/jammi-ai/tests/it/instance_identity.rs:300-309`, through a real
-session).
+(`crates/jammi-db/src/config/tests.rs:3448-3459`,
+`crates/jammi-ai/tests/it/instance_identity.rs:303-309`, through a real
+session). **F1's own oracle** — the two enforcement points reach the SAME
+verdict on one config —
+(`crates/jammi-ai/tests/it/instance_identity.rs:425-470`,
+`load_from_and_session_open_agree_on_a_fresh_artifact_dir`) drives the REAL
+public `JammiConfig::load_from` (over a real TOML file on a fresh
+`artifact_dir`) AND `InferenceSession::new` on the SAME config, asserting
+`load_from` creates nothing and the session writes a non-NULL member row.
 
-**P-B2 (the canonical root is a pure function of the config).**
-`canonical_result_root()` returns the identical string whether the default
-`jammi_db` leaf is absent, present, or a symlink to elsewhere
-(`crates/jammi-db/src/config/tests.rs:3310-3343`); two spellings of one
+**P-B2 (the canonical root is a pure function of the config, GIVEN the
+anchor).** `canonical_result_root()` returns the identical string whether
+the default `jammi_db` leaf is absent, present, or a symlink to elsewhere
+(`crates/jammi-db/src/config/tests.rs:3461-3493`); two spellings of one
 anchor (`./`, a trailing `/`, a doubled `/`) fold to the identical string
-(`crates/jammi-db/src/config/tests.rs:3344-3385`); the canonical string
+(`crates/jammi-db/src/config/tests.rs:3495-3535`); the canonical string
 equals `canon ∘ resolved_result_root()` for BOTH arms
-(`crates/jammi-db/src/config/tests.rs:3386-3429`); a cloud scheme is
+(`crates/jammi-db/src/config/tests.rs:3537-3578`); a cloud scheme is
 lowercased and alias-folded, with a trailing `/` trimmed
-(`crates/jammi-db/src/config/tests.rs:3475-3500`); `memory://` is refused
-for a gang member (`crates/jammi-db/src/config/tests.rs:3464-3474`).
+(`crates/jammi-db/src/config/tests.rs:3630-3654`); `memory://` is refused
+for a gang member (`crates/jammi-db/src/config/tests.rs:3619-3628`). The
+property SURVIVES a `chdir` between load and materialize, given the
+absolute anchor F2 guarantees
+(`crates/jammi-db/src/config/tests.rs:3276-3312`,
+`canonical_result_root_is_independent_of_a_chdir_between_load_and_materialize`
+— guards its own `std::env::set_current_dir` window with a local `Mutex`
+since cwd is process-global).
 
 ---
 
@@ -456,15 +509,17 @@ for a gang member (`crates/jammi-db/src/config/tests.rs:3464-3474`).
 | `peer_advertise_set_result_root_unset_produces_a_nonnull_row_via_open` (`:315-332`) | Arm (a) through `InferenceSession::open`: the row's `result_root` equals `canonical_result_root()`'s own value | Does not test `open_with_placement` (next oracle) |
 | `peer_advertise_set_result_root_set_produces_a_nonnull_row_via_open_with_placement` (`:339-361`) | Arm (b) through `open_with_placement`, and explicitly asserts NO `jammi_db` leaf in the written value (the B2-erratum arm) | Does not test a cloud-scheme `result_root` through this real-construction path (config/tests.rs covers cloud schemes at the pure-function layer only) |
 | `peer_advertise_without_peer_bind_fails_open_naming_both_keys` (`:365-381`) | The typed-error path through `InferenceSession::new`, not merely the pure `from_config` unit test | Does not test the SAME failure through `open`/`open_with_placement` (all three funnel through the same `wrap_with`, so one is representative) |
-| `missing_result_root_anchor_fails_open_and_writes_no_row` (`:387-426`) | The row is NEVER written on a failed check — proven by reopening the SAME catalog directory and counting `instances` rows | Does not test a non-directory (vs. missing) anchor through this real-construction path (config/tests.rs covers that arm at the pure-function layer) |
-| `a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass` (`:434-489`) | P-M4 through the session's OWN keeper (never a hand-built one), with a real `EmbeddedWorker` | Does not test a session with NO worker spawned (the drained-worker oracle, next, covers the no-`workers`-row-after-recovery case) |
-| `a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete` (`:491-551`) | The `instances` row DOES reregister (the process is alive) but `workers` does NOT re-appear — the INNER join's exclusion holds even after a real recovery | Does not test a re-spawn of a NEW worker after the drain (a fresh `upsert_worker` would naturally re-include it; this oracle is about the drained state persisting through ONE recovery, not about a subsequent claim-loop restart) |
-| `a_row_stale_in_the_margin_to_window_gap_survives_a_boot_sweep` (`:553-591`) | The construction-sweep prune call uses `instance_prune_window`, not the old `saturating_mul(2)` literal, through a REAL second session's boot | Does not test the symmetric past-window-is-pruned case through this real path (the catalog-layer oracle above covers both directions; this one isolates the regression the function extraction fixes) |
+| `missing_result_root_anchor_is_created_and_session_open_succeeds` (`:394-423`) | F1's fix: a missing (but absolute, well-formed) anchor is CREATED, never refused — session open succeeds and the row is non-NULL | Does not test a non-directory (vs. missing) anchor through this real-construction path (`file_result_root_anchor_fails_open_and_writes_no_row`, next but one, covers that arm) |
+| `load_from_and_session_open_agree_on_a_fresh_artifact_dir` (`:425-470`) | F1's own oracle, stated directly: `JammiConfig::load_from` on a fresh anchor succeeds AND creates nothing, and `InferenceSession::new` on the SAME config materializes it and writes the non-NULL row — the two enforcement points agree | Does not drive `load_from`'s file-resolution search path (`JAMMI_CONFIG`, `./jammi.toml`, …) — an explicit path is passed, matching every other test in this file |
+| `file_result_root_anchor_fails_open_and_writes_no_row` (`:472-515`) | The ONE case a missing/creatable anchor can never be confused with: an existing FILE anchor is refused naming the key, and the row is NEVER written — proven by reopening the SAME catalog directory and counting `instances` rows | Does not test the same anchor shape for `artifact_dir` (unset `result_root`) through this real-construction path (config/tests.rs covers both anchors at the pure-function layer) |
+| `a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass` (`:517-577`) | P-M4 through the session's OWN keeper (never a hand-built one), with a real `EmbeddedWorker` | Does not test a session with NO worker spawned (the drained-worker oracle, next, covers the no-`workers`-row-after-recovery case) |
+| `a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete` (`:579-641`) | The `instances` row DOES reregister (the process is alive) but `workers` does NOT re-appear — the INNER join's exclusion holds even after a real recovery | Does not test a re-spawn of a NEW worker after the drain (a fresh `upsert_worker` would naturally re-include it; this oracle is about the drained state persisting through ONE recovery, not about a subsequent claim-loop restart) |
+| `a_row_stale_in_the_margin_to_window_gap_survives_a_boot_sweep` (`:643-684`) | The construction-sweep prune call uses `instance_prune_window`, not the old `saturating_mul(2)` literal, through a REAL second session's boot — A3 fix: a longer (9 s) lease and an `ago` biased a quarter of the `(margin, window]` gap past `margin`, widening the real-wall-clock slack before the boot sweep runs from ~1.5 s to ~6.75 s so it is never red under load | Does not test the symmetric past-window-is-pruned case through this real path (the catalog-layer oracle above covers both directions; this one isolates the regression the function extraction fixes) |
 | `migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_root` (`crates/jammi-db/tests/it/migrations.rs:2012-2142`) | Ordering (relative position, never `.last()`); both columns nullable on both dialects; a both-NULL row and a both-set row are both valid inserts (no paired CHECK, unlike migration 034) | Does not test a row with exactly one of the two set through THIS oracle — `list_excludes_a_member_with_peer_addr_set_but_result_root_null` (gang_membership.rs) covers that shape's LISTING behavior, not the schema's acceptance of it (which this oracle's own both-null/both-set inserts imply by omission: no CHECK exists to reject the mixed case, and no test asserts the mixed insert fails, which would be the wrong assertion) |
 | `migration_029_copies_training_jobs_rows_into_jobs_as_queued` (`crates/jammi-db/tests/it/migrations.rs:823-988`) | The fourth K5 pin site gets teeth: `035` is on the ledger's manufactured-pre-029 DELETE list, so the reopened, replayed `instances` table carries both new columns (`:958-987`) | Proves the pin site's ABSENCE would be RED (an omission leaves the columns missing) — does not itself remove the entry to observe the red; that was done once at authorship time per the source contract's own methodology precedent, not re-executed by this file |
 | `instance_liveness_margin_is_twice_the_lease` / `prune_window_is_strictly_beyond_the_liveness_margin` (`crates/jammi-db/src/catalog/lease.rs:309-320,322-338`) | The `2×`/`3×` factors and the `Duration::MAX` saturating-arithmetic edge for both functions | Does not test a lease of zero (a lease is validated positive upstream, `LeaseConfig`'s own validation, not re-proven here) |
-| `registration_worker_half_starts_unpopulated_and_is_settable` (`crates/jammi-db/src/catalog/instance.rs:293-306`) | The cell's own set/clear/snapshot round-trip in isolation | Does not test concurrent set/snapshot from two threads (the `Mutex` makes this a liveness, not a correctness, concern — untested here) |
-| `peer_addr_parses_host_port` / `_keeps_ipv6_host_intact` / `_refuses_no_colon` / `_refuses_empty_host` / `_refuses_zero_port` / `_refuses_non_numeric_port` / `_refuses_out_of_range_port` (`crates/jammi-db/src/catalog/instance.rs:251-291`) | Every `PeerAddr::parse` edge, including the IPv6-colon-preservation shape (`rsplit_once`) | Does not test a hostname requiring DNS resolution (this type never resolves — a wire-form validator only, per its own doc) |
+| `registration_worker_half_starts_unpopulated_and_is_settable` (`crates/jammi-db/src/catalog/instance.rs:488-500`) | The cell's own set/clear/snapshot round-trip in isolation | Does not test concurrent set/snapshot from two threads (the `Mutex` makes this a liveness, not a correctness, concern — untested here) |
+| `peer_addr_parses_host_port` / `_keeps_ipv6_host_intact` / `_refuses_no_colon` / `_refuses_empty_host` / `_refuses_zero_port` / `_refuses_non_numeric_port` / `_refuses_out_of_range_port` (`crates/jammi-db/src/catalog/instance.rs:446-486`) | Every `PeerAddr::parse` edge, including the IPv6-colon-preservation shape (`rsplit_once`) | Does not test a hostname requiring DNS resolution (this type never resolves — a wire-form validator only, per its own doc) |
 
 ---
 
@@ -474,11 +529,13 @@ for a gang member (`crates/jammi-db/src/config/tests.rs:3464-3474`).
   conjuncts.** Each has its own isolated oracle (§3 table) holding every
   other conjunct at its satisfied value and flipping exactly one — deleting
   any single `continue` arm in `list_gang_members`'s Rust filter loop
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2340-2355`) flips exactly the
-  corresponding test from a correct exclusion to a false inclusion, never a
-  combined probe that could hide which conjunct actually excluded.
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2351-2367`, over the named
+  `GangCandidateRow` A5 introduced — no tuple positions to confuse) flips
+  exactly the corresponding test from a correct exclusion to a false
+  inclusion, never a combined probe that could hide which conjunct actually
+  excluded.
 - **The `sort_by` call.** Deleting
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2366` (or replacing it with a SQL
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2379` (or replacing it with a SQL
   `ORDER BY`) is exactly what
   `list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order`'s
   raw-order control is built to catch: the control proves the RAW select is
@@ -489,12 +546,14 @@ for a gang member (`crates/jammi-db/src/config/tests.rs:3464-3474`).
   `crates/jammi-ai/src/session.rs:342-344` to
   `lease_intervals.lease().saturating_mul(2)` (the pre-unit shape) is exactly
   what `a_row_stale_in_the_margin_to_window_gap_survives_a_boot_sweep` is
-  built to catch — the fixture's row is seeded stale at the WINDOW/MARGIN
-  midpoint specifically so the old literal (equal to the margin) would prune
-  it and the new function (the window) would not.
+  built to catch — the fixture's row is seeded stale at
+  `margin + (window - margin) / 4` (A3: a QUARTER of the gap past `margin`,
+  not the midpoint — widening real-wall-clock slack before `window`) so the
+  old literal (equal to the margin) would prune it and the new function (the
+  window) would not.
 - **`reregister_instance`'s worker-half conditional.** Removing the `if let
   Some(w) = worker { ... }` guard at
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2143-2155` (always writing a
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2155-2166` (always writing a
   `workers` row regardless of the cell) would flip
   `a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete`'s
   expected "no workers row after recovery" to a false resurrection — the
@@ -502,12 +561,19 @@ for a gang member (`crates/jammi-db/src/config/tests.rs:3464-3474`).
   observable.
 - **The choke-point ordering.** Moving `from_config`'s call in `wrap_with`
   (`crates/jammi-ai/src/session.rs:229-238`) to AFTER `build_result_store`
-  (`:272-275`) would let a missing-anchor failure occur only after a
-  `jammi_db` directory the anchor check itself would have refused might
-  already exist — `missing_result_root_anchor_fails_open_and_writes_no_row`
-  is built on the CURRENT ordering and does not itself re-probe the ordering
-  directly (it asserts the OUTCOME: zero rows after failure), so this is a
-  documented, not executed, mutation.
+  (`:272-275`) would let a FILE-anchor refusal occur only after
+  `build_result_store` had ALREADY materialized the wrong thing at that
+  path (a `jammi_db` file where a directory belongs, corrupting a later
+  reader) rather than being caught first, on the config AS GIVEN — this
+  fix's own F1 oracle no longer distinguishes "missing" from "ordering"
+  (a missing anchor is accepted either way, since `MembershipConfig::
+  validate` never checks existence and `from_config`'s materialize
+  `create_dir_all`s it regardless of ordering); the ordering claim now
+  rests on the FILE-anchor case alone —
+  `file_result_root_anchor_fails_open_and_writes_no_row` is built on the
+  CURRENT ordering and does not itself re-probe the ordering directly (it
+  asserts the OUTCOME: zero rows after failure), so this is a documented,
+  not executed, mutation.
 
 ---
 
@@ -556,14 +622,14 @@ for a gang member (`crates/jammi-db/src/config/tests.rs:3464-3474`).
   (`uncovered`: the typed-error path itself is read-verified, not
   test-exercised, in this unit's own suite).
 - "the `,` kind-encoding convention is honored by every real writer" —
-  executed check: `crates/jammi-ai/src/fine_tune/worker.rs:822,827,851,856`
-  are the ONLY four call sites of `self.kinds.join(",")` feeding
+  executed check: `crates/jammi-ai/src/fine_tune/worker.rs:822,827,851`
+  are the ONLY three call sites of `self.kinds.join(",")` feeding
   `upsert_worker`/`WorkerFacts.kinds` in this crate (confirmed by direct
   read of the file, not by a code-scanning oracle — `uncovered` as a
   standing tripwire the way U5a-1's enumerating-caller oracle is one).
 
 `citations_reanchored`: every citation in this document was read directly
-against `5e52ce40` in this worktree by the writing agent. `ci/scripts/perf/
+against `21a4bd0c` in this worktree by the writing agent. `ci/scripts/perf/
 check_citations.py` and the lead's `recite.py` were both run over this file
 before it was finalized; every `STALE` hit `recite.py` reported was reviewed
 and hand-corrected by re-reading the cited file at HEAD (never carried

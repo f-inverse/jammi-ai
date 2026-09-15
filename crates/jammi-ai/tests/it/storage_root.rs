@@ -26,7 +26,7 @@ use crate::common;
 /// (`storage.result_root` unset and set). Proven by creating a table and
 /// checking its `parquet_url` starts with the resolved root.
 async fn assert_store_rooted_at_resolved_root(config: jammi_db::config::JammiConfig) {
-    let expected = StorageUrl::parse(&config.resolved_result_root()).unwrap();
+    let expected = StorageUrl::parse(&config.resolved_result_root().unwrap()).unwrap();
     let session = InferenceSession::new(config).await.unwrap();
     let store = session.result_store();
     let info = store

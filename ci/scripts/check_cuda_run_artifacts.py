@@ -150,26 +150,47 @@ must carry:
       filename anchors close exactly that escape hatch
       (`check_producer_source_identity_marker`).
 
-  (k) the `gang` ARTIFACT KIND (the gpu-gang pod leg's evidence): an
-      artifact declared `gang` by ANY of three independent anchors —
-      `artifact_kind == "gang"`, a top-level `gang` block, or a committed
-      filename matching `GANG_ARTIFACT_FILENAME_RE` — must carry every row
-      of `GANG_FIELD_REGISTRY`: `world` (>= 2), `collective`, one per-rank
-      `device` for each of `world` ranks, the same-seed `digests` PAIR
-      (exactly two), the measured `per_step_loss_delta`, the leg's own
-      `verdict` (exactly `pass` or `fail`), and `epsilon`
-      with its `value`, its `derivation`, and the `registered_sha` it was
-      PRE-registered at — a commit that must be an ancestor of HEAD and a
-      STRICT ancestor of the artifact's own EVIDENCE ANCHOR (an ε landing
-      in the same commit as the tree it excuses is not pre-registered).
-      The anchor is `git_sha` when that is an ancestor of HEAD, else
-      `merged_as` when that is present, well-typed and an ancestor of HEAD,
-      else the artifact FAILS naming both — the same order rule (d) itself
-      applies, so a measured tip whose landing commit REWROTE it is still
-      ordered against something real instead of skipping the ε check
-      entirely, while a tip that IS in this history is ordered against
-      itself and no landing commit stamped beside it can loosen that
-      (`_gang_evidence_anchor` carries the full reasoning).
+  (k) the `gang` ARTIFACT KIND (the RunPod POD and CLUSTER legs' own
+      evidence — plan #500 U7b's M6): an artifact declared `gang` by ANY of
+      three independent anchors — `artifact_kind == "gang"`, a top-level
+      `gang` block, or a committed filename matching
+      `GANG_ARTIFACT_FILENAME_RE` — must FIRST carry `gang.leg`, exactly one
+      of `"pod"`/`"cluster"` (checked before either registry below — a
+      missing or unrecognized leg leaves nothing else checkable, since the
+      two legs owe DIFFERENT payloads). `gang.leg == "pod"` carries every
+      row of `GANG_POD_FIELD_REGISTRY` (this rule's ORIGINAL shape,
+      unchanged): `world` (>= 2), `collective`, one per-rank `device` for
+      each of `world` ranks, the same-seed `digests` PAIR (exactly two), the
+      measured `per_step_loss_delta`, the leg's own `verdict` (exactly
+      `pass` or `fail`), and `epsilon` with its `value`, its `derivation`,
+      and the `registered_sha` it was PRE-registered at — a commit that must
+      be an ancestor of HEAD and a STRICT ancestor of the artifact's own
+      EVIDENCE ANCHOR (an ε landing in the same commit as the tree it
+      excuses is not pre-registered). The anchor is `git_sha` when that is
+      an ancestor of HEAD, else `merged_as` when that is present, well-typed
+      and an ancestor of HEAD, else the artifact FAILS naming both — the
+      same order rule (d) itself applies, so a measured tip whose landing
+      commit REWROTE it is still ordered against something real instead of
+      skipping the ε check entirely, while a tip that IS in this history is
+      ordered against itself and no landing commit stamped beside it can
+      loosen that (`_gang_evidence_anchor` carries the full reasoning).
+
+      `gang.leg == "cluster"` (the two-HOST RunPod-cluster leg,
+      `ncclCommInitRank`, never `ncclCommInitAll`) carries every row of
+      `GANG_CLUSTER_FIELD_REGISTRY` instead: `world`, `collective`, `hosts`
+      (exactly 2), `ranks[]` (`rank`/`host`/`device`/`iface` per entry —
+      never merely `device`, since the topology this leg proves spans
+      SEPARATE hosts), `reduced_vector_digest` (a bit-exact digest, equal
+      across both ranks on a `pass` — asserted by the DRIVER before
+      assembly, never re-derived here; this is a bit-exact sum, never
+      conflated with the pod leg's LoRA-shaped same-seed reproducibility
+      PAIR, a different regime this rule does not claim anything about for
+      the cluster leg), `verdict` (the SAME generic check as the pod leg),
+      and `pod_count`/`gpu_count_per_pod`/`ttl_hours` — the shape and
+      deadline the cluster was RENTED at, as measured from the create
+      response. It carries NO `digests`/`per_step_loss_delta`/`epsilon` row
+      at all: those name a training-loss reproducibility bound the cluster
+      leg does not measure.
 
       A FAILING gang run is REPRESENTABLE: a `fail` is admitted with its deltas and digests as
       measured, and owes a non-empty `gang.reason` plus a top-level
@@ -955,10 +976,33 @@ def check_oracle_separation(data: dict) -> list[str]:
 # evidence gets no definite consequence: the gate does not decide the
 # higher-world case in either direction.
 # --------------------------------------------------------------------------- #
+# M6 (plan #500 U7b): a `gang` artifact now names WHICH RENTAL LEG produced
+# it. `gang.leg` is a required, closed-set field, checked FIRST, before
+# either registry below: `pod` keeps today's registry byte-for-byte (a
+# single 2-GPU RunPod POD, the original shape this rule was written for);
+# `cluster` is the two-HOST RunPod CLUSTER leg's own shape (2 separate
+# hosts over NCCL's `ncclCommInitRank`, never `ncclCommInitAll`) and owes a
+# DIFFERENT payload: `hosts`, per-rank `host`/`iface` (never `digests`/
+# `per_step_loss_delta`/`epsilon` -- the cluster leg proves a bit-exact
+# reduced-vector match, not a training-loss reproducibility bound; S5's own
+# LoRA-shaped byte-identical regime was never measured across two separate
+# HOSTS) plus the shape it was RENTED at (`pod_count`, `gpu_count_per_pod`,
+# `ttl_hours`). Both legs share `world`/`collective`/`verdict` (the SAME
+# generic `_gang_check_verdict` binds on either leg identically) and the
+# three-anchor kind detection below.
 GANG_ARTIFACT_KIND = "gang"
 ARTIFACT_KIND_KEY = "artifact_kind"
 GANG_BLOCK_KEY = "gang"
 GANG_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+GANG_LEG_POD = "pod"
+GANG_LEG_CLUSTER = "cluster"
+GANG_LEGS = (GANG_LEG_POD, GANG_LEG_CLUSTER)
+
+# The cluster leg proves EXACTLY two hosts -- the plan's own shape; a
+# different host count is a different, unproven regime, not a value this
+# rule tolerates.
+GANG_CLUSTER_HOSTS = 2
 
 # Third anchor (the same three-anchor shape rule (j) uses): a committed
 # artifact whose FILENAME declares the family cannot escape this rule by
@@ -1281,7 +1325,105 @@ def _gang_check_epsilon(gang: dict, data: dict, repo_root: Path) -> list[str]:
 # (field key, validator, why this field is required). The registry IS the
 # schema: a new required field lands as a row here, in the same unit that
 # teaches the leg to emit it.
-GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
+def _gang_check_leg(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    leg = gang.get("leg")
+    if leg not in GANG_LEGS:
+        return [f"`gang.leg` must be exactly one of {list(GANG_LEGS)} — which rental leg produced this run, got {leg!r}"]
+    return []
+
+
+def _gang_check_hosts(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    hosts = gang.get("hosts")
+    if isinstance(hosts, bool) or not isinstance(hosts, int):
+        return [f"`gang.hosts` must be an integer host count, got {hosts!r}"]
+    if hosts != GANG_CLUSTER_HOSTS:
+        return [
+            f"`gang.hosts` must be exactly {GANG_CLUSTER_HOSTS} — this leg proves a "
+            f"{GANG_CLUSTER_HOSTS}-host cluster only, got {hosts}"
+        ]
+    return []
+
+
+def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    ranks = gang.get("ranks")
+    if not isinstance(ranks, list) or not ranks:
+        return [f"`gang.ranks` must be a non-empty list, one entry per rank, got {ranks!r}"]
+    failures: list[str] = []
+    world = gang.get("world")
+    if isinstance(world, int) and not isinstance(world, bool) and len(ranks) != world:
+        failures.append(
+            f"`gang.ranks` carries {len(ranks)} entries but `gang.world` is {world} — every rank of "
+            "the cluster gang records its own row"
+        )
+    seen: list[int] = []
+    for i, entry in enumerate(ranks):
+        if not isinstance(entry, dict):
+            failures.append(
+                f"`gang.ranks[{i}]` must be an object with `rank`, `host`, `device`, `iface`, got {entry!r}"
+            )
+            continue
+        rank = entry.get("rank")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            failures.append(f"`gang.ranks[{i}].rank` must be a rank index >= 0, got {rank!r}")
+        else:
+            seen.append(rank)
+        for field in ("host", "device", "iface"):
+            v = entry.get(field)
+            if not isinstance(v, str) or not v.strip():
+                failures.append(f"`gang.ranks[{i}].{field}` must be a non-empty string, got {v!r}")
+    if len(set(seen)) != len(seen):
+        failures.append(f"`gang.ranks` repeats a rank index ({sorted(seen)}) — each rank appears once")
+    elif isinstance(world, int) and not isinstance(world, bool) and seen and sorted(seen) != list(range(world)):
+        failures.append(
+            f"`gang.ranks` covers rank indices {sorted(seen)}, not 0..{world - 1} — every rank of the "
+            "cluster gang records its own row"
+        )
+    return failures
+
+
+def _gang_check_reduced_vector_digest(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    digest = gang.get("reduced_vector_digest")
+    verdict = gang.get("verdict")
+    if verdict == GANG_VERDICT_PASS:
+        if not isinstance(digest, str) or not GANG_DIGEST_RE.match(digest):
+            return [
+                f"`gang.reduced_vector_digest` must be a 64-lowercase-hex digest on a "
+                f"{GANG_VERDICT_PASS!r} verdict (equal across both ranks — asserted BEFORE the driver "
+                f"assembles this artifact), got {digest!r}"
+            ]
+        return []
+    if digest is not None and not (isinstance(digest, str) and GANG_DIGEST_RE.match(digest)):
+        return [f"`gang.reduced_vector_digest` must be null or a 64-lowercase-hex digest, got {digest!r}"]
+    return []
+
+
+def _gang_check_pod_count(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    v = gang.get("pod_count")
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return [f"`gang.pod_count` must be a positive integer (the create response's own member count), got {v!r}"]
+    return []
+
+
+def _gang_check_gpu_count_per_pod(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    v = gang.get("gpu_count_per_pod")
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return [
+            f"`gang.gpu_count_per_pod` must be a positive integer (the create response's own shape), got {v!r}"
+        ]
+    return []
+
+
+def _gang_check_ttl_hours(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    v = gang.get("ttl_hours")
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return [f"`gang.ttl_hours` must be a positive integer (the cluster's own deadline), got {v!r}"]
+    return []
+
+
+# The POD-leg registry -- unchanged from before M6 (this rule's original
+# shape). Renamed from `GANG_FIELD_REGISTRY` to `GANG_POD_FIELD_REGISTRY`;
+# nothing outside this module referenced the old name.
+GANG_POD_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
     (
         "world",
         _gang_check_world,
@@ -1333,6 +1475,69 @@ GANG_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
     ),
 )
 
+# The CLUSTER-leg registry (M6): world/collective/verdict are shared with
+# the pod leg (the identical `_gang_check_world`/`_gang_check_collective`/
+# `_gang_check_verdict` validators — the SAME property binds on either leg);
+# `hosts`/`ranks`(host+device+iface)/`reduced_vector_digest` are this leg's
+# OWN topology and reproducibility claim; `pod_count`/`gpu_count_per_pod`/
+# `ttl_hours` are the shape it was RENTED at, as measured from the create
+# response. Deliberately NO `digests`/`per_step_loss_delta`/`epsilon` row —
+# those are the pod leg's training-loss reproducibility bound, a regime
+# this leg does not run at all (see the section comment above).
+GANG_CLUSTER_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
+    (
+        "world",
+        _gang_check_world,
+        "the rank count the run actually ran at — every other field is read against it",
+    ),
+    (
+        "collective",
+        _gang_check_collective,
+        "which collective carried the reduction; the same topology over a different collective is a "
+        "different run",
+    ),
+    (
+        "hosts",
+        _gang_check_hosts,
+        f"the host count this leg proves — exactly {GANG_CLUSTER_HOSTS}, the two-HOST bootstrap "
+        "(`ncclCommInitRank`) this leg exists to exercise",
+    ),
+    (
+        "ranks",
+        _gang_check_cluster_ranks,
+        "the host/device/iface each rank held — one entry per rank, so a run that silently collapsed "
+        "both ranks onto one host cannot be recorded as a two-host gang",
+    ),
+    (
+        "reduced_vector_digest",
+        _gang_check_reduced_vector_digest,
+        "the bit-exact reduced-vector digest, equal across both ranks on a pass (asserted by the "
+        "driver BEFORE assembly — never re-derived here) — a bit-exact sum, never conflated with the "
+        "pod leg's LoRA-shaped same-seed reproducibility PAIR",
+    ),
+    (
+        "verdict",
+        _gang_check_verdict,
+        f"the leg's own call, exactly {list(GANG_VERDICTS)}. A {GANG_VERDICT_FAIL!r} carries a "
+        f"non-empty `gang.reason` and a top-level `status` that is not {GANG_GREEN_STATUS}",
+    ),
+    (
+        "pod_count",
+        _gang_check_pod_count,
+        "the cluster's own member count, as measured from the create response",
+    ),
+    (
+        "gpu_count_per_pod",
+        _gang_check_gpu_count_per_pod,
+        "the cluster's own per-pod GPU count, as measured from the create response",
+    ),
+    (
+        "ttl_hours",
+        _gang_check_ttl_hours,
+        "the cluster's own deadline, baked into its entrypoint at create time",
+    ),
+)
+
 
 def gang_anchors(data: dict, relpath: str) -> list[str]:
     """Which independent anchor(s) declare this artifact a gang artifact.
@@ -1351,13 +1556,16 @@ def gang_anchors(data: dict, relpath: str) -> list[str]:
 
 def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
     """Rule (k): an artifact declared `gang` by ANY anchor must carry the
-    complete `GANG_FIELD_REGISTRY` payload. An artifact declared by none of
-    them is not a gang artifact and is untouched by this rule (every
-    artifact committed before this kind existed stays green)."""
+    complete leg-appropriate registry payload. `gang.leg` is checked FIRST —
+    it decides whether `GANG_POD_FIELD_REGISTRY` or
+    `GANG_CLUSTER_FIELD_REGISTRY` applies — and a missing or unrecognized
+    leg stops the check there (nothing else is checkable without knowing
+    which schema applies). An artifact declared by none of the anchors is
+    not a gang artifact and is untouched by this rule (every artifact
+    committed before this kind existed stays green)."""
     anchors = gang_anchors(data, relpath)
     if not anchors:
         return []
-    failures: list[str] = []
     if data.get(ARTIFACT_KIND_KEY) != GANG_ARTIFACT_KIND:
         return [
             f"declared a gang artifact by {anchors[0]} but `{ARTIFACT_KIND_KEY}` is "
@@ -1367,19 +1575,38 @@ def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
     if not isinstance(gang, dict):
         return [
             f"`{ARTIFACT_KIND_KEY}` is {GANG_ARTIFACT_KIND!r} but there is no `{GANG_BLOCK_KEY}` "
-            f"object carrying {', '.join(f'`{k}`' for k, _v, _w in GANG_FIELD_REGISTRY)}"
+            f"object carrying `leg` plus the leg-appropriate rows (pod: "
+            f"{', '.join(f'`{k}`' for k, _v, _w in GANG_POD_FIELD_REGISTRY)}; cluster: "
+            f"{', '.join(f'`{k}`' for k, _v, _w in GANG_CLUSTER_FIELD_REGISTRY)})"
         ]
-    for key, validator, why in GANG_FIELD_REGISTRY:
+    failures: list[str] = []
+    if "leg" not in gang:
+        failures.append(
+            f"`{GANG_BLOCK_KEY}.leg` is missing — every gang artifact names which rental leg produced "
+            f"it, exactly one of {list(GANG_LEGS)}"
+        )
+    else:
+        failures.extend(_gang_check_leg(gang, data, repo_root))
+    leg = gang.get("leg")
+    if leg not in GANG_LEGS:
+        return failures
+    registry = GANG_POD_FIELD_REGISTRY if leg == GANG_LEG_POD else GANG_CLUSTER_FIELD_REGISTRY
+    for key, validator, why in registry:
         if key not in gang:
             failures.append(f"`{GANG_BLOCK_KEY}.{key}` is missing — {why}")
             continue
         failures.extend(validator(gang, data, repo_root))
-    # Cross-field: on a `pass`, the recorded delta is read against the
-    # recorded ε. A committed artifact whose own numbers contradict its own
-    # verdict is a finding here, not a thing a later reader has to notice by
-    # hand. On a `fail` the deltas are admitted exactly as measured — a run
-    # that blew its tolerance is what a `fail` IS, and refusing to record it
-    # would leave the corpus with only the runs that went well.
+    if leg != GANG_LEG_POD:
+        return failures
+    # Cross-field (POD LEG ONLY): on a `pass`, the recorded delta is read
+    # against the recorded ε. A committed artifact whose own numbers
+    # contradict its own verdict is a finding here, not a thing a later
+    # reader has to notice by hand. On a `fail` the deltas are admitted
+    # exactly as measured — a run that blew its tolerance is what a `fail`
+    # IS, and refusing to record it would leave the corpus with only the
+    # runs that went well. The cluster leg carries no ε/delta row at all
+    # (see GANG_CLUSTER_FIELD_REGISTRY's own comment), so this block never
+    # runs for it.
     deltas = gang.get("per_step_loss_delta")
     epsilon = gang.get("epsilon")
     if (
@@ -1391,15 +1618,16 @@ def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
         and _is_real_number(epsilon.get("value"))
         # Deliberately redundant with `_gang_check_epsilon`'s own `value > 0`
         # guard (that validator runs unconditionally, above, in the
-        # GANG_FIELD_REGISTRY loop): this cross-field block runs regardless
-        # of whether that validator already appended a failure, so without
-        # this guard a malformed epsilon (0, negative, or non-numeric) would
-        # ALSO produce a nonsensical "worst step exceeds epsilon.value"
-        # finding piled on top of the primary `gang.epsilon.value must be...`
-        # one. Pinned here, not dropped: the two checks read the same field
-        # for two different questions (is epsilon well-formed vs. does the
-        # measured delta respect it) and this block must not run its own
-        # comparison against a value the other validator already rejected.
+        # GANG_POD_FIELD_REGISTRY loop): this cross-field block runs
+        # regardless of whether that validator already appended a failure,
+        # so without this guard a malformed epsilon (0, negative, or
+        # non-numeric) would ALSO produce a nonsensical "worst step exceeds
+        # epsilon.value" finding piled on top of the primary
+        # `gang.epsilon.value must be...` one. Pinned here, not dropped: the
+        # two checks read the same field for two different questions (is
+        # epsilon well-formed vs. does the measured delta respect it) and
+        # this block must not run its own comparison against a value the
+        # other validator already rejected.
         and epsilon["value"] > 0
     ):
         worst = max(abs(v) for v in deltas)
@@ -2782,6 +3010,7 @@ def self_test() -> int:
             d["git_sha"] = second_sha
             d["artifact_kind"] = "gang"
             d["gang"] = {
+                "leg": "pod",
                 "world": 2,
                 "collective": "nccl",
                 "ranks": [
@@ -2805,7 +3034,33 @@ def self_test() -> int:
             }
             return d
 
-        expect_clean(gang_baseline(), "2026-01-01-gang-2xa100.json", "rule (k): complete gang artifact")
+        def gang_cluster_baseline() -> dict:
+            d = baseline()
+            d["git_sha"] = second_sha
+            d["artifact_kind"] = "gang"
+            d["gang"] = {
+                "leg": "cluster",
+                "world": 2,
+                "collective": "nccl",
+                "hosts": 2,
+                "ranks": [
+                    {"rank": 0, "host": "runpod-member-0", "device": "cuda:0", "iface": "ens1"},
+                    {"rank": 1, "host": "runpod-member-1", "device": "cuda:0", "iface": "ens1"},
+                ],
+                "reduced_vector_digest": "b" * 64,
+                "verdict": "pass",
+                "pod_count": 2,
+                "gpu_count_per_pod": 1,
+                "ttl_hours": 1,
+            }
+            return d
+
+        expect_clean(gang_baseline(), "2026-01-01-gang-2xa100.json", "rule (k): complete pod-leg gang artifact")
+        expect_clean(
+            gang_cluster_baseline(),
+            "2026-01-01-gang-cluster-2x1.json",
+            "rule (k): complete cluster-leg gang artifact",
+        )
 
         # A non-gang artifact is untouched by this rule (every artifact
         # committed before the kind existed stays green).
@@ -2813,10 +3068,107 @@ def self_test() -> int:
             baseline(), "control-single-device.json", "rule (k): non-gang artifact is not gang-checked"
         )
 
+        # `leg` itself: missing, and each unrecognized/legacy value.
+        bad = gang_baseline()
+        del bad["gang"]["leg"]
+        expect_hit(bad, "x.json", "`gang.leg` is missing", "rule (k): missing gang.leg")
+        bad = gang_baseline()
+        bad["gang"]["leg"] = "solo"
+        expect_hit(bad, "x.json", "`gang.leg` must be exactly one of", "rule (k): leg outside the closed set")
+
         for field in ("world", "collective", "ranks", "digests", "per_step_loss_delta", "epsilon", "verdict"):
             bad = gang_baseline()
             del bad["gang"][field]
-            expect_hit(bad, "x.json", f"`gang.{field}` is missing", f"rule (k): missing gang.{field}")
+            expect_hit(bad, "x.json", f"`gang.{field}` is missing", f"rule (k): pod leg missing gang.{field}")
+
+        # Contract's own named example: a pod artifact lacking epsilon still
+        # fails (covered by the loop above; re-stated standalone so the
+        # exact contract wording has its own citable case).
+        bad = gang_baseline()
+        del bad["gang"]["epsilon"]
+        expect_hit(bad, "x.json", "`gang.epsilon` is missing", "rule (k): a pod artifact lacking epsilon still fails")
+
+        # Cluster leg: missing rows, one per registry entry -- the contract's
+        # own named example (a cluster artifact lacking `hosts` fails by
+        # name) plus every sibling row.
+        for field in (
+            "world",
+            "collective",
+            "hosts",
+            "ranks",
+            "reduced_vector_digest",
+            "verdict",
+            "pod_count",
+            "gpu_count_per_pod",
+            "ttl_hours",
+        ):
+            bad = gang_cluster_baseline()
+            del bad["gang"][field]
+            expect_hit(
+                bad, "x.json", f"`gang.{field}` is missing", f"rule (k): cluster leg missing gang.{field}"
+            )
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["hosts"] = 3
+        expect_hit(bad, "x.json", "must be exactly 2", "rule (k): cluster hosts != 2")
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["ranks"] = [
+            {"rank": 0, "host": "h0", "device": "cuda:0", "iface": "ens1"},
+        ]
+        expect_hit(
+            bad, "x.json", "gang.ranks` carries 1 entries but", "rule (k): cluster ranks count != world"
+        )
+
+        bad = gang_cluster_baseline()
+        del bad["gang"]["ranks"][0]["iface"]
+        expect_hit(bad, "x.json", "`gang.ranks[0].iface` must be a non-empty string", "rule (k): cluster rank missing iface")
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["ranks"][1]["rank"] = 0
+        expect_hit(bad, "x.json", "repeats a rank index", "rule (k): cluster ranks repeat an index")
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["reduced_vector_digest"] = None
+        expect_hit(
+            bad,
+            "x.json",
+            "must be a 64-lowercase-hex digest on a 'pass' verdict",
+            "rule (k): cluster pass with no reduced_vector_digest",
+        )
+
+        ok = gang_cluster_baseline()
+        ok["gang"]["verdict"] = "fail"
+        ok["gang"]["reason"] = "rank 1 disagreed with rank 0's reduced vector"
+        ok["gang"]["reduced_vector_digest"] = None
+        ok["status"] = "RED"
+        expect_clean(ok, "control-cluster-fail-no-digest.json", "rule (k): a cluster fail may record no digest at all")
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["pod_count"] = 0
+        expect_hit(bad, "x.json", "`gang.pod_count` must be a positive integer", "rule (k): cluster pod_count 0")
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["gpu_count_per_pod"] = -1
+        expect_hit(
+            bad, "x.json", "`gang.gpu_count_per_pod` must be a positive integer", "rule (k): cluster gpu_count_per_pod negative"
+        )
+
+        bad = gang_cluster_baseline()
+        bad["gang"]["ttl_hours"] = 0
+        expect_hit(bad, "x.json", "`gang.ttl_hours` must be a positive integer", "rule (k): cluster ttl_hours 0")
+
+        # The cluster leg carries NO ε/delta cross-field check at all -- a
+        # cluster artifact with those keys simply present (never required,
+        # never validated) does not trip the pod-only cross-field block.
+        odd = gang_cluster_baseline()
+        odd["gang"]["per_step_loss_delta"] = [999.0]
+        odd["gang"]["epsilon"] = {"value": 1e-9}
+        expect_clean(
+            odd,
+            "control-cluster-extra-pod-fields-ignored.json",
+            "rule (k): cluster leg ignores stray pod-only fields rather than cross-checking them",
+        )
 
         bad = gang_baseline()
         bad["gang"]["world"] = 1
@@ -3850,7 +4202,13 @@ def self_test() -> int:
         "loop from the other side: the wrong case and an unknown string are refused, a `fail` with "
         "no reason and a `fail` filed GREEN are caught, a `pass` at world 2 whose same-seed pair "
         "disagrees is caught while the same pair above world 2 is recorded rather than asserted, "
-        "and the exact delta/digest payloads that FAIL as a pass are ADMITTED as a fail."
+        "and the exact delta/digest payloads that FAIL as a pass are ADMITTED as a fail. "
+        "`gang.leg` (M6) discriminates the pod registry above from the CLUSTER leg's own "
+        "(hosts == 2, per-rank host/device/iface, a bit-exact reduced_vector_digest, pod_count/"
+        "gpu_count_per_pod/ttl_hours, no ε/delta row at all) -- missing/unrecognized leg, every "
+        "missing cluster row, a wrong host count, a malformed rank, and a pass with no digest are "
+        "each caught by name, and a cluster artifact ignores stray pod-only fields rather than "
+        "cross-checking them."
     )
     return 0
 

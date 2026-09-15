@@ -162,11 +162,9 @@ pub struct JobRecord {
     pub training_set_ref: Option<String>,
     /// The `result_tables` NAME the coordinator
     /// materialized the training set under — the one coordinate a rank
-    /// resolves with a single tenant-pinned lookup. The strict-predicate
-    /// resolver that once backed that lookup (`get_result_table_for_tenant`)
-    /// is `HostAdmission`'s to rebuild from the filed property
-    /// (<https://github.com/f-inverse/jammi-ai/issues/566>), not parked code
-    /// in this crate. See [`Self::training_set_ref`]'s pairing note.
+    /// resolves with a single tenant-pinned lookup, the strict resolver
+    /// [`Catalog::get_result_table_for_tenant`] under the job's own
+    /// `tenant_id`. See [`Self::training_set_ref`]'s pairing note.
     pub training_set_location: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -323,17 +321,41 @@ fn assembly_backoff(failures: u32) -> Duration {
 
 /// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
 /// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
-/// computed in ONE statement. No `tenant_id` column: the `world_size == 1`
-/// I-GANG lattice this unit ships derives no determinant from tenant at all
-/// (`status`/`claimed_by`/`attempts`/`lease_live`/`world_size` are the whole
-/// predicate) — a caller that DOES need the row's tenant (e.g. a future
-/// tenant-scoped sidecar lookup) reads it from [`Catalog::get_job`], never
-/// from this row.
+/// computed in ONE statement, plus the three row facts the `world_size > 1`
+/// conjunct reads ([`Self::tenant_id`], [`Self::training_set_ref`],
+/// [`Self::training_set_location`]). Every column decode here is
+/// INFALLIBLE by construction — `tenant_id` is carried as the row's raw
+/// text, never parsed here (see that field) — so `Err` from
+/// `get_job_for_rank` means the read itself faulted, never that this
+/// row's content failed to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmissionRow {
     pub status: String,
     pub claimed_by: Option<String>,
     pub attempts: u32,
+    /// The `jobs.tenant_id` column's raw text (`None` for a job submitted
+    /// outside any tenant binding — a GLOBAL job). Carried as TEXT, never
+    /// parsed into a [`crate::TenantId`] here, so a value that does not
+    /// parse is a ROW FACT the caller (the gang admission handler) refuses,
+    /// exactly like an undecodable `world_size` — never an `Err` from the
+    /// read that found it. The caller pins every training-set read to the
+    /// tenant this text names (I-GANG: tenant is derived from the row, never
+    /// accepted from the caller) through the strict resolver
+    /// [`Catalog::get_result_table_for_tenant`].
+    pub tenant_id: Option<String>,
+    /// [`JobRecord::training_set_ref`] as it stands on the row — the
+    /// `ArtifactDigest` the coordinator's write-once CAS
+    /// ([`Catalog::fill_training_set_identity`]) recorded, `None` until
+    /// filled. Read only for a `world_size > 1` row; paired with
+    /// [`Self::training_set_location`] at the schema edge (migration 034's
+    /// `CHECK`), so the two are `Some` together or `None` together.
+    pub training_set_ref: Option<String>,
+    /// [`JobRecord::training_set_location`] as it stands on the row — the
+    /// `result_tables` NAME a rank resolves with ONE strict tenant-pinned
+    /// lookup ([`Catalog::get_result_table_for_tenant`]) under
+    /// [`Self::tenant_id`], then verifies against the sidecar manifest's
+    /// `artifact` digest (must equal [`Self::training_set_ref`]).
+    pub training_set_location: Option<String>,
     /// `NOT(lease_expired_clause)`, computed against the SAME clock
     /// [`super::lease::lease_remaining_seconds_expr`] used for
     /// [`Self::remaining`] — `false` for a `NULL` lease column (no
@@ -2252,12 +2274,12 @@ impl Catalog {
     /// only in prose, never as an intra-doc link).
     /// Primary-key only (`WHERE job_id = $1`) — no tenant
     /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
-    /// not consult it at all, and returns no `tenant_id` column either: the
-    /// `world_size == 1` I-GANG lattice this unit ships derives no
-    /// determinant from tenant at all, per
-    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3) — "tenant is
-    /// derived, never accepted" — a caller that DOES need the row's tenant
-    /// reads it from [`Catalog::get_job`], never from this row).
+    /// not consult it at all). The row's OWN `tenant_id` comes back as raw
+    /// text ([`RankAdmissionRow::tenant_id`]) for the CALLER to derive and
+    /// pin — "tenant is derived, never accepted"
+    /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3)) — together with
+    /// the training-set identity pair the `world_size > 1` conjunct
+    /// resolves under that tenant.
     /// ONE statement: the row's `status`/`claimed_by`/`attempts`
     /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
     /// remaining window, from which [`RankAdmissionRow::lease_live`] is
@@ -2309,7 +2331,8 @@ impl Catalog {
                         params.push(SqlValue::TextOwned(job_id));
                         let job_bind = params.len();
                         let sql = format!(
-                            "SELECT status, claimed_by, attempts, spec, \
+                            "SELECT status, claimed_by, attempts, spec, tenant_id, \
+                                 training_set_ref, training_set_location, \
                                  {remaining_expr} AS remaining_secs \
                              FROM jobs WHERE job_id = ${job_bind}"
                         );
@@ -2330,6 +2353,9 @@ impl Catalog {
                                 status: row.get("status")?,
                                 claimed_by: row.try_get("claimed_by")?,
                                 attempts: row.get::<i32>("attempts")? as u32,
+                                tenant_id: row.try_get("tenant_id")?,
+                                training_set_ref: row.try_get("training_set_ref")?,
+                                training_set_location: row.try_get("training_set_location")?,
                                 lease_live,
                                 remaining,
                                 world_size,

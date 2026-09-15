@@ -738,3 +738,107 @@ async fn a_raw_single_column_write_is_refused_by_the_schema_check() {
         "a raw write of training_set_ref alone must be refused by the CHECK constraint"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `world_size > 1` conjunct's three row facts on the admission row:
+// `tenant_id` (raw text), `training_set_ref`, `training_set_location`.
+// ---------------------------------------------------------------------------
+
+/// `get_job_for_rank` carries the row's OWN `tenant_id` as raw text and the
+/// filled training-set pair — the three facts the gang handler's
+/// `world_size > 1` conjunct reads (#566 R2) — on both backends. Before the
+/// CAS the pair reads `None`/`None`; after it, exactly the filled values;
+/// and a `tenant_id` value that is not a UUID (manufactured by raw SQL —
+/// nothing in this crate writes one) still comes back `Ok(Some(row))` with
+/// the text verbatim: the read is infallible on content, the caller decides
+/// what an undecodable tenant means. Mutation proof: dropping any of the
+/// three columns from the SELECT fails to compile the row mapper; parsing
+/// `tenant_id` into a `TenantId` inside the mapper flips the garbage arm
+/// from `Ok(Some)` to `Err`.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn get_job_for_rank_carries_the_tenant_text_and_the_filled_pair(kind: BackendKind) {
+    use std::str::FromStr;
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
+    let tenant = jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e77").unwrap();
+    let job_id = format!("job-pair-{}", jammi_test_utils::unique_suffix());
+    // `submit_job` stamps `tenant_id` from the catalog's binding in force —
+    // a catalog pinned to `tenant` writes exactly that tenant, the same
+    // way a tenant-bound submission does.
+    catalog
+        .pinned_to_tenant(Some(tenant))
+        .submit_job(job_params(&job_id))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next("coord-pair", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("must claim the only queued job");
+
+    let before = catalog
+        .get_job_for_rank(&job_id)
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(
+        before.tenant_id.as_deref(),
+        Some(tenant.to_string().as_str())
+    );
+    assert_eq!(before.training_set_ref, None);
+    assert_eq!(before.training_set_location, None);
+
+    let outcome = catalog
+        .fill_training_set_identity(
+            &job_id,
+            "coord-pair",
+            claimed.attempts,
+            "sha256:pair-digest",
+            "pair_table",
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, TrainingSetFillOutcome::Filled);
+    let after = catalog
+        .get_job_for_rank(&job_id)
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(
+        after.training_set_ref.as_deref(),
+        Some("sha256:pair-digest")
+    );
+    assert_eq!(after.training_set_location.as_deref(), Some("pair_table"));
+    assert_eq!(after.tenant_id, before.tenant_id);
+
+    let sql = format!("UPDATE jobs SET tenant_id = 'not-a-uuid' WHERE job_id = '{job_id}'");
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            let sql = sql.clone();
+            Box::pin(async move { tx.execute(&sql, &[]).await })
+        })
+        .await
+        .unwrap();
+    let poisoned = catalog
+        .get_job_for_rank(&job_id)
+        .await
+        .expect("an undecodable tenant text is a row fact, never a fault of the read")
+        .expect("row present");
+    assert_eq!(poisoned.tenant_id.as_deref(), Some("not-a-uuid"));
+    assert_eq!(
+        poisoned.training_set_location.as_deref(),
+        Some("pair_table"),
+        "every other column is still populated"
+    );
+}

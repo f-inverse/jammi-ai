@@ -9,10 +9,16 @@ arm end to end on the shipped image, against the Postgres catalog:
   1. a long fine-tune (20 000 epochs over the bundled `training_pairs.csv`
      with the bundled `tiny_bert`) is submitted over the wire and observed
      `running`;
-  2. `docker compose kill -s SIGINT jammi-server` — the signal an operator's
-     `preStop` hook or `jammi-server release` sends — makes the server RELEASE:
-     the log carries its "released its leases; exiting now" line (the process
-     exits 0 by construction of that line) within 30 s;
+  2. SIGINT delivered to the container's init process from the HOST pid
+     namespace (`kill -s SIGINT <pid>` on `docker inspect`'s `.State.Pid`) —
+     the signal an operator's `preStop` hook or `jammi-server release` sends —
+     makes the server RELEASE: the log carries its "released its leases;
+     exiting now" line (the process exits 0 by construction of that line)
+     within 30 s. Never `docker kill -s SIGINT`: the daemon records a
+     `docker kill` (like a `docker stop`) as a MANUAL stop and then ignores
+     `restart: unless-stopped` once the process exits, so step 4 could never
+     observe the container come back — this is exactly how this script failed
+     on every `main` run from its first (2026-09-14) until it was rewritten;
   3. `psql` reads the row `lease_expires_at IS NULL AND releases = 1` —
      the lease was handed back, no status invented, no attempt consumed;
   4. `restart: unless-stopped` brings the container back (`/readyz` 200
@@ -27,6 +33,7 @@ and exits 0 without connecting. Exits 0 on success.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -59,6 +66,38 @@ def _psql(sql: str) -> str:
         text=True,
     )
     return out.stdout.strip()
+
+
+def _signal_container_init(signal_name: str) -> None:
+    """Deliver `signal_name` to the service container's init process (pid 1
+    inside; `.State.Pid` on the host) from the host pid namespace — what an
+    operator's `kill` does. This must NOT go through the daemon's kill API:
+    `docker kill`/`docker compose kill` flag the container as manually
+    stopped, and a manually stopped container is exempt from
+    `restart: unless-stopped`, so the restart this script then waits for
+    would never happen. A host-side signal leaves the restart policy in
+    force. Root is needed to signal the container's root-owned process: the
+    CI runner runs as an unprivileged user with passwordless sudo, so a
+    non-root caller goes through `sudo -n`; a root caller signals directly.
+    Requires a Linux Docker Engine sharing the host pid namespace (the CI
+    shape) — Docker Desktop's VM exposes no host pid for a container."""
+    container_id = subprocess.run(
+        _compose_cmd("ps", "-q", COMPOSE_SERVICE),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if not container_id:
+        raise AssertionError(f"no running container for compose service {COMPOSE_SERVICE!r}")
+    pid = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Pid}}", container_id],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if not pid.isdigit() or int(pid) <= 0:
+        raise AssertionError(f"container {container_id} has no host pid (State.Pid={pid!r}): not running?")
+    kill = ["kill", "-s", signal_name, pid]
+    if os.geteuid() != 0:
+        kill = ["sudo", "-n", *kill]
+    print(f"=== {' '.join(kill)} (container {container_id[:12]}, {COMPOSE_SERVICE}) ===")
+    subprocess.run(kill, check=True)
 
 
 def _server_logs() -> str:
@@ -106,7 +145,7 @@ def run(target: str, health_url: str) -> int:
         db.close()
 
     logs_before = _server_logs().count(RELEASED_LOG_LINE)
-    subprocess.run(_compose_cmd("kill", "-s", "SIGINT", COMPOSE_SERVICE), check=True)
+    _signal_container_init("SIGINT")
     _wait_for(
         lambda: _server_logs().count(RELEASED_LOG_LINE) > logs_before,
         30,
@@ -161,7 +200,7 @@ def main() -> int:
         print(f"  training url = {TRAINING_URL}")
         print(f"  model        = {MODEL}")
         print("  fine_tune(source=\"training\", epochs=20000, …) until status == running")
-        print(f"  docker compose kill -s SIGINT {COMPOSE_SERVICE}")
+        print(f"  kill -s SIGINT <host pid of {COMPOSE_SERVICE}'s init> (never docker kill: it disarms the restart policy)")
         print(f"  logs contain {RELEASED_LOG_LINE!r} within 30s")
         print("  select status, lease_expires_at is null, releases, attempts from jobs where job_id = …")
         print("  wait /readyz (restart: unless-stopped); wait attempts = 2")

@@ -24,8 +24,9 @@
 //! `Streamed` arm opens a fresh [`Self`] each epoch
 //! (`TrainingLoop::open_streamed_source`) over the train window
 //! (`Slice::PerRank`) and a second one for validation (`Slice::All`) —
-//! `EpochSource` gives both the `Resident` and the `Streamed` arm one
-//! `next_chunk` call shape, and refuses (typed) a whole-set arm ever
+//! `EpochSource` (U4b: the Streamed arm's own type now — the
+//! Resident arm calls `text_chunk_for_rank` directly, see that type's own
+//! doc) refuses (typed) a whole-set arm ever
 //! reaching this dispatch with a `Streamed` source (F6). P6.ii's "unchanged
 //! with the production path streaming" property is therefore the real
 //! claim, not a vacuous one: the pinned parity fixtures
@@ -104,7 +105,7 @@ use jammi_db::store::TrainingSetTable;
 use crate::model::ModelTask;
 use crate::session::InferenceSession;
 
-use super::data::{TextChunk, TrainingDataLoader};
+use super::data::TextChunk;
 use super::decode::{self, ChunkAccumulator, DetectedFormat, LabelVocabulary};
 use super::partition::PartitionSpec;
 use super::training_set::read_back_sql;
@@ -815,63 +816,52 @@ pub async fn build_label_vocabulary(
     ))
 }
 
-/// One epoch's row source for the trainer's production text loop (#500 U2c
-/// §10): either an already-resident [`TrainingDataLoader`] or a fresh
-/// per-epoch [`TrainingSetStream`]. [`Self::next_chunk`] gives both arms one
-/// call shape, so `trainer.rs::run`'s text loop walks either one identically.
-pub(crate) enum EpochSource<'a> {
-    Resident(&'a TrainingDataLoader),
-    Stream(TrainingSetStream),
-}
+/// One epoch's row source for the trainer's production STREAMED text loop
+/// (#500 U2c §10): a thin [`Self::next_chunk`] wrapper over a per-epoch
+/// [`TrainingSetStream`], applying the "an empty chunk means the epoch is
+/// over" contract [`TrainingDataLoader::text_chunk_for_rank`]'s own callers
+/// otherwise apply for themselves.
+///
+/// U4b: the Resident production arm no longer goes through this type —
+/// `trainer.rs::run`'s Resident branch calls `text_chunk_for_rank` directly,
+/// over a FIXED step bound (`train_batches_per_epoch`), so a genuinely
+/// empty-but-in-bound chunk at a real gang's `W > 1` (DESIGN.md §2's
+/// zero-row-rank case) is never collapsed into "no more work"; see that call
+/// site's own doc for why the Resident and Streamed arms need DIFFERENT
+/// termination rules here. The Streamed arm stays a named, deferred
+/// `W = 1`-only path (`trainer.rs::run`'s own U4b refusal above `W > 1`),
+/// so this type's "empty means done" contract is still exactly right for the
+/// only caller left.
+pub(crate) struct EpochSource(TrainingSetStream);
 
-impl<'a> EpochSource<'a> {
-    /// The chunk this source holds for global `step`. `Ok(None)` is the
-    /// end-of-epoch signal — mirroring
-    /// [`TrainingDataLoader::text_chunk_for_rank`]'s own "an empty chunk
-    /// means the epoch is over" contract exactly, so the caller's loop looks
-    /// identical for either arm.
-    ///
-    /// `spec` is the Resident arm's per-rank partition (the Stream arm
-    /// already baked its own [`Slice::PerRank`] in at [`TrainingSetStream::
-    /// open`], so `spec` goes unused there — kept as a shared parameter
-    /// rather than stored twice, once on this enum and once inside the
-    /// stream that built it).
-    ///
-    /// The Stream arm asserts `owned.step() == step` (#500 U2c §11's
+impl EpochSource {
+    /// Wrap an opened per-epoch stream.
+    pub(crate) fn new(stream: TrainingSetStream) -> Self {
+        Self(stream)
+    }
+
+    /// The chunk this source holds for global `step`, or `Ok(None)` at
+    /// end-of-epoch. Asserts `owned.step() == step` (#500 U2c §11's
     /// advisory: "the consumer asserts `owned.step() == step`") — the pump
     /// emits steps strictly in order over one channel, so any desync here is
     /// an internal invariant violation, not a caller input error.
-    pub(crate) fn next_chunk(
-        &mut self,
-        spec: &PartitionSpec,
-        step: usize,
-    ) -> Result<Option<TextChunk>> {
-        match self {
-            EpochSource::Resident(loader) => {
-                let chunk = loader.text_chunk_for_rank(spec, step)?;
-                if chunk.row_count() == 0 {
+    pub(crate) fn next_chunk(&mut self, step: usize) -> Result<Option<TextChunk>> {
+        match self.0.next_chunk()? {
+            None => Ok(None),
+            Some(owned) => {
+                assert_eq!(
+                    owned.step(),
+                    step,
+                    "EpochSource::next_chunk: pump/consumer step desync (pump emitted step {}, \
+                     consumer asked for step {step})",
+                    owned.step()
+                );
+                if owned.chunk().row_count() == 0 {
                     Ok(None)
                 } else {
-                    Ok(Some(chunk))
+                    Ok(Some(owned.into_chunk()))
                 }
             }
-            EpochSource::Stream(stream) => match stream.next_chunk()? {
-                None => Ok(None),
-                Some(owned) => {
-                    assert_eq!(
-                        owned.step(),
-                        step,
-                        "EpochSource::Stream: pump/consumer step desync (pump emitted step {}, \
-                         consumer asked for step {step})",
-                        owned.step()
-                    );
-                    if owned.chunk().row_count() == 0 {
-                        Ok(None)
-                    } else {
-                        Ok(Some(owned.into_chunk()))
-                    }
-                }
-            },
         }
     }
 }

@@ -138,7 +138,7 @@ impl MemberRoot {
     /// # Errors
     ///
     /// `resolved_result_root`'s own non-UTF-8 refusal, and
-    /// [`RootIdentity::of`]'s refusals (an in-memory root, a root the store's
+    /// the identity derivation's refusals (an in-memory root, a root the store's
     /// URL parser rejects, a local root with no resolvable ancestor).
     pub fn resolved(config: &crate::config::JammiConfig) -> Result<Self> {
         let root = config.resolved_result_root()?;

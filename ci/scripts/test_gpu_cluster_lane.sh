@@ -192,22 +192,40 @@ fi
 
 # ============================================================================
 # P-A: the id-secrecy scan runs from the EXIT trap (_rpc_cleanup_cluster ->
-# _rpc_scan_or_quarantine) on EVERY exit arm, once the id has landed --
-# driven through the REAL trap and the REAL scanner (gang_id_secrecy_scan.py,
-# never mocked), over a REAL fixture carrier directory, on the four arms the
-# round-2 audit named: assembly refused, pull failed, budget cut, wrong
-# tree. Asserts BOTH that the scan ran (its own stdout/stderr appears) and
-# that a DIRTY carrier never survives at the upload path afterward.
+# _rpc_scan_or_destroy) on EVERY exit arm, once the id has landed -- driven
+# through the REAL trap and the REAL scanner (gang_id_secrecy_scan.py, never
+# mocked), over a REAL fixture carrier directory.
+#
+# P-A2 (absent vs. unexaminable, round-2 fix): whether the assembled
+# artifact is REQUIRED of the scan is threaded through `assembly_ok`
+# (0 unless THIS run's own assembly step claimed success) exactly as the
+# real orchestration sets it -- never pre-created regardless of arm the way
+# an earlier version of this fixture did (which masked the very defect
+# these cases now reproduce: a refusal arm that never reached assembly must
+# NOT be read as UNEXAMINABLE merely because $ASSEMBLED does not exist).
+# rank0.log/rank1.log are included in the fixture too (the driver always
+# copies them into CLUSTER_ARTIFACT_DIR before assembly, pass or fail) so
+# "remains at the upload path" is checked against the FULL real carrier
+# set, not just run.log.
 # ============================================================================
 PA_ID_BYTES_PY="import sys; sys.stdout.buffer.write(bytes((i*7+1) % 256 for i in range(128)))"
 
-run_trap_scan_arm() { # $1=pending_rc $2=plant_leak(1|0) -> stdout: "<rc>\t<carrier_dir>\t<out_b64>"
-  local pending_rc="$1" plant_leak="$2" pa_sandbox
+run_trap_scan_arm() { # $1=pending_rc $2=plant_leak(1|0) $3=assembly_claimed(1|0) $4=assembled_present(1|0, meaningful only when $3=1) -> stdout: "<rc>\t<carrier_dir>\t<out_b64>"
+  local pending_rc="$1" plant_leak="$2" assembly_claimed="$3" assembled_present="${4:-1}" pa_sandbox
   pa_sandbox="$(mktemp -d)"
   mkdir -p "$pa_sandbox/artifact/nested"
   echo "clean log line" > "$pa_sandbox/artifact/run.log"
-  echo '{"gang":{"leg":"cluster"}}' > "$pa_sandbox/assembled.json"
+  echo "clean rank0 log" > "$pa_sandbox/artifact/rank0.log"
+  echo "clean rank1 log" > "$pa_sandbox/artifact/rank1.log"
   python3 -c "$PA_ID_BYTES_PY" > "$pa_sandbox/nccl.id"
+  # ASSEMBLED always lives INSIDE the artifact dir, exactly like the real
+  # driver's own `${CLUSTER_ARTIFACT_DIR}/gang-cluster-<ts>.json` -- and is
+  # only WRITTEN here when this arm claims assembly succeeded and the file
+  # is meant to be present (the "claimed but missing" case below plants
+  # assembly_claimed=1 with assembled_present=0 -- claims success, no file).
+  if [ "$assembly_claimed" = "1" ] && [ "$assembled_present" = "1" ]; then
+    echo '{"gang":{"leg":"cluster"}}' > "$pa_sandbox/artifact/assembled.json"
+  fi
   if [ "$plant_leak" = "1" ]; then
     id_hex="$(python3 -c "$PA_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
     echo "leaked: ${id_hex}" > "$pa_sandbox/artifact/nested/leak.txt"
@@ -217,9 +235,10 @@ run_trap_scan_arm() { # $1=pending_rc $2=plant_leak(1|0) -> stdout: "<rc>\t<carr
     source "'"$CLUSTER_SH"'"
     cluster_id=""
     id_landed=1
+    assembly_ok="'"$assembly_claimed"'"
     CLUSTER_ARTIFACT_DIR="'"$pa_sandbox"'/artifact"
     RUN_LOG="'"$pa_sandbox"'/artifact/run.log"
-    ASSEMBLED="'"$pa_sandbox"'/assembled.json"
+    ASSEMBLED="'"$pa_sandbox"'/artifact/assembled.json"
     STAGING_ID_FILE="'"$pa_sandbox"'/nccl.id"
     RP_WORK="'"$pa_sandbox"'"
     rp_cleanup() { : ; }
@@ -235,52 +254,108 @@ carrier_is_clean() { # $1=carrier dir -> 0 if gone or exists-but-empty, 1 if any
   [ -z "$(find "$1" -mindepth 1 2>/dev/null)" ]
 }
 
-# (a) "assembly refused" arm: pending rc=1 (an assembly failure already set
-# it), a CLEAN carrier -> the scan runs and passes, the pending rc (1)
-# survives untouched, and the (clean) carrier is left exactly as it was --
-# never quarantined for no reason.
-IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 0)"
+carrier_intact() { # $1=carrier dir -> 0 iff run.log AND both rank logs survive unaltered
+  [ -f "$1/run.log" ] && [ -f "$1/rank0.log" ] && [ -f "$1/rank1.log" ]
+}
+
+# (a) "assembly refused" arm: assembly was REACHED but REFUSED (a rank's own
+# hostname/iface unresolved, or a repeated host) and so never wrote
+# $ASSEMBLED at all -- assembly_ok=0, a CLEAN carrier. The round-2 defect:
+# an earlier fixture pre-created assembled.json unconditionally here, which
+# masked the real driver's bug (the scan required a file this arm never
+# claimed to produce, and destroyed a clean carrier for it). Fixed: the
+# scan runs and passes, the pending rc (1) survives untouched, and the
+# clean carrier -- run.log AND both rank logs -- is left exactly as it was.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 0 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 1 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && [ -f "$carrier_dir/run.log" ]; then
-  ok "P-A: 'assembly refused' arm (pending rc=1, clean carrier) -> the scan ran (clean), rc=1 preserved, carrier left intact"
+if [ "$trap_rc" -eq 1 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir"; then
+  ok "P-A2: 'assembly refused' arm (never claimed, clean carrier) -> the scan ran (clean), rc=1 preserved, run.log + rank logs REMAIN at the upload path"
 else
-  bad "P-A: 'assembly refused' arm: expected rc=1 + a clean scan + intact carrier; got rc=$trap_rc carrier_exists=$([ -f "$carrier_dir/run.log" ] && echo yes || echo no) out=$scan_out"
+  bad "P-A2: 'assembly refused' arm: expected rc=1 + a clean scan + intact carrier; got rc=$trap_rc carrier_intact=$(carrier_intact "$carrier_dir" && echo yes || echo no) out=$scan_out"
 fi
 rm -rf "$(dirname "$carrier_dir")"
 
-# (b) "pull failed" arm: pending rc=1, a DIRTY carrier (simulating a leak
-# that rode in with a partial/failed pull) -> the scan runs, finds the hit,
-# and the carrier is quarantined/emptied -- the upload path holds nothing.
-IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 1)"
+# (b) "pull failed" arm: the pull itself failed, so assembly was never even
+# REACHED -- assembly_ok=0, a CLEAN carrier (the rank reports never landed,
+# but nothing here carries the id either). The scan must not destroy this
+# arm's own diagnostics for lacking a file nobody promised: the exit code
+# is the arm's own (not 2), and run.log + rank logs REMAIN at the upload
+# path -- the only evidence a reviewer has on exactly this arm.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 0 0)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -eq 1 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir"; then
+  ok "P-A2: 'pull failed' arm (never claimed, clean carrier) -> the scan ran (clean), the exit code is the arm's own (not 2), run.log + rank logs REMAIN at the upload path"
+else
+  bad "P-A2: 'pull failed' arm: expected rc=1 (not 2) + a clean scan + intact carrier; got rc=$trap_rc carrier_intact=$(carrier_intact "$carrier_dir" && echo yes || echo no) out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# (c) a planted-id refusal arm (pull failed, but a leak rode in with a
+# partial transfer) -- assembly_ok=0, a DIRTY carrier: the scan runs, finds
+# the hit, and DESTROYS the carrier -- the upload path holds nothing. This
+# is the "planted-id refusal arm asserting removal" oracle: never claiming
+# assembly must not weaken the scan's own strictness about an actual leak.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 1 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
 if [ "$trap_rc" -ne 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: HIT" && carrier_is_clean "$carrier_dir"; then
-  ok "P-A: 'pull failed' arm (pending rc=1, dirty carrier) -> the scan ran (HIT), the carrier holds nothing at the upload path afterward"
+  ok "P-A: planted-id refusal arm (pull failed, dirty carrier, never claimed assembly) -> the scan ran (HIT), the carrier is DESTROYED, nothing reaches the upload path"
 else
-  bad "P-A: 'pull failed' arm: expected a HIT scan + an emptied/quarantined carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
+  bad "P-A: planted-id refusal arm: expected a HIT scan + a destroyed carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
 fi
 rm -rf "$(dirname "$carrier_dir")"
 
-# (c) "budget cut" arm (rc=124): a CLEAN carrier -> the scan runs and
-# passes, the driver's own named exit code (124) survives verbatim.
-IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 124 0)"
+# (d) "budget cut" arm (rc=124): never reached assembly, assembly_ok=0, a
+# CLEAN carrier -> the scan runs and passes, the driver's own named exit
+# code (124) survives verbatim, and the carrier stays intact.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 124 0 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 124 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean"; then
-  ok "P-A: 'budget cut' arm (rc=124, clean carrier) -> the scan ran (clean), the named exit code 124 survives verbatim"
+if [ "$trap_rc" -eq 124 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir"; then
+  ok "P-A2: 'budget cut' arm (never claimed, clean carrier) -> the scan ran (clean), the named exit code 124 survives verbatim, carrier intact"
 else
-  bad "P-A: 'budget cut' arm: expected rc=124 + a clean scan; got rc=$trap_rc out=$scan_out"
+  bad "P-A2: 'budget cut' arm: expected rc=124 + a clean scan + intact carrier; got rc=$trap_rc out=$scan_out"
 fi
 rm -rf "$(dirname "$carrier_dir")"
 
-# (d) "wrong tree" arm (rc=77): a DIRTY carrier -> the scan quarantines it
-# AND the driver's own named exit code (77) still survives verbatim (never
-# overwritten by the scan's own rc, since a real per-arm code always
-# outranks a bare join per rp_cluster_verdict's own priority doctrine).
-IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 77 1)"
+# (e) "wrong tree" arm (rc=77): never reached assembly, assembly_ok=0, a
+# DIRTY carrier -> the scan DESTROYS it AND the driver's own named exit
+# code (77) still survives verbatim (never overwritten by the scan's own
+# rc, since a real per-arm code always outranks a bare join per
+# rp_cluster_verdict's own priority doctrine).
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 77 1 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
 if [ "$trap_rc" -eq 77 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: HIT" && carrier_is_clean "$carrier_dir"; then
-  ok "P-A: 'wrong tree' arm (rc=77, dirty carrier) -> the scan ran (HIT), quarantined the carrier, AND the named exit code 77 survives verbatim"
+  ok "P-A: 'wrong tree' arm (rc=77, dirty carrier) -> the scan ran (HIT), DESTROYED the carrier, AND the named exit code 77 survives verbatim"
 else
-  bad "P-A: 'wrong tree' arm: expected rc=77 + a HIT scan + an emptied/quarantined carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
+  bad "P-A: 'wrong tree' arm: expected rc=77 + a HIT scan + a destroyed carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# (f) the happy-path tail: assembly SUCCEEDED (assembly_ok=1) and
+# $ASSEMBLED is present and clean -> the scan still runs, still requires
+# the file (P-A2's happy-path strictness), finds it, and passes clean --
+# proving assembly_ok=1 does not itself break the ordinary pass arm.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 0 0 1 1)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -eq 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir" && [ -f "$carrier_dir/assembled.json" ]; then
+  ok "P-A2: happy-path arm (assembly claimed, file present, clean) -> the scan still requires and finds the assembled artifact, passes clean, rc=0 preserved"
+else
+  bad "P-A2: happy-path arm: expected rc=0 + a clean scan + the assembled artifact present; got rc=$trap_rc out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# (g) the "claimed but missing" case: assembly_ok=1 (this run's own
+# assembly step reported success) but $ASSEMBLED is missing at scan time
+# (a corruption/race this driver's author did not anticipate) -> P-A2's
+# happy-path strictness holds: UNEXAMINABLE (never clean), and the carrier
+# is DESTROYED -- exactly `test_missing_assembled_artifact_is_unexaminable_
+# never_clean`'s own property, now proven threaded all the way through the
+# REAL driver's assembly_ok wiring, not just the scanner in isolation.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 0 0 1 0)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -ne 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: UNEXAMINABLE" && carrier_is_clean "$carrier_dir"; then
+  ok "P-A2: 'claimed but missing' arm (assembly_ok=1, file absent) -> UNEXAMINABLE, never clean, carrier DESTROYED -- happy-path strictness holds"
+else
+  bad "P-A2: 'claimed but missing' arm: expected a non-zero rc + UNEXAMINABLE + a destroyed carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
 fi
 rm -rf "$(dirname "$carrier_dir")"
 

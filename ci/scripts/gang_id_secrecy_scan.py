@@ -16,11 +16,29 @@ exactly that), the CARRIER SET the cluster driver's own run produces:
 
   1. the pulled artifact directory, recursively (every file the two ranks'
      `rank-<r>.json` reports, and anything else, landed in);
-  2. the driver's own run log (the ONE `tee`'d stream F6 requires);
-  3. the assembled `gang` artifact JSON;
+  2. the driver's own run log (the ONE `tee`'d stream F6 requires) --
+     ALWAYS a required carrier: this file is created before anything else
+     the driver does, so it exists on every exit arm without exception;
+  3. the assembled `gang` artifact JSON, `--assembled-artifact`, but ONLY
+     when the caller passes it (P-A2: absent vs. unexaminable, below);
   4. the staging copy's own directory LISTING (never its content a second
      time — its content is the NEEDLE SOURCE, read once, below) — a leak
      spelled into a FILENAME next to it would otherwise go unseen.
+
+P-A2 (absent vs. unexaminable): `--assembled-artifact` is OPTIONAL. Pass it
+only when the caller's own run actually CLAIMS to have written that file
+(the assembly step was reached and reported success) -- a missing file at
+that path is then UNEXAMINABLE (2), never clean, because something the run
+claims to have produced cannot be accounted for. When the caller never
+reached assembly at all, or assembly itself refused and never wrote
+anything, `--assembled-artifact` is simply omitted: there is nothing to
+account for, so its absence is not scored, and the run's other (clean)
+carriers -- the run log, the pulled artifact directory, the ranks' own logs
+-- are read as clean rather than UNEXAMINABLE on that account. The assembled
+path always lives INSIDE the pulled artifact directory in this driver's own
+usage, so omitting the flag never widens what gets scanned: a stray or
+leaked file at that path is still caught by the directory walk (item 1)
+regardless of whether the flag was passed.
 
 Exit lattice (F5): 0 clean; 1 a carrier carries the id in some encoding
 (named by carrier and encoding, the bytes themselves are NEVER printed); 2 a
@@ -67,8 +85,8 @@ when `--delete-staging` is passed — never unconditionally, so a caller can
 inspect a dirty run's staging file by hand.
 
 Run: `python3 ci/scripts/gang_id_secrecy_scan.py --staging-file <path> \
-  --artifact-dir <dir> --log <path> --assembled-artifact <path> \
-  [--delete-staging]`
+  --artifact-dir <dir> --log <path> [--assembled-artifact <path>] \
+  [--delete-staging]` -- `--assembled-artifact` is optional (P-A2, above).
 Self-test: `python3 ci/scripts/gang_id_secrecy_scan.py --self-test`
 """
 
@@ -326,7 +344,7 @@ def run_scan(
     staging_file: Path,
     artifact_dir: Path,
     log: Path,
-    assembled_artifact: Path,
+    assembled_artifact: Path | None,
     delete_staging: bool,
     budget_secs: int = DEFAULT_BUDGET_SECS,
 ) -> int:
@@ -350,7 +368,7 @@ def _run_scan_body(
     staging_file: Path,
     artifact_dir: Path,
     log: Path,
-    assembled_artifact: Path,
+    assembled_artifact: Path | None,
     delete_staging: bool,
 ) -> int:
     try:
@@ -382,7 +400,17 @@ def _run_scan_body(
         worst = max(worst, status)
         messages.append(msg)
 
-    for single in (log, assembled_artifact):
+    # `log` is ALWAYS a required carrier (it exists before anything else this
+    # driver does). `assembled_artifact` is required ONLY when the caller
+    # passed one at all (P-A2): `None` means the caller's own run never
+    # claimed to have produced one, so its absence is not itself a finding
+    # -- it is simply not in the required set for this invocation. When it
+    # IS passed, the happy-path strictness is unchanged: missing is
+    # UNEXAMINABLE, never clean.
+    required_singles = [log]
+    if assembled_artifact is not None:
+        required_singles.append(assembled_artifact)
+    for single in required_singles:
         if not (single.exists() or single.is_symlink()):
             worst = max(worst, STATUS_UNEXAMINABLE)
             messages.append(f"{single}: missing")
@@ -426,7 +454,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--staging-file", type=Path)
     ap.add_argument("--artifact-dir", type=Path)
     ap.add_argument("--log", type=Path)
-    ap.add_argument("--assembled-artifact", type=Path)
+    ap.add_argument(
+        "--assembled-artifact",
+        type=Path,
+        default=None,
+        help="P-A2: OPTIONAL -- pass this only when the caller's own run claims to have "
+        "written this file; omit it entirely on a refusal arm that never reached assembly "
+        "(its absence is then not scored, rather than read as UNEXAMINABLE)",
+    )
     ap.add_argument("--delete-staging", action="store_true")
     ap.add_argument(
         "--budget-secs",
@@ -440,13 +475,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return _run_self_test()
 
+    # P-A2: `--assembled-artifact` is intentionally NOT in this required set
+    # -- it is the one carrier a caller may legitimately omit (see its own
+    # --help text and the module doc).
     missing = [
         name
         for name, val in (
             ("--staging-file", args.staging_file),
             ("--artifact-dir", args.artifact_dir),
             ("--log", args.log),
-            ("--assembled-artifact", args.assembled_artifact),
         )
         if val is None
     ]
@@ -581,10 +618,44 @@ class GangIdSecrecyScanTest(unittest.TestCase):
         self.assertIn("missing", out)
 
     def test_missing_assembled_artifact_is_unexaminable_never_clean(self) -> None:
+        # P-A2, the "claimed" case: `self._run()` always passes
+        # `--assembled-artifact` (see `_run` above), i.e. the caller IS
+        # claiming this run produced one -- a missing file at that path
+        # stays UNEXAMINABLE even though the id-carrying content itself is
+        # clean everywhere else. This is the happy-path strictness P-A2
+        # keeps; see the two tests below for the OMITTED-flag case.
         self.assembled.unlink()
         rc, out = self._run()
         self.assertEqual(rc, STATUS_UNEXAMINABLE)
         self.assertIn("missing", out)
+
+    def test_assembled_artifact_omitted_entirely_is_not_required_and_stays_clean(self) -> None:
+        # P-A2, the "never claimed" case: a refusal arm that never reached
+        # assembly (or whose assembly step itself refused and never wrote
+        # anything) passes NO --assembled-artifact at all. Its absence must
+        # not be scored -- an otherwise-clean run stays CLEAN, never
+        # UNEXAMINABLE, purely because a file nobody claimed to produce does
+        # not exist.
+        self.assembled.unlink()
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = run_scan(self.staging, self.artifact_dir, self.log, None, False)
+        self.assertEqual(rc, STATUS_CLEAN, buf_out.getvalue() + buf_err.getvalue())
+
+    def test_assembled_artifact_omitted_but_a_leak_at_that_path_is_still_a_hit(self) -> None:
+        # Omitting --assembled-artifact never widens the scanned surface:
+        # this driver's own ASSEMBLED path always lives INSIDE the pulled
+        # artifact directory, so a stray/leaked file sitting exactly where
+        # the assembled artifact would have gone is still caught by the
+        # directory walk (item 1 of the carrier set), flag or no flag.
+        assembled_inside = self.artifact_dir / "gang-cluster-leaked.json"
+        assembled_inside.write_bytes(self.id_bytes)
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = run_scan(self.staging, self.artifact_dir, self.log, None, False)
+        out = buf_out.getvalue() + buf_err.getvalue()
+        self.assertEqual(rc, STATUS_HIT, out)
+        self.assertIn("raw encoding", out)
 
     def test_unreadable_artifact_file_is_unexaminable(self) -> None:
         if os.geteuid() == 0:

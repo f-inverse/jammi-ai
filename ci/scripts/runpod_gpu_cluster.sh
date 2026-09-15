@@ -66,15 +66,20 @@
 # EVERY exit arm from that point on — the happy path, a failed pull, a
 # refused assembly, an inactivity/wrong-tree/budget cut — the trap runs
 # `ci/scripts/gang_id_secrecy_scan.py` (F5) over every carrier the run has
-# produced so far (the pulled artifact dir, the run log, the assembled
-# artifact when one exists, the staging copy's own directory listing) for
-# the id in every encoding the ship step could emit (raw, hex either case,
-# base64, including a line-wrapped base64 encoding). A scan that is not
-# clean QUARANTINES the whole carrier directory outside the uploaded path
-# (or empties it in place) before this process exits, so
-# `actions/upload-artifact`'s own `if: always()` step can never see an
-# unscanned or dirty byte; the staging copy is deleted on every exit,
-# unconditionally, once the trap has run.
+# produced so far (the pulled artifact dir, the run log, the staging copy's
+# own directory listing, and the assembled artifact — but ONLY when THIS
+# run's own assembly step actually claims to have written one; P-A2: a
+# refusal arm that never reached assembly, or whose assembly step itself
+# refused and wrote nothing, is not penalised for a file it never promised
+# — its clean run.log and rank logs reach the upload step exactly as they
+# are) for the id in every encoding the ship step could emit (raw, hex
+# either case, base64, including a line-wrapped base64 encoding). A scan
+# that is NOT clean DESTROYS the whole carrier directory (moved outside
+# the uploaded path and deleted when this process's own `$RP_WORK` is torn
+# down, or emptied in place when the move itself fails) before this
+# process exits, so `actions/upload-artifact`'s own `if: always()` step
+# can never see an unscanned or dirty byte; the staging copy is deleted on
+# every exit, unconditionally, once the trap has run.
 #
 # THE ARTIFACT: one `gang` artifact (`gang.leg = "cluster"`, `producer.path
 # = "ci/scripts/runpod_gpu_cluster.sh"` — THIS driver names itself as the
@@ -108,8 +113,10 @@
 # member — see F2/F3); 124 budget cut (T-10m, with the per-phase
 # wall-clock breakdown printed); else this driver's own post-run refusal,
 # by name (a failed artifact pull, a failed id-secrecy scan — which also
-# quarantines the carrier directory before this process exits — a missing
-# `ens1` line in a rank's log).
+# DESTROYS the carrier directory before this process exits — a missing
+# `ens1` line in a rank's log). A refusal arm whose scan itself comes back
+# CLEAN (P-A2: no id ever landed anywhere examinable) keeps its own named
+# exit code and its run.log/rank logs at the upload path, unaltered.
 #
 # TRIGGERS: `.github/workflows/gpu-cluster.yml` only — the `run-cluster` PR
 # label and manual dispatch, deliberately no `push:`/`workflow_call:`/
@@ -622,14 +629,18 @@ with open(out_path, "w") as f:
 # Wraps the id-secrecy scan (F5, `gang_id_secrecy_scan.py`) invocation in
 # ONE place so both the real orchestration below and
 # test_gpu_cluster_lane.sh's own fixtures call it identically. $1=staging
-# id file $2=pulled artifact dir $3=run log $4=assembled artifact path.
-# Deletes the staging copy ONLY on a clean (exit 0) scan.
+# id file $2=pulled artifact dir $3=run log $4=assembled artifact path, or
+# the EMPTY STRING (P-A2: the scanner's own `--assembled-artifact` is
+# optional -- pass it only when this run's own assembly step actually
+# claims to have written that file; an empty $4 omits the flag entirely, so
+# a refusal arm that never reached assembly is not penalised for a file it
+# never promised). Deletes the staging copy ONLY on a clean (exit 0) scan.
 _rpc_run_id_secrecy_scan() {
   local staging="${1:?needs the staging id file}" artifact_dir="${2:?needs the artifact dir}" \
-        log="${3:?needs the run log}" assembled="${4:?needs the assembled artifact}"
-  python3 "$DIR/gang_id_secrecy_scan.py" \
-    --staging-file "$staging" --artifact-dir "$artifact_dir" --log "$log" \
-    --assembled-artifact "$assembled" --delete-staging
+        log="${3:?needs the run log}" assembled="${4:-}"
+  local -a scan_args=(--staging-file "$staging" --artifact-dir "$artifact_dir" --log "$log" --delete-staging)
+  [ -n "$assembled" ] && scan_args+=(--assembled-artifact "$assembled")
+  python3 "$DIR/gang_id_secrecy_scan.py" "${scan_args[@]}"
 }
 
 # The first executed run's own record of whether MEMBER SELF-REMOVAL
@@ -655,33 +666,59 @@ _rpc_self_remove_status() {
 # this runner (`id_landed=1`, set the moment the download from the primary
 # is ATTEMPTED -- see the executed block below -- never only on the
 # happy-path tail). Scans the WHOLE carrier directory (F5/M4) via the SAME
-# `_rpc_run_id_secrecy_scan` the happy path already used, and on anything
-# other than a clean scan MOVES the entire carrier directory outside the
-# uploaded path (fail-closed: never a partial or unscanned upload) so
-# `actions/upload-artifact`'s own `if: always()` step can only ever see
-# scanned-clean bytes. Globals read: STAGING_ID_FILE, CLUSTER_ARTIFACT_DIR,
-# RUN_LOG, ASSEMBLED (all set early in the executed block, before any exit
-# arm can fire, so they are stable by the time this runs regardless of
-# which phase the process is exiting from). Returns 0 (clean, or nothing to
-# scan yet) or the scan's own non-zero status (1 hit, 2 unexaminable) for
-# the caller to join into the pending exit code.
-_rpc_scan_or_quarantine() {
+# `_rpc_run_id_secrecy_scan` the happy path already used.
+#
+# P-A2 (absent vs. unexaminable): the assembled artifact is passed to the
+# scan ONLY when `assembly_ok=1` -- set (below, in the executed block)
+# immediately after `_rpc_assemble_gang_artifact` itself returns 0, i.e.
+# this run's own assembly step actually claims to have written a file at
+# `$ASSEMBLED`. On a refusal arm that never reached assembly at all (a
+# failed pull, a wrong-tree/inactivity/budget cut before assembly), or
+# whose assembly step reached this phase and REFUSED (missing/malformed
+# rank reports, an unresolved hostname/iface, a repeated host) and so never
+# wrote anything, `assembly_ok` stays 0 and the scan is called with an
+# EMPTY 4th argument -- the scanner does not require a file nobody
+# promised, so a clean run.log/rank-logs on that arm reads CLEAN, not
+# UNEXAMINABLE, and is never destroyed for lack of a file the run never
+# claimed to produce. `$ASSEMBLED` itself always lives INSIDE
+# `$CLUSTER_ARTIFACT_DIR`, so omitting the flag never widens what gets
+# scanned: a stray/leaked file sitting at that path is still caught by the
+# directory walk `_rpc_run_id_secrecy_scan` already performs.
+#
+# P-A3 (honest wording): a scan that is NOT clean has this driver DESTROY
+# the entire carrier directory before this process exits, never merely
+# "quarantine" it -- the relocation below exists ONLY so the upload step
+# (which starts concurrently with, and could otherwise race, this trap's
+# own deletion) can never see a half-removed directory; the relocation
+# target lives under `$RP_WORK`, which the chained `rp_cleanup` call
+# (below) unconditionally `rm -rf`s before this process exits. A CI runner
+# torn down at process exit is not somewhere a human can later inspect
+# anything, so this IS destruction, and every message below says so.
+#
+# Globals read: STAGING_ID_FILE, CLUSTER_ARTIFACT_DIR, RUN_LOG, ASSEMBLED,
+# assembly_ok (all set early in the executed block, before any exit arm can
+# fire, so they are stable by the time this runs regardless of which phase
+# the process is exiting from). Returns 0 (clean, or nothing to scan yet)
+# or the scan's own non-zero status (1 hit, 2 unexaminable) for the caller
+# to join into the pending exit code.
+_rpc_scan_or_destroy() {
   [ "${id_landed:-0}" = "1" ] || return 0
-  local scan_rc
-  _rpc_run_id_secrecy_scan "$STAGING_ID_FILE" "$CLUSTER_ARTIFACT_DIR" "$RUN_LOG" "$ASSEMBLED"
+  local scan_rc assembled_for_scan=""
+  [ "${assembly_ok:-0}" = "1" ] && assembled_for_scan="$ASSEMBLED"
+  _rpc_run_id_secrecy_scan "$STAGING_ID_FILE" "$CLUSTER_ARTIFACT_DIR" "$RUN_LOG" "$assembled_for_scan"
   scan_rc=$?
   if [ "$scan_rc" -ne 0 ]; then
-    local quarantine_dir="${RP_WORK:-${TMPDIR:-/tmp}}/gpu-cluster-quarantine-$$"
-    if [ -d "$CLUSTER_ARTIFACT_DIR" ] && mv "$CLUSTER_ARTIFACT_DIR" "$quarantine_dir" 2>/dev/null; then
+    local pending_destroy_dir="${RP_WORK:-${TMPDIR:-/tmp}}/gpu-cluster-destroy-$$"
+    if [ -d "$CLUSTER_ARTIFACT_DIR" ] && mv "$CLUSTER_ARTIFACT_DIR" "$pending_destroy_dir" 2>/dev/null; then
       # The relocated directory's own run.log is the SAME open file this
       # process has been tee'ing into (mv preserves the inode) -- this line
       # therefore lands as the run log's own LAST line, never a second,
       # unscanned append to whatever remains (nothing remains) at the
       # uploaded path.
-      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was QUARANTINED to ${quarantine_dir} (outside ${CLUSTER_ARTIFACT_DIR}); the upload step finds nothing there"
+      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was moved to ${pending_destroy_dir} (outside ${CLUSTER_ARTIFACT_DIR}) and WILL BE DESTROYED when this process exits (rp_cleanup rm -rf's \$RP_WORK); the upload step finds nothing there"
     else
       rm -rf "${CLUSTER_ARTIFACT_DIR:?}"/* "${CLUSTER_ARTIFACT_DIR:?}"/.[!.]* 2>/dev/null
-      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory could not be relocated, so it was EMPTIED in place; nothing reaches the upload step"
+      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory could not be relocated, so it was DESTROYED in place; nothing reaches the upload step"
     fi
   fi
   return "$scan_rc"
@@ -716,7 +753,7 @@ _rpc_cleanup_cluster() {
 
   # P-A: no byte reaches the upload unscanned, on EVERY exit arm.
   local scan_rc
-  _rpc_scan_or_quarantine
+  _rpc_scan_or_destroy
   scan_rc=$?
   [ "$scan_rc" -ne 0 ] && [ "$rc" -eq 0 ] && rc="$scan_rc"
 
@@ -747,11 +784,12 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 mkdir -p "$CLUSTER_ARTIFACT_DIR"
 RUN_LOG="$CLUSTER_ARTIFACT_DIR/run.log"
 # P-A: a STABLE path, computed once, here — before the tee even starts —
-# so the EXIT trap's own scan-or-quarantine (`_rpc_scan_or_quarantine`)
-# knows exactly where to look on EVERY exit arm, including one that fires
-# long before assembly is ever reached (the file simply will not exist yet
-# on those arms, which the scanner already reads as UNEXAMINABLE, never
-# clean — see gang_id_secrecy_scan.py's own missing-carrier handling).
+# so the EXIT trap's own scan-or-destroy (`_rpc_scan_or_destroy`) knows
+# exactly where to look on EVERY exit arm, including one that fires long
+# before assembly is ever reached. P-A2: on those arms `assembly_ok` stays
+# 0 (below) and the scanner is never told to require this path at all, so
+# the file simply not existing yet is NOT read as UNEXAMINABLE — see
+# gang_id_secrecy_scan.py's own optional --assembled-artifact handling.
 ASSEMBLED="${CLUSTER_ARTIFACT_DIR}/gang-cluster-$(date -u +%Y%m%d%H%M%S).json"
 # P-A: whether the NCCL id has landed locally on this runner yet (never
 # only "the happy path completed") -- set the moment the download from the
@@ -760,6 +798,12 @@ ASSEMBLED="${CLUSTER_ARTIFACT_DIR}/gang-cluster-$(date -u +%Y%m%d%H%M%S).json"
 # this driver has not yet read the CONTENTS of (only its remote SIZE, via
 # `stat` over ssh), so there is nothing local yet that could carry it.
 id_landed=0
+# P-A2: whether THIS run's own assembly step claims to have written
+# $ASSEMBLED (never "the happy path completed" either -- a `pass` and a
+# recorded `fail` verdict both set this to 1, since `_rpc_assemble_gang_
+# artifact` returns 0 for either; only a refusal that never wrote a file
+# at all leaves this 0). Set immediately after that call, below.
+assembly_ok=0
 exec > >(tee -a "$RUN_LOG") 2>&1   # F6: ONE tee'd stream for every byte this driver emits.
 
 _rpc_phase() { echo "=== PHASE ($(( SECONDS )))s: $* ==="; }
@@ -1003,25 +1047,32 @@ fi
 _rpc_phase "assembling the gang artifact"
 # ASSEMBLED is the STABLE path computed at the very top of this block
 # (before the tee even started) -- never recomputed here, so the EXIT
-# trap's own scan-or-quarantine (which reads the same global) always looks
-# in the place this write actually lands.
+# trap's own scan-or-destroy (which reads the same global) always looks in
+# the place this write actually lands. P-A2: `assembly_ok` is set to 1
+# ONLY on a successful write here -- never on the two refusal arms below,
+# each of which never writes $ASSEMBLED at all -- so the EXIT trap's scan
+# never requires a file that this run did not claim to produce.
 if [ -f "${CLUSTER_ARTIFACT_DIR}/rank-0.json" ] && [ -f "${CLUSTER_ARTIFACT_DIR}/rank-1.json" ]; then
   measured_sha="${PROVE_EXPECT_SHA:-$(git -C . rev-parse HEAD 2>/dev/null || echo unknown)}"
-  _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
+  if _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
     "$measured_sha" "a100-sxm4-cluster" "$ASSEMBLED" \
-    "$MEASURED_POD_COUNT" "$MEASURED_GPU_COUNT_PER_POD" \
-    || { echo "::error::could not assemble the gang artifact" >&2; [ "$rc" -eq 0 ] && rc=1; }
+    "$MEASURED_POD_COUNT" "$MEASURED_GPU_COUNT_PER_POD"; then
+    assembly_ok=1
+  else
+    echo "::error::could not assemble the gang artifact" >&2
+    [ "$rc" -eq 0 ] && rc=1
+  fi
 else
   echo "::error::one or both rank reports were not pulled -- cannot assemble the gang artifact" >&2
   [ "$rc" -eq 0 ] && rc=1
 fi
 
 # P-A: the id-secrecy scan itself now runs from the EXIT trap
-# (`_rpc_scan_or_quarantine`, via `_rpc_cleanup_cluster`) on EVERY exit arm
-# -- including this one, the natural fall-through below -- not only here on
+# (`_rpc_scan_or_destroy`, via `_rpc_cleanup_cluster`) on EVERY exit arm --
+# including this one, the natural fall-through below -- not only here on
 # the happy-path tail. Nothing further to do in THIS phase; the trap reads
-# the same STAGING_ID_FILE/CLUSTER_ARTIFACT_DIR/RUN_LOG/ASSEMBLED globals
-# this block has been populating all along.
+# the same STAGING_ID_FILE/CLUSTER_ARTIFACT_DIR/RUN_LOG/ASSEMBLED/
+# assembly_ok globals this block has been populating all along.
 
 _rpc_phase "billing read (F16)"
 billing_resp="$(_rp_rest GET /v2/billing/clusters)"

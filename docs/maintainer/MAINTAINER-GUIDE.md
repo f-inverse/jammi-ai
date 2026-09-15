@@ -2842,7 +2842,7 @@ the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB poo
 `EngineConfig::default`'s `8192` (`8192 × ~100,000 B ≈ 800 MB`, far larger than the pool
 regardless of partition count or merge shape) — see
 `f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream`
-(`crates/jammi-ai/tests/it/training_set_stream.rs:972`) for the executed numbers. The
+(`crates/jammi-ai/tests/it/training_set_stream.rs:1000`) for the executed numbers. The
 session's `RuntimeEnv` carries a disk-backed `DiskManager` by default, so a sort whose
 in-progress runs exceed the pool spills rather than failing the write. This
 single-partition property is asserted at BOTH `target_partitions ∈ {1, 4}` by
@@ -2891,19 +2891,19 @@ reads the SAME committed order the eager path reads (`read_back_sql`,
 `crates/jammi-ai/src/fine_tune/training_set.rs:74`) but never collects the whole read into
 a `Vec<RecordBatch>`: a background pump walks the DataFusion stream batch by batch,
 decoding ONLY the rows the current step's chunk needs. `RowWindow`
-(`crates/jammi-ai/src/fine_tune/stream.rs:150`) is the `[start, end)` slice a stream serves
+(`crates/jammi-ai/src/fine_tune/stream.rs:151`) is the `[start, end)` slice a stream serves
 — the training prefix `[0, train_count)` or the validation suffix `[train_count, total)`;
-`Slice` (`crates/jammi-ai/src/fine_tune/stream.rs:179`) is which rows WITHIN that window
+`Slice` (`crates/jammi-ai/src/fine_tune/stream.rs:180`) is which rows WITHIN that window
 this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for validation.
-`StreamConfig`'s `new` (`crates/jammi-ai/src/fine_tune/stream.rs:132`) refuses a zero
+`StreamConfig`'s `new` (`crates/jammi-ai/src/fine_tune/stream.rs:133`) refuses a zero
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
-(`crates/jammi-ai/src/fine_tune/stream.rs:119`, `= 2`) — a named constant, the regression
+(`crates/jammi-ai/src/fine_tune/stream.rs:120`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
 `StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:2208`). `open`
-(`crates/jammi-ai/src/fine_tune/stream.rs:377`) runs ONE bounded-memory pre-pass over its
+(`crates/jammi-ai/src/fine_tune/stream.rs:378`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
-rows of training compute; `next_chunk` (`crates/jammi-ai/src/fine_tune/stream.rs:440`) is
+rows of training compute; `next_chunk` (`crates/jammi-ai/src/fine_tune/stream.rs:441`) is
 the blocking call the trainer's per-step loop drives.
 
 **Resident vs Streamed: one predicate.** `whole_set_arm`
@@ -2928,11 +2928,11 @@ carries it), not checked-then-released, so the pool's `reserved()` genuinely ref
 Resident job's residency while it trains. A table whose eager collected size exceeds the
 pool therefore still COMPLETES when it trains through the stream
 (`f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream`,
-`crates/jammi-ai/tests/it/training_set_stream.rs:972`), and the eager collect of that SAME
+`crates/jammi-ai/tests/it/training_set_stream.rs:1000`), and the eager collect of that SAME
 table under the SAME pool still refuses, naming `training_set_eager`
-(`crates/jammi-ai/tests/it/training_set_stream.rs:783`); a Resident job's held reservation
+(`crates/jammi-ai/tests/it/training_set_stream.rs:811`); a Resident job's held reservation
 is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs`
-(`crates/jammi-ai/tests/it/training_set_stream.rs:832`).
+(`crates/jammi-ai/tests/it/training_set_stream.rs:860`).
 
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`

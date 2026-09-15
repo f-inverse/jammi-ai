@@ -226,10 +226,10 @@ preload_models = [
 # spellings, computed once by this process at registration from the same
 # config the store reads: scheme aliases folded by the store's own URL
 # parser (gcs://=gs://, abfss://=azure://), the bucket name lowercased and
-# the key normalised by the store's own key parser, the endpoint/account the
-# store would dial included ([storage.cloud]'s value, else the same env vars
-# its builder reads: AWS_ENDPOINT_URL_S3/AWS_ENDPOINT, AZURE_STORAGE_ACCOUNT_NAME),
-# a local root CREATED
+# the key normalised by the store's own key parser, the location determinants
+# (the endpoint/account/base URL the driver dials) read back from the very
+# builder the store constructs -- environment first, [storage.cloud] on top,
+# every spelling object_store accepts -- a local root CREATED
 # (as the store creates it at open) and canonicalised on this host's
 # filesystem (symlinks, ./.., the filesystem's own spelling). Only members
 # whose identity equals this process's are its gang members. A memory://

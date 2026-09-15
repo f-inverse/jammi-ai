@@ -167,11 +167,12 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   `abfss://`→`azure://`), the bucket name is lowercased and the key goes
   through the store's own key parser (one leading `/` stripped, a trailing
   one dropped, an empty segment refused — keys keep their case), the
-  endpoint or account the store would dial (`[storage.cloud]`'s S3
-  `endpoint`, R2 account/endpoint, Azure `account_name` — or, when the
-  config names none, the same environment variables the store's builder
-  reads: `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT`, `AZURE_STORAGE_ACCOUNT_NAME`)
-  is part of the identity, a local root is created (as the store creates it at open) and
+  location determinants are read back from the very builder the store
+  constructs for that root (`storage::location_determinants`: the process
+  environment first, `[storage.cloud]` on top — the S3/R2 endpoint the
+  driver dials whatever spelling set it, the Azure account, endpoint,
+  emulator and Fabric switches, the GCS base URL; no variable is spelled by
+  the identity itself, so nothing the driver honours can be missed), a local root is created (as the store creates it at open) and
   canonicalised on the owning host's filesystem (symlinks, `.`/`..`, the
   filesystem's own spelling), and an in-memory root is refused at
   registration as unshareable. Two members whose spellings

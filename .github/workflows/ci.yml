@@ -210,6 +210,13 @@ jobs:
       - name: Run tests (test-hooks lane)
         run: cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1
 
+      # The root-identity determinants are read back from the cloud drivers'
+      # own builders (`storage::builder::location_determinants`), which only
+      # exist under the `storage-*` features no other hermetic lane enables;
+      # this runs their oracles with every cloud driver compiled in.
+      - name: Run tests (storage-cloud lane — root-identity determinants)
+        run: cargo test -p jammi-db --features storage-cloud --lib -- catalog::instance storage::builder
+
       # The chmod fault-injection probes above ran as root (this container's
       # default user, per `.docker/ci.Dockerfile`'s missing `USER`), where
       # `JAMMI_REQUIRE_POSIX_PERMS` is deliberately unset: root bypasses

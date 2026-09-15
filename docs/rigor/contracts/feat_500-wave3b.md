@@ -53,14 +53,21 @@ that is never used to root anything:
   store hands its keys to (one leading `/` stripped, a trailing one
   dropped, an empty segment refused exactly as the store refuses it — so
   `s3://b//p` ≡ `s3://b/p` and `s3://b/p//` is no root), then
-  `@{endpoint}` when the store would dial one for that scheme — the
-  `[storage.cloud]` value (S3 `endpoint`, R2 `resolved_endpoint`, Azure
-  `account_name`), else the same environment variables the store's
-  `from_env` builders read (`AWS_ENDPOINT_URL_S3` over `AWS_ENDPOINT`;
-  `AZURE_STORAGE_ACCOUNT_NAME`), config over environment as the builder
-  applies it (the oracle round's finding: the first cut read the config
-  only) — two buckets of one name behind two endpoints or accounts are two
-  locations; local
+  `@{key=value;…}` — the location determinants READ BACK from the very
+  builder the store constructs for that root
+  (`storage::location_determinants`: the process environment via
+  `from_env()` first, `[storage.cloud]` on top, the order `build_*`
+  applies): the S3/R2 endpoint the driver dials (`s3_endpoint` over
+  `endpoint`, whatever spelling set either — `AWS_ENDPOINT_URL`,
+  `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, or the config; for R2 a stray
+  `AWS_ENDPOINT_URL_S3` overrides the configured endpoint in the store and
+  therefore here), the Azure account, endpoint, emulator and Fabric
+  switches, the GCS base URL. The identity spells no variable of its own
+  (the two oracle rounds' finding: a hand-written list drifted from
+  object_store's key table twice), so nothing the driver honours can be
+  missed. In a build without a scheme's storage feature the store cannot
+  dial that scheme at all and there are no determinants — two buckets of
+  one name behind two endpoints or accounts are two locations; local
   roots → the directory is CREATED first (`create_dir_all`, what the store
   does at open, idempotent) and then canonicalised (symlinks, `.`/`..`, the
   filesystem's own spelling — on a case-insensitive filesystem two
@@ -94,7 +101,7 @@ that is never used to root anything:
 | Property | Oracle (all GREEN at this head) |
 |---|---|
 | P-A1 alias / bucket-case fold and the store's own key normalisation on object stores (a key the store refuses is refused; keys the store equates are equated — the store's parser IS the oracle); key case, bucket, backend stay distinct | `catalog::instance::root_identity_tests::object_store_aliases_bucket_case_and_the_stores_key_normalisation_fold`, `::a_key_the_store_refuses_is_refused_and_keys_the_store_equates_are_equated`, `::object_store_key_case_buckets_and_backends_stay_distinct` |
-| P-A1b the endpoint/account the store would dial is part of a cloud identity (two S3 endpoints or two R2 accounts → two identities; one endpoint → one; `gs://` unaffected), whether it comes from `[storage.cloud]` or from the environment the store's builder reads (`AWS_ENDPOINT_URL_S3` over `AWS_ENDPOINT`, `AZURE_STORAGE_ACCOUNT_NAME`; config over env; an empty value is unset) | `::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity`, `::an_environment_sourced_endpoint_or_account_is_part_of_the_identity_config_first` |
+| P-A1b the location determinants the store's builder dials are part of a cloud identity, read back from that builder: every endpoint spelling object_store accepts (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3` — the S3-specific one winning as `build()` dials it), config on top of the environment, an empty value unset; R2's configured endpoint and the stray `AWS_ENDPOINT_URL_S3` override; Azure account, endpoint (both spellings), emulator and Fabric switches; the GCS base URL | `catalog::instance::root_identity_tests::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity`, `::every_endpoint_spelling_the_store_honours_is_part_of_the_identity` (with `--features storage-cloud`); `storage::builder::tests::s3_determinants_honour_every_endpoint_spelling_the_builder_does`, `::r2_determinants_are_the_configured_endpoint_unless_the_s3_env_url_overrides_it`, `::azure_determinants_carry_account_endpoint_emulator_and_fabric_as_the_builder_reads_them`, `::gcs_determinants_carry_the_base_url_the_builder_reads` — run by the new `storage-cloud` step of ci.yml's hermetic job |
 | P-A2 local roots: symlink ≡ target, `.`/`..`, trailing slash, `file://` ≡ bare, relative against cwd; the root is CREATED and its identity is stable afterwards, a case-divergent spelling settles to the on-disk one on a case-insensitive filesystem (two directories on a case-sensitive one); a root that cannot be created (a FILE where a directory is needed) is refused naming it; distinct dirs distinct | `::a_local_root_folds_symlinks_dot_segments_trailing_slashes_and_the_file_scheme`, `::a_local_root_is_created_and_a_case_divergent_spelling_settles_to_the_on_disk_one`, `::a_local_root_that_cannot_be_created_is_refused_naming_it`, `::a_relative_local_root_is_taken_against_the_working_directory`, `::distinct_local_roots_stay_distinct` |
 | P-A3 `memory://` and an unknown scheme refused naming the root | `::a_memory_root_and_an_unknown_scheme_are_refused_naming_the_root`; `config::tests::from_config_refuses_a_memory_result_root_for_a_member_only` (a library config with the same root is untouched; an upper-case scheme is refused on both paths) |
 | P-A4 the row carries the verbatim spelling AND `RootIdentity::of` of it, over every advertising arm | `config::tests::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm`, `::from_config_root_identity_is_of_the_resolved_root_over_every_arm`, `::from_config_never_aliases_gcs_and_gs_result_root_spellings_but_their_identities_are_one`; real sessions: `crates/jammi-ai/tests/it/storage_root.rs::member_row_matches_resolved_root_*` (identity column asserted), `::a_member_with_a_memory_result_root_is_refused_at_session_construction` |

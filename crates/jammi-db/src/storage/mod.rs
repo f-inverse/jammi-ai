@@ -26,6 +26,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub use builder::{build_object_store, DynObjectStore};
+pub use builder::{location_determinants, location_determinants_with, BuilderSeeds};
 pub use config::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 pub use error::StorageError;
 pub use object_store_handle::{DeleteOutcome, JammiObjectStore, ObjectMeta};

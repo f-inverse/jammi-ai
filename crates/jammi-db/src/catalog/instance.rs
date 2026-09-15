@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use super::jobs_repo::WorkerState;
 use crate::error::{JammiError, Result};
-use crate::storage::{Scheme, StorageUrl};
+use crate::storage::{BuilderSeeds, Scheme, StorageUrl};
 
 /// The address a coordinator dials a gang member / segment owner at
 /// (`host:port`, plaintext gRPC — transport encryption is the runtime's,
@@ -142,7 +142,11 @@ impl MemberRoot {
     /// URL parser rejects, a local root with no resolvable ancestor).
     pub fn resolved(config: &crate::config::JammiConfig) -> Result<Self> {
         let root = config.resolved_result_root()?;
-        let identity = RootIdentity::of(&root, config.storage.cloud.as_ref(), &process_env)?;
+        let identity = RootIdentity::of(
+            &root,
+            config.storage.cloud.as_ref(),
+            &BuilderSeeds::from_env(),
+        )?;
         Ok(Self { root, identity })
     }
 
@@ -163,9 +167,12 @@ impl MemberRoot {
     #[cfg(feature = "test-hooks")]
     pub fn new(root: impl Into<String>) -> Self {
         let root = root.into();
-        let identity = RootIdentity::of(&root, None, &process_env).unwrap_or_else(|e| {
-            panic!("the test-only root constructor was given {root:?}, which has no identity: {e}")
-        });
+        let identity =
+            RootIdentity::of(&root, None, &BuilderSeeds::from_env()).unwrap_or_else(|e| {
+                panic!(
+                    "the test-only root constructor was given {root:?}, which has no identity: {e}"
+                )
+            });
         Self { root, identity }
     }
 
@@ -208,14 +215,17 @@ impl std::fmt::Display for MemberRoot {
 ///   leading delimiter stripped, a trailing one dropped, an EMPTY segment
 ///   refused exactly as the store refuses it), so `s3://b//p` and
 ///   `s3://b/p` are one root and `s3://b/p//` is no root at all; then
-///   `@{endpoint}` when the store would dial one for that scheme: the
-///   `[storage.cloud]` value (`S3Config::endpoint`,
-///   `R2Config::resolved_endpoint`, `AzureConfig::account_name`), else the
-///   SAME environment variables the store's builder reads
-///   (`AmazonS3Builder::from_env`: `AWS_ENDPOINT_URL_S3` over
-///   `AWS_ENDPOINT`; `MicrosoftAzureBuilder::from_env`:
-///   `AZURE_STORAGE_ACCOUNT_NAME`), config over environment exactly as the
-///   builder applies it — two buckets of one name behind two endpoints or
+///   `@{key=value;…}` — the LOCATION DETERMINANTS read back from the very
+///   builder the store constructs for that root
+///   ([`crate::storage::location_determinants`]: the process environment
+///   via `from_env()`, `[storage.cloud]` on top, the order `build_*`
+///   applies): the S3/R2 endpoint the driver dials (`s3_endpoint` over
+///   `endpoint`, whatever spelling set either — `AWS_ENDPOINT_URL`,
+///   `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, or the config), the Azure
+///   account, endpoint, emulator and Fabric switches, the GCS base URL.
+///   Nothing here spells a variable of its own, so a spelling object_store
+///   accepts can never be one the identity misses. Two buckets of one name
+///   behind two endpoints or
 ///   accounts are two locations. Bucket and container names
 ///   are case-insensitive by their services' rules; object keys are not.
 ///   `r2://` and `s3://` stay distinct — different endpoints even when the
@@ -253,7 +263,7 @@ impl RootIdentity {
     pub(crate) fn of(
         root: &str,
         cloud: Option<&crate::storage::CloudConfig>,
-        env: &dyn Fn(&str) -> Option<String>,
+        seeds: &BuilderSeeds,
     ) -> Result<Self> {
         let url = StorageUrl::parse(root).map_err(|e| {
             JammiError::Config(format!(
@@ -288,9 +298,22 @@ impl RootIdentity {
                 } else {
                     format!("{scheme}://{bucket}/{}", key.as_ref())
                 };
-                if let Some(endpoint) = endpoint_of(scheme, cloud, env) {
+                let determinants = crate::storage::location_determinants_with(&url, cloud, seeds)
+                    .map_err(|e| {
+                    JammiError::Config(format!(
+                        "result root '{root}' has no identity — the store's own builder \
+                             rejects it: {e}"
+                    ))
+                })?;
+                if !determinants.is_empty() {
                     identity.push('@');
-                    identity.push_str(&endpoint);
+                    identity.push_str(
+                        &determinants
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(";"),
+                    );
                 }
                 Ok(Self(identity))
             }
@@ -307,58 +330,6 @@ impl std::fmt::Display for RootIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-/// The endpoint or account the store would dial for `scheme` — the part of
-/// a bucket's identity its name alone does not carry — resolved the way the
-/// store's own builder resolves it (`crate::storage::builder`): the
-/// `[storage.cloud]` value when set, else the environment variables
-/// `object_store`'s `from_env` reads (`AWS_ENDPOINT_URL_S3` over
-/// `AWS_ENDPOINT`; `AZURE_STORAGE_ACCOUNT_NAME`); `None` for a scheme whose
-/// namespace is global (`gs://`) or when neither names anything (the
-/// service's default endpoint). `env` is the lookup — the process
-/// environment in production ([`process_env`]), a fixed map in tests.
-fn endpoint_of(
-    scheme: Scheme,
-    cloud: Option<&crate::storage::CloudConfig>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    use crate::storage::CloudConfig;
-    let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
-    match scheme {
-        Scheme::S3 => {
-            let configured = match cloud {
-                Some(CloudConfig::S3(s3)) => s3.endpoint.clone(),
-                _ => None,
-            };
-            non_empty(configured)
-                .or_else(|| non_empty(env("AWS_ENDPOINT_URL_S3")))
-                .or_else(|| non_empty(env("AWS_ENDPOINT")))
-        }
-        Scheme::R2 => match cloud {
-            // R2 config is mandatory for the store (its builder refuses to
-            // build without it), and `resolved_endpoint` always yields one.
-            Some(CloudConfig::R2(r2)) => r2.resolved_endpoint(),
-            _ => None,
-        },
-        Scheme::Azure => {
-            let configured = match cloud {
-                Some(CloudConfig::Azure(azure)) => azure.account_name.clone(),
-                _ => None,
-            };
-            non_empty(configured).or_else(|| non_empty(env("AZURE_STORAGE_ACCOUNT_NAME")))
-        }
-        // `gs://`'s one global namespace; local and in-memory roots never
-        // reach here.
-        Scheme::Gcs | Scheme::File | Scheme::Memory => None,
-    }
-}
-
-/// The production environment lookup for [`RootIdentity`]: the process's
-/// own variables, exactly what the store's `from_env` builders read in the
-/// same process.
-fn process_env(key: &str) -> Option<String> {
-    std::env::var(key).ok()
 }
 
 /// The local-root rule of [`RootIdentity`]: create, then canonicalise.
@@ -693,16 +664,16 @@ mod root_identity_tests {
     //! refused here.
 
     use super::RootIdentity;
-    use crate::storage::{CloudConfig, R2Config, S3Config};
+    use crate::storage::{BuilderSeeds, CloudConfig, R2Config};
 
-    /// No `[storage.cloud]` section and an EMPTY environment: the
-    /// derivation never reads the test process's real variables.
-    fn no_env(_: &str) -> Option<String> {
-        None
+    /// An EMPTY environment: the derivation never reads the test process's
+    /// real variables (`BuilderSeeds::from_vars` over nothing).
+    fn no_env() -> BuilderSeeds {
+        BuilderSeeds::from_vars(std::iter::empty::<(&str, &str)>())
     }
 
     fn id(root: &str) -> String {
-        RootIdentity::of(root, None, &no_env)
+        RootIdentity::of(root, None, &no_env())
             .unwrap()
             .as_str()
             .to_string()
@@ -737,7 +708,7 @@ mod root_identity_tests {
         ] {
             let key = spelling.trim_start_matches("s3://bucket/");
             let store = object_store::path::Path::parse(key);
-            match (store, RootIdentity::of(spelling, None, &no_env)) {
+            match (store, RootIdentity::of(spelling, None, &no_env())) {
                 (Ok(k), Ok(identity)) => assert_eq!(
                     identity.as_str(),
                     format!("s3://bucket/{}", k.as_ref()),
@@ -755,7 +726,18 @@ mod root_identity_tests {
     fn object_store_key_case_buckets_and_backends_stay_distinct() {
         assert_ne!(id("s3://bucket/Prefix"), id("s3://bucket/prefix"));
         assert_ne!(id("s3://a/prefix"), id("s3://b/prefix"));
-        assert_ne!(id("r2://bucket/prefix"), id("s3://bucket/prefix"));
+        // R2 is the S3 driver at an account endpoint: the store refuses an
+        // r2:// root with no R2 config (and so does the identity, in a build
+        // with the driver); with one, it is a different location from the
+        // same-named S3 bucket.
+        let r2 = CloudConfig::R2(R2Config {
+            account_id: Some("acct".to_string()),
+            ..R2Config::default()
+        });
+        assert_ne!(
+            RootIdentity::of("r2://bucket/prefix", Some(&r2), &no_env()).unwrap(),
+            RootIdentity::of("s3://bucket/prefix", None, &no_env()).unwrap()
+        );
         assert_ne!(id("gs://bucket/prefix"), id("s3://bucket/prefix"));
         assert_ne!(id("s3://bucket/prefix"), id("s3://bucket/prefix/deeper"));
     }
@@ -763,8 +745,12 @@ mod root_identity_tests {
     /// Two buckets of one name behind two endpoints (or two R2 accounts, or
     /// two Azure accounts) are two locations; one endpoint is one location;
     /// `gs://` has one global namespace and no endpoint in its identity.
+    /// Needs the drivers compiled in: without them the store cannot dial the
+    /// scheme and there are no determinants to differ on.
+    #[cfg(all(feature = "storage-s3", feature = "storage-r2"))]
     #[test]
     fn the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity() {
+        use crate::storage::S3Config;
         let s3 = |endpoint: Option<&str>| {
             CloudConfig::S3(S3Config {
                 endpoint: endpoint.map(str::to_string),
@@ -774,7 +760,7 @@ mod root_identity_tests {
         let a = s3(Some("https://minio-a.local:9000"));
         let b = s3(Some("https://minio-b.local:9000"));
         let with = |cloud: &CloudConfig| {
-            RootIdentity::of("s3://bucket/prefix", Some(cloud), &no_env)
+            RootIdentity::of("s3://bucket/prefix", Some(cloud), &no_env())
                 .unwrap()
                 .as_str()
                 .to_string()
@@ -794,11 +780,11 @@ mod root_identity_tests {
             })
         };
         assert_ne!(
-            RootIdentity::of("r2://bucket/prefix", Some(&r2("acct-a")), &no_env).unwrap(),
-            RootIdentity::of("r2://bucket/prefix", Some(&r2("acct-b")), &no_env).unwrap()
+            RootIdentity::of("r2://bucket/prefix", Some(&r2("acct-a")), &no_env()).unwrap(),
+            RootIdentity::of("r2://bucket/prefix", Some(&r2("acct-b")), &no_env()).unwrap()
         );
         assert_eq!(
-            RootIdentity::of("gs://bucket/prefix", Some(&a), &no_env)
+            RootIdentity::of("gs://bucket/prefix", Some(&a), &no_env())
                 .unwrap()
                 .as_str(),
             id("gs://bucket/prefix")
@@ -807,11 +793,11 @@ mod root_identity_tests {
 
     #[test]
     fn a_memory_root_and_an_unknown_scheme_are_refused_naming_the_root() {
-        let err = RootIdentity::of("memory://x", None, &no_env)
+        let err = RootIdentity::of("memory://x", None, &no_env())
             .unwrap_err()
             .to_string();
         assert!(err.contains("memory://x") && err.contains("peer"), "{err}");
-        let err = RootIdentity::of("bogus://x", None, &no_env)
+        let err = RootIdentity::of("bogus://x", None, &no_env())
             .unwrap_err()
             .to_string();
         assert!(err.contains("bogus://x"), "{err}");
@@ -885,7 +871,7 @@ mod root_identity_tests {
         std::fs::write(&file, b"x").unwrap();
         let root = file.join("jammi_db");
         let root_s = root.to_str().unwrap();
-        let err = RootIdentity::of(root_s, None, &no_env)
+        let err = RootIdentity::of(root_s, None, &no_env())
             .unwrap_err()
             .to_string();
         assert!(
@@ -906,66 +892,88 @@ mod root_identity_tests {
         assert_eq!(id(&format!("./{rel_s}")), expected);
     }
 
-    /// The store's builder takes its S3 endpoint and Azure account from the
-    /// ENVIRONMENT when the config names none (`AmazonS3Builder::from_env`:
-    /// `AWS_ENDPOINT_URL_S3` over `AWS_ENDPOINT`; `MicrosoftAzureBuilder::
-    /// from_env`: `AZURE_STORAGE_ACCOUNT_NAME`), config over environment —
-    /// so does the identity, through the same lookup.
+    /// The determinants come from the builder the store constructs, so every
+    /// spelling object_store accepts in the environment is part of the
+    /// identity — `AWS_ENDPOINT_URL` (this repo's documented variable),
+    /// `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, the Azure account/endpoint,
+    /// the GCS base URL — config on top, exactly as the builder applies it.
+    /// The environment is an explicit variable set here, never the process's.
+    #[cfg(all(
+        feature = "storage-s3",
+        feature = "storage-azure",
+        feature = "storage-gcs"
+    ))]
     #[test]
-    fn an_environment_sourced_endpoint_or_account_is_part_of_the_identity_config_first() {
-        let env_a = |k: &str| match k {
-            "AWS_ENDPOINT_URL_S3" => Some("https://minio-a.local:9000".to_string()),
-            "AWS_ENDPOINT" => Some("https://ignored.local".to_string()),
-            "AZURE_STORAGE_ACCOUNT_NAME" => Some("acct-a".to_string()),
-            _ => None,
+    fn every_endpoint_spelling_the_store_honours_is_part_of_the_identity() {
+        use crate::storage::S3Config;
+        let seeds = |vars: &[(&str, &str)]| BuilderSeeds::from_vars(vars.iter().copied());
+        let s3 = |vars: &[(&str, &str)]| {
+            RootIdentity::of("s3://bucket/prefix", None, &seeds(vars))
+                .unwrap()
+                .as_str()
+                .to_string()
         };
-        let env_b = |k: &str| match k {
-            "AWS_ENDPOINT" => Some("https://minio-b.local:9000".to_string()),
-            "AZURE_STORAGE_ACCOUNT_NAME" => Some("acct-b".to_string()),
-            _ => None,
-        };
-        let s3 = |env: &dyn Fn(&str) -> Option<String>| {
-            RootIdentity::of("s3://bucket/prefix", None, env)
+        let default = s3(&[]);
+        for spelling in ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_ENDPOINT_URL_S3"] {
+            let with = s3(&[(spelling, "https://minio-a.local:9000")]);
+            assert_ne!(
+                with, default,
+                "{spelling}: an endpoint vs the service default"
+            );
+            assert!(
+                with.ends_with("@endpoint=https://minio-a.local:9000"),
+                "{spelling}: {with}"
+            );
+        }
+        assert_ne!(
+            s3(&[("AWS_ENDPOINT_URL", "https://minio-a.local:9000")]),
+            s3(&[("AWS_ENDPOINT_URL", "https://minio-b.local:9000")]),
+            "two endpoints: two locations"
+        );
+        // Config on top of the environment, as the builder applies it.
+        let configured = CloudConfig::S3(S3Config {
+            endpoint: Some("https://minio-cfg.local:9000".to_string()),
+            ..S3Config::default()
+        });
+        assert!(RootIdentity::of(
+            "s3://bucket/prefix",
+            Some(&configured),
+            &seeds(&[("AWS_ENDPOINT_URL", "https://minio-env")])
+        )
+        .unwrap()
+        .as_str()
+        .ends_with("@endpoint=https://minio-cfg.local:9000"));
+        let azure = |vars: &[(&str, &str)]| {
+            RootIdentity::of("azure://container/prefix", None, &seeds(vars))
                 .unwrap()
                 .as_str()
                 .to_string()
         };
         assert_ne!(
-            s3(&env_a),
-            s3(&no_env),
-            "an env endpoint vs the service default"
+            azure(&[("AZURE_STORAGE_ACCOUNT_NAME", "acct-a")]),
+            azure(&[("AZURE_STORAGE_ACCOUNT_NAME", "acct-b")])
         );
-        assert_ne!(s3(&env_a), s3(&env_b), "two env endpoints: two locations");
-        assert!(
-            s3(&env_a).ends_with("@https://minio-a.local:9000"),
-            "URL_S3 wins over AWS_ENDPOINT"
+        assert_ne!(
+            azure(&[("AZURE_STORAGE_ACCOUNT_NAME", "acct-a")]),
+            azure(&[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "acct-a"),
+                ("AZURE_STORAGE_ENDPOINT", "https://blob.local")
+            ]),
+            "an endpoint override is a different location"
         );
-        assert!(
-            s3(&env_b).ends_with("@https://minio-b.local:9000"),
-            "AWS_ENDPOINT alone counts"
-        );
-        // Config over environment, exactly as the builder applies it.
-        let configured = CloudConfig::S3(S3Config {
-            endpoint: Some("https://minio-cfg.local:9000".to_string()),
-            ..S3Config::default()
-        });
-        assert!(
-            RootIdentity::of("s3://bucket/prefix", Some(&configured), &env_a)
-                .unwrap()
-                .as_str()
-                .ends_with("@https://minio-cfg.local:9000")
-        );
-        let azure = |env: &dyn Fn(&str) -> Option<String>| {
-            RootIdentity::of("azure://container/prefix", None, env)
+        let gs = |vars: &[(&str, &str)]| {
+            RootIdentity::of("gs://bucket/prefix", None, &seeds(vars))
                 .unwrap()
                 .as_str()
                 .to_string()
         };
-        assert_ne!(azure(&env_a), azure(&env_b));
-        assert!(azure(&env_a).ends_with("@acct-a"));
-        // An empty value is "unset", as the builder treats it.
-        let empty = |k: &str| (k == "AWS_ENDPOINT").then(String::new);
-        assert_eq!(s3(&empty), s3(&no_env));
+        assert_ne!(
+            gs(&[]),
+            gs(&[("GOOGLE_BASE_URL", "http://fake-gcs:4443")]),
+            "a repointed GCS"
+        );
+        // An empty value is unset, as the builder treats it.
+        assert_eq!(s3(&[("AWS_ENDPOINT", "")]), default);
     }
 
     #[test]

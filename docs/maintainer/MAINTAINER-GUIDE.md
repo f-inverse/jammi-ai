@@ -1739,11 +1739,29 @@ three things to the artifact's content digest:
 3. **Producing-run identity + instant** (`produced_by` / `produced_at`, provenance only,
    never the anchor).
 
+Beside the digest — never in place of it — the manifest carries a **keyed leaf
+inventory** (`leaves: Vec<LeafDigest>`, `LeafKey`, `crates/jammi-db/src/store/manifest.rs`;
+plan 67 unit U5b-0): for a result table one leaf per Parquet row group, keyed by its
+index and byte range as the footer locates it (`parquet_leaves`, the SHA-256 of exactly
+that range); for a model bundle one leaf per file keyed by NAME (the bundle manifest's own
+sha256, so adding a file changes no existing leaf and `combined_hash` stays the bundle's
+content address). The inventory is what a peer verifies ONE partition against without
+reading the rest. It is additive: `artifact` stays the whole-object digest, the in-toto
+subject, the root of the version-identity chain, and what a verifier holding the bytes
+recomputes; bytes outside every row group (footer, page index, bloom filters) belong to
+no leaf and are the whole-object digest's to catch.
+
 `MANIFEST_VERSION = 3` (`crates/jammi-db/src/store/manifest.rs`); a version mismatch or a
 serde-shape mismatch is a typed `ManifestError`, never a silently-trusted stale hash
-(`Manifest::from_json_bytes`). The descriptor is kept **verbatim** in the manifest (not
-just the opaque hash) precisely so a reader can *replay* it — that is what the recompute
-path reads.
+(`Manifest::from_json_bytes`). One shape rejection is named on its own: an object at the
+current version with no `leaves` — a sidecar written before the inventory existed —
+is `ManifestError::PreLeavesSidecar`, and `ResultStore::read_materialization_manifest`
+reads exactly that as ABSENT (the pre-contract case every reader already handles: a
+verify says `MissingManifest`, an anchor recomputes from the bytes, a cache probe misses
+and re-materialises); a newer version or a corrupt body stays the error it is, so an
+older binary never re-materialises over a newer engine's table. The descriptor is kept
+**verbatim** in the manifest (not just the opaque hash) precisely so a reader can
+*replay* it — that is what the recompute path reads.
 
 #### verify_materialization — the read-only verb, four verdicts
 
@@ -1765,9 +1783,20 @@ is the consumer's policy. The verdict attests the Parquet **data**, never the AN
   *fully* asserted; it names the unpinned inputs (`unpinned_inputs`). **This is the
   honest verdict for the as-of training set itself** — its inputs are registered file
   sources.
-- **`MissingManifest`** — no sidecar (a pre-contract table). A truthful unknown, never a
-  fabricated match — distinct from a post-contract table that *should* carry one (a torn
-  write recovery reconciles).
+- **`MissingManifest`** — no sidecar (a pre-contract table, or a pre-`leaves` sidecar).
+  A truthful unknown, never a fabricated match — distinct from a post-contract table
+  that *should* carry one (a torn write recovery reconciles).
+
+#### verify_partitions — the per-partition verb
+
+`ResultStore::verify_partitions` (`crates/jammi-db/src/store/mod.rs`) recomputes every
+leaf of the inventory from the bytes and the footer and compares each to the recorded
+one by key, returning a `PartitionVerdict` (`crates/jammi-db/src/store/manifest.rs`):
+`Match`; `Mismatch { key, expected, found }` naming the FIRST row group whose bytes are
+not the attested ones; `InventoryDiffers { expected, found }` when the footer's row-group
+set is not the recorded one; `MissingManifest` as above. It attests the parts, never the
+whole — a footer-only mutation changes no leaf and is `verify_materialization`'s to
+report. Read-only, like its sibling: it never acts on a verdict.
 
 **Call graph — LIVE:** `Session::verify_materialization`
 (`crates/jammi-ai/src/local_session.rs`) → gRPC

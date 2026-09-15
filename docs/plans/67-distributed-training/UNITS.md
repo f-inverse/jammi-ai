@@ -654,18 +654,31 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ### U5b-0 — Partitioned attestation inventory (PR-C, new db unit)
 
 - **files_in_scope** (db): `store/manifest.rs` (`MaterializationManifest` gains `leaves:
-  Vec<LeafDigest { row_group: u32, digest: ArtifactDigest }>`; `manifest.artifact` becomes the
-  FOLD over `leaves` in row-group order — never a second, independently-computed whole-artifact
-  digest; `MANIFEST_VERSION` bump), the training-set materialization writer (one leaf per row
-  group, written as each row group is written), the freshness/probe readers that consume
-  `MaterializationManifest` (an old sidecar with no `leaves` field is a CACHE MISS —
-  re-materialize — never a whole-artifact read accepted in its place).
+  Vec<LeafDigest { key: LeafKey, digest: ArtifactDigest }>`, `LeafKey::RowGroup { index, offset,
+  length }` for a result table, `LeafKey::File { name }` for a model bundle — a KEYED inventory,
+  ADDITIVE to `manifest.artifact`, which stays the whole-object digest), the attestation writer
+  (`write_attestation`: `parquet_leaves` over the written object's footer; `write_model_
+  materialization`: one leaf per bundle file by name), `read_materialization_manifest` (a
+  sidecar at the current version with no `leaves` — written before the inventory existed — is
+  `PreLeavesSidecar` and reads as ABSENT: re-materialize, never a whole-artifact read accepted
+  in its place; a newer version or a corrupt body stays an error), and the new
+  `verify_partitions` verb naming the first divergent leaf. Dated correction, 2026-09-15
+  (contract `feat_500-wave3b` §4, the pressure round): the first design — `artifact` as the
+  FOLD over the leaves plus a `MANIFEST_VERSION` bump — was withdrawn before code: `artifact`
+  is the base of the version-identity chain (`store/version.rs`), `verify_materialization`
+  reuses it as the base fragment's digest, and row groups do not partition a Parquet file
+  (footer, page index, bloom filters belong to no leaf), so a fold would have moved every
+  downstream anchor and weakened the subject. No version bump: a required field is rejected
+  serde-first, and the number is reserved for a determinant-set change.
 - **invariants_to_preserve**: K5 (append-only manifest shape), B6.
-- **acceptance**: (a) leaf count == row-group count, asserted via a pyarrow/parquet metadata
-  oracle over a fixture with N row groups (RED at base: no `leaves` field exists); (b)
-  `manifest.artifact` == the stated fold of `leaves`, recomputed independently by the test; (c)
-  an old-format sidecar round-trips through the freshness/probe reader as a MISS, never a hit
-  that treats the whole artifact as one leaf.
+- **acceptance** (as shipped): (a) leaf count == the footer's row-group count, read
+  independently by the test with the `parquet` crate (`store::manifest::tests::leaves`, a
+  three-row-group object; `tests/it/materialization.rs` through the funnel); (b) each leaf's
+  digest == the SHA-256 over the byte range the test reads from the footer itself; (c) a byte
+  flipped inside row group k changes leaf k and no other, and `verify_partitions` names it,
+  while a footer-only mutation changes no leaf and is reported by `verify_materialization`;
+  (d) a pre-`leaves` sidecar reads as absent on both verbs and a newer version stays an error;
+  (e) a model bundle's leaves are its files by name and adding a file changes no existing leaf.
 - **lane**: hermetic. **depends_on**: none; base `main` after PR-B2. **size**: S. U5b-1b-i
   depends_on this unit (its per-partition verify reads the leaf inventory); U5a-1's own
   admission-time sidecar VERIFY is unaffected — it stays whole-artifact/admission-time-only.

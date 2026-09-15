@@ -117,7 +117,7 @@ the same arm the ENOTDIR oracle exercises but has no oracle of its own
 paths). Postgres arms ran against a local PostgreSQL 16 in the CI lane's
 shape (§6).
 
-## 4. U5b-0 — design and oracles (stated BEFORE the code; rewritten on the pressure round)
+## 4. U5b-0 — design and oracles (stated before the code, rewritten on the pressure round; BUILT)
 
 The first cut folded the leaves INTO `artifact`. The pressure round showed
 that to be wrong at the root: `manifest.artifact` is the base of the
@@ -156,18 +156,25 @@ change no leaf). So:
   `verify_partitions(&record) -> PartitionVerdict` recomputes every leaf
   from the bytes and the footer and names the first divergent leaf.
 
-| Property | Oracle (to be written RED first, then GREEN) |
+| Property | Oracle (GREEN at this head) |
 |---|---|
-| P-B1 leaf count == the footer's row-group count, read independently by the test with the `parquet` crate over a multi-row-group fixture | `tests/it/materialization.rs::leaf_count_equals_the_footer_row_group_count` |
-| P-B2 each leaf's digest == SHA-256 over the byte range the test reads from the footer itself (`ColumnChunkMetaData::byte_range`), not from the leaf | `::each_leaf_digest_is_the_footers_byte_range_digest` |
-| P-B3 a sidecar without `leaves` reads as `Ok(None)` and `verify_materialization` says `MissingManifest`; a sidecar with a NEWER `manifest_version` is an error, never a miss | `::a_pre_leaves_sidecar_is_a_miss_and_a_newer_version_is_an_error` |
-| P-B4 flipping one byte inside row group k changes leaf k's digest and no other leaf's, and `verify_partitions` names leaf k; a FOOTER-only mutation changes no leaf but `verify_materialization` still reports `Mismatch` (the whole-object digest is the subject) | `::a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the_artifact` |
-| P-B5 a model bundle's leaves are its files by name and `artifact` is still `Manifest::combined_hash`; adding a file changes no existing leaf | `store::artifact` tests `::a_model_bundle_attests_one_leaf_per_file_by_name` |
+| P-B1 leaf count == the footer's row-group count, read independently by the test with the `parquet` crate — over a three-row-group object at the unit level, and through the funnel on a real table | `store::manifest::tests::leaves::one_leaf_per_row_group_in_footer_order_each_the_footers_byte_range_digest`; `tests/it/materialization.rs::the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches` (sqlite + postgres) |
+| P-B2 each leaf's digest == SHA-256 over the byte range the test reads from the footer itself (`ColumnChunkMetaData::byte_range`), not from the leaf | the same unit oracle (the footer is read by the test, the leaf compared to it) |
+| P-B3 a sidecar without `leaves` at the current version is `PreLeavesSidecar`, reads as `Ok(None)`, and both verbs say `MissingManifest`; a NEWER version is an error, never a miss; garbage stays a serde error | `store::manifest::tests::leaves::a_pre_leaves_sidecar_is_a_typed_pre_leaves_rejection_and_nothing_else_is`; `tests/it/materialization.rs::a_pre_leaves_sidecar_reads_as_absent_on_both_verbs` |
+| P-B4 a byte flipped inside row group k changes leaf k and no other, and `verify_partitions` names leaf k; a FOOTER-only mutation changes no leaf while `verify_materialization` reports `Mismatch` (the whole-object digest is the subject) | `store::manifest::tests::leaves::a_byte_flipped_inside_row_group_k_changes_leaf_k_only_and_a_footer_flip_changes_no_leaf`; `tests/it/materialization.rs::a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the_artifact` |
+| P-B5 a model bundle's leaves are its files by name with the bundle manifest's own sha256, `artifact` is still `combined_hash`, and a bundle with one more file carries every existing leaf unchanged | `store::artifact::tests::write_model_materialization_round_trips_and_folds_the_bundle_digest` |
 
-Mutations to execute before closing: make the writer emit ONE leaf for the
-whole file → P-B1 and P-B4 go red; key bundle leaves by position → P-B5's
-add-a-file arm goes red; map a version rejection to a miss → P-B3's second
-arm goes red.
+**Mutations (executed, each restored).** The writer emitting ONE leaf for
+the whole file: P-B1 and P-B4's unit oracles red, P-B3 green (as it should
+be — it does not depend on the walk). Bundle leaves keyed by position: P-B5
+red. A version rejection mapped to a miss: P-B3 red. Every oracle green
+again after the restore.
+
+**What the oracles exclude.** A Parquet object whose footer is unreadable
+(the walk refuses with `ParquetFooter`; `verify_partitions` propagates it —
+the footer-mutation arm accepts either `Match` or that error, since a bit
+flip in the metadata may or may not break its decoding). Page indexes and
+bloom filters are covered only by the whole-object digest, by design.
 
 ## 5. Also on this branch
 

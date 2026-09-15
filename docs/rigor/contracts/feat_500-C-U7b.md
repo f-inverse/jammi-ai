@@ -19,9 +19,10 @@ actually exercised. Every citation below is instead the bare `path:line` (or `pa
 form that checker's own regex matches, tagged `(at <sha>)`, re-derived by direct read against
 THIS tree AFTER every fix below landed — the last thing done before this file was written.
 
-Owner: **docs-ci** (fix round 1, dispatched after the c4 revision's closing BLOCK). Commit
-history on this branch, oldest first, below the `main` merge (`git log --format='%h %s'
-main..HEAD`, ten commits, the c1-c4 owners' own units plus one ai-core fix landed after c4):
+Owner: **docs-ci** (fix round 1, dispatched after the c4 revision's closing BLOCK; fix round 2,
+this revision, dispatched after round 1's own closing adversarial audit BLOCKed on five findings
+on round 1's own new surfaces). Commit history on this branch, oldest first, below the `main`
+merge (`git log --format='%h %s' main..HEAD`, re-derived AFTER round 2's own fix commit landed):
 
 ```
 467dd9c9 test(ai): #500 U7b — the two-host NCCL smoke: rank 0 mints the id to a file, ...
@@ -33,16 +34,37 @@ dbadfdbf ci(cluster): #500 U7b c3 -- P8 schedule visibility, RENTING_ROOTS, and 
 d2497c42 ci(cluster): #500 U7b c3 -- record cluster-self-remove: ok|refused on the EXIT trap
 ed2e7c3c docs: #500 U7b -- the cluster leg's contract of record and the plan's current-state notes
 1480cacb test(ai): #500 U7b — the two-host test's skips are dominated by registered ... (KO-7)
-d12e1689 test(ai): #500 U7b — a missing hostname or NCCL iface is a fail verdict, never ...
+c23049f9 merge: main (#571 R12 lead gate) into feat/500-C-U7b
+b480f2dc test(ai): #500 U7b — a missing hostname or NCCL iface is a fail verdict, never ...
+31c8aa64 fix(ci): #500 U7b — the cluster driver initialises its SSH state and chains the ...
+f30813e2 fix(ci): #500 U7b — every exit scans before anything can be uploaded; the scan's ...
 ```
 
-(`c23049f9`, a `main` merge, sits between `ed2e7c3c` and `1480cacb` in the branch's actual
-commit graph — omitted from the list above since it carries no U7b content of its own.) This fix
-round lands as an eleventh commit, by pathspec, atop `d12e1689`; every citation to a file this
-round touched is tagged `(at HEAD)` — the fix commit's own tree, which this contract is
-committed inside — rather than a sha that does not exist until that commit lands. Every citation
-to a file this round did NOT touch is tagged at the sha that last touched it, per `git log -1
---format=%h -- <path>` against this same tree.
+**Correction (round 2):** round 1's own contract text (below, §2-§13, unchanged in substance
+except where explicitly marked "round 2") named the ninth commit `d12e1689` and placed the
+`c23049f9` merge between `ed2e7c3c` and `1480cacb`. Neither is accurate against this branch's
+real history: `d12e1689` does not exist on this branch (that commit's own content — "a missing
+hostname or NCCL iface is a fail verdict, never ... " — landed as `b480f2dc` instead, a distinct
+sha under a rebase this round did not itself perform but must cite correctly); every prior
+citation tagged `d12e1689` is corrected to `b480f2dc` below (5 sites: §2 F4's closing parenthetical,
+§3's own heading and body, §9's first bullet). `c23049f9` in fact sits between `1480cacb` and
+`b480f2dc` in the list above, not between `ed2e7c3c` and `1480cacb`. `b480f2dc`'s own diff
+(`git show --stat b480f2dc`) touches exactly one file, `crates/jammi-ai/tests/gpu_capability/gang_nccl.rs`
+(189 insertions, 19 deletions) — §3's own "unchanged by this fix round" heading is corrected below
+to name what actually changed, since a file round 1 did not itself touch can still have moved
+between the commit round 1's own contract was written against and this branch's real tip.
+
+Round 1's own fix (§2-§13 below) landed as `31c8aa64`, combining the code fix and this contract's
+own prior revision in one commit — every citation there tagged `(at HEAD)` refers to `31c8aa64`'s
+own tree. Round 2's own fix (§2b below) landed as `f30813e2`, atop `31c8aa64`; every citation
+there tagged `(at HEAD)` refers to `f30813e2`'s own tree — the tree THIS contract revision is
+committed against, and the LAST commit on the branch once this file's own commit lands. Every
+`(at HEAD)` citation inherited from round 1, for a file round 2 also touched, is RE-DERIVED below
+against `f30813e2`'s tree (line numbers moved); a citation to a file round 2 did not touch keeps
+round 1's own `(at HEAD)` tag unless flagged otherwise, since `31c8aa64`'s tree for that file IS
+still `f30813e2`'s tree (untouched files carry forward byte-for-byte). Every citation to a file
+neither round touched is tagged at the sha that last touched it, per `git log -1 --format=%h --
+<path>` against this same tree.
 
 ## 0. What this unit is, in one paragraph
 
@@ -70,7 +92,8 @@ in what has been verified about RunPod's own API surface, not a gap in the drive
 
 Until that pre-flight runs, this unit's actual guard is the driver's own LAUNCH-TIME READ-BACK
 refusal, never an independent confirmation that the mechanism works: `_rpc_check_readback`
-(`ci/scripts/runpod_gpu_cluster.sh:258-296` at HEAD) reads `GET /v2/clusters/{id}/pods` after
+(`ci/scripts/runpod_gpu_cluster.sh:276-309` at HEAD, moved from round 1's `258-296` by round 2's
+own header/P-C growth above this point) reads `GET /v2/clusters/{id}/pods` after
 create and refuses (exit 97) the moment either (a) a member's own `Pod.args` does not contain the
 exact entrypoint text this driver sent, or (b) neither `ssh.direct` nor a usable overlay `ip` is
 present for it. This is a REFUSAL mechanism, not a proof the API behaves as documented — it can
@@ -102,21 +125,24 @@ exactly like "not yet reachable".
 
 ```
 $ grep -n '^rp_init$\|^cluster_id="\$(rp_cluster_create' ci/scripts/runpod_gpu_cluster.sh
-655:rp_init
-658:cluster_id="$(rp_cluster_create "$RP_CLUSTER_GPU_TYPE" "$dcs")" || { echo "::error::cluster create failed"; exit 75; }
+795:rp_init
+798:cluster_id="$(rp_cluster_create "$RP_CLUSTER_GPU_TYPE" "$dcs")" || { echo "::error::cluster create failed"; exit 75; }
 ```
 
-`ci/scripts/runpod_gpu_cluster.sh:655` precedes `:658` (at HEAD).
+`ci/scripts/runpod_gpu_cluster.sh:795` precedes `:798` (at HEAD; round 2 added the module header's
+own P-A/P-C prose and the P-C measured-shape helper above this point, moving both lines down from
+round 1's `655`/`658` without changing their relative order).
 
-**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh:542-551` (at HEAD) is a new static guard — a
-line-number comparison over the committed driver text (`grep -n '^rp_init$'` vs. the first
-`rp_cluster_create ` call) — asserting `rp_init` precedes the create call, never a behavioral
-probe (no network). A SECOND, class-level guard closes the general case this specific line-number
-check does not: `test_check_gpu_prove_once.py`'s `RpSshoRequiresRpInitTest`
-(`ci/scripts/test_check_gpu_prove_once.py:587-627` at HEAD) statically scans EVERY real
-`PAID_POD_LANE_TABLE` driver on disk and asserts that any driver referencing `RP_SSHO[` also
-calls `rp_init` (a bare-line regex, `RP_INIT_CALL_RE`), with its own RED-then-GREEN self-test
-proving the regex actually distinguishes a call from a mention in prose.
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh:806-821` (at HEAD; round 2 also fixed this block's
+own comment-filter — see §2b F10) is a static guard — a line-number comparison over the committed
+driver text (`grep -n '^rp_init$'` vs. the first `rp_cluster_create ` call) — asserting `rp_init`
+precedes the create call, never a behavioral probe (no network). A SECOND, class-level guard
+closes the general case this specific line-number check does not: `test_check_gpu_prove_once.py`'s
+`RpSshoRequiresRpInitTest` (`ci/scripts/test_check_gpu_prove_once.py:587-627` at `31c8aa64`,
+unchanged by round 2) statically scans EVERY real `PAID_POD_LANE_TABLE` driver on disk and asserts
+that any driver referencing `RP_SSHO[` also calls `rp_init` (a bare-line regex,
+`RP_INIT_CALL_RE`), with its own RED-then-GREEN self-test proving the regex actually distinguishes
+a call from a mention in prose.
 
 ### F2 — the trap replaced, never chained, the library's own cleanup
 
@@ -131,21 +157,24 @@ every run).
 
 ```
 $ grep -n 'rp_cleanup  # F2' ci/scripts/runpod_gpu_cluster.sh
-606:  rp_cleanup  # F2: chain the library's own EXIT cleanup (rm -rf "$RP_WORK" -- the staging id file and the ssh keypair).
+732:  rp_cleanup  # F2: chain the library's own EXIT cleanup (rm -rf "$RP_WORK" when RP_WORK_IS_TEMP=1 -- the ssh keypair).
 ```
 
-`ci/scripts/runpod_gpu_cluster.sh:591-608` (at HEAD) is `_rpc_cleanup_cluster`'s own body,
-moved OUT of the sourced-execution guard (it was previously defined only when the file is
-EXECUTED, making it untestable by sourcing) into the pure-helpers section above it — only the
-`trap _rpc_cleanup_cluster EXIT` registration itself (`ci/scripts/runpod_gpu_cluster.sh:665` at
-HEAD) remains inside the guard.
+`ci/scripts/runpod_gpu_cluster.sh:701-734` (at HEAD; round 2 grew this body from round 1's
+`591-608` by inserting the P-A scan-join and the unconditional staging-file delete — see §2b P-A)
+is `_rpc_cleanup_cluster`'s own body, moved OUT of the sourced-execution guard (it was previously
+defined only when the file is EXECUTED, making it untestable by sourcing) into the pure-helpers
+section above it — only the `trap _rpc_cleanup_cluster EXIT` registration itself
+(`ci/scripts/runpod_gpu_cluster.sh:805` at HEAD) remains inside the guard.
 
-**Oracle**: `test_gpu_cluster_lane.sh`'s new F2/F3(c) block (`ci/scripts/test_gpu_cluster_lane.sh:104-191`
-at HEAD) drives the REAL `_rpc_cleanup_cluster` in a real subprocess (`bash -c '... source
-"$CLUSTER_SH" ...'`, so its own `exit "$rc"` terminates that subprocess exactly the way a real
-EXIT trap fires), mocking only `_rp_rest`/`rp_cluster_delete`/`rp_cleanup`: self-remove-ok,
-self-remove-refused-delete-ok, and no-cluster-id-at-all all confirm `rp_cleanup` is chained
-(a marker file it writes exists afterward) in every arm.
+**Oracle**: `test_gpu_cluster_lane.sh`'s F2/F3(c) block (`ci/scripts/test_gpu_cluster_lane.sh:104-191`
+at HEAD, unchanged in shape by round 2) drives the REAL `_rpc_cleanup_cluster` in a real subprocess
+(`bash -c '... source "$CLUSTER_SH" ...'`, so its own `exit "$rc"` terminates that subprocess
+exactly the way a real EXIT trap fires), mocking only `_rp_rest`/`rp_cluster_delete`/`rp_cleanup`:
+self-remove-ok, self-remove-refused-delete-ok, and no-cluster-id-at-all all confirm `rp_cleanup` is
+chained (a marker file it writes exists afterward) in every arm. Round 2 adds a SECOND block
+(`ci/scripts/test_gpu_cluster_lane.sh:194-319` at HEAD, §2b P-A) driving the SAME real
+`_rpc_cleanup_cluster` through the id-secrecy-scan join this round adds.
 
 ### F3 — three retire-failure classes read green
 
@@ -183,10 +212,10 @@ never joined into the trap's own exit status.
 
 ```
 $ grep -n 'LEAKED cluster' ci/scripts/runpod_gpu_cluster.sh
-602:      echo "::error::LEAKED cluster ${cluster_id}: could not delete on exit -- gpu-reap.yml's 6-hourly sweep is the backstop"
+712:      echo "::error::LEAKED cluster ${cluster_id}: could not delete on exit -- gpu-reap.yml's 6-hourly sweep is the backstop"
 ```
 
-`ci/scripts/runpod_gpu_cluster.sh:591-608` (at HEAD, the same span F2 cites) is the full trap
+`ci/scripts/runpod_gpu_cluster.sh:701-734` (at HEAD, the same span F2 cites) is the full trap
 body: `rc` is captured from `$?` FIRST (the pending exit status), joined to `1` only when it was
 still `0`, and the function's own `exit "$rc"` at the end — never a bare `return` — is what makes
 the join visible to the process's real exit status (a trap's own `return` would not override an
@@ -219,17 +248,24 @@ $ grep -n 'def _gang_check_cluster_ranks\|def _gang_check_cluster_shape\|def _ga
 1496:def _gang_check_leg_producer_binding(gang: dict, data: dict, _repo_root: Path) -> list[str]:
 ```
 
-`_gang_check_cluster_ranks` (`:1376-1461`) now asserts `host` distinct across ranks
-(`:1450`), refuses `host`/`iface` matching `GANG_UNKNOWN_SENTINELS = ("unknown", "")`
-(`:1373`, `:1418-1423`), requires a PER-RANK `reduced_vector_digest`
-(hex-validated on `pass`, `:1428-1439`) and asserts those per-rank digests equal across ranks on
-`pass` (`:1456-1461`) — never trusting the already-collapsed top-level field alone.
-`_gang_check_cluster_shape` (`:1463-1494`) asserts `hosts == pod_count` and `world == pod_count *
-gpu_count_per_pod`. `_gang_check_leg_producer_binding` (`:1496-1511`), wired into
-`check_gang_artifact` right after the leg is resolved, binds `gang.leg == "cluster"` to
-`producer.path == "ci/scripts/runpod_gpu_cluster.sh"` (and `"pod"` to
-`"ci/scripts/runpod_gpu_gang.sh"`, `GANG_LEG_PRODUCER_PATH:1023-1032`) — a self-declared leg can
-no longer dodge the other leg's registry by pointing `producer.path` at a different driver.
+`_gang_check_cluster_ranks` (`:1376-1466`; round 2 grew this from round 1's `1376-1461` by six
+lines) now asserts `host` distinct across ranks, compared CASE-INSENSITIVELY
+(`.strip().casefold()`, `:1452-1455` — round 2's own F4 advisory, matching the assembler's own
+`_norm_host`, §2b), refuses `host`/`iface` matching `GANG_UNKNOWN_SENTINELS = ("unknown", "")`
+(`:1373`, `:1418-1423`, unchanged by round 2), requires a PER-RANK `reduced_vector_digest`
+(hex-validated on `pass`, `:1428-1439`, unchanged) and asserts those per-rank digests equal across
+ranks on `pass` (`:1461-1466`) — never trusting the already-collapsed top-level field alone.
+`_gang_check_cluster_shape` (`:1469-1500`, moved from round 1's `1463-1494` by the same six-line
+shift) asserts `hosts == pod_count` and `world == pod_count * gpu_count_per_pod` — a check round 2
+makes non-vacuous for the first time, since the driver's own assembler previously hardcoded
+`pod_count`/`gpu_count_per_pod` to the same literals this check compares against (§2b P-C).
+`_gang_check_leg_producer_binding` (`:1502-1518`), wired into `check_gang_artifact` right after
+the leg is resolved, binds `gang.leg == "cluster"` to `producer.path ==
+"ci/scripts/runpod_gpu_cluster.sh"` (and `"pod"` to `"ci/scripts/runpod_gpu_gang.sh"`,
+`GANG_LEG_PRODUCER_PATH:1023-1026` — round 2 corrects round 1's own `1023-1032`, which over-ran
+into the unrelated `GANG_CLUSTER_HOSTS` comment below the dict, unchanged by round 2) — a
+self-declared leg can no longer dodge the other leg's registry by pointing `producer.path` at a
+different driver.
 
 **Fix, on the driver side** (`ci/scripts/runpod_gpu_cluster.sh`, at HEAD):
 `_rpc_assemble_gang_artifact` now refuses to WRITE an artifact at all when any rank's own
@@ -238,35 +274,50 @@ no longer dodge the other leg's registry by pointing `producer.path` at a differ
 
 ```
 $ grep -n 'refusing to assemble' ci/scripts/runpod_gpu_cluster.sh
-473:        print("refusing to assemble: rank %r own hostname is unresolved (%r)" % (r.get("rank"), host), file=sys.stderr)
-476:        print("refusing to assemble: rank %r own nccl_socket_ifname is unresolved (%r)" % (r.get("rank"), iface), file=sys.stderr)
-479:    print("refusing to assemble: both ranks report the SAME host (%r) -- not the two-host bootstrap this leg proves" % reports[0].get("hostname"), file=sys.stderr)
+541:        print("refusing to assemble: rank %r own hostname is unresolved (%r)" % (r.get("rank"), host), file=sys.stderr)
+544:        print("refusing to assemble: rank %r own nccl_socket_ifname is unresolved (%r)" % (r.get("rank"), iface), file=sys.stderr)
+547:    print("refusing to assemble: both ranks report the SAME host (%r) -- not the two-host bootstrap this leg proves" % reports[0].get("hostname"), file=sys.stderr)
 ```
 
-— a named refusal (exit 2 from the assembler; joined into the driver's own `rc` by the existing
+(round 2 moved these three lines from round 1's `473`/`476`/`479` by growing the module header and
+adding the P-C measured-shape parameters above this function — see §2b P-C/P-D; the host-repeat
+line at `:547` now compares through `_norm_host` case-insensitively, §2b advisory) — a named
+refusal (exit 2 from the assembler; joined into the driver's own `rc` by the existing
 `_rpc_assemble_gang_artifact ... || { ...; [ "$rc" -eq 0 ] && rc=1; }` call site), never an
 artifact synthesized from unresolved data. Each rank's report now carries its OWN
-`reduced_vector_digest` (`ci/scripts/runpod_gpu_cluster.sh:482-493` at HEAD, inside the `ranks`
+`reduced_vector_digest` (`ci/scripts/runpod_gpu_cluster.sh:550-560` at HEAD, inside the `ranks`
 list construction), and the assembled artifact's `producer` block is now bound to this driver's
-own path (`ci/scripts/runpod_gpu_cluster.sh:518-523` at HEAD: `"path":
+own path (`ci/scripts/runpod_gpu_cluster.sh:585-591` at HEAD: `"path":
 "ci/scripts/runpod_gpu_cluster.sh"`, `"kind": "script"`), matching `GANG_LEG_PRODUCER_PATH` above.
 (A complementary fix on the Rust side, `crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` at
-`d12e1689` — outside this contract's own owned files, landed by an ai-core agent in the same
-worktree during this fix round — makes `hostname()` return a named `Result` instead of masking a
-failed read behind `"unknown"`, so the driver-side refusal above is checking a value that itself
-can no longer silently BE `"unknown"` on a healthy run.)
+`b480f2dc` — round 2 corrects round 1's own citation of this commit as `d12e1689`, a sha that does
+not exist on this branch; see this file's own header correction note — outside this contract's own
+owned files, landed by an ai-core agent in the same worktree during round 1's own fix window —
+makes `hostname()` return a named `Result` instead of masking a failed read behind `"unknown"`, so
+the driver-side refusal above is checking a value that itself can no longer silently BE `"unknown"`
+on a healthy run.)
 
 **Oracle**: `check_cuda_run_artifacts.py --self-test`'s rule (k) self-test gains, named
-(`ci/scripts/check_cuda_run_artifacts.py:3343-3429` at HEAD): two ranks on one host FAILS; an
-`unknown` host FAILS; an `UNKNOWN` (any case) iface FAILS; a per-rank digest mismatch on `pass`
-FAILS; a missing per-rank digest on `pass` FAILS; `hosts != pod_count` FAILS; `world != pod_count
-* gpu_count_per_pod` FAILS; a cluster-leg artifact carrying the pod leg's own `producer.path`
-FAILS (and vice versa). `gang_baseline()`/`gang_cluster_baseline()`
-(`ci/scripts/check_cuda_run_artifacts.py:3148-3226` at HEAD) now stamp each leg's real producer
-path (`ci/scripts/runpod_gpu_gang.sh` / `ci/scripts/runpod_gpu_cluster.sh`), and the self-test's
-own fixture repo gains tracked stand-ins for both paths
-(`ci/scripts/check_cuda_run_artifacts.py:2745-2751` at HEAD) so rule (b)'s own
-producer.path-exists-and-is-tracked check has something real to bind against.
+(`ci/scripts/check_cuda_run_artifacts.py:3349-3448` at HEAD; round 2 grew this from round 1's
+`3343-3429` by adding a case-insensitive repeated-host arm, §2b advisory): two ranks on one host
+FAILS; two ranks on the same host differing only in CASE FAILS (round 2); an `unknown` host FAILS;
+an `UNKNOWN` (any case) iface FAILS; a per-rank digest mismatch on `pass` FAILS; a missing per-rank
+digest on `pass` FAILS; `hosts != pod_count` FAILS; `world != pod_count * gpu_count_per_pod`
+FAILS; a cluster-leg artifact carrying the pod leg's own `producer.path` FAILS (and vice versa).
+`gang_baseline()`/`gang_cluster_baseline()` (`ci/scripts/check_cuda_run_artifacts.py:3154-3232` at
+HEAD, moved from round 1's `3148-3226`) now stamp each leg's real producer path
+(`ci/scripts/runpod_gpu_gang.sh` / `ci/scripts/runpod_gpu_cluster.sh`), and the self-test's own
+fixture repo gains tracked stand-ins for both paths
+(`ci/scripts/check_cuda_run_artifacts.py:2751-2757` at HEAD, moved from round 1's `2745-2751`) so
+rule (b)'s own producer.path-exists-and-is-tracked check has something real to bind against.
+**Round 2 adds a SECOND, independent oracle** for this same F4 property: rather than only driving
+the CHECKER against hand-built fixture JSON, `ci/scripts/test_gpu_cluster_lane.sh:658-802` (at HEAD, §2b P-D)
+sources the REAL driver and calls the REAL `_rpc_assemble_gang_artifact` on the happy path and
+every refusal/representable-fail arm (unknown host, unknown iface, a case-insensitive repeated
+host, a digest mismatch), then feeds each resulting artifact through the REAL
+`check_gang_artifact` (imported directly from `check_cuda_run_artifacts.py`, never paraphrased) —
+closing the gap between "the checker's own fixtures are self-consistent" and "the driver's own
+assembler actually produces what the checker accepts".
 
 ### F5 — the id-secrecy scan could hang, and could read a FIFO/socket forever
 
@@ -279,34 +330,53 @@ on the other end blocks forever, never returning.
 **Fix** (`ci/scripts/gang_id_secrecy_scan.py`, at HEAD):
 
 ```
-$ grep -n 'def scan_dir\|def wall_clock_budget\|class ScanTimeout' ci/scripts/gang_id_secrecy_scan.py
-190:def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, str]]:
-249:class ScanTimeout(Exception):
-254:def wall_clock_budget(seconds: int):
+$ grep -n 'def scan_dir\|def scan_file\|def run_scan\|def _run_scan_body\|def wall_clock_budget\|class ScanTimeout' ci/scripts/gang_id_secrecy_scan.py
+173:def scan_file(path: Path, needles: list[tuple[str, bytes]]) -> tuple[int, str]:
+211:def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, str]]:
+277:class ScanTimeout(Exception):
+282:def wall_clock_budget(seconds: int):
+325:def run_scan(
+349:def _run_scan_body(
 ```
 
-`scan_dir` (`:190-234`) no longer calls `os.walk` at all — a private recursive `walk()` closure
-tracks the REAL path of every directory it enters in a `visited_dirs` set; a directory whose real
-path repeats is one `"cyclic carrier"` UNEXAMINABLE finding, never a re-descent.
-`scan_file` (`:66-96`) now checks `stat.S_ISREG` explicitly before ever calling `read_bytes()` —
-any other mode class (FIFO, socket, device) is refused by name (UNEXAMINABLE), never opened.
-`wall_clock_budget` (`:254-271`, a `contextlib.contextmanager` over `signal.alarm`) wraps the
-WHOLE scan body (`run_scan`/`_run_scan_body`, `:179-183`); an expiry raises `ScanTimeout`, caught
-by `run_scan` and reported UNEXAMINABLE — independent of any single carrier's own shape, the
-scan's own last line of defense. Default budget 120s
+`scan_dir` (`:211-274`; round 1 fixed the cycle-hang with a RECURSIVE `walk()` closure — line
+numbers `190-234` at round 1's own `31c8aa64` — round 2's own closing audit BLOCKed on that
+closure still being recursive, itself a SECOND way the scan could fail, `RecursionError`, escaping
+uncaught as a bare exit 1/traceback; round 2 replaces it with an EXPLICIT STACK (a plain Python
+`list`), moved round 1's own citation from `190-234` to this round's `211-274` — see §2b P-B for
+the full fix) tracks the REAL path of every directory it enters in a `visited_dirs` set; a
+directory whose real path repeats is one `"cyclic carrier"` UNEXAMINABLE finding, never a
+re-descent. `scan_file` (`:173-208`, moved from round 1's `66-96`) checks `stat.S_ISREG` explicitly
+before ever calling `read_bytes()` — any other mode class (FIFO, socket, device) is refused by
+name (UNEXAMINABLE), never opened. `wall_clock_budget` (`:282-299`, moved from round 1's
+`254-271`, a `contextlib.contextmanager` over `signal.alarm`) wraps the WHOLE scan body
+(`run_scan`/`_run_scan_body`, `:325-345`/`:349-421`, moved from round 1's `179-183`) — round 2
+also widens `run_scan`'s own `except` from `ScanTimeout` alone to `except Exception`, so ANY
+scanner-internal failure (a `RecursionError` included, though the explicit stack above no longer
+produces one; any other bug) is UNEXAMINABLE, never a traceback (§2b P-B). Default budget 120s
 (`DEFAULT_BUDGET_SECS`/`GANG_ID_SCAN_BUDGET_SECS` env override,
-`ci/scripts/gang_id_secrecy_scan.py:91` at HEAD), overridable via `--budget-secs`.
+`ci/scripts/gang_id_secrecy_scan.py:91` at HEAD, unchanged), overridable via `--budget-secs`.
 
-**Advisory, also fixed**: `id_needles` (`ci/scripts/gang_id_secrecy_scan.py:118-142` at HEAD) now
-computes FOUR base64 variants — standard padded, standard un-padded, URL-safe padded, URL-safe
-un-padded — rather than one.
+**Advisory, also fixed**: `id_needles` (`ci/scripts/gang_id_secrecy_scan.py:118-142` at `31c8aa64`,
+unchanged by round 2) now computes FOUR base64 variants — standard padded, standard un-padded,
+URL-safe padded, URL-safe un-padded — rather than one. Round 2 adds a SECOND base64 advisory: a
+line-wrapped base64 encoding (coreutils `base64`'s 76-column default, `openssl base64`'s 64-column
+default) is matched too, via a whitespace-stripped copy of the scanned bytes computed lazily for
+base64-labeled needles only (`_strip_whitespace`/`_scan_bytes`,
+`ci/scripts/gang_id_secrecy_scan.py:145-167` at HEAD — §2b advisory).
 
-**Oracle**: `gang_id_secrecy_scan.py --self-test` gains, named: a cyclic directory symlink
-(returns promptly, UNEXAMINABLE, never hangs); a FIFO under the pulled dir (UNEXAMINABLE, "not a
-regular file"); a UNIX socket under the pulled dir (UNEXAMINABLE, same message); a wall-clock
-budget expiry (`scan_dir` mocked to sleep past a 1s budget, UNEXAMINABLE, "wall-clock budget");
-base64-urlsafe and base64-unpadded planted-id hits. 23 `unittest` cases total (up from 17 at c4),
-all passing (`python3 ci/scripts/gang_id_secrecy_scan.py --self-test`, verified this round).
+**Oracle**: `gang_id_secrecy_scan.py --self-test` gains, named (round 1): a cyclic directory
+symlink (returns promptly, UNEXAMINABLE, never hangs); a FIFO under the pulled dir (UNEXAMINABLE,
+"not a regular file"); a UNIX socket under the pulled dir (UNEXAMINABLE, same message); a
+wall-clock budget expiry (`scan_dir` mocked to sleep past a 1s budget, UNEXAMINABLE, "wall-clock
+budget"); base64-urlsafe and base64-unpadded planted-id hits — 23 cases at round 1 (up from 17 at
+c4). Round 2 adds four more (§2b P-B/advisory): a tree 200 levels deep, walked under an
+artificially lowered `sys.recursionlimit(40)`, completes and finds a planted id at the bottom
+(proving the walk is not Python-stack-recursive at all, portable across the OS `PATH_MAX`
+differences a literal 1,500-level fixture would hit inconsistently); `scan_dir` mocked to raise an
+arbitrary `RuntimeError`, caught as UNEXAMINABLE, never a traceback; coreutils-width and
+openssl-width line-wrapped base64 hits. 27 `unittest` cases total, all passing (`python3
+ci/scripts/gang_id_secrecy_scan.py --self-test`, verified this round).
 
 ### F6 — the contract of record itself: the RUN_LOG claim, and this citation form
 
@@ -323,28 +393,36 @@ SEPARATE, explicit `--log` argument).
 
 ```
 $ grep -n '^mkdir -p "\$CLUSTER_ARTIFACT_DIR"$\|^RUN_LOG="\$CLUSTER_ARTIFACT_DIR/run.log"$' ci/scripts/runpod_gpu_cluster.sh
-621:mkdir -p "$CLUSTER_ARTIFACT_DIR"
-622:RUN_LOG="$CLUSTER_ARTIFACT_DIR/run.log"
-811:mkdir -p "$CLUSTER_ARTIFACT_DIR"
+747:mkdir -p "$CLUSTER_ARTIFACT_DIR"
+748:RUN_LOG="$CLUSTER_ARTIFACT_DIR/run.log"
+977:mkdir -p "$CLUSTER_ARTIFACT_DIR"
 ```
 
-the directory is created BEFORE the tee starts (`:623`, `exec > >(tee -a "$RUN_LOG") 2>&1`), so
-the run log lives inside the uploaded/scanned directory from its first byte; the SECOND `mkdir -p`
-match (`:811`) is a defensive, idempotent re-assertion immediately before the rank-log copies
-below — never a second, independent creation site with its own drift risk. Both ranks' own
-remote logs are now ALSO copied there, unconditionally, pass or fail:
+(round 2 moved these from round 1's `621`/`622`/`811` by growing the module header's own P-A/P-C
+prose above this point — see §2b — without changing their relative order or their own text) the
+directory is created BEFORE the tee starts (`:763`, `exec > >(tee -a "$RUN_LOG") 2>&1`; round 2
+also assigns `ASSEMBLED` and `id_landed=0` here, between the `mkdir` and the `exec`, so the EXIT
+trap's own P-A scan-or-quarantine knows both globals on every exit arm — §2b P-A), so the run log
+lives inside the uploaded/scanned directory from its first byte; the SECOND `mkdir -p` match
+(`:977`) is a defensive, idempotent re-assertion immediately before the rank-log copies below —
+never a second, independent creation site with its own drift risk. Both ranks' own remote logs are
+now ALSO copied there, unconditionally, pass or fail:
 
 ```
 $ grep -n 'cp -f "\$rank0_log"\|cp -f "\$rank1_log"' ci/scripts/runpod_gpu_cluster.sh
+978:cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
+979:cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
 ```
 
-placed immediately after both `wait` calls (`ci/scripts/runpod_gpu_cluster.sh:807-813` at HEAD),
-before any pass/fail branching. The workflow's own upload step needed no change — `path:
-.gpu-pull/gpu-cluster/` already covers the directory the run log now lives inside.
+placed immediately after both `wait` calls (`ci/scripts/runpod_gpu_cluster.sh:970-979` at HEAD,
+moved from round 1's `807-813`), before any pass/fail branching. The workflow's own upload step
+needed no change — `path: .gpu-pull/gpu-cluster/` already covers the directory the run log now
+lives inside.
 
-**Oracle**: `test_gpu_cluster_lane.sh`'s new F6(a) block
-(`ci/scripts/test_gpu_cluster_lane.sh:478-494` at HEAD) statically asserts the `mkdir` line
-precedes the `RUN_LOG=` assignment line, and that both `cp -f` lines exist.
+**Oracle**: `test_gpu_cluster_lane.sh`'s F6(a) block
+(`ci/scripts/test_gpu_cluster_lane.sh:592-610` at HEAD, moved from round 1's `478-494`,
+unchanged in shape) statically asserts the `mkdir` line precedes the `RUN_LOG=` assignment line,
+and that both `cp -f` lines exist.
 
 **(b) This citation form itself.** Every citation in this revision is the bare `path:line` (or
 `path:line-line`) form, tagged `(at <sha>)`, re-derived by direct read against this tree AFTER
@@ -353,15 +431,207 @@ form, which carries zero tokens `check_path_line_citations`'s regex matches, and
 had gone stale in 3 of 16 transcripts by the time of the closing audit, since a transcript's own
 output is never re-verified by that checker at all).
 
-## 3. M2 — the two-host NCCL test body (`gang_nccl.rs`) — unchanged by this fix round
+## 2b. Fix round 2 — the closing adversarial audit's five findings, each closed by name
+
+Round 1's own closing adversarial audit (2026-09-15) BLOCKed on five findings on round 1's OWN new
+surfaces (never on the base this unit builds from): (A) the carrier set was uploaded on
+`if: always()` while the id-secrecy scan ran only inline near the main body's own tail, so an
+`exit` call between "the id lands" and that tail point left the carrier directory unscanned; (B)
+the cycle-safe walk (§2 F5) was still RECURSIVE, itself a second way the scan could fail
+(`RecursionError`), escaping the documented 0/1/2 exit lattice as a bare, uncaught exit 1 or a
+traceback; (C) `world`/`hosts`/`pod_count`/`gpu_count_per_pod` were FOUR LITERALS in the assembler,
+so `_gang_check_cluster_shape`'s own cross-field check (§2 F4) compared the artifact against
+itself — a tautology, never a real falsification; (D) the assembler had no oracle beyond
+hand-built fixture JSON — nothing drove the REAL `_rpc_assemble_gang_artifact` function and fed
+its REAL output through the REAL checker; (E) this contract's own citations named a sha
+(`d12e1689`) not reachable from the branch, and one file (§3) was claimed "unchanged" when it had
+in fact changed. This round closes each by name below, landing as `f30813e2`.
+
+### P-A — no byte reaches the upload unscanned, on EVERY exit arm
+
+**Fix** (`ci/scripts/runpod_gpu_cluster.sh`, at HEAD): the id-secrecy scan invocation MOVED out of
+the main body's own tail entirely, into a new function called from the EXIT trap itself:
+
+```
+$ grep -n '^_rpc_scan_or_quarantine()\|^id_landed=0$\|^id_landed=1$\|^ASSEMBLED=' ci/scripts/runpod_gpu_cluster.sh
+668:_rpc_scan_or_quarantine() {
+755:ASSEMBLED="${CLUSTER_ARTIFACT_DIR}/gang-cluster-$(date -u +%Y%m%d%H%M%S).json"
+762:id_landed=0
+917:id_landed=1
+```
+
+`_rpc_scan_or_quarantine` (`:668-687` at HEAD) runs `_rpc_run_id_secrecy_scan` (unchanged, §2 F5)
+whenever the GLOBAL `id_landed` is `"1"`, and on anything other than a clean scan MOVES the whole
+`$CLUSTER_ARTIFACT_DIR` to a quarantine path under `$RP_WORK` (outside the uploaded
+`.gpu-pull/gpu-cluster/` tree entirely) — or, when the move itself fails (e.g. a cross-device
+`mv`), empties the directory in place — before returning the scan's own non-zero status to its
+caller. Because `mv` preserves the inode, the reason line echoed immediately after the move still
+lands as the (now-relocated) run log's own LAST line via the still-open `tee` file descriptor
+(`exec > >(tee -a "$RUN_LOG")`, unchanged, `:763` at HEAD), and also reaches the job's own console
+output regardless. `ASSEMBLED` (`:755`) and `id_landed=0` (`:762`) are both set as STABLE globals
+at the very top of the executed block — before the tee even starts — so the trap's own read of
+them is never garbage on an early exit; `id_landed` flips to `1` (`:917`) the moment the download
+from the primary is ATTEMPTED (not only once it succeeds), so a partially-written or wrong-size
+staging file on a failed download is still scanned (and refused as UNEXAMINABLE by its own
+128-byte check, `_run_scan_body`, never silently skipped).
+
+`_rpc_cleanup_cluster` (`ci/scripts/runpod_gpu_cluster.sh:701-734` at HEAD) now calls
+`_rpc_scan_or_quarantine` unconditionally (joining its non-zero return into `rc` only when `rc`
+was still `0` — the same "never overwrite a more specific existing failure" doctrine F3(c) already
+uses), then deletes `$STAGING_ID_FILE` unconditionally (`:730`) regardless of
+`RP_SESSION`/`RP_WORK_IS_TEMP` (an advisory this round also closes — `rp_cleanup`'s own conditional
+`rm -rf "$RP_WORK"` never ran at all when `RP_SESSION` was set, which would have left the staging
+id file on disk past process exit), THEN chains `rp_cleanup` (F2, unchanged) and exits. The OLD
+inline scan call at the main body's own tail is GONE entirely — every exit arm, including the
+natural fall-through at the bottom, now reaches the scan exactly once, through the trap.
+
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh:194-319` (at HEAD) drives the REAL
+`_rpc_cleanup_cluster` in a real subprocess against a REAL fixture carrier directory and the REAL
+scanner (never mocked), on the four arms the closing audit named by name: "assembly refused"
+(pending rc=1, clean carrier — the scan runs clean, rc=1 survives, the carrier is left intact,
+never quarantined for no reason), "pull failed" (pending rc=1, a DIRTY carrier — the scan HITs,
+the carrier holds nothing at the upload path afterward), "budget cut" (rc=124, clean carrier — the
+named exit code survives verbatim), "wrong tree" (rc=77, DIRTY carrier — the scan HITs, the
+carrier is quarantined, AND the named exit code still survives verbatim, proving the join never
+clobbers a more specific existing failure). A fifth control (`id_landed=0`, the id never reached
+this runner) asserts the trap invokes the scanner NOT AT ALL — nothing to protect against yet.
+
+### P-B — the scan's own exit lattice is total, never a traceback
+
+See §2b's own gang_id_secrecy_scan.py citations already folded into §5's revision above (the
+explicit-stack `scan_dir` rewrite and `run_scan`'s widened `except Exception`). Restated here by
+name: `scan_dir` (`ci/scripts/gang_id_secrecy_scan.py:211-274` at HEAD) walks via an EXPLICIT
+STACK (a plain Python `list`), never a recursive closure — the round-1 shape that made a
+`RecursionError` possible in the first place. `run_scan` (`:325-345`) wraps `_run_scan_body` in
+`except Exception`, not only `except ScanTimeout` — ANY scanner-internal failure is UNEXAMINABLE
+(2), never exit 1, never an uncaught traceback.
+
+**Oracle**: `gang_id_secrecy_scan.py --self-test` gains `test_deep_tree_well_beyond_the_recursion_limit_does_not_crash`
+(`ci/scripts/gang_id_secrecy_scan.py:691-714` at HEAD — a 200-level-deep tree walked under an
+artificially lowered `sys.setrecursionlimit(40)`, portable across OS `PATH_MAX` differences a
+literal 1,500-level fixture would hit inconsistently on different filesystems; the planted id at
+the bottom is still found, proving the walk reaches full depth) and
+`test_scan_dir_raising_an_unexpected_exception_is_unexaminable_not_a_traceback`
+(`ci/scripts/gang_id_secrecy_scan.py:717-732` at HEAD — `scan_dir` mocked to raise a bare
+`RuntimeError`, asserted UNEXAMINABLE, never propagated).
+
+### P-C — the artifact's shape is measured, never four literals
+
+**Fix** (`ci/scripts/runpod_gpu_cluster.sh`, at HEAD): a new pure helper parses the cluster's own
+`compute` block from the SAME `Cluster` object `rp_cluster_get` already returns (unmodified,
+`ci/scripts/runpod_lib.sh:1537-1557`, untouched by either round):
+
+```
+$ grep -n '^_rpc_parse_cluster_shape()\|cluster_body="\$(rp_cluster_get' ci/scripts/runpod_gpu_cluster.sh
+342:_rpc_parse_cluster_shape() {
+813:cluster_body="$(rp_cluster_get "$cluster_id")" || { echo "::error::could not read back the created cluster's own shape"; exit 97; }
+```
+
+`_rpc_parse_cluster_shape` (`:342-362` at HEAD) prints `"podCount gpuCountPerPod"` on a successful
+parse of `compute.podCount`/`compute.gpuCountPerPod` (both required positive integers), or exits 2
+on anything else. The executed block (`:807-821` at HEAD) calls it right after cluster create,
+BEFORE any member work starts, and REFUSES (exit 97, "wrong shape" — the exit code the module
+doc's own EXIT CONTRACT already named for this case, never actually checked against a measurement
+until now) when the measured shape disagrees with `RP_CLUSTER_POD_COUNT`/
+`RP_CLUSTER_GPU_COUNT_PER_POD`. `MEASURED_POD_COUNT`/`MEASURED_GPU_COUNT_PER_POD` are then threaded
+into `_rpc_assemble_gang_artifact`'s own argv (`:1010-1013` at HEAD) — the four literals
+(`"world": 2`, `"hosts": 2`, `"pod_count": 2`, `"gpu_count_per_pod": 1`) are GONE from the
+assembler's own python (`ci/scripts/runpod_gpu_cluster.sh:501-613` at HEAD is the whole function,
+signature grown from `$1..$5` to `$1..$7`); `gang.world`/`gang.hosts` are now computed as
+`pod_count * gpu_count_per_pod`/`pod_count` from whatever the driver threads in.
+
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh:658-802` (at HEAD, shared with P-D below) drives
+the REAL `_rpc_assemble_gang_artifact` with a fixture 3x8 shape (simulating a create response
+`rp_cluster_get` would have returned for a differently-shaped cluster) against the SAME two rank
+reports the happy-path case uses, and asserts the resulting artifact carries `hosts=3 world=24
+pod_count=3 gpu_count_per_pod=8` — then feeds that artifact through the REAL `check_gang_artifact`
+and asserts it is REFUSED (the checker's own `_gang_check_hosts`/`_gang_check_cluster_ranks` both
+catch it independently: `gang.hosts` fixed at `GANG_CLUSTER_HOSTS = 2` is never 3, and `gang.ranks`
+carries only 2 entries against a `gang.world` of 24) — the cross-field check is now genuinely
+falsifiable, never a tautology.
+
+### P-D — the assembler is oracled through the sourced driver, on every arm
+
+**Fix**: no new production code beyond P-C's own signature change above; this finding is closed
+entirely by the oracle itself, since the round-1 gap was "no test drives the real function", not a
+mechanism defect.
+
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh:658-802` (at HEAD) sources the driver (unchanged,
+`test_gpu_cluster_lane.sh`'s own G0 block already proves sourcing makes no network call) and calls
+the REAL `_rpc_assemble_gang_artifact` on: the happy path (2x1, two ranks, matching digests —
+assembly succeeds, and the resulting artifact passes the REAL `check_gang_artifact`, imported
+directly from `check_cuda_run_artifacts.py` via `importlib`, never paraphrased or reimplemented);
+an unresolved ("unknown") hostname (REFUSES, no artifact written); an unresolved iface (REFUSES);
+two ranks reporting the same host differing only in CASE (REFUSES — see the advisory below); and a
+digest disagreement between two `pass` ranks (REPRESENTABLE — assembly SUCCEEDS with
+`verdict: "fail"` and a named reason, never refused at assembly time, and the resulting artifact
+still passes the checker as legitimately-recorded evidence of a failed run).
+
+### Advisories folded
+
+- **Host comparison is case-insensitive on BOTH sides of the producer/checker boundary.** The
+  assembler's own `_norm_host` (`ci/scripts/runpod_gpu_cluster.sh:527-531` at HEAD) and the
+  checker's own `_gang_check_cluster_ranks` (`ci/scripts/check_cuda_run_artifacts.py:1452-1455` at
+  HEAD, plus a self-test arm at `ci/scripts/check_cuda_run_artifacts.py:3361-3373`) both compare
+  `.strip().casefold()` rather than raw string equality — "Host-A" and "host-a" are the same host
+  on both sides now, never a false "two hosts" on one side and a false negative on the other.
+- **Base64 needle matching survives line-wrapping.** See §5's revision above
+  (`ci/scripts/gang_id_secrecy_scan.py:145-167`, `_strip_whitespace`/`_scan_bytes`) — a
+  whitespace-stripped copy of the scanned bytes is checked for base64-labeled needles, lazily,
+  only when the raw check misses.
+- **`_strip_trailing_comment` handles a backslash-escaped apostrophe.** See §6's revision above
+  (`ci/scripts/check_gpu_prove_once.py:477-479`).
+- **The no-op `grep -v '^\s*#'` at `test_gpu_cluster_lane.sh` (round 1's own `:547`) is replaced by
+  an assertion that actually filters.** `grep -n`'s own output is `"N:text"` — a line ALWAYS
+  starts with digits, so a filter anchored at `^\s*#` against THAT text can never match anything (a
+  no-op that happened to be harmless only because the real file had nothing to filter). Fixed
+  (`ci/scripts/test_gpu_cluster_lane.sh:816` at HEAD: `grep -vE '^[0-9]+:[[:space:]]*#'`, stripping
+  `grep -n`'s own prefix before testing for a leading `#`) and PROVEN to actually filter against a
+  synthetic two-line fixture (`ci/scripts/test_gpu_cluster_lane.sh:824-834` at HEAD: a comment-only
+  line naming the target string on line 1, the real call on line 2 — the filtered result must land
+  on line 2, not line 1).
+- **The staging id file is deleted on EVERY exit after the scan, regardless of
+  `RP_SESSION`/`RP_WORK_IS_TEMP`.** Folded into P-A above (`ci/scripts/runpod_gpu_cluster.sh:730`).
+- **The tee flushes before the trap exits, so the trap's own last line reaches `run.log`.** Proven
+  by construction in P-A's own oracle: every `run_trap_scan_arm` case reads the SAME
+  `$out`/`scan_out` the subprocess's stdout+stderr produced, which is the identical stream `tee`
+  writes to disk — the quarantine reason line is asserted present in that captured output on every
+  dirty arm.
+- **`ci/scripts/runpod_gpu_prove.sh:196`'s discarded `rp_sweep` rc is now logged loudly, named as
+  pre-run hygiene, never a proof failure.** This is the FIRST time either docs-ci fix round has
+  touched this file (round 1 did not); `:196` was the pre-fix line the brief itself pointed at,
+  now moved to `:200` by four lines of new explanatory comment prepended above it:
+
+```
+$ grep -n 'rp_sweep ||' ci/scripts/runpod_gpu_prove.sh
+200:rp_sweep || echo "::warning::pre-run rp_sweep (orphan hygiene) failed rc=$? -- not a proof failure, continuing"
+```
+
+  (`ci/scripts/runpod_gpu_prove.sh:191-200` is the full comment explaining why a sweep failure
+  here is orthogonal to THIS run's own proof.) This file carries no dedicated fixture suite of its
+  own beyond `test_gpu_prove_lane.sh`'s existing sourced-driver coverage (unaffected by this
+  one-line change, since the sourced-execution guard skips this line entirely);
+  `test_gpu_prove_lane.sh` (74 cases, verified this round, `bash
+  ci/scripts/test_gpu_prove_lane.sh`, exit 0) stays green unchanged.
+
+**Round-3 stop rule status**: not triggered — round 2 closed all five findings on the first
+attempt, never blocking a second time on the same mechanism (`M3`/`M4`).
+
+**Correction (round 2):** round 1's own heading here read "unchanged by this fix round" and cited
+this file at `d12e1689` — a sha that does not exist on this branch (see this file's own header
+correction note). The real commit, `b480f2dc`, is NOT a no-op: `git show --stat b480f2dc` shows
+`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs | 208 ++++++++++++++++++++--` (189 insertions,
+19 deletions, one file) — round 1's own heading should have read "changed once, by `b480f2dc`,
+outside this contract's own owned files" from the start. Neither docs-ci fix round (this one
+included) has touched this file; `git status` over it stays clean across both rounds.
 
 `gang_nccl_two_hosts_reduce_a_known_vector`
-(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` at `d12e1689`) is feature-gated and reads its
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` at `b480f2dc`) is feature-gated and reads its
 own env contract (`JAMMI_GANG_TWO_HOSTS_RANK`/`_WORLD`/`_ID_FILE`,
 `JAMMI_REQUIRE_CUDA_TWO_HOSTS`). Rank 0 mints `Nccl::new_id()` and writes it atomically; rank 1
-refuses any id file whose size is not exactly 128 bytes. `d12e1689` (landed by an ai-core agent
-in this same worktree during this fix round, outside this contract's own owned files) closes a
-sibling finding to this round's own F4: `hostname()` now returns a named `Result` instead of
+refuses any id file whose size is not exactly 128 bytes. `b480f2dc` (landed by an ai-core agent in
+this same worktree during round 1's own fix window, outside this contract's own owned files)
+closes a sibling finding to round 1's own F4: `hostname()` now returns a named `Result` instead of
 masking a failed read behind `"unknown"`, and `missing_report_metadata_reason` names which of
 hostname/iface is missing before any NCCL work runs, so a bad metadata read panics rather than
 writing an indistinguishable-from-real `"unknown"` pass report.
@@ -370,151 +640,196 @@ writing an indistinguishable-from-real `"unknown"` pass report.
 gpu_capability` (the gated-surface clippy step; not itself proof the test PASSES, only that it
 compiles). The real proof is the executed run (§8) — not yet performed.
 
-## 4. M3 — the cluster driver, post-fix — sequence and exit contract
+## 4. M3 — the cluster driver, post round-2 — sequence and exit contract
 
 Never `runpod_gpu_gang.sh` — a fully separate driver, workflow, and RunPod object type. Sequence,
-post-fix: read per-data-center availability and pass only qualifying `dataCenterIds` (A1) → `rp_init`
-(F1, §2) → create ONE 2x1 cluster → poll both members RUNNING with a usable ssh path
+post round-2: read per-data-center availability and pass only qualifying `dataCenterIds` (A1) →
+`rp_init` (F1, §2) → create ONE 2x1 cluster → **read back the MEASURED shape and refuse (97) on a
+mismatch (P-C, §2b, new this round)** → poll both members RUNNING with a usable ssh path
 (`_rpc_check_readback`, §1) → build both members in parallel via one shared per-rank heredoc
-(`_rpc_remote_script`) → start rank 0, poll the 128-byte id file, `scp` to a local staging copy,
-`scp` up to the member, THEN start rank 1 → watch both ranks (inactivity/wrong-tree/budget) →
-copy both ranks' own logs into the artifact dir (F6, §2) → pull both `rank-<r>.json` reports (a
-failed pull joins `rc`) → assemble ONE `gang` artifact, refusing on an unresolved host/iface or a
-repeated host (F4, §2) → run the id-secrecy scan, now hang-proof (F5, §2) → on EVERY exit arm,
-the EXIT trap (`_rpc_cleanup_cluster`) records self-removal, deletes the cluster (joining a
-failed delete into `rc`, F3(c)), chains `rp_cleanup` (F2), and exits (`ci/scripts/runpod_gpu_cluster.sh:591-608`
-at HEAD).
+(`_rpc_remote_script`) → start rank 0, poll the 128-byte id file, **mark `id_landed=1`** (P-A,
+§2b), `scp` to a local staging copy, `scp` up to the member, THEN start rank 1 → watch both ranks
+(inactivity/wrong-tree/budget) → copy both ranks' own logs into the artifact dir (F6, §2) → pull
+both `rank-<r>.json` reports (a failed pull joins `rc`) → assemble ONE `gang` artifact with the
+MEASURED `pod_count`/`gpu_count_per_pod` threaded in (P-C, §2b), refusing on an unresolved
+host/iface or a repeated host compared case-insensitively (F4, §2 + advisory, §2b) → on EVERY exit
+arm, the EXIT trap (`_rpc_cleanup_cluster`) records self-removal, deletes the cluster (joining a
+failed delete into `rc`, F3(c)), **runs the id-secrecy scan and quarantines a dirty carrier
+directory (`_rpc_scan_or_quarantine`, P-A, §2b — moved OUT of the main body's own tail this round;
+it no longer runs there at all)**, deletes the staging id file unconditionally, chains `rp_cleanup`
+(F2), and exits (`ci/scripts/runpod_gpu_cluster.sh:701-734` at HEAD).
 
-**Exit contract**, unchanged in shape by this round, verified against the driver's own exit
-sites at HEAD: `0` pass; `75` no cluster capacity; `76` inactivity kill OR the id never crossed
-within `RP_SSH_WAIT_SECS`; `77` wrong tree; `97` wrong shape (device-count/compute-cap mismatch,
-OR a member's launch-time read-back failure); `124` budget cut at T-10m; else the driver's own
-post-run refusal (a failed pull, a failed assembly/refusal, a failed id-secrecy scan, a missing
-`ens1` line, or — new this round, F2/F3(c) — a LEAKED cluster on a failed exit-time delete), by
-name.
+**Exit contract**, verified against the driver's own exit sites at HEAD: `0` pass; `75` no cluster
+capacity; `76` inactivity kill OR the id never crossed within `RP_SSH_WAIT_SECS`; `77` wrong tree;
+`97` wrong shape (device-count/compute-cap mismatch, a member's launch-time read-back failure, OR
+— new this round, P-C — the MEASURED cluster shape disagreeing with what this driver requested);
+`124` budget cut at T-10m; else the driver's own post-run refusal (a failed pull, a failed
+assembly/refusal, a failed id-secrecy scan — which now also quarantines the carrier directory
+before the process exits, P-A — a missing `ens1` line, or a LEAKED cluster on a failed exit-time
+delete), by name.
 
-**Cost derivation** (committed, never re-derived per run, unchanged by this round):
+**Cost derivation** (committed, never re-derived per run, unchanged by round 2):
 `2 x $1.908/GPU/h = $3.816/h`; terminate-succeeds `1h x $3.816/h = $3.82`/run; sweep-only `(1 +
 6)h x $3.816/h = $26.71`. `≤ 1h billed, ≤ 2 runs` is the standing spend authorization dated
 2026-09-13.
 
-**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh` (58 cases, up from 50 at c4; verified this
-round, `bash ci/scripts/test_gpu_cluster_lane.sh`, exit 0) sources the driver, never executes it.
-Beyond the c4-era G0-G7/F2/F3/F5/F11/A5 cases (unchanged in shape), this round adds: F1 (§2), the
-F2/F3(c) EXIT-trap block (§2), F6(a) (§2).
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh` (74 cases, up from 58 at round 1's own close, up
+from 50 at c4; verified this round, `bash ci/scripts/test_gpu_cluster_lane.sh`, exit 0) sources the
+driver, never executes it. Round 2 adds: the P-A block (§2b, four named exit arms plus an
+`id_landed=0` control), the P-C/P-D block (§2b, happy path + 3x8 shape + four refusal/representable
+arms), and F10 (§2b, the comment-filter fix's own proving fixture).
 
-## 5. M4 — the id-secrecy scan, post-fix
+## 5. M4 — the id-secrecy scan, post round-2
 
-See §2 F5 in full. Carrier set unchanged: the pulled artifact directory (now hang-proof and
-FIFO/socket-refusing), the run log (now genuinely inside that directory, F6), the assembled `gang`
-artifact JSON, the staging copy's own directory listing. Exit lattice unchanged: `0` clean, `1`
-hit (named by carrier and encoding), `2` UNEXAMINABLE.
+See §2 F5 and §2b P-A/P-B/advisory in full. Carrier set unchanged: the pulled artifact directory
+(hang-proof, FIFO/socket-refusing, and now stack-safe rather than recursion-limited, P-B), the run
+log (genuinely inside that directory, F6), the assembled `gang` artifact JSON, the staging copy's
+own directory listing. Exit lattice unchanged: `0` clean, `1` hit (named by carrier and encoding,
+now including a line-wrapped base64 encoding, §2b advisory), `2` UNEXAMINABLE (now also covering
+ANY scanner-internal exception, not only its own documented `ScanTimeout`, §2b P-B). Round 2 also
+moves WHEN the scan runs: no longer inline near the main body's own tail (round 1's own shape,
+which left every `exit` call between "the id lands" and that tail point unscanned) — now the EXIT
+trap runs it on every one of those arms (§2b P-A).
 
-**Oracle**: `gang_id_secrecy_scan.py --self-test` (23 cases, up from 17 at c4; verified this
-round, exit 0). `test_gpu_cluster_lane.sh`'s F5 group drives the same scan through
-`_rpc_run_id_secrecy_scan` against equivalent fixtures, unchanged in shape by this round.
+**Oracle**: `gang_id_secrecy_scan.py --self-test` (27 cases, up from 23 at round 1's own close, up
+from 17 at c4; verified this round, exit 0). `test_gpu_cluster_lane.sh`'s F5 group drives the same
+scan through `_rpc_run_id_secrecy_scan` against equivalent fixtures, unchanged in shape by round
+2; round 2's own P-A block (§2b, §4) drives the SAME scan through the real EXIT trap instead.
 
-## 6. M5 — P8 (schedule visibility) and the `RENTING_ROOTS` derivation, post-fix
+## 6. M5 — P8 (schedule visibility) and the `RENTING_ROOTS` derivation, post round-2
 
-Unchanged in its core property from c4 (`check_p8_schedule_visibility`,
-`ci/scripts/check_gpu_prove_once.py:1341-1435` at HEAD): a `schedule:` key on a paid-pod-lane
-workflow (or any workflow mentioning a `RENTING_ROOTS`-derived driver while carrying the secret)
-is a FINDING unless the workflow is a reviewed `PAID_LANE_CRON_ALLOWLIST`
-(`ci/scripts/check_gpu_prove_once.py:1304-1315` at HEAD) entry whose token resolves.
+Unchanged in its core property since c4 (`check_p8_schedule_visibility`,
+`ci/scripts/check_gpu_prove_once.py:1354-1448` at HEAD, moved from round 1's `1341-1435` — round
+2's own `_strip_trailing_comment` fix, below, inserted 13 lines ahead of this function without
+touching its own body): a `schedule:` key on a paid-pod-lane workflow (or any workflow mentioning
+a `RENTING_ROOTS`-derived driver while carrying the secret) is a FINDING unless the workflow is a
+reviewed `PAID_LANE_CRON_ALLOWLIST` (`ci/scripts/check_gpu_prove_once.py:1317-1327` at HEAD, moved
+from round 1's `1304-1315`) entry whose token resolves.
 
-**Advisory fix this round**: the allow-list review covers exactly ONE reviewed cadence per lane —
-a SECOND `- cron:` entry under the same `schedule:` key, which the token-resolution check alone
-cannot see, is now its own FINDING:
+**Advisory fix (round 1, unchanged by round 2)**: the allow-list review covers exactly ONE
+reviewed cadence per lane — a SECOND `- cron:` entry under the same `schedule:` key, which the
+token-resolution check alone cannot see, is its own FINDING:
 
-`_read_schedule_cron_entries` (`ci/scripts/check_gpu_prove_once.py:1318-1338` at HEAD) reads
-`on.schedule` as a real list through the SAME PyYAML-backed parse `read_top_level_on_block` uses
-(`check_execution_surface_reachability.py`'s own loader, imported as `exec_mod`), never a second,
-independently-drifting text scan; its own finding text, naming the count, sits at
-`ci/scripts/check_gpu_prove_once.py:1425` (at HEAD).
+`_read_schedule_cron_entries` (`ci/scripts/check_gpu_prove_once.py:1331-1350` at HEAD, moved from
+round 1's `1318-1338`) reads `on.schedule` as a real list through the SAME PyYAML-backed parse
+`read_top_level_on_block` uses (`check_execution_surface_reachability.py`'s own loader, imported as
+`exec_mod`), never a second, independently-drifting text scan; its own finding text, naming the
+count, sits at `ci/scripts/check_gpu_prove_once.py:1438` (at HEAD, moved from round 1's `1425`).
 
-**Advisory fix, also this round**: `drop_comment_lines`
-(`ci/scripts/check_gpu_prove_once.py:478-487` at HEAD) now strips a TRAILING `# ...` comment off
-an otherwise-code line (`_strip_trailing_comment`, `ci/scripts/check_gpu_prove_once.py:456-476`
-at HEAD), tracking quoted spans so a `#` inside a string literal is never mistaken for a comment
-start — a token that occurs only after a trailing `#` is prose, never code evidence, and no
-longer resolves a P8 allow-list token (or any other "does this text mention X" search this helper
-backs).
+**Advisory fix (round 1)**: `drop_comment_lines` (`ci/scripts/check_gpu_prove_once.py:491-500` at
+HEAD, moved from round 1's `478-487`) strips a TRAILING `# ...` comment off an otherwise-code line
+(`_strip_trailing_comment`, `ci/scripts/check_gpu_prove_once.py:456-488` at HEAD — round 2 grew
+this from round 1's `456-476` by twelve lines, see below), tracking quoted spans so a `#` inside a
+string literal is never mistaken for a comment start — a token that occurs only after a trailing
+`#` is prose, never code evidence, and never resolves a P8 allow-list token (or any other "does
+this text mention X" search this helper backs).
 
-`RENTING_ROOTS` (`ci/scripts/check_gpu_prove_once.py:978` at HEAD, unchanged) still carries both
-roots; `PAID_POD_LANE_TABLE`'s cluster row (`ci/scripts/check_gpu_prove_once.py:879` at HEAD,
-unchanged) is unaffected by this round.
+**Advisory fix (round 2)**: `_strip_trailing_comment` mistoggled its own quote-state on a
+backslash-escaped apostrophe — bash's own `'\''` idiom for embedding a literal quote inside a
+single-quoted string is three quote characters but only TWO real delimiters, and toggling on all
+three left the parser believing it was still inside a string, so a genuine trailing comment
+following one would never be stripped. Fixed by skipping the escaped character
+(`ci/scripts/check_gpu_prove_once.py:477-479` at HEAD, inside the function's own `while` loop)
+rather than toggling on it.
 
-**Oracle**: `test_check_gpu_prove_once.py` (206 cases at HEAD, up from 201 pre-round; all
-passing, `python3 ci/scripts/test_check_gpu_prove_once.py`, exit 0). This round's additions:
-`RpSshoRequiresRpInitTest` (§2 F1), a second-cron-entry RED case plus a single-cron GREEN control
-in `ScheduleVisibilityTest`, `DropCommentLinesTrailingCommentTest` (5 cases). The pre-existing
+`RENTING_ROOTS` (`ci/scripts/check_gpu_prove_once.py:991` at HEAD, moved from round 1's `978`,
+unchanged content) still carries both roots; `PAID_POD_LANE_TABLE`'s cluster row
+(`ci/scripts/check_gpu_prove_once.py:892` at HEAD, moved from round 1's `879`, unchanged content)
+is unaffected by round 2.
+
+**Oracle**: `test_check_gpu_prove_once.py` (207 cases at HEAD, up from 206 at round 1's own close,
+201 pre-round-1; all passing, `python3 -m unittest ci.scripts.test_check_gpu_prove_once`, exit 0).
+Round 1's own additions: `RpSshoRequiresRpInitTest` (§2 F1), a second-cron-entry RED case plus a
+single-cron GREEN control in `ScheduleVisibilityTest`, `DropCommentLinesTrailingCommentTest` (5
+cases). Round 2 adds ONE case to that same class,
+`test_a_backslash_escaped_apostrophe_inside_a_single_quoted_string_is_not_a_toggle`
+(`ci/scripts/test_check_gpu_prove_once.py:661-672` at HEAD). The pre-existing
 `DerivedRentingDriverTest`'s own hard-coded expected-derivation list
-(`ci/scripts/test_check_gpu_prove_once.py:1296-1335` at HEAD) gained
-`ci/scripts/test_gpu_cluster_lane.sh` — this round's own F2/F3(c) fixture text sources
-`runpod_gpu_cluster.sh` in a real subshell and names `rp_cluster_delete`/`rp_cleanup` in
+(`ci/scripts/test_check_gpu_prove_once.py:1309-1348` at HEAD, moved from round 1's `1296-1335`)
+still gained `ci/scripts/test_gpu_cluster_lane.sh` at round 1 — round 1's own F2/F3(c) fixture text
+sources `runpod_gpu_cluster.sh` in a real subshell and names `rp_cluster_delete`/`rp_cleanup` in
 non-comment text, so the deliberately over-approximating derivation scan (§0's own doctrine)
-derives it too; cleared the identical way every sibling test file already is, by `ci.yml`'s guard
-job carrying no `RUNPOD_API_KEY`.
+derives it too; round 2's own new P-A/P-C/P-D fixture text (§2b) sources the same file the same
+way and adds no NEW derived driver, only more non-comment mentions of the same one already listed;
+cleared the identical way every sibling test file already is, by `ci.yml`'s guard job carrying no
+`RUNPOD_API_KEY`.
 
-## 7. M6 — artifact registry leg discrimination, post-fix
+## 7. M6 — artifact registry leg discrimination, post round-2
 
-See §2 F4 in full for the fix itself. `gang.leg` remains a required, closed-set field
-(`"pod"`|`"cluster"`), checked first. Pod-leg rows unchanged. Cluster-leg rows
-(`GANG_CLUSTER_FIELD_REGISTRY`, `ci/scripts/check_cuda_run_artifacts.py:1610-1668` at HEAD) now
-carry the strengthened `ranks[]`/cross-field/producer-binding properties §2 F4 describes.
+See §2 F4 and §2b advisory (case-insensitive host compare) in full for the fix itself. `gang.leg`
+remains a required, closed-set field (`"pod"`|`"cluster"`), checked first. Pod-leg rows unchanged.
+Cluster-leg rows (`GANG_CLUSTER_FIELD_REGISTRY`, `ci/scripts/check_cuda_run_artifacts.py:1624-1676`
+at HEAD, moved from round 1's `1610-1668`) now carry the strengthened
+`ranks[]`/cross-field/producer-binding properties §2 F4 describes, and `_gang_check_cluster_shape`'s
+own `pod_count`/`gpu_count_per_pod` cross-field check is non-vacuous for the first time since round
+2's own P-C threads the driver's MEASURED shape rather than a hardcoded literal into the field the
+checker compares against (§2b).
 
 **Oracle**: `check_cuda_run_artifacts.py --self-test` — verified green this round
 (`python3 ci/scripts/check_cuda_run_artifacts.py --self-test`, exit 0), all rule (k) cases
-including the eight new F4 arms named in §2.
+including the nine F4 arms named in §2/§2b (eight at round 1's own close, plus round 2's own
+case-insensitive-host arm).
 
-## 8. The executed attempt — status, unchanged by this fix round
+## 8. The executed attempt — status, unchanged by either fix round
 
 No real RunPod cluster run has happened. `CONTRACT-U7b.md §2` schedules one at the end of c3,
 authorized, bounded by §4's own cost figures — its log would be the evidence for the `args`
 entrypoint reaching bash on `RP_IMAGE` (§1), member sshd reachability, `ens1` as the overlay
-iface, and whether member self-removal works. This fix round is entirely mocks-only (per its own
-brief: never call the RunPod API, no key available to this agent) and changes nothing about this
-status. A failed run, when one is executed, is itself a FINDING to be recorded and fixed (re-run
-once at most, within the 2-run authorization).
+iface, and whether member self-removal works. Both fix rounds are entirely mocks-only (per their
+own briefs: never call the RunPod API, no key available to this agent) and change nothing about
+this status. A failed run, when one is executed, is itself a FINDING to be recorded and fixed
+(re-run once at most, within the 2-run authorization).
 
 ## 9. Known-unmeasured / uncovered (named, never claimed closed)
 
 - **Member self-removal on a cluster pod.** Unknown until §8's run executes and records
   `cluster-self-remove: ok|refused` (`_rpc_self_remove_status`/`_rpc_cleanup_cluster`,
-  `ci/scripts/runpod_gpu_cluster.sh:570-608` at HEAD).
+  `ci/scripts/runpod_gpu_cluster.sh:644-734` at HEAD, moved from round 1's `570-608`).
 - **The REST v2 `args` field reaching `bash -c` on `RP_IMAGE`.** Never independently confirmed —
   §1. The launch-time read-back is the guard against this being false, not a proof it is true.
 - **The `NCCL_SOCKET_IFNAME=ens1`/pin set at world >= 3.** This unit's own leg proves world 2
   only. `docs/maintainer/dev-gpu.md`'s own "Known-unmeasured" section (at `5ebe53ab`, unchanged)
   states this and points back here.
-- **S5's cross-host byte identity.** S5 (README.md, at `9f69275b`, unchanged) measured
-  byte-identical forward/backward/SGD across two PROCESSES on two A100s, never a cross-HOST NCCL
-  collective; this leg's `reduced_vector_digest` equality is a narrower, different measurement
-  (a bit-exact sum, not a training step's digest pair) and does not itself extend S5's claim.
+- **S5's cross-host byte identity.** `docs/plans/67-distributed-training/README.md`'s own **S5**
+  entry (cited by construct — a live plan doc, no sha; round 2 corrects round 1's own citation of
+  this as "README.md, at `9f69275b`", which pointed at the repository-root README rather than the
+  plan doc the measurement actually lives in) states candle 0.11 LoRA-shaped forward/backward/SGD
+  is byte-identical across processes and across two A100s with no env pins — this measured two
+  PROCESSES, never a cross-HOST NCCL collective; this leg's `reduced_vector_digest` equality is a
+  narrower, different measurement (a bit-exact sum, not a training step's digest pair) and does
+  not itself extend S5's claim.
 
 ## 10. Invariants crossed
 
 B2 (every script and doc here names no consumer — `python3 ci/scripts/check_no_consumer_names.py`
 verified green this round); the paid-lane doctrine (P1/P7/P8: label/dispatch only, never
-merge-path); B6 (the ai-core test body and the docs-ci lane land together — this branch's own ten
-commits below the merge, §0's header, plus this fix round's own eleventh); K2 (every parsed API
-body is validated before use).
+merge-path); B6 (the ai-core test body and the docs-ci lane land together — this branch's own
+twelve commits below the merge, §0's header, plus this fix round's own thirteenth/fourteenth); K2
+(every parsed API body is validated before use — round 2 adds the cluster's own `compute` block,
+§2b P-C).
 
 ## 11. Gate files a human must review at this unit's merge
 
 `swarm.yml`'s human-amend-only glob (`SWARM_GATE_TOUCHED`) covers gate-script edits; the reviewer
 checks:
 
-- `ci/scripts/check_gpu_prove_once.py` — P8's schedule-cron-count check and the trailing-comment
-  stripper (§2 F6 advisory / §6).
-- `ci/scripts/check_cuda_run_artifacts.py` — rule (k)'s strengthened cluster-leg registry and the
-  leg/producer binding (§2 F4).
+- `ci/scripts/check_gpu_prove_once.py` — P8's schedule-cron-count check, the trailing-comment
+  stripper (§2 F6 advisory / §6), and round 2's own backslash-apostrophe fix to that same stripper
+  (§2b advisory).
+- `ci/scripts/check_cuda_run_artifacts.py` — rule (k)'s strengthened cluster-leg registry, the
+  leg/producer binding (§2 F4), and round 2's own case-insensitive host compare (§2b advisory).
 - `ci/scripts/runpod_lib.sh` — `rp_sweep`'s now-fatal refused-terminate arm and
-  `rp_cluster_sweep`'s now-fatal `UNAGEABLE` arm (§2 F3).
+  `rp_cluster_sweep`'s now-fatal `UNAGEABLE` arm (§2 F3) — UNTOUCHED by round 2 (read-only this
+  round; verified via `git status` at commit time).
 - `ci/scripts/runpod_gpu_cluster.sh` — `rp_init` (§2 F1), the relocated/chained EXIT trap (§2
-  F2/F3(c)), the assembly-time refusal and RUN_LOG relocation (§2 F4/F6).
+  F2/F3(c)), the assembly-time refusal and RUN_LOG relocation (§2 F4/F6), and round 2's own
+  measured-shape refusal, EXIT-trap scan-or-quarantine, and unconditional staging-file delete
+  (§2b P-A/P-C).
 - `ci/scripts/gang_id_secrecy_scan.py` — the cycle-safe walk, the regular-file-only read, and the
-  wall-clock budget (§2 F5).
+  wall-clock budget (§2 F5), and round 2's own explicit-stack rewrite, total exception lattice,
+  and whitespace-stripped base64 matching (§2b P-B/advisory).
+- `ci/scripts/runpod_gpu_prove.sh` — round 2's own logged (never silently discarded) pre-run
+  `rp_sweep` rc (§2b advisory).
 
 ## 12. Residuals recorded UNCOVERED
 
@@ -524,14 +839,18 @@ checks:
 - The NCCL pin set at world >= 3 (§9).
 - S5's cross-host byte identity (§9).
 - **U7b-A3** (the `gpu-gang.yml` 6-hourly cron re-add) is explicitly NOT part of this unit.
-- Every residual PR-B1's own contract already recorded UNCOVERED for P6/P7 is unchanged by this
-  unit or this fix round.
+- Every residual PR-B1's own contract already recorded UNCOVERED for P6/P7 is unchanged by
+  either fix round.
 
 ## 13. Citations verified against which head
 
 Every construct cited above was read directly against this worktree's tree via `grep -n`/direct
-file reads, AFTER every fix in §2 landed — the last step before this file was written — never
-against a scratchpad working document's own line numbers, and never against `CONTRACT-U7b.md`'s
-own §7/§8 fold text beyond citing its decisions by name. Every citation is the bare `path:line`
-(or `path:line-line`) form `check_rigor_record.py`'s own `check_path_line_citations` matches,
-tagged `(at <sha>)` per this file's own header convention (§0).
+file reads, AFTER round 2's own fix commit (`f30813e2`) landed — the last step before this file
+was written — never against a scratchpad working document's own line numbers, and never against
+`CONTRACT-U7b.md`'s own §7/§8 fold text beyond citing its decisions by name. Every citation is the
+bare `path:line` (or `path:line-line`) form `check_rigor_record.py`'s own
+`check_path_line_citations` matches, tagged `(at <sha>)` per this file's own header convention
+(§0); a citation this round corrected (never merely re-derived) says so explicitly at its own
+site, rather than silently overwriting round 1's own prose. Self-check command for every citation
+in this revision: `git checkout <sha> -- <path> 2>/dev/null; sed -n '<line>,<line>p' <path>` against
+this branch's own worktree (`git log --format=%h main..HEAD` lists every sha above).

@@ -355,6 +355,48 @@ fix — nothing in the current tree references either.
 
 **The workspace-run discovery (c4b).** After c3c, a `cargo test --workspace` run (never `-p jammi-ai -p jammi-db` alone, this unit's own crate-scoped gates) surfaced two further defects neither crate-scoped suite could have seen. (i) `crates/jammi-bench/src/finetune_run.rs::run_impl`'s bench binary failed to compile: a mismatched-types error at its `training_loop.run(&train_loader)` call site against the new `crates/jammi-ai/src/fine_tune/trainer.rs::TrainingLoop::run(&mut self, source: TrainingSource)` signature — because `jammi-bench` is a separate crate outside `-p jammi-ai -p jammi-db`'s build graph entirely, so neither package-scoped `cargo test` ever compiles it; fixed by `7f493d87` (the bench call-site addendum above). (ii) `crates/jammi-server/tests/it/grpc_job.rs::training_under_a_tenant_scope_succeeds_over_the_wire`, a pre-existing tenant-isolation regression test, failed its completion assertion — because that server-level test is the first caller in the tree to submit AND await a job through a genuinely task-local tenant scope over a `Streamed` source; every `jammi-ai`-level tenant oracle at the time used the session's STICKY binding, which the P-T3 testing rule above shows masks exactly this bug class. Fixed by `b27828be` (c3d, the P-T1–P-T3 section above). Neither defect was reachable from `-p jammi-ai`/`-p jammi-db` in isolation: the first is a foreign crate's compile error, the second needed a cross-crate (`jammi-server`) caller that scopes both halves of the tenant boundary the way production's gRPC layer does — which is exactly why the merge-path gate set runs the full workspace, not each touched crate alone.
 
+## The closing round (2026-09-15) — the audit's two blocks and four advisories, lead-applied
+
+The closing adversarial audit (round 1) blocked on two items and the closing citation check on a stale
+pre-amend sha in a test's doc comment (fixed by construct in that comment). Discipline PASSED. The user then
+took the unit over from the swarm; the fixes below were applied by the lead and the closers were NOT re-run.
+
+- **The bench timer spans `run()` only.** `crates/jammi-bench/src/finetune_run.rs::run_impl` had moved the
+  per-epoch loader build (`RowSet::loader`, a clone of the whole fixture corpus, media bytes included) inside
+  the `train_run_wall_s` span, whose contract in `crates/jammi-bench/src/report.rs` excludes loader construction.
+  The build is hoisted above the timer. Oracle:
+  `crates/jammi-bench/src/finetune_run.rs::train_run_wall_s_excludes_the_loader_build` — a test-only,
+  thread-local sleep hook in `RowSet::loader` makes the build's cost large and deterministic and asserts it is
+  outside the measured span.
+- **P1 pins the shipped derivation.**
+  `crates/jammi-ai/tests/it/training_set_stream.rs::p1_the_loader_derived_state_plans_with_no_sort_and_no_merge`
+  called a hand-rolled `SessionStateBuilder::new_from_existing(..).with_config(..)` — the construction c3c
+  replaced because it replaces the caller's default catalog. It now calls
+  `crates/jammi-db/src/session.rs::single_partition_context`, the function the loader ships with.
+- **An unreadable pre-pass aggregate is a typed refusal.** `crates/jammi-ai/src/fine_tune/stream.rs::validate_window`
+  read both aggregate outputs through `unwrap_or(0.0)`, so a window whose subquery yielded no rows (a `row_count`
+  overstating the table → SQL `NULL`) silently passed the whole-table null/NaN refusal. It refuses now, naming
+  the aggregate and the window. Oracle:
+  `crates/jammi-ai/tests/it/training_set_stream.rs::p_b3_a_window_whose_aggregate_subquery_matches_no_rows_refuses_at_open`.
+- **`split` consumes.** `crates/jammi-ai/src/fine_tune/data.rs::TrainingDataLoader::split` takes `self`, so a
+  second split of a reservation-carrying loader — which would hand back zero bytes with no error — is
+  unrepresentable.
+- **An unreadable sidecar is non-fatal.** `crates/jammi-db/src/store/mod.rs::training_set_registration_sort_order`
+  treats an unreadable manifest like an absent one (warn naming the table and the error; registration succeeds;
+  `Ok(None)`; the explicit `ORDER BY` still sorts). Oracle:
+  `crates/jammi-db/tests/it/materialization.rs::registration_warns_when_a_training_sets_sidecar_is_unreadable`.
+  The one sidecar read per training-set row at session start is stated as a cost in that function's doc.
+- **The guide's writer source universe states the truth.** A versioned result table's provider is a
+  `UnionExec` over one `ListingTable` per fragment (`crates/jammi-db/src/store/masked_provider.rs`), N partitions
+  regardless of `target_partitions`, which the writer's `partition_count` guard cannot see; no training-set
+  source is one today (every `source_sql` names the source schema's table; pinned providers are read through
+  `read_table` only), and the guide says so instead of claiming the provider follows `target_partitions`.
+
+Lead verification: `cargo fmt`, the agent's `cargo clippy --workspace`, `cargo test -p jammi-bench/-db/-ai` (green),
+and a `cargo test --workspace` in which only `jobs_cancel::a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_boundary`
+failed (a poll-cadence timing assertion seen only under full-suite load, passing in isolation twice before this
+round); the unit's suites run again on the consolidated wave-3 branch before its single PR.
+
 ## Gates run at contract time
 
 **At `4b03d5a9` (the contract's first write, c4).** `cargo fmt --all --check` (0), `cargo clippy -p jammi-db --all-targets -- -D warnings` (0), `cargo test -p jammi-db` (521 lib + 480 it + 3 doc, 0 failed, 1 pre-existing ignored), `python3 ci/scripts/perf/check_citations.py` (0, 1024 files scanned). `cargo clippy -p jammi-ai`/`cargo test -p jammi-ai` are c1–c3c's own gates (unit branch, prior commits).

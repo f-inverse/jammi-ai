@@ -445,7 +445,7 @@ impl<'a> RowSet<'a> {
     /// would be unpairable with every other MNRL leg.
     ///
     /// Test-only (P-B1 oracle): sleeps
-    /// [`LOADER_BUILD_SLEEP_MS_FOR_TEST`] milliseconds first, when nonzero,
+    /// `LOADER_BUILD_SLEEP_MS_FOR_TEST` milliseconds first, when nonzero,
     /// so a test can make this call's own wall-clock cost large and
     /// deterministic and prove it is excluded from
     /// [`crate::report::FinetuneRunTier::train_run_wall_s`]'s measured span
@@ -3538,7 +3538,7 @@ mod tests {
     /// real cost (cloning 4-8 short synthetic strings) is nanoseconds,
     /// dwarfed by noise on any wall-clock comparison. This test makes
     /// construction's cost LARGE and DETERMINISTIC instead of relying on the
-    /// fixture's real size: [`LOADER_BUILD_SLEEP_MS_FOR_TEST`] injects a
+    /// fixture's real size: `LOADER_BUILD_SLEEP_MS_FOR_TEST` injects a
     /// fixed sleep into every `RowSet::loader` call for the duration of this
     /// test's `run_impl` invocation. `non_perturbation_test_params` runs 2
     /// epochs with `probe_at_init = true`, so the hook fires 3 times total

@@ -680,29 +680,6 @@ $ grep -n 'rp_sweep ||' ci/scripts/runpod_gpu_prove.sh
 **Round-3 stop rule status**: not triggered — round 2 closed all five findings on the first
 attempt, never blocking a second time on the same mechanism (`M3`/`M4`).
 
-**Correction (round 2):** round 1's own heading here read "unchanged by this fix round" and cited
-this file at `d12e1689` — a sha that does not exist on this branch (see this file's own header
-correction note). The real commit, `b480f2dc`, is NOT a no-op: `git show --stat b480f2dc` shows
-`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs | 208 ++++++++++++++++++++--` (189 insertions,
-19 deletions, one file) — round 1's own heading should have read "changed once, by `b480f2dc`,
-outside this contract's own owned files" from the start. Neither docs-ci fix round (this one
-included) has touched this file; `git status` over it stays clean across both rounds.
-
-`gang_nccl_two_hosts_reduce_a_known_vector`
-(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` at `b480f2dc`) is feature-gated and reads its
-own env contract (`JAMMI_GANG_TWO_HOSTS_RANK`/`_WORLD`/`_ID_FILE`,
-`JAMMI_REQUIRE_CUDA_TWO_HOSTS`). Rank 0 mints `Nccl::new_id()` and writes it atomically; rank 1
-refuses any id file whose size is not exactly 128 bytes. `b480f2dc` (landed by an ai-core agent in
-this same worktree during round 1's own fix window, outside this contract's own owned files)
-closes a sibling finding to round 1's own F4: `hostname()` now returns a named `Result` instead of
-masking a failed read behind `"unknown"`, and `missing_report_metadata_reason` names which of
-hostname/iface is missing before any NCCL work runs, so a bad metadata read panics rather than
-writing an indistinguishable-from-real `"unknown"` pass report.
-
-**Oracle**: compiles under `cargo clippy -p jammi-ai --features live-gpu-tests --test
-gpu_capability` (the gated-surface clippy step; not itself proof the test PASSES, only that it
-compiles). The real proof is the executed run (§8) — not yet performed.
-
 ## 2c. Fix round 2c — a lead-found defect on round 2's own new surface, closed by name
 
 **This is not a third audit BLOCK.** The lead found this defect on the tree at `ebe79a0d` (round
@@ -711,7 +688,7 @@ small, lead-initiated fix (docs-ci) BEFORE that audit re-ran — §6's round-3 s
 BLOCK on the driver excises the whole M3/M4 surface) is NOT triggered by this round: it closes one
 defect by name, the same discipline §2b's own five findings used, never a mechanism trade.
 
-**The defect.** `_rpc_scan_or_quarantine` (round 2's own name, `runpod_gpu_cluster.sh:668-687` at
+**The defect.** `_rpc_scan_or_quarantine` (round 2's own name, at
 `c4f0c36e`'s tree) ran on EVERY exit arm once the id had landed (P-A, correct), but passed
 `"$ASSEMBLED"` to `_rpc_run_id_secrecy_scan` UNCONDITIONALLY, and `gang_id_secrecy_scan.py`'s own
 `--assembled-artifact` was a REQUIRED argument whose absence-at-that-path was always UNEXAMINABLE
@@ -746,8 +723,8 @@ type to `Path | None`, and the required-carrier loop
 and `assembled_artifact` —
 required ONLY when not `None`). The driver threads a NEW global, `assembly_ok` (declared `0`
 alongside `id_landed=0`, `ci/scripts/runpod_gpu_cluster.sh:800-806` at HEAD), set to `1` ONLY
-immediately after `_rpc_assemble_gang_artifact` itself returns `0` (`ci/scripts/runpod_gpu_
-cluster.sh:1055-1068` at HEAD — the call site, previously a bare `||` refusal, is now an
+immediately after `_rpc_assemble_gang_artifact` itself returns `0`
+(`ci/scripts/runpod_gpu_cluster.sh:1055-1068` at HEAD — the call site, previously a bare `||` refusal, is now an
 `if`/`else` so the success arm can set the flag; a `1`/`2` refusal, which never writes the file,
 leaves `assembly_ok=0`). `_rpc_run_id_secrecy_scan`'s own 4th argument becomes OPTIONAL
 (`ci/scripts/runpod_gpu_cluster.sh:638-644` at HEAD: an empty string omits `--assembled-artifact`
@@ -810,6 +787,63 @@ unchanged, asserts the scanner never runs at all. `bash ci/scripts/test_gpu_clus
 `gpu-cluster-lane: 77 passed, 0 failed`, exit 0, at this round's own HEAD.
 
 **Round-3 stop rule status**: not triggered (see this section's own opening note).
+
+## 3. M2 — the two-host NCCL test body (`gang_nccl.rs`) — changed once, by `b480f2dc`, untouched by every fix round
+
+**Restored in this revision.** This section's own heading existed in the c4 revision
+(`docs/rigor/contracts/feat_500-C-U7b.md` at `31c8aa64`'s own tree, its own §3) and round 2
+corrected its body in place (§0's own header correction note, above, names this the "§3's own
+heading and body" site) — but the corrected body was left as unheaded trailing prose at the tail
+of §2b instead of being given back its own `## 3.` heading, and round 2c's own insertion of
+`## 2c` directly after that stranded text left nothing separating `2c` from `4`: the section
+sequence jumped straight from `2c` to `4` at HEAD, with no `## 3.` anywhere in the file. Restored
+here, with every citation re-derived directly against this tree — no sha below is cited from
+anywhere but `git log --format=%h main..HEAD`.
+
+`gang_nccl_two_hosts_reduce_a_known_vector`
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:637-768` at HEAD) is feature-gated and reads
+its own env contract (`JAMMI_GANG_TWO_HOSTS_RANK`/`_WORLD`/`_ID_FILE`,
+`JAMMI_REQUIRE_CUDA_TWO_HOSTS`) through `two_hosts_env_or_require`
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:194` at HEAD), consulted BEFORE
+`serial_cuda_device_or_require_two_hosts`'s own availability check
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:159` at HEAD) — both registered against KO-7's
+ungated-skip scan in `ci/kernel-oracle-helpers.txt:91-92` (at HEAD), landed by `1480cacb`. Rank 0
+mints `Nccl::new_id()` and writes it atomically; rank 1 refuses any id file whose size is not
+exactly 128 bytes.
+
+`b480f2dc` — landed by an ai-core agent in this same worktree, outside this contract's own owned
+files, and itself BEFORE round 1's own fix commit (`31c8aa64`) — closes a sibling finding to
+round 1's own F4: `hostname()` (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:483-500` at
+HEAD) now returns a named `Result<String, String>` instead of masking a failed read behind
+`"unknown"`, and `missing_report_metadata_reason`
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:518-538` at HEAD) — a pure decision function,
+factored out of `hostname`'s own `cuda`-gated shell-out so it stays hermetically testable without
+a GPU — names which of hostname/iface is
+missing (one or both, `"; "`-joined) BEFORE any NCCL work runs, so a bad metadata read panics
+inside the `catch_unwind` closure's FIRST statement rather than letting an
+indistinguishable-from-real `"unknown"` reach a `pass` report; the existing `Err(payload)` arm
+then writes the fail report and `resume_unwind`s the same reason. `RankReport`
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:431-454` at HEAD) has no field that could hold
+the NCCL id — it travels only through `$JAMMI_GANG_TWO_HOSTS_ID_FILE` — and is written on BOTH the
+pass and fail arm, never only on success.
+
+Six hermetic tests (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:788-876` at HEAD, `mod
+report_tests`) drive `missing_report_metadata_reason` directly, without a GPU or the `cuda`
+feature: both good (`:789`), an unset iface (`:799`), an empty iface (`:818`), a failed hostname
+read (`:835`), an empty-but-`Ok` hostname (`:855`), and both bad (`:868`). Three further tests in
+the same module pin `RankReport` itself: the JSON round trip with every documented field present
+under its documented name (`:927`), a fail verdict carrying no digest and the reason (`:970`), and
+— behind a non-vacuous negative control first proven to catch a genuine leak in each of three
+encodings — that the id never appears in the report in any encoding (`:999`).
+
+Neither docs-ci fix round has touched this file: `git log --format=%h main..HEAD --
+crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` names exactly `b480f2dc`, `1480cacb`,
+`467dd9c9` — none of them `31c8aa64`/`c4f0c36e` (round 1), `ebe79a0d` (round 2), or `23ef24a9`
+(round 2c); `git status` over it stays clean across every round.
+
+**Oracle**: compiles under `cargo clippy -p jammi-ai --features live-gpu-tests --test
+gpu_capability` (the gated-surface clippy step; not itself proof the test PASSES, only that it
+compiles). The real proof is the executed run (§8) — not yet performed.
 
 ## 4. M3 — the cluster driver, post round-2c — sequence and exit contract
 

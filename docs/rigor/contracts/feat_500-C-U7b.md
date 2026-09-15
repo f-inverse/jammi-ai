@@ -835,6 +835,155 @@ unchanged, asserts the scanner never runs at all. `bash ci/scripts/test_gpu_clus
 
 **Round-3 stop rule status**: not triggered (see this section's own opening note).
 
+## 2d. Fix round M1 (this revision) — round-4's SECOND block on the excised tree, the four
+findings closed by name
+
+Round 4 audited the excised tree (round 3's own M1/M2/M5/M6 scope) and BLOCKed on four executed
+findings plus advisories, per `CONTRACT-U7b.md` §11 (the round's own pre-committed stop rule:
+**round 5 is the LAST closer round for this unit**). Every citation below is `(at HEAD)` into
+this fix round's own commit (`git log --format=%h main..HEAD` at this contract's own commit lands
+this file second, atop the fix commit — the `(at HEAD)` tree the two share).
+
+**F1 — three read sites on the reap path aliased "could not parse" onto "the answer is no".**
+`rp_cluster_sweep`'s post-delete confirmation (`ci/scripts/runpod_lib.sh, lines 1900-1948` at
+HEAD) ran `json.load` with no `try`/`except` at all — an unparseable, empty, or bare-array
+second-GET body threw an UNCAUGHT Python exception, and Python's own default exit code for an
+uncaught exception (1) collided EXACTLY with the explicit `sys.exit(1)` "confirmed gone" arm,
+so a malformed re-enumeration read as a clean success (`rc=0`, "terminated N orphaned
+cluster(s)", a traceback on stderr) while the PRE-delete parse's own `try`/`except`
+(`ci/scripts/runpod_lib.sh, lines 1842-1845` at HEAD, unchanged by this round) was already
+three-valued. **Fix**: the post-delete parse (`ci/scripts/runpod_lib.sh, lines 1913-1934` at
+HEAD) wraps `json.load` in `try`/`except` and adds `isinstance` guards on the body and its
+`clusters` list, naming every parse/shape failure `sys.exit(2)` — never falling through to
+Python's own default exit code. `rp_cluster_create` (`ci/scripts/runpod_lib.sh, lines 1539-1571`
+at HEAD), `rp_cluster_get` (`:1581-1609`), `rp_cluster_pods` (`:1621-1663`) and `rp_cluster_list`
+(`:1673-1707`) each gain the identical three-valued shape: exit 0 (the key is present), exit 1 (a
+well-formed object missing the required key), exit 2 (unparseable/wrong-shaped body,
+`ci/scripts/runpod_lib.sh:1553-1555` being `rp_cluster_create`'s own pair of `sys.exit(2)` sites)
+— the bash dispatch around each (e.g. `ci/scripts/runpod_lib.sh:1565`) names a 201/200
+unparseable body "unparseable", never "missing the required key". `rp_terminate`
+(`ci/scripts/runpod_lib.sh, lines 388-432` at HEAD) no longer reads an unparseable podTerminate
+body as `sys.exit(0)` ("no errors" — success, `:415`/`:418` are the two new named-refusal prints
+replacing that arm); the doctrine contradiction between the cluster-member exclusion set's own
+doc (previously "belt-and-suspenders") and `rp_sweep`'s own doctrine comment ("FAIL-CLOSED, not
+belt-and-suspenders") is reconciled to the FAIL-CLOSED reading at `ci/scripts/runpod_lib.sh,
+lines 1767-1779` (at HEAD; `:1771` inside that same span is `rp_sweep`'s own doctrine phrase
+being echoed back, never contradicted, by the rewritten comment). **CHANGE, not merely a fix**:
+`rp_sweep`'s own UNAGEABLE-pod arm (`ci/scripts/runpod_lib.sh, lines 2749-2762` at HEAD, the
+`return 1` on the span's own last line) now bails immediately and names the pod id, mirroring
+`rp_cluster_sweep`'s pre-existing UNAGEABLE handling — pre-fix this was a silent `continue` that
+let the sweep finish green (`rc=0`); post-fix, a genuinely-reapable orphan later in the SAME
+`out` list is left unswept for this run (picked up by the next scheduled sweep), the identical
+trade-off the cluster arm already made.
+
+**Oracle**: `ci/scripts/test_runpod_cluster_lib.sh` Group 9 (post-delete confirmation:
+unparseable/empty/array second-GET bodies, and a 429 on that same second GET via
+`MOCK_CLUSTER_LIST_STATUS_2`, never previously set by any fixture on this tree — round-4's own
+citation), Group 10 (`rp_terminate` HTML-body refusal via `rp_sweep`), Group 11 (the pod
+UNAGEABLE fix); `ci/scripts/test_gpu_dev_lifecycle.sh` gains a matching Group 4c driving the same
+fix through this suite's own `rp_gql`-override harness. `bash ci/scripts/test_runpod_cluster_lib.sh`:
+`runpod-cluster-lib: 50 passed, 0 failed`, exit 0. `bash ci/scripts/test_gpu_dev_lifecycle.sh`:
+`gpu-dev-lifecycle: 157 passed, 0 failed, 0 skipped`, exit 0.
+
+**F2 — `rp_cluster_create`/`rp_cluster_get` had zero non-comment invocations anywhere on this
+tree.** `test_runpod_cluster_lib.sh`'s own header (`:5-6`) named both functions since commit c1,
+but the suite body never called either — only the header COMMENT mentioned them, which
+`drop_comment_lines` (`ci/scripts/check_gpu_prove_once.py`) strips, so neither function was even
+DERIVED as a caller of its own root by P7's own scan (§6). **Fix**:
+`ci/scripts/test_runpod_cluster_lib.sh` Group 7 (`rp_cluster_create`: 201 with an id, 201 with no id — named
+distinctly from a 201 unparseable body — a 201 unparseable body, and a non-201 refusal) and Group
+8 (`rp_cluster_get`: 200 valid, 200 missing the `id` key, 200 unparseable, 404, 500) each drive
+the real function through the suite's own mock `curl` stub. `bash
+ci/scripts/test_runpod_cluster_lib.sh`: 8 new PASS lines under `G7`/`G8`, all passing (see the F1
+oracle line above for the suite's own total).
+
+**F3 — the P7 clearance reason was misstated, and the gate's own self-match was undisclosed.**
+`ci/scripts/check_gpu_prove_once.py`'s `PAID_POD_LANE_TABLE` comment (`:888-895` at `9d356dff`'s
+tree, this round's own parent commit, before this round) claimed "P7's completeness rule clears
+it through `_check_derived_driver_cannot_rent`" — false: `rp_cluster_create` is a ROOT
+(`RENTING_ROOTS`), never itself subject to that predicate (which runs only on DERIVED DRIVERS —
+other tracked files whose text MENTIONS a closure member); `rp_cluster_create` has no CALLER on
+this tree at all, so it contributes no derived driver for P7 to hold to a row or to that
+predicate. Verified empirically against the real tree (`derive_deploy_closure`/
+`derive_renting_drivers`, `ci/scripts/check_gpu_prove_once.py`) that this file's OWN source
+self-matches its own `RENTING_ROOTS`/
+`PAID_POD_LANE_TABLE` definition (`derived["ci/scripts/check_gpu_prove_once.py"] ==
+['_rp_deploy_payload', 'rp_cluster_create', 'rp_deploy_arch']`) and clears
+`_check_derived_driver_cannot_rent` with zero findings and zero notes — a real, PRE-EXISTING,
+already-tested self-reference (`ci/scripts/test_check_gpu_prove_once.py`'s own
+`test_the_real_tree_derives_the_set_this_suite_claims`, `:1297-1355` at HEAD, already asserted
+this file is in the derived set before this round touched anything). **Fix**: the true reason is
+now stated at `ci/scripts/check_gpu_prove_once.py, lines 888-919` (at HEAD, the `PAID_POD_LANE_
+TABLE` comment's rewrite) and `:960-968` (at HEAD, the "WHAT THE DERIVATION DELIBERATELY DOES
+NOT DO" residual bullet's own extension, naming THIS FILE alongside its pre-existing
+`test_check_gpu_prove_once.py` disclosure at `:952-959`); `docs/maintainer/dev-gpu.md, lines
+859-877` (at HEAD, the "Schedule visibility (P8)" paragraph) and UNITS.md's own U7b section
+(`docs/plans/67-distributed-training/UNITS.md, lines 347-356` at HEAD) restate the same true
+reason. This is
+DISCLOSED, not "fixed" as a defect — the module's own pre-existing design philosophy ("nothing
+exempted for being ours") already applies identically to `test_check_gpu_prove_once.py`'s own
+self-match on `_rp_deploy_payload`; fixing the CLASSIFICATION (adding an exemption) would have
+been the actual regression here. `ci/scripts/test_check_gpu_prove_once.py`'s own comment on
+`test_runpod_cluster_lib.sh`'s self-match (`:1342-1351` at HEAD) is corrected to name Group 7
+(F2, above) — `rp_cluster_create` is now genuinely CALLED there, not merely mentioned in a
+stripped header comment.
+
+**Oracle**: `python3 -m unittest ci.scripts.test_check_gpu_prove_once`: `Ran 207 tests ... OK`,
+exit 0 — including the real-tree anti-vacuity assertion above, unperturbed by this round's
+comment-only edits (no closure member is mentioned in a NEW non-comment line by this round's own
+prose additions; verified: `derive_renting_drivers` against the post-fix tree still returns the
+identical derived set, plus `ci/scripts/test_runpod_cluster_lib.sh` now ALSO matching
+`rp_cluster_create` for a real reason, F2 above). `python3 ci/scripts/check_gpu_prove_once.py`:
+`gpu-prove-once: OK ...`, exit 0.
+
+**F4 — the fixed 2×1 shape was stated nowhere a caller looks.** `_rp_cluster_payload`
+(`ci/scripts/runpod_lib.sh:1488` at 23ef24a9's tree, unchanged by round 3) hardcoded
+`gpuCountPerPod: 1, podCount: 2` while its own doc, `rp_cluster_create`'s own doc, the
+cluster-primitives section header (`"N member pods"`), the reviewed key-set fixture's own
+comment, and `docs/maintainer/dev-gpu.md:802` (at `9d356dff`'s tree, before this round) never
+stated that shape is FIXED, never parameterised. **Fix**: `ci/scripts/runpod_lib.sh, lines
+1458-1466` (at HEAD, the section header) and `:1479-1499` (at HEAD, `_rp_cluster_payload`'s own
+doc) and `:1524-1538` (at HEAD, `rp_cluster_create`'s own doc) each state the fixed 2×1 request
+directly; `ci/scripts/fixtures/runpod_cluster_create_request_keys.json:3` (at HEAD, a new `_note`
+field) states the same; `docs/maintainer/dev-gpu.md, lines 763-769` (at HEAD, the cluster-leg
+section's own intro) replaces "N member pods" with the same fixed statement. "N member pods" no
+longer appears anywhere on this tree (`git grep -n 'N member pods'` — empty).
+
+**Advisories closed**: `docs/maintainer/dev-gpu.md`'s by-hand procedure (steps 4-5, `:812-826` at
+HEAD) now exports `JAMMI_REQUIRE_CUDA_TWO_HOSTS=1` on BOTH hosts (rank 0 at `:815`, rank 1 at
+`:825`) — previously implied nowhere in the procedure text, so a maintainer following it by hand
+would get a silent SKIP on a misconfigured host rather than the hard FAIL this leg's own
+require-gate flag exists to force (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:57-62` at
+`b480f2dc`, unchanged, documents the flag itself).
+
+**Advisory, recorded UNCOVERED, not closed**: the REST v2 Bearer-auth transport path itself
+(`_rp_rest`, `ci/scripts/runpod_lib.sh, lines 369-386` at HEAD) has never executed against a live
+RunPod endpoint anywhere on this tree — every test suite that reaches it (`test_runpod_cluster_
+lib.sh`, `test_gpu_dev_lifecycle.sh`, `test_gpu_gang_lane.sh`, `test_gpu_prove_lane.sh`) stubs
+`curl` on `PATH`; the live pre-flight that would exercise it for real is blocked on the user
+(§1). This is not a defect this round closes — it is named here and carried into §9 below,
+exactly as §1's own REST v2 `args`-field gap already was.
+
+**Citation-round self-check, executed for THIS revision** (§13's own convention, re-run after
+every edit in this file landed):
+
+```
+$ grep -rln 'runpod_gpu_cluster\|gpu-cluster.yml\|gang_id_secrecy_scan\|test_gpu_cluster_lane' ci .github crates docs
+```
+
+matches only `docs/rigor/contracts/feat_500-C-U7b.md` itself (104 total line matches, `grep -rn`)
+— never `docs/plans/67-distributed-training/UNITS.md` or `README.md`, and never a live `ci/`,
+`.github/`, or `crates/` path. Round 3's own self-check paragraph (§13, below) claimed the grep
+ALSO matched `UNITS.md`'s own U7b-A2b filing; re-executed against this round's own tree, it does
+not — the U7b-A2b filing text (`docs/plans/67-distributed-training/UNITS.md`, the "U7b-A2b" H3
+section) describes the excised driver conceptually without repeating any of the four deleted
+paths as a bare string. §13's own paragraph is corrected below to state this round's real output.
+
+**Round-4/M1 stop rule status**: `CONTRACT-U7b.md` §11's own pre-committed rule — **round 5 is
+the LAST closer round for this unit.** A PASS on round 5 ships M1+M2+M5+M6 whole; a BLOCK of any
+kind withholds the whole unit from wave 3 (nothing merges; U7b is refiled whole, A2 + A2b, with
+all five rounds — this one included — as its spec; the reap cron keeps main's pod-only sweep).
+
 ## 3. M2 — the two-host NCCL test body (`gang_nccl.rs`) — changed once, by `b480f2dc`, untouched by every fix round
 
 **Restored in this revision.** This section's own heading existed in the c4 revision
@@ -1097,6 +1246,16 @@ FINDING to be recorded and fixed (re-run once at most, within the 2-run authoriz
   existed on before round 3's excision, §4).
 - **The REST v2 `args` field reaching `bash -c` on `RP_IMAGE`.** Never independently confirmed —
   §1. The launch-time read-back is the guard against this being false, not a proof it is true.
+- **The REST v2 Bearer-auth transport path itself** (`_rp_rest`, `ci/scripts/runpod_lib.sh, lines
+  369-386` at HEAD — round 4/M1's own advisory, §2d). Every `rp_cluster_*` primitive and
+  `rp_cluster_sweep`/`rp_sweep`'s own cluster-member exclusion set go through this one function,
+  and every test suite that reaches it on this tree (`test_runpod_cluster_lib.sh`,
+  `test_gpu_dev_lifecycle.sh`, `test_gpu_gang_lane.sh`, `test_gpu_prove_lane.sh`) stubs `curl` on
+  `PATH` — this function's own real HTTP request/response handling (status-code parsing, the
+  `Authorization: Bearer` header, a genuine transport failure) has never executed against a live
+  RunPod endpoint anywhere on this tree. Blocked on the same user pre-flight §1 names; distinct
+  from the `args`-field bullet above (that is about whether a documented REQUEST FIELD reaches the
+  container; this is about whether the TRANSPORT CALL that ships it has ever really run).
 - **The `NCCL_SOCKET_IFNAME=ens1`/pin set at world >= 3.** This unit's own leg proves world 2
   only. `docs/maintainer/dev-gpu.md`'s own "Known-unmeasured" section (at `5ebe53ab`, unchanged)
   states this and points back here.
@@ -1198,15 +1357,26 @@ its own site. Self-check command for every citation in this revision: `git show 
 current worktree for an `(at HEAD)` tag (`git log --reverse --format=%h main..HEAD` lists every sha
 above, oldest first).
 
-**Self-check, executed for this revision** (the grep the §10 P-E1 property asks for, re-run after
-every edit in this file landed):
+**Self-check, as round 3 wrote it (historical text, corrected below — never re-executed as
+written)**: round 3's own revision of this paragraph claimed the grep below ALSO matched
+`docs/plans/67-distributed-training/UNITS.md`'s own U7b-A2b filing (and its README.md
+cost-ceiling cross-reference). Round 4/M1's own citation-round review (§2d above) re-ran the
+identical command and found that claim was FALSE — not merely stale, but never true even AT round
+3's own commit (`git show 9d356dff:docs/plans/67-distributed-training/UNITS.md | grep` and the
+same against `README.md` at that commit both return nothing): the U7b-A2b filing describes the
+excised driver conceptually and never repeats any of the four deleted paths as a bare string. This
+is the exact citation-form defect this contract's own header paragraph ("This revision supersedes
+the original c4 contract," `docs/rigor/contracts/feat_500-C-U7b.md:27-34`) already named once for
+the c4 revision's own citations — a self-check that was never actually executed against the text
+it describes, passing vacuously.
 
 ```
 $ grep -rn 'runpod_gpu_cluster\|gpu-cluster.yml\|gang_id_secrecy_scan\|test_gpu_cluster_lane' ci .github crates docs
 ```
 
-matches only: this contract's own history sections (§2/§2b/§2c/§4/§5/§9/§11/§13, all pinned `(at
-23ef24a9's tree)` or narrating what round 3 deleted), and 
-`docs/plans/67-distributed-training/UNITS.md`'s own U7b-A2b filing (and its README.md cost-ceiling cross-reference) — never a live
-`ci/`, `.github/`, or `crates/` path, and never an unqualified `(at HEAD)` into any of the four
-deleted files.
+**Re-executed for THIS revision** (§2d's own citation-round self-check, above, is the same
+command; repeated here per this section's own convention): matches only this contract's own
+history sections (§2/§2b/§2c/§4/§5/§9/§11/§13/§2d, all pinned `(at 23ef24a9's tree)` or narrating
+what round 3 deleted) — 104 total line matches, one file (§2d's own count). Never a live `ci/`,
+`.github/`, or `crates/` path, never `docs/plans/67-distributed-training/UNITS.md` or `README.md`,
+and never an unqualified `(at HEAD)` into any of the four deleted files.

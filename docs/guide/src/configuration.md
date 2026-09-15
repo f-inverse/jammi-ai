@@ -61,6 +61,10 @@ execution_threads = 8
 # `ResourcesExhausted` error rather than silently exceeding it. Default: "75%".
 memory_limit = "75%"
 # Maximum rows per DataFusion batch. Default: 8192.
+# Deployment rule: a single batch larger than `memory_limit` above cannot be
+# sorted (a spilling external sort still needs one batch resident), which
+# matters most for a training-set materialization's full-tuple sort over wide
+# rows — size this down (and `memory_limit` up) when a row is large.
 batch_size = 8192
 
 [gpu]

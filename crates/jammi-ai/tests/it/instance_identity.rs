@@ -419,9 +419,11 @@ async fn missing_result_root_path_is_accepted_verbatim_and_session_open_succeeds
 /// arm by a force-deleted `instances` row, writes NO `workers` row — the
 /// only way it could is if the cell held `Some`, which it must not after a
 /// failed first upsert. The gate is closed BEFORE the worker spawns so
-/// `run_until` parks right after that first (armed-to-fail) attempt, before
-/// it ever reaches the `claiming` transition — a stable window with no race
-/// against the loop's own later cell writes.
+/// `run_until` parks right after that first (armed-to-fail) attempt — a
+/// stable window with no race against the loop's own later cell writes —
+/// and is then OPENED so the `claiming` transition is observed too (round 6,
+/// contract §13): it creates the row by upsert, and a further prune makes the
+/// keeper re-upsert exactly those facts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -473,7 +475,44 @@ async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_
          after the injected upsert failure: {workers_after_reregister:?}"
     );
 
+    // Round 6 (contract §13): once the gate opens, the `claiming` transition
+    // must CREATE the row the failed first write never did — it is an
+    // UPSERT, never a bare `UPDATE` whose "zero rows" outcome the loop could
+    // not act on — and the cell must then match the row. This is the state
+    // the round-5 oracle stopped short of entering.
     session.open_worker_gate();
+    let mut claiming_row: Option<WorkerRecord> = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = session.catalog().list_workers().await.unwrap();
+        if let Some(w) = rows.into_iter().find(|w| w.instance_id == instance_id) {
+            if w.state == "claiming" {
+                claiming_row = Some(w);
+                break;
+            }
+        }
+    }
+    let claiming_row = claiming_row.expect(
+        "the claiming transition must write the `workers` row the failed first upsert never created",
+    );
+    // A second prune: the keeper's reregister must re-upsert EXACTLY the
+    // facts the loop last wrote (`claiming`, the same kinds), never the
+    // stale `warming` facts and never nothing.
+    force_delete_instance(session.catalog(), &instance_id).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rows = session.catalog().list_workers().await.unwrap();
+    let after = rows
+        .iter()
+        .find(|w| w.instance_id == instance_id)
+        .expect("the keeper's reregister must re-upsert the `workers` row the loop wrote");
+    assert_eq!(
+        after.state, claiming_row.state,
+        "the re-upserted row must carry the cell's state"
+    );
+    assert_eq!(
+        after.kinds, claiming_row.kinds,
+        "the re-upserted row must carry the cell's kinds"
+    );
     worker.stop_and_join().await.unwrap();
 }
 

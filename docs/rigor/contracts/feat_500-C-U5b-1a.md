@@ -329,7 +329,7 @@ has a filesystem precondition to race.
   upsert fails" deterministically (P-Y4's oracle, §12).
 - **`prune_instances(stale_after)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::prune_instances`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2557`): `DELETE FROM instances
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2559`): `DELETE FROM instances
   WHERE {stale}` — its own `workers` row cascades (`ON DELETE CASCADE`,
   `crates/jammi-db/src/catalog/schema.rs:1030`).
 
@@ -561,7 +561,7 @@ ENFORCING half; the ENUMERATING half is a new, unconditional (no
 `crates/jammi-db/tests/it/member_root_constructor.rs::
 member_root_new_has_no_production_caller`, which walks every
 `crates/<name>/src/**/*.rs` file in the whole workspace (14 crates with a
-`src/` directory, 429 `.rs` files at commit 1) and fails on the first
+`src/` directory, 430 `.rs` files at commit 1) and fails on the first
 literal occurrence of `MemberRoot::new(` — so a future in-tree production
 caller (even one that turns `test-hooks` on for an unrelated reason) is a
 named, located finding, not a silent regression. Falsified before being
@@ -886,7 +886,8 @@ LAST — no round 7) is the fold that executes the firing:
   ```
   Every survivor after this commit is history (§6, DIST-r3.md's own dated-correction chain), a
   dated correction (D9, DIST-r3.md), or U5b-1a-A2's filing (README.md) — named individually above,
-  none a live false claim. The `⇒ result_root` and "enforces at startup" instances were the TWO
+  none a live false claim — a claim round 6 REFUTED for five `crates/**` doc comments and one UNITS.md
+  sentence, closed in §13 with the phrasing-independent sweep. The `⇒ result_root` and "enforces at startup" instances were the TWO
   the round-5 audit found; no third survivor of either pattern exists after this fold. This
   contract's own §1 fixture-list error (`crates/jammi-db/src/config/tests.rs` was listed as a
   `MemberRoot::new` call site; it never builds one — it reads `member_root` off a REAL
@@ -921,7 +922,51 @@ regardless of what a seventh round's finding would be.
 
 ---
 
-## 13. Gates
+## 13. Round-6 closing verdicts (2026-09-15) — the lead's takeover; the fold's last members; the worker cell as one fact
+
+Round 6's closers: discipline PASS; citation BLOCK on one two-line drift (`prune_instances` cited at the line it
+held at commit 1, two lines above its position after `b9c4c03f` grew a doc comment earlier in the file) and a
+narrative count off by one (430 `.rs` files, not 429); audit BLOCK on (F1) five live statements — migration 035's
+own rustdoc (two sentences), `crates/jammi-ai/src/session.rs::open_with_placement`'s doc and
+`build_result_store`'s comment, and UNITS.md § U5b-1a's `MemberRoot` sentence — that still said the membership
+predicate compares the root; (F2) §12's completeness claim, refuted by F1 (the round-5 sweep's patterns could not
+match `compares`/`byte-for-byte`/`required`, and it never covered `crates/**/*.rs` doc comments); (F3) the worker
+cell: after a failed first `upsert_worker` the loop fell through, the post-gate transition set the cell to
+`claiming` UNCONDITIONALLY, and `set_worker_state`'s `Ok(false)` (no row) was discarded — a cell claiming a row
+that did not exist, which a keeper reregister would then INSERT; the P-Y4 oracle opened the gate and stopped
+without asserting, so it never entered that state. Advisory: `[]`, `[hello]` and bracketed zone-id hosts are
+admitted unstated by `PeerAddr::parse`.
+
+At this point the user took the unit over from the swarm ("implement the fixes, test and create the PRs and close
+wave 3"), so the pre-committed round-6 withhold was NOT applied; the lead applied the fixes directly and the
+closers were not re-run. What this revision changes:
+
+- **The worker cell is one fact with its row.** Every lifecycle row write of the claim loop (`warming`, `claiming`,
+  `draining`) goes through `crates/jammi-ai/src/fine_tune/worker.rs::write_worker_facts`: the cell is set FIRST to
+  the facts about to be written (so a keeper reregister racing the write re-upserts exactly those facts, §8 B1),
+  the row is written by `Catalog::upsert_worker` — an UPSERT, never a bare `UPDATE` — and on failure the cell is
+  REVERTED to its previous snapshot (`None` after a failed first write). `Catalog::set_worker_state` keeps its own
+  oracles (`jobs_queue.rs`) but has no caller on the loop. Oracle:
+  `crates/jammi-ai/tests/it/instance_identity.rs::a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row`
+  now OPENS the gate after the armed failure, waits for the `claiming` row (created by the transition's upsert),
+  force-prunes the instance again and asserts the keeper's reregister re-upserts exactly the cell's `state` and
+  `kinds`.
+- **The last five statements of the excised design are gone**, and the sweep that finds the class is the
+  phrasing-independent one the audit used — `grep -rniE '(membership|gang|list_gang_members).{0,120}root|root.{0,120}(membership|gang member|list_gang_members)' crates docs`
+  minus the negation vocabulary (`not consult|does not|no root|never|carries no|not part|A2|verbatim|history`)
+  — plus `result_root × (compar|required|byte-for-byte)` over `crates/**/*.rs`. Executed at this revision: every
+  survivor is a test name, a negation ("root is not consulted"), or `collective/`'s unrelated NCCL "root rank".
+- The `prune_instances` citation is re-derived (`:2559`); the file count is 430.
+- The IPv6 advisory is recorded here as a stated admitted domain: a bracketed host is validated for shape only
+  (non-empty, no port inside the brackets); `[]`, `[hello]` and zone ids are admitted and fail at dial time, the
+  same disclaimer `PeerAddr::parse`'s doc already makes for resolution.
+
+Verification run by the lead at this revision: `cargo fmt`, `cargo clippy -p jammi-ai -p jammi-db --all-targets
+-- -D warnings` (0), the extended oracle (ok), the four `…_root_is_not_consulted` oracles and the four IPv6
+oracles (ok), the class sweep above (clean). The unit's full suites run again on the consolidated wave-3 branch
+before its single PR.
+
+## 14. Gates
 
 `cargo fmt --all --check`; `cargo clippy -p jammi-db -p jammi-ai -p
 jammi-server --all-targets -- -D warnings` (with AND without

@@ -1216,17 +1216,18 @@ ALTER TABLE jobs ADD COLUMN training_set_location TEXT
 /// Migration 035 (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a):
 /// the gang-membership carrier on `instances` — `peer_addr` (the `host:port`
 /// this process's peer/gang listener is reachable at) and `result_root` (the
-/// VERBATIM configured result-table root, `JammiConfig::resolved_result_root`
-/// — two spellings of one physical location are two different roots to the
-/// membership predicate that compares this column byte-for-byte).
+/// VERBATIM configured result-table root, `JammiConfig::resolved_result_root`,
+/// carried for display and for U5b-1a-A2 — the membership predicate does NOT
+/// consult it; root identity and any predicate on it are U5b-1a-A2).
 ///
 /// Both columns are NULLABLE, with a shared meaning: `NULL` = "this process
 /// never joins a gang" — every library/CLI process, and every server process
 /// that never sets `[server] peer_advertise`. There is no paired `CHECK`
 /// (unlike migration 034's `training_set_ref`/`training_set_location`): a row
-/// with `peer_addr` set and `result_root` NULL is representable, and is
-/// simply never a gang member — both are required by
-/// `Catalog::list_gang_members`'s own predicate, not by a schema constraint.
+/// with `peer_addr` set and `result_root` NULL is representable, and IS a
+/// gang member like any other (`Catalog::list_gang_members` admits on
+/// `peer_addr`, `kinds`, `state` and freshness only — never on this column);
+/// the pairing is a writer convention, not a schema constraint.
 ///
 /// `Catalog::upsert_instance`/`Catalog::reregister_instance` are the only
 /// writers (through `InstanceRegistration`, `catalog::instance`); every

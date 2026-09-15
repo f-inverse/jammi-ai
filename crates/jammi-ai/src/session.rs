@@ -143,9 +143,11 @@ impl InferenceSession {
     /// spelled IDENTICALLY on every replica. When `[server] peer_advertise`
     /// is set, this shared-root topology is exactly what
     /// [`jammi_db::config::JammiConfig::resolved_result_root`] yields
-    /// verbatim and [`jammi_db::catalog::Catalog::list_gang_members`]
-    /// compares byte-for-byte across replicas — necessary, never sufficient,
-    /// for shared storage (see
+    /// verbatim into `instances.result_root` — carried, not consulted:
+    /// [`jammi_db::catalog::Catalog::list_gang_members`] admits on address,
+    /// kinds, state and freshness only; root identity and any predicate on
+    /// it are U5b-1a-A2. Identical spelling stays necessary, never
+    /// sufficient, for shared storage (see
     /// [`jammi_db::catalog::instance::InstanceRegistration::from_config`]).
     pub async fn open_with_placement(
         config: JammiConfig,
@@ -465,13 +467,13 @@ impl InferenceSession {
     /// [`crate::fine_tune::worker::JobWorker`] (and the
     /// [`crate::fine_tune::worker::EmbeddedWorker`] guard spawned over it)
     /// is the sole owner of its `worker` half: it sets the cell only AFTER
-    /// its first `upsert_worker` call SUCCEEDS (P-Y4, contract
-    /// `feat_500-C-U5b-1a` §12 — a failed first upsert leaves the cell
-    /// `None`, never a fact the row does not carry), sets it BEFORE every
-    /// LATER `set_worker_state` call, and clears it before every
-    /// `delete_worker` call — so a keeper reregister never re-upserts a
-    /// `workers` row for a fact this process's own row does not (yet, or
-    /// ever) carry.
+    /// every row write as ONE fact with the row (`write_worker_facts` in
+    /// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): the cell is
+    /// set to the facts about to be UPSERTED and reverted if that upsert
+    /// fails — after a failed first write it is `None` again — and cleared
+    /// before every `delete_worker` call. A keeper reregister therefore
+    /// re-upserts only facts a row write of this process succeeded with, or
+    /// the facts an in-flight upsert is about to write.
     pub(crate) fn instance_registration(
         &self,
     ) -> &Arc<jammi_db::catalog::instance::InstanceRegistration> {
@@ -2416,8 +2418,9 @@ fn build_result_store(
     // explicit `storage.result_root`) derivation — the SAME string a gang
     // member's `instances.result_root` row carries verbatim
     // (`InstanceRegistration::from_config`) — so this session's store is
-    // rooted at EXACTLY the root the membership predicate compares, never a
-    // second, independently re-derived path.
+    // rooted at EXACTLY the root the member row records (carried, not
+    // consulted by the membership predicate), never a second, independently
+    // re-derived path.
     let root = jammi_db::storage::StorageUrl::parse(&inner.config().resolved_result_root()?)?;
     // `local_cache_dir` is the PARENT of the two local caches
     // `ResultStore::with_root` derives (`{local_cache_dir}/index` — the ANN

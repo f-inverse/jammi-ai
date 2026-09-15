@@ -529,8 +529,8 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   both columns, RED — cited by construct rather than by an offset on a branch this fold cannot
   read), `catalog/instance.rs` (NEW — `PeerAddr` moves here from `index::peer`, re-exported there
   so the peer listener and the gang listener share ONE address type; `MemberRoot` (the VERBATIM
-  configured result-table root — no filesystem access, no URL parsing, no scheme handling; two
-  DIFFERENT spellings of the same physical location are two DIFFERENT roots to this predicate);
+  configured result-table root — no filesystem access, no URL parsing, no scheme handling; carried
+  on the row and NOT consulted by the membership predicate; root identity is U5b-1a-A2);
   `InstanceRegistration { instance_id, label, host, peer_addr: Option<PeerAddr>, member_root:
   Option<MemberRoot>, worker: Mutex<Option<WorkerFacts>> }` — the ONE value every writer of the
   `instances`(+`workers`) row builds; `InstanceRegistration::from_config` is the ONE choke point:

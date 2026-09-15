@@ -538,8 +538,9 @@ pub struct WorkerRecord {
     /// The claim loop's lifecycle state as the row carries it — one of
     /// [`WorkerState`]'s spellings (`warming` / `claiming` / `draining`),
     /// written by the loop task in that order (`upsert_worker` with
-    /// `warming` as its first statement, `set_worker_state` afterwards) so
-    /// no reader ever sees `claiming` before the row exists.
+    /// `warming` as its first statement and again at each transition —
+    /// every lifecycle write is an upsert) so no reader ever sees
+    /// `claiming` before the row exists.
     pub state: String,
     pub started_at: String,
     pub last_seen_at: String,
@@ -2387,8 +2388,9 @@ impl Catalog {
     /// (above, where each row's `kinds` is matched against
     /// `listing.kind`); `state` is the loop's lifecycle state at this
     /// instant (the loop task writes `warming` as its FIRST statement and
-    /// flips to `claiming` through [`Self::set_worker_state`] once its gate
-    /// opens). A re-upsert on an existing row resets both.
+    /// re-upserts `claiming` once its gate opens — never a bare `UPDATE`,
+    /// so a row the first write failed to create is created at the
+    /// transition). A re-upsert on an existing row resets both.
     ///
     /// # Errors
     ///

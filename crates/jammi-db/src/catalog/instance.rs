@@ -162,12 +162,12 @@ impl std::fmt::Display for MemberRoot {
 /// its lifecycle [`WorkerState`] — exactly the pair `Catalog::upsert_worker`
 /// writes. Owned exclusively by `JobWorker`
 /// (`crates/jammi-ai/src/fine_tune/worker.rs`): `run_until` sets it only
-/// AFTER its first `upsert_worker` call SUCCEEDS (P-Y4, contract
-/// `feat_500-C-U5b-1a` §12 — a failed first upsert must leave the cell
-/// `None`, never a fact the row does not yet carry), every LATER
-/// `set_worker_state` writes the cell BEFORE the row, `delete_worker` clears
-/// it — so [`InstanceRegistration::worker`] never reflects a fact the row
-/// does not (yet, or ever) carry.
+/// as ONE fact with every row write (`write_worker_facts` in jammi-ai's
+/// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): set to the facts
+/// about to be UPSERTED, reverted if that upsert fails (`None` again after a
+/// failed first write), cleared before `delete_worker` — so
+/// [`InstanceRegistration::worker`] reflects only facts a row write of this
+/// process succeeded with, or the facts an in-flight upsert is writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFacts {
     /// The `,`-joined kind set this worker claims — the ONLY encoding: no

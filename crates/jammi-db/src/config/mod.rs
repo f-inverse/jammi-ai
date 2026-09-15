@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::catalog::instance::CanonicalRoot;
 pub use crate::catalog::lease::LeaseIntervals;
 use crate::error::{JammiError, Result};
-use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
+use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config, Scheme, StorageUrl};
 
 mod env_map;
 mod layers;
@@ -1614,6 +1615,25 @@ pub struct ServerConfig {
     /// both at a fixed port (`:0` never collides). Served outside the tenant
     /// layer (I-PEER): every client of it is a jammi coordinator.
     pub peer_bind: Option<String>,
+    /// The address OTHER replicas dial THIS process's `peer_bind` listener
+    /// at — usually a load-balancer-free, directly-routable `host:port`
+    /// (`peer_bind` itself is commonly `0.0.0.0:PORT`, unusable as a dial
+    /// target). `None` (the default) = this process never advertises a gang
+    /// membership row: its `instances.peer_addr`/`result_root` columns stay
+    /// `NULL` regardless of whether `peer_bind` is set. Requires `peer_bind`
+    /// to be set too (refused at the ONE membership choke point,
+    /// [`crate::catalog::instance::InstanceRegistration::from_config`] —
+    /// naming BOTH keys); parses as a
+    /// [`PeerAddr`](crate::catalog::instance::PeerAddr).
+    ///
+    /// # TOML
+    ///
+    /// ```toml
+    /// [server]
+    /// peer_bind = "0.0.0.0:9000"
+    /// peer_advertise = "10.0.4.7:9000"
+    /// ```
+    pub peer_advertise: Option<String>,
     /// MARGINAL-LOAD ADMISSION per query, in bytes: the maximum estimated
     /// bytes ONE query may load locally for segments it does not own, when
     /// their owners are unreachable (the last rung of the placed-search
@@ -2327,6 +2347,7 @@ impl Default for ServerConfig {
             services: ServiceSelection::default(),
             limits: LimitsConfig::default(),
             peer_bind: None,
+            peer_advertise: None,
             peer_local_load_bytes: None,
         }
     }
@@ -2440,6 +2461,144 @@ fn describe_deserialize_error(
 }
 
 impl JammiConfig {
+    /// The result-table root this deployment resolves to, before any
+    /// canonicalization: the explicit `[storage] result_root` when set, else
+    /// `{artifact_dir}/jammi_db` — the SAME derivation
+    /// `jammi_db::store::ResultStore::new`'s local-root arm performs
+    /// (`artifact_dir.join("jammi_db")`), the ONE place that join happens so
+    /// nothing downstream re-derives it independently.
+    pub fn resolved_result_root(&self) -> String {
+        match &self.storage.result_root {
+            Some(root) => root.clone(),
+            None => self
+                .artifact_dir
+                .join("jammi_db")
+                .to_string_lossy()
+                .into_owned(),
+        }
+    }
+
+    /// The canonical result root two gang members compare byte-for-byte —
+    /// `Ok(None)` when `[server] peer_advertise` is unset, so a library
+    /// process (and every deployment that never joins a gang) never
+    /// computes this: an absent `jammi_db` directory can never refuse a
+    /// library load. See
+    /// [`crate::catalog::instance::InstanceRegistration::from_config`] for
+    /// the WHOLE membership check this is one piece of.
+    ///
+    /// **This is `canon ∘ resolved`: the canonicalized form of the EXACT
+    /// same effective root [`Self::resolved_result_root`] names** — never a
+    /// string no store is actually rooted under. That splits into two arms
+    /// by whether `[storage] result_root` is set, because the two arms name
+    /// different roots:
+    ///
+    /// - **`result_root` UNSET** — the effective root is
+    ///   `{artifact_dir}/jammi_db`. The ANCHOR is `artifact_dir`: it MUST
+    ///   exist and MUST be a directory (a typed error naming the key
+    ///   otherwise), `std::fs::canonicalize`d ONCE (symlinks and `.`/`..`
+    ///   resolved, so `./root`, `//root//`, a trailing `/`, and a symlinked
+    ///   `artifact_dir` all fold to the identical string) — and the default
+    ///   leaf `jammi_db` is THEN appended LEXICALLY, never itself resolved,
+    ///   whether absent, present, or a symlink.
+    /// - **`result_root` SET, `file://` or a bare path** — the effective
+    ///   root is `result_root` VERBATIM (exactly what
+    ///   `jammi_db::store::ResultStore::with_root` roots the store at — no
+    ///   `jammi_db` suffix). The ANCHOR IS `result_root` itself: it MUST
+    ///   exist and MUST be a directory (same typed error, naming
+    ///   `result_root`), canonicalized the same way — and NO leaf is
+    ///   appended.
+    /// - **`result_root` SET, a cloud scheme** — the scheme token is
+    ///   lowercased, then folded through [`Scheme`]'s own alias table
+    ///   (`StorageUrl::parse` is case-sensitive, so lowercasing precedes
+    ///   it); `memory://` is refused for a gang member; a trailing `/` is
+    ///   trimmed. No leaf is appended — the object-store namespace is
+    ///   authoritative across every replica, exactly as `result_root`
+    ///   itself already is (no local filesystem check applies).
+    pub fn canonical_result_root(&self) -> Result<Option<CanonicalRoot>> {
+        if self.server.peer_advertise.is_none() {
+            return Ok(None);
+        }
+        // Whether `result_root` is explicitly set decides BOTH the anchor
+        // (`result_root` itself vs. `artifact_dir`) and whether a `jammi_db`
+        // leaf is appended below — the two arms name genuinely different
+        // effective roots (`resolved_result_root`'s own two arms), never one
+        // formula with an optional suffix.
+        let result_root_set = self.storage.result_root.is_some();
+        let anchor_source = self
+            .storage
+            .result_root
+            .clone()
+            .unwrap_or_else(|| self.artifact_dir.to_string_lossy().into_owned());
+        let anchor_key = if result_root_set {
+            "storage.result_root"
+        } else {
+            "artifact_dir"
+        };
+        // Lowercase the scheme token BEFORE `StorageUrl::parse` (case-
+        // sensitive) so every cloud scheme spelling folds through `Scheme`'s
+        // own alias table; a bare path (no `://`) is left untouched —
+        // `StorageUrl::parse` normalises it to `file://` on its own.
+        let lowered = match anchor_source.split_once("://") {
+            Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+            None => anchor_source.clone(),
+        };
+        let url = StorageUrl::parse(&lowered).map_err(|e| {
+            JammiError::Config(format!(
+                "server.peer_advertise requires a valid [{anchor_key}]: {e}"
+            ))
+        })?;
+        match url.scheme() {
+            Scheme::Memory => Err(JammiError::Config(
+                "server.peer_advertise cannot be combined with a memory:// result root".into(),
+            )),
+            Scheme::File => {
+                let anchor = Path::new(url.path());
+                let meta = std::fs::metadata(anchor).map_err(|e| {
+                    JammiError::Config(format!(
+                        "server.peer_advertise requires [{anchor_key}] '{}' to exist: {e}",
+                        anchor.display()
+                    ))
+                })?;
+                if !meta.is_dir() {
+                    return Err(JammiError::Config(format!(
+                        "server.peer_advertise requires [{anchor_key}] '{}' to be a directory",
+                        anchor.display()
+                    )));
+                }
+                let canonical_anchor = std::fs::canonicalize(anchor).map_err(|e| {
+                    JammiError::Config(format!(
+                        "server.peer_advertise: failed to canonicalize [{anchor_key}] '{}': {e}",
+                        anchor.display()
+                    ))
+                })?;
+                // The leaf is appended ONLY when `result_root` is unset —
+                // the effective root is then `{artifact_dir}/jammi_db`; a
+                // SET `result_root` already names the whole effective root
+                // (`ResultStore::with_root`'s verbatim usage), so the anchor
+                // canonicalized IS the answer, no suffix.
+                let full = if result_root_set {
+                    canonical_anchor
+                } else {
+                    canonical_anchor.join("jammi_db")
+                };
+                Ok(Some(CanonicalRoot::new(format!(
+                    "file://{}",
+                    full.to_string_lossy()
+                ))))
+            }
+            other_scheme => {
+                // Rebuild through the RESOLVED `Scheme`'s own `Display`
+                // (`s3`/`gs`/`azure`/`r2`) rather than the lowered input
+                // token verbatim, so two alias spellings of one scheme
+                // (`gcs://` and `gs://`, `abfss://` and `azure://`) fold to
+                // the IDENTICAL string, not merely both-lowercase distinct
+                // strings.
+                let path = url.path().trim_end_matches('/');
+                Ok(Some(CanonicalRoot::new(format!("{other_scheme}://{path}"))))
+            }
+        }
+    }
+
     /// Load configuration the production way: resolve the file (explicit
     /// path, `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`, the
     /// platform config dir — `resolve_config_path_in`) against the real
@@ -2498,6 +2657,22 @@ impl JammiConfig {
         // `otlp_endpoint`) at load time, naming the offending key, rather
         // than at the first `jammi_ai::telemetry::otlp_layer` call.
         config.observability.validate()?;
+        // Reject a `[server] peer_advertise` that cannot resolve a valid
+        // gang-membership registration (an unset `peer_bind`, an
+        // unparseable address, or a result root that cannot be
+        // canonicalized) at load time, naming the offending key — rather
+        // than only surfacing deep inside `InferenceSession::wrap_with`'s
+        // own registration call. The registration itself is discarded; this
+        // call is for the early-failure side effect only (a struct-literal
+        // config that skips `load_from` is still covered — `wrap_with`
+        // calls `InstanceRegistration::from_config` too, and every
+        // `InferenceSession` constructor funnels through `wrap_with`).
+        crate::catalog::instance::InstanceRegistration::from_config(
+            &config,
+            "config-validate",
+            None,
+            None,
+        )?;
         Ok(config)
     }
 

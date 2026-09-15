@@ -3186,3 +3186,348 @@ fn load_of_a_pre_distributed_config_is_unchanged() {
     assert_eq!(cfg.worker.rank_timeout_secs, 120);
     assert!(!cfg.worker.topology(&cfg.gpu).unwrap().is_distributed());
 }
+
+// ─── U5b-1a: `[server] peer_advertise`, `canonical_result_root`, and
+// `InstanceRegistration::from_config` ───────────────────────────────────────
+
+#[test]
+fn server_peer_advertise_parses_and_defaults_unset() {
+    let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
+    assert_eq!(
+        cfg.server.peer_advertise, None,
+        "unset = this process never joins a gang"
+    );
+    let cfg =
+        JammiConfig::parse_from("[server]\npeer_advertise = \"10.0.4.7:9000\"\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_advertise.as_deref(), Some("10.0.4.7:9000"));
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__PEER_ADVERTISE".to_string(),
+            "10.0.4.8:9001".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.peer_advertise.as_deref(), Some("10.0.4.8:9001"));
+}
+
+/// A config with `peer_bind` unset and `peer_advertise` set to a directory
+/// under `artifact_dir` (the shared-topology default).
+fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>) -> JammiConfig {
+    JammiConfig {
+        artifact_dir: artifact_dir.to_path_buf(),
+        storage: StorageConfig {
+            result_root: result_root.map(str::to_string),
+            ..StorageConfig::default()
+        },
+        server: ServerConfig {
+            peer_bind: Some("0.0.0.0:9000".into()),
+            peer_advertise: Some("10.0.0.1:9000".into()),
+            ..ServerConfig::default()
+        },
+        ..JammiConfig::default()
+    }
+}
+
+/// P-M5 restated over `InstanceRegistration::from_config`, arm 1: unset
+/// `peer_bind` is refused naming BOTH keys.
+#[test]
+fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
+    let cfg = JammiConfig {
+        server: ServerConfig {
+            peer_advertise: Some("10.0.0.1:9000".into()),
+            ..ServerConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("peer_bind"),
+        "must name both keys: {msg}"
+    );
+}
+
+/// Arm 2: a missing anchor is refused naming the key.
+#[test]
+fn from_config_missing_anchor_is_refused_naming_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    let cfg = advertising_config(&missing, None);
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("artifact_dir"),
+        "must name the key: {msg}"
+    );
+}
+
+/// Arm 2 (the sibling): an anchor that exists but is a FILE, not a
+/// directory, is refused the same way.
+#[test]
+fn from_config_anchor_that_is_a_file_is_refused_naming_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, b"x").unwrap();
+    let cfg = advertising_config(&file_path, None);
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("directory"), "{err}");
+}
+
+/// Arm 3: `result_root` UNSET canonicalizes `{artifact_dir}/jammi_db`.
+#[test]
+fn from_config_unset_result_root_canonicalizes_artifact_dir_jammi_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = advertising_config(dir.path(), None);
+    let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap();
+    let expected = format!(
+        "file://{}/jammi_db",
+        std::fs::canonicalize(dir.path()).unwrap().to_string_lossy()
+    );
+    assert_eq!(reg.canonical_root.unwrap().as_str(), expected);
+    assert_eq!(reg.peer_addr.unwrap().as_str(), "10.0.0.1:9000");
+}
+
+/// Arm 4: a library config (no `peer_advertise`) produces NULLs — `peer_addr`
+/// and `canonical_root` both absent, never an error.
+#[test]
+fn from_config_without_peer_advertise_is_a_library_registration_with_nulls() {
+    let cfg = JammiConfig::default();
+    let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap();
+    assert!(reg.peer_addr.is_none());
+    assert!(reg.canonical_root.is_none());
+    assert_eq!(reg.instance_id, "i1");
+}
+
+/// The pinned B2 property: `canonical_result_root()` returns the SAME
+/// string whether the leaf (`jammi_db`) is absent, present, or a symlink to
+/// elsewhere — the leaf itself is appended lexically and never resolved.
+#[test]
+fn canonical_result_root_is_identical_whether_the_leaf_is_absent_present_or_a_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = advertising_config(dir.path(), None)
+        .canonical_result_root()
+        .unwrap()
+        .unwrap();
+
+    std::fs::create_dir_all(dir.path().join("jammi_db")).unwrap();
+    let present = advertising_config(dir.path(), None)
+        .canonical_result_root()
+        .unwrap()
+        .unwrap();
+    assert_eq!(before, present, "leaf present must fold to the same string");
+    std::fs::remove_dir(dir.path().join("jammi_db")).unwrap();
+
+    #[cfg(unix)]
+    {
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("jammi_db")).unwrap();
+        let symlinked = advertising_config(dir.path(), None)
+            .canonical_result_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before, symlinked,
+            "a symlinked leaf must fold to the same string too — it is never itself resolved"
+        );
+    }
+}
+
+/// E3: two spellings of one anchor (`./`, `//`-collapsed via
+/// `fs::canonicalize`, a trailing `/`) fold to the identical canonical
+/// string.
+#[test]
+fn canonical_result_root_folds_dot_slash_and_trailing_slash_anchor_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().to_str().unwrap().to_string();
+
+    let plain_root = advertising_config(std::path::Path::new("/unused"), Some(&plain))
+        .canonical_result_root()
+        .unwrap()
+        .unwrap();
+
+    let trailing = format!("{plain}/");
+    let trailing_root = advertising_config(std::path::Path::new("/unused"), Some(&trailing))
+        .canonical_result_root()
+        .unwrap()
+        .unwrap();
+    assert_eq!(plain_root, trailing_root, "a trailing '/' must fold");
+
+    let with_dot = format!("{plain}/.");
+    let dot_root = advertising_config(std::path::Path::new("/unused"), Some(&with_dot))
+        .canonical_result_root()
+        .unwrap()
+        .unwrap();
+    assert_eq!(plain_root, dot_root, "a trailing '/.' must fold");
+
+    let parent = dir.path().parent().unwrap().to_str().unwrap();
+    let leaf = dir.path().file_name().unwrap().to_str().unwrap();
+    let double_slash = format!("{parent}//{leaf}");
+    let double_slash_root =
+        advertising_config(std::path::Path::new("/unused"), Some(&double_slash))
+            .canonical_result_root()
+            .unwrap()
+            .unwrap();
+    assert_eq!(plain_root, double_slash_root, "a doubled '/' must fold");
+}
+
+/// `canonical_result_root()` is exactly `canon ∘ resolved`: for BOTH arms
+/// the canonical string equals the canonicalized form of the EXACT
+/// effective root `resolved_result_root()` names — arm (a) (`result_root`
+/// unset) is `{artifact_dir}/jammi_db`; arm (b) (`result_root` set) is
+/// `result_root` VERBATIM, the same string
+/// `jammi_db::store::ResultStore::with_root` roots the store at, with no
+/// `jammi_db` suffix — never a string no store is rooted under.
+#[test]
+fn canonical_result_root_equals_the_canonicalized_effective_root_for_both_arms() {
+    // Arm (a): `result_root` unset.
+    let dir_a = tempfile::tempdir().unwrap();
+    let cfg_a = advertising_config(dir_a.path(), None);
+    assert_eq!(
+        cfg_a.resolved_result_root(),
+        dir_a.path().join("jammi_db").to_string_lossy()
+    );
+    let canonical_a = cfg_a.canonical_result_root().unwrap().unwrap();
+    let expected_a = format!(
+        "file://{}",
+        std::fs::canonicalize(dir_a.path())
+            .unwrap()
+            .join("jammi_db")
+            .to_string_lossy()
+    );
+    assert_eq!(canonical_a.as_str(), expected_a);
+
+    // Arm (b): `result_root` explicitly set to an existing directory.
+    let dir_b = tempfile::tempdir().unwrap();
+    let root_b = dir_b.path().to_str().unwrap();
+    let cfg_b = advertising_config(std::path::Path::new("/unused"), Some(root_b));
+    assert_eq!(
+        cfg_b.resolved_result_root(),
+        root_b,
+        "arm (b)'s effective root is result_root VERBATIM"
+    );
+    let canonical_b = cfg_b.canonical_result_root().unwrap().unwrap();
+    let expected_b = format!(
+        "file://{}",
+        std::fs::canonicalize(root_b).unwrap().to_string_lossy()
+    );
+    assert_eq!(canonical_b.as_str(), expected_b);
+    assert!(
+        !canonical_b.as_str().ends_with("jammi_db"),
+        "arm (b) must root at result_root verbatim, no jammi_db suffix: {canonical_b:?}"
+    );
+}
+
+/// Arm (b)'s sibling of the `from_config_missing_anchor_...` /
+/// `from_config_anchor_that_is_a_file_...` cases: a MISSING or non-directory
+/// anchor is refused the same way when the anchor is an EXPLICIT
+/// `result_root`, not only when it falls back to `artifact_dir`.
+#[test]
+fn canonical_result_root_refuses_a_missing_anchor_for_an_explicit_result_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    let cfg = advertising_config(
+        std::path::Path::new("/unused"),
+        Some(missing.to_str().unwrap()),
+    );
+    let err = cfg.canonical_result_root().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("result_root"),
+        "must name the key: {msg}"
+    );
+}
+
+#[test]
+fn canonical_result_root_refuses_a_file_anchor_for_an_explicit_result_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, b"x").unwrap();
+    let cfg = advertising_config(
+        std::path::Path::new("/unused"),
+        Some(file_path.to_str().unwrap()),
+    );
+    let err = cfg.canonical_result_root().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("result_root") && msg.contains("directory"),
+        "{msg}"
+    );
+}
+
+/// A `memory://` root is refused for a gang member.
+#[test]
+fn canonical_result_root_refuses_a_memory_scheme() {
+    let cfg = advertising_config(std::path::Path::new("/unused"), Some("memory://x"));
+    let err = cfg.canonical_result_root().unwrap_err();
+    assert!(err.to_string().contains("memory"), "{err}");
+}
+
+/// Cloud schemes: the scheme token is lowercased THEN folded through
+/// `Scheme`'s own alias table (`gcs`/`gs` and `abfss`/`azure` fold to the
+/// identical string), and a trailing `/` is trimmed — no `jammi_db` leaf is
+/// ever appended for a cloud scheme.
+#[test]
+fn canonical_result_root_lowercases_and_aliases_the_cloud_scheme() {
+    let root_of = |root: &str| {
+        advertising_config(std::path::Path::new("/unused"), Some(root))
+            .canonical_result_root()
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        root_of("GCS://bucket/prefix"),
+        root_of("gs://bucket/prefix")
+    );
+    assert_eq!(
+        root_of("ABFSS://bucket/prefix"),
+        root_of("azure://bucket/prefix")
+    );
+    assert_eq!(
+        root_of("s3://bucket/prefix/"),
+        root_of("s3://bucket/prefix"),
+        "trailing '/' trimmed"
+    );
+    assert_eq!(root_of("gs://bucket/prefix").as_str(), "gs://bucket/prefix");
+}
+
+/// `canonical_result_root` is `Ok(None)` whenever `peer_advertise` is unset
+/// — a library process never computes it, whatever `result_root` says.
+#[test]
+fn canonical_result_root_is_none_when_peer_advertise_is_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = JammiConfig {
+        artifact_dir: dir.path().to_path_buf(),
+        ..JammiConfig::default()
+    };
+    assert_eq!(cfg.canonical_result_root().unwrap(), None);
+}
+
+/// `JammiConfig::resolved_result_root` mirrors `ResultStore::new`'s own
+/// `{artifact_dir}/jammi_db` derivation when `result_root` is unset, and
+/// returns the explicit root verbatim (no leaf) when it is set.
+#[test]
+fn resolved_result_root_mirrors_the_two_derivation_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let unset = JammiConfig {
+        artifact_dir: dir.path().to_path_buf(),
+        ..JammiConfig::default()
+    };
+    assert_eq!(
+        unset.resolved_result_root(),
+        dir.path().join("jammi_db").to_string_lossy().into_owned()
+    );
+    let set = JammiConfig {
+        storage: StorageConfig {
+            result_root: Some("r2://bucket/prefix".into()),
+            ..StorageConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    assert_eq!(set.resolved_result_root(), "r2://bucket/prefix");
+}

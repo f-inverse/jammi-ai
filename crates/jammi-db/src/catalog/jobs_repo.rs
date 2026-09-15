@@ -2393,11 +2393,13 @@ impl Catalog {
     /// # Errors
     ///
     /// Under `feature = "test-hooks"`, a failure armed for `instance_id`
-    /// through
-    /// [`super::worker_test_hooks::arm_upsert_worker_failure`] is returned
-    /// here, once, with no write attempted — the deterministic fixture P-Y4
-    /// (contract `feat_500-C-U5b-1a` §12) needs to prove the caller's
-    /// registration cell stays cleared when this call fails.
+    /// through `worker_test_hooks::arm_upsert_worker_failure` (not an
+    /// intra-doc link: that module exists only under `feature =
+    /// "test-hooks"`, so a link to it fails `cargo doc`'s default-feature
+    /// pass) is returned here, once, with no write attempted — the
+    /// deterministic fixture P-Y4 (contract `feat_500-C-U5b-1a` §12) needs
+    /// to prove the caller's registration cell stays cleared when this call
+    /// fails.
     pub async fn upsert_worker(
         &self,
         instance_id: &str,

@@ -85,6 +85,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
+use jammi_db::catalog::instance::{InstanceRegistration, WorkerFacts};
 use jammi_db::catalog::jobs_repo::WorkerState;
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::Catalog;
@@ -598,6 +599,46 @@ pub(crate) async fn release_sweep(
 /// own task — never on a `/metrics` scrape (a scrape storm must not become a
 /// catalog storm) and never on the claim loop (which does not tick during a
 /// run). Ends when the loop's shared state is gone.
+/// Write this process's `workers` row and its registration cell as ONE fact
+/// (contract `feat_500-C-U5b-1a` §13, round 6). The cell is set FIRST to the
+/// facts about to be written, so a `LeaseKeeper` reregister racing this
+/// write re-upserts exactly these facts and never stale ones (§8 B1); the
+/// row is then written by [`Catalog::upsert_worker`] — an UPSERT, never a
+/// bare `UPDATE` whose "zero rows matched" outcome would leave the cell
+/// claiming a row that does not exist. On a failed upsert the cell is
+/// REVERTED to its previous snapshot, so the cell never carries a fact no
+/// row write ever succeeded with: after a failed FIRST write it is `None`
+/// again (the keeper writes no row); after a failed later transition it is
+/// the previous, still-true state. Every row write on the loop's lifecycle
+/// (`warming`, `claiming`, `draining`) goes through here; the only other
+/// row write is the delete on exit, which clears the cell first. Returns
+/// whether the row write succeeded.
+async fn write_worker_facts(
+    catalog: &Catalog,
+    registration: &InstanceRegistration,
+    worker_id: &str,
+    facts: WorkerFacts,
+    what: &str,
+) -> bool {
+    let previous = registration.worker_snapshot();
+    registration.set_worker(Some(facts.clone()));
+    match catalog
+        .upsert_worker(worker_id, &facts.kinds, facts.state)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            registration.set_worker(previous);
+            tracing::error!(
+                error = %e,
+                what,
+                "failed to write this process's `workers` row; the registration cell is reverted"
+            );
+            false
+        }
+    }
+}
+
 async fn sample_loop(catalog: Arc<Catalog>, shared: Weak<WorkerShared>, every: Duration) {
     loop {
         let Some(shared) = shared.upgrade() else {
@@ -813,13 +854,23 @@ impl JobWorker {
             exit.complete();
             return;
         };
-        if let Err(e) = session
-            .catalog()
-            .upsert_worker(&self.worker_id, &self.kinds.join(","), WorkerState::Warming)
-            .await
-        {
-            tracing::error!(error = %e, "failed to upsert this process's `workers` row");
-        }
+        // The row and the registration's worker cell are written as ONE
+        // fact through `write_worker_facts` (contract `feat_500-C-U5b-1a`
+        // §13, round 6): a failed write leaves the cell exactly as it was
+        // (`None` here), so a keeper reregister racing a still-failing loop
+        // start never writes a `workers` row this loop never managed to
+        // write itself.
+        write_worker_facts(
+            session.catalog(),
+            session.instance_registration(),
+            &self.worker_id,
+            WorkerFacts {
+                kinds: self.kinds.join(","),
+                state: WorkerState::Warming,
+            },
+            "warming",
+        )
+        .await;
         let mut gate_rx = session.worker_gate_receiver();
         drop(session);
 
@@ -835,13 +886,22 @@ impl JobWorker {
             return;
         }
         if let Some(session) = self.session.upgrade() {
-            if let Err(e) = session
-                .catalog()
-                .set_worker_state(&self.worker_id, WorkerState::Claiming)
-                .await
-            {
-                tracing::error!(error = %e, "failed to flip this process's `workers.state` to claiming");
-            }
+            // The `claiming` transition is the same one-fact write as the
+            // first `warming` write above: an UPSERT (so a row the first
+            // write failed to create is created here, never a bare UPDATE
+            // whose "zero rows" outcome the loop could not act on), with the
+            // cell reverted on failure.
+            write_worker_facts(
+                session.catalog(),
+                session.instance_registration(),
+                &self.worker_id,
+                WorkerFacts {
+                    kinds: self.kinds.join(","),
+                    state: WorkerState::Claiming,
+                },
+                "claiming",
+            )
+            .await;
         }
 
         loop {
@@ -2790,6 +2850,14 @@ pub struct EmbeddedWorker {
     /// row goes stale and cascades.
     catalog: Arc<Catalog>,
     instance_id: String,
+    /// This process's `InstanceRegistration`, captured at spawn so RELEASE
+    /// needs no session (same rationale as `keeper`/`writer_id` below) —
+    /// this guard is the worker half's OTHER owner (alongside the loop task
+    /// itself): every `set_worker_state`/`delete_worker` call this guard
+    /// issues writes/clears the cell FIRST, so a keeper reregister racing a
+    /// DRAIN or a RELEASE never re-upserts a `workers` row this process has
+    /// already stopped claiming with.
+    registration: Arc<InstanceRegistration>,
     /// The session's keeper (2b releases the `Job` holds it holds) and the
     /// session's result-store writer id (the linked building sweep's
     /// `writer_id` arm) — captured at spawn so RELEASE needs no session.
@@ -2840,6 +2908,7 @@ impl EmbeddedWorker {
             shared,
             catalog: Arc::clone(session.catalog_arc()),
             instance_id: session.instance_id().to_string(),
+            registration: Arc::clone(session.instance_registration()),
             keeper: Arc::clone(session.lease_keeper()),
             writer_id: session.result_store().writer_id().to_string(),
             heartbeat,
@@ -2877,12 +2946,21 @@ impl EmbeddedWorker {
             Ordering::SeqCst,
         );
         self.shared.request_stop();
-        if let Err(e) = self
-            .catalog
-            .set_worker_state(&self.instance_id, WorkerState::Draining)
-            .await
-        {
-            tracing::warn!(error = %e, "DRAIN: failed to flip this process's `workers.state` to draining");
+        // The same one-fact write as the loop's own `warming`/`claiming`
+        // writes: preserve the cell's own `kinds`, flip only `state`, and
+        // write the row by UPSERT with the cell reverted on failure. A cell
+        // still `None` (the loop never wrote its first row) has no row to
+        // flip and nothing to race — nothing to write.
+        if let Some(mut facts) = self.registration.worker_snapshot() {
+            facts.state = WorkerState::Draining;
+            write_worker_facts(
+                &self.catalog,
+                &self.registration,
+                &self.instance_id,
+                facts,
+                "draining",
+            )
+            .await;
         }
     }
 
@@ -2941,6 +3019,9 @@ impl EmbeddedWorker {
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
         self.stop_sampler();
+        // Cell before delete (§8 B1): the loop has fully returned, so
+        // nothing else can race a re-set of the cell after this clear.
+        self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(StopOutcome::Joined)
     }
@@ -3131,6 +3212,8 @@ impl EmbeddedWorker {
         let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
         // 2h
         self.stop_sampler();
+        // Cell before delete (§8 B1) — same as `stop_and_join`.
+        self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(ReleaseReport {
             loop_state,
@@ -3169,6 +3252,11 @@ impl Drop for EmbeddedWorker {
         );
         if let LoopTask::Running(handle) | LoopTask::Abandoned(handle) = task {
             handle.abort();
+            // Cell before delete (§8 B1), synchronous — `Drop` cannot
+            // `.await` the delete below, but clearing the cell needs no
+            // await, so it happens unconditionally here rather than only
+            // once the (possibly never-scheduled) spawned task below runs.
+            self.registration.set_worker(None);
             // The loop is gone, so the claimant row must go too. `Drop` is
             // synchronous: the delete rides a detached task on the current
             // runtime when there is one (the embedded engine's own runtime

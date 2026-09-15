@@ -3413,6 +3413,133 @@ ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
 whatever `[lease] duration_secs` resolves to (`LeaseIntervals::lease()`),
 computed once at `OssServer::bind` and passed into `GangServer::new`.
 
+### 2.8b Gang membership substrate (`instances.peer_addr`/`result_root`)
+
+The catalog-level carrier §2.8a's `fresh_instance` call sits beside: two
+columns on `instances` (`crates/jammi-db/src/catalog/instance.rs`,
+`crates/jammi-db/src/catalog/jobs_repo.rs`), migration 035, and the ONE
+choke point every writer of them funnels through.
+
+- **`instances.peer_addr` / `instances.result_root`** (migration
+  `035_instances_peer_addr_result_root`, both nullable `TEXT`, no paired
+  `CHECK` — a row with `peer_addr` set and `result_root` NULL is
+  representable and simply never a member): `NULL`/`NULL` means "this
+  process never joins a gang" — every library/CLI process, and every server
+  that never sets `[server] peer_advertise`. Four K5 pin sites: the const
+  list (`catalog/migrations.rs`), `EXPECTED_MIGRATION_NAMES`
+  (`tests/it/migrations.rs`), the ordered-after oracle
+  (`migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_root`,
+  parametrized sqlite/postgres), and the `029` ledger-replay test's DELETE
+  list (`migration_029_copies_training_jobs_rows_into_jobs_as_queued` —
+  `035` ALTERs `instances`, created fresh by `029`'s replayed DDL, so an
+  omission there would leave the reopened table missing both columns, RED).
+- **`InstanceRegistration`** (`catalog/instance.rs`): the ONE value every
+  writer of the `instances` (+ `workers`) row builds — `instance_id`,
+  `label`, `host`, `peer_addr: Option<PeerAddr>`, `member_root:
+  Option<MemberRoot>`, plus a `worker: Mutex<Option<WorkerFacts>>` cell
+  that is the claim-loop half, owned exclusively by `JobWorker`/
+  `EmbeddedWorker` (`fine_tune/worker.rs`): `run_until` sets it only AFTER
+  its FIRST `upsert_worker` call SUCCEEDS (P-Y4, contract
+  `feat_500-C-U5b-1a` §12 — a failed first upsert must leave the cell
+  `None`, never a fact the row does not carry, so a keeper reregister
+  racing a still-failing loop start never writes a `workers` row the real
+  upsert never itself managed to write), every LATER `set_worker_state`
+  writes the cell before the row, `delete_worker` clears it — so a keeper
+  reregister racing a state change always re-upserts the `workers` row the
+  process is ACTUALLY about to become, never a stale snapshot, and never a
+  fact the row does not yet carry. `PeerAddr` is sealed (`parse`/`as_str`/
+  `Display` only) and is the SAME type the peer listener uses
+  (`index::peer` re-exports it) — the peer and gang listeners can never
+  drift into two address types. `PeerAddr::parse` refuses an UNBRACKETED
+  IPv6 literal (P-Y4): a bracketed IPv6 host (`[::1]:9000`), an IPv4
+  literal, or a DNS hostname are accepted; `2001:db8::1:9000` is refused
+  (ambiguous which colon separates host from port).
+- **`MembershipConfig::validate` and `InstanceRegistration::from_config`**
+  (`catalog/instance.rs`, contract §10, the round-3 excision — the
+  design history through rounds 1–3, incl. the pure-validate/materialize
+  split and the `artifact_dir`-is-a-local-path fix, is filed as unit
+  U5b-1a-A2, `docs/plans/67-distributed-training/README.md`). The member
+  row's root is the byte-for-byte output of
+  `JammiConfig::resolved_result_root()`, carried VERBATIM: `MembershipConfig::
+  validate(&JammiConfig) -> Result<Option<MembershipConfig>>` checks only
+  that `peer_advertise` parses as a `PeerAddr` and that `peer_bind` is set
+  too (else a typed error naming both keys) — it performs NO filesystem
+  access and inspects `result_root`/`artifact_dir` not at all.
+  `InstanceRegistration::from_config` runs `MembershipConfig::validate`,
+  then, when membership applies, sets `member_root` to
+  `MemberRoot::resolved(config)` — the ONE production constructor, wrapping
+  `config.resolved_result_root()?` — the SAME string `build_result_store`
+  (`jammi-ai/src/session.rs`) hands to `ResultStore::with_root`.
+  `MemberRoot::new` (a bare-string wrap, no resolver call, no validation)
+  exists ONLY behind `feature = "test-hooks"`, for fixtures — a production
+  build never links it, so nothing outside `MemberRoot::resolved` can put an
+  arbitrary string in the `instances.result_root` column. **The membership
+  path performs NO
+  interpretation of the root at all, and the gang-membership listing verb
+  does not even read it** (P-Y1, contract §12, the round-5 excision): no
+  URL parse, no scheme handling, no symlink resolution, no case folding, no
+  byte comparison. The row still carries the configured spelling verbatim —
+  two spellings of one physical location (`gcs://b/p` vs `gs://b/p`, a
+  trailing `/`, a case difference) are two DIFFERENT STRINGS in that
+  column — but `list_gang_members`'s admission predicate does not consult
+  it at all in this unit; root identity across spellings, and any
+  membership predicate built on it, is unit U5b-1a-A2's question. The only
+  refusal on this path is the non-UTF-8 refusal already inside
+  `resolved_result_root` (a non-UTF-8 `artifact_dir`,
+  the default arm's only failure mode). `JammiConfig::load_from` calls
+  `MembershipConfig::validate` directly (the early-failure check);
+  `InferenceSession::wrap_with` (`session.rs`) calls `from_config` once per
+  session, before the lease keeper starts and before the result store does
+  anything — the universal funnel every `InferenceSession` constructor
+  reaches, so a hand-built config (never routed through `load_from`) is
+  still covered. `ServerConfig::validate` is NOT the home for any of this:
+  it cannot see `artifact_dir`, which `resolved_result_root` needs.
+- **`JammiConfig::resolved_result_root()`** (`config/mod.rs`): the ONE
+  effective-root derivation (`storage.result_root` when set, else
+  `{artifact_dir}/jammi_db` — the SAME derivation `ResultStore::new`'s
+  local-root arm performs), fallible: it refuses naming `artifact_dir` when
+  the joined path is not valid UTF-8, rather than silently lossy-folding it.
+  This is the ONLY function on the membership path that can fail, and the
+  ONLY source of the member row's root string.
+- **The two read verbs** (`catalog/jobs_repo.rs`, both tenant-unscoped by
+  construction — `instances` carries no tenant column): `peer_addr_of(id,
+  lease)` is the ONE by-id resolution surface (no kind/self filter —
+  any member may resolve any other by id, including a busy or other-kind
+  one); `Some` iff the row is present, fresh under
+  `instance_liveness_margin(lease)`, and `peer_addr` is non-NULL.
+  `list_gang_members(GangListing { kind, self_instance, lease })` (no root
+  field, P-Y1) is an `instances JOIN workers` listing: excludes the caller
+  itself, excludes `workers.state != 'claiming'` (an INNER join — no
+  `workers` row is excluded too, since a member is a fleet worker with a
+  claim-loop slot, not merely a live process), excludes a `kinds` token
+  that does not match `kind` as a WHOLE comma-split trimmed token (`,`
+  is `upsert_worker`'s own encoding), excludes stale/NULL-`peer_addr`
+  rows; `result_root` plays NO part in this predicate — two members whose
+  `result_root` strings differ (by scheme alias, case, trailing `/`, or
+  anything else) ARE gang members of each other. The survivors are sorted
+  by `instance_id` BYTE ORDER in Rust (never a SQL `ORDER BY` — backend
+  collation is untrusted). A corrupted stored `peer_addr` that fails
+  `PeerAddr::parse` is a typed `Catalog` error from either verb, never
+  silently mapped to "not a
+  member".
+- **The lease keeper's reregister** (`catalog/lease_keeper.rs`,
+  `LeaseTarget::Instance(Arc<InstanceRegistration>)`): a normal heartbeat is
+  `Catalog::touch_instance` (pure UPDATE, never resurrects a pruned row); a
+  MISSED touch (`Ok(false)` — the row was pruned during a transient outage)
+  calls `Catalog::reregister_instance(&reg)` instead of flipping `lost` — it
+  re-upserts the `instances` row AND, when the registration's worker cell
+  is `Some`, the `workers` row too, in ONE transaction, so a live process
+  rejoins its gang (and its claim-loop membership, if any) with no restart.
+  `instance_prune_window(lease)` (`catalog/lease.rs`) = `instance_liveness_
+  margin(lease).saturating_add(lease)` = `3 × lease`, STRICTLY beyond the
+  `2 × lease` margin `fresh_instance`/the two read verbs judge freshness
+  by — `InferenceSession::wrap_with`'s construction-time
+  `prune_instances` call uses this function, never a literal
+  `saturating_mul(2)`/`(3)` at the call site, so a merely-stale member (in
+  `(margin, window]`) keeps its row through at least one more sweep, giving
+  the keeper's reregister a chance to land before a prune sweep could ever
+  reap it.
+
 ### 2.9 Numerics (`jammi-numerics`)
 
 - **`NumericsError` / `Result`** — `crates/jammi-numerics/src/error.rs`. The only

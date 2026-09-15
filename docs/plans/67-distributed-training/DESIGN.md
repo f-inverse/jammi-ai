@@ -204,13 +204,16 @@ the only lease (`heartbeat_job`, `crates/jammi-db/src/catalog/jobs_repo.rs::Cata
 `context_predictor` is refused at `world_size > 1`. The coordinator materializes or reuses the
 training set (with `job_attempt: None` — a shared producer output, never this attempt's
 `partial_result`), computes the scaler, resolves `W−1` **members** via U5b-1a's
-`list_gang_members(GangListing { kind, self_instance, canonical_root, window })` (`workers.kinds`
+`list_gang_members(GangListing { kind, self_instance, window })` (`workers.kinds`
 ∋ kind, `instances.peer_addr` set — the column U5b-1a appends and DIST's placement consumes —
-canonical `result_root` agreeing with this coordinator's own — NECESSARY, never SUFFICIENT, for
-shared storage; sufficiency is the attestation VERIFY (§2's whole-artifact sidecar / U5b-0's
-per-partition leaf inventory) — and `last_seen_at` fresh under
-`instance_liveness_margin()`, and from U8b `workers.devices` sufficient), mints the NCCL id when
-the collective is `nccl`, and sends each member:
+and `last_seen_at` fresh under `instance_liveness_margin()`) FILTERED, by the coordinator itself,
+on U5b-1a-A2's root-identity predicate against `instances.result_root` (`list_gang_members`'s own
+admission predicate does NOT consult the root at all — contract `feat_500-C-U5b-1a` §12, the
+round-5 excision; root identity across spellings, and the predicate built on it, is U5b-1a-A2's
+question, a precondition of this coordinator), agreeing with this coordinator's own root —
+NECESSARY, never SUFFICIENT, for shared storage; sufficiency is the attestation VERIFY (§2's
+whole-artifact sidecar / U5b-0's per-partition leaf inventory) — and, from U8b, `workers.devices`
+sufficient), mints the NCCL id when the collective is `nccl`, and sends each member:
 
 ```
 RankAssignment { job_id, attempt, coordinator_instance_id, rank, world_size,

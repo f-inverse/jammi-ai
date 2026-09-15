@@ -22,6 +22,16 @@ mod exact_search;
 mod foundation;
 mod freshness;
 mod gang_instance_freshness;
+// `MemberRoot::new` (the arbitrary-string fixture constructor this file's
+// helpers build every member root through) only exists under
+// `feature = "test-hooks"` (P-X4: the production constructor is
+// `MemberRoot::resolved`, config-only) — CI's "test-hooks lane"
+// (`.github/workflows/ci.yml`'s `Run tests (test-hooks lane)` step) compiles
+// and runs this whole file on every PR; the plain `cargo test --workspace`
+// step does not include it, same as `materialization_crash_recovery`/
+// `mutable_crash_recovery` below.
+#[cfg(feature = "test-hooks")]
+mod gang_membership;
 mod gang_rank_admission;
 mod index;
 mod jobs_queue;
@@ -30,6 +40,7 @@ mod masked_read;
 mod materialization;
 #[cfg(feature = "test-hooks")]
 mod materialization_crash_recovery;
+mod member_root_constructor;
 mod memory_pool;
 mod migrations;
 mod model_lifecycle;

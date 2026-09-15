@@ -487,6 +487,25 @@ mTLS; on a routable interface without them it exposes cross-tenant segment
 reads (I-PEER) and ungated gang admission (I-GANG) to anyone who can reach
 the port.
 
+**`[server] peer_advertise` makes a replica a gang MEMBER**, distinct from
+`peer_bind` merely opening the listener: it is the `host:port` OTHER
+replicas dial, and setting it writes this process's `instances.peer_addr`/
+`result_root` columns (requires `peer_bind` to be set too, refused naming
+both keys otherwise). The row records the configured root SPELLING
+verbatim, but the gang-membership predicate does NOT consult it in this
+unit — root identity across spellings, and any membership predicate built
+on it, is a separate, not-yet-built unit. Root-string equality was never
+more than NECESSARY, never SUFFICIENT, for shared storage: two
+byte-identical roots on two filesystems are indistinguishable to a string
+comparison; the attestation VERIFY (a later unit) is what establishes
+sufficiency. The prune window a stale member's row survives before deletion
+is strictly
+beyond the liveness margin used to judge freshness (`3 × lease` vs. `2 ×
+lease`), so a pruned-but-still-live process rejoins its gang on its very
+next heartbeat with no restart — the lease keeper's reregister re-upserts
+the whole membership tuple (`instances` + its `workers` row, if any) in one
+transaction.
+
 ## Deploying as a container
 
 The OSS server ships as two public Docker images on GHCR:

@@ -114,7 +114,7 @@ fn dead_addr() -> PeerAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    PeerAddr(addr.to_string())
+    PeerAddr::parse(&addr.to_string()).unwrap()
 }
 
 /// Instance A: a library coordinator over the SAME artifact dir (catalog +
@@ -349,7 +349,7 @@ async fn readyz_is_200(b: &PeerEngineServer) {
 async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let queries: Vec<Vec<f32>> = vec![
         vec![1.0, 0.0, 0.0, 0.0],
         vec![0.0, 0.0, 1.0, 0.0],
@@ -457,7 +457,7 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
 async fn a_caller_width_fault_is_refused_before_any_fan_out() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let placement = TestPlacement::default();
     let a = open_a(&dir, StoragePrecision::Binary, None, placement.clone()).await;
     let store = a.result_store();
@@ -557,7 +557,7 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
 async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let placement = TestPlacement::default();
     let a = open_a(&dir, StoragePrecision::F32, None, placement.clone()).await;
     let store = a.result_store();
@@ -765,7 +765,7 @@ async fn ready_table_with_poisoned_row(
 async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by_the_table() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let placement = TestPlacement::default();
     let a = open_a(&dir, StoragePrecision::F32, None, placement.clone()).await;
     let served_before = served(&b, "SegmentSearch");
@@ -841,7 +841,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
 async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let dead = dead_addr();
     let q = vec![0.0f32, 0.0, 1.0, 0.0];
     let (k, oversample) = (3usize, 4usize);
@@ -1003,7 +1003,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
 async fn coordinator_under_another_tenant_fails_before_fan_out() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
     let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
 
@@ -1172,7 +1172,7 @@ impl PeerTransport for CorruptRequestTransport {
 async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner_addr = PeerAddr(b.peer_addr.to_string());
+    let owner_addr = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let placement = TestPlacement::default();
     let a = open_a(&dir, StoragePrecision::F32, None, placement.clone()).await;
     let store = a.result_store();
@@ -1202,7 +1202,7 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
         );
     match &err {
         JammiError::Other(msg) => {
-            assert!(msg.contains(&owner_addr.0), "names the owner: {msg}");
+            assert!(msg.contains(owner_addr.as_str()), "names the owner: {msg}");
             assert!(msg.contains(&record.table_name), "names the table: {msg}");
             // The corrupted request names no segment (that IS the
             // malformation), so `PeerError`'s "first requested id"
@@ -1284,7 +1284,7 @@ fn built_index_at_width(
 async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     let b = start_engine_server_with_peer_bind().await;
     let dir = dir_of(&b);
-    let owner = PeerAddr(b.peer_addr.to_string());
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
     let placement = TestPlacement::default();
     // No budget: the ladder must be permitted to COMPLETE at rung 3 — the
     // class now arrives through the local load, not the terminal arm.

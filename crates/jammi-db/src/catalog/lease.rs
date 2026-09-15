@@ -288,6 +288,20 @@ pub fn instance_liveness_margin(lease: Duration) -> Duration {
     lease.saturating_mul(2)
 }
 
+/// The instance PRUNE window: [`instance_liveness_margin`] (`2 * lease`)
+/// plus one more `lease`, i.e. `3 * lease` — STRICTLY BEYOND the liveness
+/// margin, so a member judged merely stale (`last_seen_at` in `(margin,
+/// window]`) still keeps its row through at least one more sweep, giving the
+/// lease keeper's `reregister_instance` re-upsert a chance to land before
+/// `Catalog::prune_instances` reaps it. Before this function existed, the
+/// only caller (`InferenceSession::wrap_with`) pruned at exactly the
+/// liveness margin (`lease.saturating_mul(2)`) — a merely-stale member was
+/// therefore ALREADY prune-eligible the instant it read stale, racing the
+/// keeper's own recovery window to zero.
+pub fn instance_prune_window(lease: Duration) -> Duration {
+    instance_liveness_margin(lease).saturating_add(lease)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +317,24 @@ mod tests {
         // `reclaim_expired_jobs`'s own inline `lease.saturating_mul(2)`
         // relied on before this extraction.
         assert_eq!(instance_liveness_margin(Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn prune_window_is_strictly_beyond_the_liveness_margin() {
+        for secs in [1u64, 5, 30, 3600] {
+            let lease = Duration::from_secs(secs);
+            let margin = instance_liveness_margin(lease);
+            let window = instance_prune_window(lease);
+            assert_eq!(window, Duration::from_secs(secs * 3), "3x lease exactly");
+            assert!(
+                window > margin,
+                "the prune window ({window:?}) must be strictly beyond the \
+                 liveness margin ({margin:?}) for lease {lease:?}"
+            );
+        }
+        // `saturating_add`, never a wrapping/panicking overflow, at the
+        // `Duration` ceiling.
+        assert_eq!(instance_prune_window(Duration::MAX), Duration::MAX);
     }
 
     #[test]

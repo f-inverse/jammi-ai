@@ -3348,3 +3348,228 @@ fn load_of_a_pre_distributed_config_is_unchanged() {
     assert_eq!(cfg.worker.rank_timeout_secs, 120);
     assert!(!cfg.worker.topology(&cfg.gpu).unwrap().is_distributed());
 }
+
+// ─── U5b-1a (contract §10, round-3 excision): `[server] peer_advertise` and
+// `InstanceRegistration::from_config` carrying `resolved_result_root()`
+// VERBATIM — no filesystem access, no URL parse, no scheme handling, no
+// interpretation of the root at all. ───────────────────────────────────
+
+#[test]
+fn server_peer_advertise_parses_and_defaults_unset() {
+    let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
+    assert_eq!(
+        cfg.server.peer_advertise, None,
+        "unset = this process never joins a gang"
+    );
+    let cfg =
+        JammiConfig::parse_from("[server]\npeer_advertise = \"10.0.4.7:9000\"\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_advertise.as_deref(), Some("10.0.4.7:9000"));
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__PEER_ADVERTISE".to_string(),
+            "10.0.4.8:9001".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.peer_advertise.as_deref(), Some("10.0.4.8:9001"));
+}
+
+/// A config with BOTH `peer_bind` and `peer_advertise` set to valid
+/// `host:port` addresses (so `MembershipConfig::validate` accepts it) and
+/// `storage.result_root` set to whatever the caller passes (`None` or an
+/// explicit root string). `result_root` passes through
+/// `resolved_result_root()` UNCHANGED — this helper performs no
+/// interpretation of it either.
+fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>) -> JammiConfig {
+    JammiConfig {
+        artifact_dir: artifact_dir.to_path_buf(),
+        storage: StorageConfig {
+            result_root: result_root.map(str::to_string),
+            ..StorageConfig::default()
+        },
+        server: ServerConfig {
+            peer_bind: Some("0.0.0.0:9000".into()),
+            peer_advertise: Some("10.0.0.1:9000".into()),
+            ..ServerConfig::default()
+        },
+        ..JammiConfig::default()
+    }
+}
+
+/// P-M5 (contract §10): `peer_advertise` without `peer_bind` is refused
+/// naming BOTH keys — the ONLY thing `MembershipConfig::validate` checks
+/// beyond parsing the address, exercised through the real `load_from`
+/// loader.
+#[test]
+fn load_from_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = format!(
+        "artifact_dir = {:?}\n[server]\npeer_advertise = \"127.0.0.1:19200\"\n",
+        dir.path().to_str().unwrap()
+    );
+    let err = load_src(&src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("peer_bind"),
+        "{msg}"
+    );
+}
+
+/// The same P-M5 arm, over `InstanceRegistration::from_config` directly.
+#[test]
+fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
+    let cfg = JammiConfig {
+        server: ServerConfig {
+            peer_advertise: Some("10.0.0.1:9000".into()),
+            ..ServerConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("peer_advertise") && msg.contains("peer_bind"),
+        "must name both keys: {msg}"
+    );
+}
+
+/// P-X1 (contract §10): `InstanceRegistration::from_config`'s `member_root`
+/// is the byte-for-byte output of `resolved_result_root()` — VERBATIM —
+/// over the whole arm list: unset, `file://`, `memory://`, `s3://`, both
+/// `gcs://` and `gs://` (two DIFFERENT strings — `Scheme`'s alias table is
+/// never reached on this path), both `abfss://` and `azure://`, an
+/// uppercase scheme, and a trailing `/`. `from_config` performs NO
+/// filesystem access and NO interpretation of the root: none of these arms
+/// error.
+#[test]
+fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
+    let arms: &[Option<&str>] = &[
+        None,
+        Some("file:///var/lib/jammi/jammi_db"),
+        Some("memory://x"),
+        Some("s3://bucket/prefix"),
+        Some("gcs://bucket/prefix"),
+        Some("gs://bucket/prefix"),
+        Some("abfss://bucket/prefix"),
+        Some("azure://bucket/prefix"),
+        Some("S3://BUCKET/PREFIX"),
+        Some("s3://bucket/prefix/"),
+    ];
+    for result_root in arms {
+        let cfg = advertising_config(std::path::Path::new("/srv/jammi"), *result_root);
+        let resolved = cfg.resolved_result_root().unwrap();
+        let reg =
+            crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+                .unwrap();
+        assert_eq!(
+            reg.member_root.as_ref().map(|r| r.as_str()),
+            Some(resolved.as_str()),
+            "arm {result_root:?}: the row must carry resolved_result_root() verbatim"
+        );
+        assert_eq!(
+            reg.peer_addr.as_ref().map(|p| p.as_str()),
+            Some("10.0.0.1:9000")
+        );
+    }
+
+    // The "/" ALONE arm: `artifact_dir` itself is the root filesystem path,
+    // `result_root` unset — still carried verbatim, with no special-casing.
+    let cfg = advertising_config(std::path::Path::new("/"), None);
+    let resolved = cfg.resolved_result_root().unwrap();
+    let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap();
+    assert_eq!(reg.member_root.unwrap().as_str(), resolved);
+}
+
+/// `gcs://b/p` and `gs://b/p` are DIFFERENT `member_root` STRINGS — the
+/// membership path performs no scheme aliasing when writing the row (this
+/// is a claim about the VALUE, not about `list_gang_members`'s admission
+/// predicate: that predicate does not consult `result_root` at all in this
+/// unit — contract §12, the round-5 excision — so two members with these
+/// two different root strings ARE gang members of each other;
+/// `gang_membership.rs`'s
+/// `gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`
+/// is the join-time counterpart proving exactly that).
+#[test]
+fn from_config_never_aliases_gcs_and_gs_result_root_spellings() {
+    let cfg_gcs = advertising_config(std::path::Path::new("/unused"), Some("gcs://bucket/p"));
+    let cfg_gs = advertising_config(std::path::Path::new("/unused"), Some("gs://bucket/p"));
+    let reg_gcs =
+        crate::catalog::instance::InstanceRegistration::from_config(&cfg_gcs, "i1", None, None)
+            .unwrap();
+    let reg_gs =
+        crate::catalog::instance::InstanceRegistration::from_config(&cfg_gs, "i2", None, None)
+            .unwrap();
+    assert_ne!(
+        reg_gcs.member_root.unwrap().as_str(),
+        reg_gs.member_root.unwrap().as_str(),
+        "gcs:// and gs:// must remain two different roots on the membership path"
+    );
+}
+
+/// A library config (no `peer_advertise`) produces NULLs — `peer_addr` and
+/// `member_root` both absent, never an error.
+#[test]
+fn from_config_without_peer_advertise_is_a_library_registration_with_nulls() {
+    let cfg = JammiConfig::default();
+    let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap();
+    assert!(reg.peer_addr.is_none());
+    assert!(reg.member_root.is_none());
+    assert_eq!(reg.instance_id, "i1");
+}
+
+/// A non-UTF-8 `artifact_dir` is refused naming the key by
+/// `resolved_result_root()` itself (never a lossy fold on the compared
+/// value) — `InstanceRegistration::from_config` propagates that refusal for
+/// the default (`result_root` unset) arm; `MembershipConfig::validate`
+/// itself never touches `artifact_dir` at all. Built via `OsString::
+/// from_vec` (unix only — there is no portable way to construct an
+/// invalid-UTF-8 `PathBuf` elsewhere).
+#[cfg(unix)]
+#[test]
+fn from_config_refuses_a_non_utf8_artifact_dir_via_resolved_result_root() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut bytes = b"/tmp/jammi-".to_vec();
+    bytes.push(0xFF); // invalid UTF-8 byte, valid on a unix filesystem
+    bytes.extend_from_slice(b"-dir");
+    let bad_path = std::path::PathBuf::from(OsString::from_vec(bytes));
+    assert!(bad_path.to_str().is_none(), "fixture must be non-UTF-8");
+
+    let cfg = advertising_config(&bad_path, None);
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_dir") && msg.contains("UTF-8"),
+        "{msg}"
+    );
+}
+
+/// `JammiConfig::resolved_result_root` mirrors `ResultStore::new`'s own
+/// `{artifact_dir}/jammi_db` derivation when `result_root` is unset, and
+/// returns the explicit root verbatim (no leaf) when it is set.
+#[test]
+fn resolved_result_root_mirrors_the_two_derivation_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let unset = JammiConfig {
+        artifact_dir: dir.path().to_path_buf(),
+        ..JammiConfig::default()
+    };
+    assert_eq!(
+        unset.resolved_result_root().unwrap(),
+        dir.path().join("jammi_db").to_string_lossy().into_owned()
+    );
+    let set = JammiConfig {
+        storage: StorageConfig {
+            result_root: Some("r2://bucket/prefix".into()),
+            ..StorageConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    assert_eq!(set.resolved_result_root().unwrap(), "r2://bucket/prefix");
+}

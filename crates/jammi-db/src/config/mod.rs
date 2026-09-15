@@ -1709,6 +1709,25 @@ pub struct ServerConfig {
     /// both at a fixed port (`:0` never collides). Served outside the tenant
     /// layer (I-PEER): every client of it is a jammi coordinator.
     pub peer_bind: Option<String>,
+    /// The address OTHER replicas dial THIS process's `peer_bind` listener
+    /// at — usually a load-balancer-free, directly-routable `host:port`
+    /// (`peer_bind` itself is commonly `0.0.0.0:PORT`, unusable as a dial
+    /// target). `None` (the default) = this process never advertises a gang
+    /// membership row: its `instances.peer_addr`/`result_root` columns stay
+    /// `NULL` regardless of whether `peer_bind` is set. Requires `peer_bind`
+    /// to be set too (refused at the ONE membership choke point,
+    /// [`crate::catalog::instance::InstanceRegistration::from_config`] —
+    /// naming BOTH keys); parses as a
+    /// [`PeerAddr`](crate::catalog::instance::PeerAddr).
+    ///
+    /// # TOML
+    ///
+    /// ```toml
+    /// [server]
+    /// peer_bind = "0.0.0.0:9000"
+    /// peer_advertise = "10.0.4.7:9000"
+    /// ```
+    pub peer_advertise: Option<String>,
     /// MARGINAL-LOAD ADMISSION per query, in bytes: the maximum estimated
     /// bytes ONE query may load locally for segments it does not own, when
     /// their owners are unreachable (the last rung of the placed-search
@@ -2422,6 +2441,7 @@ impl Default for ServerConfig {
             services: ServiceSelection::default(),
             limits: LimitsConfig::default(),
             peer_bind: None,
+            peer_advertise: None,
             peer_local_load_bytes: None,
         }
     }
@@ -2535,6 +2555,39 @@ fn describe_deserialize_error(
 }
 
 impl JammiConfig {
+    /// The result-table root this deployment resolves to, VERBATIM: the
+    /// explicit `[storage] result_root` when set, else `{artifact_dir}/
+    /// jammi_db` — the SAME derivation `jammi_db::store::ResultStore::new`'s
+    /// local-root arm performs (`artifact_dir.join("jammi_db")`), the ONE
+    /// place that join happens so nothing downstream re-derives it
+    /// independently. This string is exactly what a gang member's
+    /// `instances.result_root` column carries
+    /// ([`crate::catalog::instance::InstanceRegistration::from_config`]) —
+    /// no scheme folding, no symlink resolution, no reinterpretation of any
+    /// kind.
+    ///
+    /// # Errors
+    ///
+    /// [`JammiError::Config`] naming `artifact_dir` when its joined
+    /// `{artifact_dir}/jammi_db` path is not valid UTF-8 — never a silent
+    /// lossy fold (`Path::to_string_lossy`'s replacement-character
+    /// substitution), since that fold could make two genuinely different
+    /// paths compare equal downstream.
+    pub fn resolved_result_root(&self) -> Result<String> {
+        match &self.storage.result_root {
+            Some(root) => Ok(root.clone()),
+            None => {
+                let joined = self.artifact_dir.join("jammi_db");
+                joined.to_str().map(str::to_string).ok_or_else(|| {
+                    JammiError::Config(format!(
+                        "artifact_dir '{}' is not valid UTF-8",
+                        self.artifact_dir.display()
+                    ))
+                })
+            }
+        }
+    }
+
     /// Load configuration the production way: resolve the file (explicit
     /// path, `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`, the
     /// platform config dir — `resolve_config_path_in`) against the real
@@ -2600,6 +2653,19 @@ impl JammiConfig {
         // construction. The resolved value itself is discarded here; every
         // real consumer re-resolves through this same reader (K2).
         config.engine.memory_limit_bytes()?;
+        // Reject a `[server] peer_advertise` that cannot resolve a valid
+        // gang-membership shape (an unset `peer_bind`, or an unparseable
+        // address) at load time, naming the offending key — rather than
+        // only surfacing deep inside `InferenceSession::wrap_with`'s own
+        // registration call. `MembershipConfig::validate` performs no
+        // filesystem access and no interpretation of the result root at
+        // all — the row carries `resolved_result_root()` verbatim (contract
+        // §10); `InstanceRegistration::from_config`, which `wrap_with`
+        // calls (every `InferenceSession` constructor funnels through it),
+        // is the ONLY other caller, so a struct-literal config that skips
+        // `load_from` entirely is still covered there. The `Option` is
+        // discarded; this call is for its early-failure side effect only.
+        let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
         Ok(config)
     }
 

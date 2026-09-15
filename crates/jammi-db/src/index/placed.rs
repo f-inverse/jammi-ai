@@ -1066,7 +1066,7 @@ mod tests {
             if with_remote {
                 sources.push(SegmentSource::Remote {
                     segment_id: SegmentId(2),
-                    owners: vec![PeerAddr("127.0.0.1:1".into())],
+                    owners: vec![PeerAddr::parse("127.0.0.1:1").unwrap()],
                     row_count: 1,
                     index_url: StorageUrl::parse("/tmp/x").unwrap(),
                 });
@@ -1278,8 +1278,8 @@ mod tests {
             sources.push(SegmentSource::Remote {
                 segment_id: SegmentId(id),
                 owners: vec![
-                    PeerAddr("127.0.0.1:1".into()),
-                    PeerAddr("127.0.0.1:2".into()),
+                    PeerAddr::parse("127.0.0.1:1").unwrap(),
+                    PeerAddr::parse("127.0.0.1:2").unwrap(),
                 ],
                 row_count: 6,
                 index_url: StorageUrl::parse(
@@ -1506,7 +1506,7 @@ mod tests {
         );
         let remote = || SegmentSource::Remote {
             segment_id: SegmentId(1),
-            owners: vec![PeerAddr("127.0.0.1:1".into())],
+            owners: vec![PeerAddr::parse("127.0.0.1:1").unwrap()],
             row_count: 6,
             index_url: StorageUrl::parse(
                 dir.path()

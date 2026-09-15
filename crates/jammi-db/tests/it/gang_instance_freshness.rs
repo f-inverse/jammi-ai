@@ -93,7 +93,13 @@ async fn fresh_instance_true_for_a_recently_seen_instance(kind: BackendKind) {
         "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
     );
     catalog
-        .upsert_instance("inst-fresh", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "inst-fresh",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let fresh = catalog
@@ -153,7 +159,13 @@ async fn fresh_instance_false_for_a_stale_instance(kind: BackendKind) {
         "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
     );
     catalog
-        .upsert_instance("inst-stale", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "inst-stale",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let lease = Duration::from_secs(30);
@@ -194,7 +206,13 @@ async fn fresh_instance_true_just_inside_the_liveness_margin(kind: BackendKind) 
         "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
     );
     catalog
-        .upsert_instance("inst-borderline", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "inst-borderline",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let lease = Duration::from_secs(30);
@@ -237,7 +255,13 @@ async fn fresh_instance_false_just_outside_the_liveness_margin(kind: BackendKind
         "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
     );
     catalog
-        .upsert_instance("inst-just-outside", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "inst-just-outside",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let lease = Duration::from_secs(30);

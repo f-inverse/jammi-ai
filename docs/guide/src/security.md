@@ -147,6 +147,38 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   exposes the same risk I-PEER states** — the listener speaks plaintext gRPC;
   encryption and peer authentication are the runtime's. Default unset = no
   listener = no gang admission surface.
+- **The membership predicate `list_gang_members` narrows to is a catalog-local
+  read, not an RPC.** A row is a member of a listing iff: it is NOT the
+  caller itself; its `workers` row (an INNER join — a member is a fleet
+  worker with a claim-loop slot, not merely a live process) has `state =
+  'claiming'` (`warming`/`draining` excluded); `workers.kinds` contains the
+  requested kind as a whole, comma-split, trimmed token (never a substring —
+  `fine_tune` never matches `graph_fine_tune`); `instances.peer_addr` is
+  non-NULL; and `last_seen_at` is fresh under `instance_liveness_margin(lease)`
+  (`2 × lease`) on the DB clock. `peer_addr_of` is the by-id analogue, with no
+  kind/self filter (any other member may resolve any other by id). **This
+  predicate does not consult `instances.result_root` at all** (contract
+  `feat_500-C-U5b-1a` §12, the round-5 excision): the column still carries
+  `resolved_result_root()` VERBATIM (so two different spellings of one
+  physical location, e.g. `gcs://b/p` vs `gs://b/p`, remain two different
+  STRINGS in that column), but two members with different `result_root`
+  spellings ARE gang members of each other in this unit — root identity
+  across spellings, and any membership predicate built on it, is a separate,
+  not-yet-built unit (U5b-1a-A2). Root-string equality was never more than
+  NECESSARY, never SUFFICIENT, for shared storage even when it was part of
+  this predicate: two byte-identical roots on two filesystems are
+  indistinguishable to a string comparison — sufficiency is the attestation
+  VERIFY's, a later unit's concern, not this listing's.
+- **B5 (this listing is deliberately tenant-free).** `instances`/`workers`
+  rows are deployment infrastructure (which processes exist, what they claim,
+  where they are reachable), never tenant data — there is no tenant column on
+  either table, so there is no tenant predicate to drop or keep, and
+  `list_gang_members`/`peer_addr_of` return the identical answer under any
+  tenant scope and under none. Neither verb is reachable from any RPC at all
+  today (no gang/peer handler calls either) — a vacuous truth, not yet a
+  tested boundary; the first RPC that calls one of them owes the enumerating
+  unreachability-or-scoping oracle this listener's own precedent
+  (`GANG_LISTENER_ALLOWLIST`/`PEER_LISTENER_ALLOWLIST`) already sets.
 
 ## Transport encryption is the deployer's runtime, not the engine's
 

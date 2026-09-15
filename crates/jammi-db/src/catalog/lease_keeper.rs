@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, warn};
 
+use super::instance::InstanceRegistration;
 use super::lease::LeaseIntervals;
 use super::result_repo::ResultTableCas;
 use super::Catalog;
@@ -55,9 +56,15 @@ use crate::error::{JammiError, Result};
 /// What one [`LeaseHold`] renews.
 #[derive(Debug, Clone)]
 pub enum LeaseTarget {
-    /// This process's own `instances` row — renewed via
-    /// [`Catalog::touch_instance`].
-    Instance(String),
+    /// This process's own `instances` (+ `workers`) row — renewed via
+    /// [`Catalog::touch_instance`]; a MISSED touch (the row was pruned
+    /// during a transient outage) re-upserts the WHOLE tuple via
+    /// [`Catalog::reregister_instance`] instead of merely flipping `lost` —
+    /// see `renew_all`'s `Instance` arm. `Arc`, not an owned value: the
+    /// SAME registration `JobWorker` mutates in place (its `worker` cell)
+    /// is the one this hold renews, so a state change lands on the very
+    /// next renewal with no re-registration.
+    Instance(std::sync::Arc<InstanceRegistration>),
     /// A claimed `jobs` row — renewed via [`Catalog::heartbeat_job`], the
     /// same full attempt guard (`claimed_by`/`status`/`attempts`) every
     /// other lease-guarded job write carries.
@@ -762,10 +769,29 @@ async fn renew_all(
     };
     for (target, lost, last_renewed_ms) in snapshot {
         let renewed = match &target {
-            LeaseTarget::Instance(instance_id) => match catalog.touch_instance(instance_id).await {
-                Ok(matched) => Some(matched),
+            LeaseTarget::Instance(reg) => match catalog.touch_instance(&reg.instance_id).await {
+                Ok(true) => Some(true),
+                // A missed touch means the row was pruned out from under a
+                // still-live process (a transient outage): re-upsert the
+                // WHOLE tuple (instances + workers, one transaction) rather
+                // than flipping `lost` — a live holder must never read
+                // "lost" just because a sweep won a race against its own
+                // heartbeat.
+                Ok(false) => match catalog.reregister_instance(reg).await {
+                    Ok(()) => Some(true),
+                    Err(e) => {
+                        warn!(
+                            instance_id = %reg.instance_id, error = %e,
+                            "lease keeper: instance reregister failed"
+                        );
+                        None
+                    }
+                },
                 Err(e) => {
-                    warn!(instance_id, error = %e, "lease keeper: instance heartbeat failed");
+                    warn!(
+                        instance_id = %reg.instance_id, error = %e,
+                        "lease keeper: instance heartbeat failed"
+                    );
                     None
                 }
             },

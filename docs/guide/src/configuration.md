@@ -209,6 +209,27 @@ preload_models = [
 # them it exposes cross-tenant reads. See security.md "The peer listener"
 # and "The gang listener".
 # peer_bind = "10.0.0.5:8082"
+# The address OTHER replicas dial THIS process's `peer_bind` listener at
+# (`peer_bind` is commonly `0.0.0.0:PORT`, unusable as a dial target).
+# Unset (the default) = this process never advertises a gang-membership row:
+# its `instances.peer_addr`/`result_root` columns stay NULL regardless of
+# whether `peer_bind` is set. Setting it means: this process ADVERTISES
+# itself as a gang member. Requires `peer_bind` to be set too -- refused,
+# naming both keys, by `InstanceRegistration::from_config`, called once by
+# every session construction path (and, for this early-failure check alone,
+# by `JammiConfig::load_from` at config load time too).
+# The membership root rule: `instances.result_root` carries the VERBATIM,
+# byte-for-byte output of `resolved_result_root()` -- the exact same string
+# the result store is rooted at ({artifact_dir}/jammi_db when [storage]
+# result_root is unset, else result_root itself). No filesystem access, no
+# URL parsing, no scheme handling, no symlink resolution happens on this
+# path -- the row records the configured spelling verbatim. The gang
+# listener's own membership predicate does NOT consult this column: root
+# identity across spellings, and any membership predicate built on it, is a
+# separate, not-yet-built unit (U5b-1a-A2). See "The gang listener (I-GANG)"
+# in security.md for the predicate this column is carried, but not
+# consulted, by.
+# peer_advertise = "10.0.4.7:9000"
 # MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
 # estimated bytes ONE query may load locally for segments it does not own,
 # when their owners are unreachable -- the last rung of the placed-search

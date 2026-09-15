@@ -864,7 +864,13 @@ async fn inline_job_failed_when_owning_instance_is_stale(backend: BackendKind) {
         .unwrap()
         .expect("inline job claimed");
     catalog
-        .upsert_instance("instance-dead", None, None)
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-dead",
+            None,
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
     force_stale_instance(&catalog, "instance-dead", 3650).await;
@@ -936,7 +942,13 @@ async fn inline_job_untouched_when_owning_instance_is_live(backend: BackendKind)
         .unwrap()
         .expect("inline job claimed");
     catalog
-        .upsert_instance("instance-live", None, None)
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-live",
+            None,
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
     // Fresh `last_seen_at` (just upserted): well within the liveness margin.
@@ -992,11 +1004,23 @@ async fn dead_instances_inline_job_is_failed_while_a_live_peer_with_the_same_lab
         .unwrap()
         .expect("the live peer's inline job is claimed");
     catalog
-        .upsert_instance("instance-dead-uuid", Some(label), None)
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-dead-uuid",
+            Some(label),
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
     catalog
-        .upsert_instance("instance-live-uuid", Some(label), None)
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-live-uuid",
+            Some(label),
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
     force_stale_instance(&catalog, "instance-dead-uuid", 3650).await;
@@ -3443,7 +3467,13 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
     };
 
     catalog
-        .upsert_instance("w-state", Some("lbl"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "w-state",
+            Some("lbl"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     catalog

@@ -281,7 +281,13 @@ async fn run_rank_every_i_gang_determinant_satisfied_is_unimplemented() {
     server
         .engine
         .catalog()
-        .upsert_instance("coord-full", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "coord-full",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt = submit_and_claim(
@@ -335,7 +341,13 @@ async fn run_rank_refuses_when_job_not_running() {
     server
         .engine
         .catalog()
-        .upsert_instance("coord-1", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "coord-1",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt = submit_and_claim(
@@ -390,7 +402,13 @@ async fn run_rank_refuses_when_lease_expired() {
     server
         .engine
         .catalog()
-        .upsert_instance("coord-expired", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "coord-expired",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt = submit_and_claim(
@@ -468,7 +486,13 @@ async fn run_rank_refuses_when_attempt_does_not_match() {
     server
         .engine
         .catalog()
-        .upsert_instance("coord-1", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "coord-1",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt = submit_and_claim(
@@ -512,7 +536,13 @@ async fn run_rank_refuses_when_claimed_by_a_different_coordinator() {
     server
         .engine
         .catalog()
-        .upsert_instance("coord-impostor", Some("label"), Some("host"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "coord-impostor",
+            Some("label"),
+            Some("host"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt = submit_and_claim(
@@ -557,7 +587,13 @@ async fn run_rank_fresh_instance_fault_is_unavailable() {
     server
         .engine
         .catalog()
-        .upsert_instance("coord-fresh-fault", Some("l"), Some("h"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "coord-fresh-fault",
+            Some("l"),
+            Some("h"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt = submit_and_claim(
@@ -695,7 +731,13 @@ async fn refusal_scenario(
         server
             .engine
             .catalog()
-            .upsert_instance(coord, Some("l"), Some("h"))
+            .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                coord,
+                Some("l"),
+                Some("h"),
+                None,
+                None,
+            ))
             .await
             .unwrap();
         let attempt = submit_and_claim(
@@ -747,7 +789,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-not-running", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-not-running",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
@@ -779,7 +827,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-impostor", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-impostor",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
@@ -796,7 +850,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-wrong-attempt", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-wrong-attempt",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
@@ -819,7 +879,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-lease-dead", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-lease-dead",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
@@ -851,7 +917,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-undecodable", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-undecodable",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             // A `world_size` key present but not a valid non-negative rank
@@ -887,7 +959,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-world-mismatch", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-world-mismatch",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
@@ -916,7 +994,13 @@ async fn refusal_scenario(
             server
                 .engine
                 .catalog()
-                .upsert_instance("nd-coord-multi-host", Some("l"), Some("h"))
+                .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                    "nd-coord-multi-host",
+                    Some("l"),
+                    Some("h"),
+                    None,
+                    None,
+                ))
                 .await
                 .unwrap();
             let attempt = submit_and_claim(
@@ -979,7 +1063,13 @@ async fn run_rank_refuses_an_undecodable_world_size_byte_identically_to_not_foun
         server
             .engine
             .catalog()
-            .upsert_instance(coord, Some("l"), Some("h"))
+            .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+                coord,
+                Some("l"),
+                Some("h"),
+                None,
+                None,
+            ))
             .await
             .unwrap();
         let attempt = submit_and_claim(
@@ -1067,7 +1157,13 @@ async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
     server_a
         .engine
         .catalog()
-        .upsert_instance("nd-coord-mismatch-below", Some("l"), Some("h"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "nd-coord-mismatch-below",
+            Some("l"),
+            Some("h"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt_a = submit_and_claim(
@@ -1125,7 +1221,13 @@ async fn run_rank_refuses_when_assign_world_mismatches_row_world_size() {
     server_b
         .engine
         .catalog()
-        .upsert_instance("nd-coord-mismatch-above", Some("l"), Some("h"))
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "nd-coord-mismatch-above",
+            Some("l"),
+            Some("h"),
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let attempt_b = submit_and_claim(

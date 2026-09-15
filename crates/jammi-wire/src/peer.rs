@@ -154,7 +154,7 @@ impl GrpcPeerTransport {
         if let Some(channel) = channels.get(owner) {
             return Ok(channel.clone());
         }
-        let endpoint = Endpoint::from_shared(format!("http://{}", owner.0))
+        let endpoint = Endpoint::from_shared(format!("http://{}", owner.as_str()))
             .map_err(|_| PeerFailureReason::Unreachable)?;
         let channel = endpoint.connect_lazy();
         channels.insert(owner.clone(), channel.clone());
@@ -359,7 +359,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let transport = GrpcPeerTransport::new();
-        let owner = PeerAddr(addr.to_string());
+        let owner = PeerAddr::parse(&addr.to_string()).unwrap();
         let req = SegmentSearchRequest {
             table_name: "t".into(),
             segment_ids: vec![SegmentId(7)],

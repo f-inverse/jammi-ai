@@ -8,6 +8,14 @@
 //! `migrations.rs` / `gang_instance_freshness.rs` shape: every test also
 //! runs a `::postgres` arm gated by `live-postgres-tests`, skipping (never
 //! failing) when `JAMMI_TEST_PG_URL` is unset.
+//!
+//! The Postgres arm runs every test in the lane against ONE shared, persistent
+//! database (`jammi_test_utils::unique_suffix`'s doc), so two disciplines hold
+//! in this file: a test never asserts a count over rows it did not seed (it
+//! asserts the presence or absence of ITS row), and a test that plants a row
+//! the listing predicate cannot tolerate (a corrupted `peer_addr`) deletes
+//! that row BEFORE its assertion, on every arm, so a failure never leaks the
+//! poison into every later listing in the lane.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +87,35 @@ async fn force_delete_instance(catalog: &Catalog, instance_id: &str) {
         })
         .await
         .unwrap();
+}
+
+/// Whether an `instances` row exists at all, fresh or stale — the row-scoped
+/// witness the prune oracle asserts on, instead of a `prune_instances` count
+/// that also counts every stale row a sibling test left in the shared
+/// Postgres database.
+async fn instance_row_exists(catalog: &Catalog, instance_id: &str) -> bool {
+    let instance_id = instance_id.to_string();
+    let rows = catalog
+        .backend_arc()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT instance_id FROM instances WHERE instance_id = $1",
+                        &[SqlValue::TextOwned(instance_id)],
+                        |row| row.get::<String>("instance_id"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    !rows.is_empty()
 }
 
 /// Corrupt an already-seeded row's `peer_addr` column out-of-band (a direct
@@ -907,10 +944,11 @@ async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: Ba
     )
     .await;
     force_corrupt_peer_addr(&catalog, &id).await;
-    let err = catalog
-        .peer_addr_of(&id, LEASE)
-        .await
-        .expect_err("a corrupted peer_addr must be a typed error, never a silent None");
+    let result = catalog.peer_addr_of(&id, LEASE).await;
+    // The poison row leaves the shared database before any assertion can
+    // fail, so a red here never cascades into every later listing.
+    force_delete_instance(&catalog, &id).await;
+    let err = result.expect_err("a corrupted peer_addr must be a typed error, never a silent None");
     match err {
         JammiError::Catalog(msg) => {
             assert!(
@@ -947,10 +985,14 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
     )
     .await;
     force_corrupt_peer_addr(&catalog, &id).await;
-    let err = catalog
+    let result = catalog
         .list_gang_members(listing("fine_tune", "someone-else"))
-        .await
-        .expect_err("a corrupted peer_addr candidate must be a typed error, never dropped");
+        .await;
+    // Same discipline as the `peer_addr_of` case: the poison row is gone
+    // before the assertion, on every arm.
+    force_delete_instance(&catalog, &id).await;
+    let err =
+        result.expect_err("a corrupted peer_addr candidate must be a typed error, never dropped");
     match err {
         JammiError::Catalog(msg) => {
             assert!(
@@ -1075,12 +1117,15 @@ async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kin
         !catalog.fresh_instance(&id, lease).await.unwrap(),
         "25s ago must already read stale past the 20s margin"
     );
-    let deleted = catalog
+    // The oracle is row-scoped: `prune_instances` returns the count over the
+    // WHOLE table, which on the shared Postgres database also counts every
+    // stale row a sibling test left behind, so the count is never asserted.
+    catalog
         .prune_instances(instance_prune_window(lease))
         .await
         .unwrap();
-    assert_eq!(
-        deleted, 0,
+    assert!(
+        instance_row_exists(&catalog, &id).await,
         "a member merely stale within the (margin, window] range must not be pruned"
     );
 
@@ -1090,5 +1135,12 @@ async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kin
         .prune_instances(instance_prune_window(lease))
         .await
         .unwrap();
-    assert_eq!(deleted, 1, "a member stale past the window must be pruned");
+    assert!(
+        deleted >= 1,
+        "the prune past the window must report at least this row"
+    );
+    assert!(
+        !instance_row_exists(&catalog, &id).await,
+        "a member stale past the window must be pruned"
+    );
 }

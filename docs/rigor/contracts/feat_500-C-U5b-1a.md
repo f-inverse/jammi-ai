@@ -993,3 +993,56 @@ set) for every `test_case`-parameterized test in
 `python3 ci/scripts/perf/check_citations.py`; `python3 ci/scripts/check_no_consumer_names.py`;
 `python3 ci/scripts/check_swarm_bijection.py`; `RUSTDOCFLAGS="-D warnings"
 cargo doc --no-deps -p jammi-db -p jammi-ai`.
+
+## 15. The consolidated PR's Postgres lane (2026-09-15) — one shared database, row-scoped oracles
+
+**What §14 listed and what actually ran.** §14 names the live-postgres lane
+(`--features live-postgres-tests`, `JAMMI_TEST_PG_URL` set) as a gate for
+every parameterized test in `crates/jammi-db/tests/it/gang_membership.rs`.
+That lane was NOT executed on this machine before PR #579 opened — no local
+Postgres existed — so CI's "Test (Postgres)" job was the arm's first
+execution. It failed five `::postgres` cases at the consolidated tip
+`0672f9ca`; the `::sqlite` arms of the same tests were green on every local
+run because SQLite opens a fresh catalog per test.
+
+**The defect (in the tests, not the verbs).** The lane runs the whole
+`jammi-db` integration suite `--test-threads=1` against ONE persistent
+database (`jammi_test_utils::unique_suffix`'s doc), twice (once more with
+`test-hooks`). Two tests in this file were written as if each test owned the
+table: (i) `list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr`
+and `peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr` planted
+a row with `peer_addr = 'not an addr'` and returned without deleting it, so
+every later `list_gang_members` in the lane surfaced that row's typed error
+(four listing tests red, all naming the `corrupt-list-…` instance); (ii)
+`prune_window_does_not_prune_a_member_merely_stale_within_the_window`
+asserted `prune_instances(..) == 0` and then `== 1`, a count over the WHOLE
+table that also counts every stale row a sibling test left behind (CI
+observed 5; a second local run observed 24).
+
+**The fix (this commit).** Both corrupt-row tests capture the verb's result,
+`force_delete_instance` the poison row, and only then assert — on every arm,
+so a red assertion never leaks the poison into later listings. The prune
+oracle is row-scoped: after the in-window prune it asserts ITS row still
+exists (`instance_row_exists`, a direct `SELECT … WHERE instance_id = $1`);
+after the past-window prune it asserts the count is at least one and ITS row
+is gone. The file header states the two disciplines the shared database
+imposes (never assert a count over rows a test did not seed; delete a
+predicate-intolerable row before asserting).
+
+**Executed, both arms, both passes.** A PostgreSQL 16 cluster was stood up
+under the session scratchpad (TCP only, port 54329) with the CI database
+shape. At the pre-fix file: `cargo test -p jammi-db --features
+live-postgres-tests,test-hooks --test it gang_membership -- --test-threads=1`
+→ `39 passed; 5 failed` — the same five cases as CI, the same corrupted-row
+message, the prune count `24 != 0`. At the fixed file: the `live-postgres-tests`
+pass → `0` tests (the suite compiles in only with `test-hooks`, as CI's second
+invocation does) and the `live-postgres-tests,test-hooks` pass → `44 passed;
+0 failed` (22 sqlite + 22 postgres). The full lane (`--test it` over the
+whole crate, both invocations, and the `jammi-server` introspection step) was
+then run locally in the CI shape; its result is recorded in the PR.
+
+**Residual.** Every other `test_case`-parameterized suite this wave touched
+(`migrations.rs`'s 035 oracle, `member_root_constructor.rs`,
+`memory_pool.rs`, `tenant_scope.rs`) seeds no row another test's predicate
+could reject and asserts no whole-table count; the full-lane run above is the
+executed check of that claim, not this sentence.

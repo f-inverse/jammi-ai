@@ -491,13 +491,15 @@ the port.
 `peer_bind` merely opening the listener: it is the `host:port` OTHER
 replicas dial, and setting it writes this process's `instances.peer_addr`/
 `result_root` columns (requires `peer_bind` to be set too, refused naming
-both keys otherwise). Membership compares the configured root SPELLING
-byte-for-byte — spell the root IDENTICALLY on every replica; two spellings
-of one location are two roots. That byte-equality is NECESSARY, never
-SUFFICIENT, for shared storage — two byte-identical roots on two
-filesystems are indistinguishable to the membership predicate; the
-attestation VERIFY (a later unit) is what establishes sufficiency. The
-prune window a stale member's row survives before deletion is strictly
+both keys otherwise). The row records the configured root SPELLING
+verbatim, but the gang-membership predicate does NOT consult it in this
+unit — root identity across spellings, and any membership predicate built
+on it, is a separate, not-yet-built unit. Root-string equality was never
+more than NECESSARY, never SUFFICIENT, for shared storage: two
+byte-identical roots on two filesystems are indistinguishable to a string
+comparison; the attestation VERIFY (a later unit) is what establishes
+sufficiency. The prune window a stale member's row survives before deletion
+is strictly
 beyond the liveness margin used to judge freshness (`3 × lease` vs. `2 ×
 lease`), so a pruned-but-still-live process rejoins its gang on its very
 next heartbeat with no restart — the lease keeper's reregister re-upserts

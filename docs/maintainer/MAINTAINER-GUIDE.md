@@ -3234,14 +3234,22 @@ choke point every writer of them funnels through.
   `label`, `host`, `peer_addr: Option<PeerAddr>`, `member_root:
   Option<MemberRoot>`, plus a `worker: Mutex<Option<WorkerFacts>>` cell
   that is the claim-loop half, owned exclusively by `JobWorker`/
-  `EmbeddedWorker` (`fine_tune/worker.rs`): `run_until` sets it before its
-  first `upsert_worker`, every `set_worker_state` writes the cell before the
-  row, `delete_worker` clears it — so a keeper reregister racing a state
-  change always re-upserts the `workers` row the process is ACTUALLY about
-  to become, never a stale snapshot. `PeerAddr` is sealed (`parse`/`as_str`/
+  `EmbeddedWorker` (`fine_tune/worker.rs`): `run_until` sets it only AFTER
+  its FIRST `upsert_worker` call SUCCEEDS (P-Y4, contract
+  `feat_500-C-U5b-1a` §12 — a failed first upsert must leave the cell
+  `None`, never a fact the row does not carry, so a keeper reregister
+  racing a still-failing loop start never writes a `workers` row the real
+  upsert never itself managed to write), every LATER `set_worker_state`
+  writes the cell before the row, `delete_worker` clears it — so a keeper
+  reregister racing a state change always re-upserts the `workers` row the
+  process is ACTUALLY about to become, never a stale snapshot, and never a
+  fact the row does not yet carry. `PeerAddr` is sealed (`parse`/`as_str`/
   `Display` only) and is the SAME type the peer listener uses
   (`index::peer` re-exports it) — the peer and gang listeners can never
-  drift into two address types.
+  drift into two address types. `PeerAddr::parse` refuses an UNBRACKETED
+  IPv6 literal (P-Y4): a bracketed IPv6 host (`[::1]:9000`), an IPv4
+  literal, or a DNS hostname are accepted; `2001:db8::1:9000` is refused
+  (ambiguous which colon separates host from port).
 - **`MembershipConfig::validate` and `InstanceRegistration::from_config`**
   (`catalog/instance.rs`, contract §10, the round-3 excision — the
   design history through rounds 1–3, incl. the pure-validate/materialize
@@ -3263,11 +3271,17 @@ choke point every writer of them funnels through.
   build never links it, so nothing outside `MemberRoot::resolved` can put an
   arbitrary string in the `instances.result_root` column. **The membership
   path performs NO
-  interpretation of the root at all**: no URL parse, no scheme handling, no
-  symlink resolution, no case folding — two spellings of one physical
-  location (`gcs://b/p` vs `gs://b/p`, a trailing `/`, a case difference)
-  are two DIFFERENT roots. The only refusal on this path is the non-UTF-8
-  refusal already inside `resolved_result_root` (a non-UTF-8 `artifact_dir`,
+  interpretation of the root at all, and the gang-membership listing verb
+  does not even read it** (P-Y1, contract §12, the round-5 excision): no
+  URL parse, no scheme handling, no symlink resolution, no case folding, no
+  byte comparison. The row still carries the configured spelling verbatim —
+  two spellings of one physical location (`gcs://b/p` vs `gs://b/p`, a
+  trailing `/`, a case difference) are two DIFFERENT STRINGS in that
+  column — but `list_gang_members`'s admission predicate does not consult
+  it at all in this unit; root identity across spellings, and any
+  membership predicate built on it, is unit U5b-1a-A2's question. The only
+  refusal on this path is the non-UTF-8 refusal already inside
+  `resolved_result_root` (a non-UTF-8 `artifact_dir`,
   the default arm's only failure mode). `JammiConfig::load_from` calls
   `MembershipConfig::validate` directly (the early-failure check);
   `InferenceSession::wrap_with` (`session.rs`) calls `from_config` once per
@@ -3285,23 +3299,24 @@ choke point every writer of them funnels through.
   ONLY source of the member row's root string.
 - **The two read verbs** (`catalog/jobs_repo.rs`, both tenant-unscoped by
   construction — `instances` carries no tenant column): `peer_addr_of(id,
-  lease)` is the ONE by-id resolution surface (no kind/root/self filter —
+  lease)` is the ONE by-id resolution surface (no kind/self filter —
   any member may resolve any other by id, including a busy or other-kind
   one); `Some` iff the row is present, fresh under
   `instance_liveness_margin(lease)`, and `peer_addr` is non-NULL.
-  `list_gang_members(GangListing { kind, self_instance, member_root,
-  lease })` is an `instances JOIN workers` listing: excludes the caller
+  `list_gang_members(GangListing { kind, self_instance, lease })` (no root
+  field, P-Y1) is an `instances JOIN workers` listing: excludes the caller
   itself, excludes `workers.state != 'claiming'` (an INNER join — no
   `workers` row is excluded too, since a member is a fleet worker with a
   claim-loop slot, not merely a live process), excludes a `kinds` token
   that does not match `kind` as a WHOLE comma-split trimmed token (`,`
-  is `upsert_worker`'s own encoding), excludes a `result_root` that differs
-  from the caller's `member_root` by even one byte (a Rust comparison,
-  never SQL `=`, never re-interpreted), excludes stale/NULL-`peer_addr`/
-  NULL-`result_root` rows; the survivors are sorted by `instance_id` BYTE
-  ORDER in Rust (never a SQL `ORDER BY` — backend collation is untrusted). A
-  corrupted stored `peer_addr` that fails `PeerAddr::parse` is a typed
-  `Catalog` error from either verb, never silently mapped to "not a
+  is `upsert_worker`'s own encoding), excludes stale/NULL-`peer_addr`
+  rows; `result_root` plays NO part in this predicate — two members whose
+  `result_root` strings differ (by scheme alias, case, trailing `/`, or
+  anything else) ARE gang members of each other. The survivors are sorted
+  by `instance_id` BYTE ORDER in Rust (never a SQL `ORDER BY` — backend
+  collation is untrusted). A corrupted stored `peer_addr` that fails
+  `PeerAddr::parse` is a typed `Catalog` error from either verb, never
+  silently mapped to "not a
   member".
 - **The lease keeper's reregister** (`catalog/lease_keeper.rs`,
   `LeaseTarget::Instance(Arc<InstanceRegistration>)`): a normal heartbeat is

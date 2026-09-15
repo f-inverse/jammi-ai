@@ -16,3 +16,9 @@ no scheme handling, no symlink resolution), so there is no "missing/non-director
 either; the only refusal `resolved_result_root` raises is a non-UTF-8 `artifact_dir`. The
 canonicalization design this clause described is EXCISED (contract §10) and filed as its own
 unit, U5b-1a-A2 (`docs/plans/67-distributed-training/README.md`), not shipped by U5b-1a.
+
+Further dated correction (2026-09-15, U5b-1a round-5 closing audit, contract `feat_500-C-U5b-1a`
+§12): `result_root` is not merely un-canonicalized — `Catalog::list_gang_members`'s own admission
+predicate does not consult `instances.result_root` AT ALL (`GangListing` carries no root field).
+The column is still written verbatim, but root identity across spellings AND any membership
+predicate built on it are BOTH U5b-1a-A2's question now, a precondition of U5b-1b-ii.

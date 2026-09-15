@@ -540,14 +540,15 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   `JammiConfig::resolved_result_root`) — `ServerConfig::validate` is NOT the home, since it cannot
   see `artifact_dir`), `catalog/jobs_repo.rs` (`upsert_instance`/`reregister_instance` accept ONLY
   an `InstanceRegistration`; `peer_addr_of(instance_id, lease) -> Option<PeerAddr>` — the ONE
-  by-id resolution verb, fresh-only under the same margin, no kind/root/self filter — is the
+  by-id resolution verb, fresh-only under the same margin, no kind/self filter — is the
   address-resolution surface DESIGN.md §4 names; `list_gang_members(GangListing { kind,
-  self_instance, member_root, lease })` excludes self, stale (freshness via U5a-1's
-  `instance_liveness_margin()`, consumed here, never recomputed), draining/warming, no-`workers`-row
-  (an INNER join), other-kind (kinds split on `,`, matched as whole tokens), and root-divergent
-  instances; the member order is byte order on `instance_id`, sorted and compared in Rust — never
-  a SQL `ORDER BY`, whose collation is backend-dependent; root divergence is likewise a byte-exact
-  Rust comparison of the verbatim `member_root` string, never a SQL `=`), `catalog/lease.rs`
+  self_instance, lease })` (no root field — contract `feat_500-C-U5b-1a` §12, the round-5
+  excision) excludes self, stale (freshness via U5a-1's `instance_liveness_margin()`, consumed
+  here, never recomputed), draining/warming, and no-`workers`-row (an INNER join), other-kind
+  (kinds split on `,`, matched as whole tokens); the member order is byte order on `instance_id`,
+  sorted and compared in Rust — never a SQL `ORDER BY`, whose collation is backend-dependent;
+  `result_root` plays NO part in this predicate — two members with different `result_root`
+  spellings ARE gang members of each other in this unit), `catalog/lease.rs`
   (`instance_prune_window(lease) = instance_liveness_margin(lease).saturating_add(lease)`, i.e.
   `3 × lease` — STRICTLY BEYOND the `2×` margin, so a member judged merely stale is never also
   eligible for deletion — `InferenceSession::wrap_with`'s `prune_instances` call site uses this
@@ -563,27 +564,29 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   RESOLVED result-table root VERBATIM — `[storage] result_root` when set (the WHOLE effective
   root, no leaf appended), else `{artifact_dir}/jammi_db` (leaf appended ONLY in this default arm,
   a typed refusal naming `artifact_dir` on non-UTF-8) — no filesystem access, no URL parsing, no
-  scheme handling on the membership path; membership compares this string byte-for-byte — two
-  spellings of one location are two roots — necessary, never sufficient, for shared storage —
+  scheme handling on the membership path; the row carries this string verbatim, but
+  `list_gang_members`'s admission predicate does NOT consult it in this unit (round-5 excision) —
+  root identity across spellings, and any membership predicate built on it, is filed as its own
+  unit, U5b-1a-A2 (see `docs/plans/67-distributed-training/README.md` for its scope), and is a
+  precondition of U5b-1b-ii (gang formation); were root-string equality ever made part of a
+  membership predicate, it would still be necessary, never sufficient, for shared storage —
   sufficiency is established only by the attestation VERIFY, U5a-1's whole-artifact sidecar /
-  U5b-0's and U5b-1b-i's per-partition inventory, never by this predicate alone; the spelling-fold
-  question is filed as its own unit, U5b-1a-A2 (see
-  `docs/plans/67-distributed-training/README.md` for its scope), and is NOT part of this
-  predicate). (ai-core) `session.rs` (the ONLY production call site of
+  U5b-0's and U5b-1b-i's per-partition inventory). (ai-core) `session.rs` (the ONLY production call site of
   `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — builds the
   `InstanceRegistration` via `from_config` FIRST, before the lease keeper starts or the result
   store creates a directory; `InferenceSession::open_with_placement`'s shared-`artifact_dir`
   topology note stays configurable for a gang; `build_result_store` stays the one place the
   effective root is actually computed at runtime), `fine_tune/worker.rs` (`JobWorker`/
-  `EmbeddedWorker` are the SOLE owner of the registration's worker cell: `run_until` sets it before
-  its first `upsert_worker`, every `set_worker_state` writes the cell before the row,
-  `delete_worker` clears it). (docs-ci) `docs/guide/src/{configuration.md, security.md,
+  `EmbeddedWorker` are the SOLE owner of the registration's worker cell: `run_until` sets it only
+  AFTER its FIRST `upsert_worker` call SUCCEEDS (P-Y4 — a failed first upsert leaves the cell
+  `None`), every LATER `set_worker_state` writes the cell before the row, `delete_worker` clears
+  it). (docs-ci) `docs/guide/src/{configuration.md, security.md,
   deploy-server.md, reference-topologies.md}`.
 - **invariants_to_preserve**: B6, K2 (the `from_config` choke point), K5 (migration, four pin sites).
-- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, no-`workers`-row,
-  other-kind and root-divergent instance on both backends, plus one fresh multi-kind worker
-  included, from a DB return order permuted away from `instance_id` order — the returned list is
-  still sorted (RED at base); (b) `peer_advertise` without `peer_bind` is refused by
+- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, and no-`workers`-row
+  instance on both backends (root is NOT part of this predicate — round-5 excision, P-Y1), plus
+  one fresh multi-kind worker included, from a DB return order permuted away from `instance_id`
+  order — the returned list is still sorted (RED at base); (b) `peer_advertise` without `peer_bind` is refused by
   `InstanceRegistration::from_config` (called both at `JammiConfig::load_from` and at
   `wrap_with`), naming both keys; `peer_advertise` with `result_root` UNSET is ACCEPTED and the
   row's `member_root` carries `{artifact_dir}/jammi_db` verbatim (RED at base: the prior refusal
@@ -696,7 +699,10 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   never set partially; a moved claim aborts with no write, a concurrent CAS sees zero rows and
   REUSEs.
 - **lane**: hermetic + server it-suite. **depends_on**: U5b-1a (`list_gang_members`,
-  `MemberRoot::resolved`), U5b-1b-i (the `Peer` collective it dispatches to), U4b (`spec.rs`
+  `MemberRoot::resolved` — `list_gang_members`'s own predicate does NOT consult the root,
+  round-5 excision), U5b-1a-A2 (root identity across spellings AND the membership predicate on
+  the root — this coordinator's own use of `result_root` needs BOTH), U5b-1b-i (the `Peer`
+  collective it dispatches to), U4b (`spec.rs`
   co-ownership, merge order pinned), U5a-1, U5a-2. **size**: L.
 
 ### U5b-1b-iii — The `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin (PR-C commit 3b-iii)

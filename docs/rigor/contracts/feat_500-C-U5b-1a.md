@@ -1,7 +1,7 @@
 # CONTRACT — feat/500-C-U5b-1a: gang-membership substrate
 
 **Contract of record.** slug: `feat_500-C-U5b-1a` · branch `feat/500-C-U5b-1a`
-at `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf` (the code commit, tagged
+at `781e45b73c5a086d8240a3390d420311e8b0154f` (the code commit, tagged
 throughout this revision as "commit 1") · this file is the committed
 mechanism contract `ci/scripts/check_rigor_record.py` requires under
 `docs/rigor/contracts/**` (its check 3) before this unit's rigor record at
@@ -28,6 +28,21 @@ insertions in `instance.rs` (+3 lines, before
 `path:line`/`path:a-b` citation into those three files below was
 RE-DERIVED against THIS commit's tree (self-check, §11); citations by
 `path::construct` are unaffected (no construct was renamed or moved).
+
+**Round-6 doc-fold re-anchor (this revision, FINAL).** "Commit 1" moves from
+`3b7c89d4125862ef0c7f9c5073dc80203b81f2cf` to
+`781e45b73c5a086d8240a3390d420311e8b0154f`: round 5's pre-committed rule
+fired (§11/§12) — `result_root` leaves `list_gang_members`'s admission
+predicate entirely (`GangListing` loses its root field; the Rust filter
+loses its fourth conjunct; `GangCandidateRow` loses its `result_root`
+field), `PeerAddr::parse` gains the unbracketed-IPv6 refusal (P-Y4), and
+`JobWorker::run_until`'s FIRST `upsert_worker` call reverses to
+cell-after-row (P-Y4), gated by a NEW test-only module,
+`crates/jammi-db/src/catalog/worker_test_hooks.rs`. Every
+`path:line`/`path:a-b` citation in §1–§5, §7–§9 below was RE-DERIVED
+against THIS commit's tree (self-check, §12); citations by
+`path::construct` are unaffected except where the round-5 verdicts (§12)
+name a moved or deleted construct explicitly.
 
 **P-X4 hardening (round-3→4 revision, re-anchored "commit 1" then).** The prior commit
 1 (`bd21b79081935c942bbb65154f43ee09a790aa3f`) left `MemberRoot::new` `pub`
@@ -91,77 +106,92 @@ sufficient), or a spelling-identity predicate (filed as unit U5b-1a-A2, §6).
 
 - **`PeerAddr`** (`crates/jammi-db/src/catalog/instance.rs::PeerAddr`) is a
   sealed wrapper (`pub struct PeerAddr(String)`, private field, declared
-  `crates/jammi-db/src/catalog/instance.rs:37`): the only way to build one is
+  `crates/jammi-db/src/catalog/instance.rs:43`): the only way to build one is
   `PeerAddr::parse` (`crates/jammi-db/src/catalog/instance.rs::PeerAddr::
-  parse`, `crates/jammi-db/src/catalog/instance.rs:45`), which
-  `rsplit_once(':')`s the input so an IPv6 literal's own colons stay inside
-  the host segment and only the LAST colon splits host from port, requires a
-  non-empty host, and a port that parses as `u16` and is non-zero. `as_str()`
-  and `Display` (`crates/jammi-db/src/catalog/instance.rs:73`) both return
-  the validated wire form. This is the SAME type
-  `crates/jammi-db/src/index/peer.rs` re-exports (per this module's own doc
-  comment) — the peer listener and the gang listener dial the identical
-  address type, so they can never drift into two.
+  parse`, `crates/jammi-db/src/catalog/instance.rs:57`), which
+  `rsplit_once(':')`s the input so a BRACKETED IPv6 literal's own colons stay
+  inside the host segment and only the LAST colon splits host from port,
+  requires a non-empty host, REFUSES an UNBRACKETED IPv6 host (P-Y4, §12 —
+  `host.contains(':') && !(starts_with('[') && ends_with(']'))`), and
+  requires a port that parses as `u16` and is non-zero. `as_str()`
+  (`crates/jammi-db/src/catalog/instance.rs:86`) and `Display`
+  (`crates/jammi-db/src/catalog/instance.rs:91`) both return the validated
+  wire form. This is the SAME type `crates/jammi-db/src/index/peer.rs`
+  re-exports (per this module's own doc comment) — the peer listener and the
+  gang listener dial the identical address type, so they can never drift
+  into two.
 - **`MemberRoot`** (`crates/jammi-db/src/catalog/instance.rs::MemberRoot`,
-  declared `crates/jammi-db/src/catalog/instance.rs:105`) wraps a string
-  VERBATIM — no canonicalization, no interpretation. `Self::resolved`
-  (`crates/jammi-db/src/catalog/instance.rs::MemberRoot::resolved`,
-  `crates/jammi-db/src/catalog/instance.rs:114`) is the ONE production
-  constructor — it calls `resolved_result_root` itself, so a `MemberRoot`
-  can never carry a string the resolver did not produce;
-  `InstanceRegistration::from_config` (§2) is its only caller. `Self::new`
+  declared `crates/jammi-db/src/catalog/instance.rs:123`) wraps a string
+  VERBATIM — no canonicalization, no interpretation, and, as of this
+  revision, **not consulted by `list_gang_members` at all** (P-Y1, §12).
+  `Self::resolved` (`crates/jammi-db/src/catalog/instance.rs::MemberRoot::
+  resolved`, `crates/jammi-db/src/catalog/instance.rs:132`) is the ONE
+  production constructor — it calls `resolved_result_root` itself, so a
+  `MemberRoot` can never carry a string the resolver did not produce;
+  `InstanceRegistration::from_config` (§2) is its only caller, and the value
+  is still written to `instances.result_root` on every member row (P-Y2) —
+  carried for `docs/plans/67-distributed-training/README.md` unit
+  U5b-1a-A2, which now owns BOTH root identity across spellings and any
+  membership predicate built on it. `Self::new`
   (`crates/jammi-db/src/catalog/instance.rs::MemberRoot::new`,
-  `crates/jammi-db/src/catalog/instance.rs:127`) wraps an arbitrary string
+  `crates/jammi-db/src/catalog/instance.rs:145`) wraps an arbitrary string
   with no resolver call at all and is compiled ONLY under
   `feature = "test-hooks"` — a real `cfg` gate, not `#[doc(hidden)]` — so it
   cannot link into a production build at all; fixtures/tests build a
   `MemberRoot` through it directly
   (`crates/jammi-db/tests/it/gang_membership.rs`,
-  `crates/jammi-ai/tests/it/instance_identity.rs`,
-  `crates/jammi-db/src/config/tests.rs`). Its doc states the design
-  property directly: two DIFFERENT spellings of one physical location
-  (`gcs://b/p` vs `gs://b/p`, a trailing `/`, a case difference) are two
-  DIFFERENT roots.
+  `crates/jammi-ai/tests/it/instance_identity.rs`). **Correction (this
+  revision): `crates/jammi-db/src/config/tests.rs` never builds a
+  `MemberRoot` through `new` at all** — it reads `member_root` off an
+  `InstanceRegistration` `from_config` already produced (§7's P-X1 oracle);
+  the round-4/5 text above listing it as a `MemberRoot::new` call site was
+  wrong (the §1 fixture-list error this revision corrects, per the lead's
+  brief).
 - **`WorkerFacts`** (`crates/jammi-db/src/catalog/instance.rs::WorkerFacts`,
-  declared `crates/jammi-db/src/catalog/instance.rs:152`) is the claim-loop
+  declared `crates/jammi-db/src/catalog/instance.rs:172`) is the claim-loop
   half of a registration: `kinds: String` (the comma-joined kind set) and
   `state: WorkerState`. Its doc states its SOLE owner is
   `JobWorker`/`EmbeddedWorker` (`crates/jammi-ai/src/fine_tune/worker.rs`),
-  confirmed at §4 below.
+  confirmed at §4 below, including the P-Y4 reversal on the FIRST
+  `upsert_worker` call.
 - **`InstanceRegistration`**
   (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration`, declared
-  `crates/jammi-db/src/catalog/instance.rs:176`): `instance_id`, `label`,
+  `crates/jammi-db/src/catalog/instance.rs:196`): `instance_id`, `label`,
   `host`, `peer_addr: Option<PeerAddr>`, `member_root: Option<MemberRoot>`,
   and `worker: Mutex<Option<WorkerFacts>>` — the claim-loop cell, mutated in
   place by its single owner rather than requiring a whole new registration
   per state change. `InstanceRegistration::new`
   (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration::new`,
-  `crates/jammi-db/src/catalog/instance.rs:194`) is the plain constructor
+  `crates/jammi-db/src/catalog/instance.rs:214`) is the plain constructor
   with no validation, used by `from_config` itself and by fixtures/tests
   (`crates/jammi-db/tests/it/gang_membership.rs`'s `seed_member` helper and
   direct-construction call sites, and
   `crates/jammi-ai/tests/it/instance_identity.rs`'s foreign-row fixture).
-  `set_worker`/`worker_snapshot` are the cell's read/write pair
-  (mutex-poisoning tolerant via `unwrap_or_else(|p| p.into_inner())`).
+  `set_worker`/`worker_snapshot`
+  (`crates/jammi-db/src/catalog/instance.rs:233`, `:238`) are the cell's
+  read/write pair (mutex-poisoning tolerant via
+  `unwrap_or_else(|p| p.into_inner())`).
 - **`GangListing<'a>`** (`crates/jammi-db/src/catalog/instance.rs::
-  GangListing`, `crates/jammi-db/src/catalog/instance.rs:297`) and
+  GangListing`, `crates/jammi-db/src/catalog/instance.rs:325`) carries **no
+  root field** (P-Y1, §12 — `{ kind, self_instance, lease }` only) and
   **`GangMember`** (`crates/jammi-db/src/catalog/instance.rs::GangMember`,
-  `crates/jammi-db/src/catalog/instance.rs:316`) are `list_gang_members`'s
+  `crates/jammi-db/src/catalog/instance.rs:341`) are `list_gang_members`'s
   request/response shapes (§3).
 
 ## 2. The membership check: `MembershipConfig::validate`, `InstanceRegistration::from_config`, `resolved_result_root`
 
-**The round-3 design, in one paragraph.** `MembershipConfig::validate`
+**The round-3 design, in one paragraph (round-6 line re-derivation: this
+revision).** `MembershipConfig::validate`
 (`crates/jammi-db/src/catalog/instance.rs::MembershipConfig::validate`,
-`crates/jammi-db/src/catalog/instance.rs:281-291`) is PURE and checks
+`crates/jammi-db/src/catalog/instance.rs:304-315`) is PURE and checks
 EXACTLY two things: `[server] peer_advertise` parses as a `PeerAddr`
-(`:290`), and `[server] peer_bind` is set too, else a typed
-`JammiError::Config` naming BOTH keys (`:285-287`). It inspects
+(`:313`), and `[server] peer_bind` is set too, else a typed
+`JammiError::Config` naming BOTH keys (`:308-311`). It inspects
 `result_root`/`artifact_dir` NOT AT ALL. `InstanceRegistration::from_config`
 (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration::from_config`,
-`crates/jammi-db/src/catalog/instance.rs:242-258`) runs `validate`; when
+`crates/jammi-db/src/catalog/instance.rs:265-282`) runs `validate`; when
 membership applies, it sets `member_root` to
-`MemberRoot::resolved(config)?` (`:251`), which is itself
+`MemberRoot::resolved(config)?` (`:274`), which is itself
 `Self(config.resolved_result_root()?)` — the SAME string
 `build_result_store` (`crates/jammi-ai/src/session.rs::build_result_store`,
 `crates/jammi-ai/src/session.rs:2418`) hands to `StorageUrl::parse` before
@@ -223,70 +253,83 @@ has a filesystem precondition to race.
 
 - **`upsert_instance(&InstanceRegistration)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_instance`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2082-2114`): one `INSERT ...
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2081-2113`): one `INSERT ...
   VALUES (...) ON CONFLICT(instance_id) DO UPDATE SET label, host,
   peer_addr, result_root, last_seen_at`
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2093-2099`) — `started_at` is
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2092-2098`) — `started_at` is
   stamped only on the initial insert. `reg.peer_addr`/`reg.member_root` write
-  `NULL` for a non-member registration.
+  `NULL` for a non-member registration; `result_root` is still written here,
+  verbatim (P-Y2), even though no read verb consults it (below).
 - **`reregister_instance(&InstanceRegistration)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::reregister_instance`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2126-2173`): the SAME `instances`
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2125-2172`): the SAME `instances`
   upsert, plus, INSIDE THE SAME TRANSACTION, an `INSERT ... ON
   CONFLICT(instance_id) DO UPDATE SET kinds, state` into `workers` — but ONLY
   when `reg.worker_snapshot()` (taken once, before the transaction) is
-  `Some` (`crates/jammi-db/src/catalog/jobs_repo.rs:2155-2166`, the `if let
+  `Some` (`crates/jammi-db/src/catalog/jobs_repo.rs:2154-2166`, the `if let
   Some(w) = worker { ... }` guard). This is the ONLY verb that re-creates a
   pruned row; `touch_instance`
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`, a
   pure `UPDATE ... WHERE instance_id = $2`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2177-2193`) can never resurrect
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2176-2192`) can never resurrect
   one.
 - **`fresh_instance(instance_id, lease)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::fresh_instance`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2202-2230`): `true` iff a row is
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2201-2229`): `true` iff a row is
   present AND NOT `stale_before_clause("last_seen_at", kind, margin, ...)`,
   where `margin = instance_liveness_margin(lease)` (`super::lease`, §5). No
   tenant predicate — `instances` carries no tenant column.
 - **`peer_addr_of(instance_id, lease) -> Result<Option<PeerAddr>>`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::peer_addr_of`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2247-2287`): `SELECT peer_addr
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2246-2286`): `SELECT peer_addr
   FROM instances WHERE instance_id = $N AND peer_addr IS NOT NULL AND NOT
-  ({stale})` (`crates/jammi-db/src/catalog/jobs_repo.rs:2269-2272`); `None`
+  ({stale})` (`crates/jammi-db/src/catalog/jobs_repo.rs:2267-2271`); `None`
   when the row is absent, stale, or `peer_addr` is NULL, ALL collapsed the
   same way. A stored `peer_addr` that fails `PeerAddr::parse` is a typed
-  `JammiError::Catalog`, never silently mapped to `None`. No kind/root/self
-  filter: the ONE by-id resolution surface.
-- **`list_gang_members(GangListing)`**
+  `JammiError::Catalog`, never silently mapped to `None`. No kind/self
+  filter (never had a root filter either): the ONE by-id resolution surface.
+- **`list_gang_members(GangListing)`** (P-Y1, contract §12, the round-5
+  excision — this revision's mechanism description supersedes the round-3
+  text below the line)
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::list_gang_members`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2310-2381`): SQL is `SELECT
-  i.instance_id, i.peer_addr, i.result_root, w.kinds, w.state FROM instances
-  i JOIN workers w ON w.instance_id = i.instance_id WHERE i.peer_addr IS NOT
-  NULL AND i.result_root IS NOT NULL AND NOT ({stale})` — an INNER join (a
-  member must have a `workers` row), freshness/NULL-ness pushed into SQL.
-  The Rust filter loop excludes, in order: the caller itself
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2351-2353`); `state !=
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2316-2381`): `GangListing` is
+  `{ kind, self_instance, lease }` — **no root field at all**. SQL is
+  `SELECT i.instance_id, i.peer_addr, w.kinds, w.state FROM instances i JOIN
+  workers w ON w.instance_id = i.instance_id WHERE i.peer_addr IS NOT NULL
+  AND NOT ({stale})`
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2331-2336`) — an INNER join (a
+  member must have a `workers` row), freshness/NULL-`peer_addr`-ness pushed
+  into SQL; `result_root` is neither selected nor filtered on, anywhere in
+  this SQL. The Rust filter loop excludes, in order: the caller itself
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2354-2356`); `state !=
   WorkerState::Claiming.as_db_str()`
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2354-2356`); `kinds.split(',').
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2357-2359`); `kinds.split(',').
   map(str::trim).any(|t| t == listing.kind)` false
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2357-2364`, a WHOLE trimmed
-  token, never a substring); `result_root.as_bytes() !=
-  listing.member_root.as_str().as_bytes()`
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2365-2367`, a Rust BYTE
-  comparison, never SQL `=`, never a re-interpreted value — this is the
-  round-3 predicate). A surviving row's `peer_addr` is parsed and pushed as a
-  `GangMember`; the final list is `members.sort_by(|a, b|
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2360-2367`, a WHOLE trimmed
+  token, never a substring) — **and NOTHING else**: the round-3 predicate's
+  fourth conjunct (`result_root.as_bytes() != listing.member_root...`) is
+  DELETED, not merely unreachable — `GangCandidateRow` (`jobs_repo.rs:566`)
+  no longer even carries a `result_root` field. A surviving row's
+  `peer_addr` is parsed and pushed as a `GangMember`; the final list is
+  `members.sort_by(|a, b|
   a.instance_id.as_bytes().cmp(b.instance_id.as_bytes()))`
   (`crates/jammi-db/src/catalog/jobs_repo.rs:2379`) — Rust byte-order sort,
   never a SQL `ORDER BY`.
 - **`upsert_worker`**, **`set_worker_state`**, and **`delete_worker`** are
   unchanged in SQL shape from base; their callers are at §4. The sole
   production producer, `JobWorker::run_until`/`EmbeddedWorker::begin_drain`
-  (`crates/jammi-ai/src/fine_tune/worker.rs:822,827,851`), always calls
-  `self.kinds.join(",")`.
+  (`crates/jammi-ai/src/fine_tune/worker.rs:829,836,866`), always calls
+  `self.kinds.join(",")`. `upsert_worker`'s doc gains an `# Errors` section
+  (this revision): under `feature = "test-hooks"`, a failure armed through
+  `crates/jammi-db/src/catalog/worker_test_hooks.rs::
+  arm_upsert_worker_failure` (a NEW module, mirroring `claim_test_hooks.rs`'s
+  shape — a `Mutex<Vec<String>>` of armed instance ids, one-shot, consumed by
+  `take_armed` at the top of `upsert_worker`) is returned with no write
+  attempted — the ONLY way to manufacture "this process's first `workers`
+  upsert fails" deterministically (P-Y4's oracle, §12).
 - **`prune_instances(stale_after)`**
   (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::prune_instances`,
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2542`): `DELETE FROM instances
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2557`): `DELETE FROM instances
   WHERE {stale}` — its own `workers` row cascades (`ON DELETE CASCADE`,
   `crates/jammi-db/src/catalog/schema.rs:1030`).
 
@@ -294,22 +337,28 @@ has a filesystem precondition to race.
 
 `crates/jammi-ai/src/fine_tune/worker.rs`:
 
-- **`JobWorker::run_until`**: sets the registration's worker cell to
-  `Some(WorkerFacts { kinds: self.kinds.join(","), state:
-  WorkerState::Warming })` (`crates/jammi-ai/src/fine_tune/worker.rs:821-824`)
-  BEFORE issuing the first `upsert_worker`
-  (`crates/jammi-ai/src/fine_tune/worker.rs:827`) — so a keeper reregister
-  racing this very first upsert can never observe an empty cell. After the
-  worker gate opens, the SAME cell-before-row order flips the cell's
-  `state` to `Claiming`
-  (`crates/jammi-ai/src/fine_tune/worker.rs:849-852`, `state:
-  WorkerState::Claiming` at `:852` — round-3 citation correction: `:851` is
-  the sibling `kinds: self.kinds.join(",")` line, not the state) before
-  calling `set_worker_state`.
+- **`JobWorker::run_until`** (P-Y4, contract §12, the round-5 advisory —
+  this revision REVERSES the round-3/4 "cell before row" description for
+  the FIRST `upsert_worker` call only): sets the registration's worker cell
+  to `Some(WorkerFacts { kinds: self.kinds.join(","), state:
+  WorkerState::Warming })`
+  (`crates/jammi-ai/src/fine_tune/worker.rs:832-838`) only AFTER the FIRST
+  `upsert_worker` call (`crates/jammi-ai/src/fine_tune/worker.rs:827-830`)
+  returns `Ok(())` — an `Err` arm leaves the cell untouched (`None`)
+  (`crates/jammi-ai/src/fine_tune/worker.rs:840-842`), so a keeper
+  reregister racing a STILL-FAILING loop start never writes a `workers` row
+  the real upsert never itself managed to write. After the worker gate
+  opens, every LATER cell write — the `state: Claiming` transition
+  (`crates/jammi-ai/src/fine_tune/worker.rs:863-868`, `state:
+  WorkerState::Claiming` at `:867`) before calling `set_worker_state`, and
+  every `begin_drain`/`delete_worker` call site below — is UNCHANGED:
+  cell-before-row, since by that point the row already exists (the first
+  upsert already succeeded, or none of these later call sites would ever
+  run with a populated cell to transition from).
 - **`EmbeddedWorker`** holds `registration: Arc<InstanceRegistration>`
-  (`crates/jammi-ai/src/fine_tune/worker.rs:2687`), cloned from
+  (`crates/jammi-ai/src/fine_tune/worker.rs:2702`), cloned from
   `session.instance_registration()` at spawn
-  (`crates/jammi-ai/src/fine_tune/worker.rs:2738`) — the SAME `Arc` the
+  (`crates/jammi-ai/src/fine_tune/worker.rs:2753`) — the SAME `Arc` the
   session's own `LeaseTarget::Instance` hold renews (confirmed:
   `crates/jammi-ai/src/session.rs:370` holds
   `LeaseTarget::Instance(Arc::clone(&registration))` from the SAME
@@ -317,12 +366,12 @@ has a filesystem precondition to race.
   `crates/jammi-ai/src/session.rs:389`). `begin_drain` preserves the cell's
   `kinds`, flips only `state` to `Draining`, THEN calls `set_worker_state`.
   `stop_and_join` clears the cell
-  (`crates/jammi-ai/src/fine_tune/worker.rs:2850`) BEFORE
+  (`crates/jammi-ai/src/fine_tune/worker.rs:2865`) BEFORE
   `self.catalog.delete_worker(&self.instance_id)`
-  (`crates/jammi-ai/src/fine_tune/worker.rs:2851`).
+  (`crates/jammi-ai/src/fine_tune/worker.rs:2866`).
 - **`InferenceSession::instance_registration()`**
   (`crates/jammi-ai/src/session.rs::InferenceSession::instance_registration`,
-  `crates/jammi-ai/src/session.rs:472`) is the `pub(crate)` getter both
+  `crates/jammi-ai/src/session.rs:475`) is the `pub(crate)` getter both
   `EmbeddedWorker::spawn` and the lease keeper's hold construction read
   from — the SAME `Arc` throughout a session's lifetime.
 
@@ -395,24 +444,30 @@ It is explicitly NOT a wave-3 precondition.
 
 ## 7. Properties (quantified, never a single-input claim)
 
-**P-M3 (the membership predicate).** For every
-`list_gang_members(GangListing { kind, self_instance, member_root, lease })`
-call and every DB row order: a row is returned iff it is NOT
+**P-M3 (the membership predicate, NARROWED this revision — see P-Y1, §12).**
+For every `list_gang_members(GangListing { kind, self_instance, lease })`
+call (no root field) and every DB row order: a row is returned iff it is NOT
 `self_instance`, has a `workers` row (INNER join) with `state == Claiming`,
 `kinds` contains `kind` as a whole trimmed comma-split token (a kind that is
 merely a SUBSTRING of a token, e.g. `fine_tune` vs. `graph_fine_tune`, is
 excluded —
 `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_kind_that_is_only_a_substring_token`),
-`peer_addr` and `result_root` are both non-NULL, `result_root` bytes equal
-`member_root` bytes (a root divergent only by case or a trailing `/` is
-excluded —
-`crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_root_divergent_by_case_or_trailing_slash`),
-and it is fresh under `instance_liveness_margin(lease)`; the surviving set is
-sorted by `instance_id` byte order regardless of the underlying row order
+`peer_addr` is non-NULL, and it is fresh under
+`instance_liveness_margin(lease)` — **and NOTHING else**: `result_root` is
+NOT a conjunct (a NULL `result_root`, and a `result_root` byte-divergent by
+case, trailing `/`, or scheme alias, all still ADMIT —
+`crates/jammi-db/tests/it/gang_membership.rs::
+list_includes_a_member_with_peer_addr_set_and_result_root_null_root_is_not_consulted`,
+`::list_includes_members_despite_a_root_divergent_by_case_or_trailing_slash_root_is_not_consulted`,
+`::gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`,
+`::file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`);
+the surviving set is sorted by `instance_id` byte order regardless of the
+underlying row order
 (`crates/jammi-db/tests/it/gang_membership.rs::list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order`).
 `peer_addr_of` resolves a busy or other-kind fresh member (no kind/state
-filter) and is `None` for a stale or NULL-`peer_addr` one. Both verbs return
-the SAME answer under a scoped tenant binding and under none
+filter, and never had a root filter either) and is `None` for a stale or
+NULL-`peer_addr` one. Both verbs return the SAME answer under a scoped
+tenant binding and under none
 (`crates/jammi-db/tests/it/gang_membership.rs::list_gang_members_is_identical_under_a_scoped_tenant_and_under_none`).
 
 **P-M4 (recovery restores the WHOLE membership tuple).** For a process that
@@ -467,14 +522,20 @@ the `gcs://` ALIAS arms
 `::member_row_matches_resolved_root_for_memory_scheme`,
 `::member_row_matches_resolved_root_for_a_cloud_alias_scheme`).
 
-**P-X2 (byte-equality predicate, the join-time counterpart of P-X1).**
-`gcs://b/p` and `gs://b/p` are DIFFERENT `member_root` values — never folded
-on the membership-check path
-(`crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings`)
-— and two real gang members rooted at each spelling are NOT gang members of
-each other
-(`crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_not_gang_members_of_each_other`).
-Necessary-never-sufficient for shared storage stays unchanged (§ Scope).
+**P-X2 (byte-equality of the VALUE, superseded at the join layer by P-Y1
+this revision).** `gcs://b/p` and `gs://b/p` are DIFFERENT `member_root`
+values — never folded when the value is WRITTEN
+(`crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings`).
+This is a claim about the STRING only: as of the round-5 excision (P-Y1,
+§12), `list_gang_members` does not compare `result_root` at all, so two
+real gang members rooted at each spelling ARE gang members of each other
+(the test asserting this is renamed to say so:
+`crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`,
+and the same property is proven again over an unrelated scheme pair,
+`::file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`).
+Necessary-never-sufficient for shared storage stays unchanged (§ Scope) —
+it was never more than that even when byte-equality WAS a join-time
+conjunct.
 
 **P-X3 (no interpretation on the membership path, the grep oracle).** See
 §7's self-check: `grep -ci 'canonical\|materialize\|EffectiveRoot'` is `0`
@@ -527,10 +588,11 @@ wave-3 precondition.
 | `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_stale_member` | A row past the liveness margin is excluded | Does not probe the exact margin boundary — `gang_instance_freshness.rs`'s job |
 | `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_draining_worker` / `::list_excludes_a_warming_worker` | `state != Claiming` excludes, for BOTH non-claiming states independently | Neither combines a non-claiming state with a second false conjunct |
 | `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_kind_that_is_only_a_substring_token` | `fine_tune` never matches a `graph_fine_tune` token | Does not test the reverse substring direction |
-| `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_root_divergent_by_case_or_trailing_slash` | A byte-divergent root (case, trailing `/`) is excluded — byte-exact comparison | Does not test a symlink-equivalent path (that IS the excised design, filed at U5b-1a-A2) |
-| `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_not_gang_members_of_each_other` | P-X2: two real gang members rooted at aliased cloud spellings are not each other's members, in either listing direction | Does not test the `abfss://`/`azure://` pair separately (same alias-fold mechanism a config-level test already isolates) |
-| `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_null_peer_addr` | `peer_addr IS NULL` excludes even with a fresh, correctly-kinded, claiming, root-matching row otherwise | Does not test `result_root IS NULL` in the same row (next oracle isolates it) |
-| `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_member_with_peer_addr_set_but_result_root_null` | The asymmetric NULL case (migration 035 has no paired CHECK) is still excluded | Does not test the reverse (symmetric SQL predicate stands for both) |
+| `crates/jammi-db/tests/it/gang_membership.rs::list_includes_members_despite_a_root_divergent_by_case_or_trailing_slash_root_is_not_consulted` (renamed, round-6) | P-Y1: a byte-divergent root (case, trailing `/`) does NOT exclude — `result_root` is not part of the predicate at all | Does not test a symlink-equivalent path (that identity question is U5b-1a-A2's, unbuilt) |
+| `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted` (renamed, round-6) | P-Y1/P-X2: two real gang members rooted at aliased cloud spellings ARE each other's members — one `list_gang_members` call, no root argument to even supply | Does not test the `abfss://`/`azure://` pair separately (the sibling `file://`/`s3://` oracle proves the property is not scheme-pair-specific) |
+| `crates/jammi-db/tests/it/gang_membership.rs::file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_consulted` (new, round-6) | The same P-Y1 property over an UNRELATED scheme pair that never aliases anywhere in the stack, ruling out "the two schemes alias at some other layer" as an alternative explanation | Does not test a `memory://` root in this pairing (covered singly elsewhere) |
+| `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_a_null_peer_addr` | `peer_addr IS NULL` excludes even with a fresh, correctly-kinded, claiming row otherwise | Does not test `result_root IS NULL` in the same row (next oracle isolates it — and shows it does NOT exclude) |
+| `crates/jammi-db/tests/it/gang_membership.rs::list_includes_a_member_with_peer_addr_set_and_result_root_null_root_is_not_consulted` (renamed, round-6) | P-Y1: the asymmetric NULL case (migration 035 has no paired CHECK) does NOT exclude — `result_root` plays no part in admission, NULL or otherwise; `peer_addr_of` (no root predicate ever) still resolves it too | Does not test the reverse (symmetric SQL predicate never existed for `result_root` even before this round) |
 | `crates/jammi-db/tests/it/gang_membership.rs::list_excludes_an_instance_with_no_workers_row` | The INNER join excludes an `instances` row with no `workers` row at all | Does not test a `workers` row for a DIFFERENT instance_id colliding on kind |
 | `crates/jammi-db/tests/it/gang_membership.rs::list_includes_a_fresh_multi_kind_claiming_worker` | The positive control: every conjunct held DOES return the member | Does not vary which of the two-or-more kinds is queried |
 | `crates/jammi-db/tests/it/gang_membership.rs::list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order` | Byte-order sort holds even off a descending-insertion-order raw SELECT, with a vacuity control | Does not test the postgres planner's own default order separately |
@@ -542,7 +604,7 @@ wave-3 precondition.
 | `crates/jammi-db/tests/it/gang_membership.rs::prune_window_does_not_prune_a_member_merely_stale_within_the_window` | Both boundary directions in one test | Does not test EXACTLY at the window boundary |
 | `crates/jammi-db/tests/it/member_root_constructor.rs::member_root_new_has_no_production_caller` | P-X4 (hardened, this revision): no `crates/<name>/src/**/*.rs` file in the whole workspace contains the literal call form `MemberRoot::new(` — a sanity floor on the walk itself (≥10 crates with a `src/` dir, ≥300 `.rs` files scanned) guards against a broken walk passing vacuously | Does not cover `benches/`/`examples/` (neither exists in this workspace today) or a call spelled through a type alias/re-export |
 | `crates/jammi-db/src/config/tests.rs::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm` | P-X1: the pure constructor's `member_root` == `resolved_result_root()` verbatim over the whole arm list, plus the "/" alone arm | Does not touch the filesystem — a real-session counterpart is `storage_root.rs` |
-| `crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings` | P-X2 at the pure-function layer | Does not test the join predicate (gang_membership.rs's alias test does) |
+| `crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings` | P-X2 at the pure-function layer: the two spellings stay two different STRINGS on the row | Does not test admission (gang_membership.rs's renamed alias oracle proves the two strings are still gang members of each other, since `list_gang_members` never reads either) |
 | `crates/jammi-db/src/config/tests.rs::from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys` / `load_from_...` | P-M5's one remaining refusal arm, at both call sites | Does not test a malformed address string separately (`PeerAddr::parse`'s own unit tests cover that) |
 | `crates/jammi-db/src/config/tests.rs::from_config_without_peer_advertise_is_a_library_registration_with_nulls` | A library config produces NULL/NULL, never an error | Does not test a session that later sets `peer_advertise` (no runtime mutation path exists) |
 | `crates/jammi-db/src/config/tests.rs::from_config_refuses_a_non_utf8_artifact_dir_via_resolved_result_root` | The ONE surviving refusal on the whole path, propagated from `resolved_result_root` | Does not test a non-UTF-8 explicit `result_root` (an already-`String` config field — non-UTF-8 there is not representable in TOML/env at all) |
@@ -558,17 +620,21 @@ wave-3 precondition.
 | `crates/jammi-db/tests/it/migrations.rs::migration_029_copies_training_jobs_rows_into_jobs_as_queued` | The fourth K5 pin site: `035` is on the ledger's manufactured-pre-029 DELETE list | Proves the pin site's absence would be RED; does not itself remove the entry to observe it |
 | `crates/jammi-db/src/catalog/lease.rs::tests::instance_liveness_margin_is_twice_the_lease` / `::prune_window_is_strictly_beyond_the_liveness_margin` | The `2×`/`3×` factors and the `Duration::MAX` saturating-arithmetic edge | Does not test a lease of zero (validated positive upstream) |
 | `crates/jammi-db/src/catalog/instance.rs::tests::registration_worker_half_starts_unpopulated_and_is_settable` | The cell's own set/clear/snapshot round-trip in isolation | Does not test concurrent set/snapshot from two threads |
-| `crates/jammi-db/src/catalog/instance.rs::tests::peer_addr_parses_host_port` / `::peer_addr_parse_keeps_ipv6_host_intact` / `::peer_addr_refuses_no_colon` / `::_refuses_empty_host` / `::_refuses_zero_port` / `::_refuses_non_numeric_port` / `::_refuses_out_of_range_port` | Every `PeerAddr::parse` edge, including the IPv6-colon-preservation shape | Does not test a hostname requiring DNS resolution |
+| `crates/jammi-db/src/catalog/instance.rs::tests::peer_addr_parses_host_port` / `::peer_addr_parse_keeps_ipv6_host_intact` / `::peer_addr_parses_a_full_bracketed_ipv6_host` / `::peer_addr_parses_a_dns_hostname` / `::peer_addr_refuses_no_colon` / `::_refuses_empty_host` / `::_refuses_zero_port` / `::_refuses_non_numeric_port` / `::_refuses_out_of_range_port` | Every `PeerAddr::parse` accept edge, including bracketed-IPv6-colon-preservation and a DNS hostname | Does not test a hostname requiring actual DNS resolution (this type never resolves) |
+| `crates/jammi-db/src/catalog/instance.rs::tests::peer_addr_refuses_an_unbracketed_ipv6_literal` / `::peer_addr_refuses_an_unbracketed_loopback_ipv6_literal` (new, round-6, P-Y4) | An UNBRACKETED IPv6 host is refused, naming the refusal reason, for a full address and the loopback shorthand alike | Does not test a host with an embedded zone id (`fe80::1%eth0`) — not a shape this deployment's addresses use |
+| `crates/jammi-ai/tests/it/instance_identity.rs::a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row` (new, round-6, P-Y4) | An injected failure on the FIRST `upsert_worker` call leaves the registration's worker cell `None` (proven indirectly: a subsequent forced-delete + real keeper pass, which would write a `workers` row from a `Some` cell, writes none) | Does not directly read the cell (it is `pub(crate)`, unreachable from this external test crate) — the observable effect is the oracle |
 
 ---
 
 ## 9. Mutations executed / implied by the oracle shapes above
 
-- **The self-exclusion / state-exclusion / kind-token-match / root-byte-compare
-  conjuncts.** Each has its own isolated oracle (§8 table) holding every
-  other conjunct at its satisfied value and flipping exactly one — deleting
-  any single `continue` arm in `list_gang_members`'s Rust filter loop
-  (`crates/jammi-db/src/catalog/jobs_repo.rs:2351-2367`) flips exactly the
+- **The self-exclusion / state-exclusion / kind-token-match conjuncts
+  (NARROWED this revision — the root-byte-compare conjunct is DELETED, not
+  merely untested; see the mutation below).** Each has its own isolated
+  oracle (§8 table) holding every other conjunct at its satisfied value and
+  flipping exactly one — deleting any single `continue` arm in
+  `list_gang_members`'s Rust filter loop
+  (`crates/jammi-db/src/catalog/jobs_repo.rs:2354-2367`) flips exactly the
   corresponding test from a correct exclusion to a false inclusion.
 - **The `sort_by` call.** Deleting
   `crates/jammi-db/src/catalog/jobs_repo.rs:2379` is exactly what
@@ -581,19 +647,37 @@ wave-3 precondition.
   is built to catch.
 - **`reregister_instance`'s worker-half conditional.** Removing the `if let
   Some(w) = worker { ... }` guard at
-  `crates/jammi-db/src/catalog/jobs_repo.rs:2155-2166` would flip
+  `crates/jammi-db/src/catalog/jobs_repo.rs:2154-2166` would flip
   `crates/jammi-ai/tests/it/instance_identity.rs::a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete`'s
   expected "no workers row after recovery" to a false resurrection.
-- **The verbatim-identity property (round-3, replaces the round-2 mutation
-  about the literal-`PathBuf`-vs-URL-reparse check, since that check no
-  longer exists).** Re-introducing ANY scheme fold in
+- **The verbatim-identity property (of the VALUE — a scheme fold when
+  WRITING it).** Re-introducing ANY scheme fold in
   `InstanceRegistration::from_config`
-  (`crates/jammi-db/src/catalog/instance.rs:242-258`) — e.g. lower-casing or alias-folding the
-  `member_root` string before wrapping it — is exactly what
+  (`crates/jammi-db/src/catalog/instance.rs:265-282`) — e.g. lower-casing or
+  alias-folding the `member_root` string before wrapping it — is exactly
+  what
   `crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings`
-  and `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_not_gang_members_of_each_other`
-  are built to catch: both fixtures assert the two spellings stay distinct
-  strings and distinct members.
+  is built to catch (the two spellings must stay distinct strings on the
+  row).
+- **P-Y1's own mutation, this revision: re-introducing the root conjunct at
+  the JOIN layer.** Adding a root field back to `GangListing` and a
+  `continue` arm comparing it in `list_gang_members`'s filter loop is
+  exactly what
+  `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`,
+  `::file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`,
+  `::list_includes_members_despite_a_root_divergent_by_case_or_trailing_slash_root_is_not_consulted`,
+  and
+  `::list_includes_a_member_with_peer_addr_set_and_result_root_null_root_is_not_consulted`
+  are built to catch: all four assert a member is returned DESPITE a root
+  divergence that a reintroduced conjunct would exclude on.
+- **P-Y4's mutation: reverting the cell-after-row order on the first
+  `upsert_worker`.** Restoring `session.instance_registration().set_worker(...)`
+  to BEFORE the `upsert_worker` call at
+  `crates/jammi-ai/src/fine_tune/worker.rs:827-838` is exactly what
+  `crates/jammi-ai/tests/it/instance_identity.rs::a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row`
+  is built to catch: a reverted ordering would leave the cell `Some` despite
+  the injected upsert failure, and the keeper's later reregister would then
+  write a `workers` row the test asserts must never appear.
 
 ---
 
@@ -612,8 +696,11 @@ wave-3 precondition.
 - **A capability-scoped ring** — a replica that sets `peer_advertise` also
   joins the retrieval ring by construction; scoping the two independently is
   a later plan's follow-on.
-- **Spelling identity across schemes/symlinks/case** — filed as unit
-  U5b-1a-A2 (§6), NOT a wave-3 precondition.
+- **Root identity across spellings, AND any membership predicate built on
+  it at all** (WIDENED this revision, round-5 — §12) — filed as unit
+  U5b-1a-A2 (§6), NOT a wave-3 precondition, and named as a precondition of
+  U5b-1b-ii. `list_gang_members` in THIS unit consults no root whatsoever;
+  `instances.result_root` is written verbatim and carried for A2's use.
 
 ---
 
@@ -688,9 +775,10 @@ re-derived against commit 1's (re-anchored) tree.
   (`test_case`-parameterized sqlite/postgres, `feature = "test-hooks"`) —
   no longer `uncovered`.
 - "the `,` kind-encoding convention is honored by every real writer" —
-  executed check: `crates/jammi-ai/src/fine_tune/worker.rs:822,827,851` are
+  executed check: `crates/jammi-ai/src/fine_tune/worker.rs:829,836,866` are
   the ONLY three call sites of `self.kinds.join(",")` in this crate
-  (confirmed by direct read, not a code-scanning oracle) — `uncovered`.
+  (confirmed by direct read, not a code-scanning oracle; re-derived this
+  revision after the P-Y4 line shift) — `uncovered`.
 - (round-3) "canonicalization ever made two spellings of one location
   provably identical to a third party" — this claim was never true (rounds
   1–2 canonicalized only the LOCAL `file://` case; a cloud root was already
@@ -700,40 +788,140 @@ re-derived against commit 1's (re-anchored) tree.
   machinery pretending otherwise.
 
 `citations_reanchored`: every citation in §1–§5, §7–§9 of this revision was
-re-derived directly against the tree of `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf`
-(commit 1, re-anchored this round — see the header's round-5 doc-fold
+re-derived directly against the tree of `781e45b73c5a086d8240a3390d420311e8b0154f`
+(commit 1, re-anchored this round — see the header's round-6 doc-fold
 re-anchor note) in this worktree by the writing agent; §6 (history) cites
 no construct at all, by design (see §6's own header).
 
-**Self-check (round-2 addendum requirement; re-run for the round-5
-citation fold, at `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf`).** Before this
+**Self-check (round-2 addendum requirement; re-run for the round-6
+citation fold, at `781e45b73c5a086d8240a3390d420311e8b0154f`).** Before this
 revision was committed, every `path:line`/`path:a-b` token AND every
 `path::construct` token in §1–§5, §7–§9 (§6 excluded, cites none) was
-extracted and checked against the tree of commit 1: a `path:line` token's
-cited line(s) were printed and eyeballed against the identifier/claim the
-surrounding sentence names; a `path::construct` token's LAST path segment
-(after the final `::`) was grepped against the named file, confirming the
-construct's name still occurs there.
+machine-extracted (backtick-quoted `crates/…/*.rs::Construct` and
+`crates/…/*.rs:N[-M]` patterns, scoped to each `## N.` heading's own span)
+and checked against the tree of commit 1: a `path:line`/`path:a-b` token's
+file was opened and its line count compared against the cited line(s); a
+`path::construct` token's LAST path segment (after the final `::`, generics
+stripped) was checked for literal occurrence in the named file.
 
 ```
-python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f161bf-7977-4318-a34d-d2eec24a0620/scratchpad/logs/db-selfcheck-r5.py
+python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f161bf-7977-4318-a34d-d2eec24a0620/scratchpad/logs/db-selfcheck-r6.py
 ```
 
-(a scratch script, never committed, written fresh this round — the round-4
-`db-selfcheck-px4.py` script no longer exists in this scratchpad). **Result
-(at commit 1 = `3b7c89d4`): 63 `path::construct` tokens checked, 63
-resolved (their last segment occurs in the named file); 54 unique
-`path:line`/`path:a-b` tokens checked, 54 resolved (the named file has at
-least that many lines) — both counts 100%, zero unresolved.** (This
-round's regex-based extractor is narrower than round 4's — e.g. it does not
-independently resolve the bare `:N`/`:N-M` shorthand citations that inherit
-their file from the immediately preceding full `path:line` token, such as
-`:290`/`:285-287`/`:251` in §2 — those were checked by direct read instead,
-individually, as part of this round's line-shift re-derivation above.)
+(a scratch script, never committed, written fresh this round — the round-5
+`db-selfcheck-r5.py` script no longer exists in this scratchpad). **Result
+(at commit 1 = `781e45b7`): 66 `path::construct` tokens checked, 66
+resolved (their last segment occurs in the named file); 58 unique
+`path:line`/`path:a-b` tokens checked, 58 resolved (the named file has at
+least that many lines) — both counts 100%, zero unresolved.** (This is a
+purely mechanical re-run of the round-5 script's own shape over the
+CURRENT §1–§5/§7–§9 text; it does not independently resolve the bare
+`:N`/`:N-M` shorthand citations that inherit their file from the
+immediately preceding full `path:line` token, such as `:313`, `:308-311`,
+and `:274` in §2 — those were checked by direct read instead, individually,
+as part of the line-shift re-derivation above.)
 
 ---
 
-## 12. Gates
+## 12. Round-5 closing verdicts — the round-5 rule FIRES; round 6 is the LAST (this revision)
+
+Round 5 (exhaustive) re-executed every mechanism attack from rounds 1–4 and refuted each;
+citation round 5 PASSed. One finding stood: `docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md:27`
+(D9: `` `validate()`: `peer_advertise ⇒ peer_bind ⇒ result_root` ``) and
+its sibling `:160` (`` "unit 2 enforces at startup … requires `storage.result_root`" ``) still
+stated, in present tense, an `⇒ result_root` requirement this unit had already excised at round 3
+— the round-4 wording sweep was keyed on `canonical*` and missed this REQUIREMENT class (`⇒`
+chains, "enforces at startup"). §11's pre-committed round-5 rule ("a BLOCK of ANY kind — mechanism
+OR documentation of the root column — fires the stop rule") FIRES. This revision (round 6, the
+LAST — no round 7) is the fold that executes the firing:
+
+- **P-Y1 (the predicate, mechanism).** `list_gang_members` admits on `kinds` (whole-token),
+  `workers.state == Claiming`, `peer_addr` presence, freshness, and self-exclusion ONLY;
+  `GangListing` carries NO root field at all (§1, §3). Oracle: two members rooted at `gcs://b/p`
+  and `gs://b/p` (and, over an unrelated scheme pair, `file:///a` vs `s3://b`) ARE gang members of
+  each other — the renamed tests say so in their own names
+  (`crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`,
+  `::file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`) — and this
+  contract states plainly (§ Scope, §3, §7 P-M3) that root identity is NOT part of admission in
+  this unit.
+- **P-Y2 (the row keeps the verbatim spelling, unchanged mechanism).** `instances.result_root` is
+  still written as the byte-for-byte output of `resolved_result_root()`
+  (`InstanceRegistration::from_config` → `MemberRoot::resolved`, §1–§2; P-X1's oracles are
+  UNCHANGED — the pure-arm oracle
+  `crates/jammi-db/src/config/tests.rs::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm`,
+  the four real-session oracles in `crates/jammi-ai/tests/it/storage_root.rs`, `MemberRoot::
+  resolved` remains the ONE production constructor per P-X4). It is carried for U5b-1a-A2, which
+  now owns the WHOLE root question — identity across spellings AND any membership predicate built
+  on it — and is named as a precondition of U5b-1b-ii (gang formation):
+  `docs/plans/67-distributed-training/README.md`'s unit table (§10),
+  `docs/plans/67-distributed-training/UNITS.md`'s U5b-1b-ii `depends_on` line.
+- **P-Y3 (documentation of record — the fold this revision performs).** Every sentence that
+  said root equality is "necessary, never sufficient" for MEMBERSHIP now says instead: the row
+  records the configured spelling verbatim; the membership predicate does not consult it in this
+  unit; root identity and its predicate are U5b-1a-A2's question. Corrected, this commit:
+  `docs/guide/src/configuration.md` (the `[server] peer_advertise` comment block),
+  `docs/guide/src/security.md` (I-GANG's membership-predicate bullet),
+  `docs/guide/src/deploy-server.md` (the `peer_advertise` paragraph),
+  `docs/guide/src/reference-topologies.md`
+  (Shape D's membership bullet), `docs/maintainer/MAINTAINER-GUIDE.md` §2.8b (the worker-cell
+  ordering AND the `list_gang_members` predicate description),
+  `docs/plans/67-distributed-training/UNITS.md` § U5b-1a (files_in_scope AND acceptance (a)) and its
+  U5b-1b-ii `depends_on` line, `docs/plans/67-distributed-training/DESIGN.md` (the coordinator's
+  `list_gang_members` call site — now filters on U5b-1a-A2's predicate itself, since
+  `list_gang_members` no longer does), `docs/plans/67-distributed-training/README.md`'s
+  U5b-1a-A2 row (widened: now root identity AND its predicate, a precondition of U5b-1b-ii),
+  `docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md:27` (D9, a dated correction —
+  its bullet already carried the round-3 convention elsewhere, e.g. `:292`, which stands unedited)
+  and `:160` (the precondition restated as unit 2's OWN requirement to enforce),
+  `docs/plans/68-compute-tier-substrate/pressure/verdicts/DIST-r3.md:6` (a further dated correction appended
+  after the existing round-3/4 one), `docs/rigor/contracts/feat_500-C-U5a-1.md:456` (the "coarse
+  root pre-filter at listing time" phrase corrected — no such pre-filter exists), and this
+  contract's own §1–§5/§7–§9 above. The class sweep this revision used, matching the lead's own
+  anticipation:
+  ```
+  grep -rn '⇒' docs | grep -E 'peer_advertise|result_root|peer_bind'
+  grep -rniE 'enforces at startup|refused at load|refuses at startup' docs
+  grep -rniE 'result_root' docs crates --include='*.md' --include='*.rs' | grep -iE 'refus|requires|must exist|must be absolute|necessary'
+  grep -rniE 'canonical[- ]?root|non-directory' docs crates --include='*.md' --include='*.rs'
+  ```
+  Every survivor after this commit is history (§6, DIST-r3.md's own dated-correction chain), a
+  dated correction (D9, DIST-r3.md), or U5b-1a-A2's filing (README.md) — named individually above,
+  none a live false claim. The `⇒ result_root` and "enforces at startup" instances were the TWO
+  the round-5 audit found; no third survivor of either pattern exists after this fold. This
+  contract's own §1 fixture-list error (`crates/jammi-db/src/config/tests.rs` was listed as a
+  `MemberRoot::new` call site; it never builds one — it reads `member_root` off a REAL
+  `InstanceRegistration::from_config` result) is corrected in §1 above.
+- **P-Y4 (advisories folded where cheap, mechanism).** `PeerAddr::parse` refuses an unbracketed
+  IPv6 literal — `host.contains(':') && !(host.starts_with('[') && host.ends_with(']'))` is checked
+  BEFORE the port parse (`crates/jammi-db/src/catalog/instance.rs:66-70`, inside `parse` at `:57`)
+  — accepting a bracketed IPv6 host (`[::1]:9000`, `[2001:db8::1]:9000`), an IPv4 literal
+  (`10.0.0.1:9000`), or a DNS hostname (`coordinator.internal:9000`), refusing an unbracketed one
+  (`2001:db8::1:9000`, `::1:9000`) — oracles for each (§8 table, this revision).
+  `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`'s FIRST `upsert_worker` call
+  (`:827-830`) now sets the registration's worker cell (`:832-838`) only on `Ok(())`; an `Err`
+  (`:840-842`) leaves the cell untouched (`None`), gated by a NEW test-only failure-injection
+  module mirroring `claim_test_hooks.rs`'s shape,
+  `crates/jammi-db/src/catalog/worker_test_hooks.rs::arm_upsert_worker_failure` (`feature =
+  "test-hooks"`), consumed once at the top of `Catalog::upsert_worker`
+  (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_worker`, the `take_armed` check
+  before the SQL). Oracle:
+  `crates/jammi-ai/tests/it/instance_identity.rs::
+  a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row` — an
+  armed failure, a real `EmbeddedWorker::spawn` with the worker gate closed (so `run_until` parks
+  right after the failed attempt), and a subsequent forced-delete + one real `LeaseKeeper` pass:
+  `list_workers()` never carries this instance, before OR after the keeper pass, proving the cell
+  stayed `None` throughout (the direct cell read is unreachable from this external test crate —
+  `pub(crate)` — so the observable effect on `workers` IS the oracle).
+
+**Round 6 (this revision, FINAL — pre-committed by §11, honored here).** Closers run once on this
+excision tip. A PASS ships. A BLOCK of any kind withholds the unit from wave 3: the branch is not
+merged, the whole unit is refiled as U5b-1a-A3 with all six rounds as its spec, and U5b-1b-* wait
+on it. No seventh round, no further excision — per the pre-committed rule, this stop applies
+regardless of what a seventh round's finding would be.
+
+---
+
+## 13. Gates
 
 `cargo fmt --all --check`; `cargo clippy -p jammi-db -p jammi-ai -p
 jammi-server --all-targets -- -D warnings` (with AND without

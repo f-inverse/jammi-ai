@@ -206,12 +206,12 @@ preload_models = [
 # the result store is rooted at ({artifact_dir}/jammi_db when [storage]
 # result_root is unset, else result_root itself). No filesystem access, no
 # URL parsing, no scheme handling, no symlink resolution happens on this
-# path: TWO DIFFERENT SPELLINGS of one physical location (a trailing slash,
-# a case difference, `gcs://` vs `gs://`) are TWO DIFFERENT roots to the
-# membership predicate that compares this column byte-for-byte -- a
-# deployment must spell `result_root`/`artifact_dir` IDENTICALLY on every
-# replica. See "The gang listener (I-GANG)" in security.md for the
-# membership predicate this feeds.
+# path -- the row records the configured spelling verbatim. The gang
+# listener's own membership predicate does NOT consult this column: root
+# identity across spellings, and any membership predicate built on it, is a
+# separate, not-yet-built unit (U5b-1a-A2). See "The gang listener (I-GANG)"
+# in security.md for the predicate this column is carried, but not
+# consulted, by.
 # peer_advertise = "10.0.4.7:9000"
 # MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
 # estimated bytes ONE query may load locally for segments it does not own,

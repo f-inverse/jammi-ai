@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 035) -- a new migration is added here
+/// (K5: append-only, currently ending at 036) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -56,6 +56,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "033_model_materialization",
     "034_jobs_training_set_identity",
     "035_instances_peer_addr_result_root",
+    "036_instances_result_root_identity",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -849,7 +850,8 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
                        '031_jobs_releases_workers_state', '034_jobs_training_set_identity', \
-                       '035_instances_peer_addr_result_root')",
+                       '035_instances_peer_addr_result_root', \
+                       '036_instances_result_root_identity')",
                     &[],
                 )
                 .await?;
@@ -969,7 +971,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 Box::pin(async move {
                     tx.query(
                         "SELECT name FROM pragma_table_info('instances') \
-                         WHERE name IN ('peer_addr', 'result_root')",
+                         WHERE name IN ('peer_addr', 'result_root', 'result_root_identity')",
                         &[],
                         |row| row.get::<String>("name"),
                     )
@@ -979,7 +981,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         )
         .await
         .unwrap();
-    for col in ["peer_addr", "result_root"] {
+    for col in ["peer_addr", "result_root", "result_root_identity"] {
         assert!(
             instance_columns.iter().any(|c| c == col),
             "reopened instances must carry '{col}' (migration 035 replayed): {instance_columns:?}"
@@ -2068,7 +2070,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
                         BackendKind::Sqlite => {
                             tx.query(
                                 "SELECT name, \"notnull\" FROM pragma_table_info('instances') \
-                                 WHERE name IN ('peer_addr', 'result_root')",
+                                 WHERE name IN ('peer_addr', 'result_root', 'result_root_identity')",
                                 &[],
                                 |row| {
                                     let name: String = row.get("name")?;
@@ -2082,7 +2084,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
                             tx.query(
                                 "SELECT column_name, is_nullable FROM information_schema.columns \
                                  WHERE table_name = 'instances' \
-                                   AND column_name IN ('peer_addr', 'result_root')",
+                                   AND column_name IN ('peer_addr', 'result_root', 'result_root_identity')",
                                 &[],
                                 |row| {
                                     let name: String = row.get("column_name")?;
@@ -2139,4 +2141,101 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
         })
         .await
         .expect("both set must be a valid row");
+}
+
+/// Migration `036_instances_result_root_identity`
+/// (`docs/plans/67-distributed-training/README.md` unit U5b-1a-A2) is
+/// present, ordered AFTER `035_instances_peer_addr_result_root` (K5:
+/// relative position, never `.last()`), and adds
+/// `instances.result_root_identity` as a nullable `TEXT` column, on both
+/// backends — the column `Catalog::list_gang_members` compares.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_identity(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::BackendKind;
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("036_instances_result_root_identity")
+            > position("035_instances_peer_addr_result_root"),
+        "the result_root_identity migration must follow 035"
+    );
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('instances') \
+                                 WHERE name = 'result_root_identity'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable FROM information_schema.columns \
+                                 WHERE table_name = 'instances' \
+                                   AND column_name = 'result_root_identity'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns
+            .iter()
+            .any(|(c, notnull)| c == "result_root_identity" && !notnull),
+        "instances.result_root_identity must be a nullable TEXT column; got {columns:?}"
+    );
 }

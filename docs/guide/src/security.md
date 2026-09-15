@@ -155,20 +155,25 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   requested kind as a whole, comma-split, trimmed token (never a substring —
   `fine_tune` never matches `graph_fine_tune`); `instances.peer_addr` is
   non-NULL; and `last_seen_at` is fresh under `instance_liveness_margin(lease)`
-  (`2 × lease`) on the DB clock. `peer_addr_of` is the by-id analogue, with no
-  kind/self filter (any other member may resolve any other by id). **This
-  predicate does not consult `instances.result_root` at all** (contract
-  `feat_500-C-U5b-1a` §12, the round-5 excision): the column still carries
-  `resolved_result_root()` VERBATIM (so two different spellings of one
-  physical location, e.g. `gcs://b/p` vs `gs://b/p`, remain two different
-  STRINGS in that column), but two members with different `result_root`
-  spellings ARE gang members of each other in this unit — root identity
-  across spellings, and any membership predicate built on it, is a separate,
-  not-yet-built unit (U5b-1a-A2). Root-string equality was never more than
-  NECESSARY, never SUFFICIENT, for shared storage even when it was part of
-  this predicate: two byte-identical roots on two filesystems are
-  indistinguishable to a string comparison — sufficiency is the attestation
-  VERIFY's, a later unit's concern, not this listing's.
+  (`2 × lease`) on the DB clock; and its `instances.result_root_identity`
+  EQUALS the caller's own (unit U5b-1a-A2). `peer_addr_of` is the by-id
+  analogue, with no kind/self/root filter (any other member may resolve any
+  other by id). **The root is compared by identity, never by spelling:**
+  `instances.result_root` carries `resolved_result_root()` VERBATIM (so
+  `gcs://b/p` and `gs://b/p` remain two different STRINGS in that column),
+  and `result_root_identity` carries `RootIdentity::of` that string — the
+  store's own URL parser folds the scheme aliases (`gcs://`→`gs://`,
+  `abfss://`→`azure://`), a bucket's authority is lowercased and trailing
+  slashes trimmed (object keys keep their case), a local root is resolved on
+  the owning host's filesystem (symlinks, `.`/`..`), and an in-memory root
+  is refused at registration as unshareable. Two members whose spellings
+  name one location ARE gang members of each other; two rooted at different
+  locations are not; a row with a NULL identity (pre-036, or a process with
+  no membership) never matches. Root identity equality is NECESSARY, never
+  SUFFICIENT, for shared storage: two identical local roots on two
+  unshared filesystems are indistinguishable to this predicate —
+  sufficiency is the attestation VERIFY's (U5a-1's admission-time sidecar,
+  U5b-0's leaf inventory), not this listing's.
 - **B5 (this listing is deliberately tenant-free).** `instances`/`workers`
   rows are deployment infrastructure (which processes exist, what they claim,
   where they are reachable), never tenant data — there is no tenant column on

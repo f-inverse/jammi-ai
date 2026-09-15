@@ -1224,10 +1224,11 @@ ALTER TABLE jobs ADD COLUMN training_set_location TEXT
 /// never joins a gang" — every library/CLI process, and every server process
 /// that never sets `[server] peer_advertise`. There is no paired `CHECK`
 /// (unlike migration 034's `training_set_ref`/`training_set_location`): a row
-/// with `peer_addr` set and `result_root` NULL is representable, and IS a
-/// gang member like any other (`Catalog::list_gang_members` admits on
-/// `peer_addr`, `kinds`, `state` and freshness only — never on this column);
-/// the pairing is a writer convention, not a schema constraint.
+/// with `peer_addr` set and `result_root` NULL is representable; the
+/// pairing is a writer convention, not a schema constraint.
+/// `Catalog::list_gang_members` never compares THIS column — it compares
+/// `result_root_identity` (migration 036), the root's identity across
+/// spellings; this verbatim column is carried for humans.
 ///
 /// `Catalog::upsert_instance`/`Catalog::reregister_instance` are the only
 /// writers (through `InstanceRegistration`, `catalog::instance`); every
@@ -1237,4 +1238,19 @@ ALTER TABLE jobs ADD COLUMN training_set_location TEXT
 pub(super) const MIGRATION_035_INSTANCES_PEER_ADDR_RESULT_ROOT: &str = r#"
 ALTER TABLE instances ADD COLUMN peer_addr TEXT;
 ALTER TABLE instances ADD COLUMN result_root TEXT;
+"#;
+
+/// Migration 036 (`docs/plans/67-distributed-training/README.md` unit
+/// U5b-1a-A2): `instances.result_root_identity` — the identity of the
+/// member's result root ACROSS SPELLINGS (`catalog::instance::RootIdentity`,
+/// derived once by the owning process from the verbatim `result_root` at
+/// registration). This is the column `Catalog::list_gang_members` compares
+/// (a byte-exact `=` against the caller's own identity); `result_root`
+/// stays the verbatim configured spelling. Nullable: every pre-existing row,
+/// and every row written by a process with no `[server] peer_advertise`,
+/// carries NULL — and a NULL identity never matches, so such a row is never
+/// a gang member. `Catalog::upsert_instance`/`Catalog::reregister_instance`
+/// are the only writers, through `InstanceRegistration`.
+pub(super) const MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY: &str = r#"
+ALTER TABLE instances ADD COLUMN result_root_identity TEXT;
 "#;

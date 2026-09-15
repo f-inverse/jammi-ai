@@ -2085,17 +2085,23 @@ impl Catalog {
         let host = reg.host.clone();
         let peer_addr = reg.peer_addr.as_ref().map(|p| p.as_str().to_string());
         let result_root = reg.member_root.as_ref().map(|c| c.as_str().to_string());
+        let result_root_identity = reg
+            .member_root
+            .as_ref()
+            .map(|c| c.identity().as_str().to_string());
         let now = now_sortable();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO instances \
-                             (instance_id, label, host, peer_addr, result_root, started_at, last_seen_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $6) \
+                             (instance_id, label, host, peer_addr, result_root, \
+                              result_root_identity, started_at, last_seen_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $7) \
                          ON CONFLICT(instance_id) DO UPDATE SET \
                              label = excluded.label, host = excluded.host, \
                              peer_addr = excluded.peer_addr, result_root = excluded.result_root, \
+                             result_root_identity = excluded.result_root_identity, \
                              last_seen_at = excluded.last_seen_at",
                         &[
                             SqlValue::TextOwned(instance_id),
@@ -2103,6 +2109,7 @@ impl Catalog {
                             SqlValue::from(host),
                             SqlValue::from(peer_addr),
                             SqlValue::from(result_root),
+                            SqlValue::from(result_root_identity),
                             SqlValue::TextOwned(now),
                         ],
                     )
@@ -2129,6 +2136,10 @@ impl Catalog {
         let host = reg.host.clone();
         let peer_addr = reg.peer_addr.as_ref().map(|p| p.as_str().to_string());
         let result_root = reg.member_root.as_ref().map(|c| c.as_str().to_string());
+        let result_root_identity = reg
+            .member_root
+            .as_ref()
+            .map(|c| c.identity().as_str().to_string());
         let worker = reg.worker_snapshot();
         let now = now_sortable();
         self.backend()
@@ -2136,11 +2147,13 @@ impl Catalog {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO instances \
-                             (instance_id, label, host, peer_addr, result_root, started_at, last_seen_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $6) \
+                             (instance_id, label, host, peer_addr, result_root, \
+                              result_root_identity, started_at, last_seen_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $7) \
                          ON CONFLICT(instance_id) DO UPDATE SET \
                              label = excluded.label, host = excluded.host, \
                              peer_addr = excluded.peer_addr, result_root = excluded.result_root, \
+                             result_root_identity = excluded.result_root_identity, \
                              last_seen_at = excluded.last_seen_at",
                         &[
                             SqlValue::TextOwned(instance_id.clone()),
@@ -2148,6 +2161,7 @@ impl Catalog {
                             SqlValue::from(host),
                             SqlValue::from(peer_addr),
                             SqlValue::from(result_root),
+                            SqlValue::from(result_root_identity),
                             SqlValue::TextOwned(now),
                         ],
                     )
@@ -2295,20 +2309,26 @@ impl Catalog {
     /// `instances` carries no tenant column: the same answer under a scoped
     /// tenant binding and under none.
     ///
-    /// **The `result_root` column is NOT part of this predicate** (contract
-    /// `feat_500-C-U5b-1a` §12, P-Y1, the round-5 excision): [`GangListing`]
-    /// carries no root field, so two members rooted at byte-DIFFERENT
-    /// spellings ARE gang members of each other — this verb has nothing to
-    /// say about the root. Root identity, and any membership predicate
-    /// built on it, is `docs/plans/67-distributed-training/README.md` unit
-    /// U5b-1a-A2's question.
+    /// **Root identity is part of this predicate** (unit U5b-1a-A2): a
+    /// candidate's `instances.result_root_identity` must EQUAL
+    /// `listing.root_identity`, the caller's own
+    /// ([`super::instance::RootIdentity`], derived once by each member from
+    /// its verbatim root). Two members rooted at byte-DIFFERENT spellings of
+    /// the SAME location (`gcs://b/p` and `gs://b/p`, a symlinked local
+    /// root and its target) ARE gang members of each other; two members
+    /// rooted at different locations are not; a row whose identity is NULL
+    /// (written before the column existed, or by a process with no
+    /// membership) never matches. The verbatim `result_root` column is
+    /// never compared — it is carried for humans, not for this predicate.
     ///
-    /// Filtering is split deliberately: freshness and NULL-ness are pushed
-    /// into SQL (an index-backed predicate over a potentially large table);
-    /// everything else — the self exclusion, the worker state, and the kind
-    /// token match — runs in Rust, over the already-narrowed row set, so no
-    /// SQL dialect's string/collation semantics can silently diverge from
-    /// what this verb promises.
+    /// Filtering is split deliberately: freshness, NULL-ness and the
+    /// identity equality are pushed into SQL (an index-backed predicate
+    /// over a potentially large table; the identity is a byte-exact `=` on a
+    /// string this engine wrote, never a collation question); everything
+    /// else — the self exclusion, the worker state, and the kind token
+    /// match — runs in Rust, over the already-narrowed row set, so no SQL
+    /// dialect's string/collation semantics can silently diverge from what
+    /// this verb promises.
     ///
     /// # Errors
     ///
@@ -2317,6 +2337,7 @@ impl Catalog {
     pub async fn list_gang_members(&self, listing: GangListing<'_>) -> Result<Vec<GangMember>> {
         let kind = self.backend().backend_kind();
         let margin = instance_liveness_margin(listing.lease);
+        let root_identity = listing.root_identity.as_str().to_string();
         let rows: Vec<GangCandidateRow> = self
             .backend()
             .transaction(
@@ -2329,11 +2350,15 @@ impl Catalog {
                         let mut params: Vec<SqlValue<'static>> = Vec::new();
                         let stale =
                             stale_before_clause("i.last_seen_at", kind, margin, &mut params);
+                        params.push(SqlValue::TextOwned(root_identity));
+                        let identity_bind = params.len();
                         let sql = format!(
                             "SELECT i.instance_id AS instance_id, i.peer_addr AS peer_addr, \
                                     w.kinds AS kinds, w.state AS state \
                              FROM instances i JOIN workers w ON w.instance_id = i.instance_id \
-                             WHERE i.peer_addr IS NOT NULL AND NOT ({stale})"
+                             WHERE i.peer_addr IS NOT NULL \
+                               AND i.result_root_identity = ${identity_bind} \
+                               AND NOT ({stale})"
                         );
                         tx.query(&sql, &params, |row| {
                             Ok(GangCandidateRow {

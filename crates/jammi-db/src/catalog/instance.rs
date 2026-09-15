@@ -4,35 +4,37 @@
 //! drift into two distinct address types), [`MemberRoot`] (the VERBATIM
 //! configured result-table root — see
 //! [`crate::config::JammiConfig::resolved_result_root`] — carried on the
-//! `instances` row byte-for-byte, but **not consulted by the membership
-//! predicate in this unit**: root identity across spellings, and any
-//! membership predicate built on it, are
-//! `docs/plans/67-distributed-training/README.md` unit U5b-1a-A2's
-//! question, not this one's), [`WorkerFacts`] (the claim-loop half of a
-//! registration — owned exclusively by `JobWorker`,
+//! `instances` row byte-for-byte, paired with its [`RootIdentity`]: the
+//! identity of that root ACROSS SPELLINGS, computed once by the process
+//! that owns the root and carried on the same row, which IS what the
+//! membership predicate compares), [`WorkerFacts`] (the claim-loop half of
+//! a registration — owned exclusively by `JobWorker`,
 //! `crates/jammi-ai/src/fine_tune/worker.rs`), and
 //! [`InstanceRegistration`] — the ONE value every writer of the `instances`
 //! (+ `workers`) row builds, through [`InstanceRegistration::from_config`].
 //! [`GangListing`] / [`GangMember`] are [`super::Catalog::list_gang_members`]'s
-//! request and response shapes; [`GangListing`] carries no root field — the
-//! predicate admits on `kinds` + `workers.state` + `peer_addr` presence +
-//! freshness + self-exclusion ONLY (contract `feat_500-C-U5b-1a` §12, P-Y1,
-//! the round-5 excision).
+//! request and response shapes; the predicate admits on `kinds` +
+//! `workers.state` + `peer_addr` presence + freshness + self-exclusion +
+//! ROOT IDENTITY EQUALITY (`docs/plans/67-distributed-training/README.md`
+//! unit U5b-1a-A2, the predicate U5b-1a filed and this unit builds).
 //!
-//! **The membership path performs no interpretation of the root at all,
-//! and no longer even reads it**: no filesystem access, no URL parse, no
-//! scheme handling, no symlink resolution, no byte comparison. The only
-//! refusal on this path is the non-UTF-8 refusal already inside
-//! [`crate::config::JammiConfig::resolved_result_root`]. A spelling-identity
-//! unit (folding `gcs://`/`gs://`, resolving symlinks, and any membership
-//! predicate built on the result), is filed separately —
-//! `docs/plans/67-distributed-training/README.md`, unit U5b-1a-A2.
+//! **The root is interpreted in exactly one place, by its owner, at
+//! registration** ([`RootIdentity::of`]): the verbatim string is parsed by
+//! the SAME [`crate::storage::StorageUrl`] parser the result store roots
+//! itself through (so `gcs://` and `gs://`, `abfss://` and `azure://` fold
+//! by the one alias table the store already owns), a local root is
+//! resolved on the owner's own filesystem (symlinks, `.`/`..`, the
+//! filesystem's own case), and an in-memory root is refused as
+//! unshareable. Nothing on this path re-roots anything: the store still
+//! roots at the verbatim string, the row still carries that string
+//! verbatim, and the identity is a SEPARATE column used only for equality.
 
 use std::sync::Mutex;
 use std::time::Duration;
 
 use super::jobs_repo::WorkerState;
 use crate::error::{JammiError, Result};
+use crate::storage::{Scheme, StorageUrl};
 
 /// The address a coordinator dials a gang member / segment owner at
 /// (`host:port`, plaintext gRPC — transport encryption is the runtime's,
@@ -94,68 +96,218 @@ impl std::fmt::Display for PeerAddr {
     }
 }
 
-/// The result-table root every member row carries, VERBATIM — the same
-/// string [`crate::config::JammiConfig::resolved_result_root`] returns for
-/// the deployment, and the SAME string
+/// The VERBATIM configured result-table root — the exact string
 /// [`crate::store::ResultStore`] roots itself at (never re-derived, never
-/// re-parsed, never re-spelled). [`Self::resolved`] is the ONLY production
-/// constructor — it calls `resolved_result_root` itself, so a `MemberRoot`
-/// can never carry a string that did not come from the resolver.
-/// `MemberRoot::new` wraps an arbitrary string with no resolver call at
-/// all; it is compiled only under `feature = "test-hooks"`
+/// re-parsed, never re-spelled) — PAIRED with its [`RootIdentity`], computed
+/// here, once, from that string by the process that owns the root.
+/// [`Self::resolved`] is the ONLY production constructor — it calls
+/// `resolved_result_root` itself and derives the identity from its output,
+/// so a `MemberRoot` can never carry a string that did not come from the
+/// resolver, nor an identity that was not derived from that string.
+/// `MemberRoot::new` wraps an arbitrary string (deriving its identity the
+/// same way); it is compiled only under `feature = "test-hooks"`
 /// (fixtures/tests), never in a production build (not a doc link: the
 /// method does not exist in a build without that feature, so an intra-doc
 /// link to it fails `cargo doc`'s default-feature pass) — the string
 /// constructor being reachable from production code is exactly how an
 /// unrelated string ends up in the `instances.result_root` column.
 ///
-/// **Not consulted by [`super::Catalog::list_gang_members`] in this unit**
-/// (contract `feat_500-C-U5b-1a` §12, P-Y1/P-Y2, the round-5 excision):
-/// [`GangListing`] carries no root field at all, so two members rooted at
-/// byte-DIFFERENT spellings of the same or different locations (`gcs://b/p`
-/// vs `gs://b/p`, `file:///a` vs `s3://b`) ARE gang members of each other —
-/// this predicate has nothing to say about the root. The column is still
-/// written, verbatim, for every member row: root identity across spellings,
-/// and any membership predicate built on it, is
-/// `docs/plans/67-distributed-training/README.md` unit U5b-1a-A2's
-/// question, and a precondition of U5b-1b-ii (gang formation).
+/// The row carries both halves: `instances.result_root` (this string,
+/// verbatim — a human reads the configured spelling) and
+/// `instances.result_root_identity` (the identity — what
+/// [`super::Catalog::list_gang_members`] compares, see [`GangListing`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MemberRoot(String);
+pub struct MemberRoot {
+    root: String,
+    identity: RootIdentity,
+}
 
 impl MemberRoot {
     /// The ONE production constructor: the verbatim root
     /// [`crate::config::JammiConfig::resolved_result_root`] computes for
     /// `config` — the exact string [`crate::store::ResultStore`] roots
-    /// itself at. [`InstanceRegistration::from_config`] is this method's
-    /// only caller; nothing else builds a `MemberRoot` in a production
-    /// build (`new` below does not exist outside `feature = "test-hooks"`).
+    /// itself at — and its [`RootIdentity`].
+    /// [`InstanceRegistration::from_config`] is this method's only caller;
+    /// nothing else builds a `MemberRoot` in a production build (`new`
+    /// below does not exist outside `feature = "test-hooks"`).
+    ///
+    /// # Errors
+    ///
+    /// `resolved_result_root`'s own non-UTF-8 refusal, and
+    /// [`RootIdentity::of`]'s refusals (an in-memory root, a root the store's
+    /// URL parser rejects, a local root with no resolvable ancestor).
     pub fn resolved(config: &crate::config::JammiConfig) -> Result<Self> {
-        Ok(Self(config.resolved_result_root()?))
+        let root = config.resolved_result_root()?;
+        let identity = RootIdentity::of(&root)?;
+        Ok(Self { root, identity })
     }
 
     /// Wrap an ALREADY-RESOLVED root string directly, with no resolver call
-    /// and no validation — fixtures and tests only. Gated behind
-    /// `feature = "test-hooks"` so a production build never links this
-    /// constructor: reachable from production code, it would let any
+    /// — fixtures and tests only. Its identity is derived exactly as
+    /// [`Self::resolved`] derives it; a root with no identity (an in-memory
+    /// root, an unknown scheme) panics here, naming the reason, since a
+    /// fixture asking for an unshareable member is a fixture bug. Gated
+    /// behind `feature = "test-hooks"` so a production build never links
+    /// this constructor: reachable from production code, it would let any
     /// caller put an arbitrary string in the `instances.result_root`
     /// column, defeating the one property this type exists to hold (the
     /// row and the store are the same string, constructible only through
     /// [`Self::resolved`]).
     #[cfg(feature = "test-hooks")]
     pub fn new(root: impl Into<String>) -> Self {
-        Self(root.into())
+        let root = root.into();
+        let identity = RootIdentity::of(&root).unwrap_or_else(|e| {
+            panic!("the test-only root constructor was given {root:?}, which has no identity: {e}")
+        });
+        Self { root, identity }
     }
 
     /// The verbatim root string.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.root
+    }
+
+    /// The root's identity across spellings — the membership comparand.
+    pub fn identity(&self) -> &RootIdentity {
+        &self.identity
     }
 }
 
 impl std::fmt::Display for MemberRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.root)
+    }
+}
+
+/// The identity of a result root ACROSS SPELLINGS — what two gang members
+/// must share (necessary for shared storage, never sufficient: sufficiency
+/// is the attestation VERIFY). Sealed: built only by [`Self::of`], a total
+/// function of the verbatim root string, run by the process that OWNS the
+/// root, at registration, on its own filesystem. Never used to root
+/// anything; compared for equality by
+/// [`super::Catalog::list_gang_members`].
+///
+/// The rules, by the scheme the store's own URL parser
+/// ([`crate::storage::StorageUrl::parse`]) assigns the string — the one
+/// alias table in the tree, so this type can never fold a spelling the
+/// store would not:
+///
+/// - **Object stores** (`s3://`, `gs://`|`gcs://`, `azure://`|`abfss://`,
+///   `r2://`): `{canonical scheme}://{authority, lowercased}/{key}` with
+///   trailing `/`s trimmed from the key and the key's case PRESERVED
+///   (bucket and container names are case-insensitive by their services'
+///   rules; object keys are not). `r2://` and `s3://` stay distinct — they
+///   are different endpoints even when the API is shared.
+/// - **Local roots** (`file://` or a bare path, which the parser spells as
+///   `file://`): `file://{path}` where `path` is the longest EXISTING prefix
+///   canonicalised by the filesystem (symlinks followed, `..` resolved
+///   against the real parent, the filesystem's own case) with the
+///   not-yet-existing remainder appended lexically (`.` dropped, `..`
+///   popped) — a root the store has not created yet has the identity it
+///   will have once created. A relative root is taken against the process's
+///   working directory, the same directory the store's own relative root is
+///   relative to.
+/// - **`memory://`**: refused. An in-memory store lives in this process
+///   alone; a member advertising one could never share results with a peer,
+///   so the honest answer at registration is a typed refusal, not a row.
+///
+/// # Errors
+///
+/// [`JammiError::Config`] naming the root: the parser rejects it (an
+/// unknown scheme — the store would reject it too), it is `memory://`, or a
+/// local root has no resolvable ancestor / is not valid UTF-8 once resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RootIdentity(String);
+
+impl RootIdentity {
+    /// Derive the identity of `root` (see the type's doc for the rules).
+    pub fn of(root: &str) -> Result<Self> {
+        let url = StorageUrl::parse(root).map_err(|e| {
+            JammiError::Config(format!(
+                "result root '{root}' has no identity — the store's own URL parser rejects it: {e}"
+            ))
+        })?;
+        match url.scheme() {
+            Scheme::Memory => Err(JammiError::Config(format!(
+                "result root '{root}' is an in-memory store: it lives in this process alone and \
+                 can never be shared with a gang peer — unset `[server] peer_advertise`, or point \
+                 `[storage] result_root` at a root every member can reach"
+            ))),
+            Scheme::File => {
+                let canonical = canonical_local_root(root, url.path())?;
+                Ok(Self(format!("file://{canonical}")))
+            }
+            scheme => {
+                let rest = url.path();
+                let (authority, key) = match rest.split_once('/') {
+                    Some((a, k)) => (a, k.trim_end_matches('/')),
+                    None => (rest, ""),
+                };
+                let authority = authority.to_ascii_lowercase();
+                Ok(Self(if key.is_empty() {
+                    format!("{scheme}://{authority}")
+                } else {
+                    format!("{scheme}://{authority}/{key}")
+                }))
+            }
+        }
+    }
+
+    /// The identity string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RootIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// The local-root rule of [`RootIdentity::of`]: the longest existing prefix
+/// of `path` canonicalised by the filesystem, the remainder appended
+/// lexically. `root` is the verbatim string, for the error messages.
+fn canonical_local_root(root: &str, path: &str) -> Result<String> {
+    use std::path::{Component, Path, PathBuf};
+
+    let raw = Path::new(path);
+    let absolute: PathBuf = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                JammiError::Config(format!(
+                    "result root '{root}' is relative and the working directory is unreadable: {e}"
+                ))
+            })?
+            .join(raw)
+    };
+    let components: Vec<Component<'_>> = absolute.components().collect();
+    for n in (1..=components.len()).rev() {
+        let prefix: PathBuf = components[..n].iter().collect();
+        let Ok(mut resolved) = std::fs::canonicalize(&prefix) else {
+            continue;
+        };
+        for component in &components[n..] {
+            match component {
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(name) => resolved.push(name),
+            }
+        }
+        return resolved.to_str().map(str::to_string).ok_or_else(|| {
+            JammiError::Config(format!(
+                "result root '{root}' resolves to a path that is not valid UTF-8: {}",
+                resolved.display()
+            ))
+        });
+    }
+    Err(JammiError::Config(format!(
+        "result root '{root}' has no resolvable ancestor on this filesystem"
+    )))
 }
 
 /// The claim-loop half of a registration: the `kinds` this worker claims and
@@ -315,12 +467,14 @@ impl MembershipConfig {
     }
 }
 
-/// [`super::Catalog::list_gang_members`]'s request shape. Carries **no
-/// root field** (contract `feat_500-C-U5b-1a` §12, P-Y1, the round-5
-/// excision): the predicate admits on `kind`, `workers.state == claiming`,
-/// `peer_addr` presence, freshness, and self-exclusion ONLY. Root identity
-/// is `docs/plans/67-distributed-training/README.md` unit U5b-1a-A2's
-/// question, not this verb's.
+/// [`super::Catalog::list_gang_members`]'s request: the predicate admits on
+/// `kind`, `workers.state == claiming`, `peer_addr` presence, freshness,
+/// self-exclusion, AND root identity — a candidate's
+/// `instances.result_root_identity` must EQUAL `root_identity`, the
+/// caller's own (a row whose identity is NULL, written before the column
+/// existed or by a process with no membership, never matches). Necessary
+/// for shared storage, never sufficient: sufficiency is the attestation
+/// VERIFY (U5a-1's admission-time sidecar, U5b-0's leaf inventory).
 #[derive(Debug, Clone, Copy)]
 pub struct GangListing<'a> {
     /// The `workers.kinds` token this listing matches (a whole,
@@ -328,6 +482,9 @@ pub struct GangListing<'a> {
     pub kind: &'a str,
     /// This caller's own `instance_id` — excluded from the result.
     pub self_instance: &'a str,
+    /// This caller's own root identity ([`MemberRoot::identity`]); only
+    /// members whose row carries the SAME identity are returned.
+    pub root_identity: &'a RootIdentity,
     /// The deployment's lease window — the same `lease` every other leased
     /// row family renews under. The liveness margin
     /// ([`super::lease::instance_liveness_margin`], `2 * lease`) is applied
@@ -432,5 +589,106 @@ mod tests {
         assert_eq!(snap.state, WorkerState::Claiming);
         reg.set_worker(None);
         assert!(reg.worker_snapshot().is_none());
+    }
+}
+
+#[cfg(test)]
+mod root_identity_tests {
+    //! [`RootIdentity::of`] is a total function of the verbatim root whose
+    //! equivalence classes are exactly the spellings the store would root at
+    //! the same location: scheme aliases, authority case and trailing
+    //! slashes on object stores; symlinks, `.`/`..`, trailing slashes and
+    //! not-yet-existing leaves on local roots. Everything else stays distinct.
+
+    use super::RootIdentity;
+
+    fn id(root: &str) -> String {
+        RootIdentity::of(root).unwrap().as_str().to_string()
+    }
+
+    #[test]
+    fn object_store_aliases_authority_case_and_trailing_slashes_fold() {
+        assert_eq!(id("gcs://bucket/prefix"), id("gs://bucket/prefix"));
+        assert_eq!(
+            id("abfss://container/prefix"),
+            id("azure://container/prefix")
+        );
+        assert_eq!(id("s3://BUCKET/prefix"), id("s3://bucket/prefix"));
+        assert_eq!(id("s3://bucket/prefix/"), id("s3://bucket/prefix"));
+        assert_eq!(id("s3://bucket/prefix//"), id("s3://bucket/prefix"));
+        assert_eq!(id("s3://bucket/"), id("s3://bucket"));
+        assert_eq!(id("gcs://b/p"), "gs://b/p");
+        assert_eq!(id("s3://bucket"), "s3://bucket");
+    }
+
+    #[test]
+    fn object_store_key_case_buckets_and_backends_stay_distinct() {
+        assert_ne!(id("s3://bucket/Prefix"), id("s3://bucket/prefix"));
+        assert_ne!(id("s3://a/prefix"), id("s3://b/prefix"));
+        assert_ne!(id("r2://bucket/prefix"), id("s3://bucket/prefix"));
+        assert_ne!(id("gs://bucket/prefix"), id("s3://bucket/prefix"));
+        assert_ne!(id("s3://bucket/prefix"), id("s3://bucket/prefix/deeper"));
+    }
+
+    #[test]
+    fn a_memory_root_and_an_unknown_scheme_are_refused_naming_the_root() {
+        let err = RootIdentity::of("memory://x").unwrap_err().to_string();
+        assert!(err.contains("memory://x") && err.contains("peer"), "{err}");
+        let err = RootIdentity::of("bogus://x").unwrap_err().to_string();
+        assert!(err.contains("bogus://x"), "{err}");
+    }
+
+    #[test]
+    fn a_local_root_folds_symlinks_dot_segments_trailing_slashes_and_the_file_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("jammi_db")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real_s = real.to_str().unwrap();
+        let link_s = link.to_str().unwrap();
+        let base = id(&format!("{real_s}/jammi_db"));
+        assert_eq!(id(&format!("{link_s}/jammi_db")), base, "a symlinked root");
+        assert_eq!(
+            id(&format!("file://{link_s}/jammi_db")),
+            base,
+            "file:// spelling"
+        );
+        assert_eq!(id(&format!("{real_s}/jammi_db/")), base, "trailing slash");
+        assert_eq!(id(&format!("{real_s}/./jammi_db")), base, "a dot segment");
+        assert_eq!(
+            id(&format!("{real_s}/other/../jammi_db")),
+            base,
+            "a parent segment"
+        );
+        assert!(base.starts_with("file:///"), "{base}");
+        assert!(!base.ends_with('/'), "{base}");
+    }
+
+    #[test]
+    fn a_local_root_the_store_has_not_created_yet_has_the_identity_it_will_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not").join("yet").join("jammi_db");
+        let before = id(root.to_str().unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let after = id(root.to_str().unwrap());
+        assert_eq!(before, after);
+        assert_ne!(before, id(dir.path().join("not").to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_relative_local_root_is_taken_against_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected = id(cwd.join("rel").join("jammi_db").to_str().unwrap());
+        assert_eq!(id("rel/jammi_db"), expected);
+        assert_eq!(id("./rel/jammi_db"), expected);
+    }
+
+    #[test]
+    fn distinct_local_roots_stay_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        assert_ne!(id(a.to_str().unwrap()), id(b.to_str().unwrap()));
     }
 }

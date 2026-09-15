@@ -656,14 +656,47 @@ pub(crate) async fn validate_window(
                 "TrainingSetStream pre-pass: the null/NaN aggregate returned no batch".into(),
             )
         })?;
-        let null_count = decode::extract_numeric_column(batch.column(0).as_ref())
-            .ok()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0);
-        let nan_count = decode::extract_numeric_column(batch.column(1).as_ref())
-            .ok()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0);
+        // #500 U2c closing round, A1/P-B3: an unreadable aggregate value is a
+        // typed refusal, never a silently-coerced `0.0`. `sum(..)` over a
+        // window whose inner `LIMIT`/`OFFSET` subquery matched ZERO rows
+        // (`window.start`/`window.len()` overstating the table — e.g. the F5
+        // whole-table pre-pass over a `total_rows` the catalog record
+        // overstates) returns SQL NULL, not `0`: `extract_numeric_column`
+        // correctly rejects that as `NumericColumnError::Null(0)`, so the
+        // OLD `.ok().and_then(..).unwrap_or(0.0)` here silently turned "the
+        // aggregate could not be read" into "found zero nulls/NaNs" — a
+        // window this pre-pass could not actually see would pass anyway.
+        let read_aggregate = |col: &dyn arrow::array::Array, label: &str| -> Result<f64> {
+            let values = decode::extract_numeric_column(col).map_err(|e| {
+                JammiError::FineTune(format!(
+                    "TrainingSetStream pre-pass: the '{label}' aggregate for '{target_col}' \
+                     over window [{}, {}) could not be read: {}",
+                    window.start,
+                    window.end,
+                    match e {
+                        decode::NumericColumnError::NotNumeric =>
+                            "the aggregate column is not numeric".to_string(),
+                        decode::NumericColumnError::Null(i) => format!(
+                            "row {i} of the aggregate is null -- the window's inner LIMIT/OFFSET \
+                             subquery likely matched zero rows (the window overstates the \
+                             table), so sum(..) over an empty input returned SQL NULL rather \
+                             than a real count"
+                        ),
+                        decode::NumericColumnError::Nan(i) =>
+                            format!("row {i} of the aggregate is NaN"),
+                    }
+                ))
+            })?;
+            values.first().copied().map(f64::from).ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "TrainingSetStream pre-pass: the '{label}' aggregate for '{target_col}' \
+                     over window [{}, {}) returned an empty column",
+                    window.start, window.end
+                ))
+            })
+        };
+        let null_count = read_aggregate(batch.column(0).as_ref(), "null_count")?;
+        let nan_count = read_aggregate(batch.column(1).as_ref(), "nan_count")?;
         if null_count > 0.0 {
             return Err(JammiError::FineTune(format!(
                 "TrainingSetStream pre-pass: the training window [{}, {}) contains {null_count} \

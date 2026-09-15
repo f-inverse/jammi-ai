@@ -646,44 +646,68 @@ impl TrainingDataLoader {
     /// **The eager reservation moves to the TRAIN half** (#500 U2c c3c,
     /// P-R): `self`'s ENTIRE currently-held reservation is carved, by
     /// `MemoryReservation::split`, into a fresh reservation the returned
-    /// train loader owns — `self`'s own copy is left at size zero (still
-    /// registered, releasing nothing extra when `self` itself later drops)
-    /// — so the pool accounting follows the loader that actually stays
-    /// resident through every epoch, never the transient pre-split original
-    /// or the validation half this run reads only occasionally. The moment
-    /// of the split briefly holds BOTH the original rows and the two cloned
-    /// `Vec`s the match arms below build (a stated, transient 2× — see the
-    /// module doc) before `self` (and its now-empty reservation) drops in
-    /// the caller.
-    pub fn split(&self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
+    /// train loader owns — so the pool accounting follows the loader that
+    /// actually stays resident through every epoch, never the transient
+    /// pre-split original or the validation half this run reads only
+    /// occasionally.
+    ///
+    /// **Consumes `self` (#500 U2c closing round, A2/P-B4) and moves rows,
+    /// never clones them.** `self`'s row `Vec` is truncated in place via
+    /// `Vec::split_off` — the validation half's rows are MOVED out (no
+    /// `TrainingRow` is ever cloned by this call; an earlier `&self`
+    /// revision cloned BOTH halves via `.to_vec()` since it could not move
+    /// out of a shared reference). Taking `self` by value also closes A2:
+    /// `MemoryReservation::split` drains atomically, so `self`'s reservation
+    /// would sit at size zero after a first call, and a second `split` on
+    /// the SAME loader would previously hand the new "train" half a
+    /// reservation carrying zero bytes silently — a correct-looking loader
+    /// whose pool accounting had already gone stale. A second `split` on a
+    /// moved loader is now a COMPILE error (the moved-value diagnostic
+    /// [`Self::split`]'s own doctest below pins) rather than a silent
+    /// runtime one.
+    ///
+    /// ```compile_fail,E0382
+    /// use jammi_ai::fine_tune::data::TrainingDataLoader;
+    ///
+    /// let loader = TrainingDataLoader::from_rows(4);
+    /// let (train, _val) = loader.split(0.25);
+    /// // `loader` was moved into the call above; a second `split` on it
+    /// // cannot compile — the exact shape A2 found reachable at runtime
+    /// // when `split` took `&self`.
+    /// let (_train2, _val2) = loader.split(0.25);
+    /// # let _ = train;
+    /// ```
+    pub fn split(self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
         let train_reservation = self.reservation.as_ref().map(|r| r.split(r.size()));
-        match &self.data {
-            LoaderData::TextRows(rows) => {
+        match self.data {
+            LoaderData::TextRows(mut rows) => {
                 let train_count = split_index(rows.len(), fraction);
+                let val_rows = rows.split_off(train_count);
                 (
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::TextRows(rows[..train_count].to_vec()),
+                        data: LoaderData::TextRows(rows),
                         reservation: train_reservation,
                     },
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::TextRows(rows[train_count..].to_vec()),
+                        data: LoaderData::TextRows(val_rows),
                         reservation: None,
                     },
                 )
             }
-            LoaderData::Precomputed(batches) => {
+            LoaderData::Precomputed(mut batches) => {
                 let train_count = split_index(batches.len(), fraction);
+                let val_batches = batches.split_off(train_count);
                 (
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::Precomputed(batches[..train_count].to_vec()),
+                        data: LoaderData::Precomputed(batches),
                         reservation: train_reservation,
                     },
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::Precomputed(batches[train_count..].to_vec()),
+                        data: LoaderData::Precomputed(val_batches),
                         reservation: None,
                     },
                 )

@@ -2756,7 +2756,7 @@ read as passed-by-skipping.
 A tabular fine-tune's rows are a **producer output**, not a run's private scan (§3.5
 narrates the whole submit → claim → train → finalize path; this section is the
 data-plane primitive underneath the "Train" step). `materialize_training_set`
-(`crates/jammi-db/src/store/mod.rs:4031`) commits the projected columns once into an
+(`crates/jammi-db/src/store/mod.rs:4054`) commits the projected columns once into an
 immutable `TrainingSet` result table; every reader re-applies the SAME committed order,
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
@@ -2776,15 +2776,26 @@ materialization (inside `BuildingTable::finish`) and crash recovery
 plans no `SortExec` regardless of which path bound the table:
 `a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort`
 (`crates/jammi-db/tests/it/materialization.rs:871`). `training_set_registration_sort_order`
-(`crates/jammi-db/src/store/mod.rs:2890`) is where that declaration is actually read back
+(`crates/jammi-db/src/store/mod.rs:2902`) is where that declaration is actually read back
 off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
-no sidecar at all (a pre-migration-021 table), or a sidecar whose descriptor is not a
-`TrainingSet` variant — and both arms now `warn!`, naming the table and the reason, before
-returning `Ok(None)`: registration still succeeds (the reader's explicit `ORDER BY` clause
-still sorts the read correctly), only the `SortExec`-free plan is lost for that one row,
-and the silent fallback no longer stays silent:
-`registration_warns_when_a_training_sets_sidecar_is_absent`
-(`crates/jammi-db/tests/it/materialization.rs:970`).
+no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
+object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
+round, A4/P-B6), or a sidecar whose descriptor is not a `TrainingSet` variant — and all
+three arms now `warn!`, naming the table and the reason, before returning `Ok(None)`:
+registration still succeeds (the reader's explicit `ORDER BY` clause still sorts the read
+correctly), only the `SortExec`-free plan is lost for that one row, and the silent fallback
+no longer stays silent: `registration_warns_when_a_training_sets_sidecar_is_absent`
+(`crates/jammi-db/tests/it/materialization.rs:970`) and
+`registration_warns_when_a_training_sets_sidecar_is_unreadable`
+(`crates/jammi-db/tests/it/materialization.rs:1066`). Before the unreadable arm was added,
+the read error propagated out of `training_set_registration_sort_order` via `?`, which made
+`bind_result_table` return `Err` WITHOUT ever calling `register_table` at all — the row
+never entered the session's schema, not merely lost its ordering hint.
+**Cost, unconditionally paid:** `read_materialization_manifest` issues one object-store GET
+(plus a body read, when the object exists) per `TrainingSet` row, every time
+`bind_result_table` runs for that row — never cached — which means `load_existing_tables`
+(session startup / crash recovery) pays one such GET for every `TrainingSet` row currently
+in `ready` status.
 
 **The session memory pool.** `[engine] memory_limit` — `memory_limit`
 (`crates/jammi-db/src/config/mod.rs:718`) — is the ONE knob every consumer of a session's
@@ -2816,7 +2827,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps it to
 **The writer: one partition, no merge — and the deployment rule.** The training set's
 own write plans its full-tuple sort through `single_partition_context`
 (`crates/jammi-db/src/session.rs:1180`) inside `plan_training_set_rows`
-(`crates/jammi-db/src/store/mod.rs:4200`): a `target_partitions = 1` derivation of the
+(`crates/jammi-db/src/store/mod.rs:4223`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
 partitioned local-sort-plus-`SortPreservingMergeExec` merge — there is only ever one
 partition to recombine, so no merge operator (with its own real pool reservation on top of
@@ -2824,23 +2835,23 @@ every partition's already-buffered sorted run) is ever planned. The residency th
 O(one batch) plus DataFusion's own spill reservation for that single sort, never O(the
 whole table) — **the deployment rule**, stated where the write is planned: a single
 `[engine] batch_size` batch larger than `[engine] memory_limit`
-`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:3969`), because no batch-granular
+`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:3992`), because no batch-granular
 operator (a spilling external sort, a decoded chunk) can ever hold one. Sized correctly
 the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB pool needs
 `engine.batch_size = 32` (`32 × ~100,000 B ≈ 3.1 MB` per batch) rather than
 `EngineConfig::default`'s `8192` (`8192 × ~100,000 B ≈ 800 MB`, far larger than the pool
 regardless of partition count or merge shape) — see
 `f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream`
-(`crates/jammi-ai/tests/it/training_set_stream.rs:917`) for the executed numbers. The
+(`crates/jammi-ai/tests/it/training_set_stream.rs:972`) for the executed numbers. The
 session's `RuntimeEnv` carries a disk-backed `DiskManager` by default, so a sort whose
 in-progress runs exceed the pool spills rather than failing the write. This
 single-partition property is asserted at BOTH `target_partitions ∈ {1, 4}` by
 `the_writers_single_partition_derivation_plans_one_sort_and_no_merge`
-(`crates/jammi-db/tests/it/materialization.rs:1077`).
+(`crates/jammi-db/tests/it/materialization.rs:1174`).
 
-The property holds for the source universe production actually registers: a
-`ListingTable` (a registered CSV/Parquet source, or a pinned result table's own provider —
-its file-group count follows `target_partitions`), a Postgres/MySQL federated source
+The property holds for the source universe a training-set WRITE actually registers: a
+`ListingTable` (a registered CSV/Parquet source, single-fragment — its file-group count
+follows `target_partitions`), a Postgres/MySQL federated source
 (`crates/jammi-db/src/source/postgres.rs`, `crates/jammi-db/src/source/mysql.rs`, planned
 through `FederationOptimizerRule`, `crates/jammi-db/src/session.rs:227` — one partition by
 construction), and the mutable provider's own `MemTable::try_new`
@@ -2848,14 +2859,32 @@ construction), and the mutable provider's own `MemTable::try_new`
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
 `single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
-`partition_count` (`crates/jammi-db/src/store/mod.rs:4234`) guard cannot see that shape,
+`partition_count` (`crates/jammi-db/src/store/mod.rs:4257`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
 because `target_partitions` changed (unlike a `ListingTable`'s file groups). No production
 source registers one: `MemTable::try_new` has exactly one call site in the workspace, the
 mutable provider's own scan above — and it is single-partition. See `ts_session`
-(`crates/jammi-db/tests/it/materialization.rs:1056`)'s own doc comment on why
+(`crates/jammi-db/tests/it/materialization.rs:558`)'s own doc comment on why
 `the_writers_single_partition_derivation_plans_one_sort_and_no_merge` is FILE-backed
 rather than `MemTable`-backed.
+
+**A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
+VERSIONED result table's provider is `build_masked_provider`
+(`crates/jammi-db/src/store/mod.rs:2969`): one `ListingTable` per manifest fragment,
+combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs:104`)
+into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs:153`) when there is more
+than one fragment — a shape that follows the manifest's OWN fragment count, never
+`target_partitions`, and that the writer's single-partition guard above cannot see at all
+(a versioned table is never itself re-sorted through `single_partition_context`). This does
+not threaten the property today because no training-set source is a pinned/versioned
+provider: every training-set `source_sql` this tree builds is `source_relation`
+(`crates/jammi-db/src/sql/ident.rs:50`, `"<source>".public."<table>"`) — a plain
+registered-source relation, reached through `materialize_projection_table`
+(`crates/jammi-ai/src/fine_tune/training_set.rs:142`) and `recompute_training_set`
+(`crates/jammi-ai/src/pipeline/recompute.rs:525`) — and a pinned/versioned provider is
+read only through `ResultStore::pinned_provider`/`ctx.read_table`, never through a source's
+registered SQL relation. A training set built from a versioned table's rows would need to
+name that fact explicitly; nothing in this tree does.
 
 **The per-rank stream.** `crates/jammi-ai/src/fine_tune/stream.rs`'s `TrainingSetStream`
 reads the SAME committed order the eager path reads (`read_back_sql`,
@@ -2894,16 +2923,16 @@ worker calls only `training_set::materialize_projection_table`
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`
 (`crates/jammi-ai/src/fine_tune/data.rs:603`) — held for the loader's own lifetime (moved
-into whichever half of a later `split`, `crates/jammi-ai/src/fine_tune/data.rs:658`,
+into whichever half of a later `split`, `crates/jammi-ai/src/fine_tune/data.rs:680`,
 carries it), not checked-then-released, so the pool's `reserved()` genuinely reflects a
 Resident job's residency while it trains. A table whose eager collected size exceeds the
 pool therefore still COMPLETES when it trains through the stream
 (`f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream`,
-`crates/jammi-ai/tests/it/training_set_stream.rs:917`), and the eager collect of that SAME
+`crates/jammi-ai/tests/it/training_set_stream.rs:972`), and the eager collect of that SAME
 table under the SAME pool still refuses, naming `training_set_eager`
-(`crates/jammi-ai/tests/it/training_set_stream.rs:1007`); a Resident job's held reservation
+(`crates/jammi-ai/tests/it/training_set_stream.rs:783`); a Resident job's held reservation
 is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs`
-(`crates/jammi-ai/tests/it/training_set_stream.rs:777`).
+(`crates/jammi-ai/tests/it/training_set_stream.rs:832`).
 
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`

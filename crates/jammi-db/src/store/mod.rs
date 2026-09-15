@@ -2883,16 +2883,39 @@ impl ResultStore {
     /// Returns `None` (unordered registration — still CORRECT, since
     /// [`training_set_order_by`]'s explicit clause still sorts the read, just
     /// without the `SortExec`-free plan P1 claims) when there is no sidecar at
-    /// all (a pre-migration-021 table) or its descriptor is not a
-    /// `TrainingSet` variant (a catalog/attestation mismatch this call does
-    /// not treat as fatal to registration — the row still resolves, just
-    /// without the ordering hint).
+    /// all (a pre-migration-021 table), the sidecar exists but could not be
+    /// READ (#500 U2c closing round, A4/P-B6 — an object-store error or a
+    /// corrupt/unparseable body; treated exactly like "absent", never fatal
+    /// to registration, since the row's own explicit `ORDER BY` still sorts
+    /// correctly either way), or its descriptor is not a `TrainingSet`
+    /// variant (a catalog/attestation mismatch this call does not treat as
+    /// fatal to registration — the row still resolves, just without the
+    /// ordering hint).
+    ///
+    /// **Cost:** [`Self::read_materialization_manifest`] issues one
+    /// object-store GET (plus, when the sidecar exists, a body read) per
+    /// `TrainingSet` row EVERY TIME [`Self::bind_result_table`] runs — in
+    /// particular once per such row at session startup
+    /// (`Self::load_existing_tables_inner`), never cached. Stated here and
+    /// in the maintainer guide (§2.6b): a deployment with many training-set
+    /// rows pays that many sidecar reads on every session build.
     async fn training_set_registration_sort_order(
         &self,
         record: &ResultTableRecord,
         url: &StorageUrl,
     ) -> Result<Option<Vec<Vec<SortExpr>>>> {
-        let manifest = self.read_materialization_manifest(url).await?;
+        let manifest = match self.read_materialization_manifest(url).await {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                warn!(
+                    table = record.table_name,
+                    error = %e,
+                    "training-set row's materialization manifest sidecar could not be read; \
+                     registering without a declared sort order"
+                );
+                return Ok(None);
+            }
+        };
         let Some(manifest) = manifest else {
             warn!(
                 table = record.table_name,

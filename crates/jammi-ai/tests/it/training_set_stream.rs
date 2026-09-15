@@ -99,10 +99,12 @@ async fn drain_ok(
     .expect("spawn_blocking join")
 }
 
-/// P1 (fixture side): the stream's OWN one-`target_partitions` derivation
-/// (replicated here exactly as `TrainingSetStream::open` builds it) plans
-/// the read-back with NO `SortExec` and NO `SortPreservingMergeExec` — the
-/// merge term P3's inequality claims is zero by construction.
+/// P1 (fixture side): the stream's OWN one-`target_partitions` derivation —
+/// `jammi_db::session::single_partition_context`, the SAME function
+/// `TrainingSetStream::open`/`validate_window` call, never a hand-rolled
+/// replica — plans the read-back with NO `SortExec` and NO
+/// `SortPreservingMergeExec` — the merge term P3's inequality claims is zero
+/// by construction.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
 async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
@@ -112,13 +114,17 @@ async fn p1_the_loader_derived_state_plans_with_no_sort_and_no_merge() {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
 
-    let base_state = session.context().state();
-    let one_partition_config = base_state.config().clone().with_target_partitions(1);
-    let derived_state =
-        datafusion::execution::session_state::SessionStateBuilder::new_from_existing(base_state)
-            .with_config(one_partition_config)
-            .build();
-    let derived_ctx = datafusion::prelude::SessionContext::new_with_state(derived_state);
+    // The SHIPPED derivation (#500 U2c closing round, F2): `single_partition_context`
+    // (`crates/jammi-db/src/session.rs:1180`) edits `target_partitions` on a plain
+    // `ctx.state()` clone in place — never
+    // `SessionStateBuilder::new_from_existing(..).with_config(..)`, whose `build()`
+    // re-creates the default catalog whenever the resulting config still carries
+    // `create_default_catalog_and_schema = true` (that function's own doc comment
+    // explains why), silently dropping every table this fixture registered. This
+    // test previously hand-rolled the OLD (wrong) shape, leaving the real
+    // `TrainingSetStream::open`/`validate_window` derivation unpinned; it now calls
+    // the same function `stream.rs` calls.
+    let derived_ctx = jammi_db::session::single_partition_context(session.context());
 
     let query = read_back_sql(&fixture.table, &fixture.columns);
     let batches = derived_ctx
@@ -445,6 +451,55 @@ async fn p7_early_end_when_window_exceeds_table_rows() {
     assert!(
         err.to_string().contains("streamed window ended after"),
         "unexpected error: {err}"
+    );
+}
+
+/// #500 U2c closing round, finding A1 / property P-B3: a window whose inner
+/// `LIMIT`/`OFFSET` subquery matches ZERO rows (`window.start` overstates
+/// the table's real row count, while `window.end > window.start` keeps the
+/// window itself nonempty, so `validate_window`'s `window.is_empty()`
+/// early-out does not fire) is a typed refusal naming the aggregate, never a
+/// silently-coerced "no nulls/NaNs found": `sum(case when .. end)` over an
+/// empty input is SQL NULL, not `0`, and the OLD
+/// `.ok().and_then(..).unwrap_or(0.0)` here swallowed that NULL as a clean
+/// zero count — the exact shape a whole-table pre-pass (F5) would need if a
+/// catalog `row_count` ever overstated the table it describes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(training_set_stream)]
+async fn p_b3_a_window_whose_aggregate_subquery_matches_no_rows_refuses_at_open() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let (table, columns) = common::padded_regression_fixture(&session, dir.path(), 5, 8).await;
+
+    // Only 5 real rows exist; OFFSET 10 selects none of them.
+    let window = stream::RowWindow::new(10, 15);
+    let spec =
+        partition::PartitionSpec::single_rank(1, partition::PartitionRule::BlockByGlobalBatch);
+    let cfg = stream::StreamConfig::new(1).unwrap();
+    let err = stream::TrainingSetStream::open(
+        &session,
+        &table,
+        &columns,
+        ModelTask::Regression,
+        window,
+        stream::Slice::PerRank(spec),
+        cfg,
+        None,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("null_count") && msg.contains("could not be read"),
+        "expected the typed pre-pass refusal naming the 'null_count' aggregate, got: {msg}"
+    );
+    assert!(
+        msg.contains("target"),
+        "expected the refusal to name the target column, got: {msg}"
     );
 }
 

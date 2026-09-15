@@ -334,6 +334,22 @@ pub fn media_corpus_sha256(rows: &[MediaTriplet]) -> String {
     hex::encode(hasher.finalize())
 }
 
+// P-B1 oracle hook: a per-thread sleep [`RowSet::loader`] applies to itself
+// when nonzero, test-only (`#[cfg(test)]`, so this does not exist in a
+// release build). Module-scoped (not inside `mod tests`) so `RowSet::loader`
+// itself — OUTSIDE that module — can read it; `mod tests`' own
+// `use super::*;` re-exposes it to the test that sets it
+// (`train_run_wall_s_excludes_the_loader_build`). Thread-local, never a
+// process-global `AtomicU64`: `cargo test` runs tests concurrently on
+// separate threads, and `run_impl` here always executes entirely on ONE
+// thread (a `tokio::task::spawn_blocking` closure never hops threads mid-body),
+// so setting/resetting it on the calling thread cannot leak into a
+// concurrently-running, unrelated test.
+#[cfg(test)]
+thread_local! {
+    static LOADER_BUILD_SLEEP_MS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// A borrowed view of ONE modality's rows — the single shape every loader
 /// construction in [`run_impl`] goes through, so the train split, the
 /// held-out fixture and the train-side probe can never disagree about which
@@ -427,10 +443,26 @@ impl<'a> RowSet<'a> {
     /// silent fallback onto the triplet loss under an MNRL label — the two
     /// objectives are not interchangeable and a leg mislabelled that way
     /// would be unpairable with every other MNRL leg.
+    ///
+    /// Test-only (P-B1 oracle): sleeps
+    /// [`LOADER_BUILD_SLEEP_MS_FOR_TEST`] milliseconds first, when nonzero,
+    /// so a test can make this call's own wall-clock cost large and
+    /// deterministic and prove it is excluded from
+    /// [`crate::report::FinetuneRunTier::train_run_wall_s`]'s measured span
+    /// (`tests::train_run_wall_s_excludes_the_loader_build`). Zero (a no-op)
+    /// in every other test and in production, where the hook does not exist
+    /// (`#[cfg(test)]`).
     fn loader(
         &self,
         objective: Objective,
     ) -> Result<TrainingDataLoader, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(test)]
+        {
+            let sleep_ms = LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.get());
+            if sleep_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            }
+        }
         match (self, objective) {
             (RowSet::Text(rows), Objective::Triplet) => Ok(TrainingDataLoader::from_triplets(
                 rows.iter()
@@ -2099,8 +2131,15 @@ fn run_impl(
             train_probe_series.push(init_probe.mean);
         }
 
-        let train_run_t0 = Instant::now();
+        // The loader build (`RowSet::loader`, a per-epoch-leg clone of every
+        // row's text/media bytes into the trainer's owned `TrainingDataLoader`)
+        // sits OUTSIDE `train_run_t0`, not inside it: `train_run_wall_s`'s own
+        // contract (`report.rs`'s doc on that field) times ONLY this tier's
+        // `training_loop.run()` call(s), and construction is not part of
+        // `run()` — it is this tier's own row-marshalling step, done once per
+        // epoch leg before the timed span starts.
         let train_loader = train_rows.loader(params.objective)?;
+        let train_run_t0 = Instant::now();
         let result = training_loop.run(TrainingSource::Resident(train_loader))?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
         // The DIRECT media front-end wall (contract P1-b(v)), summed across
@@ -3485,6 +3524,70 @@ mod tests {
              is silently timing more than just training_loop.run()",
             tier.train_run_wall_s,
             outer_wall_s
+        );
+    }
+
+    /// #500 U2c closing-round P-B1: `train_run_wall_s`'s composition excludes
+    /// [`RowSet::loader`]'s own build cost — the fix for finding F1, where an
+    /// earlier revision started `train_run_t0` BEFORE `train_rows.loader(..)`
+    /// ran, folding one epoch leg's row-marshalling clone into the field
+    /// `report.rs`'s own doc says is `training_loop.run()` alone.
+    ///
+    /// The prior test above (`..._strictly_less_than_the_outer_wall_clock`)
+    /// cannot catch a re-contamination on this fixture: `RowSet::loader`'s
+    /// real cost (cloning 4-8 short synthetic strings) is nanoseconds,
+    /// dwarfed by noise on any wall-clock comparison. This test makes
+    /// construction's cost LARGE and DETERMINISTIC instead of relying on the
+    /// fixture's real size: [`LOADER_BUILD_SLEEP_MS_FOR_TEST`] injects a
+    /// fixed sleep into every `RowSet::loader` call for the duration of this
+    /// test's `run_impl` invocation. `non_perturbation_test_params` runs 2
+    /// epochs with `probe_at_init = true`, so the hook fires 3 times total
+    /// (the train-probe's `loader()` call, which sits BEFORE `train_run_t0`
+    /// in every revision of this function, plus one `train_rows.loader(..)`
+    /// call per epoch leg) — only the per-epoch calls are candidates for
+    /// re-entering the timed span.
+    ///
+    /// RED evidence (executed by hand, reverted immediately after): moving
+    /// `let train_run_t0 = Instant::now();` back above
+    /// `train_rows.loader(..)` (F1's exact regression) made this test fail
+    /// with `train_run_wall_s (0.5...) must be STRICTLY LESS than the
+    /// injected per-epoch-leg sleep (0.25s)` — `train_run_wall_s` picked up
+    /// both epoch legs' injected sleeps (2 × 250ms), proving this test does
+    /// detect the F1 shape.
+    #[tokio::test]
+    async fn train_run_wall_s_excludes_the_loader_build() {
+        let work_dir = tempfile::tempdir().expect("tempdir");
+        let params = non_perturbation_test_params(work_dir.path().to_path_buf());
+        const INJECTED_MS: u64 = 250;
+        let (run_result, outer_wall_s) = tokio::task::spawn_blocking(move || {
+            LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(INJECTED_MS));
+            let outer_t0 = Instant::now();
+            let result = run_impl(&params, true);
+            let outer_wall_s = outer_t0.elapsed().as_secs_f64();
+            // Reset before this blocking-pool thread is returned to the pool
+            // and might serve a different, unrelated test.
+            LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(0));
+            (result, outer_wall_s)
+        })
+        .await
+        .expect("join run_impl task");
+        let (tier, _varmap) = run_result.expect("finetune-run");
+
+        let injected_s = INJECTED_MS as f64 / 1000.0;
+        assert!(
+            outer_wall_s >= injected_s,
+            "the injected loader-build sleep ({injected_s}s) must show up somewhere in \
+             run_impl's own wall clock ({outer_wall_s}s) -- otherwise the hook never fired"
+        );
+        assert!(
+            tier.train_run_wall_s < injected_s,
+            "train_run_wall_s ({}) must be STRICTLY LESS than the injected per-epoch-leg sleep \
+             ({injected_s}s) -- if RowSet::loader()'s cost re-entered the \
+             train_run_t0..elapsed() span, this field would carry at least one epoch leg's worth \
+             of the injected sleep (and this fixture runs 2 epoch legs, so a re-contaminated \
+             field would read at least {}s)",
+            tier.train_run_wall_s,
+            injected_s * 2.0,
         );
     }
 

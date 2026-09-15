@@ -1044,6 +1044,103 @@ async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: Back
     );
 }
 
+/// #500 U2c closing round, finding A4 / property P-B6: an UNREADABLE sidecar
+/// (present but not valid JSON — an object-store error hits the same code
+/// path) is treated like an ABSENT one, never fatal to registration: the row
+/// still resolves (the explicit `ORDER BY` still sorts it correctly) and a
+/// `tracing::warn!` names both the table and the underlying error.
+///
+/// Before this fix, `training_set_registration_sort_order` propagated the
+/// read error via `?`, which made `bind_result_table` itself return `Err`
+/// WITHOUT ever calling `register_table` — the row never enters `ctx`'s
+/// schema at all. `load_existing_tables_inner` catches that per-row (`if let
+/// Err(e) = self.bind_result_table(..) { warn!(..) }`), so `load_existing_tables`
+/// itself always returns `Ok(())` either way and cannot tell RED from GREEN;
+/// the real oracle is whether the row is still QUERYABLE afterward — before
+/// this fix the `SELECT` below would fail ("table ... not found"), same
+/// failure class as never registering the row at all, just for the wrong
+/// reason (a corrupt HINT sidecar, not a corrupt table).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: BackendKind) {
+    use std::io;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "corrupt-sidecar");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+
+    corrupt_sidecar(&store, &materialized.record).await;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufferWriter(buffer.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let ctx2 = SessionContext::new();
+    store.load_existing_tables(&ctx2).await.unwrap();
+
+    // The real oracle: the row must still be QUERYABLE after registration —
+    // `load_existing_tables` itself always returns `Ok(())` (a per-row
+    // failure there is caught and only warned about), so this SELECT, not
+    // the call above, is what distinguishes "the row registered without a
+    // declared sort order" from "the row never registered at all".
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let rows = ctx2
+        .sql(&query)
+        .await
+        .expect("the row must still be registered despite the unreadable sidecar")
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(materialized.record.table_name.as_str()),
+        "the unreadable-sidecar warning must name the table, got: {log}"
+    );
+    assert!(
+        log.contains("could not be read"),
+        "the unreadable-sidecar warning must state the reason, got: {log}"
+    );
+}
+
 /// #500 U2c c3c, P-M(i): the training-set WRITER's full-tuple sort plans at
 /// exactly ONE output partition and never builds a
 /// `SortPreservingMergeExec` — the SAME single-partition derivation
@@ -2210,6 +2307,22 @@ async fn delete_sidecar(store: &ResultStore, record: &ResultTableRecord) {
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     handle.delete_if_exists(&sidecar).await.unwrap();
+}
+
+/// Overwrite a training-set row's `.materialization.json` sidecar with bytes
+/// that are not valid JSON at all — an UNREADABLE sidecar (#500 U2c closing
+/// round, A4/P-B6), distinct from an ABSENT one: `read_materialization_manifest`
+/// finds the object present (`handle.exists` is `true`) but
+/// `MaterializationManifest::from_json_bytes` fails to parse it, so the call
+/// returns `Err`, never `Ok(None)`.
+async fn corrupt_sidecar(store: &ResultStore, record: &ResultTableRecord) {
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let handle = store.open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, b"not valid json".to_vec().into())
+        .await
+        .unwrap();
 }
 
 // ─── model_materialization (#500): `probe_model_by_definition` ────────────

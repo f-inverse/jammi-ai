@@ -98,6 +98,7 @@ use candle_nn::VarMap;
 use jammi_db::error::{JammiError, Result};
 
 use crate::fine_tune::adamw::AdamW;
+use crate::fine_tune::collective::Collective;
 
 /// Snapshot every trainable `Var` in `varmap`, in a DETERMINISTIC order —
 /// sorted by its `VarBuilder`-path NAME, never `VarMap::all_vars()`'s raw
@@ -609,6 +610,61 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// no-op, unchanged from before `ClipOutcome` existed). An EMPTY
 /// `trainable_vars` is the one UNAMBIGUOUSLY benign reading (nothing was
 /// ever asked to be clipped) and does not warn.
+/// DESIGN.md §4's "canonical-order reduce": lay `grads` out in the CANONICAL
+/// `trainable_vars` order (the same name-sorted order [`sorted_trainable_vars`]
+/// produces), with a ZERO tensor — same shape/dtype/device as the `Var` —
+/// standing in for any entry this rank's own accumulation never populated for
+/// this step; `all_reduce_sum` the whole canonical vector across the gang;
+/// write the summed values back into `grads` under every `Var`.
+///
+/// After this call every rank's `GradStore` holds an entry for EVERY
+/// trainable var (never "some vars remain absent" — a var absent from every
+/// rank still gets an explicit zero-sum entry), and that entry is the GANG's
+/// sum, not this rank's own local one. This is the seam
+/// [`TrainingLoop::process_batch_loss`]'s window-boundary flush and its
+/// epoch-end trailing-window flush both call before [`clip_and_step`], so
+/// every rank clips and steps over the identical, already-summed gradient and
+/// "every rank holds identical weights after the step" holds.
+///
+/// At `W = 1` (`collective` is [`super::collective::Noop`]) `all_reduce_sum`
+/// is the identity, so this function's only observable effect is turning an
+/// ABSENT entry into an explicit ZERO one — [`clip_and_step`]'s own doc
+/// already treats those two identically (`ClipOutcome::NoGradients`: an
+/// absent norm contributes 0 to the clip's fold; a zero tensor's own
+/// contribution is also 0), so W=1 byte parity holds — see this module's own
+/// `canonical_reduce_at_world_one_is_the_zero_filling_identity` oracle.
+///
+/// A var whose LOCAL gradient is absent on every rank of a real gang (a Var
+/// this step's loss never routes through, on ANY rank) reduces to an
+/// all-zero tensor — the same "legitimate, not a bug" case
+/// [`clip_and_step`]'s own `NoGradients` doc already names, now decided per
+/// var rather than per whole store.
+///
+/// [`TrainingLoop::process_batch_loss`]: super::trainer::TrainingLoop::process_batch_loss
+pub fn canonical_reduce(
+    collective: &dyn Collective,
+    trainable_vars: &[Var],
+    grads: &mut GradStore,
+) -> Result<()> {
+    let mut tensors: Vec<Tensor> = Vec::with_capacity(trainable_vars.len());
+    for var in trainable_vars {
+        let t: &Tensor = var;
+        let tensor = match grads.remove(t) {
+            Some(g) => g,
+            None => Tensor::zeros(t.dims(), t.dtype(), t.device()).map_err(|e| {
+                JammiError::FineTune(format!("canonical_reduce: zero-filling an absent var: {e}"))
+            })?,
+        };
+        tensors.push(tensor);
+    }
+    collective.all_reduce_sum(&mut tensors)?;
+    for (var, tensor) in trainable_vars.iter().zip(tensors) {
+        let t: &Tensor = var;
+        grads.insert(t, tensor);
+    }
+    Ok(())
+}
+
 pub fn clip_and_step(
     optimizer: &mut AdamW,
     trainable_vars: &[Var],
@@ -822,6 +878,114 @@ mod tests {
         let grads = loss.backward().unwrap();
         let g = grads.get(w.as_tensor()).unwrap().clone();
         (w, grads, g)
+    }
+
+    /// U4b (a): at `W = 1` (`Noop`), `canonical_reduce` must be the
+    /// zero-filling identity `clip_and_step`'s own `NoGradients` doc already
+    /// treats an absent entry as — RED-PROOF: removing the `None =>
+    /// Tensor::zeros(...)` arm (replacing it with `.unwrap()`, say) panics on
+    /// `w_absent` instead of returning the zero it must.
+    #[test]
+    fn canonical_reduce_at_world_one_is_the_zero_filling_identity() {
+        use crate::fine_tune::collective::Noop;
+
+        let (w_present, mut grads, g_before) = one_var_with_grad(0.5, 4);
+        let dev = Device::Cpu;
+        let w_absent = Var::from_tensor(&Tensor::zeros((3,), DType::F32, &dev).unwrap()).unwrap();
+        let vars = vec![w_present.clone(), w_absent.clone()];
+
+        canonical_reduce(&Noop::new(), &vars, &mut grads).unwrap();
+
+        let present_after: Vec<f32> = grads.get(w_present.as_tensor()).unwrap().to_vec1().unwrap();
+        let present_before: Vec<f32> = g_before.to_vec1().unwrap();
+        assert_eq!(
+            present_after, present_before,
+            "an already-present entry must survive a W=1 reduce byte-for-byte"
+        );
+
+        let absent_after = grads.get(w_absent.as_tensor()).expect(
+            "canonical_reduce must materialize an entry for every trainable var, \
+                     even one this step's loss never touched",
+        );
+        let absent_vals: Vec<f32> = absent_after.to_vec1().unwrap();
+        assert_eq!(
+            absent_vals,
+            vec![0.0f32; 3],
+            "an absent var's materialized entry must be an exact zero, matching its own shape"
+        );
+    }
+
+    /// U4b (d)'s low-level oracle: a REAL two-rank `Local` gang, where rank 1
+    /// never populates `w_only_rank0`'s gradient at all (the "a Var absent
+    /// from one rank's `GradStore`" case DESIGN.md §6 names) — after
+    /// `canonical_reduce`, BOTH ranks hold the IDENTICAL summed value for
+    /// every var: `w_shared`'s sum is `1.0 + 2.0 = 3.0` on every element, and
+    /// `w_only_rank0`'s sum equals rank 0's own value alone (rank 1's zero
+    /// fill contributes nothing) — proving the gang completes and produces
+    /// one agreed gradient rather than each rank quietly keeping its own.
+    ///
+    /// RED-PROOF: swapping `all_reduce_sum` for a no-op (each rank keeping
+    /// its own local value) makes `w_shared`'s two ranks disagree (1.0 vs
+    /// 2.0, never 3.0) — this test fails the moment the reduce stops being a
+    /// real cross-rank sum.
+    #[test]
+    fn canonical_reduce_sums_a_real_gang_and_zero_fills_a_rank_absent_var() {
+        use crate::fine_tune::collective::LocalGang;
+
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            handles.push(std::thread::spawn(move || {
+                let dev = Device::Cpu;
+                let w_shared =
+                    Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
+                let w_only_rank0 =
+                    Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
+                let vars = vec![w_shared.clone(), w_only_rank0.clone()];
+
+                let mut grads = GradStore::default();
+                let shared_value = if rank == 0 { 1.0f32 } else { 2.0f32 };
+                grads.insert(
+                    w_shared.as_tensor(),
+                    Tensor::full(shared_value, (2,), &dev).unwrap(),
+                );
+                if rank == 0 {
+                    grads.insert(
+                        w_only_rank0.as_tensor(),
+                        Tensor::full(5.0f32, (2,), &dev).unwrap(),
+                    );
+                }
+                // rank 1 never inserts an entry for `w_only_rank0` at all —
+                // the absent-on-one-rank case.
+
+                canonical_reduce(&local, &vars, &mut grads).unwrap();
+
+                let shared_sum: Vec<f32> =
+                    grads.get(w_shared.as_tensor()).unwrap().to_vec1().unwrap();
+                let only0_sum: Vec<f32> = grads
+                    .get(w_only_rank0.as_tensor())
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                (shared_sum, only0_sum)
+            }));
+        }
+        let results: Vec<(Vec<f32>, Vec<f32>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for (rank, (shared_sum, only0_sum)) in results.iter().enumerate() {
+            assert_eq!(
+                *shared_sum,
+                vec![3.0f32, 3.0f32],
+                "rank {rank}: w_shared must sum to 1.0 + 2.0 = 3.0 on every rank"
+            );
+            assert_eq!(
+                *only0_sum,
+                vec![5.0f32, 5.0f32],
+                "rank {rank}: w_only_rank0 must equal rank 0's own value — rank 1's zero \
+                 fill must contribute nothing, and both ranks must agree"
+            );
+        }
     }
 
     #[test]

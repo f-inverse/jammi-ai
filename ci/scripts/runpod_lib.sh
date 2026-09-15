@@ -1407,6 +1407,43 @@ print(json.dumps({"query": "mutation D($i: PodFindAndDeployOnDemandInput!){ podF
 PY
 }
 
+# The "zero tests matched" tripwire (F13), shared by EVERY gang leg's remote
+# text — the pod leg (`runpod_gpu_gang.sh`'s `gang-proof` group) and the
+# cluster leg (`runpod_gpu_cluster.sh`'s per-rank build+run heredoc) alike.
+# A `cargo test ... <name-filter> ...` invocation whose own filter matches NO
+# tests exits 0 with "running 0 tests ... test result: ok" printed to its
+# log — a false green a leg with no proof must never read as a pass (the
+# same never-vacuous doctrine `runpod_gpu_prove.sh`'s
+# `capability-surface-proof` group and `check_gpu_prove_once.py` state for
+# the prove lane). Factored out so this ONE check text exists once, never
+# re-typed per leg — a caller drops it into its own remote heredoc via a
+# bare `$(...)` command substitution (never `\$(...)`; see this function's
+# own $2 doc for why).
+#
+# Prints shell TEXT (never a value) meant to be substituted, via a bare
+# `$(...)`, directly after a `cargo test ... 2>&1 | tee "<log>"` line inside
+# a caller's own (unquoted, `<<REMOTE`-style) heredoc. $1=the shell variable
+# name already holding that group's own accumulated rc (e.g. `grc`,
+# unquoted — no leading `$`, no quotes: it is spliced as-is into an
+# assignment target). $2=the log file path exactly as it must appear in the
+# FINAL remote text (e.g. the literal three characters `$log_var` when the
+# remote script itself will read a shell variable — pass it SINGLE-QUOTED
+# at the call site, `'$gang_log'`, never double-quoted or bare, so bash
+# does not expand it while building the caller's OWN command-substitution
+# argv; this function performs no further escaping of it). $3=a human label
+# for the filter that matched (message text only).
+_rp_zero_test_tripwire_lines() {
+  local rc_var="${1:?_rp_zero_test_tripwire_lines needs the rc variable name}" \
+        log_path="${2:?_rp_zero_test_tripwire_lines needs the log path text}" \
+        filter_label="${3:?_rp_zero_test_tripwire_lines needs a filter label}"
+  cat <<EOF
+if grep -q "running 0 tests" "${log_path}"; then
+  echo "::error::the test filter '${filter_label}' matched ZERO tests on this ref -- refusing to read a 0-test run as a proof"
+  ${rc_var}=1
+fi
+EOF
+}
+
 # ═════════════════════════════════════════════════════════════════════════
 # Cluster primitives (RunPod REST v2, `https://api.runpod.io/v2/clusters`).
 # A cluster is a SEPARATE RunPod object type from a pod — a homogeneous

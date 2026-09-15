@@ -113,6 +113,17 @@ RP_TTL_HOURS="${RP_TTL_HOURS:-8}"
 # with the pod so a sweeper can honour each pod's OWN limit instead of imposing
 # its own — otherwise a CI sweep (3h) reaps a developer's 8h session.
 RP_POD_PREFIX="jammi-gpu"
+# Every CLUSTER this tooling rents (REST v2, `rp_cluster_*` below) carries
+# the SAME "<prefix>-ttl<H>" name shape, on its OWN prefix — never
+# `${RP_POD_PREFIX}-cluster-…` (an earlier draft's wording; deleted). A
+# cluster and a pod are two independent RunPod object types with two
+# independent lifecycles (a cluster is retired by deleting the CLUSTER,
+# never by terminating one of its member pods — see rp_cluster_delete and
+# rp_sweep's own member-exclusion logic below), so the pod sweep's prefix
+# match (`name.startswith(RP_POD_PREFIX)`) can never accidentally match a
+# cluster name, and vice versa. `RP_POD_PREFIX` has no consumer outside this
+# file.
+RP_CLUSTER_PREFIX="jammi-cluster"
 # Validated here, not at use: RP_TTL_HOURS goes into arithmetic expansion AND the
 # pod name. A non-integer would yield a malformed payload plus an unparseable
 # name, and no script here sets -e, so it would fail silently in both places.
@@ -332,8 +343,81 @@ RP_ENV_PREAMBLE='while IFS= read -r -d "" __e; do export "$__e"; done < /proc/1/
 
 rp_gql() { curl -s "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$1"; }
 
-rp_terminate() { # $1=podId
-  rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${1}\\\"}) }\"}" >/dev/null 2>&1
+# The REST v2 primitive (`https://api.runpod.io/v2/...`, Bearer auth) every
+# `rp_cluster_*` function below is built on — the cluster surface has no
+# GraphQL mutation/query at all, unlike the pod surface's `rp_gql`.
+#
+# Body and HTTP status are captured SEPARATELY — the body via `-o` to a
+# throwaway file, the status via `-w '%{http_code}'` into its OWN command
+# substitution — never a single piped read. Under `set -o pipefail` (every
+# caller of this file), `curl ... | python3 -c ...` would report CURL's own
+# exit code whenever curl itself failed, even when it still delivered a
+# complete, parseable body — the identical class rp_pod_verify's own doc
+# (above) closes for the GraphQL side, reproduced here for REST.
+#
+# Prints "STATUS\n<body>" (status on line 1, the raw response body on every
+# line after — a caller splits with `head -n1`/`tail -n +2`). Returns curl's
+# own exit code: 0 means the REQUEST completed and SOME HTTP status came
+# back (2xx, 4xx, 5xx — the caller's own per-arm lattice decides what that
+# status means); nonzero means a TRANSPORT failure (no response at all — DNS,
+# TLS, a dropped connection). A caller must never read a nonzero return here
+# as "not found" or "refused"; those are STATUSES on a successful transport,
+# never this function's own return code.
+#
+# $1=METHOD (GET/POST/PATCH/DELETE) $2=PATH (e.g. "/v2/clusters", leading
+# slash) $3=optional JSON BODY (POST/PATCH only).
+_rp_rest() {
+  local method="${1:?_rp_rest needs a METHOD}" path="${2:?_rp_rest needs a PATH}" body="${3-}"
+  local body_file status rc
+  body_file="$(mktemp "${TMPDIR:-/tmp}/jammi-rp-rest.XXXXXX")" \
+    || { echo "::error::_rp_rest could not create a capture file" >&2; return 1; }
+  if [ -n "$body" ]; then
+    status="$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
+      -H "Authorization: Bearer ${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$body")"
+  else
+    status="$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
+      -H "Authorization: Bearer ${RUNPOD_API_KEY}")"
+  fi
+  rc=$?
+  printf '%s\n' "$status"
+  cat "$body_file"
+  rm -f "$body_file"
+  return "$rc"
+}
+
+# $1=podId. Returns 0 when the mutation's response carries no `errors`
+# (including a transport failure the body-parse itself cannot see — the
+# original, fully-silent contract, preserved for rp_cleanup's best-effort
+# EXIT-trap teardown, which has never checked this function's return code
+# and must not start failing loudly on a network hiccup mid-exit). Returns 1
+# when the body DOES carry `errors` — a NAMED, non-fatal condition from a
+# caller's point of view (e.g. a cluster-member pod: S4 measured it exposes
+# `actions: []`, so RunPod's own API is expected to refuse a podTerminate
+# against one) — and PRINTS the refusal reason to stdout, on the refusal arm
+# ONLY, so a caller that wants it (rp_sweep, below) can capture it via
+# `$(rp_terminate "$id")` while every OTHER existing caller (which never
+# captures this function's stdout) is unaffected either way.
+rp_terminate() {
+  local id="${1:?rp_terminate needs a podId}" body reason rc
+  body="$(rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${id}\\\"}) }\"}" 2>/dev/null)"
+  reason="$(printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+e = d.get("errors")
+if e:
+    print(" ".join((e[0].get("message") or "unknown").split())[:200])
+    sys.exit(1)
+sys.exit(0)
+' 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "${reason:-unknown reason}"
+    return 1
+  fi
+  return 0
 }
 
 # Confirm a pod id is BOTH present in the account's live pod list AND carries
@@ -1237,32 +1321,46 @@ exit 1
 SCRIPT
 }
 
-_rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
-  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" "$RP_DISK_GB" "$RP_VOLUME_GB" "$RP_GPU_COUNT" <<'PY'
-import json, sys
-cloud, gpu, image, pub, ttl_h, prefix, disk_gb, volume_gb, gpu_count = sys.argv[1:10]
-ttl = int(ttl_h) * 3600
-# The deadline is part of the pod's own entrypoint, so it exists from the moment
-# the container starts. It CANNOT be installed over SSH after the fact: the
-# window between "pod rented" and "SSH reachable" is minutes long, and a runner
-# SIGKILLed inside it never runs its EXIT trap. That is exactly how an A100 was
-# orphaned for seven days on 2026-07-24.
+# The ONE entrypoint text every rented pod OR cluster member boots — the
+# self-terminating watchdog + sshd string — factored out of
+# `_rp_deploy_payload` (below) so the single-pod payload and
+# `_rp_cluster_payload`'s cluster payload share exactly ONE "kill this thing,
+# then let me in" mechanism instead of two that could quietly drift apart.
+# Prints the setup TEXT (no trailing newline — command substitution strips
+# it, matching what the pre-factoring inline python variable held). $1=ttl
+# hours (the deadline baked into the watchdog's own `sleep`).
 #
-# `sleep` comes FIRST so the deadline is reached no matter what the network does;
-# an install ahead of it can hang and leave the pod with no deadline at all. Every
-# step after it is `timeout`-bounded so nothing can wedge the sequence.
+# The deadline is part of the entrypoint, so it exists from the moment the
+# container starts. It CANNOT be installed over SSH after the fact: the
+# window between "pod rented" and "SSH reachable" is minutes long, and a
+# runner SIGKILLed inside it never runs its EXIT trap. That is exactly how an
+# A100 was orphaned for seven days on 2026-07-24.
 #
-# `runpodctl remove pod $RUNPOD_POD_ID` is the ONLY in-pod termination that works,
-# and it is verified on real hardware: RunPod special-cases self-removal, so it
-# succeeds in this custom image with no config file and no key of ours — even
-# though `runpodctl config` fails and `runpodctl get pod` returns Unauthorized.
+# `sleep` comes FIRST so the deadline is reached no matter what the network
+# does; an install ahead of it can hang and leave the pod with no deadline at
+# all. Every step after it is `timeout`-bounded so nothing can wedge the
+# sequence.
+#
+# `runpodctl remove pod $RUNPOD_POD_ID` is the ONLY in-pod termination that
+# works, and it is verified on real hardware: RunPod special-cases
+# self-removal, so it succeeds in this custom image with no config file and
+# no key of ours — even though `runpodctl config` fails and `runpodctl get
+# pod` returns Unauthorized. Member self-removal on a CLUSTER pod is
+# UNMEASURED (S4: members expose `actions: []`) — the cluster driver's own
+# executed run records whether it works there too.
 #
 # There is deliberately no `kill 1` fallback. It was measured to be a no-op:
 # PID 1 in a PID namespace ignores signals it has no handler for, including
-# SIGKILL, so the pod kept RUNNING and kept billing at full rate. A fallback that
-# cannot work is worse than none — it invites trusting a guard that does nothing.
-# The retry loop replaces it: the only real failure mode left is no network at
-# deadline time, and retrying costs nothing. rp_sweep remains the true backstop.
+# SIGKILL, so the pod kept RUNNING and kept billing at full rate. A fallback
+# that cannot work is worse than none — it invites trusting a guard that does
+# nothing. The retry loop replaces it: the only real failure mode left is no
+# network at deadline time, and retrying costs nothing. rp_sweep /
+# rp_cluster_sweep remain the true backstop.
+_rp_entrypoint_setup() { # $1=ttl_hours
+  python3 - "$1" <<'PY'
+import sys
+ttl_h = sys.argv[1]
+ttl = int(ttl_h) * 3600
 watchdog = ("( sleep %d; "
             "while :; do "
             "timeout 120 sh -c \"command -v runpodctl >/dev/null 2>&1 || "
@@ -1279,12 +1377,23 @@ setup = (watchdog
          "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; "
          "/usr/sbin/sshd -D")
 
-# `setup` is wrapped in bash -c '...' below. A single quote anywhere inside it
-# closes that wrapper early and hands the remainder — pipes, redirects,
-# semicolons — to the OUTER shell. The entrypoint then dies on a syntax error and
-# the pod boots, bills, and never becomes reachable: a silent, paid failure that
-# looks exactly like a capacity problem. Quote with double quotes only.
+# `setup` is wrapped in bash -c '...' by every caller. A single quote
+# anywhere inside it closes that wrapper early and hands the remainder —
+# pipes, redirects, semicolons — to the OUTER shell. The entrypoint then dies
+# on a syntax error and the pod boots, bills, and never becomes reachable: a
+# silent, paid failure that looks exactly like a capacity problem. Quote with
+# double quotes only.
 assert "'" not in setup, "pod entrypoint must contain no single quotes (breaks bash -c wrapping)"
+print(setup)
+PY
+}
+
+_rp_deploy_payload() { # $1=cloudType $2=gpuTypeId
+  local setup
+  setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
+  python3 - "$1" "$2" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_POD_PREFIX" "$RP_DISK_GB" "$RP_VOLUME_GB" "$RP_GPU_COUNT" "$setup" <<'PY'
+import json, sys
+cloud, gpu, image, pub, ttl_h, prefix, disk_gb, volume_gb, gpu_count, setup = sys.argv[1:11]
 # `gpuCount` is the caller's own RP_GPU_COUNT (default 1, validated as a
 # positive integer at the top of this file), passed as an unquoted JSON
 # number — the API rejects the string form.
@@ -1296,6 +1405,397 @@ inp = {"cloudType": cloud, "gpuCount": int(gpu_count), "gpuTypeId": gpu,
 print(json.dumps({"query": "mutation D($i: PodFindAndDeployOnDemandInput!){ podFindAndDeployOnDemand(input:$i){ id } }",
                   "variables": {"i": inp}}))
 PY
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# Cluster primitives (RunPod REST v2, `https://api.runpod.io/v2/clusters`).
+# A cluster is a SEPARATE RunPod object type from a pod — a homogeneous
+# group of N member pods on one private overlay network, created and
+# destroyed as a unit. There is no GraphQL surface for it; every
+# `rp_cluster_*` function below goes over `_rp_rest`. See the module header
+# for the honest deadline model these primitives carry:
+#
+#   A member pod's own in-pod `runpodctl remove pod` self-termination
+#   (`_rp_entrypoint_setup`, shared with the single-pod payload) is
+#   UNMEASURED for a cluster member — S4 found members expose `actions: []`,
+#   so even a SUCCESSFUL self-removal call's effect on cluster accounting is
+#   unconfirmed. The enforcers, in order, are: (1) the renting driver's own
+#   EXIT trap (`rp_cluster_delete` on every arm), (2) the cluster's own name
+#   TTL plus `rp_cluster_sweep`'s 6-hourly run (`gpu-reap.yml`), (3) a human,
+#   via the RunPod console. Worst case for one orphaned cluster that never
+#   self-removes and is caught only by the periodic sweep: `(TTL + 6h) ×
+#   $3.816/h = $26.71` (S4's measured 2×1 cluster rate; see the cluster
+#   driver's own cost derivation). The first executed cluster run records
+#   whether member self-removal actually worked (`cluster-self-remove:
+#   ok|refused` in its run log), turning "unmeasured" into a fact.
+# ═════════════════════════════════════════════════════════════════════════
+
+# The cluster create request body — REST v2's `CreateClusterRequest`, which
+# is `unevaluatedProperties: false` (RunPod's schema, read 2026-09-14): this
+# function emits EXACTLY the documented keys and no others, or the API
+# rejects the whole request. Shares `_rp_entrypoint_setup` with
+# `_rp_deploy_payload` (the SAME watchdog+sshd text on both legs — the class
+# this factoring closes: two subtly different "kill this thing" mechanisms
+# drifting apart unnoticed). $1=gpuTypeId $2=optional space-separated
+# dataCenterIds (omitted from the body entirely when empty — "let the
+# scheduler choose", the schema's own documented default).
+_rp_cluster_payload() {
+  local gpu="${1:?_rp_cluster_payload needs a gpuTypeId}" dcs="${2:-}" setup
+  setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
+  python3 - "$gpu" "$RP_IMAGE" "$RP_PUBKEY" "$RP_TTL_HOURS" "$RP_CLUSTER_PREFIX" "$RP_DISK_GB" "$setup" "$dcs" <<'PY'
+import json, sys
+gpu, image, pub, ttl_h, prefix, disk_gb, setup, dcs = sys.argv[1:9]
+body = {
+    "name": "%s-ttl%s" % (prefix, ttl_h),
+    "type": "TRAINING",
+    "compute": {"gpuTypeId": gpu, "gpuCountPerPod": 1, "podCount": 2},
+    "image": image,
+    # REST v2's env shape is an OBJECT (key -> value), unlike the GraphQL pod
+    # payload's array-of-{key,value} — see BaseContainerConfig.
+    "env": {"PUBLIC_KEY": pub},
+    "ports": ["22/tcp"],
+    "args": "bash -c '%s'" % setup,
+    "disk": int(disk_gb),
+}
+if dcs:
+    body["dataCenterIds"] = dcs.split()
+print(json.dumps(body))
+PY
+}
+
+# POST /v2/clusters. Prints the new cluster's id on success (201 + a
+# non-empty `id` in the body — the per-arm lattice `_rp_rest`'s own doc
+# describes). $1=gpuTypeId $2=optional space-separated dataCenterIds.
+rp_cluster_create() {
+  local gpu="${1:?rp_cluster_create needs a gpuTypeId}" dcs="${2:-}" payload resp status body id
+  payload="$(_rp_cluster_payload "$gpu" "$dcs")" || { echo "::error::cluster create: could not build the request body" >&2; return 1; }
+  resp="$(_rp_rest POST /v2/clusters "$payload")" \
+    || { echo "::error::cluster create: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    201)
+      id="$(printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("id") or "")
+' 2>/dev/null)"
+      if [ -z "$id" ]; then
+        echo "::error::cluster create: 201 but the response body carried no id: ${body}" >&2
+        return 1
+      fi
+      printf '%s\n' "$id"
+      return 0 ;;
+    *)
+      echo "::error::cluster create refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# GET /v2/clusters/{id}. Prints the raw Cluster body on success (200 + the
+# required `id` key present). $1=clusterId.
+rp_cluster_get() {
+  local id="${1:?rp_cluster_get needs a cluster id}" resp status body
+  resp="$(_rp_rest GET "/v2/clusters/${id}")" \
+    || { echo "::error::cluster get ${id}: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    200)
+      printf '%s' "$body" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+sys.exit(0 if d.get("id") else 1)
+' 2>/dev/null \
+        || { echo "::error::cluster get ${id}: 200 but the body is missing the required 'id' key: ${body}" >&2; return 1; }
+      printf '%s\n' "$body"
+      return 0 ;;
+    *)
+      echo "::error::cluster get ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# GET /v2/clusters/{id}/pods — the full Pod objects, not the lightweight
+# `Cluster.pods` summary. Prints one TAB-separated row per member:
+# `id  rank  ip  ssh_host:port  status` (rank/ip/ssh_host:port are empty
+# when not yet assigned — a member still provisioning). $1=clusterId.
+rp_cluster_pods() {
+  local id="${1:?rp_cluster_pods needs a cluster id}" resp status body
+  resp="$(_rp_rest GET "/v2/clusters/${id}/pods")" \
+    || { echo "::error::cluster pods ${id}: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    200)
+      printf '%s' "$body" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+pods = d.get("pods")
+if pods is None:
+    sys.exit(1)
+for p in pods:
+    pid = p.get("id") or ""
+    cl = p.get("cluster") or {}
+    rank = cl.get("rank")
+    rank = str(rank) if rank is not None else ""
+    ip = cl.get("ip") or ""
+    ssh_direct = (p.get("ssh") or {}).get("direct") or {}
+    hostport = ("%s:%s" % (ssh_direct["host"], ssh_direct["port"])) if ssh_direct else ""
+    status = p.get("status") or ""
+    print("\t".join([pid, rank, ip, hostport, status]))
+' || { echo "::error::cluster pods ${id}: 200 but the body is missing the required 'pods' key: ${body}" >&2; return 1; }
+      return 0 ;;
+    *)
+      echo "::error::cluster pods ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# GET /v2/clusters. Prints one TAB-separated row per cluster: `id  name
+# createdAt` (every cluster in the account, not filtered by prefix — a
+# caller filters, the same convention rp_sweep's own pod enumeration uses).
+rp_cluster_list() {
+  local resp status body
+  resp="$(_rp_rest GET /v2/clusters)" \
+    || { echo "::error::cluster list: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    200)
+      printf '%s' "$body" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+cl = d.get("clusters")
+if cl is None:
+    sys.exit(1)
+for c in cl:
+    print("\t".join([c.get("id") or "", c.get("name") or "", c.get("createdAt") or ""]))
+' || { echo "::error::cluster list: 200 but the body is missing the required 'clusters' key: ${body}" >&2; return 1; }
+      return 0 ;;
+    *)
+      echo "::error::cluster list refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# DELETE /v2/clusters/{id}. Success is 204 with an EMPTY body (RunPod's own
+# documented shape) — never inferred from a 200 or a non-empty body. $1=id.
+rp_cluster_delete() {
+  local id="${1:?rp_cluster_delete needs a cluster id}" resp status body
+  resp="$(_rp_rest DELETE "/v2/clusters/${id}")" \
+    || { echo "::error::cluster delete ${id}: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    204) return 0 ;;
+    *)
+      echo "::error::cluster delete ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# The ONE `-ttl<H>` deadline-NAME parser shared by rp_sweep (pods) and
+# rp_cluster_sweep (clusters) — a `python3` SOURCE FRAGMENT, not a bash
+# function, because both sweeps already do their age/deadline math in ONE
+# python process over the account's full JSON list (never one subprocess per
+# row); prepended (plain string concatenation, never duplicated) ahead of
+# each sweep's own script. Defines `_rp_parse_ttl_seconds(prefix, name)`:
+# the deadline in SECONDS carried by a `<prefix>-ttl<H>` name, or `None` when
+# the name does not carry that shape (an operator's own pod/cluster, or a
+# malformed name — "unparseable-deadline", never silently skipped).
+_rp_ttl_parser_pysrc() {
+  cat <<'PY'
+def _rp_parse_ttl_seconds(prefix, name):
+    if not name.startswith(prefix):
+        return None
+    tail = name[len(prefix):]
+    if tail.startswith('-ttl') and tail[4:].isdigit() and tail[4:] != '':
+        return int(tail[4:]) * 3600
+    return None
+PY
+}
+
+# The ONE `force_hours` override validator shared by rp_sweep and
+# rp_cluster_sweep: an all-digit, strictly-greater-than-zero hours count.
+# "0"/"00" are deliberately REFUSED rather than accepted as a (vacuous)
+# force-reap: both are all-digit (pass any digit-shape check alone), and a
+# naive `if override:` in the python side reads the STRING "0" as truthy
+# exactly like "8", giving `limit = 0` under which every RUNNING pod/cluster
+# is already "past-deadline-0s" — `reap 0` would mass-sweep the whole
+# account's fleet instead of refusing (round-4 audit finding, closed for
+# pods; shared here so clusters get the identical protection from day one
+# rather than needing their own incident first). $1=override string (empty
+# is NOT validated here — empty means "no override", the caller's own
+# per-object deadline applies, handled by the caller before this is called).
+# Prints nothing on success; on refusal prints the reason and returns 2.
+_rp_validate_force_hours() {
+  local override="${1?_rp_validate_force_hours needs an override string}"
+  case "$override" in
+    ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
+  esac
+  [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
+}
+
+# Every pod id that is a CLUSTER MEMBER right now, one per line — the
+# exclusion set rp_sweep consults before it ever calls `rp_terminate` on a
+# candidate: a cluster member is retired by deleting the CLUSTER
+# (rp_cluster_delete), never by terminating one of its own pods (S4: members
+# expose `actions: []`, so the account's own API is expected to refuse a
+# podTerminate against one anyway — this exclusion is belt-and-suspenders on
+# TOP of that refusal, not the only thing standing between rp_sweep and a
+# live member).
+#
+# Enumerates every jammi-prefixed cluster (rp_cluster_list) then every one's
+# member pods (rp_cluster_pods). A failure at EITHER level is a hard failure
+# here (rc 1, nothing printed) — an INCOMPLETE exclusion set is worse than no
+# answer at all, since a caller that silently treated it as "no members"
+# would then read a live member pod as an ordinary orphan.
+_rp_cluster_member_ids() {
+  local clusters cid cname
+  clusters="$(rp_cluster_list)" || return 1
+  while IFS=$'\t' read -r cid cname _ccreated; do
+    [ -n "$cid" ] || continue
+    case "$cname" in
+      "${RP_CLUSTER_PREFIX}"*) ;;
+      *) continue ;;
+    esac
+    rp_cluster_pods "$cid" | while IFS=$'\t' read -r pid _rest; do
+      [ -n "$pid" ] && printf '%s\n' "$pid"
+    done
+    # `rp_cluster_pods`'s own exit status is lost across the pipe above (the
+    # `while` runs in a subshell); PIPESTATUS reads it back before anything
+    # else touches it.
+    [ "${PIPESTATUS[0]}" -eq 0 ] || return 1
+  done <<< "$clusters"
+}
+
+# Terminate orphaned CLUSTERS — never a member pod (see this section's own
+# header: a cluster is retired by deleting the CLUSTER, exactly as rp_sweep
+# retires an orphaned pod by deleting the POD; the two object types have
+# fully independent lifecycles). A cluster whose name carries `-ttl<H>`
+# (`${RP_CLUSTER_PREFIX}-ttl<H>`) and whose age (from `createdAt`) exceeds H
+# hours is deleted.
+#
+# Every failure mode is `return 1` naming what could not be established —
+# "nothing to reap" is never inferred from an enumeration this function
+# could not complete (rp_sweep's own guiding principle, restated for
+# clusters: an ambiguity about whether the account was even READ resolves
+# toward REFUSING, never toward a silent green). The post-delete
+# re-enumeration (confirming every deleted cluster is actually gone) is
+# fail-closed the SAME way as the pre-delete one: a failed GET there is
+# reported by name too, never folded into "delete returned 204, assume
+# gone".
+#
+# $1=optional override age in hours (the SAME force_hours shape rp_sweep
+# validates, via the shared `_rp_validate_force_hours`).
+rp_cluster_sweep() {
+  local override="${1:-}" resp status body script out rc n=0 deleted_ids="" id age why rc2
+  if [ -n "$override" ]; then
+    _rp_validate_force_hours "$override" || return 2
+  fi
+  resp="$(_rp_rest GET /v2/clusters)" \
+    || { echo "::error::sweep could NOT enumerate clusters; orphans may exist unseen: RunPod REST request failed"; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  if [ "$status" != "200" ]; then
+    echo "::error::sweep could NOT enumerate clusters; orphans may exist unseen: status ${status}: $(printf '%s' "$body" | head -c 300)"
+    return 1
+  fi
+  script="$(_rp_ttl_parser_pysrc)
+import sys, json, datetime
+override = '''$override'''.strip()
+prefix = '$RP_CLUSTER_PREFIX'
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print('could not parse RunPod response: %s' % e); sys.exit(3)
+clusters = d.get('clusters')
+if clusters is None:
+    print('response contained no cluster list'); sys.exit(3)
+now = datetime.datetime.now(datetime.timezone.utc)
+for c in clusters:
+    name = c.get('name') or ''
+    if not name.startswith(prefix):
+        continue
+    cid = c.get('id') or ''
+    age = None
+    ca = c.get('createdAt')
+    if ca:
+        try:
+            age = int((now - datetime.datetime.fromisoformat(ca.replace('Z', '+00:00'))).total_seconds())
+        except Exception:
+            age = None
+    if age is None:
+        print('UNAGEABLE', cid, name); continue
+    if override:
+        limit = int(override) * 3600
+    else:
+        limit = _rp_parse_ttl_seconds(prefix, name)
+        if limit is None:
+            print(cid, age, 'unparseable-deadline'); continue
+    if age > limit:
+        print(cid, age, 'past-deadline-%ds' % limit)
+"
+  out="$(printf '%s' "$body" | python3 -c "$script")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::sweep could NOT enumerate clusters; orphans may exist unseen: ${out}"
+    return 1
+  fi
+  [ -n "$out" ] || { echo "sweep: queried OK — no orphaned ${RP_CLUSTER_PREFIX} clusters"; return 0; }
+  while read -r id age why; do
+    [ -n "$id" ] || continue
+    if [ "$id" = "UNAGEABLE" ]; then
+      echo "::error::cluster ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
+      continue
+    fi
+    if rp_cluster_delete "$id"; then
+      echo "::warning::swept cluster ${id} (${why}, age ${age}s)"
+      deleted_ids="${deleted_ids} ${id}"
+      n=$(( n + 1 ))
+    else
+      echo "::error::sweep could NOT delete cluster ${id}"
+      return 1
+    fi
+  done <<< "$out"
+  if [ -n "$deleted_ids" ]; then
+    # Fail-closed post-delete confirmation, mirroring the pre-delete
+    # enumeration above: a second failed GET here is reported the SAME way,
+    # never silently trusted as "the deletes must have worked".
+    resp="$(_rp_rest GET /v2/clusters)" \
+      || { echo "::error::sweep could NOT re-enumerate clusters after deleting; cannot confirm ${n} deletion(s) took"; return 1; }
+    status="$(printf '%s\n' "$resp" | head -n1)"
+    body="$(printf '%s\n' "$resp" | tail -n +2)"
+    if [ "$status" != "200" ]; then
+      echo "::error::sweep could NOT re-enumerate clusters after deleting; cannot confirm ${n} deletion(s) took: status ${status}"
+      return 1
+    fi
+    for id in $deleted_ids; do
+      printf '%s' "$body" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+cl = d.get('clusters')
+if cl is None:
+    sys.exit(2)
+sys.exit(0 if any(c.get('id') == '${id}' for c in cl) else 1)
+"
+      rc2=$?
+      if [ "$rc2" -eq 1 ]; then
+        continue
+      elif [ "$rc2" -eq 0 ]; then
+        echo "::error::cluster ${id} still present after delete"
+        return 1
+      else
+        echo "::error::sweep could NOT confirm cluster ${id} is gone: malformed re-enumeration body"
+        return 1
+      fi
+    done
+  fi
+  echo "sweep: terminated ${n} orphaned cluster(s)"
 }
 
 # Deploy a live GPU pod, failing over across a candidate list of "CLOUD|GPU_TYPE"
@@ -1994,39 +2494,39 @@ rp_wait_poll() {
 # cannot reason about is far more likely to be a leak than healthy work, and the
 # cost of a wrong sweep is one re-run; the cost of a wrong spare is $187.
 rp_sweep() { # $1=optional override age in hours
-  local override="${1:-}" body out rc id age why n=0
+  local override="${1:-}" body out rc id age why n=0 refused=0 member_ids="" reason_out term_rc
   if [ -n "$override" ]; then
-    case "$override" in
-      ''|*[!0-9]*) echo "::error::reap: hours must be a positive integer (got '${override}')"; return 2 ;;
-    esac
-    # "0" and "00" are all-digit (no non-digit character), so they pass the
-    # shape check above untouched, and the python override BELOW treats any
-    # non-empty override STRING as truthy — `if override:` is true for "0"
-    # just as it is for "8" — giving `limit = 0`, under which every RUNNING
-    # pod's age is "past-deadline-0s": `reap 0` mass-terminates the whole
-    # account's jammi-gpu* fleet instead of refusing. Mirrors the
-    # RP_DEV_TTL_HOURS >0 check in gpu-dev.sh.
-    #
-    # An all-digit override too large for `[ -gt ]`'s arithmetic (e.g. forty
-    # 9s) still refuses — but not with a message naming the real cause. The
-    # `test` builtin errors out on it ("integer expected" / "value too large
-    # for defined data type", bash-version-dependent) with a non-zero status,
-    # which `||` catches the same as an ordinary `false`, so the operator
-    # sees this function's own "hours must be > 0" text layered under bash's
-    # raw builtin error — accurate in effect (refused, exit 2) but not in
-    # wording (an overflow is not "not greater than 0"). Left as-is rather
-    # than special-cased: the shape check above already bounds the digit
-    # count in every REALISTIC input (an operator fat-fingering a TTL), and
-    # a wrong wording on a refusal is not the failure mode this guard exists
-    # to prevent — a wrong wording on an ACCEPTED input would be.
-    #
-    # A leading zero ("08") is deliberately NOT a shape-check rejection: it
-    # is all-digit like any other override, `[ "08" -gt 0 ]` compares it as
-    # decimal (the `test` builtin never applies bash's `$(( ))` octal-prefix
-    # rule), and Python's `int("08")` likewise reads it as decimal 8 — so
-    # `reap 08` sweeps exactly like `reap 8`, never like a rejected or
-    # differently-valued input.
-    [ "$override" -gt 0 ] || { echo "::error::reap: hours must be > 0"; return 2; }
+    # See `_rp_validate_force_hours`'s own doc (shared with rp_cluster_sweep)
+    # for why "0"/"00" refuse rather than sweeping, and why a leading zero
+    # ("08") is accepted like any other digit string.
+    _rp_validate_force_hours "$override" || return 2
+  fi
+  # The cluster-member exclusion set (F8): a pod this tooling would otherwise
+  # judge an ordinary orphan may actually be a LIVE cluster member (a
+  # cluster is retired by deleting the CLUSTER, never one of its pods — see
+  # the cluster primitives section above). This is FAIL-CLOSED, not
+  # belt-and-suspenders: RunPod's own podTerminate refusal on a member pod
+  # (members expose `actions: []`, a LISTING attribute) is UNMEASURED, never
+  # an observed refusal — there is no independent backstop to fall back on
+  # if this enumeration cannot be trusted. "Could not check" never becomes
+  # "act anyway" (the same doctrine gpu-reap.yml states for a failed pod
+  # enumeration, restated here for clusters): a failure here skips the
+  # ENTIRE pod sweep — nothing is terminated, not even an ordinary orphan —
+  # rather than proceeding with an exclusion set this invocation knows is
+  # incomplete.
+  local member_ids_file member_err_file member_err
+  member_ids_file="$(mktemp "${TMPDIR:-/tmp}/jammi-member-ids.XXXXXX")" \
+    || { echo "::error::sweep could NOT enumerate cluster members; pod sweep skipped: could not create a capture file"; return 1; }
+  member_err_file="$(mktemp "${TMPDIR:-/tmp}/jammi-member-err.XXXXXX")" \
+    || { rm -f "$member_ids_file"; echo "::error::sweep could NOT enumerate cluster members; pod sweep skipped: could not create a capture file"; return 1; }
+  if _rp_cluster_member_ids >"$member_ids_file" 2>"$member_err_file"; then
+    member_ids="$(cat "$member_ids_file")"
+    rm -f "$member_ids_file" "$member_err_file"
+  else
+    member_err="$(cat "$member_err_file")"
+    rm -f "$member_ids_file" "$member_err_file"
+    echo "::error::sweep could NOT enumerate cluster members; pod sweep skipped: ${member_err:-unknown reason}"
+    return 1
   fi
   # Captured before parsing — the same capture-then-parse shape as
   # rp_pod_verify's own fix (see its doc): under `set -o pipefail`, a direct
@@ -2040,7 +2540,7 @@ rp_sweep() { # $1=optional override age in hours
   # working out by coincidence.
   body="$(rp_gql '{"query":"query{ myself{ pods{ id name desiredStatus createdAt runtime{ uptimeInSeconds } } } }"}')" \
     || { echo "::error::sweep could NOT enumerate pods; orphans may exist unseen: RunPod query failed"; return 1; }
-  out="$(printf '%s' "$body" | python3 -c "
+  out="$(printf '%s' "$body" | python3 -c "$(_rp_ttl_parser_pysrc)
 import sys, json, datetime
 override = '''$override'''.strip()
 prefix = '$RP_POD_PREFIX'
@@ -2079,10 +2579,8 @@ for p in me['pods']:
     if override:
         limit = int(override) * 3600
     else:
-        tail = name[len(prefix):]
-        if tail.startswith('-ttl') and tail[4:].isdigit():
-            limit = int(tail[4:]) * 3600
-        else:
+        limit = _rp_parse_ttl_seconds(prefix, name)
+        if limit is None:
             print(p['id'], age, 'unparseable-deadline'); continue
     if age > limit:
         print(p['id'], age, 'past-deadline-%ds' % limit)
@@ -2101,11 +2599,20 @@ for p in me['pods']:
       echo "::error::pod ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
       continue
     fi
-    rp_terminate "$id"
-    echo "::warning::swept pod ${id} (${why}, age ${age}s)"
-    n=$(( n + 1 ))
+    if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qx -- "$id"; then
+      echo "cluster member, skipped: ${id}"
+      continue
+    fi
+    reason_out="$(rp_terminate "$id")"; term_rc=$?
+    if [ "$term_rc" -eq 0 ]; then
+      echo "::warning::swept pod ${id} (${why}, age ${age}s)"
+      n=$(( n + 1 ))
+    else
+      echo "::warning::terminate refused: ${reason_out:-unknown reason} (pod ${id})"
+      refused=$(( refused + 1 ))
+    fi
   done <<< "$out"
-  echo "sweep: terminated ${n} orphaned pod(s)"
+  echo "sweep: terminated ${n} orphaned pod(s) (${refused} terminate(s) refused)"
 }
 
 # A ref travels to the pod inside a remote command line, so it is constrained to

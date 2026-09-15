@@ -69,12 +69,20 @@
 # (finding: past-deadline terminates, within-deadline does not) is still
 # covered below.
 #
-# Every network-facing call (`curl`, i.e. every RunPod GraphQL request) is
+# Every network-facing call (`curl`, i.e. every RunPod GraphQL request, AND
+# every REST v2 request the cluster primitives make via `_rp_rest`) is
 # mocked: the function-level groups source runpod_lib.sh directly and
 # override rp_gql / rp_terminate as plain bash function reassignments (legal
 # because we source the file ourselves before redefining them); the CLI-level
 # groups drive gpu-dev.sh as a real subprocess (to exercise its own dispatch,
-# not just the library primitives) with a stub `curl` prepended onto PATH.
+# not just the library primitives) with a stub `curl` prepended onto PATH —
+# the SAME stub answers both shapes (GraphQL payload-in-argv, REST
+# `-X METHOD URL -o file`), defaulting every REST route to a harmless empty
+# list so a fixture that never mentions clusters at all is unaffected by
+# their existence (`gpu-dev.sh reap`'s own regressions below are exactly
+# this: `rp_cluster_sweep` now runs alongside `rp_sweep`, sees an empty
+# account, and stays green). `ci/scripts/test_runpod_cluster_lib.sh` is the
+# suite that actually exercises the cluster primitives' own behavior.
 # `ssh` is never mocked — every fixture that needs an "unreachable pod"
 # points at 127.0.0.1 on a closed local port, which the kernel refuses
 # instantly with no network traffic; no fixture in this file needs a
@@ -129,6 +137,70 @@ CALL_LOG="$SANDBOX/calls.log"
 # process with no memory of the last one.
 cat > "$STUBBIN/curl" <<'STUB'
 #!/usr/bin/env bash
+# REST v2 (`_rp_rest`, the cluster primitives): recognized by a `-X METHOD`
+# and an `https://api.runpod.io/v2/...` URL among the args (the GraphQL
+# shape below never carries either). Status/body are split the same way the
+# real API's response would be: `-o "$outfile"` gets the body, the status
+# code is this stub's own STDOUT (mirroring `-w '%{http_code}'`). Every
+# route defaults to a HARMLESS empty-list 200 unless a test sets one of the
+# MOCK_CLUSTER_* overrides below — the module's own "reap works against an
+# untouched account" regressions never need to know clusters exist at all.
+method="" url="" outfile=""
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+  a="${args[$i]}"
+  case "$a" in
+    -X) i=$((i + 1)); method="${args[$i]}" ;;
+    -o) i=$((i + 1)); outfile="${args[$i]}" ;;
+    https://api.runpod.io/v2/*) url="$a" ;;
+  esac
+  i=$((i + 1))
+done
+if [ -n "$url" ]; then
+  [ -n "${MOCK_CLUSTER_CALL_LOG:-}" ] && printf '%s %s\n' "$method" "$url" >> "$MOCK_CLUSTER_CALL_LOG"
+  status="200" body='{"clusters":[]}'
+  case "$url" in
+    */v2/clusters)
+      case "$method" in
+        GET)
+          status="${MOCK_CLUSTER_LIST_STATUS:-200}"
+          if [ -n "${MOCK_CLUSTER_LIST_RESPONSE:-}" ] && [ -f "$MOCK_CLUSTER_LIST_RESPONSE" ]; then
+            body="$(cat "$MOCK_CLUSTER_LIST_RESPONSE")"
+          else
+            body='{"clusters":[]}'
+          fi ;;
+        POST)
+          status="${MOCK_CLUSTER_CREATE_STATUS:-201}"
+          if [ -n "${MOCK_CLUSTER_CREATE_RESPONSE:-}" ] && [ -f "$MOCK_CLUSTER_CREATE_RESPONSE" ]; then
+            body="$(cat "$MOCK_CLUSTER_CREATE_RESPONSE")"
+          else
+            body='{"id":"cl_test"}'
+          fi ;;
+      esac ;;
+    */v2/clusters/*/pods)
+      status="${MOCK_CLUSTER_PODS_STATUS:-200}"
+      if [ -n "${MOCK_CLUSTER_PODS_RESPONSE:-}" ] && [ -f "$MOCK_CLUSTER_PODS_RESPONSE" ]; then
+        body="$(cat "$MOCK_CLUSTER_PODS_RESPONSE")"
+      else
+        body='{"pods":[]}'
+      fi ;;
+    */v2/clusters/*)
+      case "$method" in
+        DELETE) status="${MOCK_CLUSTER_DELETE_STATUS:-204}"; body="" ;;
+        GET)
+          status="${MOCK_CLUSTER_GET_STATUS:-200}"
+          if [ -n "${MOCK_CLUSTER_GET_RESPONSE:-}" ] && [ -f "$MOCK_CLUSTER_GET_RESPONSE" ]; then
+            body="$(cat "$MOCK_CLUSTER_GET_RESPONSE")"
+          else
+            body='{"id":"cl_test"}'
+          fi ;;
+      esac ;;
+  esac
+  [ -n "$outfile" ] && printf '%s' "$body" > "$outfile"
+  printf '%s' "$status"
+  exit 0
+fi
 payload=""
 for a in "$@"; do
   case "$a" in

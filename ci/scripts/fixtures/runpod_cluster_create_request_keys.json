@@ -1,0 +1,10 @@
+{
+  "_source": "RunPod REST v2 OpenAPI document (https://api.runpod.io/v2/openapi.json), components.schemas.CreateClusterRequest (allOf BaseContainerConfig + the cluster-specific object) and components.schemas.ClusterCompute, read 2026-09-14. `CreateClusterRequest` is `unevaluatedProperties: false` -- a request body may use ONLY these top-level keys, and `_rp_cluster_payload` (ci/scripts/runpod_lib.sh) is asserted against this exact set by ci/scripts/test_runpod_cluster_lib.sh so a future OpenAPI drift is caught here rather than live.",
+  "top_level_keys": [
+    "args", "compute", "dataCenterIds", "disk", "env", "image", "mounts",
+    "name", "ports", "startJupyter", "startSsh", "type"
+  ],
+  "top_level_required": ["name", "type", "compute"],
+  "compute_keys": ["gpuCountPerPod", "gpuTypeId", "podCount"],
+  "compute_required": ["gpuTypeId", "gpuCountPerPod", "podCount"]
+}

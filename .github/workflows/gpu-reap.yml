@@ -1,11 +1,17 @@
 name: GPU reap (RunPod orphans)
 
-# Terminates RunPod pods this repo rented that have outlived their own deadline.
+# Terminates RunPod pods AND deletes RunPod clusters this repo rented that
+# have outlived their own deadline.
 #
 # Every pod carries a deadline in its entrypoint, armed before anything else the
-# container does. This sweep is the independent backstop for the case that
-# deadline never got armed — a pod whose container died early, or a host that
-# stopped reporting.
+# container does; every cluster carries the SAME deadline shape in its member
+# pods' shared entrypoint (`_rp_entrypoint_setup`, `runpod_lib.sh`) — but a
+# cluster member's own self-termination is UNMEASURED (RunPod's REST v2
+# surface reports member pods with `actions: []`), so this sweep is the
+# PRIMARY backstop for clusters, not merely a secondary one the way it is for
+# pods. This sweep is the independent backstop for the case that deadline
+# never got armed — a pod whose container died early, or a host that stopped
+# reporting.
 #
 # It is a SEPARATE workflow on purpose. The sweep also runs at the top of
 # `runpod_gpu_prove.sh`, but that only helps when the prove lane runs; the prove
@@ -13,8 +19,22 @@ name: GPU reap (RunPod orphans)
 # A backstop that only works when the thing it backs up is healthy is not a
 # backstop.
 #
-# It fails the run when it cannot enumerate pods. "Could not check" must never be
-# reported as "nothing to clean up" — that is how a guard silently stops guarding.
+# It fails the run when it cannot enumerate pods OR clusters — EITHER
+# enumeration failing fails the whole run, even when the other one succeeded.
+# "Could not check" must never be reported as "nothing to clean up" — that is
+# how a guard silently stops guarding. A cluster is never reaped by
+# terminating one of its member pods (`rp_sweep`'s own pod sweep excludes
+# every id `rp_cluster_sweep`'s enumeration reports as a live member) — only
+# `rp_cluster_delete` (the cluster's own object) retires it.
+#
+# The pod sweep itself is FAIL-CLOSED on the cluster-member exclusion set: if
+# it cannot enumerate cluster members, it terminates NOTHING that run — not
+# even an ordinary, genuinely-orphaned pod — rather than guess an incomplete
+# exclusion set is safe. RunPod's own podTerminate refusal on a member pod
+# (members expose `actions: []`, a LISTING attribute, never an OBSERVED
+# refusal) is not a backstop this doctrine leans on. This is the pod sweep
+# SUSPENDED for that one run while the cluster API is unreachable, never
+# weakened to "sweep pods anyway and hope no member gets caught".
 
 on:
   schedule:
@@ -23,7 +43,7 @@ on:
   workflow_dispatch:
     inputs:
       force_hours:
-        description: "Force-reap every jammi pod older than this many hours (leave empty to honour each pod's own deadline)."
+        description: "Force-reap every jammi pod AND cluster older than this many hours (leave empty to honour each pod/cluster's own deadline)."
         type: string
         required: false
 

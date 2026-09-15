@@ -14,6 +14,22 @@
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
 
+/// The train/validation split boundary over a row COUNT alone (#500 U2c
+/// §10): the last `round(total * fraction)` rows go to validation, so the
+/// train prefix is `[0, split_index(total, fraction))`. The ONE place this
+/// arithmetic is spelled — [`TrainingDataLoader::split`] (over an already
+/// in-memory row/batch count) and [`super::source::StreamedSet`]'s
+/// `train_count` (over a catalog row count, no scan) both call this, so a
+/// resident loader and a streamed source over the SAME `(total, fraction)`
+/// can never disagree about where the boundary falls. Pinned for every
+/// `total ∈ 0..=1000` and every fraction the config admits by
+/// `source::split_index_matches_the_resident_split_boundary` in this
+/// crate's test suite.
+pub(crate) fn split_index(total: usize, fraction: f64) -> usize {
+    let val_count = (total as f64 * fraction).round() as usize;
+    total - val_count
+}
+
 /// A training batch — either contrastive pairs or triplets.
 #[derive(Clone)]
 pub enum TrainingBatch {
@@ -586,11 +602,16 @@ impl TrainingDataLoader {
     }
 
     /// Deterministic split: last `fraction` of data goes to validation.
+    ///
+    /// The train/validation boundary itself is `split_index` — the SAME
+    /// arithmetic a [`super::source::StreamedSet`] uses to derive its own
+    /// `train_count` from a row COUNT alone (#500 U2c §10), so a resident
+    /// loader's split and a streamed source's window never disagree about
+    /// where the boundary falls for the same `(total, fraction)`.
     pub fn split(&self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
         match &self.data {
             LoaderData::TextRows(rows) => {
-                let val_count = (rows.len() as f64 * fraction).round() as usize;
-                let train_count = rows.len() - val_count;
+                let train_count = split_index(rows.len(), fraction);
                 (
                     TrainingDataLoader {
                         format: self.format,
@@ -603,8 +624,7 @@ impl TrainingDataLoader {
                 )
             }
             LoaderData::Precomputed(batches) => {
-                let val_count = (batches.len() as f64 * fraction).round() as usize;
-                let train_count = batches.len() - val_count;
+                let train_count = split_index(batches.len(), fraction);
                 (
                     TrainingDataLoader {
                         format: self.format,

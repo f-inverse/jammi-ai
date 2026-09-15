@@ -1168,7 +1168,10 @@ mod tests {
             "text_b".to_string(),
             "score".to_string(),
         ];
-        let (table, _) = crate::fine_tune::training_set::materialize_projection(
+        // Table only — this test never reads the rows back, so it routes
+        // through the table-only form (#500 U2c c3b) rather than discarding
+        // an eager `Vec<RecordBatch>` collect it never needed.
+        let table = crate::fine_tune::training_set::materialize_projection_table(
             &session,
             "training",
             &columns,

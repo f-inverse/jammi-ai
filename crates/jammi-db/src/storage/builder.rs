@@ -360,6 +360,24 @@ pub struct BuilderSeeds {
     gcs: Option<object_store::gcp::GoogleCloudStorageBuilder>,
     #[cfg(feature = "storage-azure")]
     azure: Option<object_store::azure::MicrosoftAzureBuilder>,
+    /// The variables themselves, for the ONE host value object_store reads
+    /// with a bare `std::env::var` at `build()` time instead of through its
+    /// key tables (`AZURITE_BLOB_STORAGE_URL`, the Azure emulator arm):
+    /// `None` means the process environment, as `build()` itself reads it.
+    #[cfg_attr(not(feature = "storage-azure"), allow(dead_code))]
+    vars: Option<std::collections::BTreeMap<String, String>>,
+}
+
+impl BuilderSeeds {
+    /// A variable exactly as object_store's own bare `std::env::var` read
+    /// at `build()` would see it: from the explicit set, or the process.
+    #[cfg(feature = "storage-azure")]
+    fn raw(&self, key: &str) -> Option<String> {
+        match &self.vars {
+            Some(vars) => vars.get(key).cloned(),
+            None => std::env::var(key).ok(),
+        }
+    }
 }
 
 impl BuilderSeeds {
@@ -372,6 +390,7 @@ impl BuilderSeeds {
             gcs: Some(object_store::gcp::GoogleCloudStorageBuilder::from_env()),
             #[cfg(feature = "storage-azure")]
             azure: Some(object_store::azure::MicrosoftAzureBuilder::from_env()),
+            vars: None,
         }
     }
 
@@ -393,9 +412,11 @@ impl BuilderSeeds {
         let mut gcs = object_store::gcp::GoogleCloudStorageBuilder::new();
         #[cfg(feature = "storage-azure")]
         let mut azure = object_store::azure::MicrosoftAzureBuilder::new();
+        let mut raw = std::collections::BTreeMap::new();
         for (key, value) in vars {
             let key = key.as_ref();
             let value: String = value.into();
+            raw.insert(key.to_string(), value.clone());
             let lowered = key.to_ascii_lowercase();
             #[cfg(any(feature = "storage-s3", feature = "storage-r2"))]
             if key.starts_with("AWS_") {
@@ -424,6 +445,7 @@ impl BuilderSeeds {
             gcs: Some(gcs),
             #[cfg(feature = "storage-azure")]
             azure: Some(azure),
+            vars: Some(raw),
         }
     }
 }
@@ -435,7 +457,11 @@ impl BuilderSeeds {
 /// an endpoint, account, emulator or base URL (`AWS_ENDPOINT_URL`,
 /// `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, `AZURE_STORAGE_ENDPOINT`,
 /// `AZURE_STORAGE_ACCOUNT_NAME`, `GOOGLE_BASE_URL`, …) is honoured here
-/// exactly as at dial time, with no list of spellings of this crate's own.
+/// exactly as at dial time. The one host value object_store reads with a
+/// bare `std::env::var` outside its key tables — `AZURITE_BLOB_STORAGE_URL`,
+/// in the Azure emulator arm — is read the same way here (its default
+/// included), so the identity spells exactly the variables the driver
+/// spells and no others.
 /// Sorted `(key, value)` pairs; empty when the service's default host is
 /// dialled. A scheme whose storage feature is compiled out has no
 /// determinants (`Ok(empty)`): such a build cannot dial the scheme at all
@@ -586,20 +612,36 @@ fn azure_determinants(
         .with_container_name(container);
     let builder = configure_azure(base, config);
     let mut pairs = Vec::new();
+    let flag = |key: K| builder.get_config_value(&key).as_deref() == Some("true");
+    if flag(K::UseEmulator) {
+        // `build()`'s emulator arm: the host is `AZURITE_BLOB_STORAGE_URL`
+        // (a bare env read, default `http://127.0.0.1:10000`) and the
+        // account, defaulting to the emulator's, is a path segment; the
+        // endpoint and Fabric switch are ignored there.
+        pairs.push(("use_emulator", "true".to_string()));
+        pairs.push((
+            "emulator_url",
+            present(seeds.raw("AZURITE_BLOB_STORAGE_URL"))
+                .unwrap_or_else(|| "http://127.0.0.1:10000".to_string()),
+        ));
+        pairs.push((
+            "account",
+            present(builder.get_config_value(&K::AccountName))
+                .unwrap_or_else(|| "devstoreaccount1".to_string()),
+        ));
+        return Ok(pairs);
+    }
     // The account URL is the endpoint when set, else derived from the
-    // account name; the emulator and Fabric switches change the host too.
+    // account name — on the Fabric host when that switch is on.
     if let Some(account) = present(builder.get_config_value(&K::AccountName)) {
         pairs.push(("account", account));
     }
-    if let Some(endpoint) = present(builder.get_config_value(&K::Endpoint)) {
-        pairs.push(("endpoint", endpoint));
-    }
-    for (key, name) in [
-        (K::UseEmulator, "use_emulator"),
-        (K::UseFabricEndpoint, "use_fabric_endpoint"),
-    ] {
-        if builder.get_config_value(&key).as_deref() == Some("true") {
-            pairs.push((name, "true".to_string()));
+    match present(builder.get_config_value(&K::Endpoint)) {
+        Some(endpoint) => pairs.push(("endpoint", endpoint)),
+        None => {
+            if flag(K::UseFabricEndpoint) {
+                pairs.push(("use_fabric_endpoint", "true".to_string()));
+            }
         }
     }
     Ok(pairs)
@@ -806,9 +848,35 @@ mod tests {
                 "{spelling}"
             );
         }
+        // The emulator arm dials AZURITE_BLOB_STORAGE_URL (a bare env read
+        // in object_store, default 127.0.0.1:10000) with the account as a
+        // path segment, and ignores the endpoint.
         assert_eq!(
             of(&[("AZURE_STORAGE_USE_EMULATOR", "true")]),
-            vec![("use_emulator", "true".to_string())]
+            vec![
+                ("account", "devstoreaccount1".to_string()),
+                ("emulator_url", "http://127.0.0.1:10000".to_string()),
+                ("use_emulator", "true".to_string()),
+            ]
+        );
+        assert_ne!(
+            of(&[
+                ("AZURE_STORAGE_USE_EMULATOR", "true"),
+                ("AZURITE_BLOB_STORAGE_URL", "http://host-a:10000")
+            ]),
+            of(&[
+                ("AZURE_STORAGE_USE_EMULATOR", "true"),
+                ("AZURITE_BLOB_STORAGE_URL", "http://host-b:10000")
+            ]),
+            "two Azurite hosts are two locations"
+        );
+        assert_eq!(
+            of(&[
+                ("AZURE_STORAGE_USE_EMULATOR", "true"),
+                ("AZURE_STORAGE_ENDPOINT", "https://ignored")
+            ]),
+            of(&[("AZURE_STORAGE_USE_EMULATOR", "true")]),
+            "the endpoint is ignored in emulator mode, as build() ignores it"
         );
         assert_eq!(
             of(&[

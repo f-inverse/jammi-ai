@@ -171,8 +171,9 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   constructs for that root (`storage::location_determinants`: the process
   environment first, `[storage.cloud]` on top — the S3/R2 endpoint the
   driver dials whatever spelling set it, the Azure account, endpoint,
-  emulator and Fabric switches, the GCS base URL; no variable is spelled by
-  the identity itself, so nothing the driver honours can be missed), a local root is created (as the store creates it at open) and
+  Azurite host in emulator mode, Fabric switch, the GCS base URL; the
+  identity spells exactly the variables the driver spells, so nothing the
+  driver honours can be missed), a local root is created (as the store creates it at open) and
   canonicalised on the owning host's filesystem (symlinks, `.`/`..`, the
   filesystem's own spelling), and an in-memory root is refused at
   registration as unshareable. Two members whose spellings

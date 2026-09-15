@@ -222,9 +222,12 @@ impl std::fmt::Display for MemberRoot {
 ///   applies): the S3/R2 endpoint the driver dials (`s3_endpoint` over
 ///   `endpoint`, whatever spelling set either — `AWS_ENDPOINT_URL`,
 ///   `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, or the config), the Azure
-///   account, endpoint, emulator and Fabric switches, the GCS base URL.
-///   Nothing here spells a variable of its own, so a spelling object_store
-///   accepts can never be one the identity misses. Two buckets of one name
+///   account, endpoint (or the Azurite host and account in emulator mode),
+///   the Fabric switch, the GCS base URL. The identity spells exactly the
+///   variables the driver spells — none through its key tables, and the one
+///   bare read the driver makes (`AZURITE_BLOB_STORAGE_URL`) the same way
+///   — so a value the driver honours is never one the identity misses. Two
+///   buckets of one name
 ///   behind two endpoints or
 ///   accounts are two locations. Bucket and container names
 ///   are case-insensitive by their services' rules; object keys are not.

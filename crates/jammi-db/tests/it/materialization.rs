@@ -948,6 +948,106 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     );
 }
 
+/// #500 U2c c3c, P-M(i): the training-set WRITER's full-tuple sort plans at
+/// exactly ONE output partition and never builds a
+/// `SortPreservingMergeExec` — the SAME single-partition derivation
+/// ([`jammi_db::session::single_partition_context`]) that
+/// [`ResultStore::materialize_training_set`]'s own `plan_training_set_rows`
+/// calls (a private method; reproduced here byte-for-byte the way this
+/// file's own read-back plan-shape test above reproduces the registration's
+/// EXPLAIN), exercised at the session's OWN `target_partitions` in `{1, 4}`.
+///
+/// A FILE-backed source, not [`ts_session`]'s `MemTable`: a `MemTable`'s
+/// partition count is fixed at construction and never collapses just
+/// because `target_partitions` changed, so it cannot stand in for
+/// production's actual shape here — every real `materialize_training_set`
+/// caller's `source_sql` scans a `ListingTable` (`session.add_source`, a
+/// registered CSV/Parquet source, or a pinned result table's own
+/// `ListingTable`-backed provider), whose file-GROUP count DOES follow
+/// `target_partitions` (empirically: an 80 MiB single file plans as exactly
+/// one file group at `target_partitions = 1`, the mechanism
+/// `crates/jammi-ai/tests/it/training_set_stream.rs`'s
+/// `f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_
+/// through_the_stream` exercises end to end). `repartition_file_min_size` is
+/// forced to `1` so even this test's small file splits into multiple groups
+/// at the OUTER session's `target_partitions = 4` — otherwise the pin would
+/// be vacuous there (a file this small would never split on its own). The
+/// c3b regression this unit fixes was exactly a `target_partitions > 1`
+/// write building a real `SortPreservingMergeExec` that filled the pool
+/// before it could reserve its own few MB.
+#[test_case(1 ; "target_partitions_1")]
+#[test_case(4 ; "target_partitions_4")]
+#[tokio::test]
+async fn the_writers_single_partition_derivation_plans_one_sort_and_no_merge(
+    target_partitions: usize,
+) {
+    use datafusion::common::Column;
+    use datafusion::logical_expr::Expr;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::prelude::{CsvReadOptions, SessionConfig};
+
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("rows.csv");
+    let mut body = String::from("q,a\n");
+    for i in 0..64u32 {
+        body.push_str(&format!("q{i:04},a{i:04}\n"));
+    }
+    std::fs::write(&csv_path, body).unwrap();
+
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_target_partitions(target_partitions),
+    );
+    ctx.register_csv("rows", csv_path.to_str().unwrap(), CsvReadOptions::new())
+        .await
+        .unwrap();
+    ctx.sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let columns = ts_columns();
+
+    // Byte-for-byte `plan_training_set_rows`'s own construction
+    // (`crates/jammi-db/src/store/mod.rs`): a `Column::new_unqualified`
+    // projection (never the parsing `col(..)` helper) over the SAME
+    // single-partition derivation, sorted ascending, NULLS FIRST.
+    let single_partition_ctx = jammi_db::session::single_partition_context(&ctx);
+    let projection: Vec<Expr> = columns
+        .iter()
+        .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
+        .collect();
+    let sorted = single_partition_ctx
+        .sql("SELECT * FROM rows")
+        .await
+        .unwrap()
+        .select(projection.clone())
+        .unwrap()
+        .sort(
+            projection
+                .into_iter()
+                .map(|e| e.sort(true, true))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let plan = sorted.create_physical_plan().await.unwrap();
+
+    assert_eq!(
+        plan.output_partitioning().partition_count(),
+        1,
+        "the writer's single-partition derivation must plan exactly one output partition \
+         regardless of the session's own target_partitions ({target_partitions})"
+    );
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(
+        !text.contains("SortPreservingMergeExec"),
+        "the writer's plan must never merge partition-local sorted runs: {text}"
+    );
+}
+
 /// Regression (hard-block, contract `feat_500-B-U2c`): a projected column
 /// name is data, never a fragment of SQL to re-parse. `"meta.id"` and
 /// `"id"` are both admitted by `TrainingSetSpec::validate_columns` (no rule

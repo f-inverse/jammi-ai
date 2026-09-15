@@ -340,6 +340,16 @@ enum LoaderData {
 pub struct TrainingDataLoader {
     format: TrainingFormat,
     data: LoaderData,
+    /// The eager collected batches' pool reservation, held for this loader's
+    /// own lifetime (#500 U2c c3c, P-R) — `None` for every loader that never
+    /// went through a pool-accounted collect (every `from_*` constructor
+    /// below builds one this way; `training_set::read_back_with_reservation`'s
+    /// caller attaches the real one via [`Self::with_reservation`]).
+    /// `MemoryReservation`'s own `Drop` frees its held bytes back to the pool
+    /// the instant the LAST reservation over it goes out of scope — no
+    /// manual `Drop` impl is needed on this type for the same reason
+    /// [`super::stream::OwnedChunk`] needs none.
+    reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
 }
 
 /// Text data for one training example.
@@ -393,6 +403,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -405,6 +416,7 @@ impl TrainingDataLoader {
                     .map(|(text, label)| TrainingRow::Classification { text, label })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -420,6 +432,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -435,6 +448,7 @@ impl TrainingDataLoader {
                     .map(|(text, target)| TrainingRow::Regression { text, target })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -451,6 +465,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -468,6 +483,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -522,6 +538,7 @@ impl TrainingDataLoader {
         Ok(Self {
             format: TrainingFormat::Graph { has_negatives },
             data: LoaderData::TextRows(rows),
+            reservation: None,
         })
     }
 
@@ -544,6 +561,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -560,6 +578,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -571,7 +590,22 @@ impl TrainingDataLoader {
         Self {
             format: TrainingFormat::Contrastive,
             data: LoaderData::Precomputed(batches),
+            reservation: None,
         }
+    }
+
+    /// Attach the eager collected read's pool reservation to this loader,
+    /// moving ownership in: the bytes it reserved release only when this
+    /// loader (or whichever half of a [`Self::split`] carries it) drops
+    /// (#500 U2c c3c, P-R). `pub(crate)`: only `worker.rs`'s Resident
+    /// construction site calls this — every `from_*` constructor above
+    /// stays reservation-free by design.
+    pub(crate) fn with_reservation(
+        mut self,
+        reservation: datafusion::execution::memory_pool::MemoryReservation,
+    ) -> Self {
+        self.reservation = Some(reservation);
+        self
     }
 
     /// Total number of data points (rows for text, batches for precomputed).
@@ -608,7 +642,21 @@ impl TrainingDataLoader {
     /// `train_count` from a row COUNT alone (#500 U2c §10), so a resident
     /// loader's split and a streamed source's window never disagree about
     /// where the boundary falls for the same `(total, fraction)`.
+    ///
+    /// **The eager reservation moves to the TRAIN half** (#500 U2c c3c,
+    /// P-R): `self`'s ENTIRE currently-held reservation is carved, by
+    /// `MemoryReservation::split`, into a fresh reservation the returned
+    /// train loader owns — `self`'s own copy is left at size zero (still
+    /// registered, releasing nothing extra when `self` itself later drops)
+    /// — so the pool accounting follows the loader that actually stays
+    /// resident through every epoch, never the transient pre-split original
+    /// or the validation half this run reads only occasionally. The moment
+    /// of the split briefly holds BOTH the original rows and the two cloned
+    /// `Vec`s the match arms below build (a stated, transient 2× — see the
+    /// module doc) before `self` (and its now-empty reservation) drops in
+    /// the caller.
     pub fn split(&self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
+        let train_reservation = self.reservation.as_ref().map(|r| r.split(r.size()));
         match &self.data {
             LoaderData::TextRows(rows) => {
                 let train_count = split_index(rows.len(), fraction);
@@ -616,10 +664,12 @@ impl TrainingDataLoader {
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::TextRows(rows[..train_count].to_vec()),
+                        reservation: train_reservation,
                     },
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::TextRows(rows[train_count..].to_vec()),
+                        reservation: None,
                     },
                 )
             }
@@ -629,10 +679,12 @@ impl TrainingDataLoader {
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::Precomputed(batches[..train_count].to_vec()),
+                        reservation: train_reservation,
                     },
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::Precomputed(batches[train_count..].to_vec()),
+                        reservation: None,
                     },
                 )
             }

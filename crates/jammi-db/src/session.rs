@@ -1155,6 +1155,46 @@ impl JammiSession {
     }
 }
 
+/// Derive a single-`target_partitions` [`SessionContext`] from `ctx`'s own
+/// state — keeping every other analyzer rule (in particular the tenant-scope
+/// rule), every registered catalog, and the memory pool. `ctx.state()` is a
+/// cheap clone (no I/O); nothing here executes a row.
+///
+/// The ONE derivation two independent single-partition plans build through
+/// (#500 U2c c3c — a single source, cited by both, replacing a duplicate
+/// `jammi-ai`-side copy):
+/// - [`crate::store::ResultStore::materialize_training_set`]'s writer plans
+///   its explicit full-tuple sort at `target_partitions = 1` so the physical
+///   plan is ONE external sort at ONE output partition, never a partitioned
+///   local-sort-plus-`SortPreservingMergeExec` merge — the residency this
+///   pays is O(one batch) plus DataFusion's own spill reservation for that
+///   single sort, never O(the whole table).
+/// - `jammi-ai`'s per-rank `TrainingSetStream` reads an already-sorted,
+///   `with_file_sort_order`-declared table the same way: at
+///   `target_partitions = 1` the scan plans as a bare `DataSourceExec` with
+///   no merge and no DataFusion-side reservation of its own.
+///
+/// Both callers derive fresh state per query rather than sharing one derived
+/// [`SessionContext`], since deriving is cheap and a shared one would need
+/// its own synchronization for no benefit.
+pub fn single_partition_context(ctx: &SessionContext) -> SessionContext {
+    // A direct `config_mut()` edit on an owned clone of `ctx`'s own state —
+    // deliberately NOT `SessionStateBuilder::new_from_existing(..).with_config(..)`:
+    // that builder's `build()` re-creates the default catalog whenever the
+    // config it ends up with has `create_default_catalog_and_schema` set (an
+    // `Arc<SessionConfig>::clone().with_target_partitions(1)` off the
+    // ORIGINAL config carries that flag at its default, `true`, clobbering
+    // the `false` `new_from_existing` itself had just computed because the
+    // default catalog already existed) — silently REPLACING the caller's
+    // populated default catalog with an empty one, so every table the
+    // caller registered under it (a `ListingTable`, a test's `MemTable`)
+    // stops resolving. `state()` is a cheap clone (its fields are `Arc`s);
+    // mutating `target_partitions` in place touches nothing else.
+    let mut state = ctx.state();
+    state.config_mut().options_mut().execution.target_partitions = 1;
+    SessionContext::new_with_state(state)
+}
+
 /// Resolve the signing-key store selected by `config.signing_key`:
 /// [`EnvSigningKeyStore`] for `env`, [`FileSigningKeyStore`] for `file`.
 /// Callers that need a store this config cannot name (a KMS adapter) inject

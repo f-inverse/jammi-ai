@@ -210,26 +210,57 @@ pub async fn materialize(
 /// guard through every `Vec<RecordBatch>` return site this function has), so
 /// this is a load-time check on what was just collected, not a continuously
 /// held accounting of how long the caller keeps the batches afterward —
-/// stated, not hidden.
+/// stated, not hidden. A caller that instead needs the residency HELD for as
+/// long as it keeps the rows (the production `Resident` binding,
+/// `worker.rs::run_spec`) calls [`read_back_with_reservation`], not this
+/// function.
 pub async fn read_back(
     session: &InferenceSession,
     table: &TrainingSetTable,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     let batches = session.sql(&read_back_sql(table, columns)).await?;
-    reserve_eager_batches(session, &batches)?;
+    // Checked, then released immediately — this function's own contract
+    // (its doc above), unlike `read_back_with_reservation`'s.
+    reserve_eager_batches(session, &batches)?.free();
     Ok(batches)
 }
 
+/// [`read_back`]'s twin for a caller that must KEEP the eager reservation
+/// alive after this call returns (#500 U2c c3c, P-R): reserves the SAME
+/// `training_set_eager`-named bytes and hands the live
+/// [`MemoryReservation`](datafusion::execution::memory_pool::MemoryReservation)
+/// back rather than freeing it — the caller attaches it to whatever owns the
+/// rows for as long as they stay resident
+/// (`super::data::TrainingDataLoader::with_reservation`) so the pool
+/// reflects an eager Resident loader's true residency for its whole
+/// lifetime, not just the instant this call returns.
+pub async fn read_back_with_reservation(
+    session: &InferenceSession,
+    table: &TrainingSetTable,
+    columns: &[String],
+) -> Result<(
+    Vec<RecordBatch>,
+    datafusion::execution::memory_pool::MemoryReservation,
+)> {
+    let batches = session.sql(&read_back_sql(table, columns)).await?;
+    let reservation = reserve_eager_batches(session, &batches)?;
+    Ok((batches, reservation))
+}
+
 /// The eager reservation check (see [`read_back`]'s doc): reserve
-/// and immediately release `batches`' total `get_array_memory_size()` against
-/// `session.memory_pool()` under a dedicated `MemoryConsumer`, surfacing a
-/// typed [`jammi_db::error::JammiError::ResourcesExhausted`] naming
-/// `training_set_eager` when the pool refuses it.
+/// `batches`' total `get_array_memory_size()` against `session.memory_pool()`
+/// under a dedicated `MemoryConsumer`, surfacing a typed
+/// [`jammi_db::error::JammiError::ResourcesExhausted`] naming
+/// `training_set_eager` when the pool refuses it. Returns the GROWN,
+/// still-live reservation — a caller that wants the old "check, then
+/// release" behaviour calls `.free()` on it itself (as [`read_back`] does);
+/// a caller that wants the residency held calls [`read_back_with_reservation`]
+/// and keeps the reservation this returns.
 fn reserve_eager_batches(
     session: &InferenceSession,
     batches: &[RecordBatch],
-) -> jammi_db::error::Result<()> {
+) -> jammi_db::error::Result<datafusion::execution::memory_pool::MemoryReservation> {
     let total_bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
     let pool = session.memory_pool();
     let reservation = datafusion::execution::memory_pool::MemoryConsumer::new("training_set_eager")
@@ -237,8 +268,7 @@ fn reserve_eager_batches(
     reservation
         .try_grow(total_bytes)
         .map_err(jammi_db::error::JammiError::from)?;
-    reservation.free();
-    Ok(())
+    Ok(reservation)
 }
 
 /// The reader-class allow-list: every call site in the workspace, outside test

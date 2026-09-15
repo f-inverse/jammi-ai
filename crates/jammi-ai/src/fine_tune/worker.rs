@@ -2055,9 +2055,12 @@ impl JobWorker {
 
                 let (table, training_source) = if whole_set_arm.is_some() {
                     // Resident: the eager arm — materialise, then read the
-                    // whole table back into memory (unchanged from before
-                    // this unit).
-                    let (table, batches) = training_set::materialize_projection(
+                    // whole table back into memory, HOLDING the eager
+                    // read's pool reservation for the loader's own lifetime
+                    // (#500 U2c c3c, P-R) rather than checking-then-
+                    // releasing it (`training_set::read_back`'s own
+                    // contract, which every OTHER caller still gets).
+                    let table = training_set::materialize_projection_table(
                         session,
                         &source,
                         &columns,
@@ -2066,8 +2069,13 @@ impl JobWorker {
                     )
                     .await
                     .map_err(WorkerJobError::from)?;
+                    let (batches, reservation) =
+                        training_set::read_back_with_reservation(session, &table, &columns)
+                            .await
+                            .map_err(WorkerJobError::from)?;
                     let loader = build_training_data_loader(&batches, &columns, task)
-                        .map_err(WorkerJobError::from)?;
+                        .map_err(WorkerJobError::from)?
+                        .with_reservation(reservation);
                     // The tag the table was WRITTEN under and the shape its
                     // loader reports come from one classifier, so a
                     // mismatch is a broken engine invariant rather than a
@@ -2135,13 +2143,12 @@ impl JobWorker {
                         None
                     };
 
-                    // A fixed, conservative double-buffer depth: no config
-                    // knob exposes this yet (a future unit's work), and `2`
-                    // is a value P3/P4's oracles exercise directly (a
-                    // regression pin for the excised arm's `prefetch = 2`
-                    // deadlock — CONTRACT-U2c.md §1 M3).
-                    let stream_cfg = crate::fine_tune::stream::StreamConfig::new(2)
-                        .map_err(WorkerJobError::from)?;
+                    // `PRODUCTION_PREFETCH_DEPTH` — see its own doc for why
+                    // this is a named constant, never a literal here.
+                    let stream_cfg = crate::fine_tune::stream::StreamConfig::new(
+                        crate::fine_tune::stream::PRODUCTION_PREFETCH_DEPTH,
+                    )
+                    .map_err(WorkerJobError::from)?;
 
                     let streamed = crate::fine_tune::source::StreamedSet {
                         session: Arc::clone(session),

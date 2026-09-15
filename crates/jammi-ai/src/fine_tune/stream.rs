@@ -71,28 +71,13 @@
 //!
 //! The loader's own query plans at a SINGLE output partition —
 //! `Self::open` derives a loader-local one-`target_partitions`
-//! `SessionState` from the caller's session (keeping its tenant analyzer
-//! rule, catalogs, and memory pool) — so on a sorted single-fragment table
-//! UNDER DataFusion 54.1's default `repartition_file_min_size` (~10 MiB)
-//! this plans a bare scan with NO `SortPreservingMergeExec` and NO
-//! DataFusion-side reservation of its own: the merge term is ZERO by
-//! construction, which is why it does not appear in the inequality above.
-//! **Above that threshold it is NOT zero**: a single Parquet file larger
-//! than the threshold is scanned as several read-time file groups
-//! regardless of `target_partitions` — `target_partitions = 1` only bounds
-//! how many partitions those groups get merged DOWN to, never whether the
-//! scan itself starts multi-partition — so combining them in committed
-//! order needs a real `SortPreservingMergeExec`/`ExternalSorter`
-//! reservation this derivation does not eliminate (found executing #500
-//! U2c §11 F1's own attempted oracle: `training_set_stream.rs`'s
-//! `f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_
-//! through_the_stream` doc records six distinct configurations tried and
-//! their exact failures). Every property this crate actually pins
-//! (P1–P7, `refactor_parity`/`regression_refactor_parity`) is exercised at
-//! fixture sizes under that threshold; a table whose EAGER size must
-//! exceed `[engine] memory_limit`'s own 64 MiB floor unavoidably exceeds it
-//! too, so this merge term is UNCOVERED for that combination — stated here
-//! rather than left for a reader to discover empirically.
+//! `SessionState` from the caller's session
+//! ([`jammi_db::session::single_partition_context`], keeping its tenant
+//! analyzer rule, catalogs, and memory pool) — so on a sorted
+//! single-fragment table this plans a bare scan with NO
+//! `SortPreservingMergeExec` and NO DataFusion-side reservation of its own:
+//! the merge term is ZERO by construction, which is why it does not appear
+//! in the inequality above.
 //!
 //! # The load-time pre-pass (advisory, §9)
 //!
@@ -110,10 +95,9 @@
 use std::ops::Range;
 
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::session::single_partition_context;
 use jammi_db::store::TrainingSetTable;
 
 use crate::model::ModelTask;
@@ -123,6 +107,16 @@ use super::data::{TextChunk, TrainingDataLoader};
 use super::decode::{self, ChunkAccumulator, DetectedFormat, LabelVocabulary};
 use super::partition::PartitionSpec;
 use super::training_set::read_back_sql;
+
+/// The fixed double-buffer depth production trains a `Streamed` text arm
+/// with (`worker.rs::run_spec`'s `FineTune` arm) — no `[fine_tune]`/
+/// `[engine]` config knob exposes this yet, a future unit's work. `2` is not
+/// an arbitrary default: it is the value P3/P4's own liveness oracles pin
+/// directly, a regression pin for a `prefetch = 2` deadlock an earlier,
+/// excised design hit (`CONTRACT-U2c.md` §1 M3) — so this named constant,
+/// never a literal at the call site, is what "the value production uses"
+/// means.
+pub const PRODUCTION_PREFETCH_DEPTH: usize = 2;
 
 /// The bounded prefetch depth: how many completed [`OwnedChunk`]s the pump is
 /// allowed to hold in the channel ahead of the consumer. `new(0)` is refused
@@ -400,7 +394,7 @@ impl TrainingSetStream {
 
         validate_window(session, table, columns, detected, task, window).await?;
 
-        let derived_ctx = derive_single_partition_ctx(session);
+        let derived_ctx = single_partition_context(session.context());
 
         let query = read_back_sql(table, columns);
         let df = derived_ctx.sql(&query).await?;
@@ -584,27 +578,6 @@ async fn run_pump(
         .await;
 }
 
-/// Derive a loader-local, single-`target_partitions` `SessionContext` from
-/// `session`'s own state — keeping its tenant analyzer rule, catalogs, and
-/// memory pool (the module doc's "the loader's own query plans at a SINGLE
-/// output partition"). Shared by [`TrainingSetStream::open`]'s per-step read
-/// AND [`validate_window`]'s aggregate pass: BOTH queries wrap `read_back_
-/// sql`'s already-`ORDER BY`'d text in a `LIMIT`/`OFFSET`, and at
-/// `target_partitions > 1` DataFusion plans a real `SortPreservingMergeExec`
-/// for either one — for the aggregate specifically, that merge sits behind
-/// a blocking `.collect()`, so it is a genuine, real pool reservation, not
-/// the per-step stream's own `S₁` (DataFusion's pipeline, explicitly NOT
-/// pool-accounted). Deriving once per query is cheap (`SessionState`
-/// cloning, no I/O); nothing here executes a row.
-fn derive_single_partition_ctx(session: &InferenceSession) -> SessionContext {
-    let base_state = session.context().state();
-    let one_partition_config = base_state.config().clone().with_target_partitions(1);
-    let derived_state = SessionStateBuilder::new_from_existing(base_state)
-        .with_config(one_partition_config)
-        .build();
-    SessionContext::new_with_state(derived_state)
-}
-
 /// The load-time pre-pass (module doc): a schema check via [`read_back_sql`]'s
 /// own planned schema, plus — for a numeric target column — a null/NaN
 /// aggregate scoped to EXACTLY `window`'s rows.
@@ -663,8 +636,9 @@ pub(crate) async fn validate_window(
             window.start
         );
         // Executed through the SAME loader-local, single-`target_partitions`
-        // context `Self::open` derives (`derive_single_partition_ctx`) —
-        // never `session.sql`, which plans at the session's OWN (often > 1)
+        // context `Self::open` derives
+        // ([`jammi_db::session::single_partition_context`]) — never
+        // `session.sql`, which plans at the session's OWN (often > 1)
         // partition count. At > 1 the inner `LIMIT`/`OFFSET` subquery plans
         // a real `SortPreservingMergeExec` there, and unlike the per-step
         // stream (`S₁`, DataFusion's own pipeline, explicitly NOT
@@ -675,7 +649,7 @@ pub(crate) async fn validate_window(
         // entirely. Derived once per call (cheap: `SessionState` cloning,
         // no I/O) rather than threaded in from `open` (which needs its own
         // copy anyway, for the actual per-step read after this pre-pass).
-        let single_partition_ctx = derive_single_partition_ctx(session);
+        let single_partition_ctx = single_partition_context(session.context());
         let batches = single_partition_ctx.sql(&agg_sql).await?.collect().await?;
         let batch = batches.first().ok_or_else(|| {
             JammiError::FineTune(

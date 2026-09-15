@@ -2640,7 +2640,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1183` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1181` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.

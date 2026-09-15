@@ -759,56 +759,258 @@ async fn p3_streamed_read_completes_under_a_small_pool_while_eager_fails() {
     }
 }
 
-// #500 U2c §11 F1: UNCOVERED — "a Streamed source trains a FULL production
-// job to completion under a session pool sized well under a table's eager
-// collected size" cannot be delivered honestly under the current design.
-//
-// Every table whose EAGER collected size exceeds `[engine] memory_limit`'s
-// own floor (64 MiB — B5, refused below that, typed, at load) also exceeds
-// DataFusion 54.1's default `repartition_file_min_size` (~10 MiB, B2's own
-// design-round finding): the SAME single Parquet file is then scanned as
-// SEVERAL read-time file groups regardless of `target_partitions`, and
-// combining them in committed order needs a REAL `SortPreservingMergeExec`
-// / `ExternalSorter` reservation — one `derive_single_partition_ctx`'s
-// single-`target_partitions` derivation does not eliminate (that knob only
-// bounds how many partitions the groups get merged DOWN to, never whether
-// the scan itself starts multi-partition). Six distinct configurations were
-// executed against a real `EmbeddedWorker`/`session.fine_tune` run (an
-// 80 MiB, 800×100 KB-row `Pairs` table — no numeric-target aggregate in the
-// mix at all — over a 64–100 MiB pool), each failing with a real
-// `ResourcesExhausted`, never a hang:
-//  - the P3-matched 64 MiB floor: `SortPreservingMergeExec` short by
-//    ~4.4 MB (`60.1 MB used / 64.0 MB pool`);
-//  - a 76 MiB pool (headroom sized to that shortfall): STILL short, now by
-//    ~1.3 MB more (`73.1 MB used / 76.0 MB pool`) — the deficit does not
-//    close as the pool grows, evidence the operator sizes itself GREEDILY
-//    against whatever is available rather than against a fixed cost;
-//  - `SET repartition_file_min_size` raised past the table's own size (to
-//    force ONE file group, no merge): DataFusion instead chose a full
-//    `ExternalSorter` RE-SORT, needing 174 MB — worse, not better;
-//  - `SET execution.batch_size = 16` (shrinking the buffered chunk each
-//    merge/sort operator holds): reduced but did not close the deficit
-//    (`ExternalSorterMerge` short by ~10 MB at `62.2 MB / 64.0 MB`).
-//
-// This is a genuinely different, WRITE-SIZE-triggered cost from the one
-// this unit's `Σ E` inequality claims (`stream.rs`'s module doc already
-// states the pre-pass aggregate "would otherwise leave unnamed" a real
-// reservation, before this finding); it sits OUTSIDE `derive_single_
-// partition_ctx`'s fix (which DOES eliminate the merge for a table under
-// the ~10 MiB threshold — every OTHER oracle in this file, and `training_
-// set.rs`'s `refactor_parity`/`regression_refactor_parity`, prove that at
-// the scales they exercise) and is not something this session's remaining
-// scope can close: fixing it needs either a DataFusion-side control this
-// crate does not yet expose (forcing the provider to trust `with_file_
-// sort_order` across file groups without a merge) or lowering `[engine]
-// memory_limit`'s own floor below the point where this threshold bites,
-// neither of which is this unit's decision to make unilaterally. P3
-// (unchanged, still pinned directly against the primitive at THIS exact
-// fixture shape and pool) remains the property's oracle at the scale the
-// design was built and tested for; F2 (regression) is exercised
-// end-to-end by `regression_refactor_parity`; F3–F6 all pass end-to-end.
-// Filed here rather than silently dropped, per the "demand the refutation"
-// standard — the six attempts above ARE that refutation.
+/// #500 U2c c3c, P-R: a Resident whole-set-arm job holds its eager
+/// collected-batch reservation on the session pool for as long as training
+/// runs, and releases it once the job finishes — not a flag
+/// (`training_test_hooks::source_kind_for` only proves WHICH arm bound, not
+/// whether its bytes stayed accounted for) but the pool's own `reserved()`,
+/// sampled while a real `EmbeddedWorker` job trains.
+///
+/// A GradCache-eligible config (`cached = true`) is the whole-set arm under
+/// test: it needs no mined negatives, so the fixture stays a plain padded
+/// `Pairs` table. The padding (`pad_bytes` per row, both columns) makes the
+/// eager collected size predictable well above noise while staying small
+/// enough that a CPU-only `tiny_bert` forward/backward pass over it finishes
+/// in low single-digit seconds.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(training_set_stream)]
+async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs() {
+    let dir = TempDir::new().unwrap();
+    let rows = 50usize;
+    let pad_bytes = 5_000usize;
+    let pad: String = "x".repeat(pad_bytes);
+    let mut lines = String::from("anchor,positive\n");
+    for i in 0..rows {
+        lines.push_str(&format!("a{i:04}{pad},p{i:04}{pad}\n"));
+    }
+    let csv = dir.path().join("p_r.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "p_r",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let pool = session.memory_pool();
+    let baseline = pool.reserved();
+
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let job = session
+        .fine_tune(
+            "p_r",
+            &("local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+            &["anchor".to_string(), "positive".to_string()],
+            jammi_ai::fine_tune::FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(jammi_ai::fine_tune::FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                cached: true,
+                embedding_loss: Some(
+                    jammi_ai::fine_tune::EmbeddingLoss::MultipleNegativesRanking {
+                        temperature: 20.0,
+                    },
+                ),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let job_id = job.job_id.clone();
+
+    // Sample the pool concurrently with the job's own future: the reservation
+    // must be held (already grown to at least a row's worth of the padded
+    // text) for essentially the WHOLE run, so any sample taken before the
+    // job resolves should see it — no precise mid-run rendezvous is needed.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler_pool = pool.clone();
+    let sampler_done = std::sync::Arc::clone(&done);
+    let sampler = tokio::spawn(async move {
+        let mut max_seen = 0usize;
+        loop {
+            max_seen = max_seen.max(sampler_pool.reserved());
+            if sampler_done.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            // A short sleep, not a bare `yield_now` spin: the reservation is
+            // held for the whole (multi-second) training run, so 1 ms
+            // granularity samples it many times over without pinning a CPU
+            // core the entire test.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        max_seen
+    });
+
+    job.wait().await.expect("a GradCache W=1 run must complete");
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let max_reserved = sampler.await.expect("sampler task");
+
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("resident"),
+        "a GradCache-eligible run must bind Resident"
+    );
+
+    // A conservative lower bound: ONE column's worth of padding, summed over
+    // every row (raw text bytes alone — Arrow's own array overhead only adds
+    // to this), well under the true collected size (both columns, plus
+    // offsets/validity buffers).
+    let expected_min_bytes = rows * pad_bytes;
+    assert!(
+        max_reserved >= expected_min_bytes,
+        "the pool's reserved() never reached the eager collected size while training ran: \
+         max_reserved={max_reserved} expected_min_bytes={expected_min_bytes}"
+    );
+
+    // Returns to (at most) its pre-job baseline once the job — and with it
+    // the `Source::Resident` local holding `train_loader`'s reservation —
+    // has fully dropped. Polled rather than asserted immediately: `job.wait`
+    // resolves once the catalog row reads `succeeded`, which can race the
+    // Rust-level drop of the worker's own stack by a few scheduler ticks.
+    let mut settled = false;
+    for _ in 0..200 {
+        if pool.reserved() <= baseline {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        settled,
+        "the pool did not return to its baseline ({baseline}) after the job finished: {}",
+        pool.reserved()
+    );
+}
+
+/// #500 U2c c3c, P-F1: a full regression fine-tune job at W=1 COMPLETES
+/// through the streamed path over a table whose EAGER collected size
+/// exceeds a session pool sized well under it — the property c3b's own
+/// attempted oracle found UNCOVERED. The lead's probe (`CONTRACT-U2c.md`
+/// §12) found the six recorded attempts never opened the actual cost: the
+/// training-set WRITER's own `plan_training_set_rows` explicitly built a
+/// `SortPreservingMergeExec` over N partition-local sorts, which filled the
+/// pool before the merge could reserve its own few MB — nothing to do with
+/// the per-rank stream (already proven bounded, P3) or with read-time file
+/// groups. c3c plans the writer's sort at ONE output partition
+/// (`jammi_db::session::single_partition_context`, the same derivation the
+/// stream already used for its OWN reads), eliminating the merge entirely,
+/// so the write itself now fits comfortably under the same small pool the
+/// stream already proved it could read under.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(training_set_stream)]
+async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream() {
+    let dir = TempDir::new().unwrap();
+    // ~80 MiB total (800 rows x ~100 KiB), the SAME shape
+    // `padded_regression_fixture` builds for P3 — comfortably past the
+    // 64 MiB `[engine] memory_limit` floor.
+    //
+    // `engine.batch_size` is set explicitly here, well below
+    // `EngineConfig::default`'s `8192` (P-M's own arithmetic, stated): at the
+    // default, one DataFusion batch would be `8192 rows × ~100_000 B/row ≈
+    // 800 MB` — far larger than the 64 MiB pool, so no batch-granular
+    // operator (a spilling external sort, a decoded chunk) could ever fit
+    // ONE batch, regardless of how few partitions or merges the plan has. At
+    // `batch_size = 32` one batch is `32 × ~100_000 B ≈ 3.1 MB`, comfortably
+    // under the pool — the deployment rule `materialize_training_set`'s own
+    // doc now states: a single batch larger than `[engine] memory_limit`
+    // cannot be sorted.
+    let rows = 800usize;
+    let pad_bytes = 100_000usize;
+    let pad: String = "x".repeat(pad_bytes);
+    let mut lines = String::from("text,target\n");
+    for i in 0..rows {
+        lines.push_str(&format!("row{i:06}{pad},{}\n", i as f32));
+    }
+    let csv = dir.path().join("f1.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    let mut config = common::test_config(dir.path());
+    config.engine.memory_limit = "64MB".to_string();
+    config.engine.batch_size = 32;
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "f1",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let job = session
+        .fine_tune(
+            "f1",
+            &("local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+            &["text".to_string(), "target".to_string()],
+            jammi_ai::fine_tune::FineTuneMethod::Lora,
+            ModelTask::Regression,
+            Some(jammi_ai::fine_tune::FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let job_id = job.job_id.clone();
+    job.wait().await.expect(
+        "a Streamed W=1 regression run over a table whose eager size exceeds the pool must \
+         complete: the writer plans its sort at one output partition (c3c) and the per-rank \
+         stream never collects the whole table into memory (F1)",
+    );
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("streamed"),
+        "a plain (non-whole-set) regression arm must bind Streamed"
+    );
+
+    // The eager collect of the very table this job just trained from, under
+    // the SAME 64 MiB pool, still refuses — the streamed run did not
+    // complete because the pool secretly admitted the whole table.
+    let columns = vec!["text".to_string(), "target".to_string()];
+    let err = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "f1",
+        &columns,
+        ModelTask::Regression,
+        "regression",
+    )
+    .await
+    .unwrap_err();
+    match err {
+        JammiError::ResourcesExhausted { detail, .. } => {
+            assert!(
+                detail.contains("training_set_eager"),
+                "the eager consumer's name must appear in the failure: {detail}"
+            );
+        }
+        other => panic!("expected ResourcesExhausted naming training_set_eager, got {other:?}"),
+    }
+}
 
 /// #500 U2c §11 F4: the validation loop's chunk count is `ceil(val_count /
 /// batch_size)` for a `val_count` that is NOT a multiple of `batch_size` —

@@ -39,15 +39,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::Array;
-use arrow::compute::SortOptions;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::SortExpr;
-use datafusion::physical_expr::{expressions::col as physical_col, LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -68,6 +65,7 @@ use crate::index::sidecar::SidecarIndex;
 use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
+use crate::session::single_partition_context;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
@@ -409,7 +407,7 @@ pub fn training_set_order_by(columns: &[String]) -> String {
 /// provider is ever built from one.
 ///
 /// Binds each name via `Expr::Column(Column::new_unqualified(..))` — the
-/// SAME verbatim constructor [`Self::plan_training_set_rows`]'s own
+/// SAME verbatim constructor `ResultStore::plan_training_set_rows`'s own
 /// projection uses (see that function's doc comment) — never the `col(..)`
 /// helper, which PARSES its argument as a possibly-qualified, possibly
 /// case-folding SQL identifier: `col("meta.id")` resolves as a `meta`-table
@@ -3955,11 +3953,20 @@ impl ResultStore {
     ///
     /// The rows are ordered by the **full projected tuple**
     /// ([`TRAINING_SET_ORDER_RULE_V1`]) and written in that order. The sort is
-    /// planned explicitly and the plan is collapsed to a single partition
-    /// through a [`SortPreservingMergeExec`] when the session's
-    /// `target_partitions` left it partitioned — never left to whatever
-    /// partition count a default hands back, whose merge would silently
-    /// interleave the sorted runs. A reader re-applies the same order with
+    /// planned through [`crate::session::single_partition_context`] — a
+    /// loader-local `target_partitions = 1` derivation of the caller's own
+    /// session state (`Self::plan_training_set_rows`) — so the write is ONE
+    /// external sort at ONE output partition, never a partitioned
+    /// local-sort-plus-merge: there is only ever one partition to recombine,
+    /// so no `SortPreservingMergeExec` is ever planned here. The residency
+    /// this pays is O(one batch) plus DataFusion's own spill reservation for
+    /// that single sort, never O(the whole table) — a batch that is itself
+    /// larger than `[engine] memory_limit` cannot be sorted, the deployment
+    /// rule `[engine] batch_size` is sized against. The session's
+    /// `RuntimeEnv` carries a disk-backed `DiskManager` by default
+    /// (`JammiSession::build`, no explicit `with_disk_manager` call needed),
+    /// so a sort whose in-progress runs exceed the pool spills to disk rather
+    /// than failing the write. A reader re-applies the same order with
     /// [`training_set_order_by`] over the registered `jammi.{name}` table.
     ///
     /// # Reuse
@@ -4172,11 +4179,19 @@ impl ResultStore {
     /// it, returning the plan (for its output schema) and a single-partition
     /// stream of its rows in committed order.
     ///
-    /// The single-partition guarantee is asserted, not assumed: a global sort
-    /// plans to one output partition today, but a partitioned plan reaching
-    /// [`ExecutionPlan::execute`] would have its sorted runs concatenated in
-    /// arrival order, silently committing rows out of the order the descriptor
-    /// claims. A partitioned plan is therefore merged order-preservingly here.
+    /// Planned through [`single_partition_context`] (`ctx`'s own state,
+    /// `target_partitions` forced to `1`) rather than `ctx` directly: a
+    /// global sort at one output partition is ONE external sort with no
+    /// merge to plan, so the physical plan this returns is never a
+    /// partitioned local-sort-plus-[`SortPreservingMergeExec`] whose merge
+    /// operator would need its own real reservation on top of every
+    /// partition's already-buffered sorted run (#500 U2c c3c — see
+    /// [`Self::materialize_training_set`]'s "The order it commits"). The
+    /// single-partition guarantee is asserted, not assumed: reaching
+    /// [`ExecutionPlan::execute`] at more than one output partition would
+    /// silently commit only partition 0's rows, never every row in order —
+    /// an engine-invariant breach, surfaced as a typed error rather than a
+    /// panic in a producer.
     async fn plan_training_set_rows(
         &self,
         ctx: &SessionContext,
@@ -4195,7 +4210,8 @@ impl ResultStore {
             // a fragment of SQL to re-parse.
             .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
             .collect();
-        let sorted = ctx
+        let single_partition_ctx = single_partition_context(ctx);
+        let sorted = single_partition_ctx
             .sql(spec.source_sql)
             .await?
             .select(projection.clone())?
@@ -4210,37 +4226,17 @@ impl ResultStore {
             )?;
 
         let plan = sorted.create_physical_plan().await?;
-        let schema = plan.schema();
-        let mut sort_exprs = Vec::with_capacity(spec.columns.len());
-        for column in spec.columns {
-            sort_exprs.push(PhysicalSortExpr {
-                expr: physical_col(column, schema.as_ref())?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: true,
-                },
-            });
-        }
-        // `LexOrdering::new` is `None` only for an empty key, which
-        // `TrainingSetSpec::validate_columns` already refused at the entry —
-        // so this is an ENGINE-invariant breach (the two guards drifted
-        // apart), not the caller-fault class the entry check raises. Reported
-        // rather than `expect`ed: a broken invariant is an error to surface,
-        // never a panic in a producer.
-        let ordering = LexOrdering::new(sort_exprs).ok_or_else(|| {
-            JammiError::Other(format!(
-                "training set over '{}': an empty order key reached the planner, \
-                 which the projection check should have refused at the entry",
+        let partition_count = plan.output_partitioning().partition_count();
+        if partition_count != 1 {
+            return Err(JammiError::Other(format!(
+                "training set over '{}': the single-partition derivation left the write plan at \
+                 {partition_count} output partition(s); expected exactly one — an engine \
+                 invariant broke between the derivation and the physical plan",
                 spec.source_id
-            ))
-        })?;
-        let plan: Arc<dyn ExecutionPlan> = if plan.output_partitioning().partition_count() > 1 {
-            Arc::new(SortPreservingMergeExec::new(ordering, plan))
-        } else {
-            plan
-        };
+            )));
+        }
 
-        let stream = plan.execute(0, ctx.task_ctx())?;
+        let stream = plan.execute(0, single_partition_ctx.task_ctx())?;
         Ok((plan, stream))
     }
 }

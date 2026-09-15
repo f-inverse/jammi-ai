@@ -2833,16 +2833,16 @@ never entered the session's schema, not merely lost its ordering hint.
 in `ready` status.
 
 **The session memory pool.** `[engine] memory_limit` — `memory_limit`
-(`crates/jammi-db/src/config/mod.rs:718`) — is the ONE knob every consumer of a session's
+(`crates/jammi-db/src/config/mod.rs:720`) — is the ONE knob every consumer of a session's
 memory is bounded by: an ordinary `SortExec`/`SortPreservingMergeExec`, a training-set
 stream's chunk reservation, an eager materialization's collected-batch reservation.
-`memory_limit_bytes` (`crates/jammi-db/src/config/mod.rs:762`) is the ONE reader of the
+`memory_limit_bytes` (`crates/jammi-db/src/config/mod.rs:766`) is the ONE reader of the
 field, parsing `"<n>%"` (1–100, of `total_physical_memory_bytes`,
 `crates/jammi-db/src/config/host_memory.rs:34` — the lower of the host's physical total and
 a readable Linux cgroup ceiling), `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or `"<n>"`
 (bytes); every unparseable form is a typed `JammiError::Config` naming the key. A resolved
 value below the 64 MiB `MEMORY_LIMIT_FLOOR_BYTES`
-(`crates/jammi-db/src/config/mod.rs:730`) is refused too — small enough that DataFusion's
+(`crates/jammi-db/src/config/mod.rs:734`) is refused too — small enough that DataFusion's
 own long-lived pool consumers would be refused on the very first non-trivial query, before
 the setting ever bounds the workload it exists to bound. `JammiSession::build` resolves
 this ONCE at session construction and installs a `GreedyMemoryPool`

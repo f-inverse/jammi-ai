@@ -298,7 +298,7 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | B | 6 | U2c | Streaming training-set loader with a residency bound (issue #544) | hermetic + cookbook | U2a, U2b, U4a |
 | B | 7 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U2c, U3, U4a, S1 |
 | B | 8 | — | pod-leg artifact | gpu-gang | U4b |
-| C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
+| C | 1 | U7b | cluster-leg primitives, reap, two-host test body, schedule visibility (driver: U7b-A2b, filed, not scheduled) | gate scripts + ai-core test body | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
 | C | 3 | U5b-1a | Membership substrate: `peer_advertise`, `instances.peer_addr`/`result_root`, `list_gang_members` | hermetic + distributed | U5a-1, PR-B1 |
 | — | — | U5b-1a-A2 | Result-root identity across spellings (scheme aliasing, symlinks, case/slash folding) AND the membership predicate built on that identity — `list_gang_members` itself consults no root at all (U5b-1a's round-5 stop rule fired, excising the column from the predicate entirely); filed by U5b-1a's round-3 stop rule, widened by round-5's; spec = rounds 1–5 of `docs/rigor/feat_500-C-U5b-1a.jsonl` + contract §9/§10/§12; a precondition of U5b-1b-ii (gang formation needs an actual root-identity predicate, not merely the verbatim string) | unscheduled | U5b-1a |
@@ -328,7 +328,9 @@ compile on top of PR-C, incl. `-p jammi-db --features postgres,mysql`. **S4** (�
 and a 2-pod × 2-GPU TRAINING cluster both provision from the repo's own payload shape; cluster
 members expose `actions: []`, so the reaper deletes the cluster (not a member pod), and
 `list-pods` needs `includeClusterPods=true` to see them; cluster GPUs bill at $1.908/GPU/h, so
-U7b's ceiling is $7.63/h (4 GPUs), not $6.4. **S5** (→ GPU byte oracles) CUDA
+this spike's own 2×2 probe bills `4 x $1.908/GPU/h = $7.63/h` (not `$6.4`) — U7b's own committed
+shape is 2×1, never 2×2, and bills `2 x $1.908/GPU/h = $3.816/h` (`docs/plans/67-distributed-
+training/UNITS.md § U7b`'s own cost ceiling). **S5** (→ GPU byte oracles) CUDA
 bit-reproducibility pin. **Result:** candle 0.11 LoRA-shaped forward/backward/SGD is
 byte-identical across processes and across two A100s with no env pins; `CUBLAS_WORKSPACE_CONFIG`
 is a kernel-selection input that must merely be *consistent* across ranks (`:4096:8` reproduces

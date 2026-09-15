@@ -192,8 +192,12 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 # superseded run is SIGKILLed and never runs its EXIT trap; the pod it had just
 # rented is orphaned. Running the sweep here bounds any such orphan to the gap
 # until the next prove run rather than "until the account empties" — which is
-# what happened on 2026-07-24.
-rp_sweep
+# what happened on 2026-07-24. A non-zero rc here is pre-run HYGIENE, never
+# this run's own proof failure (the sweep enumerates and reaps PAST orphans;
+# it has no bearing on whether THIS run's own pod later proves anything) --
+# logged loudly rather than silently discarded so a real "could not
+# enumerate" is visible without gating this run on it.
+rp_sweep || echo "::warning::pre-run rp_sweep (orphan hygiene) failed rc=$? -- not a proof failure, continuing"
 
 rp_init
 echo "=== provisioning a live ${RP_DEPLOY_ARCH} (${GPU_PROVE_ARCH}) ==="

@@ -160,6 +160,14 @@ GANG_ARTIFACT_DIR="${GANG_ARTIFACT_DIR:-.gpu-pull/gpu-gang}"
 # sourced-execution guard so a fixture can `source` this file and see it.
 GANG_GROUPS=(gang-build gang-proof)
 
+# F13's shared zero-test tripwire text (runpod_lib.sh's
+# `_rp_zero_test_tripwire_lines`), computed here — BEFORE the
+# sourced-execution guard below, same reason GANG_GROUPS is — so a fixture
+# that merely `source`s this file (never executes it, never rents a pod)
+# can still read the exact text the real remote heredoc splices in via
+# `${zero_test_tripwire}`, below.
+zero_test_tripwire="$(_rp_zero_test_tripwire_lines grc '$gang_log' "${GANG_TEST_FILTER}")"
+
 # Verdict rule, mirroring `rp_prove_verdict` (runpod_gpu_prove.sh) minus the
 # bench-cut exception this lane has no non-gating group to need:
 #
@@ -314,10 +322,7 @@ mkdir -p "\${JAMMI_GANG_ARTIFACT_DIR}"
 gang_log=/tmp/gang_proof.log
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$gang_log"
 grc=\${PIPESTATUS[0]}
-if grep -q "running 0 tests" "\$gang_log"; then
-  echo "::error::the gang test filter '${GANG_TEST_FILTER}' matched ZERO tests in jammi-ai's gpu_capability target on this ref — the gang tests have not landed here; refusing to read a 0-test run as a two-GPU proof" >&2
-  grc=1
-fi
+${zero_test_tripwire}
 if [ "\$grc" -eq 0 ] && [ -z "\$(ls -A "\${JAMMI_GANG_ARTIFACT_DIR}" 2>/dev/null)" ]; then # tripwire-ok: ls's stderr on a missing dir is not evidence; an empty result is exactly the "no artifact written" case this arm reports by name on the next line.
   echo "::error::the gang tests passed but wrote NO artifact to \${JAMMI_GANG_ARTIFACT_DIR} — a gang leg with no recorded world/collective/device/digest-pair/delta/epsilon evidence proves nothing that can be reviewed or committed" >&2
   grc=1

@@ -156,9 +156,13 @@ gpu-dev.sh — GPU development on RunPod
   down    [session]                       terminate the pod, forget the session
   ls                                      list sessions
   reap    [hours]             ACCOUNT-WIDE: terminate every orphaned jammi-gpu*
-                              pod past its own deadline, not just one session's
-                              ([hours] force-reaps EVERY such pod older than
-                              that, regardless of session — not a per-pod verb)
+                              pod AND delete every orphaned jammi-cluster*
+                              cluster past its own deadline, not just one
+                              session's ([hours] force-reaps EVERY such
+                              pod/cluster older than that, regardless of
+                              session — not a per-pod/per-cluster verb).
+                              Exits non-zero if EITHER sweep could not
+                              enumerate its own object type.
 
 A running measurement is protected only by its own TTL — there is no verb to
 pause the sweep for a single pod (RunPod's pod-edit API has no rename/name
@@ -261,10 +265,20 @@ case "$CMD" in
   reap)
     # shellcheck source=ci/scripts/runpod_lib.sh
     source "$DIR/runpod_lib.sh"
-    # No argument => judge each pod against the deadline in its own name.
-    # Passing RP_TTL_HOURS here would impose THIS shell's limit on every pod.
-    rp_sweep "${1:-}"
-    exit $?
+    # No argument => judge each pod/cluster against the deadline in its own
+    # name. Passing RP_TTL_HOURS here would impose THIS shell's limit on
+    # every pod/cluster. Both object types are ACCOUNT-WIDE and independent
+    # (a cluster is retired by deleting the CLUSTER, never one of its member
+    # pods — rp_sweep's own exclusion logic already keeps the two apart);
+    # this arm reaps both, and — the SAME "could not check must never read
+    # as nothing to clean up" doctrine rp_sweep has always carried — exits
+    # non-zero if EITHER sweep could not enumerate its own object type, even
+    # when the other one succeeded.
+    pod_rc=0 cluster_rc=0
+    rp_sweep "${1:-}" || pod_rc=$?
+    rp_cluster_sweep "${1:-}" || cluster_rc=$?
+    [ "$pod_rc" -eq 0 ] && [ "$cluster_rc" -eq 0 ] && exit 0
+    exit $(( pod_rc != 0 ? pod_rc : cluster_rc ))
     ;;
 esac
 

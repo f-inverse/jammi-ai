@@ -34,10 +34,15 @@ name: GPU prove (RunPod)
 # Off the merge path by default, and NEVER in the critical path of an
 # automated workflow (operator direction, 2026-09-03): GPU minutes cost
 # money and capacity is intermittent. It fires on: the `run-gpu` PR label
-# (opt-in per PR), a nightly cron, and manual dispatch — deliberately NO
-# `push:`/`workflow_call:` trigger (`check_gpu_prove_once.py`'s P1 rule pins
-# this by name), so nothing ever auto-starts it and nothing may `uses:` it.
-# Needs the `RUNPOD_API_KEY` repo secret.
+# (opt-in per PR), manual dispatch, and an allow-listed nightly cron —
+# deliberately NO `push:`/`workflow_call:` trigger (`check_gpu_prove_once.
+# py`'s P1 rule pins this by name), so nothing ever auto-starts it and
+# nothing may `uses:` it. The nightly cron itself is a REVIEWED
+# `PAID_LANE_CRON_ALLOWLIST` entry (P8) — any OTHER paid pod lane picking up
+# a `schedule:` trigger is a finding until a human adds it there naming its
+# own never-vacuous arm; this lane's own token is its
+# `capability-surface-proof` group, which refuses a 0-test run. Needs the
+# `RUNPOD_API_KEY` repo secret.
 #
 # EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io,
 # npm, every PyPI dist, the server image, the release binaries) — gates its

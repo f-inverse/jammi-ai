@@ -21,25 +21,28 @@
 # every row below needs a real CUDA/CUTLASS toolchain to run meaningfully.
 # `runpod_gpu_prove.sh` (the driver script several rows below reference) is
 # invoked from exactly ONE workflow, `gpu-prove.yml`
-# (`workflow_dispatch` / `pull_request: types: [labeled]` / nightly
-# `schedule` — deliberately no `push:`/`workflow_call:` trigger and no
-# workflow may `uses:` it, `check_gpu_prove_once.py`'s P1 rule pins this by
-# name). Every CUDA release lane (`server-image.yml`, `release-binaries.yml`,
-# `pypi-server-cuda.yml` — the last calls `_gpu-proof-required.yml` DIRECTLY;
-# `_pypi-server.yml` carries no gate at all, only the build/package steps)
-# instead consumes that commit's already-recorded verdict through
-# `_gpu-proof-required.yml` — a hermetic API read, never a second invocation
-# of this driver script.
+# (`workflow_dispatch` / `pull_request: types: [labeled]` / an
+# allow-listed nightly `schedule` — deliberately no `push:`/`workflow_call:`
+# trigger and no workflow may `uses:` it, `check_gpu_prove_once.py`'s P1
+# rule pins this by name; the cron itself is a reviewed
+# `PAID_LANE_CRON_ALLOWLIST` entry, P8 — any OTHER paid pod lane picking up
+# a `schedule:` trigger is a finding until a human adds it there, naming its
+# own never-vacuous arm). Every CUDA release lane (`server-image.yml`,
+# `release-binaries.yml`, `pypi-server-cuda.yml` — the last calls
+# `_gpu-proof-required.yml` DIRECTLY; `_pypi-server.yml` carries no gate at
+# all, only the build/package steps) instead consumes that commit's
+# already-recorded verdict through `_gpu-proof-required.yml` — a hermetic
+# API read, never a second invocation of this driver script.
 # NOT merge-path: `gpu-prove.yml`'s own triggers are label/dispatch/
-# schedule-only, and it is never `push:`-triggered by a tag either (a dev
-# dispatches it by hand before tagging). The residual survives via that
-# trigger scoping alone, not via "only one caller" — promoting this
-# workflow to a REQUIRED merge-path check is a GitHub branch-protection
-# ruleset setting, not committed workflow YAML, so nothing in this checkout
-# can verify it — `GPU_PROVE_PROMOTED_TO_REQUIRED` in the gate script stays
-# `False` until a human flips it (with a comment recording how the
-# promotion was verified). Until then every row below is the honest,
-# written, non-silent choice: each
+# an allow-listed schedule only, and it is never `push:`-triggered by a tag
+# either (a dev dispatches it by hand before tagging). The residual
+# survives via that trigger scoping alone, not via "only one caller" —
+# promoting this workflow to a REQUIRED merge-path check is a GitHub
+# branch-protection ruleset setting, not committed workflow YAML, so
+# nothing in this checkout can verify it — `GPU_PROVE_PROMOTED_TO_REQUIRED`
+# in the gate script stays `False` until a human flips it (with a comment
+# recording how the promotion was verified). Until then every row below is
+# the honest, written, non-silent choice: each
 # tuple stays off the merge path BY NAME, not by omission.
 
 # --- ci/scripts/pod_seed_target.sh's own T1/T1b/T2/T3 (esc-050/esc-051) ---

@@ -45,14 +45,37 @@ const STATE_FILE: &str = "resume_state.json";
 
 /// The current [`ResumeState`] schema version. Bumped whenever a field's
 /// UNIT or MEANING changes in a way that would silently mis-restore an
-/// older checkpoint if read as the new schema — the C7 commit that
-/// introduces this constant is itself such a bump: `dropout_positions`
-/// changes unit from per-ELEMENT draw counts to per-FORWARD Philox
-/// counters (closing esc-032/esc-033; see that field's own doc). See
-/// [`load_bundle`]'s version check for how a mismatch (including a
-/// checkpoint with NO `schema_version` field at all, from before this
-/// commit) is refused rather than silently misinterpreted.
-pub const RESUME_STATE_SCHEMA_VERSION: u32 = 1;
+/// older checkpoint if read as the new schema. Version 1 (C7) changed
+/// `dropout_positions`'s unit from per-ELEMENT draw counts to per-FORWARD
+/// Philox counters (closing esc-032/esc-033). Version 2 (U4b) reshapes
+/// `dropout_positions` again — per RANK, not a flat per-layer map (DESIGN.md
+/// §4: each rank's own dropout position is gathered to rank 0 and stored
+/// per rank, so a resumed gang at equal topology restores every rank's own
+/// stream, not just rank 0's). See [`load_bundle`]'s version check for how
+/// a mismatch (including a checkpoint with NO `schema_version` field at
+/// all, from before version 1) is treated as no-checkpoint — never
+/// silently misinterpreted, and never a hard attempt failure either
+/// (design pressure round, finding 7): greenfield, this crate ships no
+/// reader for an old shape, so an old bundle is exactly as good as no
+/// bundle — start the attempt fresh, one `tracing::warn!` naming both
+/// versions.
+pub const RESUME_STATE_SCHEMA_VERSION: u32 = 2;
+
+/// The version an ABSENT `schema_version` key parses as (`#[serde(default)]`
+/// on [`ResumeState::schema_version`]) — a checkpoint written before version
+/// 1 (C7) ever existed. Never equal to a real [`RESUME_STATE_SCHEMA_VERSION`]
+/// (versions start at 1), so [`load_bundle`]'s ONE mismatch check also
+/// catches this case with no separate "field missing" branch: a structurally
+/// parseable-but-version-0 bundle and an absent-field bundle are the exact
+/// same event from a caller's point of view — "no checkpoint this binary can
+/// read" — so they get the exact same treatment.
+const UNVERSIONED_SCHEMA_VERSION: u32 = 0;
+
+/// `serde`'s `default` hook for [`ResumeState::schema_version`] — a function
+/// because `#[serde(default = ...)]` names a path, not a literal.
+fn unversioned_schema_version() -> u32 {
+    UNVERSIONED_SCHEMA_VERSION
+}
 
 /// The non-tensor run state persisted alongside the weights and moments. Every
 /// field is authoritative on resume — in particular `scaler` is *loaded*, never
@@ -61,15 +84,17 @@ pub const RESUME_STATE_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeState {
     /// The schema version this bundle was written under — see
-    /// [`RESUME_STATE_SCHEMA_VERSION`]. Deliberately carries NO
-    /// `#[serde(default)]`: a checkpoint captured before this field
-    /// existed has no `schema_version` key in its JSON at all, so
-    /// deserializing it FAILS with a typed error naming the missing
-    /// field, rather than silently defaulting to today's schema and
-    /// misinterpreting `dropout_positions`'s unit. [`load_bundle`] adds an
-    /// explicit post-parse check for a PRESENT-but-different version on
-    /// top of that (the case a missing-field serde error alone would not
-    /// catch: a checkpoint from a future/other schema version).
+    /// [`RESUME_STATE_SCHEMA_VERSION`]. `#[serde(default)]` to
+    /// [`UNVERSIONED_SCHEMA_VERSION`] (`0`): a checkpoint captured before
+    /// this field existed (pre-C7) has no `schema_version` key in its JSON
+    /// at all, and parses as version `0` rather than failing the whole
+    /// deserialize — [`load_bundle`]'s ONE version check then treats it
+    /// exactly like a checkpoint from a mismatched real version: no
+    /// checkpoint this binary can read, start the attempt fresh (design
+    /// pressure round, finding 7 — this crate ships no reader for an old
+    /// shape, so a hard failure here would strand every live older
+    /// checkpoint rather than simply losing its resume value).
+    #[serde(default = "unversioned_schema_version")]
     pub schema_version: u32,
     /// The last epoch whose optimizer steps all completed — the boundary this
     /// checkpoint was taken at. The resumed run starts at `epoch + 1`.
@@ -87,24 +112,36 @@ pub struct ResumeState {
     /// The `TargetScaler`'s `(μ, σ)` for a regression run, or `None`. Persisted so
     /// resume loads the authoritative standardiser rather than recomputing it.
     pub scaler: Option<(f64, f64)>,
-    /// Each layer's dropout FORWARD COUNTER at the boundary, keyed
-    /// `{layer}.dropout`. A resumed run SETS each layer's counter to this
+    /// Each RANK's own per-layer dropout FORWARD COUNTER at the boundary,
+    /// keyed `rank -> {layer}.dropout -> counter` — schema version 2 (U4b,
+    /// DESIGN.md §4): each rank's own dropout position is gathered to rank
+    /// 0 at the epoch boundary and stored PER RANK here, so a resumed gang
+    /// at equal topology restores EVERY rank's own stream (rank `r`'s
+    /// `TrainingLoop` sets its layers' counters from `dropout_positions[r]`,
+    /// never rank 0's) and reproduces an uninterrupted run byte-for-byte. At
+    /// `W = 1` this map always has exactly the one entry for rank `0` — the
+    /// same single rank's positions schema version 1 held flat, now wrapped
+    /// one level deeper by rank; a resumed W=1 run restores identically to
+    /// before this reshape, just through one more level of lookup.
+    ///
+    /// A resumed run SETS each layer's counter to its own rank's persisted
     /// value (O(1), an assignment — closing esc-033) so its next training
     /// forwards draw the same masks the uninterrupted run drew.
     ///
-    /// **Unit change (schema version 1, this commit):** before device-side
-    /// Philox dropout, this counted per-ELEMENT draws from an advancing
-    /// host RNG stream (`draw_mask`'s `position += len`); it now counts
-    /// per-FORWARD Philox counter values (`jammi_kernels::ops::
-    /// DropoutFused`'s `forward_idx`) — one increment per training
-    /// forward through the layer, regardless of the activation's element
-    /// count. A checkpoint written under the OLD unit would silently
-    /// restore a draw count into a forward counter if read under the new
-    /// schema (an off-by-many-orders-of-magnitude misinterpretation, not
-    /// a merely-stale one) — this is exactly why [`RESUME_STATE_SCHEMA_
-    /// VERSION`] exists and why an unversioned checkpoint is refused
-    /// rather than silently accepted (esc-032).
-    pub dropout_positions: HashMap<String, u64>,
+    /// **Unit change (schema version 1):** before device-side Philox
+    /// dropout, this counted per-ELEMENT draws from an advancing host RNG
+    /// stream (`draw_mask`'s `position += len`); it now counts per-FORWARD
+    /// Philox counter values (`jammi_kernels::ops::DropoutFused`'s
+    /// `forward_idx`) — one increment per training forward through the
+    /// layer, regardless of the activation's element count. A checkpoint
+    /// written under the OLD unit would silently restore a draw count into
+    /// a forward counter if read under the new schema (an
+    /// off-by-many-orders-of-magnitude misinterpretation, not a merely-stale
+    /// one) — this is exactly why [`RESUME_STATE_SCHEMA_VERSION`] exists and
+    /// why a mismatched-version checkpoint is treated as no checkpoint at
+    /// all (esc-032; see [`RESUME_STATE_SCHEMA_VERSION`]'s own doc for why
+    /// that is a soft fallback, not a hard refusal, since this bump).
+    pub dropout_positions: HashMap<u32, HashMap<String, u64>>,
 }
 
 /// AdamW first/second moment buffers per parameter, keyed by parameter name —
@@ -176,12 +213,39 @@ pub fn capture_bundle(
 }
 
 /// Load a resume bundle from a fetched [`jammi_db::store::LocalArtifact`]
-/// directory, reconstructing the weights, name-keyed moments, and run state.
+/// directory, reconstructing the weights, name-keyed moments, and run state
+/// — or `Ok(None)` when the bundle's schema version does not match this
+/// binary's (design pressure round, finding 7): greenfield, this crate ships
+/// no reader for an old `dropout_positions` shape, so treating a
+/// version-mismatched bundle as NO checkpoint (start the attempt fresh) is
+/// strictly better than a hard attempt failure, which would strand every
+/// live checkpoint written under a since-bumped schema. Logs exactly one
+/// `tracing::warn!` naming both versions when this fires, so an operator can
+/// see it happened without every such attempt failing outright.
 ///
-/// A moments file with a `{name}.m` lacking its `{name}.v` (or vice versa) is a
-/// hard error — a torn optimizer state must not restore half a parameter's
-/// trajectory and silently zero the rest.
-pub fn load_bundle(dir: &Path, device: &Device) -> Result<RestoredCheckpoint> {
+/// A moments file with a `{name}.m` lacking its `{name}.v` (or vice versa) is
+/// still a hard error once the version check passes — a torn optimizer
+/// state must not restore half a parameter's trajectory and silently zero
+/// the rest; that failure mode is unrelated to schema versioning and stays
+/// a real `Err`.
+pub fn load_bundle(dir: &Path, device: &Device) -> Result<Option<RestoredCheckpoint>> {
+    // Read and check the version FIRST, before ever touching the (larger)
+    // safetensors files: a version mismatch means nothing else in this
+    // bundle is going to be used, so there is no reason to load it.
+    let state_bytes = std::fs::read(dir.join(STATE_FILE))?;
+    let state: ResumeState = serde_json::from_slice(&state_bytes)
+        .map_err(|e| JammiError::FineTune(format!("resume: parse state: {e}")))?;
+    if state.schema_version != RESUME_STATE_SCHEMA_VERSION {
+        tracing::warn!(
+            found_schema_version = state.schema_version,
+            expected_schema_version = RESUME_STATE_SCHEMA_VERSION,
+            "resume: resume_state.json's schema_version does not match this binary's — \
+             treating as NO checkpoint (starting this attempt fresh) rather than restoring a \
+             bundle whose 'dropout_positions' shape/unit this binary does not have a reader for"
+        );
+        return Ok(None);
+    }
+
     let weights = candle_core::safetensors::load(dir.join(WEIGHTS_FILE), device)
         .map_err(|e| JammiError::FineTune(format!("resume: load weights: {e}")))?;
 
@@ -189,38 +253,11 @@ pub fn load_bundle(dir: &Path, device: &Device) -> Result<RestoredCheckpoint> {
         .map_err(|e| JammiError::FineTune(format!("resume: load moments: {e}")))?;
     let moments = pair_moments(moment_tensors)?;
 
-    let state_bytes = std::fs::read(dir.join(STATE_FILE))?;
-    // `ResumeState::schema_version` has no `#[serde(default)]`, so a
-    // checkpoint written before this field existed (no `schema_version` key
-    // in its JSON at all) fails RIGHT HERE with a typed error naming the
-    // missing field — refused, not silently misinterpreted (esc-032).
-    let state: ResumeState = serde_json::from_slice(&state_bytes).map_err(|e| {
-        JammiError::FineTune(format!(
-            "resume: parse state: {e} — a checkpoint written before the schema_version field \
-             existed (pre-C7) has no such field and is refused rather than silently restored: \
-             its 'dropout_positions' counted per-ELEMENT draws, not the per-forward Philox \
-             counters this schema now expects, so misreading one as the other would silently \
-             desynchronize every training forward's dropout mask from the run it resumes"
-        ))
-    })?;
-    // A PRESENT but DIFFERENT version — the case the missing-field parse
-    // error above cannot catch (e.g. a checkpoint from a future schema
-    // version this binary predates). Refused with the same "typed error
-    // naming the field" contract, not guessed at.
-    if state.schema_version != RESUME_STATE_SCHEMA_VERSION {
-        return Err(JammiError::FineTune(format!(
-            "resume: resume_state.json has schema_version {}, this binary expects {} — \
-             refusing rather than guessing how to interpret an unrecognized schema's \
-             'dropout_positions' units",
-            state.schema_version, RESUME_STATE_SCHEMA_VERSION
-        )));
-    }
-
-    Ok(RestoredCheckpoint {
+    Ok(Some(RestoredCheckpoint {
         weights,
         moments,
         state,
-    })
+    }))
 }
 
 /// Reassemble the flat `{name}.m` / `{name}.v` map into per-parameter pairs,
@@ -285,8 +322,13 @@ mod tests {
             (tiny(&device, 30.0), tiny(&device, 40.0)),
         );
 
+        let mut rank0_positions = HashMap::new();
+        rank0_positions.insert("projection.dropout".to_string(), 96);
+        let mut rank1_positions = HashMap::new();
+        rank1_positions.insert("projection.dropout".to_string(), 57);
         let mut dropout_positions = HashMap::new();
-        dropout_positions.insert("projection.dropout".to_string(), 96);
+        dropout_positions.insert(0u32, rank0_positions);
+        dropout_positions.insert(1u32, rank1_positions);
         let state = ResumeState {
             schema_version: RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch: 2,
@@ -303,7 +345,9 @@ mod tests {
         for (name, bytes) in &bundle {
             std::fs::write(out.path().join(name), bytes).unwrap();
         }
-        let restored = load_bundle(out.path(), &device).unwrap();
+        let restored = load_bundle(out.path(), &device)
+            .unwrap()
+            .expect("a same-version bundle must restore, not fall back to no-checkpoint");
 
         assert_eq!(restored.state, state);
         for (name, t) in &weights {
@@ -366,14 +410,15 @@ mod tests {
         capture_bundle(scratch, &weights, &moments, &state).unwrap()
     }
 
-    /// esc-032, the exact oracle the C7 contract asks for: an UNVERSIONED
-    /// checkpoint fixture (a `resume_state.json` from before the
-    /// `schema_version` field existed — the field is ABSENT, not merely
-    /// `0`/`null`, matching what a real pre-C7 checkpoint literally wrote)
-    /// must be REFUSED, never silently restored under today's
-    /// (incompatible) `dropout_positions` unit.
+    /// esc-032 / design pressure round finding 7: an UNVERSIONED checkpoint
+    /// fixture (a `resume_state.json` from before the `schema_version` field
+    /// existed — the field is ABSENT, not merely `0`/`null`, matching what a
+    /// real pre-C7 checkpoint literally wrote) is treated as NO checkpoint —
+    /// `Ok(None)`, never a hard `Err` (which would strand every live older
+    /// checkpoint as an attempt failure) and never silently restored under
+    /// today's incompatible `dropout_positions` shape/unit either.
     #[test]
-    fn unversioned_checkpoint_is_refused_not_silently_restored() {
+    fn unversioned_checkpoint_is_treated_as_no_checkpoint() {
         let device = Device::Cpu;
         let scratch = tempfile::tempdir().unwrap();
         let bundle = minimal_versioned_bundle(scratch.path());
@@ -390,26 +435,19 @@ mod tests {
                 std::fs::write(out.path().join(name), bytes).unwrap();
             }
         }
-        // `.expect_err`/`.unwrap_err` require `T: Debug`, which
-        // `RestoredCheckpoint` (holding raw `Tensor`s) does not implement —
-        // match explicitly instead of adding a `Debug` derive purely for
-        // this test's sake.
-        let err = match load_bundle(out.path(), &device) {
-            Err(e) => e,
-            Ok(_) => panic!("an unversioned checkpoint must be refused, not silently restored"),
-        };
-        let msg = err.to_string();
+        let restored = load_bundle(out.path(), &device).unwrap();
         assert!(
-            msg.contains("schema_version"),
-            "the typed error must name the missing field: {msg}"
+            restored.is_none(),
+            "an unversioned checkpoint must fall back to no-checkpoint (Ok(None)), never a hard \
+             error and never a silent restore"
         );
     }
 
-    /// The complementary case a missing-field parse error alone cannot
-    /// catch: a checkpoint whose `schema_version` is PRESENT but does not
-    /// match this binary's expectation. Also refused, not guessed at.
+    /// The complementary case: a checkpoint whose `schema_version` is
+    /// PRESENT but does not match this binary's expectation. Same
+    /// soft-fallback treatment — `Ok(None)`, not a hard error.
     #[test]
-    fn mismatched_schema_version_is_refused() {
+    fn mismatched_schema_version_is_treated_as_no_checkpoint() {
         let device = Device::Cpu;
         let scratch = tempfile::tempdir().unwrap();
         let bundle = minimal_versioned_bundle(scratch.path());
@@ -423,20 +461,44 @@ mod tests {
                 std::fs::write(out.path().join(name), bytes).unwrap();
             }
         }
+        let restored = load_bundle(out.path(), &device).unwrap();
+        assert!(
+            restored.is_none(),
+            "a mismatched schema_version must fall back to no-checkpoint (Ok(None)), never a \
+             hard error"
+        );
+    }
+
+    /// A genuinely torn moments file (unrelated to schema versioning) stays
+    /// a real, hard `Err` once the version check passes — the soft fallback
+    /// above must not swallow every failure this function can produce.
+    #[test]
+    fn a_same_version_bundle_with_torn_moments_is_still_a_hard_error() {
+        let device = Device::Cpu;
+        let scratch = tempfile::tempdir().unwrap();
+        let bundle = minimal_versioned_bundle(scratch.path());
+        let out = tempfile::tempdir().unwrap();
+        for (name, bytes) in &bundle {
+            if name == MOMENTS_FILE {
+                // Overwrite with a moments file missing every `.v` entry —
+                // torn, but still a validly-versioned bundle otherwise.
+                let mut only_m = HashMap::new();
+                only_m.insert("w.lora_a.m".to_string(), tiny(&device, 1.0));
+                only_m.insert("w.lora_b.m".to_string(), tiny(&device, 2.0));
+                let torn_path = out.path().join(MOMENTS_FILE);
+                candle_core::safetensors::save(&only_m, &torn_path).unwrap();
+            } else {
+                std::fs::write(out.path().join(name), bytes).unwrap();
+            }
+        }
         let err = match load_bundle(out.path(), &device) {
             Err(e) => e,
-            Ok(_) => panic!("a mismatched schema_version must be refused"),
+            Ok(_) => panic!("a torn moments file must be a hard error, not a soft fallback"),
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("schema_version"),
-            "error must name the field: {msg}"
-        );
-        assert!(
-            msg.contains(&(RESUME_STATE_SCHEMA_VERSION + 1).to_string())
-                && msg.contains(&RESUME_STATE_SCHEMA_VERSION.to_string()),
-            "error must state both the checkpoint's version and this binary's expected \
-             version: {msg}"
+            msg.contains("torn optimizer state") || msg.contains("no second moment"),
+            "error must name the torn-moments failure: {msg}"
         );
     }
 }

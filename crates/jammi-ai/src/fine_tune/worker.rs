@@ -5188,8 +5188,12 @@ fn run_fine_tune_blocking(
 }
 
 /// Fetch and load a job's durable resume checkpoint, if any. `None` when no
-/// checkpoint exists yet (from-scratch). A present-but-corrupt bundle surfaces as
-/// a hard error from the artifact store, not a silent from-scratch restart.
+/// checkpoint exists yet (from-scratch) OR when one exists but
+/// [`crate::fine_tune::resume::load_bundle`] falls back to no-checkpoint
+/// (a schema-version mismatch — see that function's own doc). A
+/// present-but-genuinely-corrupt bundle (e.g. torn moments) still surfaces
+/// as a hard error from the artifact store, not a silent from-scratch
+/// restart.
 fn discover_resume(
     store: &Arc<ArtifactStore>,
     tenant: Option<TenantId>,
@@ -5201,7 +5205,7 @@ fn discover_resume(
     else {
         return Ok(None);
     };
-    crate::fine_tune::resume::load_bundle(local.dir(), device).map(Some)
+    crate::fine_tune::resume::load_bundle(local.dir(), device)
 }
 
 /// Refuse a backbone precision the resolved device cannot compute at.

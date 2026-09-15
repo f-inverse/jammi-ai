@@ -4447,10 +4447,55 @@ impl TrainingLoop {
         Ok((by_name, step_t))
     }
 
+    /// Gather every rank's own per-layer dropout positions to rank 0
+    /// (DESIGN.md §4): a REAL collective call — every rank must take part,
+    /// in lockstep, even though only rank 0's caller
+    /// ([`Self::save_resume_checkpoint`]) ever reads the result. Returns the
+    /// SAME map on every rank, never a partial one only rank 0 gets, so this
+    /// function's own type never leaks which rank is about to use it.
+    ///
+    /// Encodes each rank's positions as one row of a `(1, n)` `f64` tensor
+    /// (`n` = this run's dropout-layer count, identical on every rank — the
+    /// same architecture), name-sorted so every rank fills the SAME column
+    /// for the SAME layer without exchanging names; `all_gather`s it (one
+    /// row per rank, rank order); reads the `(world, n)` result back into a
+    /// per-rank map. `f64` carries a Philox forward-counter value (a small
+    /// integer) exactly — no rounding risk for any realistic run length.
+    ///
+    /// At `W = 1` (`Noop`) `all_gather` is the identity, so the returned map
+    /// always has exactly the one entry for rank 0 — the pre-U4b flat
+    /// `dropout_positions` shape, now wrapped one level deeper (see
+    /// [`ResumeState::dropout_positions`]'s own doc).
+    fn gather_dropout_positions(&self) -> Result<HashMap<u32, HashMap<String, u64>>> {
+        let local = self.target.dropout_positions()?;
+        let mut names: Vec<String> = local.keys().cloned().collect();
+        names.sort();
+        let values: Vec<f64> = names.iter().map(|n| local[n] as f64).collect();
+        let local_tensor = Tensor::from_vec(values, (1, names.len()), &self.device)
+            .map_err(|e| JammiError::FineTune(format!("dropout position tensor: {e}")))?;
+        let counts = vec![1usize; self.rank_ctx.world() as usize];
+        let gathered = self
+            .rank_ctx
+            .collective()
+            .all_gather(&local_tensor, &counts)?;
+        let gathered_rows: Vec<Vec<f64>> = gathered
+            .to_vec2()
+            .map_err(|e| JammiError::FineTune(format!("dropout position gather readback: {e}")))?;
+        let mut by_rank = HashMap::with_capacity(gathered_rows.len());
+        for (rank, row) in gathered_rows.into_iter().enumerate() {
+            let mut m = HashMap::with_capacity(names.len());
+            for (name, v) in names.iter().zip(row) {
+                m.insert(name.clone(), v.round() as u64);
+            }
+            by_rank.insert(rank as u32, m);
+        }
+        Ok(by_rank)
+    }
+
     /// Assemble the full resume bundle at an epoch boundary: adapter weights, the
-    /// name-keyed optimizer moments, the scaler's `(μ, σ)`, the dropout-stream
-    /// positions, and the run counters. The single routine both the durable save
-    /// and the test's reference snapshot drive.
+    /// name-keyed optimizer moments, the scaler's `(μ, σ)`, the PER-RANK dropout-
+    /// stream positions (gathered to rank 0), and the run counters. The single
+    /// routine both the durable save and the test's reference snapshot drive.
     fn capture_resume_bundle(
         &self,
         scratch_dir: &Path,
@@ -4461,6 +4506,10 @@ impl TrainingLoop {
     ) -> Result<Vec<(String, bytes::Bytes)>> {
         let weights = self.target.named_trainable_weights()?;
         let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
+        // A real collective call every rank takes part in — see this
+        // function's own doc and `Self::save_resume_checkpoint`'s rank-0-only
+        // write gate immediately after its own call to this function.
+        let dropout_positions = self.gather_dropout_positions()?;
         let state = ResumeState {
             schema_version: RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch,
@@ -4468,15 +4517,23 @@ impl TrainingLoop {
             step_t,
             seed: self.config.seed,
             scaler: self.target_scaler.map(|s| (s.mean(), s.std())),
-            dropout_positions: self.target.dropout_positions()?,
+            dropout_positions,
         };
         capture_bundle(scratch_dir, &weights, &moments, &state)
     }
 
     /// Write the durable resume checkpoint to `{job_id}/_resume/` via the artifact
     /// store, overwriting the prior epoch. A `None` store is a no-op (a
-    /// trainer-internal run with no durable checkpointing). The caller has already
-    /// confirmed the lease is held (`!cancel`).
+    /// trainer-internal run with no durable checkpointing) — checked BEFORE the
+    /// gather below, since it is derived from configuration and therefore
+    /// identical on every rank of a real gang, so every rank takes this early
+    /// exit the same way (no lockstep hazard). The caller has already confirmed
+    /// the lease is held (`!cancel`).
+    ///
+    /// DESIGN.md §4: rank 0 alone writes the durable resume checkpoint; every
+    /// OTHER rank's call is a no-op — but only past the point where it has
+    /// already taken part in [`Self::capture_resume_bundle`]'s dropout-position
+    /// gather, a real collective call every rank must make in lockstep.
     fn save_resume_checkpoint(
         &self,
         checkpoint_dir: &Path,
@@ -4491,6 +4548,9 @@ impl TrainingLoop {
         let scratch = checkpoint_dir.join("_resume_scratch");
         let bundle =
             self.capture_resume_bundle(&scratch, epoch, global_step, optimizer, optim_param_names)?;
+        if self.rank_ctx.rank() != 0 {
+            return Ok(());
+        }
         tokio::runtime::Handle::current().block_on(store.put_resume_checkpoint(
             self.tenant.as_ref(),
             &self.job_id,
@@ -4596,6 +4656,13 @@ impl TrainingLoop {
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
+        // DESIGN.md §4: rank 0 alone publishes; every other rank's call is a
+        // no-op. No collective call happens anywhere in this function (unlike
+        // `Self::save_resume_checkpoint`'s dropout-position gather), so an
+        // early return here carries no lockstep hazard.
+        if self.rank_ctx.rank() != 0 {
+            return Ok(());
+        }
         let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
         let files = self.checkpoint_adapter_files(&scratch)?;
         let prefix = tokio::runtime::Handle::current().block_on(store.put_epoch_checkpoint(
@@ -4779,9 +4846,20 @@ impl TrainingLoop {
             .map(|(mean, std)| TargetScaler::from_mean_std(mean, std));
 
         // Replay each dropout stream to its epoch-boundary position so the next
-        // forwards draw the same masks the uninterrupted run drew (R3).
+        // forwards draw the same masks the uninterrupted run drew (R3). U4b:
+        // `state.dropout_positions` is keyed by RANK — this rank restores only
+        // its OWN entry, never rank 0's; an entry missing for this rank (a
+        // resume at a different world size than the checkpoint was taken at)
+        // restores nothing, leaving every stream at its from-scratch origin —
+        // the same "a missing key leaves that layer at the origin" contract
+        // `restore_dropout_positions` already documents, one level up.
+        let this_rank_positions = state
+            .dropout_positions
+            .get(&self.rank_ctx.rank())
+            .cloned()
+            .unwrap_or_default();
         self.target
-            .restore_dropout_positions(&state.dropout_positions)?;
+            .restore_dropout_positions(&this_rank_positions)?;
 
         Ok((state.last_completed_epoch + 1, state.global_step))
     }
@@ -10748,7 +10826,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         // Continue N steps → the reference forward trajectory.
         for _ in 0..N {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
@@ -10784,7 +10863,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         drop(crash_loop); // simulate process death
 
         // ── Assertion (1): restored state BYTE-EQUAL to S_ref@K ──────────────────
@@ -10846,7 +10926,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         let (start_epoch, _gstep) = {
             // Borrow the loop mutably to restore weights/scaler/dropout, and the
             // opt to restore moments — the exact `restore_from_checkpoint` routine.
@@ -10943,7 +11024,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         for _ in 0..N {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
         }
@@ -10954,9 +11036,11 @@ mod resume_invariant {
         let (mut wo_loop, wo_varmap) =
             build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
         wo_loop.target.load_weights(&bundle.weights).unwrap();
+        // This harness is always single-rank, so the gathered map holds
+        // exactly rank 0's entry.
         wo_loop
             .target
-            .restore_dropout_positions(&bundle.state.dropout_positions)
+            .restore_dropout_positions(&bundle.state.dropout_positions[&0u32])
             .unwrap();
         let (mut wo_opt, _wo_names) = build_opt(&wo_varmap, &wo_loop); // fresh zero moments
         for _ in 0..N {
@@ -11169,7 +11253,8 @@ mod resume_invariant {
                 .dir(),
             &device,
         )
-        .unwrap();
+        .unwrap()
+        .expect("a same-version bundle must restore in this test");
         assert_eq!(
             after.state.last_completed_epoch, 5,
             "the zombie's stale write must not have regressed the checkpoint below \

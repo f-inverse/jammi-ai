@@ -91,25 +91,31 @@ pub use jammi_numerics::{bucket_seq_len, MIN_BUCKET_LEN};
 
 /// The bucket rung a batch's rows are padded to: `pinned`, if the caller
 /// supplies one, or [`bucket_seq_len`] of THIS batch's own natural width
-/// otherwise (today's only reachable arm).
+/// otherwise (every reachable call site today, including a real gang — see
+/// below).
 ///
-/// **Why a rank ever needs to PIN one (DESIGN.md §2):** each rank buckets its
-/// own local batch independently by DEFAULT, so two ranks whose local
-/// batches happen to differ in natural width would encode to two DIFFERENT
-/// shapes — fine for a rank training alone, but a gather that concatenates
-/// ranks' hidden states along the sequence axis (§4's gather primitive)
-/// needs every rank at the SAME rung first. `pinned` is that agreed rung —
-/// derived across ranks (e.g. an all-gather-max of natural widths) by
-/// whoever coordinates the gang, never by this function, which only applies
-/// whichever rung it is handed.
+/// **Why a real gang does NOT need to pin one (corrected, U4b — design
+/// pressure round, finding 6; an earlier revision of this doc claimed the
+/// opposite).** The gather DESIGN.md §4 defines concatenates each rank's
+/// POOLED `[rows, hidden]` output along dim 0 (the row axis) — never along
+/// dim 1, the sequence axis this bucket rung governs. Two ranks whose local
+/// batches bucket to two DIFFERENT rungs still produce IDENTICAL trailing
+/// `hidden` widths (pooling already collapsed the sequence axis before the
+/// gather ever runs), so a dim-0 gather never needs the ranks to agree on
+/// how they got there. `pinned` therefore stays UNUSED by every production
+/// call site (`TrainingLoop::encode_texts` always passes `None`, at every
+/// world size): each rank keeps bucketing its own local batch to its OWN
+/// natural width, independently, exactly as a single rank always has. The
+/// tolerance a cross-rank gather-exactness oracle needs to absorb is the
+/// bucket ladder's own documented PADDING variance (this module's own
+/// `1e-4`/`1e-5`-scale bound on a padded-vs-natural-width forward, not a
+/// bit-identity claim) — never a reason to force every rank onto one rung.
 ///
-/// **Unused at this commit.** `TrainingLoop::encode_texts`'s call site always
-/// passes `None` — every reachable run trains one rank alone (world 1), so
-/// there is no OTHER rank's shape to agree with yet; U4b, which spawns
-/// per-rank readers and a real cross-rank gather, is what would ever
-/// construct and pass `Some(rung)`. Landed now as the plumbing that call site
-/// will need, not as a behavior change: `None` reproduces exactly what
-/// today's unconditional `bucket_seq_len` call computes, byte-for-byte.
+/// `pinned` itself stays a real, callable parameter — DESIGN.md §2 still
+/// names rung-pinning as an OPTION a future caller could exercise (e.g. to
+/// bound the per-run distinct-shape count across ranks, esc-076's own
+/// concern, rather than for gather correctness) — just not one this unit
+/// wires to any call site.
 pub fn resolve_bucket_rung(
     natural_cols: usize,
     effective_max: usize,

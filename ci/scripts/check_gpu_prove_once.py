@@ -885,11 +885,14 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     # actually rents from this site today -- see `test_gpu_dev_lifecycle.sh`
     # for the lifecycle-safety assertions on what `reap` itself may do.
     "ci/scripts/gpu-dev.sh": "gpu-reap.yml",
-    # The distributed-training CLUSTER leg: 2 hosts x 1 GPU on one RunPod
-    # CLUSTER (REST v2) -- a second, independent renting mechanism from the
-    # pod leg's GraphQL `podFindAndDeployOnDemand`, derived into P7's
-    # subject set via RENTING_ROOTS below (never a hard-coded pod-only seed).
-    "ci/scripts/runpod_gpu_cluster.sh": "gpu-cluster.yml",
+    # The distributed-training CLUSTER leg has NO driver row on this tree —
+    # its two-host driver and workflow are filed (not yet shipped) as a
+    # future unit. `rp_cluster_create` remains a second renting ROOT below
+    # (RENTING_ROOTS) even with no table row: its only callers on this tree
+    # are `runpod_lib.sh` itself and its mocks-only tests, so P7's
+    # completeness rule clears it through `_check_derived_driver_cannot_rent`
+    # (no workflow carries RUNPOD_API_KEY alongside either caller's path)
+    # rather than through a row — add the row back once a driver ships.
 }
 
 # --------------------------------------------------------------------------- #

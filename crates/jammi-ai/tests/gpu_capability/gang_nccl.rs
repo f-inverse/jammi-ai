@@ -24,26 +24,33 @@
 //! leg (`ncclCommInitAll` over two devices in one process — the RunPod POD
 //! lane, `ci/scripts/runpod_gpu_gang.sh`). [`gang_nccl_two_hosts_reduce_a_known_vector`]
 //! is the TWO-HOST leg (`ncclCommInitRank` on each of two separate processes,
-//! one per host — the RunPod CLUSTER lane, `ci/scripts/runpod_gpu_cluster.sh`).
+//! one per host). It has no automated driver or workflow on this tree today
+//! — that two-host cluster driver is filed as unit U7b-A2b. Until it ships,
+//! a maintainer drives this leg BY HAND with `ci/scripts/runpod_lib.sh`'s own
+//! cluster primitives (`rp_cluster_create`/`rp_cluster_get`/`rp_cluster_pods`/
+//! `rp_cluster_delete`): rent a 2×1 cluster, `scp` the 128-byte NCCL id
+//! between the two members, and export each rank's `JAMMI_GANG_TWO_HOSTS_*`
+//! env below before running this test on each host — see
+//! `docs/maintainer/dev-gpu.md`'s cluster-leg section for the exact steps.
 //! Both call the SAME [`assert_gang_checks`] helper so the two legs prove the
 //! identical property (rank-ordered sum, unequal-count gather, lockstep
 //! flags, barrier, not-aborted) rather than two hand-maintained copies that
 //! could silently drift apart.
 //!
-//! # The two-host leg's driver env contract
+//! # The two-host leg's env contract
 //!
-//! The two-host leg is a no-op everywhere except the cluster driver: without
-//! its env it skips loudly (never `#[ignore]`, never a vacuous pass). The
-//! driver sets:
+//! The two-host leg is a no-op with none of this env set: without it it
+//! skips loudly (never `#[ignore]`, never a vacuous pass). Whoever runs it —
+//! U7b-A2b's driver once it ships, or a maintainer by hand until then — sets:
 //!
 //! - `JAMMI_GANG_TWO_HOSTS_RANK` — this process's rank, `0` or `1`.
 //! - `JAMMI_GANG_TWO_HOSTS_WORLD` — must be `2`; any other value is a named
 //!   refusal (a panic), never a silent skip or a truncated gang — this leg
 //!   proves nothing above world 2 (see "Known-unmeasured" below).
 //! - `JAMMI_GANG_TWO_HOSTS_ID_FILE` — the path rank 0 mints the NCCL id to
-//!   and rank 1 reads it from. The driver ships this file between hosts out
-//!   of band (`scp`) BEFORE starting rank 1's process; this test never
-//!   touches the network to move it.
+//!   and rank 1 reads it from. The id is shipped between hosts out of band
+//!   (`scp`) BEFORE rank 1's process starts; this test never touches the
+//!   network to move it.
 //! - `JAMMI_GANG_ARTIFACT_DIR` — where `rank-<r>.json` is written, on both
 //!   the pass and the fail arm (same env name the pod leg's driver already
 //!   sets — see `ci/scripts/runpod_gpu_gang.sh`).
@@ -141,7 +148,7 @@ fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
 
 /// [`harness::serial_cuda_device`], hard-failing under
 /// `JAMMI_REQUIRE_CUDA_TWO_HOSTS` rather than skipping — the two-host leg's
-/// OWN require flag (module doc, "driver env contract"), never the
+/// OWN require flag (module doc, "env contract"), never the
 /// single-process leg's `JAMMI_REQUIRE_CUDA_GANG`.
 ///
 /// Unlike [`serial_cuda_device_or_require`], this is NOT `#[cfg(feature =
@@ -173,7 +180,7 @@ fn serial_cuda_device_or_require_two_hosts(test: &str) -> Option<harness::Serial
 }
 
 /// The two-host leg's four env vars, parsed and validated — see the module
-/// doc's "The two-host leg's driver env contract".
+/// doc's "The two-host leg's env contract".
 struct TwoHostsEnv {
     rank: u32,
     world: u32,
@@ -209,8 +216,8 @@ fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
             }
             tracing::warn!(
                 "SKIP: no two-host gang env (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / \
-                 JAMMI_GANG_ARTIFACT_DIR set); this leg only runs from \
-                 ci/scripts/runpod_gpu_cluster.sh"
+                 JAMMI_GANG_ARTIFACT_DIR set); this leg has no automated driver on this tree \
+                 today (U7b-A2b) and is otherwise run by hand"
             );
             return None;
         }
@@ -624,16 +631,17 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Two ranks, two HOSTS: rank 0 mints the NCCL id and ships it out of band
-/// (a file the driver copies between hosts; this test never talks to the
-/// network directly), both ranks join with `Nccl::from_rank`, and both run
+/// (an `scp`'d file; this test never talks to the network directly), both
+/// ranks join with `Nccl::from_rank`, and both run
 /// [`assert_gang_checks`] — the SAME assertions
 /// [`gang_nccl_reduces_a_known_vector_over_two_devices`] runs, over a real
 /// cross-host communicator instead of `ncclCommInitAll`'s single-process one.
 ///
-/// See the module doc's "The two-host leg's driver env contract" for the
-/// four env vars this test reads and what an incomplete/malformed one means.
-/// Without them this test skips loudly (never `#[ignore]`) — it is a no-op
-/// on every lane except the cluster driver (`ci/scripts/runpod_gpu_cluster.sh`).
+/// See the module doc's "The two-host leg's env contract" for the four env
+/// vars this test reads and what an incomplete/malformed one means. Without
+/// them this test skips loudly (never `#[ignore]`) — it is a no-op unless
+/// something sets that env: U7b-A2b's driver once it ships, or a maintainer
+/// running it by hand today (see the module doc's own procedure).
 #[test]
 fn gang_nccl_two_hosts_reduce_a_known_vector() {
     const TEST: &str = "gang_nccl_two_hosts_reduce_a_known_vector";

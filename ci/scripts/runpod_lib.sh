@@ -1408,8 +1408,8 @@ PY
 }
 
 # The "zero tests matched" tripwire (F13), shared by EVERY gang leg's remote
-# text — the pod leg (`runpod_gpu_gang.sh`'s `gang-proof` group) and the
-# cluster leg (`runpod_gpu_cluster.sh`'s per-rank build+run heredoc) alike.
+# text — today the pod leg (`runpod_gpu_gang.sh`'s `gang-proof` group); a
+# future cluster leg's own remote text sources this SAME check too.
 # A `cargo test ... <name-filter> ...` invocation whose own filter matches NO
 # tests exits 0 with "running 0 tests ... test result: ok" printed to its
 # log — a false green a leg with no proof must never read as a pass (the

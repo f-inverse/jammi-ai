@@ -178,19 +178,3 @@ cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Car
 # paid-pod-lane rule pins that `on:` block by name, exactly as its P1 pins
 # the prove lane's). ---
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$gang_log"	runpod_gpu_gang.sh's `gang-proof` group — the live two-rank gang run on one 2-GPU pod (the RAGGED normalization of a `... | tee "$gang_log"` line inside the remote heredoc, so the registry holds the escaped `\$gang_log` spelling, not the "obvious" reading). Needs two real A100s in one box; the group refuses a zero-test filter match and a run that wrote no artifact, so this row never waives a vacuous pass.
-
-# --- ci/scripts/runpod_gpu_cluster.sh — the gpu-cluster TWO-HOST leg.
-# Two RunPod PODS on one RunPod CLUSTER, one A100 each, joined over the
-# cluster's own private overlay network — the two-host NCCL bootstrap
-# (`ncclCommInitRank`) the pod leg above cannot exercise at all. Its
-# `cluster-build` compile-check tuple is byte-identical to the prove/gang
-# lanes' own `--no-run` tuple and is covered by that row above (one row,
-# three origins); the LIVE run below is this script's only tuple of its
-# own. Same off-merge-path residual as every row above, on a narrower fact:
-# the tuple needs TWO SEPARATE hosts each holding a real A100, which no
-# hermetic runner has and no single-pod lane can stand in for. Its one
-# invoker is `.github/workflows/gpu-cluster.yml` (the `run-cluster` PR
-# label and manual dispatch — deliberately no `push:`/`workflow_call:`/
-# `schedule:` trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s
-# P7/P8 rules pin that `on:` block by name). ---
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability ${CLUSTER_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$rank_log"	runpod_gpu_cluster.sh's `cluster-proof` group — the live two-HOST NCCL run, one rank per host (the RAGGED normalization of a `... | tee "$rank_log"` line inside the per-rank remote heredoc, so the registry holds the escaped `\$rank_log` spelling, not the "obvious" reading). Needs two real A100s on two SEPARATE hosts; F13's shared zero-test tripwire refuses a zero-test filter match, and the driver refuses a run that wrote no artifact, so this row never waives a vacuous pass.

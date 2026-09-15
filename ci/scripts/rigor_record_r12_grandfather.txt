@@ -21,3 +21,56 @@
 #
 # Empty by default: no unit is grandfathered at the moment this file was
 # introduced.
+# PR-B1 (#568, merged 2026-09-14): U2a's closing adversarial-audit BLOCK predates R12; its findings are filed as Stands (#561/#563/#564/#565).
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+cookbook_421-tower-chapter
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_480-487-transport-and-seam-docs
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_481-hub-delta
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_482-compute-tier-substrate
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_482-dist-data-plane
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_482-graph-job-deps
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_500-A-datafusion-54
+# PR-B1 (#568, merged 2026-09-14): U2a's closing adversarial-audit BLOCK predates R12; filed as Stands (#561/#563/#564/#565).
+feat_500-B-U2a
+# PR-B2 (#575, merged 2026-09-15): U2b's closing audit BLOCK predates R12; filed as Stands (#550, #551, #544).
+feat_500-B-U2b
+# PR-B2 (#575): U3's closing audit #6 BLOCK predates R12; filed as Stands (#573, #562).
+feat_500-B-U3
+# PR-B1 (#568, merged 2026-09-14): U7b-A1-pull's closing adversarial-audit BLOCK predates R12; filed as Stands with U2a's.
+feat_500-B-gang-local
+# PR-B2 (#575): U5a-1's closing audit #4 BLOCK predates R12; filed as Stands (#574, #566).
+feat_500-C-U5a-1
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_deploy-shapes-A-consistency
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_deploy-shapes-C-jobs
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_deploy-shapes-D-artifacts
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_deploy-shapes-E1-arm64-ci-base
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_deploy-shapes-E2-arm64
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+feat_deploy-shapes-K-kubernetes
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+fix_421-serve-gaps
+# fix/536 (merged in PR-B1's line): its closing audit BLOCK predates R12; filed with that unit's record.
+fix_536-embedded-close
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+fix_wave1-release-counter
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+perf_421-artifact
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+perf_421-followups
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+perf_421-frontend
+# this PR's own closing audit #7 BLOCK, filed as Stands (#557 item 3, #569, #570) — the mechanism cannot precede itself.
+proposal_lead-gate-R12-anticipation
+# pre-R12 unit (an earlier program's merged or retired branch): the lead's live ledger still carries its last second-round row as a BLOCK, taken before the anticipation mechanism existed; nothing re-exports this record, so the entry is a ledger fact, not a live exemption.
+proposal_lead-gate-R4-verifiable-sweep

@@ -1985,18 +1985,180 @@ fn file_header_map_plus_nested_env_header_merges() {
     assert_eq!(headers.get("b").map(Secret::expose), Some("2"));
 }
 
+/// `[engine] memory_limit` is no longer an unread String field once
+/// [`EngineConfig::memory_limit_bytes`] parses it (K2, contract
+/// `feat_500-B-U2c` §9 B5) — `[gpu] memory_limit` stays unread (out of this
+/// unit's scope), so it is the string field this oracle now pairs with the
+/// integer coercion.
 #[test]
 fn env_integer_field_parses_leading_zeros_string_field_keeps_them_verbatim() {
     let cfg = JammiConfig::parse_from(
         "",
         vec![
             ("JAMMI_ENGINE__BATCH_SIZE".to_string(), "007".to_string()),
-            ("JAMMI_ENGINE__MEMORY_LIMIT".to_string(), "007".to_string()),
+            ("JAMMI_GPU__MEMORY_LIMIT".to_string(), "007".to_string()),
         ],
     )
     .unwrap();
     assert_eq!(cfg.engine.batch_size, 7);
-    assert_eq!(cfg.engine.memory_limit, "007");
+    assert_eq!(cfg.gpu.memory_limit, "007");
+}
+
+/// `"007"` parses as the integer `7` (leading zeros tolerated, matching
+/// [`env_integer_field_parses_leading_zeros_string_field_keeps_them_verbatim`]'s
+/// batch-size half) — 7 bytes, refused by the 64 MiB floor, naming both the
+/// key and the floor. `parse_from` alone does not run this check (it is
+/// `load_from`'s post-load validation), so this drives it directly.
+#[test]
+fn memory_limit_007_parses_to_seven_bytes_and_is_refused_by_the_floor() {
+    let cfg = EngineConfig {
+        memory_limit: "007".to_string(),
+        ..EngineConfig::default()
+    };
+    let err = cfg.memory_limit_bytes().unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("memory_limit"), "{msg}");
+    assert!(msg.contains('7'), "names the resolved byte count: {msg}");
+    assert!(msg.contains("64"), "names the floor: {msg}");
+}
+
+fn engine_with(memory_limit: &str) -> EngineConfig {
+    EngineConfig {
+        memory_limit: memory_limit.to_string(),
+        ..EngineConfig::default()
+    }
+}
+
+/// `[engine] memory_limit`'s grammar (K2): every arm, both accepted and
+/// refused, driven straight through [`EngineConfig::memory_limit_bytes`].
+mod memory_limit_grammar {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn bytes_form_resolves_verbatim() {
+        assert_eq!(
+            engine_with("134217728").memory_limit_bytes().unwrap(),
+            128 * MIB
+        );
+    }
+
+    #[test]
+    fn gb_form_scales_by_the_binary_unit() {
+        assert_eq!(engine_with("2GB").memory_limit_bytes().unwrap(), 2 * GIB);
+    }
+
+    #[test]
+    fn mb_form_scales_by_the_binary_unit() {
+        assert_eq!(
+            engine_with("128MB").memory_limit_bytes().unwrap(),
+            128 * MIB
+        );
+    }
+
+    #[test]
+    fn kb_form_scales_by_the_binary_unit() {
+        assert_eq!(
+            engine_with("131072KB").memory_limit_bytes().unwrap(),
+            128 * MIB
+        );
+    }
+
+    #[test]
+    fn percent_form_resolves_against_a_readable_host() {
+        // Not pinned to an exact value (the host total varies by machine),
+        // only that it resolves to something plausible: strictly positive,
+        // and at most the (readable) host total.
+        let total = host_memory::total_physical_memory_bytes().unwrap();
+        let bytes = engine_with("50%").memory_limit_bytes().unwrap();
+        assert!(bytes > 0);
+        assert!(bytes <= total);
+    }
+
+    #[test]
+    fn percent_zero_is_refused_by_range_not_the_floor() {
+        let err = engine_with("0%").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("between 1 and 100"), "{err}");
+    }
+
+    #[test]
+    fn percent_over_a_hundred_is_refused() {
+        let err = engine_with("101%").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("between 1 and 100"), "{err}");
+    }
+
+    #[test]
+    fn zero_bytes_is_refused_by_the_floor() {
+        let err = engine_with("0").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("memory_limit"), "{err}");
+    }
+
+    #[test]
+    fn exactly_the_floor_is_accepted() {
+        assert_eq!(
+            engine_with("67108864").memory_limit_bytes().unwrap(),
+            EngineConfig::MEMORY_LIMIT_FLOOR_BYTES
+        );
+    }
+
+    #[test]
+    fn one_byte_under_the_floor_is_refused() {
+        let err = engine_with("67108863").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("64"), "{err}");
+    }
+
+    #[test]
+    fn empty_string_is_refused() {
+        let err = engine_with("").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("not a valid form"), "{err}");
+    }
+
+    #[test]
+    fn a_decimal_is_refused() {
+        let err = engine_with("4.5GB").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("not a valid form"), "{err}");
+    }
+
+    #[test]
+    fn a_negative_value_is_refused() {
+        let err = engine_with("-1").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("not a valid form"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_unit_with_no_digits_is_refused() {
+        let err = engine_with("GB").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("not a valid form"), "{err}");
+    }
+
+    #[test]
+    fn a_lowercase_unit_is_an_unrecognised_form() {
+        // The grammar is exact-case; a lowercase suffix does not fall back to
+        // a looser match, it is simply unrecognised (falls through to the
+        // bytes arm, where "4gb" fails to parse as an integer).
+        let err = engine_with("4gb").memory_limit_bytes().unwrap_err();
+        assert!(err.to_string().contains("not a valid form"), "{err}");
+    }
+
+    /// Load-time wiring: an out-of-grammar `[engine] memory_limit` in a real
+    /// TOML file is refused by `JammiConfig::load_from` (via `parse_from` +
+    /// the post-load check), never merely by a unit test calling
+    /// `memory_limit_bytes` directly.
+    #[test]
+    fn an_out_of_grammar_memory_limit_is_refused_at_load() {
+        let err = load_src(
+            r#"
+                artifact_dir = "/tmp/jammi"
+
+                [engine]
+                memory_limit = "not-a-value"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("memory_limit"), "{err}");
+    }
 }
 
 #[test]

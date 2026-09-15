@@ -11,6 +11,7 @@ use crate::error::{JammiError, Result};
 use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 
 mod env_map;
+pub mod host_memory;
 mod layers;
 pub mod secret;
 #[cfg(test)]
@@ -709,10 +710,104 @@ pub enum SigningKeyConfig {
 pub struct EngineConfig {
     /// Number of DataFusion execution threads. Default: available CPU count.
     pub execution_threads: usize,
-    /// Maximum memory for the query engine (e.g., `"75%"` or `"4GB"`). Default: `"75%"`.
+    /// Maximum memory for the query engine: `"<n>%"` (1-100) of host
+    /// physical memory, `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or
+    /// `"<n>"` (bytes). Default: `"75%"`. Parsed by
+    /// [`Self::memory_limit_bytes`] — see its doc for the full grammar and
+    /// refusals.
     pub memory_limit: String,
     /// Maximum rows per DataFusion batch. Default: 8192.
     pub batch_size: usize,
+}
+
+impl EngineConfig {
+    /// Below this, a resolved `memory_limit` is refused at load (K2, contract
+    /// `feat_500-B-U2c` §9 B5): 64 MiB is small enough that DataFusion's own
+    /// long-lived pool consumers (a `SortPreservingMergeExec`'s per-partition
+    /// reservation, an external sorter's spill buffer) would be refused on
+    /// the very first non-trivial query, before the setting ever bounds the
+    /// workload it exists to bound.
+    pub const MEMORY_LIMIT_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Parse `[engine] memory_limit` into bytes — the ONE reader of the
+    /// field; every consumer of the byte value (the session's
+    /// [`datafusion::execution::memory_pool::GreedyMemoryPool`]) calls this,
+    /// never the raw string.
+    ///
+    /// # Grammar
+    ///
+    /// - `"<n>%"`, `1 <= n <= 100`: that percentage of
+    ///   [`host_memory::total_physical_memory_bytes`] (a Linux cgroup
+    ///   ceiling honoured when it is lower than the host total and
+    ///   readable), read once per call — not cached, so a caller that wants
+    ///   ONE resolved value for a whole session's lifetime calls this once
+    ///   and keeps the `u64`, the same discipline
+    ///   `crate::session::JammiSession::build` follows.
+    /// - `"<n>GB"` / `"<n>MB"` / `"<n>KB"`: `n` binary (1024-based) units.
+    /// - `"<n>"`: `n` bytes, unadorned.
+    ///
+    /// # Refusals
+    ///
+    /// Every arm is a typed [`JammiError::Config`] naming the key and the
+    /// configured value:
+    ///
+    /// - a percentage outside `1..=100`;
+    /// - a form matching none of the three shapes above (an empty string, a
+    ///   decimal, a stray unit with no digits, an unrecognised suffix, a
+    ///   negative number);
+    /// - a resolved value below [`Self::MEMORY_LIMIT_FLOOR_BYTES`] — the
+    ///   floor also named in the message, so `"007"` (7 bytes, a
+    ///   `[engine]` config typo for `"7%"` or similar) is refused rather than
+    ///   silently building a 7-byte pool no query could ever run under.
+    pub fn memory_limit_bytes(&self) -> Result<u64> {
+        let raw = self.memory_limit.trim();
+        let bytes = if let Some(pct) = raw.strip_suffix('%') {
+            let pct: u64 = pct
+                .parse()
+                .map_err(|_| Self::memory_limit_grammar_error(&self.memory_limit))?;
+            if !(1..=100).contains(&pct) {
+                return Err(JammiError::Config(format!(
+                    "[engine] memory_limit = {:?}: a percentage must be between 1 and 100",
+                    self.memory_limit
+                )));
+            }
+            let total = host_memory::total_physical_memory_bytes()?;
+            total.saturating_mul(pct) / 100
+        } else if let Some(n) = raw.strip_suffix("GB") {
+            Self::parse_binary_unit(n, &self.memory_limit, 1024 * 1024 * 1024)?
+        } else if let Some(n) = raw.strip_suffix("MB") {
+            Self::parse_binary_unit(n, &self.memory_limit, 1024 * 1024)?
+        } else if let Some(n) = raw.strip_suffix("KB") {
+            Self::parse_binary_unit(n, &self.memory_limit, 1024)?
+        } else {
+            raw.parse::<u64>()
+                .map_err(|_| Self::memory_limit_grammar_error(&self.memory_limit))?
+        };
+        if bytes < Self::MEMORY_LIMIT_FLOOR_BYTES {
+            return Err(JammiError::Config(format!(
+                "[engine] memory_limit = {:?} resolves to {bytes} byte(s), below the {} MiB \
+                 floor (a smaller pool would refuse DataFusion's own long-lived reservations \
+                 before it ever bounds a query)",
+                self.memory_limit,
+                Self::MEMORY_LIMIT_FLOOR_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(bytes)
+    }
+
+    fn parse_binary_unit(digits: &str, raw: &str, unit: u64) -> Result<u64> {
+        let n: u64 = digits
+            .parse()
+            .map_err(|_| Self::memory_limit_grammar_error(raw))?;
+        Ok(n.saturating_mul(unit))
+    }
+
+    fn memory_limit_grammar_error(raw: &str) -> JammiError {
+        JammiError::Config(format!(
+            "[engine] memory_limit = {raw:?} is not a valid form: use \"<n>%\" (1-100), \
+             \"<n>GB\"/\"<n>MB\"/\"<n>KB\", or \"<n>\" (bytes)"
+        ))
+    }
 }
 
 /// GPU device and memory settings.
@@ -2498,6 +2593,13 @@ impl JammiConfig {
         // `otlp_endpoint`) at load time, naming the offending key, rather
         // than at the first `jammi_ai::telemetry::otlp_layer` call.
         config.observability.validate()?;
+        // Reject an out-of-grammar `[engine] memory_limit` (an unparseable
+        // form, an out-of-range percentage, or a resolved value below the
+        // floor) at load time, naming the key — rather than at the first
+        // session build, deep inside `JammiSession::build`'s memory-pool
+        // construction. The resolved value itself is discarded here; every
+        // real consumer re-resolves through this same reader (K2).
+        config.engine.memory_limit_bytes()?;
         Ok(config)
     }
 

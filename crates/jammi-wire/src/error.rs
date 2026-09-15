@@ -36,7 +36,7 @@
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
-//! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`) reconstructs exactly,
+//! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -250,6 +250,13 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     source_query: source_query.clone(),
                 })
             }
+            JammiError::ResourcesExhausted {
+                limit_bytes,
+                detail,
+            } => Variant::ResourcesExhausted(pb::ResourcesExhaustedError {
+                limit_bytes: *limit_bytes,
+                detail: detail.clone(),
+            }),
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -381,6 +388,10 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         },
         Some(Variant::EmptyTrainingSet(e)) => JammiError::EmptyTrainingSet {
             source_query: e.source_query,
+        },
+        Some(Variant::ResourcesExhausted(e)) => JammiError::ResourcesExhausted {
+            limit_bytes: e.limit_bytes,
+            detail: e.detail,
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
@@ -1005,6 +1016,7 @@ mod tests {
             | JammiError::NonUniqueKey { .. }
             | JammiError::Unavailable { .. }
             | JammiError::EmptyTrainingSet { .. }
+            | JammiError::ResourcesExhausted { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -1117,6 +1129,10 @@ mod tests {
             },
             JammiError::EmptyTrainingSet {
                 source_query: "SELECT \"abstract\", \"label\" FROM patents WHERE 1 = 0".into(),
+            },
+            JammiError::ResourcesExhausted {
+                limit_bytes: 67_108_864,
+                detail: "greedy(used: 10.0 MB, pool_size: 64.0 MB)".into(),
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

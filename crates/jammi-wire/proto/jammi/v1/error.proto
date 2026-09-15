@@ -112,6 +112,11 @@ message JammiErrorDetail {
     // source projection yielded zero rows. Maps to `InvalidArgument`, the
     // caller-input convention `InvalidKey`/`NonUniqueKey` carry.
     EmptyTrainingSetError empty_training_set = 40;
+    // `JammiError::ResourcesExhausted { limit_bytes, detail }` — a
+    // DataFusion plan operator or an engine-side memory reservation tried
+    // to grow past the session's `[engine] memory_limit`-bounded pool.
+    // Maps to `RESOURCE_EXHAUSTED`.
+    ResourcesExhaustedError resources_exhausted = 41;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -293,6 +298,18 @@ message EmptyTrainingSetError {
   // `source`: the engine variant's field carries that name so `thiserror` does
   // not read it as the error's `std::error::Error::source()`.
   string source_query = 1;
+}
+
+// `JammiError::ResourcesExhausted { limit_bytes, detail }`. A DataFusion plan
+// operator (a `SortPreservingMergeExec`'s per-partition reservation, an
+// external sorter's spill buffer) or an engine-side consumer registered
+// directly against the session's memory pool tried to grow past `[engine]
+// memory_limit`'s bound. `limit_bytes` is best-effort (0 when the raising
+// message carried no recoverable pool size); `detail` is the raising
+// operator's/consumer's own message, verbatim. Maps to `RESOURCE_EXHAUSTED`.
+message ResourcesExhaustedError {
+  uint64 limit_bytes = 1;
+  string detail = 2;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

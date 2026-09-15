@@ -124,6 +124,71 @@ async fn two_tenants_see_disjoint_rows(backend: BackendKind) {
     assert_eq!(ids_b.value(0), 2);
 }
 
+/// `JammiSession::sql_stream` runs the SAME tenant-scoped analyzer rule as
+/// `JammiSession::sql` — it is an analyzer rule over the LOGICAL plan, so
+/// both entry points see the same rewritten plan before either reaches
+/// physical planning. A tenant-scoped session's streamed read must return
+/// EXACTLY the rows the equivalent collected read does: not a superset (the
+/// tenant filter silently dropped), not a subset (a batch lost draining the
+/// stream), row for row.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn tenant_scoped_sql_stream_returns_exactly_what_sql_returns(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
+
+    let session_a = session_or_skip!(backend, dir);
+    register_widgets(&session_a, &widgets).await;
+    let session_a = session_a.with_tenant(tenant_a);
+    session_a
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (1, 'alpha')"
+        ))
+        .await
+        .unwrap();
+
+    // A peer tenant's row — must NOT appear in `session_a`'s reads, through
+    // either entry point.
+    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    session_b
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (2, 'beta')"
+        ))
+        .await
+        .unwrap();
+
+    let query = format!("SELECT id, name FROM mutable.public.{widgets} ORDER BY id");
+
+    let collected = session_a.sql(&query).await.unwrap();
+    let collected_batch =
+        arrow::compute::concat_batches(&collected[0].schema(), &collected).unwrap();
+
+    let mut stream = session_a.sql_stream(&query).await.unwrap();
+    let mut streamed = Vec::new();
+    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+        streamed.push(batch.unwrap());
+    }
+    let streamed_batch = arrow::compute::concat_batches(&streamed[0].schema(), &streamed).unwrap();
+
+    assert_eq!(
+        collected_batch, streamed_batch,
+        "sql_stream must return exactly the rows sql returns under the same tenant scope"
+    );
+    // Non-vacuous: the tenant filter actually excluded the peer's row on
+    // BOTH paths (proves this oracle is not comparing two empty results).
+    let ids = collected_batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.value(0), 1);
+}
+
 /// An `Unscoped` session sees only rows whose `tenant_id IS NULL`.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]

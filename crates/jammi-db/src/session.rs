@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
@@ -189,6 +192,27 @@ impl JammiSession {
             .with_target_partitions(config.engine.execution_threads)
             .with_batch_size(config.engine.batch_size);
 
+        // `[engine] memory_limit` becomes THIS session's memory pool — the
+        // ONE knob every consumer (a training-set stream's reservation, an
+        // eager materialization's collected-batch reservation, an ordinary
+        // `SortExec`/`SortPreservingMergeExec`) is bounded by, because it
+        // installs on the SAME `SessionStateBuilder` chain below that
+        // becomes `ctx`'s state — never a second, unbounded runtime env a
+        // later step could silently keep using.
+        let memory_limit_bytes = config.engine.memory_limit_bytes()?;
+        let pool_bytes = usize::try_from(memory_limit_bytes).map_err(|_| {
+            JammiError::Config(format!(
+                "[engine] memory_limit resolves to {memory_limit_bytes} bytes, which does not \
+                 fit this platform's usize"
+            ))
+        })?;
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)) as Arc<dyn MemoryPool>)
+            .build_arc()
+            .map_err(|e| {
+                JammiError::Config(format!("failed to build the session's runtime env: {e}"))
+            })?;
+
         // Build a base context to get the default state, then layer in
         // federation support (optimizer rule + query planner).
         let base_ctx = SessionContext::new_with_config(session_config);
@@ -219,6 +243,7 @@ impl JammiSession {
             .with_optimizer_rules(rules)
             .with_analyzer_rules(analyzer_rules)
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_runtime_env(runtime_env)
             .build();
 
         let ctx = SessionContext::new_with_state(federated_state);
@@ -751,6 +776,44 @@ impl JammiSession {
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         let df = self.ctx.sql(query).await?;
         Ok(df.collect().await?)
+    }
+
+    /// [`Self::sql`]'s streamed twin: plan `query` and return the
+    /// [`SendableRecordBatchStream`] rather than collecting it, so a caller
+    /// that must not hold the whole result set resident (a training-set
+    /// loader walking a multi-row-group table one batch at a time) can drain
+    /// it incrementally. The [`crate::tenant_scope::TenantScopeAnalyzerRule`]
+    /// applies identically to both — it is an analyzer rule over the LOGICAL
+    /// plan, run before either `sql` or `sql_stream` ever reaches physical
+    /// planning, so a tenant-scoped `sql_stream` call returns exactly the
+    /// rows the equivalent `sql` call would, row for row, never a wider or
+    /// narrower set.
+    ///
+    /// Every batch pulled from the returned stream draws on this session's
+    /// [`Self::memory_pool`] exactly as a collected [`Self::sql`] call's
+    /// buffered batches do — the difference is WHEN a caller lets the memory
+    /// go: a stream a caller drops early releases its reservations as it
+    /// goes, where `sql`'s `Vec<RecordBatch>` holds every batch until the
+    /// caller drops the whole vector.
+    pub async fn sql_stream(&self, query: &str) -> Result<SendableRecordBatchStream> {
+        let df = self.ctx.sql(query).await?;
+        Ok(df.execute_stream().await?)
+    }
+
+    /// This session's memory pool — the `[engine] memory_limit`-bounded
+    /// [`GreedyMemoryPool`] installed at `Self::build` on the SAME
+    /// `SessionStateBuilder` chain that carries the tenant/federation
+    /// analyzer rules, so every plan this session runs (`sql`, `sql_stream`,
+    /// and every internal `ctx.sql`/`create_physical_plan` call the store
+    /// layer makes through this session's context) reserves against ONE
+    /// shared bound. A caller that registers its OWN
+    /// [`datafusion::execution::memory_pool::MemoryConsumer`] against this
+    /// pool (a training-set stream's per-rank reservation, an eager read's
+    /// collected-batch reservation) is bounded by the identical knob a plan
+    /// exhausting DataFusion's own operators would surface
+    /// [`JammiError::ResourcesExhausted`] against.
+    pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.ctx.runtime_env().memory_pool)
     }
 
     /// Every ANN index segment of `table_name`, ordered by `segment_id`.

@@ -112,10 +112,17 @@ sha2.workspace = true
 hkdf.workspace = true
 hex.workspace = true
 
+# `[engine] memory_limit`'s host-memory reader (`config::host_memory`):
+# `sysctlbyname("hw.memsize")` on macOS. Already a workspace dependency and
+# already a `[dev-dependencies]` entry of this crate; this promotes it to a
+# real (non-dev) dependency so `src/` can use it.
+libc.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 tokio.workspace = true
 jammi-test-utils.workspace = true
 test-case = { workspace = true }
-libc = { workspace = true }
+# `libc` moved to `[dependencies]` above (now a real, non-dev dependency);
+# still available to every test in this crate through that promotion.
 parquet = { workspace = true }

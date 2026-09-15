@@ -30,6 +30,7 @@ mod masked_read;
 mod materialization;
 #[cfg(feature = "test-hooks")]
 mod materialization_crash_recovery;
+mod memory_pool;
 mod migrations;
 mod model_lifecycle;
 #[cfg(feature = "test-hooks")]

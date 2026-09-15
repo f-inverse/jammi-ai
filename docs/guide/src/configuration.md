@@ -45,7 +45,20 @@ artifact_dir = "/path/to/artifacts"
 [engine]
 # Number of DataFusion execution threads. Default: number of CPUs.
 execution_threads = 8
-# Memory limit for the query engine. Default: "75%".
+# Memory limit for the query engine's DataFusion session: this becomes the
+# byte size of a `GreedyMemoryPool` every plan and every engine-side memory
+# reservation (a training-set stream's chunk, an eager read's collected
+# batches) is bounded by. Three forms:
+#   - "<n>%"      -- that percentage (1-100) of the HOST's total physical
+#                    memory (a Linux cgroup ceiling is honoured when it is
+#                    lower than the host total and readable), resolved once
+#                    at session build.
+#   - "<n>GB"/"<n>MB"/"<n>KB" -- n binary (1024-based) units.
+#   - "<n>"       -- n bytes, unadorned.
+# Anything else, or a resolved value below the 64 MiB floor, is refused at
+# load, naming the key and (for the floor) the floor. A query or engine-side
+# reservation that would grow the pool past this limit fails with a typed
+# `ResourcesExhausted` error rather than silently exceeding it. Default: "75%".
 memory_limit = "75%"
 # Maximum rows per DataFusion batch. Default: 8192.
 batch_size = 8192

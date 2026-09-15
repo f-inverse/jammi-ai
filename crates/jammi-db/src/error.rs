@@ -432,6 +432,34 @@ pub enum JammiError {
         source_query: String,
     },
 
+    /// A DataFusion plan operator (a `SortPreservingMergeExec`'s
+    /// per-partition reservation, an external sorter's spill buffer) or an
+    /// engine-side consumer registered directly against the session's
+    /// [`crate::session::JammiSession::memory_pool`] (a training-set
+    /// stream's chunk reservation, an eager materialization's
+    /// collected-batch reservation) tried to grow past `[engine]
+    /// memory_limit`'s pool. Typed, never a panic, and never a silent wait:
+    /// the pool's own `try_grow` fails synchronously, so this surfaces from
+    /// the same public path (`sql`, `sql_stream`, a streamed loader's
+    /// `next_chunk`) the query or reservation was made on.
+    #[error("resources exhausted: pool limit is {limit_bytes} byte(s): {detail}")]
+    ResourcesExhausted {
+        /// The pool's configured byte limit. For a `DataFusionError::ResourcesExhausted`
+        /// classified through `From<DataFusionError>`, this is a BEST-EFFORT
+        /// value recovered by parsing the pool's own `Display` impl
+        /// (`"greedy(used: …, pool_size: …)"`) out of `detail` — that text is
+        /// itself human-readable and rounded to one decimal place by
+        /// DataFusion, so the recovered value is approximate, and is `0`
+        /// when the message carries no recognisable `pool_size: ` marker. A
+        /// caller that constructs this variant directly (an engine-side
+        /// consumer that already knows the configured limit) sets the exact
+        /// value. `detail` is always the untouched original message, so no
+        /// information is lost regardless of what this field carries.
+        limit_bytes: u64,
+        /// The raising operator's or consumer's own message, verbatim.
+        detail: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),
@@ -535,16 +563,30 @@ impl From<datafusion::error::DataFusionError> for JammiError {
     fn from(e: datafusion::error::DataFusionError) -> Self {
         match unwrap_jammi(e) {
             Ok(inner) => inner,
-            Err(e) => match not_found_path(&e) {
-                Some((path, original)) => JammiError::Storage(crate::storage::StorageError::Io {
-                    path: path.clone(),
-                    source: object_store::Error::NotFound {
-                        path,
-                        source: Box::<dyn std::error::Error + Send + Sync>::from(original),
-                    },
-                }),
-                None => JammiError::DataFusion(e),
-            },
+            Err(e) => {
+                // Shape (c): a `ResourcesExhausted` anywhere in the source
+                // chain (bare, or nested under `Context`) is always typed —
+                // checked before shape (b)'s not-found walk so a pool
+                // exhaustion is never mistaken for an object-store miss.
+                if let Some(msg) = resources_exhausted_message(&e) {
+                    return JammiError::ResourcesExhausted {
+                        limit_bytes: parse_pool_size_bytes(&msg).unwrap_or(0),
+                        detail: msg,
+                    };
+                }
+                match not_found_path(&e) {
+                    Some((path, original)) => {
+                        JammiError::Storage(crate::storage::StorageError::Io {
+                            path: path.clone(),
+                            source: object_store::Error::NotFound {
+                                path,
+                                source: Box::<dyn std::error::Error + Send + Sync>::from(original),
+                            },
+                        })
+                    }
+                    None => JammiError::DataFusion(e),
+                }
+            }
         }
     }
 }
@@ -677,6 +719,58 @@ fn not_found_path(e: &datafusion::error::DataFusionError) -> Option<(String, Str
     None
 }
 
+/// Shape (c): walk `source()` from `e` and return the first
+/// `DataFusionError::ResourcesExhausted`'s message, checking `e` itself
+/// first (the common case: a bare `ResourcesExhausted` with nothing wrapping
+/// it) then every inner error `.source()` reaches — a `Context(msg, inner)`
+/// wrapping one is the shape `unwrap_jammi`'s `Err` branch hands back
+/// unchanged when there was no `JammiError` payload to restore.
+fn resources_exhausted_message(e: &datafusion::error::DataFusionError) -> Option<String> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(datafusion::error::DataFusionError::ResourcesExhausted(msg)) =
+            err.downcast_ref::<datafusion::error::DataFusionError>()
+        {
+            return Some(msg.clone());
+        }
+        cur = err.source();
+    }
+    None
+}
+
+/// Best-effort recovery of a `GreedyMemoryPool`/`FairSpillPool`'s configured
+/// byte limit from its own `Display` impl embedded in a `ResourcesExhausted`
+/// message (`"…pool_size: <value> <unit>…"`, `<value>` rounded to one
+/// decimal place and `<unit>` one of `B`/`KB`/`MB`/`GB`/`TB`, binary-based —
+/// see `datafusion_common::display::human_readable_size`). Returns `None`
+/// when the message carries no `pool_size: ` marker, or the token after it
+/// does not parse as `<f64> <unit>` — never a panic on an unrecognised
+/// shape.
+fn parse_pool_size_bytes(message: &str) -> Option<u64> {
+    const MARKER: &str = "pool_size: ";
+    let start = message.find(MARKER)? + MARKER.len();
+    let rest = &message[start..];
+    let end = rest.find([')', ',']).unwrap_or(rest.len());
+    let token = rest[..end].trim();
+    let mut parts = token.split_whitespace();
+    let value: f64 = parts.next()?.parse().ok()?;
+    let unit = parts.next()?;
+    let multiplier: f64 = match unit {
+        "B" => 1.0,
+        "KB" => 1024.0,
+        "MB" => 1024.0 * 1024.0,
+        "GB" => 1024.0 * 1024.0 * 1024.0,
+        "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let bytes = value * multiplier;
+    if bytes.is_finite() && bytes >= 0.0 {
+        Some(bytes.round() as u64)
+    } else {
+        None
+    }
+}
+
 /// Convenience alias for `std::result::Result<T, JammiError>`.
 pub type Result<T> = std::result::Result<T, JammiError>;
 
@@ -749,5 +843,87 @@ mod tests {
             std::error::Error::source(&j).is_some(),
             "`source()` must survive on the public type"
         );
+    }
+
+    /// Shape (c): a bare `ResourcesExhausted` becomes the typed variant,
+    /// naming the raising message verbatim in `detail` and recovering the
+    /// pool size from its `Display` impl in `limit_bytes`.
+    #[test]
+    fn classifier_types_a_bare_resources_exhausted() {
+        let msg = "Failed to allocate additional 3.7 MB for SortPreservingMergeExec[0] with \
+                    0.0 B already allocated for this reservation - 63.6 KB remain available \
+                    for the total memory pool: greedy(used: 456.0 B, pool_size: 64.0 KB)"
+            .to_string();
+        match JammiError::from(DF::ResourcesExhausted(msg.clone())) {
+            JammiError::ResourcesExhausted {
+                limit_bytes,
+                detail,
+            } => {
+                assert_eq!(detail, msg);
+                assert_eq!(limit_bytes, 65536); // 64.0 KB, binary
+            }
+            other => panic!("expected ResourcesExhausted, got {other:?}"),
+        }
+    }
+
+    /// Shape (c) nested: a `ResourcesExhausted` wrapped in `Context` (the
+    /// shape `unwrap_jammi`'s `Err` branch hands back unchanged, since there
+    /// is no `JammiError` payload inside) is still classified, never falling
+    /// through to the generic `DataFusion` catch-all.
+    #[test]
+    fn classifier_types_a_resources_exhausted_nested_under_context() {
+        let e = DF::Context(
+            "physical_plan".into(),
+            Box::new(DF::ResourcesExhausted(
+                "greedy(used: 0.0 B, pool_size: 1.0 MB)".into(),
+            )),
+        );
+        match JammiError::from(e) {
+            JammiError::ResourcesExhausted { limit_bytes, .. } => {
+                assert_eq!(limit_bytes, 1024 * 1024);
+            }
+            other => panic!("expected ResourcesExhausted, got {other:?}"),
+        }
+    }
+
+    /// A `ResourcesExhausted` whose message carries no `pool_size: ` marker
+    /// (a pool this parser does not recognise the shape of) still types the
+    /// variant — `limit_bytes` degrades to `0`, `detail` keeps the message
+    /// whole, never a panic on the unrecognised shape.
+    #[test]
+    fn classifier_types_an_unparseable_resources_exhausted_with_a_zero_limit() {
+        match JammiError::from(DF::ResourcesExhausted("some other pool ran dry".into())) {
+            JammiError::ResourcesExhausted {
+                limit_bytes,
+                detail,
+            } => {
+                assert_eq!(limit_bytes, 0);
+                assert_eq!(detail, "some other pool ran dry");
+            }
+            other => panic!("expected ResourcesExhausted, got {other:?}"),
+        }
+    }
+
+    /// [`parse_pool_size_bytes`] over every unit and a degenerate input.
+    #[test]
+    fn parse_pool_size_bytes_covers_every_unit_and_degenerates_to_none() {
+        assert_eq!(
+            parse_pool_size_bytes("greedy(used: 0.0 B, pool_size: 456.0 B)"),
+            Some(456)
+        );
+        assert_eq!(
+            parse_pool_size_bytes("greedy(used: 0.0 B, pool_size: 2.0 KB)"),
+            Some(2048)
+        );
+        assert_eq!(
+            parse_pool_size_bytes("greedy(used: 0.0 B, pool_size: 1.0 GB)"),
+            Some(1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_pool_size_bytes("greedy(used: 0.0 B, pool_size: 1.0 TB)"),
+            Some(1024u64 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(parse_pool_size_bytes("no marker here"), None);
+        assert_eq!(parse_pool_size_bytes("pool_size: not-a-number KB"), None);
     }
 }

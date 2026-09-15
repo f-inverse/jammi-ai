@@ -1025,6 +1025,61 @@ impl TrainingLoop {
             }
         }
 
+        // U4b (design pressure round, finding 4): the three arms with NO
+        // gather story at all — hard-negative mining, GradCache, and the
+        // `Precomputed` test loader — are refused, typed, at `world > 1`,
+        // rather than silently run through a per-rank slice `if world == 1`
+        // would have skipped:
+        //   - mining (`mining_eligible`) retrieves from THIS PROCESS's own
+        //     index over its own local corpus view — a per-rank index would
+        //     mine a different negative pool per rank, never the objective a
+        //     gang is supposed to compute (the SAME reasoning
+        //     `RankAdmission::admit`'s existing `world_size > 1` +
+        //     `hard_negatives.mine` submit-time refusal already applies; this
+        //     is the SAME rule re-stated at the run-time edge, in case a
+        //     `TrainingLoop` is ever driven directly, past that admission).
+        //   - GradCache (`gradcache_eligible`) computes a LOCAL in-batch-
+        //     negative loss over the whole (local) train prefix — gathering
+        //     its result would silently score a DIFFERENT objective than
+        //     the caller asked for, not the real GradCache one (the same
+        //     submit-time refusal `RankAdmission::admit` already applies for
+        //     `config.cached`; restated here at the run-time edge).
+        //   - a `Precomputed` loader (trainer-internal tests only) ignores
+        //     `PartitionSpec` entirely — every rank would see the IDENTICAL
+        //     rows, so an oracle built on it would be vacuous, never
+        //     exercising the partition rule at all.
+        // None of the three has a gather story built in this unit; each is a
+        // named, deferred follow-up, not a silent gap.
+        if self.rank_ctx.world() > 1 {
+            if self.mining_eligible() {
+                return Err(JammiError::FineTune(
+                    "hard-negative mining at world > 1 is refused: the miner retrieves from \
+                     this process's own index over its own local corpus view, so each rank \
+                     would mine a different negative pool — not yet built for a real gang"
+                        .into(),
+                ));
+            }
+            if self.gradcache_eligible() {
+                return Err(JammiError::FineTune(
+                    "GradCache at world > 1 is refused: it computes a local in-batch-negative \
+                     loss over this rank's own train prefix, and gathering that result would \
+                     score a different objective than a real GradCache run — not yet built \
+                     for a real gang"
+                        .into(),
+                ));
+            }
+            if let TrainingSource::Resident(loader) = &source {
+                if loader.is_precomputed() {
+                    return Err(JammiError::FineTune(
+                        "a Precomputed loader at world > 1 is refused: it ignores PartitionSpec \
+                         entirely (every rank would see the identical rows), so it is a \
+                         trainer-internal test affordance only, never a real gang's source"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
         /// This run's training/validation source, prepared for the epoch
         /// loop: a `Resident` source is split into its two
         /// `TrainingDataLoader`s up front (unchanged from before this
@@ -2737,10 +2792,16 @@ impl TrainingLoop {
             }
             TextChunk::Classification { texts, labels } => {
                 let proj = encode(texts)?;
+                // U4b: the classification head runs HERE, on this rank's own
+                // LOCAL embeddings, so the batch carries LOGITS — already
+                // downstream of the trainable head — never the raw
+                // embeddings a gather would otherwise have to cross (see
+                // `TrainingBatch::Classification`'s own doc).
+                let logits = self.classify(&proj)?;
                 let labels_tensor = Tensor::from_vec(labels.clone(), (labels.len(),), &self.device)
                     .map_err(|e| JammiError::FineTune(format!("Labels tensor: {e}")))?;
                 Ok(super::data::TrainingBatch::Classification {
-                    embeddings: proj,
+                    logits,
                     labels: labels_tensor,
                 })
             }
@@ -3220,9 +3281,8 @@ impl TrainingLoop {
                     self.triplet_loss(&dims[0], &dims[1], &dims[2])
                 }),
             },
-            super::data::TrainingBatch::Classification { embeddings, labels } => {
-                let logits = self.classify(embeddings)?;
-                self.cross_entropy_loss(&logits, labels)
+            super::data::TrainingBatch::Classification { logits, labels } => {
+                self.cross_entropy_loss(logits, labels)
             }
             super::data::TrainingBatch::Ner {
                 hidden_states,
@@ -3248,19 +3308,22 @@ impl TrainingLoop {
     /// **Gather points, per arm** (DESIGN.md §4's own wording): `Contrastive`
     /// / `Pairs` / `Triplet` gather the POST-PROJECTION encoder outputs
     /// (already computed, locally, by [`Self::encode_chunk`] before this
-    /// call ever runs) and the scores. `Classification` gathers the LOGITS
-    /// [`Self::classify`] returns — `classify` itself is called HERE, on
-    /// this rank's own LOCAL `embeddings` only, so the trainable
-    /// classification head sees only local input and the gather point sits
-    /// strictly downstream of it; `embeddings` themselves are never gathered
-    /// (DESIGN.md §4 names this exactly: "never `embeddings`"). `Regression`
-    /// gathers `input` — already `Self::head_forward`'s output
-    /// (`Self::encode_chunk`'s `Regression` arm runs it before this function
-    /// ever sees the batch) — and the targets, the same "downstream of
-    /// every trainable parameter" rule, not a special case. `Ner` stays
-    /// refused, exactly as [`Self::compute_loss`] itself refuses it; this
-    /// function never reaches a `Ner` batch in production (`Self::
-    /// encode_chunk` never builds one).
+    /// call ever runs) and the scores. `Classification` gathers the LOGITS —
+    /// [`Self::encode_chunk`]'s `Classification` arm calls [`Self::classify`]
+    /// on this rank's own LOCAL embeddings at BATCH-CONSTRUCTION time (never
+    /// here), so by the time this function sees the batch the trainable
+    /// classification head has already run on local-only input and the
+    /// gather point sits strictly downstream of it; `embeddings` themselves
+    /// are never gathered (DESIGN.md §4 names this exactly: "never
+    /// `embeddings`") — they do not even reach this call, since
+    /// `TrainingBatch::Classification` no longer carries them (see that
+    /// variant's own doc). `Regression` gathers `input` — already `Self::
+    /// head_forward`'s output (`Self::encode_chunk`'s `Regression` arm runs
+    /// it before this function ever sees the batch) — and the targets, the
+    /// SAME rule, not a special case any more. `Ner` stays refused, exactly
+    /// as [`Self::compute_loss`] itself refuses it; this function never
+    /// reaches a `Ner` batch in production (`Self::encode_chunk` never
+    /// builds one).
     ///
     /// **Why this closes the W× gradient hazard.** [`super::collective::
     /// Collective::all_gather`]'s own contract: only the calling rank's own
@@ -3316,11 +3379,16 @@ impl TrainingLoop {
                     negative,
                 })
             }
-            TrainingBatch::Classification { embeddings, labels } => {
-                let logits = self.classify(embeddings)?;
-                let logits = collective.all_gather(&logits, counts)?;
+            TrainingBatch::Classification { logits, labels } => {
+                // `logits` is already the classification head's OUTPUT
+                // (`Self::encode_chunk`'s `Classification` arm calls
+                // `Self::classify` on this rank's own local embeddings
+                // before this function ever sees the batch) — gathering it
+                // is the same "downstream of every trainable parameter"
+                // rule as `Regression`'s `input`, not a special case.
+                let logits = collective.all_gather(logits, counts)?;
                 let labels = collective.all_gather(labels, counts)?;
-                self.cross_entropy_loss(&logits, &labels)
+                self.compute_loss(&TrainingBatch::Classification { logits, labels })
             }
             TrainingBatch::Regression { input, target } => {
                 let input = collective.all_gather(input, counts)?;
@@ -3435,9 +3503,8 @@ impl TrainingLoop {
                         .into(),
                 )),
             },
-            super::data::TrainingBatch::Classification { embeddings, labels } => {
-                let logits = self.classify(embeddings)?;
-                cross_entropy_per_row(&logits, labels)
+            super::data::TrainingBatch::Classification { logits, labels } => {
+                cross_entropy_per_row(logits, labels)
             }
             super::data::TrainingBatch::Ner { .. } => Err(JammiError::FineTune(
                 "evaluate_held_out: NER's natural unit is a token, not a held-out example — \
@@ -5197,7 +5264,7 @@ fn batch_row_count(batch: &super::data::TrainingBatch) -> Result<usize> {
         super::data::TrainingBatch::Contrastive { embeddings_a, .. } => dim0(embeddings_a),
         super::data::TrainingBatch::Pairs { anchors, .. } => dim0(anchors),
         super::data::TrainingBatch::Triplet { anchor, .. } => dim0(anchor),
-        super::data::TrainingBatch::Classification { embeddings, .. } => dim0(embeddings),
+        super::data::TrainingBatch::Classification { logits, .. } => dim0(logits),
         super::data::TrainingBatch::Ner { hidden_states, .. } => dim0(hidden_states),
         super::data::TrainingBatch::Regression { input, .. } => dim0(input),
     }
@@ -12089,19 +12156,26 @@ mod held_out_eval_tests {
         (loop_, varmap)
     }
 
-    fn classification_batch(device: &Device) -> TrainingBatch {
+    /// U4b: `TrainingBatch::Classification` now carries the head's LOGITS,
+    /// not the pre-head embeddings — `classify()` is called HERE (matching
+    /// `TrainingLoop::encode_chunk`'s own production call site), so the
+    /// classifier layer's seeded dropout mask still draws exactly where it
+    /// did before this shape change, just one call earlier.
+    fn classification_batch(loop_: &TrainingLoop, device: &Device) -> TrainingBatch {
+        let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], device).unwrap();
+        let logits = loop_.classify(&embeddings).unwrap();
         TrainingBatch::Classification {
-            embeddings: Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], device).unwrap(),
+            logits,
             labels: Tensor::new(&[0u32, 1u32], device).unwrap(),
         }
     }
 
-    /// One real training micro-step: forward `compute_loss` (drawing the
-    /// classifier layer's seeded dropout mask when training is on),
-    /// backward, `AdamW::step`. Mirrors `resume_invariant::step_epoch`'s
+    /// One real training micro-step: forward `classify` + `compute_loss`
+    /// (drawing the classifier layer's seeded dropout mask when training is
+    /// on), backward, `AdamW::step`. Mirrors `resume_invariant::step_epoch`'s
     /// shape.
     fn train_step(loop_: &TrainingLoop, opt: &mut AdamW, device: &Device) {
-        let batch = classification_batch(device);
+        let batch = classification_batch(loop_, device);
         let loss = loop_.compute_loss(&batch).unwrap();
         let grads = loss.backward().unwrap();
         opt.step(&grads).unwrap();
@@ -12152,8 +12226,23 @@ mod held_out_eval_tests {
         train_step(&b_loop, &mut b_opt, &device);
         train_step(&b_loop, &mut b_opt, &device);
 
-        let held_out_loader =
-            TrainingDataLoader::from_precomputed(vec![classification_batch(&device)]);
+        // U4b: `classify()` now runs at batch-CONSTRUCTION time (matching
+        // `encode_chunk`'s production shape), so building this Precomputed
+        // held-out batch's logits under `with_dropout_disabled` is what
+        // reproduces the pre-U4b eval-time call's own dropout-off scope —
+        // never advancing the seeded stream this test asserts stays
+        // undisturbed.
+        let held_out_batch = b_loop
+            .with_dropout_disabled(|loop_| {
+                let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], &device).unwrap();
+                let logits = loop_.classify(&embeddings)?;
+                Ok(TrainingBatch::Classification {
+                    logits,
+                    labels: Tensor::new(&[0u32, 1u32], &device).unwrap(),
+                })
+            })
+            .unwrap();
+        let held_out_loader = TrainingDataLoader::from_precomputed(vec![held_out_batch]);
         let held_out_ids = ids(&["ho-0", "ho-1"]);
         let held_out = b_loop
             .evaluate_held_out(&held_out_loader, &held_out_ids)
@@ -13658,14 +13747,15 @@ mod decomposition_oracle_tests {
         assert_decomposition_matches(&loop_, &triplet_batch(&device), "Triplet margin");
     }
 
-    /// Objective 4: Classification cross-entropy. `lora_dropout: 0.0` is
-    /// load-bearing here, not incidental: `compute_loss` and
-    /// `compute_loss_per_example` each independently call
-    /// `Self::classify(embeddings)`, which draws a FRESH seeded dropout mask
-    /// per call when dropout is on — with dropout on, the two calls would
-    /// score two DIFFERENT forward passes and the oracle would be comparing
-    /// unlike quantities, not testing the decomposition. Zero dropout keeps
-    /// both calls' forward pass identical.
+    /// Objective 4: Classification cross-entropy. U4b moved `classify()` out
+    /// of `compute_loss`/`compute_loss_per_example` and into batch
+    /// construction (`TrainingBatch::Classification` now carries LOGITS,
+    /// matching `TrainingLoop::encode_chunk`'s production shape) — `classify`
+    /// is therefore called exactly ONCE here, by the test, and both
+    /// `compute_loss` and `compute_loss_per_example` read the SAME logits, so
+    /// `lora_dropout: 0.0` is no longer load-bearing for this oracle (no two
+    /// independent forward passes to keep in sync); kept anyway for parity
+    /// with this suite's other fixtures.
     #[tokio::test(flavor = "multi_thread")]
     async fn classification_decomposition_matches_compute_loss() {
         let device = Device::Cpu;
@@ -13674,8 +13764,10 @@ mod decomposition_oracle_tests {
             ..Default::default()
         };
         let loop_ = minimal_classification_loop(&device, config).await;
+        let embeddings = Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4], [-0.3, 0.9]], &device).unwrap();
+        let logits = loop_.classify(&embeddings).unwrap();
         let batch = TrainingBatch::Classification {
-            embeddings: Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4], [-0.3, 0.9]], &device).unwrap(),
+            logits,
             labels: Tensor::new(&[0u32, 1u32, 2u32], &device).unwrap(),
         };
         assert_decomposition_matches(&loop_, &batch, "Classification");

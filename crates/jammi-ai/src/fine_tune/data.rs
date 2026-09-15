@@ -50,9 +50,13 @@ pub enum TrainingBatch {
         positive: Tensor,
         negative: Tensor,
     },
-    /// Classification: embeddings + integer class labels.
+    /// Classification: the trainable head's LOGITS (never the pre-head
+    /// embeddings — U4b, DESIGN.md §4: the gather point for this arm must
+    /// sit downstream of the classification head, so the head is applied at
+    /// BATCH-CONSTRUCTION time, in `TrainingLoop::encode_chunk`, rather than
+    /// inside the loss dispatch) + integer class labels.
     Classification {
-        embeddings: Tensor,
+        logits: Tensor,
         labels: Tensor, // shape (batch_size,) u32
     },
     /// NER: hidden states for all tokens + per-token labels.

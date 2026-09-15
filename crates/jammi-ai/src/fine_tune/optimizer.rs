@@ -700,11 +700,7 @@ pub fn canonical_reduce(
         .to_vec1()
         .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence readback: {e}")))?;
 
-    for ((var, tensor), present_count) in trainable_vars
-        .iter()
-        .zip(tensors)
-        .zip(presence_summed)
-    {
+    for ((var, tensor), present_count) in trainable_vars.iter().zip(tensors).zip(presence_summed) {
         if present_count > 0.0 {
             let t: &Tensor = var;
             grads.insert(t, tensor);

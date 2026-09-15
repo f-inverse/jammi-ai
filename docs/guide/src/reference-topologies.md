@@ -309,6 +309,18 @@ for the failure ladder). Three facts fix the shape:
   `InferenceSession::open_with_placement`. Batch builders (the neighbor
   graph, eval) never fan out: they load the whole table's segment set on the
   building replica.
+- **Membership is judged fresh under a margin, pruned only well beyond it.**
+  A row missing its heartbeat for `2 × lease` (`instance_liveness_margin`) is
+  no longer a fresh member; it is not actually deleted until `3 × lease`
+  (`instance_prune_window`) — strictly beyond the margin, so a merely-stale
+  member still has its row when the lease keeper's own reregister lands. A
+  process whose row WAS pruned during a transient outage (an outage longer
+  than the window) rejoins the ring on its very next successful heartbeat,
+  with no restart: the keeper's reregister re-upserts the whole membership
+  tuple (the `instances` row and, if this process runs a claim loop, its
+  `workers` row) in one transaction. Canonical-root equality between two
+  members is necessary, never sufficient, for shared storage — the
+  attestation VERIFY a later unit owns is what establishes sufficiency.
 
 **A REFRESHED table's `Mixed` arm is not version-aware.** The single-node
 (`AllLocal`, every segment this replica's own) search path always resolves a

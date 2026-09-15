@@ -519,62 +519,83 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ### U5b-1a — Membership substrate (PR-C commit 3a)
 
 - **files_in_scope**: (db) `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr_result_root`
-  migration, number at rebase, three pin sites incl. the ordered-after oracle in
-  `crates/jammi-db/tests/it/migrations.rs` (added by U5a-1) — the same
-  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern
-  (`crates/jammi-db/tests/it/migrations.rs::migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`, on `main`) repeated for this migration, cited by
-  construct rather than by an offset on a branch this fold cannot read), `catalog/jobs_repo.rs`
-  (`upsert_instance` gains `peer_addr` + a
-  canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
+  migration, number at rebase, FOUR pin sites — the const list, `EXPECTED_MIGRATION_NAMES`, the
+  ordered-after oracle in `crates/jammi-db/tests/it/migrations.rs` (the same
+  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern, `crates/
+  jammi-db/tests/it/migrations.rs::migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`,
+  on `main`, repeated for this migration), AND the `029` ledger-replay test's DELETE list
+  (`migration_029_copies_training_jobs_rows_into_jobs_as_queued` — `035` ALTERs `instances`,
+  created fresh by `029`'s replayed DDL, so an omission there leaves the reopened table missing
+  both columns, RED — cited by construct rather than by an offset on a branch this fold cannot
+  read), `catalog/instance.rs` (NEW — `PeerAddr` moves here from `index::peer`, re-exported there
+  so the peer listener and the gang listener share ONE address type; `CanonicalRoot`;
+  `InstanceRegistration { instance_id, label, host, peer_addr: Option<PeerAddr>, canonical_root:
+  Option<CanonicalRoot>, worker: Mutex<Option<WorkerFacts>> }` — the ONE value every writer of the
+  `instances`(+`workers`) row builds; `InstanceRegistration::from_config` is the ONE choke point:
+  `peer_advertise` unset yields a non-member registration (NULLs, no filesystem check at all);
+  `peer_advertise` set performs the WHOLE membership check (parses as `PeerAddr`, `peer_bind` is
+  set too, the root canonicalizes) — `ServerConfig::validate` is NOT the home, since it cannot see
+  `artifact_dir`), `catalog/jobs_repo.rs` (`upsert_instance`/`reregister_instance` accept ONLY an
+  `InstanceRegistration`; `peer_addr_of(instance_id, lease) -> Option<PeerAddr>` — the ONE
   by-id resolution verb, fresh-only under the same margin, no kind/root/self filter — is the
   address-resolution surface DESIGN.md §4 names; `list_gang_members(GangListing { kind,
-  self_instance, canonical_root, window })` excludes self, stale (freshness via U5a-1's
-  `instance_liveness_margin()`, consumed here, never recomputed), draining/warming, other-kind
-  (kinds split on `,`, matched as whole tokens), and root-divergent instances; the member order is
-  byte order on `instance_id`, sorted and compared in Rust — never a SQL `ORDER BY`, whose
-  collation is backend-dependent; root divergence is likewise a byte-exact Rust comparison of the
-  canonicalized string, never a SQL `=`; `prune_instances`' window (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`'s call
-  site, exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
-  will return) moves to STRICTLY BEYOND the margin, so a member judged merely stale is never also
-  eligible for deletion; the lease keeper's `Instance` arm (`crates/jammi-db/src/catalog/lease_keeper.rs::renew_all`, folded into
-  the generic `Some(false) → lost` dispatch at `renew_all`) RE-UPSERTS the row on a failed touch
-  instead of only flipping `lost` — `touch_instance` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`) is a pure `UPDATE`
+  self_instance, canonical_root, lease })` excludes self, stale (freshness via U5a-1's
+  `instance_liveness_margin()`, consumed here, never recomputed), draining/warming, no-`workers`-row
+  (an INNER join), other-kind (kinds split on `,`, matched as whole tokens), and root-divergent
+  instances; the member order is byte order on `instance_id`, sorted and compared in Rust — never
+  a SQL `ORDER BY`, whose collation is backend-dependent; root divergence is likewise a byte-exact
+  Rust comparison of the canonicalized string, never a SQL `=`), `catalog/lease.rs`
+  (`instance_prune_window(lease) = instance_liveness_margin(lease).saturating_add(lease)`, i.e.
+  `3 × lease` — STRICTLY BEYOND the `2×` margin, so a member judged merely stale is never also
+  eligible for deletion — `InferenceSession::wrap_with`'s `prune_instances` call site uses this
+  function, never a literal `saturating_mul(2)`/`(3)`), `catalog/lease_keeper.rs`
+  (`LeaseTarget::Instance(Arc<InstanceRegistration>)`; the `Instance` arm of `renew_all`
+  RE-UPSERTS the WHOLE tuple — `instances` row AND, when the registration's worker cell is `Some`,
+  the `workers` row too, in one transaction, via `reregister_instance` — on a failed touch instead
+  of only flipping `lost`; `touch_instance` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`) is a pure `UPDATE`
   that can never resurrect a pruned row, so a process whose row was pruned during a transient
   outage now rejoins on its next heartbeat with no restart), `config/mod.rs` (`[server]
-  peer_advertise` validated at load — requires `peer_bind`; `canonicalize_result_root()`
-  canonicalizes the RESOLVED result-table root — `[storage] result_root` when set, else
-  `{artifact_dir}/jammi_db` (`crates/jammi-db/src/config/mod.rs::StorageConfig`'s documented default, mirroring
-  `session.rs`'s `build_result_store`, `crates/jammi-ai/src/session.rs::build_result_store`) — scheme-aliased, trailing slash
-  trimmed, a non-existent or relative `file://` root refused at load with the row never written;
-  canonical-root equality is NECESSARY, never SUFFICIENT, for shared storage — sufficiency is
-  established only by the attestation VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and
-  U5b-1b-i's per-partition inventory, never by this predicate alone). (ai-core) `session.rs` (the
-  ONLY production call site of `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — gains the `peer_addr` /
-  canonicalized-`result_root` arguments; `InferenceSession::open_with_placement`'s shared-`artifact_dir` topology note stays
-  configurable for a gang; `build_result_store` stays the one place the effective
-  root is actually computed at runtime). (docs-ci) `docs/guide/src/{configuration.md, security.md,
+  peer_advertise` — refused by `InstanceRegistration::from_config`, NOT `validate()` (which cannot
+  see `artifact_dir`): unset `peer_bind` is a named-key error; `canonical_result_root()`
+  canonicalizes the RESOLVED result-table root — `[storage] result_root` when set (the WHOLE
+  effective root, no leaf appended), else `{artifact_dir}/jammi_db` (leaf appended ONLY in this
+  default arm) — scheme-aliased, trailing slash trimmed, a missing or non-directory anchor refused
+  naming the offending key, with the row never written; canonical-root equality is NECESSARY,
+  never SUFFICIENT, for shared storage — sufficiency is established only by the attestation
+  VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and U5b-1b-i's per-partition inventory, never by
+  this predicate alone). (ai-core) `session.rs` (the ONLY production call site of
+  `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — builds the
+  `InstanceRegistration` via `from_config` FIRST, before the lease keeper starts or the result
+  store creates a directory; `InferenceSession::open_with_placement`'s shared-`artifact_dir`
+  topology note stays configurable for a gang; `build_result_store` stays the one place the
+  effective root is actually computed at runtime), `fine_tune/worker.rs` (`JobWorker`/
+  `EmbeddedWorker` are the SOLE owner of the registration's worker cell: `run_until` sets it before
+  its first `upsert_worker`, every `set_worker_state` writes the cell before the row,
+  `delete_worker` clears it). (docs-ci) `docs/guide/src/{configuration.md, security.md,
   deploy-server.md, reference-topologies.md}`.
-- **invariants_to_preserve**: B6, K2 (validate chain), K5 (migration, three pin sites).
-- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, other-kind and
-  root-divergent instance on both backends, plus one fresh multi-kind worker included, from a DB
-  return order permuted away from `instance_id` order — the returned list is still sorted (RED at
-  base); (b) `peer_advertise` without `peer_bind`, or with a non-existent or relative `file://`
-  root, is refused at load, each its own typed error; `peer_advertise` with `result_root` UNSET is
-  ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: the prior refusal sentence
-  is dropped); (c) the migration's ordered-after oracle on both backends; (d) a config with
-  `peer_advertise` set (result root set OR unset) produces a non-NULL `peer_addr`/`canonical_root`
-  `instances` row through the real session-construction path (`InferenceSession::open` /
-  `open_with_placement`), never a direct db write (RED at base: no caller threads the new
-  arguments); (e) `peer_addr_of` resolves a busy or other-kind fresh member and returns
-  `None` for a stale one; it is unreachable from any public RPC and ignores any caller tenant (the
-  invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not exist); (f) two
-  members whose canonicalized `result_root` strings are byte-identical but sit on different
-  filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY, never
-  silently — root equality alone never green-lights a round; (g) a `2×`-lease heartbeat gap
+- **invariants_to_preserve**: B6, K2 (the `from_config` choke point), K5 (migration, four pin sites).
+- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, no-`workers`-row,
+  other-kind and root-divergent instance on both backends, plus one fresh multi-kind worker
+  included, from a DB return order permuted away from `instance_id` order — the returned list is
+  still sorted (RED at base); (b) `peer_advertise` without `peer_bind`, or with a missing or
+  non-directory result-root anchor, is refused by `InstanceRegistration::from_config` (called both
+  at `JammiConfig::load_from` and at `wrap_with`), each its own typed error; `peer_advertise` with
+  `result_root` UNSET is ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: the
+  prior refusal sentence is dropped); (c) the migration's ordered-after oracle on both backends;
+  (d) a config with `peer_advertise` set (result root set OR unset) produces a non-NULL
+  `peer_addr`/`canonical_root` `instances` row through the real session-construction path
+  (`InferenceSession::open` / `open_with_placement`), never a direct db write (RED at base: no
+  caller threads the new arguments); (e) `peer_addr_of` resolves a busy or other-kind fresh member
+  and returns `None` for a stale one; it is unreachable from any public RPC and ignores any caller
+  tenant (the invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not
+  exist); (f) two members whose canonicalized `result_root` strings are byte-identical but sit on
+  different filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY,
+  never silently — root equality alone never green-lights a round; (g) a `2×`-lease heartbeat gap
   followed by recovery makes the member fresh again without a process restart, via the keeper's
-  re-upsert on a failed touch (RED at base: `touch_instance` never resurrects a pruned row); (h)
-  `gang_instance_freshness` runs on BOTH backends — the SQLite-only file is widened, and the
-  live-postgres lane exercises it too.
+  reregister of the WHOLE tuple on a failed touch (RED at base: `touch_instance` never resurrects a
+  pruned row); (h) `tests/it/gang_instance_freshness.rs` is ALREADY parameterized sqlite/postgres
+  at base (satisfied, verified — no widening needed); the NEW `gang_membership.rs` and the 035
+  oracle carry the SAME `test_case` sqlite/postgres shape.
 - **lane**: hermetic + distributed. **depends_on**: **U5a-1** (creates
   `instance_liveness_margin()`; merge order pinned, U5a-1 lands first), PR-B1. **size**: M.
 

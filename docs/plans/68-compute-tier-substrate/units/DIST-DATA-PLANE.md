@@ -207,8 +207,21 @@ Stated semantics: a peer outage is visible (an `UNAVAILABLE` naming the segment)
 
 ### 5.8 Unit 2 — membership (post PR-C; designed here, not built in the first unit)
 
-- `ServerConfig.peer_advertise: Option<String>`: the address peers reach this replica at. `validate()`: `peer_advertise ⇒ peer_bind`; and a `JammiConfig`-level check `peer_advertise ⇒ storage.result_root` is set (K2 — placement over a local root is refused at startup naming the precondition).
-- Migration `NNN_instances_peer_addr` (next free number at rebase, after `030`, wt-C migrations.rs:102): `ALTER TABLE instances ADD COLUMN peer_addr TEXT;`. `instances.host` stays a label (wt-C schema.rs:1023); `upsert_instance` (jobs_repo.rs:1500-1506) gains `peer_addr: Option<&str>`, written from `peer_advertise` by the server's session open (wt-C session.rs:247-251) and `None` by every library/CLI process — those never join the ring.
+- **Shipped as U5b-1a** (`InstanceRegistration::from_config`,
+  `crates/jammi-db/src/catalog/instance.rs`), superseding this sketch's own validation
+  rule: `ServerConfig.peer_advertise: Option<String>` (the address peers reach this
+  replica at) requires `peer_bind` to be set too (a typed error naming both keys
+  otherwise) — but `storage.result_root` UNSET is ACCEPTED, canonicalizing
+  `{artifact_dir}/jammi_db`; only a MISSING or non-directory anchor (the explicit
+  `result_root`, or `artifact_dir` when it is unset) is refused, naming the offending
+  key (K2). `canonical_result_root()` (`config/mod.rs`) is `canon ∘ resolved_result_root()`.
+- Migration `035_instances_peer_addr_result_root` (shipped as U5b-1a, four K5 pin sites):
+  `ALTER TABLE instances ADD COLUMN peer_addr TEXT; ALTER TABLE instances ADD COLUMN
+  result_root TEXT;` — both columns, nullable, no paired `CHECK`. `instances.host` stays
+  a label; `upsert_instance`/`reregister_instance` (`catalog/jobs_repo.rs`) take the ONE
+  `InstanceRegistration` carrier, written by `InferenceSession::wrap_with`
+  (`session.rs`) and `NULL`/`NULL` by every process that never sets `peer_advertise` —
+  never "every library/CLI process": a server with `peer_advertise` set also joins.
 - `RendezvousPlacement { catalog, self_instance_id, lease_window }`: live ring = `instances` rows with `peer_addr IS NOT NULL AND last_seen_at ≥ now − lease_window` (`idx_instances_seen`, wt-C schema.rs:1027); candidates for `(table_name, segment_id)` = ring members ordered by `hash(instance_id, table_name, segment_id)`; first = self → local (empty); otherwise `[first, second]`. Membership is re-read per `resolve_search_mode` call (a catalog read the coordinator already makes for `list_index_segments`), so no background loop (D5). N=1 maps every segment to self — today's path.
 - The Postgres + MinIO two-process proof rides the nightly distributed lane (wt-C crates/jammi-ai/tests/distributed/, `Fleet::spawn` harness.rs:224-230) after PR-C merges.
 
@@ -274,7 +287,7 @@ Gates crossed: K4 suite unchanged; `cargo test --workspace`; `git diff main -- C
 - **B5** — tenant scope is the same generic predicate, applied once at the coordinator's resolve (P11); the owner path is documented tenant-free and gated by I-PEER.
 - **B6** — one PR; `search_final` stays sync and is NOT made async; the async entry is a new type (`PlacedIndex::search_final_placed`), and every caller site in P29 is rewritten to its designated entry (§5.2) in the same change.
 - **I-PEER (new, written)** — every client of `peer_bind` is a jammi coordinator; the owner trusts the channel and enforces only segment-belongs-to-table; binding `peer_bind` on a routable interface without network policy/mTLS exposes cross-tenant reads; default unset. Lives in security.md ("what it does not defend"), deploy-server.md "The identity seam", and configuration.md beside the knob.
-- **K2** — owner validates ids and precision at its input edge; coordinator refuses to exact-scan a multi-node table; `validate()` refuses listener collisions, `peer_local_load_bytes = 0`, and (unit 2) `peer_advertise` without `peer_bind`/`result_root`.
+- **K2** — owner validates ids and precision at its input edge; coordinator refuses to exact-scan a multi-node table; `validate()` refuses listener collisions, `peer_local_load_bytes = 0`, and (shipped as U5b-1a, at the `InstanceRegistration::from_config` choke point, not `validate()`) `peer_advertise` without `peer_bind`, or a missing/non-directory result-root anchor — `result_root` itself UNSET is accepted, never refused.
 - **K4** — A3, A8, A11.
 - **K5** — no migration in the first unit; unit 2 appends one at the next free number.
 - **K6/K7** — no version or identity change; the wire surface grows additively.

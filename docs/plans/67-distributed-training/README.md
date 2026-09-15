@@ -74,8 +74,11 @@ those still in force are restated here in their v4 form. Principle in parenthese
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
     sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-unit-2--membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
     not a plannable unit, so **U5b-1a** lands the
-    substrate it sketches: `[server] peer_advertise` (validate: `peer_advertise ⇒ peer_bind ⇒
-    result_root`), the canonicalized `instances.peer_addr`/`result_root` columns (migration,
+    substrate it sketches: `[server] peer_advertise` (the ONE choke point,
+    `InstanceRegistration::from_config`: `peer_advertise ⇒ peer_bind`, named-key error
+    otherwise; `storage.result_root` UNSET is ACCEPTED and canonicalizes
+    `{artifact_dir}/jammi_db` — never a refusal, only a missing/non-directory anchor
+    refuses), the canonicalized `instances.peer_addr`/`result_root` columns (migration,
     numbered at rebase), the `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_instance` signature and the session write site
     (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`, its `upsert_instance` call site). DIST's `RendezvousPlacement` builds on it later. Peers are resolved
     from the catalog: `workers.kinds` ∋ kind, `instances.peer_addr` set, `last_seen_at` within

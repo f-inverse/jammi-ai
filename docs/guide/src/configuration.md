@@ -192,6 +192,24 @@ preload_models = [
 # them it exposes cross-tenant reads. See security.md "The peer listener"
 # and "The gang listener".
 # peer_bind = "10.0.0.5:8082"
+# The address OTHER replicas dial THIS process's `peer_bind` listener at
+# (`peer_bind` is commonly `0.0.0.0:PORT`, unusable as a dial target).
+# Unset (the default) = this process never advertises a gang-membership row:
+# its `instances.peer_addr`/`result_root` columns stay NULL regardless of
+# whether `peer_bind` is set. Setting it means: this process ADVERTISES
+# itself as a gang member. Requires `peer_bind` to be set too -- refused
+# (naming both keys) at the one membership choke point,
+# `InstanceRegistration::from_config`, which every session construction path
+# (and `JammiConfig::load_from`, for its early-failure side effect) calls.
+# The canonical result root rule: when `[storage] result_root` is UNSET, the
+# root is `{artifact_dir}/jammi_db`, canonicalized; when it IS set, the root
+# is the canonicalized `result_root` itself, with no `jammi_db` suffix
+# appended. Either way the anchor (`artifact_dir` or the explicit
+# `result_root`) MUST already exist and MUST be a directory -- refused,
+# naming the offending key, otherwise; a `memory://` root is refused for a
+# gang member. See "The gang listener (I-GANG)" in security.md for the
+# membership predicate this feeds.
+# peer_advertise = "10.0.4.7:9000"
 # MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
 # estimated bytes ONE query may load locally for segments it does not own,
 # when their owners are unreachable -- the last rung of the placed-search

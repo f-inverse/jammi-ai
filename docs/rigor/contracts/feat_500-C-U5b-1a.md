@@ -1,7 +1,7 @@
 # CONTRACT — feat/500-C-U5b-1a: gang-membership substrate
 
 **Contract of record.** slug: `feat_500-C-U5b-1a` · branch `feat/500-C-U5b-1a`
-at `1c38ee315f7f286546441db0f831014cf81fbfba` (the code commit, tagged
+at `686d4aedfefb3693ee1b798a8749f63493df1acc` (the code commit, tagged
 throughout this revision as "commit 1") · this file is the committed
 mechanism contract `ci/scripts/check_rigor_record.py` requires under
 `docs/rigor/contracts/**` (its check 3) before this unit's rigor record at
@@ -9,6 +9,21 @@ mechanism contract `ci/scripts/check_rigor_record.py` requires under
 Source design contract: the lead's `CONTRACT-U5b-1a.md` v4 (scratchpad-only,
 never a repo path — it is not cited with a `path:line` token anywhere in this
 document, since it is not a tracked file at HEAD).
+
+**P-X4 hardening (this revision, re-anchors "commit 1").** The prior commit
+1 (`bd21b79081935c942bbb65154f43ee09a790aa3f`) left `MemberRoot::new` `pub`
+with no `cfg` gate: P-X4's claim ("constructible in production ONLY from
+`resolved_result_root()`") held BY CONVENTION (the only call site in that
+diff was `from_config`) but was not ENFORCED — nothing stopped a future
+in-tree caller from reaching the arbitrary-string constructor directly, a
+greenfield-threat-model gap (`pub` is not a control the moment a second
+in-tree caller can compile against it). "Commit 1" is re-anchored to
+`686d4aedfefb3693ee1b798a8749f63493df1acc`, which adds `MemberRoot::
+resolved(&JammiConfig) -> Result<Self>` as the ONE production constructor
+(it calls `resolved_result_root` itself), gates `MemberRoot::new` behind
+`feature = "test-hooks"`, and adds the enumerating oracle P-X4 now cites.
+Every `path::construct`/`path:line` citation below was re-derived directly
+against THIS commit's tree (self-check, §11).
 
 **Round-3 revision.** This is the THIRD mechanism revision of this contract.
 Rounds 1–2 built, then twice patched, a canonicalization step over the
@@ -69,29 +84,40 @@ sufficient), or a spelling-identity predicate (filed as unit U5b-1a-A2, §6).
   comment) — the peer listener and the gang listener dial the identical
   address type, so they can never drift into two.
 - **`MemberRoot`** (`crates/jammi-db/src/catalog/instance.rs::MemberRoot`,
-  declared `crates/jammi-db/src/catalog/instance.rs:100`) wraps a string
-  VERBATIM — no canonicalization, no interpretation. `Self::new`
-  (`crates/jammi-db/src/catalog/instance.rs:106`) exists for
-  `InstanceRegistration::from_config` (§2) and fixtures, not as a
-  general-purpose constructor any caller may build an arbitrary string
-  through. Its doc states the design property directly: two DIFFERENT
-  spellings of one physical location (`gcs://b/p` vs `gs://b/p`, a trailing
-  `/`, a case difference) are two DIFFERENT roots.
+  declared `crates/jammi-db/src/catalog/instance.rs:105`) wraps a string
+  VERBATIM — no canonicalization, no interpretation. `Self::resolved`
+  (`crates/jammi-db/src/catalog/instance.rs::MemberRoot::resolved`,
+  `crates/jammi-db/src/catalog/instance.rs:114`) is the ONE production
+  constructor — it calls `resolved_result_root` itself, so a `MemberRoot`
+  can never carry a string the resolver did not produce;
+  `InstanceRegistration::from_config` (§2) is its only caller. `Self::new`
+  (`crates/jammi-db/src/catalog/instance.rs::MemberRoot::new`,
+  `crates/jammi-db/src/catalog/instance.rs:127`) wraps an arbitrary string
+  with no resolver call at all and is compiled ONLY under
+  `feature = "test-hooks"` — a real `cfg` gate, not `#[doc(hidden)]` — so it
+  cannot link into a production build at all; fixtures/tests build a
+  `MemberRoot` through it directly
+  (`crates/jammi-db/tests/it/gang_membership.rs`,
+  `crates/jammi-ai/tests/it/instance_identity.rs`,
+  `crates/jammi-db/src/config/tests.rs`). Its doc states the design
+  property directly: two DIFFERENT spellings of one physical location
+  (`gcs://b/p` vs `gs://b/p`, a trailing `/`, a case difference) are two
+  DIFFERENT roots.
 - **`WorkerFacts`** (`crates/jammi-db/src/catalog/instance.rs::WorkerFacts`,
-  declared `crates/jammi-db/src/catalog/instance.rs:131`) is the claim-loop
+  declared `crates/jammi-db/src/catalog/instance.rs:152`) is the claim-loop
   half of a registration: `kinds: String` (the comma-joined kind set) and
   `state: WorkerState`. Its doc states its SOLE owner is `JobWorker`/
   `EmbeddedWorker` (`crates/jammi-ai/src/fine_tune/worker.rs`), confirmed at
   §4 below.
 - **`InstanceRegistration`**
   (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration`, declared
-  `crates/jammi-db/src/catalog/instance.rs:152`): `instance_id`, `label`,
+  `crates/jammi-db/src/catalog/instance.rs:173`): `instance_id`, `label`,
   `host`, `peer_addr: Option<PeerAddr>`, `member_root: Option<MemberRoot>`,
   and `worker: Mutex<Option<WorkerFacts>>` — the claim-loop cell, mutated in
   place by its single owner rather than requiring a whole new registration
   per state change. `InstanceRegistration::new`
   (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration::new`,
-  `crates/jammi-db/src/catalog/instance.rs:170`) is the plain constructor
+  `crates/jammi-db/src/catalog/instance.rs:191`) is the plain constructor
   with no validation, used by `from_config` itself and by fixtures/tests
   (`crates/jammi-db/tests/it/gang_membership.rs`'s `seed_member` helper and
   direct-construction call sites, and
@@ -99,24 +125,25 @@ sufficient), or a spelling-identity predicate (filed as unit U5b-1a-A2, §6).
   `set_worker`/`worker_snapshot` are the cell's read/write pair
   (mutex-poisoning tolerant via `unwrap_or_else(|p| p.into_inner())`).
 - **`GangListing<'a>`** (`crates/jammi-db/src/catalog/instance.rs::
-  GangListing`, `crates/jammi-db/src/catalog/instance.rs:273`) and
+  GangListing`, `crates/jammi-db/src/catalog/instance.rs:294`) and
   **`GangMember`** (`crates/jammi-db/src/catalog/instance.rs::GangMember`,
-  `crates/jammi-db/src/catalog/instance.rs:292`) are `list_gang_members`'s
+  `crates/jammi-db/src/catalog/instance.rs:313`) are `list_gang_members`'s
   request/response shapes (§3).
 
 ## 2. The membership check: `MembershipConfig::validate`, `InstanceRegistration::from_config`, `resolved_result_root`
 
 **The round-3 design, in one paragraph.** `MembershipConfig::validate`
 (`crates/jammi-db/src/catalog/instance.rs::MembershipConfig::validate`,
-`crates/jammi-db/src/catalog/instance.rs:257-267`) is PURE and checks
+`crates/jammi-db/src/catalog/instance.rs:278-288`) is PURE and checks
 EXACTLY two things: `[server] peer_advertise` parses as a `PeerAddr`
-(`:265`), and `[server] peer_bind` is set too, else a typed
-`JammiError::Config` naming BOTH keys (`:261-263`). It inspects
+(`:286`), and `[server] peer_bind` is set too, else a typed
+`JammiError::Config` naming BOTH keys (`:282-284`). It inspects
 `result_root`/`artifact_dir` NOT AT ALL. `InstanceRegistration::from_config`
 (`crates/jammi-db/src/catalog/instance.rs::InstanceRegistration::from_config`,
-`crates/jammi-db/src/catalog/instance.rs:218-234`) runs `validate`; when
+`crates/jammi-db/src/catalog/instance.rs:239-255`) runs `validate`; when
 membership applies, it sets `member_root` to
-`MemberRoot::new(config.resolved_result_root()?)` (`:227`) — the SAME string
+`MemberRoot::resolved(config)?` (`:248`), which is itself
+`Self(config.resolved_result_root()?)` — the SAME string
 `build_result_store` (`crates/jammi-ai/src/session.rs::build_result_store`,
 `crates/jammi-ai/src/session.rs:2418`) hands to `StorageUrl::parse` before
 rooting the `ResultStore` there. `JammiConfig::resolved_result_root`
@@ -439,13 +466,27 @@ in `instance.rs`, `config/mod.rs`, `config/tests.rs`, `gang_membership.rs`,
 `canonical constructor` doc phrase) — named individually in commit 1's own
 body.
 
-**P-X4 (the store and the row are one string, stated once).** `MemberRoot`
-is constructible in production ONLY from
-`InstanceRegistration::from_config` (§2); its `Self::new` is `pub` for
-fixtures/tests only (no production call site outside `from_config`, verified
-by direct read of every `MemberRoot::new` call site in commit 1's diff: the
-one inside `from_config`, and test-file fixtures in `config/tests.rs`,
-`gang_membership.rs`, and `instance_identity.rs`).
+**P-X4 (the store and the row are one string, stated once; hardened this
+revision — see the header note).** `MemberRoot` is constructible in
+production ONLY from `MemberRoot::resolved`
+(`crates/jammi-db/src/catalog/instance.rs::MemberRoot::resolved`, §1),
+which `InstanceRegistration::from_config` (§2) is the only caller of, and
+which itself calls `resolved_result_root` — never a caller-supplied
+string. `MemberRoot::new`, the arbitrary-string wrapper, is compiled ONLY
+under `feature = "test-hooks"` (§1): a real `cfg` gate, so it does not link
+into a production build at all, unlike `#[doc(hidden)]` (which hides a
+symbol from rendered docs but not from the compiler). This is the
+ENFORCING half; the ENUMERATING half is a new, unconditional (no
+`test-hooks` needed — a pure static sweep of the tree) oracle,
+`crates/jammi-db/tests/it/member_root_constructor.rs::
+member_root_new_has_no_production_caller`, which walks every
+`crates/<name>/src/**/*.rs` file in the whole workspace (14 crates with a
+`src/` directory, 429 `.rs` files at commit 1) and fails on the first
+literal occurrence of `MemberRoot::new(` — so a future in-tree production
+caller (even one that turns `test-hooks` on for an unrelated reason) is a
+named, located finding, not a silent regression. Falsified before being
+committed: a throwaway call injected into `lease.rs` made the oracle fail,
+naming that file and line; reverted before commit 1.
 
 **P-X5 (this contract).** History (§6) is kept, corrected to the RIGHT
 constructs (the F1 narrative, §2); the citation round-3 items land (worker.rs
@@ -478,6 +519,7 @@ wave-3 precondition.
 | `crates/jammi-db/tests/it/gang_membership.rs::peer_addr_of_resolves_a_busy_or_other_kind_fresh_member` / three `::peer_addr_of_is_none_for_*` | No kind/state filter; three independent `None`-producing causes | Does not distinguish the three by return shape — all `None` |
 | `crates/jammi-db/tests/it/gang_membership.rs::keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete` | P-M4 at the catalog layer, `peer_addr_of` too | Does not exercise the session-construction path (next file does) |
 | `crates/jammi-db/tests/it/gang_membership.rs::prune_window_does_not_prune_a_member_merely_stale_within_the_window` | Both boundary directions in one test | Does not test EXACTLY at the window boundary |
+| `crates/jammi-db/tests/it/member_root_constructor.rs::member_root_new_has_no_production_caller` | P-X4 (hardened, this revision): no `crates/<name>/src/**/*.rs` file in the whole workspace contains the literal call form `MemberRoot::new(` — a sanity floor on the walk itself (≥10 crates with a `src/` dir, ≥300 `.rs` files scanned) guards against a broken walk passing vacuously | Does not cover `benches/`/`examples/` (neither exists in this workspace today) or a call spelled through a type alias/re-export |
 | `crates/jammi-db/src/config/tests.rs::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm` | P-X1: the pure constructor's `member_root` == `resolved_result_root()` verbatim over the whole arm list, plus the "/" alone arm | Does not touch the filesystem — a real-session counterpart is `storage_root.rs` |
 | `crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings` | P-X2 at the pure-function layer | Does not test the join predicate (gang_membership.rs's alias test does) |
 | `crates/jammi-db/src/config/tests.rs::from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys` / `load_from_...` | P-M5's one remaining refusal arm, at both call sites | Does not test a malformed address string separately (`PeerAddr::parse`'s own unit tests cover that) |
@@ -525,7 +567,7 @@ wave-3 precondition.
   about the literal-`PathBuf`-vs-URL-reparse check, since that check no
   longer exists).** Re-introducing ANY scheme fold in
   `InstanceRegistration::from_config` (`crates/jammi-db/src/catalog/
-  instance.rs:218-234`) — e.g. lower-casing or alias-folding the
+  instance.rs:239-255`) — e.g. lower-casing or alias-folding the
   `member_root` string before wrapping it — is exactly what
   `crates/jammi-db/src/config/tests.rs::from_config_never_aliases_gcs_and_gs_result_root_spellings`
   and `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_not_gang_members_of_each_other`
@@ -580,26 +622,27 @@ wave-3 precondition.
   machinery pretending otherwise.
 
 `citations_reanchored`: every citation in §1–§5, §7–§9 of this revision was
-re-derived directly against the tree of `1c38ee315f7f286546441db0f831014cf81fbfba`
-(commit 1) in this worktree by the writing agent; §6 (history) cites no
-construct at all, by design (see §6's own header).
+re-derived directly against the tree of `686d4aedfefb3693ee1b798a8749f63493df1acc`
+(commit 1, re-anchored — see the header's P-X4 hardening note) in this
+worktree by the writing agent; §6 (history) cites no construct at all, by
+design (see §6's own header).
 
-**Self-check (round-2 addendum requirement, re-run for round 3).** Before
-this revision was committed, every `path:line`/`path:a-b` token AND every
-`path::construct` token in §1–§5, §7–§9 (§6 excluded, cites none) was
-extracted and checked against the tree of commit 1: a `path:line` token's
-cited line(s) were printed and eyeballed against the identifier/claim the
-surrounding sentence names; a `path::construct` token's LAST path segment
-(after the final `::`) was grepped against the named file, confirming the
-construct's name still occurs there.
+**Self-check (round-2 addendum requirement; re-run for the P-X4 hardening
+re-anchor).** Before this revision was committed, every `path:line`/
+`path:a-b` token AND every `path::construct` token in §1–§5, §7–§9 (§6
+excluded, cites none) was extracted and checked against the tree of commit
+1: a `path:line` token's cited line(s) were printed and eyeballed against
+the identifier/claim the surrounding sentence names; a `path::construct`
+token's LAST path segment (after the final `::`) was grepped against the
+named file, confirming the construct's name still occurs there.
 
 ```
-python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f161bf-7977-4318-a34d-d2eec24a0620/scratchpad/logs/db-selfcheck-r3.py
+python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f161bf-7977-4318-a34d-d2eec24a0620/scratchpad/logs/db-selfcheck-px4.py
 ```
 
-(a scratch script, never committed). **Result: 82 `path::construct` tokens
-checked, 82 resolved (their last segment occurs in the named file); 59
-unique `path:line`/`path:a-b` tokens checked, 59 resolved (the named file
+(a scratch script, never committed). **Result: 86 `path::construct` tokens
+checked, 86 resolved (their last segment occurs in the named file); 55
+unique `path:line`/`path:a-b` tokens checked, 55 resolved (the named file
 has at least that many lines) — both counts 100%, zero unresolved.**
 
 ---
@@ -607,10 +650,22 @@ has at least that many lines) — both counts 100%, zero unresolved.**
 ## 12. Gates
 
 `cargo fmt --all --check`; `cargo clippy -p jammi-db -p jammi-ai -p
-jammi-server --all-targets -- -D warnings`; `cargo test -p jammi-db -p
-jammi-ai` and `cargo test --workspace` (a server-startup-adjacent config
-change — other crates' test harnesses spawn the binary with their own env);
-the live-postgres lane (`--features live-postgres-tests`, `JAMMI_TEST_PG_URL`
+jammi-server --all-targets -- -D warnings` (with AND without
+`--features test-hooks` on `jammi-db`, since `MemberRoot::new` and the
+`gang_membership.rs` module it is built through are `cfg`-gated on it —
+`jammi-ai`'s own test targets already turn `jammi-db/test-hooks` on
+unconditionally via its self dev-dependency, so only the `jammi-db`-alone
+invocation needs the explicit flag both ways); `cargo test -p jammi-db -p
+jammi-ai` (the plain, `test-hooks`-off run: `gang_membership.rs` is
+`#[cfg(feature = "test-hooks")]`-gated at `tests/it/main.rs` and does not
+compile in this pass, same as `materialization_crash_recovery.rs`/
+`mutable_crash_recovery.rs`; `member_root_constructor.rs`'s enumerating
+oracle is unconditional and DOES run here) AND `cargo test -p jammi-db
+--features test-hooks --test it` (the lane `gang_membership.rs` actually
+runs in — `.github/workflows/ci.yml`'s "test-hooks lane" step, on every
+PR) and `cargo test --workspace` (a server-startup-adjacent config change —
+other crates' test harnesses spawn the binary with their own env); the
+live-postgres lane (`--features live-postgres-tests`, `JAMMI_TEST_PG_URL`
 set) for every `test_case`-parameterized test in
 `crates/jammi-db/tests/it/gang_membership.rs` and
 `crates/jammi-db/tests/it/migrations.rs`'s 035 oracle;

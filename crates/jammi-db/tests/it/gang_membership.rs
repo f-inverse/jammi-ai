@@ -374,6 +374,77 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
     );
 }
 
+/// The distinct `peer_addr` SET / `result_root` NULL state (representable
+/// by construction — no paired `CHECK`, schema.rs ~:1225) gets its OWN
+/// oracle, separate from the both-NULL case above: excluded from
+/// `list_gang_members` (both are required by the listing predicate), while
+/// an otherwise-identical full member IS returned, and `peer_addr_of` still
+/// resolves it — a NULL `result_root` does not hide the address, since
+/// `peer_addr_of` has no root predicate at all.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn list_excludes_a_member_with_peer_addr_set_but_result_root_null(kind: BackendKind) {
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = base_catalog_kind(kind)
+        .await
+        .expect("already skipped above when unconfigured");
+    let id = format!("addr-no-root-{}", jammi_test_utils::unique_suffix());
+    // peer_addr SET, canonical_root NULL — distinct from both-NULL above.
+    let reg = InstanceRegistration::new(
+        &id,
+        Some("label"),
+        Some("host"),
+        Some(PeerAddr::parse("10.0.0.6:9000").unwrap()),
+        None,
+    );
+    catalog.upsert_instance(&reg).await.unwrap();
+    catalog
+        .upsert_worker(&id, "fine_tune", WorkerState::Claiming)
+        .await
+        .unwrap();
+
+    // An otherwise-identical full member (peer_addr AND result_root both
+    // set) — the control proving the exclusion above is the NULL
+    // result_root, not some other divergence between the two rows.
+    let full_id = format!("addr-full-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &full_id,
+        "10.0.0.7:9000",
+        ROOT,
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+
+    let root = CanonicalRoot::new(ROOT);
+    let members = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &root))
+        .await
+        .unwrap();
+    assert!(
+        members.iter().all(|m| m.instance_id != id),
+        "a NULL result_root row must never be returned by list_gang_members: {members:?}"
+    );
+    assert!(
+        members.iter().any(|m| m.instance_id == full_id),
+        "the otherwise-identical full member must still be returned: {members:?}"
+    );
+
+    // peer_addr_of has no root predicate at all — a NULL result_root must
+    // never hide the address.
+    let resolved = catalog.peer_addr_of(&id, LEASE).await.unwrap();
+    assert_eq!(
+        resolved.map(|a| a.as_str().to_string()),
+        Some("10.0.0.6:9000".to_string()),
+        "peer_addr_of must still resolve a NULL-result_root instance"
+    );
+}
+
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",

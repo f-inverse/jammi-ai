@@ -125,10 +125,14 @@ async fn oracle_epochs_honored_exactly_precomputed() {
         .build()
         .unwrap();
 
-        let result = tokio::task::spawn_blocking(move || tl.run(&loader))
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            tl.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
+                loader,
+            ))
+        })
+        .await
+        .unwrap()
+        .unwrap();
 
         let expected = N * epochs;
         assert_eq!(
@@ -196,10 +200,14 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || tl.run(&loader))
-        .await
-        .unwrap()
-        .unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        tl.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
+            loader,
+        ))
+    })
+    .await
+    .unwrap()
+    .unwrap();
 
     let expected = EPOCHS * N.div_ceil(GA);
     assert_eq!(
@@ -269,10 +277,14 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || tl.run(&loader))
-        .await
-        .unwrap()
-        .unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        tl.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
+            loader,
+        ))
+    })
+    .await
+    .unwrap()
+    .unwrap();
 
     // total_steps reported == realised global_step. Oracle realised = ceil(N/GA)*EPOCHS = 2.
     // The trailing partial-window flush takes the extra step the old floored

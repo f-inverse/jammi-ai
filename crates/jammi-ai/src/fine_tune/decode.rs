@@ -17,7 +17,8 @@
 //!
 //! - `build_training_data_loader`: the eager entry point. Reads EVERY row of
 //!   EVERY batch into a fully in-memory [`TrainingDataLoader`] — what
-//!   `materialize_and_read`'s collected `Vec<RecordBatch>` feeds today, and
+//!   `super::training_set::read_back`'s collected `Vec<RecordBatch>` feeds
+//!   for a `Resident` [`super::source::TrainingSource`], and
 //!   what a whole-set arm (mining, GradCache, classification — see below)
 //!   still needs, since those arms require the complete row set before they
 //!   can do anything (mining scores every candidate, GradCache treats the
@@ -30,17 +31,25 @@
 //!   stream walking a batch that spans several ranks' worth of rows (world >
 //!   1) allocates nothing for the rows another rank owns.
 //!
-//! # Classification is an ADDITIONAL exemption (not just K3/mining/GradCache)
+//! # Classification streams too, GIVEN a vocabulary (#500 U2c §11 F3)
 //!
-//! `ChunkAccumulator::new_for` refuses `DetectedFormat::Classification`:
-//! assigning a label its integer class index needs the FULL label vocabulary
-//! (`build_training_data_loader`'s `BTreeSet` pass over every row), which is
-//! exactly the same "whole-dataset pass before any chunk can be built" shape
-//! the regression K3 scaler already carries as a named, separate, unfiltered
-//! pass (`super::target::TargetScaler`) — never streamed. Classification
-//! therefore stays on the eager path alongside the stated mining/GradCache
-//! exemptions; [`super::stream::TrainingSetStream::open`] refuses it at open,
-//! not mid-stream.
+//! Assigning a label its integer class index needs the FULL label
+//! vocabulary — the same "whole-dataset pass before any chunk can be built"
+//! shape the regression K3 scaler already carries as a named, separate,
+//! unfiltered pass (`super::target::TargetScaler`) — but that pass is
+//! SEPARATE from the per-step chunk build, not a reason to keep the chunk
+//! build itself eager. [`LabelVocabulary`] is that whole-table pass, built
+//! ONCE (by `build_training_data_loader`'s `BTreeSet` for a `Resident`
+//! source, or by the worker's own `Slice::All` sweep over `[0, total_rows)`
+//! for a `Streamed` one — see `super::worker::run_spec`'s doc) and handed to
+//! `ChunkAccumulator::new_for`, which accepts `DetectedFormat::
+//! Classification` GIVEN one (and refuses it, typed, without one — a
+//! per-step accumulator can never invent a vocabulary of its own).
+//! `append_selected_rows`'s Classification arm looks every row's label up
+//! in that SAME vocabulary, so the class index a stream assigns is
+//! byte-identical to the eager `BTreeSet`'s (both are a sorted-set
+//! enumeration over the identical label set, assigned in the identical
+//! order — see [`LabelVocabulary::from_labels`]'s doc).
 
 use arrow::array::RecordBatch;
 use jammi_db::error::{JammiError, Result};
@@ -326,11 +335,11 @@ pub(crate) fn detect_training_format(
 }
 
 /// The training-set producer's read-back, converted into a
-/// [`TrainingDataLoader`]: dispatches on [`detect_training_format`]'s
+/// [`TrainingDataLoader`]: dispatches on `detect_training_format`'s
 /// classification of the projected columns and the job's task, then decodes
 /// every `RecordBatch` the eager read-back returned into the matching
 /// `TrainingRow` shape.
-pub(crate) fn build_training_data_loader(
+pub fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
     task: ModelTask,
@@ -523,8 +532,8 @@ pub(crate) fn build_training_data_loader(
             Ok(TrainingDataLoader::from_regression(rows))
         }
         DetectedFormat::Classification => {
-            let mut label_set = std::collections::BTreeSet::new();
-            let mut rows = Vec::new();
+            let mut texts = Vec::new();
+            let mut labels = Vec::new();
             for batch in batches {
                 let text_vals = batch
                     .column_by_name("text")
@@ -535,23 +544,16 @@ pub(crate) fn build_training_data_loader(
                     .and_then(|c| extract_string_column(c.as_ref()))
                     .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
                 for i in 0..batch.num_rows() {
-                    label_set.insert(label_vals[i].clone());
-                    rows.push((text_vals[i].clone(), label_vals[i].clone()));
+                    texts.push(text_vals[i].clone());
+                    labels.push(label_vals[i].clone());
                 }
             }
-            let label_to_idx: std::collections::HashMap<String, u32> = label_set
-                .iter()
-                .enumerate()
-                .map(|(i, l)| (l.clone(), i as u32))
-                .collect();
-            let num_classes = label_to_idx.len();
-            let indexed_rows: Vec<(String, u32)> = rows
-                .into_iter()
-                .map(|(text, label)| {
-                    let idx = label_to_idx[&label];
-                    (text, idx)
-                })
-                .collect();
+            let vocab = LabelVocabulary::from_labels(labels.iter().map(String::as_str));
+            let num_classes = vocab.num_classes();
+            let mut indexed_rows = Vec::with_capacity(texts.len());
+            for (text, label) in texts.into_iter().zip(labels) {
+                indexed_rows.push((text, vocab.index_of(&label)?));
+            }
             Ok(TrainingDataLoader::from_classification(
                 indexed_rows,
                 num_classes,
@@ -625,12 +627,66 @@ fn build_media_triplet_loader(
 // The per-row-index decode entry (new, U2c): the stream's chunk builder.
 // =========================================================================
 
+/// The full label→class-index assignment for a `Classification` source,
+/// built ONCE over the WHOLE table (train + val — #500 U2c §11 F3) — a
+/// per-step `ChunkAccumulator` can never invent one of its own, since a
+/// class index is only well-defined relative to the complete label set.
+///
+/// [`Self::from_labels`] enumerates the DISTINCT labels in SORTED order and
+/// assigns `0, 1, 2, …` — the exact `BTreeSet::iter().enumerate()` shape
+/// [`build_training_data_loader`]'s Classification arm used inline before
+/// this type existed (and still uses, through this same constructor), so a
+/// vocabulary built from a `Resident` source's whole label column and one
+/// built from a `Streamed` source's whole-table sweep
+/// (`super::worker::run_spec`) assign the IDENTICAL index to the identical
+/// label set.
+#[derive(Debug, Clone)]
+pub struct LabelVocabulary {
+    label_to_idx: std::collections::HashMap<String, u32>,
+}
+
+impl LabelVocabulary {
+    /// Build the vocabulary from every label string seen, in any order —
+    /// the `BTreeSet` internally re-sorts them before assigning indices, so
+    /// the caller's iteration order never affects the result.
+    pub fn from_labels<'a>(labels: impl Iterator<Item = &'a str>) -> Self {
+        let sorted: std::collections::BTreeSet<&str> = labels.collect();
+        let label_to_idx = sorted
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (l.to_string(), i as u32))
+            .collect();
+        Self { label_to_idx }
+    }
+
+    /// The number of distinct labels — `TrainingFormat::Classification`'s
+    /// `num_classes`, and the classification head's output width.
+    pub fn num_classes(&self) -> usize {
+        self.label_to_idx.len()
+    }
+
+    /// The class index for `label`, typed-refused when `label` was never
+    /// seen by [`Self::from_labels`] — for a `Streamed` source this can only
+    /// happen if the whole-table vocabulary sweep (`[0, total_rows)`) and
+    /// the per-step decode (bounded to the SAME window) somehow disagreed
+    /// about the table's contents between the two passes, an internal
+    /// invariant violation rather than a caller input error.
+    pub(crate) fn index_of(&self, label: &str) -> Result<u32> {
+        self.label_to_idx.get(label).copied().ok_or_else(|| {
+            JammiError::FineTune(format!(
+                "label '{label}' is not in the vocabulary the whole-table pass built — the \
+                 vocabulary sweep and the per-step decode disagree about the table's contents"
+            ))
+        })
+    }
+}
+
 /// A partially-built [`TextChunk`], grown incrementally by
-/// [`append_selected_rows`] across however many `RecordBatch`es the current
+/// `append_selected_rows` across however many `RecordBatch`es the current
 /// step's row range spans, then converted to the immutable [`TextChunk`] a
-/// consumer receives. Mirrors [`TextChunk`]'s own shapes (minus
-/// `Classification`/`Ner`, neither of which a stream ever builds — see the
-/// module doc).
+/// consumer receives. Mirrors [`TextChunk`]'s own shapes (minus `Ner`, which
+/// a stream never builds: no producer ever writes an NER training set
+/// through the `TrainingSet` result-table route this module reads).
 #[derive(Debug)]
 pub(crate) enum ChunkAccumulator {
     Contrastive {
@@ -656,13 +712,22 @@ pub(crate) enum ChunkAccumulator {
         texts: Vec<String>,
         targets: Vec<f32>,
     },
+    Classification {
+        texts: Vec<String>,
+        labels: Vec<u32>,
+    },
 }
 
 impl ChunkAccumulator {
-    /// A fresh, empty accumulator shaped for `detected` — refuses
-    /// [`DetectedFormat::Classification`] (see the module doc: it needs a
-    /// whole-dataset label vocabulary, not a per-step one).
-    pub(crate) fn new_for(detected: DetectedFormat) -> Result<Self> {
+    /// A fresh, empty accumulator shaped for `detected`.
+    ///
+    /// `vocab` is required (and REFUSED, typed, when absent) exactly for
+    /// [`DetectedFormat::Classification`] — every other arm ignores it, so a
+    /// caller streaming a non-classification format never has to build one.
+    pub(crate) fn new_for(
+        detected: DetectedFormat,
+        vocab: Option<&LabelVocabulary>,
+    ) -> Result<Self> {
         match detected {
             DetectedFormat::Contrastive => Ok(Self::Contrastive {
                 texts_a: Vec::new(),
@@ -687,14 +752,20 @@ impl ChunkAccumulator {
                 texts: Vec::new(),
                 targets: Vec::new(),
             }),
-            DetectedFormat::Classification => Err(JammiError::FineTune(
-                "classification cannot stream per-step: assigning a label its integer class \
-                 index needs the FULL label vocabulary (every row), the same whole-dataset-pass \
-                 shape the regression K3 scaler already carries as a named, separate, unfiltered \
-                 pass — it stays on the eager `TrainingDataLoader` path, alongside the stated \
-                 mining/GradCache exemptions"
-                    .into(),
-            )),
+            DetectedFormat::Classification => {
+                if vocab.is_none() {
+                    return Err(JammiError::FineTune(
+                        "classification needs a whole-table label vocabulary before a per-step \
+                         chunk can assign class indices — build one via `LabelVocabulary::\
+                         from_labels` over the WHOLE table first (#500 U2c §11 F3)"
+                            .into(),
+                    ));
+                }
+                Ok(Self::Classification {
+                    texts: Vec::new(),
+                    labels: Vec::new(),
+                })
+            }
         }
     }
 
@@ -731,6 +802,7 @@ impl ChunkAccumulator {
                 negatives,
             },
             Self::Regression { texts, targets } => TextChunk::Regression { texts, targets },
+            Self::Classification { texts, labels } => TextChunk::Classification { texts, labels },
         }
     }
 }
@@ -744,15 +816,20 @@ impl ChunkAccumulator {
 /// its index is never cloned into `acc`, so a stream skipping another rank's
 /// rows (world > 1) allocates nothing for them.
 ///
-/// `acc` must have been built by [`ChunkAccumulator::new_for`] with the SAME
+/// `acc` must have been built by `ChunkAccumulator::new_for` with the SAME
 /// `detected` this call receives — this is an internal invariant of
 /// [`super::stream::TrainingSetStream`]'s pump, not a caller-facing contract,
 /// so a mismatch is an internal-error panic rather than a typed `Result`.
+///
+/// `vocab` is read only for the `Classification` arm (looking up each
+/// selected row's class index — see [`LabelVocabulary::index_of`]); every
+/// other arm ignores it.
 pub(crate) fn append_selected_rows(
     detected: DetectedFormat,
     task: ModelTask,
     batch: &RecordBatch,
     indices: &[usize],
+    vocab: Option<&LabelVocabulary>,
     acc: &mut ChunkAccumulator,
 ) -> Result<()> {
     if indices.is_empty() {
@@ -951,6 +1028,29 @@ pub(crate) fn append_selected_rows(
             for &i in indices {
                 texts.push(text_vals[i].clone());
                 targets.push(target_vals[i]);
+            }
+        }
+        (DetectedFormat::Classification, ChunkAccumulator::Classification { texts, labels }) => {
+            let vocab = vocab.ok_or_else(|| {
+                JammiError::FineTune(
+                    "append_selected_rows: a Classification accumulator with no vocabulary — \
+                     ChunkAccumulator::new_for already refuses building one without a \
+                     vocabulary, so this is an internal invariant violation, never a caller \
+                     input error"
+                        .into(),
+                )
+            })?;
+            let text_vals = batch
+                .column_by_name("text")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+            let label_vals = batch
+                .column_by_name("label")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+            for &i in indices {
+                texts.push(text_vals[i].clone());
+                labels.push(vocab.index_of(&label_vals[i])?);
             }
         }
         (detected, acc) => {

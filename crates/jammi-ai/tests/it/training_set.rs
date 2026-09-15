@@ -128,7 +128,19 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         )
         .await
         .unwrap();
+    let job_id = job.job_id.clone();
     job.wait().await.unwrap();
+
+    // #500 U2c §10: the pinned adapter prints below must be produced by the
+    // STREAMED path, not a silently-unchanged eager one — a `test-hooks`
+    // observation of the source kind `run_spec` actually bound for this job
+    // (mining/GradCache are off in `parity_config`, so `whole_set_arm` is
+    // `None` and the worker must have selected `Streamed`).
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("streamed"),
+        "refactor_parity must run through the Streamed source (no mining, no GradCache)"
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let ft = models
@@ -311,7 +323,16 @@ async fn run_regression_parity_fixture(
         )
         .await
         .unwrap();
+    let job_id = job.job_id.clone();
     job.wait().await.unwrap();
+
+    // #500 U2c §10/§11 F2: the K3 scaler and the pinned prints below must
+    // both come from the STREAMED path.
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("streamed"),
+        "regression_refactor_parity must run through the Streamed source"
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let ft = models
@@ -414,9 +435,21 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         )
         .await
         .unwrap();
+    let job_id = job.job_id.clone();
     job.wait()
         .await
         .expect("a W=1 GradCache run over the eager loader must complete");
+
+    // #500 U2c §11 F6: `whole_set_arm` must select `Resident` for a
+    // GradCache-eligible configuration — the complementary oracle to
+    // `refactor_parity`/`regression_refactor_parity`'s `Streamed`
+    // observation above (mining on / GradCache on → `Resident`, never
+    // `Streamed`).
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("resident"),
+        "a GradCache-eligible run must bind Resident, never Streamed"
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let ft = models

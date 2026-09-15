@@ -2039,34 +2039,134 @@ impl JobWorker {
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
-                // carries this definition), then read that table back in its
-                // committed order. The rows a run trains on are a durable,
-                // attested artifact, not this worker's private scan.
+                // carries this definition). The rows a run trains on are a
+                // durable, attested artifact, not this worker's private scan.
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
-                let (table, batches) = training_set::materialize_projection(
-                    session,
-                    &source,
-                    &columns,
-                    task,
-                    detected.format_tag(),
-                )
-                .await
-                .map_err(WorkerJobError::from)?;
-                let loader = build_training_data_loader(&batches, &columns, task)
-                    .map_err(WorkerJobError::from)?;
-                // The tag the table was WRITTEN under and the shape its loader
-                // reports come from one classifier, so a mismatch is a broken
-                // engine invariant rather than a caller error — and it must be
-                // loud: it would mean two formats sharing one definition hash.
-                if loader.format().format_tag() != detected.format_tag() {
-                    return Err(WorkerJobError::from(JammiError::Other(format!(
-                        "training set was committed as format '{}' but its loader reports \
-                         '{}': the column classifier and the loader disagree",
+
+                // #500 U2c §11 F6: the ONE predicate deciding Resident vs
+                // Streamed — the SAME `source::whole_set_arm` the trainer's
+                // own dispatch (`trainer.rs::run`) refuses a mismatch
+                // against. `run_fine_tune_blocking` always loads a base
+                // model for a `FineTune` spec (unconditionally calls
+                // `.base_model(base_model_arc)` below), so `has_base_model`
+                // is always `true` here.
+                let whole_set_arm = crate::fine_tune::source::whole_set_arm(&common.config, true);
+
+                let (table, training_source) = if whole_set_arm.is_some() {
+                    // Resident: the eager arm — materialise, then read the
+                    // whole table back into memory (unchanged from before
+                    // this unit).
+                    let (table, batches) = training_set::materialize_projection(
+                        session,
+                        &source,
+                        &columns,
+                        task,
                         detected.format_tag(),
-                        loader.format().format_tag()
-                    ))));
-                }
+                    )
+                    .await
+                    .map_err(WorkerJobError::from)?;
+                    let loader = build_training_data_loader(&batches, &columns, task)
+                        .map_err(WorkerJobError::from)?;
+                    // The tag the table was WRITTEN under and the shape its
+                    // loader reports come from one classifier, so a
+                    // mismatch is a broken engine invariant rather than a
+                    // caller error — and it must be loud: it would mean two
+                    // formats sharing one definition hash.
+                    if loader.format().format_tag() != detected.format_tag() {
+                        return Err(WorkerJobError::from(JammiError::Other(format!(
+                            "training set was committed as format '{}' but its loader reports \
+                             '{}': the column classifier and the loader disagree",
+                            detected.format_tag(),
+                            loader.format().format_tag()
+                        ))));
+                    }
+                    (
+                        table,
+                        crate::fine_tune::source::TrainingSource::Resident(loader),
+                    )
+                } else {
+                    // Streamed (#500 U2c §10/§11): table only — no row is
+                    // ever collected into memory for this arm (F1).
+                    let table = training_set::materialize_projection_table(
+                        session,
+                        &source,
+                        &columns,
+                        task,
+                        detected.format_tag(),
+                    )
+                    .await
+                    .map_err(WorkerJobError::from)?;
+                    let total_rows = table.record.row_count;
+                    let train_count = crate::fine_tune::data::split_index(
+                        total_rows,
+                        common.config.validation_fraction,
+                    );
+
+                    // F5: the whole-table refusal pre-pass, ONCE, over
+                    // `[0, total_rows)`, BEFORE the first training step —
+                    // not lazily discovered mid-run.
+                    crate::fine_tune::stream::validate_window(
+                        session,
+                        &table,
+                        &columns,
+                        detected,
+                        task,
+                        crate::fine_tune::stream::RowWindow::new(0, total_rows),
+                    )
+                    .await
+                    .map_err(WorkerJobError::from)?;
+
+                    // F3: the classification label vocabulary spans the
+                    // WHOLE table (train + val), built ONCE here — never
+                    // re-derived per-epoch or per-window.
+                    let label_vocab = if matches!(
+                        detected,
+                        crate::fine_tune::decode::DetectedFormat::Classification
+                    ) {
+                        Some(
+                            crate::fine_tune::stream::build_label_vocabulary(
+                                session, &table, &columns,
+                            )
+                            .await
+                            .map_err(WorkerJobError::from)?,
+                        )
+                    } else {
+                        None
+                    };
+
+                    // A fixed, conservative double-buffer depth: no config
+                    // knob exposes this yet (a future unit's work), and `2`
+                    // is a value P3/P4's oracles exercise directly (a
+                    // regression pin for the excised arm's `prefetch = 2`
+                    // deadlock — CONTRACT-U2c.md §1 M3).
+                    let stream_cfg = crate::fine_tune::stream::StreamConfig::new(2)
+                        .map_err(WorkerJobError::from)?;
+
+                    let streamed = crate::fine_tune::source::StreamedSet {
+                        session: Arc::clone(session),
+                        table: table.clone(),
+                        columns: columns.clone(),
+                        task,
+                        total_rows,
+                        train_count,
+                        batch: common.config.batch_size,
+                        stream_cfg,
+                        label_vocab,
+                    };
+                    (
+                        table,
+                        crate::fine_tune::source::TrainingSource::Streamed(Box::new(streamed)),
+                    )
+                };
+                #[cfg(feature = "test-hooks")]
+                training_test_hooks::note_source_kind(
+                    job_id,
+                    match &training_source {
+                        crate::fine_tune::source::TrainingSource::Resident(_) => "resident",
+                        crate::fine_tune::source::TrainingSource::Streamed(_) => "streamed",
+                    },
+                );
                 // The `ProducingDescriptor::FineTune` materialization
                 // identity — the training-set table's own definition hash,
                 // artifact digest and row count, binding this fine-tune to
@@ -2103,7 +2203,7 @@ impl JobWorker {
                 let run = FineTuneRun {
                     task,
                     common,
-                    loader,
+                    source: training_source,
                     materialization_source,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
@@ -2115,7 +2215,12 @@ impl JobWorker {
                 common,
             } => {
                 // Re-read node/edge sources and re-sample the graph (seeded →
-                // deterministic), then train on the text-embedding head.
+                // deterministic), then train on the text-embedding head. A
+                // graph fine-tune's rows are sampled in memory, not read
+                // from a `TrainingSet` result table — there is no table to
+                // stream, so this arm is ALWAYS `Resident` (`training_set.
+                // rs`'s module doc, "The graph arm does not go through this
+                // module").
                 let loader = self
                     .reconstruct_graph_loader(session, &sources, sample_config)
                     .await
@@ -2123,7 +2228,7 @@ impl JobWorker {
                 let run = FineTuneRun {
                     task: ModelTask::TextEmbedding,
                     common,
-                    loader,
+                    source: crate::fine_tune::source::TrainingSource::Resident(loader),
                     // `ProducingDescriptor::FineTune` covers only the
                     // column-source `FineTune` kind (its own doc); a graph
                     // fine-tune's model row carries no materialization.
@@ -2267,7 +2372,7 @@ impl JobWorker {
         let FineTuneRun {
             task,
             common,
-            loader,
+            source: training_source,
             materialization_source,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
@@ -2398,7 +2503,7 @@ impl JobWorker {
             base_model: base_model.clone(),
             task,
             config: common.config,
-            loader,
+            source: training_source,
             base_model_arc,
             hidden_size,
             device_config: session.device_config().clone(),
@@ -3378,7 +3483,11 @@ pub mod loop_test_hooks {
 struct FineTuneRun {
     task: ModelTask,
     common: TrainingCommon,
-    loader: TrainingDataLoader,
+    /// What the training loop trains from — either an already in-memory
+    /// [`crate::fine_tune::source::TrainingSource::Resident`] loader or a
+    /// [`crate::fine_tune::source::TrainingSource::Streamed`] source (#500
+    /// U2c §10).
+    source: crate::fine_tune::source::TrainingSource,
     /// Set ONLY for the column-source `TrainingSpec::FineTune` kind — see
     /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
     /// carries `None` here.
@@ -4044,6 +4153,51 @@ pub mod training_test_hooks {
         THREADS_FINISHED.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// One recorded source-kind observation, keyed by the job it was
+    /// selected for. A `Vec` rather than a `HashMap`, mirroring
+    /// [`WatcherProbe`]'s own reasoning: a retried job can re-select a
+    /// (possibly different) source kind under a later attempt, so a caller
+    /// looks up the MOST RECENT entry.
+    struct SourceKindProbe {
+        job_id: String,
+        kind: &'static str,
+    }
+
+    fn source_kinds() -> &'static Mutex<Vec<SourceKindProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<SourceKindProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Record which [`crate::fine_tune::source::TrainingSource`] variant
+    /// `run_spec`'s FineTune arm bound for `job_id` — `"resident"` or
+    /// `"streamed"`. #500 U2c §10's oracle: "a `test-hooks` observation …
+    /// proves the worker really bound `Streamed`" — the P6.ii parity fixtures
+    /// read this back through [`source_kind_for`] to prove the pinned
+    /// adapter prints they assert on were actually produced by the streamed
+    /// path, not a silently-unchanged eager one.
+    pub(super) fn note_source_kind(job_id: &str, kind: &'static str) {
+        source_kinds()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(SourceKindProbe {
+                job_id: job_id.to_string(),
+                kind,
+            });
+    }
+
+    /// The most recently recorded source kind for `job_id` — `None` if this
+    /// job never reached `run_spec`'s `TrainingSpec::FineTune` arm (a
+    /// `GraphFineTune` run, or a job that hasn't been claimed yet).
+    pub fn source_kind_for(job_id: &str) -> Option<&'static str> {
+        source_kinds()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.kind)
+    }
+
     /// One-shot pause slot: `Some` once armed, taken (and thereby disarmed)
     /// the first time [`checkpoint_before_spawn_blocking`] runs after that.
     fn pause_slot() -> &'static Mutex<Option<oneshot::Sender<()>>> {
@@ -4338,7 +4492,9 @@ struct RunFineTuneParams {
     base_model: String,
     task: ModelTask,
     config: FineTuneConfig,
-    loader: TrainingDataLoader,
+    /// What the training loop trains from (#500 U2c §10) — see
+    /// [`crate::fine_tune::source::TrainingSource`]'s own doc.
+    source: crate::fine_tune::source::TrainingSource,
     base_model_arc: Arc<crate::model::LoadedModel>,
     hidden_size: usize,
     device_config: DeviceConfig,
@@ -4373,7 +4529,7 @@ fn run_fine_tune_blocking(
         base_model,
         task,
         config,
-        loader: data_loader,
+        source: training_source,
         base_model_arc,
         hidden_size,
         device_config,
@@ -4387,14 +4543,35 @@ fn run_fine_tune_blocking(
 
     let target = if config.target_modules.is_empty() {
         let head = if task == ModelTask::Classification {
-            let num_classes = match data_loader.format() {
-                crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
-                    num_classes
+            // `num_classes` from the SAME source: a `Resident` loader's
+            // `TrainingFormat::Classification { num_classes }` (built from
+            // the eager `BTreeSet` pass), or a `Streamed` source's
+            // `StreamedSet::num_classes()` (built from the worker's own
+            // whole-table vocabulary sweep, F3) — both are the identical
+            // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
+            // doc), so the head is sized identically either way.
+            let num_classes = match &training_source {
+                crate::fine_tune::source::TrainingSource::Resident(loader) => {
+                    match loader.format() {
+                        crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
+                            num_classes
+                        }
+                        _ => {
+                            return Err(JammiError::FineTune(
+                                "Classification task requires classification training data \
+                                 format"
+                                    .into(),
+                            ))
+                        }
+                    }
                 }
-                _ => {
-                    return Err(JammiError::FineTune(
-                        "Classification task requires classification training data format".into(),
-                    ))
+                crate::fine_tune::source::TrainingSource::Streamed(streamed) => {
+                    streamed.num_classes().ok_or_else(|| {
+                        JammiError::FineTune(
+                            "Classification task requires classification training data format"
+                                .into(),
+                        )
+                    })?
                 }
             };
             crate::fine_tune::lora::build_classification_head(
@@ -4513,7 +4690,7 @@ fn run_fine_tune_blocking(
     }
     let mut training_loop = builder.build()?;
 
-    training_loop.run(&data_loader)
+    training_loop.run(training_source)
 }
 
 /// Fetch and load a job's durable resume checkpoint, if any. `None` when no

@@ -1454,9 +1454,13 @@ async fn training_divergence_detection() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || training_loop.run(&loader))
-        .await
-        .unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        training_loop.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
+            loader,
+        ))
+    })
+    .await
+    .unwrap();
 
     assert!(result.is_err(), "Training should fail on NaN loss");
     let msg = result.unwrap_err().to_string();
@@ -1583,10 +1587,14 @@ async fn training_early_stopping_triggers() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || training_loop.run(&loader))
-        .await
-        .unwrap()
-        .unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        training_loop.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
+            loader,
+        ))
+    })
+    .await
+    .unwrap()
+    .unwrap();
 
     // With patience=1 and constant validation loss, early stopping triggers
     // after epoch 2 (epoch 1 sets best, epoch 2 doesn't improve).
@@ -3201,9 +3209,13 @@ async fn training_bails_when_lease_lost_mid_run() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || training_loop.run(&loader))
-        .await
-        .unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        training_loop.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
+            loader,
+        ))
+    })
+    .await
+    .unwrap();
 
     assert!(result.is_err(), "a lost lease must bail the training loop");
     let msg = result.unwrap_err().to_string();

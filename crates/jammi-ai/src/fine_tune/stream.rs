@@ -12,27 +12,24 @@
 //! extractors the eager loader uses), and hands finished chunks to the
 //! trainer one at a time over a bounded channel.
 //!
-//! # Production wiring (current state, stated plainly)
+//! # Production wiring (current state, stated plainly — #500 U2c §10/§11)
 //!
-//! This module ships the data-plane PRIMITIVE — `open`/`next_chunk`, fully
-//! oracled (P3–P7 below; P1's plan-shape property and P6.i's byte parity
-//! against `read_back_sql` are exercised directly against this type in
-//! `tests/it/training_set_stream.rs`). `TrainingLoop::run`
-//! (`trainer.rs`)'s production text arm still calls the EAGER
-//! `TrainingDataLoader::text_chunk_for_rank` exclusively at this commit — no
-//! call site in `worker.rs` opens a `TrainingSetStream` yet. Switching the
-//! W=1 non-exempt production arms onto this stream (binding `EpochSource`,
-//! re-opening the stream per epoch, and re-deriving the train/validation
-//! split and the K3 scaler from row COUNTS rather than an already-resident
-//! `TrainingDataLoader`) is follow-on work: `trainer.rs`'s `run` is the
-//! single most heavily pinned function in this crate (three byte-for-byte
-//! adapter-digest oracles depend on it), and rewiring it needs its own
-//! design-pressure round rather than a same-commit addition bolted onto this
-//! primitive's own review. P6.ii's "unchanged with the production path
-//! streaming" property is therefore vacuously true today (the production
-//! path has not changed at all) rather than the stronger claim the contract
-//! names — recorded here rather than left for a reader to discover by
-//! grepping `worker.rs` for a call that is not there.
+//! `worker.rs::run_spec`'s `TrainingSpec::FineTune` arm binds a `Streamed`
+//! [`super::source::TrainingSource`] at `W = 1` for every text arm that is
+//! NOT a whole-set arm (`super::source::whole_set_arm` returns `None`) —
+//! mining, GradCache, the precomputed test path, and a `GraphFineTune` run
+//! stay on `Resident`, the stated exemptions. `TrainingLoop::run`
+//! (`trainer.rs`) dispatches on the `TrainingSource` it is handed: the
+//! `Streamed` arm opens a fresh [`Self`] each epoch
+//! (`TrainingLoop::open_streamed_source`) over the train window
+//! (`Slice::PerRank`) and a second one for validation (`Slice::All`) —
+//! `EpochSource` gives both the `Resident` and the `Streamed` arm one
+//! `next_chunk` call shape, and refuses (typed) a whole-set arm ever
+//! reaching this dispatch with a `Streamed` source (F6). P6.ii's "unchanged
+//! with the production path streaming" property is therefore the real
+//! claim, not a vacuous one: the pinned parity fixtures
+//! (`refactor_parity`/`regression_refactor_parity`) run the worker end to
+//! end and are produced by this stream.
 //!
 //! # The W× amplification (stated, not hidden)
 //!
@@ -61,22 +58,41 @@
 //!   the same `B − 1` rows).
 //! - `Σ E` = the NAMED exemptions: the regression K3 scaler's whole-prefix
 //!   `Vec<f32>` pass (`crate::fine_tune::regression_loss::TargetScaler`, a
-//!   SEPARATE, unfiltered pass this module never streams), the
-//!   mining/GradCache whole-set loaders, and — new to this module —
-//!   `crate::fine_tune::decode::DetectedFormat::Classification` (its label
-//!   vocabulary is exactly the same whole-dataset-pass shape as K3; see
-//!   `decode`'s module doc). **The bound is claimed only for the non-exempt
-//!   configuration** (no mining, no GradCache, not classification); with an
-//!   exemption active the eager loader is pool-ACCOUNTED (a typed failure
-//!   still surfaces) but not BOUNDED by this doc's inequality.
+//!   SEPARATE, unfiltered pass this module never streams) and the
+//!   mining/GradCache whole-set loaders. Classification is NOT an exemption
+//!   (#500 U2c §11 F3 reverses that): its whole-table label vocabulary
+//!   (`decode::LabelVocabulary`, `build_label_vocabulary` below) is its OWN
+//!   separate, bounded-by-cardinality pass — the SAME shape as K3's scalar
+//!   scan, not a reason to keep the per-step CHUNK build eager, so it does
+//!   not enter `Σ E` at all. **The bound is claimed only for the non-exempt
+//!   configuration** (no mining, no GradCache); with an exemption active the
+//!   eager loader is pool-ACCOUNTED (a typed failure still surfaces) but not
+//!   BOUNDED by this doc's inequality.
 //!
 //! The loader's own query plans at a SINGLE output partition —
 //! `Self::open` derives a loader-local one-`target_partitions`
 //! `SessionState` from the caller's session (keeping its tenant analyzer
 //! rule, catalogs, and memory pool) — so on a sorted single-fragment table
+//! UNDER DataFusion 54.1's default `repartition_file_min_size` (~10 MiB)
 //! this plans a bare scan with NO `SortPreservingMergeExec` and NO
 //! DataFusion-side reservation of its own: the merge term is ZERO by
 //! construction, which is why it does not appear in the inequality above.
+//! **Above that threshold it is NOT zero**: a single Parquet file larger
+//! than the threshold is scanned as several read-time file groups
+//! regardless of `target_partitions` — `target_partitions = 1` only bounds
+//! how many partitions those groups get merged DOWN to, never whether the
+//! scan itself starts multi-partition — so combining them in committed
+//! order needs a real `SortPreservingMergeExec`/`ExternalSorter`
+//! reservation this derivation does not eliminate (found executing #500
+//! U2c §11 F1's own attempted oracle: `training_set_stream.rs`'s
+//! `f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_
+//! through_the_stream` doc records six distinct configurations tried and
+//! their exact failures). Every property this crate actually pins
+//! (P1–P7, `refactor_parity`/`regression_refactor_parity`) is exercised at
+//! fixture sizes under that threshold; a table whose EAGER size must
+//! exceed `[engine] memory_limit`'s own 64 MiB floor unavoidably exceeds it
+//! too, so this merge term is UNCOVERED for that combination — stated here
+//! rather than left for a reader to discover empirically.
 //!
 //! # The load-time pre-pass (advisory, §9)
 //!
@@ -103,8 +119,8 @@ use jammi_db::store::TrainingSetTable;
 use crate::model::ModelTask;
 use crate::session::InferenceSession;
 
-use super::data::TextChunk;
-use super::decode::{self, ChunkAccumulator, DetectedFormat};
+use super::data::{TextChunk, TrainingDataLoader};
+use super::decode::{self, ChunkAccumulator, DetectedFormat, LabelVocabulary};
 use super::partition::PartitionSpec;
 use super::training_set::read_back_sql;
 
@@ -354,6 +370,16 @@ impl TrainingSetStream {
     /// module doc's "the loader's own query plans at a single output
     /// partition"), and spawns a pump task on the current Tokio runtime that
     /// walks the ordered read [`read_back_sql`] renders, batch by batch.
+    ///
+    /// `label_vocab` is required (and refused, typed, when absent) exactly
+    /// when `columns`/`task` detect `DetectedFormat::Classification`
+    /// (#500 U2c §11 F3) — every other format ignores it. The caller builds
+    /// it from a whole-table pass BEFORE calling `open` (see
+    /// `super::worker::run_spec`'s doc); this function never builds one
+    /// itself, since a per-window stream cannot see rows outside its own
+    /// window and a vocabulary built from less than the whole table would
+    /// silently under-count `num_classes`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         session: &InferenceSession,
         table: &TrainingSetTable,
@@ -362,23 +388,19 @@ impl TrainingSetStream {
         window: RowWindow,
         slice: Slice,
         cfg: StreamConfig,
+        label_vocab: Option<LabelVocabulary>,
     ) -> Result<Self> {
         let detected = decode::detect_training_format(columns, task)?;
-        // Refuses `Classification` (and any future format with no per-step
-        // shape) at OPEN, not on the first `next_chunk` — P7's "a format
-        // with no row-level chunk shape is refused at open". The
-        // accumulator built here is discarded; it exists only to run the
-        // check.
-        drop(ChunkAccumulator::new_for(detected)?);
+        // Refuses a format with no per-step shape (or a Classification
+        // source with no vocabulary) at OPEN, not on the first `next_chunk`
+        // — P7's "a format with no row-level chunk shape is refused at
+        // open". The accumulator built here is discarded; it exists only to
+        // run the check.
+        drop(ChunkAccumulator::new_for(detected, label_vocab.as_ref())?);
 
         validate_window(session, table, columns, detected, task, window).await?;
 
-        let base_state = session.context().state();
-        let one_partition_config = base_state.config().clone().with_target_partitions(1);
-        let derived_state = SessionStateBuilder::new_from_existing(base_state)
-            .with_config(one_partition_config)
-            .build();
-        let derived_ctx = SessionContext::new_with_state(derived_state);
+        let derived_ctx = derive_single_partition_ctx(session);
 
         let query = read_back_sql(table, columns);
         let df = derived_ctx.sql(&query).await?;
@@ -402,6 +424,7 @@ impl TrainingSetStream {
             slice,
             root_reservation,
             tx,
+            label_vocab,
         ));
 
         Ok(Self { receiver: rx, pump })
@@ -463,11 +486,12 @@ async fn run_pump(
     slice: Slice,
     mut root_reservation: MemoryReservation,
     tx: tokio::sync::mpsc::Sender<Result<OwnedChunk>>,
+    label_vocab: Option<LabelVocabulary>,
 ) {
     let mut step = 0usize;
     let mut range = slice.rows_for_step(window.len(), step);
 
-    let mut acc = match ChunkAccumulator::new_for(detected) {
+    let mut acc = match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
         Ok(a) => a,
         Err(e) => {
             let _ = tx.send(Err(e)).await;
@@ -507,9 +531,14 @@ async fn run_pump(
                 return;
             }
             if local_idx >= range.start && local_idx < range.end {
-                if let Err(e) =
-                    decode::append_selected_rows(detected, task, &batch, &[row_in_batch], &mut acc)
-                {
+                if let Err(e) = decode::append_selected_rows(
+                    detected,
+                    task,
+                    &batch,
+                    &[row_in_batch],
+                    label_vocab.as_ref(),
+                    &mut acc,
+                ) {
                     let _ = tx.send(Err(e)).await;
                     return;
                 }
@@ -519,7 +548,7 @@ async fn run_pump(
             if local_idx == range.end {
                 let finished = std::mem::replace(
                     &mut acc,
-                    match ChunkAccumulator::new_for(detected) {
+                    match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
                         Ok(a) => a,
                         Err(e) => {
                             let _ = tx.send(Err(e)).await;
@@ -555,6 +584,27 @@ async fn run_pump(
         .await;
 }
 
+/// Derive a loader-local, single-`target_partitions` `SessionContext` from
+/// `session`'s own state — keeping its tenant analyzer rule, catalogs, and
+/// memory pool (the module doc's "the loader's own query plans at a SINGLE
+/// output partition"). Shared by [`TrainingSetStream::open`]'s per-step read
+/// AND [`validate_window`]'s aggregate pass: BOTH queries wrap `read_back_
+/// sql`'s already-`ORDER BY`'d text in a `LIMIT`/`OFFSET`, and at
+/// `target_partitions > 1` DataFusion plans a real `SortPreservingMergeExec`
+/// for either one — for the aggregate specifically, that merge sits behind
+/// a blocking `.collect()`, so it is a genuine, real pool reservation, not
+/// the per-step stream's own `S₁` (DataFusion's pipeline, explicitly NOT
+/// pool-accounted). Deriving once per query is cheap (`SessionState`
+/// cloning, no I/O); nothing here executes a row.
+fn derive_single_partition_ctx(session: &InferenceSession) -> SessionContext {
+    let base_state = session.context().state();
+    let one_partition_config = base_state.config().clone().with_target_partitions(1);
+    let derived_state = SessionStateBuilder::new_from_existing(base_state)
+        .with_config(one_partition_config)
+        .build();
+    SessionContext::new_with_state(derived_state)
+}
+
 /// The load-time pre-pass (module doc): a schema check via [`read_back_sql`]'s
 /// own planned schema, plus — for a numeric target column — a null/NaN
 /// aggregate scoped to EXACTLY `window`'s rows.
@@ -566,7 +616,17 @@ async fn run_pump(
 /// exactly as it does for the pump: a `LIMIT`/`OFFSET` immediately wrapping
 /// an already-`ORDER BY`'d subquery is DataFusion's own idiom for "the first
 /// `n` rows of this order, `LIMIT` never reshuffling what `ORDER BY` fixed.
-async fn validate_window(
+///
+/// `pub(crate)` so `super::worker::run_spec` can run it directly over
+/// `RowWindow::new(0, total_rows)` — the WHOLE table, once, before the
+/// first training step (#500 U2c §11 F5) — in addition to [`Self::open`]
+/// running it again over each stream's own (narrower) window, which is
+/// stated cost, not a bug: a `Streamed` source's train window is always a
+/// SUBSET of `[0, total_rows)`, so the worker's whole-table pass already
+/// covers everything the per-epoch train stream's own pass would find; the
+/// duplication is the "per-epoch re-open cost (two opens + pre-pass
+/// planning)" the module doc already states.
+pub(crate) async fn validate_window(
     session: &InferenceSession,
     table: &TrainingSetTable,
     columns: &[String],
@@ -586,14 +646,37 @@ async fn validate_window(
         return Ok(());
     }
     if let Some(target_col) = decode::numeric_target_column(detected) {
+        // The `LIMIT`/`OFFSET` must scope the ROWS the aggregate reads, not
+        // the aggregate's OWN one-row output: an aggregate `SELECT` over
+        // `w` always produces exactly one row, so wrapping THAT in
+        // `LIMIT n OFFSET window.start` (as an earlier revision of this
+        // function did) discards the one row whenever `window.start > 0` —
+        // silently returning zero batches for every window that does not
+        // start at row 0 (the validation suffix, always). The `LIMIT`/
+        // `OFFSET` therefore apply to an INNER subquery that selects the
+        // window's own rows first; the aggregate runs over THAT.
         let agg_sql = format!(
             "SELECT sum(case when \"{target_col}\" is null then 1 else 0 end) as null_count, \
              sum(case when isnan(cast(\"{target_col}\" as double)) then 1 else 0 end) as nan_count \
-             FROM ({ordered_sql}) AS w LIMIT {} OFFSET {}",
+             FROM (SELECT * FROM ({ordered_sql}) AS w LIMIT {} OFFSET {}) AS windowed",
             window.len(),
             window.start
         );
-        let batches = session.sql(&agg_sql).await?;
+        // Executed through the SAME loader-local, single-`target_partitions`
+        // context `Self::open` derives (`derive_single_partition_ctx`) —
+        // never `session.sql`, which plans at the session's OWN (often > 1)
+        // partition count. At > 1 the inner `LIMIT`/`OFFSET` subquery plans
+        // a real `SortPreservingMergeExec` there, and unlike the per-step
+        // stream (`S₁`, DataFusion's own pipeline, explicitly NOT
+        // pool-accounted per the module doc) an AGGREGATE's merge sits
+        // behind a blocking `.collect()` that holds every input partition's
+        // buffered rows at once — a genuine, real pool reservation this
+        // pre-pass would otherwise leave unnamed in P3's inequality
+        // entirely. Derived once per call (cheap: `SessionState` cloning,
+        // no I/O) rather than threaded in from `open` (which needs its own
+        // copy anyway, for the actual per-step read after this pre-pass).
+        let single_partition_ctx = derive_single_partition_ctx(session);
+        let batches = single_partition_ctx.sql(&agg_sql).await?.collect().await?;
         let batch = batches.first().ok_or_else(|| {
             JammiError::FineTune(
                 "TrainingSetStream pre-pass: the null/NaN aggregate returned no batch".into(),
@@ -625,4 +708,110 @@ async fn validate_window(
         }
     }
     Ok(())
+}
+
+/// Build a classification vocabulary from a WHOLE table's `label` column,
+/// via a bounded-memory forward scan (`session.sql_stream`) over
+/// [`read_back_sql`]'s ordered read — never a collected `Vec<RecordBatch>`
+/// (#500 U2c §11 F3). Called ONCE, by the worker, before any per-epoch
+/// stream opens (`super::worker::run_spec`'s doc).
+///
+/// This is a PLAIN forward scan, not a [`TrainingSetStream`] pump: the
+/// vocabulary's own residency is bounded by its CARDINALITY (only the
+/// distinct label SET is ever held — the row values themselves are
+/// discarded per-batch, never accumulated), so none of `TrainingSetStream`'s
+/// per-step chunk/prefetch machinery applies here, and building the
+/// vocabulary through `open`/`ChunkAccumulator` is circular anyway: a
+/// Classification `ChunkAccumulator` REQUIRES a vocabulary before it can
+/// be built (see `ChunkAccumulator::new_for`'s doc) — this function is
+/// what produces the vocabulary that later requirement consumes.
+///
+/// The relation is spelled ONLY through [`read_back_sql`] (the reader-class
+/// allow-list's property, `training_set.rs`'s module doc) — order does not
+/// matter for a SET, but this function still reads the SAME query text
+/// every other production caller does, never a second hand-spelling.
+pub async fn build_label_vocabulary(
+    session: &InferenceSession,
+    table: &TrainingSetTable,
+    columns: &[String],
+) -> Result<LabelVocabulary> {
+    let query = read_back_sql(table, columns);
+    let mut df_stream = session.sql_stream(&query).await?;
+    let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    while let Some(batch) = df_stream.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let label_col = batch
+            .column_by_name("label")
+            .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+        let label_vals = decode::extract_string_column(label_col.as_ref())
+            .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+        labels.extend(label_vals);
+    }
+    Ok(LabelVocabulary::from_labels(
+        labels.iter().map(String::as_str),
+    ))
+}
+
+/// One epoch's row source for the trainer's production text loop (#500 U2c
+/// §10): either an already-resident [`TrainingDataLoader`] or a fresh
+/// per-epoch [`TrainingSetStream`]. [`Self::next_chunk`] gives both arms one
+/// call shape, so `trainer.rs::run`'s text loop walks either one identically.
+pub(crate) enum EpochSource<'a> {
+    Resident(&'a TrainingDataLoader),
+    Stream(TrainingSetStream),
+}
+
+impl<'a> EpochSource<'a> {
+    /// The chunk this source holds for global `step`. `Ok(None)` is the
+    /// end-of-epoch signal — mirroring
+    /// [`TrainingDataLoader::text_chunk_for_rank`]'s own "an empty chunk
+    /// means the epoch is over" contract exactly, so the caller's loop looks
+    /// identical for either arm.
+    ///
+    /// `spec` is the Resident arm's per-rank partition (the Stream arm
+    /// already baked its own [`Slice::PerRank`] in at [`TrainingSetStream::
+    /// open`], so `spec` goes unused there — kept as a shared parameter
+    /// rather than stored twice, once on this enum and once inside the
+    /// stream that built it).
+    ///
+    /// The Stream arm asserts `owned.step() == step` (#500 U2c §11's
+    /// advisory: "the consumer asserts `owned.step() == step`") — the pump
+    /// emits steps strictly in order over one channel, so any desync here is
+    /// an internal invariant violation, not a caller input error.
+    pub(crate) fn next_chunk(
+        &mut self,
+        spec: &PartitionSpec,
+        step: usize,
+    ) -> Result<Option<TextChunk>> {
+        match self {
+            EpochSource::Resident(loader) => {
+                let chunk = loader.text_chunk_for_rank(spec, step)?;
+                if chunk.row_count() == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(chunk))
+                }
+            }
+            EpochSource::Stream(stream) => match stream.next_chunk()? {
+                None => Ok(None),
+                Some(owned) => {
+                    assert_eq!(
+                        owned.step(),
+                        step,
+                        "EpochSource::Stream: pump/consumer step desync (pump emitted step {}, \
+                         consumer asked for step {step})",
+                        owned.step()
+                    );
+                    if owned.chunk().row_count() == 0 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(owned.into_chunk()))
+                    }
+                }
+            },
+        }
+    }
 }

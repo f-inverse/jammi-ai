@@ -223,13 +223,16 @@ preload_models = [
 # the result store is rooted at ({artifact_dir}/jammi_db when [storage]
 # result_root is unset, else result_root itself) -- and
 # `instances.result_root_identity` carries that root's IDENTITY across
-# spellings, computed once by this process at registration: scheme aliases
-# folded by the store's own URL parser (gcs://=gs://, abfss://=azure://), a
-# bucket's name lowercased and trailing slashes trimmed, a local root
-# resolved on this host's filesystem (symlinks, ./..). Only members whose
-# identity equals this process's are its gang members. A memory:// root is
-# refused here: it lives in this process alone and can never be shared with
-# a peer. See "The gang listener (I-GANG)" in security.md.
+# spellings, computed once by this process at registration from the same
+# config the store reads: scheme aliases folded by the store's own URL
+# parser (gcs://=gs://, abfss://=azure://), the bucket name lowercased and
+# the key normalised by the store's own key parser, the endpoint/account
+# named under [storage.cloud] for that scheme included, a local root CREATED
+# (as the store creates it at open) and canonicalised on this host's
+# filesystem (symlinks, ./.., the filesystem's own spelling). Only members
+# whose identity equals this process's are its gang members. A memory://
+# root is refused here: it lives in this process alone and can never be
+# shared with a peer. See "The gang listener (I-GANG)" in security.md.
 # peer_advertise = "10.0.4.7:9000"
 # MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
 # estimated bytes ONE query may load locally for segments it does not own,

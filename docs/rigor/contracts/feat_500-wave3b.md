@@ -21,10 +21,14 @@ call site names the oracle that goes red when it is deleted.
 3. **The merge path, locally** — `ci/scripts/merge_path.sh`: the CI matrix
    read from the workflow files at run time, in the gate-safe order
    (records last). Documented in the maintainer guide's PR-gate paragraph.
-4. **The live lane's container** — `.github/workflows/ci.yml` `test-live`
-   gains the `safe.directory` step every other container job has; the
-   `pinned_source_gate` tests shelled out to `git ls-files` and died with
-   "dubious ownership" on every main run (nine on 937d72e6, six on ad2f5b7b).
+4. **The container jobs' git** — `.github/actions/setup-rust-ci` (the
+   composite every container job runs right after checkout) now sets the
+   `safe.directory` mark ONCE; the five per-job copies in `ci.yml` are
+   removed. The `pinned_source_gate` tests shelled out to `git ls-files`
+   and died with "dubious ownership" on every main run of the live lane
+   (nine on 937d72e6, six on ad2f5b7b), which had no copy; eight container
+   jobs had none. Placed in the composite on the pressure round's finding
+   (F16), not as a sixth copy.
 
 Out of scope: U5b-1b-i/ii/iii, U4b, U5a-2, U5b-2, U7b-A2b (their own
 branches); a shared refusal-message constructor for the eager and streamed
@@ -39,19 +43,32 @@ produced a string the store never rooted at). The design here keeps the
 verbatim root untouched everywhere and adds identity as a SEPARATE value
 that is never used to root anything:
 
-- `RootIdentity::of(root: &str) -> Result<RootIdentity>` — one total
-  function of the verbatim root string, run by the process that OWNS the
-  root, at registration, on its own filesystem
+- `RootIdentity::of(root, cloud)` (crate-private) — the derivation, run
+  by the process that OWNS the root, at registration, on its own
+  filesystem, from the SAME config the store roots itself from
   (`crates/jammi-db/src/catalog/instance.rs`). Rules, by the scheme the
   store's own parser (`StorageUrl::parse`, the one alias table) assigns:
-  object stores → `{canonical scheme}://{authority lowercased}/{key}` with
-  trailing `/`s trimmed and key case preserved (`r2://` ≠ `s3://`); local
-  roots → `file://{longest existing prefix, canonicalised}{remainder,
-  lexical}` (symlinks, `.`/`..`, the filesystem's case; a root the store has
-  not created yet has the identity it will have); `memory://` → refused,
-  typed, naming the root and the way out (an in-memory store is never
-  shareable); an unknown or upper-case scheme → refused exactly as the
-  store refuses it when rooting.
+  object stores → `{canonical scheme}://{bucket lowercased}/{key}` where
+  the key is normalised by the SAME `object_store::path::Path::parse` the
+  store hands its keys to (one leading `/` stripped, a trailing one
+  dropped, an empty segment refused exactly as the store refuses it — so
+  `s3://b//p` ≡ `s3://b/p` and `s3://b/p//` is no root), then
+  `@{endpoint}` when `[storage.cloud]` names one for that scheme (S3
+  `endpoint`, R2 `resolved_endpoint`, Azure `account_name`) — two buckets
+  of one name behind two endpoints or accounts are two locations; local
+  roots → the directory is CREATED first (`create_dir_all`, what the store
+  does at open, idempotent) and then canonicalised (symlinks, `.`/`..`, the
+  filesystem's own spelling — on a case-insensitive filesystem two
+  spellings of one directory settle to the on-disk one; a relative root
+  against the working directory); any filesystem error is a typed refusal
+  naming the root, never a fallback to a different identity; `memory://`
+  → refused, typed, naming the root and the way out; an unknown or
+  upper-case scheme → refused exactly as the store refuses it.
+  The pressure round's five findings on the first cut are each closed by
+  one of these rules: the store's key parser (F1), refusal on every
+  non-ENOENT error (F2), create-then-canonicalise instead of a lexical tail
+  (F3), the endpoint in the identity (F4), and the listing taking the
+  member's own `MemberRoot` with the derivation private (F5).
 - `MemberRoot { root, identity }` — the verbatim string PAIRED with its
   identity, built only by `MemberRoot::resolved(config)` in production
   (`resolved_result_root()` then `RootIdentity::of`); the `test-hooks`
@@ -61,17 +78,19 @@ that is never used to root anything:
   `036_instances_result_root_identity`, appended, nullable, pinned at the
   four K5 sites; written by `upsert_instance`/`reregister_instance` from
   the one `MemberRoot`.
-- `GangListing.root_identity: &RootIdentity` — the caller's own;
-  `list_gang_members` adds `AND i.result_root_identity = $n` to its SQL
-  (a byte-exact `=` on a string this engine wrote; NULL never matches).
-  The verbatim `result_root` column is never compared.
+- `GangListing.root: &MemberRoot` — the caller's own registration value,
+  never a bare identity (an identity exists only inside a `MemberRoot`,
+  derived once); `list_gang_members` adds `AND i.result_root_identity =
+  $n` to its SQL (a byte-exact `=` on a string this engine wrote; NULL
+  never matches). The verbatim `result_root` column is never compared.
 
 ## 3. U5b-1a-A2 — properties, each with its executed oracle
 
 | Property | Oracle (all GREEN at this head) |
 |---|---|
-| P-A1 alias/authority-case/trailing-slash fold on object stores; key case, bucket, backend stay distinct | `catalog::instance::root_identity_tests::object_store_aliases_authority_case_and_trailing_slashes_fold`, `::object_store_key_case_buckets_and_backends_stay_distinct` |
-| P-A2 local roots: symlink ≡ target, `.`/`..`, trailing slash, `file://` ≡ bare, not-yet-existing leaf, relative against cwd; distinct dirs distinct | `::a_local_root_folds_symlinks_dot_segments_trailing_slashes_and_the_file_scheme`, `::a_local_root_the_store_has_not_created_yet_has_the_identity_it_will_have`, `::a_relative_local_root_is_taken_against_the_working_directory`, `::distinct_local_roots_stay_distinct` |
+| P-A1 alias / bucket-case fold and the store's own key normalisation on object stores (a key the store refuses is refused; keys the store equates are equated — the store's parser IS the oracle); key case, bucket, backend stay distinct | `catalog::instance::root_identity_tests::object_store_aliases_bucket_case_and_the_stores_key_normalisation_fold`, `::a_key_the_store_refuses_is_refused_and_keys_the_store_equates_are_equated`, `::object_store_key_case_buckets_and_backends_stay_distinct` |
+| P-A1b the endpoint/account the store would dial is part of a cloud identity (two S3 endpoints or two R2 accounts → two identities; one endpoint → one; `gs://` unaffected) | `::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity` |
+| P-A2 local roots: symlink ≡ target, `.`/`..`, trailing slash, `file://` ≡ bare, relative against cwd; the root is CREATED and its identity is stable afterwards, a case-divergent spelling settles to the on-disk one on a case-insensitive filesystem (two directories on a case-sensitive one); a root that cannot be created (a FILE where a directory is needed) is refused naming it; distinct dirs distinct | `::a_local_root_folds_symlinks_dot_segments_trailing_slashes_and_the_file_scheme`, `::a_local_root_is_created_and_a_case_divergent_spelling_settles_to_the_on_disk_one`, `::a_local_root_that_cannot_be_created_is_refused_naming_it`, `::a_relative_local_root_is_taken_against_the_working_directory`, `::distinct_local_roots_stay_distinct` |
 | P-A3 `memory://` and an unknown scheme refused naming the root | `::a_memory_root_and_an_unknown_scheme_are_refused_naming_the_root`; `config::tests::from_config_refuses_a_memory_result_root_for_a_member_only` (a library config with the same root is untouched; an upper-case scheme is refused on both paths) |
 | P-A4 the row carries the verbatim spelling AND `RootIdentity::of` of it, over every advertising arm | `config::tests::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm`, `::from_config_root_identity_is_of_the_resolved_root_over_every_arm`, `::from_config_never_aliases_gcs_and_gs_result_root_spellings_but_their_identities_are_one`; real sessions: `crates/jammi-ai/tests/it/storage_root.rs::member_row_matches_resolved_root_*` (identity column asserted), `::a_member_with_a_memory_result_root_is_refused_at_session_construction` |
 | P-A5 the predicate: same-location spellings ARE members (gcs/gs; symlink/target; authority case; trailing slash); different locations and NULL identities are NOT | `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other`, `::a_symlinked_local_root_and_its_target_are_the_same_gang`, `::list_folds_authority_case_and_trailing_slash_but_not_key_case`, `::file_and_s3_rooted_members_are_not_gang_members_of_each_other`, `::list_excludes_a_member_with_peer_addr_set_and_no_root`, `::a_row_with_a_root_but_no_identity_is_never_a_member` (sqlite + postgres arms) |
@@ -90,50 +109,82 @@ would not have caught its absence (they are the control, not the test).
 accepts one; no fixture here runs on Windows). Two hosts whose local roots
 canonicalise to the same path on UNSHARED filesystems — indistinguishable
 to this predicate by design (necessary, never sufficient; sufficiency is the
-attestation VERIFY). Postgres arms ran against a local PostgreSQL 16 in the
-CI lane's shape (§6).
+attestation VERIFY). A permission-denied ancestor (EACCES) is refused by
+the same arm the ENOTDIR oracle exercises but has no oracle of its own
+(CI's lanes run as root, where chmod is bypassed). An Azure
+`https://…blob.core.windows.net` spelling (the parser's doc mentions it;
+`parse_scheme` accepts only `azure`/`abfss`, so it is refused on both
+paths). Postgres arms ran against a local PostgreSQL 16 in the CI lane's
+shape (§6).
 
-## 4. U5b-0 — design and oracles (stated BEFORE the code)
+## 4. U5b-0 — design and oracles (stated BEFORE the code; rewritten on the pressure round)
 
-- `LeafDigest { index: u32, digest: ArtifactDigest }`;
-  `MaterializationManifest.leaves: Vec<LeafDigest>` (a REQUIRED field);
-  `MaterializationManifest.artifact` becomes `ArtifactDigest::fold(&leaves)`
-  — ONE fold function over the leaf digests in index order, never a second
-  independently computed whole-artifact digest.
-- Result table: one leaf per Parquet row group, its digest the SHA-256 of
-  that row group's byte range in the file (from the footer's column-chunk
-  offsets), computed by the writer as each row group is written. Model
-  bundle (`ArtifactStore::write_model_materialization`): one leaf per file
-  in the bundle manifest's name-sorted order, its digest the file's own
-  sha256 the bundle manifest already records.
-- `MANIFEST_VERSION` 3 → 4. An old sidecar (no `leaves`, version 3) is
-  rejected by `from_json_bytes` (serde-first, then the version guard), and
-  every reader that consults a manifest treats that rejection as a MISS —
-  re-materialise — never a whole-artifact read accepted in its place.
-- `verify_materialization` recomputes the leaves from the artifact bytes +
-  footer and folds; the freshness reader's `CurrentAnchor::ResultDigest`
-  keeps reading `manifest.artifact` (now the fold).
+The first cut folded the leaves INTO `artifact`. The pressure round showed
+that to be wrong at the root: `manifest.artifact` is the base of the
+version-identity chain (`store/version.rs`: the base version's identity IS
+the artifact hex; every downstream `InputAnchor::result_digest` records it),
+`verify_materialization` reuses the whole-object digest as the base
+fragment's digest beside `of_bytes` over the deletes object, and a leaf set
+over row groups does not partition a Parquet file (footer, page index,
+bloom filters, magic belong to no row group — a footer-only mutation would
+change no leaf). So:
+
+- `MaterializationManifest.artifact` is UNCHANGED: the whole-object SHA-256,
+  the in-toto subject, the root of the version chain, recomputable by any
+  verifier holding the bytes.
+- `MaterializationManifest.leaves: Vec<LeafDigest>` is ADDITIVE — a keyed
+  inventory, `LeafDigest { key: LeafKey, digest: ArtifactDigest }` with
+  `LeafKey::RowGroup { index, offset, length }` for a result table (the
+  digest of that byte range, read from the footer's column-chunk offsets)
+  and `LeafKey::File { name }` for a model bundle (the file's own sha256
+  the bundle manifest already records, keyed by NAME so adding a file
+  changes no other leaf and `Manifest::combined_hash` stays the bundle's
+  content address). The inventory is what a peer verifies one partition
+  against without reading the file; it never stands in for `artifact`.
+- No `MANIFEST_VERSION` bump: the number is reserved for a change to an
+  existing descriptor variant's determinant set, and a since-added
+  REQUIRED field is already rejected serde-first. `leaves` is required.
+- The MISS rule, scoped: `read_materialization_manifest` maps a SHAPE
+  rejection (serde: a sidecar written before `leaves` existed) to
+  `Ok(None)` — a pre-`leaves` table reads as a pre-contract table, which
+  every reader already handles (`MatchVerdict::MissingManifest`, the
+  recompute-from-bytes anchor arm, the cache probe's miss) — while a
+  VERSION rejection (`UnsupportedManifestVersion`, a newer engine's
+  sidecar) stays an error: an older binary must never re-materialise over
+  a newer engine's table.
+- `verify_materialization` is unchanged in what it compares; a new
+  `verify_partitions(&record) -> PartitionVerdict` recomputes every leaf
+  from the bytes and the footer and names the first divergent leaf.
 
 | Property | Oracle (to be written RED first, then GREEN) |
 |---|---|
-| P-B1 leaf count == row-group count (the footer's own count, read independently by the test) over a multi-row-group fixture | `store::manifest` or `tests/it/materialization.rs::leaf_count_equals_the_footer_row_group_count` |
-| P-B2 `artifact == fold(leaves)`, the fold recomputed independently by the test | `::artifact_digest_is_the_fold_over_the_leaves` |
-| P-B3 a v3 sidecar (no `leaves`) is a typed rejection in `from_json_bytes` and a MISS in the freshness/probe reader — never a hit | `::a_pre_leaves_sidecar_is_a_cache_miss_not_a_whole_artifact_hit` |
-| P-B4 partition property: flipping one byte inside row group k changes leaf k's digest and no other leaf's; `verify_materialization` names row group k | `::a_corrupted_row_group_is_named_by_its_leaf` |
-| P-B5 a model bundle's leaves are its files, name-sorted, and `artifact` is their fold; `write_model_materialization` and `read_model_materialization` round-trip | `::a_model_bundle_attests_one_leaf_per_file` |
+| P-B1 leaf count == the footer's row-group count, read independently by the test with the `parquet` crate over a multi-row-group fixture | `tests/it/materialization.rs::leaf_count_equals_the_footer_row_group_count` |
+| P-B2 each leaf's digest == SHA-256 over the byte range the test reads from the footer itself (`ColumnChunkMetaData::byte_range`), not from the leaf | `::each_leaf_digest_is_the_footers_byte_range_digest` |
+| P-B3 a sidecar without `leaves` reads as `Ok(None)` and `verify_materialization` says `MissingManifest`; a sidecar with a NEWER `manifest_version` is an error, never a miss | `::a_pre_leaves_sidecar_is_a_miss_and_a_newer_version_is_an_error` |
+| P-B4 flipping one byte inside row group k changes leaf k's digest and no other leaf's, and `verify_partitions` names leaf k; a FOOTER-only mutation changes no leaf but `verify_materialization` still reports `Mismatch` (the whole-object digest is the subject) | `::a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the_artifact` |
+| P-B5 a model bundle's leaves are its files by name and `artifact` is still `Manifest::combined_hash`; adding a file changes no existing leaf | `store::artifact` tests `::a_model_bundle_attests_one_leaf_per_file_by_name` |
 
-Mutation to execute before closing: make the writer emit ONE leaf for the
-whole file → P-B1 and P-B4 must go red; make `artifact` an independent
-whole-file digest → P-B2 must go red.
+Mutations to execute before closing: make the writer emit ONE leaf for the
+whole file → P-B1 and P-B4 go red; key bundle leaves by position → P-B5's
+add-a-file arm goes red; map a version rejection to a miss → P-B3's second
+arm goes red.
 
 ## 5. Also on this branch
 
-- `ci/scripts/merge_path.sh` (§1.3). Validated by running its `guards` and
-  `swarm` stages on this tree (`scratchpad/logs/mp-guards-swarm.log`) and
-  the full script before the PR.
-- `.github/workflows/ci.yml` `test-live`: `safe.directory` (§1.4). Verified
-  only by the next main run of that lane (it does not run on PRs); the fix
-  is the same step the hermetic job carries at its own `git` sites.
+- `ci/scripts/merge_path.sh` (§1.3). The first cut split each Swarm-gates
+  step into lines (so the two multi-line human-amend-only guards were never
+  evaluated), substituted two workflow expressions and passed the rest
+  through, and ran diff-scoped gates over an empty diff when HEAD was the
+  base. Rewritten: each step's `run:` block executes whole, every `${{ }}`
+  expression is expanded or the run stops naming it, HEAD == base or a
+  dirty tree is a refusal, a missing `mdbook` fails like a missing
+  Postgres, and the `ci.yml` jobs it does not cover are printed up front.
+  Validation: the `guards` and `swarm` stages run to their summary on the
+  committed tree (`scratchpad/logs/mp-guards-swarm-2.log`), and the full
+  script before the PR.
+- `.github/actions/setup-rust-ci` sets `safe.directory` (§1.4). Verified by
+  every container job's next run; the live lane's `pinned_source_gate`
+  tests are the observable.
 
 ## 6. Gates (the merge path)
 

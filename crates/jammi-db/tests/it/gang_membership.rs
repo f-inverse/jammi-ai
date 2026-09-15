@@ -2,7 +2,7 @@
 //! contract `feat_500-C-U5b-1a` §12 and unit U5b-1a-A2): the gang-membership
 //! listing and by-id resolution verbs. `result_root` is written to every
 //! member row verbatim, and its IDENTITY across spellings
-//! (`result_root_identity`, `RootIdentity::of`) is what the admission
+//! (`result_root_identity`, derived by `MemberRoot::resolved`) is what the admission
 //! predicate compares: members whose roots spell the same location
 //! differently (`gcs://` vs `gs://`, a symlink and its target, a trailing
 //! slash) are gang members of each other; members rooted elsewhere, and rows
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::instance::{
-    GangListing, InstanceRegistration, MemberRoot, PeerAddr, RootIdentity, WorkerFacts,
+    GangListing, InstanceRegistration, MemberRoot, PeerAddr, WorkerFacts,
 };
 use jammi_db::catalog::jobs_repo::WorkerState;
 use jammi_db::catalog::lease::instance_prune_window;
@@ -36,8 +36,19 @@ use jammi_db::tenant::TenantId;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 
-/// The member root every "matching" fixture in this file shares.
-const ROOT: &str = "file:///shared/jammi_db";
+/// The member root every "matching" fixture in this file shares: a local
+/// directory this process owns (the derivation creates it; a fixed absolute
+/// path under `/` would be unwritable), one per test process.
+fn root() -> &'static str {
+    static SHARED: std::sync::OnceLock<(tempfile::TempDir, String)> = std::sync::OnceLock::new();
+    &SHARED
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = format!("file://{}/jammi_db", dir.path().to_str().unwrap());
+            (dir, root)
+        })
+        .1
+}
 const LEASE: Duration = Duration::from_secs(30);
 
 async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
@@ -172,21 +183,17 @@ async fn seed_member(
         .unwrap();
 }
 
-/// The identity every `ROOT`-rooted fixture shares — what a caller rooted
-/// at `ROOT` passes as its own.
-fn shared_identity() -> RootIdentity {
-    RootIdentity::of(ROOT).unwrap()
+/// The root every `root()`-rooted fixture shares — what a caller rooted
+/// there passes as its own.
+fn shared_root() -> MemberRoot {
+    MemberRoot::new(root())
 }
 
-fn listing<'a>(
-    kind: &'a str,
-    self_instance: &'a str,
-    root_identity: &'a RootIdentity,
-) -> GangListing<'a> {
+fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a MemberRoot) -> GangListing<'a> {
     GangListing {
         kind,
         self_instance,
-        root_identity,
+        root,
         lease: LEASE,
     }
 }
@@ -231,13 +238,13 @@ async fn list_excludes_the_caller_itself(kind: BackendKind) {
         &catalog,
         &self_id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", &self_id, &shared_identity()))
+        .list_gang_members(listing("fine_tune", &self_id, &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -262,7 +269,7 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -270,7 +277,7 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
     // instance_liveness_margin(30s) == 60s; push well past it.
     force_stale_instance(&catalog, &id, Duration::from_secs(600)).await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -295,13 +302,13 @@ async fn list_excludes_a_draining_worker(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Draining,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -326,13 +333,13 @@ async fn list_excludes_a_warming_worker(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Warming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -359,13 +366,13 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "graph_fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -389,7 +396,7 @@ async fn list_folds_authority_case_and_trailing_slash_but_not_key_case(kind: Bac
     let (_dir, catalog) = base_catalog_kind(kind)
         .await
         .expect("already skipped above when unconfigured");
-    let me = RootIdentity::of("s3://bucket/prefix").unwrap();
+    let me = MemberRoot::new("s3://bucket/prefix");
     let id_case = format!("auth-case-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
@@ -476,7 +483,7 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: Backend
         ("gcs://bucket/prefix", &gs_id),
         ("gs://bucket/prefix", &gcs_id),
     ] {
-        let me = RootIdentity::of(caller_root).unwrap();
+        let me = MemberRoot::new(caller_root);
         let members = catalog
             .list_gang_members(listing("fine_tune", "someone-else", &me))
             .await
@@ -544,7 +551,7 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
         &catalog,
         &file_id,
         "10.0.0.5:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -560,7 +567,7 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
     )
     .await;
     let as_file = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -571,7 +578,7 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
         as_file.iter().all(|m| m.instance_id != s3_id),
         "{as_file:?}"
     );
-    let s3 = RootIdentity::of("s3://bucket/prefix").unwrap();
+    let s3 = MemberRoot::new("s3://bucket/prefix");
     let as_s3 = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &s3))
         .await
@@ -600,7 +607,7 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
         .await
         .unwrap();
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -642,13 +649,13 @@ async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind
         &catalog,
         &full_id,
         "10.0.0.7:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -708,7 +715,7 @@ async fn a_symlinked_local_root_and_its_target_are_the_same_gang(kind: BackendKi
     )
     .await;
     for (caller_root, other) in [(&real_root, &link_id), (&link_root, &real_id)] {
-        let me = RootIdentity::of(caller_root).unwrap();
+        let me = MemberRoot::new(caller_root);
         let members = catalog
             .list_gang_members(listing("fine_tune", "someone-else", &me))
             .await
@@ -740,13 +747,13 @@ async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) 
         &catalog,
         &id,
         "10.0.0.10:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let before = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -768,7 +775,7 @@ async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) 
         .await
         .unwrap();
     let after = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -794,14 +801,14 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
         None,
         None,
         Some(PeerAddr::parse("10.0.0.1:9000").unwrap()),
-        Some(MemberRoot::new(ROOT)),
+        Some(MemberRoot::new(root())),
     );
     catalog.upsert_instance(&reg).await.unwrap();
     // Deliberately no `upsert_worker` call: an `instances` row with no
     // `workers` row is a live process that never runs the claim loop, not a
     // fleet member (the INNER join, DESIGN.md § 4).
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -832,13 +839,13 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.5:9000",
-        ROOT,
+        root(),
         "embedding, fine_tune ,other",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let member = members
@@ -873,7 +880,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
             &catalog,
             id,
             "10.0.0.1:9000",
-            ROOT,
+            root(),
             "fine_tune",
             WorkerState::Claiming,
         )
@@ -917,7 +924,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
     );
 
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let ours: Vec<&str> = members
@@ -951,19 +958,19 @@ async fn list_gang_members_is_identical_under_a_scoped_tenant_and_under_none(kin
         &catalog,
         &id,
         "10.0.0.7:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let unscoped = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let scoped_catalog =
         catalog.pinned_to_tenant(Some(TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap()));
     let scoped = scoped_catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert_eq!(
@@ -994,7 +1001,7 @@ async fn peer_addr_of_resolves_a_busy_or_other_kind_fresh_member(kind: BackendKi
         &catalog,
         &id,
         "10.0.0.3:9000",
-        ROOT,
+        root(),
         "embedding",
         WorkerState::Draining,
     )
@@ -1022,7 +1029,7 @@ async fn peer_addr_of_is_none_for_a_stale_instance(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.4:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -1090,7 +1097,7 @@ async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: Ba
         &catalog,
         &id,
         "10.0.0.9:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -1131,14 +1138,14 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
         &catalog,
         &id,
         "10.0.0.10:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     force_corrupt_peer_addr(&catalog, &id).await;
     let result = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await;
     // Same discipline as the `peer_addr_of` case: the poison row is gone
     // before the assertion, on every arm.
@@ -1184,7 +1191,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
         Some("label"),
         Some("host"),
         Some(PeerAddr::parse("10.0.0.9:9000").unwrap()),
-        Some(MemberRoot::new(ROOT)),
+        Some(MemberRoot::new(root())),
     ));
     reg.set_worker(Some(WorkerFacts {
         kinds: "fine_tune".into(),
@@ -1212,7 +1219,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
     tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(500)).await;
 
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_identity()))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let member = members
@@ -1259,7 +1266,7 @@ async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kin
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )

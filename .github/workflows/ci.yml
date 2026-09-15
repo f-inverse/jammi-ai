@@ -153,9 +153,9 @@ jobs:
       # not a real hermeticity gap). CI run 32995714545 hit the same trap one
       # step earlier still: the F3 step's own `git commit` died with this
       # exact fatal before printing anything, never a genuine `before`/
-      # `after` mismatch.
-      - name: Mark the checkout safe for git (container UID != checkout UID)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # `after` mismatch. The safe.directory mark is set ONCE for every job
+      # by `./.github/actions/setup-rust-ci` (right after checkout, above),
+      # never as a per-job step.
 
       - name: Run tests
         env:
@@ -484,13 +484,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # The same trap the hermetic lane documents: the container's git does
-      # not see the safe.directory `actions/checkout` set, so every test that
-      # shells out to `git ls-files` (the pinned-source gate) died with
-      # "dubious ownership" on every main run of this lane.
-      - name: Mark the checkout safe for git (container UID != checkout UID)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
       - name: Run live tests
         env:
           # esc-096: live, up through `HubSource`'s token fallback chain
@@ -583,15 +576,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # A bare `git` in a container `run:` step hits "fatal: detected
-      # dubious ownership" (exit 128) — same trap as `ci.yml`'s "Run tests"
-      # step and `flash-attn-compile`'s submodule init above (see those
-      # comment blocks for the full story). Since esc-081, this job's own
-      # `check_prove_surface` calls `discover_all_tuples`, which shells out
-      # to `git ls-files` to enumerate tracked files — this is that job's
-      # first git call, so it is the first place this trap can fire here.
-      - name: Mark the checkout safe for git (container UID != checkout UID)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Since esc-081, this job's own `check_prove_surface` calls
+      # `discover_all_tuples`, which shells out to `git ls-files` — the
+      # container's git needs the safe.directory mark
+      # `./.github/actions/setup-rust-ci` sets once for every job (above).
 
       # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
       # build; it must depend on `cuda` but never be IMPLIED by it, or the
@@ -1221,16 +1209,13 @@ jobs:
 
       # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
       # freshness step: a container `run:` step's `git` is a different UID
-      # than the checkout, so the safe.directory `actions/checkout` sets is
-      # not visible here. This job's own it-suite shells out to `git
+      # than the checkout. This job's own it-suite shells out to `git
       # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
       # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
-      # (exit 128) without this — measured against PR #521's CI run, where
-      # this job's whole `whose_fault_gate` suite failed at that one shared
-      # line with no other difference from the hermetic lane, which already
-      # carries this step.
-      - name: Mark the checkout safe for git (container UID != checkout UID)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # (exit 128) without the safe.directory mark
+      # `./.github/actions/setup-rust-ci` sets once for every job (above) —
+      # measured against PR #521's CI run, where this job's whole
+      # `whose_fault_gate` suite failed at that one shared line.
 
       - name: Install and start nats-server (with JetStream)
         # GHA `services:` cannot override the upstream image's CMD to pass
@@ -1324,16 +1309,13 @@ jobs:
 
       # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
       # freshness step: a container `run:` step's `git` is a different UID
-      # than the checkout, so the safe.directory `actions/checkout` sets is
-      # not visible here. This job's own it-suite shells out to `git
+      # than the checkout. This job's own it-suite shells out to `git
       # ls-files` (`crates/jammi-db/tests/it/whose_fault_gate.rs`'s
       # `tracked_rs_files`), which hits "fatal: detected dubious ownership"
-      # (exit 128) without this — measured against PR #521's CI run, where
-      # this job's whole `whose_fault_gate` suite failed at that one shared
-      # line with no other difference from the hermetic lane, which already
-      # carries this step.
-      - name: Mark the checkout safe for git (container UID != checkout UID)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # (exit 128) without the safe.directory mark
+      # `./.github/actions/setup-rust-ci` sets once for every job (above) —
+      # measured against PR #521's CI run, where this job's whole
+      # `whose_fault_gate` suite failed at that one shared line.
 
       - name: Run Postgres-gated tests
         env:

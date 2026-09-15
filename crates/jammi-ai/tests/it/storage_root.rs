@@ -11,7 +11,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use candle_core::{Device, Tensor};
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::instance::RootIdentity;
+use jammi_db::catalog::instance::MemberRoot;
 use jammi_db::config::StorageConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
@@ -164,6 +164,11 @@ async fn assert_member_row_matches_resolved_root(
     // parse); the `instances.result_root` column, checked below, carries
     // the PRE-parse string verbatim.
     let expected_store_root = StorageUrl::parse(&expected).unwrap();
+    let expected_identity = MemberRoot::resolved(&config)
+        .unwrap()
+        .identity()
+        .as_str()
+        .to_string();
     let session = InferenceSession::new(config).await.unwrap();
     let store = session.result_store();
     let info = store
@@ -223,8 +228,8 @@ async fn assert_member_row_matches_resolved_root(
     );
     assert_eq!(
         identity.as_deref(),
-        Some(RootIdentity::of(&expected).unwrap().as_str()),
-        "instances.result_root_identity must be RootIdentity::of(resolved_result_root())"
+        Some(expected_identity.as_str()),
+        "instances.result_root_identity must be the identity MemberRoot::resolved derives"
     );
 }
 
@@ -322,9 +327,16 @@ async fn member_row_matches_resolved_root_for_a_cloud_alias_scheme() {
         "the gcs:// spelling must never fold to gs:// (or anything else) on the member row"
     );
     // …while its IDENTITY is the folded one, equal to the `gs://` spelling's.
+    let mut gs = common::test_config(dir.path());
+    gs.storage = StorageConfig {
+        result_root: Some("gs://bucket/jammi_member_row_probe".into()),
+        cloud: None,
+    };
+    let mut gcs = gs.clone();
+    gcs.storage.result_root = Some("gcs://bucket/jammi_member_row_probe".into());
     assert_eq!(
-        RootIdentity::of("gcs://bucket/jammi_member_row_probe").unwrap(),
-        RootIdentity::of("gs://bucket/jammi_member_row_probe").unwrap()
+        MemberRoot::resolved(&gcs).unwrap().identity(),
+        MemberRoot::resolved(&gs).unwrap().identity()
     );
 }
 

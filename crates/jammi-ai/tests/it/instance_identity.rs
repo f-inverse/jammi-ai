@@ -11,7 +11,7 @@ use std::time::Duration;
 use jammi_ai::fine_tune::worker::{EmbeddedWorker, COMPILED_KINDS};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
-use jammi_db::catalog::instance::{GangListing, InstanceRegistration, RootIdentity};
+use jammi_db::catalog::instance::{GangListing, InstanceRegistration, MemberRoot};
 use jammi_db::catalog::jobs_repo::WorkerRecord;
 use jammi_db::catalog::lease::{instance_liveness_margin, instance_prune_window};
 use jammi_db::catalog::Catalog;
@@ -257,10 +257,10 @@ async fn force_delete_instance(catalog: &Catalog, instance_id: &str) {
 /// keeper pass and the liveness margin/prune window are observable within a
 /// test's own timeout, plus `[server] peer_bind`/`peer_advertise` set to a
 /// distinct loopback port pair.
-/// The root identity a session built from `config` registers — what a
+/// The member root a session built from `config` registers — what a
 /// listing over its members must pass as the caller's own.
-fn identity_of(config: &jammi_db::config::JammiConfig) -> RootIdentity {
-    RootIdentity::of(&config.resolved_result_root().unwrap()).unwrap()
+fn root_of(config: &jammi_db::config::JammiConfig) -> MemberRoot {
+    MemberRoot::resolved(config).unwrap()
 }
 
 fn fast_peer_config(dir: &std::path::Path, port: u16) -> jammi_db::config::JammiConfig {
@@ -273,15 +273,15 @@ fn fast_peer_config(dir: &std::path::Path, port: u16) -> jammi_db::config::Jammi
 }
 
 /// Poll until `catalog.list_gang_members` returns `instance_id` as a
-/// member, or panic past `deadline`. `root_identity` is the caller's own
-/// (the session's, `identity_of(&config)`): the predicate admits only
-/// members rooted at the same identity (unit U5b-1a-A2).
+/// member, or panic past `deadline`. `root` is the caller's own (the
+/// session's, `root_of(&config)`): the predicate admits only members whose
+/// root identity equals it (unit U5b-1a-A2).
 async fn wait_until_gang_member(
     catalog: &Catalog,
     instance_id: &str,
     kind: &str,
     lease: Duration,
-    root_identity: &RootIdentity,
+    root: &MemberRoot,
 ) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -289,7 +289,7 @@ async fn wait_until_gang_member(
             .list_gang_members(GangListing {
                 kind,
                 self_instance: "not-a-real-instance-id",
-                root_identity,
+                root,
                 lease,
             })
             .await
@@ -543,7 +543,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
     let lease = config.lease.intervals().unwrap().lease();
     let kind = COMPILED_KINDS[0];
 
-    let me = identity_of(&config);
+    let me = root_of(&config);
     let session = InferenceSession::open(config).await.unwrap();
     let worker = EmbeddedWorker::spawn(&session).unwrap();
 
@@ -591,7 +591,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
     let lease = config.lease.intervals().unwrap().lease();
     let kind = COMPILED_KINDS[0];
 
-    let me = identity_of(&config);
+    let me = root_of(&config);
     let session = InferenceSession::open(config).await.unwrap();
     let worker = EmbeddedWorker::spawn(&session).unwrap();
     wait_until_gang_member(session.catalog(), session.instance_id(), kind, lease, &me).await;
@@ -620,7 +620,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
         .list_gang_members(GangListing {
             kind,
             self_instance: "not-a-real-instance-id",
-            root_identity: &me,
+            root: &me,
             lease,
         })
         .await

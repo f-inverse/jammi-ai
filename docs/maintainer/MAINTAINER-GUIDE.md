@@ -4630,18 +4630,23 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
 / `py-client` / `test-python` / `test-broker` (serialised `--test-threads=1`) / `test-pg` (serialised)
 → `test-live` (main-only, advisory).
 
-**The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for everything above plus
-the `guard` matrix, the Swarm-gates workflow and the Postgres lane, read from the workflow files
-at run time (never a copied list) and run in the order that keeps the last gate fresh: `static`
-(fmt, the four clippy surfaces, rustdoc `-D warnings`, the guide build) → `guards` (every
-`ci.yml` guard-matrix command, stdin closed) → `swarm` (`swarm.yml`'s steps) → `tests` (the
-hermetic lane, the `test-hooks` lane, golden-parity, and the Postgres lane against
+**The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for the `check`, `test`,
+`test-pg` and `guard` jobs above plus the Swarm-gates workflow and `docs.yml`'s build, read from
+the workflow files at run time (never a copied list) and run in one process: `static` (fmt, the
+four clippy surfaces, rustdoc `-D warnings`, the guide build — a missing `mdbook` FAILS unless
+`--skip-mdbook`) → `guards` (every `ci.yml` guard-matrix command, stdin closed, every `${{ }}`
+expression expanded from the checkout or a hard stop) → `swarm` (`swarm.yml`'s steps, each
+`run:` block executed WHOLE — the two human-amend-only guards are multi-line `if` blocks) →
+`tests` (the hermetic lane, the `test-hooks` lane, golden-parity, and the Postgres lane against
 `JAMMI_TEST_PG_URL` — a missing database FAILS the stage unless `--skip-pg` is passed, because a
 silently skipped lane is how a shared-database leak once reached CI) → `records`
-(`check_rigor_record.py`, `check_oracle_gate.py` — last, because the oracle gate stales on any
-change outside `docs/rigor/**`; run the phase-5 oracle after everything else is green and commit
-only its record afterwards). `--only STAGE,...` selects stages; the exit status is the number of
-failed commands and the summary names each one with its log under `$CARGO_TARGET_DIR/merge-path`.
+(`check_rigor_record.py`, `check_oracle_gate.py`). It refuses to run when HEAD is the base or the
+tree is dirty (every diff-scoped gate would be vacuously green), prints up front which `ci.yml`
+jobs it does NOT cover (CI runs those), and exits with the number of failed commands, each named
+with its log under `$CARGO_TARGET_DIR/merge-path`. The oracle gate's freshness is a diff of
+COMMITTED content between the recorded `head_sha` and HEAD outside `docs/rigor/**`, so the order
+that matters is the commit order: commit every code and doc change, run the phase-5 oracle, then
+commit only its record.
 
 **CI guard contracts:**
 - **`ci/scripts/check_dep_direction.py`** BFS-walks the normal-dependency closure of

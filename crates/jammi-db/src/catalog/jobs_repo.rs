@@ -2310,10 +2310,11 @@ impl Catalog {
     /// tenant binding and under none.
     ///
     /// **Root identity is part of this predicate** (unit U5b-1a-A2): a
-    /// candidate's `instances.result_root_identity` must EQUAL
-    /// `listing.root_identity`, the caller's own
-    /// ([`super::instance::RootIdentity`], derived once by each member from
-    /// its verbatim root). Two members rooted at byte-DIFFERENT spellings of
+    /// candidate's `instances.result_root_identity` must EQUAL the identity
+    /// of `listing.root`, the caller's own [`super::instance::MemberRoot`]
+    /// (the value its row carries — never a bare identity; the identity is
+    /// derived once by each member from its verbatim root and the store's
+    /// cloud config). Two members rooted at byte-DIFFERENT spellings of
     /// the SAME location (`gcs://b/p` and `gs://b/p`, a symlinked local
     /// root and its target) ARE gang members of each other; two members
     /// rooted at different locations are not; a row whose identity is NULL
@@ -2337,7 +2338,7 @@ impl Catalog {
     pub async fn list_gang_members(&self, listing: GangListing<'_>) -> Result<Vec<GangMember>> {
         let kind = self.backend().backend_kind();
         let margin = instance_liveness_margin(listing.lease);
-        let root_identity = listing.root_identity.as_str().to_string();
+        let root_identity = listing.root.identity().as_str().to_string();
         let rows: Vec<GangCandidateRow> = self
             .backend()
             .transaction(

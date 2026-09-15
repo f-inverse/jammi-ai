@@ -161,12 +161,18 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   other by id). **The root is compared by identity, never by spelling:**
   `instances.result_root` carries `resolved_result_root()` VERBATIM (so
   `gcs://b/p` and `gs://b/p` remain two different STRINGS in that column),
-  and `result_root_identity` carries `RootIdentity::of` that string — the
-  store's own URL parser folds the scheme aliases (`gcs://`→`gs://`,
-  `abfss://`→`azure://`), a bucket's authority is lowercased and trailing
-  slashes trimmed (object keys keep their case), a local root is resolved on
-  the owning host's filesystem (symlinks, `.`/`..`), and an in-memory root
-  is refused at registration as unshareable. Two members whose spellings
+  and `result_root_identity` carries that root's identity, derived by
+  `MemberRoot::resolved` from the same config the store roots itself from:
+  the store's own URL parser folds the scheme aliases (`gcs://`→`gs://`,
+  `abfss://`→`azure://`), the bucket name is lowercased and the key goes
+  through the store's own key parser (one leading `/` stripped, a trailing
+  one dropped, an empty segment refused — keys keep their case), the
+  endpoint or account the store would dial (`[storage.cloud]`'s S3
+  `endpoint`, R2 account/endpoint, Azure `account_name`) is part of the
+  identity, a local root is created (as the store creates it at open) and
+  canonicalised on the owning host's filesystem (symlinks, `.`/`..`, the
+  filesystem's own spelling), and an in-memory root is refused at
+  registration as unshareable. Two members whose spellings
   name one location ARE gang members of each other; two rooted at different
   locations are not; a row with a NULL identity (pre-036, or a process with
   no membership) never matches. Root identity equality is NECESSARY, never

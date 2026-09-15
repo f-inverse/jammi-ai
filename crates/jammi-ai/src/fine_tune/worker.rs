@@ -80,7 +80,7 @@
 //! row (`jobs.cancel_requested` remains `true`) — the run completes and the
 //! row finishes `completed`, never retroactively `failed`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -235,25 +235,365 @@ fn resolve_kinds(kinds: &jammi_db::config::WorkerKinds) -> Result<Vec<String>> {
 }
 
 /// A job worker bound to a session. Claims and runs durable jobs — training
-/// The claim loop's shutdown phase (§3.1 of the OPS design): `Running` until
-/// a DRAIN or RELEASE begins; `Draining` finishes the in-flight job and stops
-/// claiming; `Releasing` hands every lease back and stops at once. Stored in
-/// [`WorkerShared::phase`] as an `AtomicU8` — every store and load `SeqCst`.
+/// This host's shutdown phase (§3.1 of the OPS design): `Running` until a
+/// DRAIN or RELEASE begins; `Draining` finishes the in-flight job and stops
+/// claiming; `Releasing` hands every lease back and stops at once. Owned by
+/// the session's [`HostAdmission`] (one `watch` cell), read by the claim
+/// loop's gate and by every admitted gang rank's hold loop alike — a phase
+/// leaving `Running` ends a held rank with the host-initiated `Drain`
+/// reason, the same instant it stops the loop from claiming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum WorkerPhase {
-    Running = 0,
-    Draining = 1,
-    Releasing = 2,
+    Running,
+    Draining,
+    Releasing,
 }
 
-impl WorkerPhase {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => WorkerPhase::Draining,
-            2 => WorkerPhase::Releasing,
-            _ => WorkerPhase::Running,
+/// Who holds this host's single job slot — the per-process holder cell a
+/// peer is defined by (plan 67 README r27; OPS D6/D10): a peer never claims
+/// while it holds a rank, never receives a rank while it runs a loop-claimed
+/// job, and is reachable whenever idle. Every transition is a
+/// compare-and-set on one `watch` cell (`send_if_modified`), never a lock
+/// held across an `.await`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    /// Nobody: the loop is idle (or between claims) and no rank is held.
+    Free,
+    /// The claim loop is inside `claim_next` or the claim→hold prologue —
+    /// a claim transaction may be in flight, so nothing aborts the loop
+    /// task here and a rank waits (bounded) for the probe to resolve.
+    ClaimProbe,
+    /// A loop-claimed job runs under a registered lease hold.
+    JobRun,
+    /// An admitted gang rank is held for `(job_id, attempt)`.
+    Rank { job_id: String, attempt: u32 },
+}
+
+/// Why [`HostAdmission::try_hold_rank`] did not take the slot — the holder
+/// it found instead. Every arm is TRANSIENT from the caller's side (the
+/// coordinator retries after at least one heartbeat or picks another
+/// member); none consumes any assembly budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderBusy {
+    /// A claim probe is in flight — wait at most one heartbeat, then retry.
+    ClaimProbe,
+    /// A loop-claimed job is running here.
+    JobRun,
+    /// Another rank is held: a different job, or the SAME job at an
+    /// attempt not below the caller's (an equal attempt is a duplicate
+    /// assignment of a session already held; a greater one supersedes the
+    /// caller). A lesser held attempt never refuses — it is taken over.
+    Rank { job_id: String, attempt: u32 },
+}
+
+/// This host's admission state, owned by the session and shared (one `Arc`)
+/// by the claim loop, its [`EmbeddedWorker`] guard, and the gang admission
+/// handler: the shutdown [`WorkerPhase`], the slot [`Holder`], and this
+/// process's fleet [`InstanceRegistration`] (the `instances`/`workers` row
+/// carrier, whose worker half the claim loop alone writes).
+pub struct HostAdmission {
+    phase: watch::Sender<WorkerPhase>,
+    holder: watch::Sender<Holder>,
+    registry: Arc<InstanceRegistration>,
+}
+
+impl HostAdmission {
+    /// Fresh admission state: phase `Running`, holder `Free`.
+    pub fn new(registry: Arc<InstanceRegistration>) -> Arc<Self> {
+        let (phase, _) = watch::channel(WorkerPhase::Running);
+        let (holder, _) = watch::channel(Holder::Free);
+        Arc::new(Self {
+            phase,
+            holder,
+            registry,
+        })
+    }
+
+    /// This process's registration — the ONE carrier its `instances` row
+    /// (and, once a claim loop runs, its `workers` row) is written from.
+    pub fn registry(&self) -> &Arc<InstanceRegistration> {
+        &self.registry
+    }
+
+    /// The current shutdown phase.
+    pub fn phase(&self) -> WorkerPhase {
+        *self.phase.borrow()
+    }
+
+    /// A receiver on the phase watch — a held rank `wait_for(|p| *p !=
+    /// Running)`s on it and ends with the `Drain` reason when it fires.
+    pub fn phase_receiver(&self) -> watch::Receiver<WorkerPhase> {
+        self.phase.subscribe()
+    }
+
+    /// Begin a DRAIN: `Running → Draining` (a `Releasing` phase already in
+    /// force is never regressed). Returns whether this call flipped it.
+    pub fn begin_drain(&self) -> bool {
+        self.phase.send_if_modified(|p| {
+            if *p == WorkerPhase::Running {
+                *p = WorkerPhase::Draining;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Begin a RELEASE: the phase is `Releasing` from this instant, whatever
+    /// it was (a RELEASE wins over a DRAIN in progress).
+    pub fn begin_release(&self) {
+        self.phase.send_if_modified(|p| {
+            if *p == WorkerPhase::Releasing {
+                false
+            } else {
+                *p = WorkerPhase::Releasing;
+                true
+            }
+        });
+    }
+
+    /// Test-only: set the phase WITHOUT any stop request or row write —
+    /// the gate-direct shape no real `begin_drain`/`release_and_stop` call
+    /// produces (both pair the flip with a stop), used to prove the loop's
+    /// gate refuses a claim on the phase read alone.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_phase_for_test(&self, phase: WorkerPhase) {
+        self.phase.send_replace(phase);
+    }
+
+    /// The current holder (a snapshot).
+    pub fn holder(&self) -> Holder {
+        self.holder.borrow().clone()
+    }
+
+    /// A receiver on the holder watch — what a rank waits on while a
+    /// `ClaimProbe` resolves.
+    pub fn holder_receiver(&self) -> watch::Receiver<Holder> {
+        self.holder.subscribe()
+    }
+
+    /// The claim loop's probe, immediately before `claim_next`: `Free →
+    /// ClaimProbe`. `None` when the slot is held — a rank is admitted here
+    /// (a peer never claims while it holds a rank), or a job already runs —
+    /// so the loop skips this iteration's claim. The returned guard resets
+    /// `ClaimProbe`/`JobRun` to `Free` when dropped, on every exit path of
+    /// the iteration it covers (the claim finding nothing, the run
+    /// returning, a panic, the loop future being aborted).
+    pub fn probe_claim(self: &Arc<Self>) -> Option<ClaimGuard> {
+        let taken = self.holder.send_if_modified(|h| {
+            if *h == Holder::Free {
+                *h = Holder::ClaimProbe;
+                true
+            } else {
+                false
+            }
+        });
+        taken.then(|| ClaimGuard {
+            admission: Arc::clone(self),
+        })
+    }
+
+    /// `ClaimProbe → JobRun`, at the loop's hold site once the claimed
+    /// job's lease hold is registered (never earlier: the claim→hold
+    /// prologue stays a `ClaimProbe`, so a RELEASE landing inside it still
+    /// waits for the prologue's own self-release rather than aborting a
+    /// claim whose lease would then only fall to expiry — OPS D10, zero net
+    /// attempts). A direct [`JobWorker::run_claimed_job`] run, or an inline
+    /// `run_now`, holds no probe and leaves the cell as it was.
+    pub(crate) fn job_running(&self) {
+        self.holder.send_if_modified(|h| {
+            if *h == Holder::ClaimProbe {
+                *h = Holder::JobRun;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// A rank's compare-and-set: `Free → Rank{job_id, attempt}`, or a held
+    /// `Rank` of the SAME job at a LESSER attempt superseded in place (the
+    /// job's attempt moved on; the elder session no longer owns the cell,
+    /// its next re-verification refutes it against the row, and its guard's
+    /// drop leaves the cell alone). Every other holder refuses with the
+    /// [`HolderBusy`] it found — decided at once, no waiting; a caller that
+    /// tolerates a `ClaimProbe` waits through [`Self::admit_rank`].
+    pub fn try_hold_rank(
+        self: &Arc<Self>,
+        job_id: &str,
+        attempt: u32,
+    ) -> std::result::Result<RankHold, HolderBusy> {
+        let mut busy: Option<HolderBusy> = None;
+        self.holder.send_if_modified(|h| match h {
+            Holder::Free => {
+                *h = Holder::Rank {
+                    job_id: job_id.to_string(),
+                    attempt,
+                };
+                true
+            }
+            Holder::Rank {
+                job_id: held_job,
+                attempt: held_attempt,
+            } if held_job == job_id && *held_attempt < attempt => {
+                *held_attempt = attempt;
+                true
+            }
+            Holder::ClaimProbe => {
+                busy = Some(HolderBusy::ClaimProbe);
+                false
+            }
+            Holder::JobRun => {
+                busy = Some(HolderBusy::JobRun);
+                false
+            }
+            Holder::Rank {
+                job_id: held_job,
+                attempt: held_attempt,
+            } => {
+                busy = Some(HolderBusy::Rank {
+                    job_id: held_job.clone(),
+                    attempt: *held_attempt,
+                });
+                false
+            }
+        });
+        match busy {
+            Some(busy) => Err(busy),
+            None => Ok(RankHold {
+                admission: Arc::clone(self),
+                job_id: job_id.to_string(),
+                attempt,
+            }),
         }
+    }
+
+    /// [`Self::try_hold_rank`] that waits out a `ClaimProbe`: a probe found
+    /// in the cell is waited on for at most `bound` (one heartbeat — the
+    /// longest a claim round trip plus its prologue takes), retrying the
+    /// CAS on every holder change; the slot freeing within the bound admits,
+    /// the bound elapsing (or the probe resolving into a `JobRun`) refuses
+    /// with what was found. `JobRun` and another `Rank` refuse at once.
+    pub async fn admit_rank(
+        self: &Arc<Self>,
+        job_id: &str,
+        attempt: u32,
+        bound: Duration,
+    ) -> std::result::Result<RankHold, HolderBusy> {
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut rx = self.holder_receiver();
+        loop {
+            // Mark the current value seen BEFORE the CAS, so a change that
+            // lands between the CAS and the `changed().await` below is
+            // still observed as a change (a `watch` receiver's `changed`
+            // resolves for any version newer than the last one it marked).
+            rx.borrow_and_update();
+            match self.try_hold_rank(job_id, attempt) {
+                Err(HolderBusy::ClaimProbe) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(HolderBusy::ClaimProbe);
+                    }
+                    match tokio::time::timeout(deadline - now, rx.changed()).await {
+                        Ok(Ok(())) => continue,
+                        // The sender dropped (the session is gone) or the
+                        // bound elapsed: refuse with what was found.
+                        Ok(Err(_)) | Err(_) => return Err(HolderBusy::ClaimProbe),
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Test-only: overwrite the holder and hand back a guard that resets it
+    /// to `Free` on drop — how a test manufactures a `JobRun`/`ClaimProbe`/
+    /// foreign-`Rank` holder without running a job, to drive the admission
+    /// lattice's contention arms deterministically.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_for_test(self: &Arc<Self>, holder: Holder) -> TestHold {
+        self.holder.send_replace(holder);
+        TestHold {
+            admission: Arc::clone(self),
+        }
+    }
+}
+
+/// The claim loop's probe guard — see [`HostAdmission::probe_claim`].
+pub struct ClaimGuard {
+    admission: Arc<HostAdmission>,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.admission.holder.send_if_modified(|h| {
+            if matches!(h, Holder::ClaimProbe | Holder::JobRun) {
+                *h = Holder::Free;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// An admitted rank's hold on the slot — see
+/// [`HostAdmission::try_hold_rank`]. Dropping it frees the slot ONLY if the
+/// cell still names this exact `(job_id, attempt)`: a session superseded by
+/// the same job's greater attempt leaves the successor's hold untouched.
+pub struct RankHold {
+    admission: Arc<HostAdmission>,
+    job_id: String,
+    attempt: u32,
+}
+
+impl std::fmt::Debug for RankHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RankHold")
+            .field("job_id", &self.job_id)
+            .field("attempt", &self.attempt)
+            .finish()
+    }
+}
+
+impl RankHold {
+    /// The job this hold was admitted for.
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// The attempt this hold was admitted at.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+}
+
+impl Drop for RankHold {
+    fn drop(&mut self) {
+        self.admission.holder.send_if_modified(|h| {
+            let mine = matches!(
+                h,
+                Holder::Rank { job_id, attempt }
+                    if *job_id == self.job_id && *attempt == self.attempt
+            );
+            if mine {
+                *h = Holder::Free;
+            }
+            mine
+        });
+    }
+}
+
+/// Test-only: see [`HostAdmission::hold_for_test`].
+#[cfg(feature = "test-hooks")]
+pub struct TestHold {
+    admission: Arc<HostAdmission>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for TestHold {
+    fn drop(&mut self) {
+        self.admission.holder.send_replace(Holder::Free);
     }
 }
 
@@ -277,20 +617,18 @@ pub enum LoopState {
 /// `Arc`, held strongly by the loop task and the guard, handed out `Weak`
 /// through [`EmbeddedWorker::shared`].
 ///
+/// * `admission` is the session's [`HostAdmission`]: the shutdown phase the
+///   loop's gate reads, and the slot [`Holder`] the loop moves through
+///   `Free → ClaimProbe → JobRun → Free` around every claim (an inline
+///   `run_now` and a direct `run_claimed_job` never touch it).
 /// * `stop` is a level-triggered `watch<bool>`: the loop's pre-claim check
 ///   reads it and its idle sleep is `select!`ed against `wait_for(|v| *v)`,
 ///   so a stop set during the sleep wakes the loop at once and a receiver
 ///   subscribed after the send still resolves — a wakeup cannot be lost.
-/// * `in_flight` counts loop-claimed jobs running under a live hold
-///   (incremented by `register_job_hold_or_release` on its `Some` path,
-///   decremented by the `InFlightGuard` bound beside the hold). Invariant:
-///   `in_flight > 0` ⇒ the loop is inside a job, not inside `claim_next`.
-///   An inline `run_now` registers its own hold and never touches this.
 /// * `state` is the [`LoopState`] watch the exit guard writes.
 pub struct WorkerShared {
-    phase: AtomicU8,
+    admission: Arc<HostAdmission>,
     stop: watch::Sender<bool>,
-    in_flight: AtomicUsize,
     state_tx: watch::Sender<LoopState>,
     instance_id: String,
     /// The gauge sampler's last catalog snapshot (`/metrics` copies it on a
@@ -314,15 +652,14 @@ pub struct WorkerSample {
 }
 
 impl WorkerShared {
-    /// Fresh shared state for one loop task: phase `Running`, stop unset,
-    /// nothing in flight, state `Running`.
-    pub fn new(instance_id: String) -> Arc<Self> {
+    /// Fresh shared state for one loop task over the session's
+    /// `admission`: stop unset, state `Running`.
+    pub fn new(admission: Arc<HostAdmission>, instance_id: String) -> Arc<Self> {
         let (stop, _) = watch::channel(false);
         let (state_tx, _) = watch::channel(LoopState::Running);
         Arc::new(Self {
-            phase: AtomicU8::new(WorkerPhase::Running as u8),
+            admission,
             stop,
-            in_flight: AtomicUsize::new(0),
             state_tx,
             instance_id,
             sample: std::sync::RwLock::new(WorkerSample::default()),
@@ -379,25 +716,22 @@ impl WorkerShared {
         &self.instance_id
     }
 
-    /// The current shutdown phase (`SeqCst` load).
+    /// The session's [`HostAdmission`] this loop runs under.
+    pub fn admission(&self) -> &Arc<HostAdmission> {
+        &self.admission
+    }
+
+    /// The current shutdown phase ([`HostAdmission::phase`]).
     pub fn phase(&self) -> WorkerPhase {
-        WorkerPhase::from_u8(self.phase.load(Ordering::SeqCst))
+        self.admission.phase()
     }
 
-    fn set_phase(&self, phase: WorkerPhase) {
-        self.phase.store(phase as u8, Ordering::SeqCst);
-    }
-
-    /// Test-only: set the phase WITHOUT requesting a stop (`set_phase` and
-    /// `request_stop` are both private, and the `it` tests are an external
-    /// crate, so this is the only way to construct the P1 gate-direct
-    /// scenario — a phase flip with `stop` deliberately left unset — to
-    /// prove the loop-top gate refuses a new claim on the phase read alone,
-    /// never relying on a real `release_and_stop` call, which always pairs
-    /// the two).
+    /// Test-only: [`HostAdmission::set_phase_for_test`] — a phase flip
+    /// with `stop` deliberately left unset, the P1 gate-direct scenario
+    /// (the loop-top gate refuses a new claim on the phase read alone).
     #[cfg(feature = "test-hooks")]
     pub fn set_phase_for_test(&self, phase: WorkerPhase) {
-        self.set_phase(phase);
+        self.admission.set_phase_for_test(phase);
     }
 
     /// Whether a stop has been requested (the level the loop's pre-claim
@@ -425,11 +759,6 @@ impl WorkerShared {
 
     fn stop_receiver(&self) -> watch::Receiver<bool> {
         self.stop.subscribe()
-    }
-
-    /// Loop-claimed jobs currently running under a live hold (0 or 1).
-    pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// The loop task's current [`LoopState`].
@@ -480,19 +809,6 @@ impl Drop for LoopExitGuard {
     }
 }
 
-/// Decrements [`WorkerShared::in_flight`] on drop — bound in the same scope
-/// as the job's [`LeaseHold`] by both loop hold sites, so the ordinary exit
-/// (an explicit `drop` paired with `drop(hold)`), a panic, and the loop
-/// future being dropped by an abort all release the count together with
-/// the hold.
-struct InFlightGuard(Arc<WorkerShared>);
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Register a claimed job's lease hold at a loop hold site — the ONE helper
 /// both sites ([`JobWorker::run_claimed_job`]'s fine-tune arm and its
 /// compute arm) call, so the RELEASE check exists in exactly one place.
@@ -505,11 +821,12 @@ impl Drop for InFlightGuard {
 /// took it), drops the hold and returns `None`: the caller returns without
 /// dispatching, the row is left `running` with a NULL lease for the
 /// successor to claim within one idle poll, and the cap is untouched
-/// (`attempts - releases` is net 0). Otherwise `in_flight` is incremented and
-/// the hold returned; the caller binds an [`InFlightGuard`] beside it.
+/// (`attempts - releases` is net 0). Otherwise the holder moves `ClaimProbe
+/// → JobRun` ([`HostAdmission::job_running`]) and the hold is returned; the
+/// loop's [`ClaimGuard`] resets the holder to `Free` when the run returns.
 ///
 /// An inline `run_now` registers its hold directly (`crate::jobs`) and never
-/// calls this, so it never changes `in_flight` and is never released here.
+/// calls this, so it never touches the holder and is never released here.
 async fn register_job_hold_or_release(
     session: &Arc<InferenceSession>,
     catalog: &Arc<Catalog>,
@@ -545,11 +862,7 @@ async fn register_job_hold_or_release(
         drop(hold);
         return None;
     }
-    let previous = shared.in_flight.fetch_add(1, Ordering::SeqCst);
-    debug_assert!(
-        previous == 0,
-        "the loop runs one job at a time, so in_flight was {previous} before this hold"
-    );
+    shared.admission.job_running();
     Some(hold)
 }
 
@@ -745,6 +1058,10 @@ pub struct JobWorker {
     /// The job kinds this worker claims (`[worker] kinds`, validated against
     /// [`COMPILED_KINDS`] by [`resolve_kinds`] at construction).
     kinds: Vec<String>,
+    /// The session's [`HostAdmission`] (its own `Arc`, so holding it keeps
+    /// no session alive): the phase and holder every loop this worker
+    /// drives runs under.
+    admission: Arc<HostAdmission>,
 }
 
 impl JobWorker {
@@ -783,6 +1100,7 @@ impl JobWorker {
             worker_id: session.instance_id().to_string(),
             intervals,
             kinds,
+            admission: Arc::clone(session.host_admission()),
         }
     }
 
@@ -809,8 +1127,11 @@ impl JobWorker {
     /// state — for callers that rely solely on the session dropping (the
     /// `Weak` upgrade failing) to stop the worker.
     pub async fn run(&self) {
-        self.run_until(WorkerShared::new(self.worker_id.clone()))
-            .await
+        self.run_until(WorkerShared::new(
+            Arc::clone(&self.admission),
+            self.worker_id.clone(),
+        ))
+        .await
     }
 
     /// Run the claim→reconstruct→train loop until `shared`'s stop is set,
@@ -944,6 +1265,19 @@ impl JobWorker {
             if !shared.admits_claim() {
                 break;
             }
+            // The slot: `Free → ClaimProbe` before `claim_next` (a peer never
+            // claims while it holds a rank — OPS D6); the guard resets the
+            // holder to `Free` on every exit of this iteration. A held slot
+            // (an admitted rank, or a job already running) skips the claim
+            // and sleeps the idle poll exactly like a claim that found
+            // nothing.
+            let Some(claim) = shared.admission.probe_claim() else {
+                tokio::select! {
+                    _ = tokio::time::sleep(self.intervals.idle_poll) => {}
+                    _ = stop_rx.wait_for(|stop| *stop) => {}
+                }
+                continue;
+            };
             let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::record_claim_next(&self.worker_id);
@@ -963,9 +1297,13 @@ impl JobWorker {
                     // Drop the session strong ref before the (possibly long) run
                     // so the worker does not pin the session for the whole job —
                     // the run re-upgrades the Weak through the `Arc` it captures.
+                    // The probe guard lives across the run: `ClaimProbe → JobRun`
+                    // at the hold site, `→ Free` here when the run returns.
                     self.run_claimed_job_under(&session, record, &shared).await;
+                    drop(claim);
                 }
                 None => {
+                    drop(claim);
                     // Interruptible: a stop set mid-sleep wakes the loop now,
                     // not up to `idle_poll` later; `wait_for` is level-
                     // triggered so a stop sent before this poll resolves too.
@@ -1089,8 +1427,11 @@ impl JobWorker {
         record: jammi_db::catalog::jobs_repo::JobRecord,
     ) {
         // A caller driving one claimed job outside a loop task runs it under
-        // fresh shared state: phase `Running`, so the hold sites dispatch.
-        let shared = WorkerShared::new(self.worker_id.clone());
+        // fresh shared state over the session's own admission: the hold
+        // sites read the session's phase, and — holding no claim probe —
+        // leave the session's holder exactly as they found it (a direct run
+        // sits beside the loop's slot the way an inline `run_now` does).
+        let shared = WorkerShared::new(Arc::clone(&self.admission), self.worker_id.clone());
         self.run_claimed_job_under(session, record, &shared).await
     }
 
@@ -1175,7 +1516,6 @@ impl JobWorker {
         else {
             return;
         };
-        let in_flight = InFlightGuard(Arc::clone(shared));
         let cancel = hold.lost_flag();
 
         // #485: `cancel` (the lease-lost flag above) is not the ONLY source
@@ -1252,7 +1592,6 @@ impl JobWorker {
         // it by a caller aborting the task — #485 BLOCK B1).
         drop(hold);
         drop(cancel_watcher);
-        drop(in_flight);
 
         match outcome {
             Ok(artifact) => {
@@ -2020,7 +2359,6 @@ impl JobWorker {
         else {
             return;
         };
-        let in_flight = InFlightGuard(Arc::clone(shared));
         let job_attempt = jammi_db::catalog::result_repo::JobAttempt {
             job_id,
             instance_id: &self.worker_id,
@@ -2028,7 +2366,6 @@ impl JobWorker {
         };
         let outcome = crate::jobs::execute_compute(session, catalog, &spec, job_attempt).await;
         drop(hold);
-        drop(in_flight);
 
         match outcome {
             Ok(result) => match serde_json::to_string(&result) {
@@ -2841,9 +3178,13 @@ pub struct EmbeddedWorker {
     /// signal-and-await without giving up the guard itself (its `Drop` must
     /// still run at the connection's own end of life).
     handle: std::sync::Mutex<LoopTask>,
-    /// The state shared with the loop task: phase, stop, in-flight count,
-    /// loop state.
+    /// The state shared with the loop task: stop, loop state, and the
+    /// session's admission (phase + holder).
     shared: Arc<WorkerShared>,
+    /// The session's [`HostAdmission`] — the phase this guard flips on
+    /// DRAIN/RELEASE and the holder 2e reads; captured at spawn so RELEASE
+    /// needs no session.
+    admission: Arc<HostAdmission>,
     /// The catalog the `workers` row was upserted into, and the id it is
     /// keyed by — so stopping the loop (graceful or `Drop`) can delete the
     /// row rather than leave a claimant advertised until its `instances`
@@ -2893,7 +3234,8 @@ impl EmbeddedWorker {
     /// harness that needs explicit timing/kinds via
     /// [`JobWorker::with_intervals_and_kinds`]).
     pub fn spawn_worker(session: &Arc<InferenceSession>, worker: JobWorker) -> Result<Self> {
-        let shared = WorkerShared::new(session.instance_id().to_string());
+        let admission = Arc::clone(session.host_admission());
+        let shared = WorkerShared::new(Arc::clone(&admission), session.instance_id().to_string());
         let heartbeat = worker.intervals.heartbeat;
         let task_shared = Arc::clone(&shared);
         let handle = tokio::spawn(async move { worker.run_until(task_shared).await });
@@ -2906,6 +3248,7 @@ impl EmbeddedWorker {
         Ok(Self {
             handle: std::sync::Mutex::new(LoopTask::Running(handle)),
             shared,
+            admission,
             catalog: Arc::clone(session.catalog_arc()),
             instance_id: session.instance_id().to_string(),
             registration: Arc::clone(session.instance_registration()),
@@ -2935,16 +3278,12 @@ impl EmbeddedWorker {
     }
 
     /// Begin a DRAIN: phase `Draining` (a later RELEASE still wins), stop
-    /// requested — the loop finishes its in-flight job and claims no more —
-    /// and the `workers` row flipped to `draining` (best-effort). The join
-    /// is [`Self::stop_and_join`]'s.
+    /// requested — the loop finishes its in-flight job and claims no more,
+    /// and every gang rank held on this host ends with the `Drain` reason
+    /// ([`HostAdmission::begin_drain`]) — and the `workers` row flipped to
+    /// `draining` (best-effort). The join is [`Self::stop_and_join`]'s.
     pub async fn begin_drain(&self) {
-        let _ = self.shared.phase.compare_exchange(
-            WorkerPhase::Running as u8,
-            WorkerPhase::Draining as u8,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        self.admission.begin_drain();
         self.shared.request_stop();
         // The same one-fact write as the loop's own `warming`/`claiming`
         // writes: preserve the cell's own `kinds`, flip only `state`, and
@@ -3078,19 +3417,21 @@ impl EmbeddedWorker {
     ///   by a previous stop attempt this process's own caller cancelled
     ///   (F1 — e.g. a DRAIN's `stop_and_join` preempted by this RELEASE) is
     ///   aborted unconditionally, since its true state is unknown and an
-    ///   abort is always safe here. A `Running` handle with `in_flight ==
-    ///   0` (the loop is idle, inside `reclaim_expired_jobs`/`claim_next`,
-    ///   or in the claim→hold prologue) is never aborted while a claim
-    ///   transaction can be in flight; wait one heartbeat for the
-    ///   cooperative exit, joining the task on it. On timeout, abort
-    ///   (outcome (iii): a claim between COMMIT and hold registration keeps
-    ///   its live lease and is recovered by the expiry path with `attempts
-    ///   + 1`, never `failed`). `in_flight > 0`: the loop is inside a job
-    ///   under a hold, not inside `claim_next` — abort now; the dropped
-    ///   future runs the hold's and the watcher's `Drop`. `Joined` is a
+    ///   abort is always safe here. A `Running` handle whose holder is not
+    ///   `JobRun` (`Free`: the loop is idle or inside `reclaim_expired_jobs`;
+    ///   `ClaimProbe`: inside `claim_next` or the claim→hold prologue; a
+    ///   `Rank`: an admitted gang rank is held beside an idle loop — never
+    ///   loop work) is never aborted while a claim transaction can be in
+    ///   flight; wait one heartbeat for the cooperative exit, joining the
+    ///   task on it. On timeout, abort (outcome (iii): a claim between
+    ///   COMMIT and hold registration keeps its live lease and is recovered
+    ///   by the expiry path with `attempts + 1`, never `failed`). `JobRun`:
+    ///   the loop is inside a job under a hold, not inside `claim_next` —
+    ///   abort now; the dropped future runs the hold's and the watcher's
+    ///   `Drop`. The decision reads the holder KIND, never a count. `Joined` is a
     ///   no-op — nothing left to take; see `TakenHandle`'s own doc for why
     ///   this alone does not witness P-2F (a concurrent `stop_and_join` may
-    ///     still be mid-flight holding the handle).
+    ///   still be mid-flight holding the handle).
     /// * **2f** observe the terminal [`LoopState`] (the in-task guard reports
     ///   on every path). `stop_witnessed` (P-2F) is `true` when 2e itself
     ///   resolved the task (joined or aborted, any arm) OR this observation
@@ -3118,7 +3459,7 @@ impl EmbeddedWorker {
         // poll-once test proves both setters resolve this pair before their
         // first yield, so exit latency after either flip is bounded by the
         // in-flight job, never by `idle_poll`.
-        self.shared.set_phase(WorkerPhase::Releasing);
+        self.admission.begin_release();
         self.shared.request_stop();
         // 2b
         let holds = match self.keeper.release_job_holds(self.heartbeat).await {
@@ -3133,11 +3474,13 @@ impl EmbeddedWorker {
         // 2e
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::fire(&self.instance_id, loop_test_hooks::Rendezvous::ReleaseAt2e);
-        let in_flight = self.shared.in_flight();
-        debug_assert!(
-            in_flight <= 1,
-            "the loop runs one job at a time; in_flight = {in_flight}"
-        );
+        // The release decision reads the HOLDER KIND (OPS D6/D10): `JobRun`
+        // means the loop is inside a job under a hold — abort now; anything
+        // else (`Free`, a `ClaimProbe` whose claim transaction or prologue
+        // may be in flight, or a `Rank` — which is never loop work, the
+        // loop being idle beside it) waits one heartbeat for the
+        // cooperative exit.
+        let holder = self.admission.holder();
         let mut state_rx = self.shared.state_receiver();
         // P-2F's first disjunct: whether THIS call resolved the task with
         // certainty (joined, or aborted on any arm). `NothingToTake` — the
@@ -3158,7 +3501,7 @@ impl EmbeddedWorker {
                      the loop's terminal state; aborting the loop task now"
                 );
                 taken.abort_now();
-            } else if in_flight == 0 {
+            } else if holder != Holder::JobRun {
                 // The watch `Ref` is dropped before the join below: a guard
                 // held across an `.await` would make this future `!Send`.
                 let exited = tokio::time::timeout(

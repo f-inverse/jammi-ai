@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::worker::{
-    loop_test_hooks, training_test_hooks, EmbeddedWorker, HoldReleaseOutcome, JobWorker, LoopState,
-    StopOutcome, WorkerPhase, WorkerShared,
+    loop_test_hooks, training_test_hooks, EmbeddedWorker, HoldReleaseOutcome, Holder, JobWorker,
+    LoopState, StopOutcome, WorkerPhase, WorkerShared,
 };
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::{compute_test_hooks, ComputeSpec, JobResult, JobSpec};
@@ -167,13 +167,21 @@ fn shared_of(worker: &EmbeddedWorker) -> Arc<WorkerShared> {
         .expect("the loop's shared state lives as long as the guard")
 }
 
+/// Loop-claimed jobs running under a live hold, read off the host's slot
+/// holder: `1` iff it is `JobRun` (a `ClaimProbe` — the claim round trip
+/// or the claim→hold prologue — and a held gang `Rank` both read `0`).
+fn in_flight(shared: &WorkerShared) -> usize {
+    matches!(shared.admission().holder(), Holder::JobRun) as usize
+}
+
 async fn wait_in_flight(shared: &WorkerShared, want: usize) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while shared.in_flight() != want {
+    while in_flight(shared) != want {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "in_flight never reached {want} (now {})",
-            shared.in_flight()
+            "in_flight never reached {want} (now {}, holder {:?})",
+            in_flight(shared),
+            shared.admission().holder()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -500,7 +508,7 @@ async fn release_mid_materialization_resumes_on_the_successor_without_backoff() 
         .wait_parked()
         .await
         .expect("the loop's writer parks inside finish");
-    assert_eq!(shared.in_flight(), 1);
+    assert_eq!(in_flight(&shared), 1);
     let mid = session.catalog().get_job(&handle.job_id).await.unwrap();
     let first_table = mid
         .partial_result
@@ -613,7 +621,7 @@ async fn release_with_the_loop_paused_inside_claim_next_does_not_abort() {
     let worker = spawn_worker(&session);
     let shared = shared_of(&worker);
     claim_park.wait_parked().await;
-    assert_eq!(shared.in_flight(), 0);
+    assert_eq!(in_flight(&shared), 0);
     // The claim already parked here is the ONE genuine race the mechanism
     // allows (its COMMIT precedes 2a); the counter must never grow past this
     // point -- release_and_stop has not even been called yet.
@@ -704,7 +712,7 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
         let shared = shared_of(&worker);
         park.wait_parked().await;
         assert_eq!(
-            shared.in_flight(),
+            in_flight(&shared),
             0,
             "{kind}: the hold is not registered yet"
         );
@@ -785,7 +793,10 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
     let handle_b = session.enqueue(fine_tune(1), 0).await.unwrap();
 
     let job_worker = JobWorker::with_intervals(&session, session.worker_intervals().unwrap());
-    let shared = WorkerShared::new(session.instance_id().to_string());
+    let shared = WorkerShared::new(
+        Arc::clone(session.host_admission()),
+        session.instance_id().to_string(),
+    );
     // The gate-direct construction: phase flipped, stop deliberately left
     // unset, BEFORE the loop ever takes its first iteration -- no race with
     // the loop's own startup sequence is possible, since the phase is fixed
@@ -1102,7 +1113,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
     let spec = never_dispatched_infer(&source);
     let run = tokio::spawn(async move { runner.run_now(spec).await });
     park.wait_parked().await;
-    assert_eq!(shared.in_flight(), 0, "an inline claim never counts");
+    assert_eq!(in_flight(&shared), 0, "an inline claim never counts");
     let inline = session
         .catalog()
         .list_jobs()
@@ -1125,7 +1136,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
         }),
         "the inline hold is registered but never released: {report:?}"
     );
-    assert_eq!(shared.in_flight(), 0);
+    assert_eq!(in_flight(&shared), 0);
     let after = session.catalog().get_job(&inline.job_id).await.unwrap();
     assert_eq!(after.status, JobStatus::Running.to_string());
     assert!(
@@ -1354,7 +1365,7 @@ async fn a_release_racing_an_in_flight_drain_reads_stop_unwitnessed() {
         .await
         .expect("the loop's writer parks inside finish");
     assert_eq!(
-        shared.in_flight(),
+        in_flight(&shared),
         1,
         "a real hold must be registered before this test's race means anything"
     );

@@ -1371,7 +1371,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
            // (see `session_registration_literal_sites`'s allowlist entry for
            // this same file) rather than through `pinned_provider` — an
            // unpinned, version-branched content read, re-exported publicly at
-           // `read_vectors`, `jammi-ai/src/session.rs:1141` and
+           // `read_vectors`, `jammi-ai/src/session.rs:1156` and
            // `read_vectors`, `jammi-ai/src/local_session.rs:365`.
            // `READ_VECTORS_CALLERS` above is the machine-checked claim: its
            // only two in-tree callers are those two forwarding wrappers, each

@@ -392,7 +392,7 @@ impl RankContext {
     /// A stable digest of the CANONICAL `trainable_vars` name order this
     /// gang's reduce must agree on (the same order [`super::optimizer::
     /// sorted_trainable_vars`] produces, threaded through
-    /// [`super::optimizer::canonical_reduce`]) — exposed here for the
+    /// [`optimizer::canonical_reduce`]) — exposed here for the
     /// concurrently-built `Peer` collective (U5b-1b-i), whose round
     /// descriptor carries this as `agreement`: a wire round only publishes
     /// once every rank's descriptor (root, counts, tensor signatures, AND
@@ -13280,16 +13280,19 @@ mod media_front_end_wall_tests {
 /// versus an independently-built natural-width forward pass.
 #[cfg(test)]
 mod encode_texts_bucketing_oracle {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use candle_core::{Device, Tensor};
     use candle_nn::VarMap;
     use serial_test::serial;
 
+    use super::super::data::TextChunk;
     use super::super::target::TrainingTarget;
     use super::super::FineTuneConfig;
     use super::encoder_adapters_training_state_tests::build_encoder_adapters_target;
-    use super::TrainingLoopBuilder;
+    use super::{RankContext, TrainingLoop, TrainingLoopBuilder};
+    use crate::fine_tune::optimizer;
     use crate::model::{LoadedModel, ModelSource, ModelTask};
 
     // The three tests below all call into `tokenize_and_bucket`/
@@ -13740,6 +13743,240 @@ mod encode_texts_bucketing_oracle {
             "split fixture must present more than one distinct natural width for this test \
              to be meaningful, got {pass_1:?}"
         );
+    }
+
+    /// U4b acceptance (b): gather exactness, on a REAL two-rank `Local` gang
+    /// sharing one `tiny_modernbert` base model, driven through the
+    /// PRODUCTION per-step body (`TrainingLoop::encode_chunk` ->
+    /// `TrainingLoop::compute_loss_gathered` -> `backward` ->
+    /// `optimizer::canonical_reduce`) — compared against a W=1 reference
+    /// over the IDENTICAL rows, one combined batch, through the same
+    /// per-step body at `world = 1` (`Noop`).
+    ///
+    /// PRE-REGISTERED ε (design pressure round, finding 1) —
+    /// [`GATHER_EXACTNESS_EPSILON`], written BEFORE this test measures
+    /// anything: `1e-4` absolute, on both the loss scalar and every element
+    /// of the reduced adapter gradient. Derivation: W=2's gather
+    /// concatenates two INDEPENDENTLY-bucketed per-rank batches (each rank
+    /// buckets its own local batch to its OWN natural width — DESIGN.md
+    /// §2/§6; no rung is exchanged, design pressure round finding 6) before
+    /// computing the SAME loss W=1 computes over one combined batch bucketed
+    /// to ITS OWN (generally different) natural width — the attention
+    /// softmax over a differently-wide masked tail rounds slightly
+    /// differently depending on the padding width. This is `batch_bucket.
+    /// rs`'s OWN already-measured padding-variance tolerance
+    /// (`encode_texts_bucketing_oracle`'s sibling test
+    /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site`'s own
+    /// `TOLERANCE: f32 = 1e-4`), not a bound invented for this oracle. The
+    /// discriminator this ε must catch is the W× gradient hazard (moving a
+    /// trainable op after the gather, or dropping the reduce): either
+    /// produces an O(1)-or-larger error, orders of magnitude past `1e-4` —
+    /// never reassociation noise (`~1e-6`), which `1e-4` does not even
+    /// measure at (bit-identity is claimed only for acceptance (a) and the
+    /// resume-vs-uninterrupted comparison, never here).
+    ///
+    /// RED-PROOF: this test is RED at base (`compute_loss_gathered`,
+    /// `RankContext`, and `PartitionSpec::for_gang` do not exist there).
+    /// EXECUTED mutation (applied, run, and reverted by hand — not left in
+    /// this tree): `compute_loss_gathered`'s `Contrastive` arm changed to
+    /// `.clone()` each tensor instead of `rank_ctx.all_gather(..)`-ing it —
+    /// the gather never runs, so each rank scores only its own 2-row local
+    /// slice as if it were the whole batch. RED output's first line:
+    /// `rank 0: gathered global loss 0.37497652 must match the W=1
+    /// reference 1.0657526 within 0.0001` — an O(1) divergence, orders of
+    /// magnitude past `1e-4`, immediately distinguishable from the
+    /// reassociation-noise band this ε is calibrated to ignore.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn gather_exactness_w2_matches_w1_within_pre_registered_epsilon() {
+        use super::super::partition::{PartitionRule, PartitionSpec};
+        use crate::fine_tune::collective::LocalGang;
+
+        const GATHER_EXACTNESS_EPSILON: f32 = 1e-4;
+
+        let device = Device::Cpu;
+        let base_model = tiny_modernbert_base_model().await;
+
+        // 4 contrastive rows, deliberately of varying length so each rank's
+        // OWN 2-row half buckets independently of the W=1 reference's
+        // combined 4-row batch (exercising the padding-variance ε, not a
+        // vacuous bit-identical case).
+        let rows: Vec<(String, String, f32)> = vec![
+            ("a b".to_string(), "a b c".to_string(), 0.9),
+            (
+                "a b c d e f".to_string(),
+                "a b c d e f g h i".to_string(),
+                0.4,
+            ),
+            ("a".to_string(), "a b".to_string(), 0.7),
+            (
+                "a b c d e f g h i j k l m n o".to_string(),
+                "a b".to_string(),
+                0.1,
+            ),
+        ];
+
+        // Build one TrainingLoop's worth of scaffolding (its own VarMap,
+        // seeded identically across every instance — `build_encoder_adapters_
+        // target` has no seed parameter, so every call is the SAME seeded
+        // init) plus a per-instance catalog/tempdir. Catalog creation is
+        // async, so every instance is built HERE, before any thread spawns.
+        async fn build_loop(
+            device: &Device,
+            base_model: Arc<LoadedModel>,
+            job_id: &str,
+        ) -> (TrainingLoop, VarMap) {
+            let varmap = VarMap::new();
+            let target = build_encoder_adapters_target(device, &varmap);
+            let dir = tempfile::tempdir().unwrap();
+            let dir_path = dir.keep();
+            let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+            let loop_ = TrainingLoopBuilder::new(target, varmap.clone(), FineTuneConfig::default())
+                .device(device.clone())
+                .base_model(base_model)
+                .job_id(job_id.into())
+                .worker_id(format!("{job_id}-worker"))
+                .catalog(catalog)
+                .artifact_dir(dir_path)
+                .build()
+                .unwrap();
+            (loop_, varmap)
+        }
+
+        // ── W=1 reference: one combined 4-row batch, Noop, single rank ──
+        let (mut ref_loop, _ref_varmap) =
+            build_loop(&device, base_model.clone(), "gather-ref").await;
+        // `build_encoder_adapters_target`'s fixture bakes in `lora_dropout =
+        // 0.3` (unconditionally — it has no override parameter), and a
+        // Philox dropout mask draw is keyed by its OWN forward's tensor
+        // shape: a 4-row combined forward and two independent 2-row forwards
+        // draw DIFFERENT masks even from the identical seed, which would
+        // swamp this oracle's ε with an irrelevant confound. Eval mode
+        // (`set_training(false)`) disables dropout deterministically on
+        // every instance, isolating the property this test actually checks
+        // — the GATHER's numerical correctness — from dropout's own,
+        // already-covered behaviour (`resume_invariant`'s and this module's
+        // other suites pin dropout separately).
+        ref_loop.set_training(false);
+        let ref_chunk = TextChunk::Contrastive {
+            texts_a: rows.iter().map(|(a, _, _)| a.clone()).collect(),
+            texts_b: rows.iter().map(|(_, b, _)| b.clone()).collect(),
+            scores: rows.iter().map(|(_, _, s)| *s).collect(),
+        };
+        let ref_batch = ref_loop.encode_chunk(&ref_chunk).unwrap();
+        let ref_loss = ref_loop.compute_loss(&ref_batch).unwrap();
+        let ref_loss_val: f32 = ref_loss.to_scalar().unwrap();
+        let ref_trainable_vars = optimizer::sorted_trainable_vars(&_ref_varmap);
+        let ref_names: Vec<String> = {
+            let data = _ref_varmap.data().lock().unwrap();
+            let id_to_name: std::collections::HashMap<_, _> = data
+                .iter()
+                .map(|(name, var)| (var.id(), name.clone()))
+                .collect();
+            ref_trainable_vars
+                .iter()
+                .map(|v| id_to_name[&v.id()].clone())
+                .collect()
+        };
+        let mut ref_grads = ref_loss.backward().unwrap();
+        let ref_grad_by_name: HashMap<String, Vec<f32>> = ref_names
+            .iter()
+            .zip(&ref_trainable_vars)
+            .filter_map(|(name, var)| {
+                ref_grads
+                    .remove(var.as_tensor())
+                    .map(|g| (name.clone(), g.flatten_all().unwrap().to_vec1().unwrap()))
+            })
+            .collect();
+
+        // ── W=2 gang: two ranks, each its own 2-row half, real Local gang ──
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let (loop_, varmap) =
+                build_loop(&device, base_model.clone(), &format!("gather-gang-{rank}")).await;
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let mut loop_ = loop_;
+            loop_.rank_ctx = rank_ctx;
+            // See the W=1 reference's own comment: eval mode isolates the
+            // gather's numerical correctness from dropout's shape-keyed mask
+            // draw, which otherwise differs between a combined and a split
+            // forward even from an identical seed.
+            loop_.set_training(false);
+            let rows = rows.clone();
+            handles.push(std::thread::spawn(move || {
+                let range = partition.rows_for_step(rows.len(), 0);
+                let slice = &rows[range];
+                let chunk = TextChunk::Contrastive {
+                    texts_a: slice.iter().map(|(a, _, _)| a.clone()).collect(),
+                    texts_b: slice.iter().map(|(_, b, _)| b.clone()).collect(),
+                    scores: slice.iter().map(|(_, _, s)| *s).collect(),
+                };
+                let batch = loop_.encode_chunk(&chunk).unwrap();
+                let counts = partition.counts_for_step(rows.len(), 0);
+                let loss = loop_.compute_loss_gathered(&batch, &counts).unwrap();
+                let loss_val: f32 = loss.to_scalar().unwrap();
+                let trainable_vars = optimizer::sorted_trainable_vars(&varmap);
+                let names: Vec<String> = {
+                    let data = varmap.data().lock().unwrap();
+                    let id_to_name: std::collections::HashMap<_, _> = data
+                        .iter()
+                        .map(|(name, var)| (var.id(), name.clone()))
+                        .collect();
+                    trainable_vars
+                        .iter()
+                        .map(|v| id_to_name[&v.id()].clone())
+                        .collect()
+                };
+                let mut grads = loss.backward().unwrap();
+                optimizer::canonical_reduce(&loop_.rank_ctx, &trainable_vars, &mut grads).unwrap();
+                let grad_by_name: HashMap<String, Vec<f32>> = names
+                    .iter()
+                    .zip(&trainable_vars)
+                    .filter_map(|(name, var)| {
+                        grads
+                            .remove(var.as_tensor())
+                            .map(|g| (name.clone(), g.flatten_all().unwrap().to_vec1().unwrap()))
+                    })
+                    .collect();
+                (loss_val, grad_by_name)
+            }));
+        }
+        let results: Vec<(f32, HashMap<String, Vec<f32>>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for (rank, (loss_val, grad_by_name)) in results.iter().enumerate() {
+            assert!(
+                (loss_val - ref_loss_val).abs() <= GATHER_EXACTNESS_EPSILON,
+                "rank {rank}: gathered global loss {loss_val} must match the W=1 reference \
+                 {ref_loss_val} within {GATHER_EXACTNESS_EPSILON}"
+            );
+            assert_eq!(
+                grad_by_name.len(),
+                ref_grad_by_name.len(),
+                "rank {rank}: the reduced gradient must cover the same named vars as the \
+                 W=1 reference"
+            );
+            for (name, ref_vals) in &ref_grad_by_name {
+                let vals = &grad_by_name[name];
+                assert_eq!(
+                    vals.len(),
+                    ref_vals.len(),
+                    "rank {rank}: var '{name}' shape"
+                );
+                for (i, (v, rv)) in vals.iter().zip(ref_vals).enumerate() {
+                    assert!(
+                        (v - rv).abs() <= GATHER_EXACTNESS_EPSILON,
+                        "rank {rank}: var '{name}'[{i}] = {v} must match the W=1 reference \
+                         {rv} within {GATHER_EXACTNESS_EPSILON}"
+                    );
+                }
+            }
+        }
     }
 }
 

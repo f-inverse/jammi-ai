@@ -1153,3 +1153,138 @@ async fn f5_a_nan_target_in_the_validation_suffix_refuses_before_step_zero_under
         "expected the pre-pass's NaN refusal, got: {err}"
     );
 }
+
+/// #500 U2c c3d, P-T2 — reproduces the server-level regression
+/// (`grpc_job::training_under_a_tenant_scope_succeeds_over_the_wire`) at the
+/// jammi-ai level: a job submitted under a BOUND tenant, whose source (and
+/// therefore its materialised training-set table) was registered under that
+/// SAME bound tenant, must train to completion through the `Streamed`
+/// source.
+///
+/// RED at 0506b9460cfc7389164c440418a868e74dcfa325 (before this commit):
+/// `job.wait()` returns `Err(FineTune("DataFusion error: Error during
+/// planning: table 'datafusion.public.jammi.training__text_embedding__
+/// training-set__…' not found"))` — `TrainingLoop::open_streamed_source`
+/// drives `TrainingSetStream::open` through `Handle::block_on` from the
+/// `spawn_blocking` pool, a fresh top-level poll on a thread that does not
+/// inherit the async task's `with_tenant_scoped` task-local, so
+/// `ResultTableSchemaProvider::table` (`result_schema.rs`) resolves the
+/// tenant-owned training-set table as `Unscoped`-invisible — the SAME
+/// "present but invisible resolves not-found" gate a peer's private table
+/// hits. Source order matters: `worker_run_span_carries_job_and_tenant`
+/// (`fine_tune.rs`) binds its tenant AFTER its source is already added, so
+/// that source's result tables are GLOBAL (`owner = None`, always visible)
+/// and that test passes at 0506b946 regardless of the bug — this test binds
+/// the tenant FIRST, so the training-set table is genuinely owner-gated.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(training_set_stream)]
+async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own_rows() {
+    use std::str::FromStr;
+
+    use jammi_db::TenantId;
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    let tenant =
+        TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").expect("valid tenant uuid");
+
+    // A plain (non-whole-set) regression source — the same arm F1/F4/F5
+    // above exercise — added AFTER the bind, so its materialised
+    // training-set table is owned by `tenant`, not GLOBAL. An exact, known
+    // row count makes the "the tenant's rows were the ones trained on"
+    // assertion below falsifiable.
+    let rows = 17usize;
+    let mut lines = String::from("text,target\n");
+    for i in 0..rows {
+        lines.push_str(&format!("row{i},{}\n", i as f32));
+    }
+    let csv = dir.path().join("p_t2.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    // Both the source registration AND the submit go through the task-local
+    // `with_tenant_scoped` override — never the session's STICKY
+    // `bind_tenant` — matching production exactly: the gRPC layer scopes
+    // each request's task-local (`grpc_job.rs`'s
+    // `training_under_a_tenant_scope_succeeds_over_the_wire`), and the
+    // worker's own session (`worker.rs`'s "the claim is intentionally
+    // unscoped" doc) NEVER carries a sticky tenant at all. A sticky bind
+    // would mask this bug: `TenantBinding::current_tenant()` falls back to
+    // the sticky value when no task-local override is installed, so a
+    // sticky-bound session's blocking-thread `open_streamed_source` call
+    // would "accidentally" resolve the right tenant even without this
+    // commit's fix.
+    // `TrainingJob::wait` polls `Catalog::get_job`, which ALSO scopes on
+    // `current_tenant()` (`jobs_repo.rs::get_job`) — outside this scope the
+    // session carries no sticky tenant at all, so the wait must run INSIDE
+    // the same task-local scope as the submit, exactly like the gRPC
+    // server's per-request interceptor keeps every call (`SetTenant`,
+    // `StartTraining`, `TrainingStatus`) under one scoped session.
+    let (job_id, wait_result) = session
+        .with_tenant_scoped(tenant, |_scope| async {
+            session
+                .add_source(
+                    "p_t2",
+                    SourceType::File,
+                    SourceConnection {
+                        url: Some(format!("file://{}", csv.display())),
+                        format: Some(FileFormat::Csv),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let job = session
+                .fine_tune(
+                    "p_t2",
+                    &("local:".to_string()
+                        + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+                    &["text".to_string(), "target".to_string()],
+                    jammi_ai::fine_tune::FineTuneMethod::Lora,
+                    ModelTask::Regression,
+                    Some(jammi_ai::fine_tune::FineTuneConfig {
+                        epochs: 1,
+                        batch_size: 4,
+                        lora_rank: 4,
+                        warmup_steps: 0,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let result = job.wait().await;
+            (job.job_id.clone(), result)
+        })
+        .await;
+
+    wait_result.expect(
+        "a tenant-scoped Streamed run must complete: every query the stream issues \
+         (validate_window's whole-table pre-pass, read_back_sql's ordered plan, the pump's own \
+         execution) must resolve the tenant-owned training-set table, never 'table … not found'",
+    );
+
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("streamed"),
+        "a plain (non-whole-set) regression arm must bind Streamed"
+    );
+
+    // `StreamedSet::total_rows` — the window the stream actually opened over
+    // — is EXACTLY the tenant's own source's row count: an unscoped fallback
+    // that happened to also find a table (a differently-broken "fix") is
+    // ruled out by this equality just as much as an outright not-found is
+    // ruled out by the completion above, since only one tenant's data exists
+    // in this session at all.
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::streamed_total_rows_for(&job_id),
+        Some(rows),
+        "the streamed source's window must span exactly the tenant's own {rows} rows"
+    );
+}

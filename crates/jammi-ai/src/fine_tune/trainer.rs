@@ -3495,13 +3495,27 @@ impl TrainingLoop {
     /// session/table/columns for the duration of the call (the pump task it
     /// spawns owns everything it needs independently once `open` returns),
     /// so this never holds a borrow past this function's own return.
+    ///
+    /// `block_on` starts a fresh top-level poll on whichever `spawn_blocking`
+    /// OS thread this call lands on — it does NOT inherit the Tokio
+    /// task-local `with_tenant_scoped` installed in the async task that
+    /// built `streamed` (#500 U2c c3d). Every query `open` issues —
+    /// `validate_window`'s schema/null-NaN pre-pass, the ordered
+    /// `read_back_sql` plan, and `run_pump`'s planning — reaches
+    /// `ResultTableSchemaProvider::table`, which gates resolution on
+    /// `TenantBinding::current_tenant()`; unscoped, a tenant-owned training
+    /// set resolves "table not found" exactly like a peer's private table
+    /// (`result_schema.rs`'s own doc). So `streamed.tenant` (captured by the
+    /// caller while still inside the real scope, `source.rs`'s field doc) is
+    /// re-entered HERE, inside this `block_on`'s own future, covering every
+    /// nested `.await` `open` makes.
     fn open_streamed_source(
         &self,
         streamed: &super::source::StreamedSet,
         window: super::stream::RowWindow,
         slice: super::stream::Slice,
     ) -> Result<super::stream::TrainingSetStream> {
-        tokio::runtime::Handle::current().block_on(super::stream::TrainingSetStream::open(
+        let open = super::stream::TrainingSetStream::open(
             &streamed.session,
             &streamed.table,
             &streamed.columns,
@@ -3510,7 +3524,18 @@ impl TrainingLoop {
             slice,
             streamed.stream_cfg,
             streamed.label_vocab.clone(),
-        ))
+        );
+        tokio::runtime::Handle::current().block_on(async move {
+            match streamed.tenant {
+                Some(tenant) => {
+                    streamed
+                        .session
+                        .with_tenant_scoped(tenant, |_scope| open)
+                        .await
+                }
+                None => open.await,
+            }
+        })
     }
 
     /// The K3 scaler's whole-prefix target vector for a `Streamed` source
@@ -6875,6 +6900,7 @@ mod f6_streamed_refusal_oracle {
             batch: 1,
             stream_cfg: StreamConfig::new(1).unwrap(),
             label_vocab: None,
+            tenant: None,
         }
     }
 

@@ -2878,10 +2878,10 @@ rows of training compute; `next_chunk` (`crates/jammi-ai/src/fine_tune/stream.rs
 the blocking call the trainer's per-step loop drives.
 
 **Resident vs Streamed: one predicate.** `whole_set_arm`
-(`crates/jammi-ai/src/fine_tune/source.rs:150`) decides: mining (scores every candidate
+(`crates/jammi-ai/src/fine_tune/source.rs:161`) decides: mining (scores every candidate
 against the full corpus) and GradCache (treats the whole dataset as one in-batch-negative
 batch) both need every row resident before an epoch begins, so a config taking either arm
-gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:88`); every other text arm at
+gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:99`); every other text arm at
 `W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
 `whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:2054`) that the trainer's own
 dispatch refuses a mismatch against, so the two decisions can never come apart. A

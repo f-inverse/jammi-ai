@@ -2150,6 +2150,16 @@ impl JobWorker {
                     )
                     .map_err(WorkerJobError::from)?;
 
+                    // Captured HERE, inside `run_spec`'s own task, which is
+                    // still running under the caller's `with_tenant_scoped`
+                    // task-local (`worker.rs::run_claimed_job_under`'s doc) —
+                    // `session.tenant()` reads that override, not the
+                    // session's sticky binding. `TrainingSetStream::open`
+                    // later runs on the `spawn_blocking` pool via
+                    // `Handle::block_on`, which does NOT inherit this
+                    // task-local, so the value is captured now and re-applied
+                    // explicitly per open (#500 U2c c3d).
+                    let tenant = session.tenant();
                     let streamed = crate::fine_tune::source::StreamedSet {
                         session: Arc::clone(session),
                         table: table.clone(),
@@ -2160,6 +2170,7 @@ impl JobWorker {
                         batch: common.config.batch_size,
                         stream_cfg,
                         label_vocab,
+                        tenant,
                     };
                     (
                         table,
@@ -2174,6 +2185,12 @@ impl JobWorker {
                         crate::fine_tune::source::TrainingSource::Streamed(_) => "streamed",
                     },
                 );
+                #[cfg(feature = "test-hooks")]
+                if let crate::fine_tune::source::TrainingSource::Streamed(streamed) =
+                    &training_source
+                {
+                    training_test_hooks::note_streamed_total_rows(job_id, streamed.total_rows);
+                }
                 // The `ProducingDescriptor::FineTune` materialization
                 // identity — the training-set table's own definition hash,
                 // artifact digest and row count, binding this fine-tune to
@@ -4203,6 +4220,45 @@ pub mod training_test_hooks {
             .rev()
             .find(|p| p.job_id == job_id)
             .map(|p| p.kind)
+    }
+
+    /// One recorded `StreamedSet::total_rows` observation, keyed by the job
+    /// it was built for — the same "most recent entry wins" shape as
+    /// [`SourceKindProbe`], for the same retry reason.
+    struct StreamedRowsProbe {
+        job_id: String,
+        total_rows: usize,
+    }
+
+    fn streamed_rows() -> &'static Mutex<Vec<StreamedRowsProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<StreamedRowsProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Record the row count `run_spec`'s FineTune arm built the `Streamed`
+    /// source over for `job_id` — `StreamedSet::total_rows`, the catalog
+    /// record's own `row_count` (#500 U2c c3d's tenant-isolation oracle:
+    /// "the row count … the stream served equals the tenant's own").
+    pub(super) fn note_streamed_total_rows(job_id: &str, total_rows: usize) {
+        streamed_rows()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(StreamedRowsProbe {
+                job_id: job_id.to_string(),
+                total_rows,
+            });
+    }
+
+    /// The most recently recorded `StreamedSet::total_rows` for `job_id` —
+    /// `None` if this job's FineTune arm never bound `Streamed`.
+    pub fn streamed_total_rows_for(job_id: &str) -> Option<usize> {
+        streamed_rows()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.total_rows)
     }
 
     /// One-shot pause slot: `Some` once armed, taken (and thereby disarmed)

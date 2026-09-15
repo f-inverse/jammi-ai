@@ -47,6 +47,17 @@ pub struct StreamedSet {
     pub(crate) train_count: usize,
     pub(crate) batch: usize,
     pub(crate) stream_cfg: StreamConfig,
+    /// The job's tenant scope, captured (`InferenceSession::tenant()`) at
+    /// construction time — while the worker's `run_spec` is still running
+    /// inside `with_tenant_scoped`'s task-local scope (`worker.rs`'s doc on
+    /// that call). `TrainingLoop::open_streamed_source` runs on the
+    /// `spawn_blocking` pool via `Handle::block_on`, a fresh top-level poll
+    /// on a different OS thread that does NOT inherit a Tokio task-local —
+    /// so every per-epoch stream open re-enters this scope explicitly rather
+    /// than relying on inheritance (#500 U2c c3d). `None` for an unscoped
+    /// run (the queue-drain worker's own claim, or a test session that never
+    /// bound a tenant).
+    pub(crate) tenant: Option<jammi_db::TenantId>,
     /// Built ONCE by the worker's own whole-table sweep (F3) — `None` for
     /// every non-classification task. Carries the FULL label→index
     /// assignment, not just its cardinality: every per-epoch training-window

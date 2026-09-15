@@ -2640,7 +2640,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1181` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1182` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.
@@ -3202,7 +3202,7 @@ fn falsification_every_ddl_literal_is_detected_and_scoped() {
 // anywhere outside those two `src` trees is outside its universe entirely --
 // under `tests/it/` in either crate (e.g. the five `.register_table(`
 // calls this file's own review list keys to, `.register_table(`,
-// `crates/jammi-db/tests/it/materialization.rs:567/:616/:669/:671/:1024`,
+// `crates/jammi-db/tests/it/materialization.rs:568/:616/:669/:671/:1024`,
 // none of them under `crates/jammi-db/src`), or in a third crate, both
 // count the same way. A fifth gap sits inside the scan itself, not at its
 // boundary: [`mask_comments_only`]'s masking step desyncs on a raw string

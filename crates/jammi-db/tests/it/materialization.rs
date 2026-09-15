@@ -447,6 +447,7 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
         &env(),
         vec![InputAnchor::mutable_version("docs", 1)],
         store_artifact_digest(&store, &info).await,
+        store_artifact_leaves(&store, &info).await,
         "run-x".into(),
         "2026-06-17T00:00:00Z".into(),
     )
@@ -2289,6 +2290,16 @@ async fn store_artifact_digest(
     jammi_db::store::manifest::ArtifactDigest::of_bytes(&bytes)
 }
 
+async fn store_artifact_leaves(
+    store: &ResultStore,
+    info: &BuildingTable,
+) -> Vec<jammi_db::store::manifest::LeafDigest> {
+    let handle = store.open_parquet(info.parquet_url()).unwrap();
+    let path = handle.data_path().unwrap();
+    let bytes = handle.get_bytes(&path).await.unwrap();
+    jammi_db::store::manifest::parquet_leaves(&bytes).unwrap()
+}
+
 async fn write_sidecar(
     store: &ResultStore,
     info: &BuildingTable,
@@ -2883,4 +2894,186 @@ async fn probe_model_by_definition_tenant_fan_out(backend: BackendKind) {
         "the servability predicate must exclude tenant D's own unfinalized row \
          and fall through to the global one"
     );
+}
+
+// ── U5b-0: the leaf inventory, through the store ──────────────────────────
+//
+// The unit-level oracles (`store::manifest::tests::leaves`) prove the
+// footer walk over a three-row-group object; these prove the FUNNEL writes
+// the inventory, `verify_partitions` names the corrupt row group, a
+// footer-only mutation is the whole-object digest's to catch (no leaf
+// covers it), and a pre-`leaves` sidecar reads as absent on both verbs.
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn the_funnel_writes_one_leaf_per_row_group_and_verify_partitions_matches(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+    let (record, _def) =
+        materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let manifest = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("the funnel wrote a sidecar");
+    // The footer is the oracle for the count, read here independently.
+    let handle = store.open_parquet(&url).unwrap();
+    let bytes = handle
+        .get_bytes(&handle.data_path().unwrap())
+        .await
+        .unwrap();
+    let footer = parquet::file::metadata::ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .unwrap();
+    assert_eq!(manifest.leaves.len(), footer.num_row_groups());
+    assert!(!manifest.leaves.is_empty());
+    assert_eq!(
+        store.verify_partitions(&record).await.unwrap(),
+        jammi_db::store::manifest::PartitionVerdict::Match
+    );
+    assert_eq!(
+        store.verify_materialization(&record, None).await.unwrap(),
+        MatchVerdict::Match
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_corrupted_row_group_is_named_by_its_leaf_and_a_footer_mutation_by_the_artifact(
+    backend: BackendKind,
+) {
+    use jammi_db::store::manifest::{LeafKey, PartitionVerdict};
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+    let (record, _def) =
+        materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let manifest = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .unwrap();
+    let handle = store.open_parquet(&url).unwrap();
+    let path = handle.data_path().unwrap();
+    let original = handle.get_bytes(&path).await.unwrap().to_vec();
+    let LeafKey::RowGroup {
+        index,
+        offset,
+        length,
+    } = manifest.leaves[0].key.clone()
+    else {
+        panic!("a result table's leaf is a row group");
+    };
+    // Inside the first row group: the leaf names it.
+    let mut inside = original.clone();
+    inside[(offset + length / 2) as usize] ^= 0xff;
+    handle
+        .put_bytes(&path, bytes::Bytes::from(inside))
+        .await
+        .unwrap();
+    match store.verify_partitions(&record).await.unwrap() {
+        PartitionVerdict::Mismatch { key, .. } => assert!(
+            matches!(key, LeafKey::RowGroup { index: i, .. } if i == index),
+            "{key:?}"
+        ),
+        other => panic!("expected the corrupt row group to be named, got {other:?}"),
+    }
+    assert!(matches!(
+        store.verify_materialization(&record, None).await.unwrap(),
+        MatchVerdict::Mismatch { .. }
+    ));
+    // In the footer (past the last row group's range, inside the metadata):
+    // no leaf covers it, so the inventory still matches — the whole-object
+    // digest is the subject that catches it.
+    let last = manifest.leaves.last().unwrap();
+    let LeafKey::RowGroup {
+        offset: last_off,
+        length: last_len,
+        ..
+    } = last.key.clone()
+    else {
+        panic!("row-group leaf");
+    };
+    let mut footered = original.clone();
+    footered[(last_off + last_len) as usize + 4] ^= 0x01;
+    handle
+        .put_bytes(&path, bytes::Bytes::from(footered))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.verify_materialization(&record, None).await.unwrap(),
+        MatchVerdict::Mismatch { .. }
+    ));
+    match store.verify_partitions(&record).await {
+        Ok(PartitionVerdict::Match) => {}
+        // The flip may have made the footer unreadable: then no inventory
+        // can be derived at all — still never a false leaf mismatch.
+        Err(e) => assert!(e.to_string().contains("parquet footer"), "{e}"),
+        other => panic!("a footer mutation names no leaf: {other:?}"),
+    }
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_pre_leaves_sidecar_reads_as_absent_on_both_verbs(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+    let (record, _def) =
+        materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let manifest = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .unwrap();
+    // Rewrite the sidecar as the pre-inventory format: the same object
+    // without `leaves`.
+    let mut value = serde_json::to_value(&manifest).unwrap();
+    value.as_object_mut().unwrap().remove("leaves");
+    let handle = store.open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, serde_json::to_vec(&value).unwrap().into())
+        .await
+        .unwrap();
+    assert!(store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.verify_materialization(&record, None).await.unwrap(),
+        MatchVerdict::MissingManifest
+    );
+    assert_eq!(
+        store.verify_partitions(&record).await.unwrap(),
+        jammi_db::store::manifest::PartitionVerdict::MissingManifest
+    );
+    // A NEWER version stays an error, never a miss.
+    let mut newer = serde_json::to_value(&manifest).unwrap();
+    newer.as_object_mut().unwrap().insert(
+        "manifest_version".into(),
+        serde_json::json!(jammi_db::store::manifest::MANIFEST_VERSION + 1),
+    );
+    handle
+        .put_bytes(&sidecar, serde_json::to_vec(&newer).unwrap().into())
+        .await
+        .unwrap();
+    assert!(store
+        .read_materialization_manifest(&url)
+        .await
+        .err()
+        .is_some());
 }

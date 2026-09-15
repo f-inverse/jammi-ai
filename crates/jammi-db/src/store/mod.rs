@@ -25,9 +25,10 @@ pub use freshness::{
 pub use layout::TenantSegment;
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, DeletePolicy,
-    InputAnchor, ManifestError, MatchVerdict, Materialization, MaterializationEnv,
-    MaterializationManifest, ModelContentDigest, ModelContentDigestUnavailableReason,
-    ModelIdentity, ProducingDescriptor, TRAINING_SET_ORDER_RULE_V1,
+    InputAnchor, LeafDigest, LeafKey, ManifestError, MatchVerdict, Materialization,
+    MaterializationEnv, MaterializationManifest, ModelContentDigest,
+    ModelContentDigestUnavailableReason, ModelIdentity, PartitionVerdict, ProducingDescriptor,
+    TRAINING_SET_ORDER_RULE_V1,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
@@ -1404,12 +1405,14 @@ impl ResultStore {
         let parquet_path = parquet_handle.data_path()?;
         let bytes = parquet_handle.get_bytes(&parquet_path).await?;
         let digest = ArtifactDigest::of_bytes(&bytes);
+        let leaves = manifest::parquet_leaves(&bytes).map_err(manifest_to_jammi)?;
 
         let manifest = MaterializationManifest::compute(
             materialization.descriptor,
             materialization.env,
             materialization.inputs,
             digest,
+            leaves,
             run_id().to_string(),
             chrono::Utc::now().to_rfc3339(),
         )
@@ -1566,9 +1569,63 @@ impl ResultStore {
             return Ok(None);
         }
         let bytes = handle.get_bytes(&sidecar).await?;
-        let manifest =
-            MaterializationManifest::from_json_bytes(&bytes).map_err(manifest_to_jammi)?;
-        Ok(Some(manifest))
+        match MaterializationManifest::from_json_bytes(&bytes) {
+            Ok(manifest) => Ok(Some(manifest)),
+            // A sidecar written before the leaf inventory existed reads as
+            // ABSENT — the same "pre-contract table" every reader already
+            // handles (a verify says MissingManifest, an anchor recomputes
+            // from the bytes, a cache probe misses and re-materialises) —
+            // never a hit that treats the whole artifact as one leaf. Only
+            // that one shape; a newer version or a corrupt body stays the
+            // error it is.
+            Err(ManifestError::PreLeavesSidecar) => {
+                tracing::info!(
+                    url = %parquet_url,
+                    "materialization sidecar predates the leaf inventory; treated as absent"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(manifest_to_jammi(e)),
+        }
+    }
+
+    /// Recompute every leaf of a `ready` result table's inventory from its
+    /// bytes and footer and compare each to the recorded one, by key — the
+    /// per-partition verify a peer needs to name WHICH row group is not the
+    /// attested one. Read-only; returns a [`PartitionVerdict`], never acts
+    /// on it. The whole-object digest is [`Self::verify_materialization`]'s
+    /// to check; this verb attests the parts.
+    pub async fn verify_partitions(&self, table: &ResultTableRecord) -> Result<PartitionVerdict> {
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? else {
+            return Ok(PartitionVerdict::MissingManifest);
+        };
+        let handle = self.open_parquet(&parquet_url)?;
+        let path = handle.data_path()?;
+        let bytes = handle.get_bytes(&path).await?;
+        let found = manifest::parquet_leaves(&bytes).map_err(manifest_to_jammi)?;
+        if found.len() != manifest.leaves.len() {
+            return Ok(PartitionVerdict::InventoryDiffers {
+                expected: manifest.leaves.len(),
+                found: found.len(),
+            });
+        }
+        for (recorded, recomputed) in manifest.leaves.iter().zip(&found) {
+            if recorded.key != recomputed.key {
+                return Ok(PartitionVerdict::InventoryDiffers {
+                    expected: manifest.leaves.len(),
+                    found: found.len(),
+                });
+            }
+            if recorded.digest != recomputed.digest {
+                return Ok(PartitionVerdict::Mismatch {
+                    key: recorded.key.clone(),
+                    expected: recorded.digest.0.clone(),
+                    found: recomputed.digest.0.clone(),
+                });
+            }
+        }
+        Ok(PartitionVerdict::Match)
     }
 
     /// Write a result table's `.materialization.json` sidecar.

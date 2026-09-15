@@ -11,6 +11,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use candle_core::{Device, Tensor};
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::instance::MemberRoot;
 use jammi_db::config::StorageConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
@@ -163,6 +164,11 @@ async fn assert_member_row_matches_resolved_root(
     // parse); the `instances.result_root` column, checked below, carries
     // the PRE-parse string verbatim.
     let expected_store_root = StorageUrl::parse(&expected).unwrap();
+    let expected_identity = MemberRoot::resolved(&config)
+        .unwrap()
+        .identity()
+        .as_str()
+        .to_string();
     let session = InferenceSession::new(config).await.unwrap();
     let store = session.result_store();
     let info = store
@@ -189,7 +195,7 @@ async fn assert_member_row_matches_resolved_root(
     );
 
     let instance_id = session.instance_id().to_string();
-    let row: Option<String> = session
+    let row: Option<(Option<String>, Option<String>)> = session
         .catalog()
         .backend_arc()
         .transaction(
@@ -198,21 +204,32 @@ async fn assert_member_row_matches_resolved_root(
                 let instance_id = instance_id.clone();
                 Box::pin(async move {
                     tx.query_opt(
-                        "SELECT result_root FROM instances WHERE instance_id = $1",
+                        "SELECT result_root, result_root_identity FROM instances \
+                         WHERE instance_id = $1",
                         &[jammi_db::catalog::backend::SqlValue::TextOwned(instance_id)],
-                        |row| row.try_get::<String>("result_root"),
+                        |row| {
+                            Ok((
+                                row.try_get::<String>("result_root")?,
+                                row.try_get::<String>("result_root_identity")?,
+                            ))
+                        },
                     )
                     .await
                 })
             },
         )
         .await
-        .unwrap()
-        .flatten();
+        .unwrap();
+    let (root, identity) = row.expect("the member row exists");
     assert_eq!(
-        row.as_deref(),
+        root.as_deref(),
         Some(expected.as_str()),
         "instances.result_root must carry resolved_result_root() verbatim"
+    );
+    assert_eq!(
+        identity.as_deref(),
+        Some(expected_identity.as_str()),
+        "instances.result_root_identity must be the identity MemberRoot::resolved derives"
     );
 }
 
@@ -237,16 +254,34 @@ async fn member_row_matches_resolved_root_for_file_scheme() {
     assert_member_row_matches_resolved_root(config, 19302).await;
 }
 
-/// `result_root` a `memory://` root.
+/// `result_root` a `memory://` root: a MEMBER (peer_advertise set) is
+/// refused at session construction, naming the root and the way out — an
+/// in-memory store can never be shared with a gang peer (unit U5b-1a-A2).
+/// The same root with no `peer_advertise` is a plain library session.
 #[tokio::test]
-async fn member_row_matches_resolved_root_for_memory_scheme() {
+async fn a_member_with_a_memory_result_root_is_refused_at_session_construction() {
     let dir = TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
     config.storage = StorageConfig {
         result_root: Some("memory:///jammi_member_row_probe".into()),
         cloud: None,
     };
-    assert_member_row_matches_resolved_root(config, 19303).await;
+    let library = InferenceSession::new(config.clone()).await;
+    assert!(
+        library.is_ok(),
+        "a library session may use an in-memory root"
+    );
+    drop(library);
+    config.server.peer_bind = Some("0.0.0.0:19303".to_string());
+    config.server.peer_advertise = Some("127.0.0.1:19303".to_string());
+    let err = match InferenceSession::new(config).await {
+        Ok(_) => panic!("a member with an in-memory root must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("memory:///jammi_member_row_probe") && err.contains("peer_advertise"),
+        "{err}"
+    );
 }
 
 /// `result_root` a `gcs://` ALIAS scheme — proving the alias is never
@@ -290,6 +325,18 @@ async fn member_row_matches_resolved_root_for_a_cloud_alias_scheme() {
         row.as_deref(),
         Some("gcs://bucket/jammi_member_row_probe"),
         "the gcs:// spelling must never fold to gs:// (or anything else) on the member row"
+    );
+    // …while its IDENTITY is the folded one, equal to the `gs://` spelling's.
+    let mut gs = common::test_config(dir.path());
+    gs.storage = StorageConfig {
+        result_root: Some("gs://bucket/jammi_member_row_probe".into()),
+        cloud: None,
+    };
+    let mut gcs = gs.clone();
+    gcs.storage.result_root = Some("gcs://bucket/jammi_member_row_probe".into());
+    assert_eq!(
+        MemberRoot::resolved(&gcs).unwrap().identity(),
+        MemberRoot::resolved(&gs).unwrap().identity()
     );
 }
 

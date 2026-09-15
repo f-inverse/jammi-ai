@@ -122,6 +122,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "035_instances_peer_addr_result_root",
         schema::MIGRATION_035_INSTANCES_PEER_ADDR_RESULT_ROOT,
     ),
+    (
+        "036_instances_result_root_identity",
+        schema::MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

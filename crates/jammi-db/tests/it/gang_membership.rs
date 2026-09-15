@@ -1,10 +1,12 @@
 //! `Catalog::list_gang_members` / `Catalog::peer_addr_of` (DESIGN.md § 4,
-//! contract `feat_500-C-U5b-1a` §12, P-Y1): the gang-membership listing and
-//! by-id resolution verbs. `result_root` is written to every member row
-//! (P-Y2) but plays NO part in `list_gang_members`'s admission predicate in
-//! this unit — root identity across spellings, and any membership
-//! predicate built on it, is `docs/plans/67-distributed-training/README.md`
-//! unit U5b-1a-A2's question. Parameterized sqlite/postgres, the
+//! contract `feat_500-C-U5b-1a` §12 and unit U5b-1a-A2): the gang-membership
+//! listing and by-id resolution verbs. `result_root` is written to every
+//! member row verbatim, and its IDENTITY across spellings
+//! (`result_root_identity`, derived by `MemberRoot::resolved`) is what the admission
+//! predicate compares: members whose roots spell the same location
+//! differently (`gcs://` vs `gs://`, a symlink and its target, a trailing
+//! slash) are gang members of each other; members rooted elsewhere, and rows
+//! with no identity, are not. Parameterized sqlite/postgres, the
 //! `migrations.rs` / `gang_instance_freshness.rs` shape: every test also
 //! runs a `::postgres` arm gated by `live-postgres-tests`, skipping (never
 //! failing) when `JAMMI_TEST_PG_URL` is unset.
@@ -34,8 +36,19 @@ use jammi_db::tenant::TenantId;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 
-/// The member root every "matching" fixture in this file shares.
-const ROOT: &str = "file:///shared/jammi_db";
+/// The member root every "matching" fixture in this file shares: a local
+/// directory this process owns (the derivation creates it; a fixed absolute
+/// path under `/` would be unwritable), one per test process.
+fn root() -> &'static str {
+    static SHARED: std::sync::OnceLock<(tempfile::TempDir, String)> = std::sync::OnceLock::new();
+    &SHARED
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = format!("file://{}/jammi_db", dir.path().to_str().unwrap());
+            (dir, root)
+        })
+        .1
+}
 const LEASE: Duration = Duration::from_secs(30);
 
 async fn base_catalog_kind(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catalog>)> {
@@ -170,10 +183,17 @@ async fn seed_member(
         .unwrap();
 }
 
-fn listing<'a>(kind: &'a str, self_instance: &'a str) -> GangListing<'a> {
+/// The root every `root()`-rooted fixture shares — what a caller rooted
+/// there passes as its own.
+fn shared_root() -> MemberRoot {
+    MemberRoot::new(root())
+}
+
+fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a MemberRoot) -> GangListing<'a> {
     GangListing {
         kind,
         self_instance,
+        root,
         lease: LEASE,
     }
 }
@@ -218,13 +238,13 @@ async fn list_excludes_the_caller_itself(kind: BackendKind) {
         &catalog,
         &self_id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", &self_id))
+        .list_gang_members(listing("fine_tune", &self_id, &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -249,7 +269,7 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -257,7 +277,7 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
     // instance_liveness_margin(30s) == 60s; push well past it.
     force_stale_instance(&catalog, &id, Duration::from_secs(600)).await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -282,13 +302,13 @@ async fn list_excludes_a_draining_worker(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Draining,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -313,13 +333,13 @@ async fn list_excludes_a_warming_worker(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Warming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -346,13 +366,13 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "graph_fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -361,75 +381,80 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
     );
 }
 
-/// P-Y1 (contract §12, the round-5 excision): a root that differs only by
-/// CASE, or by a trailing `/`, is a byte-exact mismatch as a STRING — but
-/// `result_root` is not part of the admission predicate at all in this
-/// unit, so both members are gang members of a caller listing regardless of
-/// which root spelling the caller itself carries (`GangListing` has no root
-/// field to carry one).
+/// The identity rules on object-store roots, through the verb: a member
+/// whose root differs from the caller's only by a trailing slash is
+/// returned; one whose bucket or key differs by case is not (the store and
+/// the driver dial both as spelled).
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn list_includes_members_despite_a_root_divergent_by_case_or_trailing_slash_root_is_not_consulted(
-    kind: BackendKind,
-) {
+async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: BackendKind) {
     skip_unless_ready!(kind);
     let (_dir, catalog) = base_catalog_kind(kind)
         .await
         .expect("already skipped above when unconfigured");
-    let id_case = format!("root-case-{}", jammi_test_utils::unique_suffix());
+    let me = MemberRoot::new("s3://bucket/prefix");
+    let id_case = format!("auth-case-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
         &id_case,
         "10.0.0.1:9000",
-        "FILE:///SHARED/jammi_db",
+        "s3://BUCKET/prefix",
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
-    let id_slash = format!("root-slash-{}", jammi_test_utils::unique_suffix());
+    let id_slash = format!("slash-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
         &id_slash,
         "10.0.0.2:9000",
-        "file:///shared/jammi_db/",
+        "s3://bucket/prefix/",
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    let id_key = format!("key-case-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &id_key,
+        "10.0.0.3:9000",
+        "s3://bucket/Prefix",
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &me))
         .await
         .unwrap();
     assert!(
-        members.iter().any(|m| m.instance_id == id_case),
-        "a case-divergent root must still match — root is not part of this predicate: {members:?}"
+        members.iter().all(|m| m.instance_id != id_case),
+        "a bucket-case-divergent root is a DIFFERENT root — the driver dials it as spelled: {members:?}"
     );
     assert!(
         members.iter().any(|m| m.instance_id == id_slash),
-        "a trailing-slash-divergent root must still match — root is not part of this \
-         predicate: {members:?}"
+        "a trailing-slash-divergent root is the same root: {members:?}"
+    );
+    assert!(
+        members.iter().all(|m| m.instance_id != id_key),
+        "a key-case-divergent root is a DIFFERENT root: {members:?}"
     );
 }
 
-/// P-Y1 (contract §12, the round-5 excision — formerly P-X2's "these must
-/// never match" oracle, inverted): `gcs://b/p` and `gs://b/p` are DIFFERENT
-/// `result_root` STRINGS, but `result_root` plays no part in
-/// `list_gang_members`'s admission predicate in this unit (`GangListing`
-/// carries no root field at all) — a `gcs://`-rooted member and a
-/// `gs://`-rooted member ARE gang members of each other.
+/// Scheme aliasing, through the verb: `gcs://b/p` and `gs://b/p` are ONE
+/// root, so each member is returned to a caller rooted at the other
+/// spelling — and the rows still carry the two spellings verbatim.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted(
-    kind: BackendKind,
-) {
+async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: BackendKind) {
     skip_unless_ready!(kind);
     let (_dir, catalog) = base_catalog_kind(kind)
         .await
@@ -438,7 +463,7 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_c
     seed_member(
         &catalog,
         &gcs_id,
-        "10.0.0.10:9000",
+        "10.0.0.3:9000",
         "gcs://bucket/prefix",
         "fine_tune",
         WorkerState::Claiming,
@@ -448,42 +473,75 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_c
     seed_member(
         &catalog,
         &gs_id,
-        "10.0.0.11:9000",
+        "10.0.0.4:9000",
         "gs://bucket/prefix",
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
-
-    // ONE listing, no root at all — both differently-rooted members show up
-    // for each other.
-    let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+    for (caller_root, other) in [
+        ("gcs://bucket/prefix", &gs_id),
+        ("gs://bucket/prefix", &gcs_id),
+    ] {
+        let me = MemberRoot::new(caller_root);
+        let members = catalog
+            .list_gang_members(listing("fine_tune", "someone-else", &me))
+            .await
+            .unwrap();
+        assert!(
+            members.iter().any(|m| &m.instance_id == other),
+            "a caller rooted at {caller_root} must see the other spelling: {members:?}"
+        );
+    }
+    let roots: Vec<Option<String>> = catalog
+        .backend_arc()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let ids = vec![gcs_id.clone(), gs_id.clone()];
+                Box::pin(async move {
+                    let mut out = Vec::new();
+                    for id in ids {
+                        out.push(
+                            tx.query_opt(
+                                "SELECT result_root FROM instances WHERE instance_id = $1",
+                                &[SqlValue::TextOwned(id)],
+                                |row| row.try_get::<String>("result_root"),
+                            )
+                            .await?
+                            .flatten(),
+                        );
+                    }
+                    Ok(out)
+                })
+            },
+        )
         .await
         .unwrap();
-    assert!(
-        members.iter().any(|m| m.instance_id == gcs_id),
-        "the gcs://-rooted member must be listed: {members:?}"
-    );
-    assert!(
-        members.iter().any(|m| m.instance_id == gs_id),
-        "the gs://-rooted member must be listed: {members:?}"
+    assert_eq!(
+        roots,
+        vec![
+            Some("gcs://bucket/prefix".to_string()),
+            Some("gs://bucket/prefix".to_string())
+        ],
+        "the rows keep the two spellings verbatim; only the identity folds"
     );
 }
 
-/// The same property (P-Y1) over a second, unrelated scheme pair —
-/// `file://` and `s3://` — so the finding is not an artifact of the two
-/// schemes happening to alias in some other layer; here they never alias
-/// anywhere, and membership still does not care.
+/// Two members rooted at DIFFERENT locations are not gang members of each
+/// other, in either direction: a caller rooted at the local root sees only
+/// the local member; a caller rooted at the bucket sees only the bucket
+/// member.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_consulted(
-    kind: BackendKind,
-) {
+async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: BackendKind) {
     skip_unless_ready!(kind);
     let (_dir, catalog) = base_catalog_kind(kind)
         .await
@@ -492,8 +550,8 @@ async fn file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_
     seed_member(
         &catalog,
         &file_id,
-        "10.0.0.12:9000",
-        "file:///a",
+        "10.0.0.5:9000",
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -502,25 +560,31 @@ async fn file_and_s3_spelled_members_are_gang_members_of_each_other_root_is_not_
     seed_member(
         &catalog,
         &s3_id,
-        "10.0.0.13:9000",
-        "s3://b",
+        "10.0.0.6:9000",
+        "s3://bucket/prefix",
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
-
-    let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+    let as_file = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
-        members.iter().any(|m| m.instance_id == file_id),
-        "the file://-rooted member must be listed: {members:?}"
+        as_file.iter().any(|m| m.instance_id == file_id),
+        "{as_file:?}"
     );
     assert!(
-        members.iter().any(|m| m.instance_id == s3_id),
-        "the s3://-rooted member must be listed: {members:?}"
+        as_file.iter().all(|m| m.instance_id != s3_id),
+        "{as_file:?}"
     );
+    let s3 = MemberRoot::new("s3://bucket/prefix");
+    let as_s3 = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &s3))
+        .await
+        .unwrap();
+    assert!(as_s3.iter().any(|m| m.instance_id == s3_id), "{as_s3:?}");
+    assert!(as_s3.iter().all(|m| m.instance_id != file_id), "{as_s3:?}");
 }
 
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
@@ -543,7 +607,7 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
         .await
         .unwrap();
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -553,27 +617,21 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
 }
 
 /// The distinct `peer_addr` SET / `result_root` NULL state (representable
-/// by construction — no paired `CHECK`, schema.rs ~:1225) gets its OWN
-/// oracle, separate from the both-NULL case above: `result_root` is not
-/// part of the admission predicate in this unit (P-Y1, contract §12), so
-/// this row IS returned by `list_gang_members` exactly like an
-/// otherwise-identical full member, and `peer_addr_of` (which never had a
-/// root predicate at all) resolves it too.
+/// by construction — no paired `CHECK`) has no root identity, so it is NOT
+/// a gang member of anyone; an otherwise-identical full member is the
+/// control. `peer_addr_of` (which has no root predicate) still resolves it.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn list_includes_a_member_with_peer_addr_set_and_result_root_null_root_is_not_consulted(
-    kind: BackendKind,
-) {
+async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind) {
     skip_unless_ready!(kind);
     let (_dir, catalog) = base_catalog_kind(kind)
         .await
         .expect("already skipped above when unconfigured");
     let id = format!("addr-no-root-{}", jammi_test_utils::unique_suffix());
-    // peer_addr SET, member_root NULL — distinct from both-NULL above.
     let reg = InstanceRegistration::new(
         &id,
         Some("label"),
@@ -586,42 +644,143 @@ async fn list_includes_a_member_with_peer_addr_set_and_result_root_null_root_is_
         .upsert_worker(&id, "fine_tune", WorkerState::Claiming)
         .await
         .unwrap();
-
-    // An otherwise-identical full member (peer_addr AND result_root both
-    // set) — the control proving the row above was returned for the same
-    // reason as any other member, not some divergence between the two rows.
     let full_id = format!("addr-full-{}", jammi_test_utils::unique_suffix());
     seed_member(
         &catalog,
         &full_id,
         "10.0.0.7:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
-
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
-        members.iter().any(|m| m.instance_id == id),
-        "a NULL result_root row must still be returned by list_gang_members — root is not \
-         part of this predicate: {members:?}"
+        members.iter().all(|m| m.instance_id != id),
+        "a row with no root identity is never a gang member: {members:?}"
     );
     assert!(
         members.iter().any(|m| m.instance_id == full_id),
-        "the otherwise-identical full member must still be returned: {members:?}"
+        "the control member must be returned: {members:?}"
     );
-
-    // peer_addr_of has no root predicate at all — a NULL result_root must
-    // never hide the address.
     let resolved = catalog.peer_addr_of(&id, LEASE).await.unwrap();
     assert_eq!(
         resolved.map(|a| a.as_str().to_string()),
         Some("10.0.0.6:9000".to_string()),
-        "peer_addr_of must still resolve a NULL-result_root instance"
+        "peer_addr_of has no root predicate and still resolves the row"
+    );
+}
+
+/// A symlinked local root and its target are ONE root: each member is
+/// returned to a caller rooted at the other spelling.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn a_symlinked_local_root_and_its_target_are_the_same_gang(kind: BackendKind) {
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = base_catalog_kind(kind)
+        .await
+        .expect("already skipped above when unconfigured");
+    let roots = tempfile::tempdir().unwrap();
+    let real = roots.path().join("real");
+    std::fs::create_dir_all(real.join("jammi_db")).unwrap();
+    let link = roots.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let real_root = format!("{}/jammi_db", real.to_str().unwrap());
+    let link_root = format!("file://{}/jammi_db/", link.to_str().unwrap());
+    let real_id = format!("real-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &real_id,
+        "10.0.0.8:9000",
+        &real_root,
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    let link_id = format!("link-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &link_id,
+        "10.0.0.9:9000",
+        &link_root,
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    for (caller_root, other) in [(&real_root, &link_id), (&link_root, &real_id)] {
+        let me = MemberRoot::new(caller_root);
+        let members = catalog
+            .list_gang_members(listing("fine_tune", "someone-else", &me))
+            .await
+            .unwrap();
+        assert!(
+            members.iter().any(|m| &m.instance_id == other),
+            "a caller rooted at {caller_root} must see the other spelling: {members:?}"
+        );
+    }
+}
+
+/// A row written before migration 036, or by a writer that skipped the
+/// identity (the state a hand-edited row leaves behind): `result_root`
+/// present, `result_root_identity` NULL — never a gang member, never an
+/// error.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) {
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = base_catalog_kind(kind)
+        .await
+        .expect("already skipped above when unconfigured");
+    let id = format!("legacy-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &id,
+        "10.0.0.10:9000",
+        root(),
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    let before = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .await
+        .unwrap();
+    assert!(
+        before.iter().any(|m| m.instance_id == id),
+        "control: {before:?}"
+    );
+    let legacy = id.clone();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE instances SET result_root_identity = NULL WHERE instance_id = $1",
+                    &[SqlValue::TextOwned(legacy)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    let after = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .await
+        .unwrap();
+    assert!(
+        after.iter().all(|m| m.instance_id != id),
+        "a NULL identity never matches: {after:?}"
     );
 }
 
@@ -642,14 +801,14 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
         None,
         None,
         Some(PeerAddr::parse("10.0.0.1:9000").unwrap()),
-        Some(MemberRoot::new(ROOT)),
+        Some(MemberRoot::new(root())),
     );
     catalog.upsert_instance(&reg).await.unwrap();
     // Deliberately no `upsert_worker` call: an `instances` row with no
     // `workers` row is a live process that never runs the claim loop, not a
     // fleet member (the INNER join, DESIGN.md § 4).
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -680,13 +839,13 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.5:9000",
-        ROOT,
+        root(),
         "embedding, fine_tune ,other",
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let member = members
@@ -721,7 +880,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
             &catalog,
             id,
             "10.0.0.1:9000",
-            ROOT,
+            root(),
             "fine_tune",
             WorkerState::Claiming,
         )
@@ -765,7 +924,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
     );
 
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let ours: Vec<&str> = members
@@ -799,19 +958,19 @@ async fn list_gang_members_is_identical_under_a_scoped_tenant_and_under_none(kin
         &catalog,
         &id,
         "10.0.0.7:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     let unscoped = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let scoped_catalog =
         catalog.pinned_to_tenant(Some(TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap()));
     let scoped = scoped_catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     assert_eq!(
@@ -842,7 +1001,7 @@ async fn peer_addr_of_resolves_a_busy_or_other_kind_fresh_member(kind: BackendKi
         &catalog,
         &id,
         "10.0.0.3:9000",
-        ROOT,
+        root(),
         "embedding",
         WorkerState::Draining,
     )
@@ -870,7 +1029,7 @@ async fn peer_addr_of_is_none_for_a_stale_instance(kind: BackendKind) {
         &catalog,
         &id,
         "10.0.0.4:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -938,7 +1097,7 @@ async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: Ba
         &catalog,
         &id,
         "10.0.0.9:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
@@ -979,14 +1138,14 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
         &catalog,
         &id,
         "10.0.0.10:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )
     .await;
     force_corrupt_peer_addr(&catalog, &id).await;
     let result = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await;
     // Same discipline as the `peer_addr_of` case: the poison row is gone
     // before the assertion, on every arm.
@@ -1032,7 +1191,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
         Some("label"),
         Some("host"),
         Some(PeerAddr::parse("10.0.0.9:9000").unwrap()),
-        Some(MemberRoot::new(ROOT)),
+        Some(MemberRoot::new(root())),
     ));
     reg.set_worker(Some(WorkerFacts {
         kinds: "fine_tune".into(),
@@ -1060,7 +1219,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
     tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(500)).await;
 
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else"))
+        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await
         .unwrap();
     let member = members
@@ -1107,7 +1266,7 @@ async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kin
         &catalog,
         &id,
         "10.0.0.1:9000",
-        ROOT,
+        root(),
         "fine_tune",
         WorkerState::Claiming,
     )

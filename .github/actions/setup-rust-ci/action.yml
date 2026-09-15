@@ -70,6 +70,18 @@ inputs:
 runs:
   using: composite
   steps:
+    # Every job that runs in a container checks out as one UID and runs git
+    # as another, and the safe.directory mark `actions/checkout` sets is not
+    # visible to the container's git — so any `git` call (a build.rs
+    # `rev-parse`, a gate's `git ls-files`, a submodule init) dies with
+    # "fatal: detected dubious ownership" (exit 128). Marked here, ONCE, for
+    # every job that runs this composite — it runs right after checkout by
+    # this action's own contract — instead of a per-job copy each new gate
+    # had to remember (the live lane forgot, and its pinned-source gate died
+    # on every main run). Harmless on a hosted runner without a container.
+    - shell: bash
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
     - if: inputs.no-sccache != 'true'
       uses: mozilla-actions/sccache-action@v0.0.9
 

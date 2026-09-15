@@ -572,8 +572,8 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   both columns, RED — cited by construct rather than by an offset on a branch this fold cannot
   read), `catalog/instance.rs` (NEW — `PeerAddr` moves here from `index::peer`, re-exported there
   so the peer listener and the gang listener share ONE address type; `MemberRoot` (the VERBATIM
-  configured result-table root — no filesystem access, no URL parsing, no scheme handling; carried
-  on the row and NOT consulted by the membership predicate; root identity is U5b-1a-A2);
+  configured result-table root, carried on the row byte-for-byte; since U5b-1a-A2 it is PAIRED
+  with its `RootIdentity` — the identity across spellings the membership predicate compares);
   `InstanceRegistration { instance_id, label, host, peer_addr: Option<PeerAddr>, member_root:
   Option<MemberRoot>, worker: Mutex<Option<WorkerFacts>> }` — the ONE value every writer of the
   `instances`(+`workers`) row builds; `InstanceRegistration::from_config` is the ONE choke point:
@@ -607,12 +607,12 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   RESOLVED result-table root VERBATIM — `[storage] result_root` when set (the WHOLE effective
   root, no leaf appended), else `{artifact_dir}/jammi_db` (leaf appended ONLY in this default arm,
   a typed refusal naming `artifact_dir` on non-UTF-8) — no filesystem access, no URL parsing, no
-  scheme handling on the membership path; the row carries this string verbatim, but
-  `list_gang_members`'s admission predicate does NOT consult it in this unit (round-5 excision) —
-  root identity across spellings, and any membership predicate built on it, is filed as its own
-  unit, U5b-1a-A2 (see `docs/plans/67-distributed-training/README.md` for its scope), and is a
-  precondition of U5b-1b-ii (gang formation); were root-string equality ever made part of a
-  membership predicate, it would still be necessary, never sufficient, for shared storage —
+  scheme handling on the membership path IN THIS UNIT; the row carries this string verbatim.
+  U5b-1a-A2 (shipped after this unit) added the identity: `RootIdentity::of(resolved_result_root())`
+  written to `instances.result_root_identity` (migration 036) by the owning process, and
+  `list_gang_members` admits only members whose identity equals the caller's — a precondition of
+  U5b-1b-ii (gang formation). Root identity equality is necessary, never sufficient, for shared
+  storage —
   sufficiency is established only by the attestation VERIFY, U5a-1's whole-artifact sidecar /
   U5b-0's and U5b-1b-i's per-partition inventory). (ai-core) `session.rs` (the ONLY production call site of
   `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — builds the
@@ -654,18 +654,31 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ### U5b-0 — Partitioned attestation inventory (PR-C, new db unit)
 
 - **files_in_scope** (db): `store/manifest.rs` (`MaterializationManifest` gains `leaves:
-  Vec<LeafDigest { row_group: u32, digest: ArtifactDigest }>`; `manifest.artifact` becomes the
-  FOLD over `leaves` in row-group order — never a second, independently-computed whole-artifact
-  digest; `MANIFEST_VERSION` bump), the training-set materialization writer (one leaf per row
-  group, written as each row group is written), the freshness/probe readers that consume
-  `MaterializationManifest` (an old sidecar with no `leaves` field is a CACHE MISS —
-  re-materialize — never a whole-artifact read accepted in its place).
+  Vec<LeafDigest { key: LeafKey, digest: ArtifactDigest }>`, `LeafKey::RowGroup { index, offset,
+  length }` for a result table, `LeafKey::File { name }` for a model bundle — a KEYED inventory,
+  ADDITIVE to `manifest.artifact`, which stays the whole-object digest), the attestation writer
+  (`write_attestation`: `parquet_leaves` over the written object's footer; `write_model_
+  materialization`: one leaf per bundle file by name), `read_materialization_manifest` (a
+  sidecar at the current version with no `leaves` — written before the inventory existed — is
+  `PreLeavesSidecar` and reads as ABSENT: re-materialize, never a whole-artifact read accepted
+  in its place; a newer version or a corrupt body stays an error), and the new
+  `verify_partitions` verb naming the first divergent leaf. Dated correction, 2026-09-15
+  (contract `feat_500-wave3b` §4, the pressure round): the first design — `artifact` as the
+  FOLD over the leaves plus a `MANIFEST_VERSION` bump — was withdrawn before code: `artifact`
+  is the base of the version-identity chain (`store/version.rs`), `verify_materialization`
+  reuses it as the base fragment's digest, and row groups do not partition a Parquet file
+  (footer, page index, bloom filters belong to no leaf), so a fold would have moved every
+  downstream anchor and weakened the subject. No version bump: a required field is rejected
+  serde-first, and the number is reserved for a determinant-set change.
 - **invariants_to_preserve**: K5 (append-only manifest shape), B6.
-- **acceptance**: (a) leaf count == row-group count, asserted via a pyarrow/parquet metadata
-  oracle over a fixture with N row groups (RED at base: no `leaves` field exists); (b)
-  `manifest.artifact` == the stated fold of `leaves`, recomputed independently by the test; (c)
-  an old-format sidecar round-trips through the freshness/probe reader as a MISS, never a hit
-  that treats the whole artifact as one leaf.
+- **acceptance** (as shipped): (a) leaf count == the footer's row-group count, read
+  independently by the test with the `parquet` crate (`store::manifest::tests::leaves`, a
+  three-row-group object; `tests/it/materialization.rs` through the funnel); (b) each leaf's
+  digest == the SHA-256 over the byte range the test reads from the footer itself; (c) a byte
+  flipped inside row group k changes leaf k and no other, and `verify_partitions` names it,
+  while a footer-only mutation changes no leaf and is reported by `verify_materialization`;
+  (d) a pre-`leaves` sidecar reads as absent on both verbs and a newer version stays an error;
+  (e) a model bundle's leaves are its files by name and adding a file changes no existing leaf.
 - **lane**: hermetic. **depends_on**: none; base `main` after PR-B2. **size**: S. U5b-1b-i
   depends_on this unit (its per-partition verify reads the leaf inventory); U5a-1's own
   admission-time sidecar VERIFY is unaffected — it stays whole-artifact/admission-time-only.
@@ -742,9 +755,9 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   never set partially; a moved claim aborts with no write, a concurrent CAS sees zero rows and
   REUSEs.
 - **lane**: hermetic + server it-suite. **depends_on**: U5b-1a (`list_gang_members`,
-  `MemberRoot::resolved` — `list_gang_members`'s own predicate does NOT consult the root,
-  round-5 excision), U5b-1a-A2 (root identity across spellings AND the membership predicate on
-  the root — this coordinator's own use of `result_root` needs BOTH), U5b-1b-i (the `Peer`
+  `MemberRoot::resolved`), U5b-1a-A2 (shipped: `list_gang_members` admits on root identity, so
+  this coordinator passes its own `MemberRoot::identity()` in the `GangListing` and filters
+  nothing itself), U5b-1b-i (the `Peer`
   collective it dispatches to), U4b (`spec.rs`
   co-ownership, merge order pinned), U5a-1, U5a-2. **size**: L.
 

@@ -1739,11 +1739,29 @@ three things to the artifact's content digest:
 3. **Producing-run identity + instant** (`produced_by` / `produced_at`, provenance only,
    never the anchor).
 
+Beside the digest — never in place of it — the manifest carries a **keyed leaf
+inventory** (`leaves: Vec<LeafDigest>`, `LeafKey`, `crates/jammi-db/src/store/manifest.rs`;
+plan 67 unit U5b-0): for a result table one leaf per Parquet row group, keyed by its
+index and byte range as the footer locates it (`parquet_leaves`, the SHA-256 of exactly
+that range); for a model bundle one leaf per file keyed by NAME (the bundle manifest's own
+sha256, so adding a file changes no existing leaf and `combined_hash` stays the bundle's
+content address). The inventory is what a peer verifies ONE partition against without
+reading the rest. It is additive: `artifact` stays the whole-object digest, the in-toto
+subject, the root of the version-identity chain, and what a verifier holding the bytes
+recomputes; bytes outside every row group (footer, page index, bloom filters) belong to
+no leaf and are the whole-object digest's to catch.
+
 `MANIFEST_VERSION = 3` (`crates/jammi-db/src/store/manifest.rs`); a version mismatch or a
 serde-shape mismatch is a typed `ManifestError`, never a silently-trusted stale hash
-(`Manifest::from_json_bytes`). The descriptor is kept **verbatim** in the manifest (not
-just the opaque hash) precisely so a reader can *replay* it — that is what the recompute
-path reads.
+(`Manifest::from_json_bytes`). One shape rejection is named on its own: an object at the
+current version with no `leaves` — a sidecar written before the inventory existed —
+is `ManifestError::PreLeavesSidecar`, and `ResultStore::read_materialization_manifest`
+reads exactly that as ABSENT (the pre-contract case every reader already handles: a
+verify says `MissingManifest`, an anchor recomputes from the bytes, a cache probe misses
+and re-materialises); a newer version or a corrupt body stays the error it is, so an
+older binary never re-materialises over a newer engine's table. The descriptor is kept
+**verbatim** in the manifest (not just the opaque hash) precisely so a reader can
+*replay* it — that is what the recompute path reads.
 
 #### verify_materialization — the read-only verb, four verdicts
 
@@ -1765,9 +1783,20 @@ is the consumer's policy. The verdict attests the Parquet **data**, never the AN
   *fully* asserted; it names the unpinned inputs (`unpinned_inputs`). **This is the
   honest verdict for the as-of training set itself** — its inputs are registered file
   sources.
-- **`MissingManifest`** — no sidecar (a pre-contract table). A truthful unknown, never a
-  fabricated match — distinct from a post-contract table that *should* carry one (a torn
-  write recovery reconciles).
+- **`MissingManifest`** — no sidecar (a pre-contract table, or a pre-`leaves` sidecar).
+  A truthful unknown, never a fabricated match — distinct from a post-contract table
+  that *should* carry one (a torn write recovery reconciles).
+
+#### verify_partitions — the per-partition verb
+
+`ResultStore::verify_partitions` (`crates/jammi-db/src/store/mod.rs`) recomputes every
+leaf of the inventory from the bytes and the footer and compares each to the recorded
+one by key, returning a `PartitionVerdict` (`crates/jammi-db/src/store/manifest.rs`):
+`Match`; `Mismatch { key, expected, found }` naming the FIRST row group whose bytes are
+not the attested ones; `InventoryDiffers { expected, found }` when the footer's row-group
+set is not the recorded one; `MissingManifest` as above. It attests the parts, never the
+whole — a footer-only mutation changes no leaf and is `verify_materialization`'s to
+report. Read-only, like its sibling: it never acts on a verdict.
 
 **Call graph — LIVE:** `Session::verify_materialization`
 (`crates/jammi-ai/src/local_session.rs`) → gRPC
@@ -2756,27 +2785,27 @@ read as passed-by-skipping.
 A tabular fine-tune's rows are a **producer output**, not a run's private scan (§3.5
 narrates the whole submit → claim → train → finalize path; this section is the
 data-plane primitive underneath the "Train" step). `materialize_training_set`
-(`crates/jammi-db/src/store/mod.rs:4054`) commits the projected columns once into an
+(`crates/jammi-db/src/store/mod.rs:4111`) commits the projected columns once into an
 immutable `TrainingSet` result table; every reader re-applies the SAME committed order,
 and a session reads it either eagerly (collected into memory) or through a per-rank,
 residency-bounded stream — which arm a run takes is a single predicate, stated below.
 
 **The committed order: one key list, two renderers, declared at both registration
-paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:345`) is the ONE
+paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:346`) is the ONE
 source — every projected column, ascending, NULLs first, in declared order — that both
-`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:372`, the SQL `ORDER BY` clause
+`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:373`, the SQL `ORDER BY` clause
 a reader re-applies) and `training_set_file_sort_order`
-(`crates/jammi-db/src/store/mod.rs:420`, the DataFusion `ListingOptions::with_file_sort_order`
+(`crates/jammi-db/src/store/mod.rs:421`, the DataFusion `ListingOptions::with_file_sort_order`
 form a provider DECLARES) render from — a reader that hand-wrote either form independently
 could silently disagree with the producer's own commitment. `bind_result_table`
-(`crates/jammi-db/src/store/mod.rs:2808`) passes the declared order to `register_table`
+(`crates/jammi-db/src/store/mod.rs:2865`) passes the declared order to `register_table`
 for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
 materialization (inside `BuildingTable::finish`) and crash recovery
 (`load_existing_tables`, on a session that never saw the write) — so a read-back query
 plans no `SortExec` regardless of which path bound the table:
 `a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort`
-(`crates/jammi-db/tests/it/materialization.rs:871`). `training_set_registration_sort_order`
-(`crates/jammi-db/src/store/mod.rs:2902`) is where that declaration is actually read back
+(`crates/jammi-db/tests/it/materialization.rs:872`). `training_set_registration_sort_order`
+(`crates/jammi-db/src/store/mod.rs:2959`) is where that declaration is actually read back
 off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
 no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
 object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
@@ -2785,9 +2814,9 @@ three arms now `warn!`, naming the table and the reason, before returning `Ok(No
 registration still succeeds (the reader's explicit `ORDER BY` clause still sorts the read
 correctly), only the `SortExec`-free plan is lost for that one row, and the silent fallback
 no longer stays silent: `registration_warns_when_a_training_sets_sidecar_is_absent`
-(`crates/jammi-db/tests/it/materialization.rs:970`) and
+(`crates/jammi-db/tests/it/materialization.rs:971`) and
 `registration_warns_when_a_training_sets_sidecar_is_unreadable`
-(`crates/jammi-db/tests/it/materialization.rs:1066`). Before the unreadable arm was added,
+(`crates/jammi-db/tests/it/materialization.rs:1067`). Before the unreadable arm was added,
 the read error propagated out of `training_set_registration_sort_order` via `?`, which made
 `bind_result_table` return `Err` WITHOUT ever calling `register_table` at all — the row
 never entered the session's schema, not merely lost its ordering hint.
@@ -2827,7 +2856,7 @@ edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps it to
 **The writer: one partition, no merge — and the deployment rule.** The training set's
 own write plans its full-tuple sort through `single_partition_context`
 (`crates/jammi-db/src/session.rs:1180`) inside `plan_training_set_rows`
-(`crates/jammi-db/src/store/mod.rs:4223`): a `target_partitions = 1` derivation of the
+(`crates/jammi-db/src/store/mod.rs:4280`): a `target_partitions = 1` derivation of the
 caller's session state, so the write is ONE external sort at ONE output partition, never a
 partitioned local-sort-plus-`SortPreservingMergeExec` merge — there is only ever one
 partition to recombine, so no merge operator (with its own real pool reservation on top of
@@ -2835,7 +2864,7 @@ every partition's already-buffered sorted run) is ever planned. The residency th
 O(one batch) plus DataFusion's own spill reservation for that single sort, never O(the
 whole table) — **the deployment rule**, stated where the write is planned: a single
 `[engine] batch_size` batch larger than `[engine] memory_limit`
-`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:3992`), because no batch-granular
+`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:4049`), because no batch-granular
 operator (a spilling external sort, a decoded chunk) can ever hold one. Sized correctly
 the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB pool needs
 `engine.batch_size = 32` (`32 × ~100,000 B ≈ 3.1 MB` per batch) rather than
@@ -2847,7 +2876,7 @@ session's `RuntimeEnv` carries a disk-backed `DiskManager` by default, so a sort
 in-progress runs exceed the pool spills rather than failing the write. This
 single-partition property is asserted at BOTH `target_partitions ∈ {1, 4}` by
 `the_writers_single_partition_derivation_plans_one_sort_and_no_merge`
-(`crates/jammi-db/tests/it/materialization.rs:1174`).
+(`crates/jammi-db/tests/it/materialization.rs:1175`).
 
 The property holds for the source universe a training-set WRITE actually registers: a
 `ListingTable` (a registered CSV/Parquet source, single-fragment — its file-group count
@@ -2859,18 +2888,18 @@ construction), and the mutable provider's own `MemTable::try_new`
 one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
 `single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
 `SortExec`s that still collapses to ONE output partition — the writer's own
-`partition_count` (`crates/jammi-db/src/store/mod.rs:4257`) guard cannot see that shape,
+`partition_count` (`crates/jammi-db/src/store/mod.rs:4314`) guard cannot see that shape,
 because a `MemTable`'s partition count is fixed at construction and never collapses just
 because `target_partitions` changed (unlike a `ListingTable`'s file groups). No production
 source registers one: `MemTable::try_new` has exactly one call site in the workspace, the
 mutable provider's own scan above — and it is single-partition. See `ts_session`
-(`crates/jammi-db/tests/it/materialization.rs:558`)'s own doc comment on why
+(`crates/jammi-db/tests/it/materialization.rs:559`)'s own doc comment on why
 `the_writers_single_partition_derivation_plans_one_sort_and_no_merge` is FILE-backed
 rather than `MemTable`-backed.
 
 **A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
 VERSIONED result table's provider is `build_masked_provider`
-(`crates/jammi-db/src/store/mod.rs:2969`): one `ListingTable` per manifest fragment,
+(`crates/jammi-db/src/store/mod.rs:3026`): one `ListingTable` per manifest fragment,
 combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs:104`)
 into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs:153`) when there is more
 than one fragment — a shape that follows the manifest's OWN fragment count, never
@@ -3776,22 +3805,22 @@ id space, this defends the context-predictor id space, and each surface owns its
 rather than trusting the id's shape alone.
 
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
-(`crates/jammi-db/src/store/artifact.rs:242`) raises two DISTINCT typed storage outcomes,
+(`crates/jammi-db/src/store/artifact.rs:331`) raises two DISTINCT typed storage outcomes,
 never folding them together. A manifest that is ABSENT entirely — nothing was ever
 published at that prefix, or a catalog pointer names the wrong one — reclassifies to
 `StorageError::NotPublished` (`reclassify_missing_manifest`,
-`crates/jammi-db/src/store/artifact.rs:540`; covered by
+`crates/jammi-db/src/store/artifact.rs:684`; covered by
 `missing_manifest_is_not_published_not_corruption`,
-`crates/jammi-db/src/store/artifact.rs:870`): no manifest is in hand, so there is nothing
+`crates/jammi-db/src/store/artifact.rs:887`): no manifest is in hand, so there is nothing
 to say is corrupt. A manifest that IS present but malformed, or that names a key which is
 missing or hash-mismatched on an otherwise-published bundle, is the genuine integrity
 failure, `StorageError::Layout` (`reclassify_missing_key`,
-`crates/jammi-db/src/store/artifact.rs:575`; `verify_sha256`,
-`crates/jammi-db/src/store/artifact.rs:576`). Any OTHER storage fault off `fetch_artifact`
+`crates/jammi-db/src/store/artifact.rs:715`; `verify_sha256`,
+`crates/jammi-db/src/store/artifact.rs:730`). Any OTHER storage fault off `fetch_artifact`
 — transport/IO, a disabled scheme, driver-init failure, or a permission-denied open on a
 present key (which stays `StorageError::Io`, never reclassified —
 `permission_fault_on_a_present_key_stays_a_transport_error`,
-`crates/jammi-db/src/store/artifact.rs:944`) — is left unchanged.
+`crates/jammi-db/src/store/artifact.rs:961`) — is left unchanged.
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.
@@ -4629,6 +4658,24 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
 → `dep-direction` (`check_dep_direction.py`) → `oss-only-build` (`--locked` hermeticity) → `ts-client`
 / `py-client` / `test-python` / `test-broker` (serialised `--test-threads=1`) / `test-pg` (serialised)
 → `test-live` (main-only, advisory).
+
+**The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for the `check`, `test`,
+`test-pg` and `guard` jobs above plus the Swarm-gates workflow and `docs.yml`'s build, read from
+the workflow files at run time (never a copied list) and run in one process: `static` (fmt, the
+four clippy surfaces, rustdoc `-D warnings`, the guide build — a missing `mdbook` FAILS unless
+`--skip-mdbook`) → `guards` (every `ci.yml` guard-matrix command, stdin closed, every `${{ }}`
+expression expanded from the checkout or a hard stop) → `swarm` (`swarm.yml`'s steps, each
+`run:` block executed WHOLE — the two human-amend-only guards are multi-line `if` blocks) →
+`tests` (the hermetic lane, the `test-hooks` lane, golden-parity, and the Postgres lane against
+`JAMMI_TEST_PG_URL` — a missing database FAILS the stage unless `--skip-pg` is passed, because a
+silently skipped lane is how a shared-database leak once reached CI) → `records`
+(`check_rigor_record.py`, `check_oracle_gate.py`). It refuses to run when HEAD is the base or the
+tree is dirty (every diff-scoped gate would be vacuously green), prints up front which `ci.yml`
+jobs it does NOT cover (CI runs those), and exits with the number of failed commands, each named
+with its log under `$CARGO_TARGET_DIR/merge-path`. The oracle gate's freshness is a diff of
+COMMITTED content between the recorded `head_sha` and HEAD outside `docs/rigor/**`, so the order
+that matters is the commit order: commit every code and doc change, run the phase-5 oracle, then
+commit only its record.
 
 **CI guard contracts:**
 - **`ci/scripts/check_dep_direction.py`** BFS-walks the normal-dependency closure of

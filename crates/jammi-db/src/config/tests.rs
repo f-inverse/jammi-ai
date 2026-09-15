@@ -3445,20 +3445,21 @@ fn from_config_peer_advertise_without_peer_bind_is_refused_naming_both_keys() {
 /// error.
 #[test]
 fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_root = format!("file://{}/explicit/jammi_db", dir.path().to_str().unwrap());
     let arms: &[Option<&str>] = &[
         None,
-        Some("file:///var/lib/jammi/jammi_db"),
-        Some("memory://x"),
+        Some(file_root.as_str()),
         Some("s3://bucket/prefix"),
         Some("gcs://bucket/prefix"),
         Some("gs://bucket/prefix"),
         Some("abfss://bucket/prefix"),
         Some("azure://bucket/prefix"),
-        Some("S3://BUCKET/PREFIX"),
+        Some("s3://BUCKET/prefix"),
         Some("s3://bucket/prefix/"),
     ];
     for result_root in arms {
-        let cfg = advertising_config(std::path::Path::new("/srv/jammi"), *result_root);
+        let cfg = advertising_config(dir.path(), *result_root);
         let resolved = cfg.resolved_result_root().unwrap();
         let reg =
             crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
@@ -3474,9 +3475,9 @@ fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
         );
     }
 
-    // The "/" ALONE arm: `artifact_dir` itself is the root filesystem path,
-    // `result_root` unset — still carried verbatim, with no special-casing.
-    let cfg = advertising_config(std::path::Path::new("/"), None);
+    // The unset arm on its own: `artifact_dir` alone — carried verbatim as
+    // `{artifact_dir}/jammi_db`, with no special-casing.
+    let cfg = advertising_config(dir.path(), None);
     let resolved = cfg.resolved_result_root().unwrap();
     let reg = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
         .unwrap();
@@ -3493,20 +3494,114 @@ fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
 /// `gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`
 /// is the join-time counterpart proving exactly that).
 #[test]
-fn from_config_never_aliases_gcs_and_gs_result_root_spellings() {
-    let cfg_gcs = advertising_config(std::path::Path::new("/unused"), Some("gcs://bucket/p"));
-    let cfg_gs = advertising_config(std::path::Path::new("/unused"), Some("gs://bucket/p"));
+fn from_config_never_aliases_gcs_and_gs_result_root_spellings_but_their_identities_are_one() {
+    let cfg_gcs = advertising_config(
+        std::path::Path::new("/unused-artifact-dir"),
+        Some("gcs://bucket/p"),
+    );
+    let cfg_gs = advertising_config(
+        std::path::Path::new("/unused-artifact-dir"),
+        Some("gs://bucket/p"),
+    );
     let reg_gcs =
         crate::catalog::instance::InstanceRegistration::from_config(&cfg_gcs, "i1", None, None)
             .unwrap();
     let reg_gs =
         crate::catalog::instance::InstanceRegistration::from_config(&cfg_gs, "i2", None, None)
             .unwrap();
+    let gcs = reg_gcs.member_root.unwrap();
+    let gs = reg_gs.member_root.unwrap();
     assert_ne!(
-        reg_gcs.member_root.unwrap().as_str(),
-        reg_gs.member_root.unwrap().as_str(),
-        "gcs:// and gs:// must remain two different roots on the membership path"
+        gcs.as_str(),
+        gs.as_str(),
+        "gcs:// and gs:// remain two different VERBATIM roots on the row"
     );
+    assert_eq!(
+        gcs.identity(),
+        gs.identity(),
+        "…and ONE identity — the alias table the store itself owns"
+    );
+}
+
+/// The identity every advertising arm writes is exactly
+/// `RootIdentity::of(resolved_result_root())` — derived once, from the
+/// verbatim string, by the same function the tests can call.
+#[test]
+fn from_config_root_identity_is_of_the_resolved_root_over_every_arm() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_root = format!("file://{}/jammi_db", dir.path().to_str().unwrap());
+    let arms: Vec<Option<String>> = vec![
+        None,
+        Some(file_root),
+        Some("s3://bucket/prefix".into()),
+        Some("gcs://bucket/prefix".into()),
+        Some("abfss://bucket/prefix".into()),
+        Some("s3://BUCKET/prefix".into()),
+        Some("s3://bucket/prefix/".into()),
+    ];
+    for result_root in &arms {
+        let cfg = advertising_config(dir.path(), result_root.as_deref());
+        let resolved = cfg.resolved_result_root().unwrap();
+        let reg =
+            crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+                .unwrap();
+        let root = reg
+            .member_root
+            .expect("an advertising config registers a root");
+        assert_eq!(
+            root.identity(),
+            &crate::catalog::instance::RootIdentity::of(
+                &resolved,
+                cfg.storage.cloud.as_ref(),
+                &crate::storage::BuilderSeeds::from_env()
+            )
+            .unwrap(),
+            "arm {result_root:?}"
+        );
+    }
+}
+
+/// A member whose result root is an in-memory store is refused at
+/// registration, naming the root and the way out: an in-memory store can
+/// never be shared with a gang peer. A LIBRARY config (no
+/// `peer_advertise`) with the same root is untouched — nothing on this path
+/// runs for it.
+#[test]
+fn from_config_refuses_a_memory_result_root_for_a_member_only() {
+    let cfg = advertising_config(
+        std::path::Path::new("/unused-artifact-dir"),
+        Some("memory://x"),
+    );
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("memory://x") && err.contains("peer_advertise"),
+        "{err}"
+    );
+    // An upper-case scheme is refused on this path exactly as the store's
+    // own URL parser refuses it when rooting (`StorageUrl::parse` knows
+    // lower-case schemes only): one parser, one answer.
+    let cfg = advertising_config(
+        std::path::Path::new("/unused-artifact-dir"),
+        Some("S3://BUCKET/PREFIX"),
+    );
+    let err = crate::catalog::instance::InstanceRegistration::from_config(&cfg, "i1", None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("S3://BUCKET/PREFIX"), "{err}");
+    assert!(crate::storage::StorageUrl::parse("S3://BUCKET/PREFIX").is_err());
+    let library = JammiConfig {
+        storage: StorageConfig {
+            result_root: Some("memory://x".into()),
+            ..StorageConfig::default()
+        },
+        ..JammiConfig::default()
+    };
+    let reg =
+        crate::catalog::instance::InstanceRegistration::from_config(&library, "i1", None, None)
+            .unwrap();
+    assert!(reg.member_root.is_none());
 }
 
 /// A library config (no `peer_advertise`) produces NULLs — `peer_addr` and

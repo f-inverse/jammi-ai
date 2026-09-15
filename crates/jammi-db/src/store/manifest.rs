@@ -7,7 +7,9 @@
 //! embedding tables, an ANN-index sidecar bundle). This module adds a *separate*
 //! `.materialization.json` sidecar — written for **every** result table, not
 //! only embedding tables — carrying an in-toto-shaped attestation that binds
-//! three things to the artifact's content digest:
+//! three things to the artifact's content digest (and, beside the digest, a
+//! keyed inventory of the artifact's parts — [`LeafDigest`] per row group or
+//! bundle file — so one partition can be verified without the rest):
 //!
 //! 1. a **definition hash** of *how* the table was produced — a canonical
 //!    encoding of the [`ProducingDescriptor`] (the verb plus its typed
@@ -1159,6 +1161,113 @@ pub enum AnchorKind {
 #[serde(transparent)]
 pub struct AnchorValue(pub String);
 
+/// What one leaf of a [`MaterializationManifest`]'s inventory names — a
+/// KEYED part of the artifact, never a position (adding a file to a bundle
+/// renumbers nothing; a row group's key carries its own byte range).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LeafKey {
+    /// A Parquet row group: its index in the footer and the byte range
+    /// `[offset, offset + length)` of the file its column chunks occupy
+    /// (from the footer's own column-chunk offsets — the dictionary page
+    /// first when there is one).
+    RowGroup {
+        index: u32,
+        offset: u64,
+        length: u64,
+    },
+    /// A file of a model bundle, by its name in the bundle manifest.
+    File { name: String },
+}
+
+/// One leaf of the inventory: a keyed part of the artifact and the SHA-256
+/// of exactly that part. A peer verifies one partition against its leaf
+/// without reading the rest; the whole-object [`ArtifactDigest`] stays the
+/// subject every verifier matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafDigest {
+    pub key: LeafKey,
+    pub digest: ArtifactDigest,
+}
+
+/// The leaf inventory of a Parquet object: one [`LeafKey::RowGroup`] leaf per
+/// row group, in footer order, each digest over that row group's byte range.
+/// Read from the footer the object itself carries, so a verifier with the
+/// bytes recomputes exactly this (that is what `verify_partitions` does).
+/// Bytes outside every row group — the magic, the footer, page indexes,
+/// bloom filters — belong to no leaf; they are covered by the whole-object
+/// digest, never by the inventory.
+///
+/// # Errors
+///
+/// [`ManifestError::ParquetFooter`] when the bytes carry no readable footer
+/// or a row group's range falls outside them.
+pub fn parquet_leaves(bytes: &[u8]) -> Result<Vec<LeafDigest>, ManifestError> {
+    use parquet::file::metadata::ParquetMetaDataReader;
+    let owned = bytes::Bytes::copy_from_slice(bytes);
+    let metadata = ParquetMetaDataReader::new()
+        .parse_and_finish(&owned)
+        .map_err(|e| ManifestError::ParquetFooter(e.to_string()))?;
+    let mut leaves = Vec::with_capacity(metadata.num_row_groups());
+    for (index, row_group) in metadata.row_groups().iter().enumerate() {
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for column in row_group.columns() {
+            let (offset, length) = column.byte_range();
+            start = start.min(offset);
+            end = end.max(offset + length);
+        }
+        if start == u64::MAX {
+            // A row group with no column chunks: an empty range at the end
+            // of the previous one.
+            start = end;
+        }
+        let range = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .filter(|(s, e)| s <= e && *e <= bytes.len())
+            .ok_or_else(|| {
+                ManifestError::ParquetFooter(format!(
+                    "row group {index} names bytes [{start}, {end}) outside the {}-byte object",
+                    bytes.len()
+                ))
+            })?;
+        leaves.push(LeafDigest {
+            key: LeafKey::RowGroup {
+                index: u32::try_from(index).map_err(|_| {
+                    ManifestError::ParquetFooter(format!("row group index {index} overflows u32"))
+                })?,
+                offset: start,
+                length: end - start,
+            },
+            digest: ArtifactDigest::of_bytes(&bytes[range.0..range.1]),
+        });
+    }
+    Ok(leaves)
+}
+
+/// The verdict of `verify_partitions`: every leaf of the inventory
+/// recomputed from the bytes and compared by key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum PartitionVerdict {
+    /// Every leaf recomputes to its recorded digest.
+    Match,
+    /// The table has no sidecar (pre-contract, or pre-`leaves`).
+    MissingManifest,
+    /// The first leaf whose recomputed digest differs — named by its key so
+    /// a consumer knows WHICH partition is not the attested one.
+    Mismatch {
+        key: LeafKey,
+        expected: String,
+        found: String,
+    },
+    /// The bytes' own inventory has a different shape from the recorded
+    /// one (a row group added or removed): no per-leaf comparison is
+    /// meaningful.
+    InventoryDiffers { expected: usize, found: usize },
+}
+
 /// The attestation written beside every materialised table. Shaped after an
 /// in-toto statement: a `subject` (the artifact digest) plus a predicate
 /// (everything about how it was produced), so a consumer verifies by digest
@@ -1167,6 +1276,15 @@ pub struct AnchorValue(pub String);
 pub struct MaterializationManifest {
     /// in-toto subject: digest of the Parquet artifact this manifest attests to.
     pub artifact: ArtifactDigest,
+    /// The keyed inventory of the artifact's parts ([`LeafDigest`]): one leaf
+    /// per Parquet row group for a result table ([`parquet_leaves`]), one
+    /// per file for a model bundle. ADDITIVE to `artifact` — a peer verifies
+    /// one partition against its leaf; the whole-object digest above stays
+    /// the subject, the root of the version-identity chain, and what every
+    /// verifier holding the bytes recomputes. REQUIRED: a sidecar without it
+    /// was written before this field existed and reads as absent (see
+    /// [`Self::from_json_bytes`]).
+    pub leaves: Vec<LeafDigest>,
     /// How it was produced (the "definition"): hash of descriptor + environment.
     pub definition_hash: DefinitionHash,
     /// The producing descriptor recorded **verbatim** — the typed verb + its
@@ -1205,12 +1323,14 @@ impl MaterializationManifest {
         env: &MaterializationEnv,
         inputs: Vec<InputAnchor>,
         artifact: ArtifactDigest,
+        leaves: Vec<LeafDigest>,
         produced_by: String,
         produced_at: String,
     ) -> Result<Self, ManifestError> {
         let definition_hash = Self::definition_of(descriptor, env)?;
         Ok(Self {
             artifact,
+            leaves,
             definition_hash,
             descriptor: descriptor.clone(),
             input_anchors: inputs,
@@ -1270,7 +1390,30 @@ impl MaterializationManifest {
     /// reader never silently trusts a stale hash or replays a stale descriptor;
     /// whichever guard fires, the typed error is the signal to re-emit.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ManifestError> {
-        let manifest: Self = serde_json::from_slice(bytes)?;
+        let manifest: Self = match serde_json::from_slice(bytes) {
+            Ok(m) => m,
+            Err(shape) => {
+                // The ONE shape rejection that is a known past format, not
+                // corruption: an object at the CURRENT version with no
+                // `leaves` — a sidecar written before the inventory existed.
+                // Named, so a reader can treat exactly that as "no sidecar"
+                // (re-materialise) while every other rejection — garbage, a
+                // missing determinant field, another version — stays the
+                // error it is.
+                if let Ok(serde_json::Value::Object(object)) =
+                    serde_json::from_slice::<serde_json::Value>(bytes)
+                {
+                    let at_current_version = object
+                        .get("manifest_version")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(MANIFEST_VERSION));
+                    if at_current_version && !object.contains_key("leaves") {
+                        return Err(ManifestError::PreLeavesSidecar);
+                    }
+                }
+                return Err(ManifestError::Serde(shape));
+            }
+        };
         if manifest.manifest_version != MANIFEST_VERSION {
             return Err(ManifestError::UnsupportedManifestVersion {
                 found: manifest.manifest_version,
@@ -1387,6 +1530,17 @@ pub enum ManifestError {
         /// The format version this build reads and writes.
         supported: u32,
     },
+    /// A sidecar at the current version with no `leaves` inventory — written
+    /// before the inventory existed. The reader treats it as absent
+    /// (re-materialise); it is never a hit and never a crash.
+    #[error(
+        "manifest sidecar predates the leaf inventory (no `leaves` field); re-emit the artifact"
+    )]
+    PreLeavesSidecar,
+    /// The object's Parquet footer could not be read, so no inventory can be
+    /// derived from (or verified against) its bytes.
+    #[error("parquet footer unreadable: {0}")]
+    ParquetFooter(String),
     /// JSON (de)serialisation of a descriptor / environment / manifest failed.
     #[error("manifest serialisation error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -1867,6 +2021,7 @@ mod tests {
             &cpu_env(),
             vec![InputAnchor::mutable_version("ref_ranges", 7)],
             ArtifactDigest::of_bytes(b"parquet-bytes"),
+            vec![],
             "run-123".into(),
             "2026-06-17T00:00:00Z".into(),
         )
@@ -1882,6 +2037,7 @@ mod tests {
             &cpu_env(),
             vec![],
             ArtifactDigest::of_bytes(b"x"),
+            vec![],
             "run".into(),
             "2026-06-17T00:00:00Z".into(),
         )
@@ -1909,6 +2065,7 @@ mod tests {
             &cpu_env(),
             vec![],
             ArtifactDigest::of_bytes(b"x"),
+            vec![],
             "run".into(),
             "2026-06-17T00:00:00Z".into(),
         )
@@ -2398,6 +2555,7 @@ mod tests {
                 InputAnchor::unpinned_at_instant("federated", "2026-06-17T00:00:00Z"),
             ],
             ArtifactDigest::of_bytes(b"x"),
+            vec![],
             "run".into(),
             "2026-06-17T00:00:00Z".into(),
         )
@@ -2706,5 +2864,156 @@ mod tests {
             ArtifactDigest::of_bytes(b"a"),
             ArtifactDigest::of_bytes(b"b")
         );
+    }
+
+    /// The leaf inventory (U5b-0): one leaf per row group in footer order,
+    /// each the digest of exactly that row group's bytes as the footer
+    /// itself locates them; a byte flipped inside row group k changes leaf
+    /// k and no other; the whole-object digest is untouched by the
+    /// inventory and still catches a footer-only mutation.
+    mod leaves {
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::ParquetMetaDataReader;
+        use parquet::file::properties::WriterProperties;
+
+        use super::super::{
+            parquet_leaves, ArtifactDigest, LeafKey, ManifestError, MaterializationManifest,
+            MANIFEST_VERSION,
+        };
+        use super::{cpu_env, embedding_descriptor};
+
+        fn three_row_group_parquet() -> Vec<u8> {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from((0..6).collect::<Vec<i64>>()))],
+            )
+            .unwrap();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2))
+                .build();
+            let mut out = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut out, schema, Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            out
+        }
+
+        #[test]
+        fn one_leaf_per_row_group_in_footer_order_each_the_footers_byte_range_digest() {
+            let bytes = three_row_group_parquet();
+            let footer = ParquetMetaDataReader::new()
+                .parse_and_finish(&bytes::Bytes::from(bytes.clone()))
+                .unwrap();
+            assert_eq!(
+                footer.num_row_groups(),
+                3,
+                "the fixture must span row groups"
+            );
+            let leaves = parquet_leaves(&bytes).unwrap();
+            assert_eq!(leaves.len(), footer.num_row_groups());
+            for (i, (leaf, rg)) in leaves.iter().zip(footer.row_groups()).enumerate() {
+                // The oracle reads the footer ITSELF, not the leaf.
+                let (start, end) = rg.columns().iter().fold((u64::MAX, 0), |(s, e), c| {
+                    let (o, l) = c.byte_range();
+                    (s.min(o), e.max(o + l))
+                });
+                let expected = ArtifactDigest::of_bytes(&bytes[start as usize..end as usize]);
+                assert_eq!(leaf.digest, expected, "leaf {i}");
+                assert_eq!(
+                    leaf.key,
+                    LeafKey::RowGroup {
+                        index: i as u32,
+                        offset: start,
+                        length: end - start
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn a_byte_flipped_inside_row_group_k_changes_leaf_k_only_and_a_footer_flip_changes_no_leaf()
+        {
+            let bytes = three_row_group_parquet();
+            let before = parquet_leaves(&bytes).unwrap();
+            let LeafKey::RowGroup { offset, length, .. } = before[1].key.clone() else {
+                panic!("row-group leaf");
+            };
+            let mut tampered = bytes.clone();
+            let at = (offset + length / 2) as usize;
+            tampered[at] ^= 0xff;
+            let after = parquet_leaves(&tampered).unwrap();
+            assert_ne!(after[1].digest, before[1].digest, "leaf 1 changed");
+            assert_eq!(after[0], before[0], "leaf 0 untouched");
+            assert_eq!(after[2], before[2], "leaf 2 untouched");
+            assert_ne!(
+                ArtifactDigest::of_bytes(&tampered),
+                ArtifactDigest::of_bytes(&bytes)
+            );
+            // A footer-only mutation (inside the metadata, outside every row
+            // group) changes no leaf — the whole-object digest is the
+            // subject that catches it.
+            let LeafKey::RowGroup {
+                offset: last_off,
+                length: last_len,
+                ..
+            } = before[2].key.clone()
+            else {
+                panic!("row-group leaf");
+            };
+            let footer_at = (last_off + last_len) as usize + 4;
+            let mut footered = bytes.clone();
+            footered[footer_at] ^= 0x01;
+            assert_ne!(
+                ArtifactDigest::of_bytes(&footered),
+                ArtifactDigest::of_bytes(&bytes)
+            );
+            if let Ok(leaves) = parquet_leaves(&footered) {
+                assert_eq!(leaves, before, "no leaf covers the footer");
+            }
+        }
+
+        #[test]
+        fn a_pre_leaves_sidecar_is_a_typed_pre_leaves_rejection_and_nothing_else_is() {
+            let manifest = MaterializationManifest::compute(
+                &embedding_descriptor(),
+                &cpu_env(),
+                vec![],
+                ArtifactDigest::of_bytes(b"x"),
+                vec![],
+                "run".into(),
+                "2026-06-17T00:00:00Z".into(),
+            )
+            .unwrap();
+            let mut value = serde_json::to_value(&manifest).unwrap();
+            value.as_object_mut().unwrap().remove("leaves");
+            let pre = serde_json::to_vec(&value).unwrap();
+            assert!(matches!(
+                MaterializationManifest::from_json_bytes(&pre),
+                Err(ManifestError::PreLeavesSidecar)
+            ));
+            // A NEWER version without leaves is never a pre-leaves miss (an
+            // older binary must not re-materialise over it).
+            let mut newer = serde_json::to_value(&manifest).unwrap();
+            let object = newer.as_object_mut().unwrap();
+            object.remove("leaves");
+            object.insert(
+                "manifest_version".into(),
+                serde_json::json!(MANIFEST_VERSION + 1),
+            );
+            assert!(!matches!(
+                MaterializationManifest::from_json_bytes(&serde_json::to_vec(&newer).unwrap()),
+                Err(ManifestError::PreLeavesSidecar)
+            ));
+            // Garbage stays a serde error.
+            assert!(matches!(
+                MaterializationManifest::from_json_bytes(b"not json"),
+                Err(ManifestError::Serde(_))
+            ));
+        }
     }
 }

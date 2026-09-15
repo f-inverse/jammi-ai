@@ -55,7 +55,9 @@ use crate::storage::{
     sha256_hex, JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl,
 };
 use crate::store::layout::TenantSegment;
-use crate::store::manifest::{ArtifactDigest, Materialization, MaterializationManifest};
+use crate::store::manifest::{
+    ArtifactDigest, LeafDigest, LeafKey, Materialization, MaterializationManifest,
+};
 use crate::store::{manifest_to_jammi, run_id};
 use crate::tenant::TenantId;
 
@@ -256,12 +258,27 @@ impl ArtifactStore {
         let handle = self.handle(prefix)?;
         let manifest = self.read_manifest(&handle, prefix).await?;
         let digest = ArtifactDigest(manifest.combined_hash());
+        // One leaf per file, keyed by NAME (the bundle manifest's own
+        // sha256 per file): adding a file changes no existing leaf, and the
+        // subject stays `combined_hash` — the content address
+        // `fetch_artifact`'s cache already keys on.
+        let leaves = manifest
+            .files
+            .iter()
+            .map(|entry| LeafDigest {
+                key: LeafKey::File {
+                    name: entry.name.clone(),
+                },
+                digest: ArtifactDigest(entry.sha256.clone()),
+            })
+            .collect();
 
         let attestation = MaterializationManifest::compute(
             materialization.descriptor,
             materialization.env,
             materialization.inputs,
             digest,
+            leaves,
             run_id().to_string(),
             chrono::Utc::now().to_rfc3339(),
         )
@@ -1320,6 +1337,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(written.artifact.as_str(), manifest.combined_hash());
+        // One leaf per bundle file, by NAME, carrying the manifest's own
+        // sha256 — the inventory is additive to the subject.
+        let mut names: Vec<(String, String)> = written
+            .leaves
+            .iter()
+            .map(|l| match &l.key {
+                LeafKey::File { name } => (name.clone(), l.digest.0.clone()),
+                other => panic!("a bundle leaf is keyed by file name, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        let mut expected: Vec<(String, String)> = manifest
+            .files
+            .iter()
+            .map(|e| (e.name.clone(), e.sha256.clone()))
+            .collect();
+        expected.sort();
+        assert_eq!(names, expected);
+        // Keyed by name, not position: a bundle with ONE MORE file carries
+        // the same leaf for every file it shares with this one.
+        let mut more = files.clone();
+        more.push(("extra.bin".to_string(), Bytes::from_static(b"extra bytes")));
+        let prefix_more = store
+            .put_artifact(None, &["job-m1", "worker-a", "1"], &more)
+            .await
+            .unwrap();
+        let written_more = store
+            .write_model_materialization(
+                &prefix_more,
+                Materialization::new(&descriptor, &env, anchors.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written_more.leaves.len(), written.leaves.len() + 1);
+        for leaf in &written.leaves {
+            assert!(
+                written_more.leaves.contains(leaf),
+                "adding a file must change no existing leaf: {leaf:?}"
+            );
+        }
+        assert_ne!(written_more.artifact, written.artifact);
 
         let read_back = store
             .read_model_materialization(&prefix)

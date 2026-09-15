@@ -287,6 +287,7 @@ pub async fn write_manifest_sidecar_for(
             "1970-01-01T00:00:00Z",
         )],
         ArtifactDigest::of_bytes(&bytes),
+        jammi_db::store::manifest::parquet_leaves(&bytes).unwrap(),
         "test-run".into(),
         "1970-01-01T00:00:00Z".into(),
     )

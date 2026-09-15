@@ -98,6 +98,7 @@ use candle_nn::VarMap;
 
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::resume::load_bundle;
+use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::TrainingLoopBuilder;
 use jammi_ai::fine_tune::{EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, LrSchedule};
@@ -1859,8 +1860,32 @@ fn run_impl(
     // Both loaders go through [`RowSet::loader`], the ONE place a modality +
     // objective becomes a `TrainingDataLoader`, so the train split and the
     // held-out fixture can never be built in different shapes.
-    let train_loader = train_rows.loader(params.objective)?;
-
+    //
+    // `train_loader` itself is rebuilt fresh inside the epoch loop below
+    // (never hoisted as one value reused by reference): `TrainingLoop::run`
+    // now takes an owned `TrainingSource` (#500 U2c §10), and
+    // `TrainingDataLoader` carries no `Clone` (`data.rs`'s own doc —
+    // `with_reservation`'s pool-accounted bytes must have exactly one
+    // owner). Rebuilding from `train_rows` — the SAME borrowed fixture rows
+    // this loader was always built from, never mutated by a `run()` leg —
+    // reproduces byte-identical content and order every epoch, which is
+    // exactly what the old `run(&train_loader)` call obtained by borrowing
+    // one hoisted loader `params.epochs` times. This tier's `train_loader`
+    // is `TrainingDataLoader::from_triplets`/`from_pairs`/
+    // `from_media_triplets` over in-memory fixture rows — it never goes
+    // through `read_back_with_reservation`/`materialize_projection_table`
+    // (there is no `InferenceSession`/materialised table anywhere in this
+    // tier's construction, see the module doc: it drives
+    // `TrainingLoopBuilder` directly off a committed corpus file), so it
+    // carries no `MemoryReservation` and is correctly passed as a
+    // `TrainingSource::Resident` with `with_reservation` never called — the
+    // SAME "reservation-free by construction" state `from_triplets` et al.
+    // document for every non-worker caller. This tier's numbers (wall time,
+    // dispatch counters, loss/held-out trajectories) are therefore measured
+    // OUTSIDE the loader-residency pool this unit adds: they report training
+    // math identically to the eager path DataFusion pool accounting never
+    // touches, not the pool's own bound (P2/P3), which is exercised by
+    // `jammi-ai`'s own `tests/it/training_set_stream.rs` oracles instead.
     let heldout_ids: Vec<String> = heldout_rows.ids();
     let heldout_loader = heldout_rows.loader(params.objective)?;
 
@@ -2075,7 +2100,8 @@ fn run_impl(
         }
 
         let train_run_t0 = Instant::now();
-        let result = training_loop.run(&train_loader)?;
+        let train_loader = train_rows.loader(params.objective)?;
+        let result = training_loop.run(TrainingSource::Resident(train_loader))?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
         // The DIRECT media front-end wall (contract P1-b(v)), summed across
         // resume legs exactly as `train_run_wall_s` above is —

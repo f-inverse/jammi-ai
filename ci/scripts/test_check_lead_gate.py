@@ -68,11 +68,17 @@ class SelfTestActuallyExecutes(unittest.TestCase):
     runs and passes in this checkout."""
 
     def test_self_test_subprocess_exits_zero(self):
+        # esc-lead-gate-R12 fix round 2 item 9: measured 64.8-72.7s over 3
+        # unloaded samples in the closing audit at 5b9fa369, confirmed at
+        # 70.55s in this session's own run — the R12 fixture set (121
+        # fixtures total, most spinning up a real git repo + subprocess per
+        # fixture) pushed the self-test past the old 60s bound. 150s is a
+        # measured >=2x margin over the higher end (72.7s), not a guess.
         proc = subprocess.run(
             [sys.executable, str(REPO_ROOT / "ci" / "scripts" / "check_lead_gate.py"), "--self-test"],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=150,
         )
         self.assertEqual(
             proc.returncode, 0,

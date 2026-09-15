@@ -150,8 +150,11 @@ impl std::fmt::Display for MemberRoot {
 /// ABOUT to become, never what it already is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFacts {
-    /// The comma-joined (or otherwise producer-encoded) kind set this
-    /// worker claims.
+    /// The `,`-joined kind set this worker claims — the ONLY encoding: no
+    /// "otherwise producer-encoded" alternative exists.
+    /// `Catalog::list_gang_members` splits this column on `,` and trims
+    /// each token (`jobs_repo.rs` §"gang-membership listing verb", where
+    /// the row's `kinds` is matched against `listing.kind`).
     pub kinds: String,
     /// The claim loop's lifecycle state at this instant.
     pub state: WorkerState,

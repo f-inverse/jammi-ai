@@ -3213,9 +3213,11 @@ fn server_peer_advertise_parses_and_defaults_unset() {
     assert_eq!(cfg.server.peer_advertise.as_deref(), Some("10.0.4.8:9001"));
 }
 
-/// A config with `peer_bind` unset and `peer_advertise` set to a directory
-/// under `artifact_dir` (the shared-topology default). `result_root` passes
-/// through `resolved_result_root()` UNCHANGED — this helper performs no
+/// A config with BOTH `peer_bind` and `peer_advertise` set to valid
+/// `host:port` addresses (so `MembershipConfig::validate` accepts it) and
+/// `storage.result_root` set to whatever the caller passes (`None` or an
+/// explicit root string). `result_root` passes through
+/// `resolved_result_root()` UNCHANGED — this helper performs no
 /// interpretation of it either.
 fn advertising_config(artifact_dir: &std::path::Path, result_root: Option<&str>) -> JammiConfig {
     JammiConfig {

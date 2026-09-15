@@ -17,6 +17,7 @@ use jammi_db::catalog::lease::instance_prune_window;
 use jammi_db::catalog::lease_keeper::LeaseTarget;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::LeaseConfig;
+use jammi_db::error::JammiError;
 use jammi_db::tenant::TenantId;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
@@ -68,6 +69,34 @@ async fn force_delete_instance(catalog: &Catalog, instance_id: &str) {
                 tx.execute(
                     "DELETE FROM instances WHERE instance_id = $1",
                     &[SqlValue::TextOwned(instance_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// Corrupt an already-seeded row's `peer_addr` column out-of-band (a direct
+/// `UPDATE`, never through [`PeerAddr::parse`]) — the state a hand-edited
+/// row, or a future writer that skips the sealed constructor, leaves
+/// behind. Both read verbs must surface this as the typed
+/// [`jammi_db::error::JammiError::Catalog`] their doc comments promise
+/// (`jobs_repo.rs` at [`Catalog::peer_addr_of`] and
+/// [`Catalog::list_gang_members`]'s `# Errors` sections), never a panic and
+/// never a silently-dropped row.
+async fn force_corrupt_peer_addr(catalog: &Catalog, instance_id: &str) {
+    let instance_id = instance_id.to_string();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE instances SET peer_addr = $1 WHERE instance_id = $2",
+                    &[
+                        SqlValue::Text("not an addr"),
+                        SqlValue::TextOwned(instance_id),
+                    ],
                 )
                 .await
             })
@@ -807,6 +836,87 @@ async fn peer_addr_of_is_none_for_an_absent_instance(kind: BackendKind) {
         .await
         .unwrap();
     assert!(resolved.is_none());
+}
+
+/// A row whose `peer_addr` column was corrupted out-of-band (never through
+/// [`PeerAddr::parse`]) surfaces the typed [`JammiError::Catalog`] naming
+/// the instance — never a panic, never a silently `None` result.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: BackendKind) {
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = base_catalog_kind(kind)
+        .await
+        .expect("already skipped above when unconfigured");
+    let id = format!("corrupt-addr-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &id,
+        "10.0.0.9:9000",
+        ROOT,
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    force_corrupt_peer_addr(&catalog, &id).await;
+    let err = catalog
+        .peer_addr_of(&id, LEASE)
+        .await
+        .expect_err("a corrupted peer_addr must be a typed error, never a silent None");
+    match err {
+        JammiError::Catalog(msg) => {
+            assert!(
+                msg.contains(&id),
+                "the error must name the corrupted instance: {msg}"
+            );
+        }
+        other => panic!("expected JammiError::Catalog, got {other:?}"),
+    }
+}
+
+/// The `list_gang_members` sibling of the case above: a matching, fresh,
+/// claiming candidate whose `peer_addr` is corrupted out-of-band surfaces
+/// the same typed error, never a silently-dropped candidate.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kind: BackendKind) {
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = base_catalog_kind(kind)
+        .await
+        .expect("already skipped above when unconfigured");
+    let id = format!("corrupt-list-{}", jammi_test_utils::unique_suffix());
+    seed_member(
+        &catalog,
+        &id,
+        "10.0.0.10:9000",
+        ROOT,
+        "fine_tune",
+        WorkerState::Claiming,
+    )
+    .await;
+    force_corrupt_peer_addr(&catalog, &id).await;
+    let root = MemberRoot::new(ROOT);
+    let err = catalog
+        .list_gang_members(listing("fine_tune", "someone-else", &root))
+        .await
+        .expect_err("a corrupted peer_addr candidate must be a typed error, never dropped");
+    match err {
+        JammiError::Catalog(msg) => {
+            assert!(
+                msg.contains(&id),
+                "the error must name the corrupted instance: {msg}"
+            );
+        }
+        other => panic!("expected JammiError::Catalog, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

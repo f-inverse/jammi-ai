@@ -2381,12 +2381,14 @@ impl Catalog {
     }
 
     /// Upsert this process's `workers` row — present only while the process
-    /// runs the claim loop. `kinds` is the comma-joined (or otherwise
-    /// producer-encoded) kind set this worker claims; `state` is the loop's
-    /// lifecycle state at this instant (the loop task writes `warming` as
-    /// its FIRST statement and flips to `claiming` through
-    /// [`Self::set_worker_state`] once its gate opens). A re-upsert on an
-    /// existing row resets both.
+    /// runs the claim loop. `kinds` is the `,`-joined kind set this worker
+    /// claims — the ONLY encoding this column carries, since
+    /// [`Self::list_gang_members`] splits it on `,` and trims each token
+    /// (above, where each row's `kinds` is matched against
+    /// `listing.kind`); `state` is the loop's lifecycle state at this
+    /// instant (the loop task writes `warming` as its FIRST statement and
+    /// flips to `claiming` through [`Self::set_worker_state`] once its gate
+    /// opens). A re-upsert on an existing row resets both.
     pub async fn upsert_worker(
         &self,
         instance_id: &str,

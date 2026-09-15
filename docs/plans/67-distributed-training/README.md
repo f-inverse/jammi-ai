@@ -76,9 +76,9 @@ those still in force are restated here in their v4 form. Principle in parenthese
     not a plannable unit, so **U5b-1a** lands the
     substrate it sketches: `[server] peer_advertise` (the ONE choke point,
     `InstanceRegistration::from_config`: `peer_advertise ⇒ peer_bind`, named-key error
-    otherwise; `storage.result_root` UNSET is ACCEPTED and canonicalizes
-    `{artifact_dir}/jammi_db` — never a refusal, only a missing/non-directory anchor
-    refuses), the canonicalized `instances.peer_addr`/`result_root` columns (migration,
+    otherwise; `storage.result_root` UNSET is ACCEPTED, `{artifact_dir}/jammi_db` —
+    never a refusal on this path at all, contract §10), the `instances.peer_addr`/
+    `result_root` columns carrying the VERBATIM `resolved_result_root()` string (migration,
     numbered at rebase), the `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_instance` signature and the session write site
     (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`, its `upsert_instance` call site). DIST's `RendezvousPlacement` builds on it later. Peers are resolved
     from the catalog: `workers.kinds` ∋ kind, `instances.peer_addr` set, `last_seen_at` within
@@ -301,6 +301,7 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
 | C | 3 | U5b-1a | Membership substrate: `peer_advertise`, `instances.peer_addr`/`result_root`, `list_gang_members` | hermetic + distributed | U5a-1, PR-B1 |
+| — | — | U5b-1a-A2 | Result-root identity across spellings (scheme aliasing, symlinks, case/slash folding) — filed by U5b-1a's round-3 stop rule; spec = rounds 1–3 of `docs/rigor/feat_500-C-U5b-1a.jsonl` + contract §9/§10; NOT a wave-3 precondition | unscheduled | U5b-1a |
 | C | 4 | U5b-0 | Partitioned attestation inventory (per-row-group leaf digests, `MaterializationManifest`) | hermetic | none (base: PR-B2) |
 | C | 5 | U5b-1b-i | The `Peer` collective + round protocol | hermetic + distributed | U5a-1, U5b-0 |
 | C | 6 | U5b-1b-ii | Coordinator: membership → assignment → dispatch → assembly | hermetic + server it-suite | U5b-1a, U5b-1b-i, U4b, U5a-1, U5a-2 |

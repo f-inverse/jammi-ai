@@ -211,10 +211,12 @@ Stated semantics: a peer outage is visible (an `UNAVAILABLE` naming the segment)
   `crates/jammi-db/src/catalog/instance.rs`), superseding this sketch's own validation
   rule: `ServerConfig.peer_advertise: Option<String>` (the address peers reach this
   replica at) requires `peer_bind` to be set too (a typed error naming both keys
-  otherwise) — but `storage.result_root` UNSET is ACCEPTED, canonicalizing
-  `{artifact_dir}/jammi_db`; only a MISSING or non-directory anchor (the explicit
-  `result_root`, or `artifact_dir` when it is unset) is refused, naming the offending
-  key (K2). `canonical_result_root()` (`config/mod.rs`) is `canon ∘ resolved_result_root()`.
+  otherwise); `storage.result_root` UNSET is ACCEPTED, `{artifact_dir}/jammi_db`. The
+  member row's `result_root` carries `JammiConfig::resolved_result_root()` VERBATIM
+  (contract §10, the round-3 excision) — no filesystem access, no scheme handling, no
+  symlink resolution on the membership path at all; a spelling-identity follow-on
+  (scheme aliasing, symlinks, case/slash folding) is filed as unit U5b-1a-A2
+  (`docs/plans/67-distributed-training/README.md`), not a precondition here.
 - Migration `035_instances_peer_addr_result_root` (shipped as U5b-1a, four K5 pin sites):
   `ALTER TABLE instances ADD COLUMN peer_addr TEXT; ALTER TABLE instances ADD COLUMN
   result_root TEXT;` — both columns, nullable, no paired `CHECK`. `instances.host` stays

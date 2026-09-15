@@ -3231,8 +3231,8 @@ choke point every writer of them funnels through.
   omission there would leave the reopened table missing both columns, RED).
 - **`InstanceRegistration`** (`catalog/instance.rs`): the ONE value every
   writer of the `instances` (+ `workers`) row builds — `instance_id`,
-  `label`, `host`, `peer_addr: Option<PeerAddr>`, `canonical_root:
-  Option<CanonicalRoot>`, plus a `worker: Mutex<Option<WorkerFacts>>` cell
+  `label`, `host`, `peer_addr: Option<PeerAddr>`, `member_root:
+  Option<MemberRoot>`, plus a `worker: Mutex<Option<WorkerFacts>>` cell
   that is the claim-loop half, owned exclusively by `JobWorker`/
   `EmbeddedWorker` (`fine_tune/worker.rs`): `run_until` sets it before its
   first `upsert_worker`, every `set_worker_state` writes the cell before the
@@ -3242,103 +3242,62 @@ choke point every writer of them funnels through.
   `Display` only) and is the SAME type the peer listener uses
   (`index::peer` re-exports it) — the peer and gang listeners can never
   drift into two address types.
-- **PURE validate / MATERIALIZE split: `MembershipConfig::validate` and
-  `InstanceRegistration::from_config`** (`catalog/instance.rs`). Before this
-  split, `JammiConfig::load_from` called the SAME `from_config` the session
-  did, and `from_config`'s anchor check REQUIRED the anchor to already
-  exist — so on a genuinely fresh host `load_from` refused
-  (`{artifact_dir}` does not exist yet at config-load time) while
-  `InferenceSession::new` silently ACCEPTED the identical config, because
-  `JammiSession::new`'s own catalog open had already `create_dir_all`'d
-  `artifact_dir` as a side effect BEFORE `from_config` ever ran — two
-  enforcement points, two different verdicts on one config. The fix:
-  `MembershipConfig::validate(&JammiConfig) -> Result<Option<MembershipConfig>>`
-  is PURE — NO filesystem access at all: `peer_advertise` parses as a
-  `PeerAddr`; `peer_bind` is set too (else a typed error naming both keys).
-  **`artifact_dir` is a LOCAL PATH, never a URL (contract §9, the round-2
-  redesign).** When `[storage] result_root` is UNSET, the anchor is
-  `artifact_dir`'s LITERAL `PathBuf` — the SAME value every other consumer
-  (the catalog's own directory creation, `resolved_result_root`, the local
-  cache dir, `JobWorker`) uses — checked directly with `Path::is_absolute()`
-  and `Path::to_str()`, NEVER reinterpreted as a URL: a `file://`- or
-  cloud-scheme-spelled `artifact_dir` (or the `.jammi` fallback
-  `default_artifact_dir` returns when `ProjectDirs` is unavailable) is
-  refused as RELATIVE (as a bare path string it never starts with `/`),
-  naming `artifact_dir` — the earlier round's fix parsed `artifact_dir`
-  itself as a `StorageUrl`, which let a `file:///…`-spelled path pass the
-  absoluteness check as a URL while remaining relative as the literal
-  `PathBuf` every OTHER consumer uses, and let a cloud-spelled
-  `artifact_dir` silently take the no-leaf `Cloud` arm — a false-positive
-  member naming a root the store never actually roots at; round 2 closes
-  both. **Only an explicit `result_root` is ever parsed as a URL** — and
-  VERBATIM: no scheme lowercasing (an uppercase scheme is refused by
-  `StorageUrl::parse` itself, case-sensitively, consistently with the
-  store's own parse of the identical string). `memory://` is refused.
-  `JammiConfig::load_from` calls ONLY `MembershipConfig::validate` —
-  loading a config file must never itself create a directory as a side
-  effect. `InstanceRegistration::from_config` = validate PLUS MATERIALIZE:
-  for a `file://` anchor (either arm), `create_dir_all`s it if absent
-  (idempotent with `JammiSession`'s own catalog-open `create_dir_all` of
-  `artifact_dir`, and with `ResultStore`'s later one of the same
-  `result_root` path — refusing naming the key if it exists as a
-  non-directory or cannot be created), `fs::canonicalize`s it, and appends
-  the leaf rule (`artifact_dir` gets `jammi_db` appended lexically after
-  canonicalizing; an explicit `result_root` already names the whole
-  effective root, no suffix). `create_dir_all` is not atomic: a failure
-  partway through can leave some parent directories created on disk even
-  though `materialize` returns `Err` — stated honestly in its own doc,
-  never papered over.
-  `InferenceSession::wrap_with` (`session.rs`) calls `from_config` FIRST —
-  before the lease keeper starts, before the result store creates a
-  directory, before any other session-level side effect — but it is NOT
-  true that a refusal here leaves nothing behind: `wrap_with` receives an
-  ALREADY-CONSTRUCTED `JammiSession` (its catalog connection pool is open,
-  and `artifact_dir` already exists, both created by the caller before
-  `wrap_with` is ever invoked), and a `from_config` refusal returns an `Err`
-  without closing that connection — the caller must still `drop`/retry past
-  it (`jammi-ai`'s `instance_identity.rs` reopens the SAME catalog directory
-  in a bounded retry loop after a deliberately-failed construction,
-  specifically because the failed session's pool is not synchronously
-  released). `ServerConfig::validate` is NOT the home for any of this: it
-  cannot see `artifact_dir`, which the anchor needs.
-- **`JammiConfig::canonical_result_root()` / `resolved_result_root()`**
-  (`config/mod.rs`): `resolved_result_root()` is the plain, uncanonicalized
-  effective root (`storage.result_root` when set, else
+- **`MembershipConfig::validate` and `InstanceRegistration::from_config`**
+  (`catalog/instance.rs`, contract §10, the round-3 excision — the
+  design history through rounds 1–3, incl. the pure-validate/materialize
+  split and the `artifact_dir`-is-a-local-path fix, is filed as unit
+  U5b-1a-A2, `docs/plans/67-distributed-training/README.md`). The member
+  row's root is the byte-for-byte output of
+  `JammiConfig::resolved_result_root()`, carried VERBATIM: `MembershipConfig::
+  validate(&JammiConfig) -> Result<Option<MembershipConfig>>` checks only
+  that `peer_advertise` parses as a `PeerAddr` and that `peer_bind` is set
+  too (else a typed error naming both keys) — it performs NO filesystem
+  access and inspects `result_root`/`artifact_dir` not at all.
+  `InstanceRegistration::from_config` runs `MembershipConfig::validate`,
+  then, when membership applies, sets `member_root` to
+  `MemberRoot::new(config.resolved_result_root()?)` — the SAME string
+  `build_result_store` (`jammi-ai/src/session.rs`) hands to
+  `ResultStore::with_root`. **The membership path performs NO
+  interpretation of the root at all**: no URL parse, no scheme handling, no
+  symlink resolution, no case folding — two spellings of one physical
+  location (`gcs://b/p` vs `gs://b/p`, a trailing `/`, a case difference)
+  are two DIFFERENT roots. The only refusal on this path is the non-UTF-8
+  refusal already inside `resolved_result_root` (a non-UTF-8 `artifact_dir`,
+  the default arm's only failure mode). `JammiConfig::load_from` calls
+  `MembershipConfig::validate` directly (the early-failure check);
+  `InferenceSession::wrap_with` (`session.rs`) calls `from_config` once per
+  session, before the lease keeper starts and before the result store does
+  anything — the universal funnel every `InferenceSession` constructor
+  reaches, so a hand-built config (never routed through `load_from`) is
+  still covered. `ServerConfig::validate` is NOT the home for any of this:
+  it cannot see `artifact_dir`, which `resolved_result_root` needs.
+- **`JammiConfig::resolved_result_root()`** (`config/mod.rs`): the ONE
+  effective-root derivation (`storage.result_root` when set, else
   `{artifact_dir}/jammi_db` — the SAME derivation `ResultStore::new`'s
   local-root arm performs), fallible: it refuses naming `artifact_dir` when
   the joined path is not valid UTF-8, rather than silently lossy-folding it.
-  `canonical_result_root()` is `materialize ∘ validate` (a convenience
-  one-shot wrapping `MembershipConfig::validate` + `MembershipConfig::
-  materialize`) — `Ok(None)` when `peer_advertise` is unset; otherwise the
-  file:// anchor (`result_root` itself when set, else `artifact_dir`'s
-  LITERAL `PathBuf`, never a URL reparse) is CREATED if absent (never
-  required to pre-exist — see the validate/materialize split above),
-  `fs::canonicalize`d once, and — ONLY when `result_root` is unset — the
-  default leaf `jammi_db` is appended lexically (never itself resolved); an
-  explicit `result_root` IS the whole effective root, no suffix. Cloud
-  schemes (`result_root` only): parsed VERBATIM through `StorageUrl::parse`,
-  NO scheme lowercasing (an uppercase scheme is refused, case-sensitively,
-  consistently with the store's own parse of the identical string);
-  `memory://` is refused for a gang member; a trailing `/` is trimmed.
+  This is the ONLY function on the membership path that can fail, and the
+  ONLY source of the member row's root string.
 - **The two read verbs** (`catalog/jobs_repo.rs`, both tenant-unscoped by
   construction — `instances` carries no tenant column): `peer_addr_of(id,
   lease)` is the ONE by-id resolution surface (no kind/root/self filter —
   any member may resolve any other by id, including a busy or other-kind
   one); `Some` iff the row is present, fresh under
   `instance_liveness_margin(lease)`, and `peer_addr` is non-NULL.
-  `list_gang_members(GangListing { kind, self_instance, canonical_root,
+  `list_gang_members(GangListing { kind, self_instance, member_root,
   lease })` is an `instances JOIN workers` listing: excludes the caller
   itself, excludes `workers.state != 'claiming'` (an INNER join — no
   `workers` row is excluded too, since a member is a fleet worker with a
   claim-loop slot, not merely a live process), excludes a `kinds` token
   that does not match `kind` as a WHOLE comma-split trimmed token (`,`
   is `upsert_worker`'s own encoding), excludes a `result_root` that differs
-  from the caller's `canonical_root` by even one byte (a Rust comparison,
-  never SQL `=`), excludes stale/NULL-`peer_addr`/NULL-`result_root` rows;
-  the survivors are sorted by `instance_id` BYTE ORDER in Rust (never a SQL
-  `ORDER BY` — backend collation is untrusted). A corrupted stored
-  `peer_addr` that fails `PeerAddr::parse` is a typed `Catalog` error from
-  either verb, never silently mapped to "not a member".
+  from the caller's `member_root` by even one byte (a Rust comparison,
+  never SQL `=`, never re-interpreted), excludes stale/NULL-`peer_addr`/
+  NULL-`result_root` rows; the survivors are sorted by `instance_id` BYTE
+  ORDER in Rust (never a SQL `ORDER BY` — backend collation is untrusted). A
+  corrupted stored `peer_addr` that fails `PeerAddr::parse` is a typed
+  `Catalog` error from either verb, never silently mapped to "not a
+  member".
 - **The lease keeper's reregister** (`catalog/lease_keeper.rs`,
   `LeaseTarget::Instance(Arc<InstanceRegistration>)`): a normal heartbeat is
   `Catalog::touch_instance` (pure UPDATE, never resurrects a pruned row); a

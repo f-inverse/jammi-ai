@@ -197,25 +197,21 @@ preload_models = [
 # Unset (the default) = this process never advertises a gang-membership row:
 # its `instances.peer_addr`/`result_root` columns stay NULL regardless of
 # whether `peer_bind` is set. Setting it means: this process ADVERTISES
-# itself as a gang member. Requires `peer_bind` to be set too, and the
-# effective root's file:// anchor (`artifact_dir` is a local ABSOLUTE
-# path -- a URL belongs in `[storage] result_root`, never in
-# `artifact_dir`, which is NEVER parsed as one; or the explicit
-# `result_root` itself, when set) must be absolute -- both refused, naming
-# the offending key(s), at `MembershipConfig::validate` -- the PURE check
-# (no filesystem access at all) `JammiConfig::load_from` runs at config
-# load time. `InstanceRegistration::from_config`, called once by every
-# session construction path, runs that SAME check and then MATERIALIZES
-# the anchor (creating it if absent, exactly like the catalog's own
-# directory creation at open) before canonicalizing it -- a missing anchor
-# is never refused, only a non-directory one.
-# The canonical result root rule: when `[storage] result_root` is UNSET, the
-# root is `{artifact_dir}/jammi_db`, canonicalized; when it IS set, it is
-# parsed VERBATIM (no scheme lowercasing -- an uppercase scheme is refused,
-# consistently, by both this check and the store itself) and the root is
-# the canonicalized `result_root` itself, with no `jammi_db` suffix
-# appended; a `memory://` root is refused for a gang member. See "The gang
-# listener (I-GANG)" in security.md for the membership predicate this feeds.
+# itself as a gang member. Requires `peer_bind` to be set too -- refused,
+# naming both keys, by `InstanceRegistration::from_config`, called once by
+# every session construction path (and, for this early-failure check alone,
+# by `JammiConfig::load_from` at config load time too).
+# The membership root rule: `instances.result_root` carries the VERBATIM,
+# byte-for-byte output of `resolved_result_root()` -- the exact same string
+# the result store is rooted at ({artifact_dir}/jammi_db when [storage]
+# result_root is unset, else result_root itself). No filesystem access, no
+# URL parsing, no scheme handling, no symlink resolution happens on this
+# path: TWO DIFFERENT SPELLINGS of one physical location (a trailing slash,
+# a case difference, `gcs://` vs `gs://`) are TWO DIFFERENT roots to the
+# membership predicate that compares this column byte-for-byte -- a
+# deployment must spell `result_root`/`artifact_dir` IDENTICALLY on every
+# replica. See "The gang listener (I-GANG)" in security.md for the
+# membership predicate this feeds.
 # peer_advertise = "10.0.4.7:9000"
 # MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
 # estimated bytes ONE query may load locally for segments it does not own,

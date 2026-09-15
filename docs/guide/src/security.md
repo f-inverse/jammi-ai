@@ -155,14 +155,17 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   requested kind as a whole, comma-split, trimmed token (never a substring —
   `fine_tune` never matches `graph_fine_tune`); `instances.peer_addr` and
   `instances.result_root` are both non-NULL; `result_root` equals the
-  caller's own canonicalized root byte-for-byte (never a SQL `=`); and
-  `last_seen_at` is fresh under `instance_liveness_margin(lease)` (`2 ×
-  lease`) on the DB clock. `peer_addr_of` is the by-id analogue, with no
-  kind/root/self filter (any other member may resolve any other by id).
-  **Canonical-root equality is NECESSARY, never SUFFICIENT, for shared
-  storage**: two byte-identical roots on two filesystems are indistinguishable
-  to this predicate — sufficiency is the attestation VERIFY's, a later unit's
-  concern, not this listing's.
+  caller's own root byte-for-byte (never a SQL `=`, never re-interpreted —
+  `result_root` carries `resolved_result_root()` VERBATIM, so two different
+  spellings of one physical location, e.g. `gcs://b/p` vs `gs://b/p`, are
+  two different roots to this predicate); and `last_seen_at` is fresh under
+  `instance_liveness_margin(lease)` (`2 × lease`) on the DB clock.
+  `peer_addr_of` is the by-id analogue, with no kind/root/self filter (any
+  other member may resolve any other by id). **Root-string equality is
+  NECESSARY, never SUFFICIENT, for shared storage**: two byte-identical
+  roots on two filesystems are indistinguishable to this predicate —
+  sufficiency is the attestation VERIFY's, a later unit's concern, not this
+  listing's.
 - **B5 (this listing is deliberately tenant-free).** `instances`/`workers`
   rows are deployment infrastructure (which processes exist, what they claim,
   where they are reachable), never tenant data — there is no tenant column on

@@ -76,6 +76,46 @@ impl PartitionSpec {
         }
     }
 
+    /// A VALIDATED arbitrary-rank constructor (#500 U2c §9 advisory): `world
+    /// >= 1`, `rank < world`, `batch >= 1`, refused by name otherwise. Gated
+    /// `#[cfg(any(test, feature = "test-hooks"))]` — reachable from
+    /// `tests/it` only through this crate's own `test-hooks` dev-dependency
+    /// (`Cargo.toml`), never from a release build — so [`Self::single_rank`]
+    /// stays the ONLY production route to a [`PartitionSpec`] (the struct's
+    /// own doc's compile-time property, unchanged by this constructor's
+    /// existence). Used by the per-rank stream's `P5` oracle (`world = 2`),
+    /// which needs a real, out-of-this-module `PartitionSpec` value rather
+    /// than `for_test`'s `pub(crate)`-only visibility.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn for_rank(
+        rank: usize,
+        world: usize,
+        batch: usize,
+        rule: PartitionRule,
+    ) -> jammi_db::error::Result<Self> {
+        if world == 0 {
+            return Err(jammi_db::error::JammiError::FineTune(format!(
+                "PartitionSpec::for_rank: world must be >= 1, got {world}"
+            )));
+        }
+        if rank >= world {
+            return Err(jammi_db::error::JammiError::FineTune(format!(
+                "PartitionSpec::for_rank: rank {rank} must be < world {world}"
+            )));
+        }
+        if batch == 0 {
+            return Err(jammi_db::error::JammiError::FineTune(
+                "PartitionSpec::for_rank: batch must be >= 1, got 0".into(),
+            ));
+        }
+        Ok(Self {
+            rank,
+            world,
+            batch,
+            rule,
+        })
+    }
+
     /// The row range THIS rank holds for global step `step`, over a train
     /// prefix of `train_count` rows.
     ///

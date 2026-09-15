@@ -413,3 +413,177 @@ pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartCont
     )
     .await;
 }
+
+/// The 70,000-row multi-row-group `(anchor, positive)` fixture — lifted, as
+/// ONE builder, out of the inline body
+/// `training_set::read_back_re_applies_the_committed_order_across_row_groups`
+/// used to carry (#500 U2c §2 fold): 70,000 rows so the writer's 65,536-row
+/// group boundary is crossed (more than one row group), scrambled by a
+/// permutation with no fixed point in the sort order, and every `anchor`
+/// value appears twice so `positive` is the tie-breaker (a key-column-only
+/// sort would not be total).
+///
+/// `session` must already exist (each `#[tokio::test]` owns its own
+/// session/tempdir — a session is bound to its runtime, so ONE shared
+/// fixture *session* across tests is not meaningful; "one fixture per
+/// binary" is met as ONE fixture DEFINITION, called by every U2c oracle).
+/// Registers the CSV source under `"pairs"` and materialises the
+/// `(anchor, positive)` projection.
+///
+/// `split`, when `true`, issues `SET datafusion.optimizer.repartition_file_min_size
+/// = 1` before materialising — DataFusion only splits ONE file across
+/// partitions above the default 10 MiB threshold, and a 70k-row ZSTD table is
+/// far under that, so without this knob a multi-partition read gets a single
+/// file group and any ordering oracle built on it is vacuous (never
+/// exercising a genuinely interleaved scan).
+pub struct MultiRowGroupFixture {
+    /// The materialised training-set table.
+    pub table: jammi_db::store::TrainingSetTable,
+    /// The projected columns, in order — what [`Self::table`] was
+    /// materialised with.
+    pub columns: Vec<String>,
+    /// Every `(anchor, positive)` row, in WRITE order (before the producer's
+    /// own commit sort) — sort this with [`std::vec::Vec::sort`] to get the
+    /// canonical (`full_tuple_v1`) committed order, since the fixture carries
+    /// no NULLs (a plain tuple sort is the whole key).
+    pub written: Vec<(String, String)>,
+    /// The number of Parquet row groups the committed file actually has,
+    /// measured off the footer — MEASURED, never assumed, so a future writer
+    /// change that alters the row-group boundary fails this fixture's own
+    /// callers loudly rather than silently making their oracle vacuous.
+    pub row_groups: usize,
+}
+
+impl MultiRowGroupFixture {
+    /// The rows in their canonical (`full_tuple_v1`) committed order: every
+    /// projected column, ascending, NULLs first — a plain tuple sort, since
+    /// this fixture carries no NULLs.
+    pub fn canonical_order(&self) -> Vec<(String, String)> {
+        let mut sorted = self.written.clone();
+        sorted.sort();
+        sorted
+    }
+}
+
+/// Build [`MultiRowGroupFixture`] over `session` — see the struct's own doc.
+pub async fn multi_row_group_pairs(
+    session: &Arc<InferenceSession>,
+    dir: &std::path::Path,
+    split: bool,
+) -> MultiRowGroupFixture {
+    use jammi_ai::model::ModelTask;
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+    const ROWS: usize = 70_000;
+    let mut lines = String::from("anchor,positive\n");
+    let mut written = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        let n = (i * 37) % ROWS;
+        let anchor = format!("a{:05}", n / 2);
+        let positive = format!("p{n:05}");
+        lines.push_str(&format!("{anchor},{positive}\n"));
+        written.push((anchor, positive));
+    }
+    let csv = dir.join("pairs.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    session
+        .add_source(
+            "pairs",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    if split {
+        session
+            .sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+            .await
+            .unwrap();
+    }
+
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+    let (table, _batches) = jammi_ai::fine_tune::training_set::materialize_projection(
+        session,
+        "pairs",
+        &columns,
+        ModelTask::TextEmbedding,
+        "pairs",
+    )
+    .await
+    .unwrap();
+
+    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
+    let handle = session.result_store().open_parquet(&url).unwrap();
+    let bytes = handle
+        .get_bytes(&handle.data_path().unwrap())
+        .await
+        .unwrap();
+    let builder =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let row_groups = builder.metadata().num_row_groups();
+
+    MultiRowGroupFixture {
+        table,
+        columns,
+        written,
+        row_groups,
+    }
+}
+
+/// A `(text, target)` regression fixture whose row PAYLOAD is padded to
+/// roughly `pad_bytes` per row — built for the P3 residency oracle
+/// (`training_set_stream.rs`), which needs a table whose EAGER collected
+/// size genuinely exceeds `[engine] memory_limit`'s 64 MiB floor (the
+/// smallest pool the normal config-validated session-build path can ever
+/// produce — `EngineConfig::MEMORY_LIMIT_FLOOR_BYTES`) while a handful of
+/// per-step STREAMED chunks stay tiny. `rows` is deliberately small (the
+/// padding, not the row count, is what drives total size) so the fixture
+/// writes/reads in low single-digit seconds.
+pub async fn padded_regression_fixture(
+    session: &Arc<InferenceSession>,
+    dir: &std::path::Path,
+    rows: usize,
+    pad_bytes: usize,
+) -> (jammi_db::store::TrainingSetTable, Vec<String>) {
+    use jammi_ai::model::ModelTask;
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+    let pad: String = "x".repeat(pad_bytes);
+    let mut lines = String::from("text,target\n");
+    for i in 0..rows {
+        lines.push_str(&format!("row{i:06}{pad},{}\n", i as f32));
+    }
+    let csv = dir.join("padded.csv");
+    std::fs::write(&csv, lines).unwrap();
+
+    session
+        .add_source(
+            "padded",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", csv.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let columns = vec!["text".to_string(), "target".to_string()];
+    let (table, _batches) = jammi_ai::fine_tune::training_set::materialize_projection(
+        session,
+        "padded",
+        &columns,
+        ModelTask::Regression,
+        "regression",
+    )
+    .await
+    .unwrap();
+    (table, columns)
+}

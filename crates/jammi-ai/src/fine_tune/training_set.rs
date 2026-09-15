@@ -159,6 +159,20 @@ pub async fn materialize_projection(
 /// binds the table there on both the computed and the reused path, so the
 /// read-back resolves without a second registration and a reused table is read
 /// exactly like a fresh one.
+///
+/// **The eager reservation route (#500 U2c, §9 B6).** The collected batches'
+/// `RecordBatch::get_array_memory_size()` sum is reserved against a
+/// `MemoryConsumer("training_set_eager")` on `session.memory_pool()` right
+/// after collection — the SAME pool a per-rank [`super::stream::
+/// TrainingSetStream`] reserves against — so an eager read that collected
+/// more bytes than `[engine] memory_limit` allows surfaces the typed
+/// [`jammi_db::error::JammiError::ResourcesExhausted`] naming
+/// `training_set_eager`, never a silent over-budget hold. The reservation is
+/// checked and then released here (this crate does not thread a residency
+/// guard through every `Vec<RecordBatch>` return site this function has), so
+/// this is a load-time check on what was just collected, not a continuously
+/// held accounting of how long the caller keeps the batches afterward —
+/// stated, not hidden.
 async fn materialize_and_read(
     session: &InferenceSession,
     spec: TrainingSetSpec<'_>,
@@ -169,7 +183,28 @@ async fn materialize_and_read(
         .materialize_training_set(session.context(), spec)
         .await?;
     let batches = session.sql(&read_back_sql(&table, &columns)).await?;
+    reserve_eager_batches(session, &batches)?;
     Ok((table, batches))
+}
+
+/// The eager reservation check (see [`materialize_and_read`]'s doc): reserve
+/// and immediately release `batches`' total `get_array_memory_size()` against
+/// `session.memory_pool()` under a dedicated `MemoryConsumer`, surfacing a
+/// typed [`jammi_db::error::JammiError::ResourcesExhausted`] naming
+/// `training_set_eager` when the pool refuses it.
+fn reserve_eager_batches(
+    session: &InferenceSession,
+    batches: &[RecordBatch],
+) -> jammi_db::error::Result<()> {
+    let total_bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+    let pool = session.memory_pool();
+    let reservation = datafusion::execution::memory_pool::MemoryConsumer::new("training_set_eager")
+        .register(&pool);
+    reservation
+        .try_grow(total_bytes)
+        .map_err(jammi_db::error::JammiError::from)?;
+    reservation.free();
+    Ok(())
 }
 
 /// The reader-class allow-list: every call site in the workspace, outside test

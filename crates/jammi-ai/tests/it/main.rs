@@ -57,5 +57,6 @@ mod storage_root;
 mod telemetry_otlp;
 mod tower_adapters;
 mod training_set;
+mod training_set_stream;
 mod uat_workflows;
 mod utf8view_columns;

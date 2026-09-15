@@ -1371,7 +1371,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
            // (see `session_registration_literal_sites`'s allowlist entry for
            // this same file) rather than through `pinned_provider` — an
            // unpinned, version-branched content read, re-exported publicly at
-           // `read_vectors`, `jammi-ai/src/session.rs:1056` and
+           // `read_vectors`, `jammi-ai/src/session.rs:1082` and
            // `read_vectors`, `jammi-ai/src/local_session.rs:365`.
            // `READ_VECTORS_CALLERS` above is the machine-checked claim: its
            // only two in-tree callers are those two forwarding wrappers, each
@@ -2640,7 +2640,7 @@ fn allowlists_match_current_hits_exactly() {
 //     catalog and returned"), the identical silent-overwrite shape
 //     `register_catalog`/`register_udf` already have above;
 //     `deregister_schema` is its inverse. `ResultStore`'s own
-//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1095` calls
+//     `install_result_schema`, `crates/jammi-db/src/store/mod.rs:1183` calls
 //     exactly this verb — which is why this literal set had to widen past
 //     `SessionContext`'s own surface rather than staying a pure enumeration
 //     of it.

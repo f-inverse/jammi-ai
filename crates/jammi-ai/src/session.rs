@@ -557,6 +557,32 @@ impl InferenceSession {
         self.inner.sql(query).await
     }
 
+    /// [`Self::sql`]'s streamed twin: plan `query` and return the
+    /// `SendableRecordBatchStream` rather than collecting it. Forwarded to
+    /// [`jammi_db::session::JammiSession::sql_stream`] — see that method's
+    /// doc for the tenant-scoping and residency-release guarantees a caller
+    /// (the per-rank training-set stream, `fine_tune::stream`) relies on.
+    pub async fn sql_stream(
+        &self,
+        query: &str,
+    ) -> Result<datafusion::execution::SendableRecordBatchStream> {
+        self.inner.sql_stream(query).await
+    }
+
+    /// This session's `[engine] memory_limit`-bounded memory pool. Forwarded
+    /// to [`jammi_db::session::JammiSession::memory_pool`] — the route a
+    /// caller registers its own [`datafusion::execution::memory_pool::
+    /// MemoryConsumer`] through (a training-set stream's per-rank
+    /// reservation, an eager read's collected-batch reservation) so it is
+    /// bounded by the SAME knob a plan exhausting DataFusion's own operators
+    /// would surface [`jammi_db::error::JammiError::ResourcesExhausted`]
+    /// against.
+    pub fn memory_pool(
+        &self,
+    ) -> std::sync::Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
+        self.inner.memory_pool()
+    }
+
     /// Every ANN index segment of `table_name`, ordered by `segment_id`.
     /// Forwarded to
     /// [`jammi_db::session::JammiSession::list_index_segments`], which owns the

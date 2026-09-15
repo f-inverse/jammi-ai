@@ -237,7 +237,7 @@ impl TrainingFormat {
 
 /// A chunk of text data for one training batch. The training loop encodes
 /// these through the base model before computing loss.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TextChunk {
     Contrastive {
         texts_a: Vec<String>,

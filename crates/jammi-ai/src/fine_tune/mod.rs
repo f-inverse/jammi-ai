@@ -19,6 +19,8 @@ pub mod collective;
 #[cfg(feature = "local")]
 pub mod data;
 #[cfg(feature = "local")]
+pub mod decode;
+#[cfg(feature = "local")]
 pub mod gradcache;
 #[cfg(feature = "local")]
 pub mod graph_sampler;
@@ -35,7 +37,11 @@ pub(crate) mod regression_loss;
 #[cfg(feature = "local")]
 pub mod resume;
 #[cfg(feature = "local")]
+pub mod source;
+#[cfg(feature = "local")]
 pub mod spec;
+#[cfg(feature = "local")]
+pub mod stream;
 #[cfg(feature = "local")]
 pub mod target;
 #[cfg(feature = "local")]

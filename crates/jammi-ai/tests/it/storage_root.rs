@@ -19,6 +19,60 @@ use tempfile::TempDir;
 
 use crate::common;
 
+/// `InferenceSession`'s result store is rooted at EXACTLY
+/// `JammiConfig::resolved_result_root()`'s own value — the SAME string a
+/// gang member's `instances.result_root` row carries verbatim (contract
+/// §10) — never a second, independently re-derived path, for both arms
+/// (`storage.result_root` unset and set). Proven by creating a table and
+/// checking its `parquet_url` starts with the resolved root.
+async fn assert_store_rooted_at_resolved_root(config: jammi_db::config::JammiConfig) {
+    let expected = StorageUrl::parse(&config.resolved_result_root().unwrap()).unwrap();
+    let session = InferenceSession::new(config).await.unwrap();
+    let store = session.result_store();
+    let info = store
+        .create_table(
+            "root_parity_probe",
+            ModelTask::Classification,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
+            "model",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        info.parquet_url().as_str().starts_with(expected.as_str()),
+        "store root {} does not match resolved_result_root() {}",
+        info.parquet_url(),
+        expected
+    );
+}
+
+/// `storage.result_root` UNSET: the store roots at `{artifact_dir}/jammi_db`,
+/// exactly what `resolved_result_root()` names.
+#[tokio::test]
+async fn store_root_matches_resolved_result_root_when_unset() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    assert_store_rooted_at_resolved_root(config).await;
+}
+
+/// `storage.result_root` SET (to a `memory://` root): the store roots
+/// exactly there, again matching `resolved_result_root()`.
+#[tokio::test]
+async fn store_root_matches_resolved_result_root_when_set() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.storage = StorageConfig {
+        result_root: Some("memory:///jammi_root_parity".into()),
+        cloud: None,
+    };
+    assert_store_rooted_at_resolved_root(config).await;
+}
+
 /// With `storage.result_root` set to a `memory://` URL, the session's result
 /// store creates tables under that root and round-trips a batch back — proving
 /// the configured cloud root threads from `JammiConfig` into the `ResultStore`
@@ -83,6 +137,159 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
     assert!(
         !has_parquet,
         "result-table parquet leaked to local disk under {local_db:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P-X1 (contract `feat_500-C-U5b-1a` §10, the round-3 excision): the
+// `instances.result_root` column carries `resolved_result_root()` VERBATIM —
+// the SAME string the result store is rooted at — through a REAL session.
+// No filesystem access, no interpretation, no scheme aliasing.
+// ---------------------------------------------------------------------------
+
+/// With `[server] peer_advertise`/`peer_bind` set, `config` produces a
+/// member row whose `result_root` equals `resolved_result_root()`, which in
+/// turn equals the prefix every table this session creates is rooted at.
+async fn assert_member_row_matches_resolved_root(
+    mut config: jammi_db::config::JammiConfig,
+    port: u16,
+) {
+    config.server.peer_bind = Some(format!("0.0.0.0:{port}"));
+    config.server.peer_advertise = Some(format!("127.0.0.1:{port}"));
+
+    let expected = config.resolved_result_root().unwrap();
+    // The store parses `resolved_result_root()` as a `StorageUrl` (a bare
+    // local path becomes a `file://` URL — `build_result_store`'s own
+    // parse); the `instances.result_root` column, checked below, carries
+    // the PRE-parse string verbatim.
+    let expected_store_root = StorageUrl::parse(&expected).unwrap();
+    let session = InferenceSession::new(config).await.unwrap();
+    let store = session.result_store();
+    let info = store
+        .create_table(
+            "member_row_root_probe",
+            ModelTask::Classification,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
+            "model",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        info.parquet_url()
+            .as_str()
+            .starts_with(expected_store_root.as_str()),
+        "store root {} does not match resolved_result_root() {}",
+        info.parquet_url(),
+        expected_store_root
+    );
+
+    let instance_id = session.instance_id().to_string();
+    let row: Option<String> = session
+        .catalog()
+        .backend_arc()
+        .transaction(
+            jammi_db::catalog::backend::TxOptions::default(),
+            move |tx| {
+                let instance_id = instance_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT result_root FROM instances WHERE instance_id = $1",
+                        &[jammi_db::catalog::backend::SqlValue::TextOwned(instance_id)],
+                        |row| row.try_get::<String>("result_root"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .flatten();
+    assert_eq!(
+        row.as_deref(),
+        Some(expected.as_str()),
+        "instances.result_root must carry resolved_result_root() verbatim"
+    );
+}
+
+/// `result_root` UNSET: the member row carries `{artifact_dir}/jammi_db`.
+#[tokio::test]
+async fn member_row_matches_resolved_root_when_unset() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    assert_member_row_matches_resolved_root(config, 19301).await;
+}
+
+/// `result_root` an explicit `file://` root.
+#[tokio::test]
+async fn member_row_matches_resolved_root_for_file_scheme() {
+    let dir = TempDir::new().unwrap();
+    let root_dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.storage = StorageConfig {
+        result_root: Some(format!("file://{}", root_dir.path().to_string_lossy())),
+        cloud: None,
+    };
+    assert_member_row_matches_resolved_root(config, 19302).await;
+}
+
+/// `result_root` a `memory://` root.
+#[tokio::test]
+async fn member_row_matches_resolved_root_for_memory_scheme() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.storage = StorageConfig {
+        result_root: Some("memory:///jammi_member_row_probe".into()),
+        cloud: None,
+    };
+    assert_member_row_matches_resolved_root(config, 19303).await;
+}
+
+/// `result_root` a `gcs://` ALIAS scheme — proving the alias is never
+/// folded (to `gs://` or anything else) on the membership path either.
+#[tokio::test]
+async fn member_row_matches_resolved_root_for_a_cloud_alias_scheme() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.storage = StorageConfig {
+        result_root: Some("gcs://bucket/jammi_member_row_probe".into()),
+        cloud: None,
+    };
+    let expected = config.resolved_result_root().unwrap();
+    assert_eq!(expected, "gcs://bucket/jammi_member_row_probe");
+
+    config.server.peer_bind = Some("0.0.0.0:19304".to_string());
+    config.server.peer_advertise = Some("127.0.0.1:19304".to_string());
+    let session = InferenceSession::new(config).await.unwrap();
+    let instance_id = session.instance_id().to_string();
+    let row: Option<String> = session
+        .catalog()
+        .backend_arc()
+        .transaction(
+            jammi_db::catalog::backend::TxOptions::default(),
+            move |tx| {
+                let instance_id = instance_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT result_root FROM instances WHERE instance_id = $1",
+                        &[jammi_db::catalog::backend::SqlValue::TextOwned(instance_id)],
+                        |row| row.try_get::<String>("result_root"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .flatten();
+    assert_eq!(
+        row.as_deref(),
+        Some("gcs://bucket/jammi_member_row_probe"),
+        "the gcs:// spelling must never fold to gs:// (or anything else) on the member row"
     );
 }
 

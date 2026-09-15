@@ -308,48 +308,91 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   stream this unit's rank body binds to), U3, U4a, S1. **size**: XL (the
   plan's mathematical core; five hermetic oracles).
 
-## U7b — cluster leg + cluster reap (PR-C commit 1)
+## U7b — cluster-leg primitives, reap, two-host test body, and schedule visibility (PR-C commit 1)
 
-The cluster leg is a SEPARATE driver from the pod-tier smoke — never `runpod_gpu_gang.sh`, which
-stays the pod-tier driver end to end. The cluster leg's own driver script (built on
-`runpod_lib.sh`'s `rp_cluster_*` primitives) launches, ships the NCCL id, and assembles the one
-committed artifact for a **2×1 shape**: 2 hosts, 1 GPU each (never `gpuCount: 4`) — a genuine
-two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process bootstrap.
+The pod-tier smoke's driver (`runpod_gpu_gang.sh`) stays the pod-tier driver end to end; a
+separate two-host CLUSTER leg proves the same NCCL properties over a genuine two-HOST bootstrap
+(`ens1`, never a second copy of the pod-tier's single-process two-device smoke) for a **2×1
+shape**: 2 hosts, 1 GPU each (never `gpuCount: 4`). This unit ships the REST v2 cluster
+primitives, the fail-closed cluster reap, the two-host test body, the artifact registry's leg
+discrimination, and schedule visibility (P8). The cluster leg's own DRIVER (launch, id-ship,
+report-pull, artifact assembly) and its workflow have no automated invocation on this tree today
+— that is **U7b-A2b** (below), a separate unit; until it ships, a maintainer drives the two-host
+test by hand with this unit's primitives (`docs/maintainer/dev-gpu.md`'s cluster-leg section has
+the exact steps).
 
-- **files_in_scope** (docs-ci): `ci/scripts/runpod_lib.sh` (cluster create/get/pods/delete/list
-  primitives with the same self-terminating entrypoint deadline a pod already carries), the
-  cluster leg's OWN driver script (never `runpod_gpu_gang.sh`) — launch, id-ship, report-ship,
-  single-writer assembly (both members only ever REPORT; the driver alone assembles and writes
-  the one artifact) — `ci/scripts/execution_surface_reachability_allowlist.txt` (the cluster-leg
-  tuples; U7a's rows re-verified if their command lines change), `.github/workflows/gpu-reap.yml`
-  (clusters enumerated and reaped; the reaper's second enumeration is fail-closed on a failed
-  GET, mirroring the pod arm), `gpu-gang.yml` (never carries a `schedule:` trigger for the
-  cluster leg without the allow-listed exception below).
-- **invariants_to_preserve**: U7b's OWN obligation — extend `ci/scripts/check_gpu_prove_once.py`
-  with a new P7 arm, landing with U7b-A1's own PR beside the script's existing P1–P6, so a
-  `schedule:` trigger on ANY paid-lane workflow is refused unless that workflow is on a reviewed
-  cron allow-list with its never-vacuous arm named — a rule this unit BUILDS, never one it finds
-  already enforced; B2.
-- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring;
-  `check_execution_surface_reachability.py` green with the cluster-leg tuples allowlisted.
-- **acceptance (id-secrecy)**: the NCCL id's out-of-band crossing is backstopped by a scan over
-  its full carrier set — the pulled artifact directory, the run log, the committed `gang.reason`
-  field, and the driver's own staging copy of the id file created for the ship step — asserting
-  none of them ever carries the id's 128 bytes (base64 or raw), the staging copy deleted after
-  the pull scan runs; an unexaminable carrier (unreadable log, missing staging path) is a
-  refusal, never a silent pass (RED at base: the cluster leg and its driver do not exist yet, so
-  this scan has nothing to run against).
-- **acceptance (schedule visibility)**: the new P7 arm this unit adds to
+The unit's own A1/A2/A3 decomposition: **A1-pull** is the pod-tier smoke's CI scaffolding, merged
+in PR-B1 (U7a); **A2** is this unit's own scope (primitives, reap, test body, registry, P8),
+split from **A2b** (the driver and its workflow, below); **A3** is a FUTURE, separately
+authorized re-add of `gpu-gang.yml`'s 6-hourly cron, not part of this unit — P8 (below) is what
+makes that re-add a reviewed, human-visible act instead of a silent default.
+
+- **files_in_scope** (docs-ci unless noted): `ci/scripts/runpod_lib.sh` (REST v2 cluster
+  create/get/pods/delete/list primitives sharing the pod payload's entrypoint text via
+  `_rp_entrypoint_setup`; its own `RP_CLUSTER_PREFIX` ("jammi-cluster") is a name space separate
+  from `RP_POD_PREFIX`, so the pod and cluster sweeps' prefix matches can never collide; the pod
+  sweep is FAIL-CLOSED on its cluster-member exclusion set — an enumeration failure there skips
+  the ENTIRE pod sweep, never proceeds with an incomplete exclusion set; a `podTerminate` result
+  is now checked, and a live member is reported "cluster member, skipped" rather than acted on),
+  `ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives suite), `.github/workflows/
+  gpu-reap.yml` (clusters enumerated and reaped; the reaper's post-delete re-enumeration is
+  fail-closed on a failed GET, mirroring the pod arm), `crates/jammi-ai/tests/gpu_capability/
+  gang_nccl.rs` (ai-core: `gang_nccl_two_hosts_reduce_a_known_vector` — rank 0 mints the NCCL id
+  to a file, rank 1 joins from it, both reduce a known vector and report; no automated caller on
+  this tree today), `ci/scripts/check_cuda_run_artifacts.py` (rule (k)'s cluster-leg field
+  registry and shape/rank checks stay; a `gang.leg == "cluster"` artifact is REFUSED — no
+  producer is registered for that leg until U7b-A2b ships a driver), `ci/scripts/
+  check_gpu_prove_once.py` (P8, below) — no workflow this unit touches carries a `schedule:`
+  trigger without the allow-listed exception P8 names.
+- **invariants_to_preserve**: this unit's OWN obligation — U7a/PR-B1 already landed P7 (every
+  paid pod lane held to P1's three sub-rules, over a renting closure derived from
+  `runpod_lib.sh`, with `rp_cluster_create` as a SECOND renting root — it has no CALLER on this
+  tree, so it contributes no derived DRIVER for P7 to hold to a table row or to
+  `_check_derived_driver_cannot_rent`; the root is registered so the FIRST real caller is judged
+  the moment U7b-A2b's driver ships. Three tracked files word-match its literal name today and are
+  each cleared through that same predicate, none exempted for being ours: the library's own
+  mocks-only test suite, which genuinely calls it, `test_check_gpu_prove_once.py` (whose fixtures
+  spell the literal), and `check_gpu_prove_once.py` itself, which
+  self-matches its own `RENTING_ROOTS` definition — see that file's own disclosure); this unit
+  extends `ci/scripts/
+  check_gpu_prove_once.py` with a NEW arm, **P8** (schedule visibility): a `schedule:` trigger on
+  ANY paid-lane workflow — pod or cluster — is refused unless that workflow is a reviewed key of
+  `PAID_LANE_CRON_ALLOWLIST` naming its own never-vacuous arm — a rule this unit BUILDS, never one
+  it finds already enforced; B2.
+- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring.
+- **acceptance (id-secrecy)**: SCHEDULED under U7b-A2b, not shipped by this unit — the id-secrecy
+  scan over the driver's full carrier set (the pulled artifact directory, the run log, the
+  assembled `gang` artifact, the staging copy) for every encoding the ship step could emit (raw
+  bytes, hex lower, hex upper, base64), an unexaminable carrier its own refusal — has nothing to
+  scan until U7b-A2b's driver exists; U7b-A2b (below) is where it lands.
+- **acceptance (schedule visibility)**: the new P8 arm this unit adds to
   `check_gpu_prove_once.py` refuses a `schedule:` trigger on ANY paid-lane workflow — pod or
-  cluster — unless that workflow is on a reviewed cron allow-list with its own never-vacuous arm
-  named; a planted cron on `gpu-gang.yml` is a FINDING under P7, an allow-listed cron is not —
-  RED-then-GREEN within this unit: RED before P7 exists (a planted cron passes unrefused, since
-  no arm reads `schedule:` at all), GREEN once this unit's P7 and its fixture land together.
-- **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
-- **cost ceiling** (human-approved before first run, committed figures — never re-derived per
-  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md#units-and-order (~:305) — never the 2-GPU pod rate),
-  the 2×1 shape bills $3.816/h; ≤ 1 h billed wall per run, ≤ 2 runs per authorization; label-only
-  until a flake-free streak.
+  cluster — unless that workflow is a reviewed key of `PAID_LANE_CRON_ALLOWLIST` naming its own
+  never-vacuous arm; a planted cron on a gang-shaped workflow is a FINDING under P8, an
+  allow-listed cron (`gpu-prove.yml`, `gpu-reap.yml`) is not — RED-then-GREEN within this unit:
+  RED before P8 exists (a planted cron passes unrefused, since no arm reads `schedule:` at all at
+  the unit's own base), GREEN once P8 and its fixture land together.
+- **lane**: gate scripts + ai-core test body. **depends_on**: U7a, S4. **size**: M.
+
+### U7b-A2b — the two-host cluster driver, workflow and id-secrecy scan
+
+Filed here, NOT scheduled as a wave-3 precondition. Builds the cluster leg's own DRIVER (launch
+via `rp_cluster_create`, wait for both members reachable, ship the NCCL id, pull both ranks'
+reports, single-writer artifact assembly — both members only ever REPORT), its OWN workflow (a
+`run-cluster` PR label or manual dispatch, never `gpu-gang.yml`'s), and the id-secrecy scan over
+the driver's full carrier set. Spec: this unit's (U7b's) own three audit rounds recorded in
+`docs/rigor/feat_500-C-U7b.jsonl`; `docs/rigor/contracts/feat_500-C-U7b.md` §2/§2b/§2c/§4/§5 as
+history; §9's P-A (no byte reaches the upload unscanned), P-B (the scan's exit lattice is total),
+P-C (the artifact's shape is measured from the create/members response, never a literal), and
+P-D (the assembler is oracled through the sourced driver on every arm) as the acceptance
+properties a driver must satisfy; round 3's F1–F3 — the scan reachable only from a skippable
+EXIT-only trap sequenced behind untimed REST calls; a false "WILL BE DESTROYED" claim under
+`RP_SESSION`; the in-place fallback's globs missing `..`-prefixed names — plus its A1–A4
+advisories, as the first pressure round any re-attempt inherits. The one real cluster run
+(bounded by this unit's own cost ceiling: at S4's MEASURED cluster rate, $1.908/GPU/h, the 2×1
+shape bills `2 × $1.908/GPU/h = $3.816/h`; ≤ 1 h billed wall per run, ≤ 2 runs per authorization;
+label-only until a flake-free streak — blocked today on the operator's own pre-flight) moves with
+this unit.
 
 ## U5a — `GangService` on `peer_bind`; I-GANG authorization; admit-and-hold (PR-C commit 2)
 
@@ -519,62 +562,92 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 ### U5b-1a — Membership substrate (PR-C commit 3a)
 
 - **files_in_scope**: (db) `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr_result_root`
-  migration, number at rebase, three pin sites incl. the ordered-after oracle in
-  `crates/jammi-db/tests/it/migrations.rs` (added by U5a-1) — the same
-  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern
-  (`crates/jammi-db/tests/it/migrations.rs::migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`, on `main`) repeated for this migration, cited by
-  construct rather than by an offset on a branch this fold cannot read), `catalog/jobs_repo.rs`
-  (`upsert_instance` gains `peer_addr` + a
-  canonicalized `result_root`; `peer_addr_of(instance_id, window) -> Option<PeerAddr>` — the ONE
-  by-id resolution verb, fresh-only under the same margin, no kind/root/self filter — is the
+  migration, number at rebase, FOUR pin sites — the const list, `EXPECTED_MIGRATION_NAMES`, the
+  ordered-after oracle in `crates/jammi-db/tests/it/migrations.rs` (the same
+  `migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`'s pattern, `crates/
+  jammi-db/tests/it/migrations.rs::migration_031_is_ordered_after_030_and_adds_releases_and_workers_state`,
+  on `main`, repeated for this migration), AND the `029` ledger-replay test's DELETE list
+  (`migration_029_copies_training_jobs_rows_into_jobs_as_queued` — `035` ALTERs `instances`,
+  created fresh by `029`'s replayed DDL, so an omission there leaves the reopened table missing
+  both columns, RED — cited by construct rather than by an offset on a branch this fold cannot
+  read), `catalog/instance.rs` (NEW — `PeerAddr` moves here from `index::peer`, re-exported there
+  so the peer listener and the gang listener share ONE address type; `MemberRoot` (the VERBATIM
+  configured result-table root — no filesystem access, no URL parsing, no scheme handling; carried
+  on the row and NOT consulted by the membership predicate; root identity is U5b-1a-A2);
+  `InstanceRegistration { instance_id, label, host, peer_addr: Option<PeerAddr>, member_root:
+  Option<MemberRoot>, worker: Mutex<Option<WorkerFacts>> }` — the ONE value every writer of the
+  `instances`(+`workers`) row builds; `InstanceRegistration::from_config` is the ONE choke point:
+  `peer_advertise` unset yields a non-member registration (NULLs, no filesystem check at all);
+  `peer_advertise` set performs the WHOLE membership check (parses as `PeerAddr`, `peer_bind` is
+  set too) and wraps the verbatim root (`MemberRoot::resolved`, over
+  `JammiConfig::resolved_result_root`) — `ServerConfig::validate` is NOT the home, since it cannot
+  see `artifact_dir`), `catalog/jobs_repo.rs` (`upsert_instance`/`reregister_instance` accept ONLY
+  an `InstanceRegistration`; `peer_addr_of(instance_id, lease) -> Option<PeerAddr>` — the ONE
+  by-id resolution verb, fresh-only under the same margin, no kind/self filter — is the
   address-resolution surface DESIGN.md §4 names; `list_gang_members(GangListing { kind,
-  self_instance, canonical_root, window })` excludes self, stale (freshness via U5a-1's
-  `instance_liveness_margin()`, consumed here, never recomputed), draining/warming, other-kind
-  (kinds split on `,`, matched as whole tokens), and root-divergent instances; the member order is
-  byte order on `instance_id`, sorted and compared in Rust — never a SQL `ORDER BY`, whose
-  collation is backend-dependent; root divergence is likewise a byte-exact Rust comparison of the
-  canonicalized string, never a SQL `=`; `prune_instances`' window (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`'s call
-  site, exactly `lease().saturating_mul(2)` — the same value `instance_liveness_margin()`
-  will return) moves to STRICTLY BEYOND the margin, so a member judged merely stale is never also
-  eligible for deletion; the lease keeper's `Instance` arm (`crates/jammi-db/src/catalog/lease_keeper.rs::renew_all`, folded into
-  the generic `Some(false) → lost` dispatch at `renew_all`) RE-UPSERTS the row on a failed touch
-  instead of only flipping `lost` — `touch_instance` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`) is a pure `UPDATE`
+  self_instance, lease })` (no root field — contract `feat_500-C-U5b-1a` §12, the round-5
+  excision) excludes self, stale (freshness via U5a-1's `instance_liveness_margin()`, consumed
+  here, never recomputed), draining/warming, and no-`workers`-row (an INNER join), other-kind
+  (kinds split on `,`, matched as whole tokens); the member order is byte order on `instance_id`,
+  sorted and compared in Rust — never a SQL `ORDER BY`, whose collation is backend-dependent;
+  `result_root` plays NO part in this predicate — two members with different `result_root`
+  spellings ARE gang members of each other in this unit), `catalog/lease.rs`
+  (`instance_prune_window(lease) = instance_liveness_margin(lease).saturating_add(lease)`, i.e.
+  `3 × lease` — STRICTLY BEYOND the `2×` margin, so a member judged merely stale is never also
+  eligible for deletion — `InferenceSession::wrap_with`'s `prune_instances` call site uses this
+  function, never a literal `saturating_mul(2)`/`(3)`), `catalog/lease_keeper.rs`
+  (`LeaseTarget::Instance(Arc<InstanceRegistration>)`; the `Instance` arm of `renew_all`
+  RE-UPSERTS the WHOLE tuple — `instances` row AND, when the registration's worker cell is `Some`,
+  the `workers` row too, in one transaction, via `reregister_instance` — on a failed touch instead
+  of only flipping `lost`; `touch_instance` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::touch_instance`) is a pure `UPDATE`
   that can never resurrect a pruned row, so a process whose row was pruned during a transient
   outage now rejoins on its next heartbeat with no restart), `config/mod.rs` (`[server]
-  peer_advertise` validated at load — requires `peer_bind`; `canonicalize_result_root()`
-  canonicalizes the RESOLVED result-table root — `[storage] result_root` when set, else
-  `{artifact_dir}/jammi_db` (`crates/jammi-db/src/config/mod.rs::StorageConfig`'s documented default, mirroring
-  `session.rs`'s `build_result_store`, `crates/jammi-ai/src/session.rs::build_result_store`) — scheme-aliased, trailing slash
-  trimmed, a non-existent or relative `file://` root refused at load with the row never written;
-  canonical-root equality is NECESSARY, never SUFFICIENT, for shared storage — sufficiency is
-  established only by the attestation VERIFY, U5a-1's whole-artifact sidecar / U5b-0's and
-  U5b-1b-i's per-partition inventory, never by this predicate alone). (ai-core) `session.rs` (the
-  ONLY production call site of `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — gains the `peer_addr` /
-  canonicalized-`result_root` arguments; `InferenceSession::open_with_placement`'s shared-`artifact_dir` topology note stays
-  configurable for a gang; `build_result_store` stays the one place the effective
-  root is actually computed at runtime). (docs-ci) `docs/guide/src/{configuration.md, security.md,
+  peer_advertise` — refused by `InstanceRegistration::from_config`, NOT `validate()` (which cannot
+  see `artifact_dir`): unset `peer_bind` is a named-key error; `resolved_result_root()` returns the
+  RESOLVED result-table root VERBATIM — `[storage] result_root` when set (the WHOLE effective
+  root, no leaf appended), else `{artifact_dir}/jammi_db` (leaf appended ONLY in this default arm,
+  a typed refusal naming `artifact_dir` on non-UTF-8) — no filesystem access, no URL parsing, no
+  scheme handling on the membership path; the row carries this string verbatim, but
+  `list_gang_members`'s admission predicate does NOT consult it in this unit (round-5 excision) —
+  root identity across spellings, and any membership predicate built on it, is filed as its own
+  unit, U5b-1a-A2 (see `docs/plans/67-distributed-training/README.md` for its scope), and is a
+  precondition of U5b-1b-ii (gang formation); were root-string equality ever made part of a
+  membership predicate, it would still be necessary, never sufficient, for shared storage —
+  sufficiency is established only by the attestation VERIFY, U5a-1's whole-artifact sidecar /
+  U5b-0's and U5b-1b-i's per-partition inventory). (ai-core) `session.rs` (the ONLY production call site of
+  `upsert_instance`, `crates/jammi-ai/src/session.rs::InferenceSession::wrap_with` — builds the
+  `InstanceRegistration` via `from_config` FIRST, before the lease keeper starts or the result
+  store creates a directory; `InferenceSession::open_with_placement`'s shared-`artifact_dir`
+  topology note stays configurable for a gang; `build_result_store` stays the one place the
+  effective root is actually computed at runtime), `fine_tune/worker.rs` (`JobWorker`/
+  `EmbeddedWorker` are the SOLE owner of the registration's worker cell: `run_until` sets it only
+  AFTER its FIRST `upsert_worker` call SUCCEEDS (P-Y4 — a failed first upsert leaves the cell
+  `None`), every LATER `set_worker_state` writes the cell before the row, `delete_worker` clears
+  it). (docs-ci) `docs/guide/src/{configuration.md, security.md,
   deploy-server.md, reference-topologies.md}`.
-- **invariants_to_preserve**: B6, K2 (validate chain), K5 (migration, three pin sites).
-- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, other-kind and
-  root-divergent instance on both backends, plus one fresh multi-kind worker included, from a DB
-  return order permuted away from `instance_id` order — the returned list is still sorted (RED at
-  base); (b) `peer_advertise` without `peer_bind`, or with a non-existent or relative `file://`
-  root, is refused at load, each its own typed error; `peer_advertise` with `result_root` UNSET is
-  ACCEPTED and canonicalizes `{artifact_dir}/jammi_db` (RED at base: the prior refusal sentence
-  is dropped); (c) the migration's ordered-after oracle on both backends; (d) a config with
-  `peer_advertise` set (result root set OR unset) produces a non-NULL `peer_addr`/`canonical_root`
-  `instances` row through the real session-construction path (`InferenceSession::open` /
-  `open_with_placement`), never a direct db write (RED at base: no caller threads the new
-  arguments); (e) `peer_addr_of` resolves a busy or other-kind fresh member and returns
-  `None` for a stale one; it is unreachable from any public RPC and ignores any caller tenant (the
-  invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not exist); (f) two
-  members whose canonicalized `result_root` strings are byte-identical but sit on different
-  filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY, never
-  silently — root equality alone never green-lights a round; (g) a `2×`-lease heartbeat gap
+- **invariants_to_preserve**: B6, K2 (the `from_config` choke point), K5 (migration, four pin sites).
+- **acceptance**: (a) `list_gang_members` excludes a stale, draining/warming, and no-`workers`-row
+  instance on both backends (root is NOT part of this predicate — round-5 excision, P-Y1), plus
+  one fresh multi-kind worker included, from a DB return order permuted away from `instance_id`
+  order — the returned list is still sorted (RED at base); (b) `peer_advertise` without `peer_bind` is refused by
+  `InstanceRegistration::from_config` (called both at `JammiConfig::load_from` and at
+  `wrap_with`), naming both keys; `peer_advertise` with `result_root` UNSET is ACCEPTED and the
+  row's `member_root` carries `{artifact_dir}/jammi_db` verbatim (RED at base: the prior refusal
+  sentence is dropped); (c) the migration's ordered-after oracle on both backends;
+  (d) a config with `peer_advertise` set (result root set OR unset) produces a non-NULL
+  `peer_addr`/`member_root` `instances` row through the real session-construction path
+  (`InferenceSession::open` / `open_with_placement`), never a direct db write (RED at base: no
+  caller threads the new arguments); (e) `peer_addr_of` resolves a busy or other-kind fresh member
+  and returns `None` for a stale one; it is unreachable from any public RPC and ignores any caller
+  tenant (the invariant oracle, mirroring `get_job_for_rank`'s, RED at base: the verb does not
+  exist); (f) two members whose `result_root` strings are byte-identical (the same spelling) but sit
+  on different filesystems land in the member-scoped `StoreUnavailable` arm at the attestation VERIFY,
+  never silently — root equality alone never green-lights a round; (g) a `2×`-lease heartbeat gap
   followed by recovery makes the member fresh again without a process restart, via the keeper's
-  re-upsert on a failed touch (RED at base: `touch_instance` never resurrects a pruned row); (h)
-  `gang_instance_freshness` runs on BOTH backends — the SQLite-only file is widened, and the
-  live-postgres lane exercises it too.
+  reregister of the WHOLE tuple on a failed touch (RED at base: `touch_instance` never resurrects a
+  pruned row); (h) `tests/it/gang_instance_freshness.rs` is ALREADY parameterized sqlite/postgres
+  at base (satisfied, verified — no widening needed); the NEW `gang_membership.rs` and the 035
+  oracle carry the SAME `test_case` sqlite/postgres shape.
 - **lane**: hermetic + distributed. **depends_on**: **U5a-1** (creates
   `instance_liveness_margin()`; merge order pinned, U5a-1 lands first), PR-B1. **size**: M.
 
@@ -669,7 +742,10 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   never set partially; a moved claim aborts with no write, a concurrent CAS sees zero rows and
   REUSEs.
 - **lane**: hermetic + server it-suite. **depends_on**: U5b-1a (`list_gang_members`,
-  `canonicalize_result_root`), U5b-1b-i (the `Peer` collective it dispatches to), U4b (`spec.rs`
+  `MemberRoot::resolved` — `list_gang_members`'s own predicate does NOT consult the root,
+  round-5 excision), U5b-1a-A2 (root identity across spellings AND the membership predicate on
+  the root — this coordinator's own use of `result_root` needs BOTH), U5b-1b-i (the `Peer`
+  collective it dispatches to), U4b (`spec.rs`
   co-ownership, merge order pinned), U5a-1, U5a-2. **size**: L.
 
 ### U5b-1b-iii — The `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin (PR-C commit 3b-iii)

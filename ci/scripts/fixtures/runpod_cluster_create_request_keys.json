@@ -1,0 +1,11 @@
+{
+  "_source": "RunPod REST v2 OpenAPI document (https://api.runpod.io/v2/openapi.json), components.schemas.CreateClusterRequest (allOf BaseContainerConfig + the cluster-specific object) and components.schemas.ClusterCompute, read 2026-09-14. `CreateClusterRequest` is `unevaluatedProperties: false` -- a request body may use ONLY these top-level keys, and `_rp_cluster_payload` (ci/scripts/runpod_lib.sh) is asserted against this exact set by ci/scripts/test_runpod_cluster_lib.sh so a future OpenAPI drift is caught here rather than live.",
+  "_note": "This fixture checks the KEY SET only, never the VALUES: `_rp_cluster_payload` (ci/scripts/runpod_lib.sh) hardcodes `compute.gpuCountPerPod=1` and `compute.podCount=2` -- a FIXED 2x1 shape (2 pods x 1 GPU each), this tooling's own choice and not something `ClusterCompute`'s own schema demands (the schema allows any positive integer in both fields). Nothing that builds a create request on this tree takes a shape argument; a caller wanting a different one has none to ask for.",
+  "top_level_keys": [
+    "args", "compute", "dataCenterIds", "disk", "env", "image", "mounts",
+    "name", "ports", "startJupyter", "startSsh", "type"
+  ],
+  "top_level_required": ["name", "type", "compute"],
+  "compute_keys": ["gpuCountPerPod", "gpuTypeId", "podCount"],
+  "compute_required": ["gpuTypeId", "gpuCountPerPod", "podCount"]
+}

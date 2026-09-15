@@ -304,7 +304,13 @@ async fn every_hold_reports_lost_when_the_keeper_thread_dies() {
         .unwrap()
         .expect("job claimed");
     catalog
-        .upsert_instance("instance-a", None, None)
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-a",
+            None,
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
 
@@ -316,7 +322,15 @@ async fn every_hold_reports_lost_when_the_keeper_thread_dies() {
         instance_id: "instance-a".to_string(),
         attempts: claimed.attempts,
     });
-    let instance_hold = keeper.hold(LeaseTarget::Instance("instance-a".to_string()));
+    let instance_hold = keeper.hold(LeaseTarget::Instance(Arc::new(
+        jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-a",
+            None,
+            None,
+            None,
+            None,
+        ),
+    )));
     let polled_flag = job_hold.lost_flag();
     assert!(
         !job_hold.lost() && !instance_hold.lost(),
@@ -351,12 +365,26 @@ async fn a_holds_last_renewed_at_advances_with_each_landed_renewal() {
     let dir = tempdir().unwrap();
     let catalog = seeded_catalog(dir.path()).await;
     catalog
-        .upsert_instance("instance-b", None, None)
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-b",
+            None,
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
     let intervals = fast_intervals();
     let keeper = keeper_for(dir.path().to_path_buf(), intervals).await;
-    let hold = keeper.hold(LeaseTarget::Instance("instance-b".to_string()));
+    let hold = keeper.hold(LeaseTarget::Instance(Arc::new(
+        jammi_db::catalog::instance::InstanceRegistration::new(
+            "instance-b",
+            None,
+            None,
+            None,
+            None,
+        ),
+    )));
     let at_hold = hold.last_renewed_at();
     let keeper_pass_at_start = keeper.last_renewed_at();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -408,7 +436,15 @@ async fn shutdown_and_join_releases_the_keepers_own_catalog_connection() {
     // A live hold, so the keeper is doing real renewal work over the
     // connection this test proves gets closed — not merely an idle thread
     // that happens to have one open.
-    let _hold = keeper.hold(LeaseTarget::Instance("closing-probe".to_string()));
+    let _hold = keeper.hold(LeaseTarget::Instance(Arc::new(
+        jammi_db::catalog::instance::InstanceRegistration::new(
+            "closing-probe",
+            None,
+            None,
+            None,
+            None,
+        ),
+    )));
 
     keeper
         .shutdown_and_join(Duration::from_secs(60))

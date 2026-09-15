@@ -35,6 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{now_sortable, BackendError, BackendKind, Row, SqlValue, TxOptions};
+use super::instance::{GangListing, GangMember, InstanceRegistration, PeerAddr};
 use super::lease::{
     instance_liveness_margin, lease_deadline_expr, lease_expired_clause, stale_before_clause,
 };
@@ -537,8 +538,9 @@ pub struct WorkerRecord {
     /// The claim loop's lifecycle state as the row carries it — one of
     /// [`WorkerState`]'s spellings (`warming` / `claiming` / `draining`),
     /// written by the loop task in that order (`upsert_worker` with
-    /// `warming` as its first statement, `set_worker_state` afterwards) so
-    /// no reader ever sees `claiming` before the row exists.
+    /// `warming` as its first statement and again at each transition —
+    /// every lifecycle write is an upsert) so no reader ever sees
+    /// `claiming` before the row exists.
     pub state: String,
     pub started_at: String,
     pub last_seen_at: String,
@@ -556,6 +558,17 @@ fn parse_worker_row(
         started_at: row.get("started_at")?,
         last_seen_at: row.get("last_seen_at")?,
     })
+}
+
+/// One `instances JOIN workers` candidate row, before
+/// [`Catalog::list_gang_members`]'s own Rust-side exclusion filters run —
+/// a named struct rather than a five-element tuple (A5: `clippy::
+/// type_complexity` is a signal to name the shape, not to suppress it).
+struct GangCandidateRow {
+    instance_id: String,
+    peer_addr: String,
+    kinds: String,
+    state: String,
 }
 
 /// The `workers.state` vocabulary (migration 031, CHECK-constrained at the
@@ -2059,36 +2072,100 @@ impl Catalog {
             .await?)
     }
 
-    /// Upsert this process's `instances` row: insert on first call
-    /// (`started_at` stamped once), refresh `label`/`host`/`last_seen_at` on
-    /// every later call.
-    pub async fn upsert_instance(
-        &self,
-        instance_id: &str,
-        label: Option<&str>,
-        host: Option<&str>,
-    ) -> Result<()> {
-        let instance_id = instance_id.to_string();
-        let label = label.map(str::to_string);
-        let host = host.map(str::to_string);
+    /// Upsert this process's `instances` row from `reg`: insert on first
+    /// call (`started_at` stamped once), refresh `label`/`host`/`peer_addr`/
+    /// `result_root`/`last_seen_at` on every later call. `reg.peer_addr` /
+    /// `reg.member_root` write `NULL` for a process that never joins a
+    /// gang — `reg` (produced by
+    /// [`InstanceRegistration::from_config`](super::instance::InstanceRegistration::from_config))
+    /// is the ONLY shape this and [`Self::reregister_instance`] accept.
+    pub async fn upsert_instance(&self, reg: &InstanceRegistration) -> Result<()> {
+        let instance_id = reg.instance_id.clone();
+        let label = reg.label.clone();
+        let host = reg.host.clone();
+        let peer_addr = reg.peer_addr.as_ref().map(|p| p.as_str().to_string());
+        let result_root = reg.member_root.as_ref().map(|c| c.as_str().to_string());
         let now = now_sortable();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "INSERT INTO instances (instance_id, label, host, started_at, last_seen_at) \
-                         VALUES ($1, $2, $3, $4, $4) \
+                        "INSERT INTO instances \
+                             (instance_id, label, host, peer_addr, result_root, started_at, last_seen_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $6) \
                          ON CONFLICT(instance_id) DO UPDATE SET \
                              label = excluded.label, host = excluded.host, \
+                             peer_addr = excluded.peer_addr, result_root = excluded.result_root, \
                              last_seen_at = excluded.last_seen_at",
                         &[
                             SqlValue::TextOwned(instance_id),
                             SqlValue::from(label),
                             SqlValue::from(host),
+                            SqlValue::from(peer_addr),
+                            SqlValue::from(result_root),
                             SqlValue::TextOwned(now),
                         ],
                     )
                     .await
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The lease keeper's re-upsert on a MISSED touch (`Catalog::
+    /// touch_instance` returning `Ok(false)`): re-writes the WHOLE
+    /// membership tuple — the `instances` row from `reg` exactly like
+    /// [`Self::upsert_instance`], AND, when `reg`'s worker half
+    /// ([`InstanceRegistration::worker_snapshot`]) is `Some`, the `workers`
+    /// row too — in ONE transaction, so a process whose row was pruned
+    /// during a transient outage rejoins its gang (and its claim-loop
+    /// membership, if any) atomically on its next successful heartbeat, with
+    /// no restart. `touch_instance` itself stays a pure `UPDATE` that can
+    /// never resurrect a pruned row; this is the ONLY verb that can.
+    pub async fn reregister_instance(&self, reg: &InstanceRegistration) -> Result<()> {
+        let instance_id = reg.instance_id.clone();
+        let label = reg.label.clone();
+        let host = reg.host.clone();
+        let peer_addr = reg.peer_addr.as_ref().map(|p| p.as_str().to_string());
+        let result_root = reg.member_root.as_ref().map(|c| c.as_str().to_string());
+        let worker = reg.worker_snapshot();
+        let now = now_sortable();
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO instances \
+                             (instance_id, label, host, peer_addr, result_root, started_at, last_seen_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $6) \
+                         ON CONFLICT(instance_id) DO UPDATE SET \
+                             label = excluded.label, host = excluded.host, \
+                             peer_addr = excluded.peer_addr, result_root = excluded.result_root, \
+                             last_seen_at = excluded.last_seen_at",
+                        &[
+                            SqlValue::TextOwned(instance_id.clone()),
+                            SqlValue::from(label),
+                            SqlValue::from(host),
+                            SqlValue::from(peer_addr),
+                            SqlValue::from(result_root),
+                            SqlValue::TextOwned(now),
+                        ],
+                    )
+                    .await?;
+                    if let Some(w) = worker {
+                        tx.execute(
+                            "INSERT INTO workers (instance_id, kinds, state) VALUES ($1, $2, $3) \
+                             ON CONFLICT(instance_id) DO UPDATE \
+                             SET kinds = excluded.kinds, state = excluded.state",
+                            &[
+                                SqlValue::TextOwned(instance_id),
+                                SqlValue::TextOwned(w.kinds),
+                                SqlValue::Text(w.state.as_db_str()),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
                 })
             })
             .await?;
@@ -2152,19 +2229,191 @@ impl Catalog {
             .is_some())
     }
 
+    /// The ONE by-id peer-address resolution verb (DESIGN.md § 4): `Some`
+    /// iff `instance_id`'s row is present, its `peer_addr` is non-NULL, and
+    /// it is fresh under [`super::lease::instance_liveness_margin`] on the
+    /// DB clock. No kind / root / self filter — a rank resolving its own
+    /// coordinator (or a peer resolving ANY other member by id, including a
+    /// busy or other-kind one) uses this, never `list_gang_members`.
+    /// `instances` carries no tenant column, so there is no tenant predicate
+    /// to drop or keep — the same answer under a scoped tenant binding and
+    /// under none.
+    ///
+    /// # Errors
+    ///
+    /// A stored `peer_addr` that fails [`PeerAddr::parse`] is a typed
+    /// [`JammiError::Catalog`] — a corrupted row fact, never silently mapped
+    /// to `None` the way an absent or stale row is.
+    pub async fn peer_addr_of(
+        &self,
+        instance_id: &str,
+        lease: Duration,
+    ) -> Result<Option<PeerAddr>> {
+        let instance_id_owned = instance_id.to_string();
+        let kind = self.backend().backend_kind();
+        let margin = instance_liveness_margin(lease);
+        let raw = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let stale = stale_before_clause("last_seen_at", kind, margin, &mut params);
+                        params.push(SqlValue::TextOwned(instance_id_owned));
+                        let id_bind = params.len();
+                        let sql = format!(
+                            "SELECT peer_addr FROM instances \
+                             WHERE instance_id = ${id_bind} AND peer_addr IS NOT NULL \
+                               AND NOT ({stale})"
+                        );
+                        tx.query_opt(&sql, &params, |row| row.get::<String>("peer_addr"))
+                            .await
+                    })
+                },
+            )
+            .await?;
+        match raw {
+            None => Ok(None),
+            Some(addr) => PeerAddr::parse(&addr).map(Some).map_err(|e| {
+                JammiError::Catalog(format!(
+                    "instance '{instance_id}' has a corrupted peer_addr row: {e}"
+                ))
+            }),
+        }
+    }
+
+    /// The gang-membership listing verb (DESIGN.md § 4, M3): every FRESH,
+    /// `claiming` worker whose `kinds` contains `listing.kind` as a whole,
+    /// trimmed, comma-split token, excluding `listing.self_instance` —
+    /// sorted by `instance_id` BYTE ORDER, in Rust, never a SQL `ORDER BY`
+    /// (backend-dependent collation). An INNER join on `workers`: a member
+    /// is a fleet worker with a claim-loop slot, not merely a live process.
+    /// `instances` carries no tenant column: the same answer under a scoped
+    /// tenant binding and under none.
+    ///
+    /// **The `result_root` column is NOT part of this predicate** (contract
+    /// `feat_500-C-U5b-1a` §12, P-Y1, the round-5 excision): [`GangListing`]
+    /// carries no root field, so two members rooted at byte-DIFFERENT
+    /// spellings ARE gang members of each other — this verb has nothing to
+    /// say about the root. Root identity, and any membership predicate
+    /// built on it, is `docs/plans/67-distributed-training/README.md` unit
+    /// U5b-1a-A2's question.
+    ///
+    /// Filtering is split deliberately: freshness and NULL-ness are pushed
+    /// into SQL (an index-backed predicate over a potentially large table);
+    /// everything else — the self exclusion, the worker state, and the kind
+    /// token match — runs in Rust, over the already-narrowed row set, so no
+    /// SQL dialect's string/collation semantics can silently diverge from
+    /// what this verb promises.
+    ///
+    /// # Errors
+    ///
+    /// A stored `peer_addr` that fails [`PeerAddr::parse`] is a typed
+    /// [`JammiError::Catalog`] naming the corrupted instance.
+    pub async fn list_gang_members(&self, listing: GangListing<'_>) -> Result<Vec<GangMember>> {
+        let kind = self.backend().backend_kind();
+        let margin = instance_liveness_margin(listing.lease);
+        let rows: Vec<GangCandidateRow> = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let stale =
+                            stale_before_clause("i.last_seen_at", kind, margin, &mut params);
+                        let sql = format!(
+                            "SELECT i.instance_id AS instance_id, i.peer_addr AS peer_addr, \
+                                    w.kinds AS kinds, w.state AS state \
+                             FROM instances i JOIN workers w ON w.instance_id = i.instance_id \
+                             WHERE i.peer_addr IS NOT NULL AND NOT ({stale})"
+                        );
+                        tx.query(&sql, &params, |row| {
+                            Ok(GangCandidateRow {
+                                instance_id: row.get::<String>("instance_id")?,
+                                peer_addr: row.get::<String>("peer_addr")?,
+                                kinds: row.get::<String>("kinds")?,
+                                state: row.get::<String>("state")?,
+                            })
+                        })
+                        .await
+                    })
+                },
+            )
+            .await?;
+
+        let claiming = WorkerState::Claiming.as_db_str();
+        let mut members = Vec::new();
+        for row in rows {
+            if row.instance_id == listing.self_instance {
+                continue;
+            }
+            if row.state != claiming {
+                continue;
+            }
+            if !row
+                .kinds
+                .split(',')
+                .map(str::trim)
+                .any(|token| token == listing.kind)
+            {
+                continue;
+            }
+            let peer_addr = PeerAddr::parse(&row.peer_addr).map_err(|e| {
+                JammiError::Catalog(format!(
+                    "instance '{}' has a corrupted peer_addr row: {e}",
+                    row.instance_id
+                ))
+            })?;
+            members.push(GangMember {
+                instance_id: row.instance_id,
+                peer_addr,
+            });
+        }
+        members.sort_by(|a, b| a.instance_id.as_bytes().cmp(b.instance_id.as_bytes()));
+        Ok(members)
+    }
+
     /// Upsert this process's `workers` row — present only while the process
-    /// runs the claim loop. `kinds` is the comma-joined (or otherwise
-    /// producer-encoded) kind set this worker claims; `state` is the loop's
-    /// lifecycle state at this instant (the loop task writes `warming` as
-    /// its FIRST statement and flips to `claiming` through
-    /// [`Self::set_worker_state`] once its gate opens). A re-upsert on an
-    /// existing row resets both.
+    /// runs the claim loop. `kinds` is the `,`-joined kind set this worker
+    /// claims — the ONLY encoding this column carries, since
+    /// [`Self::list_gang_members`] splits it on `,` and trims each token
+    /// (above, where each row's `kinds` is matched against
+    /// `listing.kind`); `state` is the loop's lifecycle state at this
+    /// instant (the loop task writes `warming` as its FIRST statement and
+    /// re-upserts `claiming` once its gate opens — never a bare `UPDATE`,
+    /// so a row the first write failed to create is created at the
+    /// transition). A re-upsert on an existing row resets both.
+    ///
+    /// # Errors
+    ///
+    /// Under `feature = "test-hooks"`, a failure armed for `instance_id`
+    /// through `worker_test_hooks::arm_upsert_worker_failure` (not an
+    /// intra-doc link: that module exists only under `feature =
+    /// "test-hooks"`, so a link to it fails `cargo doc`'s default-feature
+    /// pass) is returned here, once, with no write attempted — the
+    /// deterministic fixture P-Y4 (contract `feat_500-C-U5b-1a` §12) needs
+    /// to prove the caller's registration cell stays cleared when this call
+    /// fails.
     pub async fn upsert_worker(
         &self,
         instance_id: &str,
         kinds: &str,
         state: WorkerState,
     ) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if super::worker_test_hooks::take_armed(instance_id) {
+            return Err(JammiError::Catalog(format!(
+                "test-hooks: injected upsert_worker failure for instance '{instance_id}'"
+            )));
+        }
         let instance_id = instance_id.to_string();
         let kinds = kinds.to_string();
         let state = state.as_db_str();

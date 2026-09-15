@@ -39,14 +39,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::Array;
-use arrow::compute::SortOptions;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_expr::{expressions::col as physical_col, LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::logical_expr::SortExpr;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -67,6 +65,7 @@ use crate::index::sidecar::SidecarIndex;
 use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
+use crate::session::single_partition_context;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
@@ -323,9 +322,42 @@ impl TrainingSetTable {
     }
 }
 
+/// One column of the training-set producer's committed order
+/// ([`TRAINING_SET_ORDER_RULE_V1`]): a projected column, ascending, NULLs
+/// first — the direction and NULL placement every training-set write commits
+/// today, for every column, with no per-column override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    pub column: String,
+    pub ascending: bool,
+    pub nulls_first: bool,
+}
+
+/// **P1's one source.** The canonical key list both
+/// [`training_set_order_by`] (the SQL renderer, for a reader that re-applies
+/// the order) and [`training_set_file_sort_order`] (the DataFusion renderer,
+/// for the provider that DECLARES the order so no plan has to re-impose it)
+/// render from — every projected column, in declared order, ascending, NULLs
+/// first. A third hand-spelling of the direction/NULL placement is exactly
+/// the bug class this list exists to rule out: the two renderers can disagree
+/// only if this list itself is wrong, which is testable once, not per
+/// renderer.
+pub fn training_set_sort_keys(columns: &[String]) -> Vec<SortKey> {
+    columns
+        .iter()
+        .map(|c| SortKey {
+            column: c.clone(),
+            ascending: true,
+            nulls_first: true,
+        })
+        .collect()
+}
+
 /// The `ORDER BY` clause that re-applies the training-set producer's committed
 /// row order ([`TRAINING_SET_ORDER_RULE_V1`]) to a read of the materialised
-/// table: every projected column, in declared order, ascending, NULLs first.
+/// table: every projected column, in declared order, ascending, NULLs first —
+/// rendered from [`training_set_sort_keys`], the single source both this
+/// function and [`training_set_file_sort_order`] read.
 ///
 /// The single source of truth for the reader's half of the order contract — a
 /// reader that hand-writes the clause and gets the direction, the NULL
@@ -338,14 +370,68 @@ impl TrainingSetTable {
 /// string (there is nothing to order by), which is a caller error
 /// [`TrainingSetSpec`] refuses at materialization time.
 pub fn training_set_order_by(columns: &[String]) -> String {
-    if columns.is_empty() {
+    let keys = training_set_sort_keys(columns);
+    if keys.is_empty() {
         return String::new();
     }
-    let keys: Vec<String> = columns
+    let parts: Vec<String> = keys
         .iter()
-        .map(|c| format!("{} ASC NULLS FIRST", crate::sql::quote_ident(c)))
+        .map(|k| {
+            format!(
+                "{} {} {}",
+                crate::sql::quote_ident(&k.column),
+                if k.ascending { "ASC" } else { "DESC" },
+                if k.nulls_first {
+                    "NULLS FIRST"
+                } else {
+                    "NULLS LAST"
+                }
+            )
+        })
         .collect();
-    format!("ORDER BY {}", keys.join(", "))
+    format!("ORDER BY {}", parts.join(", "))
+}
+
+/// The DataFusion form of the SAME order [`training_set_order_by`] renders as
+/// SQL, rendered from the SAME [`training_set_sort_keys`] list: one
+/// `ListingOptions::with_file_sort_order` ordering group (a `Vec<SortExpr>`,
+/// one column per entry) wrapped in the outer `Vec` that API takes. Declaring
+/// this on a TrainingSet table's provider is what lets DataFusion skip the
+/// `SortExec` a plain provider would otherwise plan for `training_set_order_by`'s
+/// clause (P1) — the provider ASSERTS the file is already in this order, so
+/// the read-back query never has to prove it by sorting.
+///
+/// An empty column list renders no ordering group (matching
+/// [`training_set_order_by`]'s empty-string case): there is nothing to
+/// declare, and [`TrainingSetSpec`] refuses an empty projection before a
+/// provider is ever built from one.
+///
+/// Binds each name via `Expr::Column(Column::new_unqualified(..))` — the
+/// SAME verbatim constructor `ResultStore::plan_training_set_rows`'s own
+/// projection uses (see that function's doc comment) — never the `col(..)`
+/// helper, which PARSES its argument as a possibly-qualified, possibly
+/// case-folding SQL identifier: `col("meta.id")` resolves as a `meta`-table
+/// reference to `id`, and `col("Abstract")` lower-cases to `abstract`. A
+/// projected column name is data, never a fragment of SQL to re-parse; a
+/// renderer that parsed it could declare the WRONG leading sort key for a
+/// dotted or mixed-case column while DataFusion trusts the declaration and
+/// skips the sort — a silent wrong order on the registered table, not a
+/// loud error.
+pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
+    use datafusion::common::Column;
+    use datafusion::logical_expr::Expr;
+
+    let keys = training_set_sort_keys(columns);
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let exprs: Vec<SortExpr> = keys
+        .iter()
+        .map(|k| {
+            Expr::Column(Column::new_unqualified(k.column.clone())).sort(k.ascending, k.nulls_first)
+        })
+        .collect();
+    vec![exprs]
 }
 
 /// Coordinates Parquet storage, ANN indexes, DataFusion registration,
@@ -1268,14 +1354,22 @@ impl ResultStore {
     /// resolves through the provider's tenant gate on every read lane, so a
     /// correctly-bound peer that names another tenant's table resolves
     /// not-found.
+    ///
+    /// `file_sort_order` is threaded straight to
+    /// `build_result_table_provider` (P1) — `None` for every kind but a
+    /// single-fragment [`ResultTableKind::TrainingSet`] table, whose caller
+    /// ([`Self::bind_result_table`]) renders it from the recorded projected
+    /// columns.
     pub async fn register_table(
         &self,
         ctx: &SessionContext,
         name: &str,
         url: &StorageUrl,
         owner: Option<TenantId>,
+        file_sort_order: Option<Vec<Vec<SortExpr>>>,
     ) -> Result<()> {
-        let provider = build_result_table_provider(ctx, &self.registry, url, None).await?;
+        let provider =
+            build_result_table_provider(ctx, &self.registry, url, None, file_sort_order).await?;
         self.install_result_schema(ctx)?;
         self.result_schema
             .add_result_table(format!("jammi.{name}"), provider, owner);
@@ -2720,8 +2814,14 @@ impl ResultStore {
         let url = StorageUrl::parse(&record.parquet_path)?;
         self.segment_sets.evict_table(&record.table_name);
         let Some(version) = record.current_version else {
+            let file_sort_order = if record.kind == ResultTableKind::TrainingSet {
+                self.training_set_registration_sort_order(record, &url)
+                    .await?
+            } else {
+                None
+            };
             return self
-                .register_table(ctx, &record.table_name, &url, owner)
+                .register_table(ctx, &record.table_name, &url, owner, file_sort_order)
                 .await;
         };
         let Some(dimensions) = record.dimensions() else {
@@ -2761,6 +2861,83 @@ impl ResultStore {
             owner,
         );
         Ok(())
+    }
+
+    /// P1's registration-side half: the `file_sort_order` [`Self::bind_result_table`]
+    /// passes to [`Self::register_table`] for a single-fragment
+    /// [`ResultTableKind::TrainingSet`] row — `record.kind` is checked by the
+    /// caller, this always renders one.
+    ///
+    /// Reads the table's own `.materialization.json` sidecar back and pulls
+    /// [`ProducingDescriptor::TrainingSet::columns`] — the PROJECTED COLUMNS as
+    /// the producer recorded them, the same list a reader's
+    /// [`training_set_order_by`] call renders its clause from — and renders
+    /// [`training_set_file_sort_order`] over exactly that list. This is
+    /// deliberately NOT the resolved Arrow schema's field order: a schema
+    /// reader that reordered fields (or a projection pushdown) would silently
+    /// desync a second source from the one the reader's SQL actually commits
+    /// to, which is the bug class [`training_set_sort_keys`] exists to rule
+    /// out for the two renderers — the registration side must read the exact
+    /// same list, not re-derive its own.
+    ///
+    /// Returns `None` (unordered registration — still CORRECT, since
+    /// [`training_set_order_by`]'s explicit clause still sorts the read, just
+    /// without the `SortExec`-free plan P1 claims) when there is no sidecar at
+    /// all (a pre-migration-021 table), the sidecar exists but could not be
+    /// READ (#500 U2c closing round, A4/P-B6 — an object-store error or a
+    /// corrupt/unparseable body; treated exactly like "absent", never fatal
+    /// to registration, since the row's own explicit `ORDER BY` still sorts
+    /// correctly either way), or its descriptor is not a `TrainingSet`
+    /// variant (a catalog/attestation mismatch this call does not treat as
+    /// fatal to registration — the row still resolves, just without the
+    /// ordering hint).
+    ///
+    /// **Cost:** [`Self::read_materialization_manifest`] issues one
+    /// object-store GET (plus, when the sidecar exists, a body read) per
+    /// `TrainingSet` row EVERY TIME [`Self::bind_result_table`] runs — in
+    /// particular once per such row at session startup
+    /// (`Self::load_existing_tables_inner`), never cached. Stated here and
+    /// in the maintainer guide (§2.6b): a deployment with many training-set
+    /// rows pays that many sidecar reads on every session build.
+    async fn training_set_registration_sort_order(
+        &self,
+        record: &ResultTableRecord,
+        url: &StorageUrl,
+    ) -> Result<Option<Vec<Vec<SortExpr>>>> {
+        let manifest = match self.read_materialization_manifest(url).await {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                warn!(
+                    table = record.table_name,
+                    error = %e,
+                    "training-set row's materialization manifest sidecar could not be read; \
+                     registering without a declared sort order"
+                );
+                return Ok(None);
+            }
+        };
+        let Some(manifest) = manifest else {
+            warn!(
+                table = record.table_name,
+                "training-set row carries no materialization manifest sidecar (a \
+                 pre-migration-021 table); registering without a declared sort order"
+            );
+            return Ok(None);
+        };
+        match manifest.descriptor {
+            ProducingDescriptor::TrainingSet { columns, .. } => {
+                Ok(Some(training_set_file_sort_order(&columns)))
+            }
+            other => {
+                warn!(
+                    table = record.table_name,
+                    descriptor = ?other,
+                    "training-set row carries a non-TrainingSet manifest descriptor; \
+                     registering without a declared sort order"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// The [`MaskedTableProvider`] for `manifest` — one `ListingTable` per
@@ -2812,7 +2989,8 @@ impl ResultStore {
         for fragment in &manifest.fragments {
             let url = StorageUrl::parse(&fragment.url)?;
             let provider =
-                build_result_table_provider(ctx, &self.registry, &url, pinned.clone()).await?;
+                build_result_table_provider(ctx, &self.registry, &url, pinned.clone(), None)
+                    .await?;
             if pinned.is_none() {
                 pinned = Some(provider.schema());
             }
@@ -2878,7 +3056,7 @@ impl ResultStore {
         match table.current_version {
             None => {
                 let url = StorageUrl::parse(&table.parquet_path)?;
-                build_result_table_provider(ctx, &self.registry, &url, None).await
+                build_result_table_provider(ctx, &self.registry, &url, None, None).await
             }
             Some(version) => {
                 let manifest = self.resolve_version_manifest(table, version).await?;
@@ -3803,11 +3981,20 @@ impl ResultStore {
     ///
     /// The rows are ordered by the **full projected tuple**
     /// ([`TRAINING_SET_ORDER_RULE_V1`]) and written in that order. The sort is
-    /// planned explicitly and the plan is collapsed to a single partition
-    /// through a [`SortPreservingMergeExec`] when the session's
-    /// `target_partitions` left it partitioned — never left to whatever
-    /// partition count a default hands back, whose merge would silently
-    /// interleave the sorted runs. A reader re-applies the same order with
+    /// planned through [`crate::session::single_partition_context`] — a
+    /// loader-local `target_partitions = 1` derivation of the caller's own
+    /// session state (`Self::plan_training_set_rows`) — so the write is ONE
+    /// external sort at ONE output partition, never a partitioned
+    /// local-sort-plus-merge: there is only ever one partition to recombine,
+    /// so no `SortPreservingMergeExec` is ever planned here. The residency
+    /// this pays is O(one batch) plus DataFusion's own spill reservation for
+    /// that single sort, never O(the whole table) — a batch that is itself
+    /// larger than `[engine] memory_limit` cannot be sorted, the deployment
+    /// rule `[engine] batch_size` is sized against. The session's
+    /// `RuntimeEnv` carries a disk-backed `DiskManager` by default
+    /// (`JammiSession::build`, no explicit `with_disk_manager` call needed),
+    /// so a sort whose in-progress runs exceed the pool spills to disk rather
+    /// than failing the write. A reader re-applies the same order with
     /// [`training_set_order_by`] over the registered `jammi.{name}` table.
     ///
     /// # Reuse
@@ -4020,11 +4207,19 @@ impl ResultStore {
     /// it, returning the plan (for its output schema) and a single-partition
     /// stream of its rows in committed order.
     ///
-    /// The single-partition guarantee is asserted, not assumed: a global sort
-    /// plans to one output partition today, but a partitioned plan reaching
-    /// [`ExecutionPlan::execute`] would have its sorted runs concatenated in
-    /// arrival order, silently committing rows out of the order the descriptor
-    /// claims. A partitioned plan is therefore merged order-preservingly here.
+    /// Planned through [`single_partition_context`] (`ctx`'s own state,
+    /// `target_partitions` forced to `1`) rather than `ctx` directly: a
+    /// global sort at one output partition is ONE external sort with no
+    /// merge to plan, so the physical plan this returns is never a
+    /// partitioned local-sort-plus-[`SortPreservingMergeExec`] whose merge
+    /// operator would need its own real reservation on top of every
+    /// partition's already-buffered sorted run (#500 U2c c3c — see
+    /// [`Self::materialize_training_set`]'s "The order it commits"). The
+    /// single-partition guarantee is asserted, not assumed: reaching
+    /// [`ExecutionPlan::execute`] at more than one output partition would
+    /// silently commit only partition 0's rows, never every row in order —
+    /// an engine-invariant breach, surfaced as a typed error rather than a
+    /// panic in a producer.
     async fn plan_training_set_rows(
         &self,
         ctx: &SessionContext,
@@ -4043,7 +4238,8 @@ impl ResultStore {
             // a fragment of SQL to re-parse.
             .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
             .collect();
-        let sorted = ctx
+        let single_partition_ctx = single_partition_context(ctx);
+        let sorted = single_partition_ctx
             .sql(spec.source_sql)
             .await?
             .select(projection.clone())?
@@ -4058,37 +4254,17 @@ impl ResultStore {
             )?;
 
         let plan = sorted.create_physical_plan().await?;
-        let schema = plan.schema();
-        let mut sort_exprs = Vec::with_capacity(spec.columns.len());
-        for column in spec.columns {
-            sort_exprs.push(PhysicalSortExpr {
-                expr: physical_col(column, schema.as_ref())?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: true,
-                },
-            });
-        }
-        // `LexOrdering::new` is `None` only for an empty key, which
-        // `TrainingSetSpec::validate_columns` already refused at the entry —
-        // so this is an ENGINE-invariant breach (the two guards drifted
-        // apart), not the caller-fault class the entry check raises. Reported
-        // rather than `expect`ed: a broken invariant is an error to surface,
-        // never a panic in a producer.
-        let ordering = LexOrdering::new(sort_exprs).ok_or_else(|| {
-            JammiError::Other(format!(
-                "training set over '{}': an empty order key reached the planner, \
-                 which the projection check should have refused at the entry",
+        let partition_count = plan.output_partitioning().partition_count();
+        if partition_count != 1 {
+            return Err(JammiError::Other(format!(
+                "training set over '{}': the single-partition derivation left the write plan at \
+                 {partition_count} output partition(s); expected exactly one — an engine \
+                 invariant broke between the derivation and the physical plan",
                 spec.source_id
-            ))
-        })?;
-        let plan: Arc<dyn ExecutionPlan> = if plan.output_partitioning().partition_count() > 1 {
-            Arc::new(SortPreservingMergeExec::new(ordering, plan))
-        } else {
-            plan
-        };
+            )));
+        }
 
-        let stream = plan.execute(0, ctx.task_ctx())?;
+        let stream = plan.execute(0, single_partition_ctx.task_ctx())?;
         Ok((plan, stream))
     }
 }
@@ -4202,11 +4378,24 @@ pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
 /// single bare `jammi.{name}` literal — the same literal the query side reaches
 /// these tables through, which the SQL tokenizer never splits on the embedded
 /// timestamp dot or a sanitized model path's hyphen.
+///
+/// `file_sort_order`, when `Some`, is applied via
+/// `ListingOptions::with_file_sort_order` — the provider then DECLARES its
+/// rows already carry that order, so a read that re-asserts it (e.g.
+/// [`training_set_order_by`]'s clause) plans no `SortExec` (P1). Only a
+/// [`ResultTableKind::TrainingSet`] table's fresh-materialization and
+/// crash-recovery registration passes `Some` (rendered from
+/// [`training_set_file_sort_order`] over its recorded projected columns);
+/// every other caller — a masked/versioned fragment
+/// ([`ResultStore::build_masked_provider`]), the unversioned fallback
+/// ([`ResultStore::current_version_provider`]) — passes `None`, unchanged
+/// from before this parameter existed.
 async fn build_result_table_provider(
     ctx: &SessionContext,
     registry: &StorageRegistry,
     url: &StorageUrl,
     pinned_schema: Option<arrow::datatypes::SchemaRef>,
+    file_sort_order: Option<Vec<Vec<SortExpr>>>,
 ) -> Result<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
@@ -4222,8 +4411,11 @@ async fn build_result_table_provider(
     }
 
     let config = ctx.copied_config();
-    let listing_options =
+    let mut listing_options =
         ParquetReadOptions::default().to_listing_options(&config, ctx.copied_table_options());
+    if let Some(order) = file_sort_order {
+        listing_options = listing_options.with_file_sort_order(order);
+    }
     let table_path = ListingTableUrl::parse(url.as_str())?;
     // A versioned table's fragments are pinned to the base fragment's
     // inferred schema so the union's schema is one shape; a fragment whose
@@ -4297,6 +4489,139 @@ mod tests {
     #[test]
     fn the_training_set_order_clause_is_empty_for_no_columns() {
         assert_eq!(training_set_order_by(&[]), "");
+    }
+
+    /// P1's one-source property: the SQL renderer
+    /// ([`training_set_order_by`]) and the DataFusion renderer
+    /// ([`training_set_file_sort_order`]) agree — same column order, same
+    /// direction, same NULL placement — for a permuted column list, proving
+    /// they both read [`training_set_sort_keys`] rather than each
+    /// re-deriving the order from the column list independently.
+    #[test]
+    fn the_two_order_renderers_agree_for_a_permuted_column_list() {
+        let columns = cols(&["z_col", "a_col", "mid_col"]);
+        let clause = training_set_order_by(&columns);
+        let file_order = training_set_file_sort_order(&columns);
+
+        assert_eq!(file_order.len(), 1, "one ordering group");
+        let exprs = &file_order[0];
+        assert_eq!(exprs.len(), columns.len());
+
+        // Same column order.
+        let file_columns: Vec<String> = exprs.iter().map(|e| e.expr.to_string()).collect();
+        assert_eq!(file_columns, columns);
+
+        // Same direction and NULL placement, for every column, matching the
+        // SQL clause's "ASC NULLS FIRST" on each entry.
+        for expr in exprs {
+            assert!(expr.asc, "every column sorts ascending");
+            assert!(expr.nulls_first, "every column sorts NULLs first");
+        }
+        assert_eq!(
+            clause,
+            "ORDER BY \"z_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"mid_col\" ASC NULLS FIRST"
+        );
+
+        // A reversed permutation reverses BOTH renderers identically.
+        let reversed: Vec<String> = columns.iter().rev().cloned().collect();
+        let reversed_file_columns: Vec<String> = training_set_file_sort_order(&reversed)[0]
+            .iter()
+            .map(|e| e.expr.to_string())
+            .collect();
+        assert_eq!(reversed_file_columns, reversed);
+        assert_eq!(
+            training_set_order_by(&reversed),
+            "ORDER BY \"mid_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"z_col\" ASC NULLS FIRST"
+        );
+    }
+
+    /// The exact defect a hard-block found: `training_set_file_sort_order`
+    /// must bind each column name VERBATIM, never through DataFusion's
+    /// identifier PARSER (the `col(..)` helper), which lower-cases an
+    /// unquoted mixed-case name and splits a dotted name into
+    /// `relation.column`. A dotted or mixed-case projected column is
+    /// reachable from `materialize_training_set` (`validate_columns` admits
+    /// both), so a parsing renderer would silently declare the WRONG
+    /// leading sort key while DataFusion trusts the declaration and skips
+    /// the sort — never a loud error.
+    #[test]
+    fn the_file_sort_order_binds_names_verbatim_never_through_the_identifier_parser() {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::Expr;
+
+        let columns = cols(&["meta.id", "Abstract"]);
+        let file_order = training_set_file_sort_order(&columns);
+        assert_eq!(file_order.len(), 1);
+        let exprs = &file_order[0];
+        assert_eq!(exprs.len(), 2);
+
+        match &exprs[0].expr {
+            Expr::Column(Column { relation, name, .. }) => {
+                assert_eq!(
+                    *relation, None,
+                    "a dotted name must NOT resolve as table.column"
+                );
+                assert_eq!(
+                    name, "meta.id",
+                    "the dot is part of the name, not a qualifier"
+                );
+            }
+            other => panic!("expected an unqualified Column, got {other:?}"),
+        }
+        match &exprs[1].expr {
+            Expr::Column(Column { relation, name, .. }) => {
+                assert_eq!(*relation, None);
+                assert_eq!(
+                    name, "Abstract",
+                    "case must be preserved verbatim, never lower-cased"
+                );
+            }
+            other => panic!("expected an unqualified Column, got {other:?}"),
+        }
+
+        // The SQL renderer's clause already quotes and preserves both names
+        // verbatim (its own, pre-existing property) -- the two renderers
+        // agree on this input too.
+        assert_eq!(
+            training_set_order_by(&columns),
+            "ORDER BY \"meta.id\" ASC NULLS FIRST, \"Abstract\" ASC NULLS FIRST"
+        );
+    }
+
+    /// Degenerate input, the DataFusion renderer's half: no columns declares
+    /// no ordering group at all — matching
+    /// [`the_training_set_order_clause_is_empty_for_no_columns`]'s empty SQL
+    /// clause, never a group with zero expressions (which `with_file_sort_order`
+    /// would treat as a real, if vacuous, ordering claim).
+    #[test]
+    fn the_file_sort_order_is_empty_for_no_columns() {
+        assert_eq!(
+            training_set_file_sort_order(&[]),
+            Vec::<Vec<SortExpr>>::new()
+        );
+    }
+
+    /// [`training_set_sort_keys`] itself: every key is ascending, NULLs
+    /// first, in declared order — the one source both renderers above prove
+    /// agree.
+    #[test]
+    fn the_sort_keys_are_ascending_nulls_first_in_declared_order() {
+        let keys = training_set_sort_keys(&cols(&["b", "a"]));
+        assert_eq!(
+            keys,
+            vec![
+                SortKey {
+                    column: "b".to_string(),
+                    ascending: true,
+                    nulls_first: true,
+                },
+                SortKey {
+                    column: "a".to_string(),
+                    ascending: true,
+                    nulls_first: true,
+                },
+            ]
+        );
     }
 
     /// Family D at the spec's edge: each degenerate projection is refused with

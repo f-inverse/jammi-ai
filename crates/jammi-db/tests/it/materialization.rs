@@ -850,6 +850,507 @@ async fn a_training_set_lands_as_a_ready_kinded_table_with_its_attestation(backe
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 }
 
+/// P1's registration-side wiring, over BOTH sites that build a TrainingSet
+/// table's provider: fresh materialization's own registration (inside
+/// `BuildingTable::finish`) and crash-recovery's (`ResultStore::load_existing_tables`,
+/// on an entirely fresh session that never saw the write) both declare the
+/// producer's committed order on the `ListingTable`, so the read-back query
+/// ([`training_set_order_by`]'s clause, applied over the SAME columns the
+/// table was materialised from) plans no `SortExec` — the table asserts its
+/// own order rather than the plan re-proving it by sorting.
+///
+/// The full fixture-based oracle (a multi-row-group, >1-file-group table, and
+/// the NULLS-LAST positive control that must reinstate `SortExec`) lives in
+/// `jammi-ai`'s `tests/it/training_set.rs` beside the row-order oracle
+/// (contract `feat_500-B-U2c` §9 "Fixture placement"): this test instead
+/// pins the two REGISTRATION call sites this unit's own code changed,
+/// independent of `jammi-ai`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(
+        4,
+        vec![
+            ts_batch(&[(Some("q2"), Some("a2"))]),
+            ts_batch(&[(Some("q1"), Some("a1"))]),
+        ],
+    );
+    let columns = ts_columns();
+    let source = unique_source(&dir, "tickets");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+
+    // Fresh materialization's own registration (inside `finish`) declared the
+    // committed order: the read-back plan carries no `SortExec`.
+    let plan = ctx
+        .sql(&query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(
+        !text.contains("SortExec"),
+        "fresh materialization's registration must declare the order (P1): {text}"
+    );
+
+    // The sort columns are nullable in the resolved schema -- otherwise NULLS
+    // FIRST is indistinguishable from NULLS LAST and "no SortExec" would be a
+    // vacuous claim about a schema that could not have forced one anyway.
+    let schema = plan.schema();
+    for column in &columns {
+        let field = schema.field_with_name(column).unwrap();
+        assert!(
+            field.is_nullable(),
+            "'{column}' must be nullable for the no-SortExec claim to be non-vacuous"
+        );
+    }
+
+    // Recovery's registration path (`load_existing_tables` -> the SAME
+    // `bind_result_table`) declares the identical order on a session that
+    // never ran the write -- reading the manifest sidecar back, not reusing
+    // any in-process state from the write above.
+    let ctx2 = SessionContext::new();
+    store.load_existing_tables(&ctx2).await.unwrap();
+    let plan2 = ctx2
+        .sql(&query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text2 = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan2.as_ref()).indent(true)
+    );
+    assert!(
+        !text2.contains("SortExec"),
+        "recovery's registration must declare the order (P1) too: {text2}"
+    );
+}
+
+/// A training-set row whose `.materialization.json` sidecar is absent (a
+/// pre-migration-021 table — the same shape
+/// [`verdict_missing_manifest_for_a_pre_contract_table`] models for the
+/// verify path) still registers: `training_set_registration_sort_order`
+/// returns `Ok(None)` rather than refusing the row, because
+/// [`training_set_order_by`]'s explicit `ORDER BY` clause still sorts the
+/// read correctly — only the `SortExec`-free plan P1 claims is lost, not
+/// correctness. That silent fallback now STATES itself: a `tracing::warn!`
+/// naming the table fires on recovery's registration path
+/// (`load_existing_tables` -> `bind_result_table` ->
+/// `training_set_registration_sort_order`), captured here the same way
+/// `jammi-ai`'s `model::cache::tests::catalog_read_error_skips_bookkeeping_write`
+/// captures a `tracing::warn!` — a real `tracing_subscriber::fmt` subscriber
+/// writing into an in-memory buffer this test inspects, never a log-crate
+/// shim. Deleting the `warn!` call (reverting to a bare `Ok(None)`) turns
+/// this test red without changing any other assertion in this file.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn registration_warns_when_a_training_sets_sidecar_is_absent(backend: BackendKind) {
+    use std::io;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "no-sidecar");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+
+    // Simulate a pre-migration-021 row: bytes + a `ready` catalog row, but no
+    // manifest sidecar — the SAME corruption
+    // `recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished`
+    // applies to the verify path, applied here to the registration path.
+    delete_sidecar(&store, &materialized.record).await;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufferWriter(buffer.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Recovery's registration path re-reads the sidecar from a session that
+    // never saw the write, exactly `a_training_sets_registration_declares_
+    // its_order_so_the_read_back_plans_no_sort`'s recovery half above — but
+    // now with no sidecar to read.
+    let ctx2 = SessionContext::new();
+    store.load_existing_tables(&ctx2).await.unwrap();
+
+    // Registration still succeeds (correctness is preserved: the explicit
+    // `ORDER BY` still sorts the read).
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let rows = ctx2.sql(&query).await.unwrap().collect().await.unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(materialized.record.table_name.as_str()),
+        "the missing-sidecar warning must name the table, got: {log}"
+    );
+    assert!(
+        log.contains("no materialization manifest sidecar"),
+        "the missing-sidecar warning must state the reason, got: {log}"
+    );
+}
+
+/// #500 U2c closing round, finding A4 / property P-B6: an UNREADABLE sidecar
+/// (present but not valid JSON — an object-store error hits the same code
+/// path) is treated like an ABSENT one, never fatal to registration: the row
+/// still resolves (the explicit `ORDER BY` still sorts it correctly) and a
+/// `tracing::warn!` names both the table and the underlying error.
+///
+/// Before this fix, `training_set_registration_sort_order` propagated the
+/// read error via `?`, which made `bind_result_table` itself return `Err`
+/// WITHOUT ever calling `register_table` — the row never enters `ctx`'s
+/// schema at all. `load_existing_tables_inner` catches that per-row (`if let
+/// Err(e) = self.bind_result_table(..) { warn!(..) }`), so `load_existing_tables`
+/// itself always returns `Ok(())` either way and cannot tell RED from GREEN;
+/// the real oracle is whether the row is still QUERYABLE afterward — before
+/// this fix the `SELECT` below would fail ("table ... not found"), same
+/// failure class as never registering the row at all, just for the wrong
+/// reason (a corrupt HINT sidecar, not a corrupt table).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn registration_warns_when_a_training_sets_sidecar_is_unreadable(backend: BackendKind) {
+    use std::io;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = ts_session(1, vec![ts_batch(&[(Some("q1"), Some("a1"))])]);
+    let columns = ts_columns();
+    let source = unique_source(&dir, "corrupt-sidecar");
+
+    let materialized = store
+        .materialize_training_set(&ctx, ts_spec(&source, &columns, "pairs"))
+        .await
+        .unwrap();
+    assert_eq!(materialized.record.kind, ResultTableKind::TrainingSet);
+
+    corrupt_sidecar(&store, &materialized.record).await;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufferWriter(buffer.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let ctx2 = SessionContext::new();
+    store.load_existing_tables(&ctx2).await.unwrap();
+
+    // The real oracle: the row must still be QUERYABLE after registration —
+    // `load_existing_tables` itself always returns `Ok(())` (a per-row
+    // failure there is caught and only warned about), so this SELECT, not
+    // the call above, is what distinguishes "the row registered without a
+    // declared sort order" from "the row never registered at all".
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let rows = ctx2
+        .sql(&query)
+        .await
+        .expect("the row must still be registered despite the unreadable sidecar")
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(materialized.record.table_name.as_str()),
+        "the unreadable-sidecar warning must name the table, got: {log}"
+    );
+    assert!(
+        log.contains("could not be read"),
+        "the unreadable-sidecar warning must state the reason, got: {log}"
+    );
+}
+
+/// #500 U2c c3c, P-M(i): the training-set WRITER's full-tuple sort plans at
+/// exactly ONE output partition and never builds a
+/// `SortPreservingMergeExec` — the SAME single-partition derivation
+/// ([`jammi_db::session::single_partition_context`]) that
+/// [`ResultStore::materialize_training_set`]'s own `plan_training_set_rows`
+/// calls (a private method; reproduced here byte-for-byte the way this
+/// file's own read-back plan-shape test above reproduces the registration's
+/// EXPLAIN), exercised at the session's OWN `target_partitions` in `{1, 4}`.
+///
+/// A FILE-backed source, not [`ts_session`]'s `MemTable`: a `MemTable`'s
+/// partition count is fixed at construction and never collapses just
+/// because `target_partitions` changed, so it cannot stand in for
+/// production's actual shape here — every real `materialize_training_set`
+/// caller's `source_sql` scans a `ListingTable` (`session.add_source`, a
+/// registered CSV/Parquet source, or a pinned result table's own
+/// `ListingTable`-backed provider), whose file-GROUP count DOES follow
+/// `target_partitions` (empirically: an 80 MiB single file plans as exactly
+/// one file group at `target_partitions = 1`, the mechanism
+/// `crates/jammi-ai/tests/it/training_set_stream.rs`'s
+/// `f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_
+/// through_the_stream` exercises end to end). `repartition_file_min_size` is
+/// forced to `1` so even this test's small file splits into multiple groups
+/// at the OUTER session's `target_partitions = 4` — otherwise the pin would
+/// be vacuous there (a file this small would never split on its own). The
+/// c3b regression this unit fixes was exactly a `target_partitions > 1`
+/// write building a real `SortPreservingMergeExec` that filled the pool
+/// before it could reserve its own few MB.
+#[test_case(1 ; "target_partitions_1")]
+#[test_case(4 ; "target_partitions_4")]
+#[tokio::test]
+async fn the_writers_single_partition_derivation_plans_one_sort_and_no_merge(
+    target_partitions: usize,
+) {
+    use datafusion::common::Column;
+    use datafusion::logical_expr::Expr;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::prelude::{CsvReadOptions, SessionConfig};
+
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("rows.csv");
+    let mut body = String::from("q,a\n");
+    for i in 0..64u32 {
+        body.push_str(&format!("q{i:04},a{i:04}\n"));
+    }
+    std::fs::write(&csv_path, body).unwrap();
+
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_target_partitions(target_partitions),
+    );
+    ctx.register_csv("rows", csv_path.to_str().unwrap(), CsvReadOptions::new())
+        .await
+        .unwrap();
+    ctx.sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let columns = ts_columns();
+
+    // Byte-for-byte `plan_training_set_rows`'s own construction
+    // (`crates/jammi-db/src/store/mod.rs`): a `Column::new_unqualified`
+    // projection (never the parsing `col(..)` helper) over the SAME
+    // single-partition derivation, sorted ascending, NULLS FIRST.
+    let single_partition_ctx = jammi_db::session::single_partition_context(&ctx);
+    let projection: Vec<Expr> = columns
+        .iter()
+        .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
+        .collect();
+    let sorted = single_partition_ctx
+        .sql("SELECT * FROM rows")
+        .await
+        .unwrap()
+        .select(projection.clone())
+        .unwrap()
+        .sort(
+            projection
+                .into_iter()
+                .map(|e| e.sort(true, true))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let plan = sorted.create_physical_plan().await.unwrap();
+
+    assert_eq!(
+        plan.output_partitioning().partition_count(),
+        1,
+        "the writer's single-partition derivation must plan exactly one output partition \
+         regardless of the session's own target_partitions ({target_partitions})"
+    );
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(
+        !text.contains("SortPreservingMergeExec"),
+        "the writer's plan must never merge partition-local sorted runs: {text}"
+    );
+}
+
+/// Regression (hard-block, contract `feat_500-B-U2c`): a projected column
+/// name is data, never a fragment of SQL to re-parse. `"meta.id"` and
+/// `"id"` are both admitted by `TrainingSetSpec::validate_columns` (no rule
+/// there forbids a dot or mixed case), so a training set materialized over
+/// exactly these two column names is reachable from
+/// `materialize_training_set` — the registration renderer must bind
+/// `"meta.id"` as ONE verbatim column name, never split it into a
+/// `meta`-qualified reference to `id` (which would falsely collapse onto
+/// the SAME schema field the second, bare `"id"` column also names).
+///
+/// Asserted directly against the resolved physical plan's own
+/// `output_ordering` (never string-matched against `EXPLAIN` text, which a
+/// cosmetic Display change could accidentally satisfy either way): the
+/// LEADING declared sort column must be the schema field literally named
+/// `"meta.id"`, not `"id"`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualified_reference(
+    backend: BackendKind,
+) {
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+
+    let schema: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("meta.id", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, true),
+    ]));
+    let meta_id: StringArray = vec![Some("z"), Some("m")].into_iter().collect();
+    let id: StringArray = vec![Some("a"), Some("b")].into_iter().collect();
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(meta_id), Arc::new(id)]).unwrap();
+    let ctx = SessionContext::new();
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("rows", Arc::new(table)).unwrap();
+
+    let columns = vec!["meta.id".to_string(), "id".to_string()];
+    let source = unique_source(&dir, "dotted");
+    let spec = TrainingSetSpec {
+        source_id: &source,
+        source_sql: "SELECT \"meta.id\", \"id\" FROM rows",
+        columns: &columns,
+        task: ModelTask::TextEmbedding,
+        format: "pairs",
+        inputs: vec![InputAnchor::unpinned_at_instant(
+            &source,
+            "2026-09-15T00:00:00Z",
+        )],
+        device: ComputeDevice::Cpu,
+    };
+
+    let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
+
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let plan = ctx
+        .sql(&query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    // No SortExec: the (small, single-file-group) table's declared order is
+    // still trusted for the read-back plan.
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(!text.contains("SortExec"), "no SortExec expected: {text}");
+
+    // The defect itself: the declared ordering's LEADING column must be the
+    // schema field literally named "meta.id" -- a parsing renderer would
+    // have declared "id" here instead (both "meta.id" and the bare "id"
+    // collapsing onto the same misresolved schema field).
+    let ordering = plan
+        .properties()
+        .output_ordering()
+        .expect("a declared file sort order");
+    assert_eq!(ordering.len(), 2, "both projected columns are declared");
+    let leading = ordering[0]
+        .expr
+        .downcast_ref::<PhysicalColumn>()
+        .expect("the leading sort expr is a bare column reference");
+    assert_eq!(
+        leading.name(),
+        "meta.id",
+        "the leading declared sort key must be the dotted column verbatim, not a \
+         misresolved 'id' — got the physical plan: {text}"
+    );
+
+    // The rows themselves come back in the true committed order (meta.id
+    // ascending: "m" then "z") -- correctness, not merely the metadata.
+    let rows = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+    let out = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+    let meta_id_out = string_column(&out, "meta.id");
+    assert_eq!(
+        meta_id_out,
+        vec![Some("m".to_string()), Some("z".to_string())],
+        "rows must read back in the committed full-tuple order"
+    );
+}
+
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -1806,6 +2307,22 @@ async fn delete_sidecar(store: &ResultStore, record: &ResultTableRecord) {
     let handle = store.open_parquet(&url).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     handle.delete_if_exists(&sidecar).await.unwrap();
+}
+
+/// Overwrite a training-set row's `.materialization.json` sidecar with bytes
+/// that are not valid JSON at all — an UNREADABLE sidecar (#500 U2c closing
+/// round, A4/P-B6), distinct from an ABSENT one: `read_materialization_manifest`
+/// finds the object present (`handle.exists` is `true`) but
+/// `MaterializationManifest::from_json_bytes` fails to parse it, so the call
+/// returns `Err`, never `Ok(None)`.
+async fn corrupt_sidecar(store: &ResultStore, record: &ResultTableRecord) {
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let handle = store.open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, b"not valid json".to_vec().into())
+        .await
+        .unwrap();
 }
 
 // ─── model_materialization (#500): `probe_model_by_definition` ────────────

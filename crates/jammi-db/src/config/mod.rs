@@ -11,6 +11,7 @@ use crate::error::{JammiError, Result};
 use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 
 mod env_map;
+pub mod host_memory;
 mod layers;
 pub mod secret;
 #[cfg(test)]
@@ -709,10 +710,104 @@ pub enum SigningKeyConfig {
 pub struct EngineConfig {
     /// Number of DataFusion execution threads. Default: available CPU count.
     pub execution_threads: usize,
-    /// Maximum memory for the query engine (e.g., `"75%"` or `"4GB"`). Default: `"75%"`.
+    /// Maximum memory for the query engine: `"<n>%"` (1-100) of host
+    /// physical memory, `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or
+    /// `"<n>"` (bytes). Default: `"75%"`. Parsed by
+    /// [`Self::memory_limit_bytes`] — see its doc for the full grammar and
+    /// refusals.
     pub memory_limit: String,
     /// Maximum rows per DataFusion batch. Default: 8192.
     pub batch_size: usize,
+}
+
+impl EngineConfig {
+    /// Below this, a resolved `memory_limit` is refused at load (K2, contract
+    /// `feat_500-B-U2c` §9 B5): 64 MiB is small enough that DataFusion's own
+    /// long-lived pool consumers (a `SortPreservingMergeExec`'s per-partition
+    /// reservation, an external sorter's spill buffer) would be refused on
+    /// the very first non-trivial query, before the setting ever bounds the
+    /// workload it exists to bound.
+    pub const MEMORY_LIMIT_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Parse `[engine] memory_limit` into bytes — the ONE reader of the
+    /// field; every consumer of the byte value (the session's
+    /// [`datafusion::execution::memory_pool::GreedyMemoryPool`]) calls this,
+    /// never the raw string.
+    ///
+    /// # Grammar
+    ///
+    /// - `"<n>%"`, `1 <= n <= 100`: that percentage of
+    ///   [`host_memory::total_physical_memory_bytes`] (a Linux cgroup
+    ///   ceiling honoured when it is lower than the host total and
+    ///   readable), read once per call — not cached, so a caller that wants
+    ///   ONE resolved value for a whole session's lifetime calls this once
+    ///   and keeps the `u64`, the same discipline
+    ///   `crate::session::JammiSession::build` follows.
+    /// - `"<n>GB"` / `"<n>MB"` / `"<n>KB"`: `n` binary (1024-based) units.
+    /// - `"<n>"`: `n` bytes, unadorned.
+    ///
+    /// # Refusals
+    ///
+    /// Every arm is a typed [`JammiError::Config`] naming the key and the
+    /// configured value:
+    ///
+    /// - a percentage outside `1..=100`;
+    /// - a form matching none of the three shapes above (an empty string, a
+    ///   decimal, a stray unit with no digits, an unrecognised suffix, a
+    ///   negative number);
+    /// - a resolved value below [`Self::MEMORY_LIMIT_FLOOR_BYTES`] — the
+    ///   floor also named in the message, so `"007"` (7 bytes, a
+    ///   `[engine]` config typo for `"7%"` or similar) is refused rather than
+    ///   silently building a 7-byte pool no query could ever run under.
+    pub fn memory_limit_bytes(&self) -> Result<u64> {
+        let raw = self.memory_limit.trim();
+        let bytes = if let Some(pct) = raw.strip_suffix('%') {
+            let pct: u64 = pct
+                .parse()
+                .map_err(|_| Self::memory_limit_grammar_error(&self.memory_limit))?;
+            if !(1..=100).contains(&pct) {
+                return Err(JammiError::Config(format!(
+                    "[engine] memory_limit = {:?}: a percentage must be between 1 and 100",
+                    self.memory_limit
+                )));
+            }
+            let total = host_memory::total_physical_memory_bytes()?;
+            total.saturating_mul(pct) / 100
+        } else if let Some(n) = raw.strip_suffix("GB") {
+            Self::parse_binary_unit(n, &self.memory_limit, 1024 * 1024 * 1024)?
+        } else if let Some(n) = raw.strip_suffix("MB") {
+            Self::parse_binary_unit(n, &self.memory_limit, 1024 * 1024)?
+        } else if let Some(n) = raw.strip_suffix("KB") {
+            Self::parse_binary_unit(n, &self.memory_limit, 1024)?
+        } else {
+            raw.parse::<u64>()
+                .map_err(|_| Self::memory_limit_grammar_error(&self.memory_limit))?
+        };
+        if bytes < Self::MEMORY_LIMIT_FLOOR_BYTES {
+            return Err(JammiError::Config(format!(
+                "[engine] memory_limit = {:?} resolves to {bytes} byte(s), below the {} MiB \
+                 floor (a smaller pool would refuse DataFusion's own long-lived reservations \
+                 before it ever bounds a query)",
+                self.memory_limit,
+                Self::MEMORY_LIMIT_FLOOR_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(bytes)
+    }
+
+    fn parse_binary_unit(digits: &str, raw: &str, unit: u64) -> Result<u64> {
+        let n: u64 = digits
+            .parse()
+            .map_err(|_| Self::memory_limit_grammar_error(raw))?;
+        Ok(n.saturating_mul(unit))
+    }
+
+    fn memory_limit_grammar_error(raw: &str) -> JammiError {
+        JammiError::Config(format!(
+            "[engine] memory_limit = {raw:?} is not a valid form: use \"<n>%\" (1-100), \
+             \"<n>GB\"/\"<n>MB\"/\"<n>KB\", or \"<n>\" (bytes)"
+        ))
+    }
 }
 
 /// GPU device and memory settings.
@@ -1614,6 +1709,25 @@ pub struct ServerConfig {
     /// both at a fixed port (`:0` never collides). Served outside the tenant
     /// layer (I-PEER): every client of it is a jammi coordinator.
     pub peer_bind: Option<String>,
+    /// The address OTHER replicas dial THIS process's `peer_bind` listener
+    /// at — usually a load-balancer-free, directly-routable `host:port`
+    /// (`peer_bind` itself is commonly `0.0.0.0:PORT`, unusable as a dial
+    /// target). `None` (the default) = this process never advertises a gang
+    /// membership row: its `instances.peer_addr`/`result_root` columns stay
+    /// `NULL` regardless of whether `peer_bind` is set. Requires `peer_bind`
+    /// to be set too (refused at the ONE membership choke point,
+    /// [`crate::catalog::instance::InstanceRegistration::from_config`] —
+    /// naming BOTH keys); parses as a
+    /// [`PeerAddr`](crate::catalog::instance::PeerAddr).
+    ///
+    /// # TOML
+    ///
+    /// ```toml
+    /// [server]
+    /// peer_bind = "0.0.0.0:9000"
+    /// peer_advertise = "10.0.4.7:9000"
+    /// ```
+    pub peer_advertise: Option<String>,
     /// MARGINAL-LOAD ADMISSION per query, in bytes: the maximum estimated
     /// bytes ONE query may load locally for segments it does not own, when
     /// their owners are unreachable (the last rung of the placed-search
@@ -2327,6 +2441,7 @@ impl Default for ServerConfig {
             services: ServiceSelection::default(),
             limits: LimitsConfig::default(),
             peer_bind: None,
+            peer_advertise: None,
             peer_local_load_bytes: None,
         }
     }
@@ -2440,6 +2555,39 @@ fn describe_deserialize_error(
 }
 
 impl JammiConfig {
+    /// The result-table root this deployment resolves to, VERBATIM: the
+    /// explicit `[storage] result_root` when set, else `{artifact_dir}/
+    /// jammi_db` — the SAME derivation `jammi_db::store::ResultStore::new`'s
+    /// local-root arm performs (`artifact_dir.join("jammi_db")`), the ONE
+    /// place that join happens so nothing downstream re-derives it
+    /// independently. This string is exactly what a gang member's
+    /// `instances.result_root` column carries
+    /// ([`crate::catalog::instance::InstanceRegistration::from_config`]) —
+    /// no scheme folding, no symlink resolution, no reinterpretation of any
+    /// kind.
+    ///
+    /// # Errors
+    ///
+    /// [`JammiError::Config`] naming `artifact_dir` when its joined
+    /// `{artifact_dir}/jammi_db` path is not valid UTF-8 — never a silent
+    /// lossy fold (`Path::to_string_lossy`'s replacement-character
+    /// substitution), since that fold could make two genuinely different
+    /// paths compare equal downstream.
+    pub fn resolved_result_root(&self) -> Result<String> {
+        match &self.storage.result_root {
+            Some(root) => Ok(root.clone()),
+            None => {
+                let joined = self.artifact_dir.join("jammi_db");
+                joined.to_str().map(str::to_string).ok_or_else(|| {
+                    JammiError::Config(format!(
+                        "artifact_dir '{}' is not valid UTF-8",
+                        self.artifact_dir.display()
+                    ))
+                })
+            }
+        }
+    }
+
     /// Load configuration the production way: resolve the file (explicit
     /// path, `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`, the
     /// platform config dir — `resolve_config_path_in`) against the real
@@ -2498,6 +2646,26 @@ impl JammiConfig {
         // `otlp_endpoint`) at load time, naming the offending key, rather
         // than at the first `jammi_ai::telemetry::otlp_layer` call.
         config.observability.validate()?;
+        // Reject an out-of-grammar `[engine] memory_limit` (an unparseable
+        // form, an out-of-range percentage, or a resolved value below the
+        // floor) at load time, naming the key — rather than at the first
+        // session build, deep inside `JammiSession::build`'s memory-pool
+        // construction. The resolved value itself is discarded here; every
+        // real consumer re-resolves through this same reader (K2).
+        config.engine.memory_limit_bytes()?;
+        // Reject a `[server] peer_advertise` that cannot resolve a valid
+        // gang-membership shape (an unset `peer_bind`, or an unparseable
+        // address) at load time, naming the offending key — rather than
+        // only surfacing deep inside `InferenceSession::wrap_with`'s own
+        // registration call. `MembershipConfig::validate` performs no
+        // filesystem access and no interpretation of the result root at
+        // all — the row carries `resolved_result_root()` verbatim (contract
+        // §10); `InstanceRegistration::from_config`, which `wrap_with`
+        // calls (every `InferenceSession` constructor funnels through it),
+        // is the ONLY other caller, so a struct-literal config that skips
+        // `load_from` entirely is still covered there. The `Option` is
+        // discarded; this call is for its early-failure side effect only.
+        let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
         Ok(config)
     }
 

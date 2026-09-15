@@ -2751,6 +2751,210 @@ GPU-less build reads as skip; set (the pod session's actual landing proof), it
 panics instead — so a broken device acquisition on the pod cannot silently
 read as passed-by-skipping.
 
+### 2.6b The training-set loader: committed order, the session memory pool, and the residency bound (`jammi-db` + `jammi-ai/fine_tune`)
+
+A tabular fine-tune's rows are a **producer output**, not a run's private scan (§3.5
+narrates the whole submit → claim → train → finalize path; this section is the
+data-plane primitive underneath the "Train" step). `materialize_training_set`
+(`crates/jammi-db/src/store/mod.rs:4054`) commits the projected columns once into an
+immutable `TrainingSet` result table; every reader re-applies the SAME committed order,
+and a session reads it either eagerly (collected into memory) or through a per-rank,
+residency-bounded stream — which arm a run takes is a single predicate, stated below.
+
+**The committed order: one key list, two renderers, declared at both registration
+paths.** `training_set_sort_keys` (`crates/jammi-db/src/store/mod.rs:345`) is the ONE
+source — every projected column, ascending, NULLs first, in declared order — that both
+`training_set_order_by` (`crates/jammi-db/src/store/mod.rs:372`, the SQL `ORDER BY` clause
+a reader re-applies) and `training_set_file_sort_order`
+(`crates/jammi-db/src/store/mod.rs:420`, the DataFusion `ListingOptions::with_file_sort_order`
+form a provider DECLARES) render from — a reader that hand-wrote either form independently
+could silently disagree with the producer's own commitment. `bind_result_table`
+(`crates/jammi-db/src/store/mod.rs:2808`) passes the declared order to `register_table`
+for every single-fragment `TrainingSet` row, on BOTH registration paths: fresh
+materialization (inside `BuildingTable::finish`) and crash recovery
+(`load_existing_tables`, on a session that never saw the write) — so a read-back query
+plans no `SortExec` regardless of which path bound the table:
+`a_training_sets_registration_declares_its_order_so_the_read_back_plans_no_sort`
+(`crates/jammi-db/tests/it/materialization.rs:871`). `training_set_registration_sort_order`
+(`crates/jammi-db/src/store/mod.rs:2902`) is where that declaration is actually read back
+off the table's `.materialization.json` sidecar; it can legitimately fail to declare one —
+no sidecar at all (a pre-migration-021 table), the sidecar present but UNREADABLE (an
+object-store error, or a body that fails to parse as the manifest JSON — #500 U2c closing
+round, A4/P-B6), or a sidecar whose descriptor is not a `TrainingSet` variant — and all
+three arms now `warn!`, naming the table and the reason, before returning `Ok(None)`:
+registration still succeeds (the reader's explicit `ORDER BY` clause still sorts the read
+correctly), only the `SortExec`-free plan is lost for that one row, and the silent fallback
+no longer stays silent: `registration_warns_when_a_training_sets_sidecar_is_absent`
+(`crates/jammi-db/tests/it/materialization.rs:970`) and
+`registration_warns_when_a_training_sets_sidecar_is_unreadable`
+(`crates/jammi-db/tests/it/materialization.rs:1066`). Before the unreadable arm was added,
+the read error propagated out of `training_set_registration_sort_order` via `?`, which made
+`bind_result_table` return `Err` WITHOUT ever calling `register_table` at all — the row
+never entered the session's schema, not merely lost its ordering hint.
+**Cost, unconditionally paid:** `read_materialization_manifest` issues one object-store GET
+(plus a body read, when the object exists) per `TrainingSet` row, every time
+`bind_result_table` runs for that row — never cached — which means `load_existing_tables`
+(session startup / crash recovery) pays one such GET for every `TrainingSet` row currently
+in `ready` status.
+
+**The session memory pool.** `[engine] memory_limit` — `memory_limit`
+(`crates/jammi-db/src/config/mod.rs:718`) — is the ONE knob every consumer of a session's
+memory is bounded by: an ordinary `SortExec`/`SortPreservingMergeExec`, a training-set
+stream's chunk reservation, an eager materialization's collected-batch reservation.
+`memory_limit_bytes` (`crates/jammi-db/src/config/mod.rs:762`) is the ONE reader of the
+field, parsing `"<n>%"` (1–100, of `total_physical_memory_bytes`,
+`crates/jammi-db/src/config/host_memory.rs:34` — the lower of the host's physical total and
+a readable Linux cgroup ceiling), `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or `"<n>"`
+(bytes); every unparseable form is a typed `JammiError::Config` naming the key. A resolved
+value below the 64 MiB `MEMORY_LIMIT_FLOOR_BYTES`
+(`crates/jammi-db/src/config/mod.rs:730`) is refused too — small enough that DataFusion's
+own long-lived pool consumers would be refused on the very first non-trivial query, before
+the setting ever bounds the workload it exists to bound. `JammiSession::build` resolves
+this ONCE at session construction and installs a `GreedyMemoryPool`
+(`crates/jammi-db/src/session.rs:210`) sized to it on the SAME `RuntimeEnvBuilder` chain
+the session's `SessionContext` is built from; `memory_pool`
+(`crates/jammi-db/src/session.rs:815`) is how an engine-side consumer (the training-set
+stream, the eager reader) registers its own `MemoryConsumer` against that identical bound,
+and `sql_stream` (`crates/jammi-db/src/session.rs:798`) is `sql`'s streamed twin — the same
+tenant-scoped plan, returned as a `SendableRecordBatchStream` a caller drains incrementally
+rather than collects. Every over-budget grow — a DataFusion operator's own reservation or
+an engine-side consumer's — surfaces as the typed `ResourcesExhausted`
+(`crates/jammi-db/src/error.rs:446`, `{ limit_bytes, detail }`) from the same public path
+the query or reservation was made on: never a panic, never a silent wait. At the gRPC
+edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps it to
+`Code::ResourceExhausted` (`crates/jammi-server/src/grpc/wire.rs:308`).
+
+**The writer: one partition, no merge — and the deployment rule.** The training set's
+own write plans its full-tuple sort through `single_partition_context`
+(`crates/jammi-db/src/session.rs:1180`) inside `plan_training_set_rows`
+(`crates/jammi-db/src/store/mod.rs:4223`): a `target_partitions = 1` derivation of the
+caller's session state, so the write is ONE external sort at ONE output partition, never a
+partitioned local-sort-plus-`SortPreservingMergeExec` merge — there is only ever one
+partition to recombine, so no merge operator (with its own real pool reservation on top of
+every partition's already-buffered sorted run) is ever planned. The residency this pays is
+O(one batch) plus DataFusion's own spill reservation for that single sort, never O(the
+whole table) — **the deployment rule**, stated where the write is planned: a single
+`[engine] batch_size` batch larger than `[engine] memory_limit`
+`cannot be sorted` (`crates/jammi-db/src/store/mod.rs:3992`), because no batch-granular
+operator (a spilling external sort, a decoded chunk) can ever hold one. Sized correctly
+the arithmetic is comfortable — a fixture with ~100 KB rows under a 64 MiB pool needs
+`engine.batch_size = 32` (`32 × ~100,000 B ≈ 3.1 MB` per batch) rather than
+`EngineConfig::default`'s `8192` (`8192 × ~100,000 B ≈ 800 MB`, far larger than the pool
+regardless of partition count or merge shape) — see
+`f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream`
+(`crates/jammi-ai/tests/it/training_set_stream.rs:1000`) for the executed numbers. The
+session's `RuntimeEnv` carries a disk-backed `DiskManager` by default, so a sort whose
+in-progress runs exceed the pool spills rather than failing the write. This
+single-partition property is asserted at BOTH `target_partitions ∈ {1, 4}` by
+`the_writers_single_partition_derivation_plans_one_sort_and_no_merge`
+(`crates/jammi-db/tests/it/materialization.rs:1174`).
+
+The property holds for the source universe a training-set WRITE actually registers: a
+`ListingTable` (a registered CSV/Parquet source, single-fragment — its file-group count
+follows `target_partitions`), a Postgres/MySQL federated source
+(`crates/jammi-db/src/source/postgres.rs`, `crates/jammi-db/src/source/mysql.rs`, planned
+through `FederationOptimizerRule`, `crates/jammi-db/src/session.rs:227` — one partition by
+construction), and the mutable provider's own `MemTable::try_new`
+(`crates/jammi-db/src/store/mutable/provider.rs:165`, always built `vec![vec![batch]]` —
+one partition). The edge this excludes: a hand-built MULTI-partition `MemTable` under
+`single_partition_context` plans a `SortPreservingMergeExec` over N per-partition
+`SortExec`s that still collapses to ONE output partition — the writer's own
+`partition_count` (`crates/jammi-db/src/store/mod.rs:4257`) guard cannot see that shape,
+because a `MemTable`'s partition count is fixed at construction and never collapses just
+because `target_partitions` changed (unlike a `ListingTable`'s file groups). No production
+source registers one: `MemTable::try_new` has exactly one call site in the workspace, the
+mutable provider's own scan above — and it is single-partition. See `ts_session`
+(`crates/jammi-db/tests/it/materialization.rs:558`)'s own doc comment on why
+`the_writers_single_partition_derivation_plans_one_sort_and_no_merge` is FILE-backed
+rather than `MemTable`-backed.
+
+**A pinned/versioned result table is NOT this universe (#500 U2c closing round, A3).** A
+VERSIONED result table's provider is `build_masked_provider`
+(`crates/jammi-db/src/store/mod.rs:2969`): one `ListingTable` per manifest fragment,
+combined by `MaskedTableProvider`'s `scan` (`crates/jammi-db/src/store/masked_provider.rs:104`)
+into a `UnionExec` (`crates/jammi-db/src/store/masked_provider.rs:153`) when there is more
+than one fragment — a shape that follows the manifest's OWN fragment count, never
+`target_partitions`, and that the writer's single-partition guard above cannot see at all
+(a versioned table is never itself re-sorted through `single_partition_context`). This does
+not threaten the property today because no training-set source is a pinned/versioned
+provider: every training-set `source_sql` this tree builds is `source_relation`
+(`crates/jammi-db/src/sql/ident.rs:50`, `"<source>".public."<table>"`) — a plain
+registered-source relation, reached through `materialize_projection_table`
+(`crates/jammi-ai/src/fine_tune/training_set.rs:142`) and `recompute_training_set`
+(`crates/jammi-ai/src/pipeline/recompute.rs:525`) — and a pinned/versioned provider is
+read only through `ResultStore::pinned_provider`/`ctx.read_table`, never through a source's
+registered SQL relation. A training set built from a versioned table's rows would need to
+name that fact explicitly; nothing in this tree does.
+
+**The per-rank stream.** `crates/jammi-ai/src/fine_tune/stream.rs`'s `TrainingSetStream`
+reads the SAME committed order the eager path reads (`read_back_sql`,
+`crates/jammi-ai/src/fine_tune/training_set.rs:74`) but never collects the whole read into
+a `Vec<RecordBatch>`: a background pump walks the DataFusion stream batch by batch,
+decoding ONLY the rows the current step's chunk needs. `RowWindow`
+(`crates/jammi-ai/src/fine_tune/stream.rs:151`) is the `[start, end)` slice a stream serves
+— the training prefix `[0, train_count)` or the validation suffix `[train_count, total)`;
+`Slice` (`crates/jammi-ai/src/fine_tune/stream.rs:180`) is which rows WITHIN that window
+this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for validation.
+`StreamConfig`'s `new` (`crates/jammi-ai/src/fine_tune/stream.rs:133`) refuses a zero
+prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
+(`crates/jammi-ai/src/fine_tune/stream.rs:120`, `= 2`) — a named constant, the regression
+pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
+`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:2208`). `open`
+(`crates/jammi-ai/src/fine_tune/stream.rs:378`) runs ONE bounded-memory pre-pass over its
+whole window BEFORE the first training step — a schema check plus, for a numeric target, a
+null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
+rows of training compute; `next_chunk` (`crates/jammi-ai/src/fine_tune/stream.rs:441`) is
+the blocking call the trainer's per-step loop drives.
+
+**Resident vs Streamed: one predicate.** `whole_set_arm`
+(`crates/jammi-ai/src/fine_tune/source.rs:161`) decides: mining (scores every candidate
+against the full corpus) and GradCache (treats the whole dataset as one in-batch-negative
+batch) both need every row resident before an epoch begins, so a config taking either arm
+gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:99`); every other text arm at
+`W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
+`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:2108`) that the trainer's own
+dispatch refuses a mismatch against, so the two decisions can never come apart. A
+`Streamed` source never collects a `Vec<RecordBatch>` for the training set at all — the
+worker calls only `training_set::materialize_projection_table`
+(`crates/jammi-ai/src/fine_tune/worker.rs:2123`), never `read_back`/
+`read_back_with_reservation` — while a `Resident` loader's construction reads back through
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:2133`) — defined at
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:238`) — and
+attaches the live
+`MemoryReservation` to the loader via `with_reservation`
+(`crates/jammi-ai/src/fine_tune/data.rs:603`) — held for the loader's own lifetime (moved
+into whichever half of a later `split`, `crates/jammi-ai/src/fine_tune/data.rs:680`,
+carries it), not checked-then-released, so the pool's `reserved()` genuinely reflects a
+Resident job's residency while it trains. A table whose eager collected size exceeds the
+pool therefore still COMPLETES when it trains through the stream
+(`f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_through_the_stream`,
+`crates/jammi-ai/tests/it/training_set_stream.rs:1000`), and the eager collect of that SAME
+table under the SAME pool still refuses, naming `training_set_eager`
+(`crates/jammi-ai/tests/it/training_set_stream.rs:811`); a Resident job's held reservation
+is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs`
+(`crates/jammi-ai/tests/it/training_set_stream.rs:860`).
+
+**A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
+blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
+captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:746`) on
+`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:2076`) is still
+executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
+(`crates/jammi-ai/src/fine_tune/trainer.rs:3512`) drives the stream's own `open` through
+`Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
+different OS thread — it does NOT inherit the async task's task-local (`current`
+(`crates/jammi-db/src/tenant_scope.rs:128`) on `TenantBinding` only ever reads the override
+installed on the CURRENT task, falling back to the session's sticky binding otherwise). So
+every query `TrainingSetStream::open` issues — the schema/null-NaN pre-pass, the ordered
+`read_back_sql` plan, the pump's own planning — re-enters `with_tenant_scoped` explicitly
+INSIDE that `block_on`'s own future, never relying on inheritance, covering every nested
+`.await` `open` makes. Tests of this behaviour must scope via `with_tenant_scoped` on BOTH the
+submit and the wait, matching production's per-request scoping exactly: the session's STICKY
+binding (`bind_tenant`/`with_tenant`) masks the bug class, because `current_tenant` on
+`TenantBinding` falls back to it whenever no task-local override is installed on the current
+task — including the `spawn_blocking` thread `block_on` runs on — so a sticky-bound session's
+blocking-thread call would "accidentally" resolve the right tenant even without the
+re-entry above.
+
 ### 2.7 Model lifecycle (`jammi-ai/model` + `jammi-db/catalog`)
 
 This section covers two distinct lifecycles that share the word "model" but never touch:
@@ -3209,6 +3413,133 @@ ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
 whatever `[lease] duration_secs` resolves to (`LeaseIntervals::lease()`),
 computed once at `OssServer::bind` and passed into `GangServer::new`.
 
+### 2.8b Gang membership substrate (`instances.peer_addr`/`result_root`)
+
+The catalog-level carrier §2.8a's `fresh_instance` call sits beside: two
+columns on `instances` (`crates/jammi-db/src/catalog/instance.rs`,
+`crates/jammi-db/src/catalog/jobs_repo.rs`), migration 035, and the ONE
+choke point every writer of them funnels through.
+
+- **`instances.peer_addr` / `instances.result_root`** (migration
+  `035_instances_peer_addr_result_root`, both nullable `TEXT`, no paired
+  `CHECK` — a row with `peer_addr` set and `result_root` NULL is
+  representable and simply never a member): `NULL`/`NULL` means "this
+  process never joins a gang" — every library/CLI process, and every server
+  that never sets `[server] peer_advertise`. Four K5 pin sites: the const
+  list (`catalog/migrations.rs`), `EXPECTED_MIGRATION_NAMES`
+  (`tests/it/migrations.rs`), the ordered-after oracle
+  (`migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_root`,
+  parametrized sqlite/postgres), and the `029` ledger-replay test's DELETE
+  list (`migration_029_copies_training_jobs_rows_into_jobs_as_queued` —
+  `035` ALTERs `instances`, created fresh by `029`'s replayed DDL, so an
+  omission there would leave the reopened table missing both columns, RED).
+- **`InstanceRegistration`** (`catalog/instance.rs`): the ONE value every
+  writer of the `instances` (+ `workers`) row builds — `instance_id`,
+  `label`, `host`, `peer_addr: Option<PeerAddr>`, `member_root:
+  Option<MemberRoot>`, plus a `worker: Mutex<Option<WorkerFacts>>` cell
+  that is the claim-loop half, owned exclusively by `JobWorker`/
+  `EmbeddedWorker` (`fine_tune/worker.rs`): `run_until` sets it only AFTER
+  its FIRST `upsert_worker` call SUCCEEDS (P-Y4, contract
+  `feat_500-C-U5b-1a` §12 — a failed first upsert must leave the cell
+  `None`, never a fact the row does not carry, so a keeper reregister
+  racing a still-failing loop start never writes a `workers` row the real
+  upsert never itself managed to write), every LATER `set_worker_state`
+  writes the cell before the row, `delete_worker` clears it — so a keeper
+  reregister racing a state change always re-upserts the `workers` row the
+  process is ACTUALLY about to become, never a stale snapshot, and never a
+  fact the row does not yet carry. `PeerAddr` is sealed (`parse`/`as_str`/
+  `Display` only) and is the SAME type the peer listener uses
+  (`index::peer` re-exports it) — the peer and gang listeners can never
+  drift into two address types. `PeerAddr::parse` refuses an UNBRACKETED
+  IPv6 literal (P-Y4): a bracketed IPv6 host (`[::1]:9000`), an IPv4
+  literal, or a DNS hostname are accepted; `2001:db8::1:9000` is refused
+  (ambiguous which colon separates host from port).
+- **`MembershipConfig::validate` and `InstanceRegistration::from_config`**
+  (`catalog/instance.rs`, contract §10, the round-3 excision — the
+  design history through rounds 1–3, incl. the pure-validate/materialize
+  split and the `artifact_dir`-is-a-local-path fix, is filed as unit
+  U5b-1a-A2, `docs/plans/67-distributed-training/README.md`). The member
+  row's root is the byte-for-byte output of
+  `JammiConfig::resolved_result_root()`, carried VERBATIM: `MembershipConfig::
+  validate(&JammiConfig) -> Result<Option<MembershipConfig>>` checks only
+  that `peer_advertise` parses as a `PeerAddr` and that `peer_bind` is set
+  too (else a typed error naming both keys) — it performs NO filesystem
+  access and inspects `result_root`/`artifact_dir` not at all.
+  `InstanceRegistration::from_config` runs `MembershipConfig::validate`,
+  then, when membership applies, sets `member_root` to
+  `MemberRoot::resolved(config)` — the ONE production constructor, wrapping
+  `config.resolved_result_root()?` — the SAME string `build_result_store`
+  (`jammi-ai/src/session.rs`) hands to `ResultStore::with_root`.
+  `MemberRoot::new` (a bare-string wrap, no resolver call, no validation)
+  exists ONLY behind `feature = "test-hooks"`, for fixtures — a production
+  build never links it, so nothing outside `MemberRoot::resolved` can put an
+  arbitrary string in the `instances.result_root` column. **The membership
+  path performs NO
+  interpretation of the root at all, and the gang-membership listing verb
+  does not even read it** (P-Y1, contract §12, the round-5 excision): no
+  URL parse, no scheme handling, no symlink resolution, no case folding, no
+  byte comparison. The row still carries the configured spelling verbatim —
+  two spellings of one physical location (`gcs://b/p` vs `gs://b/p`, a
+  trailing `/`, a case difference) are two DIFFERENT STRINGS in that
+  column — but `list_gang_members`'s admission predicate does not consult
+  it at all in this unit; root identity across spellings, and any
+  membership predicate built on it, is unit U5b-1a-A2's question. The only
+  refusal on this path is the non-UTF-8 refusal already inside
+  `resolved_result_root` (a non-UTF-8 `artifact_dir`,
+  the default arm's only failure mode). `JammiConfig::load_from` calls
+  `MembershipConfig::validate` directly (the early-failure check);
+  `InferenceSession::wrap_with` (`session.rs`) calls `from_config` once per
+  session, before the lease keeper starts and before the result store does
+  anything — the universal funnel every `InferenceSession` constructor
+  reaches, so a hand-built config (never routed through `load_from`) is
+  still covered. `ServerConfig::validate` is NOT the home for any of this:
+  it cannot see `artifact_dir`, which `resolved_result_root` needs.
+- **`JammiConfig::resolved_result_root()`** (`config/mod.rs`): the ONE
+  effective-root derivation (`storage.result_root` when set, else
+  `{artifact_dir}/jammi_db` — the SAME derivation `ResultStore::new`'s
+  local-root arm performs), fallible: it refuses naming `artifact_dir` when
+  the joined path is not valid UTF-8, rather than silently lossy-folding it.
+  This is the ONLY function on the membership path that can fail, and the
+  ONLY source of the member row's root string.
+- **The two read verbs** (`catalog/jobs_repo.rs`, both tenant-unscoped by
+  construction — `instances` carries no tenant column): `peer_addr_of(id,
+  lease)` is the ONE by-id resolution surface (no kind/self filter —
+  any member may resolve any other by id, including a busy or other-kind
+  one); `Some` iff the row is present, fresh under
+  `instance_liveness_margin(lease)`, and `peer_addr` is non-NULL.
+  `list_gang_members(GangListing { kind, self_instance, lease })` (no root
+  field, P-Y1) is an `instances JOIN workers` listing: excludes the caller
+  itself, excludes `workers.state != 'claiming'` (an INNER join — no
+  `workers` row is excluded too, since a member is a fleet worker with a
+  claim-loop slot, not merely a live process), excludes a `kinds` token
+  that does not match `kind` as a WHOLE comma-split trimmed token (`,`
+  is `upsert_worker`'s own encoding), excludes stale/NULL-`peer_addr`
+  rows; `result_root` plays NO part in this predicate — two members whose
+  `result_root` strings differ (by scheme alias, case, trailing `/`, or
+  anything else) ARE gang members of each other. The survivors are sorted
+  by `instance_id` BYTE ORDER in Rust (never a SQL `ORDER BY` — backend
+  collation is untrusted). A corrupted stored `peer_addr` that fails
+  `PeerAddr::parse` is a typed `Catalog` error from either verb, never
+  silently mapped to "not a
+  member".
+- **The lease keeper's reregister** (`catalog/lease_keeper.rs`,
+  `LeaseTarget::Instance(Arc<InstanceRegistration>)`): a normal heartbeat is
+  `Catalog::touch_instance` (pure UPDATE, never resurrects a pruned row); a
+  MISSED touch (`Ok(false)` — the row was pruned during a transient outage)
+  calls `Catalog::reregister_instance(&reg)` instead of flipping `lost` — it
+  re-upserts the `instances` row AND, when the registration's worker cell
+  is `Some`, the `workers` row too, in ONE transaction, so a live process
+  rejoins its gang (and its claim-loop membership, if any) with no restart.
+  `instance_prune_window(lease)` (`catalog/lease.rs`) = `instance_liveness_
+  margin(lease).saturating_add(lease)` = `3 × lease`, STRICTLY beyond the
+  `2 × lease` margin `fresh_instance`/the two read verbs judge freshness
+  by — `InferenceSession::wrap_with`'s construction-time
+  `prune_instances` call uses this function, never a literal
+  `saturating_mul(2)`/`(3)` at the call site, so a merely-stale member (in
+  `(margin, window]`) keeps its row through at least one more sweep, giving
+  the keeper's reregister a chance to land before a prune sweep could ever
+  reap it.
+
 ### 2.9 Numerics (`jammi-numerics`)
 
 - **`NumericsError` / `Result`** — `crates/jammi-numerics/src/error.rs`. The only
@@ -3500,7 +3831,7 @@ At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`
 maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 `Code::Internal`, and lets every unmatched variant — including the propagated
 `JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:300`). Because both reload surfaces raise the same
+(`crates/jammi-server/src/grpc/wire.rs:311`). Because both reload surfaces raise the same
 `JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either

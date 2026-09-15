@@ -297,6 +297,17 @@ pub fn map_engine_error(err: JammiError) -> Status {
                 "training set over `{source_query}` is empty: the projection yielded zero rows"
             ),
         ),
+        // A DataFusion plan operator or an engine-side memory reservation
+        // tried to grow past the session's `[engine] memory_limit`-bounded
+        // pool. `ResourceExhausted` — gRPC's code for exactly this ("some
+        // resource has been exhausted, perhaps a per-user quota, or perhaps
+        // the entire file system is out of space"); a retry with a smaller
+        // request, a higher `memory_limit`, or backoff is the caller's
+        // remedy, never a bare `Internal`.
+        JammiError::ResourcesExhausted { limit_bytes, .. } => (
+            Code::ResourceExhausted,
+            format!("resources exhausted: pool limit is {limit_bytes} byte(s)"),
+        ),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)
@@ -498,6 +509,40 @@ mod tests {
         assert!(
             matches!(&back, JammiError::EmptyTrainingSet { source_query } if source_query == query),
             "an empty training set must reconstruct as itself, got {back:?}"
+        );
+        assert_eq!(
+            back.to_string(),
+            engine.to_string(),
+            "the remote text must be the embedded text"
+        );
+    }
+
+    /// A memory-pool exhaustion (a training-set stream's reservation, an
+    /// ordinary DataFusion plan) maps to gRPC `ResourceExhausted` — never a
+    /// bare `Internal` — and reconstructs on the remote side as the exact
+    /// typed variant, `limit_bytes` and `detail` both faithful, through the
+    /// same `attach_error_detail` → real `tonic::Status` → `error_from_status`
+    /// chain a live call uses.
+    #[test]
+    fn resources_exhausted_maps_to_resource_exhausted_and_round_trips() {
+        let engine = JammiError::ResourcesExhausted {
+            limit_bytes: 67_108_864,
+            detail: "greedy(used: 10.0 MB, pool_size: 64.0 MB)".to_string(),
+        };
+        let status = map_engine_error(JammiError::ResourcesExhausted {
+            limit_bytes: 67_108_864,
+            detail: "greedy(used: 10.0 MB, pool_size: 64.0 MB)".to_string(),
+        });
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let back = error_from_status(&status);
+        assert!(
+            matches!(
+                &back,
+                JammiError::ResourcesExhausted { limit_bytes, detail }
+                    if *limit_bytes == 67_108_864
+                        && detail == "greedy(used: 10.0 MB, pool_size: 64.0 MB)"
+            ),
+            "resources-exhausted must reconstruct as itself, got {back:?}"
         );
         assert_eq!(
             back.to_string(),

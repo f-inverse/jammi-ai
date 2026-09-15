@@ -5,6 +5,7 @@ pub mod channel_repo;
 #[cfg(feature = "test-hooks")]
 pub mod claim_test_hooks;
 pub mod eval_repo;
+pub mod instance;
 pub mod jobs_repo;
 pub mod lease;
 pub mod lease_keeper;
@@ -18,6 +19,8 @@ pub mod source_repo;
 pub mod status;
 pub mod topic_repo;
 pub mod version_repo;
+#[cfg(feature = "test-hooks")]
+pub mod worker_test_hooks;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -1637,6 +1637,21 @@ jobs:
           # ci/scripts/test_gpu_dev_lifecycle.sh's own module doc.
           - name: gpu-dev lifecycle safety
             cmd: bash ci/scripts/test_gpu_dev_lifecycle.sh
+          # RunPod REST v2 cluster primitives (plan #500 U7b c1): the create
+          # request body carries exactly the documented CreateClusterRequest
+          # keys (`unevaluatedProperties: false`, a reviewed fixture under
+          # ci/scripts/fixtures/); the pod payload and the cluster payload
+          # share byte-identical entrypoint text (_rp_entrypoint_setup);
+          # rp_cluster_sweep's age judgement, prefix scoping, and every
+          # REST failure arm (401/429/500, unparseable body, a non-204
+          # delete, the fail-closed post-delete re-enumeration); the shared
+          # force_hours validator's 0/00/leading-zero/overflow lattice; and
+          # rp_sweep's new cluster-member exclusion ("cluster member,
+          # skipped") plus its named, non-fatal "terminate refused: <reason>"
+          # arm. Mocks-only: no RunPod account, no GPU, no network. See
+          # ci/scripts/test_runpod_cluster_lib.sh's own module doc.
+          - name: runpod cluster primitives suite
+            cmd: bash ci/scripts/test_runpod_cluster_lib.sh
           # Pod-build-substrate mechanisms (M1-M6, contract
           # ci/pod-build-substrate): wrapper-off + no S3/sccache in
           # .jammi_env; pod_target_clone.sh's marker refusal, cp -a clone,

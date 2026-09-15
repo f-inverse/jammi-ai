@@ -114,6 +114,12 @@ pub(crate) fn training_set_spec<'a>(
 ///
 /// The projection runs unordered — the producer owns the sort, and asking the
 /// source for an order it is about to re-impose would only plan the sort twice.
+///
+/// The EAGER entry point: collects the whole read-back into memory (see
+/// [`read_back`]'s own doc for the reservation this pays). A `Streamed`
+/// [`super::source::TrainingSource`] calls [`materialize_projection_table`]
+/// instead — the table-only form — and never reaches this function, so no
+/// `Vec<RecordBatch>` is ever collected for it (#500 U2c §11 F1).
 pub async fn materialize_projection(
     session: &InferenceSession,
     source_id: &str,
@@ -121,6 +127,25 @@ pub async fn materialize_projection(
     task: ModelTask,
     format: &str,
 ) -> Result<(TrainingSetTable, Vec<RecordBatch>)> {
+    let table = materialize_projection_table(session, source_id, columns, task, format).await?;
+    let batches = read_back(session, &table, columns).await?;
+    Ok((table, batches))
+}
+
+/// Materialise `columns` of a registered `source` as a training set,
+/// returning the table ONLY — no row is ever read. The table-only entry
+/// point [`materialize_projection`] (the eager arm) and a `Streamed`
+/// [`super::source::TrainingSource`] (the worker's stream arm) both build
+/// their [`TrainingSetSpec`] identically through `training_set_spec`, so a
+/// table this function materialises names EXACTLY the definition hash
+/// [`materialize_projection`] would have computed from the same inputs.
+pub async fn materialize_projection_table(
+    session: &InferenceSession,
+    source_id: &str,
+    columns: &[String],
+    task: ModelTask,
+    format: &str,
+) -> Result<TrainingSetTable> {
     let table_name = session.find_table_name(source_id)?;
     let projection = columns
         .iter()
@@ -131,7 +156,7 @@ pub async fn materialize_projection(
         "SELECT {projection} FROM {}",
         source_relation(source_id, &table_name)
     );
-    materialize_and_read(
+    materialize(
         session,
         training_set_spec(
             source_id,
@@ -152,24 +177,98 @@ pub async fn materialize_projection(
     .await
 }
 
-/// Materialise a spec through the producer and read the table back in its
-/// committed order.
+/// Materialise a spec through the producer. Reads NO row (#500 U2c §11 F1) —
+/// the reader's half of the order contract ([`read_back`]) is a SEPARATE
+/// call, made only by a caller that actually wants the rows in memory.
+pub async fn materialize(
+    session: &InferenceSession,
+    spec: TrainingSetSpec<'_>,
+) -> Result<TrainingSetTable> {
+    session
+        .result_store()
+        .materialize_training_set(session.context(), spec)
+        .await
+}
+
+/// Read a materialised training set back in its committed order, collected
+/// into memory — the EAGER arm's whole-table read.
 ///
 /// The read runs on the SAME `SessionContext` the verb was handed: the verb
 /// binds the table there on both the computed and the reused path, so the
 /// read-back resolves without a second registration and a reused table is read
 /// exactly like a fresh one.
-async fn materialize_and_read(
+///
+/// **The eager reservation route (#500 U2c, §9 B6).** The collected batches'
+/// `RecordBatch::get_array_memory_size()` sum is reserved against a
+/// `MemoryConsumer("training_set_eager")` on `session.memory_pool()` right
+/// after collection — the SAME pool a per-rank [`super::stream::
+/// TrainingSetStream`] reserves against — so an eager read that collected
+/// more bytes than `[engine] memory_limit` allows surfaces the typed
+/// [`jammi_db::error::JammiError::ResourcesExhausted`] naming
+/// `training_set_eager`, never a silent over-budget hold. The reservation is
+/// checked and then released here (this crate does not thread a residency
+/// guard through every `Vec<RecordBatch>` return site this function has), so
+/// this is a load-time check on what was just collected, not a continuously
+/// held accounting of how long the caller keeps the batches afterward —
+/// stated, not hidden. A caller that instead needs the residency HELD for as
+/// long as it keeps the rows (the production `Resident` binding,
+/// `worker.rs::run_spec`) calls [`read_back_with_reservation`], not this
+/// function.
+pub async fn read_back(
     session: &InferenceSession,
-    spec: TrainingSetSpec<'_>,
-) -> Result<(TrainingSetTable, Vec<RecordBatch>)> {
-    let columns = spec.columns.to_vec();
-    let table = session
-        .result_store()
-        .materialize_training_set(session.context(), spec)
-        .await?;
-    let batches = session.sql(&read_back_sql(&table, &columns)).await?;
-    Ok((table, batches))
+    table: &TrainingSetTable,
+    columns: &[String],
+) -> Result<Vec<RecordBatch>> {
+    let batches = session.sql(&read_back_sql(table, columns)).await?;
+    // Checked, then released immediately — this function's own contract
+    // (its doc above), unlike `read_back_with_reservation`'s.
+    reserve_eager_batches(session, &batches)?.free();
+    Ok(batches)
+}
+
+/// [`read_back`]'s twin for a caller that must KEEP the eager reservation
+/// alive after this call returns (#500 U2c c3c, P-R): reserves the SAME
+/// `training_set_eager`-named bytes and hands the live
+/// [`MemoryReservation`](datafusion::execution::memory_pool::MemoryReservation)
+/// back rather than freeing it — the caller attaches it to whatever owns the
+/// rows for as long as they stay resident
+/// (`super::data::TrainingDataLoader::with_reservation`) so the pool
+/// reflects an eager Resident loader's true residency for its whole
+/// lifetime, not just the instant this call returns.
+pub async fn read_back_with_reservation(
+    session: &InferenceSession,
+    table: &TrainingSetTable,
+    columns: &[String],
+) -> Result<(
+    Vec<RecordBatch>,
+    datafusion::execution::memory_pool::MemoryReservation,
+)> {
+    let batches = session.sql(&read_back_sql(table, columns)).await?;
+    let reservation = reserve_eager_batches(session, &batches)?;
+    Ok((batches, reservation))
+}
+
+/// The eager reservation check (see [`read_back`]'s doc): reserve
+/// `batches`' total `get_array_memory_size()` against `session.memory_pool()`
+/// under a dedicated `MemoryConsumer`, surfacing a typed
+/// [`jammi_db::error::JammiError::ResourcesExhausted`] naming
+/// `training_set_eager` when the pool refuses it. Returns the GROWN,
+/// still-live reservation — a caller that wants the old "check, then
+/// release" behaviour calls `.free()` on it itself (as [`read_back`] does);
+/// a caller that wants the residency held calls [`read_back_with_reservation`]
+/// and keeps the reservation this returns.
+fn reserve_eager_batches(
+    session: &InferenceSession,
+    batches: &[RecordBatch],
+) -> jammi_db::error::Result<datafusion::execution::memory_pool::MemoryReservation> {
+    let total_bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+    let pool = session.memory_pool();
+    let reservation = datafusion::execution::memory_pool::MemoryConsumer::new("training_set_eager")
+        .register(&pool);
+    reservation
+        .try_grow(total_bytes)
+        .map_err(jammi_db::error::JammiError::from)?;
+    Ok(reservation)
 }
 
 /// The reader-class allow-list: every call site in the workspace, outside test
@@ -420,7 +519,7 @@ mod reader_class_allow_list {
 mod tests {
     use super::*;
 
-    /// [`training_set_spec`] is a thin pass-through, so it must name the
+    /// `training_set_spec` is a thin pass-through, so it must name the
     /// exact same [`TrainingSetSpec::
     /// definition_hash`] as a hand-built struct literal over the identical
     /// seven fields — the "unification must not change any hash" property,

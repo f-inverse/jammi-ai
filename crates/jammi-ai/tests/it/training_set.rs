@@ -128,7 +128,19 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         )
         .await
         .unwrap();
+    let job_id = job.job_id.clone();
     job.wait().await.unwrap();
+
+    // #500 U2c §10: the pinned adapter prints below must be produced by the
+    // STREAMED path, not a silently-unchanged eager one — a `test-hooks`
+    // observation of the source kind `run_spec` actually bound for this job
+    // (mining/GradCache are off in `parity_config`, so `whole_set_arm` is
+    // `None` and the worker must have selected `Streamed`).
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("streamed"),
+        "refactor_parity must run through the Streamed source (no mining, no GradCache)"
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let ft = models
@@ -311,7 +323,16 @@ async fn run_regression_parity_fixture(
         )
         .await
         .unwrap();
+    let job_id = job.job_id.clone();
     job.wait().await.unwrap();
+
+    // #500 U2c §10/§11 F2: the K3 scaler and the pinned prints below must
+    // both come from the STREAMED path.
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("streamed"),
+        "regression_refactor_parity must run through the Streamed source"
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let ft = models
@@ -414,9 +435,21 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         )
         .await
         .unwrap();
+    let job_id = job.job_id.clone();
     job.wait()
         .await
         .expect("a W=1 GradCache run over the eager loader must complete");
+
+    // #500 U2c §11 F6: `whole_set_arm` must select `Resident` for a
+    // GradCache-eligible configuration — the complementary oracle to
+    // `refactor_parity`/`regression_refactor_parity`'s `Streamed`
+    // observation above (mining on / GradCache on → `Resident`, never
+    // `Streamed`).
+    assert_eq!(
+        jammi_ai::fine_tune::worker::training_test_hooks::source_kind_for(&job_id),
+        Some("resident"),
+        "a GradCache-eligible run must bind Resident, never Streamed"
+    );
 
     let models = session.catalog().list_models().await.unwrap();
     let ft = models
@@ -524,7 +557,7 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
 /// off-ness the embedding cache records (`pipeline/embedding.rs:89-93`).
 /// Reuse over a genuinely PINNED anchor is exercised at the store level, in
 /// `two_runs_over_one_pinned_definition_share_one_training_set`,
-/// `crates/jammi-db/tests/it/materialization.rs:856`; this is the
+/// `crates/jammi-db/tests/it/materialization.rs:1357`; this is the
 /// job-level corollary: each job's OWN materialize call runs the producer
 /// fresh (the reuse probe never matches), so two jobs leave two tables
 /// behind, each the one its own run actually read from before training.
@@ -689,16 +722,6 @@ async fn empty_projection_is_refused_through_the_job_path() {
     }
 }
 
-/// The order key `full_tuple_v1` commits for a two-column projection: every
-/// projected column, declared order, ascending, NULLs first. The fixture below
-/// carries no NULLs (the producer's NULL placement is the db half's oracle), so
-/// a plain tuple sort is the whole key.
-fn canonical_order(rows: &[(String, String)]) -> Vec<(String, String)> {
-    let mut sorted = rows.to_vec();
-    sorted.sort();
-    sorted
-}
-
 fn rows_of(batches: &[arrow::array::RecordBatch]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for batch in batches {
@@ -758,23 +781,6 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
 
     let dir = TempDir::new().unwrap();
 
-    // 70_000 rows: the writer flushes a row group every 65_536, so the file
-    // has more than one. The rows are scrambled by a permutation with no fixed
-    // point in the sort order, and every `anchor` value appears twice, so
-    // `positive` is the separator — a key-column-only sort would not be total.
-    const ROWS: usize = 70_000;
-    let mut lines = String::from("anchor,positive\n");
-    let mut written = Vec::with_capacity(ROWS);
-    for i in 0..ROWS {
-        let n = (i * 37) % ROWS;
-        let anchor = format!("a{:05}", n / 2);
-        let positive = format!("p{n:05}");
-        lines.push_str(&format!("{anchor},{positive}\n"));
-        written.push((anchor, positive));
-    }
-    let csv = dir.path().join("pairs.csv");
-    std::fs::write(&csv, lines).unwrap();
-
     let mut config = common::test_config(dir.path());
     config.engine.execution_threads = 4;
     let partitions = config.engine.execution_threads;
@@ -784,69 +790,23 @@ async fn read_back_re_applies_the_committed_order_across_row_groups() {
          be vacuous"
     );
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    session
-        .add_source(
-            "pairs",
-            SourceType::File,
-            SourceConnection {
-                url: Some(format!("file://{}", csv.display())),
-                format: Some(FileFormat::Csv),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
 
-    // DataFusion only splits ONE file across partitions when the file exceeds
-    // `repartition_file_min_size` (10 MB by default). A 70k-row ZSTD training
-    // set is far under that, so without this the reader gets a single file
-    // group and the committed order survives an unordered scan by accident —
-    // the regime in which this oracle proves nothing. Lowering the threshold
-    // puts the reader in the regime the ORDER BY exists for, which a
-    // production-scale training set reaches on size alone.
-    session
-        .sql("SET datafusion.optimizer.repartition_file_min_size = 1")
-        .await
-        .unwrap();
+    // The 70,000-row multi-row-group fixture (#500 U2c §2): lifted out of
+    // this test's own body into ONE builder every U2c oracle calls.
+    let fixture = common::multi_row_group_pairs(&session, dir.path(), true).await;
+    let table = fixture.table.clone();
+    let columns = fixture.columns.clone();
 
-    let columns = vec!["anchor".to_string(), "positive".to_string()];
-    let (table, batches) = jammi_ai::fine_tune::training_set::materialize_projection(
-        &session,
-        "pairs",
-        &columns,
-        ModelTask::TextEmbedding,
-        "pairs",
-    )
-    .await
-    .unwrap();
-
-    // The committed file, read straight off the Parquet object in FILE order —
-    // never back through a scan, whose partitioning is exactly what this oracle
-    // must not be at the mercy of.
-    let url = jammi_db::storage::StorageUrl::parse(&table.record.parquet_path).unwrap();
-    let handle = session.result_store().open_parquet(&url).unwrap();
-    let bytes = handle
-        .get_bytes(&handle.data_path().unwrap())
-        .await
-        .unwrap();
-    let builder =
-        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
-    let row_groups = builder.metadata().num_row_groups();
     assert!(
-        row_groups > 1,
-        "the order oracle is vacuous on a single row group; the fixture produced {row_groups}"
+        fixture.row_groups > 1,
+        "the order oracle is vacuous on a single row group; the fixture produced {}",
+        fixture.row_groups
     );
-    let committed: Vec<(String, String)> = rows_of(
-        &builder
-            .build()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap(),
-    );
-    assert_eq!(committed.len(), ROWS);
-    assert_eq!(committed, canonical_order(&written));
+    let committed = fixture.canonical_order();
+    assert_eq!(committed.len(), fixture.written.len());
 
     // The read-back the worker performs, through the production reader.
+    let batches = session.sql(&read_back_sql(&table, &columns)).await.unwrap();
     assert_eq!(
         rows_of(&batches),
         committed,

@@ -84,8 +84,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use arrow::array::RecordBatch;
 use bytes::Bytes;
+use jammi_db::catalog::instance::{InstanceRegistration, WorkerFacts};
 use jammi_db::catalog::jobs_repo::WorkerState;
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::Catalog;
@@ -98,7 +98,10 @@ use jammi_db::store::{ArtifactStore, ResultStore};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
-use crate::fine_tune::data::{TrainingDataLoader, TrainingFormat};
+use crate::fine_tune::data::TrainingDataLoader;
+use crate::fine_tune::decode::{
+    build_training_data_loader, detect_training_format, extract_string_column,
+};
 use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
@@ -596,6 +599,46 @@ pub(crate) async fn release_sweep(
 /// own task — never on a `/metrics` scrape (a scrape storm must not become a
 /// catalog storm) and never on the claim loop (which does not tick during a
 /// run). Ends when the loop's shared state is gone.
+/// Write this process's `workers` row and its registration cell as ONE fact
+/// (contract `feat_500-C-U5b-1a` §13, round 6). The cell is set FIRST to the
+/// facts about to be written, so a `LeaseKeeper` reregister racing this
+/// write re-upserts exactly these facts and never stale ones (§8 B1); the
+/// row is then written by [`Catalog::upsert_worker`] — an UPSERT, never a
+/// bare `UPDATE` whose "zero rows matched" outcome would leave the cell
+/// claiming a row that does not exist. On a failed upsert the cell is
+/// REVERTED to its previous snapshot, so the cell never carries a fact no
+/// row write ever succeeded with: after a failed FIRST write it is `None`
+/// again (the keeper writes no row); after a failed later transition it is
+/// the previous, still-true state. Every row write on the loop's lifecycle
+/// (`warming`, `claiming`, `draining`) goes through here; the only other
+/// row write is the delete on exit, which clears the cell first. Returns
+/// whether the row write succeeded.
+async fn write_worker_facts(
+    catalog: &Catalog,
+    registration: &InstanceRegistration,
+    worker_id: &str,
+    facts: WorkerFacts,
+    what: &str,
+) -> bool {
+    let previous = registration.worker_snapshot();
+    registration.set_worker(Some(facts.clone()));
+    match catalog
+        .upsert_worker(worker_id, &facts.kinds, facts.state)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            registration.set_worker(previous);
+            tracing::error!(
+                error = %e,
+                what,
+                "failed to write this process's `workers` row; the registration cell is reverted"
+            );
+            false
+        }
+    }
+}
+
 async fn sample_loop(catalog: Arc<Catalog>, shared: Weak<WorkerShared>, every: Duration) {
     loop {
         let Some(shared) = shared.upgrade() else {
@@ -811,13 +854,23 @@ impl JobWorker {
             exit.complete();
             return;
         };
-        if let Err(e) = session
-            .catalog()
-            .upsert_worker(&self.worker_id, &self.kinds.join(","), WorkerState::Warming)
-            .await
-        {
-            tracing::error!(error = %e, "failed to upsert this process's `workers` row");
-        }
+        // The row and the registration's worker cell are written as ONE
+        // fact through `write_worker_facts` (contract `feat_500-C-U5b-1a`
+        // §13, round 6): a failed write leaves the cell exactly as it was
+        // (`None` here), so a keeper reregister racing a still-failing loop
+        // start never writes a `workers` row this loop never managed to
+        // write itself.
+        write_worker_facts(
+            session.catalog(),
+            session.instance_registration(),
+            &self.worker_id,
+            WorkerFacts {
+                kinds: self.kinds.join(","),
+                state: WorkerState::Warming,
+            },
+            "warming",
+        )
+        .await;
         let mut gate_rx = session.worker_gate_receiver();
         drop(session);
 
@@ -833,13 +886,22 @@ impl JobWorker {
             return;
         }
         if let Some(session) = self.session.upgrade() {
-            if let Err(e) = session
-                .catalog()
-                .set_worker_state(&self.worker_id, WorkerState::Claiming)
-                .await
-            {
-                tracing::error!(error = %e, "failed to flip this process's `workers.state` to claiming");
-            }
+            // The `claiming` transition is the same one-fact write as the
+            // first `warming` write above: an UPSERT (so a row the first
+            // write failed to create is created here, never a bare UPDATE
+            // whose "zero rows" outcome the loop could not act on), with the
+            // cell reverted on failure.
+            write_worker_facts(
+                session.catalog(),
+                session.instance_registration(),
+                &self.worker_id,
+                WorkerFacts {
+                    kinds: self.kinds.join(","),
+                    state: WorkerState::Claiming,
+                },
+                "claiming",
+            )
+            .await;
         }
 
         loop {
@@ -2037,33 +2099,157 @@ impl JobWorker {
             } => {
                 // Materialise the projected rows into an immutable
                 // `TrainingSet` result table (or reuse the one that already
-                // carries this definition), then read that table back in its
-                // committed order. The rows a run trains on are a durable,
-                // attested artifact, not this worker's private scan.
+                // carries this definition). The rows a run trains on are a
+                // durable, attested artifact, not this worker's private scan.
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
-                let (table, batches) = training_set::materialize_projection(
-                    session,
-                    &source,
-                    &columns,
-                    task,
-                    detected.format_tag(),
-                )
-                .await
-                .map_err(WorkerJobError::from)?;
-                let loader = build_training_data_loader(&batches, &columns, task)
-                    .map_err(WorkerJobError::from)?;
-                // The tag the table was WRITTEN under and the shape its loader
-                // reports come from one classifier, so a mismatch is a broken
-                // engine invariant rather than a caller error — and it must be
-                // loud: it would mean two formats sharing one definition hash.
-                if loader.format().format_tag() != detected.format_tag() {
-                    return Err(WorkerJobError::from(JammiError::Other(format!(
-                        "training set was committed as format '{}' but its loader reports \
-                         '{}': the column classifier and the loader disagree",
+
+                // #500 U2c §11 F6: the ONE predicate deciding Resident vs
+                // Streamed — the SAME `source::whole_set_arm` the trainer's
+                // own dispatch (`trainer.rs::run`) refuses a mismatch
+                // against. `run_fine_tune_blocking` always loads a base
+                // model for a `FineTune` spec (unconditionally calls
+                // `.base_model(base_model_arc)` below), so `has_base_model`
+                // is always `true` here.
+                let whole_set_arm = crate::fine_tune::source::whole_set_arm(&common.config, true);
+
+                let (table, training_source) = if whole_set_arm.is_some() {
+                    // Resident: the eager arm — materialise, then read the
+                    // whole table back into memory, HOLDING the eager
+                    // read's pool reservation for the loader's own lifetime
+                    // (#500 U2c c3c, P-R) rather than checking-then-
+                    // releasing it (`training_set::read_back`'s own
+                    // contract, which every OTHER caller still gets).
+                    let table = training_set::materialize_projection_table(
+                        session,
+                        &source,
+                        &columns,
+                        task,
                         detected.format_tag(),
-                        loader.format().format_tag()
-                    ))));
+                    )
+                    .await
+                    .map_err(WorkerJobError::from)?;
+                    let (batches, reservation) =
+                        training_set::read_back_with_reservation(session, &table, &columns)
+                            .await
+                            .map_err(WorkerJobError::from)?;
+                    let loader = build_training_data_loader(&batches, &columns, task)
+                        .map_err(WorkerJobError::from)?
+                        .with_reservation(reservation);
+                    // The tag the table was WRITTEN under and the shape its
+                    // loader reports come from one classifier, so a
+                    // mismatch is a broken engine invariant rather than a
+                    // caller error — and it must be loud: it would mean two
+                    // formats sharing one definition hash.
+                    if loader.format().format_tag() != detected.format_tag() {
+                        return Err(WorkerJobError::from(JammiError::Other(format!(
+                            "training set was committed as format '{}' but its loader reports \
+                             '{}': the column classifier and the loader disagree",
+                            detected.format_tag(),
+                            loader.format().format_tag()
+                        ))));
+                    }
+                    (
+                        table,
+                        crate::fine_tune::source::TrainingSource::Resident(loader),
+                    )
+                } else {
+                    // Streamed (#500 U2c §10/§11): table only — no row is
+                    // ever collected into memory for this arm (F1).
+                    let table = training_set::materialize_projection_table(
+                        session,
+                        &source,
+                        &columns,
+                        task,
+                        detected.format_tag(),
+                    )
+                    .await
+                    .map_err(WorkerJobError::from)?;
+                    let total_rows = table.record.row_count;
+                    let train_count = crate::fine_tune::data::split_index(
+                        total_rows,
+                        common.config.validation_fraction,
+                    );
+
+                    // F5: the whole-table refusal pre-pass, ONCE, over
+                    // `[0, total_rows)`, BEFORE the first training step —
+                    // not lazily discovered mid-run.
+                    crate::fine_tune::stream::validate_window(
+                        session,
+                        &table,
+                        &columns,
+                        detected,
+                        task,
+                        crate::fine_tune::stream::RowWindow::new(0, total_rows),
+                    )
+                    .await
+                    .map_err(WorkerJobError::from)?;
+
+                    // F3: the classification label vocabulary spans the
+                    // WHOLE table (train + val), built ONCE here — never
+                    // re-derived per-epoch or per-window.
+                    let label_vocab = if matches!(
+                        detected,
+                        crate::fine_tune::decode::DetectedFormat::Classification
+                    ) {
+                        Some(
+                            crate::fine_tune::stream::build_label_vocabulary(
+                                session, &table, &columns,
+                            )
+                            .await
+                            .map_err(WorkerJobError::from)?,
+                        )
+                    } else {
+                        None
+                    };
+
+                    // `PRODUCTION_PREFETCH_DEPTH` — see its own doc for why
+                    // this is a named constant, never a literal here.
+                    let stream_cfg = crate::fine_tune::stream::StreamConfig::new(
+                        crate::fine_tune::stream::PRODUCTION_PREFETCH_DEPTH,
+                    )
+                    .map_err(WorkerJobError::from)?;
+
+                    // Captured HERE, inside `run_spec`'s own task, which is
+                    // still running under the caller's `with_tenant_scoped`
+                    // task-local (`worker.rs::run_claimed_job_under`'s doc) —
+                    // `session.tenant()` reads that override, not the
+                    // session's sticky binding. `TrainingSetStream::open`
+                    // later runs on the `spawn_blocking` pool via
+                    // `Handle::block_on`, which does NOT inherit this
+                    // task-local, so the value is captured now and re-applied
+                    // explicitly per open (#500 U2c c3d).
+                    let tenant = session.tenant();
+                    let streamed = crate::fine_tune::source::StreamedSet {
+                        session: Arc::clone(session),
+                        table: table.clone(),
+                        columns: columns.clone(),
+                        task,
+                        total_rows,
+                        train_count,
+                        batch: common.config.batch_size,
+                        stream_cfg,
+                        label_vocab,
+                        tenant,
+                    };
+                    (
+                        table,
+                        crate::fine_tune::source::TrainingSource::Streamed(Box::new(streamed)),
+                    )
+                };
+                #[cfg(feature = "test-hooks")]
+                training_test_hooks::note_source_kind(
+                    job_id,
+                    match &training_source {
+                        crate::fine_tune::source::TrainingSource::Resident(_) => "resident",
+                        crate::fine_tune::source::TrainingSource::Streamed(_) => "streamed",
+                    },
+                );
+                #[cfg(feature = "test-hooks")]
+                if let crate::fine_tune::source::TrainingSource::Streamed(streamed) =
+                    &training_source
+                {
+                    training_test_hooks::note_streamed_total_rows(job_id, streamed.total_rows);
                 }
                 // The `ProducingDescriptor::FineTune` materialization
                 // identity — the training-set table's own definition hash,
@@ -2101,7 +2287,7 @@ impl JobWorker {
                 let run = FineTuneRun {
                     task,
                     common,
-                    loader,
+                    source: training_source,
                     materialization_source,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
@@ -2113,7 +2299,12 @@ impl JobWorker {
                 common,
             } => {
                 // Re-read node/edge sources and re-sample the graph (seeded →
-                // deterministic), then train on the text-embedding head.
+                // deterministic), then train on the text-embedding head. A
+                // graph fine-tune's rows are sampled in memory, not read
+                // from a `TrainingSet` result table — there is no table to
+                // stream, so this arm is ALWAYS `Resident` (`training_set.
+                // rs`'s module doc, "The graph arm does not go through this
+                // module").
                 let loader = self
                     .reconstruct_graph_loader(session, &sources, sample_config)
                     .await
@@ -2121,7 +2312,7 @@ impl JobWorker {
                 let run = FineTuneRun {
                     task: ModelTask::TextEmbedding,
                     common,
-                    loader,
+                    source: crate::fine_tune::source::TrainingSource::Resident(loader),
                     // `ProducingDescriptor::FineTune` covers only the
                     // column-source `FineTune` kind (its own doc); a graph
                     // fine-tune's model row carries no materialization.
@@ -2265,7 +2456,7 @@ impl JobWorker {
         let FineTuneRun {
             task,
             common,
-            loader,
+            source: training_source,
             materialization_source,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
@@ -2396,7 +2587,7 @@ impl JobWorker {
             base_model: base_model.clone(),
             task,
             config: common.config,
-            loader,
+            source: training_source,
             base_model_arc,
             hidden_size,
             device_config: session.device_config().clone(),
@@ -2659,6 +2850,14 @@ pub struct EmbeddedWorker {
     /// row goes stale and cascades.
     catalog: Arc<Catalog>,
     instance_id: String,
+    /// This process's `InstanceRegistration`, captured at spawn so RELEASE
+    /// needs no session (same rationale as `keeper`/`writer_id` below) —
+    /// this guard is the worker half's OTHER owner (alongside the loop task
+    /// itself): every `set_worker_state`/`delete_worker` call this guard
+    /// issues writes/clears the cell FIRST, so a keeper reregister racing a
+    /// DRAIN or a RELEASE never re-upserts a `workers` row this process has
+    /// already stopped claiming with.
+    registration: Arc<InstanceRegistration>,
     /// The session's keeper (2b releases the `Job` holds it holds) and the
     /// session's result-store writer id (the linked building sweep's
     /// `writer_id` arm) — captured at spawn so RELEASE needs no session.
@@ -2709,6 +2908,7 @@ impl EmbeddedWorker {
             shared,
             catalog: Arc::clone(session.catalog_arc()),
             instance_id: session.instance_id().to_string(),
+            registration: Arc::clone(session.instance_registration()),
             keeper: Arc::clone(session.lease_keeper()),
             writer_id: session.result_store().writer_id().to_string(),
             heartbeat,
@@ -2746,12 +2946,21 @@ impl EmbeddedWorker {
             Ordering::SeqCst,
         );
         self.shared.request_stop();
-        if let Err(e) = self
-            .catalog
-            .set_worker_state(&self.instance_id, WorkerState::Draining)
-            .await
-        {
-            tracing::warn!(error = %e, "DRAIN: failed to flip this process's `workers.state` to draining");
+        // The same one-fact write as the loop's own `warming`/`claiming`
+        // writes: preserve the cell's own `kinds`, flip only `state`, and
+        // write the row by UPSERT with the cell reverted on failure. A cell
+        // still `None` (the loop never wrote its first row) has no row to
+        // flip and nothing to race — nothing to write.
+        if let Some(mut facts) = self.registration.worker_snapshot() {
+            facts.state = WorkerState::Draining;
+            write_worker_facts(
+                &self.catalog,
+                &self.registration,
+                &self.instance_id,
+                facts,
+                "draining",
+            )
+            .await;
         }
     }
 
@@ -2810,6 +3019,9 @@ impl EmbeddedWorker {
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
         self.stop_sampler();
+        // Cell before delete (§8 B1): the loop has fully returned, so
+        // nothing else can race a re-set of the cell after this clear.
+        self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(StopOutcome::Joined)
     }
@@ -3000,6 +3212,8 @@ impl EmbeddedWorker {
         let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
         // 2h
         self.stop_sampler();
+        // Cell before delete (§8 B1) — same as `stop_and_join`.
+        self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(ReleaseReport {
             loop_state,
@@ -3038,6 +3252,11 @@ impl Drop for EmbeddedWorker {
         );
         if let LoopTask::Running(handle) | LoopTask::Abandoned(handle) = task {
             handle.abort();
+            // Cell before delete (§8 B1), synchronous — `Drop` cannot
+            // `.await` the delete below, but clearing the cell needs no
+            // await, so it happens unconditionally here rather than only
+            // once the (possibly never-scheduled) spawned task below runs.
+            self.registration.set_worker(None);
             // The loop is gone, so the claimant row must go too. `Drop` is
             // synchronous: the delete rides a detached task on the current
             // runtime when there is one (the embedded engine's own runtime
@@ -3376,7 +3595,11 @@ pub mod loop_test_hooks {
 struct FineTuneRun {
     task: ModelTask,
     common: TrainingCommon,
-    loader: TrainingDataLoader,
+    /// What the training loop trains from — either an already in-memory
+    /// [`crate::fine_tune::source::TrainingSource::Resident`] loader or a
+    /// [`crate::fine_tune::source::TrainingSource::Streamed`] source (#500
+    /// U2c §10).
+    source: crate::fine_tune::source::TrainingSource,
     /// Set ONLY for the column-source `TrainingSpec::FineTune` kind — see
     /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
     /// carries `None` here.
@@ -3862,577 +4085,13 @@ fn classify_training_error(
 
 // =========================================================================
 // Reconstruction helpers (the data-loading + blocking-training tail moved off
-// the submit path: the worker is their only consumer now).
+// the submit path: the worker is their only consumer now). The Arrow decode
+// itself (`extract_string_column`/`extract_numeric_column`/
+// `build_training_data_loader`/`detect_training_format`/`DetectedFormat`/
+// `NumericColumnError`) lives in `super::decode` (#500 U2c) — the ONE decoder
+// both this worker's eager reconstruction and `super::stream`'s per-rank
+// stream call, brought into scope below.
 // =========================================================================
-
-/// Extract all string values from an Arrow column, or `None` when the column
-/// is not honestly readable as text.
-///
-/// DataFusion 52+ returns Parquet string columns as `Utf8View` by default;
-/// older versions returned `Utf8` or `LargeUtf8`. Dictionary-encoded variants
-/// are also possible. Fast paths cover the three common types; the `cast`
-/// fallback handles everything else.
-///
-/// # Two refusals the cast fallback cannot be trusted to make (family D)
-///
-/// `arrow::compute::cast`'s DEFAULT options are `safe: true`, which means a
-/// value the target type cannot represent becomes NULL rather than an error.
-/// Combined with `StringArray::value(i)` — which returns `""` for a null slot
-/// rather than failing — the fallback silently turned unreadable cells into
-/// empty strings:
-///
-/// - A **binary** column (an image or audio triplet submitted under a TEXT
-///   task) cast cell-by-cell into NULLs, and every training row became the
-///   empty string. The job then completed, published an adapter, and reported
-///   success — a fine-tune of a text tower on nothing at all. Bytes are not
-///   text: the binary families are refused OUTRIGHT here, so the caller gets
-///   the typed, task-naming schema error its caller already raises.
-/// - Any OTHER column whose cast introduces a null where the source had a
-///   value is refused for the same reason — the empty string is a fabricated
-///   input, not a reading of the caller's data.
-///
-/// A column that was ALREADY null keeps its historical `""` reading: that is a
-/// pre-existing null-handling contract of the text path, not a value this
-/// function invented.
-fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
-    use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
-    use arrow::datatypes::DataType;
-
-    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
-    }
-    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
-    }
-    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
-    }
-    if matches!(
-        col.data_type(),
-        DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_)
-    ) {
-        return None;
-    }
-    let casted = arrow::compute::cast(col, &DataType::Utf8).ok()?;
-    let a = casted.as_any().downcast_ref::<StringArray>()?;
-    if (0..a.len()).any(|i| a.is_null(i) && !col.is_null(i)) {
-        return None;
-    }
-    Some((0..a.len()).map(|i| a.value(i).to_string()).collect())
-}
-
-/// Extract a binary column into owned byte vectors, accepting the Arrow binary
-/// families DataFusion produces for an audio-bytes column
-/// (`Binary`/`LargeBinary`/`BinaryView`). Returns `None` for any other type so
-/// the caller can surface a typed schema error.
-fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> {
-    use arrow::array::{Array, BinaryArray, BinaryViewArray, LargeBinaryArray};
-
-    if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
-    }
-    if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
-    }
-    if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
-    }
-    None
-}
-
-/// Why a numeric column could not be read into clean `f32` targets.
-enum NumericColumnError {
-    /// The column's Arrow type is not numeric (and the cast fallback failed).
-    NotNumeric,
-    /// A null target at the cited row index. Rejected rather than coerced to
-    /// `0.0`, which would silently corrupt the scaler's μ/σ.
-    Null(usize),
-    /// A `NaN` target at the cited row index (float columns only). Rejected for
-    /// the same reason as a null.
-    Nan(usize),
-}
-
-/// Extract a numeric column into `Vec<f32>`, accepting the Arrow numeric
-/// families DataFusion emits for a regression `target` column. Integer targets
-/// (e.g. an `int64` year) are common, so the fast paths cover
-/// `Int64`/`Int32`/`Float64`/`Float32`; the final `cast` fallback handles the
-/// remaining numeric types (`UInt*`, `Int16`, `Decimal`, …) so a target's exact
-/// Arrow width never decides whether the fine-tune is reachable.
-///
-/// **Null/NaN rejection is load-bearing.** `Array::value(i)` on a null slot
-/// returns a zero default rather than erroring, which would silently corrupt
-/// the scaler's μ/σ. A null or `NaN` target therefore returns a typed error
-/// citing the row, never a coerced `0.0`.
-fn extract_numeric_column(
-    col: &dyn arrow::array::Array,
-) -> std::result::Result<Vec<f32>, NumericColumnError> {
-    use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array};
-    use arrow::datatypes::DataType;
-
-    // A string/binary `target` is a schema mistake, not numeric data — reject it
-    // as "not numeric" rather than letting the Float64 cast turn unparseable
-    // strings into nulls (which would surface a misleading per-row null error).
-    if matches!(
-        col.data_type(),
-        DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::Boolean
-            | DataType::Null
-    ) {
-        return Err(NumericColumnError::NotNumeric);
-    }
-
-    // Reject a null in any slot up front; `value(i)` would otherwise return a
-    // garbage default for it.
-    if let Some(i) = (0..col.len()).find(|&i| col.is_null(i)) {
-        return Err(NumericColumnError::Null(i));
-    }
-
-    let floats: Vec<f32> = if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        (0..a.len()).map(|i| a.value(i) as f32).collect()
-    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        (0..a.len()).map(|i| a.value(i) as f32).collect()
-    } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        (0..a.len()).map(|i| a.value(i) as f32).collect()
-    } else if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
-        (0..a.len()).map(|i| a.value(i)).collect()
-    } else {
-        // Fallback: cast through Float64 for the remaining numeric families. A
-        // cast failure means the column is not numeric.
-        let casted = arrow::compute::cast(col, &DataType::Float64)
-            .map_err(|_| NumericColumnError::NotNumeric)?;
-        let a = casted
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or(NumericColumnError::NotNumeric)?;
-        // The cast can introduce nulls (e.g. an unrepresentable value); reject
-        // them with the same per-row contract.
-        if let Some(i) = (0..a.len()).find(|&i| a.is_null(i)) {
-            return Err(NumericColumnError::Null(i));
-        }
-        (0..a.len()).map(|i| a.value(i) as f32).collect()
-    };
-
-    // A NaN target (float columns only) would corrupt the scaler; reject it
-    // citing the row, mirroring the null contract.
-    if let Some(i) = floats.iter().position(|v| v.is_nan()) {
-        return Err(NumericColumnError::Nan(i));
-    }
-    Ok(floats)
-}
-
-/// Build a [`TrainingDataLoader`] from query result batches.
-///
-/// `task` selects how `anchor`/`positive`/`negative` triplet columns are read:
-/// an image or audio embedding task reads them as encoded MEDIA bytes; every
-/// other task reads them as text. The column names are identical across
-/// modalities (the triplet shape is the same) — only the cell decoding
-/// differs, so the caller's chosen task is the discriminator, not a parallel
-/// set of column names, and not a byte-header sniff (an encoded WAV and an
-/// encoded PNG are both binary blobs).
-/// The training format a projection's COLUMN NAMES and the job's task fix,
-/// before a single row is read — everything the training-set producer must know
-/// to name the table it is about to write.
-///
-/// The data-derived parameters of [`TrainingFormat`] (`Classification`'s
-/// `num_classes`, `Ner`'s `num_labels`) are absent by construction: they are
-/// counts of what the rows turned out to contain, which is not knowable at the
-/// point the table is named, and which the canonical tag drops for exactly that
-/// reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetectedFormat {
-    Contrastive,
-    Pairs,
-    Triplet,
-    MediaTriplet,
-    Classification,
-    Regression,
-}
-
-impl DetectedFormat {
-    /// The canonical tag this shape records. Every arm names the
-    /// [`TrainingFormat`] variant the loader will build and reads the tag off
-    /// [`TrainingFormat::format_tag`] — the mapping lives in exactly one place,
-    /// so the tag a table is written under and the tag its loader reports can
-    /// never be spelled differently.
-    fn format_tag(self) -> &'static str {
-        match self {
-            Self::Contrastive => TrainingFormat::Contrastive.format_tag(),
-            Self::Pairs => TrainingFormat::Pairs.format_tag(),
-            Self::Triplet => TrainingFormat::Triplet.format_tag(),
-            Self::MediaTriplet => TrainingFormat::MediaTriplet.format_tag(),
-            // `num_classes` is a function of the rows and the tag discards it
-            // (see `format_tag`), so every value names the same tag; the zero
-            // is a neutral placeholder that never leaves this expression.
-            Self::Classification => TrainingFormat::Classification { num_classes: 0 }.format_tag(),
-            Self::Regression => TrainingFormat::Regression.format_tag(),
-        }
-    }
-}
-
-/// Detect the training format from the projected column names and the job's
-/// task — the SINGLE classifier, shared by the producer (which needs the format
-/// tag before it writes the table) and by [`build_training_data_loader`] (which
-/// needs the shape to read it back). Two copies of these predicates would let a
-/// table be written under one format and read under another.
-///
-/// The arm ORDER is part of the contract: media triplets are recognised before
-/// text ones (the columns are identical; only `task` distinguishes an encoded
-/// blob from a string), and regression is tested before classification and
-/// gated on `task == Regression`, so a numeric outcome can never fall into the
-/// classification path and be gathered as a class index.
-fn detect_training_format(columns: &[String], task: ModelTask) -> Result<DetectedFormat> {
-    let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-
-    let has_contrastive = col_names.contains(&"text_a")
-        && col_names.contains(&"text_b")
-        && col_names.contains(&"score");
-    let has_triplet = col_names.contains(&"anchor")
-        && col_names.contains(&"positive")
-        && col_names.contains(&"negative");
-    // Pairs = anchor + positive with no negative column. In-batch negatives
-    // (MultipleNegativesRanking) supply the contrast, so `negative` is absent.
-    let has_pairs = col_names.contains(&"anchor")
-        && col_names.contains(&"positive")
-        && !col_names.contains(&"negative");
-    let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
-    let has_regression = col_names.contains(&"text") && col_names.contains(&"target");
-
-    if has_triplet && matches!(task, ModelTask::AudioEmbedding | ModelTask::ImageEmbedding) {
-        Ok(DetectedFormat::MediaTriplet)
-    } else if has_contrastive {
-        Ok(DetectedFormat::Contrastive)
-    } else if has_triplet {
-        Ok(DetectedFormat::Triplet)
-    } else if has_pairs {
-        Ok(DetectedFormat::Pairs)
-    } else if task == ModelTask::Regression {
-        // A `task=regression` request with no usable `target` column is a typed
-        // error here, never a fall-through to classification.
-        if !has_regression {
-            return Err(JammiError::FineTune(format!(
-                "task=regression needs a string 'text' column and a numeric 'target' column, \
-                 but the projected columns are {col_names:?}. (Classification's string 'label' \
-                 is distinct: name the numeric outcome column 'target'.)"
-            )));
-        }
-        Ok(DetectedFormat::Regression)
-    } else if has_classification {
-        Ok(DetectedFormat::Classification)
-    } else {
-        Err(JammiError::FineTune(format!(
-            "Cannot detect training format from columns: {col_names:?}. \
-             Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             pairs (anchor, positive), classification (text, label), or regression \
-             (text, target) with task=regression. For image/audio triplets, use the \
-             same (anchor, positive, negative) columns with binary cells and \
-             task=image_embedding/audio_embedding."
-        )))
-    }
-}
-
-/// The training-set producer's read-back, converted into a
-/// [`TrainingDataLoader`]: dispatches on [`detect_training_format`]'s
-/// classification of the projected columns and the job's task, then decodes
-/// every `RecordBatch` the eager read-back returned into the matching
-/// `TrainingRow` shape.
-fn build_training_data_loader(
-    batches: &[RecordBatch],
-    columns: &[String],
-    task: ModelTask,
-) -> Result<TrainingDataLoader> {
-    let detected = detect_training_format(columns, task)?;
-
-    // Exhaustive on every `DetectedFormat` arm — no `_`, so a seventh variant
-    // is a compile error here rather than a silent fall-through to whatever
-    // arm happened to be last.
-    match detected {
-        DetectedFormat::MediaTriplet => build_media_triplet_loader(batches, task),
-        DetectedFormat::Contrastive => {
-            let mut rows = Vec::new();
-            for batch in batches {
-                let a_col = batch
-                    .column_by_name("text_a")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
-                let b_col = batch
-                    .column_by_name("text_b")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
-                let s_col = batch
-                    .column_by_name("score")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
-
-                let a_vals = extract_string_column(a_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune("'text_a' is not a string column".into())
-                })?;
-                let b_vals = extract_string_column(b_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune("'text_b' is not a string column".into())
-                })?;
-                let s_arr = s_col
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
-                    .map(|arr| {
-                        (0..arr.len())
-                            .map(|i| arr.value(i) as f32)
-                            .collect::<Vec<_>>()
-                    })
-                    .or_else(|| {
-                        s_col
-                            .as_any()
-                            .downcast_ref::<arrow::array::Float32Array>()
-                            .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                    })
-                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
-
-                for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
-                    rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
-                }
-            }
-            Ok(TrainingDataLoader::from_contrastive(rows))
-        }
-        DetectedFormat::Triplet => {
-            let mut rows = Vec::new();
-            for batch in batches {
-                let schema_info = || {
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let anchor_vals = batch
-                    .column_by_name("anchor")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                    })?;
-                let pos_vals = batch
-                    .column_by_name("positive")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                    })?;
-                let neg_vals = batch
-                    .column_by_name("negative")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                    })?;
-
-                for i in 0..batch.num_rows() {
-                    rows.push((
-                        anchor_vals[i].clone(),
-                        pos_vals[i].clone(),
-                        neg_vals[i].clone(),
-                    ));
-                }
-            }
-            Ok(TrainingDataLoader::from_triplets(rows))
-        }
-        DetectedFormat::Pairs => {
-            let mut rows = Vec::new();
-            for batch in batches {
-                let schema_info = || {
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let anchor_vals = batch
-                    .column_by_name("anchor")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
-                         this source has the anchor/positive PAIR shape, which is read as text \
-                         for every task. Image/audio training reads encoded media bytes only \
-                         from the anchor/positive/negative TRIPLET shape under \
-                         task=image_embedding/audio_embedding — add a 'negative' column. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                    })?;
-                let pos_vals = batch
-                    .column_by_name("positive")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                            "Missing/invalid 'positive' column: task {task} expects text columns, \
-                         and this source has the anchor/positive PAIR shape, which is read as \
-                         text for every task. Image/audio training reads encoded media bytes \
-                         only from the anchor/positive/negative TRIPLET shape under \
-                         task=image_embedding/audio_embedding — add a 'negative' column. \
-                         Batch schema: [{}]",
-                            schema_info()
-                        ))
-                    })?;
-                for i in 0..batch.num_rows() {
-                    rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
-                }
-            }
-            Ok(TrainingDataLoader::from_pairs(rows))
-        }
-        DetectedFormat::Regression => {
-            // Regression: a string `text` column and a numeric `target` column. The
-            // target is read into `f32` (handling int64/float64/float32/… via
-            // `extract_numeric_column`); nulls and NaNs are rejected citing the row
-            // rather than coerced, since a coerced `0.0` would silently corrupt the
-            // scaler's μ/σ.
-            let mut rows = Vec::new();
-            for batch in batches {
-                let text_vals = batch
-                    .column_by_name("text")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-                let target_col = batch
-                    .column_by_name("target")
-                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
-                let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                    JammiError::FineTune(match e {
-                        NumericColumnError::NotNumeric => format!(
-                            "regression 'target' is not a numeric column (its Arrow type is {})",
-                            target_col.data_type()
-                        ),
-                        NumericColumnError::Null(i) => format!(
-                            "regression 'target' has a null at row {i}; a null target cannot be \
-                         coerced (it would corrupt the scaler) — remove or fill the row"
-                        ),
-                        NumericColumnError::Nan(i) => format!(
-                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
-                         (it would corrupt the scaler) — remove or fix the row"
-                    ),
-                    })
-                })?;
-                for i in 0..batch.num_rows() {
-                    rows.push((text_vals[i].clone(), target_vals[i]));
-                }
-            }
-            Ok(TrainingDataLoader::from_regression(rows))
-        }
-        DetectedFormat::Classification => {
-            let mut label_set = std::collections::BTreeSet::new();
-            let mut rows = Vec::new();
-            for batch in batches {
-                let text_vals = batch
-                    .column_by_name("text")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-                let label_vals = batch
-                    .column_by_name("label")
-                    .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
-                for i in 0..batch.num_rows() {
-                    label_set.insert(label_vals[i].clone());
-                    rows.push((text_vals[i].clone(), label_vals[i].clone()));
-                }
-            }
-            let label_to_idx: std::collections::HashMap<String, u32> = label_set
-                .iter()
-                .enumerate()
-                .map(|(i, l)| (l.clone(), i as u32))
-                .collect();
-            let num_classes = label_to_idx.len();
-            let indexed_rows: Vec<(String, u32)> = rows
-                .into_iter()
-                .map(|(text, label)| {
-                    let idx = label_to_idx[&label];
-                    (text, idx)
-                })
-                .collect();
-            Ok(TrainingDataLoader::from_classification(
-                indexed_rows,
-                num_classes,
-            ))
-        }
-    }
-}
-
-/// Build a MEDIA-triplet loader: read `anchor`/`positive`/`negative` as
-/// encoded binary columns (audio clips or images, per `task`). Shares the
-/// triplet column shape with the text path; only the cell type differs
-/// (binary blobs vs strings).
-fn build_media_triplet_loader(
-    batches: &[RecordBatch],
-    task: ModelTask,
-) -> Result<TrainingDataLoader> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema_info = || {
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let anchor_vals = batch
-            .column_by_name("anchor")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'anchor' column for media triplets (task \
-                     {task}). Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
-        let pos_vals = batch
-            .column_by_name("positive")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'positive' column for media triplets (task \
-                     {task}). Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
-        let neg_vals = batch
-            .column_by_name("negative")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'negative' column for media triplets (task \
-                     {task}). Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
-
-        for i in 0..batch.num_rows() {
-            rows.push((
-                anchor_vals[i].clone(),
-                pos_vals[i].clone(),
-                neg_vals[i].clone(),
-            ));
-        }
-    }
-    Ok(TrainingDataLoader::from_media_triplets(rows))
-}
 
 /// Extract a human-readable message from a panic payload.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -4604,6 +4263,90 @@ pub mod training_test_hooks {
 
     pub(super) fn note_training_thread_finished() {
         THREADS_FINISHED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// One recorded source-kind observation, keyed by the job it was
+    /// selected for. A `Vec` rather than a `HashMap`, mirroring
+    /// [`WatcherProbe`]'s own reasoning: a retried job can re-select a
+    /// (possibly different) source kind under a later attempt, so a caller
+    /// looks up the MOST RECENT entry.
+    struct SourceKindProbe {
+        job_id: String,
+        kind: &'static str,
+    }
+
+    fn source_kinds() -> &'static Mutex<Vec<SourceKindProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<SourceKindProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Record which [`crate::fine_tune::source::TrainingSource`] variant
+    /// `run_spec`'s FineTune arm bound for `job_id` — `"resident"` or
+    /// `"streamed"`. #500 U2c §10's oracle: "a `test-hooks` observation …
+    /// proves the worker really bound `Streamed`" — the P6.ii parity fixtures
+    /// read this back through [`source_kind_for`] to prove the pinned
+    /// adapter prints they assert on were actually produced by the streamed
+    /// path, not a silently-unchanged eager one.
+    pub(super) fn note_source_kind(job_id: &str, kind: &'static str) {
+        source_kinds()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(SourceKindProbe {
+                job_id: job_id.to_string(),
+                kind,
+            });
+    }
+
+    /// The most recently recorded source kind for `job_id` — `None` if this
+    /// job never reached `run_spec`'s `TrainingSpec::FineTune` arm (a
+    /// `GraphFineTune` run, or a job that hasn't been claimed yet).
+    pub fn source_kind_for(job_id: &str) -> Option<&'static str> {
+        source_kinds()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.kind)
+    }
+
+    /// One recorded `StreamedSet::total_rows` observation, keyed by the job
+    /// it was built for — the same "most recent entry wins" shape as
+    /// [`SourceKindProbe`], for the same retry reason.
+    struct StreamedRowsProbe {
+        job_id: String,
+        total_rows: usize,
+    }
+
+    fn streamed_rows() -> &'static Mutex<Vec<StreamedRowsProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<StreamedRowsProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Record the row count `run_spec`'s FineTune arm built the `Streamed`
+    /// source over for `job_id` — `StreamedSet::total_rows`, the catalog
+    /// record's own `row_count` (#500 U2c c3d's tenant-isolation oracle:
+    /// "the row count … the stream served equals the tenant's own").
+    pub(super) fn note_streamed_total_rows(job_id: &str, total_rows: usize) {
+        streamed_rows()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(StreamedRowsProbe {
+                job_id: job_id.to_string(),
+                total_rows,
+            });
+    }
+
+    /// The most recently recorded `StreamedSet::total_rows` for `job_id` —
+    /// `None` if this job's FineTune arm never bound `Streamed`.
+    pub fn streamed_total_rows_for(job_id: &str) -> Option<usize> {
+        streamed_rows()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.total_rows)
     }
 
     /// One-shot pause slot: `Some` once armed, taken (and thereby disarmed)
@@ -4900,7 +4643,9 @@ struct RunFineTuneParams {
     base_model: String,
     task: ModelTask,
     config: FineTuneConfig,
-    loader: TrainingDataLoader,
+    /// What the training loop trains from (#500 U2c §10) — see
+    /// [`crate::fine_tune::source::TrainingSource`]'s own doc.
+    source: crate::fine_tune::source::TrainingSource,
     base_model_arc: Arc<crate::model::LoadedModel>,
     hidden_size: usize,
     device_config: DeviceConfig,
@@ -4935,7 +4680,7 @@ fn run_fine_tune_blocking(
         base_model,
         task,
         config,
-        loader: data_loader,
+        source: training_source,
         base_model_arc,
         hidden_size,
         device_config,
@@ -4949,14 +4694,35 @@ fn run_fine_tune_blocking(
 
     let target = if config.target_modules.is_empty() {
         let head = if task == ModelTask::Classification {
-            let num_classes = match data_loader.format() {
-                crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
-                    num_classes
+            // `num_classes` from the SAME source: a `Resident` loader's
+            // `TrainingFormat::Classification { num_classes }` (built from
+            // the eager `BTreeSet` pass), or a `Streamed` source's
+            // `StreamedSet::num_classes()` (built from the worker's own
+            // whole-table vocabulary sweep, F3) — both are the identical
+            // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
+            // doc), so the head is sized identically either way.
+            let num_classes = match &training_source {
+                crate::fine_tune::source::TrainingSource::Resident(loader) => {
+                    match loader.format() {
+                        crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
+                            num_classes
+                        }
+                        _ => {
+                            return Err(JammiError::FineTune(
+                                "Classification task requires classification training data \
+                                 format"
+                                    .into(),
+                            ))
+                        }
+                    }
                 }
-                _ => {
-                    return Err(JammiError::FineTune(
-                        "Classification task requires classification training data format".into(),
-                    ))
+                crate::fine_tune::source::TrainingSource::Streamed(streamed) => {
+                    streamed.num_classes().ok_or_else(|| {
+                        JammiError::FineTune(
+                            "Classification task requires classification training data format"
+                                .into(),
+                        )
+                    })?
                 }
             };
             crate::fine_tune::lora::build_classification_head(
@@ -5075,7 +4841,7 @@ fn run_fine_tune_blocking(
     }
     let mut training_loop = builder.build()?;
 
-    training_loop.run(&data_loader)
+    training_loop.run(training_source)
 }
 
 /// Fetch and load a job's durable resume checkpoint, if any. `None` when no

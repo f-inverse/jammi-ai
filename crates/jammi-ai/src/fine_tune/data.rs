@@ -14,6 +14,22 @@
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
 
+/// The train/validation split boundary over a row COUNT alone (#500 U2c
+/// §10): the last `round(total * fraction)` rows go to validation, so the
+/// train prefix is `[0, split_index(total, fraction))`. The ONE place this
+/// arithmetic is spelled — [`TrainingDataLoader::split`] (over an already
+/// in-memory row/batch count) and [`super::source::StreamedSet`]'s
+/// `train_count` (over a catalog row count, no scan) both call this, so a
+/// resident loader and a streamed source over the SAME `(total, fraction)`
+/// can never disagree about where the boundary falls. Pinned for every
+/// `total ∈ 0..=1000` and every fraction the config admits by
+/// `source::split_index_matches_the_resident_split_boundary` in this
+/// crate's test suite.
+pub(crate) fn split_index(total: usize, fraction: f64) -> usize {
+    let val_count = (total as f64 * fraction).round() as usize;
+    total - val_count
+}
+
 /// A training batch — either contrastive pairs or triplets.
 #[derive(Clone)]
 pub enum TrainingBatch {
@@ -237,7 +253,7 @@ impl TrainingFormat {
 
 /// A chunk of text data for one training batch. The training loop encodes
 /// these through the base model before computing loss.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TextChunk {
     Contrastive {
         texts_a: Vec<String>,
@@ -324,6 +340,16 @@ enum LoaderData {
 pub struct TrainingDataLoader {
     format: TrainingFormat,
     data: LoaderData,
+    /// The eager collected batches' pool reservation, held for this loader's
+    /// own lifetime (#500 U2c c3c, P-R) — `None` for every loader that never
+    /// went through a pool-accounted collect (every `from_*` constructor
+    /// below builds one this way; `training_set::read_back_with_reservation`'s
+    /// caller attaches the real one via [`Self::with_reservation`]).
+    /// `MemoryReservation`'s own `Drop` frees its held bytes back to the pool
+    /// the instant the LAST reservation over it goes out of scope — no
+    /// manual `Drop` impl is needed on this type for the same reason
+    /// [`super::stream::OwnedChunk`] needs none.
+    reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
 }
 
 /// Text data for one training example.
@@ -377,6 +403,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -389,6 +416,7 @@ impl TrainingDataLoader {
                     .map(|(text, label)| TrainingRow::Classification { text, label })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -404,6 +432,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -419,6 +448,7 @@ impl TrainingDataLoader {
                     .map(|(text, target)| TrainingRow::Regression { text, target })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -435,6 +465,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -452,6 +483,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -506,6 +538,7 @@ impl TrainingDataLoader {
         Ok(Self {
             format: TrainingFormat::Graph { has_negatives },
             data: LoaderData::TextRows(rows),
+            reservation: None,
         })
     }
 
@@ -528,6 +561,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -544,6 +578,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            reservation: None,
         }
     }
 
@@ -555,7 +590,22 @@ impl TrainingDataLoader {
         Self {
             format: TrainingFormat::Contrastive,
             data: LoaderData::Precomputed(batches),
+            reservation: None,
         }
+    }
+
+    /// Attach the eager collected read's pool reservation to this loader,
+    /// moving ownership in: the bytes it reserved release only when this
+    /// loader (or whichever half of a [`Self::split`] carries it) drops
+    /// (#500 U2c c3c, P-R). `pub(crate)`: only `worker.rs`'s Resident
+    /// construction site calls this — every `from_*` constructor above
+    /// stays reservation-free by design.
+    pub(crate) fn with_reservation(
+        mut self,
+        reservation: datafusion::execution::memory_pool::MemoryReservation,
+    ) -> Self {
+        self.reservation = Some(reservation);
+        self
     }
 
     /// Total number of data points (rows for text, batches for precomputed).
@@ -586,33 +636,79 @@ impl TrainingDataLoader {
     }
 
     /// Deterministic split: last `fraction` of data goes to validation.
-    pub fn split(&self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
-        match &self.data {
-            LoaderData::TextRows(rows) => {
-                let val_count = (rows.len() as f64 * fraction).round() as usize;
-                let train_count = rows.len() - val_count;
+    ///
+    /// The train/validation boundary itself is `split_index` — the SAME
+    /// arithmetic a [`super::source::StreamedSet`] uses to derive its own
+    /// `train_count` from a row COUNT alone (#500 U2c §10), so a resident
+    /// loader's split and a streamed source's window never disagree about
+    /// where the boundary falls for the same `(total, fraction)`.
+    ///
+    /// **The eager reservation moves to the TRAIN half** (#500 U2c c3c,
+    /// P-R): `self`'s ENTIRE currently-held reservation is carved, by
+    /// `MemoryReservation::split`, into a fresh reservation the returned
+    /// train loader owns — so the pool accounting follows the loader that
+    /// actually stays resident through every epoch, never the transient
+    /// pre-split original or the validation half this run reads only
+    /// occasionally.
+    ///
+    /// **Consumes `self` (#500 U2c closing round, A2/P-B4) and moves rows,
+    /// never clones them.** `self`'s row `Vec` is truncated in place via
+    /// `Vec::split_off` — the validation half's rows are MOVED out (no
+    /// `TrainingRow` is ever cloned by this call; an earlier `&self`
+    /// revision cloned BOTH halves via `.to_vec()` since it could not move
+    /// out of a shared reference). Taking `self` by value also closes A2:
+    /// `MemoryReservation::split` drains atomically, so `self`'s reservation
+    /// would sit at size zero after a first call, and a second `split` on
+    /// the SAME loader would previously hand the new "train" half a
+    /// reservation carrying zero bytes silently — a correct-looking loader
+    /// whose pool accounting had already gone stale. A second `split` on a
+    /// moved loader is now a COMPILE error (the moved-value diagnostic
+    /// [`Self::split`]'s own doctest below pins) rather than a silent
+    /// runtime one.
+    ///
+    /// ```compile_fail,E0382
+    /// use jammi_ai::fine_tune::data::TrainingDataLoader;
+    ///
+    /// let loader = TrainingDataLoader::from_rows(4);
+    /// let (train, _val) = loader.split(0.25);
+    /// // `loader` was moved into the call above; a second `split` on it
+    /// // cannot compile — the exact shape A2 found reachable at runtime
+    /// // when `split` took `&self`.
+    /// let (_train2, _val2) = loader.split(0.25);
+    /// # let _ = train;
+    /// ```
+    pub fn split(self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
+        let train_reservation = self.reservation.as_ref().map(|r| r.split(r.size()));
+        match self.data {
+            LoaderData::TextRows(mut rows) => {
+                let train_count = split_index(rows.len(), fraction);
+                let val_rows = rows.split_off(train_count);
                 (
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::TextRows(rows[..train_count].to_vec()),
+                        data: LoaderData::TextRows(rows),
+                        reservation: train_reservation,
                     },
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::TextRows(rows[train_count..].to_vec()),
+                        data: LoaderData::TextRows(val_rows),
+                        reservation: None,
                     },
                 )
             }
-            LoaderData::Precomputed(batches) => {
-                let val_count = (batches.len() as f64 * fraction).round() as usize;
-                let train_count = batches.len() - val_count;
+            LoaderData::Precomputed(mut batches) => {
+                let train_count = split_index(batches.len(), fraction);
+                let val_batches = batches.split_off(train_count);
                 (
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::Precomputed(batches[..train_count].to_vec()),
+                        data: LoaderData::Precomputed(batches),
+                        reservation: train_reservation,
                     },
                     TrainingDataLoader {
                         format: self.format,
-                        data: LoaderData::Precomputed(batches[train_count..].to_vec()),
+                        data: LoaderData::Precomputed(val_batches),
+                        reservation: None,
                     },
                 )
             }

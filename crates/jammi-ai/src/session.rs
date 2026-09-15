@@ -54,6 +54,14 @@ pub struct InferenceSession {
     /// identity, and `catalog::lease_keeper::LeaseTarget::Instance`
     /// registers the SAME id `jobs.claimed_by` carries.
     instance_id: String,
+    /// This process's `InstanceRegistration` — the ONE carrier
+    /// [`Self::instance_id`]'s row is written from
+    /// ([`jammi_db::catalog::instance::InstanceRegistration::from_config`]),
+    /// shared with the lease keeper's [`jammi_db::catalog::lease_keeper::
+    /// LeaseTarget::Instance`] hold below. [`crate::fine_tune::worker::
+    /// JobWorker`] and [`crate::fine_tune::worker::EmbeddedWorker`] are the
+    /// SOLE owners of its worker half (see [`Self::instance_registration`]).
+    instance_registration: Arc<jammi_db::catalog::instance::InstanceRegistration>,
     /// The process's one lease-renewal thread (N3) — every claimed lease
     /// this session (or a job/table it owns) holds is held open here instead
     /// of spawning its own `tokio::spawn` heartbeat task, so a CPU-bound
@@ -131,7 +139,16 @@ impl InferenceSession {
     /// becomes a full coordinator over the gRPC peer transport
     /// (`jammi_wire::peer::GrpcPeerTransport`, wired by the store builder).
     /// Precondition for any non-local placement: `storage.result_root` (or a
-    /// shared local `artifact_dir`) is a root every replica can read.
+    /// shared local `artifact_dir`) is a root every replica can read,
+    /// spelled IDENTICALLY on every replica. When `[server] peer_advertise`
+    /// is set, this shared-root topology is exactly what
+    /// [`jammi_db::config::JammiConfig::resolved_result_root`] yields
+    /// verbatim into `instances.result_root` — carried, not consulted:
+    /// [`jammi_db::catalog::Catalog::list_gang_members`] admits on address,
+    /// kinds, state and freshness only; root identity and any predicate on
+    /// it are U5b-1a-A2. Identical spelling stays necessary, never
+    /// sufficient, for shared storage (see
+    /// [`jammi_db::catalog::instance::InstanceRegistration::from_config`]).
     pub async fn open_with_placement(
         config: JammiConfig,
         placement: Arc<dyn jammi_db::index::SegmentPlacement>,
@@ -197,6 +214,29 @@ impl InferenceSession {
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
+
+        // The ONE choke point (contract §10, the round-3 excision), run
+        // FIRST — before the lease keeper starts, before the result store
+        // creates a single directory, before any other side effect:
+        // `peer_advertise` unset yields a non-member registration
+        // (`peer_addr`/`member_root` both `None`) with no filesystem/config
+        // check at all; `peer_advertise` set parses it as a `PeerAddr`,
+        // requires `peer_bind`, and carries `resolved_result_root()`
+        // VERBATIM as the member root — no filesystem access, no
+        // interpretation of the root at all. `wrap_with` is the universal
+        // funnel every `InferenceSession` constructor reaches, so a
+        // hand-built config (never routed through `JammiConfig::load_from`)
+        // is still covered here.
+        let instance_id = crate::fine_tune::worker::mint_instance_id();
+        let label = crate::fine_tune::worker::worker_label();
+        let registration = Arc::new(
+            jammi_db::catalog::instance::InstanceRegistration::from_config(
+                inner.config(),
+                instance_id.clone(),
+                label.as_deref(),
+                None,
+            )?,
+        );
 
         // N3: one lease-renewal thread per process, started before anything
         // holds a lease with it (the result store's `BuildingTable`
@@ -300,7 +340,9 @@ impl InferenceSession {
         // rows live for `[jobs] retention_days` — the retention knob never
         // decides process liveness.
         catalog
-            .prune_instances(lease_intervals.lease().saturating_mul(2))
+            .prune_instances(jammi_db::catalog::lease::instance_prune_window(
+                lease_intervals.lease(),
+            ))
             .await?;
         // `Catalog::prune_jobs` is tenant-scoped (F2, issue #485): every
         // `JobService::PruneJobs` RPC call runs it under the CALLER's own
@@ -319,18 +361,15 @@ impl InferenceSession {
                 .await?;
         }
 
-        // This process's `instances` row + keeper hold — every
-        // session upserts and heartbeats one, whether or not it runs a
-        // claim loop (only `workers` membership is gated on `[worker]
-        // enabled`, upserted by `EmbeddedWorker::spawn`/`JobWorker`). The
-        // id is minted here; `JAMMI_WORKER_ID` only labels the row.
-        let instance_id = crate::fine_tune::worker::mint_instance_id();
-        let label = crate::fine_tune::worker::worker_label();
-        catalog
-            .upsert_instance(&instance_id, label.as_deref(), None)
-            .await?;
+        // This process's `instances` row + keeper hold — every session
+        // upserts and heartbeats one, whether or not it runs a claim loop
+        // (only `workers` membership is gated on `[worker] enabled`,
+        // upserted by `EmbeddedWorker::spawn`/`JobWorker`). `registration`
+        // was already validated above, before any side effect; this is its
+        // first actual write.
+        catalog.upsert_instance(&registration).await?;
         let instance_hold = lease_keeper.hold(
-            jammi_db::catalog::lease_keeper::LeaseTarget::Instance(instance_id.clone()),
+            jammi_db::catalog::lease_keeper::LeaseTarget::Instance(Arc::clone(&registration)),
         );
 
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
@@ -349,6 +388,7 @@ impl InferenceSession {
             hub,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
             instance_id,
+            instance_registration: registration,
             lease_keeper,
             _instance_hold: instance_hold,
             worker_gate,
@@ -419,6 +459,25 @@ impl InferenceSession {
     /// [`Self::run_now`]'s inline claim alike.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// This process's [`jammi_db::catalog::instance::InstanceRegistration`]
+    /// — the SAME value [`Self::instance_id`]'s row was written from and the
+    /// lease keeper's `LeaseTarget::Instance` hold renews. A
+    /// [`crate::fine_tune::worker::JobWorker`] (and the
+    /// [`crate::fine_tune::worker::EmbeddedWorker`] guard spawned over it)
+    /// is the sole owner of its `worker` half: it sets the cell only AFTER
+    /// every row write as ONE fact with the row (`write_worker_facts` in
+    /// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): the cell is
+    /// set to the facts about to be UPSERTED and reverted if that upsert
+    /// fails — after a failed first write it is `None` again — and cleared
+    /// before every `delete_worker` call. A keeper reregister therefore
+    /// re-upserts only facts a row write of this process succeeded with, or
+    /// the facts an in-flight upsert is about to write.
+    pub(crate) fn instance_registration(
+        &self,
+    ) -> &Arc<jammi_db::catalog::instance::InstanceRegistration> {
+        &self.instance_registration
     }
 
     /// This process's one lease-renewal thread (N3). A
@@ -555,6 +614,32 @@ impl InferenceSession {
     /// Execute a SQL query.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         self.inner.sql(query).await
+    }
+
+    /// [`Self::sql`]'s streamed twin: plan `query` and return the
+    /// `SendableRecordBatchStream` rather than collecting it. Forwarded to
+    /// [`jammi_db::session::JammiSession::sql_stream`] — see that method's
+    /// doc for the tenant-scoping and residency-release guarantees a caller
+    /// (the per-rank training-set stream, `fine_tune::stream`) relies on.
+    pub async fn sql_stream(
+        &self,
+        query: &str,
+    ) -> Result<datafusion::execution::SendableRecordBatchStream> {
+        self.inner.sql_stream(query).await
+    }
+
+    /// This session's `[engine] memory_limit`-bounded memory pool. Forwarded
+    /// to [`jammi_db::session::JammiSession::memory_pool`] — the route a
+    /// caller registers its own [`datafusion::execution::memory_pool::
+    /// MemoryConsumer`] through (a training-set stream's per-rank
+    /// reservation, an eager read's collected-batch reservation) so it is
+    /// bounded by the SAME knob a plan exhausting DataFusion's own operators
+    /// would surface [`jammi_db::error::JammiError::ResourcesExhausted`]
+    /// against.
+    pub fn memory_pool(
+        &self,
+    ) -> std::sync::Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
+        self.inner.memory_pool()
     }
 
     /// Every ANN index segment of `table_name`, ordered by `segment_id`.
@@ -2355,29 +2440,30 @@ fn build_result_store(
     // The one lease timing every leased row shares: the store's building
     // tables are held under the same `[lease]` the training worker uses.
     let lease = inner.config().lease.intervals()?;
-    let store = match inner.config().storage.result_root.as_deref() {
-        Some(root) => {
-            let root = jammi_db::storage::StorageUrl::parse(root)?;
-            // `local_cache_dir` is the PARENT of the two local caches
-            // `ResultStore::with_root` derives (`{local_cache_dir}/index` —
-            // the ANN segment cache, always local since USearch reads the
-            // local filesystem even when `root` is a cloud scheme — and
-            // `{local_cache_dir}/artifact`, the model-artifact fetch cache
-            // its own internal `ArtifactStore` uses). Rooted under the local
-            // artifact dir's `cache/` sub-prefix: relocated OUT of the
-            // `jammi_db/` result-table root so a `reconcile`/backup pass over
-            // that root never walks scratch cache state.
-            let local_cache_dir = inner.config().artifact_dir.join("cache");
-            ResultStore::with_root(
-                root,
-                inner.storage_registry(),
-                catalog,
-                ann,
-                local_cache_dir,
-            )
-        }
-        None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
-    }?;
+    // `resolved_result_root()` is the ONE `{artifact_dir}/jammi_db` (or
+    // explicit `storage.result_root`) derivation — the SAME string a gang
+    // member's `instances.result_root` row carries verbatim
+    // (`InstanceRegistration::from_config`) — so this session's store is
+    // rooted at EXACTLY the root the member row records (carried, not
+    // consulted by the membership predicate), never a second, independently
+    // re-derived path.
+    let root = jammi_db::storage::StorageUrl::parse(&inner.config().resolved_result_root()?)?;
+    // `local_cache_dir` is the PARENT of the two local caches
+    // `ResultStore::with_root` derives (`{local_cache_dir}/index` — the ANN
+    // segment cache, always local since USearch reads the local filesystem
+    // even when `root` is a cloud scheme — and `{local_cache_dir}/artifact`,
+    // the model-artifact fetch cache its own internal `ArtifactStore` uses).
+    // Rooted under the local artifact dir's `cache/` sub-prefix: relocated
+    // OUT of the `jammi_db/` result-table root so a `reconcile`/backup pass
+    // over that root never walks scratch cache state.
+    let local_cache_dir = inner.config().artifact_dir.join("cache");
+    let store = ResultStore::with_root(
+        root,
+        inner.storage_registry(),
+        catalog,
+        ann,
+        local_cache_dir,
+    )?;
     Ok(store
         .with_lease_intervals(lease)
         // The placed-search seams: who owns which segment (`AllLocal` unless

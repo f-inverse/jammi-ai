@@ -838,7 +838,9 @@ impl TrainingLoop {
     /// - With `base_model`: text-based loaders encode through the frozen base
     ///   model, project through LoRA, and compute loss on the projected embeddings.
     /// - Without `base_model`: precomputed tensor batches go directly to loss.
-    pub fn run(&mut self, data_loader: &TrainingDataLoader) -> Result<TrainingResult> {
+    pub fn run(&mut self, source: super::source::TrainingSource) -> Result<TrainingResult> {
+        use super::source::TrainingSource;
+
         // Reset the media front-end accumulator for THIS `run` call — see
         // `TrainingResult::media_front_end_wall`'s doc: a caller driving
         // multiple resume legs through separate `run` calls sums this field
@@ -853,9 +855,70 @@ impl TrainingLoop {
         // (below), never written mid-run under its own lease-guarded CAS.
         let started_at = chrono::Utc::now().to_rfc3339();
 
-        // Split training/validation
-        let total_rows = data_loader.len();
-        let (train_loader, val_loader) = data_loader.split(self.config.validation_fraction);
+        // F6 (#500 U2c §11): a whole-set arm (mining, GradCache) can only
+        // ever run against a `Resident` source — every row must already be
+        // in memory before either one can do anything. The worker's own
+        // source selection (`worker.rs::run_spec`) calls the SAME predicate
+        // (`source::whole_set_arm`) to decide `Resident` vs `Streamed`, so
+        // reaching this point with a `Streamed` source under a
+        // whole-set-arm config is an internal invariant violation — a typed
+        // refusal here, never a silent fall-through to a code path that
+        // assumes every row is resident when it is not.
+        if let TrainingSource::Streamed(_) = &source {
+            if let Some(arm) = super::source::whole_set_arm(&self.config, self.base_model.is_some())
+            {
+                return Err(JammiError::FineTune(format!(
+                    "a Streamed training source reached a whole-set arm ({arm:?}): \
+                     `source::whole_set_arm` must have selected Resident for this \
+                     configuration — internal invariant violated"
+                )));
+            }
+        }
+
+        /// This run's training/validation source, prepared for the epoch
+        /// loop: a `Resident` source is split into its two
+        /// `TrainingDataLoader`s up front (unchanged from before this
+        /// unit); a `Streamed` source keeps its [`super::source::
+        /// StreamedSet`] around to open a fresh [`super::stream::
+        /// TrainingSetStream`] each epoch (the restart boundary is the
+        /// epoch, `resume.rs`) and for validation.
+        enum Source {
+            Resident {
+                train_loader: TrainingDataLoader,
+                val_loader: TrainingDataLoader,
+            },
+            // Boxed for the same reason `TrainingSource::Streamed` is
+            // (`source.rs`'s own doc): a `StreamedSet` is substantially
+            // larger than the `Resident` variant, and this type is moved by
+            // value once per epoch loop, not once per row.
+            Streamed(Box<super::source::StreamedSet>),
+        }
+
+        let mut source = match source {
+            TrainingSource::Resident(loader) => {
+                let (train_loader, val_loader) = loader.split(self.config.validation_fraction);
+                Source::Resident {
+                    train_loader,
+                    val_loader,
+                }
+            }
+            TrainingSource::Streamed(streamed) => Source::Streamed(streamed),
+        };
+
+        // Split training/validation row counts — a `Resident` source reads
+        // them off its already-split loaders; a `Streamed` source already
+        // carries them (`StreamedSet::total_rows`/`train_count`, both row
+        // COUNTS from the catalog record, no scan).
+        let (total_rows, val_is_empty) = match &source {
+            Source::Resident {
+                train_loader,
+                val_loader,
+            } => (train_loader.len() + val_loader.len(), val_loader.is_empty()),
+            Source::Streamed(streamed) => (
+                streamed.total_rows,
+                streamed.total_rows == streamed.train_count,
+            ),
+        };
 
         // A validation split can come out empty even when `validation_fraction`
         // is non-zero, because the split rounds: `round(rows * fraction)` is 0
@@ -865,9 +928,7 @@ impl TrainingLoop {
         // where it is known. Without this the run monitors a loss that is never
         // measured, stops on the first non-improvement, and publishes the
         // epoch-0 adapter as its result.
-        if self.config.early_stopping_metric == EarlyStoppingMetric::ValLoss
-            && val_loader.is_empty()
-        {
+        if self.config.early_stopping_metric == EarlyStoppingMetric::ValLoss && val_is_empty {
             return Err(JammiError::FineTune(format!(
                 "early_stopping_metric=val_loss requires a non-empty validation split, but \
                  validation_fraction={} over {total_rows} row(s) holds out none. Set \
@@ -881,7 +942,27 @@ impl TrainingLoop {
         // (a regression run only). Computed from the train split — the val split
         // is held out — so every regression-loss call scores in a z-space the
         // zero-init head can reach, while the head stays in raw space.
-        self.target_scaler = match train_loader.regression_targets() {
+        //
+        // The `Streamed` arm (#500 U2c §11 F2) collects the SAME whole-prefix
+        // `Vec<f32>` through a `Slice::All` stream over `[0, train_count)`
+        // projecting the full committed column order and keeping only each
+        // chunk's `TextChunk::Regression::targets` — the SAME decoder
+        // (`decode::extract_numeric_column`), the SAME order, so the vector is
+        // byte-identical to the `Resident` arm's `regression_targets()`. This
+        // is the K3 scaler's own named, separate, unfiltered pass (never
+        // itself streamed per-chunk) — `Σ E`'s scaler term in `stream.rs`'s
+        // module doc — not a new exemption.
+        let regression_targets: Option<Vec<f32>> = match &source {
+            Source::Resident { train_loader, .. } => train_loader.regression_targets(),
+            Source::Streamed(streamed) => {
+                if streamed.task == crate::model::ModelTask::Regression {
+                    Some(self.collect_streamed_regression_targets(streamed)?)
+                } else {
+                    None
+                }
+            }
+        };
+        self.target_scaler = match regression_targets {
             Some(targets) if !targets.is_empty() => {
                 let n = targets.len();
                 let tensor = Tensor::from_vec(targets, (n,), &self.device)
@@ -916,10 +997,28 @@ impl TrainingLoop {
         // already one batch), so the row-count-based formula does not apply
         // to it; it stays on `num_batches` unchanged (DESIGN.md §2, PRESSURE
         // round-2 design finding 7).
-        let train_batches_per_epoch = if train_loader.is_precomputed() {
-            train_loader.num_batches(self.config.batch_size)
-        } else {
-            super::partition::batches_per_epoch(train_loader.len(), 1, self.config.batch_size)
+        //
+        // The `Streamed` arm has no `Precomputed` shape (a stream only ever
+        // carries text rows), so it always takes the row-count formula, over
+        // `StreamedSet::train_count` — the SAME `batches_per_epoch` function
+        // the `Resident` text arm uses, so a `Streamed` and a `Resident`
+        // source over the identical `(train_count, batch_size)` compute the
+        // identical horizon (the W=1 parity oracle this doc already names).
+        let train_batches_per_epoch = match &source {
+            Source::Resident { train_loader, .. } => {
+                if train_loader.is_precomputed() {
+                    train_loader.num_batches(self.config.batch_size)
+                } else {
+                    super::partition::batches_per_epoch(
+                        train_loader.len(),
+                        1,
+                        self.config.batch_size,
+                    )
+                }
+            }
+            Source::Streamed(streamed) => {
+                super::partition::batches_per_epoch(streamed.train_count, 1, streamed.batch)
+            }
         };
         let total_steps = train_batches_per_epoch
             .div_ceil(self.config.gradient_accumulation_steps.max(1))
@@ -1032,14 +1131,19 @@ impl TrainingLoop {
         //    (the first step past the horizon), so such a run pays one
         //    extra sync, not one per step — see `LastStepHorizon`'s lattice
         //    and the run-level oracles in `last_step_horizon_run_oracles`.
-        let total_optimizer_steps = if Self::wants_gradcache_horizon(
-            train_loader.is_precomputed(),
-            self.gradcache_eligible(),
-        ) {
-            self.config.epochs
-        } else {
-            total_steps
-        };
+        // A `Streamed` source is never `Precomputed` (F6 already refuses a
+        // Streamed source under a GradCache-eligible config, so this is
+        // never `true` on that arm regardless).
+        let source_is_precomputed = matches!(
+            &source,
+            Source::Resident { train_loader, .. } if train_loader.is_precomputed()
+        );
+        let total_optimizer_steps =
+            if Self::wants_gradcache_horizon(source_is_precomputed, self.gradcache_eligible()) {
+                self.config.epochs
+            } else {
+                total_steps
+            };
         let mut last_step_horizon = LastStepHorizon::new(total_optimizer_steps);
 
         // Snapshot the trainable variables ONCE, in a DETERMINISTIC (name-sorted)
@@ -1186,123 +1290,194 @@ impl TrainingLoop {
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
-            // through the MNRL hard-negative path.
-            if self.mining_eligible()
-                && super::hard_negative_miner::should_refresh(
-                    epoch,
-                    self.config.hard_negatives.refresh_every,
-                )
-            {
-                mined_loader = Some(self.mine_hard_negative_loader(&train_loader)?);
-            }
-            // The loader this epoch trains on: the freshly/last-mined triplets
-            // when mining is active, otherwise the original data.
-            let epoch_loader: &TrainingDataLoader = mined_loader.as_ref().unwrap_or(&train_loader);
-
-            if epoch_loader.is_precomputed() {
-                // Test path: direct tensor batches, no encoding.
-                let train_batches = epoch_loader.batches(self.config.batch_size)?;
-                for batch in train_batches {
-                    let batch = batch?;
-                    Self::accumulate_sim_stats(&batch, &mut sim_stats);
-                    let loss = self.compute_loss(&batch)?;
-                    self.process_batch_loss(
-                        loss,
-                        EpochState {
-                            batch_count: &mut batch_count,
-                            epoch_loss: &mut epoch_loss,
-                            accumulated_grads: &mut accumulated_grads,
-                            grads_pending: &mut grads_pending,
-                            global_step: &mut global_step,
-                        },
-                        StepContext {
-                            trainable_vars: &trainable_vars,
-                            optimizer: &mut optimizer,
-                            checkpoint_dir: &checkpoint_dir,
-                            checkpoint_interval,
-                            lr_horizon: total_steps,
-                            last_step_horizon: &mut last_step_horizon,
-                            batches_per_epoch: train_batches_per_epoch,
-                        },
-                    )?;
-                }
-            } else if self.gradcache_eligible() {
-                // GradCache path: the whole dataset is one in-batch-negative
-                // batch, chunked at `batch_size` for memory. One optimiser step
-                // per epoch over the full negative pool.
-                let lr = compute_lr(&self.config, global_step, total_steps);
-                optimizer.set_learning_rate(lr);
-                let loss_val = self.run_gradcache_epoch(
-                    epoch_loader,
-                    &trainable_vars,
-                    &mut optimizer,
-                    &mut last_step_horizon,
-                    global_step,
-                )?;
-                epoch_loss += loss_val;
-                batch_count += 1;
-                global_step += 1;
-                if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
-                    self.save_checkpoint(&checkpoint_dir, global_step)?;
-                }
-            } else {
-                // Production path: encode text through the target, then
-                // compute loss. Walks `epoch_loader` by PartitionSpec-selected
-                // GLOBAL step (DESIGN.md §2) rather than a pre-collected
-                // `Vec<TextChunk>` — one step's row slice is decoded at a
-                // time, never the whole epoch's chunks at once. The spec is
-                // always [`super::partition::PartitionSpec::single_rank`]
-                // (rank 0 of world 1, the only assignment reachable at this
-                // commit — U4b is what would ever spawn more than one rank),
-                // under which `rows_for_step` walks exactly the same `[s*B,
-                // (s+1)*B)` row slices `epoch_loader.chunks(batch_size)` would
-                // have collected, terminating at the same boundary — the
-                // first empty chunk, which falls exactly at
-                // `epoch_loader.len().div_ceil(batch_size)` steps — so this is
-                // a control-flow change only; the W=1 parity oracle is the
-                // whole existing trainer suite passing byte-for-byte.
-                //
-                // Bound by `epoch_loader`'s OWN row count via the
-                // empty-chunk terminator, never by `train_batches_per_epoch`
-                // (computed once from `train_loader`, before the loop): a
-                // hard-negative-mined `epoch_loader` can hold a different row
-                // count than `train_loader` on a refresh epoch (see the
-                // `total_optimizer_steps` doc above), and this loop must keep
-                // iterating exactly as many chunks as THIS epoch's loader
-                // actually holds, as `text_chunks` always did.
-                let partition_spec = super::partition::PartitionSpec::single_rank(
-                    self.config.batch_size,
-                    super::partition::PartitionRule::BlockByGlobalBatch,
-                );
-                let mut step = 0usize;
-                loop {
-                    let chunk = epoch_loader.text_chunk_for_rank(&partition_spec, step)?;
-                    if chunk.row_count() == 0 {
-                        break;
+            // through the MNRL hard-negative path. Mining/GradCache/the
+            // precomputed test path are Resident-only — F6 (checked once,
+            // above the loop, before `start_epoch`) already refused a
+            // Streamed source under a whole-set-arm config, so a Streamed
+            // source here always takes the production text arm.
+            match &mut source {
+                Source::Resident {
+                    train_loader,
+                    val_loader: _,
+                } => {
+                    if self.mining_eligible()
+                        && super::hard_negative_miner::should_refresh(
+                            epoch,
+                            self.config.hard_negatives.refresh_every,
+                        )
+                    {
+                        mined_loader = Some(self.mine_hard_negative_loader(train_loader)?);
                     }
-                    let batch = self.encode_chunk(&chunk)?;
-                    let loss = self.compute_loss(&batch)?;
-                    Self::accumulate_sim_stats(&batch, &mut sim_stats);
-                    self.process_batch_loss(
-                        loss,
-                        EpochState {
-                            batch_count: &mut batch_count,
-                            epoch_loss: &mut epoch_loss,
-                            accumulated_grads: &mut accumulated_grads,
-                            grads_pending: &mut grads_pending,
-                            global_step: &mut global_step,
-                        },
-                        StepContext {
-                            trainable_vars: &trainable_vars,
-                            optimizer: &mut optimizer,
-                            checkpoint_dir: &checkpoint_dir,
-                            checkpoint_interval,
-                            lr_horizon: total_steps,
-                            last_step_horizon: &mut last_step_horizon,
-                            batches_per_epoch: train_batches_per_epoch,
-                        },
-                    )?;
-                    step += 1;
+                    // The loader this epoch trains on: the freshly/last-mined
+                    // triplets when mining is active, otherwise the original
+                    // data.
+                    let epoch_loader: &TrainingDataLoader =
+                        mined_loader.as_ref().unwrap_or(train_loader);
+
+                    if epoch_loader.is_precomputed() {
+                        // Test path: direct tensor batches, no encoding.
+                        let train_batches = epoch_loader.batches(self.config.batch_size)?;
+                        for batch in train_batches {
+                            let batch = batch?;
+                            Self::accumulate_sim_stats(&batch, &mut sim_stats);
+                            let loss = self.compute_loss(&batch)?;
+                            self.process_batch_loss(
+                                loss,
+                                EpochState {
+                                    batch_count: &mut batch_count,
+                                    epoch_loss: &mut epoch_loss,
+                                    accumulated_grads: &mut accumulated_grads,
+                                    grads_pending: &mut grads_pending,
+                                    global_step: &mut global_step,
+                                },
+                                StepContext {
+                                    trainable_vars: &trainable_vars,
+                                    optimizer: &mut optimizer,
+                                    checkpoint_dir: &checkpoint_dir,
+                                    checkpoint_interval,
+                                    lr_horizon: total_steps,
+                                    last_step_horizon: &mut last_step_horizon,
+                                    batches_per_epoch: train_batches_per_epoch,
+                                },
+                            )?;
+                        }
+                    } else if self.gradcache_eligible() {
+                        // GradCache path: the whole dataset is one in-batch-negative
+                        // batch, chunked at `batch_size` for memory. One optimiser step
+                        // per epoch over the full negative pool.
+                        let lr = compute_lr(&self.config, global_step, total_steps);
+                        optimizer.set_learning_rate(lr);
+                        let loss_val = self.run_gradcache_epoch(
+                            epoch_loader,
+                            &trainable_vars,
+                            &mut optimizer,
+                            &mut last_step_horizon,
+                            global_step,
+                        )?;
+                        epoch_loss += loss_val;
+                        batch_count += 1;
+                        global_step += 1;
+                        if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
+                            self.save_checkpoint(&checkpoint_dir, global_step)?;
+                        }
+                    } else {
+                        // Production path: encode text through the target, then
+                        // compute loss. Walks `epoch_loader` by PartitionSpec-selected
+                        // GLOBAL step (DESIGN.md §2) rather than a pre-collected
+                        // `Vec<TextChunk>` — one step's row slice is decoded at a
+                        // time, never the whole epoch's chunks at once. The spec is
+                        // always [`super::partition::PartitionSpec::single_rank`]
+                        // (rank 0 of world 1, the only assignment reachable at this
+                        // commit — U4b is what would ever spawn more than one rank),
+                        // under which `rows_for_step` walks exactly the same `[s*B,
+                        // (s+1)*B)` row slices `epoch_loader.chunks(batch_size)` would
+                        // have collected, terminating at the same boundary — the
+                        // first empty chunk, which falls exactly at
+                        // `epoch_loader.len().div_ceil(batch_size)` steps — so this is
+                        // a control-flow change only; the W=1 parity oracle is the
+                        // whole existing trainer suite passing byte-for-byte.
+                        //
+                        // Bound by `epoch_loader`'s OWN row count via the
+                        // empty-chunk terminator, never by `train_batches_per_epoch`
+                        // (computed once from `train_loader`, before the loop): a
+                        // hard-negative-mined `epoch_loader` can hold a different row
+                        // count than `train_loader` on a refresh epoch (see the
+                        // `total_optimizer_steps` doc above), and this loop must keep
+                        // iterating exactly as many chunks as THIS epoch's loader
+                        // actually holds, as `text_chunks` always did.
+                        let partition_spec = super::partition::PartitionSpec::single_rank(
+                            self.config.batch_size,
+                            super::partition::PartitionRule::BlockByGlobalBatch,
+                        );
+                        // `EpochSource::Resident`'s `next_chunk` is a pure
+                        // control-flow rewrap of `text_chunk_for_rank` (see
+                        // its own doc) — zero bytes of this arm's output
+                        // change; it exists so the Resident and Streamed
+                        // production text arms share one chunk-source
+                        // interface.
+                        let mut epoch_source = super::stream::EpochSource::Resident(epoch_loader);
+                        let mut step = 0usize;
+                        loop {
+                            let Some(chunk) = epoch_source.next_chunk(&partition_spec, step)?
+                            else {
+                                break;
+                            };
+                            let batch = self.encode_chunk(&chunk)?;
+                            let loss = self.compute_loss(&batch)?;
+                            Self::accumulate_sim_stats(&batch, &mut sim_stats);
+                            self.process_batch_loss(
+                                loss,
+                                EpochState {
+                                    batch_count: &mut batch_count,
+                                    epoch_loss: &mut epoch_loss,
+                                    accumulated_grads: &mut accumulated_grads,
+                                    grads_pending: &mut grads_pending,
+                                    global_step: &mut global_step,
+                                },
+                                StepContext {
+                                    trainable_vars: &trainable_vars,
+                                    optimizer: &mut optimizer,
+                                    checkpoint_dir: &checkpoint_dir,
+                                    checkpoint_interval,
+                                    lr_horizon: total_steps,
+                                    last_step_horizon: &mut last_step_horizon,
+                                    batches_per_epoch: train_batches_per_epoch,
+                                },
+                            )?;
+                            step += 1;
+                        }
+                    }
+                }
+                Source::Streamed(streamed) => {
+                    // Production path over a fresh per-epoch stream (#500
+                    // U2c §10): the SAME per-step body as the Resident text
+                    // arm above (encode → loss → accumulate sim stats →
+                    // `process_batch_loss`), sourcing its chunks from a
+                    // [`super::stream::EpochSource::Stream`] instead of an
+                    // already-resident loader. `PartitionSpec::single_rank`
+                    // is baked into the stream's own `Slice::PerRank` at
+                    // `open` (never re-applied per chunk, unlike the
+                    // Resident arm, which re-derives the slice on every
+                    // `text_chunk_for_rank` call — both land on the
+                    // identical `[s*B, (s+1)*B)` row range for the SAME
+                    // step, the W=1 parity property P6 pins).
+                    let partition_spec = super::partition::PartitionSpec::single_rank(
+                        self.config.batch_size,
+                        super::partition::PartitionRule::BlockByGlobalBatch,
+                    );
+                    let window = super::stream::RowWindow::new(0, streamed.train_count);
+                    let slice = super::stream::Slice::PerRank(partition_spec);
+                    let opened = self.open_streamed_source(streamed, window, slice)?;
+                    let mut epoch_source = super::stream::EpochSource::Stream(opened);
+                    let mut step = 0usize;
+                    loop {
+                        let Some(chunk) = epoch_source.next_chunk(&partition_spec, step)? else {
+                            break;
+                        };
+                        let batch = self.encode_chunk(&chunk)?;
+                        let loss = self.compute_loss(&batch)?;
+                        Self::accumulate_sim_stats(&batch, &mut sim_stats);
+                        self.process_batch_loss(
+                            loss,
+                            EpochState {
+                                batch_count: &mut batch_count,
+                                epoch_loss: &mut epoch_loss,
+                                accumulated_grads: &mut accumulated_grads,
+                                grads_pending: &mut grads_pending,
+                                global_step: &mut global_step,
+                            },
+                            StepContext {
+                                trainable_vars: &trainable_vars,
+                                optimizer: &mut optimizer,
+                                checkpoint_dir: &checkpoint_dir,
+                                checkpoint_interval,
+                                lr_horizon: total_steps,
+                                last_step_horizon: &mut last_step_horizon,
+                                batches_per_epoch: train_batches_per_epoch,
+                            },
+                        )?;
+                        step += 1;
+                    }
                 }
             }
 
@@ -1389,7 +1564,21 @@ impl TrainingLoop {
                     // same three operations in the same order, so `evaluate`'s
                     // return value — and every pinned value downstream of it
                     // (early stopping, `checkpoint_best`) — is unchanged.
-                    Some(self.with_dropout_disabled(|loop_| loop_.evaluate(&val_loader))?)
+                    //
+                    // The `Streamed` arm's validation pass opens a fresh
+                    // stream over the held-out suffix `[train_count, total)`
+                    // (#500 U2c §10/§11 F4) rather than reusing an
+                    // already-resident `val_loader` — `evaluate_streamed`
+                    // folds it through the SAME per-batch loss accumulation
+                    // `evaluate` uses.
+                    match &source {
+                        Source::Resident { val_loader, .. } => {
+                            Some(self.with_dropout_disabled(|loop_| loop_.evaluate(val_loader))?)
+                        }
+                        Source::Streamed(streamed) => Some(
+                            self.with_dropout_disabled(|loop_| loop_.evaluate_streamed(streamed))?,
+                        ),
+                    }
                 }
             };
 
@@ -1554,13 +1743,14 @@ impl TrainingLoop {
     /// model is present to embed the corpus. Mining replaces the epoch's data
     /// with mined triplets, so it requires a text loader — the precomputed test
     /// path skips it.
+    ///
+    /// Delegates to [`super::source::mining_eligible`] — the SAME predicate
+    /// `super::source::whole_set_arm` (which `worker.rs::run_spec`'s source
+    /// selection calls, #500 U2c §11 F6) folds in, so this method and the
+    /// worker's `Resident`/`Streamed` choice can never disagree about
+    /// whether mining applies to this run's configuration.
     fn mining_eligible(&self) -> bool {
-        self.base_model.is_some()
-            && self.config.hard_negatives.mine
-            && matches!(
-                self.config.embedding_loss,
-                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. })
-            )
+        super::source::mining_eligible(&self.config, self.base_model.is_some())
     }
 
     /// Mine hard negatives from the current model and build a triplet loader of
@@ -1709,13 +1899,13 @@ impl TrainingLoop {
     /// present to re-encode chunks (the test/precomputed path has no encoder).
     /// `cached` only enlarges an *in-batch-negative* pool, so it is a no-op for
     /// graded-pair or triplet-margin objectives — those take the standard path.
+    ///
+    /// Delegates to [`super::source::gradcache_eligible`] — see that
+    /// function's doc for why it stays independent of
+    /// [`Self::mining_eligible`] rather than being folded into one
+    /// mutually-exclusive choice.
     fn gradcache_eligible(&self) -> bool {
-        self.base_model.is_some()
-            && self.config.cached
-            && matches!(
-                self.config.embedding_loss,
-                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. })
-            )
+        super::source::gradcache_eligible(&self.config, self.base_model.is_some())
     }
 
     /// Whether `total_optimizer_steps` (in `run`) should use GradCache's
@@ -3282,6 +3472,173 @@ impl TrainingLoop {
                 let batch = self.encode_chunk(chunk)?;
                 accumulate(batch, &mut total_loss, &mut count)?;
             }
+        }
+
+        Ok(if count > 0 {
+            total_loss / count as f64
+        } else {
+            0.0
+        })
+    }
+
+    /// Open a fresh [`super::stream::TrainingSetStream`] over `streamed`
+    /// (#500 U2c §10) — the shared entry point the per-epoch training loop
+    /// AND [`Self::evaluate_streamed`]/[`Self::collect_streamed_regression_
+    /// targets`] all call, each with its own `window`/`slice`.
+    ///
+    /// `TrainingSetStream::open` is `async`; this method — like every other
+    /// method on this SYNC `TrainingLoop` — runs on the blocking pool
+    /// (`worker.rs`'s `spawn_blocking`), so it drives the open through the
+    /// current Tokio runtime's `Handle::block_on` — the SAME pattern
+    /// `worker.rs::discover_resume` already uses to call async code from
+    /// inside that same blocking closure. `open` only BORROWS `streamed`'s
+    /// session/table/columns for the duration of the call (the pump task it
+    /// spawns owns everything it needs independently once `open` returns),
+    /// so this never holds a borrow past this function's own return.
+    ///
+    /// `block_on` starts a fresh top-level poll on whichever `spawn_blocking`
+    /// OS thread this call lands on — it does NOT inherit the Tokio
+    /// task-local `with_tenant_scoped` installed in the async task that
+    /// built `streamed` (#500 U2c c3d). Every query `open` issues —
+    /// `validate_window`'s schema/null-NaN pre-pass, the ordered
+    /// `read_back_sql` plan, and `run_pump`'s planning — reaches
+    /// `ResultTableSchemaProvider::table`, which gates resolution on
+    /// `TenantBinding::current_tenant()`; unscoped, a tenant-owned training
+    /// set resolves "table not found" exactly like a peer's private table
+    /// (`result_schema.rs`'s own doc). So `streamed.tenant` (captured by the
+    /// caller while still inside the real scope, `source.rs`'s field doc) is
+    /// re-entered HERE, inside this `block_on`'s own future, covering every
+    /// nested `.await` `open` makes.
+    fn open_streamed_source(
+        &self,
+        streamed: &super::source::StreamedSet,
+        window: super::stream::RowWindow,
+        slice: super::stream::Slice,
+    ) -> Result<super::stream::TrainingSetStream> {
+        let open = super::stream::TrainingSetStream::open(
+            &streamed.session,
+            &streamed.table,
+            &streamed.columns,
+            streamed.task,
+            window,
+            slice,
+            streamed.stream_cfg,
+            streamed.label_vocab.clone(),
+        );
+        tokio::runtime::Handle::current().block_on(async move {
+            match streamed.tenant {
+                Some(tenant) => {
+                    streamed
+                        .session
+                        .with_tenant_scoped(tenant, |_scope| open)
+                        .await
+                }
+                None => open.await,
+            }
+        })
+    }
+
+    /// The K3 scaler's whole-prefix target vector for a `Streamed` source
+    /// (#500 U2c §11 F2): a `Slice::All` stream over the FULL committed
+    /// column projection, window `[0, train_count)`, keeping only each
+    /// chunk's `TextChunk::Regression::targets` and dropping the rest of the
+    /// chunk — the concatenation, in committed order, of exactly the chunks
+    /// the trainer will see, decoded by the SAME `decode::
+    /// extract_numeric_column` the eager `regression_targets()` uses. This
+    /// is the ONE extra pass a `Streamed` regression run pays before the
+    /// epoch loop starts — a SEPARATE, unfiltered pass, never itself
+    /// streamed per-chunk (the K3 scaler exemption `stream.rs`'s module doc
+    /// already names).
+    fn collect_streamed_regression_targets(
+        &self,
+        streamed: &super::source::StreamedSet,
+    ) -> Result<Vec<f32>> {
+        if streamed.train_count == 0 {
+            return Ok(Vec::new());
+        }
+        let window = super::stream::RowWindow::new(0, streamed.train_count);
+        let slice = super::stream::Slice::All {
+            batch: streamed.batch.max(1),
+        };
+        let mut ts = self.open_streamed_source(streamed, window, slice)?;
+        let mut targets = Vec::new();
+        loop {
+            let Some(owned) = ts.next_chunk()? else {
+                break;
+            };
+            if owned.chunk().row_count() == 0 {
+                break;
+            }
+            match owned.into_chunk() {
+                TextChunk::Regression { targets: t, .. } => targets.extend(t),
+                other => {
+                    return Err(JammiError::FineTune(format!(
+                        "K3 scaler stream: expected a Regression chunk over the streamed \
+                         source's train window, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(targets)
+    }
+
+    /// The `Streamed` source's validation pass (#500 U2c §10/§11 F4): opens
+    /// a fresh stream over the held-out suffix `[train_count, total)`
+    /// (`Slice::All{batch}` — never per-rank; every rank validates the SAME
+    /// held-out rows) and folds it through the SAME per-batch loss
+    /// accumulation `Self::evaluate` uses for a `Resident` source.
+    ///
+    /// Asserts `chunks_seen == ceil(val_count / batch)` (F4's own oracle):
+    /// every `EpochSource::Stream` consumer terminates on the first
+    /// zero-row chunk and never encodes it, so a correct pump emits exactly
+    /// that many non-empty chunks before its terminal one.
+    fn evaluate_streamed(&self, streamed: &super::source::StreamedSet) -> Result<f64> {
+        let val_count = streamed.total_rows - streamed.train_count;
+        if val_count == 0 {
+            // Unreachable in production: the ValLoss path is refused at the
+            // split whenever the validation window is empty (mirroring
+            // `evaluate`'s own unreachable-empty-loader doc).
+            return Err(JammiError::FineTune(
+                "internal: evaluate_streamed() called with an empty validation window".into(),
+            ));
+        }
+        let batch = streamed.batch.max(1);
+        let window = super::stream::RowWindow::new(streamed.train_count, streamed.total_rows);
+        let slice = super::stream::Slice::All { batch };
+        let mut ts = self.open_streamed_source(streamed, window, slice)?;
+
+        let mut total_loss = 0.0;
+        let mut count = 0usize;
+        let mut chunks_seen = 0usize;
+        loop {
+            let Some(owned) = ts.next_chunk()? else {
+                break;
+            };
+            if owned.chunk().row_count() == 0 {
+                break;
+            }
+            chunks_seen += 1;
+            let chunk = owned.into_chunk();
+            let batch_out = self.encode_chunk(&chunk)?;
+            let loss = self.compute_loss(&batch_out)?;
+            let loss = if loss.dtype() == DType::F32 {
+                loss
+            } else {
+                loss.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
+            };
+            total_loss += loss
+                .to_scalar::<f32>()
+                .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
+                as f64;
+            count += 1;
+        }
+        let expected_chunks = val_count.div_ceil(batch);
+        if chunks_seen != expected_chunks {
+            return Err(JammiError::FineTune(format!(
+                "evaluate_streamed: internal: saw {chunks_seen} non-empty validation chunk(s) \
+                 but expected ceil({val_count} / {batch}) = {expected_chunks}"
+            )));
         }
 
         Ok(if count > 0 {
@@ -6467,6 +6824,144 @@ mod gradcache_last_step_oracle {
     }
 }
 
+/// #500 U2c §11 F6: `run`'s own typed refusal when a `Streamed` source
+/// reaches a whole-set-arm configuration — the trainer-side half of F6 (the
+/// worker-side half, "mining/GradCache on selects `Resident`", is observed
+/// end to end by `tests/it/training_set.rs::gradcache_completes_at_w1_with_
+/// a_pinned_adapter_digest`'s `source_kind_for` assertion). This is a unit
+/// test, not an end-to-end one, PRECISELY because the property under test is
+/// an INTERNAL invariant no correctly-behaving worker can ever actually
+/// trigger (`source::whole_set_arm` is the SAME predicate on both sides) —
+/// driving it any other way would mean deliberately breaking the worker's
+/// own call to `whole_set_arm` just to reach this branch, which is a
+/// different (and already-covered, by construction) property.
+#[cfg(test)]
+mod f6_streamed_refusal_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::split_index;
+    use super::super::lora::build_projection_head;
+    use super::super::source::{StreamedSet, TrainingSource};
+    use super::super::stream::StreamConfig;
+    use super::super::target::TrainingTarget;
+    use super::super::{EmbeddingLoss, FineTuneConfig, HardNegativeConfig};
+    use super::test_fixtures::tiny_bert;
+    use super::TrainingLoopBuilder;
+    use crate::model::ModelTask;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    /// A `StreamedSet` whose `session`/`table` are real (a tiny materialised
+    /// regression table) but which `run` must never actually read from: F6's
+    /// refusal fires before `run` ever opens a stream off any of these
+    /// fields, so their CONTENT is irrelevant to this oracle — only their
+    /// TYPE (a genuine `Arc<InferenceSession>`/`TrainingSetTable`) matters,
+    /// since `StreamedSet`'s fields are not optional.
+    async fn tiny_streamed_set() -> StreamedSet {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+        let csv = dir.path().join("f6.csv");
+        std::fs::write(&csv, "text,target\nhello,1.0\nworld,2.0\n").unwrap();
+        session
+            .add_source(
+                "f6",
+                jammi_db::source::SourceType::File,
+                jammi_db::source::SourceConnection {
+                    url: Some(format!("file://{}", csv.display())),
+                    format: Some(jammi_db::source::FileFormat::Csv),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let columns = vec!["text".to_string(), "target".to_string()];
+        let table = crate::fine_tune::training_set::materialize_projection_table(
+            &session,
+            "f6",
+            &columns,
+            ModelTask::Regression,
+            "regression",
+        )
+        .await
+        .unwrap();
+        let total_rows = 2usize;
+        let train_count = split_index(total_rows, 0.0);
+        StreamedSet {
+            session,
+            table,
+            columns,
+            task: ModelTask::Regression,
+            total_rows,
+            train_count,
+            batch: 1,
+            stream_cfg: StreamConfig::new(1).unwrap(),
+            label_vocab: None,
+            tenant: None,
+        }
+    }
+
+    /// A mining-eligible config (`hard_negatives.mine`, an in-batch-negative
+    /// objective, a base model present) reached with a `Streamed` source
+    /// must be refused, typed, naming the internal-invariant violation —
+    /// never silently trained through the production text arm as though it
+    /// were an ordinary non-whole-set run.
+    #[test]
+    fn a_streamed_source_under_a_mining_eligible_config_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let base_model = tiny_bert().await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let config = FineTuneConfig {
+                embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+                hard_negatives: HardNegativeConfig {
+                    mine: true,
+                    ..Default::default()
+                },
+                batch_size: 1,
+                epochs: 1,
+                lora_rank: 2,
+                ..Default::default()
+            };
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let job_dir = tempfile::tempdir().unwrap();
+            let catalog = Arc::new(
+                jammi_db::catalog::Catalog::open(job_dir.path())
+                    .await
+                    .unwrap(),
+            );
+            let mut loop_ =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id("f6-mining-job".into())
+                    .worker_id("f6-mining-worker".into())
+                    .catalog(catalog)
+                    .artifact_dir(job_dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .build()
+                    .unwrap();
+
+            let streamed = tiny_streamed_set().await;
+            let err = loop_
+                .run(TrainingSource::Streamed(Box::new(streamed)))
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Streamed") && msg.contains("whole-set arm") && msg.contains("Mining"),
+                "expected the F6 internal-invariant refusal naming the whole-set arm, got: {msg}"
+            );
+        });
+    }
+}
+
 /// End-to-end last-step harness: every arm of `TrainingLoop::run` drives the
 /// REAL entry point with a fixture that reaches that arm, and a gradient
 /// poisoned to NaN (through the `after_backward` test seam) on exactly the
@@ -6623,7 +7118,7 @@ mod last_step_run_harness {
         });
         loop_.after_backward = hook;
         let _enter = rt.enter();
-        loop_.run(&loader)
+        loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader))
     }
     /// The typed grad-norm refusal, discriminated from every other error the
     /// run could end in: it must name the poisoned step.
@@ -10262,10 +10757,12 @@ mod resume_invariant {
                 .unwrap();
 
         // The cancelled run bails at the first epoch-boundary check.
-        let err = tokio::task::spawn_blocking(move || zombie.run(&loader))
-            .await
-            .unwrap()
-            .unwrap_err();
+        let err = tokio::task::spawn_blocking(move || {
+            zombie.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
         assert!(
             err.to_string().contains("training cancelled"),
             "a cancelled run must bail, got: {err}"
@@ -11969,10 +12466,12 @@ mod media_front_end_wall_tests {
         let loader = one_row_audio_loader();
 
         let started = Instant::now();
-        let result: TrainingResult = tokio::task::spawn_blocking(move || audio_loop.run(&loader))
-            .await
-            .unwrap()
-            .expect("the audio EncoderAdapters run must complete");
+        let result: TrainingResult = tokio::task::spawn_blocking(move || {
+            audio_loop.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        })
+        .await
+        .unwrap()
+        .expect("the audio EncoderAdapters run must complete");
         let total_wall = started.elapsed();
 
         assert!(
@@ -12029,10 +12528,14 @@ mod media_front_end_wall_tests {
         .artifact_dir(dir.path().to_path_buf())
         .build()
         .unwrap();
-        let text_result = tokio::task::spawn_blocking(move || text_loop.run(&text_loader))
-            .await
-            .unwrap()
-            .expect("the precomputed text run must complete");
+        let text_result = tokio::task::spawn_blocking(move || {
+            text_loop.run(crate::fine_tune::source::TrainingSource::Resident(
+                text_loader,
+            ))
+        })
+        .await
+        .unwrap()
+        .expect("the precomputed text run must complete");
         assert_eq!(
             text_result.media_front_end_wall,
             Duration::ZERO,

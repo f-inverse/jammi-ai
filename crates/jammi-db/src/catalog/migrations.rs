@@ -118,6 +118,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "034_jobs_training_set_identity",
         schema::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY,
     ),
+    (
+        "035_instances_peer_addr_result_root",
+        schema::MIGRATION_035_INSTANCES_PEER_ADDR_RESULT_ROOT,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

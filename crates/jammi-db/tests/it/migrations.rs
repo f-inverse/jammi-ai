@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 036) -- a new migration is added here
+/// (K5: append-only, currently ending at 037) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -57,6 +57,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "034_jobs_training_set_identity",
     "035_instances_peer_addr_result_root",
     "036_instances_result_root_identity",
+    "037_jobs_assembly_failures_next_after",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -840,18 +841,21 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // `instances` / `workers` tables must replay too (030's
                 // idempotency key, 031's `releases` / `workers.state`, 034's
                 // `training_set_ref`/`training_set_location`, 035's
-                // `instances.peer_addr`/`result_root` -- 032 and 033 never
-                // touch `jobs`/`instances`/`workers`, so they are left
-                // applied), or the reopen would rebuild a 029-shaped table
-                // the current `SELECT_COLS` cannot read — the manufactured
-                // state is pre-029, so the ledger must say so for everything
-                // from 029 onwards that alters `jobs`/`instances`/`workers`.
+                // `instances.peer_addr`/`result_root`, 037's
+                // `jobs.assembly_failures`/`next_assembly_after` -- 032 and
+                // 033 never touch `jobs`/`instances`/`workers`, so they are
+                // left applied), or the reopen would rebuild a 029-shaped
+                // table the current `SELECT_COLS` cannot read — the
+                // manufactured state is pre-029, so the ledger must say so
+                // for everything from 029 onwards that alters
+                // `jobs`/`instances`/`workers`.
                 tx.execute(
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
                        '031_jobs_releases_workers_state', '034_jobs_training_set_identity', \
                        '035_instances_peer_addr_result_root', \
-                       '036_instances_result_root_identity')",
+                       '036_instances_result_root_identity', \
+                       '037_jobs_assembly_failures_next_after')",
                     &[],
                 )
                 .await?;
@@ -985,6 +989,37 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         assert!(
             instance_columns.iter().any(|c| c == col),
             "reopened instances must carry '{col}' (migration 035 replayed): {instance_columns:?}"
+        );
+    }
+
+    // The fifth K5 pin site gets teeth: 037 is on the ledger's DELETE list
+    // above (it ALTERs `jobs`, dropped and recreated fresh by 029's
+    // replayed DDL), so an omission from that list would leave the
+    // reopened `jobs` missing both columns here -- RED, not a silent pass.
+    let job_columns: Vec<String> = raw_backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name FROM pragma_table_info('jobs') \
+                         WHERE name IN ('assembly_failures', 'next_assembly_after')",
+                        &[],
+                        |row| row.get::<String>("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for col in ["assembly_failures", "next_assembly_after"] {
+        assert!(
+            job_columns.iter().any(|c| c == col),
+            "reopened jobs must carry '{col}' (migration 037 replayed): {job_columns:?}"
         );
     }
 }
@@ -2238,4 +2273,156 @@ async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_ident
             .any(|(c, notnull)| c == "result_root_identity" && !notnull),
         "instances.result_root_identity must be a nullable TEXT column; got {columns:?}"
     );
+}
+
+/// Migration `037_jobs_assembly_failures_next_after`
+/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii) is present,
+/// ordered AFTER `036_instances_result_root_identity` (K5: relative
+/// position, never `.last()`), and adds `jobs.assembly_failures`
+/// (`NOT NULL DEFAULT 0`) and `jobs.next_assembly_after` (nullable `TEXT`,
+/// the SAME representation `jobs.lease_expires_at` uses) on both backends.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_after(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::BackendKind;
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("037_jobs_assembly_failures_next_after")
+            > position("036_instances_result_root_identity"),
+        "the assembly cooldown/counter migration must follow 036"
+    );
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('jobs') \
+                                 WHERE name IN ('assembly_failures', 'next_assembly_after')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable FROM information_schema.columns \
+                                 WHERE table_name = 'jobs' \
+                                   AND column_name IN ('assembly_failures', 'next_assembly_after')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns
+            .iter()
+            .any(|(c, notnull)| c == "assembly_failures" && *notnull),
+        "jobs.assembly_failures must be a NOT NULL column; got {columns:?}"
+    );
+    assert!(
+        columns
+            .iter()
+            .any(|(c, notnull)| c == "next_assembly_after" && !notnull),
+        "jobs.next_assembly_after must be a nullable TEXT column; got {columns:?}"
+    );
+
+    // The default is 0/NULL for a freshly migrated (i.e. pre-existing) row
+    // -- inserting with neither column named must not fail and must read
+    // back the documented defaults.
+    let job_id = format!("mig037_default_{}", jammi_test_utils::unique_suffix());
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO jobs \
+                     (job_id, kind, status, execution, spec, created_at, updated_at) \
+                     VALUES ($1, 'fine_tune', 'queued', 'queued', '{}', 'now', 'now')",
+                    &[jammi_db::catalog::backend::SqlValue::TextOwned(job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("a row naming neither column must be a valid insert");
+    let (failures, next_after): (i32, Option<String>) = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT assembly_failures, next_assembly_after FROM jobs \
+                         WHERE job_id = $1",
+                        &[jammi_db::catalog::backend::SqlValue::TextOwned(job_id)],
+                        |row| {
+                            Ok((
+                                row.get::<i32>("assembly_failures")?,
+                                row.try_get::<String>("next_assembly_after")?,
+                            ))
+                        },
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the inserted row must be readable");
+    assert_eq!(failures, 0, "assembly_failures defaults to 0");
+    assert_eq!(next_after, None, "next_assembly_after defaults to NULL");
 }

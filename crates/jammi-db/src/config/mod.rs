@@ -298,6 +298,10 @@ pub struct JammiConfig {
     /// Worker-loop settings: whether this process claims `jobs` rows at all,
     /// which kinds it claims, and how often an idle worker polls for work.
     pub worker: WorkerConfig,
+    /// The widest `Peer` gang any coordinator on this deployment may admit
+    /// — loads independently of `[worker]`'s own per-host rank count; see
+    /// [`DistributedConfig`].
+    pub distributed: DistributedConfig,
     /// Job retention: how long a terminal `jobs` row survives the sweep.
     pub jobs: JobsConfig,
     /// Cache layer settings (ANN cache, embedding cache).
@@ -1601,6 +1605,63 @@ impl WorkerTopology {
     }
 }
 
+/// The widest `Peer` gang any coordinator on this deployment may accept —
+/// bounds a job's per-job `world_size` (`TrainingCommon`, checked at
+/// submit against [`Self::max_world_size`] by the submit edge) ACROSS FLEET
+/// MEMBERS (67 U5b-1b-ii). Orthogonal to [`WorkerConfig::world_size`]
+/// (renamed `local_ranks` in 67 U4b), which bounds how many ranks THIS HOST
+/// places on its own `[gpu] devices` for a job it runs entirely in-process:
+/// the two knobs load independently, with no cross-check between them
+/// (`docs/plans/67-distributed-training/DESIGN.md` § 7) — a deployment can
+/// set one without the other, and this crate never reads
+/// [`WorkerConfig::world_size`] while validating this section or vice
+/// versa.
+///
+/// This crate only loads and validates the knob; the submit-time check
+/// against a job's own `world_size` is the coordinator body's
+/// (`fine_tune/spec.rs`), not built here.
+///
+/// # TOML
+///
+/// ```toml
+/// [distributed]
+/// max_world_size = 1
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DistributedConfig {
+    /// The widest gang a coordinator on this deployment may admit. Must be
+    /// `>= 1` (`1`, the default, is the single-rank deployment: no fleet
+    /// gang is ever admitted). `0` is refused at load — it is not "unset",
+    /// since the unset value is the default `1`.
+    pub max_world_size: u32,
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        // One rank: an unconfigured deployment admits no fleet gang at
+        // all, matching `[worker]`'s own single-rank default.
+        Self { max_world_size: 1 }
+    }
+}
+
+impl DistributedConfig {
+    /// Validate `max_world_size`: refuses `0` (a deployment that admits no
+    /// rank at all cannot be the widest bound anything is checked against)
+    /// at load time, naming the key, rather than surfacing as a confusing
+    /// "every job refused" symptom the first time a job is submitted.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_world_size == 0 {
+            return Err(JammiError::Config(
+                "[distributed] max_world_size must be >= 1 (1 is the single-rank deployment; \
+                 0 admits no gang at all)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Job retention (N9): how long a TERMINAL `jobs` row (`completed` /
 /// `failed`) keeps blocking `delete_model` and survives the retention sweep
 /// (`prune_jobs`) before it is eligible for deletion. A non-terminal job
@@ -2337,6 +2398,7 @@ impl Default for JammiConfig {
             fine_tuning: FineTuningConfig::default(),
             lease: LeaseConfig::default(),
             worker: WorkerConfig::default(),
+            distributed: DistributedConfig::default(),
             jobs: JobsConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
@@ -2633,6 +2695,10 @@ impl JammiConfig {
         // offending key — never at the first gang boundary, half-way into a
         // training run.
         config.worker.topology(&config.gpu)?;
+        // Reject a `[distributed] max_world_size = 0` at load time, naming
+        // the key — never cross-checked against `[worker]`'s own topology
+        // (the two knobs load independently; DESIGN.md § 7).
+        config.distributed.validate()?;
         // Reject a retention window past the cap at load, not in the first
         // sweep's timestamp arithmetic.
         config.jobs.validate()?;

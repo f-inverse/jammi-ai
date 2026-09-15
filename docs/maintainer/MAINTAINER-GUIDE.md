@@ -629,7 +629,13 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   shares. Config: `[lease] duration_secs = 30, heartbeat_secs = 10`
   (`config::LeaseConfig`, `#[serde(deny_unknown_fields)]`); `[worker]` carries
   `enabled`/`kinds`/`idle_poll_secs` and refuses (no alias) the former
-  `lease_duration_secs`/`heartbeat_interval_secs` keys.
+  `lease_duration_secs`/`heartbeat_interval_secs` keys. `[distributed]
+  max_world_size = 1` (`config::DistributedConfig`, 67 U5b-1b-ii) loads
+  INDEPENDENTLY of `[worker]`'s own per-host rank count — the widest `Peer`
+  gang any coordinator on this deployment may admit ACROSS FLEET MEMBERS,
+  refused at load when `0` (never cross-checked against `[worker]` by
+  anything in this crate; the per-job `world_size` submit-time check against
+  it is the coordinator body's).
 - **Lease-owned building result tables** — `ResultStore` mints
   `writer_id = "writer-{uuid}"` per instance; `create_table` stamps it plus a
   lease on the row and returns a `BuildingTable` handle (`table_name()`,

@@ -126,6 +126,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "036_instances_result_root_identity",
         schema::MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY,
     ),
+    (
+        "037_jobs_assembly_failures_next_after",
+        schema::MIGRATION_037_JOBS_ASSEMBLY_FAILURES_NEXT_AFTER,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

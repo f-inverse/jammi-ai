@@ -1254,3 +1254,38 @@ ALTER TABLE instances ADD COLUMN result_root TEXT;
 pub(super) const MIGRATION_036_INSTANCES_RESULT_ROOT_IDENTITY: &str = r#"
 ALTER TABLE instances ADD COLUMN result_root_identity TEXT;
 "#;
+
+/// Migration 037 (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii):
+/// the assembly cooldown/counter on `jobs` — `assembly_failures` (the
+/// running count of COUNTED assembly refusals this job has accumulated,
+/// never reset except by a success) and `next_assembly_after` (when this
+/// job's next assembly attempt may run at the earliest; `NULL` = no
+/// cooldown pending), in the SAME representation
+/// [`super::lease::LEASE_TS_FORMAT`]-family lease columns already use on
+/// this table (`lease_expires_at`, migration 029): nullable `TEXT`, read and
+/// written through the SAME lease-module helpers those columns use — never
+/// a second clock source or a new stored representation.
+/// [`super::jobs_repo::Catalog::claim_next`]'s new cooldown conjunct in its
+/// CANDIDATE subselect reuses [`super::lease::lease_expired_clause`]
+/// VERBATIM against this column (`next_assembly_after IS NULL OR
+/// next_assembly_after` has passed, on the backend's own clock — no bound
+/// application timestamp on Postgres), and
+/// [`super::jobs_repo::Catalog::record_assembly_outcome`] reuses
+/// [`super::lease::lease_deadline_expr`] to stamp a fresh deadline.
+/// `assembly_failures` starts at `0` for every existing and new row (an
+/// unconfigured/pre-migration job has never failed assembly);
+/// `next_assembly_after` starts `NULL` (no cooldown), so the cooldown
+/// conjunct admits every pre-existing row exactly as before this migration
+/// — zero observable behaviour change for any row this migration does not
+/// itself write.
+///
+/// [`super::jobs_repo::Catalog::record_assembly_outcome`] is the only
+/// writer: it applies the exhaustive
+/// [`super::jobs_repo::AssemblyOutcome`] rule (counted reasons bump
+/// `assembly_failures`; every non-proceeding, in-assembly reason stamps a
+/// fresh `next_assembly_after` via bounded exponential backoff on the new
+/// count; a success resets both columns).
+pub(super) const MIGRATION_037_JOBS_ASSEMBLY_FAILURES_NEXT_AFTER: &str = r#"
+ALTER TABLE jobs ADD COLUMN assembly_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
+"#;

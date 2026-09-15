@@ -158,6 +158,14 @@ idle_poll_secs = 1
 # scrape and never on the claim loop. Must be >= 1. Default: 5.
 metrics_sample_secs = 5
 
+[distributed]
+# The widest `Peer` gang any coordinator on this deployment may admit,
+# bounding a job's own `world_size` ACROSS FLEET MEMBERS. Loads independently
+# of `[worker]`'s own per-host rank count -- the two knobs are checked
+# against each other by nothing in this crate. Must be >= 1 (1, the default,
+# admits no fleet gang at all).
+max_world_size = 1
+
 [jobs]
 # How many days a terminal (completed/failed) job row survives before the
 # retention sweep may delete it, and before it stops blocking `delete_model`

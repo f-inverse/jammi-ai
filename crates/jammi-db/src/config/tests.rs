@@ -767,6 +767,68 @@ fn worker_kinds_toml_all_forms_parse_like_services() {
     assert_eq!(empty.worker.kinds, WorkerKinds::Only(Vec::new()));
 }
 
+// ── `[distributed] max_world_size` ─────────────────────────────────────────
+
+#[test]
+fn distributed_config_default_is_single_rank() {
+    assert_eq!(DistributedConfig::default().max_world_size, 1);
+    assert_eq!(JammiConfig::default().distributed.max_world_size, 1);
+}
+
+#[test]
+fn distributed_config_toml_round_trips_max_world_size() {
+    let cfg: JammiConfig = toml::from_str("[distributed]\nmax_world_size = 8\n").unwrap();
+    assert_eq!(cfg.distributed.max_world_size, 8);
+}
+
+/// `max_world_size = 0` is refused at load, naming the key -- both via
+/// direct `validate()` and via `JammiConfig::load_from` (the production
+/// path), matching `JobsConfig::retention_days`'s own refusal shape.
+#[test]
+fn distributed_config_zero_max_world_size_is_refused_at_load() {
+    assert!(DistributedConfig { max_world_size: 1 }.validate().is_ok());
+
+    let err = DistributedConfig { max_world_size: 0 }
+        .validate()
+        .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_world_size")),
+        "expected a typed Config error naming the field, got {err:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[distributed]\nmax_world_size = 0\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_world_size")),
+        "load_from must refuse max_world_size = 0, got {err:?}"
+    );
+}
+
+/// `[distributed]` loads independently of `[worker]`: setting one section's
+/// knob leaves the other at its own default, and neither section's loader
+/// consults the other's value (DESIGN.md § 7 — "the two knobs load
+/// independently, with no cross-check").
+#[test]
+fn distributed_config_loads_independently_of_worker() {
+    let cfg: JammiConfig = toml::from_str("[distributed]\nmax_world_size = 4\n").unwrap();
+    assert_eq!(cfg.distributed.max_world_size, 4);
+    assert_eq!(
+        cfg.worker.world_size, 1,
+        "[worker]'s own default must be untouched by [distributed]"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    // `[worker] world_size = 1` alone (a single device) must load a
+    // deployment-wide gang bound of the DEFAULT (1), never a value derived
+    // from or checked against `[worker]`.
+    std::fs::write(&path, "[worker]\nworld_size = 1\n").unwrap();
+    let loaded = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap();
+    assert_eq!(loaded.distributed.max_world_size, 1);
+}
+
 // ── `[jobs] retention_days` ───────────────────────────────────────────────
 
 #[test]

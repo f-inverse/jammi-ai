@@ -200,6 +200,127 @@ pub enum TrainingSetFillOutcome {
     Aborted,
 }
 
+/// The coordinator's call-site wrapper of [`TrainingSetFillOutcome`], named
+/// in DESIGN.md § 4's own vocabulary ("the coordinator materializes or
+/// reuses the training set") — see
+/// [`Catalog::materialize_or_reuse_training_set`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingSetAssembly {
+    /// This call's own values won the write-once CAS.
+    Won,
+    /// A pair already existed, set to the SAME values this call passed — a
+    /// concurrent racer or a retry observing its own would-be write.
+    Reused,
+    /// The claim moved (a different claimant/attempt now holds the row, or
+    /// an existing pair holds DIFFERENT values) between this call being
+    /// issued and its CAS running — NO write happened. The coordinator that
+    /// issued this call is no longer the row's current attempt and must
+    /// abandon assembly rather than proceed under a pair it does not
+    /// actually own.
+    Moved,
+}
+
+/// The closed set of reasons a coordinator's ASSEMBLY attempt (membership →
+/// dispatch, DESIGN.md § 4) did not proceed to a run, each carrying its own
+/// cooldown/counting rule
+/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1b-ii). A new
+/// variant with no rule is a COMPILE error — [`AssemblyOutcome::effect`]
+/// matches every variant explicitly, never a wildcard arm.
+///
+/// The rule, by variant (see [`AssemblyEffect`]):
+///
+/// - [`Self::Refuted`] / [`Self::AllRootDivergent`] — a genuine, terminal-
+///   looking refusal of THIS attempt: counted AND cooled down.
+/// - [`Self::Unavailable`] / [`Self::StoreUnavailable`] / [`Self::ShortListed`]
+///   — a member-scoped or transient condition (OPS D10): cooled down so the
+///   next attempt does not immediately repeat the same failed dispatch, but
+///   NOT counted — the job itself did nothing wrong.
+/// - [`Self::NoBody`] / [`Self::Drain`] / [`Self::Cancelled`] — assembly
+///   never actually ran (no coordinator body to dispatch to, a draining
+///   host, an external cancel): NEITHER counted nor cooled down, since no
+///   assembly ATTEMPT happened at all.
+/// - [`Self::Success`] — assembly proceeded: RESETS both the counter and
+///   the cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssemblyOutcome {
+    /// The coordinator's own row was refuted at re-verification.
+    Refuted,
+    /// Every listed member's result-root identity diverged from the
+    /// coordinator's own (U5b-1a-A2's root predicate): no admissible member
+    /// existed for this attempt at all.
+    AllRootDivergent,
+    /// A member the listing named answered unavailable/unreachable at
+    /// dispatch.
+    Unavailable,
+    /// The shared object store this attempt's training set would
+    /// materialize into was itself unavailable.
+    StoreUnavailable,
+    /// Fewer members answered than `world_size - 1` requires.
+    ShortListed,
+    /// No coordinator body exists to run this attempt at all.
+    NoBody,
+    /// The host is draining (68 OPS) and refuses new assembly.
+    Drain,
+    /// The job was cancelled before assembly completed.
+    Cancelled,
+    /// Assembly proceeded to a run.
+    Success,
+}
+
+/// The effect class [`AssemblyOutcome::effect`] maps every variant onto — a
+/// proper enum, not a `(bool, bool)` pair, so "counted but not cooled down"
+/// (a combination the design never calls for) is not even representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssemblyEffect {
+    /// Neither counted nor cooled down — the counter and cooldown columns
+    /// are left exactly as they were.
+    Neither,
+    /// Cooled down (a fresh `next_assembly_after`, on the current counter
+    /// value), NOT counted.
+    CooldownOnly,
+    /// Cooled down AND counted: `assembly_failures` bumps by one, and the
+    /// fresh cooldown is computed on the NEW (post-bump) count.
+    CooldownAndCounted,
+    /// Success: both columns reset (`assembly_failures = 0`,
+    /// `next_assembly_after = NULL`).
+    Reset,
+}
+
+impl AssemblyOutcome {
+    fn effect(self) -> AssemblyEffect {
+        match self {
+            Self::Refuted | Self::AllRootDivergent => AssemblyEffect::CooldownAndCounted,
+            Self::Unavailable | Self::StoreUnavailable | Self::ShortListed => {
+                AssemblyEffect::CooldownOnly
+            }
+            Self::NoBody | Self::Drain | Self::Cancelled => AssemblyEffect::Neither,
+            Self::Success => AssemblyEffect::Reset,
+        }
+    }
+}
+
+/// Bounded exponential backoff on a count of COUNTED assembly failures:
+/// `BASE * 2^min(failures, CLAMP_EXPONENT)`, capped at [`CEILING`] — the
+/// clamp on the exponent guards the `u32` shift against overflow
+/// regardless of how large `failures` grows (an 8-bit exponent already
+/// saturates the ceiling: `2s * 2^8 = 512s > 300s`), and the final `.min`
+/// pins the documented ceiling exactly: no cooldown this function computes
+/// ever exceeds five minutes, however many counted failures accumulate.
+const ASSEMBLY_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const ASSEMBLY_BACKOFF_CLAMP_EXPONENT: u32 = 8;
+/// The documented backoff ceiling: five minutes.
+const ASSEMBLY_BACKOFF_CEILING: Duration = Duration::from_secs(300);
+
+fn assembly_backoff(failures: u32) -> Duration {
+    let exponent = failures.min(ASSEMBLY_BACKOFF_CLAMP_EXPONENT);
+    let multiplier = 1u32
+        .checked_shl(exponent)
+        .expect("exponent clamped to ASSEMBLY_BACKOFF_CLAMP_EXPONENT, always < 32");
+    ASSEMBLY_BACKOFF_BASE
+        .saturating_mul(multiplier)
+        .min(ASSEMBLY_BACKOFF_CEILING)
+}
+
 /// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
 /// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
 /// computed in ONE statement. No `tenant_id` column: the `world_size == 1`
@@ -902,16 +1023,29 @@ impl Catalog {
         let kind_in = kind_placeholders.join(", ");
         params.push(SqlValue::TextOwned(queued_execution));
         let execution_bind = params.len();
+        // The cooldown term (migration 037's `jobs.next_assembly_after`):
+        // in the CANDIDATE subselect only, never the outer CAS `UPDATE`'s
+        // own guard, so a job cooling down after a non-proceeding assembly
+        // outcome is simply never a candidate a higher-priority row could
+        // block a lower-priority ready one behind — the ORDER BY / LIMIT 1
+        // never even considers it. `lease_expired_clause` is reused
+        // VERBATIM (never a second clock helper, never a new stored
+        // representation): "the deadline is absent or has passed" is
+        // exactly the same predicate for a cooldown as for a lease, on the
+        // SAME backend clock the lease columns use (`super::lease`'s
+        // module docs) — no bind at all on Postgres, so a skewed calling
+        // process's clock cannot affect that arm.
+        let cooldown_clause = lease_expired_clause("next_assembly_after", kind, &mut params);
 
         let candidate = match kind {
             BackendKind::Postgres => format!(
                 "(SELECT job_id FROM jobs WHERE status = $3 AND execution = ${execution_bind} \
-                  AND claimable AND kind IN ({kind_in}) \
+                  AND claimable AND kind IN ({kind_in}) AND {cooldown_clause} \
                   ORDER BY priority DESC, created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
             ),
             BackendKind::Sqlite => format!(
                 "(SELECT job_id FROM jobs WHERE status = $3 AND execution = ${execution_bind} \
-                  AND claimable AND kind IN ({kind_in}) \
+                  AND claimable AND kind IN ({kind_in}) AND {cooldown_clause} \
                   ORDER BY priority DESC, created_at LIMIT 1)"
             ),
         };
@@ -1974,6 +2108,142 @@ impl Catalog {
                 })
             })
             .await?)
+    }
+
+    /// The coordinator's call site into [`Self::fill_training_set_identity`]
+    /// — DESIGN.md § 4's own vocabulary ("the coordinator materializes or
+    /// reuses the training set"), returned as [`TrainingSetAssembly`] rather
+    /// than the lower-level [`TrainingSetFillOutcome`] so the coordinator's
+    /// own call site never has to re-derive "moved" from "aborted".
+    ///
+    /// This crate ships the verb and its own oracle here; the production
+    /// caller is the coordinator body (`jammi-ai`'s `fine_tune/worker.rs`,
+    /// U5b-1b-i / U5a-2) — DEFERRED, not built in this crate.
+    pub async fn materialize_or_reuse_training_set(
+        &self,
+        job_id: &str,
+        claimed_by: &str,
+        attempts: u32,
+        training_set_ref: &str,
+        training_set_location: &str,
+    ) -> Result<TrainingSetAssembly> {
+        Ok(
+            match self
+                .fill_training_set_identity(
+                    job_id,
+                    claimed_by,
+                    attempts,
+                    training_set_ref,
+                    training_set_location,
+                )
+                .await?
+            {
+                TrainingSetFillOutcome::Filled => TrainingSetAssembly::Won,
+                TrainingSetFillOutcome::Reused => TrainingSetAssembly::Reused,
+                TrainingSetFillOutcome::Aborted => TrainingSetAssembly::Moved,
+            },
+        )
+    }
+
+    /// Apply [`AssemblyOutcome::effect`]'s rule to `job_id`'s attempt
+    /// `attempt`, in ONE `UPDATE`: `assembly_failures` bumps by one only for
+    /// [`AssemblyEffect::CooldownAndCounted`] reasons, `next_assembly_after`
+    /// is stamped `now + backoff(k)` (`k` the NEW, post-bump count for a
+    /// counted reason, the UNCHANGED current count for a cooldown-only
+    /// reason) for every reason that carries a cooldown at all, and a
+    /// [`AssemblyOutcome::Success`] resets both columns — always on the
+    /// BACKEND's own clock (`super::lease::lease_deadline_expr`, never a
+    /// bound application timestamp on Postgres).
+    ///
+    /// A guard read (`SELECT … WHERE job_id = $1 AND attempts = $2`,
+    /// row-locked on Postgres via `FOR UPDATE` — SQLite is already
+    /// serialized for the whole transaction under `BEGIN IMMEDIATE`) learns
+    /// the CURRENT `assembly_failures` count before the one `UPDATE` writes
+    /// it (never a second, independent write): a moved claim — `attempt` no
+    /// longer names the row's current attempt, or the job is gone — is
+    /// caught here and the call returns `Ok(false)` with NO write at all,
+    /// the exact "moved claim aborts with no write" shape
+    /// [`Self::fill_training_set_identity`]'s own CAS uses.
+    ///
+    /// Returns `true` when the guarded row was found and updated, `false`
+    /// when the attempt had already moved.
+    pub async fn record_assembly_outcome(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        outcome: AssemblyOutcome,
+    ) -> Result<bool> {
+        let job_id = job_id.to_string();
+        let attempt_i = attempt as i64;
+        let now = now_sortable();
+        let kind = self.backend().backend_kind();
+        let effect = outcome.effect();
+
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    let select_sql = match kind {
+                        BackendKind::Postgres => {
+                            "SELECT assembly_failures FROM jobs \
+                             WHERE job_id = $1 AND attempts = $2 FOR UPDATE"
+                        }
+                        BackendKind::Sqlite => {
+                            "SELECT assembly_failures FROM jobs \
+                             WHERE job_id = $1 AND attempts = $2"
+                        }
+                    };
+                    let current: Option<i32> = tx
+                        .query_opt(
+                            select_sql,
+                            &[
+                                SqlValue::TextOwned(job_id.clone()),
+                                SqlValue::Int(attempt_i),
+                            ],
+                            |row| row.get::<i32>("assembly_failures"),
+                        )
+                        .await?;
+                    let Some(current) = current else {
+                        // The attempt already moved (or the job never
+                        // existed): no write, matching the CAS's own
+                        // "moved claim aborts with no write" shape.
+                        return Ok(false);
+                    };
+
+                    let new_failures: i32 = match effect {
+                        AssemblyEffect::CooldownAndCounted => current.saturating_add(1),
+                        AssemblyEffect::CooldownOnly | AssemblyEffect::Neither => current,
+                        AssemblyEffect::Reset => 0,
+                    };
+
+                    let mut params: Vec<SqlValue<'static>> =
+                        vec![SqlValue::Int(i64::from(new_failures))];
+                    let failures_bind = params.len();
+                    let cooldown_expr = match effect {
+                        AssemblyEffect::Neither | AssemblyEffect::Reset => "NULL".to_string(),
+                        AssemblyEffect::CooldownOnly | AssemblyEffect::CooldownAndCounted => {
+                            let backoff =
+                                assembly_backoff(u32::try_from(new_failures).unwrap_or(u32::MAX));
+                            lease_deadline_expr(kind, backoff, &mut params)
+                        }
+                    };
+                    params.push(SqlValue::TextOwned(now));
+                    let updated_at_bind = params.len();
+                    params.push(SqlValue::TextOwned(job_id));
+                    let job_id_bind = params.len();
+                    params.push(SqlValue::Int(attempt_i));
+                    let attempt_bind = params.len();
+                    let sql = format!(
+                        "UPDATE jobs SET assembly_failures = ${failures_bind}, \
+                             next_assembly_after = {cooldown_expr}, \
+                             updated_at = ${updated_at_bind} \
+                         WHERE job_id = ${job_id_bind} AND attempts = ${attempt_bind}"
+                    );
+                    let n = tx.execute(&sql, &params).await?;
+                    Ok(n == 1)
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// The row `GangService::run_rank`'s I-GANG row predicate reads

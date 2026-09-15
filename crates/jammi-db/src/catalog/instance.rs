@@ -209,7 +209,10 @@ impl std::fmt::Display for MemberRoot {
 /// store would not:
 ///
 /// - **Object stores** (`s3://`, `gs://`|`gcs://`, `azure://`|`abfss://`,
-///   `r2://`): `{canonical scheme}://{bucket, lowercased}/{key}` where
+///   `r2://`): `{canonical scheme}://{bucket}/{key}` where the bucket is
+///   taken VERBATIM (the store hands it to the driver as spelled and the
+///   driver dials it as spelled — the service, not this identity, decides
+///   whether a mixed-case name exists), and
 ///   `key` is the bucket-stripped path normalised by the SAME
 ///   `object_store::path::Path::parse` the store hands its keys to (one
 ///   leading delimiter stripped, a trailing one dropped, an EMPTY segment
@@ -219,11 +222,12 @@ impl std::fmt::Display for MemberRoot {
 ///   builder the store constructs for that root
 ///   ([`crate::storage::location_determinants`]: the process environment
 ///   via `from_env()`, `[storage.cloud]` on top, the order `build_*`
-///   applies): the S3/R2 endpoint the driver dials (`s3_endpoint` over
-///   `endpoint`, whatever spelling set either — `AWS_ENDPOINT_URL`,
-///   `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, or the config), the Azure
-///   account, endpoint (or the Azurite host and account in emulator mode),
-///   the Fabric switch, the GCS base URL. The identity spells exactly the
+///   applies): for S3/R2 the bucket endpoint `build()` dials, computed by
+///   the driver's own expression (endpoint spelling, virtual-hosted style,
+///   S3 Express, region — so two regions for one bucket are two identities,
+///   a split, never a merge), the Azure account, endpoint (or the Azurite
+///   host and account in emulator mode), the Fabric switch, the GCS base
+///   URL. The identity spells exactly the
 ///   variables the driver spells — none through its key tables, and the one
 ///   bare read the driver makes (`AZURITE_BLOB_STORAGE_URL`) the same way
 ///   — and reads every value as the driver reads it (its boolean parser's
@@ -231,8 +235,8 @@ impl std::fmt::Display for MemberRoot {
 ///   driver honours is never one the identity misses. Two
 ///   buckets of one name
 ///   behind two endpoints or
-///   accounts are two locations. Bucket and container names
-///   are case-insensitive by their services' rules; object keys are not.
+///   accounts are two locations. Neither the bucket nor the key is case-folded — the driver dials both as
+///   spelled.
 ///   `r2://` and `s3://` stay distinct — different endpoints even when the
 ///   API is shared.
 /// - **Local roots** (`file://` or a bare path, which the parser spells as
@@ -297,7 +301,6 @@ impl RootIdentity {
                          rejects it: {e}"
                     ))
                 })?;
-                let bucket = bucket.to_ascii_lowercase();
                 let mut identity = if key.as_ref().is_empty() {
                     format!("{scheme}://{bucket}")
                 } else {
@@ -685,20 +688,23 @@ mod root_identity_tests {
     }
 
     #[test]
-    fn object_store_aliases_bucket_case_and_the_stores_key_normalisation_fold() {
+    fn object_store_aliases_and_the_stores_key_normalisation_fold() {
         assert_eq!(id("gcs://bucket/prefix"), id("gs://bucket/prefix"));
         assert_eq!(
             id("abfss://container/prefix"),
             id("azure://container/prefix")
         );
-        assert_eq!(id("s3://BUCKET/prefix"), id("s3://bucket/prefix"));
         // The store strips ONE leading delimiter from the key and drops a
         // trailing one (`object_store::path::Path::parse`): the same fold.
         assert_eq!(id("s3://bucket//prefix"), id("s3://bucket/prefix"));
         assert_eq!(id("s3://bucket/prefix/"), id("s3://bucket/prefix"));
         assert_eq!(id("s3://bucket/"), id("s3://bucket"));
         assert_eq!(id("gcs://b/p"), "gs://b/p");
-        assert_eq!(id("s3://bucket"), "s3://bucket");
+        assert!(
+            id("s3://bucket").starts_with("s3://bucket@"),
+            "{}",
+            id("s3://bucket")
+        );
     }
 
     /// The store's key parser is the oracle: a spelling is a root iff the
@@ -730,6 +736,8 @@ mod root_identity_tests {
     #[test]
     fn object_store_key_case_buckets_and_backends_stay_distinct() {
         assert_ne!(id("s3://bucket/Prefix"), id("s3://bucket/prefix"));
+        // The bucket is dialled as spelled by the store and the driver alike.
+        assert_ne!(id("s3://BUCKET/prefix"), id("s3://bucket/prefix"));
         assert_ne!(id("s3://a/prefix"), id("s3://b/prefix"));
         // R2 is the S3 driver at an account endpoint: the store refuses an
         // r2:// root with no R2 config (and so does the identity, in a build
@@ -926,7 +934,7 @@ mod root_identity_tests {
                 "{spelling}: an endpoint vs the service default"
             );
             assert!(
-                with.ends_with("@endpoint=https://minio-a.local:9000"),
+                with.ends_with("@bucket_endpoint=https://minio-a.local:9000/bucket"),
                 "{spelling}: {with}"
             );
         }
@@ -947,7 +955,7 @@ mod root_identity_tests {
         )
         .unwrap()
         .as_str()
-        .ends_with("@endpoint=https://minio-cfg.local:9000"));
+        .ends_with("@bucket_endpoint=https://minio-cfg.local:9000/bucket"));
         let azure = |vars: &[(&str, &str)]| {
             RootIdentity::of("azure://container/prefix", None, &seeds(vars))
                 .unwrap()

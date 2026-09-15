@@ -450,29 +450,30 @@ impl BuilderSeeds {
     }
 }
 
-/// The values that decide WHICH service the store dials for `url` under
+/// The values that decide WHICH location the store dials for `url` under
 /// `config` — read back from the SAME builder [`build_object_store`]
 /// constructs (the environment first, `config` on top, exactly the order
-/// the `build_*` functions apply), so every spelling object_store accepts for
-/// an endpoint, account, emulator or base URL (`AWS_ENDPOINT_URL`,
-/// `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, `AZURE_STORAGE_ENDPOINT`,
-/// `AZURE_STORAGE_ACCOUNT_NAME`, `GOOGLE_BASE_URL`, …) is honoured here
-/// exactly as at dial time. The one host value object_store reads with a
-/// bare `std::env::var` outside its key tables — `AZURITE_BLOB_STORAGE_URL`,
-/// in the Azure emulator arm — is read the same way here (its default
-/// included), so the identity spells exactly the variables the driver
-/// spells and no others; and every value is read as the driver reads it
-/// (its boolean parser's five spellings, its URL parse).
-/// Sorted `(key, value)` pairs; empty when the service's default host is
-/// dialled. A scheme whose storage feature is compiled out has no
-/// determinants (`Ok(empty)`): such a build cannot dial the scheme at all
-/// (`build_object_store` refuses with `SchemeNotEnabled`), so a process that
-/// registers such a root never opens a store there.
+/// the `build_*` functions apply) and folded through the driver's own
+/// resolution: for S3 and R2 the bucket endpoint `build()` dials
+/// ([`s3_bucket_endpoint`], the driver's expression over endpoint spelling,
+/// virtual-hosted style, S3 Express and region); for Azure the account, the
+/// parsed endpoint or the Fabric switch, or in emulator mode the Azurite
+/// host object_store reads with a bare `std::env::var` (its default
+/// included); for GCS the base URL. No variable or spelling is listed here
+/// that the driver does not read the same way — every input arrives
+/// through `get_config_value` on that builder and every boolean through
+/// the driver's own spellings — so a value the driver honours is never one
+/// the identity misses. Sorted `(key, value)` pairs. A scheme whose
+/// storage feature is compiled out has no determinants (`Ok(empty)`): such
+/// a build cannot dial the scheme at all (`build_object_store` refuses with
+/// `SchemeNotEnabled`), so a process that registers such a root never
+/// opens a store there.
 ///
 /// # Errors
 ///
 /// The same refusals `build_object_store` makes before dialling: a URL with
-/// no bucket, an R2 root with no config to resolve its endpoint.
+/// no bucket, an R2 root with no config to resolve its endpoint, an S3
+/// Express bucket with no zone suffix.
 pub fn location_determinants(
     url: &StorageUrl,
     config: Option<&CloudConfig>,
@@ -507,13 +508,68 @@ fn present(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
 
+/// The bucket endpoint `AmazonS3Builder::build()` dials — object_store
+/// 0.13's own expression, mirrored input for input (it is not exposed):
+/// the S3-specific endpoint over the generic one; under virtual-hosted
+/// style a configured endpoint is dialled verbatim (the bucket is in its
+/// host), otherwise `endpoint/bucket` with trailing slashes trimmed; with
+/// no endpoint, the S3 Express zonal host when that switch is on (the zone
+/// parsed from the bucket name as the driver parses it — a bucket without
+/// one is a refusal, as the driver refuses), else the regional AWS host
+/// (`us-east-1` when no region is set). Every input read through
+/// `get_config_value` from the SAME builder `build_object_store` dials
+/// with, and every boolean through the driver's own spellings. The region
+/// is part of this URL, so two regions for one bucket are two identities —
+/// a split, never a merge.
+#[cfg(any(feature = "storage-s3", feature = "storage-r2"))]
+fn s3_bucket_endpoint(
+    builder: &object_store::aws::AmazonS3Builder,
+    bucket: &str,
+    scheme: Scheme,
+) -> Result<String, StorageError> {
+    use object_store::aws::AmazonS3ConfigKey as K;
+    let flag = |key: K| {
+        builder
+            .get_config_value(&key)
+            .is_some_and(|v| driver_bool(&v))
+    };
+    let region =
+        present(builder.get_config_value(&K::Region)).unwrap_or_else(|| "us-east-1".to_string());
+    let endpoint = present(builder.get_config_value(&K::S3Endpoint))
+        .or_else(|| present(builder.get_config_value(&K::Endpoint)));
+    let zonal = if flag(K::S3Express) {
+        let zone = bucket
+            .strip_suffix("--x-s3")
+            .or_else(|| bucket.strip_suffix("--xa-s3"))
+            .and_then(|base| base.rsplit_once("--"))
+            .map(|(_, zone)| zone)
+            .ok_or_else(|| StorageError::DriverInit {
+                scheme,
+                reason: format!("S3 Express bucket '{bucket}' carries no zone suffix"),
+            })?;
+        Some(format!(
+            "https://{bucket}.s3express-{zone}.{region}.amazonaws.com"
+        ))
+    } else {
+        None
+    };
+    Ok(
+        match (&endpoint, zonal, flag(K::VirtualHostedStyleRequest)) {
+            (Some(endpoint), _, true) => endpoint.clone(),
+            (Some(endpoint), _, false) => format!("{}/{}", endpoint.trim_end_matches('/'), bucket),
+            (None, Some(endpoint), _) => endpoint,
+            (None, None, true) => format!("https://{bucket}.s3.{region}.amazonaws.com"),
+            (None, None, false) => format!("https://s3.{region}.amazonaws.com/{bucket}"),
+        },
+    )
+}
+
 #[cfg(feature = "storage-s3")]
 fn s3_determinants(
     url: &StorageUrl,
     config: Option<&CloudConfig>,
     seeds: &BuilderSeeds,
 ) -> Result<Vec<(&'static str, String)>, StorageError> {
-    use object_store::aws::AmazonS3ConfigKey as K;
     let bucket = bucket_of(url, Scheme::S3, "S3")?;
     let base = seeds
         .s3
@@ -521,14 +577,10 @@ fn s3_determinants(
         .unwrap_or_default()
         .with_bucket_name(bucket);
     let builder = configure_s3(base, config);
-    // `build()` dials `s3_endpoint.or(endpoint)`: the S3-specific URL wins
-    // over the generic one whatever set either.
-    // …and trims trailing slashes before appending the bucket, so they are
-    // trimmed here too.
-    let endpoint = present(builder.get_config_value(&K::S3Endpoint))
-        .or_else(|| present(builder.get_config_value(&K::Endpoint)))
-        .map(|e| e.trim_end_matches('/').to_string());
-    Ok(endpoint.map(|e| ("endpoint", e)).into_iter().collect())
+    Ok(vec![(
+        "bucket_endpoint",
+        s3_bucket_endpoint(&builder, bucket, Scheme::S3)?,
+    )])
 }
 
 #[cfg(not(feature = "storage-s3"))]
@@ -546,7 +598,6 @@ fn r2_determinants(
     config: Option<&CloudConfig>,
     seeds: &BuilderSeeds,
 ) -> Result<Vec<(&'static str, String)>, StorageError> {
-    use object_store::aws::AmazonS3ConfigKey as K;
     let bucket = bucket_of(url, Scheme::R2, "R2")?;
     let (r2, endpoint) = resolve_r2(config)?;
     let base = seeds
@@ -555,13 +606,13 @@ fn r2_determinants(
         .unwrap_or_default()
         .with_bucket_name(bucket);
     let builder = configure_r2(base, r2, &endpoint);
-    // The same `s3_endpoint.or(endpoint)` the S3 driver dials: an
-    // `AWS_ENDPOINT_URL_S3` in the environment overrides the configured R2
-    // endpoint in the store, and therefore here.
-    let dialled = present(builder.get_config_value(&K::S3Endpoint))
-        .or_else(|| present(builder.get_config_value(&K::Endpoint)))
-        .map(|e| e.trim_end_matches('/').to_string());
-    Ok(dialled.map(|e| ("endpoint", e)).into_iter().collect())
+    // The same S3 driver, the same dialled URL: an `AWS_ENDPOINT_URL_S3` in
+    // the environment overrides the configured R2 endpoint in the store,
+    // and therefore here.
+    Ok(vec![(
+        "bucket_endpoint",
+        s3_bucket_endpoint(&builder, bucket, Scheme::R2)?,
+    )])
 }
 
 #[cfg(not(feature = "storage-r2"))]
@@ -678,7 +729,11 @@ fn azure_determinants(
 /// because it is not public. Any spelling the driver takes as true must
 /// switch the identity's arm too, or two members at two hosts would derive
 /// one identity (the fourth oracle round's executed refutation).
-#[cfg(feature = "storage-azure")]
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-r2",
+    feature = "storage-azure"
+))]
 fn driver_bool(value: &str) -> bool {
     // Exactly the driver's domain: no trimming — a padded value is one the
     // driver refuses to build on, and the identity takes the false arm for
@@ -769,35 +824,62 @@ mod tests {
         ));
     }
 
-    /// The determinants are read back from the builder itself, so every
-    /// spelling object_store accepts for an endpoint reaches them — the
-    /// oracle enumerates spellings from object_store's documented key table;
-    /// the derivation enumerates nothing.
+    /// The S3 determinant is the bucket endpoint `build()` dials, computed
+    /// by the driver's own expression over inputs read back from the
+    /// builder — so every endpoint spelling object_store accepts, the
+    /// virtual-hosted switch, S3 Express and the region all reach it. The
+    /// oracle enumerates spellings from object_store's documented key
+    /// table; the derivation enumerates nothing.
     #[cfg(feature = "storage-s3")]
     #[test]
-    fn s3_determinants_honour_every_endpoint_spelling_the_builder_does() {
+    fn s3_determinants_are_the_bucket_endpoint_the_builder_dials() {
         let url = StorageUrl::parse("s3://bucket/prefix").unwrap();
         let of = |vars: &[(&str, &str)]| {
             location_determinants_with(&url, None, &BuilderSeeds::from_vars(vars.iter().copied()))
                 .unwrap()
         };
-        assert!(of(&[]).is_empty(), "the service default has no determinant");
+        let be = |u: &str| vec![("bucket_endpoint", u.to_string())];
+        // The service default: the regional AWS host, path-style.
+        assert_eq!(of(&[]), be("https://s3.us-east-1.amazonaws.com/bucket"));
+        assert_eq!(
+            of(&[("AWS_REGION", "eu-west-1")]),
+            be("https://s3.eu-west-1.amazonaws.com/bucket")
+        );
+        assert_eq!(
+            of(&[("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "true")]),
+            be("https://bucket.s3.us-east-1.amazonaws.com")
+        );
         for spelling in ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_ENDPOINT_URL_S3"] {
             assert_eq!(
                 of(&[(spelling, "https://minio.local:9000")]),
-                vec![("endpoint", "https://minio.local:9000".to_string())],
+                be("https://minio.local:9000/bucket"),
                 "{spelling}"
             );
         }
+        // Virtual-hosted style dials a configured endpoint verbatim (the
+        // bucket is in its host): a different key namespace, a different
+        // identity — the fifth oracle round's executed refutation.
+        assert_eq!(
+            of(&[
+                ("AWS_ENDPOINT_URL", "https://minio.local:9000"),
+                ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "1")
+            ]),
+            be("https://minio.local:9000")
+        );
         // `AWS_ENDPOINT_URL_S3` wins over the generic endpoint, as `build()` dials it.
         assert_eq!(
             of(&[
                 ("AWS_ENDPOINT_URL", "https://generic"),
                 ("AWS_ENDPOINT_URL_S3", "https://s3-specific")
             ]),
-            vec![("endpoint", "https://s3-specific".to_string())]
+            be("https://s3-specific/bucket")
         );
-        // Config on top of the environment, as `build_s3` applies it.
+        // Trailing slashes are trimmed as the driver trims them.
+        assert_eq!(
+            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000/")]),
+            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000")])
+        );
+        // Config on top of the environment, as `build_s3` applies it …
         let cfg = CloudConfig::S3(super::super::config::S3Config {
             endpoint: Some("https://from-config".to_string()),
             ..Default::default()
@@ -809,9 +891,9 @@ mod tests {
                 &BuilderSeeds::from_vars([("AWS_ENDPOINT_URL", "https://from-env")])
             )
             .unwrap(),
-            vec![("endpoint", "https://from-config".to_string())]
+            be("https://from-config/bucket")
         );
-        // …except that the S3-specific env URL still wins in `build()`, and so here.
+        // … except that the S3-specific env URL still wins in `build()`, and so here.
         assert_eq!(
             location_determinants_with(
                 &url,
@@ -819,21 +901,35 @@ mod tests {
                 &BuilderSeeds::from_vars([("AWS_ENDPOINT_URL_S3", "https://s3-env")])
             )
             .unwrap(),
-            vec![("endpoint", "https://s3-env".to_string())]
+            be("https://s3-env/bucket")
         );
-        // Trailing slashes are trimmed as the driver trims them before
-        // appending the bucket.
+        // S3 Express: the zonal host from the bucket's zone suffix; a bucket
+        // without one is refused as the driver refuses it.
+        let express = StorageUrl::parse("s3://data--usw2-az1--x-s3/prefix").unwrap();
         assert_eq!(
-            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000/")]),
-            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000")])
+            location_determinants_with(
+                &express,
+                None,
+                &BuilderSeeds::from_vars([("AWS_S3_EXPRESS", "true")])
+            )
+            .unwrap(),
+            be("https://data--usw2-az1--x-s3.s3express-usw2-az1.us-east-1.amazonaws.com")
         );
+        assert!(location_determinants_with(
+            &url,
+            None,
+            &BuilderSeeds::from_vars([("AWS_S3_EXPRESS", "true")])
+        )
+        .is_err());
         // Unknown keys and other prefixes are ignored; an empty value is unset.
-        assert!(of(&[
-            ("AWS_NOT_A_KEY", "x"),
-            ("OTHER_ENDPOINT", "y"),
-            ("AWS_ENDPOINT", "")
-        ])
-        .is_empty());
+        assert_eq!(
+            of(&[
+                ("AWS_NOT_A_KEY", "x"),
+                ("OTHER_ENDPOINT", "y"),
+                ("AWS_ENDPOINT", "")
+            ]),
+            of(&[])
+        );
     }
 
     #[cfg(feature = "storage-r2")]
@@ -857,8 +953,8 @@ mod tests {
         assert_eq!(
             a,
             vec![(
-                "endpoint",
-                "https://acct-a.r2.cloudflarestorage.com".to_string()
+                "bucket_endpoint",
+                "https://acct-a.r2.cloudflarestorage.com/bucket".to_string()
             )]
         );
         let overridden = location_determinants_with(
@@ -867,7 +963,24 @@ mod tests {
             &BuilderSeeds::from_vars([("AWS_ENDPOINT_URL_S3", "https://stray")]),
         )
         .unwrap();
-        assert_eq!(overridden, vec![("endpoint", "https://stray".to_string())]);
+        assert_eq!(
+            overridden,
+            vec![("bucket_endpoint", "https://stray/bucket".to_string())]
+        );
+        // Virtual-hosted style reaches R2 through the same driver expression.
+        let vh = location_determinants_with(
+            &url,
+            Some(&cfg("acct-a")),
+            &BuilderSeeds::from_vars([("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "yes")]),
+        )
+        .unwrap();
+        assert_eq!(
+            vh,
+            vec![(
+                "bucket_endpoint",
+                "https://acct-a.r2.cloudflarestorage.com".to_string()
+            )]
+        );
     }
 
     #[cfg(feature = "storage-azure")]

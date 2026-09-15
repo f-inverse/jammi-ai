@@ -164,13 +164,15 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   and `result_root_identity` carries that root's identity, derived by
   `MemberRoot::resolved` from the same config the store roots itself from:
   the store's own URL parser folds the scheme aliases (`gcs://`→`gs://`,
-  `abfss://`→`azure://`), the bucket name is lowercased and the key goes
+  `abfss://`→`azure://`), the bucket is kept as spelled (the driver dials
+  it as spelled) and the key goes
   through the store's own key parser (one leading `/` stripped, a trailing
   one dropped, an empty segment refused — keys keep their case), the
   location determinants are read back from the very builder the store
   constructs for that root (`storage::location_determinants`: the process
-  environment first, `[storage.cloud]` on top — the S3/R2 endpoint the
-  driver dials whatever spelling set it, the Azure account, endpoint,
+  environment first, `[storage.cloud]` on top — for S3/R2 the bucket
+  endpoint the driver dials (endpoint spelling, virtual-hosted or path
+  style, S3 Express, region), the Azure account, endpoint,
   Azurite host in emulator mode, Fabric switch, the GCS base URL; the
   identity spells exactly the variables the driver spells and reads their
   values as the driver reads them, so nothing the driver honours can be

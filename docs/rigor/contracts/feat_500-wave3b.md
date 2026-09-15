@@ -48,7 +48,9 @@ that is never used to root anything:
   filesystem, from the SAME config the store roots itself from
   (`crates/jammi-db/src/catalog/instance.rs`). Rules, by the scheme the
   store's own parser (`StorageUrl::parse`, the one alias table) assigns:
-  object stores → `{canonical scheme}://{bucket lowercased}/{key}` where
+  object stores → `{canonical scheme}://{bucket}/{key}` (the bucket verbatim —
+  the store hands it to the driver as spelled and the driver dials it as
+  spelled; the fifth oracle round retired the lowercase fold) where
   the key is normalised by the SAME `object_store::path::Path::parse` the
   store hands its keys to (one leading `/` stripped, a trailing one
   dropped, an empty segment refused exactly as the store refuses it — so
@@ -57,11 +59,17 @@ that is never used to root anything:
   builder the store constructs for that root
   (`storage::location_determinants`: the process environment via
   `from_env()` first, `[storage.cloud]` on top, the order `build_*`
-  applies): the S3/R2 endpoint the driver dials (`s3_endpoint` over
-  `endpoint`, whatever spelling set either — `AWS_ENDPOINT_URL`,
-  `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, or the config; for R2 a stray
-  `AWS_ENDPOINT_URL_S3` overrides the configured endpoint in the store and
-  therefore here), the Azure account and endpoint — or, in emulator mode,
+  applies): for S3/R2 the BUCKET ENDPOINT `build()` dials, computed by the
+  driver's own expression over inputs read back from the builder — the
+  S3-specific endpoint over the generic one whatever spelling set either
+  (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3`, the config;
+  for R2 a stray `AWS_ENDPOINT_URL_S3` overrides the configured endpoint in
+  the store and therefore here), dialled verbatim under virtual-hosted
+  style or as `endpoint/bucket` path-style (the fifth oracle round: the two
+  styles are two key namespaces), the S3 Express zonal host, or the
+  regional AWS host (region is part of that URL: two regions for one
+  bucket are two identities, a split, never a merge) — the Azure account
+  and endpoint — or, in emulator mode,
   the Azurite host `AZURITE_BLOB_STORAGE_URL` object_store reads with a
   bare `std::env::var` outside its key tables (default included) and the
   emulator account — the Fabric switch, the GCS base URL. The identity
@@ -113,12 +121,12 @@ that is never used to root anything:
 
 | Property | Oracle (all GREEN at this head) |
 |---|---|
-| P-A1 alias / bucket-case fold and the store's own key normalisation on object stores (a key the store refuses is refused; keys the store equates are equated — the store's parser IS the oracle); key case, bucket, backend stay distinct | `catalog::instance::root_identity_tests::object_store_aliases_bucket_case_and_the_stores_key_normalisation_fold`, `::a_key_the_store_refuses_is_refused_and_keys_the_store_equates_are_equated`, `::object_store_key_case_buckets_and_backends_stay_distinct` |
-| P-A1b the location determinants the store's builder dials are part of a cloud identity, read back from that builder: every endpoint spelling object_store accepts (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3` — the S3-specific one winning as `build()` dials it), config on top of the environment, an empty value unset; R2's configured endpoint and the stray `AWS_ENDPOINT_URL_S3` override; Azure account, endpoint (both spellings), the Fabric switch, and in emulator mode the Azurite host (`AZURITE_BLOB_STORAGE_URL`, its default, URL-parsed, the endpoint ignored as `build()` ignores it) — both switches read through every spelling the driver's boolean parser accepts and none it rejects; the GCS base URL | `catalog::instance::root_identity_tests::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity`, `::every_endpoint_spelling_the_store_honours_is_part_of_the_identity` (with `--features storage-cloud`); `storage::builder::tests::s3_determinants_honour_every_endpoint_spelling_the_builder_does`, `::r2_determinants_are_the_configured_endpoint_unless_the_s3_env_url_overrides_it`, `::azure_determinants_carry_account_endpoint_emulator_and_fabric_as_the_builder_reads_them`, `::gcs_determinants_carry_the_base_url_the_builder_reads` — run by the new `storage-cloud` step of ci.yml's hermetic job |
+| P-A1 alias fold and the store's own key normalisation on object stores (a key the store refuses is refused; keys the store equates are equated — the store's parser IS the oracle); bucket case, key case, bucket, backend stay distinct | `catalog::instance::root_identity_tests::object_store_aliases_and_the_stores_key_normalisation_fold`, `::a_key_the_store_refuses_is_refused_and_keys_the_store_equates_are_equated`, `::object_store_key_case_buckets_and_backends_stay_distinct` |
+| P-A1b the location determinants the store's builder dials are part of a cloud identity, read back from that builder: for S3/R2 the bucket endpoint `build()` dials — every endpoint spelling object_store accepts (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `AWS_ENDPOINT_URL_S3` — the S3-specific one winning as `build()` dials it), virtual-hosted vs path style, S3 Express (a bucket without a zone suffix refused as the driver refuses), the region, config on top of the environment, an empty value unset; R2's configured endpoint and the stray `AWS_ENDPOINT_URL_S3` override; Azure account, endpoint (both spellings), the Fabric switch, and in emulator mode the Azurite host (`AZURITE_BLOB_STORAGE_URL`, its default, URL-parsed, the endpoint ignored as `build()` ignores it) — both switches read through every spelling the driver's boolean parser accepts and none it rejects; the GCS base URL | `catalog::instance::root_identity_tests::the_endpoint_the_store_would_dial_is_part_of_a_cloud_identity`, `::every_endpoint_spelling_the_store_honours_is_part_of_the_identity` (with `--features storage-cloud`); `storage::builder::tests::s3_determinants_are_the_bucket_endpoint_the_builder_dials`, `::r2_determinants_are_the_configured_endpoint_unless_the_s3_env_url_overrides_it`, `::azure_determinants_carry_account_endpoint_emulator_and_fabric_as_the_builder_reads_them`, `::gcs_determinants_carry_the_base_url_the_builder_reads` — run by the new `storage-cloud` step of ci.yml's hermetic job |
 | P-A2 local roots: symlink ≡ target, `.`/`..`, trailing slash, `file://` ≡ bare, relative against cwd; the root is CREATED and its identity is stable afterwards, a case-divergent spelling settles to the on-disk one on a case-insensitive filesystem (two directories on a case-sensitive one); a root that cannot be created (a FILE where a directory is needed) is refused naming it; distinct dirs distinct | `::a_local_root_folds_symlinks_dot_segments_trailing_slashes_and_the_file_scheme`, `::a_local_root_is_created_and_a_case_divergent_spelling_settles_to_the_on_disk_one`, `::a_local_root_that_cannot_be_created_is_refused_naming_it`, `::a_relative_local_root_is_taken_against_the_working_directory`, `::distinct_local_roots_stay_distinct` |
 | P-A3 `memory://` and an unknown scheme refused naming the root | `::a_memory_root_and_an_unknown_scheme_are_refused_naming_the_root`; `config::tests::from_config_refuses_a_memory_result_root_for_a_member_only` (a library config with the same root is untouched; an upper-case scheme is refused on both paths) |
 | P-A4 the row carries the verbatim spelling AND `RootIdentity::of` of it, over every advertising arm | `config::tests::from_config_member_root_is_resolved_result_root_verbatim_over_every_arm`, `::from_config_root_identity_is_of_the_resolved_root_over_every_arm`, `::from_config_never_aliases_gcs_and_gs_result_root_spellings_but_their_identities_are_one`; real sessions: `crates/jammi-ai/tests/it/storage_root.rs::member_row_matches_resolved_root_*` (identity column asserted), `::a_member_with_a_memory_result_root_is_refused_at_session_construction` |
-| P-A5 the predicate: same-location spellings ARE members (gcs/gs; symlink/target; authority case; trailing slash); different locations and NULL identities are NOT | `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other`, `::a_symlinked_local_root_and_its_target_are_the_same_gang`, `::list_folds_authority_case_and_trailing_slash_but_not_key_case`, `::file_and_s3_rooted_members_are_not_gang_members_of_each_other`, `::list_excludes_a_member_with_peer_addr_set_and_no_root`, `::a_row_with_a_root_but_no_identity_is_never_a_member` (sqlite + postgres arms) |
+| P-A5 the predicate: same-location spellings ARE members (gcs/gs; symlink/target; authority case; trailing slash); different locations and NULL identities are NOT | `crates/jammi-db/tests/it/gang_membership.rs::gcs_and_gs_spelled_members_are_gang_members_of_each_other`, `::a_symlinked_local_root_and_its_target_are_the_same_gang`, `::list_folds_a_trailing_slash_but_neither_bucket_nor_key_case`, `::file_and_s3_rooted_members_are_not_gang_members_of_each_other`, `::list_excludes_a_member_with_peer_addr_set_and_no_root`, `::a_row_with_a_root_but_no_identity_is_never_a_member` (sqlite + postgres arms) |
 | P-A6 migration 036 appended after 035, nullable on both dialects, replayed with the instances family | `crates/jammi-db/tests/it/migrations.rs::migration_036_is_ordered_after_035_and_adds_instances_result_root_identity` (both arms); the 029-replay DELETE list and the `pragma_table_info` teeth include the column |
 
 **Mutation (executed).** With the `AND i.result_root_identity = $n` clause

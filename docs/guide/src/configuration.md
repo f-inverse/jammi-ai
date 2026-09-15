@@ -225,7 +225,7 @@ preload_models = [
 # `instances.result_root_identity` carries that root's IDENTITY across
 # spellings, computed once by this process at registration from the same
 # config the store reads: scheme aliases folded by the store's own URL
-# parser (gcs://=gs://, abfss://=azure://), the bucket name lowercased and
+# parser (gcs://=gs://, abfss://=azure://), the bucket as spelled and
 # the key normalised by the store's own key parser, the location determinants
 # (the endpoint/account/base URL the driver dials) read back from the very
 # builder the store constructs -- environment first, [storage.cloud] on top,

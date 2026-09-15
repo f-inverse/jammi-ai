@@ -382,16 +382,16 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
 }
 
 /// The identity rules on object-store roots, through the verb: a member
-/// whose root differs from the caller's only by authority CASE or a
-/// trailing slash is returned; one whose KEY differs by case is not (object
-/// keys are case-sensitive; bucket names are not).
+/// whose root differs from the caller's only by a trailing slash is
+/// returned; one whose bucket or key differs by case is not (the store and
+/// the driver dial both as spelled).
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn list_folds_authority_case_and_trailing_slash_but_not_key_case(kind: BackendKind) {
+async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: BackendKind) {
     skip_unless_ready!(kind);
     let (_dir, catalog) = base_catalog_kind(kind)
         .await
@@ -432,8 +432,8 @@ async fn list_folds_authority_case_and_trailing_slash_but_not_key_case(kind: Bac
         .await
         .unwrap();
     assert!(
-        members.iter().any(|m| m.instance_id == id_case),
-        "an authority-case-divergent root is the same root: {members:?}"
+        members.iter().all(|m| m.instance_id != id_case),
+        "a bucket-case-divergent root is a DIFFERENT root — the driver dials it as spelled: {members:?}"
     );
     assert!(
         members.iter().any(|m| m.instance_id == id_slash),

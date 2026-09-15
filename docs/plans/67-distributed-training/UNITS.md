@@ -308,51 +308,56 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
   stream this unit's rank body binds to), U3, U4a, S1. **size**: XL (the
   plan's mathematical core; five hermetic oracles).
 
-## U7b — cluster leg + cluster reap (PR-C commit 1)
+## U7b — cluster-leg primitives, reap, two-host test body, and schedule visibility (PR-C commit 1)
 
-The cluster leg is a SEPARATE driver from the pod-tier smoke — never `runpod_gpu_gang.sh`, which
-stays the pod-tier driver end to end. The cluster leg's own driver script (built on
-`runpod_lib.sh`'s `rp_cluster_*` primitives) launches, ships the NCCL id, and assembles the one
-committed artifact for a **2×1 shape**: 2 hosts, 1 GPU each (never `gpuCount: 4`) — a genuine
-two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process bootstrap.
+The pod-tier smoke's driver (`runpod_gpu_gang.sh`) stays the pod-tier driver end to end; a
+separate two-host CLUSTER leg proves the same NCCL properties over a genuine two-HOST bootstrap
+(`ens1`, never a second copy of the pod-tier's single-process two-device smoke) for a **2×1
+shape**: 2 hosts, 1 GPU each (never `gpuCount: 4`). This unit ships the REST v2 cluster
+primitives, the fail-closed cluster reap, the two-host test body, the artifact registry's leg
+discrimination, and schedule visibility (P8). The cluster leg's own DRIVER (launch, id-ship,
+report-pull, artifact assembly) and its workflow have no automated invocation on this tree today
+— that is **U7b-A2b** (below), a separate unit; until it ships, a maintainer drives the two-host
+test by hand with this unit's primitives (`docs/maintainer/dev-gpu.md`'s cluster-leg section has
+the exact steps).
 
-The unit's own A1/A2/A3 decomposition: **A1-pull** is the pod-tier smoke's CI scaffolding, already
-merged in PR-B1 (U7a); **A2** is this unit — the cluster leg, its reap arm, and P8; **A3** is a
-FUTURE, separately authorized re-add of `gpu-gang.yml`'s 6-hourly cron, not part of this unit — P8
-(below) is what makes that re-add a reviewed, human-visible act instead of a silent default.
+The unit's own A1/A2/A3 decomposition: **A1-pull** is the pod-tier smoke's CI scaffolding, merged
+in PR-B1 (U7a); **A2** is this unit's own scope (primitives, reap, test body, registry, P8),
+split from **A2b** (the driver and its workflow, below); **A3** is a FUTURE, separately
+authorized re-add of `gpu-gang.yml`'s 6-hourly cron, not part of this unit — P8 (below) is what
+makes that re-add a reviewed, human-visible act instead of a silent default.
 
-- **files_in_scope** (docs-ci): `ci/scripts/runpod_lib.sh` (REST v2 cluster create/get/pods/
-  delete/list primitives sharing the pod payload's entrypoint text via `_rp_entrypoint_setup`;
-  its own `RP_CLUSTER_PREFIX` ("jammi-cluster") is a name space separate from `RP_POD_PREFIX`, so
-  the pod and cluster sweeps' prefix matches can never collide; the pod sweep is FAIL-CLOSED on
-  its cluster-member exclusion set — an enumeration failure there skips the ENTIRE pod sweep,
-  never proceeds with an incomplete exclusion set; a `podTerminate` result is now checked, and a
-  live member is reported "cluster member, skipped" rather than acted on), `ci/scripts/
-  runpod_gpu_cluster.sh` (the cluster leg's OWN driver script, never `runpod_gpu_gang.sh`) —
-  launch, id-ship, report-ship, single-writer assembly (both members only ever REPORT; the driver
-  alone assembles and writes the one artifact) — `.github/workflows/gpu-cluster.yml` (its OWN
-  workflow: the `run-cluster` PR label or manual dispatch, never `gpu-gang.yml`) —
-  `ci/scripts/execution_surface_reachability_allowlist.txt` (the cluster-leg tuples; U7a's rows
-  re-verified if their command lines change), `.github/workflows/gpu-reap.yml` (clusters
-  enumerated and reaped; the reaper's post-delete re-enumeration is fail-closed on a failed GET,
-  mirroring the pod arm) — no workflow this unit touches carries a `schedule:` trigger without the
-  allow-listed exception P8 (below) names.
+- **files_in_scope** (docs-ci unless noted): `ci/scripts/runpod_lib.sh` (REST v2 cluster
+  create/get/pods/delete/list primitives sharing the pod payload's entrypoint text via
+  `_rp_entrypoint_setup`; its own `RP_CLUSTER_PREFIX` ("jammi-cluster") is a name space separate
+  from `RP_POD_PREFIX`, so the pod and cluster sweeps' prefix matches can never collide; the pod
+  sweep is FAIL-CLOSED on its cluster-member exclusion set — an enumeration failure there skips
+  the ENTIRE pod sweep, never proceeds with an incomplete exclusion set; a `podTerminate` result
+  is now checked, and a live member is reported "cluster member, skipped" rather than acted on),
+  `ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives suite), `.github/workflows/
+  gpu-reap.yml` (clusters enumerated and reaped; the reaper's post-delete re-enumeration is
+  fail-closed on a failed GET, mirroring the pod arm), `crates/jammi-ai/tests/gpu_capability/
+  gang_nccl.rs` (ai-core: `gang_nccl_two_hosts_reduce_a_known_vector` — rank 0 mints the NCCL id
+  to a file, rank 1 joins from it, both reduce a known vector and report; no automated caller on
+  this tree today), `ci/scripts/check_cuda_run_artifacts.py` (rule (k)'s cluster-leg field
+  registry and shape/rank checks stay; a `gang.leg == "cluster"` artifact is REFUSED — no
+  producer is registered for that leg until U7b-A2b ships a driver), `ci/scripts/
+  check_gpu_prove_once.py` (P8, below) — no workflow this unit touches carries a `schedule:`
+  trigger without the allow-listed exception P8 names.
 - **invariants_to_preserve**: this unit's OWN obligation — U7a/PR-B1 already landed P7 (every
   paid pod lane held to P1's three sub-rules, over a renting closure derived from
-  `runpod_lib.sh`); this unit extends `ci/scripts/check_gpu_prove_once.py` with a NEW arm, **P8**
-  (schedule visibility): a `schedule:` trigger on ANY paid-lane workflow — pod or cluster — is
-  refused unless that workflow is a reviewed key of `PAID_LANE_CRON_ALLOWLIST` naming its own
-  never-vacuous arm — a rule this unit BUILDS, never one it finds already enforced; B2.
-- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring;
-  `check_execution_surface_reachability.py` green with the cluster-leg tuples allowlisted.
-- **acceptance (id-secrecy)**: the NCCL id crosses hosts HEX-encoded (the `scp` ship step); the
-  scan (`ci/scripts/gang_id_secrecy_scan.py`) covers its full carrier set — the pulled artifact
-  directory (recursively), the run log, the assembled `gang` artifact, and the driver's own
-  staging copy's directory listing — for every encoding the ship step could emit (raw bytes, hex
-  lower, hex upper, base64), the staging copy deleted only after a clean scan; an unexaminable
-  carrier (unreadable log, a dangling symlink, an archive member, a missing staging path) is its
-  own refusal, never a silent pass (RED at base: the cluster leg and its driver do not exist yet,
-  so this scan has nothing to run against).
+  `runpod_lib.sh`, with `rp_cluster_create` as a SECOND renting root — its only callers on this
+  tree are the library's own tests until U7b-A2b lands a driver); this unit extends `ci/scripts/
+  check_gpu_prove_once.py` with a NEW arm, **P8** (schedule visibility): a `schedule:` trigger on
+  ANY paid-lane workflow — pod or cluster — is refused unless that workflow is a reviewed key of
+  `PAID_LANE_CRON_ALLOWLIST` naming its own never-vacuous arm — a rule this unit BUILDS, never one
+  it finds already enforced; B2.
+- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring.
+- **acceptance (id-secrecy)**: SCHEDULED under U7b-A2b, not shipped by this unit — the id-secrecy
+  scan over the driver's full carrier set (the pulled artifact directory, the run log, the
+  assembled `gang` artifact, the staging copy) for every encoding the ship step could emit (raw
+  bytes, hex lower, hex upper, base64), an unexaminable carrier its own refusal — has nothing to
+  scan until U7b-A2b's driver exists; U7b-A2b (below) is where it lands.
 - **acceptance (schedule visibility)**: the new P8 arm this unit adds to
   `check_gpu_prove_once.py` refuses a `schedule:` trigger on ANY paid-lane workflow — pod or
   cluster — unless that workflow is a reviewed key of `PAID_LANE_CRON_ALLOWLIST` naming its own
@@ -360,11 +365,27 @@ FUTURE, separately authorized re-add of `gpu-gang.yml`'s 6-hourly cron, not part
   allow-listed cron (`gpu-prove.yml`, `gpu-reap.yml`) is not — RED-then-GREEN within this unit:
   RED before P8 exists (a planted cron passes unrefused, since no arm reads `schedule:` at all at
   the unit's own base), GREEN once P8 and its fixture land together.
-- **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
-- **cost ceiling** (human-approved before first run, committed figures — never re-derived per
-  run): at S4's MEASURED cluster rate, $1.908/GPU/h (README.md's own S4 spike-result paragraph —
-  never the 2-GPU pod rate), the 2×1 shape bills $3.816/h; ≤ 1 h billed wall per run, ≤ 2 runs per
-  authorization; label-only until a flake-free streak.
+- **lane**: gate scripts + ai-core test body. **depends_on**: U7a, S4. **size**: M.
+
+### U7b-A2b — the two-host cluster driver, workflow and id-secrecy scan
+
+Filed here, NOT scheduled as a wave-3 precondition. Builds the cluster leg's own DRIVER (launch
+via `rp_cluster_create`, wait for both members reachable, ship the NCCL id, pull both ranks'
+reports, single-writer artifact assembly — both members only ever REPORT), its OWN workflow (a
+`run-cluster` PR label or manual dispatch, never `gpu-gang.yml`'s), and the id-secrecy scan over
+the driver's full carrier set. Spec: this unit's (U7b's) own three audit rounds recorded in
+`docs/rigor/feat_500-C-U7b.jsonl`; `docs/rigor/contracts/feat_500-C-U7b.md` §2/§2b/§2c/§4/§5 as
+history; §9's P-A (no byte reaches the upload unscanned), P-B (the scan's exit lattice is total),
+P-C (the artifact's shape is measured from the create/members response, never a literal), and
+P-D (the assembler is oracled through the sourced driver on every arm) as the acceptance
+properties a driver must satisfy; round 3's F1–F3 — the scan reachable only from a skippable
+EXIT-only trap sequenced behind untimed REST calls; a false "WILL BE DESTROYED" claim under
+`RP_SESSION`; the in-place fallback's globs missing `..`-prefixed names — plus its A1–A4
+advisories, as the first pressure round any re-attempt inherits. The one real cluster run
+(bounded by this unit's own cost ceiling: at S4's MEASURED cluster rate, $1.908/GPU/h, the 2×1
+shape bills `2 × $1.908/GPU/h = $3.816/h`; ≤ 1 h billed wall per run, ≤ 2 runs per authorization;
+label-only until a flake-free streak — blocked today on the operator's own pre-flight) moves with
+this unit.
 
 ## U5a — `GangService` on `peer_bind`; I-GANG authorization; admit-and-hold (PR-C commit 2)
 

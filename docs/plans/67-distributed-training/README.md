@@ -295,7 +295,7 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | B | 6 | U2c | Streaming training-set loader with a residency bound (issue #544) | hermetic + cookbook | U2a, U2b, U4a |
 | B | 7 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U2c, U3, U4a, S1 |
 | B | 8 | — | pod-leg artifact | gpu-gang | U4b |
-| C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
+| C | 1 | U7b | cluster-leg primitives, reap, two-host test body, schedule visibility (driver: U7b-A2b, filed, not scheduled) | gate scripts + ai-core test body | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
 | C | 3 | U5b-1a | Membership substrate: `peer_advertise`, `instances.peer_addr`/`result_root`, `list_gang_members` | hermetic + distributed | U5a-1, PR-B1 |
 | C | 4 | U5b-0 | Partitioned attestation inventory (per-row-group leaf digests, `MaterializationManifest`) | hermetic | none (base: PR-B2) |

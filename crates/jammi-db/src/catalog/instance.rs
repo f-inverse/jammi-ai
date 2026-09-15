@@ -80,11 +80,16 @@ impl std::fmt::Display for PeerAddr {
 /// VERBATIM string [`crate::config::JammiConfig::resolved_result_root`]
 /// returns for the deployment, and the SAME string
 /// [`crate::store::ResultStore`] roots itself at (never re-derived, never
-/// re-parsed, never re-spelled). Built exclusively by
-/// [`InstanceRegistration::from_config`] in production; [`Self::new`] exists
-/// for that function (and fixtures/tests) rather than being a
-/// general-purpose string wrapper any caller may construct from an
-/// arbitrary value.
+/// re-parsed, never re-spelled). [`Self::resolved`] is the ONLY production
+/// constructor — it calls `resolved_result_root` itself, so a `MemberRoot`
+/// can never carry a string that did not come from the resolver.
+/// `MemberRoot::new` wraps an arbitrary string with no resolver call at
+/// all; it is compiled only under `feature = "test-hooks"`
+/// (fixtures/tests), never in a production build (not a doc link: the
+/// method does not exist in a build without that feature, so an intra-doc
+/// link to it fails `cargo doc`'s default-feature pass) — the string
+/// constructor being reachable from production code is exactly how an
+/// unrelated string ends up in the `instances.result_root` column.
 ///
 /// **Necessary, never sufficient, for shared storage**: two byte-identical
 /// roots on two filesystems are indistinguishable to this type or to the
@@ -100,9 +105,25 @@ impl std::fmt::Display for PeerAddr {
 pub struct MemberRoot(String);
 
 impl MemberRoot {
-    /// Wrap an already-resolved root string
-    /// ([`crate::config::JammiConfig::resolved_result_root`]'s output in
-    /// production).
+    /// The ONE production constructor: the verbatim root
+    /// [`crate::config::JammiConfig::resolved_result_root`] computes for
+    /// `config` — the exact string [`crate::store::ResultStore`] roots
+    /// itself at. [`InstanceRegistration::from_config`] is this method's
+    /// only caller; nothing else builds a `MemberRoot` in a production
+    /// build (`new` below does not exist outside `feature = "test-hooks"`).
+    pub fn resolved(config: &crate::config::JammiConfig) -> Result<Self> {
+        Ok(Self(config.resolved_result_root()?))
+    }
+
+    /// Wrap an ALREADY-RESOLVED root string directly, with no resolver call
+    /// and no validation — fixtures and tests only. Gated behind
+    /// `feature = "test-hooks"` so a production build never links this
+    /// constructor: reachable from production code, it would let any
+    /// caller put an arbitrary string in the `instances.result_root`
+    /// column, defeating the one property this type exists to hold (the
+    /// row and the store are the same string, constructible only through
+    /// [`Self::resolved`]).
+    #[cfg(feature = "test-hooks")]
     pub fn new(root: impl Into<String>) -> Self {
         Self(root.into())
     }
@@ -224,7 +245,7 @@ impl InstanceRegistration {
         let Some(membership) = MembershipConfig::validate(config)? else {
             return Ok(Self::new(instance_id, label, host, None, None));
         };
-        let member_root = MemberRoot::new(config.resolved_result_root()?);
+        let member_root = MemberRoot::resolved(config)?;
         Ok(Self::new(
             instance_id,
             label,

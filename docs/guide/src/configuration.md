@@ -157,6 +157,26 @@ idle_poll_secs = 1
 # one grouped count per tick on a dedicated task, never on a `/metrics`
 # scrape and never on the claim loop. Must be >= 1. Default: 5.
 metrics_sample_secs = 5
+# How many ranks THIS HOST places on its own `[gpu] devices` for a
+# distributed training job it runs entirely in-process - one rank per
+# device, rank `i` on `[gpu] devices[i]`. Must be >= 1 (the default, 1, is
+# the single-rank deployment: no gang, no collective) and never more than
+# the configured device count. Orthogonal to a submitted job's own
+# `world_size` (a separate, per-job knob) and to `[distributed]
+# max_world_size` (a later unit's fleet-wide bound on a `Peer` gang across
+# hosts) - the three knobs load independently, with no cross-check between
+# any pair.
+local_ranks = 1
+# Which collective a multi-rank worker reduces gradients over. Default:
+# "auto" (the best collective this process can actually reach: NCCL on a
+# CUDA build, the host CPU reduction otherwise). "nccl" on a build without
+# the `cuda` feature is refused at session open. Configuration, not a build
+# feature.
+collective = "auto"
+# How long a rank waits on its peers at a gang boundary before the wait is a
+# failure. Must be > 0 - a zero deadline expires before any peer can answer,
+# turning every gang into an immediate failure. Default: 120.
+rank_timeout_secs = 120
 
 [distributed]
 # The widest `Peer` gang any coordinator on this deployment may admit,

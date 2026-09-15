@@ -20,7 +20,7 @@
 //! containerized deployment's `"75%"` must mean 75% of what the container can
 //! actually use, not 75% of the bare hardware total it can never reach — the
 //! same reasoning [`crate::config::WorkerConfig::topology`]'s device-bound
-//! validation applies to `world_size`, applied here to memory instead.
+//! validation applies to `local_ranks`, applied here to memory instead.
 //!
 //! No cgroup file, an unreadable one, or the v2 sentinel `"max"` (explicitly
 //! "no ceiling") all resolve to "no cgroup bound" — the host total stands

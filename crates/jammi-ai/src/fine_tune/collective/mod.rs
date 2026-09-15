@@ -1,7 +1,7 @@
 //! The collective: what a gang of training ranks does at a step boundary.
 //!
 //! One trait, one implementation per transport, selected by CONFIGURATION —
-//! `[worker] collective` and `[worker] world_size`, never a cargo feature. The
+//! `[worker] collective` and `[worker] local_ranks`, never a cargo feature. The
 //! trainer holds a `&dyn Collective` and is never `cfg`-forked: a single-rank
 //! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`], a
 //! multi-host run holds a [`Peer`] (rank 0 in the coordinator's process, every

@@ -909,7 +909,7 @@ impl GpuConfig {
     ///
     /// - an ordinal below [`Self::CPU_DEVICE`] — not a device;
     /// - a repeated ordinal — two ranks on one device is a placement mistake,
-    ///   and it makes the `world_size <= devices` bound meaningless;
+    ///   and it makes the `local_ranks <= devices` bound meaningless;
     /// - the CPU (`-1`) listed alongside real ordinals — one gang runs on one
     ///   kind of device, and a mixed list has no collective that spans it.
     pub fn validate(&self) -> Result<()> {
@@ -1332,6 +1332,9 @@ impl LeaseConfig {
 /// kinds = "all"
 /// idle_poll_secs = 1
 /// metrics_sample_secs = 5
+/// local_ranks = 1
+/// collective = "auto"
+/// rank_timeout_secs = 120
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1376,16 +1379,21 @@ pub struct WorkerConfig {
     /// loop (a scrape storm must not become a catalog storm). Must be
     /// `>= 1`. Default: 5.
     pub metrics_sample_secs: u64,
-    /// How many ranks this deployment runs a distributed job over — one rank
-    /// per device, rank `i` on `[gpu] devices[i]`. Must be `>= 1`
-    /// (`1`, the default, is the single-rank deployment: no gang, no
-    /// collective) and never more than the configured device count, both
-    /// enforced by [`WorkerConfig::topology`] at load.
+    /// How many ranks THIS HOST places on its own `[gpu] devices` for a job
+    /// it runs entirely in-process — one rank per device, rank `i` on
+    /// `[gpu] devices[i]`. Must be `>= 1` (`1`, the default, is the
+    /// single-rank deployment: no gang, no collective) and never more than
+    /// the configured device count, both enforced by
+    /// [`WorkerConfig::topology`] at load.
     ///
-    /// This is the DEPLOYMENT's width. A submitted job carries its own
-    /// per-job width, which the submit edge checks against this one; the two
-    /// are separate numbers and neither defaults from the other.
-    pub world_size: u32,
+    /// Renamed from `world_size` (U4b S8): orthogonal to `[distributed]
+    /// max_world_size` (the widest `Peer` gang across FLEET members a
+    /// coordinator on this deployment may accept — a later unit's own knob)
+    /// and to the per-job `world_size` in `TrainingCommon` (identity-relevant,
+    /// checked against `[distributed] max_world_size` at submit) — the three
+    /// knobs load independently, with no cross-check between any pair
+    /// (DESIGN.md §7).
+    pub local_ranks: u32,
     /// Which collective a multi-rank worker reduces over. Default: `auto`.
     /// Configuration, not a build feature — see [`CollectiveSelection`].
     pub collective: CollectiveSelection,
@@ -1408,7 +1416,7 @@ impl Default for WorkerConfig {
             // One rank on the primary device: an unconfigured deployment is
             // the single-process one it has always been, with no gang and no
             // collective to resolve.
-            world_size: 1,
+            local_ranks: 1,
             collective: CollectiveSelection::Auto,
             rank_timeout_secs: 120,
         }
@@ -1498,30 +1506,30 @@ impl WorkerConfig {
     ///
     /// The refusals, each typed ([`JammiError::Config`]) and naming its key:
     ///
-    /// - `world_size == 0` — a deployment with no rank cannot run anything,
+    /// - `local_ranks == 0` — a deployment with no rank cannot run anything,
     ///   and `0` is not "unset" (the unset value is the default `1`);
-    /// - `world_size > devices` — there is no device for the last rank, and
+    /// - `local_ranks > devices` — there is no device for the last rank, and
     ///   the alternative to refusing is two ranks silently sharing one;
     /// - `rank_timeout_secs == 0` — a deadline that has already passed.
     ///
     /// `gpu`'s own domain rules ([`GpuConfig::validate`]) are checked first,
-    /// so the device count this bounds `world_size` against is a count of
+    /// so the device count this bounds `local_ranks` against is a count of
     /// distinct, placeable devices.
     pub fn topology(&self, gpu: &GpuConfig) -> Result<WorkerTopology> {
         gpu.validate()?;
         let devices = gpu.device_list();
-        if self.world_size == 0 {
+        if self.local_ranks == 0 {
             return Err(JammiError::Config(
-                "[worker] world_size must be >= 1 (1 is the single-rank deployment; 0 has no \
+                "[worker] local_ranks must be >= 1 (1 is the single-rank deployment; 0 has no \
                  rank to run on)"
                     .into(),
             ));
         }
-        if self.world_size as usize > devices.len() {
+        if self.local_ranks as usize > devices.len() {
             return Err(JammiError::Config(format!(
-                "[worker] world_size = {} exceeds the {} configured device(s) {:?}: one rank \
-                 per device, so list more in `[gpu] devices` or lower `world_size`",
-                self.world_size,
+                "[worker] local_ranks = {} exceeds the {} configured device(s) {:?}: one rank \
+                 per device, so list more in `[gpu] devices` or lower `local_ranks`",
+                self.local_ranks,
                 devices.len(),
                 devices
             )));
@@ -1534,7 +1542,7 @@ impl WorkerConfig {
             ));
         }
         Ok(WorkerTopology {
-            world_size: self.world_size,
+            local_ranks: self.local_ranks,
             devices,
             collective: self.collective,
             rank_timeout: Duration::from_secs(self.rank_timeout_secs),
@@ -1547,13 +1555,13 @@ impl WorkerConfig {
 /// reduce over, and how long a rank waits at a gang boundary.
 ///
 /// [`WorkerConfig::topology`] is the only constructor, so every instance has
-/// already cleared the bounds: `world_size >= 1`, `world_size <=
+/// already cleared the bounds: `local_ranks >= 1`, `local_ranks <=
 /// devices.len()`, the devices distinct and placeable, and a non-zero
 /// timeout. The fields are private for the same reason — the bounds hold for
 /// the lifetime of the value, not just at the moment it was built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerTopology {
-    world_size: u32,
+    local_ranks: u32,
     devices: Vec<i32>,
     collective: CollectiveSelection,
     rank_timeout: Duration,
@@ -1561,8 +1569,8 @@ pub struct WorkerTopology {
 
 impl WorkerTopology {
     /// How many ranks this deployment runs. Always `>= 1`.
-    pub fn world_size(&self) -> u32 {
-        self.world_size
+    pub fn local_ranks(&self) -> u32 {
+        self.local_ranks
     }
 
     /// Every configured device, in order — the full set a process opens
@@ -1573,17 +1581,17 @@ impl WorkerTopology {
     }
 
     /// The devices the ranks of a gang occupy: the first
-    /// [`Self::world_size`] entries of [`Self::devices`]. Never longer than
+    /// [`Self::local_ranks`] entries of [`Self::devices`]. Never longer than
     /// the gang, so a caller cannot spawn a rank onto a device no rank owns.
     pub fn rank_devices(&self) -> &[i32] {
-        &self.devices[..self.world_size as usize]
+        &self.devices[..self.local_ranks as usize]
     }
 
     /// The device rank `rank` runs on, or `None` when `rank` is not a rank of
-    /// this topology (`rank >= world_size`) — an out-of-range rank has no
+    /// this topology (`rank >= local_ranks`) — an out-of-range rank has no
     /// device, and saying so is not the same as handing back the primary.
     pub fn device_for_rank(&self, rank: u32) -> Option<i32> {
-        (rank < self.world_size).then(|| self.devices[rank as usize])
+        (rank < self.local_ranks).then(|| self.devices[rank as usize])
     }
 
     /// The configured collective. `Auto` is still unresolved here: this layer
@@ -1601,7 +1609,7 @@ impl WorkerTopology {
     /// Whether this topology has more than one rank — the one question that
     /// decides whether a collective is needed at all.
     pub fn is_distributed(&self) -> bool {
-        self.world_size > 1
+        self.local_ranks > 1
     }
 }
 

@@ -64,7 +64,14 @@
 //! NCCL id in any form (raw, hex, or base64): the id travels only through
 //! `JAMMI_GANG_TWO_HOSTS_ID_FILE`, [`RankReport`] has no field for it, and
 //! [`report_tests::rank_report_never_carries_the_id`] pins that property with
-//! a non-vacuous negative control.
+//! a non-vacuous negative control. A failed `hostname` read (or an empty
+//! one) and an unset/empty `NCCL_SOCKET_IFNAME` are NEVER masked behind a
+//! placeholder like `"unknown"` in a `pass` report — either is a `fail`
+//! verdict naming which is missing ([`missing_report_metadata_reason`]),
+//! because a `pass` report is the one artifact that must let a reviewer
+//! tell a genuine two-HOST gang apart from two ranks that collapsed onto
+//! one host (two placeholder-hostname reports would be indistinguishable
+//! from that).
 //!
 //! # Known-unmeasured
 //!
@@ -431,9 +438,10 @@ struct RankReport {
     /// somewhere to put a different value.
     device_ordinal: i64,
     /// `NCCL_SOCKET_IFNAME` as this rank's process saw it in its own
-    /// environment — `None` when the driver did not export it. This test
-    /// only READS it for the report; the driver, not this test, exports it
-    /// (pinned to `ens1`).
+    /// environment — `None` when the driver did not export it OR exported
+    /// it empty (both refuse a `pass` verdict — see
+    /// [`missing_report_metadata_reason`]). This test only READS it for the
+    /// report; the driver, not this test, exports it (pinned to `ens1`).
     nccl_socket_ifname: Option<String>,
     /// SHA-256 hex digest of the reduced known vector's little-endian `f32`
     /// bytes — `Some` and equal across both ranks on a `pass`; `None` on a
@@ -458,24 +466,75 @@ fn reduced_vector_digest_sha256(vector: &[f32]) -> String {
 }
 
 /// This host's name, shelled out to the `hostname` command — the same
-/// shell-out idiom `gguf_quantized_gpu.rs` uses for `nvidia-smi`. Best
-/// effort: the report field is informational and never asserted on by this
-/// test, so a host without the command gets `"unknown"` rather than failing
-/// the leg over a metadata read.
+/// shell-out idiom `gguf_quantized_gpu.rs` uses for `nvidia-smi`. `Err`
+/// names the problem (the command failed to run, exited non-zero, printed
+/// non-UTF-8, or printed an empty name after trimming) rather than masking
+/// it: the report's `hostname` field is what a reviewer uses to tell two
+/// ranks on genuinely DIFFERENT hosts apart from two ranks collapsed onto
+/// ONE — a silent placeholder there would make that indistinguishable
+/// (closing-audit finding F4). See [`missing_report_metadata_reason`] for
+/// how a bad read here turns into a `fail` verdict rather than a `pass`
+/// report carrying a placeholder.
 ///
 /// Only the two-host leg calls this today (the single-process leg writes no
 /// report), so it rides the same `cuda` gate as its one call site — a
 /// GPU-less build has no caller for it at all.
 #[cfg(feature = "cuda")]
-fn hostname() -> String {
-    std::process::Command::new("hostname")
+fn hostname() -> Result<String, String> {
+    let output = std::process::Command::new("hostname")
         .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .map_err(|e| format!("failed to run the `hostname` command: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the `hostname` command exited with {}",
+            output.status
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("the `hostname` command's output was not valid UTF-8: {e}"))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("the `hostname` command produced an empty name".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Whether this rank's report metadata (the hostname read and
+/// `NCCL_SOCKET_IFNAME`) is fit to appear in a `pass` verdict — `Some(reason)`
+/// naming WHICH is missing (one or both, `; `-joined) when not, `None` when
+/// both are present and non-empty. `NEVER` a placeholder like `"unknown"`:
+/// a `pass` report is the one artifact that must let a reviewer tell a
+/// genuine two-HOST gang apart from two ranks that collapsed onto one host,
+/// and two placeholder-hostname reports would be indistinguishable from
+/// that (closing-audit finding F4).
+///
+/// A pure decision function, deliberately separate from [`hostname`]'s own
+/// shell-out (which needs the `cuda` feature to even be reachable, since it
+/// rides its one call site's gate): this is what makes the property
+/// hermetically testable without a GPU — [`report_tests`] drives all three
+/// bad arms (a failed hostname read, an empty-but-`Ok` hostname, and an
+/// unset/empty `NCCL_SOCKET_IFNAME`) by constructing the `Result`/`Option`
+/// values directly, the same shape [`hostname`]'s real call site hands it.
+fn missing_report_metadata_reason(
+    hostname_result: &Result<String, String>,
+    nccl_socket_ifname: Option<&str>,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    match hostname_result {
+        Ok(h) if !h.is_empty() => {}
+        Ok(_) => problems.push("hostname: read an empty name".to_string()),
+        Err(e) => problems.push(format!("hostname: {e}")),
+    }
+    match nccl_socket_ifname {
+        Some(s) if !s.is_empty() => {}
+        _ => problems
+            .push("NCCL_SOCKET_IFNAME: unset or empty in this rank's own environment".to_string()),
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
 }
 
 /// Write `report` to `<artifact_dir>/rank-<report.rank>.json`, creating
@@ -618,11 +677,28 @@ fn gang_nccl_two_hosts_reduce_a_known_vector() {
             artifact_dir,
         } = env;
         let device = slot.device().clone();
-        let nccl_socket_ifname = std::env::var("NCCL_SOCKET_IFNAME").ok();
-        let host = hostname();
+        // An empty `NCCL_SOCKET_IFNAME` is treated the same as unset — see
+        // `missing_report_metadata_reason`.
+        let nccl_socket_ifname = std::env::var("NCCL_SOCKET_IFNAME")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let host_result = hostname();
+        // Used for BOTH report arms below; only ever a real hostname on the
+        // arm that can actually reach `pass` — see the metadata check at
+        // the top of the closure, which panics (and so routes through the
+        // `Err` arm below, never the `Ok` one) before either bad value could
+        // land in a `pass` report.
+        let host = host_result.clone().unwrap_or_default();
         let device_ordinal: i64 = 0;
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Vec<f32> {
+            if let Some(reason) =
+                missing_report_metadata_reason(&host_result, nccl_socket_ifname.as_deref())
+            {
+                panic!(
+                    "{TEST}: rank {rank}: report metadata missing before the gang ran: {reason}"
+                );
+            }
             let id: NcclIdBytes = if rank == 0 {
                 let id = Nccl::new_id()
                     .unwrap_or_else(|e| panic!("{TEST}: ncclGetUniqueId failed on rank 0: {e}"));
@@ -695,7 +771,9 @@ fn gang_nccl_two_hosts_reduce_a_known_vector() {
 
 #[cfg(test)]
 mod report_tests {
-    use super::{reduced_vector_digest_sha256, write_rank_report, RankReport};
+    use super::{
+        missing_report_metadata_reason, reduced_vector_digest_sha256, write_rank_report, RankReport,
+    };
 
     fn fake_id() -> [u8; 128] {
         let mut id = [0u8; 128];
@@ -703,6 +781,98 @@ mod report_tests {
             *b = (i as u8).wrapping_mul(7).wrapping_add(3);
         }
         id
+    }
+
+    /// Both good: no reason. The baseline every bad-arm test below is
+    /// contrasted against.
+    #[test]
+    fn missing_report_metadata_reason_is_none_when_both_are_present() {
+        assert_eq!(
+            missing_report_metadata_reason(&Ok("host-a".to_string()), Some("ens1")),
+            None
+        );
+    }
+
+    /// `NCCL_SOCKET_IFNAME` unset (`None`) is a named reason, hostname
+    /// staying good.
+    #[test]
+    fn missing_report_metadata_reason_names_an_unset_iface() {
+        let reason = missing_report_metadata_reason(&Ok("host-a".to_string()), None)
+            .expect("an unset iface must be a reason, not None");
+        assert!(
+            reason.contains("NCCL_SOCKET_IFNAME"),
+            "reason must name the iface: {reason}"
+        );
+        assert!(
+            !reason.contains("hostname"),
+            "a good hostname must not appear as a problem: {reason}"
+        );
+    }
+
+    /// `NCCL_SOCKET_IFNAME` set but empty is treated identically to unset —
+    /// the driver's own call site filters `""` to `None` before this
+    /// function ever sees it, but the function's own `Some("")` arm is
+    /// pinned directly too (defense in depth: nothing upstream of this
+    /// function is trusted to have already done the filtering).
+    #[test]
+    fn missing_report_metadata_reason_names_an_empty_iface() {
+        let reason = missing_report_metadata_reason(&Ok("host-a".to_string()), Some(""))
+            .expect("an empty iface must be a reason, not None");
+        assert!(
+            reason.contains("NCCL_SOCKET_IFNAME"),
+            "reason must name the iface: {reason}"
+        );
+    }
+
+    /// A failed hostname read (the `Err` arm [`super::hostname`] takes on a
+    /// missing/failing command, a non-zero exit, or non-UTF-8 output) is a
+    /// named reason — this is the arm a fake hostname resolver would drive;
+    /// since `hostname()` itself shells out and is `cuda`-gated, this
+    /// injects the SAME `Result` shape its real call site would hand this
+    /// function, covering the hostname arm through the identical decision
+    /// code path without needing a GPU or the `cuda` feature.
+    #[test]
+    fn missing_report_metadata_reason_names_a_failed_hostname_read() {
+        let reason = missing_report_metadata_reason(
+            &Err("failed to run the `hostname` command: no such file or directory".to_string()),
+            Some("ens1"),
+        )
+        .expect("a failed hostname read must be a reason, not None");
+        assert!(
+            reason.contains("hostname"),
+            "reason must name the hostname problem: {reason}"
+        );
+        assert!(
+            !reason.contains("NCCL_SOCKET_IFNAME"),
+            "a good iface must not appear as a problem: {reason}"
+        );
+    }
+
+    /// An `Ok` but empty hostname (the command ran, exited 0, and printed
+    /// nothing) is ALSO a named reason — never treated as a successful read
+    /// just because the `Result` was `Ok`.
+    #[test]
+    fn missing_report_metadata_reason_names_an_empty_ok_hostname() {
+        let reason = missing_report_metadata_reason(&Ok(String::new()), Some("ens1"))
+            .expect("an empty Ok(\"\") hostname must be a reason, not None");
+        assert!(
+            reason.contains("hostname"),
+            "reason must name the hostname problem: {reason}"
+        );
+    }
+
+    /// Both bad: the reason names BOTH, not just the first one found —
+    /// `";"`-joined, so a reviewer sees the whole picture in one report
+    /// rather than fixing one problem only to hit the other on the next run.
+    #[test]
+    fn missing_report_metadata_reason_names_both_when_both_are_bad() {
+        let reason = missing_report_metadata_reason(&Err("boom".to_string()), None)
+            .expect("both bad must be a reason, not None");
+        assert!(reason.contains("hostname"), "must name hostname: {reason}");
+        assert!(
+            reason.contains("NCCL_SOCKET_IFNAME"),
+            "must name the iface: {reason}"
+        );
     }
 
     /// Minimal standard base64 (with `=` padding). This crate carries no

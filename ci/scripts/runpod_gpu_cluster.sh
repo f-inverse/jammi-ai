@@ -557,10 +557,35 @@ _rpc_phase "cluster create"
 cluster_id="$(rp_cluster_create "$RP_CLUSTER_GPU_TYPE" "$dcs")" || { echo "::error::cluster create failed"; exit 75; }
 echo "cluster ${cluster_id} created"
 
+# The first executed run's own record of whether MEMBER SELF-REMOVAL
+# actually works on a cluster (S4: members expose `actions: []`; the
+# module doc's own header states this is otherwise UNMEASURED). Checked
+# BEFORE this driver's own delete call: a 404 on the cluster's own GET
+# means every member already self-terminated and RunPod retired the
+# cluster object on its own -- "ok". Any other status (200, meaning the
+# cluster is still present) means self-removal has NOT happened by the
+# time this driver's own EXIT trap fires -- "refused" -- and the driver's
+# own `rp_cluster_delete` call is what actually retires it.
+_rpc_self_remove_status() {
+  local id="${1:?needs a cluster id}" resp status
+  resp="$(_rp_rest GET "/v2/clusters/${id}")"
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  case "$status" in
+    404) echo "ok" ;;
+    *) echo "refused" ;;
+  esac
+}
+
 _rpc_cleanup_cluster() {
   [ -n "${cluster_id:-}" ] || return 0
+  local self_remove
+  self_remove="$(_rpc_self_remove_status "$cluster_id")"
+  echo "cluster-self-remove: ${self_remove}"
+  if [ "$self_remove" = "ok" ]; then
+    return 0  # already gone -- a driver-initiated delete against a 404 would be a spurious failure.
+  fi
   if rp_cluster_delete "$cluster_id"; then
-    echo "cluster-self-remove: n/a (driver-initiated delete succeeded)"
+    echo "cluster deleted by the driver's own EXIT trap (member self-removal had not taken by then)"
   else
     echo "::error::could not delete cluster ${cluster_id} on exit -- gpu-reap.yml's 6-hourly sweep is the backstop"
   fi

@@ -191,6 +191,122 @@ else
 fi
 
 # ============================================================================
+# P-A: the id-secrecy scan runs from the EXIT trap (_rpc_cleanup_cluster ->
+# _rpc_scan_or_quarantine) on EVERY exit arm, once the id has landed --
+# driven through the REAL trap and the REAL scanner (gang_id_secrecy_scan.py,
+# never mocked), over a REAL fixture carrier directory, on the four arms the
+# round-2 audit named: assembly refused, pull failed, budget cut, wrong
+# tree. Asserts BOTH that the scan ran (its own stdout/stderr appears) and
+# that a DIRTY carrier never survives at the upload path afterward.
+# ============================================================================
+PA_ID_BYTES_PY="import sys; sys.stdout.buffer.write(bytes((i*7+1) % 256 for i in range(128)))"
+
+run_trap_scan_arm() { # $1=pending_rc $2=plant_leak(1|0) -> stdout: "<rc>\t<carrier_dir>\t<out_b64>"
+  local pending_rc="$1" plant_leak="$2" pa_sandbox
+  pa_sandbox="$(mktemp -d)"
+  mkdir -p "$pa_sandbox/artifact/nested"
+  echo "clean log line" > "$pa_sandbox/artifact/run.log"
+  echo '{"gang":{"leg":"cluster"}}' > "$pa_sandbox/assembled.json"
+  python3 -c "$PA_ID_BYTES_PY" > "$pa_sandbox/nccl.id"
+  if [ "$plant_leak" = "1" ]; then
+    id_hex="$(python3 -c "$PA_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
+    echo "leaked: ${id_hex}" > "$pa_sandbox/artifact/nested/leak.txt"
+  fi
+  local out trap_rc
+  out="$(bash -c '
+    source "'"$CLUSTER_SH"'"
+    cluster_id=""
+    id_landed=1
+    CLUSTER_ARTIFACT_DIR="'"$pa_sandbox"'/artifact"
+    RUN_LOG="'"$pa_sandbox"'/artifact/run.log"
+    ASSEMBLED="'"$pa_sandbox"'/assembled.json"
+    STAGING_ID_FILE="'"$pa_sandbox"'/nccl.id"
+    RP_WORK="'"$pa_sandbox"'"
+    rp_cleanup() { : ; }
+    ( exit "'"$pending_rc"'" )
+    _rpc_cleanup_cluster
+  ' 2>&1)"
+  trap_rc=$?
+  printf '%s\t%s\t%s\n' "$trap_rc" "$pa_sandbox/artifact" "$(printf '%s' "$out" | base64 | tr -d '\n')"
+}
+
+carrier_is_clean() { # $1=carrier dir -> 0 if gone or exists-but-empty, 1 if any content survives
+  [ ! -e "$1" ] && return 0
+  [ -z "$(find "$1" -mindepth 1 2>/dev/null)" ]
+}
+
+# (a) "assembly refused" arm: pending rc=1 (an assembly failure already set
+# it), a CLEAN carrier -> the scan runs and passes, the pending rc (1)
+# survives untouched, and the (clean) carrier is left exactly as it was --
+# never quarantined for no reason.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 0)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -eq 1 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && [ -f "$carrier_dir/run.log" ]; then
+  ok "P-A: 'assembly refused' arm (pending rc=1, clean carrier) -> the scan ran (clean), rc=1 preserved, carrier left intact"
+else
+  bad "P-A: 'assembly refused' arm: expected rc=1 + a clean scan + intact carrier; got rc=$trap_rc carrier_exists=$([ -f "$carrier_dir/run.log" ] && echo yes || echo no) out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# (b) "pull failed" arm: pending rc=1, a DIRTY carrier (simulating a leak
+# that rode in with a partial/failed pull) -> the scan runs, finds the hit,
+# and the carrier is quarantined/emptied -- the upload path holds nothing.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 1)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -ne 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: HIT" && carrier_is_clean "$carrier_dir"; then
+  ok "P-A: 'pull failed' arm (pending rc=1, dirty carrier) -> the scan ran (HIT), the carrier holds nothing at the upload path afterward"
+else
+  bad "P-A: 'pull failed' arm: expected a HIT scan + an emptied/quarantined carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# (c) "budget cut" arm (rc=124): a CLEAN carrier -> the scan runs and
+# passes, the driver's own named exit code (124) survives verbatim.
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 124 0)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -eq 124 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean"; then
+  ok "P-A: 'budget cut' arm (rc=124, clean carrier) -> the scan ran (clean), the named exit code 124 survives verbatim"
+else
+  bad "P-A: 'budget cut' arm: expected rc=124 + a clean scan; got rc=$trap_rc out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# (d) "wrong tree" arm (rc=77): a DIRTY carrier -> the scan quarantines it
+# AND the driver's own named exit code (77) still survives verbatim (never
+# overwritten by the scan's own rc, since a real per-arm code always
+# outranks a bare join per rp_cluster_verdict's own priority doctrine).
+IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 77 1)"
+scan_out="$(printf '%s' "$out_b64" | base64 -d)"
+if [ "$trap_rc" -eq 77 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: HIT" && carrier_is_clean "$carrier_dir"; then
+  ok "P-A: 'wrong tree' arm (rc=77, dirty carrier) -> the scan ran (HIT), quarantined the carrier, AND the named exit code 77 survives verbatim"
+else
+  bad "P-A: 'wrong tree' arm: expected rc=77 + a HIT scan + an emptied/quarantined carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
+fi
+rm -rf "$(dirname "$carrier_dir")"
+
+# id_landed=0 (no id ever reached this runner) -> the trap does NOT invoke
+# the scanner at all (nothing to protect against yet).
+rc75_out="$(bash -c '
+  pa_sandbox="'"$SANDBOX"'/pa-unlanded"
+  rm -rf "$pa_sandbox"; mkdir -p "$pa_sandbox/artifact"
+  echo "clean log line" > "$pa_sandbox/artifact/run.log"
+  source "'"$CLUSTER_SH"'"
+  cluster_id=""
+  CLUSTER_ARTIFACT_DIR="$pa_sandbox/artifact"
+  RUN_LOG="$pa_sandbox/artifact/run.log"
+  rp_cleanup() { : ; }
+  ( exit 75 )
+  _rpc_cleanup_cluster
+' 2>&1)"
+rc75=$?
+if [ "$rc75" -eq 75 ] && ! printf '%s' "$rc75_out" | grep -q "gang-id-secrecy-scan"; then
+  ok "P-A: id_landed=0 (the id never reached this runner) -> the trap never invokes the scanner at all"
+else
+  bad "P-A: expected no scanner invocation when id_landed is unset; rc=$rc75 out=$rc75_out"
+fi
+rm -rf "$SANDBOX/pa-unlanded"
+
+# ============================================================================
 # G2: CLUSTER_GROUPS closure — {::group:: names} - {device} == CLUSTER_GROUPS.
 # ============================================================================
 mapfile -t script_groups < <(grep -oE '::group::[a-z0-9-]+' "$CLUSTER_SH" | sed 's/::group:://' | sort -u)
@@ -539,16 +655,182 @@ fi
 rm -f "$scan_fixture_dir/pulled/bundle.tar.gz"
 
 # ============================================================================
+# P-C/P-D: the assembler (_rpc_assemble_gang_artifact) is oracled through
+# the REAL function, on the happy path AND every refusal/representable-fail
+# arm, with the MEASURED pod_count/gpu_count_per_pod threaded in (never the
+# four literals the round-2 audit found) -- and its output is run through
+# the REAL check_cuda_run_artifacts.py checker, imported directly rather
+# than paraphrased.
+# ============================================================================
+assemble_dir="$SANDBOX/assemble"
+mkdir -p "$assemble_dir"
+DIGEST_A="$(python3 -c 'print("a" * 64)')"
+DIGEST_B="$(python3 -c 'print("b" * 64)')"
+
+write_rank_report() { # $1=path $2=rank $3=host $4=iface $5=verdict $6=digest(or "-") $7=device_ordinal
+  python3 -c '
+import json, sys
+path, rank, host, iface, verdict, digest, dev = sys.argv[1:8]
+d = {"rank": int(rank), "hostname": host, "nccl_socket_ifname": iface, "verdict": verdict, "device_ordinal": int(dev)}
+if digest != "-":
+    d["reduced_vector_digest_sha256"] = digest
+if verdict != "pass":
+    d["reason"] = "fixture-forced fail"
+json.dump(d, open(path, "w"))
+' "$@"
+}
+
+check_gang_via_checker() { # $1=assembled artifact path -> real exit code (0 clean, 1 findings)
+  python3 -c '
+import sys, json, importlib.util
+spec = importlib.util.spec_from_file_location("check_cuda_run_artifacts", sys.argv[2])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+data = json.load(open(sys.argv[1]))
+failures = mod.check_gang_artifact(data, "crates/jammi-kernels/artifacts/cuda-runs/fixture-gang-cluster.json", mod.REPO_ROOT)
+for f in failures:
+    print(f, file=sys.stderr)
+sys.exit(1 if failures else 0)
+' "$1" "$DIR/check_cuda_run_artifacts.py"
+}
+
+# Happy path: 2x1 (the measured shape matches what this leg pins).
+write_rank_report "$assemble_dir/r0.json" 0 "host-a" "ens1" pass "$DIGEST_A" 0
+write_rank_report "$assemble_dir/r1.json" 1 "host-b" "ens1" pass "$DIGEST_A" 0
+out_happy="$assemble_dir/gang-happy.json"
+_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-cluster" "$out_happy" 2 1 1
+rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$out_happy" ]; then
+  ok "P-D: happy-path assembly succeeds with the measured pod_count=2/gpu_count_per_pod=1 threaded in"
+else
+  bad "P-D: happy-path assembly failed (rc=$rc)"
+fi
+check_out="$SANDBOX/checker-happy.txt"
+if check_gang_via_checker "$out_happy" >"$check_out" 2>&1; then
+  ok "P-D: the happy-path artifact passes the REAL check_cuda_run_artifacts.py's check_gang_artifact"
+else
+  bad "P-D: the happy-path artifact was refused by check_gang_artifact: $(cat "$check_out")"
+fi
+
+# P-C: a 3x8 create-response shape yields a 3x8 artifact -- the four
+# literals are gone, and the checker then refuses it against the SAME
+# 2-rank reports (the cross-field check is falsifiable, not a tautology).
+out_38="$assemble_dir/gang-3x8.json"
+_rpc_assemble_gang_artifact "$assemble_dir/r0.json" "$assemble_dir/r1.json" deadbeef "a100-sxm4-cluster" "$out_38" 3 8 1
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "P-C: the assembler accepts a driver-supplied 3x8 shape without hardcoding pod_count/gpu_count_per_pod"
+else
+  bad "P-C: assembly with a 3x8 shape unexpectedly failed (rc=$rc)"
+fi
+read -r hosts_f world_f pod_f gpu_f < <(python3 -c '
+import json
+g = json.load(open("'"$out_38"'"))["gang"]
+print(g["hosts"], g["world"], g["pod_count"], g["gpu_count_per_pod"])
+')
+if [ "$hosts_f" = "3" ] && [ "$world_f" = "24" ] && [ "$pod_f" = "3" ] && [ "$gpu_f" = "8" ]; then
+  ok "P-C: a 3x8 create-response shape yields hosts=3 world=24 pod_count=3 gpu_count_per_pod=8 (measured, not literal)"
+else
+  bad "P-C: expected hosts=3/world=24/pod_count=3/gpu_count_per_pod=8; got hosts=$hosts_f world=$world_f pod_count=$pod_f gpu_count_per_pod=$gpu_f"
+fi
+check_out38="$SANDBOX/checker-3x8.txt"
+if check_gang_via_checker "$out_38" >"$check_out38" 2>&1; then
+  bad "P-C: expected the checker to REFUSE a 3x8 artifact carrying only 2 ranks[] entries; it passed clean"
+else
+  if grep -q "gang.hosts\|gang.ranks\|gang.world" "$check_out38"; then
+    ok "P-C: check_cuda_run_artifacts.py's own cross-field/registry checks refuse the 3x8 artifact against its 2-rank reports -- the check is falsifiable"
+  else
+    bad "P-C: the checker refused the 3x8 artifact but not for a shape-related reason: $(cat "$check_out38")"
+  fi
+fi
+
+# P-D refusal arm: unknown hostname -> assembly REFUSES (no artifact).
+write_rank_report "$assemble_dir/ruh0.json" 0 "unknown" "ens1" pass "$DIGEST_A" 0
+write_rank_report "$assemble_dir/ruh1.json" 1 "host-b" "ens1" pass "$DIGEST_A" 0
+out_uh="$assemble_dir/gang-unknown-host.json"
+_rpc_assemble_gang_artifact "$assemble_dir/ruh0.json" "$assemble_dir/ruh1.json" deadbeef box "$out_uh" 2 1 1
+rc=$?
+if [ "$rc" -ne 0 ] && [ ! -f "$out_uh" ]; then
+  ok "P-D: an unresolved (\"unknown\") rank hostname REFUSES assembly, no artifact written"
+else
+  bad "P-D: expected an unresolved hostname to refuse assembly; rc=$rc, artifact exists=$([ -f "$out_uh" ] && echo yes || echo no)"
+fi
+
+# P-D refusal arm: unknown iface -> assembly REFUSES.
+write_rank_report "$assemble_dir/rui0.json" 0 "host-a" "unknown" pass "$DIGEST_A" 0
+write_rank_report "$assemble_dir/rui1.json" 1 "host-b" "ens1" pass "$DIGEST_A" 0
+out_ui="$assemble_dir/gang-unknown-iface.json"
+_rpc_assemble_gang_artifact "$assemble_dir/rui0.json" "$assemble_dir/rui1.json" deadbeef box "$out_ui" 2 1 1
+rc=$?
+if [ "$rc" -ne 0 ] && [ ! -f "$out_ui" ]; then
+  ok "P-D: an unresolved (\"unknown\") rank iface REFUSES assembly, no artifact written"
+else
+  bad "P-D: expected an unresolved iface to refuse assembly; rc=$rc, artifact exists=$([ -f "$out_ui" ] && echo yes || echo no)"
+fi
+
+# P-D refusal arm: repeated host, compared CASE-INSENSITIVELY (F4 advisory)
+# -- "Host-A" and "host-a" are the same host.
+write_rank_report "$assemble_dir/rrh0.json" 0 "Host-A" "ens1" pass "$DIGEST_A" 0
+write_rank_report "$assemble_dir/rrh1.json" 1 "host-a" "ens1" pass "$DIGEST_A" 0
+out_rh="$assemble_dir/gang-repeated-host.json"
+_rpc_assemble_gang_artifact "$assemble_dir/rrh0.json" "$assemble_dir/rrh1.json" deadbeef box "$out_rh" 2 1 1
+rc=$?
+if [ "$rc" -ne 0 ] && [ ! -f "$out_rh" ]; then
+  ok "P-D: two ranks reporting the SAME host case-insensitively (Host-A vs host-a) REFUSES assembly"
+else
+  bad "P-D: expected a case-insensitive repeated host to refuse assembly; rc=$rc, artifact exists=$([ -f "$out_rh" ] && echo yes || echo no)"
+fi
+
+# P-D arm: digest mismatch is REPRESENTABLE (assembly succeeds, verdict
+# recorded as fail, never refused at assembly time) -- and the resulting
+# artifact still passes the checker as a legitimately-recorded failed run.
+write_rank_report "$assemble_dir/rd0.json" 0 "host-a" "ens1" pass "$DIGEST_A" 0
+write_rank_report "$assemble_dir/rd1.json" 1 "host-b" "ens1" pass "$DIGEST_B" 0
+out_dm="$assemble_dir/gang-digest-mismatch.json"
+_rpc_assemble_gang_artifact "$assemble_dir/rd0.json" "$assemble_dir/rd1.json" deadbeef box "$out_dm" 2 1 1
+rc=$?
+verdict_f="$(python3 -c "import json; print(json.load(open('$out_dm'))['gang']['verdict'])" 2>/dev/null)"
+if [ "$rc" -eq 0 ] && [ "$verdict_f" = "fail" ]; then
+  ok "P-D: a digest disagreement between two 'pass' ranks is REPRESENTABLE (verdict=fail), never refused at assembly time"
+else
+  bad "P-D: expected assembly to succeed with verdict=fail on a digest mismatch; rc=$rc verdict=${verdict_f:-<none>}"
+fi
+check_outdm="$SANDBOX/checker-digest-mismatch.txt"
+if check_gang_via_checker "$out_dm" >"$check_outdm" 2>&1; then
+  ok "P-D: the digest-mismatch (verdict=fail) artifact still passes the checker -- a recorded failure is valid evidence"
+else
+  bad "P-D: the digest-mismatch artifact was unexpectedly refused by check_gang_artifact: $(cat "$check_outdm")"
+fi
+
+# ============================================================================
 # F1: rp_init precedes the FIRST rp_cluster_create in the executed block —
 # a static line-number comparison over the committed driver text, never a
 # behavioral probe (rp_init itself needs no network; ssh-keygen only).
 # ============================================================================
 rp_init_line="$(grep -n '^rp_init$' "$CLUSTER_SH" | head -1 | cut -d: -f1)"
-rp_cluster_create_line="$(grep -n 'rp_cluster_create ' "$CLUSTER_SH" | grep -v '^\s*#' | head -1 | cut -d: -f1)"
+# F10 advisory: `grep -n`'s own output is "N:text" -- a line ALWAYS starts
+# with digits, so a filter anchored at `^\s*#` against THAT text can never
+# match anything (a no-op, round-2 audit finding). The comment-vs-code
+# check has to strip grep -n's own "N:" prefix before testing for a
+# leading `#`.
+rp_cluster_create_line="$(grep -n 'rp_cluster_create ' "$CLUSTER_SH" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1)"
 if [ -n "$rp_init_line" ] && [ -n "$rp_cluster_create_line" ] && [ "$rp_init_line" -lt "$rp_cluster_create_line" ]; then
   ok "F1: rp_init (line ${rp_init_line}) precedes the first rp_cluster_create call (line ${rp_cluster_create_line})"
 else
   bad "F1: expected rp_init before the first rp_cluster_create call; rp_init_line=${rp_init_line:-<none>} rp_cluster_create_line=${rp_cluster_create_line:-<none>}"
+fi
+
+# The filter above actually filters -- proven against a synthetic fixture
+# (the real file has no commented-out mention to exercise it against): a
+# comment-only line naming rp_cluster_create must never be read as the real
+# call.
+comment_fixture="$SANDBOX/comment-filter-fixture.sh"
+printf '# rp_cluster_create mentioned only in a comment\nrp_cluster_create "$x" "$y"\n' > "$comment_fixture"
+filtered_line="$(grep -n 'rp_cluster_create ' "$comment_fixture" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1)"
+if [ "$filtered_line" = "2" ]; then
+  ok "F10: the comment-vs-code filter actually filters a commented-out mention (line 1), landing on the real call (line 2)"
+else
+  bad "F10: expected the filter to skip line 1's comment and land on line 2; got '${filtered_line:-<none>}'"
 fi
 
 # ============================================================================

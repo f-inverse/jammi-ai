@@ -658,6 +658,19 @@ class DropCommentLinesTrailingCommentTest(unittest.TestCase):
         self.assertNotIn("rp_cluster_create", stripped)
         self.assertIn("real code", stripped)
 
+    def test_a_backslash_escaped_apostrophe_inside_a_single_quoted_string_is_not_a_toggle(self) -> None:
+        # bash's own `'\''` idiom for embedding a literal apostrophe inside
+        # a single-quoted string is THREE quote characters but only TWO
+        # real quote-state toggles (close, then reopen) -- the middle one
+        # is a backslash-escaped LITERAL character. A parser that toggles
+        # on all three ends up believing it is still inside a string, and
+        # fails to strip a REAL trailing comment that follows (round-2
+        # audit advisory).
+        text = "echo 'it'\\''s done'  # mentions rp_cluster_create only here\n"
+        stripped = cgo.drop_comment_lines(text)
+        self.assertNotIn("rp_cluster_create", stripped)
+        self.assertIn("echo 'it'\\''s done'", stripped)
+
 
 class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
     """P7's 'nothing may call a paid pod lane' rule reads a job-level

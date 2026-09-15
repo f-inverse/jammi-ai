@@ -1445,10 +1445,16 @@ def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list
             f"`gang.ranks` covers rank indices {sorted(seen)}, not 0..{world - 1} — every rank of the "
             "cluster gang records its own row"
         )
-    if len(hosts_seen) >= 2 and len(set(hosts_seen)) != len(hosts_seen):
+    # F4 advisory: compared case-insensitively (and stripped) -- the SAME
+    # normalization the assembler's own `_norm_host` applies before it ever
+    # writes the artifact, so "Host-A" and "host-a" are never read as two
+    # distinct hosts on either side of the producer/checker boundary.
+    hosts_norm = [h.strip().casefold() for h in hosts_seen]
+    if len(hosts_norm) >= 2 and len(set(hosts_norm)) != len(hosts_norm):
         failures.append(
-            f"`gang.ranks[].host` repeats a host across ranks ({hosts_seen}) — a two-host cluster gang "
-            "with two ranks on the SAME host is not the two-host bootstrap this leg exists to prove"
+            f"`gang.ranks[].host` repeats a host across ranks ({hosts_seen}, compared case-insensitively) "
+            "— a two-host cluster gang with two ranks on the SAME host is not the two-host bootstrap this "
+            "leg exists to prove"
         )
     if verdict == GANG_VERDICT_PASS and len(digests_seen) >= 2:
         valid = [d for d in digests_seen if isinstance(d, str) and GANG_DIGEST_RE.match(d)]
@@ -3350,6 +3356,20 @@ def self_test() -> int:
             "x.json",
             "repeats a host across ranks",
             "rule (k) F4: two ranks on the same host FAILS",
+        )
+
+        # (i-b) two ranks on the SAME host differing only in CASE also FAILS
+        # -- compared case-insensitively (and stripped), the same
+        # normalization the assembler's own `_norm_host` applies before it
+        # ever writes an artifact (F4 advisory).
+        bad = gang_cluster_baseline()
+        bad["gang"]["ranks"][0]["host"] = "Host-A"
+        bad["gang"]["ranks"][1]["host"] = "host-a"
+        expect_hit(
+            bad,
+            "x.json",
+            "repeats a host across ranks",
+            "rule (k) F4: two ranks on the same host differing only in case FAILS",
         )
 
         # (ii) an `unknown` host or iface FAILS -- the driver's own

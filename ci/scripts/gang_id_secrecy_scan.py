@@ -142,10 +142,31 @@ def id_needles(id_bytes: bytes) -> list[tuple[str, bytes]]:
     ]
 
 
+def _strip_whitespace(data: bytes) -> bytes:
+    """Every ASCII whitespace byte removed (space, tab, CR, LF, VT, FF) --
+    the shape a line-wrapped base64 encoder inserts (`base64`'s coreutils
+    default wraps at 76 columns with `\\n`; `openssl base64` wraps at 64),
+    never any other transformation."""
+    return data.translate(None, b" \t\r\n\v\f")
+
+
 def _scan_bytes(data: bytes, needles: list[tuple[str, bytes]]) -> str | None:
+    """A needle occurring contiguously in `data` is a hit. A base64-labeled
+    needle is ALSO checked against a whitespace-stripped copy of `data`,
+    lazily computed only when the raw check misses -- a line-wrapped
+    base64 encoding (F5 advisory) would otherwise never match a single
+    contiguous needle even though the id is plainly present."""
+    stripped: bytes | None = None
     for name, needle in needles:
-        if needle and needle in data:
+        if not needle:
+            continue
+        if needle in data:
             return name
+        if name.startswith("base64"):
+            if stripped is None:
+                stripped = _strip_whitespace(data)
+            if needle in stripped:
+                return name
     return None
 
 
@@ -190,34 +211,42 @@ def scan_file(path: Path, needles: list[tuple[str, bytes]]) -> tuple[int, str]:
 def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, str]]:
     """Every file under `root`, recursively. NEVER `os.walk(followlinks=True)`
     — that detects no cycles at all and hangs forever on a cyclic directory
-    symlink (`rsync -a` preserves a symlink exactly as planted). This walk
-    instead tracks the REAL path of every directory it has entered; a
-    directory whose real path repeats is a cycle — one UNEXAMINABLE finding
-    naming the path, never a re-descent. A directory that cannot itself be
-    listed is one UNEXAMINABLE finding for the whole subtree (fail-closed:
-    an incomplete listing is worse than no listing at all — the same
-    doctrine `rp_cluster_sweep`'s enumeration failures use)."""
+    symlink (`rsync -a` preserves a symlink exactly as planted). NEVER a
+    recursive helper either (P-B): a directory this deep is not implausible
+    for a pulled artifact tree, and Python's own call-stack recursion limit
+    is a THIRD, independent way this scan could fail besides a hit or an
+    unreadable carrier — a `RecursionError` escaping uncaught would exit
+    with the wrong code (or a bare traceback), never the scan's own 1/2
+    lattice. This walk instead tracks the REAL path of every directory it
+    has entered on an EXPLICIT stack (a plain Python list): a directory
+    whose real path repeats is a cycle — one UNEXAMINABLE finding naming
+    the path, never a re-descent. A directory that cannot itself be listed
+    is one UNEXAMINABLE finding for the whole subtree (fail-closed: an
+    incomplete listing is worse than no listing at all — the same doctrine
+    `rp_cluster_sweep`'s enumeration failures use)."""
     if not root.is_dir():
         return [(STATUS_UNEXAMINABLE, f"{root}: not a directory (pulled artifact dir missing?)")]
     findings: list[tuple[int, str]] = []
     visited_dirs: set[str] = set()
+    stack: list[Path] = [root]
 
-    def walk(d: Path) -> None:
+    while stack:
+        d = stack.pop()
         try:
             real_d = d.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             findings.append((STATUS_UNEXAMINABLE, f"{d}: dangling symlink or unresolvable ({exc})"))
-            return
+            continue
         key = str(real_d)
         if key in visited_dirs:
             findings.append((STATUS_UNEXAMINABLE, f"{d}: cyclic carrier — directory symlink cycle back to {real_d}"))
-            return
+            continue
         visited_dirs.add(key)
         try:
             entries = sorted(real_d.iterdir(), key=lambda p: p.name)
         except OSError as exc:
             findings.append((STATUS_UNEXAMINABLE, f"{d}: unreadable directory ({exc})"))
-            return
+            continue
         for entry in entries:
             try:
                 lst = entry.lstat()
@@ -225,7 +254,7 @@ def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, st
                 findings.append((STATUS_UNEXAMINABLE, f"{entry}: unreadable ({exc})"))
                 continue
             if stat.S_ISDIR(lst.st_mode) and not stat.S_ISLNK(lst.st_mode):
-                walk(entry)
+                stack.append(entry)
                 continue
             if stat.S_ISLNK(lst.st_mode):
                 try:
@@ -234,7 +263,7 @@ def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, st
                     findings.append((STATUS_UNEXAMINABLE, f"{entry}: dangling symlink or unresolvable ({exc})"))
                     continue
                 if stat.S_ISDIR(target_st.st_mode):
-                    walk(entry)
+                    stack.append(entry)
                     continue
                 # A symlink to a non-directory falls through to the ordinary
                 # per-file handling below — scan_file resolves it itself.
@@ -242,7 +271,6 @@ def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, st
             if status != STATUS_CLEAN:
                 findings.append((status, msg))
 
-    walk(root)
     return findings
 
 
@@ -307,6 +335,14 @@ def run_scan(
             return _run_scan_body(staging_file, artifact_dir, log, assembled_artifact, delete_staging)
     except ScanTimeout as exc:
         print(f"gang-id-secrecy-scan: UNEXAMINABLE: {exc}", file=sys.stderr)
+        return STATUS_UNEXAMINABLE
+    except Exception as exc:  # noqa: BLE001 -- P-B: the scan's own exit lattice
+        # is TOTAL. A RecursionError, or any other exception the scanner's
+        # own code raises (a bug in this module, an environment this module's
+        # author did not anticipate), is UNEXAMINABLE (2), never exit 1 and
+        # never an uncaught traceback (which a shell caller would read as an
+        # ambiguous nonzero, not this scan's own documented lattice).
+        print(f"gang-id-secrecy-scan: UNEXAMINABLE: the scan itself failed unexpectedly: {exc!r}", file=sys.stderr)
         return STATUS_UNEXAMINABLE
 
 
@@ -631,6 +667,70 @@ class GangIdSecrecyScanTest(unittest.TestCase):
                 rc = run_scan(self.staging, self.artifact_dir, self.log, self.assembled, False, budget_secs=1)
         self.assertEqual(rc, STATUS_UNEXAMINABLE)
         self.assertIn("wall-clock budget", buf_out.getvalue() + buf_err.getvalue())
+
+    def test_line_wrapped_base64_coreutils_width_is_still_a_hit(self) -> None:
+        # coreutils `base64` wraps at 76 columns by default -- a leak into a
+        # log via that CLI would never appear as one contiguous needle.
+        b64 = base64.b64encode(self.id_bytes).decode("ascii")
+        wrapped = "\n".join(b64[i : i + 76] for i in range(0, len(b64), 76))
+        self.log.write_text("leaked (76-col wrapped):\n" + wrapped + "\n")
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_HIT)
+        self.assertIn("base64", out)
+
+    def test_line_wrapped_base64_openssl_width_is_still_a_hit(self) -> None:
+        # `openssl base64` wraps at 64 columns by default -- a second,
+        # differently-wrapped shape the ship step could plausibly emit.
+        b64 = base64.b64encode(self.id_bytes).decode("ascii")
+        wrapped = "\n".join(b64[i : i + 64] for i in range(0, len(b64), 64))
+        self.log.write_text("leaked (64-col wrapped):\n" + wrapped + "\n")
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_HIT)
+        self.assertIn("base64", out)
+
+    def test_deep_tree_well_beyond_the_recursion_limit_does_not_crash(self) -> None:
+        # P-B: `scan_dir` uses an EXPLICIT stack, never Python call-stack
+        # recursion — proven here by lowering `sys.getrecursionlimit()` far
+        # below the tree's own depth (a real filesystem depth deep enough to
+        # exceed a typical OS `PATH_MAX` differs by platform, so this proves
+        # the underlying property directly and portably: if `scan_dir` still
+        # recursed per directory level, this would raise `RecursionError`
+        # long before reaching the bottom). The deepest directory carries a
+        # planted id, so completing the walk AND finding it both prove the
+        # explicit stack actually reaches full depth, not merely "does not
+        # crash immediately".
+        depth = 200
+        deep = self.artifact_dir
+        for _ in range(depth):
+            deep = deep / "d"
+        deep.mkdir(parents=True)  # built at the NORMAL recursion limit -- pathlib's own mkdir(parents=True) recurses too.
+        (deep / "leak.bin").write_bytes(self.id_bytes)
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(40)  # far below `depth` -- only the SCAN below runs under this lowered limit.
+        try:
+            rc, out = self._run()
+        finally:
+            sys.setrecursionlimit(old_limit)
+        self.assertEqual(rc, STATUS_HIT, f"a {depth}-level-deep tree must be walked to completion, not crash: {out}")
+        self.assertIn("raw encoding", out)
+
+    def test_scan_dir_raising_an_unexpected_exception_is_unexaminable_not_a_traceback(self) -> None:
+        # P-B: ANY failure of the scanner itself -- not only its own
+        # documented ScanTimeout -- is exit 2, never exit 1, never an
+        # uncaught traceback. Simulated here by making `scan_dir` itself
+        # raise, the same shape `test_wall_clock_budget_expiry_...` already
+        # uses for the timeout arm.
+        import unittest.mock as mock
+
+        def _raising_scan_dir(_root: Path, _needles: object) -> list[tuple[int, str]]:
+            raise RuntimeError("injected failure -- simulates a bug in the scanner itself")
+
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch(f"{__name__}.scan_dir", _raising_scan_dir):
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = run_scan(self.staging, self.artifact_dir, self.log, self.assembled, False)
+        self.assertEqual(rc, STATUS_UNEXAMINABLE)
+        self.assertIn("failed unexpectedly", buf_out.getvalue() + buf_err.getvalue())
 
     def test_hex_upper_and_lower_are_distinct_needles(self) -> None:
         # A control proving the two cases are checked independently: an id

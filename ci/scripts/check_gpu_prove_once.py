@@ -459,12 +459,24 @@ def _strip_trailing_comment(line: str) -> str:
     rule bash/YAML both use -- a `#` glued to a non-whitespace character,
     e.g. a URL fragment or a hex color literal, is never a comment start).
     Single- and double-quoted spans are tracked so a `#` inside a string
-    literal is never mistaken for one. Best-effort, not a real
-    shell/YAML tokenizer -- good enough for 'is this token evidence, or
-    only prose' over this module's own token-resolution search, never
-    relied on for anything security-load-bearing beyond that."""
+    literal is never mistaken for one. A backslash-escaped apostrophe
+    (bash's own `'\\''` idiom for embedding a literal quote inside a
+    single-quoted string -- three quote characters, but the MIDDLE one is a
+    literal char, never a real delimiter) is skipped rather than toggled: a
+    parser that toggled all three would end up believing it is still
+    inside a string, and would fail to strip a REAL trailing comment that
+    follows (round-2 audit advisory). Best-effort, not a real shell/YAML
+    tokenizer -- good enough for 'is this token evidence, or only prose'
+    over this module's own token-resolution search, never relied on for
+    anything security-load-bearing beyond that."""
     in_squote = in_dquote = False
-    for i, ch in enumerate(line):
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and i + 1 < n and line[i + 1] == "'":
+            i += 2
+            continue
         if ch == "'" and not in_dquote:
             in_squote = not in_squote
         elif ch == '"' and not in_squote:
@@ -472,6 +484,7 @@ def _strip_trailing_comment(line: str) -> str:
         elif ch == "#" and not in_squote and not in_dquote:
             if i == 0 or line[i - 1].isspace():
                 return line[:i]
+        i += 1
     return line
 
 

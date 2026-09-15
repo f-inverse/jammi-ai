@@ -61,11 +61,20 @@
 # LOCAL staging copy (`$RP_WORK/nccl.id`, mode 0600), then `scp`s that
 # staging copy up to the member host — ONLY THEN does rank 1 start. The id
 # never rides inside `JAMMI_GANG_ARTIFACT_DIR` and never reaches this
-# driver's own stdout/log in the clear; `ci/scripts/gang_id_secrecy_scan.py`
-# (F5) scans every carrier this run produces (the pulled artifact dir, the
-# run log, the assembled artifact, the staging copy's own directory
-# listing) for the id in every encoding the ship step could emit (raw, hex
-# either case, base64) before the staging copy is deleted.
+# driver's own stdout/log in the clear. The moment the download from the
+# primary is ATTEMPTED, this driver's own EXIT trap starts scanning: on
+# EVERY exit arm from that point on — the happy path, a failed pull, a
+# refused assembly, an inactivity/wrong-tree/budget cut — the trap runs
+# `ci/scripts/gang_id_secrecy_scan.py` (F5) over every carrier the run has
+# produced so far (the pulled artifact dir, the run log, the assembled
+# artifact when one exists, the staging copy's own directory listing) for
+# the id in every encoding the ship step could emit (raw, hex either case,
+# base64, including a line-wrapped base64 encoding). A scan that is not
+# clean QUARANTINES the whole carrier directory outside the uploaded path
+# (or empties it in place) before this process exits, so
+# `actions/upload-artifact`'s own `if: always()` step can never see an
+# unscanned or dirty byte; the staging copy is deleted on every exit,
+# unconditionally, once the trap has run.
 #
 # THE ARTIFACT: one `gang` artifact (`gang.leg = "cluster"`, `producer.path
 # = "ci/scripts/runpod_gpu_cluster.sh"` — THIS driver names itself as the
@@ -77,21 +86,30 @@
 # (`world`, `collective`, `hosts`, `ranks[]` — each carrying its OWN
 # `reduced_vector_digest`, kept per rank and asserted equal on `pass`,
 # never collapsed here — `verdict`, `pod_count`, `gpu_count_per_pod`,
-# `ttl_hours`). Assembly itself REFUSES (named, never an artifact) when
-# either rank's own `hostname`/`nccl_socket_ifname` is empty or `unknown`,
-# or the two ranks report the SAME host. A human reviews the pulled
-# artifact and commits it under `crates/jammi-kernels/artifacts/cuda-runs/`.
+# `ttl_hours`). `world`/`hosts`/`pod_count`/`gpu_count_per_pod` are the
+# MEASURED shape read back from the cluster RunPod actually created (`GET
+# /v2/clusters/{id}`'s own `compute` block, via `_rpc_parse_cluster_shape`)
+# — never a hardcoded literal, and refused (97, wrong shape) before any
+# member work starts if it disagrees with what this driver requested.
+# Assembly itself REFUSES (named, never an artifact) when either rank's own
+# `hostname`/`nccl_socket_ifname` is empty or `unknown`, or the two ranks
+# report the SAME host (compared case-insensitively). A human reviews the
+# pulled artifact and commits it under
+# `crates/jammi-kernels/artifacts/cuda-runs/`.
 #
 # EXIT CONTRACT: 0 pass; 75 no cluster capacity (no data center at
 # RP_CLUSTER_MIN_AVAILABILITY or better — a neutral provider condition); 76
 # inactivity kill (a hung leg, watched across BOTH ranks' output); 77 wrong
 # tree (a rank's own echoed PROVE_SHA disagreed with PROVE_EXPECT_SHA); 97
-# wrong shape (a member's launch-time read-back failed: `Pod.args` does not
-# echo the shared entrypoint text, or NEITHER `ssh.direct` nor an overlay-ip
-# proxy path is reachable for a member — see F2/F3); 124 budget cut (T-10m,
-# with the per-phase wall-clock breakdown printed); else this driver's own
-# post-run refusal, by name (a failed artifact pull, a failed id-secrecy
-# scan, a missing `ens1` line in a rank's log).
+# wrong shape (the MEASURED cluster shape, read back right after create,
+# disagrees with what this driver requested; or a member's launch-time
+# read-back failed: `Pod.args` does not echo the shared entrypoint text, or
+# NEITHER `ssh.direct` nor an overlay-ip proxy path is reachable for a
+# member — see F2/F3); 124 budget cut (T-10m, with the per-phase
+# wall-clock breakdown printed); else this driver's own post-run refusal,
+# by name (a failed artifact pull, a failed id-secrecy scan — which also
+# quarantines the carrier directory before this process exits — a missing
+# `ens1` line in a rank's log).
 #
 # TRIGGERS: `.github/workflows/gpu-cluster.yml` only — the `run-cluster` PR
 # label and manual dispatch, deliberately no `push:`/`workflow_call:`/
@@ -311,6 +329,39 @@ _rpc_ens1_seen() {
   grep -q 'NCCL INFO NET/Socket.*ens1' "$log" 2>/dev/null
 }
 
+# P-C: the MEASURED cluster shape, read from the SAME `Cluster` object
+# `rp_cluster_get` already returns (`GET /v2/clusters/{id}`, which echoes
+# the create request's own `compute` block back) -- never the request-side
+# RP_CLUSTER_POD_COUNT/RP_CLUSTER_GPU_COUNT_PER_POD literals re-asserted
+# uninspected. $1(stdin)=the raw Cluster response body. Prints
+# "podCount gpuCountPerPod" on a successful parse (both required, positive
+# integers); returns 2 when the body does not carry that shape at all --
+# closing the class the round-2 audit named: four literals duplicated into
+# the assembled artifact made check_cuda_run_artifacts.py's own cross-field
+# check (`_gang_check_cluster_shape`) a tautology.
+_rpc_parse_cluster_shape() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("PARSE_ERROR: could not parse the cluster response: %s" % e, file=sys.stderr)
+    sys.exit(2)
+compute = d.get("compute") or {}
+pod_count = compute.get("podCount")
+gpu_count_per_pod = compute.get("gpuCountPerPod")
+def _pos_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+if not _pos_int(pod_count):
+    print("PARSE_ERROR: compute.podCount missing or not a positive integer (%r)" % (pod_count,), file=sys.stderr)
+    sys.exit(2)
+if not _pos_int(gpu_count_per_pod):
+    print("PARSE_ERROR: compute.gpuCountPerPod missing or not a positive integer (%r)" % (gpu_count_per_pod,), file=sys.stderr)
+    sys.exit(2)
+print("%d %d" % (pod_count, gpu_count_per_pod))
+'
+}
+
 # The shared verdict rule (mirrors `runpod_gpu_gang.sh`'s own
 # `rp_gang_verdict`, generalized to ONE RANK's own ssh exit code + log —
 # the driver calls this ONCE PER RANK and combines both below). $1=raw ssh
@@ -440,27 +491,44 @@ EOF
 # Assembles the ONE `gang` (leg=cluster) artifact from both ranks' own
 # `rank-<r>.json` reports (this driver is the SOLE writer of the assembled
 # artifact; the ranks only report). $1=rank0 json path $2=rank1 json path
-# $3=git_sha $4=box label $5=out path. Prints nothing; returns 0 on a
-# successful write (regardless of the recorded verdict — a `fail` is
-# representable, never refused at assembly time), 1 when EITHER rank report
-# is missing or malformed (an artifact with no evidence to assemble from is
-# refused outright, never synthesized).
+# $3=git_sha $4=box label $5=out path $6=pod_count (MEASURED, from
+# `_rpc_parse_cluster_shape`) $7=gpu_count_per_pod (MEASURED) $8=ttl_hours
+# (optional, default 1). Prints nothing; returns 0 on a successful write
+# (regardless of the recorded verdict — a `fail` is representable, never
+# refused at assembly time), 1 when EITHER rank report is missing or
+# malformed (an artifact with no evidence to assemble from is refused
+# outright, never synthesized), 2 on the named per-rank refusals below.
 _rpc_assemble_gang_artifact() {
   local r0="${1:?needs rank-0.json}" r1="${2:?needs rank-1.json}" git_sha="${3:?needs git_sha}" \
-        box="${4:?needs a box label}" out="${5:?needs an output path}"
+        box="${4:?needs a box label}" out="${5:?needs an output path}" \
+        pod_count="${6:?needs the MEASURED pod_count}" gpu_count_per_pod="${7:?needs the MEASURED gpu_count_per_pod}"
   python3 -c '
 import json, sys
-r0_path, r1_path, git_sha, box, out_path = sys.argv[1:6]
+r0_path, r1_path, git_sha, box, out_path, pod_count_s, gpu_count_per_pod_s = sys.argv[1:8]
 try:
     r0 = json.load(open(r0_path))
     r1 = json.load(open(r1_path))
 except Exception as e:
     print("could not read one or both rank reports: %s" % e, file=sys.stderr)
     sys.exit(1)
+try:
+    pod_count = int(pod_count_s)
+    gpu_count_per_pod = int(gpu_count_per_pod_s)
+    if pod_count < 1 or gpu_count_per_pod < 1:
+        raise ValueError("must be >= 1")
+except ValueError as e:
+    print("could not read the measured pod_count/gpu_count_per_pod: %s" % e, file=sys.stderr)
+    sys.exit(1)
 reports = sorted([r0, r1], key=lambda r: r.get("rank", 0))
 
 def _resolved(v):
     return isinstance(v, str) and v.strip() and v.strip().lower() != "unknown"
+
+def _norm_host(v):
+    # F4 advisory: compared case-insensitively (and stripped) on BOTH this
+    # assembler and check_cuda_run_artifacts own duplicate-host check --
+    # "Host-A" and "host-a" are the same host, never a false "two hosts".
+    return (v or "").strip().casefold()
 
 # F4: a named driver refusal, never an artifact -- this assembler is the
 # SOLE writer, and check_cuda_run_artifacts.py (rule k, F4) refuses to
@@ -475,7 +543,7 @@ for r in reports:
     if not _resolved(iface):
         print("refusing to assemble: rank %r own nccl_socket_ifname is unresolved (%r)" % (r.get("rank"), iface), file=sys.stderr)
         sys.exit(2)
-if reports[0].get("hostname") == reports[1].get("hostname"):
+if _norm_host(reports[0].get("hostname")) == _norm_host(reports[1].get("hostname")):
     print("refusing to assemble: both ranks report the SAME host (%r) -- not the two-host bootstrap this leg proves" % reports[0].get("hostname"), file=sys.stderr)
     sys.exit(2)
 
@@ -526,15 +594,21 @@ artifact = {
     "artifact_kind": "gang",
     "gang": {
         "leg": "cluster",
-        "world": 2,
+        # P-C: derived from the MEASURED shape (the cluster own `compute`
+        # block, threaded in from `_rpc_parse_cluster_shape`), never a
+        # hardcoded literal -- a fixture that requests a different shape
+        # gets a different artifact, and check_cuda_run_artifacts own
+        # cross-field check (`_gang_check_cluster_shape`) is falsifiable
+        # against it.
+        "world": pod_count * gpu_count_per_pod,
         "collective": "nccl",
-        "hosts": 2,
+        "hosts": pod_count,
         "ranks": ranks,
         "reduced_vector_digest": reduced_digest,
         "verdict": verdict,
-        "pod_count": 2,
-        "gpu_count_per_pod": 1,
-        "ttl_hours": int((sys.argv[6] if len(sys.argv) > 6 else "1")),
+        "pod_count": pod_count,
+        "gpu_count_per_pod": gpu_count_per_pod,
+        "ttl_hours": int((sys.argv[8] if len(sys.argv) > 8 else "1")),
     },
 }
 if verdict == "fail":
@@ -542,7 +616,7 @@ if verdict == "fail":
 with open(out_path, "w") as f:
     json.dump(artifact, f, indent=2)
     f.write("\n")
-' "$r0" "$r1" "$git_sha" "$box" "$out" "${RP_TTL_HOURS}"
+' "$r0" "$r1" "$git_sha" "$box" "$out" "$pod_count" "$gpu_count_per_pod" "${RP_TTL_HOURS}"
 }
 
 # Wraps the id-secrecy scan (F5, `gang_id_secrecy_scan.py`) invocation in
@@ -577,6 +651,42 @@ _rpc_self_remove_status() {
   esac
 }
 
+# P-A: runs from the EXIT trap, on EVERY arm, once the id has landed on
+# this runner (`id_landed=1`, set the moment the download from the primary
+# is ATTEMPTED -- see the executed block below -- never only on the
+# happy-path tail). Scans the WHOLE carrier directory (F5/M4) via the SAME
+# `_rpc_run_id_secrecy_scan` the happy path already used, and on anything
+# other than a clean scan MOVES the entire carrier directory outside the
+# uploaded path (fail-closed: never a partial or unscanned upload) so
+# `actions/upload-artifact`'s own `if: always()` step can only ever see
+# scanned-clean bytes. Globals read: STAGING_ID_FILE, CLUSTER_ARTIFACT_DIR,
+# RUN_LOG, ASSEMBLED (all set early in the executed block, before any exit
+# arm can fire, so they are stable by the time this runs regardless of
+# which phase the process is exiting from). Returns 0 (clean, or nothing to
+# scan yet) or the scan's own non-zero status (1 hit, 2 unexaminable) for
+# the caller to join into the pending exit code.
+_rpc_scan_or_quarantine() {
+  [ "${id_landed:-0}" = "1" ] || return 0
+  local scan_rc
+  _rpc_run_id_secrecy_scan "$STAGING_ID_FILE" "$CLUSTER_ARTIFACT_DIR" "$RUN_LOG" "$ASSEMBLED"
+  scan_rc=$?
+  if [ "$scan_rc" -ne 0 ]; then
+    local quarantine_dir="${RP_WORK:-${TMPDIR:-/tmp}}/gpu-cluster-quarantine-$$"
+    if [ -d "$CLUSTER_ARTIFACT_DIR" ] && mv "$CLUSTER_ARTIFACT_DIR" "$quarantine_dir" 2>/dev/null; then
+      # The relocated directory's own run.log is the SAME open file this
+      # process has been tee'ing into (mv preserves the inode) -- this line
+      # therefore lands as the run log's own LAST line, never a second,
+      # unscanned append to whatever remains (nothing remains) at the
+      # uploaded path.
+      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was QUARANTINED to ${quarantine_dir} (outside ${CLUSTER_ARTIFACT_DIR}); the upload step finds nothing there"
+    else
+      rm -rf "${CLUSTER_ARTIFACT_DIR:?}"/* "${CLUSTER_ARTIFACT_DIR:?}"/.[!.]* 2>/dev/null
+      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory could not be relocated, so it was EMPTIED in place; nothing reaches the upload step"
+    fi
+  fi
+  return "$scan_rc"
+}
+
 # F2/F3(c): captures the PENDING exit status FIRST ($? here is whatever the
 # script was about to exit with), chains runpod_lib.sh's own `rp_cleanup`
 # (this trap REPLACES the `trap rp_cleanup EXIT` that sourcing runpod_lib.sh
@@ -603,7 +713,23 @@ _rpc_cleanup_cluster() {
       [ "$rc" -eq 0 ] && rc=1
     fi
   fi
-  rp_cleanup  # F2: chain the library's own EXIT cleanup (rm -rf "$RP_WORK" -- the staging id file and the ssh keypair).
+
+  # P-A: no byte reaches the upload unscanned, on EVERY exit arm.
+  local scan_rc
+  _rpc_scan_or_quarantine
+  scan_rc=$?
+  [ "$scan_rc" -ne 0 ] && [ "$rc" -eq 0 ] && rc="$scan_rc"
+
+  # F5 advisory: the staging id file is deleted on EVERY exit AFTER the
+  # scan above, regardless of RP_SESSION/RP_WORK_IS_TEMP -- never left to
+  # rp_cleanup's own conditional `rm -rf "$RP_WORK"` (which only fires when
+  # RP_WORK_IS_TEMP=1), and never left behind for "inspection" on a dirty
+  # scan either: a destroyed CI runner is not somewhere a human can inspect
+  # anything, so unconditional deletion here is strictly safer than the
+  # scanner's own generic (reusable) leave-it-for-a-caller default.
+  [ -n "${STAGING_ID_FILE:-}" ] && rm -f "$STAGING_ID_FILE" 2>/dev/null
+
+  rp_cleanup  # F2: chain the library's own EXIT cleanup (rm -rf "$RP_WORK" when RP_WORK_IS_TEMP=1 -- the ssh keypair).
   exit "$rc"
 }
 
@@ -620,6 +746,20 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 # emits is written to an unuploaded, unscanned path.
 mkdir -p "$CLUSTER_ARTIFACT_DIR"
 RUN_LOG="$CLUSTER_ARTIFACT_DIR/run.log"
+# P-A: a STABLE path, computed once, here — before the tee even starts —
+# so the EXIT trap's own scan-or-quarantine (`_rpc_scan_or_quarantine`)
+# knows exactly where to look on EVERY exit arm, including one that fires
+# long before assembly is ever reached (the file simply will not exist yet
+# on those arms, which the scanner already reads as UNEXAMINABLE, never
+# clean — see gang_id_secrecy_scan.py's own missing-carrier handling).
+ASSEMBLED="${CLUSTER_ARTIFACT_DIR}/gang-cluster-$(date -u +%Y%m%d%H%M%S).json"
+# P-A: whether the NCCL id has landed locally on this runner yet (never
+# only "the happy path completed") -- set the moment the download from the
+# primary is ATTEMPTED, below. The EXIT trap only ever scans once this is 1:
+# before that point the id exists only on rank 0's own remote host, which
+# this driver has not yet read the CONTENTS of (only its remote SIZE, via
+# `stat` over ssh), so there is nothing local yet that could carry it.
+id_landed=0
 exec > >(tee -a "$RUN_LOG") 2>&1   # F6: ONE tee'd stream for every byte this driver emits.
 
 _rpc_phase() { echo "=== PHASE ($(( SECONDS )))s: $* ==="; }
@@ -663,6 +803,22 @@ echo "cluster ${cluster_id} created"
 # merely sourcing this file, mocking `_rp_rest`/`rp_cluster_delete`) — only
 # the trap REGISTRATION itself is an executed-only action.
 trap _rpc_cleanup_cluster EXIT
+
+# P-C: the MEASURED shape, read back from the cluster RunPod actually
+# created (never the request-side RP_CLUSTER_POD_COUNT/
+# RP_CLUSTER_GPU_COUNT_PER_POD literals re-asserted uninspected) — this is
+# also the wrong-shape refusal the module doc's own EXIT CONTRACT already
+# names (97: "member count or GPU count != payload"), just not actually
+# checked against a measurement until now.
+cluster_body="$(rp_cluster_get "$cluster_id")" || { echo "::error::could not read back the created cluster's own shape"; exit 97; }
+shape_line="$(printf '%s' "$cluster_body" | _rpc_parse_cluster_shape)" \
+  || { echo "::error::the cluster's own GET response does not carry a valid compute.podCount/gpuCountPerPod -- refusing to trust the request-side literal instead"; exit 97; }
+read -r MEASURED_POD_COUNT MEASURED_GPU_COUNT_PER_POD <<< "$shape_line"
+if [ "$MEASURED_POD_COUNT" != "$RP_CLUSTER_POD_COUNT" ] || [ "$MEASURED_GPU_COUNT_PER_POD" != "$RP_CLUSTER_GPU_COUNT_PER_POD" ]; then
+  echo "::error::RunPod granted a ${MEASURED_POD_COUNT}x${MEASURED_GPU_COUNT_PER_POD} cluster, not the ${RP_CLUSTER_POD_COUNT}x${RP_CLUSTER_GPU_COUNT_PER_POD} this driver requested -- refusing (wrong shape)"
+  exit 97
+fi
+echo "measured cluster shape: ${MEASURED_POD_COUNT}x${MEASURED_GPU_COUNT_PER_POD}"
 
 _rpc_phase "waiting for both members RUNNING with a usable ssh path"
 primary_host="" primary_port="" member_host="" member_port="" member_ip="" pods_body="" ok_count=0
@@ -750,6 +906,16 @@ if [ "$id_ready" -ne 1 ]; then
   exit 76
 fi
 
+# P-A: from THIS line on, the id is about to exist locally on this runner
+# -- every exit arm from here onward (a failed download, a bad staging
+# size, a failed upload to the member, the watch loop's own inactivity/
+# wrong-tree/budget exits, a failed pull, a refused assembly) is scanned by
+# the EXIT trap before anything can be uploaded. Set BEFORE the download is
+# attempted, not after it succeeds, so a partially-written staging file
+# from a failed transfer is scanned (and refused as UNEXAMINABLE by its
+# own wrong byte-length, never silently skipped) rather than ignored.
+id_landed=1
+
 scp "${RP_SSHO[@]}" -P "$primary_port" "root@${primary_host}:${CLUSTER_REMOTE_ID_FILE}" "$STAGING_ID_FILE" \
   || { echo "::error::could not scp the id down from the primary"; kill -TERM "$rank0_pid" 2>/dev/null; wait "$rank0_pid" 2>/dev/null; exit 76; }
 chmod 600 "$STAGING_ID_FILE"
@@ -835,33 +1001,27 @@ if [ "$pull_rc" -ne 0 ]; then
 fi
 
 _rpc_phase "assembling the gang artifact"
-ASSEMBLED="${CLUSTER_ARTIFACT_DIR}/gang-cluster-$(date -u +%Y%m%d%H%M%S).json"
+# ASSEMBLED is the STABLE path computed at the very top of this block
+# (before the tee even started) -- never recomputed here, so the EXIT
+# trap's own scan-or-quarantine (which reads the same global) always looks
+# in the place this write actually lands.
 if [ -f "${CLUSTER_ARTIFACT_DIR}/rank-0.json" ] && [ -f "${CLUSTER_ARTIFACT_DIR}/rank-1.json" ]; then
   measured_sha="${PROVE_EXPECT_SHA:-$(git -C . rev-parse HEAD 2>/dev/null || echo unknown)}"
   _rpc_assemble_gang_artifact "${CLUSTER_ARTIFACT_DIR}/rank-0.json" "${CLUSTER_ARTIFACT_DIR}/rank-1.json" \
     "$measured_sha" "a100-sxm4-cluster" "$ASSEMBLED" \
+    "$MEASURED_POD_COUNT" "$MEASURED_GPU_COUNT_PER_POD" \
     || { echo "::error::could not assemble the gang artifact" >&2; [ "$rc" -eq 0 ] && rc=1; }
 else
   echo "::error::one or both rank reports were not pulled -- cannot assemble the gang artifact" >&2
   [ "$rc" -eq 0 ] && rc=1
 fi
 
-_rpc_phase "id-secrecy scan"
-if [ -f "$STAGING_ID_FILE" ]; then
-  if [ -f "$ASSEMBLED" ]; then
-    _rpc_run_id_secrecy_scan "$STAGING_ID_FILE" "$CLUSTER_ARTIFACT_DIR" "$RUN_LOG" "$ASSEMBLED"
-    scan_rc=$?
-  else
-    scan_rc=2
-    echo "::error::no assembled artifact exists to scan" >&2
-  fi
-  if [ "$scan_rc" -ne 0 ]; then
-    echo "::error::id-secrecy scan FAILED (rc=${scan_rc}) -- a carrier may hold the NCCL id, or could not be examined" >&2
-    [ "$rc" -eq 0 ] && rc="$scan_rc"
-  fi
-else
-  echo "::warning::no staging id file present to scan (a prior phase never reached id-shipping)"
-fi
+# P-A: the id-secrecy scan itself now runs from the EXIT trap
+# (`_rpc_scan_or_quarantine`, via `_rpc_cleanup_cluster`) on EVERY exit arm
+# -- including this one, the natural fall-through below -- not only here on
+# the happy-path tail. Nothing further to do in THIS phase; the trap reads
+# the same STAGING_ID_FILE/CLUSTER_ARTIFACT_DIR/RUN_LOG/ASSEMBLED globals
+# this block has been populating all along.
 
 _rpc_phase "billing read (F16)"
 billing_resp="$(_rp_rest GET /v2/billing/clusters)"

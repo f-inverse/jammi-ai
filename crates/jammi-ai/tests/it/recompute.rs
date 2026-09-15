@@ -1048,3 +1048,166 @@ async fn reattest_with_new_digest(session: &InferenceSession, table: &str, new_b
         .await
         .unwrap();
 }
+
+// ── #500: the `TrainingSet` replay arm re-resolves a recorded PINNED
+//    anchor pinned, never silently downgrading it to unpinned ──
+//
+// `pipeline::recompute`'s `TrainingSet` arm reads the table's own recorded
+// `input_anchors` and re-anchors every relation they name at replay time.
+// Before this fix it did so UNCONDITIONALLY as `unpinned_at_instant`,
+// regardless of the recorded anchor's own kind — harmless while every
+// training-set input actually recorded was itself unpinned (the only shape
+// `materialize_projection` ever wrote), but a latent bug the moment ANY
+// producer records a PINNED input on a `TrainingSet`-kind table:
+// `ProducingDescriptor::FineTune` makes that possible for the first time,
+// anchoring the training set it trained from by content digest. These tests
+// exercise `recompute_training_set`'s anchor handling directly via a
+// hand-forged manifest fixture rather than requiring an end-to-end
+// pinned-source production path.
+
+/// Overwrite a table's `.materialization.json` sidecar's `input_anchors` —
+/// the addendum test fixture: forges the ONE thing under test (the recorded
+/// anchor set) while leaving every other manifest field (`descriptor`,
+/// `artifact`, `definition_hash`, …) exactly as the real producer wrote it.
+async fn overwrite_input_anchors(
+    session: &InferenceSession,
+    table: &str,
+    anchors: Vec<InputAnchor>,
+) {
+    let record = session
+        .catalog()
+        .get_result_table(table)
+        .await
+        .unwrap()
+        .unwrap();
+    let url = StorageUrl::parse(&record.parquet_path).unwrap();
+    let store = session.result_store();
+    let original = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("manifest present");
+    let updated = jammi_db::store::manifest::MaterializationManifest {
+        input_anchors: anchors,
+        ..original
+    };
+    let handle = store.open_parquet(&url).unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, updated.to_json_bytes().unwrap().into())
+        .await
+        .unwrap();
+}
+
+/// A recorded [`AnchorKind::ResultDigest`] anchor (a genuinely PINNED shape —
+/// the same kind [`ProducingDescriptor::FineTune`]'s own input anchor uses)
+/// replays PINNED: the replayed table's fresh manifest carries the SAME kind
+/// over the SAME source, re-resolved to the source's CURRENT digest — never
+/// silently downgraded to [`AnchorKind::UnpinnedAtInstant`].
+#[tokio::test]
+async fn recompute_training_set_re_resolves_a_pinned_result_digest_anchor_pinned() {
+    let (session, _dir, emb) = session_with_synthetic_embeddings().await;
+
+    let (table, _batches) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "points",
+        &["_row_id".to_string()],
+        jammi_ai::model::ModelTask::TextEmbedding,
+        "pinned_anchor_probe_v1",
+    )
+    .await
+    .unwrap();
+
+    // Forge the training set's OWN manifest: ONE pinned anchor over the
+    // synthetic embedding table (a real, resolvable `result_tables` row), at
+    // a deliberately STALE digest value distinct from the table's real
+    // current one — so a passing re-resolution is observable (the replayed
+    // anchor must carry the CURRENT digest, not this forged stale one).
+    let stale = ArtifactDigest("stale-digest-does-not-match-current".to_string());
+    overwrite_input_anchors(
+        &session,
+        table.table_name(),
+        vec![InputAnchor::result_digest(emb.table_name.clone(), &stale)],
+    )
+    .await;
+
+    let svc = Session::new(Arc::clone(&session));
+    let report = svc
+        .recompute(table.table_name(), Cascade::ReportOnly)
+        .await
+        .unwrap();
+    let replayed_name = report.recomputed[0].recomputed.clone();
+
+    let replayed_record = session
+        .catalog()
+        .get_result_table(&replayed_name)
+        .await
+        .unwrap()
+        .unwrap();
+    let replayed_url = StorageUrl::parse(&replayed_record.parquet_path).unwrap();
+    let replayed_manifest = session
+        .result_store()
+        .read_materialization_manifest(&replayed_url)
+        .await
+        .unwrap()
+        .expect("replay must write its own manifest");
+
+    assert_eq!(
+        replayed_manifest.input_anchors.len(),
+        1,
+        "the single recorded anchor must replay as exactly one anchor"
+    );
+    let anchor = &replayed_manifest.input_anchors[0];
+    assert_eq!(
+        anchor.kind,
+        jammi_db::store::manifest::AnchorKind::ResultDigest,
+        "a pinned anchor must replay PINNED, never silently downgraded to unpinned; got {anchor:?}"
+    );
+    assert_eq!(anchor.source, emb.table_name);
+    let current_digest = artifact_digest(&session, &emb.table_name).await;
+    assert_eq!(
+        anchor.anchor.0, current_digest,
+        "a re-resolved pinned anchor must carry the CURRENT digest, never the stale recorded one"
+    );
+}
+
+/// The other determinant the addendum names: a recorded PINNED anchor whose
+/// target no longer resolves (deregistered / reaped) is `NotRecomputable`,
+/// naming the anchor — never silently treated as unpinned, and never a panic.
+#[tokio::test]
+async fn recompute_training_set_refuses_a_pinned_anchor_whose_target_is_gone() {
+    let (session, _dir, _emb) = session_with_synthetic_embeddings().await;
+
+    let (table, _batches) = jammi_ai::fine_tune::training_set::materialize_projection(
+        &session,
+        "points",
+        &["_row_id".to_string()],
+        jammi_ai::model::ModelTask::TextEmbedding,
+        "pinned_anchor_probe_v1",
+    )
+    .await
+    .unwrap();
+
+    let stale = ArtifactDigest("stale-digest".to_string());
+    overwrite_input_anchors(
+        &session,
+        table.table_name(),
+        vec![InputAnchor::result_digest(
+            "a-table-that-was-never-materialised",
+            &stale,
+        )],
+    )
+    .await;
+
+    let svc = Session::new(Arc::clone(&session));
+    let err = svc
+        .recompute(table.table_name(), Cascade::ReportOnly)
+        .await
+        .expect_err(
+            "a pinned anchor whose target no longer resolves must refuse, not silently downgrade",
+        );
+    assert!(
+        matches!(err, JammiError::NotRecomputable { .. }),
+        "expected NotRecomputable, got {err:?}"
+    );
+}

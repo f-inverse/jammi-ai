@@ -32,6 +32,7 @@ fn main() {
         proto_root.join("jammi/v1/audit.proto"),
         proto_root.join("jammi/v1/lifecycle.proto"),
         proto_root.join("jammi/v1/peer.proto"),
+        proto_root.join("jammi/v1/gang.proto"),
     ];
 
     for f in &proto_files {
@@ -49,6 +50,16 @@ fn main() {
     let mut config = tonic_prost_build::Config::new();
     config.enable_type_names();
     config.type_name_domain(["."], "type.googleapis.com");
+
+    // `JobEvent.Event.done` carries a whole `JobStatusResponse` beside
+    // `Event.progress`'s much smaller `JobProgress`; a `ModelResult` field
+    // (`cache_outcome`) tipped that gap over clippy's
+    // `large_enum_variant` threshold (the streaming frame paid for a full
+    // terminal payload on the hot `progress` variant's stack slot too).
+    // Boxing the rarely-taken terminal frame carries the pointer size on
+    // every frame instead, at the cost of one allocation on the terminal
+    // frame alone.
+    config.boxed(".jammi.v1.job.JobEvent.event.done");
 
     // Export the compiled `FileDescriptorSet` so consumers can decode the
     // service surface from the binary itself. The tenant-isolation oracle

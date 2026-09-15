@@ -166,6 +166,34 @@ const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Rpcs served ONLY on the internal `[server] peer_bind` listener, beside
+/// `PeerService` — but NEVER appended to [`PEER_LISTENER_ALLOWLIST`], so the
+/// ground of each exemption stays stated per bucket. At the W=1 lattice this
+/// unit ships, `RunRank` reads NO tenant value at all: `Catalog::get_job_for_rank`
+/// is a primary-key row predicate with no tenant column, ambient admin scope
+/// is refused before any row is read, and the handler's only outputs are
+/// status codes. That is the whole ground of this exemption — not a
+/// derivation of tenant from the row, which nothing on this path performs.
+/// Tenant-scoped resolution (the world>1 training-set identity by the row's
+/// tenant) is U5a-2's to build (#566); when it lands, this sentence and its
+/// assertion below change to the derivation claim WITH a cross-tenant-denial
+/// case, never before. Residual stated, not hidden: a caller on `peer_bind`
+/// holding another tenant's `(job_id, coordinator_instance_id, attempt)` can
+/// distinguish `Unimplemented` (every determinant satisfied) from the fixed
+/// `FailedPrecondition`, a liveness oracle over that row — bounded by the
+/// listener's I-PEER trust (every client of `peer_bind` is a coordinator).
+///
+/// The exemption's premise — that this path is NOT reachable on the public
+/// listener — is proven in this file by
+/// [`gang_service_is_unimplemented_on_the_public_listener`], the same way
+/// [`peer_service_is_unimplemented_on_the_public_listener`] proves it for
+/// `PeerService`.
+const GANG_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[(
+    "GangService",
+    "RunRank",
+    "served only on peer_bind; reads no tenant value at W=1 (primary-key row predicate, ambient admin scope refused before any read, status-only responses); tenant-scoped resolution is U5a-2's (#566)",
+)];
+
 // ---------------------------------------------------------------------------
 // Case model
 // ---------------------------------------------------------------------------
@@ -3113,6 +3141,9 @@ fn covered_on_wire(cases: &[IsolationCase]) -> BTreeSet<String> {
     for (service, rpc, _why) in PEER_LISTENER_ALLOWLIST {
         covered.insert(format!("{service}/{rpc}"));
     }
+    for (service, rpc, _why) in GANG_LISTENER_ALLOWLIST {
+        covered.insert(format!("{service}/{rpc}"));
+    }
     covered
 }
 
@@ -3171,6 +3202,11 @@ fn allowlist_and_cases_partition_the_wire_surface() {
         .map(|(s, r)| format!("{s}/{r}"))
         .chain(
             PEER_LISTENER_ALLOWLIST
+                .iter()
+                .map(|(s, r, _why)| format!("{s}/{r}")),
+        )
+        .chain(
+            GANG_LISTENER_ALLOWLIST
                 .iter()
                 .map(|(s, r, _why)| format!("{s}/{r}")),
         )
@@ -3274,6 +3310,51 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
                 && why.contains("tenant enforced by the coordinator")
                 && why.contains("deliberately tenant-free"),
             "{service}/{rpc}: the allowlist entry must carry the I-PEER text"
+        );
+    }
+}
+
+/// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`:
+/// `GangServiceServer` is mounted only on the internal `peer_bind` `Routes`
+/// (`OssServer::bind`), beside `PeerServiceServer`, and is never added to the
+/// public `Routes`. This is the invariant that makes
+/// [`GANG_LISTENER_ALLOWLIST`] sound — a tenant-bearing caller cannot reach
+/// the gang admission handler through the public tenant layer, and on the
+/// listener it IS reachable from, no tenant value is read at W=1 (the
+/// allowlist entry's own text; tenant-scoped resolution is U5a-2's, #566).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gang_service_is_unimplemented_on_the_public_listener() {
+    use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
+    use jammi_wire::proto::gang::{rank_control, Assign, RankControl};
+
+    let server = crate::common::grpc::start_engine_server().await;
+    let channel = crate::common::grpc::channel(server.addr).await;
+    let mut client = GangServiceClient::new(channel);
+    let outbound = tokio_stream::once(RankControl {
+        control: Some(rank_control::Control::Assign(Assign {
+            job_id: "any".into(),
+            attempt: 0,
+            rank: 0,
+            world: 1,
+            coordinator_instance_id: "any".into(),
+        })),
+    });
+    let err = client
+        .run_rank(outbound)
+        .await
+        .expect_err("the public listener must not serve GangService");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "public listener must answer UNIMPLEMENTED for GangService/RunRank: {err:?}"
+    );
+    for (service, rpc, why) in GANG_LISTENER_ALLOWLIST {
+        assert!(
+            why.contains("served only on peer_bind")
+                && why.contains("reads no tenant value at W=1")
+                && why.contains("#566"),
+            "{service}/{rpc}: the allowlist entry must state the ground it actually has — no tenant \
+             value read at W=1, the derivation being U5a-2's (#566)"
         );
     }
 }

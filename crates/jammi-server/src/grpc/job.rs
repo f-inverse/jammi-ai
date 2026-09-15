@@ -215,7 +215,7 @@ impl JobService for JobServer {
                 {
                     let event = job_status_response_from_record(&job_id, &record).map(|done| {
                         pb::JobEvent {
-                            event: Some(pb::job_event::Event::Done(done)),
+                            event: Some(pb::job_event::Event::Done(Box::new(done))),
                         }
                     });
                     let _ = tx.send(event).await;
@@ -380,10 +380,12 @@ fn job_status_response_from_record(
                     model_id,
                     artifact_path,
                     metrics,
+                    cache_outcome,
                 } => pb::job_status_response::Result::Model(pb::ModelResult {
                     model_id,
                     artifact_path,
                     metrics_json: metrics,
+                    cache_outcome,
                 }),
                 EngineJobResult::Table {
                     table,

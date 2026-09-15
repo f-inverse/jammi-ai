@@ -531,6 +531,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
             config: config.clone(),
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
+        cache: jammi_db::store::CachePolicy::Bypass,
     };
     let spec_json = serde_json::to_string(&spec).unwrap();
     let job_b_id = "esc075-raw-transport-job".to_string();
@@ -1464,6 +1465,7 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
                 config: encoder_adapters_config(ComputePrecision::F32),
                 world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
+            cache: jammi_db::store::CachePolicy::Bypass,
         })
         .unwrap()
     };
@@ -1635,6 +1637,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
             config: encoder_adapters_config(ComputePrecision::F32),
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
+        cache: jammi_db::store::CachePolicy::Bypass,
     })
     .unwrap();
 

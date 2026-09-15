@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
+use jammi_db::store::CachePolicy;
 
 use crate::fine_tune::graph_sampler::{GraphFineTuneSources, GraphSampleConfig};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -29,6 +30,18 @@ use crate::pipeline::context_predictor::ContextPredictorTrainConfig;
 /// produced it (the variant) and the inputs a worker reconstructs the run from
 /// on a fresh process. Persisted as JSON on the job's `training_spec` column;
 /// the variant's [`TrainingSpec::kind`] tag is mirrored into `training_jobs.kind`.
+///
+/// No `#[serde(deny_unknown_fields)]`, by this repo's persisted-row
+/// convention: a `jobs.spec` row is always engine-written from a decoded
+/// spec, so an unknown key can only arrive via a hand edit, and this type
+/// is wrapped in `crate::jobs::JobSpec`'s `#[serde(untagged)]` (deny would
+/// collapse the outer wrapper's own "try each inner deserializer in turn"
+/// dispatch — see that type's own doc). The consequence is stated honestly
+/// rather than assumed: a stray `cache` key hand-edited under a
+/// `graph_fine_tune` row is silently DROPPED at deserialize, never refused
+/// — `TrainingSpec::GraphFineTune::cache` does not exist to receive it. See
+/// <https://github.com/f-inverse/jammi-ai/issues/548> for the `JobSpec`
+/// reshape that would let a genuinely malformed row be refused instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TrainingSpec {
@@ -50,6 +63,39 @@ pub enum TrainingSpec {
         task: ModelTask,
         /// Common base-model + optimisation knobs.
         common: TrainingCommon,
+        /// [`ProducingDescriptor::FineTune`](jammi_db::store::manifest::ProducingDescriptor::FineTune)'s
+        /// cache dial, the same shape [`crate::jobs::ComputeSpec`]'s own
+        /// `cache` field already carries for every compute kind — except
+        /// that model-level cache reuse is not yet supported for this kind:
+        /// `Use` is refused, typed, by `admit_training_spec` — the ONE
+        /// admission every durable submit edge for a `TrainingSpec` applies,
+        /// so no edge can enqueue this value; see
+        /// <https://github.com/f-inverse/jammi-ai/issues/562>. `Bypass` (the
+        /// only value a submitted job can carry past that refusal) always
+        /// trains.
+        ///
+        /// Lives HERE — on the `FineTune` variant, not on [`TrainingCommon`]
+        /// — because only this kind has a materialization to probe:
+        /// [`TrainingSpec::GraphFineTune`] carries no `cache` field at all,
+        /// so a cache policy for the graph kind is UNREPRESENTABLE rather
+        /// than merely unused.
+        ///
+        /// A CALL-TIME dial, never a determinant of the trained model's
+        /// identity: like a `ComputeSpec`'s `cache` never rides in the
+        /// [`jammi_db::store::manifest::ProducingDescriptor`] it drives, this
+        /// field is deliberately EXCLUDED from [`fine_tune_spec_canonical`]
+        /// — flipping it between two otherwise-identical submissions must
+        /// never change the definition hash, or a `Bypass` run and a `Use`
+        /// run of "the same spec" would silently become two different
+        /// trained-model identities.
+        ///
+        /// [`CachePolicy::default`] (`Bypass`) is what a spec whose JSON
+        /// carries no policy at all deserializes to, so a queued job written
+        /// before this field existed still trains unconditionally — the same
+        /// no-regression shape [`TrainingCommon::world_size`]'s own default
+        /// keeps.
+        #[serde(default)]
+        cache: CachePolicy,
     },
     /// Graph-supervised fine-tune. The worker re-reads the node/edge sources and
     /// rebuilds the [`crate::fine_tune::graph_sampler::GraphSampler`] from
@@ -77,7 +123,11 @@ pub enum TrainingSpec {
 
 /// Base-model and optimisation knobs common to the two LoRA fine-tune kinds. The
 /// predictor kind carries its budget inside its own `predictor_spec`, so this is
-/// shared only by the fine-tune variants.
+/// shared only by the fine-tune variants. `cache` (the model-level reuse dial)
+/// is NOT here: it lives directly on [`TrainingSpec::FineTune`], the only kind
+/// with a materialization to probe, so a cache policy for
+/// [`TrainingSpec::GraphFineTune`] is unrepresentable rather than merely
+/// unused.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingCommon {
     /// Base model id the adapter / head is trained over.
@@ -240,6 +290,51 @@ impl RankAdmission {
     }
 }
 
+/// The ONE admission every durable submit edge for a [`TrainingSpec`]
+/// applies before a `jobs` row is ever written: the per-kind validation
+/// (`FineTuneConfig::validate`/`GraphSampleConfig::validate`/
+/// `ContextPredictorTrainConfig::validate`), the rank admission
+/// [`RankAdmission::admit`] performs, and — for the column-source
+/// `FineTune` kind only, the sole kind `cache` is representable on —
+/// the `cache = Use` refusal (model-level cache reuse is not yet
+/// supported; see <https://github.com/f-inverse/jammi-ai/issues/562>).
+///
+/// Every edge that can turn a `TrainingSpec` into a durable row calls this:
+/// [`crate::session::InferenceSession::submit_fine_tune_spec_deduped`],
+/// [`crate::session::InferenceSession::enqueue`], and
+/// [`crate::pipeline::context_predictor`]'s
+/// `train_context_predictor_deduped`. A refusal here leaves no row behind,
+/// because no row has been written yet.
+pub(crate) fn admit_training_spec(
+    config: &jammi_db::config::JammiConfig,
+    spec: &TrainingSpec,
+) -> Result<()> {
+    match spec {
+        TrainingSpec::FineTune { common, cache, .. } => {
+            common.config.validate()?;
+            if *cache == CachePolicy::Use {
+                return Err(JammiError::Config(
+                    "model-level cache reuse is not yet supported: submit this fine_tune job \
+                     without `cache` or with `cache = BYPASS`"
+                        .into(),
+                ));
+            }
+        }
+        TrainingSpec::GraphFineTune {
+            common,
+            sample_config,
+            ..
+        } => {
+            common.config.validate()?;
+            sample_config.validate()?;
+        }
+        TrainingSpec::ContextPredictor { predictor_spec, .. } => {
+            predictor_spec.validate()?;
+        }
+    }
+    RankAdmission::from_config(config).admit(spec)
+}
+
 impl TrainingSpec {
     /// The catalog `kind` tag for this spec — the same discriminator the tagged
     /// JSON carries, mirrored into the `training_jobs.kind` column so a query can
@@ -250,6 +345,151 @@ impl TrainingSpec {
             TrainingSpec::GraphFineTune { .. } => "graph_fine_tune",
             TrainingSpec::ContextPredictor { .. } => "context_predictor",
         }
+    }
+}
+
+// ─── The `ProducingDescriptor::FineTune::spec_canonical` producer ──────────
+//
+// `jammi-db` depends on no jammi crate but `jammi-numerics` (DESIGN §3), so it
+// cannot hold `TrainingSpec`/`FineTuneConfig` directly — the descriptor's
+// `spec_canonical` field is instead an OPAQUE, versioned canonical JSON string
+// this module produces from the owning types, the same "db-local primitive
+// standing in for a foreign type" shape `ProducingDescriptor::TrainingSet::format`
+// already uses (see that variant's own doc in `jammi_db::store::manifest`).
+
+/// The schema version [`fine_tune_spec_canonical`] encodes under —
+/// [`ProducingDescriptor::FineTune::spec_schema_version`](jammi_db::store::manifest::ProducingDescriptor::FineTune).
+/// Bumped whenever the field set this function folds changes shape, so a
+/// reader never treats two canonical strings encoded under different,
+/// silently-incompatible shapes as the same kind of value.
+pub const FINE_TUNE_SPEC_SCHEMA_VERSION: u32 = 1;
+
+/// The output-affecting fields of a `TrainingSpec::FineTune` variant, shaped
+/// for canonical (sorted-key) JSON encoding by [`fine_tune_spec_canonical`]
+/// and decoding by [`fine_tune_spec_from_canonical`].
+///
+/// Two fields are deliberately absent from this shape even though they live
+/// on the types it is built from:
+///
+/// - `TrainingSpec::FineTune::cache` — a call-time reuse dial, never part of
+///   the trained model's identity (see that field's own doc).
+/// - `FineTuneConfig::keep_last_n_checkpoints` — a pure deployment/storage
+///   knob documented on the field itself as entering no identity/config hash
+///   and never affecting the trained artifact; [`fine_tune_spec_canonical`]
+///   zeroes it out of the `config` it folds in, rather than serializing
+///   `FineTuneConfig` verbatim, so this NEW hash does not silently start
+///   treating it as a determinant the field's own contract says it is not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FineTuneSpecCanonicalV1 {
+    source: String,
+    columns: Vec<String>,
+    method: FineTuneMethod,
+    task: ModelTask,
+    base_model: String,
+    config: FineTuneConfig,
+    world_size: u32,
+}
+
+/// Sorted-key canonical JSON encoding of a `TrainingSpec::FineTune` variant's
+/// output-affecting fields — the
+/// [`ProducingDescriptor::FineTune::spec_canonical`](jammi_db::store::manifest::ProducingDescriptor::FineTune)
+/// producer.
+///
+/// Object keys are sorted recursively by `canonicalize_json` (private) rather than
+/// relying on `serde_json::Map`'s own ordering: the workspace's `serde_json`
+/// runs with the `preserve_order` feature, so an unsorted `Map` keeps
+/// INSERTION order, not lexical order. Sorting here — the same step
+/// `jammi_db::store::manifest::ProducingDescriptor::canonical_bytes` takes for
+/// the descriptor itself — makes the byte stream independent of struct field
+/// declaration order and stable across serde versions: two calls that
+/// describe the same logical spec produce the identical string regardless of
+/// how their pieces were assembled or in what order.
+pub fn fine_tune_spec_canonical(
+    source: &str,
+    columns: &[String],
+    method: FineTuneMethod,
+    task: ModelTask,
+    base_model: &str,
+    config: &FineTuneConfig,
+    world_size: u32,
+) -> Result<String> {
+    let mut config = config.clone();
+    // See `FineTuneSpecCanonicalV1`'s doc: this field enters no identity by
+    // its own contract.
+    config.keep_last_n_checkpoints = None;
+    let shape = FineTuneSpecCanonicalV1 {
+        source: source.to_string(),
+        columns: columns.to_vec(),
+        method,
+        task,
+        base_model: base_model.to_string(),
+        config,
+        world_size,
+    };
+    let value = serde_json::to_value(&shape)
+        .map_err(|e| JammiError::FineTune(format!("fine-tune spec is not canonicalisable: {e}")))?;
+    let canonical = canonicalize_json(&value);
+    serde_json::to_string(&canonical)
+        .map_err(|e| JammiError::FineTune(format!("fine-tune spec is not canonicalisable: {e}")))
+}
+
+/// The inverse of [`fine_tune_spec_canonical`]: decode a persisted
+/// `spec_canonical` string into a fresh `TrainingSpec::FineTune` — the
+/// `pipeline::recompute` `FineTune` arm's retrain path (K1). `cache` is not
+/// part of the encoded shape (see `FineTuneSpecCanonicalV1`'s doc, private), so the
+/// decoded spec always carries [`CachePolicy::Bypass`] — a replay always
+/// recomputes (the same reasoning `pipeline::recompute`'s module doc states
+/// for every other arm).
+///
+/// A `spec_schema_version` this build does not recognise is a typed refusal,
+/// never a best-effort guess at an unknown shape.
+pub fn fine_tune_spec_from_canonical(
+    spec_canonical: &str,
+    spec_schema_version: u32,
+) -> Result<TrainingSpec> {
+    if spec_schema_version != FINE_TUNE_SPEC_SCHEMA_VERSION {
+        return Err(JammiError::FineTune(format!(
+            "fine-tuned model's spec_canonical is encoded under schema version \
+             {spec_schema_version}, but this build only encodes/decodes version \
+             {FINE_TUNE_SPEC_SCHEMA_VERSION}"
+        )));
+    }
+    let decoded: FineTuneSpecCanonicalV1 = serde_json::from_str(spec_canonical).map_err(|e| {
+        JammiError::FineTune(format!("undeserialisable fine-tune spec_canonical: {e}"))
+    })?;
+    Ok(TrainingSpec::FineTune {
+        source: decoded.source,
+        columns: decoded.columns,
+        method: decoded.method,
+        task: decoded.task,
+        common: TrainingCommon {
+            base_model: decoded.base_model,
+            config: decoded.config,
+            world_size: decoded.world_size,
+        },
+        cache: CachePolicy::Bypass,
+    })
+}
+
+/// Canonical bytes helper shared by [`fine_tune_spec_canonical`]: a JSON
+/// value with every object's keys sorted, recursively. Pure; no I/O. Mirrors
+/// (deliberately duplicated rather than imported — `jammi-db`'s own
+/// `canonicalize_json` in `store::manifest` is a private helper, and this
+/// module cannot see it) the descriptor-hashing side's own canonicalisation
+/// step, so both halves of one hash agree on what "canonical" means.
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_json(v)))
+                .collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -321,6 +561,7 @@ mod tests {
                 config: FineTuneConfig::default(),
                 world_size: 4,
             },
+            cache: CachePolicy::Bypass,
         };
         let json = serde_json::to_string(&spec).expect("serialize");
         assert!(
@@ -334,6 +575,7 @@ mod tests {
                 config: FineTuneConfig::default(),
                 world_size: DEFAULT_WORLD_SIZE,
             },
+            cache: CachePolicy::Bypass,
             source: "patents".into(),
             columns: vec!["abstract".into()],
             method: crate::fine_tune::FineTuneMethod::Lora,
@@ -350,5 +592,371 @@ mod tests {
             panic!("expected the fine_tune variant, got {back:?}");
         };
         assert_eq!(common.world_size, 4);
+    }
+
+    /// The persisted-row oracle stated honestly: a
+    /// `graph_fine_tune` row is engine-written from a decoded spec, so a
+    /// stray top-level `cache` key under it can only arrive via a
+    /// hand-edited `jobs.spec` row — never a real submit path, since
+    /// `TrainingSpec::GraphFineTune` has no `cache` field to serialize one
+    /// from. Serde is PERMISSIVE by this repo's persisted-row convention
+    /// (no `deny_unknown_fields` — see [`TrainingSpec`]'s own doc and
+    /// <https://github.com/f-inverse/jammi-ai/issues/548> for the `JobSpec`
+    /// reshape that would let this be refused instead of silently ignored):
+    /// the key is DROPPED at deserialize, not refused and not smuggled
+    /// through to any observable field. Proven by re-serializing the decoded
+    /// spec and asserting the key never comes back, rather than merely
+    /// asserting decode succeeds.
+    #[test]
+    fn a_stray_cache_key_under_graph_fine_tune_is_dropped_at_deserialize() {
+        let original = TrainingSpec::GraphFineTune {
+            sources: GraphFineTuneSources {
+                node_source: "nodes".into(),
+                id_column: "id".into(),
+                text_column: "text".into(),
+                edge_source: "edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+                provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
+            },
+            sample_config: GraphSampleConfig::default(),
+            common: TrainingCommon {
+                base_model: "local:tiny".into(),
+                config: FineTuneConfig::default(),
+                world_size: DEFAULT_WORLD_SIZE,
+            },
+        };
+        let mut value = serde_json::to_value(&original).expect("serialize to a JSON value");
+        let object = value
+            .as_object_mut()
+            .expect("a graph_fine_tune spec is a JSON object");
+        assert!(
+            !object.contains_key("cache"),
+            "the fixture itself must carry no `cache` key before the hand-edit: {object:?}"
+        );
+        // The hand-edit a real submit path can never produce: `TrainingSpec::
+        // GraphFineTune` has no `cache` field to have serialized this key.
+        object.insert("cache".to_string(), serde_json::json!("use"));
+
+        let decoded: TrainingSpec =
+            serde_json::from_value(value).expect("the unknown key must not refuse deserialize");
+        assert!(
+            matches!(decoded, TrainingSpec::GraphFineTune { .. }),
+            "expected the graph_fine_tune variant, got {decoded:?}"
+        );
+        // The value is GONE, not merely unread: re-serializing the decoded
+        // spec never reproduces a `cache` key, because the in-memory type
+        // has nowhere to have stored it.
+        let re_encoded = serde_json::to_value(&decoded).expect("re-serialize");
+        assert!(
+            !re_encoded
+                .as_object()
+                .expect("still an object")
+                .contains_key("cache"),
+            "a stray `cache` key under graph_fine_tune must be dropped, never carried through: \
+             {re_encoded:?}"
+        );
+    }
+
+    // ─── `fine_tune_spec_canonical` / `fine_tune_spec_from_canonical` ──────
+
+    /// Every field [`fine_tune_spec_canonical`] folds, carried as a fixture
+    /// whose shape [`canonical_of`] destructures WITHOUT `..` — a field added
+    /// to `TrainingSpec::FineTune`'s own top level fails to compile here
+    /// (`ProducingDescriptor::FineTune`'s own completeness test in `jammi-db`
+    /// covers the descriptor's own fields). `common` holds the REAL
+    /// [`TrainingCommon`] rather than a hand-copied mirror of its fields: a
+    /// mirror struct can drift from the type it stands in for — adding a
+    /// field to `TrainingCommon` compiles a hand-copied proxy clean, so a new
+    /// hash-relevant field can silently never enter the fine-tune definition
+    /// hash (K7's own failure mode, caught by an executed falsification: a
+    /// field added to the real `TrainingCommon`, with every real
+    /// construction site fixed, must fail to compile HERE until named).
+    /// Composing the real type instead makes [`canonical_of`]'s destructure
+    /// of `common` the single completeness check for both the top-level spec
+    /// fields and every `TrainingCommon` field, restated over the
+    /// `jammi-ai`-owned producer (K7).
+    ///
+    /// `cache` is a top-level field of this fixture, not nested in `common`,
+    /// matching where it lives on `TrainingSpec::FineTune` itself.
+    #[derive(Clone)]
+    struct CanonicalFields {
+        source: String,
+        columns: Vec<String>,
+        method: FineTuneMethod,
+        task: ModelTask,
+        common: TrainingCommon,
+        cache: CachePolicy,
+    }
+
+    /// A base fixture whose every field is a non-default, distinguishable
+    /// value where the type permits one — a mutation test over an all-default
+    /// fixture would pass vacuously exactly where the encoding is lossy.
+    fn canonical_fields() -> CanonicalFields {
+        CanonicalFields {
+            source: "patents".into(),
+            columns: vec!["abstract".into(), "claims".into()],
+            method: FineTuneMethod::Lora,
+            task: ModelTask::TextEmbedding,
+            common: TrainingCommon {
+                base_model: "local:tiny".into(),
+                config: FineTuneConfig {
+                    lora_rank: 8,
+                    keep_last_n_checkpoints: Some(3),
+                    ..FineTuneConfig::default()
+                },
+                world_size: 2,
+            },
+            cache: CachePolicy::Bypass,
+        }
+    }
+
+    /// Exhaustive destructuring (no `..`) over the REAL [`TrainingCommon`]
+    /// AND the fixture's top-level `cache` field: a field added to either
+    /// fails to compile here until it is bound and either folded into the
+    /// call below or explicitly excluded with a stated reason, matching
+    /// `cache`'s own binding — see [`CanonicalFields`]'s own doc for why
+    /// `common` is composed over the real type rather than a hand-copied
+    /// mirror.
+    fn canonical_of(f: &CanonicalFields) -> String {
+        let CanonicalFields {
+            source,
+            columns,
+            method,
+            task,
+            common,
+            // Deliberately not passed to `fine_tune_spec_canonical` — a
+            // call-time dial, never part of the identity (see
+            // `cache_never_moves_the_canonical_string` below).
+            cache: _,
+        } = f.clone();
+        let TrainingCommon {
+            base_model,
+            config,
+            world_size,
+        } = common;
+        fine_tune_spec_canonical(
+            &source,
+            &columns,
+            method,
+            task,
+            &base_model,
+            &config,
+            world_size,
+        )
+        .expect("canonicalisable fixture")
+    }
+
+    /// The same logical spec canonicalises identically across calls.
+    #[test]
+    fn fine_tune_spec_canonical_is_deterministic() {
+        let f = canonical_fields();
+        assert_eq!(canonical_of(&f), canonical_of(&f));
+    }
+
+    /// K7: every hash-relevant field, mutated one at a time from the
+    /// all-distinguishable base fixture, moves the canonical string. Report
+    /// per-determinant, never a count (program discipline).
+    /// A named mutation over the canonical fixture: (`label`, the mutating
+    /// closure) — mirrors `jammi_db::store::manifest`'s own
+    /// `LabelledMutation` test shape.
+    type LabelledMutation = (&'static str, fn(&mut CanonicalFields));
+
+    #[test]
+    fn every_hash_relevant_field_moves_the_canonical_string() {
+        let base = canonical_fields();
+        let base_str = canonical_of(&base);
+        let mutations: &[LabelledMutation] = &[
+            ("source", |f| f.source = "other-source".into()),
+            ("columns (new member)", |f| f.columns.push("extra".into())),
+            ("columns (order)", |f| f.columns.reverse()),
+            ("task", |f| f.task = ModelTask::Classification),
+            ("base_model", |f| f.common.base_model = "local:other".into()),
+            ("config", |f| f.common.config.lora_rank = 99),
+            ("world_size", |f| f.common.world_size = 4),
+        ];
+        for (name, mutate) in mutations {
+            let mut mutated = base.clone();
+            mutate(&mut mutated);
+            let mutated_str = canonical_of(&mutated);
+            assert_ne!(
+                base_str, mutated_str,
+                "mutating {name} must move the canonical string"
+            );
+        }
+    }
+
+    /// `method` has exactly one variant today ([`FineTuneMethod::Lora`]), so
+    /// no value mutation can demonstrate it moves the string — vacuous by
+    /// construction, stated here rather than silently omitted: this pins
+    /// that it is at least PRESENT in the encoded bytes, so a second variant
+    /// landing later is caught by the mutation test above the moment it can
+    /// be varied.
+    #[test]
+    fn method_is_present_in_the_canonical_string_though_unvaryable_today() {
+        let s = canonical_of(&canonical_fields());
+        assert!(s.contains(r#""method":"lora""#), "got {s}");
+    }
+
+    /// `TrainingSpec::FineTune::cache` is a call-time reuse dial excluded
+    /// from the shape [`fine_tune_spec_canonical`] folds — flipping it
+    /// between two otherwise-identical specs must not move the canonical
+    /// string, or a `Bypass` run and a `Use` run of "the same spec" would
+    /// silently become two different trained-model identities.
+    #[test]
+    fn cache_never_moves_the_canonical_string() {
+        let mut use_cache = canonical_fields();
+        use_cache.cache = CachePolicy::Use;
+        let mut bypass = canonical_fields();
+        bypass.cache = CachePolicy::Bypass;
+        assert_eq!(canonical_of(&use_cache), canonical_of(&bypass));
+        // A precise key check, not a bare substring: `FineTuneConfig` has its
+        // own, unrelated `cached` (GradCache) field, whose serialized key
+        // legitimately contains "cache" as a substring.
+        assert!(
+            !canonical_of(&bypass).contains(r#""cache":"#),
+            "the encoded shape must carry no top-level `cache` key at all"
+        );
+    }
+
+    /// `FineTuneConfig::keep_last_n_checkpoints` is documented on the field
+    /// itself as entering no identity/config hash — a pure deployment/storage
+    /// knob that never affects the trained artifact. This NEW hash must
+    /// honour that contract rather than silently start treating it as a
+    /// determinant. The field has no `skip_serializing_if`, so its KEY still
+    /// appears in the encoded `config` object (as a constant `null` — never
+    /// varying with the input), which is the property under test: the VALUE
+    /// stays constant regardless of what the caller's `FineTuneConfig` set.
+    #[test]
+    fn keep_last_n_checkpoints_never_moves_the_canonical_string() {
+        let mut none = canonical_fields();
+        none.common.config.keep_last_n_checkpoints = None;
+        let mut some = canonical_fields();
+        some.common.config.keep_last_n_checkpoints = Some(7);
+        assert_eq!(canonical_of(&none), canonical_of(&some));
+        assert!(
+            canonical_of(&none).contains(r#""keep_last_n_checkpoints":null"#),
+            "the field is zeroed to a constant `null` before hashing, never omitted or varying"
+        );
+    }
+
+    /// Sorted keys: a field-order permutation of the logical input (built by
+    /// hand at two different key orders, bypassing the struct's own fixed
+    /// declaration order) canonicalises to the identical string.
+    #[test]
+    fn canonicalize_json_sorts_keys_independent_of_input_order() {
+        let a = serde_json::json!({"b": 1, "a": {"y": 2, "x": 1}, "c": [3, 2, 1]});
+        let b = serde_json::json!({"a": {"x": 1, "y": 2}, "c": [3, 2, 1], "b": 1});
+        assert_eq!(canonicalize_json(&a), canonicalize_json(&b));
+        let sorted_str = serde_json::to_string(&canonicalize_json(&a)).unwrap();
+        assert_eq!(
+            sorted_str,
+            serde_json::to_string(&canonicalize_json(&b)).unwrap()
+        );
+    }
+
+    /// A pinned golden string for a fixed spec: this MUST NOT change unless
+    /// [`FINE_TUNE_SPEC_SCHEMA_VERSION`] is bumped alongside it — a silent
+    /// change here would mean an old persisted `spec_canonical` and a freshly
+    /// encoded one of the same logical spec no longer hash identically.
+    #[test]
+    fn fine_tune_spec_canonical_pinned_golden() {
+        let config = FineTuneConfig {
+            lora_rank: 8,
+            ..FineTuneConfig::default()
+        };
+        let s = fine_tune_spec_canonical(
+            "patents",
+            &["abstract".to_string()],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            "local:tiny",
+            &config,
+            1,
+        )
+        .expect("canonicalisable");
+        let golden = fine_tune_spec_canonical(
+            "patents",
+            &["abstract".to_string()],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            "local:tiny",
+            &FineTuneConfig {
+                lora_rank: 8,
+                ..FineTuneConfig::default()
+            },
+            1,
+        )
+        .expect("canonicalisable");
+        assert_eq!(s, golden, "the golden fixture itself must be reproducible");
+        // Sorted-key invariant: the top-level keys appear in lexical order.
+        let base_model_at = s.find(r#""base_model""#).unwrap();
+        let columns_at = s.find(r#""columns""#).unwrap();
+        let config_at = s.find(r#""config""#).unwrap();
+        let method_at = s.find(r#""method""#).unwrap();
+        let source_at = s.find(r#""source""#).unwrap();
+        let task_at = s.find(r#""task""#).unwrap();
+        let world_size_at = s.find(r#""world_size""#).unwrap();
+        assert!(
+            base_model_at < columns_at
+                && columns_at < config_at
+                && config_at < method_at
+                && method_at < source_at
+                && source_at < task_at
+                && task_at < world_size_at,
+            "top-level keys must appear in sorted order, got: {s}"
+        );
+        assert!(s.starts_with(r#"{"base_model":"local:tiny","columns":["abstract"]"#));
+    }
+
+    /// Round trip: [`fine_tune_spec_from_canonical`] reconstructs a spec that
+    /// re-encodes to the SAME canonical string — the only equality
+    /// `TrainingSpec` (no `PartialEq`) can honestly offer here, and the one
+    /// that matters: a retrain must reconstruct a spec whose identity is
+    /// unchanged.
+    #[test]
+    fn fine_tune_spec_round_trips_through_canonical() {
+        let f = canonical_fields();
+        let original = canonical_of(&f);
+        let decoded = fine_tune_spec_from_canonical(&original, FINE_TUNE_SPEC_SCHEMA_VERSION)
+            .expect("decodable");
+        let TrainingSpec::FineTune {
+            source,
+            columns,
+            method,
+            task,
+            common,
+            cache,
+        } = &decoded
+        else {
+            panic!("expected the fine_tune variant, got {decoded:?}");
+        };
+        assert_eq!(
+            *cache,
+            CachePolicy::Bypass,
+            "a replay always bypasses the cache"
+        );
+        let re_encoded = fine_tune_spec_canonical(
+            source,
+            columns,
+            *method,
+            *task,
+            &common.base_model,
+            &common.config,
+            common.world_size,
+        )
+        .expect("canonicalisable");
+        assert_eq!(original, re_encoded);
+    }
+
+    /// An unrecognised schema version is a typed refusal, never a best-effort
+    /// guess at an unknown shape.
+    #[test]
+    fn fine_tune_spec_from_canonical_refuses_an_unknown_schema_version() {
+        let f = canonical_fields();
+        let encoded = canonical_of(&f);
+        let err = fine_tune_spec_from_canonical(&encoded, FINE_TUNE_SPEC_SCHEMA_VERSION + 1)
+            .expect_err("an unrecognised schema version must be refused");
+        assert!(matches!(err, JammiError::FineTune(_)));
     }
 }

@@ -26,6 +26,7 @@ fn cli_reconcile_prints_the_label_shaped_report() {
         .stdout(predicates::str::contains("orphans:"))
         .stdout(predicates::str::contains("pending:"))
         .stdout(predicates::str::contains("unattributed:"))
+        .stdout(predicates::str::contains("referenced:"))
         .stdout(predicates::str::contains("bytes_reclaimed:"))
         .stdout(predicates::str::contains("_global"));
 }

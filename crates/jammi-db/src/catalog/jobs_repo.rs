@@ -35,7 +35,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{now_sortable, BackendError, BackendKind, Row, SqlValue, TxOptions};
-use super::lease::{lease_deadline_expr, lease_expired_clause, stale_before_clause};
+use super::lease::{
+    instance_liveness_margin, lease_deadline_expr, lease_expired_clause, stale_before_clause,
+};
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
 use crate::error::{JammiError, Result};
@@ -149,6 +151,22 @@ pub struct JobRecord {
     /// never fabricated into a state. Each terminal reason is distinct, so
     /// the retired marker names WHICH edge retired it.
     pub acceleration_report: Option<String>,
+    /// The `ArtifactDigest` of the coordinator's
+    /// materialized `TrainingSet` — job-scoped, write-once (see
+    /// [`Catalog::fill_training_set_identity`]), `NULL` until filled and for
+    /// every `world_size == 1` job. Never `Some` while
+    /// [`Self::training_set_location`] is `None`, or vice versa — enforced
+    /// by migration 033's `CHECK` constraint at the schema edge, not merely
+    /// by convention.
+    pub training_set_ref: Option<String>,
+    /// The `result_tables` NAME the coordinator
+    /// materialized the training set under — the one coordinate a rank
+    /// resolves with a single tenant-pinned lookup. The strict-predicate
+    /// resolver that once backed that lookup (`get_result_table_for_tenant`)
+    /// is `HostAdmission`'s to rebuild from the filed property
+    /// (<https://github.com/f-inverse/jammi-ai/issues/566>), not parked code
+    /// in this crate. See [`Self::training_set_ref`]'s pairing note.
+    pub training_set_location: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -163,10 +181,140 @@ impl JobRecord {
     }
 }
 
+/// The outcome of [`Catalog::fill_training_set_identity`]'s write-once CAS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingSetFillOutcome {
+    /// This call's own statement won the CAS: the pair is now set to the
+    /// values it passed.
+    Filled,
+    /// Zero rows updated, but a re-read under the SAME `claimed_by`/
+    /// `attempts` found the pair already set to the SAME values this call
+    /// passed — a concurrent racer (or a retried caller) observing its own
+    /// would-be write, never a second write.
+    Reused,
+    /// Zero rows updated, and the re-read found either a different
+    /// `claimed_by`/`attempts` (the claim moved) or a different pair value —
+    /// the attempt ends here with NO terminal write ("no supersession"), a
+    /// normal event, not a failure.
+    Aborted,
+}
+
+/// The row [`Catalog::get_job_for_rank`] returns — every field the I-GANG
+/// row predicate needs (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1),
+/// computed in ONE statement. No `tenant_id` column: the `world_size == 1`
+/// I-GANG lattice this unit ships derives no determinant from tenant at all
+/// (`status`/`claimed_by`/`attempts`/`lease_live`/`world_size` are the whole
+/// predicate) — a caller that DOES need the row's tenant (e.g. a future
+/// tenant-scoped sidecar lookup) reads it from [`Catalog::get_job`], never
+/// from this row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankAdmissionRow {
+    pub status: String,
+    pub claimed_by: Option<String>,
+    pub attempts: u32,
+    /// `NOT(lease_expired_clause)`, computed against the SAME clock
+    /// [`super::lease::lease_remaining_seconds_expr`] used for
+    /// [`Self::remaining`] — `false` for a `NULL` lease column (no
+    /// live-by-default), matching `lease.rs`'s own stated semantics.
+    pub lease_live: bool,
+    /// The remaining lease window, floored at zero once expired (or absent).
+    pub remaining: Duration,
+    /// The ROW's own rank count, decoded from the SAME `spec` JSON the
+    /// claiming worker reconstructs its run from — never the caller's own
+    /// `Assign.world`. A gang admission gate keyed on the caller's claim
+    /// instead of this field lets a `world_size > 1` job admit under a
+    /// caller-supplied `world = 1`, skipping the training-set pair conjunct
+    /// and the sidecar verify entirely — a hazard this field's row-keying
+    /// closes.
+    ///
+    /// Decoded via `world_size_from_spec_json` (module-private): a top-level
+    /// `world_size` key, or (the shape `jammi-ai`'s `TrainingCommon` actually
+    /// persists) a `world_size` key nested one level under `common`. Absent
+    /// either way ⇒ [`WorldSizeFact::Decoded`]`(1)` (the single-rank default
+    /// every job kind that never names a rank count implicitly is —
+    /// `jammi-db` cannot depend on `jammi-ai` to read its serde default
+    /// directly, so this mirrors it independently). A `world_size` key
+    /// present but not a valid non-negative rank count (non-numeric,
+    /// negative, fractional, or overflowing `u32`), or `spec` text that is
+    /// not valid JSON at all, is [`WorldSizeFact::Undecodable`] — a ROW FACT
+    /// about the content this claimant wrote, never a fault of the read that
+    /// found it: [`Catalog::get_job_for_rank`] still returns `Ok(Some(row))`
+    /// with every other column populated, and the caller (the gang admission
+    /// handler) decides how to refuse it. `Err` from `get_job_for_rank`
+    /// means the read itself faulted, never that this row's `spec` failed to
+    /// decode; a malformed `lease_expires_at` is still re-parsed in SQL on
+    /// Postgres and surfaces there as `Err` (tracked at
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
+    pub world_size: WorldSizeFact,
+}
+
+/// The outcome of decoding [`RankAdmissionRow::world_size`] from a job's
+/// `spec` JSON — a row FACT the caller matches on, never a sentinel integer
+/// and never an `Option` (whose `None` would read as "absent" rather than
+/// "present but unreadable"). A row whose spec does not decode a
+/// `world_size` is exactly as real a row as one that does: `Undecodable`
+/// carries no further detail (the caller refuses the row outright; the
+/// decode failure's own text is not part of the I-GANG row predicate), and
+/// deciding what to do with it is the caller's (the gang admission
+/// handler's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldSizeFact {
+    /// The row's own rank count, decoded successfully — including the
+    /// absent-field default, `WORLD_SIZE_IF_ABSENT`.
+    Decoded(u32),
+    /// The row's `spec` column did not decode a `world_size`: either the
+    /// text is not valid JSON at all, or a `world_size` key (top-level or
+    /// nested under `common`) is present but not a valid non-negative rank
+    /// count. The row otherwise exists and every other column is populated.
+    Undecodable,
+}
+
+/// The single-rank default this module stamps when a job's `spec` JSON names
+/// no `world_size` at all — every non-training job kind, and every training
+/// spec predating the field. Mirrors (independently: `jammi-db` must not
+/// depend on `jammi-ai`) the wire default `jammi_ai::fine_tune::spec::
+/// TrainingCommon`'s own `#[serde(default = "default_world_size")]` hook
+/// falls back to when its JSON carries no count.
+const WORLD_SIZE_IF_ABSENT: u32 = 1;
+
+/// Decodes [`RankAdmissionRow::world_size`] from a job's raw `spec` JSON — a
+/// targeted field read, not a typed deserialization of the whole spec
+/// (`jammi-db` does not know, and must not depend on, `jammi-ai`'s
+/// `TrainingSpec` shape). Checks a top-level `world_size` key first, then a
+/// `world_size` key nested one level under `common` (the shape
+/// `TrainingCommon` actually persists for the two fine-tune spec variants),
+/// so a future producer that flattens the field is read the same way a
+/// current nested one is. Neither key present ⇒
+/// [`WorldSizeFact::Decoded`]`(`[`WORLD_SIZE_IF_ABSENT`]`)`. The key present
+/// but not decodable as a `u32` (a string, a negative number, a fraction, or
+/// a value overflowing `u32`), or `spec` text that is not valid JSON at all,
+/// ⇒ [`WorldSizeFact::Undecodable`] — infallible: a job row's `spec` column
+/// is the worker's own reconstruction input, so a value that fails to parse
+/// or names something un-decodable is a fact about THIS row's content, never
+/// a fault of the read that found it, and this function never returns an
+/// `Err` a caller could conflate with a genuine backend/driver failure.
+fn world_size_from_spec_json(spec: &str) -> WorldSizeFact {
+    let value: serde_json::Value = match serde_json::from_str(spec) {
+        Ok(v) => v,
+        Err(_) => return WorldSizeFact::Undecodable,
+    };
+    let field = value
+        .get("world_size")
+        .or_else(|| value.get("common").and_then(|c| c.get("world_size")));
+    match field {
+        None => WorldSizeFact::Decoded(WORLD_SIZE_IF_ABSENT),
+        Some(v) => match serde_json::from_value::<u32>(v.clone()) {
+            Ok(n) => WorldSizeFact::Decoded(n),
+            Err(_) => WorldSizeFact::Undecodable,
+        },
+    }
+}
+
 const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, partial_result, \
      result, error, progress_rows_done, progress_rows_total, progress_phase, cancel_requested, \
      model_ref, output_model_id, model_source, claimed_by, attempts, releases, \
-     lease_expires_at, priority, claimable, acceleration_report, created_at, updated_at";
+     lease_expires_at, priority, claimable, acceleration_report, \
+     training_set_ref, training_set_location, created_at, updated_at";
 
 /// The explicit submission-time marker [`Catalog::submit_job`] writes into
 /// `acceleration_report`: the job exists but no claimant has yet computed an
@@ -269,6 +417,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
         priority: row.get("priority")?,
         claimable: row.get("claimable")?,
         acceleration_report: row.try_get("acceleration_report")?,
+        training_set_ref: row.try_get("training_set_ref")?,
+        training_set_location: row.try_get("training_set_location")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -1678,7 +1828,7 @@ impl Catalog {
                     // a still-pending acceleration_report (esc-075) — see
                     // `JobRecord::acceleration_report`'s lifecycle section.
                     {
-                        let margin = lease.saturating_mul(2);
+                        let margin = instance_liveness_margin(lease);
                         let mut params: Vec<SqlValue<'static>> = vec![
                             SqlValue::TextOwned(failed.clone()),
                             SqlValue::TextOwned(inline_error.clone()),
@@ -1720,6 +1870,193 @@ impl Catalog {
             })
             .await
             .map_err(Into::into)
+    }
+
+    /// The write-once CAS for the training-set
+    /// identity pair. ONE statement sets BOTH `training_set_ref` and
+    /// `training_set_location`, guarded on `job_id`, the CALLER'S OWN
+    /// `claimed_by`/`attempts`, and the pair still being unset —
+    /// `training_set_ref IS NULL AND training_set_location IS NULL`. A
+    /// concurrent second coordinator's CAS (the same attempt, racing this
+    /// one) sees zero rows updated and re-reads: if the pair landed with
+    /// the SAME values under the SAME claim, this is [`TrainingSetFillOutcome::Reused`]
+    /// (the loser observes its own would-be write already there, never a
+    /// second write); if the claim moved (a different `claimed_by`/
+    /// `attempts`) or the pair holds different values, this is
+    /// [`TrainingSetFillOutcome::Aborted`] — a normal event, not a failure,
+    /// and NO terminal write follows from it ("no supersession").
+    ///
+    /// The pair is one fact, not two independently nullable columns
+    /// (migration 033's `CHECK` constraint pins this at the schema edge);
+    /// this is the ONLY method in this crate that writes either column.
+    pub async fn fill_training_set_identity(
+        &self,
+        job_id: &str,
+        claimed_by: &str,
+        attempts: u32,
+        training_set_ref: &str,
+        training_set_location: &str,
+    ) -> Result<TrainingSetFillOutcome> {
+        let job_id = job_id.to_string();
+        let claimed_by = claimed_by.to_string();
+        let training_set_ref = training_set_ref.to_string();
+        let training_set_location = training_set_location.to_string();
+        let attempts_i = attempts as i64;
+        let now = now_sortable();
+
+        Ok(self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    let updated = tx
+                        .execute(
+                            "UPDATE jobs SET training_set_ref = $1, training_set_location = $2, \
+                                 updated_at = $3 \
+                             WHERE job_id = $4 AND claimed_by = $5 AND attempts = $6 \
+                               AND training_set_ref IS NULL AND training_set_location IS NULL",
+                            &[
+                                SqlValue::TextOwned(training_set_ref.clone()),
+                                SqlValue::TextOwned(training_set_location.clone()),
+                                SqlValue::TextOwned(now),
+                                SqlValue::TextOwned(job_id.clone()),
+                                SqlValue::TextOwned(claimed_by.clone()),
+                                SqlValue::Int(attempts_i),
+                            ],
+                        )
+                        .await?;
+                    if updated == 1 {
+                        return Ok(TrainingSetFillOutcome::Filled);
+                    }
+
+                    // Zero rows: re-read by primary key alone (this is an
+                    // internal consistency check on a job id the caller
+                    // already holds, not a tenant-scoped external read) and
+                    // decide REUSE vs ABORT.
+                    let row = tx
+                        .query_opt(
+                            "SELECT claimed_by, attempts, training_set_ref, training_set_location \
+                             FROM jobs WHERE job_id = $1",
+                            &[SqlValue::TextOwned(job_id)],
+                            |row| {
+                                Ok((
+                                    row.try_get::<String>("claimed_by")?,
+                                    row.get::<i32>("attempts")? as u32,
+                                    row.try_get::<String>("training_set_ref")?,
+                                    row.try_get::<String>("training_set_location")?,
+                                ))
+                            },
+                        )
+                        .await?;
+                    Ok(match row {
+                        Some((cb, att, Some(tsref), Some(tsloc)))
+                            if cb.as_deref() == Some(claimed_by.as_str())
+                                && att == attempts
+                                && tsref == training_set_ref
+                                && tsloc == training_set_location =>
+                        {
+                            TrainingSetFillOutcome::Reused
+                        }
+                        _ => TrainingSetFillOutcome::Aborted,
+                    })
+                })
+            })
+            .await?)
+    }
+
+    /// The row `GangService::run_rank`'s I-GANG row predicate reads
+    /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A1; `GangService` is a
+    /// `jammi-server` type this crate has no visibility into — named here
+    /// only in prose, never as an intra-doc link).
+    /// Primary-key only (`WHERE job_id = $1`) — no tenant
+    /// predicate, never [`TenantBinding::is_admin_scope`] (this method does
+    /// not consult it at all, and returns no `tenant_id` column either: the
+    /// `world_size == 1` I-GANG lattice this unit ships derives no
+    /// determinant from tenant at all, per
+    /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3) — "tenant is
+    /// derived, never accepted" — a caller that DOES need the row's tenant
+    /// reads it from [`Catalog::get_job`], never from this row).
+    /// ONE statement: the row's `status`/`claimed_by`/`attempts`
+    /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
+    /// remaining window, from which [`RankAdmissionRow::lease_live`] is
+    /// derived — never a second round trip, and never the caller's OWN
+    /// clock standing in for the remaining-window computation (see that
+    /// function's docs). `Ok(None)` when no such job exists. `Err` means the
+    /// read itself faulted, or — on Postgres only — that the row's
+    /// `lease_expires_at` text did not parse as a timestamp (tracked at
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>); never that the
+    /// row's `spec` failed to decode a `world_size`: that outcome is a ROW
+    /// FACT, represented in
+    /// [`RankAdmissionRow::world_size`] as [`WorldSizeFact::Undecodable`],
+    /// and still returned `Ok(Some(row))` with every other column populated
+    /// (see that type's docs).
+    ///
+    /// This method decides NOTHING beyond that lookup — it is a plain
+    /// row-by-primary-key read, never itself the I-GANG decider. Every
+    /// determinant the returned [`RankAdmissionRow`] feeds (`status`,
+    /// `claimed_by`, `attempts`, `lease_live`, and — critically —
+    /// [`RankAdmissionRow::world_size`], the ROW's own rank count, never a
+    /// caller-supplied `Assign.world`) is decided by the caller
+    /// (`GangService::run_rank`, the gang admission handler). A gate keyed
+    /// on the caller's own claim about `world` rather than this field's
+    /// value lets a mismatched claim skip the `world_size > 1` conjuncts
+    /// entirely — the row is the only authority; the caller is never trusted
+    /// to state its own admission class.
+    ///
+    /// **Enumerating-caller oracle** (`crates/jammi-server/tests/it/
+    /// gang_rank_admission_oracle.rs`): the only call site outside this
+    /// crate's own tests is the gang `RunRank` handler.
+    pub async fn get_job_for_rank(&self, job_id: &str) -> Result<Option<RankAdmissionRow>> {
+        let job_id = job_id.to_string();
+        let kind = self.backend().backend_kind();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let remaining_expr = super::lease::lease_remaining_seconds_expr(
+                            "lease_expires_at",
+                            kind,
+                            &mut params,
+                        );
+                        params.push(SqlValue::TextOwned(job_id));
+                        let job_bind = params.len();
+                        let sql = format!(
+                            "SELECT status, claimed_by, attempts, spec, \
+                                 {remaining_expr} AS remaining_secs \
+                             FROM jobs WHERE job_id = ${job_bind}"
+                        );
+                        tx.query_opt(&sql, &params, |row| {
+                            let spec: String = row.get("spec")?;
+                            let world_size = world_size_from_spec_json(&spec);
+                            let remaining_secs: Option<f64> = row.try_get("remaining_secs")?;
+                            // NULL (no lease) is treated exactly like an
+                            // expired one -- zero remaining, never live --
+                            // matching `lease_expired_clause`'s own `col IS
+                            // NULL` arm (`lease.rs`'s module docs: NULL means
+                            // remaining 0, never live-by-default).
+                            let remaining = remaining_secs
+                                .map(|s| Duration::from_secs_f64(s.max(0.0)))
+                                .unwrap_or(Duration::ZERO);
+                            let lease_live = remaining_secs.is_some_and(|s| s >= 0.0);
+                            Ok(RankAdmissionRow {
+                                status: row.get("status")?,
+                                claimed_by: row.try_get("claimed_by")?,
+                                attempts: row.get::<i32>("attempts")? as u32,
+                                lease_live,
+                                remaining,
+                                world_size,
+                            })
+                        })
+                        .await
+                    })
+                },
+            )
+            .await?)
     }
 
     /// Upsert this process's `instances` row: insert on first call
@@ -1776,6 +2113,43 @@ impl Catalog {
             })
             .await?;
         Ok(updated == 1)
+    }
+
+    /// Is `instance_id`'s `instances` row FRESH —
+    /// present, and last seen within [`super::lease::instance_liveness_margin`]
+    /// (`2 * lease`) on the DB clock? Primary-key lookup; `instances` carries
+    /// no tenant column, so there is no tenant predicate to drop or keep.
+    /// `false` for an absent OR a stale row alike — the caller (a gang rank
+    /// checking its coordinator) maps either to the same member-scoped
+    /// `FailedPrecondition`, disclosing nothing about which.
+    pub async fn fresh_instance(&self, instance_id: &str, lease: Duration) -> Result<bool> {
+        let instance_id = instance_id.to_string();
+        let kind = self.backend().backend_kind();
+        let margin = instance_liveness_margin(lease);
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let stale = stale_before_clause("last_seen_at", kind, margin, &mut params);
+                        params.push(SqlValue::TextOwned(instance_id));
+                        let id_bind = params.len();
+                        let sql = format!(
+                            "SELECT 1 AS present FROM instances \
+                             WHERE instance_id = ${id_bind} AND NOT ({stale})"
+                        );
+                        tx.query_opt(&sql, &params, |row| row.get::<i32>("present"))
+                            .await
+                    })
+                },
+            )
+            .await?
+            .is_some())
     }
 
     /// Upsert this process's `workers` row — present only while the process

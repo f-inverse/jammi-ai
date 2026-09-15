@@ -74,6 +74,10 @@ them supplies them above the engine.
   peer_bind` (unset by default) serves the engine-internal segment-search
   seam to other replicas and trusts the channel — see
   [The peer listener](#the-peer-listener-i-peer) below.
+- **The gang listener authenticates nothing either (I-GANG).** The same
+  `[server] peer_bind` listener also serves the coordinator-to-member gang
+  admission seam for a multi-host training run and trusts the channel — see
+  [The gang listener](#the-gang-listener-i-gang) below.
 
 ## The peer listener (I-PEER)
 
@@ -103,6 +107,46 @@ is stated as one invariant, **I-PEER**:
   listener speaks plaintext gRPC like every other engine port; encryption and
   peer authentication are the runtime's (a mesh, a network policy, mTLS at a
   sidecar), exactly as for the public listener. Default unset = no listener.
+
+## The gang listener (I-GANG)
+
+The same `[server] peer_bind` listener also serves `jammi.v1.gang.GangService`
+(`RunRank`) — the seam a coordinator uses to admit a member into a multi-host
+training run. Its threat model is stated as one invariant, **I-GANG**:
+
+- **Every client of `peer_bind` is a jammi coordinator**, the same trust I-PEER
+  states — no separate authentication for the gang seam.
+- **No tenant value is read — not the caller's, and at W=1 not the row's.** A
+  `RunRank` call carries only job coordinates (`job_id`, `attempt`, `rank`,
+  `world`, `coordinator_instance_id`); caller-supplied tenant metadata is never
+  read, ambient admin scope is refused before any row is read, and the admission
+  row the member reads (`Catalog::get_job_for_rank`, primary key only) carries no
+  tenant column. Deriving the tenant from the `jobs` row and pinning the
+  training-set lookups to it is the world>1 conjunct U5a-2 builds
+  (<https://github.com/f-inverse/jammi-ai/issues/566>); until then a
+  coordinator on `peer_bind` holding another tenant's job coordinates can learn
+  only whether that job is admissible (`Unimplemented`) or not (the fixed
+  `FailedPrecondition`) — a liveness signal, no row content, bounded by I-PEER's
+  own trust statement above.
+- **Non-disclosure on refusal.** Every admission determinant — job not found,
+  not running, wrong claimant, wrong attempt, lease not live, world size not
+  one or undecodable, coordinator not fresh — collapses to the
+  SAME status (`FAILED_PRECONDITION`) with a fixed message. The listener
+  discloses neither a job's existence, its claimant, nor its attempt; tests
+  distinguish determinants through a test-only seam, never response text.
+- **Multi-host gang admission is a Postgres-only deployment shape.** The
+  admission row predicate's remaining-lease computation is sound only against
+  a shared, single-writer clock (Postgres's `now()`); a SQLite deployment
+  (single process, no second host to admit) never exercises this seam.
+- **The public listener never reaches it.** The gang routes are mounted beside
+  `PeerService` outside `assemble_grpc_chain`, never wrapped by the
+  tenant-binding layer, never advertised by `GetServerInfo`; the public
+  listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*` (proven
+  by the tenant-isolation oracle).
+- **Binding `peer_bind` on a routable interface without network policy / mTLS
+  exposes the same risk I-PEER states** — the listener speaks plaintext gRPC;
+  encryption and peer authentication are the runtime's. Default unset = no
+  listener = no gang admission surface.
 
 ## Transport encryption is the deployer's runtime, not the engine's
 

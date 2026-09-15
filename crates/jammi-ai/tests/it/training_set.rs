@@ -1,4 +1,4 @@
-//! The training set as a producer output (#500 U2a) — the `jammi-ai` half.
+//! The training set as a producer output (#500) — the `jammi-ai` half.
 //!
 //! A tabular fine-tune no longer re-runs its source query into memory: it
 //! materialises the projected rows into an immutable `TrainingSet` result table
@@ -86,6 +86,34 @@ async fn session_over(dir: &TempDir, csv_fixture: &str) -> Arc<InferenceSession>
 /// Run the parity fixture to completion and return every published adapter
 /// file's fingerprint, keyed by file name (so a file appearing or disappearing
 /// moves the oracle as loudly as a byte change does).
+/// Fingerprint every file the published model prefix holds, keyed by file
+/// name — the print set the byte-for-byte pinned fixtures in this file
+/// compare against. One reader for every pin, so the exclusion below is
+/// applied once, never re-derived per fixture.
+///
+/// `materialization.json` embeds `produced_at` (wall-clock) and `produced_by`
+/// (a per-process run id) — never byte-stable across runs by design
+/// (provenance metadata, not the reproducibility anchor; see
+/// `MaterializationManifest`'s own doc), so it can never join a
+/// byte-for-byte pinned fixture the way the other files here can. Excluded
+/// from the print set rather than pinned or ignored silently: this comment
+/// is the record of why the file every fine-tune now publishes is absent
+/// from each `*_ADAPTER_PRINTS` fixture.
+fn pinned_prints(dir: &std::path::Path) -> BTreeMap<String, String> {
+    let mut prints = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "materialization.json" {
+                continue;
+            }
+            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
+        }
+    }
+    prints
+}
+
 async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String, String> {
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session)
         .expect("default worker intervals are valid");
@@ -115,15 +143,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         .await
         .expect("the published adapter fetches and verifies");
 
-    let mut prints = BTreeMap::new();
-    for entry in std::fs::read_dir(local.dir()).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            prints.insert(name, fingerprint(&std::fs::read(entry.path()).unwrap()));
-        }
-    }
-    prints
+    pinned_prints(local.dir())
 }
 
 /// (c) Refactor parity — a PINNED oracle, not a RED-at-base one.
@@ -216,6 +236,213 @@ async fn refactor_parity() {
     );
 }
 
+/// U2b's refactor-parity criterion, the regression shape — the fixture
+/// extends [`refactor_parity`] (which only covers the contrastive shape)
+/// with the SAME pinned-oracle discipline over `task=regression`.
+///
+/// Pinned at THIS unit's own base (`4e27156a`, U2b's dispatch base — U2a and
+/// U4a already landed, so `task=regression` already routed through the
+/// `TrainingSet` producer and read it back eagerly). Fingerprinted with the
+/// recipe: `git worktree add <dir> 4e27156a`, copy
+/// `regression_parity_columns`/`regression_parity_config`/
+/// `run_regression_parity_fixture`/`regression_parity_baseline_capture` (a
+/// print-only capture, no assertion) into a test module there, `cargo test
+/// -p jammi-ai --test it -- training_set::regression_parity_baseline_capture
+/// --exact --nocapture`, twice, to confirm byte-stability before pinning.
+///
+/// The regression fixture routes the K3 scaler (`TrainingDataLoader::
+/// regression_targets`) and the `Regression` `TextChunk` decode
+/// (`worker::build_training_data_loader`'s regression arm) through paths
+/// [`refactor_parity`]'s contrastive fixture never exercises at all.
+///
+/// Platform-specific like [`PARITY_ADAPTER_PRINTS`]: the Linux set is what the
+/// CI hermetic lane produced for this fixture (recorded from its run at the
+/// PR-B2 head where the Apple Silicon pin first met Linux; the next CI run
+/// re-verifies it, a drifting print failing there), the other set is from the
+/// Apple Silicon host the fixture was first pinned on.
+#[cfg(target_os = "linux")]
+const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
+    ("adapter.safetensors", "1888:89f81b61ca42fde5"),
+    ("adapter_config.json", "284:6d66bd5b8594e1fa"),
+    ("checkpoint_1.safetensors", "1888:758cae962d0ae1b5"),
+    ("checkpoint_2.safetensors", "1888:6e8e9e39f9914524"),
+    ("checkpoint_3.safetensors", "1888:89f81b61ca42fde5"),
+    ("checkpoint_best.safetensors", "1888:89f81b61ca42fde5"),
+    ("manifest.json", "676:c2c59e89853c592b"),
+];
+#[cfg(not(target_os = "linux"))]
+const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
+    ("adapter.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("adapter_config.json", "284:6d66bd5b8594e1fa"),
+    ("checkpoint_1.safetensors", "1888:6ca7a223b9045945"),
+    ("checkpoint_2.safetensors", "1888:33c390ee0a486f52"),
+    ("checkpoint_3.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("checkpoint_best.safetensors", "1888:12c78e9fa2c9f67c"),
+    ("manifest.json", "676:db99b094ab1030df"),
+];
+
+fn regression_parity_columns() -> Vec<String> {
+    vec!["text".to_string(), "target".to_string()]
+}
+
+fn regression_parity_config() -> FineTuneConfig {
+    FineTuneConfig {
+        epochs: 1,
+        batch_size: 8,
+        lora_rank: 4,
+        warmup_steps: 0,
+        ..Default::default()
+    }
+}
+
+async fn run_regression_parity_fixture(
+    session: &Arc<InferenceSession>,
+) -> BTreeMap<String, String> {
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session)
+        .expect("default worker intervals are valid");
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_model(),
+            &regression_parity_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::Regression,
+            Some(regression_parity_config()),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let models = session.catalog().list_models().await.unwrap();
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the fine-tune registers its output model");
+    let prefix =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix)
+        .await
+        .expect("the published adapter fetches and verifies");
+
+    let prints = pinned_prints(local.dir());
+    prints
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_refactor_parity() {
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("regression_years.csv")).await;
+    let prints = run_regression_parity_fixture(&session).await;
+    println!("REGRESSION_PARITY_ADAPTER_PRINTS = {prints:#?}");
+
+    let expected: BTreeMap<String, String> = REGRESSION_PARITY_ADAPTER_PRINTS
+        .iter()
+        .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        prints, expected,
+        "the adapter bytes moved: which rows the trainer sees, in which \
+         order, and how the K3 scaler is computed must stay unchanged"
+    );
+}
+
+/// U2b's GradCache criterion: GradCache (`FineTuneConfig::cached = true`) at `W=1`
+/// on the eager `TextRows` path, digest-pinned like [`refactor_parity`]'s
+/// adapter bytes (this file's own FNV-1a [`fingerprint`], for the reason
+/// stated there: neither `sha2` nor `DefaultHasher` can back a constant
+/// pinned in source).
+///
+/// **Provenance.** The fixture (a `Pairs`-format projection — `anchor,
+/// positive` only — of the 15-row `training_triplets.csv` source, one epoch,
+/// rank-4 LoRA, GradCache on, `MultipleNegativesRanking` at temperature 20)
+/// is recovered verbatim from `git show 803b5139:crates/jammi-ai/tests/it/
+/// streaming_loader.rs`'s `gradcache_completes_through_the_streaming_loader_
+/// at_w1_with_a_pinned_adapter_digest`, pinned there against a streaming
+/// loader that module implements. This unit's loader is the eager `TextRows`
+/// path: running the identical fixture through it produces digests
+/// BYTE-IDENTICAL to that commit's pin — the M1 chunk-for-chunk parity
+/// property holds for this fixture, so the same pinned bytes stand as this
+/// eager-path witness. Confirmed byte-stable across two repeated runs before
+/// being pinned.
+#[tokio::test(flavor = "multi_thread")]
+async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
+    use jammi_ai::fine_tune::EmbeddingLoss;
+
+    // Platform-specific like `PARITY_ADAPTER_PRINTS`: the Linux set from the
+    // CI hermetic lane at the PR-B2 head, the other from the Apple Silicon
+    // host the fixture was first pinned on.
+    #[cfg(target_os = "linux")]
+    const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
+        ("adapter.safetensors", "1184:aff14fbe59384868"),
+        ("adapter_config.json", "143:1feeeb6239c3fd30"),
+        ("checkpoint_1.safetensors", "1184:aff14fbe59384868"),
+        ("checkpoint_best.safetensors", "1184:aff14fbe59384868"),
+        ("manifest.json", "452:464c50f3532a2f94"),
+    ];
+    #[cfg(not(target_os = "linux"))]
+    const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
+        ("adapter.safetensors", "1184:36a3ebd09680e266"),
+        ("adapter_config.json", "143:1feeeb6239c3fd30"),
+        ("checkpoint_1.safetensors", "1184:36a3ebd09680e266"),
+        ("checkpoint_best.safetensors", "1184:36a3ebd09680e266"),
+        ("manifest.json", "452:42481add2507ae14"),
+    ];
+
+    let dir = TempDir::new().unwrap();
+    let session = session_over(&dir, &common::fixture_url("training_triplets.csv")).await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_model(),
+            &["anchor".to_string(), "positive".to_string()],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 4,
+                lora_rank: 4,
+                warmup_steps: 0,
+                cached: true,
+                embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("a W=1 GradCache run over the eager loader must complete");
+
+    let models = session.catalog().list_models().await.unwrap();
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the GradCache run registers its output model");
+    let prefix =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix)
+        .await
+        .expect("the published GradCache adapter fetches and verifies");
+
+    let prints = pinned_prints(local.dir());
+    println!("GRADCACHE_ADAPTER_PRINTS = {prints:#?}");
+    let expected: BTreeMap<String, String> = GRADCACHE_ADAPTER_PRINTS
+        .iter()
+        .map(|(n, p)| ((*n).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        prints, expected,
+        "the GradCache adapter bytes moved from the pinned fixture"
+    );
+}
+
 /// (a) A fine-tune job creates a `ready` `TrainingSet` result table carrying a
 /// definition hash and a manifest attestation, and trains from it.
 #[tokio::test(flavor = "multi_thread")]
@@ -289,16 +516,15 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
 /// Corrected (b) — two fine-tune JOBS over the same plain source, columns,
 /// task and format materialise TWO training-set tables, never one.
 ///
-/// `CONTRACT-U2a.md`'s original (b) ("two jobs over the same
-/// source/columns/task/format reuse ONE table") was refuted by the lead's own
-/// K7 ruling: reuse requires pinned EQUAL anchors, and a registered source
-/// exposes no version surface, so the engine anchors it
+/// Two jobs over the same source/columns/task/format do not reuse ONE table:
+/// reuse requires pinned EQUAL anchors, and a registered source exposes no
+/// version surface, so the engine anchors it
 /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
 /// and never reuses across two independent reads of it — the same honest
 /// off-ness the embedding cache records (`pipeline/embedding.rs:89-93`).
 /// Reuse over a genuinely PINNED anchor is exercised at the store level, in
 /// `two_runs_over_one_pinned_definition_share_one_training_set`,
-/// `crates/jammi-db/tests/it/materialization.rs:854`; this is the
+/// `crates/jammi-db/tests/it/materialization.rs:856`; this is the
 /// job-level corollary: each job's OWN materialize call runs the producer
 /// fresh (the reuse probe never matches), so two jobs leave two tables
 /// behind, each the one its own run actually read from before training.

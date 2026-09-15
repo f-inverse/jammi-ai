@@ -55,12 +55,26 @@ use crate::storage::{
     sha256_hex, JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl,
 };
 use crate::store::layout::TenantSegment;
+use crate::store::manifest::{ArtifactDigest, Materialization, MaterializationManifest};
+use crate::store::{manifest_to_jammi, run_id};
 use crate::tenant::TenantId;
 
 /// The file every artifact prefix carries last, naming the bundle's exact keys
 /// and per-file digests. Written after every data file so its presence proves
 /// the bundle is complete.
 const MANIFEST_NAME: &str = "manifest.json";
+
+/// The model-artifact peer of a result table's `.materialization.json`
+/// sidecar (`crate::store::mod::materialization_sidecar_path`) — the
+/// reproducibility attestation over a `FineTune`
+/// [`crate::store::manifest::ProducingDescriptor`]. Written by
+/// [`ArtifactStore::write_model_materialization`] strictly AFTER
+/// [`MANIFEST_NAME`] (which [`ArtifactStore::put_artifact`] already writes
+/// last among the bundle's own files), so it is the LAST object in the
+/// prefix overall: a reader that finds it knows the bundle is not only
+/// complete (`manifest.json`'s own guarantee) but carries the definition
+/// hash and input anchors this contract exists to attest.
+const MATERIALIZATION_NAME: &str = "materialization.json";
 
 /// The attempt-shared prefix segment for a job's durable resume checkpoint:
 /// `{job_id}/_resume/`. Distinct from the per-attempt publish prefix
@@ -73,10 +87,11 @@ const RESUME_SEGMENT: &str = "_resume";
 /// (unit 348, CONTRACT item 1 / K7). `N` is the 0-based loop epoch index. This
 /// is the ONE place the epoch-checkpoint key shape is spelled — both
 /// [`ArtifactStore::put_epoch_checkpoint`] (the trainer's write) and
-/// [`ArtifactStore::delete_epoch_checkpoint`] (any terminating path's GC sweep)
-/// build the prefix through it, so a GC sweep can never drift out of sync with
-/// where the writer actually publishes: reachability is a property of shared
-/// code, not of two call sites independently agreeing on a string shape.
+/// [`ArtifactStore::epoch_checkpoint_prefix`] (every guarded GC sweep's
+/// prefix computation) build the prefix through it, so a GC sweep can never
+/// drift out of sync with where the writer actually publishes: reachability
+/// is a property of shared code, not of two call sites independently
+/// agreeing on a string shape.
 const CHECKPOINTS_SEGMENT: &str = "checkpoints";
 
 /// One file in an artifact bundle: its relative name (the candle loader joins
@@ -214,6 +229,77 @@ impl ArtifactStore {
         Ok(prefix)
     }
 
+    /// Compute and write the `materialization.json` attestation for the
+    /// bundle already published at `prefix` by [`Self::put_artifact`] — the
+    /// model-artifact peer of a result table's attestation
+    /// (`crate::store::ResultStore::write_attestation`). Written strictly
+    /// AFTER `manifest.json`, making it the LAST object in the prefix (see
+    /// `MATERIALIZATION_NAME`'s doc).
+    ///
+    /// The [`ArtifactDigest`] folded into the [`crate::store::manifest::DefinitionHash`]
+    /// is the bundle's `Manifest::combined_hash` — every file name + its own
+    /// sha256, in the manifest's stable name-sorted order — the SAME content
+    /// address [`Self::fetch_artifact`]'s local cache already keys on, so two
+    /// bundles with identical file names and bytes attest identically.
+    ///
+    /// This reads back the ALREADY-WRITTEN `manifest.json` rather than
+    /// accepting a digest parameter, so it can only ever attest a bundle
+    /// that is provably complete: calling it before `put_artifact` has
+    /// finished simply fails with [`StorageError::NotPublished`] (via
+    /// `read_manifest`'s reclassification) — it can never attest a partial
+    /// bundle.
+    pub async fn write_model_materialization(
+        &self,
+        prefix: &StorageUrl,
+        materialization: Materialization<'_>,
+    ) -> Result<MaterializationManifest> {
+        let handle = self.handle(prefix)?;
+        let manifest = self.read_manifest(&handle, prefix).await?;
+        let digest = ArtifactDigest(manifest.combined_hash());
+
+        let attestation = MaterializationManifest::compute(
+            materialization.descriptor,
+            materialization.env,
+            materialization.inputs,
+            digest,
+            run_id().to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .map_err(manifest_to_jammi)?;
+
+        let bytes = attestation.to_json_bytes().map_err(manifest_to_jammi)?;
+        let path = self.child(prefix, MATERIALIZATION_NAME)?;
+        handle.put_bytes(&path, Bytes::from(bytes)).await?;
+
+        Ok(attestation)
+    }
+
+    /// Read a model artifact prefix's `materialization.json` sidecar, if
+    /// present — the model-artifact peer of
+    /// [`crate::store::ResultStore::read_materialization_manifest`]. Returns
+    /// `Ok(None)` when no sidecar exists (a model that predates this
+    /// contract, or one with no materialization at all).
+    ///
+    /// The sidecar's path is always DERIVED here — `self.child(prefix,
+    /// MATERIALIZATION_NAME)`, the fixed relative name under the given
+    /// artifact prefix — never read back from a catalog column: `models`
+    /// carries no `manifest_path` column, so there is no separate pointer
+    /// that could drift out of sync with where the sidecar actually lives.
+    pub async fn read_model_materialization(
+        &self,
+        prefix: &StorageUrl,
+    ) -> Result<Option<MaterializationManifest>> {
+        let handle = self.handle(prefix)?;
+        let path = self.child(prefix, MATERIALIZATION_NAME)?;
+        if !handle.exists(&path).await? {
+            return Ok(None);
+        }
+        let bytes = handle.get_bytes(&path).await?;
+        let manifest =
+            MaterializationManifest::from_json_bytes(&bytes).map_err(manifest_to_jammi)?;
+        Ok(Some(manifest))
+    }
+
     /// Fetch the artifact at `prefix` into a verified local directory candle can
     /// mmap.
     ///
@@ -272,12 +358,35 @@ impl ArtifactStore {
 
     /// Best-effort delete of every object under an artifact prefix.
     ///
+    /// This is the UNGUARDED primitive: it carries no reference check of its
+    /// own (`ArtifactStore` stays catalog-free), so it must never be called
+    /// on a prefix a live `models` row might still name — either itself or
+    /// as that row's immediate containing directory — without the caller
+    /// having already consulted
+    /// [`crate::store::ResultStore::prefix_is_referenced`] on that EXACT
+    /// prefix.
+    ///
+    /// Sanctioned routes: (1)
+    /// [`crate::store::ResultStore::delete_unreferenced_prefix`], which
+    /// consults [`crate::store::ResultStore::prefix_is_referenced`] first
+    /// and refuses, typed, before ever reaching this call — the route for a
+    /// worker's abandon path (a losing cache-hit attempt, a zombie's
+    /// orphaned prefix) and for a retained epoch checkpoint (the caller
+    /// computes the checkpoint's exact prefix via
+    /// [`Self::epoch_checkpoint_prefix`], then reaches this method only
+    /// through the guarded route above — this type stays catalog-free, so
+    /// it cannot perform that consult itself); and (2)
+    /// [`Self::delete_resume_checkpoint`],
+    /// whose own doc states why its `_resume/` prefix is proven to need no
+    /// guard at all (a namespace no `models` row's `artifact_path` can ever
+    /// name, equal or as an immediate containing directory).
+    ///
     /// Used to GC a losing attempt's orphaned prefix. Reads the manifest to learn
     /// the keys and deletes each (plus the manifest); a 404 is not an error — the
     /// caller is paving over already-cleaned or never-completed state. A missing
     /// manifest means the attempt never completed its write; nothing durable to
     /// reclaim, so that is a no-op too.
-    pub async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
+    pub(crate) async fn delete_artifact_prefix(&self, prefix: &StorageUrl) -> Result<()> {
         let handle = self.handle(prefix)?;
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
         let manifest = if handle.exists(&manifest_path).await? {
@@ -347,6 +456,21 @@ impl ArtifactStore {
     /// the finalize-CAS winner only: the resume state is dead the moment the job
     /// is `completed`, and the prefix is bounded to one bundle per job
     /// (overwrite-in-place), so this is the single point that reclaims it.
+    ///
+    /// Calls the unguarded `Self::delete_artifact_prefix` directly, with
+    /// no [`crate::store::ResultStore::prefix_is_referenced`] consult: the
+    /// `_resume/` prefix is a namespace no `models` row's `artifact_path`
+    /// ever names — equal or as an immediate containing directory —
+    /// because it is a SIBLING of every attempt-level path a served or
+    /// checkpoint row names
+    /// (`{job}/_resume` vs. `{job}/{worker}/{attempt}[/checkpoints/epoch_N]`),
+    /// never a served commit pointer itself, only a crash-recovery side
+    /// channel (see this type's own module docs). Proven by an executed
+    /// test, not asserted: `tests/it/reconcile.rs`'s
+    /// `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`
+    /// registers a job's served AND retained-checkpoint rows and asserts
+    /// [`crate::store::ResultStore::prefix_is_referenced`] still answers
+    /// `0` for the same job's resume prefix.
     pub async fn delete_resume_checkpoint(
         &self,
         tenant: Option<&TenantId>,
@@ -384,27 +508,31 @@ impl ArtifactStore {
         .await
     }
 
-    /// Best-effort GC of ONE epoch-checkpoint prefix
-    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{epoch}/`), tolerant
-    /// of an epoch that was never actually written (no manifest — the same
-    /// no-op [`Self::delete_artifact_prefix`] already treats a never-completed
-    /// attempt as, not an error). This lets a caller derive and sweep a whole
-    /// `[0, epochs)` range without first knowing how far training actually
-    /// got: indices past the run's real progress are simply no-ops.
-    pub async fn delete_epoch_checkpoint(
+    /// The exact prefix [`Self::put_epoch_checkpoint`] publishes to, computed
+    /// without touching storage — the SAME segment construction that write
+    /// uses, so a guarded delete can never drift into asking
+    /// [`crate::store::ResultStore::prefix_is_referenced`] about a
+    /// different key than the one it is actually about to delete. Every
+    /// epoch-checkpoint delete reaches
+    /// [`crate::store::ResultStore::delete_unreferenced_prefix`] with a
+    /// prefix computed through this method: unlike
+    /// [`Self::delete_resume_checkpoint`], an epoch checkpoint is NOT exempt
+    /// from the guard — a RETAINED checkpoint gets its own `models` row
+    /// whose `artifact_path` EQUALS this exact prefix (the winning finalize
+    /// CAS inserts one such row per retained checkpoint).
+    pub fn epoch_checkpoint_prefix(
         &self,
         tenant: Option<&TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: &str,
         epoch: usize,
-    ) -> Result<()> {
+    ) -> Result<StorageUrl> {
         let segment = epoch_segment(epoch);
-        let prefix = self.prefix_url(
+        self.prefix_url(
             tenant,
             &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
-        )?;
-        self.delete_artifact_prefix(&prefix).await
+        )
     }
 
     /// Read and parse `manifest.json` under `prefix`. A manifest absent
@@ -598,7 +726,7 @@ fn verify_sha256(prefix: &StorageUrl, entry: &ManifestEntry, bytes: &[u8]) -> Re
 
 /// The `checkpoints/` child segment naming one epoch's checkpoint: `epoch_{N}`.
 /// The single spelling both [`ArtifactStore::put_epoch_checkpoint`] and
-/// [`ArtifactStore::delete_epoch_checkpoint`] build their prefix from.
+/// [`ArtifactStore::epoch_checkpoint_prefix`] build their prefix from.
 fn epoch_segment(epoch: usize) -> String {
     format!("epoch_{epoch}")
 }
@@ -1107,5 +1235,187 @@ mod tests {
         };
         let m2 = m1.clone();
         assert_eq!(m1.combined_hash(), m2.combined_hash());
+    }
+
+    // ─── The model `materialization.json` attestation ──────────────────────
+
+    fn fine_tune_descriptor() -> crate::store::manifest::ProducingDescriptor {
+        crate::store::manifest::ProducingDescriptor::FineTune {
+            training_set_definition_hash: "a".repeat(64),
+            training_set_artifact_digest: "b".repeat(64),
+            training_set_row_count: 128,
+            spec_canonical: r#"{"base_model":"bert-base"}"#.into(),
+            spec_schema_version: 1,
+            base_model_id: "bert-base-uncased".into(),
+            world_size: 1,
+        }
+    }
+
+    fn fine_tune_env() -> crate::store::manifest::MaterializationEnv {
+        crate::store::manifest::MaterializationEnv::new(
+            crate::store::manifest::ComputeDevice::Cpu,
+            vec![crate::store::manifest::ModelIdentity {
+                model_id: "bert-base-uncased".into(),
+                backend: "candle".into(),
+                compute_precision: crate::store::manifest::ComputePrecision::F32,
+                content_digest: crate::store::manifest::ModelContentDigest::Sha256(
+                    "fixture-digest".into(),
+                ),
+                quantization: None,
+            }],
+        )
+    }
+
+    /// `write_model_materialization` writes `materialization.json` into a
+    /// model artifact prefix, readable back byte-for-byte, folding the
+    /// RIGHT artifact digest (the bundle's `combined_hash`, not an
+    /// arbitrary one).
+    #[tokio::test]
+    async fn write_model_materialization_round_trips_and_folds_the_bundle_digest() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-model-materialization"),
+            cache.path().to_path_buf(),
+        );
+        let files = sample_files();
+        let prefix = store
+            .put_artifact(None, &["job-m1", "worker-a", "0"], &files)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .read_model_materialization(&prefix)
+                .await
+                .unwrap()
+                .is_none(),
+            "no sidecar exists before write_model_materialization runs"
+        );
+
+        let descriptor = fine_tune_descriptor();
+        let env = fine_tune_env();
+        // Inlined rather than behind a helper: no function in this module
+        // may carry an `InputAnchor`-shaped return type (the straddle gate,
+        // `crates/jammi-ai/tests/it/pinned_source_gate.rs`, flags exactly
+        // that shape as an unreviewed anchor producer). This fixture never
+        // resolves a version -- it is a fixed digest handed straight to
+        // `Materialization::new`, never re-derived from a catalog record.
+        let anchors: Vec<crate::store::manifest::InputAnchor> =
+            vec![crate::store::manifest::InputAnchor::result_digest(
+                "training-set",
+                &ArtifactDigest("c".repeat(64)),
+            )];
+        let written = store
+            .write_model_materialization(
+                &prefix,
+                Materialization::new(&descriptor, &env, anchors.clone()),
+            )
+            .await
+            .unwrap();
+
+        // The digest folded is the BUNDLE's combined hash, computed from the
+        // already-written manifest.json -- not a placeholder.
+        let manifest = store
+            .read_manifest(&store.handle(&prefix).unwrap(), &prefix)
+            .await
+            .unwrap();
+        assert_eq!(written.artifact.as_str(), manifest.combined_hash());
+
+        let read_back = store
+            .read_model_materialization(&prefix)
+            .await
+            .unwrap()
+            .expect("the sidecar this call just wrote must read back");
+        assert_eq!(read_back, written);
+        assert_eq!(read_back.descriptor, descriptor);
+        assert_eq!(read_back.input_anchors, anchors);
+    }
+
+    /// The manifest cannot attest a bundle whose OWN `manifest.json` is not
+    /// yet in hand: calling `write_model_materialization` before
+    /// `put_artifact` (or after a torn write that never reached
+    /// `manifest.json`) fails with the same `NotPublished` reclassification
+    /// `fetch_artifact` uses for a missing bundle manifest — never a silent
+    /// attestation of a partial bundle.
+    #[tokio::test]
+    async fn write_model_materialization_fails_before_the_bundle_manifest_exists() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-model-materialization-no-manifest"),
+            cache.path().to_path_buf(),
+        );
+        let prefix = store
+            .prefix_url(None, &["job-m2", "worker-a", "0"])
+            .unwrap();
+
+        let descriptor = fine_tune_descriptor();
+        let env = fine_tune_env();
+        let anchors = vec![crate::store::manifest::InputAnchor::result_digest(
+            "training-set",
+            &ArtifactDigest("c".repeat(64)),
+        )];
+        let err = store
+            .write_model_materialization(&prefix, Materialization::new(&descriptor, &env, anchors))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::NotPublished { .. })),
+            "expected NotPublished before the bundle manifest exists, got: {err:?}"
+        );
+    }
+
+    /// The materialization sidecar is the LAST object written into the
+    /// prefix: every data file, then the bundle's own `manifest.json`
+    /// (`put_artifact`'s existing guarantee), then `materialization.json`.
+    /// Observed through the object store's own `last_modified` timestamps
+    /// (the crate-private `list` seam `reconcile.rs` also uses) rather than
+    /// asserted from code-reading alone: the materialization sidecar's
+    /// timestamp is never EARLIER than any other object's in the prefix.
+    #[tokio::test]
+    async fn model_materialization_is_the_last_object_written_by_timestamp() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-model-materialization-order"),
+            cache.path().to_path_buf(),
+        );
+        let files = sample_files();
+        let prefix = store
+            .put_artifact(None, &["job-m3", "worker-a", "0"], &files)
+            .await
+            .unwrap();
+        let descriptor = fine_tune_descriptor();
+        let env = fine_tune_env();
+        let anchors = vec![crate::store::manifest::InputAnchor::result_digest(
+            "training-set",
+            &ArtifactDigest("c".repeat(64)),
+        )];
+        store
+            .write_model_materialization(&prefix, Materialization::new(&descriptor, &env, anchors))
+            .await
+            .unwrap();
+
+        let handle = store.handle(&prefix).unwrap();
+        let listed = handle.list(&handle.data_path().unwrap()).await.unwrap();
+        assert!(
+            listed.len() >= files.len() + 2,
+            "expected every data file plus manifest.json and materialization.json, got {listed:?}"
+        );
+        let materialization_ts = listed
+            .iter()
+            .find(|m| m.path.to_string().ends_with(MATERIALIZATION_NAME))
+            .expect("materialization.json must be listed")
+            .last_modified;
+        for m in &listed {
+            if m.path.to_string().ends_with(MATERIALIZATION_NAME) {
+                continue;
+            }
+            assert!(
+                m.last_modified <= materialization_ts,
+                "materialization.json ({materialization_ts:?}) must never be EARLIER than \
+                 '{}' ({:?})",
+                m.path,
+                m.last_modified
+            );
+        }
     }
 }

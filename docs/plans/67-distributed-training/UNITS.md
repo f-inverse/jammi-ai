@@ -240,20 +240,39 @@ on top of it can ever be bounded. This unit fixes the provider FIRST, then build
 ## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B2 commit 2, concurrent with U2b)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::FineTune`;
-  `MaterializationEnv` kernel-profile), `catalog/{schema.rs, migrations.rs}` (`model_materialization`,
-  next free number at rebase, both pin sites; nullable columns), `catalog/model_repo.rs` (`probe_model_by_definition`, NULL never matches),
-  `store/artifact.rs` (manifest last), `store/reconcile.rs` (prefix reaped only when
-  unreferenced), `tests/it/migrations.rs`. (ai-core) `fine_tune/worker.rs::publish_and_finalize`
-  (materialization; probe before training; own name → reused prefix), `pipeline/recompute.rs`
-  (arm = retrain), `model/resolver.rs` (manifest on `ModelRecord`), the canonical-encoding
-  producer and the exhaustive-destructuring completeness test in `jammi-ai` (and `jammi-wire`
-  for `FineTuneConfig`). (docs-ci) the `PRODUCING-DESCRIPTOR-VARIANTS` guide block (co-owned).
+  `MaterializationEnv` kernel-profile field — declared, UNCOVERED, no writer;
+  https://github.com/f-inverse/jammi-ai/issues/546), `catalog/{schema.rs, migrations.rs}`
+  (`model_materialization` migration 033, both pin sites; two nullable columns —
+  `definition_hash`, `input_anchors_json`; no `manifest_path` column, since the sidecar path
+  is always derived from `artifact_path`), `catalog/model_repo.rs` (`probe_model_by_definition`,
+  NULL never matches), `store/artifact.rs` (manifest last), `store/reconcile.rs`
+  (`prefix_is_referenced`, an admin-scoped whole-catalog scan, guards every `models/`-prefix
+  byte-delete — the reap and `delete_unreferenced_prefix` both consult it; `ReconcileReport.
+  referenced`/`referenced_count`, carried on the wire, name a prefix found still referenced),
+  `tests/it/migrations.rs`. (ai-core) `fine_tune/worker.rs::publish_and_finalize`
+  (materialization; probe before training; own name → reused prefix; every byte-delete on the
+  abandon path routes through the guarded `PrefixReferences` port, never the unguarded
+  primitive), `pipeline/recompute.rs` (arm = retrain), `model/resolver.rs` (manifest on
+  `ModelRecord`), `fine_tune/spec.rs` (`cache` lives on `TrainingSpec::FineTune` itself, not
+  `TrainingCommon`, so `TrainingSpec::GraphFineTune` cannot carry one — a stray `cache` key
+  under `graph_fine_tune` in a persisted `jobs.spec` row is dropped at deserialize, not
+  refused; a hard error on unknown keys is a separate reshape,
+  https://github.com/f-inverse/jammi-ai/issues/548), `wire/training.rs`
+  (`lora_common_from_proto` refuses `cache = Use` for `GraphFineTune`, typed, at decode), the
+  canonical-encoding producer and the exhaustive-destructuring completeness test in `jammi-ai`
+  (and `jammi-wire` for `FineTuneConfig`). (docs-ci) the `PRODUCING-DESCRIPTOR-VARIANTS` guide
+  block (co-owned).
 - **invariants_to_preserve**: K5, K7 (exhaustive destructuring of `FineTuneConfig` and
-  `TrainingCommon`, fields existing at this commit; the descriptor holds an opaque versioned
-  canonical encoding, never a foreign type), K1, B6, B1 (no `register_*`), doc parity.
-- **acceptance**: (a) same spec on the same training-set digest with `CachePolicy::Use` trains
-  once, two model rows share one prefix, deleting one leaves the prefix (RED at base); (b) the
-  exhaustive-destructuring completeness test (RED at base); (c) the append-only migration test admits the appended migration.
+  `TrainingCommon`; the descriptor holds an opaque versioned canonical encoding, never a
+  foreign type), K1, B6, B1 (no `register_*`), doc parity.
+- **acceptance**: (a) same spec on the same training-set digest with `CachePolicy::Use` is
+  refused on every durable submit edge (reuse is https://github.com/f-inverse/jammi-ai/issues/562);
+  `Bypass` trains, two model rows may share one prefix; deleting either row is always allowed (no catalog edge
+  enforces which is the original — the ownership edge is
+  https://github.com/f-inverse/jammi-ai/issues/547) and leaves the prefix servable through the
+  other row; the prefix itself is reclaimed only once no live row, in any tenant, still names
+  it; (b) the exhaustive-destructuring completeness test; (c) the append-only migration test
+  admits the appended migration.
 - **lane**: hermetic. **depends_on**: U2a. **size**: L (migration, NULL-probe semantics,
   reference-counted reaping, artifact ordering, ten files across two crates). Co-ownership:
   `manifest.rs` and `recompute.rs` with U2a/U4b.
@@ -332,46 +351,152 @@ two-HOST NCCL smoke over `ens1`, not a second copy of the pod-tier's two-process
   the 2×1 shape bills $3.816/h; ≤ 1 h billed wall per run, ≤ 2 runs per authorization; label-only
   until a flake-free streak.
 
-## U5a — `GangService` on `peer_bind`; I-GANG authorization (PR-C commit 2)
+## U5a — `GangService` on `peer_bind`; I-GANG authorization; admit-and-hold (PR-C commit 2)
 
-- **files_in_scope**: (wire-server) `crates/jammi-wire/proto/jammi/v1/gang.proto`
-  (`RunRank(RankAssignment) returns (stream RankEvent)` with `RankEvent::Released`),
-  `crates/jammi-wire/build.rs::main` (the `proto_files` list),
-  `crates/jammi-wire/src/{lib.rs, gang.rs}`, `crates/jammi-server/src/grpc/gang.rs` (handler on
-  the **peer listener** — 68 DIST D7's routes built outside `assemble_grpc_chain`; the I-GANG
-  verification through `get_job_for_rank`, `status = 'running'`, `claimed_by`, live lease, tenant
-  derived from the row and pinned; peer addresses resolved through U5b-1a's
-  `peer_addr_of(instance_id, window)`, never a raw `instances.peer_addr` read; handler order
-  fence-then-slot; #485
-  bounds), (db) `crates/jammi-db/src/catalog/jobs_repo.rs` (`get_job_for_rank(job_id)`: primary
-  key, no tenant predicate, never admin scope; the coordinator-freshness check on an inbound
-  `RunRank` is U5a-1's own `fresh_instance(coordinator_instance_id)` — a single by-id read, never
-  U5b-1a's `list_gang_members`, the full-roster enumerator that unit owns end to end for the
-  coordinator's OWN dispatch), `crates/jammi-server/src/runtime.rs` (mount on the peer
-  routes), `crates/jammi-server/tests/it/{api_freeze_baseline.txt (RPC + PACKAGE lines),
-  api_freeze.rs (package count prose), tenant_isolation_oracle.rs (`GANG_LISTENER_ALLOWLIST`,
-  unioned into `covered_on_wire`; public-listener `UNIMPLEMENTED`
-  probe), gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot`: taken before
-  `claim_next`, held across `run_claimed_job_under`, released before
-  the idle sleep — all three in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`). (db) `config/mod.rs` (`rank_timeout_secs`
-  if not already in U4a).
-- **invariants_to_preserve**: B5 (I-GANG written invariant; no double binder — never mounted under
-  `TenantResolverLayer`), K2, B1 (no `stage`/`register` stems), B6, OPS D6 (no abort while a claim
-  may be in flight — the slot is taken outside the transaction).
-- **acceptance**: (b) `RunRank` for a job not running / not claimed by the named instance / lease
-  expired is refused with a typed status (RED at base); (c) fence
-  before slot: a greater attempt for the job whose stale runner holds the slot aborts it and
-  takes the slot; lesser-or-equal refused (RED at base); (d) a peer busy with its *own* claimed
-  job refuses with `Unavailable`; an idle peer accepts; the claim loop never claims while a rank
-  runs (RED at base); (e) `api_freeze` and `every_rpc_is_covered` green with the new lines; the
-  public listener answers `UNIMPLEMENTED` for `GangService/*`; `get_job_for_rank` is unreachable
-  from any public RPC and ignores any caller tenant (invariant oracles); (f) an assignment naming
-  an instance id that is not a fresh member is refused (RED at base).
-- **lane**: hermetic + server it-suite. **depends_on**: U4a, **68 DIST unit 1 merged** (the
-  `peer_bind` listener — a hard precondition, no fallback), **68 OPS merged** (it rewrites the
-  claim loop that `JobSlot` wraps). GRAPH does not depend_on: it is deferred to #515, so
-  `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`) is unrewritten in this wave and `JobSlot` wraps it as it
-  stands on `main`. **size**: L.
+One bidi RPC, `GangService.RunRank(stream RankControl) returns (stream
+RankEvent)` (`crates/jammi-wire/proto/jammi/v1/gang.proto`) — no
+`RankAssignment`/`FetchPartition`/`RankEvent::Released`/`RankEvent::Progress`;
+message shape and arity are protected by review and
+`docs/rigor/contracts/feat_500-C-U5a-1.md`, not by
+`api_freeze` (which tracks only `PACKAGE`/`RPC` tokens). Two sub-units, split
+across two branches: U5a-1 freezes the wire, I-GANG, and the training-set
+identity; U5a-2 builds `HostAdmission` (the admit-and-hold session, drain,
+re-verification) on top of it.
+
+### U5a-1 — wire freeze, I-GANG, training-set identity (wire-server → db → docs-ci)
+
+- **files_in_scope**: (wire) `crates/jammi-wire/proto/jammi/v1/gang.proto`,
+  `crates/jammi-wire/build.rs`, `crates/jammi-wire/src/lib.rs`. (wire-server)
+  `crates/jammi-server/src/grpc/gang.rs` (`GangServer::run_rank`: wire K2
+  before any row read; the `world_size == 1` admission lattice, keyed on the
+  ROW's own `world_size` (`WorldSizeFact::{Decoded, Undecodable}`,
+  `get_job_for_rank`), never the caller's `assign.world` —
+  `assign.world != row.world_size` refuses
+  (`GangRefusalReason::WorldMismatch`); a row whose `world_size` decodes but
+  is not `1` refuses (`GangRefusalReason::MultiHostUnsupported` — the
+  training-set pair conjunct and its sidecar verify that would admit a
+  genuine multi-host row are U5a-2's to build, filed at
+  <https://github.com/f-inverse/jammi-ai/issues/566>); a row whose `spec`
+  does not decode a `world_size` at all refuses as a row fact
+  (`GangRefusalReason::SpecUndecodable`), never a fault of the read that
+  found it; `fresh_instance` for the coordinator's own liveness; every
+  admission-time catalog read maps its `Err` through
+  `admission_catalog_fault` to `Unavailable`, never `map_engine_error`;
+  every determinant collapses to one `FailedPrecondition` with a fixed
+  message; ends `Unimplemented` — no `HostAdmission` session exists yet in
+  this sub-unit), `crates/jammi-server/src/runtime.rs` (`GangServiceServer`
+  mounted beside `PeerServiceServer` on `[server] peer_bind`, never the
+  public listener), `crates/jammi-server/src/metrics_layer.rs` +
+  `crates/jammi-server/src/routes/health.rs` (`jammi_gang_requests_total{rpc}`).
+  (db) `crates/jammi-db/src/catalog/jobs_repo.rs` (`get_job_for_rank(job_id)`:
+  primary key, no tenant predicate, never admin scope; `fill_training_set_identity`,
+  the write-once CAS over `training_set_ref`/`training_set_location`;
+  `fresh_instance(instance_id, lease)`), `crates/jammi-db/src/catalog/lease.rs`
+  (`instance_liveness_margin(lease)` = `2 × lease`, shared with
+  `reclaim_expired_jobs`'s inline-execution arm), `crates/jammi-db/src/catalog/result_repo.rs`
+  (`get_result_table_for_tenant`: the strict tenant predicate, never the
+  relaxed `get_result_table` read), `crates/jammi-db/src/catalog/schema.rs` +
+  `migrations.rs` (migration adding `jobs.training_set_ref`/
+  `training_set_location`, both nullable TEXT, a paired-nullability `CHECK`
+  constraint — numbered `034_jobs_training_set_identity`, ordered after U3's
+  `033_model_materialization`, which lands in the same PR; the number is pinned at four
+  sites plus the ordered-after oracle: the tuple in `catalog/migrations.rs`'s const list,
+  the constant `catalog/schema.rs::MIGRATION_034_JOBS_TRAINING_SET_IDENTITY`, the const
+  `tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`, the SQL `IN`-list literal inside
+  `tests/it/migrations.rs::migration_029_copies_training_jobs_rows_into_jobs_as_queued`
+  (the ledger rows that test clears so the reopen replays every later migration that
+  alters `jobs`), and
+  `tests/it/migrations.rs::migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge`'s
+  own `position("034_jobs_training_set_identity")` literal). (docs-ci)
+  `crates/jammi-server/tests/it/api_freeze_baseline.txt` +  `api_freeze.rs`
+  (`PACKAGE jammi.v1.gang` / `RPC GangService/RunRank`),
+  `tenant_isolation_oracle.rs` (`GANG_LISTENER_ALLOWLIST`, never appended to
+  `PEER_LISTENER_ALLOWLIST`), `gang_rank_admission_oracle.rs` (the
+  enumerating caller oracle: `get_job_for_rank`'s only production caller is
+  the gang `RunRank` handler — the `get_result_table_for_tenant` caller
+  surface this file once also enumerated is gone, not merely retired, since
+  this sub-unit's handler no longer reaches that verb at all),
+  `gang_admission_catalog_fault_oracle.rs` (a source-scan oracle: no
+  admission-time catalog read in `run_rank` reaches `map_engine_error`,
+  every one reaches `admission_catalog_fault`), `gang_training_spec_parity.rs`
+  (producer→consumer parity: `get_job_for_rank`'s `world_size` decode reads
+  exactly what a real `TrainingSpec::FineTune`'s `TrainingCommon` producer
+  writes, never a hand-written spec literal on either side).
+- **invariants_to_preserve**: B5 (I-GANG beside I-PEER, never under
+  `TenantResolverLayer`, tenant from the row, non-disclosure on refusal), K2
+  (`world == 0`, `rank >= world`; the lease-NULL edge), B6 (docs same commit
+  set), B4 (no admitted `RunRank` session reaches a rank body in this
+  sub-unit or U5a-2 — every session parks and ends `Aborted{NoBody}` absent
+  an earlier exit, once U5a-2 lands), K4 (this sub-unit's instance: the
+  `training_set_ref`/`training_set_location` write-once CAS, exercised
+  directly at the db layer; no caller on this sub-unit's wire path reaches
+  it yet, since the row-keyed world gate refuses every `world_size != 1` row
+  outright — verify-at-read is U5a-2's K4 instance, built once a rank
+  actually reads the pair it names), B1 (`RunRank`/`Assign`/`Outcome` are
+  mechanism names), `api_freeze` additive-only (`Outcome` is a new oneof
+  arm, not a new RPC).
+- **acceptance**: a1' (the `training_set_ref`/`training_set_location` CAS
+  fires exactly once per job, and a concurrent racer reuses the winner's
+  pair rather than overwriting it — both asserted directly against the CAS
+  at the db layer); b1' (one refusal test per I-GANG determinant — ten
+  total: `AdminScope`, `NotFound`, `NotRunning`, `WrongClaimant`,
+  `WrongAttempt`, `LeaseDead`, `SpecUndecodable`, `WorldMismatch`,
+  `MultiHostUnsupported`, `CoordinatorNotFresh` — status + `test-hooks`
+  reason pairwise-identical across every determinant, on both the plain and
+  `--features test-hooks` lanes, counted separately; plus wire K2; plus the
+  producer→consumer `world_size` parity oracle; plus the admission-catalog-
+  fault-maps-to-`Unavailable` source-scan oracle); e1 (`api_freeze` green
+  with the gang lines; `every_rpc_is_covered` green with the new allowlist;
+  public-listener `Unimplemented` probe; the `get_job_for_rank` caller
+  oracle); f1' (a call satisfying every I-GANG determinant still ends
+  `Unimplemented` — this sub-unit has no `HostAdmission` session to hand it
+  to).
+- **lane**: hermetic + server it-suite. **depends_on**: U2b, U4a, PR-B2 merged
+  (the `peer_bind` listener this mounts beside `PeerService` on). GRAPH does
+  not depend_on: it is deferred to #515. **size**: M.
+
+### U5a-2 — `HostAdmission`, drain, re-verification, admit-and-hold (ai-core → wire-server)
+
+- **files_in_scope**: (ai-core) `fine_tune/worker.rs` (`phase` moves from
+  `WorkerShared` to a session-owned cell; `HostAdmission { phase, holder,
+  registry }`; the holder CAS lattice — `Free`/`ClaimProbe`/`JobRun`/
+  `Rank{job_id,attempt}` — replacing the attempt-keyed fence), `session.rs`
+  (`worker_gate_receiver`, the same gate reader a claim loop already
+  `wait_for`s on). (wire-server) `crates/jammi-server/src/grpc/gang.rs` (the
+  bidi handler's order: admission decision before the CAS, `Admitted` emitted
+  only after it, the guard moved into a spawned HOLD-loop future driving
+  re-verification and the park-bound timer; the `select!`'s four arms —
+  inbound stream, drain signal, re-verification tick, park-bound timer — no
+  fifth "quiesce" arm, since `Quiesce` is never emitted; **carried whole from
+  U5a-1** — the `world_size > 1` conjunct U5a-1 refuses outright under
+  `GangRefusalReason::MultiHostUnsupported`: the training-set pair conjunct
+  against the already-written `training_set_ref`/`training_set_location` CAS
+  and the sidecar verify that would admit a genuine multi-host row, filed at
+  <https://github.com/f-inverse/jammi-ai/issues/566>).
+- **invariants_to_preserve**: OPS D6/D10 (a rank is not loop work; the
+  release decision reads the holder kind, never `in_flight`; a peer-tier
+  rolling restart costs zero net attempts), B4, K2 (a second `Assign` on an
+  already-admitted stream is a protocol violation, `InvalidArgument`), K4
+  (the peer-local-vs-coordinator-local partition-parity row is U5b-1b-i's K4
+  instance, not this one's).
+- **acceptance**: c2' (holder contention: `Free` admits, `ClaimProbe` waits
+  ≤ one heartbeat then admits-if-freed or `Unavailable`, `JobRun`/another
+  `Rank` refuses `Unavailable` at once; the second-`Assign` K2 row); d2'
+  (exclusion: a `JobRun`-holding peer refuses, an idle peer admits, inline
+  `run_now` is outside the exclusion); g2' (terminal-write scope: the peer
+  writes nothing terminal on behalf of a rank; a reclaim/drain/park ends the
+  stream with the matching reason, the job row otherwise untouched); i2'
+  (re-verification: row refutation vs. catalog-unavailable vs.
+  object-store-unavailable are pairwise distinguishable, each with its own
+  scope and count-toward-`assembly_attempts` rule); j2' (an admitted
+  `RunRank`, either `world_size` arm, receives `Admitted`, is held under
+  re-verification, and — absent an earlier exit — ends `Aborted{NoBody}` at
+  the park bound; no acceptance row in this sub-unit asserts a body running
+  end to end).
+- **lane**: hermetic + server it-suite (rows needing `world_size > 1` are
+  built below the submit edge). **depends_on**: U5a-1 (cut from its merge),
+  68 OPS merged (the claim loop and `WorkerShared` shape this reshapes).
+  **size**: L.
 
 **Partition-aware inference operator.** Out of scope for this plan; filed as GitHub issue #540.
 The head target's frozen forward is a per-batch call inside the trainer

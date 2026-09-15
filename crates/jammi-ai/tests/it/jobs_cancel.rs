@@ -285,6 +285,7 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
             config: FineTuneConfig::default(),
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
         },
+        cache: jammi_db::store::CachePolicy::Bypass,
     }
     .into();
     let handle = session.enqueue(spec, 0).await.unwrap();
@@ -438,6 +439,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
                 },
+                cache: jammi_db::store::CachePolicy::Bypass,
             }
             .into(),
             0,
@@ -585,6 +587,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
                 },
+                cache: jammi_db::store::CachePolicy::Bypass,
             }
             .into(),
             0,
@@ -766,6 +769,7 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
                 },
+                cache: jammi_db::store::CachePolicy::Bypass,
             }
             .into(),
             0,

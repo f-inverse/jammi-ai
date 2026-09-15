@@ -289,11 +289,13 @@ for the failure ladder). Three facts fix the shape:
   and the search is exactly the single-node search (the same kernels, the
   same bytes, the same exact-read count at every segment count). Nothing on
   this page changes until a deployment opts in.
-- **`peer_bind` makes a replica an owner.** Setting `[server] peer_bind`
-  (`JAMMI_SERVER__PEER_BIND`) opens the internal `PeerService` listener on
-  that replica. Bind it on a private interface behind network policy / mTLS
-  from the runtime — its clients are other jammi coordinators and it
-  authenticates nothing itself.
+- **`peer_bind` makes a replica an owner (and a gang admission member).**
+  Setting `[server] peer_bind` (`JAMMI_SERVER__PEER_BIND`) opens the internal
+  listener serving both `PeerService` (segment search) and `GangService`
+  (multi-host training-run admission — see [Security
+  Posture](./security.md#the-gang-listener-i-gang)) on that replica. Bind it
+  on a private interface behind network policy / mTLS from the runtime — its
+  clients are other jammi coordinators and it authenticates nothing itself.
 - **Precondition: a shared, replica-readable `result_root`.** A segment an
   owner serves must be a bundle every replica can reach: `[storage]
   result_root` on an object store every replica reads (a local

@@ -42,3 +42,6 @@ pub mod lifecycle {
 pub mod peer {
     tonic::include_proto!("jammi.v1.peer");
 }
+pub mod gang {
+    tonic::include_proto!("jammi.v1.gang");
+}

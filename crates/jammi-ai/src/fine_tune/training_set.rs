@@ -79,6 +79,36 @@ pub fn read_back_sql(table: &TrainingSetTable, columns: &[String]) -> String {
     )
 }
 
+/// The single constructor every production call site in this crate builds a
+/// [`TrainingSetSpec`] through: a future field added to the spec is added in
+/// exactly ONE place, rather than re-derived independently at each of
+/// [`materialize_projection`] and `pipeline/recompute.rs`'s
+/// `recompute_training_set`.
+///
+/// A thin pass-through by design — it changes nothing about what a caller
+/// supplies, only WHERE the seven fields are named — so it cannot move a
+/// [`TrainingSetSpec::definition_hash`]; pinned by `training_set_spec_matches_
+/// a_hand_built_spec_byte_for_byte` below.
+pub(crate) fn training_set_spec<'a>(
+    source_id: &'a str,
+    source_sql: &'a str,
+    columns: &'a [String],
+    task: ModelTask,
+    format: &'a str,
+    inputs: Vec<InputAnchor>,
+    device: jammi_db::store::manifest::ComputeDevice,
+) -> TrainingSetSpec<'a> {
+    TrainingSetSpec {
+        source_id,
+        source_sql,
+        columns,
+        task,
+        format,
+        inputs,
+        device,
+    }
+}
+
 /// Materialise `columns` of a registered `source` as a training set, then read
 /// the committed rows back in order.
 ///
@@ -103,23 +133,21 @@ pub async fn materialize_projection(
     );
     materialize_and_read(
         session,
-        TrainingSetSpec {
+        training_set_spec(
             source_id,
-            source_sql: &source_sql,
+            &source_sql,
             columns,
             task,
             format,
             // The source has no version surface to pin, so it is anchored at
             // the instant it was read — the same honest anchor the embedding
-            // producer records for the same reason, constructed here rather
-            // than behind a helper so the anchor value never travels apart
-            // from the read it describes.
-            inputs: vec![InputAnchor::unpinned_at_instant(
+            // producer records for the same reason.
+            vec![InputAnchor::unpinned_at_instant(
                 source_id,
                 chrono::Utc::now().to_rfc3339(),
             )],
-            device: session.compute_device(),
-        },
+            session.compute_device(),
+        ),
     )
     .await
 }
@@ -142,4 +170,294 @@ async fn materialize_and_read(
         .await?;
     let batches = session.sql(&read_back_sql(&table, &columns)).await?;
     Ok((table, batches))
+}
+
+/// The reader-class allow-list: every call site in the workspace, outside test
+/// code, that reaches a training-set table's relation KEY through one of the
+/// three named routes below, keyed by `path:function` rather than
+/// `path:line` — a line number drifts under an unrelated edit, a function
+/// name does not — with the ONE property each entry must hold: it applies
+/// [`training_set_order_by`] itself. A caller that reads a relation by name
+/// without doing so loses the committed order silently on a multi-row-group
+/// table scanned by more than one partition.
+///
+/// # The three named routes this scan covers
+///
+/// [`TrainingSetTable::sql_relation`] is not the only way to reach the
+/// registered name — the scan matches three named routes:
+/// - `.sql_relation(` — the dot-call form.
+/// - `sql_relation(&` — the UFCS form (`TrainingSetTable::sql_relation(&t)`).
+/// - `registered_name(` — [`TrainingSetTable::registered_name`], the
+///   UNQUOTED key `sql_relation` itself quotes. Its own doc says it is "NOT
+///   safe to interpolate into SQL as-is", but a caller that reaches for it
+///   directly (skipping the quoting) is still on the identical route to the
+///   same relation, and the order hazard is the same.
+///
+/// # This scan's universe is exactly these three named routes — nothing wider
+///
+/// The scan matches literal invocation syntax for `sql_relation`/
+/// `registered_name`, so it covers a caller **only** if the caller spells one
+/// of those two names. [`TrainingSetTable::table_name`] returns the bare
+/// catalog name with no `jammi.` schema prefix and is NOT one of the three
+/// needles, so a caller that hand-builds the relation string from it — e.g.
+/// `format!("SELECT * FROM \"jammi.{}\"", table.table_name())`, reproducing
+/// [`TrainingSetTable::sql_relation`]'s own formatting by hand instead of
+/// calling it — is invisible to this scan: it reaches the identical
+/// relation, carries the identical order hazard, and is counted nowhere in
+/// the table above.
+/// [`TrainingSetTable::record`] is a public field, so nothing in the type
+/// system stops this: the allow-list is a scan over spelling, not a closed
+/// set over meaning, and a hand-built key never triggers it no matter how
+/// many such callers exist. Making the hand-built form unrepresentable — a
+/// `RelationKey` newtype that owns quoting and is the only value
+/// [`TrainingSetTable::sql_relation`]-shaped code can hold — is tracked as
+/// <https://github.com/f-inverse/jammi-ai/issues/551>; until it lands, this
+/// scan's guarantee is "every caller that reaches for the relation by NAME
+/// applies the order", not "every caller that reaches the relation at all".
+///
+/// One exclusion, by construction rather than by allow-listing: `sql_relation`'s
+/// OWN body (`crates/jammi-db/src/store/mod.rs`) calls `registered_name()` on
+/// itself to build the string it then quotes — that call constructs an
+/// identifier, not a query, so there is no order to lose. The scan skips
+/// matches whose enclosing function IS `table_name`/`registered_name`/
+/// `sql_relation` in that one file (the accessors' own implementations),
+/// never a caller elsewhere.
+///
+/// | `path:function`                                  | mechanism                          | behavioural order assertion |
+/// |---------------------------------------------------|-------------------------------------|------------------------------|
+/// | `fine_tune/training_set.rs:read_back_sql`          | `ORDER BY` via `training_set_order_by` | `training_set::read_back_re_applies_the_committed_order_across_row_groups` (`tests/it/training_set.rs`) |
+///
+/// This test finds every call site itself (never hand-transcribes the count)
+/// by walking every `crates/*/src/**/*.rs` file from the workspace root and
+/// grepping for each route's invocation syntax — so a NEW caller anywhere in
+/// the workspace, not just this crate, fails it, and a call site that moves
+/// to a different function name (rename) requires a conscious edit to this
+/// allow-list rather than silently staying "covered". Every needle is
+/// assembled at runtime (never spelled as one contiguous literal in this
+/// module's own source) so this scan does not match its own doc comments,
+/// messages, or the `const` below.
+#[cfg(test)]
+mod reader_class_allow_list {
+    /// `(workspace-relative path, enclosing function name)` for every
+    /// production call site this fold has audited and accepted.
+    const ALLOWED: &[(&str, &str)] = &[(
+        "crates/jammi-ai/src/fine_tune/training_set.rs",
+        "read_back_sql",
+    )];
+
+    /// The accessors' own implementations (`crates/jammi-db/src/store/mod.rs`)
+    /// — excluded by construction, not by allow-listing, since a match there
+    /// is the method building its own return value, never a caller reaching
+    /// for the relation key. See the module doc's "One exclusion" note.
+    const ACCESSOR_IMPL_FILE: &str = "crates/jammi-db/src/store/mod.rs";
+    const ACCESSOR_IMPL_FNS: &[&str] = &["table_name", "registered_name", "sql_relation"];
+
+    /// Every route this scan matches, each assembled from separate literal
+    /// parts so the exact contiguous text never appears once in this file
+    /// (which would otherwise match itself, its own doc comments, and its
+    /// own messages).
+    fn needles() -> Vec<String> {
+        vec![
+            format!(".{}(", "sql_relation"),
+            format!("{}(&", "sql_relation"),
+            format!("{}(", "registered_name"),
+        ]
+    }
+
+    /// A route's own definition line (`fn sql_relation(` / `fn registered_name(`)
+    /// is not a call site — the return-type accessor being DEFINED, never
+    /// invoked. Distinct from [`ACCESSOR_IMPL_FNS`]'s exclusion, which covers
+    /// calls made FROM inside those functions' bodies.
+    fn is_definition_line(line: &str) -> bool {
+        line.contains(&format!("fn {}(", "sql_relation"))
+            || line.contains(&format!("fn {}(", "registered_name"))
+    }
+
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("crates/jammi-ai/../.. must be the workspace root")
+    }
+
+    /// Every `crates/*/src/**/*.rs` file under the workspace root — `src/`
+    /// only, so a test fixture calling the reader method (there are several,
+    /// deliberately, to build committed-order oracles) never enters this
+    /// production-code sweep.
+    fn all_workspace_src_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let crates_dir = root.join("crates");
+        for crate_entry in std::fs::read_dir(&crates_dir)
+            .unwrap_or_else(|e| panic!("read_dir({}): {e}", crates_dir.display()))
+        {
+            let crate_entry = crate_entry.unwrap();
+            if !crate_entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let src_dir = crate_entry.path().join("src");
+            if src_dir.is_dir() {
+                walk_rs_files(&src_dir, &mut out);
+            }
+        }
+        out
+    }
+
+    fn walk_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir({}): {e}", dir.display()))
+        {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The name of the nearest `fn`/`async fn` declaration at or before
+    /// `line_idx` (0-based) in `lines` — a plain textual scan, adequate for
+    /// this codebase's style of one function body per reader-method call
+    /// site (never a closure or a nested `fn`).
+    fn enclosing_fn_name(lines: &[&str], line_idx: usize) -> Option<String> {
+        let fn_line = regex_lite_find_fn(lines, line_idx)?;
+        let after_fn = fn_line.split("fn ").nth(1)?;
+        let name: String = after_fn
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Walk backward from `line_idx` for a line containing `"fn "` — no
+    /// external regex dependency needed for this narrow a scan.
+    fn regex_lite_find_fn<'a>(lines: &[&'a str], line_idx: usize) -> Option<&'a str> {
+        (0..=line_idx).rev().map(|i| lines[i]).find(|l| {
+            l.trim_start().starts_with("fn ")
+                || l.trim_start().starts_with("pub fn ")
+                || l.trim_start().starts_with("pub(crate) fn ")
+                || l.trim_start().starts_with("async fn ")
+                || l.trim_start().starts_with("pub async fn ")
+                || l.trim_start().starts_with("pub(crate) async fn ")
+        })
+    }
+
+    #[test]
+    fn every_production_sql_relation_call_site_is_on_the_allow_list() {
+        let root = workspace_root();
+        let needles = needles();
+        let mut found: Vec<(String, String)> = Vec::new();
+        for path in all_workspace_src_files(&root) {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let lines: Vec<&str> = text.lines().collect();
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (i, line) in lines.iter().enumerate() {
+                // Skip comment/doc lines outright — a mention of a route in
+                // prose is not an invocation of it.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // A route's own definition line is not a call site.
+                if is_definition_line(line) {
+                    continue;
+                }
+                if !needles.iter().any(|n| line.contains(n)) {
+                    continue;
+                }
+                let func = enclosing_fn_name(&lines, i).unwrap_or_else(|| {
+                    panic!(
+                        "{rel}:{}: reader-method call with no enclosing `fn` found by this \
+                         scan — widen `regex_lite_find_fn`'s prefix list",
+                        i + 1
+                    )
+                });
+                // The accessors' own bodies (`sql_relation` calling
+                // `registered_name` on itself) are excluded by construction —
+                // see the module doc's "One exclusion" note.
+                if rel == ACCESSOR_IMPL_FILE && ACCESSOR_IMPL_FNS.contains(&func.as_str()) {
+                    continue;
+                }
+                found.push((rel.clone(), func));
+            }
+        }
+        found.sort();
+        found.dedup();
+        let mut allowed: Vec<(String, String)> = ALLOWED
+            .iter()
+            .map(|(p, f)| (p.to_string(), f.to_string()))
+            .collect();
+        allowed.sort();
+
+        let extra: Vec<_> = found.iter().filter(|e| !allowed.contains(e)).collect();
+        assert!(
+            extra.is_empty(),
+            "new caller(s) reaching a training-set table's relation key (via `sql_relation`, \
+             its UFCS form, or `registered_name`) not on the reader-class allow-list — each \
+             one must either apply `training_set_order_by` or pin `target_partitions = 1` on \
+             an `ORDER BY`-free scan, then be added here with its own behavioural order \
+             assertion: {extra:?}"
+        );
+        let missing: Vec<_> = allowed.iter().filter(|e| !found.contains(e)).collect();
+        assert!(
+            missing.is_empty(),
+            "allow-listed call site(s) no longer found — the allow-list is stale, narrow it: \
+             {missing:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`training_set_spec`] is a thin pass-through, so it must name the
+    /// exact same [`TrainingSetSpec::
+    /// definition_hash`] as a hand-built struct literal over the identical
+    /// seven fields — the "unification must not change any hash" property,
+    /// pinned directly rather than by re-running a whole fixture through the
+    /// engine.
+    #[test]
+    fn training_set_spec_matches_a_hand_built_spec_byte_for_byte() {
+        let columns = vec!["anchor".to_string(), "positive".to_string()];
+        let inputs = vec![InputAnchor::unpinned_at_instant(
+            "training",
+            "2024-01-01T00:00:00Z".to_string(),
+        )];
+        let device = jammi_db::store::manifest::ComputeDevice::Cpu;
+
+        let via_helper = training_set_spec(
+            "training",
+            "SELECT anchor, positive FROM training",
+            &columns,
+            ModelTask::TextEmbedding,
+            "pairs",
+            inputs.clone(),
+            device.clone(),
+        );
+        let hand_built = TrainingSetSpec {
+            source_id: "training",
+            source_sql: "SELECT anchor, positive FROM training",
+            columns: &columns,
+            task: ModelTask::TextEmbedding,
+            format: "pairs",
+            inputs,
+            device,
+        };
+        assert_eq!(
+            via_helper.definition_hash().unwrap(),
+            hand_built.definition_hash().unwrap(),
+            "training_set_spec must be a pure pass-through: it cannot move the definition hash \
+             relative to constructing the SAME fields directly"
+        );
+    }
 }

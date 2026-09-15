@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 032) -- a new migration is added here
+/// (K5: append-only, currently ending at 034) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -53,6 +53,8 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "030_jobs_idempotency_key",
     "031_jobs_releases_workers_state",
     "032_result_table_versions",
+    "033_model_materialization",
+    "034_jobs_training_set_identity",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -814,7 +816,8 @@ async fn migration_029_creates_jobs_instances_workers_and_drops_training_jobs() 
 /// seed one row, clear the ledger's `029_jobs_instances_workers` row and
 /// every later row that alters the dropped tables) and reopening — the
 /// reopen re-runs the REAL migration 029 DDL (never a test-duplicated copy
-/// of it), then 030 and 031, against that manufactured state.
+/// of it), then 030, 031, and 034 (032 and 033 never touch `jobs`), against
+/// that manufactured state.
 #[tokio::test]
 async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
     use jammi_db::catalog::backend::SqlValue;
@@ -833,14 +836,17 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 tx.execute("DROP TABLE jobs", &[]).await?;
                 // Every later migration that ALTERs the dropped `jobs` /
                 // `workers` tables must replay too (030's idempotency key,
-                // 031's `releases` / `workers.state`), or the reopen would
-                // rebuild a 029-shaped table the current `SELECT_COLS`
+                // 031's `releases` / `workers.state`, 034's
+                // `training_set_ref`/`training_set_location` -- 032 and 033
+                // never touch `jobs`, so they are left applied), or the reopen
+                // would rebuild a 029-shaped table the current `SELECT_COLS`
                 // cannot read — the manufactured state is pre-029, so the
-                // ledger must say so for everything from 029 onwards.
+                // ledger must say so for everything from 029 onwards that
+                // alters `jobs`.
                 tx.execute(
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
-                       '031_jobs_releases_workers_state')",
+                       '031_jobs_releases_workers_state', '034_jobs_training_set_identity')",
                     &[],
                 )
                 .await?;
@@ -1548,4 +1554,418 @@ async fn migration_032_creates_result_table_versions(
         .await
         .unwrap();
     assert_eq!(dflt, 0, "next_version defaults to 0");
+}
+
+/// Migration `033_model_materialization` (#500) is present and ordered
+/// AFTER `032_result_table_versions` (K5: relative position, never
+/// `.last()`, so a renumber on a later merge keeps this green), adds
+/// the two NULLABLE `models` columns (`definition_hash`,
+/// `input_anchors_json`), the `idx_models_definition_hash` cache-lookup
+/// index, and the `idx_models_artifact_path` reference-guard index — on
+/// both backends. `manifest_path` is deliberately absent: the sidecar path
+/// stays derived from the artifact prefix rather than recorded.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_033_is_ordered_after_032_and_adds_model_materialization_columns(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::BackendKind;
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("033_model_materialization") > position("032_result_table_versions"),
+        "the model_materialization migration must follow 032"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    let applied = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM applied_migrations ORDER BY name",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    let ledger_position = |name: &str| {
+        applied
+            .iter()
+            .position(|m| m == name)
+            .unwrap_or_else(|| panic!("{name} missing from the applied ledger: {applied:?}"))
+    };
+    assert!(
+        ledger_position("033_model_materialization") > ledger_position("032_result_table_versions")
+    );
+
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('models')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable \
+                                 FROM information_schema.columns WHERE table_name = 'models'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for expected in ["definition_hash", "input_anchors_json"] {
+        assert!(
+            columns.iter().any(|(c, notnull)| c == expected && !notnull),
+            "models.{expected} must exist and be nullable after migration 033; got {columns:?}"
+        );
+    }
+    assert!(
+        columns.iter().all(|(c, _)| c != "manifest_path"),
+        "manifest_path must never exist on models (P7: dropped before merge; \
+         the sidecar path is derived from the artifact prefix, never recorded); got {columns:?}"
+    );
+
+    for index_name in ["idx_models_definition_hash", "idx_models_artifact_path"] {
+        let index_present = backend
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        match kind {
+                            BackendKind::Sqlite => {
+                                tx.query::<_, i64>(
+                                    &format!(
+                                        "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
+                                         AND name='{index_name}' AND tbl_name='models'"
+                                    ),
+                                    &[],
+                                    |row| row.get("one"),
+                                )
+                                .await
+                            }
+                            BackendKind::Postgres => {
+                                tx.query::<_, i64>(
+                                    &format!(
+                                        "SELECT 1::bigint AS one FROM pg_indexes \
+                                         WHERE tablename = 'models' AND indexname = '{index_name}'"
+                                    ),
+                                    &[],
+                                    |row| row.get("one"),
+                                )
+                                .await
+                            }
+                        }
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(index_present.len(), 1, "{index_name} must exist on models");
+    }
+
+    // A pre-migration-shaped row (NULL definition_hash) is never matched by
+    // an equality probe -- the SQL-level half of "NULL never matches" the
+    // model_repo unit test exercises through `probe_model_by_definition`.
+    let name = format!("mig033_{}", jammi_test_utils::unique_suffix());
+    let pk = name.clone();
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let pk = pk.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO models (model_id, name, model_type, task, version) \
+                     VALUES ($1, $1, 'lora', 'text_embedding', 1)",
+                    &[jammi_db::catalog::backend::SqlValue::TextOwned(pk)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    let matches: i64 = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let name = name.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT count(*) AS c FROM models WHERE model_id = $1 \
+                         AND definition_hash = $2",
+                        &[
+                            jammi_db::catalog::backend::SqlValue::TextOwned(name),
+                            jammi_db::catalog::backend::SqlValue::Text("anything"),
+                        ],
+                        |row| row.get::<i64>("c"),
+                    )
+                    .await
+                    .map(|c| c.unwrap_or(-1))
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        matches, 0,
+        "a NULL definition_hash must never equality-match a probed hash"
+    );
+}
+
+/// Migration `034_jobs_training_set_identity`
+/// (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6)
+/// is present, ordered AFTER `033_model_materialization` (K5: relative
+/// position, never `.last()`), adds `jobs.training_set_ref` /
+/// `jobs.training_set_location` as nullable `TEXT` columns, and pins the
+/// pair's stop rule ("never one column without the other in the same
+/// statement") at the SCHEMA edge: a raw single-column write is
+/// refused by the `CHECK` constraint itself, on both backends — never left
+/// to "the only writer is the CAS" as the sole guarantee.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::{BackendKind, SqlValue};
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("034_jobs_training_set_identity") > position("033_model_materialization"),
+        "the training-set identity migration must follow 033"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    // Both columns exist and are nullable, on both dialects.
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('jobs') \
+                                 WHERE name IN ('training_set_ref', 'training_set_location')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable FROM information_schema.columns \
+                                 WHERE table_name = 'jobs' \
+                                   AND column_name IN ('training_set_ref', 'training_set_location')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for col in ["training_set_ref", "training_set_location"] {
+        assert!(
+            columns.iter().any(|(c, notnull)| c == col && !notnull),
+            "jobs.{col} must be a nullable TEXT column; got {columns:?}"
+        );
+    }
+
+    let job_id = format!("mig033_{}", jammi_test_utils::unique_suffix());
+    let insert_bare = format!(
+        "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at) \
+         VALUES ('{job_id}', 'k', 'queued', '{{}}', 'now', 'now')"
+    );
+
+    // Both NULL succeeds — the default, every existing and every `world_size
+    // == 1` row.
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let sql = insert_bare.clone();
+            Box::pin(async move { tx.execute(&sql, &[]).await })
+        })
+        .await
+        .expect("both columns NULL must be a valid row");
+
+    // Both SET together succeeds.
+    let job_id2 = format!("{job_id}_paired");
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let job_id2 = job_id2.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO jobs (job_id, kind, execution, spec, created_at, updated_at, \
+                         training_set_ref, training_set_location) \
+                     VALUES ($1, 'k', 'queued', '{}', 'now', 'now', 'digest-x', 'table-y')",
+                    &[SqlValue::TextOwned(job_id2)],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("both columns set together must be a valid row");
+
+    // A raw write of ONE column, leaving the other NULL, is refused by the
+    // schema itself — the mutation this test proves: drop the `CHECK` clause
+    // from migration 033 and this exact statement stops erroring.
+    let one_col_err = backend
+        .transaction(TxOptions::default(), |tx| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET training_set_ref = $1 WHERE job_id = $2",
+                    &[
+                        SqlValue::TextOwned("digest-only".to_string()),
+                        SqlValue::TextOwned(job_id),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+    assert!(
+        one_col_err.is_err(),
+        "setting training_set_ref alone (training_set_location left NULL) must be refused \
+         by the schema CHECK constraint, never silently accepted"
+    );
+
+    // ... and the symmetric case: the OTHER column alone.
+    let job_id3 = format!("{job_id}_other_alone");
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let sql = insert_bare.replace(&job_id, &job_id3);
+            Box::pin(async move { tx.execute(&sql, &[]).await })
+        })
+        .await
+        .expect("fixture row for the symmetric case");
+    let other_col_err = backend
+        .transaction(TxOptions::default(), |tx| {
+            let job_id3 = job_id3.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET training_set_location = $1 WHERE job_id = $2",
+                    &[
+                        SqlValue::TextOwned("location-only".to_string()),
+                        SqlValue::TextOwned(job_id3),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+    assert!(
+        other_col_err.is_err(),
+        "setting training_set_location alone (training_set_ref left NULL) must be refused \
+         by the schema CHECK constraint, never silently accepted"
+    );
 }

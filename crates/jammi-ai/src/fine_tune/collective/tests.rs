@@ -153,7 +153,7 @@ fn local_all_gather_refuses_counts_that_contradict_the_ranks() {
     // Determinant 3: the ranks derived DIFFERENT count vectors. Each is
     // self-consistent, so only the round descriptor's `counts` field catches
     // it — and it catches it on BOTH ranks, symmetrically, before either is
-    // handed a result (this is the auditor's PROBE2).
+    // handed a result.
     let disagreeing = run_gang(2, move |local| {
         let (rows, counts) = if local.rank() == 0 {
             (1usize, [1usize, 1])
@@ -586,7 +586,7 @@ fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
 
 // ── The round descriptor: no rank returns `Ok` from a round any rank rejects ─
 
-/// The auditor's PROBE1: rank 0 calls `broadcast(root = 0)`, rank 1 calls
+/// Rank 0 calls `broadcast(root = 0)`, rank 1 calls
 /// `broadcast(root = 1)` — each is a valid root of a two-rank gang on its
 /// own, so nothing here is a domain error either rank could catch alone. At
 /// base (`f74943b5`) both return `Ok` with DIFFERENT bytes: rank 0 broadcasts
@@ -595,7 +595,7 @@ fn every_collective_after_a_fault_errs_promptly_on_every_rank() {
 /// `root` field agreed before publishing, this is a symmetric typed error on
 /// both ranks instead.
 #[test]
-fn probe1_broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
+fn broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
     let results: Vec<std::result::Result<Vec<u32>, String>> = run_gang(2, move |local| {
         let mut t = matrix(1, 1, local.rank() as f32 + 1.0);
         let root = local.rank(); // each rank names ITSELF the root
@@ -620,7 +620,7 @@ fn probe1_broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
     }
 }
 
-/// The auditor's PROBE2: rank 0 calls `all_gather` with `counts = [1, 1]`,
+/// Rank 0 calls `all_gather` with `counts = [1, 1]`,
 /// rank 1 calls it with `counts = [1, 2]` — each rank's OWN row count agrees
 /// with its OWN counts vector, so neither can catch the disagreement from its
 /// own inputs alone. At base (`f74943b5`) rank 0 errs (its view of rank 1's
@@ -629,7 +629,7 @@ fn probe1_broadcast_with_self_named_roots_faults_both_ranks_symmetrically() {
 /// can see). With the round descriptor's `counts` field agreed before
 /// publishing, both ranks are refused.
 #[test]
-fn probe2_all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
+fn all_gather_with_disagreeing_counts_faults_both_ranks_symmetrically() {
     let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
         let (rows, counts) = if local.rank() == 0 {
             (1usize, [1usize, 1])
@@ -733,7 +733,7 @@ fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
 
 // ── The shared seam: a 0-dim tensor is refused before any arm signs it ─────
 
-/// The auditor's PROBE-A1 (closing audit #3, `c9d20550`): a 0-dim scalar has
+/// A 0-dim scalar has
 /// no row count to check against a partition rule, so `checked_gather_counts`
 /// — the ONE seam every arm calls before it does anything else — must refuse
 /// it, naming the rank and the shape, before any arm's own gather logic ever
@@ -748,7 +748,7 @@ fn a_faulted_gang_reports_the_fault_before_a_new_domain_error_on_every_rank() {
 /// `[Ok([]), Ok([0])]`, one rank silently signing a shape the other rank
 /// never actually held.
 #[test]
-fn probe_a1_a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
+fn a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
     // Noop (world = 1): the single-rank topology gets the same domain check.
     let noop = Noop::new();
     let scalar = Tensor::new(1.0f32, &Device::Cpu).expect("0-dim scalar");
@@ -760,7 +760,7 @@ fn probe_a1_a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
         "unexpected message: {error}"
     );
 
-    // Local (world = 2): the auditor's exact PROBE-A1 shape — rank 0 a 0-dim
+    // Local (world = 2): the same 0-dim shape — rank 0 a 0-dim
     // scalar, rank 1 a real 1-D `[0]` tensor, both claiming zero rows.
     let results: Vec<std::result::Result<Vec<usize>, String>> = run_gang(2, move |local| {
         let counts = [0usize, 0];
@@ -791,7 +791,7 @@ fn probe_a1_a_0_dim_tensor_is_refused_before_any_arm_signs_it() {
 }
 
 /// A second missing end-to-end oracle found while re-aiming the per-field
-/// sweep at the descriptor constructors (fix round 4, item 6): `all_gather`'s
+/// sweep at the descriptor constructors: `all_gather`'s
 /// TRAILING shape is a descriptor determinant (`TensorSignature::of_gather_slice`
 /// drops only dim 0, which `counts` already governs) but, before this test,
 /// no end-to-end case exercised it — a mutation that replaced the
@@ -828,7 +828,7 @@ fn a_two_rank_all_gather_with_a_trailing_shape_mismatch_at_equal_counts_faults_b
     }
 }
 
-/// A reachability probe (not one of the auditor's numbered probes): three
+/// A reachability probe: three
 /// ranks name an ASYMMETRIC set of roots for `broadcast` — two agree with
 /// each other, one disagrees — so more than one rank's `Contribution` carries
 /// `Some` at once if the round were ever (wrongly) assembled. The property
@@ -891,13 +891,13 @@ fn reachability_a_two_rank_uneven_all_reduce_sum_list_never_panics() {
     }
 }
 
-/// PROBE-A4 (from the fold list): the root passes a `[2, 3]` tensor, the
+/// The root passes a `[2, 3]` tensor, the
 /// non-root a `[1, 1]` tensor. `broadcast`'s descriptor carries every rank's
 /// OWN tensor shape, not only the root's, so a shape mismatch off the root is
 /// a symmetric typed error on BOTH ranks, and the gang is left faulted for
 /// any later collective.
 #[test]
-fn probe_a4_broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically() {
+fn broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symmetrically() {
     let gang = LocalGang::with_timeout(vec![Device::Cpu; 2], Duration::from_secs(5)).expect("gang");
     let rank0 = gang.rank(0).expect("rank 0");
     let rank1 = gang.rank(1).expect("rank 1");
@@ -945,14 +945,13 @@ fn probe_a4_broadcast_with_a_shape_mismatch_off_the_root_faults_both_ranks_symme
     );
 }
 
-/// A third attempt (of this implementer's own design, not one of the
-/// auditor's) to break "no rank can return `Ok` from a round any rank
+/// A third attempt to break "no rank can return `Ok` from a round any rank
 /// rejects": a THREE-rank gang where two ranks agree with EACH OTHER and
-/// only the THIRD disagrees, on a field neither PROBE1 (root) nor PROBE2
-/// (counts) exercises — the reduced tensor's dtype. This shape of case is
+/// only the THIRD disagrees, on a field neither the root check nor the
+/// counts check exercises — the reduced tensor's dtype. This shape of case is
 /// exactly what a wrong implementation (say, one that compared each rank
-/// only to its immediate neighbor, or that only checked the field the named
-/// probes happened to cover) would get wrong: two agreeing ranks pairing up
+/// only to its immediate neighbor, or that only checked the field the
+/// tests above happened to cover) would get wrong: two agreeing ranks pairing up
 /// and only the outlier ever noticing. `agrees_with` compares every rank's
 /// descriptor against rank 0's, so this must fault symmetrically too.
 #[test]
@@ -984,8 +983,8 @@ fn a_third_attempt_two_ranks_agree_a_third_disagrees_on_dtype_still_faults_every
     }
 }
 
-/// The missing end-to-end oracle for `all_reduce_sum`'s SHAPE determinant
-/// (fix round 4, item 6): a two-rank gang where rank 0 reduces a `[2, 2]`
+/// The missing end-to-end oracle for `all_reduce_sum`'s SHAPE determinant:
+/// a two-rank gang where rank 0 reduces a `[2, 2]`
 /// tensor and rank 1 a `[2, 3]` tensor at the same trainable-variable index.
 /// Neither rank's own tensor is internally inconsistent — each is a valid
 /// shape for a reduce on its own — so only the round descriptor's per-tensor
@@ -1043,7 +1042,7 @@ fn a_two_rank_all_reduce_sum_with_a_per_tensor_shape_mismatch_faults_both_ranks_
     );
 }
 
-// ── Fix round 4 item 6: the verb field, pinned at EACH constructor ──────────
+// ── the verb field, pinned at EACH constructor ──────────
 //
 // `agrees_with`'s per-field mutation sweep proves the `verb` COMPARISON is
 // sound in isolation, but every `Descriptor` in that sweep is hand-built —

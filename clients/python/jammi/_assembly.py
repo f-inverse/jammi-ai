@@ -532,6 +532,32 @@ def _wire_world_size(world_size: int) -> Optional[int]:
     return world_size if world_size > 1 else None
 
 
+def _wire_cache_policy_for_submit_job(cache: Optional[str]) -> Optional[int]:
+    """Convert a `cache` kwarg into the value `SubmitJobRequest.cache` should
+    carry — the SubmitJob-specific sibling of :func:`_wire_world_size`, NOT
+    :func:`_cache_policy_value` (which every other producer verb's `cache`
+    field uses).
+
+    `SubmitJobRequest` is the frozen wire surface `world_size` was appended
+    to (`crates/jammi-wire/proto/jammi/v1/job.proto`), and `cache` is a
+    SECOND field appended there the same way: a caller that never names the
+    keyword (or explicitly asks for the engine default, `"bypass"`) must
+    submit byte-for-byte the request it submitted before this field existed
+    — the same no-regression property `tests/test_world_size.py`'s golden
+    hex pins for `world_size`. Returning ``None`` here leaves the field OFF
+    the encoding entirely (the proto constructor skips a ``None`` kwarg),
+    which is also what an explicit `CACHE_POLICY_UNSPECIFIED` would encode
+    to, since a proto3 enum's zero value is never serialized either way; only
+    `"use"` costs a byte on the wire, the one case that changes what the
+    engine does with the request.
+    """
+    if cache is None or cache == "bypass":
+        return None
+    if cache == "use":
+        return inference_pb2.CachePolicy.CACHE_POLICY_USE
+    raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
+
+
 def build_fine_tune_request(
     *,
     source: str,
@@ -571,6 +597,7 @@ def build_fine_tune_request(
     keep_last_n_checkpoints: Optional[int] = None,
     idempotency_key: str = "",
     world_size: int = 1,
+    cache: Optional[str] = None,
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for a LoRA fine-tune (the `FineTuneSpec`
     arm) from the embed binding's flat kwargs.
@@ -583,8 +610,14 @@ def build_fine_tune_request(
     durable per-tenant contract (migration 030). `world_size` is the number of
     ranks that train this job cooperatively; `1` (the default) is a single
     process and leaves the wire field unset — see :func:`_wire_world_size`.
+    `cache="use"` is refused, typed (:class:`jammi.errors.InvalidArgument`):
+    model-level cache reuse is not yet supported
+    (<https://github.com/f-inverse/jammi-ai/issues/562>); `cache=None` or
+    ``"bypass"`` (the default) always trains — see
+    :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
+    wire_cache = _wire_cache_policy_for_submit_job(cache)
     try:
         wire_method = _FINE_TUNE_METHOD[method]
     except KeyError:
@@ -636,6 +669,7 @@ def build_fine_tune_request(
         config=config,
         idempotency_key=idempotency_key,
         world_size=wire_world_size,
+        cache=wire_cache,
     )
 
 
@@ -668,6 +702,7 @@ def build_fine_tune_graph_request(
     keep_last_n_checkpoints: Optional[int] = None,
     idempotency_key: str = "",
     world_size: int = 1,
+    cache: Optional[str] = None,
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for a graph-supervised fine-tune (S11,
     the `GraphFineTuneSpec` arm) from the embed binding's flat kwargs.
@@ -679,9 +714,13 @@ def build_fine_tune_graph_request(
     "declared" external edges teach the metric something new; "similarity" edges
     are a weak bootstrap only. `world_size` is the number of ranks that train
     this job cooperatively; `1` (the default) is a single process and leaves the
-    wire field unset — see :func:`_wire_world_size`.
+    wire field unset — see :func:`_wire_world_size`. `cache="use"` is refused,
+    typed (:class:`jammi.errors.InvalidArgument`): a graph fine-tune carries no
+    materialization to probe or record; `cache=None` or ``"bypass"`` (the
+    default) is unaffected — see :func:`_wire_cache_policy_for_submit_job`.
     """
     wire_world_size = _wire_world_size(world_size)
+    wire_cache = _wire_cache_policy_for_submit_job(cache)
     try:
         provenance = _EDGE_PROVENANCE[edge_provenance]
     except KeyError:
@@ -758,6 +797,7 @@ def build_fine_tune_graph_request(
         config=config,
         idempotency_key=idempotency_key,
         world_size=wire_world_size,
+        cache=wire_cache,
     )
 
 

@@ -1051,10 +1051,14 @@ impl PyDatabase {
     /// Returns the report as a dict tagged `{"scope", "applied", "rows_failed",
     /// "rows_failed_count", "orphans", "orphan_count", "pending",
     /// "pending_count", "unattributed", "unattributed_count", "damaged",
-    /// "damaged_count", "truncated", "bytes_reclaimed"}` — the same shape the
-    /// remote client's `reconcile` returns. Every `*_count` field is the true
-    /// total independent of whether its list was capped; `truncated` says
-    /// whether any list was.
+    /// "damaged_count", "referenced", "referenced_count", "truncated",
+    /// "bytes_reclaimed"}` — the same 16-field shape the remote client's
+    /// `reconcile` returns. `referenced` names the `models/`-namespaced
+    /// prefixes this pass's reap-site consult found still referenced by some
+    /// live `models` row and so skipped instead of reclaiming; `referenced_count`
+    /// is that list's true total. Every `*_count` field is the true total
+    /// independent of whether its list was capped; `truncated` says whether
+    /// any list was.
     ///
     /// [`ResultStore::reconcile`]: jammi_db::store::ResultStore::reconcile
     /// [`ResultStore::reconcile_all`]: jammi_db::store::ResultStore::reconcile_all

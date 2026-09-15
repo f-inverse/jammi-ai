@@ -481,15 +481,18 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
 /// `ResultStore::reconcile` / `reconcile_all` over the SAME engine report the
 /// IDENTICAL `ReconcileReport`, byte-for-byte on the wire encoding — proven on
 /// the divergence-prone shape (multiple non-empty repeated fields landing at
-/// once: an orphan candidate AND an unattributed key), never only the trivial
-/// empty-engine happy path. `all = false` runs under a tenant session bound
-/// over the wire (`SetTenant`); `all = true` runs the cross-tenant admin pass
-/// via [`AllowAllAdmin`] (proving the admin-gated arm agrees once authorized —
-/// the refusal itself is `remote_reconcile_all_is_denied_by_default_without_an_authorizer`).
-/// Both arms run `apply = false, grace_secs = 0`: a dry run, so the fixture's
+/// once: an orphan candidate, a `referenced` prefix, AND an unattributed
+/// key), never only the trivial empty-engine happy path. `all = false` runs
+/// under a tenant session bound over the wire (`SetTenant`); `all = true`
+/// runs the cross-tenant admin pass via [`AllowAllAdmin`] (proving the
+/// admin-gated arm agrees once authorized — the refusal itself is
+/// `remote_reconcile_all_is_denied_by_default_without_an_authorizer`). Both
+/// arms run `apply = false, grace_secs = 0`: a dry run, so the fixture's
 /// files survive both comparisons.
 #[tokio::test]
 async fn remote_reconcile_reports_like_local() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::model_task::ModelTask;
     use jammi_server::grpc::catalog::AdminAuthorizer;
     use prost::Message;
 
@@ -513,6 +516,54 @@ async fn remote_reconcile_reports_like_local() {
     std::fs::create_dir_all(&seg_dir).expect("mkdir tenant segment");
     std::fs::write(seg_dir.join("stray.parquet"), b"stray").expect("write stray orphan");
     std::fs::write(root.join("legacy_table.parquet"), b"legacy").expect("write unattributed key");
+
+    // Plant a THIRD divergence-prone shape: a live `models` row under tenant
+    // A whose job-level prefix carries a stray file the manifest does not
+    // name. The reap-site's fresh `prefix_is_referenced` consult (not the
+    // up-front attribution scan) must name it `referenced`, never `orphans` —
+    // proven under `with_tenant_scoped` below exactly like the db-level
+    // oracle `a_stray_file_under_a_referenced_job_level_prefix_survives_via_the_reap_site_consult`.
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let bundle = vec![(
+        "adapter.safetensors".to_string(),
+        bytes::Bytes::from_static(b"weights"),
+    )];
+    let referenced_prefix_url = server
+        .engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let prefix_url = server
+                .engine
+                .result_store()
+                .artifact_store()
+                .put_artifact(Some(&tenant_a()), &[&job_id], &bundle)
+                .await
+                .expect("put referenced-model artifact bundle");
+            server
+                .engine
+                .result_store()
+                .catalog()
+                .register_model(RegisterModelParams {
+                    model_id: "referenced-wire-model",
+                    version: 1,
+                    model_type: "lora",
+                    backend: "candle",
+                    task: ModelTask::TextEmbedding,
+                    base_model_id: None,
+                    artifact_path: Some(prefix_url.as_str()),
+                    config_json: None,
+                })
+                .await
+                .expect("register referenced model");
+            prefix_url
+        })
+        .await;
+    let referenced_prefix_dir = root
+        .join("models")
+        .join(tenant_a().to_string())
+        .join(&job_id);
+    std::fs::write(referenced_prefix_dir.join("debug_dump.tmp"), b"leftover")
+        .expect("write stray file under the referenced job prefix");
+    let _ = &referenced_prefix_url;
 
     let opts = jammi_db::store::ReconcileOptions {
         apply: false,
@@ -544,6 +595,22 @@ async fn remote_reconcile_reports_like_local() {
             .iter()
             .any(|o| o.ends_with("stray.parquet")),
         "the divergence-prone fixture must actually plant an orphan: {remote_report:?}"
+    );
+    assert!(
+        remote_report
+            .referenced
+            .iter()
+            .any(|r| r.ends_with("debug_dump.tmp")),
+        "the reap-site consult must deliver the referenced prefix over the wire: \
+         {remote_report:?}"
+    );
+    assert!(
+        remote_report
+            .orphans
+            .iter()
+            .all(|o| !o.ends_with("debug_dump.tmp")),
+        "a stray file under a referenced job prefix must never be reported as an orphan: \
+         {remote_report:?}"
     );
     // A tenant-scoped pass reports NO unattributed entries at all —
     // an unattributed key is store-wide by definition, so only the admin

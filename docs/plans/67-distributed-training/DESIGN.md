@@ -125,7 +125,7 @@ built here). The gather primitive (§4) is what lifts this later.
 | training-set definition hash + artifact digest + row count | the data and its order |
 | **canonical serialization of the whole `TrainingSpec` variant** — `FineTuneConfig` (`crates/jammi-wire/src/fine_tune.rs::FineTuneConfig`: LoRA rank/alpha/dropout, `use_rslora`, `rank_pattern`, `init_lora_weights`, lr, epochs, batch, `max_seq_length`, losses, `matryoshka_dims`, `quantile_levels`, `validation_fraction`, early stopping, `cached`, `hard_negatives`, …), `TrainingCommon`, method, task, seed | everything the trainer reads |
 | base model identity (`ModelIdentity`: id, backend, precision, content digest, quantization) | the frozen weights |
-| backbone dtype; fused-kernel admission profile | bits per op |
+| backbone dtype; fused-kernel admission profile (declared, UNCOVERED — see below) | bits per op |
 | `world_size`, per-rank batch, partition rule version, collective backend, reduction policy | the summation order and the batch layout |
 | `MaterializationEnv` (engine version, device kind, model identities) | as for every producer |
 
@@ -142,16 +142,58 @@ new field fails compilation instead of escaping the hash; U4b extends it with th
 fields.
 
 The catalog name `jammi:fine-tuned:{job_id}` stays as the handle and re-claim idempotency key
-(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::train_fine_tune`). The `model_materialization` migration (numbered at
-rebase) adds nullable
-`models.definition_hash`, `models.input_anchors`, `models.manifest_path` (append-only, K5;
-nullable because `ContextPredictor` has no materialization; the probe never matches NULL). The
-manifest is written last into the artifact prefix by the coordinator before the finalize CAS.
-`CachePolicy::Use` probes by definition hash + anchors; on a hit the job completes by
-registering **its own name** pointing at the reused prefix (two rows, one prefix); a prefix is
-reaped only when no model row references it (reconcile attribution, the object → row check in
-`crates/jammi-db/src/store/reconcile.rs`'s module doc). The recompute replay arm
-(`pipeline/recompute.rs`, K1) for `FineTune` is **retrain**.
+(`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::train_fine_tune`; the id format is documented
+again on `ModelRegistration::model_id`). The `model_materialization` migration (033)
+adds nullable `models.definition_hash`, `models.input_anchors` (append-only, K5; nullable
+because `ContextPredictor` has no materialization; the probe never matches NULL —
+`find_models_by_definition`/`probe_model_by_definition` additionally restrict to
+`artifact_path IS NOT NULL`, the SERVABLE set). No `models.manifest_path` column: the
+sidecar's path is always the fixed name `materialization.json` under the model's artifact
+prefix, never a recorded column. The manifest is written last into the artifact prefix by
+the coordinator before the finalize CAS, and the two catalog columns are written only after
+that CAS has already committed this attempt's `artifact_path` — no unfinalized row is ever a
+cache-hit candidate.
+
+`cache` lives on `TrainingSpec::FineTune` itself, not `TrainingCommon` — `TrainingSpec::
+GraphFineTune` has no `cache` field at all, so `lora_common_from_proto` refuses `cache = Use`
+for that kind, typed, at decode (the one place that can still see both the kind and the
+requested value). A stray `cache` key found under `graph_fine_tune` in a persisted
+`jobs.spec` row is dropped at deserialize rather than refused, since the type has nowhere to
+put it; a hard error on unknown keys across the persisted-row format is a separate reshape
+(<https://github.com/f-inverse/jammi-ai/issues/548>). Model-level cache reuse is not
+implemented: `CachePolicy::Use` on the column-source `FineTune` kind is also refused, typed, at
+submit (`InferenceSession::submit_fine_tune_spec_deduped`) rather than probing by definition
+hash. The probe-by-definition design is filed as the property to implement — a hit
+registers **its own name** pointing at the reused prefix (two rows, one prefix, reported on
+the job's own result via `cache_outcome`), probing by definition hash alone (the anchors leg
+removed as redundant: the training-set digest is already inside the hash)
+(<https://github.com/f-inverse/jammi-ai/issues/562>). An unset `cache` field encodes
+identically on both transports: the Rust client omits the field (rather than assigning the
+enum's `Bypass` discriminant) so an explicit `Bypass` and an unset field put the SAME bytes on
+the wire, matching the embedded Python encoding.
+
+Deleting a model row is always allowed. Catalog referential integrity between two rows that
+might name the same prefix only becomes relevant once model-level reuse ships
+(<https://github.com/f-inverse/jammi-ai/issues/547>). The underlying bytes are reclaimed only
+when no live `models` row, in any tenant, names the object's exact key or its immediate
+containing directory as `artifact_path` — the guard rule every `models/` byte-delete this
+design's reclaim paths perform runs through: `ResultStore::prefix_is_referenced` is an
+admin-scoped whole-catalog scan of `models.artifact_path` that
+`ResultStore::delete_unreferenced_prefix` consults before every `models/`-prefix byte-delete
+(reconcile's own reap, the worker's abandon path, the worker's epoch-checkpoint sweep, and the
+trainer's mid-run retention prune all reach it), refusing typed (`StorageError::Referenced
+{ prefix, count }`) while any row still references the prefix; reconcile's attribution set is
+built from the same admin-scoped scan, never the tenant-scoped `list_models`, and a prefix it
+finds still referenced this way is reported (with its count) via
+`ReconcileReport.referenced`/`referenced_count` (`crates/jammi-db/src/store/reconcile.rs`),
+carried on the wire (`catalog.proto`, tags 15/16).
+
+The fused-kernel admission profile the training loop actually resolves (fused vs. eager per
+operator) is declared on `MaterializationEnv` but UNCOVERED: nothing writes a real value into
+it, so it does not yet distinguish two runs that differ only in that outcome
+(<https://github.com/f-inverse/jammi-ai/issues/546>).
+
+The recompute replay arm (`pipeline/recompute.rs`, K1) for `FineTune` is **retrain**.
 
 ## 4. The gang
 
@@ -201,9 +243,9 @@ lease, then **derives the tenant from the row** (`jobs.tenant_id`) and pins ever
 catalog read to it. Nothing dialable travels on the wire: the assignment carries
 `peers[rank → instance_id]`; each peer resolves addresses through U5b-1a's `peer_addr_of(instance_id,
 window) -> Option<PeerAddr>` and refuses a rank naming any instance that resolves to `None` — not
-a fresh member (the NCCL id, an opaque secret, is the only out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
-"served only on peer_bind; tenant derived from the verified job row; deliberately not
-caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
+a fresh member (the NCCL id, an opaque secret, is the only out-of-band value). `RunRank` sits in its own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (its text
+states the ground the shipped W=1 lattice actually has — no tenant value read on the path; the
+derivation claim returns with U5a-2's cross-tenant-denial case, #566), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
 `api_freeze_baseline.txt` lines land in the same commit. Peers fence on **`job_id`**: a `RunRank`
 at attempt N aborts every local runner of that job with attempt < N; a lesser or equal attempt is
 refused; `(job_id, rank)` is the runner's identity only. Mutual transport auth stays the
@@ -318,7 +360,7 @@ in this design produces a table for it to partition.
 | **Lockstep**: one rank's batch forced to diverge; one rank's batch yields no gradient for a Var; the gang completes | property | hermetic |
 | **Gang failure**: kill −9 a peer → job requeued, completed by a new gang from the checkpoint, exactly one model, no orphan prefix promoted; kill −9 the coordinator → same via lease; split-brain: attempt N+1 dispatched while N is live on the peer → N aborted, N+1 runs | property | distributed lane |
 | **Authorization**: `RunRank` for a job not running / not claimed by the caller / lease expired is refused | property | server it-suite |
-| **Cache reuse**: same spec on the same training-set digest with `CachePolicy::Use` → no second training; two model rows, one prefix; reaping respects references | property | hermetic |
+| **Cache reuse refused**: `CachePolicy::Use` on a fine-tune is refused on every durable submit edge (reuse: https://github.com/f-inverse/jammi-ai/issues/562); two model rows may share one prefix; reaping respects references | property | hermetic |
 | **Distributor-agnosticism**: an embedding job through a Ballista scheduler + 2 executors hosted by the jammi binary → identical bytes to the same query's single-executor plan; a gang job through the scheduler → identical bytes to U5b's peer-based run | byte | U8 |
 
 ## 7. Configuration and placement

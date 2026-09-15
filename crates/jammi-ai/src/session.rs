@@ -1785,6 +1785,12 @@ impl InferenceSession {
                 config: config.clone(),
                 world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
+            // This loose-argument entry point has no cache parameter to
+            // carry a caller's choice; a caller that wants the model-level
+            // reuse probe builds the spec directly and submits it through
+            // `Self::run_training_spec`. Matches the pre-`cache` behaviour
+            // byte-for-byte.
+            cache: jammi_db::store::CachePolicy::Bypass,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -1819,6 +1825,7 @@ impl InferenceSession {
             task,
             config,
             world_size,
+            cache,
         } = request;
         let config = config.unwrap_or_default();
         config.validate()?;
@@ -1834,6 +1841,7 @@ impl InferenceSession {
                 world_size: world_size
                     .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
             },
+            cache,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -1865,14 +1873,19 @@ impl InferenceSession {
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
-        // The rank count is admitted HERE, before anything durable exists:
-        // this method is the one place a LoRA spec becomes a `jobs` row, so
-        // every entry path that submits one — [`Self::fine_tune`],
-        // [`Self::fine_tune_graph`], [`Self::submit_fine_tune`] and
-        // [`Self::run_training_spec_deduped`] (which the gRPC handler and
-        // the Python binding both drive) — is admitted by this call. A
-        // refusal leaves no row behind, because no row has been written yet.
-        crate::fine_tune::spec::RankAdmission::from_config(self.inner.config()).admit(&spec)?;
+        // The ONE admission (per-kind validation, rank admission, the
+        // `cache = Use` refusal) is applied HERE, before anything durable
+        // exists: this method is one of the durable submit edges for a
+        // training spec, so every entry path that reaches it —
+        // [`Self::fine_tune`], [`Self::fine_tune_graph`],
+        // [`Self::submit_fine_tune`] and [`Self::run_training_spec_deduped`]
+        // (which the gRPC handler and the Python binding both drive) — is
+        // admitted by this call. [`InferenceSession::enqueue`] and
+        // `train_context_predictor_deduped` are the other two durable
+        // edges; all three call
+        // [`crate::fine_tune::spec::admit_training_spec`]. A refusal leaves
+        // no row behind, because no row has been written yet.
+        crate::fine_tune::spec::admit_training_spec(self.inner.config(), &spec)?;
         let job_id = uuid::Uuid::new_v4().to_string();
         let links = self.training_job_links(&spec, &job_id).await?;
         let spec_json = serde_json::to_string(&spec)?;
@@ -2060,30 +2073,18 @@ impl InferenceSession {
     /// caller — the Python binding included — routes through here with
     /// `None`, byte-identical to before this method existed).
     ///
-    /// Runs the SAME per-kind validation the embedded entry points
-    /// ([`Self::fine_tune`], [`Self::fine_tune_graph`],
-    /// [`Self::train_context_predictor`]) apply, then submits directly
-    /// through the deduped catalog seam — `spec` is already fully formed
-    /// here (decoded off the wire or handed in by a caller), so there is no
-    /// need to re-destructure it through those entry points' own
-    /// loose-argument constructors only to rebuild the identical spec.
+    /// Dispatches directly through the deduped catalog seam — `spec` is
+    /// already fully formed here (decoded off the wire or handed in by a
+    /// caller), so there is no need to re-destructure it through the loose-
+    /// argument entry points' own constructors only to rebuild the
+    /// identical spec. Neither dispatch arm below skips admission: each is
+    /// itself one of the three durable submit edges for a `TrainingSpec`
+    /// and applies `admit_training_spec` before writing a row.
     pub async fn run_training_spec_deduped(
         self: &Arc<Self>,
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
-        match &spec {
-            TrainingSpec::FineTune { common, .. } => common.config.validate()?,
-            TrainingSpec::GraphFineTune {
-                common,
-                sample_config,
-                ..
-            } => {
-                common.config.validate()?;
-                sample_config.validate()?;
-            }
-            TrainingSpec::ContextPredictor { predictor_spec, .. } => predictor_spec.validate()?,
-        }
         match spec {
             TrainingSpec::ContextPredictor {
                 source,

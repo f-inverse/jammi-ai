@@ -8,6 +8,7 @@
 
 use std::num::NonZeroU32;
 
+use jammi_db::store::CachePolicy;
 use jammi_db::ModelTask;
 
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -124,6 +125,20 @@ pub struct FineTuneRequest {
     /// distinction survives in this struct for the caller that wants to say
     /// "one rank" out loud; it does not reach the wire.
     pub world_size: Option<NonZeroU32>,
+    /// Model-level cache policy for the fine-tune: the engine refuses
+    /// [`CachePolicy::Use`] on every durable submit edge
+    /// (<https://github.com/f-inverse/jammi-ai/issues/562> tracks reuse), so
+    /// only [`CachePolicy::Bypass`] trains. Defaults to [`CachePolicy::Bypass`] (always
+    /// train), matching the engine's own default on `TrainingSpec::FineTune`'s
+    /// `cache` field (it lives on that variant, not `TrainingCommon` — the
+    /// graph fine-tune kind has no materialization to probe, so it carries no
+    /// `cache` field at all) and every caller that predates this field. On
+    /// the wire this is
+    /// `jammi.v1.job.SubmitJobRequest.cache`, the shared
+    /// `jammi.v1.inference.CachePolicy` enum every other result-table
+    /// producer verb carries — `UNSPECIFIED` and `BYPASS` decode identically,
+    /// so an unset field costs a pre-existing caller nothing.
+    pub cache: CachePolicy,
 }
 
 /// Identifier of a fine-tune job. Returned in place of an in-process job handle

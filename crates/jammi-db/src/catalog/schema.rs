@@ -1139,3 +1139,76 @@ ALTER TABLE result_tables ADD COLUMN current_version INTEGER;
 ALTER TABLE result_tables ADD COLUMN next_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE index_segments ADD COLUMN version INTEGER;
 "#;
+
+/// Migration 033 (#500) — the `model_materialization` contract columns.
+///
+/// A fine-tuned model is a producer like any other
+/// ([`crate::store::manifest::ProducingDescriptor::FineTune`]): `definition_hash`
+/// and `input_anchors_json` are the same indexable summary migration 021 added
+/// to `result_tables`, restated on `models` because a fine-tuned model's row
+/// lives there instead.
+///
+/// No `manifest_path` column: the sidecar path is always the fixed name
+/// `materialization.json` under the model's artifact prefix
+/// (`ArtifactStore::MATERIALIZATION_NAME`) — no leading dot, unlike a result
+/// table's `{table}.materialization.json` sidecar, because a model prefix
+/// has no stem to suffix — exactly the way `materialization_sidecar_path`
+/// derives the `result_tables` sidecar from a sibling path rather than a
+/// recorded column.
+///
+/// Both remaining columns are NULLABLE: `ContextPredictor` has no
+/// materialization at all, and a directly-registered base model (never
+/// itself a producer's output) has none either.
+/// [`crate::catalog::model_repo::Catalog::find_models_by_definition`]'s
+/// `definition_hash = $1` equality predicate can never match a `NULL`
+/// column, so a pre-migration or non-materialized row is simply never a
+/// cache-hit candidate — no separate guard is needed for THAT case. A row
+/// that does carry `definition_hash` but has not yet been committed by the
+/// finalize CAS (`artifact_path IS NULL`) is excluded by a second, load-
+/// bearing predicate on the same query (the servable set), so a
+/// losing/zombie attempt's row can never poison a cache probe even before
+/// [`crate::catalog::model_repo::Catalog::delete_registered_model_if_unfinalized`]
+/// reaps it. The index mirrors migration 022's
+/// `idx_result_tables_definition_hash` for the same probe's hot-path
+/// predicate.
+///
+/// `idx_models_artifact_path` backs
+/// [`crate::catalog::model_repo::Catalog::count_models_naming_prefix_all_tenants`]'s
+/// per-object "does any live row name this key or an ancestor of it"
+/// consult — every `models/`-namespaced byte-delete runs this query once
+/// per candidate, so it needs an index exactly like the definition-hash
+/// probe above does.
+pub(super) const MIGRATION_033_MODEL_MATERIALIZATION: &str = r#"
+ALTER TABLE models ADD COLUMN definition_hash TEXT;
+ALTER TABLE models ADD COLUMN input_anchors_json TEXT;
+CREATE INDEX idx_models_definition_hash ON models(definition_hash);
+CREATE INDEX idx_models_artifact_path ON models(artifact_path);
+"#;
+
+/// Migration 034 (`docs/rigor/contracts/feat_500-C-U5a-1.md` § A6): the
+/// gang's training-set identity pair on `jobs` — the `ArtifactDigest` of the
+/// coordinator's materialized `TrainingSet` (`training_set_ref`) and the
+/// `result_tables` NAME it materialized under (`training_set_location`),
+/// job-scoped (never attempt-scoped), written/consulted only for
+/// `world_size > 1`. Both columns start `NULL` on every existing and new
+/// row; a `world_size == 1` job never touches them, so this migration
+/// changes zero observable behaviour for every row it does not itself write.
+///
+/// **The pair is one fact, not two independently nullable columns (the
+/// write-once CAS's own stop rule).** A `CHECK` constraint pins this at the
+/// schema edge — preferred over "the only writer is the CAS" (Greenfield: a schema
+/// constraint that makes the wrong shape UNREPRESENTABLE beats a mechanism
+/// that merely avoids constructing it) — because both backends support a
+/// same-table-column `CHECK` referenced from an `ALTER TABLE ADD COLUMN`
+/// statement: SQLite (bundled `libsqlite3-sys` 0.30, SQLite ≥ 3.31) lifted
+/// its historical "no other columns" restriction on an added column's
+/// `CHECK` expression years ago, and Postgres has never had that
+/// restriction. The constraint fires on every `UPDATE` that would leave the
+/// pair split, not just on `INSERT` — a raw single-column write (never a
+/// call site this program makes; the CAS is the only writer) is
+/// refused by the database itself, not merely by convention.
+pub(super) const MIGRATION_034_JOBS_TRAINING_SET_IDENTITY: &str = r#"
+ALTER TABLE jobs ADD COLUMN training_set_ref TEXT;
+ALTER TABLE jobs ADD COLUMN training_set_location TEXT
+    CHECK ((training_set_ref IS NULL) = (training_set_location IS NULL));
+"#;

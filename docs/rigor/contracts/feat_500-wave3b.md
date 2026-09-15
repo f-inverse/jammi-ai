@@ -68,8 +68,12 @@ that is never used to root anything:
   spells exactly the variables the driver spells: none through the key
   tables, and the one bare read the same way; and it reads every VALUE as
   the driver reads it — the boolean parser's `1`/`true`/`on`/`yes`/`y` in
-  any case (mirrored, since that parser is private, with an oracle over
-  every spelling), the emulator URL parsed. Two oracle rounds found a
+  any case and nothing else (mirrored, since that parser is private, with
+  an oracle over every spelling it accepts and several it rejects; a value
+  it rejects is one it refuses to build a store on, and takes the false
+  arm here), the emulator and Azure account URLs parsed and the S3/R2
+  endpoint's trailing slashes trimmed as the driver does before appending
+  the bucket. Two oracle rounds found a
   hand-written variable list drifting, a third found the bare read, a
   fourth found the boolean spellings — each closed by mirroring the
   driver's own resolution, not by listing. So nothing the driver honours

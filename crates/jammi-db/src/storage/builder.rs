@@ -523,8 +523,11 @@ fn s3_determinants(
     let builder = configure_s3(base, config);
     // `build()` dials `s3_endpoint.or(endpoint)`: the S3-specific URL wins
     // over the generic one whatever set either.
+    // …and trims trailing slashes before appending the bucket, so they are
+    // trimmed here too.
     let endpoint = present(builder.get_config_value(&K::S3Endpoint))
-        .or_else(|| present(builder.get_config_value(&K::Endpoint)));
+        .or_else(|| present(builder.get_config_value(&K::Endpoint)))
+        .map(|e| e.trim_end_matches('/').to_string());
     Ok(endpoint.map(|e| ("endpoint", e)).into_iter().collect())
 }
 
@@ -556,7 +559,8 @@ fn r2_determinants(
     // `AWS_ENDPOINT_URL_S3` in the environment overrides the configured R2
     // endpoint in the store, and therefore here.
     let dialled = present(builder.get_config_value(&K::S3Endpoint))
-        .or_else(|| present(builder.get_config_value(&K::Endpoint)));
+        .or_else(|| present(builder.get_config_value(&K::Endpoint)))
+        .map(|e| e.trim_end_matches('/').to_string());
     Ok(dialled.map(|e| ("endpoint", e)).into_iter().collect())
 }
 
@@ -649,8 +653,16 @@ fn azure_determinants(
     if let Some(account) = present(builder.get_config_value(&K::AccountName)) {
         pairs.push(("account", account));
     }
+    // The driver `Url::parse`s the account URL, so it is parsed here too (a
+    // trailing slash is not a second host); an unparseable one is kept raw
+    // (the driver refuses to build on it).
     match present(builder.get_config_value(&K::Endpoint)) {
-        Some(endpoint) => pairs.push(("endpoint", endpoint)),
+        Some(endpoint) => pairs.push((
+            "endpoint",
+            url::Url::parse(&endpoint)
+                .map(|u| u.to_string())
+                .unwrap_or(endpoint),
+        )),
         None => {
             if flag(K::UseFabricEndpoint) {
                 pairs.push(("use_fabric_endpoint", "true".to_string()));
@@ -668,8 +680,11 @@ fn azure_determinants(
 /// one identity (the fourth oracle round's executed refutation).
 #[cfg(feature = "storage-azure")]
 fn driver_bool(value: &str) -> bool {
+    // Exactly the driver's domain: no trimming — a padded value is one the
+    // driver refuses to build on, and the identity takes the false arm for
+    // it as the driver takes none.
     matches!(
-        value.trim().to_ascii_lowercase().as_str(),
+        value.to_ascii_lowercase().as_str(),
         "1" | "true" | "on" | "yes" | "y"
     )
 }
@@ -806,6 +821,12 @@ mod tests {
             .unwrap(),
             vec![("endpoint", "https://s3-env".to_string())]
         );
+        // Trailing slashes are trimmed as the driver trims them before
+        // appending the bucket.
+        assert_eq!(
+            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000/")]),
+            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000")])
+        );
         // Unknown keys and other prefixes are ignored; an empty value is unset.
         assert!(of(&[
             ("AWS_NOT_A_KEY", "x"),
@@ -862,6 +883,17 @@ mod tests {
             of(&[("AZURE_STORAGE_ACCOUNT_NAME", "acct")]),
             vec![("account", "acct".to_string())]
         );
+        // The endpoint is parsed as the driver parses the account URL.
+        assert_eq!(
+            of(&[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                ("AZURE_STORAGE_ENDPOINT", "https://blob.local")
+            ]),
+            of(&[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                ("AZURE_STORAGE_ENDPOINT", "https://blob.local/")
+            ])
+        );
         for spelling in ["AZURE_STORAGE_ENDPOINT", "AZURE_ENDPOINT"] {
             assert_eq!(
                 of(&[
@@ -870,7 +902,7 @@ mod tests {
                 ]),
                 vec![
                     ("account", "acct".to_string()),
-                    ("endpoint", "https://blob.local".to_string())
+                    ("endpoint", "https://blob.local/".to_string())
                 ],
                 "{spelling}"
             );
@@ -918,9 +950,7 @@ mod tests {
         // Every spelling object_store's boolean parser accepts (`1`, `true`,
         // `on`, `yes`, `y`, any case) switches the arm exactly as `build()`
         // does; a spelling it rejects does not.
-        for spelling in [
-            "1", "true", "on", "yes", "y", "TRUE", "True", "Yes", "ON", " y ",
-        ] {
+        for spelling in ["1", "true", "on", "yes", "y", "TRUE", "True", "Yes", "ON"] {
             assert_eq!(
                 of(&[
                     ("AZURE_STORAGE_USE_EMULATOR", spelling),
@@ -944,7 +974,9 @@ mod tests {
                 "fabric spelling {spelling:?}"
             );
         }
-        for spelling in ["0", "false", "off", "no", "n", ""] {
+        // Rejected by the driver (it refuses to BUILD on these, so no store
+        // exists): the identity takes the false arm, never a padded true.
+        for spelling in ["0", "false", "off", "no", "n", "", " y ", "y ", "maybe"] {
             assert_eq!(
                 of(&[
                     ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),

@@ -612,33 +612,52 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 /// ever asked to be clipped) and does not warn.
 /// DESIGN.md §4's "canonical-order reduce": lay `grads` out in the CANONICAL
 /// `trainable_vars` order (the same name-sorted order [`sorted_trainable_vars`]
-/// produces), with a ZERO tensor — same shape/dtype/device as the `Var` —
-/// standing in for any entry this rank's own accumulation never populated for
-/// this step; `all_reduce_sum` the whole canonical vector across the gang;
-/// write the summed values back into `grads` under every `Var`.
+/// produces), `all_reduce_sum` it across the gang, and write the summed
+/// values back — but ONLY for a var PRESENT ON AT LEAST ONE RANK; a var
+/// absent on EVERY rank stays absent from `grads`, exactly as it would at
+/// `W = 1`.
 ///
-/// After this call every rank's `GradStore` holds an entry for EVERY
-/// trainable var (never "some vars remain absent" — a var absent from every
-/// rank still gets an explicit zero-sum entry), and that entry is the GANG's
-/// sum, not this rank's own local one. This is the seam
-/// [`TrainingLoop::process_batch_loss`]'s window-boundary flush and its
-/// epoch-end trailing-window flush both call before [`clip_and_step`], so
-/// every rank clips and steps over the identical, already-summed gradient and
-/// "every rank holds identical weights after the step" holds.
+/// **Absent is not zero for AdamW** — this is why the presence set matters,
+/// not just the sum. `AdamW::step` skips a `Var` `grads` has no entry for
+/// (`adamw.rs`): no moment update, no bias-correction advance, no weight
+/// decay. Materializing a zero entry for a var this step's loss never
+/// touches on ANY rank (`clip_and_step`'s own `NoGradients` doc: a batch
+/// whose loss legitimately never routes through some `Var`s is a real,
+/// common shape, not a bug) would make AdamW STEP that var anyway — decaying
+/// its weight and advancing its bias-correction exponent for a step that
+/// never trained it, a real behavioural change [`clip_and_step`]'s own
+/// "absent is a real shape" contract exists to prevent. So this function
+/// reduces the PRESENCE SET too: a var present on rank `r` but not on THIS
+/// rank still needs a value here to sum correctly (a rank's own absence
+/// contributes the additive identity, `0`, to the gang's sum — mathematically
+/// exact, not an approximation), but that materialized zero is written back
+/// to `grads` ONLY when the presence reduce says at least one rank actually
+/// had this var — never for a var absent everywhere.
 ///
-/// At `W = 1` (`collective` is [`super::collective::Noop`]) `all_reduce_sum`
-/// is the identity, so this function's only observable effect is turning an
-/// ABSENT entry into an explicit ZERO one — [`clip_and_step`]'s own doc
-/// already treats those two identically (`ClipOutcome::NoGradients`: an
-/// absent norm contributes 0 to the clip's fold; a zero tensor's own
-/// contribution is also 0), so W=1 byte parity holds — see this module's own
-/// `canonical_reduce_at_world_one_is_the_zero_filling_identity` oracle.
+/// The presence reduce is a SECOND `all_reduce_sum` call, over a `(n,)`
+/// tensor of `1.0`/`0.0` per canonical var (this rank's own presence) — the
+/// summed count is `> 0` iff at least one rank had the var. Reusing
+/// `all_reduce_sum` (rather than `all_reduce_max_flags`, capped at 32 bits)
+/// is what lets this scale to the real LoRA var count (224 on a
+/// ModernBERT-large r16 config) without chunking into 32-var words.
 ///
-/// A var whose LOCAL gradient is absent on every rank of a real gang (a Var
-/// this step's loss never routes through, on ANY rank) reduces to an
-/// all-zero tensor — the same "legitimate, not a bug" case
-/// [`clip_and_step`]'s own `NoGradients` doc already names, now decided per
-/// var rather than per whole store.
+/// This is the seam [`TrainingLoop::process_batch_loss`]'s window-boundary
+/// flush and its epoch-end trailing-window flush both call before
+/// [`clip_and_step`], so every rank clips and steps over the identical,
+/// already-summed gradient AND the identical presence set, and "every rank
+/// holds identical weights after the step" holds.
+///
+/// At `W = 1` (`collective` is [`super::collective::Noop`]) BOTH
+/// `all_reduce_sum` calls are the identity: a present var's summed count is
+/// exactly `1.0` (`> 0`, so it is written back unchanged) and an absent var's
+/// is exactly `0.0` (so it is never written back) — this function's
+/// observable effect at W=1 is NOTHING, byte-for-byte identical to calling
+/// neither reduce at all, restoring the W=1 trajectory this crate's whole
+/// existing trainer suite already pins. See this module's own
+/// `canonical_reduce_at_world_one_leaves_absence_and_presence_unchanged`
+/// oracle (RED-PROOF: unconditionally inserting the zero-filled tensor for
+/// every var, the shape this function held before the presence-set fix,
+/// reds it — the absent var gains an entry it must not have).
 ///
 /// [`TrainingLoop::process_batch_loss`]: super::trainer::TrainingLoop::process_batch_loss
 pub fn canonical_reduce(
@@ -646,21 +665,52 @@ pub fn canonical_reduce(
     trainable_vars: &[Var],
     grads: &mut GradStore,
 ) -> Result<()> {
+    if trainable_vars.is_empty() {
+        return Ok(());
+    }
     let mut tensors: Vec<Tensor> = Vec::with_capacity(trainable_vars.len());
+    let mut presence: Vec<f32> = Vec::with_capacity(trainable_vars.len());
     for var in trainable_vars {
         let t: &Tensor = var;
-        let tensor = match grads.remove(t) {
-            Some(g) => g,
-            None => Tensor::zeros(t.dims(), t.dtype(), t.device()).map_err(|e| {
-                JammiError::FineTune(format!("canonical_reduce: zero-filling an absent var: {e}"))
-            })?,
-        };
-        tensors.push(tensor);
+        match grads.remove(t) {
+            Some(g) => {
+                presence.push(1.0);
+                tensors.push(g);
+            }
+            None => {
+                presence.push(0.0);
+                tensors.push(Tensor::zeros(t.dims(), t.dtype(), t.device()).map_err(|e| {
+                    JammiError::FineTune(format!(
+                        "canonical_reduce: zero-filling an absent var: {e}"
+                    ))
+                })?);
+            }
+        }
     }
     collective.all_reduce_sum(&mut tensors)?;
-    for (var, tensor) in trainable_vars.iter().zip(tensors) {
-        let t: &Tensor = var;
-        grads.insert(t, tensor);
+
+    // The gang-wide presence set: `> 0` at index `i` iff SOME rank's own
+    // accumulation populated canonical var `i` this window.
+    let device = trainable_vars[0].device();
+    let n = trainable_vars.len();
+    let mut presence_tensor = vec![Tensor::from_vec(presence, (n,), device)
+        .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence tensor: {e}")))?];
+    collective.all_reduce_sum(&mut presence_tensor)?;
+    let presence_summed: Vec<f32> = presence_tensor[0]
+        .to_vec1()
+        .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence readback: {e}")))?;
+
+    for ((var, tensor), present_count) in trainable_vars
+        .iter()
+        .zip(tensors)
+        .zip(presence_summed)
+    {
+        if present_count > 0.0 {
+            let t: &Tensor = var;
+            grads.insert(t, tensor);
+        }
+        // `present_count == 0.0`: absent on every rank — leave `grads`
+        // without this key, exactly as an unreduced, single-rank run would.
     }
     Ok(())
 }
@@ -880,13 +930,25 @@ mod tests {
         (w, grads, g)
     }
 
-    /// U4b (a): at `W = 1` (`Noop`), `canonical_reduce` must be the
-    /// zero-filling identity `clip_and_step`'s own `NoGradients` doc already
-    /// treats an absent entry as — RED-PROOF: removing the `None =>
-    /// Tensor::zeros(...)` arm (replacing it with `.unwrap()`, say) panics on
-    /// `w_absent` instead of returning the zero it must.
+    /// U4b (a)/(e), corrected per the design pressure round: at `W = 1`
+    /// (`Noop`), `canonical_reduce` must change NOTHING — a present var's
+    /// value survives byte-for-byte and an ABSENT var stays ABSENT (never
+    /// gains a materialized zero entry), because absent-vs-zero is not a
+    /// cosmetic distinction for `AdamW::step`: an absent `Var` is skipped
+    /// entirely (no moment update, no bias-correction advance, no weight
+    /// decay), while a present zero-gradient `Var` still gets stepped. A
+    /// version of this function that zero-fills every var unconditionally
+    /// (this function's OWN first-cut shape, before the fix) would silently
+    /// start decaying every never-touched adapter weight — a real behavioural
+    /// change no existing W=1 test happens to construct a batch that would
+    /// catch by accident.
+    ///
+    /// RED-PROOF: reverting to the unconditional-insert shape (`grads.insert`
+    /// for every var regardless of `present_count`) makes `w_absent` gain an
+    /// entry it must not have — this test's `assert!(grads.get(..).is_none())`
+    /// catches it directly.
     #[test]
-    fn canonical_reduce_at_world_one_is_the_zero_filling_identity() {
+    fn canonical_reduce_at_world_one_leaves_absence_and_presence_unchanged() {
         use crate::fine_tune::collective::Noop;
 
         let (w_present, mut grads, g_before) = one_var_with_grad(0.5, 4);
@@ -903,33 +965,32 @@ mod tests {
             "an already-present entry must survive a W=1 reduce byte-for-byte"
         );
 
-        let absent_after = grads.get(w_absent.as_tensor()).expect(
-            "canonical_reduce must materialize an entry for every trainable var, \
-                     even one this step's loss never touched",
-        );
-        let absent_vals: Vec<f32> = absent_after.to_vec1().unwrap();
-        assert_eq!(
-            absent_vals,
-            vec![0.0f32; 3],
-            "an absent var's materialized entry must be an exact zero, matching its own shape"
+        assert!(
+            grads.get(w_absent.as_tensor()).is_none(),
+            "a var absent on the only rank of a W=1 gang must STAY absent — never gain a \
+             materialized zero entry, which would make AdamW step it (moment decay, bias \
+             correction, weight decay) for a step that never trained it"
         );
     }
 
-    /// U4b (d)'s low-level oracle: a REAL two-rank `Local` gang, where rank 1
-    /// never populates `w_only_rank0`'s gradient at all (the "a Var absent
-    /// from one rank's `GradStore`" case DESIGN.md §6 names) — after
-    /// `canonical_reduce`, BOTH ranks hold the IDENTICAL summed value for
-    /// every var: `w_shared`'s sum is `1.0 + 2.0 = 3.0` on every element, and
-    /// `w_only_rank0`'s sum equals rank 0's own value alone (rank 1's zero
-    /// fill contributes nothing) — proving the gang completes and produces
-    /// one agreed gradient rather than each rank quietly keeping its own.
+    /// U4b (d)'s low-level oracle: a REAL two-rank `Local` gang exercising
+    /// all three presence shapes at once — `w_shared` (present on both,
+    /// summed), `w_only_rank0` (present on rank 0 alone — "a Var absent from
+    /// one rank's `GradStore`", DESIGN.md §6), and `w_absent_everywhere`
+    /// (present on NEITHER rank). After `canonical_reduce`, both ranks agree
+    /// on `w_shared` (`1.0 + 2.0 = 3.0`) and on `w_only_rank0` (`5.0`, rank
+    /// 1's zero contributing nothing) — proving the gang completes and
+    /// produces one agreed gradient — and BOTH ranks leave
+    /// `w_absent_everywhere` ABSENT from `grads`, never materializing a zero
+    /// entry for a var neither rank's loss touched (the presence-set fix:
+    /// AdamW must skip it entirely, not step it with a zero gradient).
     ///
     /// RED-PROOF: swapping `all_reduce_sum` for a no-op (each rank keeping
     /// its own local value) makes `w_shared`'s two ranks disagree (1.0 vs
-    /// 2.0, never 3.0) — this test fails the moment the reduce stops being a
-    /// real cross-rank sum.
+    /// 2.0, never 3.0); reverting to the unconditional-insert shape makes
+    /// `w_absent_everywhere` gain a materialized entry on both ranks.
     #[test]
-    fn canonical_reduce_sums_a_real_gang_and_zero_fills_a_rank_absent_var() {
+    fn canonical_reduce_sums_a_real_gang_and_restores_absence_where_no_rank_had_it() {
         use crate::fine_tune::collective::LocalGang;
 
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
@@ -942,7 +1003,13 @@ mod tests {
                     Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
                 let w_only_rank0 =
                     Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
-                let vars = vec![w_shared.clone(), w_only_rank0.clone()];
+                let w_absent_everywhere =
+                    Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
+                let vars = vec![
+                    w_shared.clone(),
+                    w_only_rank0.clone(),
+                    w_absent_everywhere.clone(),
+                ];
 
                 let mut grads = GradStore::default();
                 let shared_value = if rank == 0 { 1.0f32 } else { 2.0f32 };
@@ -957,7 +1024,8 @@ mod tests {
                     );
                 }
                 // rank 1 never inserts an entry for `w_only_rank0` at all —
-                // the absent-on-one-rank case.
+                // the absent-on-one-rank case. Neither rank ever inserts one
+                // for `w_absent_everywhere` — the absent-on-every-rank case.
 
                 canonical_reduce(&local, &vars, &mut grads).unwrap();
 
@@ -968,12 +1036,16 @@ mod tests {
                     .unwrap()
                     .to_vec1()
                     .unwrap();
-                (shared_sum, only0_sum)
+                let absent_everywhere_stayed_absent =
+                    grads.get(w_absent_everywhere.as_tensor()).is_none();
+                (shared_sum, only0_sum, absent_everywhere_stayed_absent)
             }));
         }
-        let results: Vec<(Vec<f32>, Vec<f32>)> =
+        let results: Vec<(Vec<f32>, Vec<f32>, bool)> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();
-        for (rank, (shared_sum, only0_sum)) in results.iter().enumerate() {
+        for (rank, (shared_sum, only0_sum, absent_everywhere_stayed_absent)) in
+            results.iter().enumerate()
+        {
             assert_eq!(
                 *shared_sum,
                 vec![3.0f32, 3.0f32],
@@ -984,6 +1056,11 @@ mod tests {
                 vec![5.0f32, 5.0f32],
                 "rank {rank}: w_only_rank0 must equal rank 0's own value — rank 1's zero \
                  fill must contribute nothing, and both ranks must agree"
+            );
+            assert!(
+                absent_everywhere_stayed_absent,
+                "rank {rank}: a var absent on EVERY rank must stay absent, never gain a \
+                 materialized zero entry"
             );
         }
     }

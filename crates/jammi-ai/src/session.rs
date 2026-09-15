@@ -326,12 +326,24 @@ impl InferenceSession {
         // id is minted here; `JAMMI_WORKER_ID` only labels the row.
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
-        catalog
-            .upsert_instance(&instance_id, label.as_deref(), None)
-            .await?;
-        let instance_hold = lease_keeper.hold(
-            jammi_db::catalog::lease_keeper::LeaseTarget::Instance(instance_id.clone()),
-        );
+        // Minimal compile-only carrier: `[server] peer_advertise` threading
+        // (`InstanceRegistration::from_config`, the worker-half hold) is
+        // U5b-1a's ai-core commit (c3), not this commit's scope — this
+        // registration is always the non-member shape (`peer_addr` /
+        // `canonical_root` both `None`), matching today's behaviour exactly.
+        let registration =
+            std::sync::Arc::new(jammi_db::catalog::instance::InstanceRegistration::new(
+                instance_id.clone(),
+                label.as_deref(),
+                None,
+                None,
+                None,
+            ));
+        catalog.upsert_instance(&registration).await?;
+        let instance_hold =
+            lease_keeper.hold(jammi_db::catalog::lease_keeper::LeaseTarget::Instance(
+                std::sync::Arc::clone(&registration),
+            ));
 
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
         let ann_cache = Arc::new(AnnCache::new(ann_cache_size));

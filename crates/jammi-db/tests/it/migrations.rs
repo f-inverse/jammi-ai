@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 034) -- a new migration is added here
+/// (K5: append-only, currently ending at 035) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -55,6 +55,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "032_result_table_versions",
     "033_model_materialization",
     "034_jobs_training_set_identity",
+    "035_instances_peer_addr_result_root",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -835,18 +836,20 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 tx.execute("DROP TABLE instances", &[]).await?;
                 tx.execute("DROP TABLE jobs", &[]).await?;
                 // Every later migration that ALTERs the dropped `jobs` /
-                // `workers` tables must replay too (030's idempotency key,
-                // 031's `releases` / `workers.state`, 034's
-                // `training_set_ref`/`training_set_location` -- 032 and 033
-                // never touch `jobs`, so they are left applied), or the reopen
-                // would rebuild a 029-shaped table the current `SELECT_COLS`
-                // cannot read — the manufactured state is pre-029, so the
-                // ledger must say so for everything from 029 onwards that
-                // alters `jobs`.
+                // `instances` / `workers` tables must replay too (030's
+                // idempotency key, 031's `releases` / `workers.state`, 034's
+                // `training_set_ref`/`training_set_location`, 035's
+                // `instances.peer_addr`/`result_root` -- 032 and 033 never
+                // touch `jobs`/`instances`/`workers`, so they are left
+                // applied), or the reopen would rebuild a 029-shaped table
+                // the current `SELECT_COLS` cannot read — the manufactured
+                // state is pre-029, so the ledger must say so for everything
+                // from 029 onwards that alters `jobs`/`instances`/`workers`.
                 tx.execute(
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
-                       '031_jobs_releases_workers_state', '034_jobs_training_set_identity')",
+                       '031_jobs_releases_workers_state', '034_jobs_training_set_identity', \
+                       '035_instances_peer_addr_result_root')",
                     &[],
                 )
                 .await?;
@@ -951,6 +954,37 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         !table_exists,
         "training_jobs must be dropped by migration 029"
     );
+
+    // The fourth K5 pin site gets teeth: 035 is on the ledger's DELETE list
+    // above (it ALTERs `instances`, created fresh by 029's replayed DDL), so
+    // an omission from that list would leave the reopened `instances`
+    // missing both columns here -- RED, not a silent pass.
+    let instance_columns: Vec<String> = raw_backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name FROM pragma_table_info('instances') \
+                         WHERE name IN ('peer_addr', 'result_root')",
+                        &[],
+                        |row| row.get::<String>("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for col in ["peer_addr", "result_root"] {
+        assert!(
+            instance_columns.iter().any(|c| c == col),
+            "reopened instances must carry '{col}' (migration 035 replayed): {instance_columns:?}"
+        );
+    }
 }
 
 /// Names in the `applied_migrations` ledger, sorted, read through `backend`.
@@ -1968,4 +2002,141 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
         "setting training_set_location alone (training_set_ref left NULL) must be refused \
          by the schema CHECK constraint, never silently accepted"
     );
+}
+
+/// Migration `035_instances_peer_addr_result_root`
+/// (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a) is present,
+/// ordered AFTER `034_jobs_training_set_identity` (K5: relative position,
+/// never `.last()`), and adds `instances.peer_addr` / `instances.result_root`
+/// as nullable `TEXT` columns, on both backends.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_root(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::{BackendKind, SqlValue};
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("035_instances_peer_addr_result_root")
+            > position("034_jobs_training_set_identity"),
+        "the instances peer_addr/result_root migration must follow 034"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    // Both columns exist and are nullable, on both dialects -- the SAME
+    // two-dialect nullability probe `migration_034_...`'s own oracle uses,
+    // repeated for `instances`.
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('instances') \
+                                 WHERE name IN ('peer_addr', 'result_root')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable FROM information_schema.columns \
+                                 WHERE table_name = 'instances' \
+                                   AND column_name IN ('peer_addr', 'result_root')",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for col in ["peer_addr", "result_root"] {
+        assert!(
+            columns.iter().any(|(c, notnull)| c == col && !notnull),
+            "instances.{col} must be a nullable TEXT column; got {columns:?}"
+        );
+    }
+
+    // A row with both columns NULL (every pre-existing/library-process row)
+    // and a row with both set (a gang member) are both valid inserts -- no
+    // paired CHECK, unlike migration 034's pair.
+    let id_null = format!("mig035_null_{}", jammi_test_utils::unique_suffix());
+    let id_set = format!("mig035_set_{}", jammi_test_utils::unique_suffix());
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let id_null = id_null.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO instances (instance_id, started_at, last_seen_at) \
+                     VALUES ($1, 'now', 'now')",
+                    &[SqlValue::TextOwned(id_null)],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("both NULL must be a valid row");
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let id_set = id_set.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO instances \
+                         (instance_id, started_at, last_seen_at, peer_addr, result_root) \
+                     VALUES ($1, 'now', 'now', '10.0.0.1:9000', 'file:///data/jammi_db')",
+                    &[SqlValue::TextOwned(id_set)],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("both set must be a valid row");
 }

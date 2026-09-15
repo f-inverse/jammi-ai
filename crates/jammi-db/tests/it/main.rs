@@ -22,6 +22,7 @@ mod exact_search;
 mod foundation;
 mod freshness;
 mod gang_instance_freshness;
+mod gang_membership;
 mod gang_rank_admission;
 mod index;
 mod jobs_queue;

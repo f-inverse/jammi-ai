@@ -5,6 +5,7 @@ pub mod channel_repo;
 #[cfg(feature = "test-hooks")]
 pub mod claim_test_hooks;
 pub mod eval_repo;
+pub mod instance;
 pub mod jobs_repo;
 pub mod lease;
 pub mod lease_keeper;

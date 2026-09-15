@@ -1212,3 +1212,26 @@ ALTER TABLE jobs ADD COLUMN training_set_ref TEXT;
 ALTER TABLE jobs ADD COLUMN training_set_location TEXT
     CHECK ((training_set_ref IS NULL) = (training_set_location IS NULL));
 "#;
+
+/// Migration 035 (`docs/plans/67-distributed-training/UNITS.md` § U5b-1a):
+/// the gang-membership carrier on `instances` — `peer_addr` (the `host:port`
+/// this process's peer/gang listener is reachable at) and `result_root` (its
+/// canonicalized result-table root, `JammiConfig::canonical_result_root`).
+///
+/// Both columns are NULLABLE, with a shared meaning: `NULL` = "this process
+/// never joins a gang" — every library/CLI process, and every server process
+/// that never sets `[server] peer_advertise`. There is no paired `CHECK`
+/// (unlike migration 034's `training_set_ref`/`training_set_location`): a row
+/// with `peer_addr` set and `result_root` NULL is representable, and is
+/// simply never a gang member — both are required by
+/// `Catalog::list_gang_members`'s own predicate, not by a schema constraint.
+///
+/// `Catalog::upsert_instance`/`Catalog::reregister_instance` are the only
+/// writers (through `InstanceRegistration`, `catalog::instance`); every
+/// pre-existing row (and every row written by a process with no
+/// `peer_advertise`) carries both columns `NULL`, so this migration changes
+/// zero observable behaviour for any row it does not itself write.
+pub(super) const MIGRATION_035_INSTANCES_PEER_ADDR_RESULT_ROOT: &str = r#"
+ALTER TABLE instances ADD COLUMN peer_addr TEXT;
+ALTER TABLE instances ADD COLUMN result_root TEXT;
+"#;

@@ -28,16 +28,15 @@ use async_trait::async_trait;
 use crate::config::StoragePrecision;
 use crate::index::{SegmentId, ValidatedQuery};
 
-/// The address a coordinator dials an owner at (`host:port`, plaintext gRPC —
-/// transport encryption is the runtime's, never the engine's).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PeerAddr(pub String);
-
-impl std::fmt::Display for PeerAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// The address a coordinator dials an owner at. Moved to
+/// [`crate::catalog::instance::PeerAddr`] (§8 of
+/// `docs/rigor/contracts/feat_500-C-U5b-1a.md`): the peer listener this
+/// module's transport dials and the gang listener
+/// [`crate::catalog::Catalog::list_gang_members`] advertises are the SAME
+/// address, so two distinct types here and in the catalog would be a lie.
+/// Re-exported so every existing `index::peer::PeerAddr` path keeps
+/// resolving.
+pub use crate::catalog::instance::PeerAddr;
 
 /// Which stage of the per-precision protocol a segment search runs.
 ///
@@ -420,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_peers_is_unreachable_and_all_local_owns_nothing() {
-        let owner = PeerAddr("127.0.0.1:1".into());
+        let owner = PeerAddr::parse("127.0.0.1:1").unwrap();
         let req = SegmentSearchRequest {
             table_name: "t".into(),
             segment_ids: vec![SegmentId(3)],

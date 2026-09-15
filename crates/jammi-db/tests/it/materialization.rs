@@ -948,6 +948,116 @@ async fn a_training_sets_registration_declares_its_order_so_the_read_back_plans_
     );
 }
 
+/// Regression (hard-block, contract `feat_500-B-U2c`): a projected column
+/// name is data, never a fragment of SQL to re-parse. `"meta.id"` and
+/// `"id"` are both admitted by `TrainingSetSpec::validate_columns` (no rule
+/// there forbids a dot or mixed case), so a training set materialized over
+/// exactly these two column names is reachable from
+/// `materialize_training_set` — the registration renderer must bind
+/// `"meta.id"` as ONE verbatim column name, never split it into a
+/// `meta`-qualified reference to `id` (which would falsely collapse onto
+/// the SAME schema field the second, bare `"id"` column also names).
+///
+/// Asserted directly against the resolved physical plan's own
+/// `output_ordering` (never string-matched against `EXPLAIN` text, which a
+/// cosmetic Display change could accidentally satisfy either way): the
+/// LEADING declared sort column must be the schema field literally named
+/// `"meta.id"`, not `"id"`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn the_file_sort_order_declares_a_dotted_column_verbatim_not_as_a_qualified_reference(
+    backend: BackendKind,
+) {
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+
+    let schema: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("meta.id", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, true),
+    ]));
+    let meta_id: StringArray = vec![Some("z"), Some("m")].into_iter().collect();
+    let id: StringArray = vec![Some("a"), Some("b")].into_iter().collect();
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(meta_id), Arc::new(id)]).unwrap();
+    let ctx = SessionContext::new();
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("rows", Arc::new(table)).unwrap();
+
+    let columns = vec!["meta.id".to_string(), "id".to_string()];
+    let source = unique_source(&dir, "dotted");
+    let spec = TrainingSetSpec {
+        source_id: &source,
+        source_sql: "SELECT \"meta.id\", \"id\" FROM rows",
+        columns: &columns,
+        task: ModelTask::TextEmbedding,
+        format: "pairs",
+        inputs: vec![InputAnchor::unpinned_at_instant(
+            &source,
+            "2026-09-15T00:00:00Z",
+        )],
+        device: ComputeDevice::Cpu,
+    };
+
+    let materialized = store.materialize_training_set(&ctx, spec).await.unwrap();
+
+    let query = format!(
+        "SELECT * FROM {} {}",
+        materialized.sql_relation(),
+        jammi_db::store::training_set_order_by(&columns)
+    );
+    let plan = ctx
+        .sql(&query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    // No SortExec: the (small, single-file-group) table's declared order is
+    // still trusted for the read-back plan.
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(!text.contains("SortExec"), "no SortExec expected: {text}");
+
+    // The defect itself: the declared ordering's LEADING column must be the
+    // schema field literally named "meta.id" -- a parsing renderer would
+    // have declared "id" here instead (both "meta.id" and the bare "id"
+    // collapsing onto the same misresolved schema field).
+    let ordering = plan
+        .properties()
+        .output_ordering()
+        .expect("a declared file sort order");
+    assert_eq!(ordering.len(), 2, "both projected columns are declared");
+    let leading = ordering[0]
+        .expr
+        .downcast_ref::<PhysicalColumn>()
+        .expect("the leading sort expr is a bare column reference");
+    assert_eq!(
+        leading.name(),
+        "meta.id",
+        "the leading declared sort key must be the dotted column verbatim, not a \
+         misresolved 'id' — got the physical plan: {text}"
+    );
+
+    // The rows themselves come back in the true committed order (meta.id
+    // ascending: "m" then "z") -- correctness, not merely the metadata.
+    let rows = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+    let out = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+    let meta_id_out = string_column(&out, "meta.id");
+    assert_eq!(
+        meta_id_out,
+        vec![Some("m".to_string()), Some("z".to_string())],
+        "rows must read back in the committed full-tuple order"
+    );
+}
+
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]

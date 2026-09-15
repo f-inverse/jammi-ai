@@ -45,7 +45,7 @@ use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingT
 use datafusion::datasource::TableProvider;
 use datafusion::execution::options::ReadOptions;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::{col as logical_col, SortExpr};
+use datafusion::logical_expr::SortExpr;
 use datafusion::physical_expr::{expressions::col as physical_col, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -407,14 +407,31 @@ pub fn training_set_order_by(columns: &[String]) -> String {
 /// [`training_set_order_by`]'s empty-string case): there is nothing to
 /// declare, and [`TrainingSetSpec`] refuses an empty projection before a
 /// provider is ever built from one.
+///
+/// Binds each name via `Expr::Column(Column::new_unqualified(..))` — the
+/// SAME verbatim constructor [`Self::plan_training_set_rows`]'s own
+/// projection uses (see that function's doc comment) — never the `col(..)`
+/// helper, which PARSES its argument as a possibly-qualified, possibly
+/// case-folding SQL identifier: `col("meta.id")` resolves as a `meta`-table
+/// reference to `id`, and `col("Abstract")` lower-cases to `abstract`. A
+/// projected column name is data, never a fragment of SQL to re-parse; a
+/// renderer that parsed it could declare the WRONG leading sort key for a
+/// dotted or mixed-case column while DataFusion trusts the declaration and
+/// skips the sort — a silent wrong order on the registered table, not a
+/// loud error.
 pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
+    use datafusion::common::Column;
+    use datafusion::logical_expr::Expr;
+
     let keys = training_set_sort_keys(columns);
     if keys.is_empty() {
         return Vec::new();
     }
     let exprs: Vec<SortExpr> = keys
         .iter()
-        .map(|k| logical_col(k.column.as_str()).sort(k.ascending, k.nulls_first))
+        .map(|k| {
+            Expr::Column(Column::new_unqualified(k.column.clone())).sort(k.ascending, k.nulls_first)
+        })
         .collect();
     vec![exprs]
 }
@@ -4491,6 +4508,59 @@ mod tests {
         assert_eq!(
             training_set_order_by(&reversed),
             "ORDER BY \"mid_col\" ASC NULLS FIRST, \"a_col\" ASC NULLS FIRST, \"z_col\" ASC NULLS FIRST"
+        );
+    }
+
+    /// The exact defect a hard-block found: `training_set_file_sort_order`
+    /// must bind each column name VERBATIM, never through DataFusion's
+    /// identifier PARSER (the `col(..)` helper), which lower-cases an
+    /// unquoted mixed-case name and splits a dotted name into
+    /// `relation.column`. A dotted or mixed-case projected column is
+    /// reachable from `materialize_training_set` (`validate_columns` admits
+    /// both), so a parsing renderer would silently declare the WRONG
+    /// leading sort key while DataFusion trusts the declaration and skips
+    /// the sort — never a loud error.
+    #[test]
+    fn the_file_sort_order_binds_names_verbatim_never_through_the_identifier_parser() {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::Expr;
+
+        let columns = cols(&["meta.id", "Abstract"]);
+        let file_order = training_set_file_sort_order(&columns);
+        assert_eq!(file_order.len(), 1);
+        let exprs = &file_order[0];
+        assert_eq!(exprs.len(), 2);
+
+        match &exprs[0].expr {
+            Expr::Column(Column { relation, name, .. }) => {
+                assert_eq!(
+                    *relation, None,
+                    "a dotted name must NOT resolve as table.column"
+                );
+                assert_eq!(
+                    name, "meta.id",
+                    "the dot is part of the name, not a qualifier"
+                );
+            }
+            other => panic!("expected an unqualified Column, got {other:?}"),
+        }
+        match &exprs[1].expr {
+            Expr::Column(Column { relation, name, .. }) => {
+                assert_eq!(*relation, None);
+                assert_eq!(
+                    name, "Abstract",
+                    "case must be preserved verbatim, never lower-cased"
+                );
+            }
+            other => panic!("expected an unqualified Column, got {other:?}"),
+        }
+
+        // The SQL renderer's clause already quotes and preserves both names
+        // verbatim (its own, pre-existing property) -- the two renderers
+        // agree on this input too.
+        assert_eq!(
+            training_set_order_by(&columns),
+            "ORDER BY \"meta.id\" ASC NULLS FIRST, \"Abstract\" ASC NULLS FIRST"
         );
     }
 

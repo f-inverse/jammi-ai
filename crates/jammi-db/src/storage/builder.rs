@@ -455,7 +455,7 @@ impl BuilderSeeds {
 /// constructs (the environment first, `config` on top, exactly the order
 /// the `build_*` functions apply) and folded through the driver's own
 /// resolution: for S3 and R2 the bucket endpoint `build()` dials
-/// ([`s3_bucket_endpoint`], the driver's expression over endpoint spelling,
+/// (`s3_bucket_endpoint`, the driver's expression over endpoint spelling,
 /// virtual-hosted style, S3 Express and region); for Azure the account, the
 /// parsed endpoint or the Fabric switch, or in emulator mode the Azurite
 /// host object_store reads with a bare `std::env::var` (its default

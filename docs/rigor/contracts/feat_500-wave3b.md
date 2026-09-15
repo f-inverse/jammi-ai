@@ -132,7 +132,7 @@ that is never used to root anything:
 **Mutation (executed).** With the `AND i.result_root_identity = $n` clause
 removed from `list_gang_members`, exactly the four exclusion oracles of
 P-A5 go RED (`list_excludes_a_member_with_peer_addr_set_and_no_root`,
-`list_folds_authority_case_and_trailing_slash_but_not_key_case`,
+`list_folds_a_trailing_slash_but_neither_bucket_nor_key_case`,
 `file_and_s3_rooted_members_are_not_gang_members_of_each_other`,
 `a_row_with_a_root_but_no_identity_is_never_a_member`) and the rest stay
 green — the predicate is load-bearing, and the inclusion oracles alone

@@ -1,0 +1,271 @@
+# PROPOSAL (human-merge): tighten(lead-gate) — anticipate before the fix, not after (esc-lead-gate-R12)
+
+Status: PROPOSED. This branch (`proposal/lead-gate-R12-anticipation`) applies the change
+directly to the tracked files it touches, rather than shipping as a standalone patch series
+— `SWARM_GATE_TOUCHED` (`.claude/hooks/**`, `ci/scripts/check_*.py`, `.claude/agents/*`,
+`docs/swarm/CONSTITUTION.md`) fires on it and it is human admin-merged, exactly as every
+other lead-gate change in this family (R7/R10/R11) is.
+
+## The escape (session ad5aa3db, 2026-09-13, unit feat/500-B-U4a)
+
+The tarball loader arm of `ci/scripts/bundle_cuda_libs.sh` BLOCKed in closing audits #2, #3
+and #4 — each on the mechanism the PREVIOUS fix introduced (a builder-resolved soname passed
+an `LD_LIBRARY_PATH` prepend; a vacuous pass on an `ldd` failure/empty report; a fix-3 set
+cross-check that failed a CORRECT stage because `ldd` prints its own loader's `DT_NEEDED`
+entry by absolute path). Every one of the three defects was discoverable by running the
+mechanism once, on real input, before the re-audit. esc-lead-gate-R10's `open_question`
+field, as designed, required only that the lead NAME an attack "for the next round to run" —
+a schema requirement over lead-authored prose, never an executed check — which
+institutionalised exactly this deferral; every relay between these rounds satisfied
+`open_question` in full, and the round-4 relay's own text reads "the next round asks
+whether …", naming the attack as a hand-off rather than running it. The user's own words,
+verbatim: "it's not about the count … the lead proactively anticipates and acts even before
+the next audit round's finding."
+
+## v1 (KILLED by its own pressure round)
+
+The first design attached every new obligation to the RELAY — the artifact written only
+AFTER a fix commit already exists. A pressure-tester round on that design found it fillable
+after the fact for the identical reason `open_question` was: nothing forced the lead to have
+run anything before writing the relay, so a plausible-sounding, never-executed "attack" and a
+genuinely-executed one were indistinguishable at the schema layer. v1 was killed outright,
+not softened, and the load-bearing check was moved to the one moment that cannot be gamed
+after the fact — an IMPLEMENTER dispatch, before any fix exists at all.
+
+## v2 (the design this branch implements) — READER 1 / READER 2 / READER 3
+
+**Where the value lives.** A NEW artifact under `.jammi/gate-state/`, distinct from the
+relay (which is written only after the fix commit exists): `{unit_branch, pre_fix_sha,
+covers, attacks: {"<file>": {command, hash}}, residual_risk}`.
+
+**Reader 1 — implementer dispatch (the pre-fix moment).** When a dispatch of an
+implementer-type agent (or, per fix round 1's M6' below, a generic/harness type that DOES
+name a unit) names, via a `unit:` line, a unit branch carrying ANY open second-round BLOCK
+(`adversarial-audit`/`fix-verifier`/`acceptance-verifier`), the dispatch is DENIED unless the
+anticipation artifact exists at the branch's CURRENT TIP, covers every derived key the union
+of every such open BLOCK's own `finding_locations`/`class_enumeration` names, and every
+command the hook itself re-executes hash-matches, in a worktree whose `HEAD` equals that tip
+with `git status --porcelain` empty. `residual_risk` is the one field where the lead admits
+an unclosed site — the defect this proposal answers was that the next round RAN the
+deferred attack, not that a deferral was written down.
+
+**Reader 2 — the closing-verifier relay (post-fix).** The relay gains `attacks_post`, the
+SAME keys re-run at `fix_head`, widened by every file the fix window changed or added a new
+surface to. `outcome` is DERIVED from a measured hash inequality for every fix-changed file a
+pre-fix key covers — never declared; a pre-fix reproduction is the REQUIRED state and never
+itself denies.
+
+**Reader 3 — CI (`ci/scripts/check_rigor_record.py`), the half the lead cannot forge.** The
+exported record carries the anticipation artifacts (`lead-gate-lib.py --export-anticipation
+<slug>`); CI independently re-derives the required key set from the committed record and
+checks the record's own SHAPE, with re-execution against a real checkout as a second,
+advisory layer (fix round 1 narrows what is a hard fail here — see below).
+
+**Execution mechanics.** Commands run in the worktree `git worktree list --porcelain`
+resolves for the unit branch — a COMPUTED cwd, never `$CLAUDE_PROJECT_DIR` (a different
+checkout on a stale branch that may not contain the fix's own files). The denylist admits a
+suite's own entry point (`sh|bash <existing repo-relative path>`); everything else in R11's
+denylist stays denied. Attack execution has its OWN budget (`_ATTACK_BUDGET_S`), separate
+from the git-metadata budget. The witness is `sha256(rc + "\n" + stdout + "\n" + first line
+of stderr)`; `rc ∈ {126, 127}` or empty captured output DENIES as VACUOUS; the SAME
+`(command, hash)` pair reused across two keys DENIES as templated.
+
+The stderr-inclusion in the witness closes a MEASURED collision: two different commands (a
+real script absent from a stale checkout, and a nonexistent script) both produce `rc=127`
+with empty stdout and hash identically under `sha256(rc+stdout)` alone, while `rc=1` never
+collides with `rc=127` under either scheme. `ci/scripts/check_lead_gate.py`'s `R12witness`
+fixture is a STANDING PIN on this exact non-collision property — never a one-round acceptance
+check to be deleted once this proposal merges; it stays in the suite for as long as
+`_witness_hash` exists, the same way a regression test for a fixed bug outlives the bug.
+
+## Honest limits (stated as R3/R11 state theirs)
+
+The hook cannot judge that an attack is a GOOD attack. What the pre-fix tip check and the
+pre/post differential add is that the attack ran, at that instant, against a worktree whose
+`HEAD` really was the tip with nothing uncommitted, and that its output changed after the
+fix — this does NOT establish that no fix exists off-tree (a stash, another branch or
+worktree), nor that the attack necessarily preceded any later fix commit. The human at merge
+remains the control for attack quality, reading the exported attack list. The hook trusts the
+lead's own `unit:` line — a decoy branch name is not detected.
+
+## Fix round 1 (CONTRACT-R12-fix1.md, M1'–M6') — what changed from the design above
+
+A design-round pressure-tester audited the mechanism described above BEFORE an implementer
+ever wrote it, and found a mechanism-level defect the design's own prose had not surfaced:
+keying the pre-fix artifact by a SINGLE BLOCK's own `ts`/`head_sha` and requiring the
+branch's tip to equal exactly that sha is a PERMANENT DENY the moment two open second-round
+BLOCKs of different types (e.g. an older `adversarial-audit` and a newer
+`acceptance-verifier`, provoked after a fix commit landed in between) sit at different shas —
+the tip cannot equal two different values at once. Fix round 1 amends the design in place,
+before any implementer built the permanently-broken shape:
+
+- **M1' — the artifact binds the CURRENT TIP; keys are the UNION over every open block.** One
+  artifact per `(unit, tip)`, not per `(unit, block_ts)`. `block_sha` is NOT required to equal
+  any one BLOCK row's own `head_sha` — only that the artifact's `pre_fix_sha` equals the
+  branch's current tip, that tip equals the resolved worktree's own `HEAD`, and that the tree
+  is clean. Keys are reduced PER FILE (`_key_to_file`) — this unit's many raw `path:line` keys
+  cover a handful of files, and the artifact records an attack per file, not per line.
+- **M2' — no key set is empty, vacuous, or unreachable.** An empty derived set (an
+  `uncertain` BLOCK with no findings) requires ≥2 lead-chosen keys, each naming a file the
+  unit's own `merge-base(main, tip)..tip` diff actually touches, distinct commands, distinct
+  hashes, at least one execution-class (a real script, `cargo`, `python3`, `pytest`, `make` —
+  never only inspectors: `sed`/`grep`/`cat`/`head`/`awk`/`rg`/`wc`/`tail`/`ls`).
+- **M3' — reader 3 is a committed-record SHAPE check; re-execution is advisory.** CI HARD
+  FAILS only on shape (the record exists, every union key is covered, every command passes
+  the hook's own denylist); re-execution against a real `pre_fix_sha` checkout is reported
+  per row as reproduced/mismatched/not_re_executed and NEVER fails the check (measured:
+  BSD/GNU userland and path divergence between the lead's machine and CI's changes a witness
+  hash without the mechanism under attack having changed). A shrink-only, human-maintained
+  grandfather list (mirroring the existing `rigor_record_allowlist.txt` ratchet) exempts
+  in-flight units whose BLOCK predates this mechanism landing.
+- **M4' — reader 2 widens by FILE.** Every changed file in `block_sha..fix_head` widens the
+  required set by file; this implementation does not further refine to the per-rewritten-
+  definition granularity M4' also describes for `.rs`/`.py` files — a documented, honest
+  simplification, never a weaker per-file guarantee (every changed file still needs its own
+  covering key).
+- **M5' — the deny-coverage sweep is committed.** `# R12-BEGIN`/`# R12-END` sentinels bound
+  the four core `str | None`-returning mechanism helpers in `lead-gate-lib.py`;
+  `ci/scripts/check_lead_gate.py --r12-sweep` (its own `swarm.yml` step, separate from
+  `--self-test` — mutating and re-running the R12 fixture subset per deny arm is too slow to
+  fold into the per-invocation self-test) enumerates every deny-`Return` inside that region by
+  AST, neuters each arm's nearest enclosing `if` test to `False` ALONE, and fails when a
+  neutered arm kills no R12 fixture. Scope note: the dispatch-routing arms M6' added
+  (`_decide_implementer_dispatch`) sit outside the sentinel region and are not swept by this
+  mechanism — they are independently covered by named, RED-verified fixtures instead
+  (R12P1/R12P1b/R12P1c/R12P2/R12P2b). **Measured** (this round, on this machine): the
+  hook's own unarmed hot path stays at 0.08-0.13s over repeated 5-invocation samples (well
+  under the 0.2s budget); `--r12-sweep` itself — 36 arms, re-running every "R12"-named fixture
+  per arm — took 541.66s at 24 fixtures/arm and 885.24s at 41 fixtures/arm (both real,
+  observed wall-clock runs; a third run at 48 fixtures/arm was still in progress at hand-off).
+- **M6' — close the fail-open enumerations.** `general-purpose`/`claude`/`fork`/
+  `doc-updater` dispatches are now gated identically to the nine domain-implementer types the
+  moment their prompt names a unit with an open second-round BLOCK (previously unconditionally
+  allowed); an `IMPLEMENTER_TYPES` dispatch with NO `unit:` line now DENIES, naming the
+  required line (previously allowed); a `unit:` line naming a branch that does not resolve
+  under `refs/heads/` DENIES (previously silently treated as "no unit named").
+
+## Residuals carried forward from fix round 1 (stated, not claimed closed)
+
+The decoy-unit-line risk (the hook trusts the lead's own `unit:` line); the in-function-
+rewrite residual (M4'); the `rm .jammi/gate-state/<slug>.*` escape hatch, which removes the
+antecedent for every check above it and is never named as a remedy in any deny message;
+`check_rigor_record.py`'s own re-execution being advisory, not a hard guarantee.
+
+**The M5' sweep's own honest result, not rounded up.** The committed `--r12-sweep` found 36
+deny-shaped `if` arms across the four core mechanism helpers; the FIRST run (before this
+round's own fixtures) found 27 with no dying fixture, and — after adding the fixtures this
+round documents (R12P13-15, R12E1-6, R12F1-5, R12R2f-i, plus `check_rigor_record.py`'s
+RR12g/RR12h) — a second run found 11 remaining, a third (with two more fixtures added, not
+yet re-verified by a fourth full run at the time of hand-off) targets two of those 11. The
+STATED, un-closed remainder, by cause:
+- Two arms in `_r12_attack_command_denied` (empty/non-string `command`; zero shlex tokens)
+  are DEAD CODE from every current caller — `_r12_validate_and_run_entry` already filters
+  both shapes out before ever calling this function. Not fixed here (removing dead code was
+  out of this round's scope) — named so a future reader does not waste a round trying to
+  cover them.
+- One arm (the M3' git-tracked-at-sha check) is invoked ONLY from `check_rigor_record.py`'s
+  Reader 3, which the `--r12-sweep` tool does not exercise (it only re-runs
+  `check_lead_gate.py`'s own "R12"-named fixtures) — a stated SCOPE LIMIT of the sweep tool
+  itself, not a missing property (the property IS fixture-tested, in `check_rigor_record.py`'s
+  own self-test, as RR12g/RR12h — just not swept by this AST tool).
+- One arm (reader 2's "defensive re-check" for a missing pre-fix artifact) is now DEAD CODE
+  after this round's own rewiring: `pre_by_file` is derived FROM the artifact lookup, so it is
+  always empty exactly when the artifact is missing, making the guard's own condition
+  unreachable by construction. Named, not removed, in this round.
+- Five arms (a git command itself failing — `rev-parse`, `git status --porcelain`; a
+  worktree resolving to a branch whose ref and checked-out `HEAD` have diverged) require
+  constructing a git-internal failure or a race that this fixture harness cannot cleanly
+  produce without mocking `_run_git` — `uncovered`, not asserted tested.
+- `_pre_fix_anticipation_rejection`'s internal tip-moved-mid-decision re-check (a defense
+  against a race WITHIN one decision, between the caller's tip resolution and this function's
+  own re-check) has no practical, non-mocked fixture for the same reason — `uncovered`.
+
+No claim in this proposal or in `lead.md`/`hooks/README.md` states these arms are covered;
+each is named exactly where it is, per the discipline this program itself imposes.
+
+See `.claude/agents/lead.md`'s "Anticipate before the fix, not after" paragraph and
+`.claude/hooks/README.md`'s "(2b)" paragraph for the operator-facing statement of the same
+mechanism, and `.jammi/escapes.jsonl`'s `esc-lead-gate-R12-anticipate-before-the-fix` row for
+the ledgered symptom/control pair this proposal answers.
+
+## Fix round 3, item 8 (the fold-9 replacement) — a new obligation triple, not a new reader
+
+Three companion checks land alongside the existing pre-fix/post-fix artifact pair, each
+armed strictly by the DATA (never merely by a unit being open):
+
+- **8a, gates.** `ci/lead-gate-required-commands.txt` is a committed, human-amend-only list of
+  cheap, already-existing gate commands. Reader 1 requires the pre-fix artifact's own `gates`
+  object to name every committed line VERBATIM with an integer `rc` — SHAPE only, the VALUE
+  never judged (the pre-fix tip is expected broken). Reader 2 requires the SAME shape from the
+  relay, PLUS `rc == 0` for every line. Reader 3 (`check_rigor_record.py`) hard-fails the
+  COMMITTED anticipation export's GOVERNING row (selected order-independently, never by
+  position in the file — see below) on a missing line or a non-zero `rc` — the
+  committed record is expected to reflect the fix's own verified state, never a mid-round
+  broken-tip snapshot; it never re-executes the gates (they are CI jobs elsewhere).
+- **8b, mutations.** Armed when the fix's own diff adds a new definition inside a file the
+  BLOCK's own `finding_locations` also names. The relay's `mutations` array carries 1-3
+  LABELED-sample rows, each either an ACCEPTED case (`rc_before==0 ∧ rc_after!=0 ∧
+  marker_after` names a committed TEST-failure marker, distinct from a build-failure marker)
+  or an explicit `uncovered` reason. No hash-reproduction — like `gates`, a lead-attested
+  record.
+- **8c, exclusions.** Armed when the fix's own diff adds a new TEST definition (a heuristic
+  filter over the SAME `_parse_new_surfaces` enumeration reader 2 already uses to widen its
+  own required set). The relay's `exclusions` object must name, per new test, a non-empty
+  case the attack does NOT cover, normalized-distinct from its siblings and from the unit's
+  own previous relay of the same agent_type — the anti-templating cousin of R11's own
+  uncovered-claim check.
+
+HONEST LIMITS, stated as plainly as the pair above: `gates`/`mutations`/`exclusions` are
+LEAD-ATTESTED, never re-executed by the hook. `gates` is visible in the committed
+`docs/rigor/<slug>.anticipation.jsonl` — a human at merge is the control there.
+`mutations`/`exclusions` stay HOOK-ATTESTED ONLY: they are visible in the gitignored relay
+artifact under `.jammi/gate-state/<slug>.relay.*.json`, read directly by Readers 1 and 2, and
+`--export-anticipation` never exports them and never writes a second committed file for
+them — the same "attack quality" limit already named for the pre/post-fix pair, and R11's own
+`claims` disposition, apply. Reader 3 REFUSES — a
+loud, named FAIL, never a silent ignore or select — any row it still finds in the
+anticipation stream whose `agent_type` is not `lead-anticipation` (a stale export or a
+hand-edit). A committed, reader-required record for `mutations`/`exclusions`, AND a CI-side
+derivation of the REQUIRED non-test call-site set from `base...HEAD` with a hard requirement
+that every such site carry its own `mutations` row, are both filed as one separately-scoped
+unit, not yet implemented: https://github.com/f-inverse/jammi-ai/issues/557. `_r12_new_test_surfaces`'s
+"looks like a test" filter can under- or over-include relative to a human's own judgment, the
+same class of limit `_parse_new_surfaces` itself already carries.
+
+Reader 3's SHAPE checks (unit_branch/residual_risk presence, attack pair-reuse, the
+execution-class requirement, the omits-a-command arm, and the gates governing row's shape/
+value) run through the SAME shared validator Reader 1 calls for these arms; `_r12_validate_
+and_run_entry` (Reader 1's own per-file loop, same file) is a KNOWN, unmarked SECOND
+implementation of the three attacks[*]-entry-shape checks specifically — Reader 3's own
+structural detector (`RR31`) cannot see it (it never scans lead-gate-lib.py), so this property
+is recorded, not claimed proven: this unit's own committed
+`docs/rigor/lead-gate-r12-anticipation.anticipation.jsonl` names it in `residual_risk`,
+citing `_r12_validate_and_run_entry` (`lead-gate-lib.py` ~:2072-2079) as the known,
+unmarked second implementation.
+Governing-row selection is order-independent BY CONSTRUCTION, never by an impossibility claim:
+`cmd_export_anticipation` stamps `ts` (the artifact file's own mtime) and `head_sha` (its own
+`pre_fix_sha`) on every row it emits, and selection is by `head_sha` match against the
+checkout's own `HEAD`, else by the row naming the greatest `ts` TEXT (compared as a plain
+string, never parsed as a `datetime` — an executed probe found a mixed-awareness pool crashes
+`max()` with `TypeError: can't compare offset-naive and offset-aware datetimes` and ABORTS the
+run instead of failing loudly, so the compare stays text-only) — never by position in the file,
+so an older round's row sorting after a newer one in the export (which sorts by filename, a tip
+sha with no chronological meaning) cannot stand in for the fix's own verified state. When the
+candidate pool holds two or more rows and any lacks a non-empty string `ts` (a shape the real
+exporter no longer produces, but a hand-typed or pre-fix-round-5 record still can), OR when two
+or more rows share the IDENTICAL `ts` TEXT (a tie is exactly as ambiguous as a missing `ts`, and
+resolving it by append position silently shadows a genuinely different sibling row), selection
+FAILS LOUDLY, naming the tied rows' own line numbers, rather than falling back to append order.
+The SAME instant named in different text (a trailing `Z` vs an explicit `+00:00` offset) is NOT
+caught by this text compare — that narrower case, and `_r12_previous_relay_row`'s own identical
+text-ordering limit, are filed at https://github.com/f-inverse/jammi-ai/issues/557.
+
+**Item 8's acceptance oracle, stated as a split (fix round 5, acceptance #2).** Item 8's
+fixture set carries 24 DENY oracles (RED at the base commit, each by one mutation) and 6
+POSITIVE CONTROLS (green at base BY CONSTRUCTION — a shape-complete/satisfiable artifact must
+allow, guarding the reader against over-refusal, never itself a RED-at-base oracle): R12G2,
+R12G5, R12M8b3, R12M8b4, R12X2, and RR15. Each positive control's own docstring names its
+paired deny fixture(s) (R12G1/R12G3-4/R12G6-8; R12M8b1-2/R12M8b5-12; R12X1/R12X3-6; RR14/RR16).
+The round-3 commit message's "29 oracles RED" predates this split and stays as committed
+history, uncorrected — the correction lives here and in the unit's own rigor-record ledger
+row, never as a rewrite of a past commit's message.

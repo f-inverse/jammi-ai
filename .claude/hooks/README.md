@@ -65,17 +65,157 @@ only shrink the adjacent set) and is therefore NOT the acceptance-easing
 normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
 row is diagnostic only — no gate decision reads it; which requirement has content is
 derived from the enumeration itself.
-**(2b) Open question — ALWAYS (esc-lead-gate-R10).** Alongside the ≥2 examined-clean
-sites (2) already requires, a non-empty `open_question` string must be present on
-every BLOCK relay of every gated verifier type: a site the lead examined and
-explicitly could NOT close, naming the attack for the next round to run. (2)'s own
-≥2-distinct-non-reactive count is UNCHANGED — this is a separate, ADDITIONAL field,
-never folded into the `probe` array or its counting. No subprocess, no regex, no
-match count, no cap: a plain non-empty-string presence check, nothing that scales
-with the size of a class. HONEST LIMIT, stated as one: this is a SCHEMA requirement
-over lead-authored text, a COST FLOOR, not proof of examination — the same limit (2)
-already carries. A lead can write a hollow open question; what it cannot do is write
-nothing and pass. What a human reads at merge is whether the open question was real.
+**(2b) Anticipate before the fix, not after (esc-lead-gate-R12, fix round 1 —
+REPLACES esc-lead-gate-R10's `open_question`).** `open_question` required only that
+the lead NAME a site examined and not closed, "the attack for the NEXT ROUND to
+run" — a schema requirement over lead-authored prose, never an executed check, which
+institutionalised exactly the deferral it was meant to catch (three closing audits in
+a row BLOCKed on a mechanism the PREVIOUS fix introduced, each discoverable by
+running it once before re-dispatching; see `docs/swarm/SELF-FAILURE-MODES.md` F10's
+third incident). R12 moves the load-bearing check to the PRE-FIX moment, before the
+implementer is ever dispatched: `_decide_implementer_dispatch` denies a dispatch onto
+a unit branch carrying ANY open `VERIFIER_SECOND_ROUND_TYPES` BLOCK unless a
+`.jammi/gate-state/<slug>.anticipation.<tip_sha>.json` artifact exists — KEYED BY THE
+BRANCH'S CURRENT TIP, never a single block's own sha (two open blocks of different
+types at different shas must both be satisfiable by ONE artifact, never a permanent
+deny) — `{unit_branch, pre_fix_sha, covers, attacks: {"<file>": {command, hash}},
+residual_risk}`, one entry PER FILE covering the UNION of every open block's own
+`finding_locations` ∪ `class_enumeration`, whose every command the hook RE-EXECUTES
+and hash-matches, whose ordering evidence is a tip that has not moved and a CLEAN
+tree (`git status --porcelain` empty — a dirty worktree denies, naming the paths),
+and at least one of whose commands is execution-class (never only inspectors —
+`sed`/`grep`/`cat`/`head`/`awk`/`rg`/`wc`/`tail`/`ls`). `residual_risk` is the one
+field where the lead admits what stays unclosed — honest, never a hand-off. The
+CLOSING relay then requires `attacks_post` — the SAME per-file keys (widened by every
+file the fix changed or added a new surface to), re-run at `fix_head`; for every file
+the fix changed that a pre-fix key covers, its hash must have MOVED, an `outcome`
+DERIVED from the inequality, never lead-declared. `ci/scripts/check_rigor_record.py`
+independently HARD-FAILS on the committed record's SHAPE (every union key covered,
+every command passing the hook's own denylist) and, separately, ADVISORY-re-executes
+what it can from a real `pre_fix_sha` checkout — never a hard fail there (BSD/GNU and
+path divergence between the lead's machine and CI, measured). HONEST LIMITS: the hook
+cannot judge that an attack is a GOOD attack, only that it ran, at this instant,
+against a worktree whose HEAD really was the tip with nothing uncommitted, and that
+its output moved after the fix — this does not establish that no fix exists off-tree,
+nor that the attack necessarily preceded a later fix commit; the hook trusts the
+lead's own `unit:` line (a decoy is not detected); a fix that REWRITES a function's
+body inside an already-covered file is not separately re-armed beyond that file's own
+required key. A lead can still write a weak attack; what it cannot do is write
+nothing, or write it AFTER a fix already landed, and pass.
+**(2c) Required gates, mutations, exclusions (esc-lead-gate-R12, fix round 3, item
+8a/8b/8c) — three companion checks beside (2b)'s pre/post-fix
+attack pair, each armed strictly by the DATA, never merely by a unit being open.**
+`ci/lead-gate-required-commands.txt` (`_R12_REQUIRED_COMMANDS_FILENAME`,
+human-amend-only, `SWARM_GATE_TOUCHED`-guarded, shrink-only-ratcheted) is a committed
+list of cheap, already-existing gate commands, one per line, `#`-comment/blank lines
+skipped, a trailing `  # measured ~Xs` annotation stripped from each
+(`_r12_required_commands_or_deny`) — a MISSING, EMPTY, or all-comment file is now a
+hard DENY in the hook and a hard FAIL in reader 3: the old `[]`
+"honest default" silently meant "no gate obligation" and let the file's own
+existence/length be weakened with zero CI signal; that silent path is closed. Every
+SHAPE check below is INTENDED to run through the ONE shared validator,
+`_r12_anticipation_rejection` — reader 3 imports and calls this SAME function, so a
+fix there fixes reader 3 identically. Its three attacks[*]-entry-shape deny texts
+(not an object / no `command` / no valid `hash`) carry an `anticipation-validator:`
+provenance marker — a harmless label naming which function produced the text, NOT a
+claim of uniqueness: `_r12_validate_and_run_entry` (this same file, reader 1's own
+per-file loop) already re-implements the identical three checks with its own,
+unmarked deny texts, and `check_rigor_record.py`'s own structural detector
+(`RR31`) only ever scans check_rigor_record.py, never this file. This gap — the
+shared validator is NOT provably the only implementation of these three checks — is
+recorded, not hidden: this unit's own committed
+`docs/rigor/lead-gate-r12-anticipation.anticipation.jsonl` names it in `residual_risk`
+(the one field an anticipation row already carries for exactly this admission —
+"which case does the attack you just ran NOT cover?"), citing
+`_r12_validate_and_run_entry` (`lead-gate-lib.py` ~:2072-2079) as the known,
+unmarked second implementation.
+**8a, gates.** `_r12_gates_shape_rejection` requires `gates` to be a dict naming
+EVERY required command VERBATIM, each an object with an integer `rc`; called with
+`judge_rc=False` at Reader 1 (the pre-fix anticipation artifact — shape only, the
+pre-fix tip is expected to be broken, so its `rc` value is never inspected) and
+`judge_rc=True` at Reader 2 (the closing relay — SAME shape PLUS `rc == 0` for every
+line, armed UNCONDITIONALLY on every relay, never scoped to only
+R12-anticipation-covered units) and at Reader 3 (the committed record's GOVERNING
+row). The hook never runs these commands itself. **8b, mutations.**
+`_mutations_rejection` is armed only when the fix's own diff adds a new definition
+(`new_surfaces`, the hook's own derived enumeration) inside a file the open BLOCK's
+own `finding_locations` also names — never merely because `finding_locations` is
+non-empty. `None` iff the relay's `mutations` array then carries 1..3 rows
+(`len(mutations) > 3` denies outright — K<=3, a LABELED sample, never an exhaustive
+sweep), each shaped `{site, command, rc_before, rc_after, marker_after}` with EITHER
+an ACCEPTED mutation (`rc_before == 0 ∧ rc_after != 0 ∧ marker_after` matches a
+committed TEST-failure marker — `"test result: FAILED"`, `"FAIL —"`, `"= FAILURES ="`
+— distinct from a build-failure marker) OR an explicit non-empty `uncovered` reason
+(R11's own disposition precedent), and every `uncovered` reason in the array is
+NORMALIZED-DISTINCT from its siblings (three identical excuses is
+one real disposition). No hash-reproduction here — like `gates`, a lead-attested
+record, never re-executed by the hook. `mutations`/`exclusions` stay HOOK-ATTESTED
+ONLY — they live in the relay artifact under `.jammi/gate-state/<slug>.relay.*.json`,
+read directly by Readers 1 and 2, and `--export-anticipation` never exports them and
+never writes a second committed file for them.
+`docs/rigor/<slug>.anticipation.jsonl` (stdout, redirected by the operator) carries
+ONLY `lead-anticipation` rows; Reader 3 REFUSES — a loud, named FAIL, never a silent
+ignore or a silent select — any row it still finds in that stream whose `agent_type`
+is not `lead-anticipation` (a stale export or a hand-edit); the shared validator
+(`_r12_anticipation_rejection`) receives anticipation rows only. Filed as one
+separately-scoped unit (not yet implemented, tracked at
+https://github.com/f-inverse/jammi-ai/issues/557): a committed, reader-required
+record for `mutations`/`exclusions`, AND a CI-side derivation of the REQUIRED
+non-test call-site set from `base...HEAD` hard-requiring every such site to carry
+its own `mutations` row. **8c,
+exclusions.** `_r12_new_test_surfaces` narrows `new_surfaces` to entries that LOOK
+like a test (the file path contains "test", or the definition name starts with
+`test_`/`fixture_` or contains "test" — a heuristic, stated as one, that can under-
+or over-include). `_exclusions_rejection` then requires the relay's `exclusions`
+object to name, per new test surface, a non-empty case the attack does NOT cover,
+NORMALIZED-DISTINCT (`_probe_normalize` — strips zero-width/control characters and
+surrounding whitespace ONLY; a genuine paraphrase is never detected, only exact-mod-
+whitespace repetition) both from every sibling entry in the SAME relay (a
+within-relay duplicate denies, naming both keys) and from the unit's own PREVIOUS
+relay of the SAME `agent_type` (`_r12_previous_relay_row`, the earlier `ts` — a
+cross-relay duplicate, an exclusion repeated verbatim across rounds, also denies);
+when the ledger records a previous relay but its own artifact is gone from disk,
+that is ALSO a DENY, naming the missing witness — never a silent
+"nothing to compare against, so it passes" (the SAME shape the pre-fix witness arm
+already takes). This is the anti-templating cousin of `_claims_rejection`'s own
+uncovered-reason check. LIMIT, stated as plainly as R11's own: this cannot prove an
+exclusion is TRUE, only that two are not one. **Reader 3**
+(`ci/scripts/check_rigor_record.py`, armed UNCONDITIONALLY — a missing, empty, or
+all-comment `ci/lead-gate-required-commands.txt` is itself a hard FAIL here, never a
+silent skip) hard-fails the
+committed `docs/rigor/<slug>.anticipation.jsonl` export on the SAME shared checks
+Reader 1 makes (`unit_branch`/`residual_risk` presence, attack pair-reuse WITHIN a
+row, the execution-class requirement, the omits-a-command arm) plus the GOVERNING
+row's `gates` shape/value. The governing row is selected ORDER-INDEPENDENTLY: a row
+whose own `head_sha` matches this checkout's actual `HEAD` is preferred; when none
+does — the common case, since a pre-fix witness by construction predates the commit
+Reader 3 validates against — every row is eligible; within whichever pool applies,
+the row naming the GREATEST `ts` TEXT governs, never the row nearest the end of
+the file (`cmd_export_anticipation` sorts the artifacts it dumps by FILENAME — a tip
+sha, pseudorandom hex with no chronological meaning — so an older round's row can
+sort after a newer one and land on the file's last line); BOTH `ts` and `head_sha`
+are stamped by the exporter itself (from the artifact file's own mtime
+and its own `pre_fix_sha`, never hand-typed). `ts` is compared as a plain STRING,
+never parsed as a `datetime` — an executed probe found a mixed-awareness pool (one
+row's `ts` with no UTC offset beside another's `...Z`/`...+00:00`) crashes `max()`
+with `TypeError: can't compare offset-naive and offset-aware datetimes` and ABORTS
+the run instead of failing loudly, so nothing on this selection path ever parses
+`ts`. When the candidate pool holds two or more rows and ANY of them lacks a
+non-empty string `ts`, OR two or more rows share the IDENTICAL `ts` TEXT, Reader 3
+FAILS LOUDLY, naming the tied rows' own line numbers, rather than guessing. The SAME
+instant named in different text (a trailing `Z` vs an explicit `+00:00` offset) is
+NOT caught by this text compare — that narrower case, and `_r12_previous_relay_row`'s
+own identical text-ordering limit, are filed at
+https://github.com/f-inverse/jammi-ai/issues/557.
+Reader 3 never re-executes these commands; they are already CI jobs
+elsewhere in `.github/workflows/`. HONEST LIMITS, stated as plainly as (2b)'s own:
+`gates`/`mutations`/`exclusions` are LEAD-ATTESTED, never re-executed by the hook.
+`gates` is visible in the committed `docs/rigor/<slug>.anticipation.jsonl` — a human
+at merge is the control there. `mutations`/`exclusions` are visible ONLY in the
+gitignored relay artifact under `.jammi/gate-state/` (Readers 1 and 2 read them
+directly from there); they are never exported and never committed — a committed,
+reader-required record for these two fields is filed at
+https://github.com/f-inverse/jammi-ai/issues/557.
 **(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
 `_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
 (no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE
@@ -129,7 +269,8 @@ probing the fix's own surface satisfies this even when that file is also a findi
 location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
 conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
 though one entry can double as both when it qualifies for each), with (2b)'s
-separate `open_question` field, and with (4)'s `claims` object below — all
+`attacks_post` differential (armed pre-fix, at implementer-dispatch time, not merely
+at this relay), and with (4)'s `claims` object below — all
 conjunctive with R1-R3. **One unit per
 dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
 type, the dispatch is denied outright, naming every targeted unit — R3 never

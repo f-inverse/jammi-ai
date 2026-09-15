@@ -19,6 +19,60 @@ use tempfile::TempDir;
 
 use crate::common;
 
+/// `InferenceSession`'s result store is rooted at EXACTLY
+/// `JammiConfig::resolved_result_root()`'s own value — the ONE derivation
+/// U5b-1a's `canonical_result_root()` canonicalizes for gang membership —
+/// never a second, independently re-derived path, for both arms
+/// (`storage.result_root` unset and set). Proven by creating a table and
+/// checking its `parquet_url` starts with the resolved root.
+async fn assert_store_rooted_at_resolved_root(config: jammi_db::config::JammiConfig) {
+    let expected = StorageUrl::parse(&config.resolved_result_root()).unwrap();
+    let session = InferenceSession::new(config).await.unwrap();
+    let store = session.result_store();
+    let info = store
+        .create_table(
+            "root_parity_probe",
+            ModelTask::Classification,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
+            "model",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        info.parquet_url().as_str().starts_with(expected.as_str()),
+        "store root {} does not match resolved_result_root() {}",
+        info.parquet_url(),
+        expected
+    );
+}
+
+/// `storage.result_root` UNSET: the store roots at `{artifact_dir}/jammi_db`,
+/// exactly what `resolved_result_root()` names.
+#[tokio::test]
+async fn store_root_matches_resolved_result_root_when_unset() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    assert_store_rooted_at_resolved_root(config).await;
+}
+
+/// `storage.result_root` SET (to a `memory://` root): the store roots
+/// exactly there, again matching `resolved_result_root()`.
+#[tokio::test]
+async fn store_root_matches_resolved_result_root_when_set() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.storage = StorageConfig {
+        result_root: Some("memory:///jammi_root_parity".into()),
+        cloud: None,
+    };
+    assert_store_rooted_at_resolved_root(config).await;
+}
+
 /// With `storage.result_root` set to a `memory://` URL, the session's result
 /// store creates tables under that root and round-trips a batch back — proving
 /// the configured cloud root threads from `JammiConfig` into the `ResultStore`

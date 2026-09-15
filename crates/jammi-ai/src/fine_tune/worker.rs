@@ -86,6 +86,7 @@ use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
+use jammi_db::catalog::instance::{InstanceRegistration, WorkerFacts};
 use jammi_db::catalog::jobs_repo::WorkerState;
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::Catalog;
@@ -811,6 +812,16 @@ impl JobWorker {
             exit.complete();
             return;
         };
+        // The registration's worker half is set BEFORE the row: a keeper
+        // reregister that races this very first upsert must never observe
+        // an empty cell (`InstanceRegistration.worker` is the SOLE owner
+        // path this loop writes through — §8 B1).
+        session
+            .instance_registration()
+            .set_worker(Some(WorkerFacts {
+                kinds: self.kinds.join(","),
+                state: WorkerState::Warming,
+            }));
         if let Err(e) = session
             .catalog()
             .upsert_worker(&self.worker_id, &self.kinds.join(","), WorkerState::Warming)
@@ -833,6 +844,13 @@ impl JobWorker {
             return;
         }
         if let Some(session) = self.session.upgrade() {
+            // Cell before row, same as the `warming` upsert above.
+            session
+                .instance_registration()
+                .set_worker(Some(WorkerFacts {
+                    kinds: self.kinds.join(","),
+                    state: WorkerState::Claiming,
+                }));
             if let Err(e) = session
                 .catalog()
                 .set_worker_state(&self.worker_id, WorkerState::Claiming)
@@ -2659,6 +2677,14 @@ pub struct EmbeddedWorker {
     /// row goes stale and cascades.
     catalog: Arc<Catalog>,
     instance_id: String,
+    /// This process's `InstanceRegistration`, captured at spawn so RELEASE
+    /// needs no session (same rationale as `keeper`/`writer_id` below) —
+    /// this guard is the worker half's OTHER owner (alongside the loop task
+    /// itself): every `set_worker_state`/`delete_worker` call this guard
+    /// issues writes/clears the cell FIRST, so a keeper reregister racing a
+    /// DRAIN or a RELEASE never re-upserts a `workers` row this process has
+    /// already stopped claiming with.
+    registration: Arc<InstanceRegistration>,
     /// The session's keeper (2b releases the `Job` holds it holds) and the
     /// session's result-store writer id (the linked building sweep's
     /// `writer_id` arm) — captured at spawn so RELEASE needs no session.
@@ -2709,6 +2735,7 @@ impl EmbeddedWorker {
             shared,
             catalog: Arc::clone(session.catalog_arc()),
             instance_id: session.instance_id().to_string(),
+            registration: Arc::clone(session.instance_registration()),
             keeper: Arc::clone(session.lease_keeper()),
             writer_id: session.result_store().writer_id().to_string(),
             heartbeat,
@@ -2746,6 +2773,14 @@ impl EmbeddedWorker {
             Ordering::SeqCst,
         );
         self.shared.request_stop();
+        // Cell before row (§8 B1): preserve the cell's own `kinds` (set by
+        // the loop task's `warming`/`claiming` writes), flip only `state`.
+        // A cell still `None` (the loop has not yet issued its first
+        // `upsert_worker`) has no row to race either — nothing to update.
+        if let Some(mut facts) = self.registration.worker_snapshot() {
+            facts.state = WorkerState::Draining;
+            self.registration.set_worker(Some(facts));
+        }
         if let Err(e) = self
             .catalog
             .set_worker_state(&self.instance_id, WorkerState::Draining)
@@ -2810,6 +2845,9 @@ impl EmbeddedWorker {
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
         self.stop_sampler();
+        // Cell before delete (§8 B1): the loop has fully returned, so
+        // nothing else can race a re-set of the cell after this clear.
+        self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(StopOutcome::Joined)
     }
@@ -3000,6 +3038,8 @@ impl EmbeddedWorker {
         let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
         // 2h
         self.stop_sampler();
+        // Cell before delete (§8 B1) — same as `stop_and_join`.
+        self.registration.set_worker(None);
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(ReleaseReport {
             loop_state,
@@ -3038,6 +3078,11 @@ impl Drop for EmbeddedWorker {
         );
         if let LoopTask::Running(handle) | LoopTask::Abandoned(handle) = task {
             handle.abort();
+            // Cell before delete (§8 B1), synchronous — `Drop` cannot
+            // `.await` the delete below, but clearing the cell needs no
+            // await, so it happens unconditionally here rather than only
+            // once the (possibly never-scheduled) spawned task below runs.
+            self.registration.set_worker(None);
             // The loop is gone, so the claimant row must go too. `Drop` is
             // synchronous: the delete rides a detached task on the current
             // runtime when there is one (the embedded engine's own runtime

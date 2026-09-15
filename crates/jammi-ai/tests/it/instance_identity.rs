@@ -11,7 +11,7 @@ use std::time::Duration;
 use jammi_ai::fine_tune::worker::{EmbeddedWorker, COMPILED_KINDS};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
-use jammi_db::catalog::instance::{GangListing, InstanceRegistration, MemberRoot};
+use jammi_db::catalog::instance::{GangListing, InstanceRegistration};
 use jammi_db::catalog::jobs_repo::WorkerRecord;
 use jammi_db::catalog::lease::{instance_liveness_margin, instance_prune_window};
 use jammi_db::catalog::Catalog;
@@ -266,22 +266,17 @@ fn fast_peer_config(dir: &std::path::Path, port: u16) -> jammi_db::config::Jammi
     config
 }
 
-/// Poll until `catalog.list_gang_members` returns `instance_id` as a member,
-/// or panic past `deadline`.
-async fn wait_until_gang_member(
-    catalog: &Catalog,
-    instance_id: &str,
-    kind: &str,
-    member_root: &MemberRoot,
-    lease: Duration,
-) {
+/// Poll until `catalog.list_gang_members` returns `instance_id` as a
+/// member, or panic past `deadline`. `GangListing` carries no root — the
+/// predicate does not consult `instances.result_root` in this unit
+/// (contract `feat_500-C-U5b-1a` §12, P-Y1).
+async fn wait_until_gang_member(catalog: &Catalog, instance_id: &str, kind: &str, lease: Duration) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let members = catalog
             .list_gang_members(GangListing {
                 kind,
                 self_instance: "not-a-real-instance-id",
-                member_root,
                 lease,
             })
             .await
@@ -416,6 +411,72 @@ async fn missing_result_root_path_is_accepted_verbatim_and_session_open_succeeds
     assert_eq!(row.1.as_deref(), Some(expected_root.as_str()));
 }
 
+/// P-Y4 (contract `feat_500-C-U5b-1a` §12): the registration's worker cell
+/// is set only AFTER the claim loop's FIRST `upsert_worker` call SUCCEEDS.
+/// An injected failure on that call is proven, indirectly (the cell itself
+/// is `pub(crate)` to `jammi-ai`, unreachable from this external test
+/// crate): a subsequent `LeaseKeeper` pass, forced to take the reregister
+/// arm by a force-deleted `instances` row, writes NO `workers` row — the
+/// only way it could is if the cell held `Some`, which it must not after a
+/// failed first upsert. The gate is closed BEFORE the worker spawns so
+/// `run_until` parks right after that first (armed-to-fail) attempt, before
+/// it ever reaches the `claiming` transition — a stable window with no race
+/// against the loop's own later cell writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_no_workers_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = fast_peer_config(dir.path(), 19108);
+    config.worker.enabled = true;
+    let lease = config.lease.intervals().unwrap().lease();
+
+    let session = InferenceSession::open(config).await.unwrap();
+    let instance_id = session.instance_id().to_string();
+    session.close_worker_gate();
+    jammi_db::catalog::worker_test_hooks::arm_upsert_worker_failure(&instance_id);
+
+    let worker = EmbeddedWorker::spawn(&session).unwrap();
+
+    // The injected failure is logged, never panics; give the loop task time
+    // to run its first statement and return from the failed call before
+    // asserting anything about its effect.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        session
+            .catalog()
+            .list_workers()
+            .await
+            .unwrap()
+            .iter()
+            .all(|w| w.instance_id != instance_id),
+        "the failed first upsert must never leave a `workers` row"
+    );
+
+    // Force the `instances` row to look pruned so the keeper's next pass
+    // takes the reregister arm, which writes `workers` ONLY when the
+    // registration's worker cell is `Some`.
+    force_delete_instance(session.catalog(), &instance_id).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        session
+            .catalog()
+            .fresh_instance(&instance_id, lease)
+            .await
+            .unwrap(),
+        "the instances row must reregister -- the process itself never stopped"
+    );
+    let workers_after_reregister = session.catalog().list_workers().await.unwrap();
+    assert!(
+        workers_after_reregister
+            .iter()
+            .all(|w| w.instance_id != instance_id),
+        "the keeper must never write a `workers` row for a cell that stayed `None` \
+         after the injected upsert failure: {workers_after_reregister:?}"
+    );
+
+    session.open_worker_gate();
+    worker.stop_and_join().await.unwrap();
+}
+
 /// P-M4 (ai-level, §8 B1 restated): a session with `[worker] enabled` and
 /// `peer_advertise` set is a `list_gang_members` member (`kinds` + `state ==
 /// claiming`) once its claim loop warms up. Force-deleting its `instances`
@@ -428,20 +489,12 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
     let mut config = fast_peer_config(dir.path(), 19105);
     config.worker.enabled = true;
     let lease = config.lease.intervals().unwrap().lease();
-    let member_root = MemberRoot::new(config.resolved_result_root().unwrap());
     let kind = COMPILED_KINDS[0];
 
     let session = InferenceSession::open(config).await.unwrap();
     let worker = EmbeddedWorker::spawn(&session).unwrap();
 
-    wait_until_gang_member(
-        session.catalog(),
-        session.instance_id(),
-        kind,
-        &member_root,
-        lease,
-    )
-    .await;
+    wait_until_gang_member(session.catalog(), session.instance_id(), kind, lease).await;
     let before = session
         .catalog()
         .list_workers()
@@ -457,14 +510,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
     // keeper to notice the missed touch and reregister the whole tuple.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    wait_until_gang_member(
-        session.catalog(),
-        session.instance_id(),
-        kind,
-        &member_root,
-        lease,
-    )
-    .await;
+    wait_until_gang_member(session.catalog(), session.instance_id(), kind, lease).await;
     let after = session
         .catalog()
         .list_workers()
@@ -490,19 +536,11 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
     let mut config = fast_peer_config(dir.path(), 19106);
     config.worker.enabled = true;
     let lease = config.lease.intervals().unwrap().lease();
-    let member_root = MemberRoot::new(config.resolved_result_root().unwrap());
     let kind = COMPILED_KINDS[0];
 
     let session = InferenceSession::open(config).await.unwrap();
     let worker = EmbeddedWorker::spawn(&session).unwrap();
-    wait_until_gang_member(
-        session.catalog(),
-        session.instance_id(),
-        kind,
-        &member_root,
-        lease,
-    )
-    .await;
+    wait_until_gang_member(session.catalog(), session.instance_id(), kind, lease).await;
 
     // A graceful stop clears the registration's worker cell BEFORE deleting
     // the `workers` row (§8 B1) — the process itself (its `instances` row)
@@ -528,7 +566,6 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
         .list_gang_members(GangListing {
             kind,
             self_instance: "not-a-real-instance-id",
-            member_root: &member_root,
             lease,
         })
         .await

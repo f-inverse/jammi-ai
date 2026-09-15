@@ -3321,9 +3321,15 @@ fn from_config_member_root_is_resolved_result_root_verbatim_over_every_arm() {
     assert_eq!(reg.member_root.unwrap().as_str(), resolved);
 }
 
-/// `gcs://b/p` and `gs://b/p` are DIFFERENT `member_root` strings — the
-/// membership path performs no scheme aliasing (contract §10 P-X2's
-/// `gang_membership.rs` case is the join-time counterpart of this).
+/// `gcs://b/p` and `gs://b/p` are DIFFERENT `member_root` STRINGS — the
+/// membership path performs no scheme aliasing when writing the row (this
+/// is a claim about the VALUE, not about `list_gang_members`'s admission
+/// predicate: that predicate does not consult `result_root` at all in this
+/// unit — contract §12, the round-5 excision — so two members with these
+/// two different root strings ARE gang members of each other;
+/// `gang_membership.rs`'s
+/// `gcs_and_gs_spelled_members_are_gang_members_of_each_other_root_is_not_consulted`
+/// is the join-time counterpart proving exactly that).
 #[test]
 fn from_config_never_aliases_gcs_and_gs_result_root_spellings() {
     let cfg_gcs = advertising_config(std::path::Path::new("/unused"), Some("gcs://bucket/p"));

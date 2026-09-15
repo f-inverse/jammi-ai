@@ -566,7 +566,6 @@ fn parse_worker_row(
 struct GangCandidateRow {
     instance_id: String,
     peer_addr: String,
-    result_root: String,
     kinds: String,
     state: String,
 }
@@ -2288,20 +2287,27 @@ impl Catalog {
 
     /// The gang-membership listing verb (DESIGN.md § 4, M3): every FRESH,
     /// `claiming` worker whose `kinds` contains `listing.kind` as a whole,
-    /// trimmed, comma-split token, whose `result_root` matches
-    /// `listing.member_root` byte-for-byte, excluding `listing.
-    /// self_instance` — sorted by `instance_id` BYTE ORDER, in Rust, never a
-    /// SQL `ORDER BY` (backend-dependent collation). An INNER join on
-    /// `workers`: a member is a fleet worker with a claim-loop slot, not
-    /// merely a live process. `instances` carries no tenant column: the same
-    /// answer under a scoped tenant binding and under none.
+    /// trimmed, comma-split token, excluding `listing.self_instance` —
+    /// sorted by `instance_id` BYTE ORDER, in Rust, never a SQL `ORDER BY`
+    /// (backend-dependent collation). An INNER join on `workers`: a member
+    /// is a fleet worker with a claim-loop slot, not merely a live process.
+    /// `instances` carries no tenant column: the same answer under a scoped
+    /// tenant binding and under none.
+    ///
+    /// **The `result_root` column is NOT part of this predicate** (contract
+    /// `feat_500-C-U5b-1a` §12, P-Y1, the round-5 excision): [`GangListing`]
+    /// carries no root field, so two members rooted at byte-DIFFERENT
+    /// spellings ARE gang members of each other — this verb has nothing to
+    /// say about the root. Root identity, and any membership predicate
+    /// built on it, is `docs/plans/67-distributed-training/README.md` unit
+    /// U5b-1a-A2's question.
     ///
     /// Filtering is split deliberately: freshness and NULL-ness are pushed
     /// into SQL (an index-backed predicate over a potentially large table);
-    /// everything else — the self exclusion, the worker state, the kind
-    /// token match, and the root comparison — runs in Rust, over the
-    /// already-narrowed row set, so no SQL dialect's string/collation
-    /// semantics can silently diverge from what this verb promises.
+    /// everything else — the self exclusion, the worker state, and the kind
+    /// token match — runs in Rust, over the already-narrowed row set, so no
+    /// SQL dialect's string/collation semantics can silently diverge from
+    /// what this verb promises.
     ///
     /// # Errors
     ///
@@ -2324,17 +2330,14 @@ impl Catalog {
                             stale_before_clause("i.last_seen_at", kind, margin, &mut params);
                         let sql = format!(
                             "SELECT i.instance_id AS instance_id, i.peer_addr AS peer_addr, \
-                                    i.result_root AS result_root, w.kinds AS kinds, \
-                                    w.state AS state \
+                                    w.kinds AS kinds, w.state AS state \
                              FROM instances i JOIN workers w ON w.instance_id = i.instance_id \
-                             WHERE i.peer_addr IS NOT NULL AND i.result_root IS NOT NULL \
-                               AND NOT ({stale})"
+                             WHERE i.peer_addr IS NOT NULL AND NOT ({stale})"
                         );
                         tx.query(&sql, &params, |row| {
                             Ok(GangCandidateRow {
                                 instance_id: row.get::<String>("instance_id")?,
                                 peer_addr: row.get::<String>("peer_addr")?,
-                                result_root: row.get::<String>("result_root")?,
                                 kinds: row.get::<String>("kinds")?,
                                 state: row.get::<String>("state")?,
                             })
@@ -2362,9 +2365,6 @@ impl Catalog {
             {
                 continue;
             }
-            if row.result_root.as_bytes() != listing.member_root.as_str().as_bytes() {
-                continue;
-            }
             let peer_addr = PeerAddr::parse(&row.peer_addr).map_err(|e| {
                 JammiError::Catalog(format!(
                     "instance '{}' has a corrupted peer_addr row: {e}",
@@ -2389,12 +2389,27 @@ impl Catalog {
     /// instant (the loop task writes `warming` as its FIRST statement and
     /// flips to `claiming` through [`Self::set_worker_state`] once its gate
     /// opens). A re-upsert on an existing row resets both.
+    ///
+    /// # Errors
+    ///
+    /// Under `feature = "test-hooks"`, a failure armed for `instance_id`
+    /// through
+    /// [`super::worker_test_hooks::arm_upsert_worker_failure`] is returned
+    /// here, once, with no write attempted — the deterministic fixture P-Y4
+    /// (contract `feat_500-C-U5b-1a` §12) needs to prove the caller's
+    /// registration cell stays cleared when this call fails.
     pub async fn upsert_worker(
         &self,
         instance_id: &str,
         kinds: &str,
         state: WorkerState,
     ) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if super::worker_test_hooks::take_armed(instance_id) {
+            return Err(JammiError::Catalog(format!(
+                "test-hooks: injected upsert_worker failure for instance '{instance_id}'"
+            )));
+        }
         let instance_id = instance_id.to_string();
         let kinds = kinds.to_string();
         let state = state.as_db_str();

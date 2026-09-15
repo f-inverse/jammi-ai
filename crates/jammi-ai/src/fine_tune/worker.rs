@@ -812,22 +812,34 @@ impl JobWorker {
             exit.complete();
             return;
         };
-        // The registration's worker half is set BEFORE the row: a keeper
-        // reregister that races this very first upsert must never observe
-        // an empty cell (`InstanceRegistration.worker` is the SOLE owner
-        // path this loop writes through — §8 B1).
-        session
-            .instance_registration()
-            .set_worker(Some(WorkerFacts {
-                kinds: self.kinds.join(","),
-                state: WorkerState::Warming,
-            }));
-        if let Err(e) = session
+        // The registration's worker half is set only AFTER this first
+        // upsert SUCCEEDS (P-Y4, contract `feat_500-C-U5b-1a` §12, round 5):
+        // an upsert failure must leave the cell `None`, so a keeper
+        // reregister racing a still-failing loop start never writes a
+        // `workers` row the real upsert never itself managed to write
+        // (`InstanceRegistration.worker` is the SOLE owner path this loop
+        // writes through). Every LATER cell write in this loop
+        // (`set_worker_state`'s call sites below) still writes the cell
+        // BEFORE its row, unchanged — this ordering applies only to the
+        // very first upsert, where "the row never existed" and "the upsert
+        // is still in flight" are otherwise indistinguishable to the
+        // keeper.
+        match session
             .catalog()
             .upsert_worker(&self.worker_id, &self.kinds.join(","), WorkerState::Warming)
             .await
         {
-            tracing::error!(error = %e, "failed to upsert this process's `workers` row");
+            Ok(()) => {
+                session
+                    .instance_registration()
+                    .set_worker(Some(WorkerFacts {
+                        kinds: self.kinds.join(","),
+                        state: WorkerState::Warming,
+                    }));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to upsert this process's `workers` row");
+            }
         }
         let mut gate_rx = session.worker_gate_receiver();
         drop(session);
@@ -844,7 +856,10 @@ impl JobWorker {
             return;
         }
         if let Some(session) = self.session.upgrade() {
-            // Cell before row, same as the `warming` upsert above.
+            // Cell before row (§8 B1), unchanged: only the very FIRST
+            // `warming` upsert above reverses this order (P-Y4) — every
+            // LATER `set_worker_state` transition still writes the cell
+            // first, same as `delete_worker`'s own call sites.
             session
                 .instance_registration()
                 .set_worker(Some(WorkerFacts {

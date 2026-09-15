@@ -464,11 +464,14 @@ impl InferenceSession {
     /// lease keeper's `LeaseTarget::Instance` hold renews. A
     /// [`crate::fine_tune::worker::JobWorker`] (and the
     /// [`crate::fine_tune::worker::EmbeddedWorker`] guard spawned over it)
-    /// is the sole owner of its `worker` half: it sets the cell before every
-    /// `upsert_worker`/`set_worker_state` call and clears it before every
-    /// `delete_worker` call, so a keeper reregister always re-upserts the
-    /// `workers` row this process's row is ACTUALLY about to become, never a
-    /// stale snapshot.
+    /// is the sole owner of its `worker` half: it sets the cell only AFTER
+    /// its first `upsert_worker` call SUCCEEDS (P-Y4, contract
+    /// `feat_500-C-U5b-1a` §12 — a failed first upsert leaves the cell
+    /// `None`, never a fact the row does not carry), sets it BEFORE every
+    /// LATER `set_worker_state` call, and clears it before every
+    /// `delete_worker` call — so a keeper reregister never re-upserts a
+    /// `workers` row for a fact this process's own row does not (yet, or
+    /// ever) carry.
     pub(crate) fn instance_registration(
         &self,
     ) -> &Arc<jammi_db::catalog::instance::InstanceRegistration> {

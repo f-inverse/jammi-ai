@@ -3,24 +3,30 @@
 //! re-exported there, so the peer listener and the gang listener can never
 //! drift into two distinct address types), [`MemberRoot`] (the VERBATIM
 //! configured result-table root — see
-//! [`crate::config::JammiConfig::resolved_result_root`] — two gang members
-//! compare byte-for-byte; two DIFFERENT spellings of the same physical
-//! location, e.g. `gcs://b/p` vs `gs://b/p`, are two DIFFERENT roots to this
-//! predicate — necessary, never sufficient, for shared storage),
-//! [`WorkerFacts`] (the claim-loop half of a registration — owned
-//! exclusively by `JobWorker`, `crates/jammi-ai/src/fine_tune/worker.rs`),
-//! and [`InstanceRegistration`] — the ONE value every writer of the
-//! `instances` (+ `workers`) row builds, through
-//! [`InstanceRegistration::from_config`]. [`GangListing`] / [`GangMember`]
-//! are [`super::Catalog::list_gang_members`]'s request and response shapes.
+//! [`crate::config::JammiConfig::resolved_result_root`] — carried on the
+//! `instances` row byte-for-byte, but **not consulted by the membership
+//! predicate in this unit**: root identity across spellings, and any
+//! membership predicate built on it, are
+//! `docs/plans/67-distributed-training/README.md` unit U5b-1a-A2's
+//! question, not this one's), [`WorkerFacts`] (the claim-loop half of a
+//! registration — owned exclusively by `JobWorker`,
+//! `crates/jammi-ai/src/fine_tune/worker.rs`), and
+//! [`InstanceRegistration`] — the ONE value every writer of the `instances`
+//! (+ `workers`) row builds, through [`InstanceRegistration::from_config`].
+//! [`GangListing`] / [`GangMember`] are [`super::Catalog::list_gang_members`]'s
+//! request and response shapes; [`GangListing`] carries no root field — the
+//! predicate admits on `kinds` + `workers.state` + `peer_addr` presence +
+//! freshness + self-exclusion ONLY (contract `feat_500-C-U5b-1a` §12, P-Y1,
+//! the round-5 excision).
 //!
-//! **The membership path performs no interpretation of the root at all**:
-//! no filesystem access, no URL parse, no scheme handling, no symlink
-//! resolution. The only refusal on this path is the non-UTF-8 refusal
-//! already inside [`crate::config::JammiConfig::resolved_result_root`]. A
-//! spelling-identity unit (folding `gcs://`/`gs://`, resolving symlinks, …)
-//! is filed separately — `docs/plans/67-distributed-training/README.md`,
-//! unit U5b-1a-A2 — and is NOT part of this predicate.
+//! **The membership path performs no interpretation of the root at all,
+//! and no longer even reads it**: no filesystem access, no URL parse, no
+//! scheme handling, no symlink resolution, no byte comparison. The only
+//! refusal on this path is the non-UTF-8 refusal already inside
+//! [`crate::config::JammiConfig::resolved_result_root`]. A spelling-identity
+//! unit (folding `gcs://`/`gs://`, resolving symlinks, and any membership
+//! predicate built on the result), is filed separately —
+//! `docs/plans/67-distributed-training/README.md`, unit U5b-1a-A2.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -37,11 +43,17 @@ use crate::error::{JammiError, Result};
 pub struct PeerAddr(String);
 
 impl PeerAddr {
-    /// Parse `host:port`: a non-empty host (a DNS name or an IP literal —
-    /// this type never resolves it, only validates the wire-form shape) and
-    /// a port in `1..=65535`. `rsplit_once(':')` so an IPv6 literal's own
-    /// colons stay inside the host segment and only the LAST colon is
-    /// treated as the host/port separator.
+    /// Parse `host:port`: a non-empty host (a DNS name, an IPv4 literal, or
+    /// a BRACKETED IPv6 literal — this type never resolves it, only
+    /// validates the wire-form shape) and a port in `1..=65535`.
+    /// `rsplit_once(':')` so a bracketed IPv6 literal's own colons stay
+    /// inside the host segment and only the LAST colon is treated as the
+    /// host/port separator. An UNBRACKETED IPv6 literal (`2001:db8::1:9000`)
+    /// is refused, never silently split on its own last colon: the split is
+    /// ambiguous (nothing distinguishes "the last hextet's `:` continues the
+    /// address" from "the last `:` is the port separator"), so `[::1]:9000`
+    /// is the only accepted IPv6 wire form (P-Y4, contract
+    /// `feat_500-C-U5b-1a` §12).
     pub fn parse(input: &str) -> Result<Self> {
         let (host, port) = input.rsplit_once(':').ok_or_else(|| {
             JammiError::Config(format!("peer address '{input}' must be 'host:port'"))
@@ -49,6 +61,12 @@ impl PeerAddr {
         if host.is_empty() {
             return Err(JammiError::Config(format!(
                 "peer address '{input}' has an empty host"
+            )));
+        }
+        if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+            return Err(JammiError::Config(format!(
+                "peer address '{input}' has an unbracketed IPv6 host; wrap it in \
+                 brackets, e.g. '[{host}]:{port}'"
             )));
         }
         let port: u16 = port.parse().map_err(|_| {
@@ -76,9 +94,9 @@ impl std::fmt::Display for PeerAddr {
     }
 }
 
-/// The result-table root two gang members compare BYTE-FOR-BYTE — the
-/// VERBATIM string [`crate::config::JammiConfig::resolved_result_root`]
-/// returns for the deployment, and the SAME string
+/// The result-table root every member row carries, VERBATIM — the same
+/// string [`crate::config::JammiConfig::resolved_result_root`] returns for
+/// the deployment, and the SAME string
 /// [`crate::store::ResultStore`] roots itself at (never re-derived, never
 /// re-parsed, never re-spelled). [`Self::resolved`] is the ONLY production
 /// constructor — it calls `resolved_result_root` itself, so a `MemberRoot`
@@ -91,16 +109,16 @@ impl std::fmt::Display for PeerAddr {
 /// constructor being reachable from production code is exactly how an
 /// unrelated string ends up in the `instances.result_root` column.
 ///
-/// **Necessary, never sufficient, for shared storage**: two byte-identical
-/// roots on two filesystems are indistinguishable to this type or to the
-/// membership predicate that compares it — sufficiency is established only
-/// by the attestation VERIFY (the whole-artifact / per-partition inventory a
-/// later unit owns), never by this string alone. **Two DIFFERENT spellings
-/// of one physical location are two DIFFERENT roots**: this type performs
-/// no reinterpretation of the string at all — no scheme aliasing, no
-/// symlink resolution, no case folding — a deployment must spell
-/// `[storage] result_root` (or `artifact_dir`) identically on every replica
-/// for membership to see them as one.
+/// **Not consulted by [`super::Catalog::list_gang_members`] in this unit**
+/// (contract `feat_500-C-U5b-1a` §12, P-Y1/P-Y2, the round-5 excision):
+/// [`GangListing`] carries no root field at all, so two members rooted at
+/// byte-DIFFERENT spellings of the same or different locations (`gcs://b/p`
+/// vs `gs://b/p`, `file:///a` vs `s3://b`) ARE gang members of each other —
+/// this predicate has nothing to say about the root. The column is still
+/// written, verbatim, for every member row: root identity across spellings,
+/// and any membership predicate built on it, is
+/// `docs/plans/67-distributed-training/README.md` unit U5b-1a-A2's
+/// question, and a precondition of U5b-1b-ii (gang formation).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemberRoot(String);
 
@@ -143,11 +161,13 @@ impl std::fmt::Display for MemberRoot {
 /// The claim-loop half of a registration: the `kinds` this worker claims and
 /// its lifecycle [`WorkerState`] — exactly the pair `Catalog::upsert_worker`
 /// writes. Owned exclusively by `JobWorker`
-/// (`crates/jammi-ai/src/fine_tune/worker.rs`):
-/// `run_until` sets it (then issues the first `upsert_worker`), every
+/// (`crates/jammi-ai/src/fine_tune/worker.rs`): `run_until` sets it only
+/// AFTER its first `upsert_worker` call SUCCEEDS (P-Y4, contract
+/// `feat_500-C-U5b-1a` §12 — a failed first upsert must leave the cell
+/// `None`, never a fact the row does not yet carry), every LATER
 /// `set_worker_state` writes the cell BEFORE the row, `delete_worker` clears
-/// it — so [`InstanceRegistration::worker`] always reflects what the row is
-/// ABOUT to become, never what it already is.
+/// it — so [`InstanceRegistration::worker`] never reflects a fact the row
+/// does not (yet, or ever) carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFacts {
     /// The `,`-joined kind set this worker claims — the ONLY encoding: no
@@ -222,13 +242,16 @@ impl InstanceRegistration {
             .clone()
     }
 
-    /// The WHOLE membership check, in ONE place: [`MembershipConfig::validate`]
-    /// (`[server] peer_advertise` parses as a [`PeerAddr`], `peer_bind` is
-    /// set) PLUS the VERBATIM root
+    /// The WHOLE registration-eligibility check, in ONE place:
+    /// [`MembershipConfig::validate`] (`[server] peer_advertise` parses as a
+    /// [`PeerAddr`], `peer_bind` is set) PLUS the VERBATIM root
     /// ([`crate::config::JammiConfig::resolved_result_root`] — no
-    /// filesystem access, no interpretation) — or, with `peer_advertise`
-    /// unset, a non-member registration with NULL `peer_addr`/`member_root`.
-    /// The ONLY constructor
+    /// filesystem access, no interpretation) carried onto the row for
+    /// U5b-1a-A2 — or, with `peer_advertise` unset, a non-member
+    /// registration with NULL `peer_addr`/`member_root`. `member_root` is
+    /// never consulted by [`super::Catalog::list_gang_members`]'s admission
+    /// predicate in this unit (see [`GangListing`]'s doc); `peer_addr`
+    /// still is (presence + the returned address). The ONLY constructor
     /// [`super::Catalog::upsert_instance`]/[`super::Catalog::
     /// reregister_instance`] accept in production:
     /// `InferenceSession::wrap_with` calls it once per session (every
@@ -292,7 +315,12 @@ impl MembershipConfig {
     }
 }
 
-/// [`super::Catalog::list_gang_members`]'s request shape.
+/// [`super::Catalog::list_gang_members`]'s request shape. Carries **no
+/// root field** (contract `feat_500-C-U5b-1a` §12, P-Y1, the round-5
+/// excision): the predicate admits on `kind`, `workers.state == claiming`,
+/// `peer_addr` presence, freshness, and self-exclusion ONLY. Root identity
+/// is `docs/plans/67-distributed-training/README.md` unit U5b-1a-A2's
+/// question, not this verb's.
 #[derive(Debug, Clone, Copy)]
 pub struct GangListing<'a> {
     /// The `workers.kinds` token this listing matches (a whole,
@@ -300,9 +328,6 @@ pub struct GangListing<'a> {
     pub kind: &'a str,
     /// This caller's own `instance_id` — excluded from the result.
     pub self_instance: &'a str,
-    /// The caller's own verbatim result root — a member's `result_root`
-    /// must match this BYTE-FOR-BYTE (a Rust comparison, never a SQL `=`).
-    pub member_root: &'a MemberRoot,
     /// The deployment's lease window — the same `lease` every other leased
     /// row family renews under. The liveness margin
     /// ([`super::lease::instance_liveness_margin`], `2 * lease`) is applied
@@ -331,10 +356,40 @@ mod tests {
 
     #[test]
     fn peer_addr_parse_keeps_ipv6_host_intact() {
-        // `rsplit_once(':')` — only the LAST colon splits host/port, so an
-        // IPv6 literal's own colons stay inside the host segment.
+        // `rsplit_once(':')` — only the LAST colon splits host/port, so a
+        // BRACKETED IPv6 literal's own colons stay inside the host segment.
         let a = PeerAddr::parse("[::1]:9000").unwrap();
         assert_eq!(a.as_str(), "[::1]:9000");
+    }
+
+    #[test]
+    fn peer_addr_parses_a_full_bracketed_ipv6_host() {
+        let a = PeerAddr::parse("[2001:db8::1]:9000").unwrap();
+        assert_eq!(a.as_str(), "[2001:db8::1]:9000");
+    }
+
+    #[test]
+    fn peer_addr_parses_a_dns_hostname() {
+        let a = PeerAddr::parse("coordinator.internal:9000").unwrap();
+        assert_eq!(a.as_str(), "coordinator.internal:9000");
+    }
+
+    /// P-Y4 (contract `feat_500-C-U5b-1a` §12): an UNBRACKETED IPv6 literal
+    /// is refused, never silently split on its own last colon (which would
+    /// treat `9000` as the port and `2001:db8::1` as the host, indistinguishable
+    /// from a shorter address whose author simply forgot the brackets).
+    #[test]
+    fn peer_addr_refuses_an_unbracketed_ipv6_literal() {
+        let err = PeerAddr::parse("2001:db8::1:9000").unwrap_err();
+        assert!(
+            err.to_string().contains("unbracketed"),
+            "error must name the unbracketed-IPv6 refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_addr_refuses_an_unbracketed_loopback_ipv6_literal() {
+        assert!(PeerAddr::parse("::1:9000").is_err());
     }
 
     #[test]

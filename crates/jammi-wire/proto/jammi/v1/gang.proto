@@ -18,9 +18,9 @@ package jammi.v1.gang;
 // Served ONLY on the internal `[server] peer_bind` listener, beside
 // `PeerService` — never on the public gRPC + Flight SQL listener (which
 // answers UNIMPLEMENTED for these paths), never wrapped by the tenant-binding
-// layer. Invariant I-GANG: a caller-supplied tenant is never read; at the
-// W=1 lattice no tenant value is read from the row either (the admission row
-// carries no tenant column) — tenant-scoped resolution is U5a-2's (#566).
+// layer. Invariant I-GANG: a caller-supplied tenant is never read; the
+// member derives the tenant from the verified `jobs` row and resolves a
+// multi-host job's training set under that tenant alone.
 //
 // Message shape and arity are frozen by review and by the committed
 // mechanism contract `docs/rigor/contracts/feat_500-C-U5a-1.md`, not by the

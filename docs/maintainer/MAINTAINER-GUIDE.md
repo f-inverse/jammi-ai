@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2068`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2082`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -2934,7 +2934,7 @@ this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for 
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
 (`crates/jammi-ai/src/fine_tune/stream.rs:120`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
-`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:2208`). `open`
+`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:2545`). `open`
 (`crates/jammi-ai/src/fine_tune/stream.rs:378`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
@@ -2947,13 +2947,13 @@ against the full corpus) and GradCache (treats the whole dataset as one in-batch
 batch) both need every row resident before an epoch begins, so a config taking either arm
 gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:99`); every other text arm at
 `W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
-`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:2108`) that the trainer's own
+`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:2445`) that the trainer's own
 dispatch refuses a mismatch against, so the two decisions can never come apart. A
 `Streamed` source never collects a `Vec<RecordBatch>` for the training set at all — the
 worker calls only `training_set::materialize_projection_table`
-(`crates/jammi-ai/src/fine_tune/worker.rs:2123`), never `read_back`/
+(`crates/jammi-ai/src/fine_tune/worker.rs:2460`), never `read_back`/
 `read_back_with_reservation` — while a `Resident` loader's construction reads back through
-`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:2133`) — defined at
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:2470`) — defined at
 `read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:238`) — and
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`
@@ -2972,7 +2972,7 @@ is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_r
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
 captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:746`) on
-`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:2076`) is still
+`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:2413`) is still
 executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
 (`crates/jammi-ai/src/fine_tune/trainer.rs:3512`) drives the stream's own `open` through
 `Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
@@ -3323,7 +3323,7 @@ describing a removed surface.
   **Invariant: faithful errors** — each `Status` carries the full structured detail so the
   client reconstructs the exact variant.
 
-### 2.8a GangService — multi-host gang admission (I-GANG)
+### 2.8a GangService — multi-host gang admission (I-GANG) and `HostAdmission`
 
 The coordinator-to-member admission seam for a multi-host training run.
 Proto: `crates/jammi-wire/proto/jammi/v1/gang.proto`, `service GangService`
@@ -3335,107 +3335,188 @@ never on the public listener, never wrapped by `TenantResolverLayer`; the
 public listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`
 (`GANG_LISTENER_ALLOWLIST`, `crates/jammi-server/tests/it/tenant_isolation_oracle.rs`).
 
-**This unit ships the `world_size == 1` lattice only.** The training-set pair
-conjunct and its sidecar verify that would admit a genuine multi-host row are
-`HostAdmission`'s to build (docs/plans/67-distributed-training/UNITS.md §
-U5a-2); this handler never attempts them — a row whose own `world_size` is
-not exactly `1` refuses the same fixed way every other determinant does,
-whether or not the caller's `Assign.world` happens to agree with it.
+**Two observables, split at admission.** BEFORE admission every determinant
+is the call's own result — `Err(Status)`: the ONE fixed `FailedPrecondition`
+for every I-GANG determinant (rung 5 below), `Unavailable` for a catalog fault
+or a busy slot, `InvalidArgument` for the wire K2 edges — and no stream
+exists. AFTER admission the call has returned `Ok(stream)`, so every later
+outcome is delivered IN the stream: `Admitted`, then exactly one
+`Aborted{reason}`, or — for a protocol violation on the admitted stream — a
+status trailer. An admitted session's end may name its reason (the caller
+already holds the job's own coordinates and was admitted on them); a
+pre-admission refusal never does.
 
-**The RunRank refusal lattice.** A call is decided in this order, each rung
-its own status:
+**The RunRank admission lattice.** A call is decided in this order, each
+rung its own status, and NOTHING on this host is touched before the decision
+is complete:
 
 1. **Wire K2** (`gang.rs`, before any row read): `world == 0` →
    `InvalidArgument("world must be greater than zero")`; `rank >= world` →
    `InvalidArgument("rank must be less than world")`.
 2. **Ambient admin scope.** `TenantBinding::is_admin_scope()` — I-GANG
-   refuses ambient admin scope outright, so this is decided before any row
-   is even read. No tenant value is read on this path at W=1 (the admission
-   row carries no tenant column); tenant-scoped resolution is U5a-2's (#566).
+   refuses ambient admin scope outright, before any row is read.
 3. **I-GANG, the row predicate.** `Catalog::get_job_for_rank(job_id)`
    (`crates/jammi-db/src/catalog/jobs_repo.rs`, primary-key-only, no tenant
    predicate, never admin scope) returns the row by primary key alone — it
-   decides nothing itself and returns `Ok(None)` only when no job with that
-   id exists. Every determinant is decided by the CALLER, the
-   `GangServer::run_rank` handler: `status = 'running'`; `claimed_by =
-   assign.coordinator_instance_id`; `attempts == assign.attempt`; the lease
-   is live (the negation of `lease_expired_clause`,
-   `crates/jammi-db/src/catalog/lease.rs` — a NULL lease column reads
-   not-live, never live-by-default). The ROW's OWN
-   `RankAdmissionRow::world_size` (a `WorldSizeFact`, decoded from the job's
-   `spec` JSON, never the caller's `Assign.world`) then decides two more
-   conjuncts, likewise inside the handler, never inside
-   `get_job_for_rank`'s own statement: `WorldSizeFact::Undecodable` (the
-   `spec` names no valid rank count, or is not valid JSON at all) is itself a
-   refusal — a ROW FACT, never a fault of the read that found it, so it never
-   maps through `admission_catalog_fault`; `assign.world != row.world_size`
-   is itself a refusal — a caller-keyed gate (deciding this conjunct on
-   `assign.world` rather than `row.world_size`) would let a `world_size > 1`
-   job admit under a caller-supplied `world = 1`, which is why the gate is
-   keyed on the row and not the caller's claim; and, separately, a row whose
-   own `world_size` (now known to equal `assign.world`) is not `1` is ALSO a
-   refusal — this unit ships the `world_size == 1` lattice only, so a
-   multi-host row that genuinely agrees with its caller's `world` still
-   refuses. Any conjunct false, or the row absent, refuses.
-4. **Coordinator freshness.** `Catalog::fresh_instance(coordinator_instance_id,
-   lease)` (`crates/jammi-db/src/catalog/jobs_repo.rs`) requires the named
-   coordinator's `instances` row present and last seen within
-   `instance_liveness_margin(lease)` — `2 × lease` on the DB clock
-   (`crates/jammi-db/src/catalog/lease.rs`, the same margin
-   `reclaim_expired_jobs`'s inline-execution arm already uses); absent or
-   stale refuses.
-5. Every refusal in rung 2, 3, or 4 is the SAME status and message —
+   decides nothing itself, returns `Ok(None)` only when no job with that id
+   exists, and carries the row's OWN `tenant_id` (raw text), its
+   `training_set_ref`/`training_set_location` pair, and its `world_size`
+   (`WorldSizeFact`, decoded from the job's `spec` JSON). Every determinant
+   is decided by the CALLER, `GangServer::run_rank`: `status = 'running'`;
+   `claimed_by = assign.coordinator_instance_id`; `attempts ==
+   assign.attempt`; the lease is live (the negation of
+   `lease_expired_clause`, `crates/jammi-db/src/catalog/lease.rs` — a NULL
+   lease column reads not-live, never live-by-default);
+   `WorldSizeFact::Undecodable` is itself a refusal — a ROW FACT, never a
+   fault of the read, so it never maps through `admission_catalog_fault`;
+   `assign.world != row.world_size` is itself a refusal — the lattice is
+   keyed on the ROW's rank count, never the caller's claim (a caller-keyed
+   gate would let a `world_size > 1` job admit under a caller-supplied
+   `world = 1`, skipping the next rung entirely).
+4. **The world>1 conjunct** (`row.world_size > 1` only — a `world_size == 1`
+   row reads no tenant value and no pair at all): (a) the training-set
+   identity pair is filled on the row (the coordinator's write-once CAS,
+   `Catalog::fill_training_set_identity`); the row's `tenant_id` text
+   parses (an unparseable value is a row fact, refused); and (b)
+   `resolve_training_set_identity` (`gang.rs`) — the resolution site
+   refuses ambient admin scope again, explicitly, before calling the
+   resolver; then the ONE tenant-pinned lookup, the STRICT
+   `Catalog::get_result_table_for_tenant(training_set_location, tenant)`
+   (`crates/jammi-db/src/catalog/result_repo.rs`: `tenant_id = $t OR
+   (tenant_id IS NULL AND $t IS NULL)`, an explicit tenant argument, no
+   admin arm — never the relaxed `get_result_table`, whose `OR tenant_id IS
+   NULL` would hand a real tenant every GLOBAL row of the same name) must
+   find a row with `status = 'ready'`; then the sidecar verify (K4,
+   verify-at-read): `ResultStore::read_materialization_manifest` of the
+   row's `parquet_path` must return a manifest whose `artifact` equals
+   `training_set_ref` — a sidecar predating the leaf inventory reads as
+   ABSENT and refuses; a mismatching or undecodable one refuses; this host's
+   store faulting on the read refuses too. The classification
+   (`TrainingSetOutcome`: `Verified` / `AdminScopeRefused` / `Unresolved` /
+   `NotReady` / `SidecarAbsent` / `DigestMismatch` / `StoreFault`) is kept
+   for the `test-hooks` seam and for re-verification; on the wire every
+   non-`Verified` arm is rung 5.
+5. **Coordinator freshness.** `Catalog::fresh_instance(coordinator_instance_id,
+   lease)` requires the named coordinator's `instances` row present and last
+   seen within `instance_liveness_margin(lease)` — `2 × lease` on the DB
+   clock; absent or stale refuses.
+6. Every refusal in rungs 2–5 is the SAME status and message —
    `FailedPrecondition("gang admission refused")` — regardless of which
-   conjunct failed: the listener discloses neither a job's existence, its
-   claimant, nor its attempt (non-disclosure). A call that satisfies every
-   rung still ends `Unimplemented("gang admission is not implemented on
-   this build")`: the handler has decided every I-GANG determinant but has
-   no admission session to hand the call to.
+   determinant failed: the listener discloses neither a job's existence, its
+   claimant, its attempt, its tenant, nor another tenant's table
+   (non-disclosure).
+7. **The slot.** Only now the holder CAS
+   (`HostAdmission::admit_rank`, below): `Free` admits; a `ClaimProbe` is
+   waited on for at most one heartbeat, then admits if freed or refuses;
+   `JobRun` or another `Rank` refuse at once —
+   `Unavailable("gang admission: this host's job slot is busy")`, transient,
+   no assembly budget consumed. Nothing about the job is decided here, so
+   the refusal is the same for every holder kind.
+8. **Admitted.** `Admitted` is the stream's first event, emitted only after
+   the CAS succeeded; the `RankHold` guard moves into the spawned hold loop.
 
-**Non-disclosure and the `test-hooks` seam.** A
-table-driven oracle asserts the rung-5 `Status` (code and message bytes) is
-byte-identical across every determinant above, so no leaking message ever
-distinguishes them on the wire. Behind `#[cfg(feature = "test-hooks")]`
+**`HostAdmission` — the host's admission state** (`crates/jammi-ai/src/fine_tune/worker.rs`,
+owned by `InferenceSession`, `InferenceSession::host_admission`): three cells
+— the shutdown `phase` (`WorkerPhase`: `Running`/`Draining`/`Releasing`, one
+`watch`, read by the claim loop's gate and by every held rank; flipped by
+`EmbeddedWorker::begin_drain`/`release_and_stop`, by
+`InferenceSession::release_job_leases`, and by the server's DRAIN arm for a
+worker-less process), the slot `holder` (`Holder`: `Free` / `ClaimProbe` /
+`JobRun` / `Rank{job_id, attempt}`, one `watch`, every transition a
+`send_if_modified` compare-and-set, no lock across an `.await`), and this
+process's `registry` (its `InstanceRegistration`). The claim loop moves the
+holder `Free → ClaimProbe` immediately before `claim_next`
+(`HostAdmission::probe_claim`; a held slot skips the claim — a peer never
+claims while it holds a rank), `ClaimProbe → JobRun` at the hold site once
+the claimed job's lease hold is registered (`HostAdmission::job_running`,
+never earlier: the claim→hold prologue stays a probe, so a RELEASE landing
+inside it still self-releases at zero net attempts), and `→ Free` when the
+run returns (the `ClaimGuard`'s drop, on every exit path). A rank's CAS
+(`HostAdmission::try_hold_rank`): `Free → Rank{..}`; the SAME job at a
+GREATER attempt supersedes a held `Rank` in place (the elder session is then
+refuted by the row at its next tick; its guard's drop leaves the successor's
+hold alone); an equal attempt (a duplicate assignment), another job's rank,
+`JobRun`, or `ClaimProbe` refuse with what was found (`HolderBusy`). An
+inline `run_now` and a direct `JobWorker::run_claimed_job` never touch the
+holder — they run beside it. RELEASE's abort decision (`EmbeddedWorker::release_and_stop`,
+2e) reads the holder KIND, never a count: `JobRun` aborts the loop task now;
+`Free`/`ClaimProbe`/`Rank` wait one heartbeat for the cooperative exit (a
+rank is never loop work; its own session ends on the phase). The `/metrics`
+gauge `jammi_worker_jobs_in_flight` is `1` iff the holder is `JobRun`.
+
+**The hold loop** (`HeldSession::hold`, `gang.rs`, a spawned task owning the
+`RankHold` and the inbound stream) has exactly FOUR arms and no fifth:
+
+- **inbound** — `Cancel` ends the session `Aborted{Cancelled}`; a second
+  `Assign` is the K2 protocol violation, a status trailer
+  (`InvalidArgument`), never a second admission; every other frame goes
+  through `HeldSession::dispatch_round_frame`, the ONE site the round
+  protocol is wired at (today only an empty frame reaches it — a protocol
+  violation). The client half-closing its send side disables the arm; the
+  session stays held.
+- **drain** — the host's phase leaving `Running` (a DRAIN or a RELEASE) ends
+  the session `Aborted{Drain}` at once: the only host-initiated cut.
+- **re-verification tick** — every heartbeat, the SAME determinants
+  admission decided are re-read against the live row (`reverify`): the row
+  predicate, the training-set identity (`world_size > 1` sessions:
+  the pair unchanged, then the strict resolution and the sidecar verify
+  again), the coordinator's liveness. Three ends, pairwise distinct on the
+  wire, in scope, and in whether they count (`ReverifyEnd`):
+  `Refuted` (`REFUTED`, assembly-scoped, COUNTS toward the assembly's
+  attempts — a row or artifact fact no longer holds), `Unavailable`
+  (`UNAVAILABLE`, assembly-scoped, never counted — the catalog did not
+  answer), `StoreUnavailable` (`STORE_UNAVAILABLE`, member-scoped, never
+  counted — THIS host's object store faulted: `JammiError::Storage`/`Io` on
+  the sidecar read; a sidecar that does not decode is the artifact's fact,
+  `Refuted`).
+- **park bound** — one lease window after admission with no rank body to
+  hand the session to (none exists in this unit), the session ends
+  `Aborted{NoBody}`.
+
+Every end is ONE stream event (or one trailer) followed by the stream closing
+and the hold's release. **The peer writes nothing to the job row on behalf of
+a rank**: `crates/jammi-server/tests/it/gang_terminal_write_oracle.rs`
+derives the catalog's `jobs` writers from `jobs_repo.rs` itself and asserts
+none is named in `gang.rs`; the wire rows snapshot the row before admission
+and after every end.
+
+**Non-disclosure and the `test-hooks` seam.** A table-driven oracle asserts
+the rung-6 `Status` (code and message bytes) is byte-identical across every
+determinant above — sixteen, `GangRefusalReason` — so no leaking message
+ever distinguishes them on the wire. Behind `#[cfg(feature = "test-hooks")]`
 only, `GangServer::last_refusal_reason()` / `refusal_reason_handle()`
-(`crates/jammi-server/src/grpc/gang.rs`) expose which `GangRefusalReason`
-variant a call actually refused for — a test-only introspection point, never
-response text; the plain `cargo test -p jammi-server --test it` lane cannot
-observe it, and the `--features test-hooks` lane executes a strictly larger
-determinant-covering case count as a result. `GangRefusalReason`'s test
-witness list (`gang_service.rs`, `every_gang_refusal_reason`) is itself
-derived from an exhaustive match over one witness per variant, never a
-hardcoded array length, so a future variant fails that file to compile until
-it is added there too.
+(`gang.rs`) expose which variant a call actually refused for — a test-only
+introspection point, never response text; the plain
+`cargo test -p jammi-server --test it` lane cannot observe it, and the
+`--features test-hooks` lane executes a strictly larger case count as a
+result (the holder-contention rows that manufacture a holder through
+`HostAdmission::hold_for_test` are `test-hooks` only too). The witness list
+(`gang_service.rs`, `every_gang_refusal_reason`) is re-validated by an
+exhaustive match over the enum, so a new variant fails that file to compile
+until an arm is added.
 
 **A genuine catalog fault during admission is `Unavailable`, not
-`FailedPrecondition`.** `admission_catalog_fault`
-(`crates/jammi-server/src/grpc/gang.rs`) maps `Catalog::get_job_for_rank`
-erroring, and `Catalog::fresh_instance` erroring, to `Status::unavailable(..)`
-— a transient, retriable status distinct from every rung-5
-`FailedPrecondition` refusal above, which is a genuine, non-retriable row
-fact. `map_engine_error` is never called on the `RunRank` path — every
-admission-time catalog read on it uses this same classification. This
-handler never reaches `Catalog::get_result_table_for_tenant` or
-`ResultStore::read_materialization_manifest` at all — the training-set
-sidecar lookup they backed is `HostAdmission`'s to build from the filed
-property. No such wrapper exists in this crate.
-`Catalog::get_result_table_for_tenant` itself and the strict-predicate test
-that measured its NULL-tenant-row guarantee (a NULL-tenant row never
-matches a real tenant's lookup) are deleted with the world>1 conjunct; the
-property and its rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
-<https://github.com/f-inverse/jammi-ai/issues/566>). The mid-stream re-verification three-way split
-(`Refuted`/`Unavailable`/`StoreUnavailable`) is likewise built with
-`HostAdmission` once an admitted session exists to re-verify inside.
+`FailedPrecondition`.** `admission_catalog_fault` (`gang.rs`) maps
+`Catalog::get_job_for_rank`, `Catalog::get_result_table_for_tenant` and
+`Catalog::fresh_instance` erroring to `Status::unavailable(..)` — transient,
+retriable, distinct from every rung-6 refusal (a non-retriable row fact).
+`map_engine_error` is never called on the `RunRank` path
+(`crates/jammi-server/tests/it/gang_admission_catalog_fault_oracle.rs` scans
+`run_rank`'s own body for it and for at least three `admission_catalog_fault`
+sites). At re-verification the same fault is `ReverifyEnd::Unavailable`.
 
-**Tenant handling.** No tenant value is read on this path at W=1: caller
-metadata is never read (a caller naming a different tenant is silently
-ignored, not refused), ambient admin scope is refused before any row is
-read, and the row `get_job_for_rank` returns carries no tenant column.
-Deriving the tenant from the `jobs` row and pinning the training-set lookups
-to it is U5a-2's world>1 conjunct (#566); the `GANG_LISTENER_ALLOWLIST`
-exemption states exactly this ground, and the residual it leaves — a
-`peer_bind` caller can learn whether another tenant's job is admissible — is
-recorded on #566.
+**Tenant handling.** The tenant is DERIVED from the `jobs` row, never accepted
+from the caller: `Assign` carries none, no request metadata is read (the
+peer listener runs no resolver), ambient admin scope is refused twice, and
+the strict resolver takes the row's tenant as an explicit argument that
+ambient scope cannot widen. The `GANG_LISTENER_ALLOWLIST` exemption states
+this derivation beside its executed cross-tenant-denial cases
+(`gang_service.rs`: another tenant's ready, verifying table is refused with
+the fixed status; a NULL-tenant row never resolves for a tenant-bound job;
+`jammi-session-id` metadata on the call is ignored). Enumerating-caller
+oracles (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs`) pin
+`get_job_for_rank`'s and `get_result_table_for_tenant`'s only production
+callers to this handler.
 
 **Observability.** `jammi_gang_requests_total{rpc="RunRank"}`
 (`crates/jammi-server/src/routes/health.rs`) counts every `RunRank` call
@@ -3444,9 +3525,12 @@ reaching this member, incremented by the whole-server
 ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
 `PeerService`.
 
-**Config.** `instance_liveness_margin` is not its own config key: it is `2 ×`
-whatever `[lease] duration_secs` resolves to (`LeaseIntervals::lease()`),
-computed once at `OssServer::bind` and passed into `GangServer::new`.
+**Config.** Neither the park bound nor the tick is its own key: `[lease]
+duration_secs` (`LeaseIntervals::lease()`) is the held session's park bound
+and, doubled, `fresh_instance`'s liveness margin; `[lease] heartbeat_secs`
+(`LeaseIntervals::heartbeat()`) is the re-verification cadence and the
+longest a `ClaimProbe` is waited on — both read once at `OssServer::bind`
+and passed into `GangServer::new`.
 
 ### 2.8b Gang membership substrate (`instances.peer_addr`/`result_root`)
 

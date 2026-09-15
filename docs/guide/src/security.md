@@ -116,24 +116,39 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
 
 - **Every client of `peer_bind` is a jammi coordinator**, the same trust I-PEER
   states — no separate authentication for the gang seam.
-- **No tenant value is read — not the caller's, and at W=1 not the row's.** A
+- **Tenant is derived from the job row, never accepted from the caller.** A
   `RunRank` call carries only job coordinates (`job_id`, `attempt`, `rank`,
   `world`, `coordinator_instance_id`); caller-supplied tenant metadata is never
-  read, ambient admin scope is refused before any row is read, and the admission
-  row the member reads (`Catalog::get_job_for_rank`, primary key only) carries no
-  tenant column. Deriving the tenant from the `jobs` row and pinning the
-  training-set lookups to it is the world>1 conjunct U5a-2 builds
-  (<https://github.com/f-inverse/jammi-ai/issues/566>); until then a
-  coordinator on `peer_bind` holding another tenant's job coordinates can learn
-  only whether that job is admissible (`Unimplemented`) or not (the fixed
-  `FailedPrecondition`) — a liveness signal, no row content, bounded by I-PEER's
-  own trust statement above.
-- **Non-disclosure on refusal.** Every admission determinant — job not found,
-  not running, wrong claimant, wrong attempt, lease not live, world size not
-  one or undecodable, coordinator not fresh — collapses to the
-  SAME status (`FAILED_PRECONDITION`) with a fixed message. The listener
-  discloses neither a job's existence, its claimant, nor its attempt; tests
-  distinguish determinants through a test-only seam, never response text.
+  read, and ambient admin scope is refused before any row is read (and again
+  at the training-set resolution site). The admission row the member reads
+  (`Catalog::get_job_for_rank`, primary key only) carries the row's OWN
+  `tenant_id`, and a multi-host job's training set is resolved under that
+  tenant alone through the strict tenant-pinned resolver
+  (`Catalog::get_result_table_for_tenant`) — another tenant's table of the same
+  name, or a global (NULL-tenant) one, never resolves. The job's coordinates are
+  the capability: a coordinator on `peer_bind` holding them is admitted for
+  that job — bounded by I-PEER's own trust statement above — and can read
+  nothing beyond what that job's row names.
+- **Non-disclosure on refusal; reasons only after admission.** Every admission
+  determinant — job not found, not running, wrong claimant, wrong attempt,
+  lease not live, world size undecodable or not the caller's, the training-set
+  pair missing, the tenant undecodable, the training set unresolved under the
+  job's tenant / not ready / its sidecar absent / its digest mismatching /
+  this host's store faulting, coordinator not fresh — collapses to the SAME
+  status (`FAILED_PRECONDITION`) with a fixed message, as the call's own
+  result: the listener discloses neither a job's existence, its claimant, its
+  attempt, its tenant, nor another tenant's table; tests distinguish
+  determinants through a test-only seam, never response text. Only an
+  ADMITTED session — the caller already holds the job's own coordinates — ends
+  with a named reason in the stream (`Aborted{Drain | Refuted | Cancelled |
+  NoBody | StoreUnavailable | Unavailable}`).
+- **Admit-and-hold.** An admitted rank holds this host's single job slot (a
+  peer never claims while it holds a rank, never admits a rank while it runs
+  a job; a busy slot refuses `UNAVAILABLE`, transient) and is re-verified every
+  heartbeat against the same determinants; a DRAIN or RELEASE of the host ends
+  every held rank at once, and with no rank body to run yet the session parks
+  and ends `NoBody` after one lease window. The member writes nothing to the
+  job row on behalf of a rank.
 - **Multi-host gang admission is a Postgres-only deployment shape.** The
   admission row predicate's remaining-lease computation is sound only against
   a shared, single-writer clock (Postgres's `now()`); a SQLite deployment

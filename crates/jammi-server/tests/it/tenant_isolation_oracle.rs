@@ -168,20 +168,29 @@ const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
 
 /// Rpcs served ONLY on the internal `[server] peer_bind` listener, beside
 /// `PeerService` — but NEVER appended to [`PEER_LISTENER_ALLOWLIST`], so the
-/// ground of each exemption stays stated per bucket. At the W=1 lattice this
-/// unit ships, `RunRank` reads NO tenant value at all: `Catalog::get_job_for_rank`
-/// is a primary-key row predicate with no tenant column, ambient admin scope
-/// is refused before any row is read, and the handler's only outputs are
-/// status codes. That is the whole ground of this exemption — not a
-/// derivation of tenant from the row, which nothing on this path performs.
-/// Tenant-scoped resolution (the world>1 training-set identity by the row's
-/// tenant) is U5a-2's to build (#566); when it lands, this sentence and its
-/// assertion below change to the derivation claim WITH a cross-tenant-denial
-/// case, never before. Residual stated, not hidden: a caller on `peer_bind`
-/// holding another tenant's `(job_id, coordinator_instance_id, attempt)` can
-/// distinguish `Unimplemented` (every determinant satisfied) from the fixed
-/// `FailedPrecondition`, a liveness oracle over that row — bounded by the
-/// listener's I-PEER trust (every client of `peer_bind` is a coordinator).
+/// ground of each exemption stays stated per bucket. `RunRank` reads no
+/// tenant value from the CALLER — `Assign` carries none, no metadata is
+/// read, and ambient admin scope is refused before any row is read (and
+/// again at the training-set resolution site) — and DERIVES the tenant
+/// from the `jobs` row: `Catalog::get_job_for_rank` is a primary-key row
+/// predicate that returns the row's OWN `tenant_id`, and a `world_size > 1`
+/// job's training set is resolved through the strict tenant-pinned
+/// `Catalog::get_result_table_for_tenant` under that tenant alone, never
+/// the relaxed read. The executed cross-tenant-denial cases stand beside
+/// this claim, never before it:
+/// `gang_service.rs::run_rank_refuses_a_training_set_another_tenant_owns`
+/// (another tenant's genuinely ready, verifying table is refused with the
+/// fixed non-disclosing status),
+/// `gang_service.rs::run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job`
+/// (a NULL-tenant row never resolves for a tenant-bound job), and
+/// `gang_service.rs::run_rank_never_reads_a_caller_supplied_tenant` (tenant
+/// metadata naming another tenant on the call is ignored: the row's own
+/// tenant admits). Residual stated, not hidden: a caller on `peer_bind`
+/// holding another tenant's OWN `(job_id, coordinator_instance_id,
+/// attempt)` is admitted for that job — the job's coordinates are the
+/// capability (I-GANG), bounded by the listener's I-PEER trust (every
+/// client of `peer_bind` is a coordinator); what it can never do is read
+/// another tenant's table through them.
 ///
 /// The exemption's premise — that this path is NOT reachable on the public
 /// listener — is proven in this file by
@@ -191,7 +200,7 @@ const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
 const GANG_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[(
     "GangService",
     "RunRank",
-    "served only on peer_bind; reads no tenant value at W=1 (primary-key row predicate, ambient admin scope refused before any read, status-only responses); tenant-scoped resolution is U5a-2's (#566)",
+    "served only on peer_bind; tenant derived from the verified job row (never the caller's), the world>1 training set resolved under it through the strict tenant-pinned resolver; cross-tenant denial executed in gang_service.rs",
 )];
 
 // ---------------------------------------------------------------------------
@@ -3320,8 +3329,9 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
 /// public `Routes`. This is the invariant that makes
 /// [`GANG_LISTENER_ALLOWLIST`] sound — a tenant-bearing caller cannot reach
 /// the gang admission handler through the public tenant layer, and on the
-/// listener it IS reachable from, no tenant value is read at W=1 (the
-/// allowlist entry's own text; tenant-scoped resolution is U5a-2's, #566).
+/// listener it IS reachable from, the tenant is derived from the verified
+/// job row (the allowlist entry's own text, with its executed cross-tenant
+/// cases in `gang_service.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gang_service_is_unimplemented_on_the_public_listener() {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
@@ -3351,10 +3361,11 @@ async fn gang_service_is_unimplemented_on_the_public_listener() {
     for (service, rpc, why) in GANG_LISTENER_ALLOWLIST {
         assert!(
             why.contains("served only on peer_bind")
-                && why.contains("reads no tenant value at W=1")
-                && why.contains("#566"),
-            "{service}/{rpc}: the allowlist entry must state the ground it actually has — no tenant \
-             value read at W=1, the derivation being U5a-2's (#566)"
+                && why.contains("tenant derived from the verified job row")
+                && why.contains("strict tenant-pinned resolver")
+                && why.contains("cross-tenant denial executed"),
+            "{service}/{rpc}: the allowlist entry must carry the I-GANG derivation claim and name \
+             its executed cross-tenant-denial cases"
         );
     }
 }

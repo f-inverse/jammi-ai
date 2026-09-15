@@ -476,11 +476,12 @@ carries none — because tenant scope was already enforced by the coordinator
 (the replica that received the `Search`), which resolved the table through its
 own tenant-scoped catalog read before fanning out; the owner enforces only
 that every requested segment belongs to the named table. The gang member
-likewise binds no caller-supplied tenant — and reads no tenant value at all
-today: the admission row a `RunRank` call names carries no tenant column, and
-deriving the tenant from the `jobs` row is U5a-2's world>1 conjunct (#566), so
-a coordinator on this listener can learn whether another tenant's job is
-admissible, never its content. The invariant every deployment
+likewise binds no caller-supplied tenant: a `RunRank` call names job
+coordinates only, the member derives the tenant from the verified `jobs` row
+and resolves the job's training set under that tenant alone (never another
+tenant's table, never a global one), so a coordinator on this listener holding
+a job's own coordinates is admitted for that job and can read nothing beyond
+what that job's row names. The invariant every deployment
 inherits: **every client of `peer_bind` is a jammi coordinator.** Bind it on a
 private interface behind network policy and, where the runtime provides it,
 mTLS; on a routable interface without them it exposes cross-tenant segment

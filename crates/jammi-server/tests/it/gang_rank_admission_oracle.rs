@@ -1,17 +1,13 @@
-//! An enumerating-caller oracle (see
+//! Two enumerating-caller oracles (see
 //! `docs/rigor/contracts/feat_500-C-U5a-1.md` § 1.6 — the I-GANG row
-//! predicate), a MEASURED claim (never prose): `Catalog::get_job_for_rank`
+//! predicate), MEASURED claims (never prose): `Catalog::get_job_for_rank`
 //! is called from nowhere outside the gang `RunRank` handler (plus
 //! `jammi-db`'s own tests, which call it directly to exercise it in
-//! isolation). The training-set sidecar verify's own enumerating-caller
-//! oracle (`get_result_table_for_tenant`'s only production caller) does
-//! not apply: the gang `RunRank` handler does not reach that verb at all —
-//! this unit ships the `world_size == 1` lattice only — so there is no
-//! gang-adjacent caller surface left to enumerate here.
-//! `get_result_table_for_tenant` itself and the strict-predicate test that
-//! measured it are deleted with the world>1 conjunct; the property and its
-//! rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
-//! <https://github.com/f-inverse/jammi-ai/issues/566>).
+//! isolation, and the producer→consumer parity test), and the strict
+//! tenant-pinned resolver `Catalog::get_result_table_for_tenant` — the
+//! world>1 conjunct's ONE tenant-scoped read (#566 R2(b)) — is called from
+//! nowhere outside `gang.rs`'s `resolve_training_set_identity` (plus
+//! `jammi-db`'s own strict-predicate tests).
 //!
 //! The scanned surface is derived from `git ls-files` (never a hand-rolled
 //! directory walk) over the whole tracked tree — `crates/**` and everything
@@ -294,7 +290,40 @@ fn only_the_gang_run_rank_handler_calls_get_job_for_rank() {
     }
 }
 
-/// The masking self-test the enumerating-caller oracle above depends on:
+/// The strict resolver's enumerating-caller oracle: `get_result_table_for_tenant`'s
+/// only production caller is `gang.rs`'s `resolve_training_set_identity`
+/// (the world>1 conjunct's resolution site, whose own callers are
+/// `run_rank` and the hold loop's re-verification); the other hits are the
+/// definition and `jammi-db`'s own strict-predicate tests. A new caller of
+/// this verb is a new tenant-pinned read site and must be reviewed here.
+#[test]
+fn only_the_gang_resolution_site_calls_get_result_table_for_tenant() {
+    let hits = files_containing("get_result_table_for_tenant(");
+    let allowed: HashSet<&str> = [
+        "crates/jammi-db/src/catalog/result_repo.rs", // the definition itself
+        "crates/jammi-server/src/grpc/gang.rs",       // the ONE production caller
+        "crates/jammi-db/tests/it/result_tables.rs",  // jammi-db's own strict-predicate tests
+    ]
+    .into_iter()
+    .collect();
+    for hit in &hits {
+        assert!(
+            allowed.contains(hit.as_str()),
+            "unexpected `get_result_table_for_tenant(` occurrence outside the allowed set: {hit} \
+             (allowed: {allowed:?}) — a new tenant-pinned read site must be reviewed and this \
+             allowlist deliberately grown, never left stale"
+        );
+    }
+    for must_hit in &allowed {
+        assert!(
+            hits.contains(*must_hit),
+            "{must_hit} is in the allowlist but no longer contains \
+             `get_result_table_for_tenant(` — shrink the allowlist rather than leaving a stale entry"
+        );
+    }
+}
+
+/// The masking self-test the enumerating-caller oracles above depend on:
 /// a call-token inside a `//` line comment, a `///` doc comment, or a
 /// string literal is NOT a code occurrence; the same token appearing as an
 /// actual call in code IS one. Without this, this very file's own doc

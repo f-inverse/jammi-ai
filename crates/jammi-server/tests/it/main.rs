@@ -7,6 +7,7 @@ mod flight_tenant;
 mod gang_admission_catalog_fault_oracle;
 mod gang_rank_admission_oracle;
 mod gang_service;
+mod gang_terminal_write_oracle;
 mod gang_training_spec_parity;
 mod grpc_byo_auth;
 mod grpc_embedding;

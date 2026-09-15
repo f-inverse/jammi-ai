@@ -1,65 +1,91 @@
 //! `GangService` — the coordinator-to-member admission wire for a multi-host
-//! gang run (see `docs/rigor/contracts/feat_500-C-U5a-1.md` for the
-//! committed mechanism contract this module implements).
+//! gang run (`docs/rigor/contracts/feat_500-C-U5a-1.md` is the committed
+//! mechanism contract for the wire, the I-GANG row predicate and the
+//! training-set identity pair; this module is the `HostAdmission` half:
+//! admit-and-hold, the holder lattice, drain, re-verification).
 //!
-//! This module freezes the wire (`jammi.v1.gang`, see `gang.proto`), the
-//! wire-level K2 edges (`world == 0`, `rank >= world`) decided before any row
-//! is ever read, and this handler's own full I-GANG decision for the
-//! `world_size == 1` lattice this unit ships: `get_job_for_rank` for the row
-//! predicate and `fresh_instance` for the coordinator's own liveness. Every
-//! determinant collapses to the SAME `FailedPrecondition` status with a
-//! FIXED message (non-disclosure) — the listener discloses neither a job's
-//! existence, claimant, nor attempt. A call satisfying EVERY I-GANG
-//! determinant still reaches the handler and, having no `HostAdmission`
-//! session to hand it to, returns `Unimplemented`.
-//! `HostAdmission` itself (the admit-and-hold session, drain,
-//! re-verification) is built on top of this handler once it exists
-//! (docs/plans/67-distributed-training/UNITS.md § U5a-2).
+//! `GangServer::run_rank` decides, in this order, before a single stream
+//! event is emitted: the wire-level K2 edges (`world == 0`, `rank >= world`)
+//! before any row is read; ambient admin scope, refused outright; the
+//! I-GANG row predicate through `Catalog::get_job_for_rank` (`running`,
+//! claimed by the caller's coordinator, at the caller's attempt, lease
+//! live); the ROW's own `world_size` (`WorldSizeFact`, decoded from the
+//! same `spec` JSON the claiming worker reconstructs its run from — never
+//! the caller's `Assign.world`, which must merely agree with it); and, for
+//! `row.world_size > 1` ONLY, the world>1 conjunct (#566 R2): (a) the
+//! training-set identity pair is filled on the row, and (b) the row's own
+//! `tenant_id` pins a strict tenant-scoped resolution of a `ready`
+//! `result_tables` row named by `training_set_location`
+//! ([`jammi_db::catalog::Catalog::get_result_table_for_tenant`], never the
+//! relaxed read) whose sidecar manifest verifies `artifact ==
+//! training_set_ref` (K4's verify-at-read instance; a sidecar written
+//! before the leaf inventory reads as absent and refuses). Then the
+//! coordinator's own liveness (`Catalog::fresh_instance`). Every one of
+//! those determinants collapses to the SAME `FailedPrecondition` with ONE
+//! fixed message (non-disclosure, #566 R3): the listener discloses neither
+//! a job's existence, its claimant, its attempt, its tenant, nor another
+//! tenant's table.
 //!
-//! **This unit ships the `world_size == 1` lattice only.** `row.world_size`
-//! (`jammi_db::catalog::jobs_repo::WorldSizeFact`) is a ROW FACT, decoded
-//! from the SAME `spec` JSON the claiming worker reconstructs its run from —
-//! never the caller's own `Assign.world`. A `spec` column that does not
-//! decode a `world_size` at all is likewise a row fact, never a fault of the
-//! read that found it (see [`GangRefusalReason::SpecUndecodable`]).
-//! `assign.world != row.world_size` is itself an I-GANG refusal (the SAME
-//! fixed message as every other one — see [`RankAdmissionRow::world_size`]'s
-//! own doc for why a caller-keyed gate is unsound); separately, a row whose
-//! own `world_size` disagrees with `1` refuses the SAME way EVEN WHEN the
-//! caller's `Assign.world` agrees with it (see
-//! [`GangRefusalReason::MultiHostUnsupported`]) — the training-set pair
-//! conjunct and its sidecar verify that would admit a genuine multi-host row
-//! are `HostAdmission`'s to build (docs/plans/67-distributed-training/UNITS.md
-//! § U5a-2, filed at <https://github.com/f-inverse/jammi-ai/issues/566>);
-//! this handler never attempts them.
+//! Only once every determinant holds does the handler contend for this
+//! host's single job slot — [`HostAdmission::admit_rank`]'s
+//! compare-and-set on the holder cell (`Free` admits; a `ClaimProbe` is
+//! waited on for at most one heartbeat; `JobRun` or another `Rank` refuse
+//! `Unavailable` at once — transient, no assembly budget consumed) — and
+//! only once the CAS succeeded is `Admitted` emitted. The stream is then
+//! HELD by a spawned loop owning the [`RankHold`] guard, with exactly four
+//! arms: the inbound stream (`Cancel` ends the session cooperatively; a
+//! second `Assign` is a protocol violation, `InvalidArgument` — K2), the
+//! host's phase watch (a DRAIN or RELEASE ends every held rank with
+//! `Drain`, the only host-initiated cut), the re-verification tick (one per
+//! heartbeat: the row predicate, the training-set identity, and the
+//! coordinator's liveness are re-decided, ending the session `Refuted` /
+//! `Unavailable` / `StoreUnavailable` — see [`ReverifyEnd`] for why those
+//! three are pairwise distinct in scope and in whether they count), and the
+//! park bound (one lease window: with no rank body to hand the session to,
+//! it ends `NoBody`). The peer writes NOTHING terminal on behalf of a rank:
+//! every end is a stream event, the job row untouched — a source-scan
+//! oracle over this file enumerates the catalog's `jobs` writers and asserts
+//! none is named here.
 //!
-//! **A catalog fault during admission is `Unavailable`, never
-//! `FailedPrecondition`**: see `admission_catalog_fault`.
+//! **A catalog fault at admission is `Unavailable`, never
+//! `FailedPrecondition`**: see `admission_catalog_fault`; every
+//! admission-time catalog read on this path maps through it, never
+//! `map_engine_error` (a source-scan oracle pins this over `run_rank`'s own
+//! body).
 //!
-//! **I-GANG refuses ambient admin scope, and reads no tenant value at W=1**
-//! (`docs/rigor/contracts/feat_500-C-U5a-1.md` Addendum 3) — this handler
-//! refuses outright, before any row is even read, whenever
-//! [`TenantBinding::is_admin_scope`] is ambient: see
-//! [`GangRefusalReason::AdminScope`]. The row predicate itself carries no
-//! tenant column; tenant-scoped resolution is U5a-2's (#566).
+//! **Tenant is derived, never accepted (I-GANG).** No tenant value is read
+//! from the caller: `Assign` carries none, no `SessionTenant` extension is
+//! read, and ambient admin scope is refused before any row is read AND
+//! again at the resolution site before the strict resolver is ever called
+//! (`resolve_training_set_identity`). The ONLY tenant this handler uses is
+//! the `jobs` row's own `tenant_id`, read by `get_job_for_rank` as raw text
+//! and parsed here (a value that does not parse is a row fact, refused the
+//! same fixed way).
+//!
+//! **Two observables, split at admission.** BEFORE admission every
+//! determinant is the call's own result: `Err(Status)` — the ONE fixed
+//! `FailedPrecondition` for every I-GANG determinant (R3), `Unavailable`
+//! for a catalog fault or a busy slot, `InvalidArgument` for the wire K2
+//! edges — and no stream ever exists. AFTER admission the call has
+//! returned `Ok(stream)`, so every later outcome is delivered IN the
+//! stream: `Admitted`, then exactly one `Aborted{reason}` (the session's
+//! end), or — for a protocol violation on the admitted stream (a second
+//! `Assign`, K2) — a status TRAILER ending the stream, never a second
+//! initial result. An admitted session's ends may name their reason
+//! (`Refuted`/`Unavailable`/`StoreUnavailable`/`Drain`/`Cancelled`/
+//! `NoBody`): the caller already holds the job's own coordinates and was
+//! admitted on them, so a reason discloses nothing a pre-admission refusal
+//! withholds — pre-admission refusals never name one.
 //!
 //! **`test-hooks` non-disclosure introspection**: behind
 //! `#[cfg(feature = "test-hooks")]`, `GangServer::last_refusal_reason`
 //! exposes which [`GangRefusalReason`] variant the most recent call refused
 //! for — same-process, test-only, never reaching the wire — so the
-//! `test-hooks` lane can assert every I-GANG determinant was actually
-//! DECIDED (not merely "some earlier check happened to also refuse")
-//! without leaking that distinction into the response the plain lane's own
-//! non-disclosure oracle asserts is uniform.
+//! `test-hooks` lane can assert every determinant was actually DECIDED.
 //!
 //! Served only on the internal `[server] peer_bind` listener, mounted beside
 //! `PeerService` (`OssServer::bind`) — never on the public listener, never
-//! wrapped by the tenant-binding layer. No tenant value is read on this path
-//! at W=1 — not from the caller (this handler never reads a `SessionTenant`
-//! extension the way the tenant-wrapped services do) and not from the row
-//! (`Catalog::get_job_for_rank` has no tenant column); the responses are
-//! status codes only. The exemption `tenant_isolation_oracle.rs` carries for
-//! this rpc states exactly that ground.
+//! wrapped by the tenant-binding layer.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -68,31 +94,52 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::Stream;
+use jammi_ai::fine_tune::worker::{HolderBusy, RankHold, WorkerPhase};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::{RankAdmissionRow, WorldSizeFact};
-use jammi_db::catalog::status::JobStatus;
+use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
 use jammi_db::error::JammiError;
+use jammi_db::storage::StorageUrl;
+use jammi_db::store::ResultStore;
 use jammi_db::tenant_scope::TenantBinding;
+use jammi_db::TenantId;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
-use tokio_stream::StreamExt;
-
 use crate::grpc::proto::gang::gang_service_server::GangService;
-use crate::grpc::proto::gang::{rank_control, RankControl, RankEvent};
+use crate::grpc::proto::gang::{
+    rank_control, rank_event, AbortReason, Aborted, Admitted, Assign, RankControl, RankEvent,
+};
 
-/// Non-disclosure (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2)):
-/// every I-GANG refusal — ambient admin scope, row
-/// absent, wrong status, wrong claimant, wrong attempt, lease not live, an
-/// undecodable `world_size`, the caller's `Assign.world` not matching the
-/// row's own `world_size`, a row whose own `world_size` names more than one
-/// rank, or the coordinator's own `instances` row not fresh — collapses to
-/// this ONE status with this ONE fixed message. Never interpolate a job id,
-/// a claimant, or a reason into it: that is exactly the disclosure this
-/// property forbids.
+/// Non-disclosure (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2); #566
+/// R3): every I-GANG refusal — ambient admin scope, row absent, wrong
+/// status, wrong claimant, wrong attempt, lease not live, an undecodable
+/// `world_size`, the caller's `Assign.world` not matching the row's own
+/// `world_size`, the world>1 conjunct's every determinant (pair missing,
+/// tenant undecodable, unresolved under the job's tenant, not ready, sidecar
+/// absent, digest mismatch, this host's store faulting), or the
+/// coordinator's own `instances` row not fresh — collapses to this ONE
+/// status with this ONE fixed message. Never interpolate a job id, a
+/// claimant, a tenant, a table name or a reason into it: that is exactly
+/// the disclosure this property forbids.
 const I_GANG_REFUSAL_MESSAGE: &str = "gang admission refused";
 
 fn i_gang_refused() -> Status {
     Status::failed_precondition(I_GANG_REFUSAL_MESSAGE)
+}
+
+/// The holder-contention refusal: every determinant held, but this host's
+/// single job slot is busy ([`HolderBusy`]). `Unavailable` — TRANSIENT, no
+/// assembly budget consumed; the coordinator retries after at least one
+/// heartbeat or picks another member. One fixed message for every holder
+/// kind: which job or rank this host is busy with is not the caller's to
+/// learn.
+const SLOT_BUSY_MESSAGE: &str = "gang admission: this host's job slot is busy";
+
+fn slot_busy() -> Status {
+    Status::unavailable(SLOT_BUSY_MESSAGE)
 }
 
 /// Every I-GANG determinant a `RunRank` call can refuse for, kept
@@ -103,17 +150,15 @@ fn i_gang_refused() -> Status {
 /// never so the wire can. Adding a determinant this handler decides without
 /// a matching variant here reopens exactly the coverage gap this enum
 /// closes: the pairwise non-disclosure oracle only proves what it can
-/// distinguish. Defined unconditionally (a plain
-/// enum costs nothing) so `GangServer::record_refusal`'s call sites never
-/// need their own `#[cfg]`; only the STORAGE ([`GangServer`]'s field) and the
-/// GETTER (`GangServer::last_refusal_reason`) are `test-hooks`-gated, so a
-/// plain build carries no additional state and this seam is provably inert
-/// there.
+/// distinguish. Defined unconditionally (a plain enum costs nothing) so
+/// `GangServer::record_refusal`'s call sites never need their own `#[cfg]`;
+/// only the STORAGE ([`GangServer`]'s field) and the GETTER
+/// (`GangServer::last_refusal_reason`) are `test-hooks`-gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GangRefusalReason {
-    /// [`TenantBinding::is_admin_scope`] was ambient when this call reached
-    /// the handler — I-GANG refuses ambient admin scope outright, so this is
-    /// decided before any row is even read.
+    /// [`TenantBinding::is_admin_scope`] was ambient — refused before any
+    /// row is read, and again at the training-set resolution site before
+    /// the strict resolver is ever called (`resolve_training_set_identity`).
     AdminScope,
     /// No row exists for `assign.job_id`.
     NotFound,
@@ -132,14 +177,38 @@ pub enum GangRefusalReason {
     /// `assign.world != row.world_size` (the row's own `world_size`
     /// decoded successfully).
     WorldMismatch,
-    /// `assign.world == row.world_size`, but that shared value is not `1`
-    /// — this unit ships the `world_size == 1` lattice only; the
-    /// training-set pair conjunct and its sidecar verify that would admit a
-    /// genuine multi-host row are `HostAdmission`'s to build
-    /// (docs/plans/67-distributed-training/UNITS.md § U5a-2 — the property
-    /// this refusal holds the line for, filed at
-    /// <https://github.com/f-inverse/jammi-ai/issues/566>).
-    MultiHostUnsupported,
+    /// `row.world_size > 1` and the training-set identity pair
+    /// (`training_set_ref`, `training_set_location`) is not filled on the
+    /// row — the coordinator has not materialized (or recorded) the
+    /// training set this rank would read.
+    TrainingSetPairMissing,
+    /// `row.world_size > 1`, the pair is filled, but the row's own
+    /// `tenant_id` text does not parse as a tenant — a row fact, refused
+    /// before any tenant-pinned read.
+    TenantUndecodable,
+    /// The strict tenant-pinned resolver found no `result_tables` row named
+    /// `training_set_location` under the job's OWN tenant — whether none
+    /// exists at all, or one exists under another tenant or under no tenant
+    /// (the strict predicate does not distinguish the three; a NULL-tenant
+    /// row never resolves for a real tenant).
+    TrainingSetUnresolved,
+    /// A row was found for the job's own tenant, but its `status` was not
+    /// `ready`.
+    TrainingSetNotReady,
+    /// The row was `ready`, but no sidecar manifest exists for it — or the
+    /// one that exists predates the leaf inventory and reads as absent
+    /// (`ResultStore::read_materialization_manifest`'s `Ok(None)`).
+    TrainingSetSidecarAbsent,
+    /// The sidecar exists but does not verify `training_set_ref`: its
+    /// `artifact` digest differs, its body does not decode, or the row's
+    /// `parquet_path` is not a storage URL at all — the artifact's own
+    /// facts, not this host's.
+    TrainingSetDigestMismatch,
+    /// This host's own object store faulted reading the sidecar
+    /// (`JammiError::Storage`/`Io` — the driver could not be built or the
+    /// read itself errored): refused the same fixed way at admission; the
+    /// member-scoped `StoreUnavailable` distinction is re-verification's.
+    TrainingSetStoreFault,
     /// The coordinator's own `instances` row was absent or stale
     /// (`Catalog::fresh_instance` returned `false`).
     CoordinatorNotFresh,
@@ -152,36 +221,32 @@ pub enum GangRefusalReason {
 const FIRST_ASSIGN_BOUND: Duration = Duration::from_secs(10);
 
 /// Server-side handler for the gang admission surface. Holds the shared
-/// engine session for its catalog + result store — the same handle
-/// [`crate::grpc::peer::PeerServer`] holds for the owner side of the
-/// distributed data plane — and the `[lease]` window this deployment runs
-/// with, needed for [`jammi_db::catalog::Catalog::fresh_instance`]'s own
-/// `instance_liveness_margin` computation
-/// (`docs/rigor/contracts/feat_500-C-U5a-1.md` §1.5) without reaching back into
-/// `InferenceSession` for a config accessor this crate does not own.
+/// engine session (its catalog, its result store, and its
+/// [`jammi_ai::fine_tune::worker::HostAdmission`]) and the deployment's
+/// `[lease]` timing: `lease` is [`jammi_db::catalog::Catalog::fresh_instance`]'s
+/// margin input and the held session's park bound; `heartbeat` is the
+/// re-verification cadence and the longest a `ClaimProbe` is waited on.
 pub struct GangServer {
     session: Arc<InferenceSession>,
     lease: Duration,
+    heartbeat: Duration,
     /// The test-only introspection state the non-disclosure oracle's
     /// `test-hooks` seam reads
     /// ([`Self::last_refusal_reason`], [`Self::refusal_reason_handle`]).
     /// Absent entirely from a plain build — this field, and every write to
-    /// it, compiles away, so a published `jammi-server` binary carries no
-    /// additional state for this. `Arc<Mutex<..>>`, not a bare `Mutex`, so
+    /// it, compiles away. `Arc<Mutex<..>>`, not a bare `Mutex`, so
     /// [`Self::refusal_reason_handle`] can clone out a handle onto this SAME
-    /// state before `self` is moved into tonic's generated service wrapper
-    /// (`GangServiceServer::new` takes it by value) — the mounted, actually
-    /// serving instance and the handle a test harness holds observe the
-    /// identical state.
+    /// state before `self` is moved into tonic's generated service wrapper.
     #[cfg(feature = "test-hooks")]
     last_refusal: Arc<Mutex<Option<GangRefusalReason>>>,
 }
 
 impl GangServer {
-    pub fn new(session: Arc<InferenceSession>, lease: Duration) -> Self {
+    pub fn new(session: Arc<InferenceSession>, lease: Duration, heartbeat: Duration) -> Self {
         Self {
             session,
             lease,
+            heartbeat,
             #[cfg(feature = "test-hooks")]
             last_refusal: Arc::new(Mutex::new(None)),
         }
@@ -192,10 +257,9 @@ impl GangServer {
     /// — called unconditionally at every refusal site regardless of feature,
     /// so no call site needs its own `#[cfg]`. Last-write-wins: this
     /// `GangServer` serves one call at a time in every test that reads it
-    /// back (a single in-process client, sequential `run_rank` calls); a
-    /// concurrent caller reading `last_refusal_reason()` mid-call would see
-    /// an interleaved answer, which is exactly why this seam is `test-hooks`
-    /// only, never a production observability surface.
+    /// back; a concurrent caller reading `last_refusal_reason()` mid-call
+    /// would see an interleaved answer, which is exactly why this seam is
+    /// `test-hooks` only, never a production observability surface.
     #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
     fn record_refusal(&self, reason: GangRefusalReason) {
         #[cfg(feature = "test-hooks")]
@@ -206,12 +270,11 @@ impl GangServer {
 
     /// `test-hooks` only: which [`GangRefusalReason`] the most recent
     /// `run_rank` call on this `GangServer` refused for, if any. `None`
-    /// until the first refusal, or after a call that reached
-    /// `Unimplemented` (reaching the not-yet-implemented terminal state is
-    /// not itself a refusal — no reason is recorded
-    /// for it, so a prior refusal's reason survives an admitting call,
+    /// until the first refusal; an admitting call (or one refused
+    /// `Unavailable` for a busy slot, which is not an I-GANG determinant)
+    /// records nothing, so a prior refusal's reason survives it —
     /// intentionally: this seam names the last determinant that actually
-    /// refused, not "whether the most recent call was refused").
+    /// refused, not "whether the most recent call was refused".
     #[cfg(feature = "test-hooks")]
     pub fn last_refusal_reason(&self) -> Option<GangRefusalReason> {
         *self.last_refusal.lock().unwrap()
@@ -247,7 +310,8 @@ impl GangRefusalHandle {
 
 /// The transient class this admission path uses (see
 /// `docs/rigor/contracts/feat_500-C-U5a-1.md` §B4): a genuine catalog fault
-/// reached DURING admission — `Catalog::get_job_for_rank`'s own read or
+/// reached DURING admission — `Catalog::get_job_for_rank`'s own read,
+/// `Catalog::get_result_table_for_tenant`'s own read, or
 /// `Catalog::fresh_instance`'s own read ERRORING rather than simply finding
 /// no row / no fresh instance — is `Unavailable`, never `map_engine_error`'s
 /// generic mapping. A raw catalog-backend fault surfaces as
@@ -256,20 +320,381 @@ impl GangRefusalHandle {
 /// catch-all and never tell a retrying caller this was transient. Every
 /// admission-time catalog read on the `RunRank` path uses this SAME
 /// classification; `map_engine_error` is never called on this path. This is
-/// the ADMISSION-time classification; the mid-stream three-way split between
-/// `Refuted` / `Unavailable` / `StoreUnavailable` at RE-VERIFICATION is built
-/// with `HostAdmission` (docs/plans/67-distributed-training/UNITS.md §
-/// U5a-2) once an admitted session exists to re-verify inside. This unit's
-/// handler never reaches `Catalog::get_result_table_for_tenant` or
-/// `ResultStore::read_materialization_manifest` at all — the training-set
-/// sidecar lookup they backed is `HostAdmission`'s to build from the filed
-/// property. No such wrapper exists in this crate.
+/// the ADMISSION-time classification; a held session's re-verification
+/// classifies the same fault as [`ReverifyEnd::Unavailable`].
 fn admission_catalog_fault(err: JammiError) -> Status {
     tracing::warn!(
         error = %err,
         "gang admission: a catalog read faulted rather than returning no row"
     );
     Status::unavailable("gang admission: catalog temporarily unavailable")
+}
+
+/// The classification of the world>1 conjunct's resolution + verify
+/// ([`resolve_training_set_identity`]), collapsed by `run_rank` to the ONE
+/// fixed `FailedPrecondition` for the wire (non-disclosure) and kept
+/// distinguishable here so `run_rank` can name the exact
+/// [`GangRefusalReason`] the `test-hooks` lane records, and so a held
+/// session's re-verification can split [`Self::StoreFault`] (member-scoped)
+/// from every other non-`Verified` arm (the artifact's or the row's fact).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingSetOutcome {
+    /// The row resolved for this job's own tenant, is `ready`, and its
+    /// sidecar manifest's `artifact` equals `training_set_ref`.
+    Verified,
+    /// [`TenantBinding::is_admin_scope`] was ambient at the resolution
+    /// site; refused before the strict resolver ever ran.
+    AdminScopeRefused,
+    /// No `result_tables` row named `training_set_location` under the job's
+    /// own tenant (none at all, another tenant's, or a NULL-tenant row).
+    Unresolved,
+    /// Found for the job's tenant, but not `ready`.
+    NotReady,
+    /// `ready`, but no sidecar manifest (or one predating the leaf
+    /// inventory, which reads as absent).
+    SidecarAbsent,
+    /// The sidecar does not verify `training_set_ref` (digest differs, body
+    /// does not decode, or `parquet_path` is not a storage URL).
+    DigestMismatch,
+    /// This host's own object store faulted reading the sidecar.
+    StoreFault,
+}
+
+/// The world>1 conjunct's resolution + verify (#566 R2(b)): the ONE
+/// tenant-pinned lookup a rank performs for the training set its job row
+/// names — no listing, no candidate search — and the sidecar verify against
+/// the row's recorded digest (K4, verify-at-read).
+///
+/// Two properties bind this function:
+///
+/// - **Admin scope is guarded explicitly at this call site, not left to the
+///   verb.** [`TenantBinding::is_admin_scope`] is ambient task-local state
+///   this call site does not control by construction, so this function
+///   refuses immediately, before ever calling the strict resolver, whenever
+///   admin scope is active — regardless of which tenant or table it was
+///   asked to resolve. The strict verb itself ignores ambient scope too
+///   (its own tests prove it); this guard is the resolution site's own line.
+/// - **The lookup is the strict-predicate verb, never the relaxed read.**
+///   Exactly [`jammi_db::catalog::Catalog::get_result_table_for_tenant`]
+///   (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`), never
+///   `get_result_table` (whose `OR tenant_id IS NULL` would also hand a
+///   real tenant every GLOBAL row of the same name).
+///
+/// `Err` is the ONE way this returns a fault: the catalog read itself
+/// erroring (never "no row"). Every store-side outcome — the sidecar
+/// absent, mismatching, undecodable, or the read erroring — is CLASSIFIED
+/// into a [`TrainingSetOutcome`] and returned `Ok`, so an admission-time
+/// caller collapses it to the fixed refusal and a re-verification caller
+/// splits [`TrainingSetOutcome::StoreFault`] (this host's `Storage`/`Io`
+/// error) from the artifact's own facts.
+///
+/// This is the ONLY production caller of `get_result_table_for_tenant`
+/// (`crates/jammi-server/tests/it/gang_rank_admission_oracle.rs` enumerates
+/// it); its sole production caller in turn is [`GangServer::run_rank`] and
+/// the hold loop's re-verification, threading the job's own `tenant_id` and
+/// pair straight from the row `get_job_for_rank` resolved.
+pub async fn resolve_training_set_identity(
+    store: &ResultStore,
+    tenant: Option<TenantId>,
+    training_set_ref: &str,
+    training_set_location: &str,
+) -> Result<TrainingSetOutcome, JammiError> {
+    if TenantBinding::is_admin_scope() {
+        return Ok(TrainingSetOutcome::AdminScopeRefused);
+    }
+
+    let record = match store
+        .catalog()
+        .get_result_table_for_tenant(training_set_location, tenant)
+        .await?
+    {
+        None => return Ok(TrainingSetOutcome::Unresolved),
+        Some(record) if record.status != ResultTableStatus::Ready.to_string() => {
+            return Ok(TrainingSetOutcome::NotReady)
+        }
+        Some(record) => record,
+    };
+
+    let url = match StorageUrl::parse(&record.parquet_path) {
+        Ok(url) => url,
+        Err(_) => return Ok(TrainingSetOutcome::DigestMismatch),
+    };
+
+    Ok(match store.read_materialization_manifest(&url).await {
+        Ok(Some(manifest)) if manifest.artifact.0 == training_set_ref => {
+            TrainingSetOutcome::Verified
+        }
+        Ok(Some(_)) => TrainingSetOutcome::DigestMismatch,
+        Ok(None) => TrainingSetOutcome::SidecarAbsent,
+        // This host's store: the driver could not be built for the row's
+        // URL, or the object read itself errored — member-scoped.
+        Err(JammiError::Storage(_)) | Err(JammiError::Io(_)) => TrainingSetOutcome::StoreFault,
+        // A sidecar body that does not decode (or names a format this
+        // engine does not read) is the ARTIFACT's fact: it verifies nothing.
+        Err(_) => TrainingSetOutcome::DigestMismatch,
+    })
+}
+
+/// The training-set identity a `world_size > 1` session was admitted
+/// against, re-verified on every tick exactly as it was decided at
+/// admission: the row's OWN tenant (derived, never accepted) and the pair
+/// as the row carried it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrainingSetIdentity {
+    tenant: Option<TenantId>,
+    training_set_ref: String,
+    training_set_location: String,
+}
+
+/// How a held session ends at re-verification — three outcomes, pairwise
+/// distinct in their scope and in whether they count toward the assembly's
+/// attempt budget (`[worker] assembly_attempts`, the coordinator's to
+/// consume — this unit ships the classification the coordinator reads off
+/// the wire, never the counter):
+///
+/// | end | wire reason | scope | counts |
+/// |---|---|---|---|
+/// | `Refuted` | `REFUTED` | assembly | yes — a row fact refuted admission (status, claimant, attempt, lease, the training-set identity, or the coordinator's liveness no longer holds) |
+/// | `Unavailable` | `UNAVAILABLE` | assembly | never — the catalog did not answer; transient |
+/// | `StoreUnavailable` | `STORE_UNAVAILABLE` | member | never — THIS host's object store faulted; another member may verify fine |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverifyEnd {
+    Refuted,
+    Unavailable,
+    StoreUnavailable,
+}
+
+/// Whose failure a [`ReverifyEnd`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverifyScope {
+    /// The assembly's: every member sees the same fact.
+    Assembly,
+    /// This member's alone.
+    Member,
+}
+
+impl ReverifyEnd {
+    /// The `Aborted.reason` this end is emitted as.
+    pub fn abort_reason(self) -> AbortReason {
+        match self {
+            Self::Refuted => AbortReason::Refuted,
+            Self::Unavailable => AbortReason::Unavailable,
+            Self::StoreUnavailable => AbortReason::StoreUnavailable,
+        }
+    }
+
+    /// Whose failure this is.
+    pub fn scope(self) -> ReverifyScope {
+        match self {
+            Self::Refuted | Self::Unavailable => ReverifyScope::Assembly,
+            Self::StoreUnavailable => ReverifyScope::Member,
+        }
+    }
+
+    /// Whether this end consumes one of the assembly's attempts. Only a
+    /// refutation does — a fact about the run, not about the weather.
+    pub fn counts_toward_assembly_attempts(self) -> bool {
+        matches!(self, Self::Refuted)
+    }
+}
+
+/// One re-verification tick over an admitted session: the SAME determinants
+/// admission decided, re-read against the live row — the I-GANG row
+/// predicate, the training-set identity (`world_size > 1` sessions only),
+/// and the coordinator's liveness — classified into a [`ReverifyEnd`] when
+/// any no longer holds. A row fact that no longer holds is `Refuted`; a
+/// catalog read that errors is `Unavailable`; this host's own store erroring
+/// on the sidecar is `StoreUnavailable`.
+async fn reverify(
+    session: &InferenceSession,
+    assign: &Assign,
+    identity: Option<&TrainingSetIdentity>,
+    lease: Duration,
+) -> Result<(), ReverifyEnd> {
+    let catalog = session.catalog();
+    let row: RankAdmissionRow = match catalog.get_job_for_rank(&assign.job_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(ReverifyEnd::Refuted),
+        Err(_) => return Err(ReverifyEnd::Unavailable),
+    };
+    let row_holds = row.status == JobStatus::Running.to_string()
+        && row.claimed_by.as_deref() == Some(assign.coordinator_instance_id.as_str())
+        && i64::from(row.attempts) == assign.attempt
+        && row.lease_live;
+    if !row_holds {
+        return Err(ReverifyEnd::Refuted);
+    }
+    if let Some(identity) = identity {
+        // The pair is write-once (the CAS + the schema `CHECK`), so a row
+        // whose pair no longer equals what was admitted is a different
+        // fact about this job than the one admitted against.
+        if row.training_set_ref.as_deref() != Some(identity.training_set_ref.as_str())
+            || row.training_set_location.as_deref() != Some(identity.training_set_location.as_str())
+        {
+            return Err(ReverifyEnd::Refuted);
+        }
+        match resolve_training_set_identity(
+            session.result_store().as_ref(),
+            identity.tenant,
+            &identity.training_set_ref,
+            &identity.training_set_location,
+        )
+        .await
+        {
+            Ok(TrainingSetOutcome::Verified) => {}
+            Ok(TrainingSetOutcome::StoreFault) => return Err(ReverifyEnd::StoreUnavailable),
+            // `AdminScopeRefused` cannot occur on a spawned hold task (no
+            // task-local scope is inherited); classified as a refutation
+            // if it ever did — never as an admission.
+            Ok(_) => return Err(ReverifyEnd::Refuted),
+            Err(_) => return Err(ReverifyEnd::Unavailable),
+        }
+    }
+    match catalog
+        .fresh_instance(&assign.coordinator_instance_id, lease)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ReverifyEnd::Refuted),
+        Err(_) => Err(ReverifyEnd::Unavailable),
+    }
+}
+
+fn admitted_event() -> RankEvent {
+    RankEvent {
+        event: Some(rank_event::Event::Admitted(Admitted {})),
+    }
+}
+
+fn aborted_event(reason: AbortReason) -> RankEvent {
+    RankEvent {
+        event: Some(rank_event::Event::Aborted(Aborted {
+            reason: reason as i32,
+        })),
+    }
+}
+
+/// An admitted session: everything the spawned hold loop owns. The
+/// [`RankHold`] is dropped with it, on every exit path, freeing the slot.
+struct HeldSession {
+    session: Arc<InferenceSession>,
+    hold: RankHold,
+    assign: Assign,
+    identity: Option<TrainingSetIdentity>,
+    lease: Duration,
+    heartbeat: Duration,
+    inbound: tonic::Streaming<RankControl>,
+    events: mpsc::Sender<Result<RankEvent, Status>>,
+}
+
+impl HeldSession {
+    /// The inbound arm's decision for one control frame on an ADMITTED
+    /// stream — every frame decided here ENDS the session: `Cancel`
+    /// cooperatively (`Aborted{Cancelled}`); a second `Assign` as the K2
+    /// protocol violation (a status trailer, never a second admission);
+    /// every OTHER frame through [`Self::dispatch_round_frame`], the one
+    /// site the round protocol is wired at.
+    fn on_control_frame(
+        &mut self,
+        control: Option<rank_control::Control>,
+    ) -> Result<AbortReason, Status> {
+        match control {
+            Some(rank_control::Control::Cancel(_)) => Ok(AbortReason::Cancelled),
+            Some(rank_control::Control::Assign(_)) => Err(Status::invalid_argument(
+                "a second Assign on an admitted RunRank stream is a protocol violation",
+            )),
+            other => self.dispatch_round_frame(other),
+        }
+    }
+
+    /// THE dispatch point for every inbound control frame on an admitted
+    /// stream that is neither `Assign` nor `Cancel` — where the Peer
+    /// collective's round machinery (`grpc/gang_rounds.rs`, its own unit)
+    /// is wired, at this ONE site, once its round frames join
+    /// `RankControl`'s oneof. Today no such frame exists: the only value
+    /// that reaches here is an EMPTY frame (`control: None`), a protocol
+    /// violation that ends the session with a status trailer.
+    fn dispatch_round_frame(
+        &mut self,
+        control: Option<rank_control::Control>,
+    ) -> Result<AbortReason, Status> {
+        match control {
+            None => Err(Status::invalid_argument(
+                "an empty RankControl frame on an admitted RunRank stream is a protocol violation",
+            )),
+            Some(rank_control::Control::Assign(_)) | Some(rank_control::Control::Cancel(_)) => {
+                unreachable!("Assign and Cancel are decided by on_control_frame, never dispatched")
+            }
+        }
+    }
+
+    /// The HOLD loop: exactly four arms — the inbound stream, the host's
+    /// phase (drain) watch, the re-verification tick, the park bound. No
+    /// fifth arm: nothing else ends a held session. Every end is ONE
+    /// stream event (or, for a protocol violation, one status) followed by
+    /// the stream closing; the job row is never written here.
+    async fn hold(mut self) {
+        let admission = Arc::clone(self.session.host_admission());
+        let mut phase = admission.phase_receiver();
+        let mut tick =
+            tokio::time::interval_at(tokio::time::Instant::now() + self.heartbeat, self.heartbeat);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let park = tokio::time::sleep(self.lease);
+        tokio::pin!(park);
+        // The client half-closing its send side (it sent its one `Assign`
+        // and has nothing more to say) is NOT an end: the session stays
+        // held and the arm is simply disabled. A transport error on the
+        // inbound side means the client is gone — there is nobody to send
+        // a reason to, so the loop ends silently.
+        let mut inbound_open = true;
+
+        let end: Result<AbortReason, Status> = loop {
+            tokio::select! {
+                frame = self.inbound.next(), if inbound_open => match frame {
+                    Some(Ok(frame)) => break self.on_control_frame(frame.control),
+                    Some(Err(status)) => {
+                        tracing::debug!(
+                            job_id = %self.assign.job_id,
+                            %status,
+                            "gang hold: the inbound stream errored; ending the session"
+                        );
+                        return;
+                    }
+                    None => {
+                        inbound_open = false;
+                    }
+                },
+                // The `watch::Ref` `wait_for` yields is consumed inside this
+                // arm's own future (never held in the `select!`'s output
+                // across another arm's await), so the hold loop stays
+                // `Send` for `tokio::spawn`. The sender dropping (the
+                // session is gone) reads as a drain too: this host is going
+                // away either way.
+                () = async {
+                    let _ = phase.wait_for(|p| *p != WorkerPhase::Running).await;
+                } => break Ok(AbortReason::Drain),
+                _ = tick.tick() => {
+                    if let Err(end) =
+                        reverify(&self.session, &self.assign, self.identity.as_ref(), self.lease)
+                            .await
+                    {
+                        break Ok(end.abort_reason());
+                    }
+                }
+                _ = &mut park => break Ok(AbortReason::NoBody),
+            }
+        };
+
+        let item = match end {
+            Ok(reason) => Ok(aborted_event(reason)),
+            Err(status) => Err(status),
+        };
+        // A receiver already gone (the client dropped the response stream)
+        // has nobody to tell; the hold is freed regardless, below.
+        let _ = self.events.send(item).await;
+        drop(self.events);
+        drop(self.hold);
+    }
 }
 
 #[tonic::async_trait]
@@ -319,21 +744,18 @@ impl GangService for GangServer {
             return Err(Status::invalid_argument("rank must be less than world"));
         }
 
-        // I-GANG refuses ambient admin scope
-        // (docs/rigor/contracts/feat_500-C-U5a-1.md Addendum 3) — this holds
-        // for the WHOLE handler, not merely a tenant-scoped catalog read a
-        // later unit performs: a call reaching this handler while wrapped in
-        // admin scope is refused outright, before any row is even read, the
-        // same fixed way every other determinant refuses.
+        // I-GANG refuses ambient admin scope — for the WHOLE handler: a call
+        // reaching this handler while wrapped in admin scope is refused
+        // outright, before any row is even read, the same fixed way every
+        // other determinant refuses.
         if TenantBinding::is_admin_scope() {
             self.record_refusal(GangRefusalReason::AdminScope);
             return Err(i_gang_refused());
         }
 
-        // The row predicate: primary-key-only, no tenant predicate and no
-        // tenant column — at W=1 nothing on this path reads a tenant value,
-        // from the caller or from the row (I-GANG; the tenant-scoped
-        // resolution is U5a-2's, #566).
+        // The row predicate: primary-key-only, no tenant predicate. The
+        // row's OWN tenant comes back as raw text for the world>1 conjunct
+        // below to derive and pin (never the caller's).
         let catalog = self.session.catalog();
         let row: RankAdmissionRow = match catalog.get_job_for_rank(&assign.job_id).await {
             Ok(Some(row)) => row,
@@ -368,9 +790,8 @@ impl GangService for GangServer {
         // (`jammi_db::catalog::jobs_repo::WorldSizeFact`), never a fault of
         // the read that found it: a `spec` column that does not decode a
         // `world_size` at all refuses the SAME fixed way every other
-        // determinant does, counted against the attempt budget like every
-        // refusal — never `admission_catalog_fault`, which is reserved for
-        // the read ITSELF faulting (`get_job_for_rank` returning `Err`).
+        // determinant does — never `admission_catalog_fault`, which is
+        // reserved for the read ITSELF faulting.
         let world_size = match row.world_size {
             WorldSizeFact::Undecodable => {
                 self.record_refusal(GangRefusalReason::SpecUndecodable);
@@ -381,35 +802,79 @@ impl GangService for GangServer {
 
         // The lattice is keyed on the ROW's own `world_size`, never the
         // caller's `assign.world` — a caller naming a `world` the row does
-        // not agree with is itself a refusal, with the SAME fixed message
-        // every other I-GANG determinant refuses with. This runs BEFORE the
-        // `world_size != 1` gate below so a multi-host job assigned at a
-        // mismatched `world` (in either direction) is distinguished from one
-        // whose caller-supplied `world` genuinely agrees with the row.
+        // not agree with is itself a refusal. Keying the conjunct below on
+        // `assign.world` instead would let a `world_size > 1` job admit
+        // under a caller-supplied `world = 1`, skipping the pair conjunct
+        // and the sidecar verify entirely (#566 R2).
         if assign.world != world_size {
             self.record_refusal(GangRefusalReason::WorldMismatch);
             return Err(i_gang_refused());
         }
 
-        // This unit ships the `world_size == 1` lattice only: the
-        // training-set pair conjunct and its sidecar verify that
-        // would admit a genuine multi-host row are `HostAdmission`'s to
-        // build (docs/plans/67-distributed-training/UNITS.md § U5a-2). A row
-        // whose OWN `world_size` (now known to equal `assign.world`, the
-        // conjunct above) names more than one rank refuses the SAME fixed
-        // way — never admitted, never silently treated as `world_size == 1`.
-        if world_size != 1 {
-            self.record_refusal(GangRefusalReason::MultiHostUnsupported);
-            return Err(i_gang_refused());
-        }
+        // The world>1 conjunct (#566 R2), on the ROW's decoded fact: (a)
+        // the training-set identity pair is filled; (b) the row's own
+        // tenant pins a strict resolution of a `ready` table whose sidecar
+        // verifies the recorded digest. A `world_size == 1` row reads no
+        // tenant value and no pair at all.
+        let identity = if world_size > 1 {
+            let (Some(training_set_ref), Some(training_set_location)) = (
+                row.training_set_ref.as_deref(),
+                row.training_set_location.as_deref(),
+            ) else {
+                self.record_refusal(GangRefusalReason::TrainingSetPairMissing);
+                return Err(i_gang_refused());
+            };
+            let tenant: Option<TenantId> = match row.tenant_id.as_deref() {
+                None => None,
+                Some(text) => match text.parse::<TenantId>() {
+                    Ok(tenant) => Some(tenant),
+                    Err(_) => {
+                        self.record_refusal(GangRefusalReason::TenantUndecodable);
+                        return Err(i_gang_refused());
+                    }
+                },
+            };
+            // The strict resolver's own catalog read erroring is a catalog
+            // fault — `Unavailable` through the SAME classification every
+            // other admission-time catalog read on this path uses.
+            let outcome = resolve_training_set_identity(
+                self.session.result_store().as_ref(),
+                tenant,
+                training_set_ref,
+                training_set_location,
+            )
+            .await
+            .map_err(admission_catalog_fault)?;
+            let reason = match outcome {
+                TrainingSetOutcome::Verified => None,
+                TrainingSetOutcome::AdminScopeRefused => Some(GangRefusalReason::AdminScope),
+                TrainingSetOutcome::Unresolved => Some(GangRefusalReason::TrainingSetUnresolved),
+                TrainingSetOutcome::NotReady => Some(GangRefusalReason::TrainingSetNotReady),
+                TrainingSetOutcome::SidecarAbsent => {
+                    Some(GangRefusalReason::TrainingSetSidecarAbsent)
+                }
+                TrainingSetOutcome::DigestMismatch => {
+                    Some(GangRefusalReason::TrainingSetDigestMismatch)
+                }
+                TrainingSetOutcome::StoreFault => Some(GangRefusalReason::TrainingSetStoreFault),
+            };
+            if let Some(reason) = reason {
+                self.record_refusal(reason);
+                return Err(i_gang_refused());
+            }
+            Some(TrainingSetIdentity {
+                tenant,
+                training_set_ref: training_set_ref.to_string(),
+                training_set_location: training_set_location.to_string(),
+            })
+        } else {
+            None
+        };
 
         // Coordinator freshness (`docs/rigor/contracts/feat_500-C-U5a-1.md`
         // §1.5): the coordinator's own `instances` row must be fresh. A
         // genuine catalog fault reading this row is `Unavailable`
-        // (`admission_catalog_fault`), the SAME admission-time
-        // classification every other catalog read on this path uses — never
-        // `map_engine_error`'s generic mapping, which has no case for a raw
-        // backend fault and would fall through to `Internal`.
+        // (`admission_catalog_fault`).
         match catalog
             .fresh_instance(&assign.coordinator_instance_id, self.lease)
             .await
@@ -422,11 +887,81 @@ impl GangService for GangServer {
             Err(e) => return Err(admission_catalog_fault(e)),
         }
 
-        // Every I-GANG determinant is satisfied. This handler has no
-        // `HostAdmission` session to hand the call to yet
-        // (docs/plans/67-distributed-training/UNITS.md § U5a-2 builds it).
-        Err(Status::unimplemented(
-            "gang admission is not implemented on this build",
-        ))
+        // Every I-GANG determinant is satisfied. ONLY NOW the slot: the
+        // holder CAS runs after the decision, never before it, so a refused
+        // call never touches this host's holder and an admitted one is
+        // held under a guard that frees the slot on every exit path.
+        let hold = match self
+            .session
+            .host_admission()
+            .admit_rank(&assign.job_id, row.attempts, self.heartbeat)
+            .await
+        {
+            Ok(hold) => hold,
+            Err(busy) => {
+                tracing::debug!(
+                    job_id = %assign.job_id,
+                    ?busy,
+                    "gang admission: every determinant held but this host's slot is busy"
+                );
+                let _: HolderBusy = busy;
+                return Err(slot_busy());
+            }
+        };
+
+        // `Admitted` is emitted only after the CAS succeeded; the guard
+        // moves into the spawned HOLD loop with the inbound stream.
+        let (events, rx) = mpsc::channel::<Result<RankEvent, Status>>(4);
+        if events.try_send(Ok(admitted_event())).is_err() {
+            // A fresh channel with room for four frames cannot refuse the
+            // first; stated rather than unwrapped.
+            return Err(Status::internal("gang admission: could not emit Admitted"));
+        }
+        let held = HeldSession {
+            session: Arc::clone(&self.session),
+            hold,
+            assign,
+            identity,
+            lease: self.lease,
+            heartbeat: self.heartbeat,
+            inbound,
+            events,
+        };
+        tokio::spawn(held.hold());
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// i2' at the classification: the three re-verification ends are
+    /// pairwise distinct on the wire reason, on their scope, and on the
+    /// count rule — never two ends that differ only in name.
+    #[test]
+    fn reverify_ends_are_pairwise_distinguishable_in_reason_scope_and_count() {
+        let ends = [
+            ReverifyEnd::Refuted,
+            ReverifyEnd::Unavailable,
+            ReverifyEnd::StoreUnavailable,
+        ];
+        for (i, a) in ends.iter().enumerate() {
+            for b in &ends[i + 1..] {
+                assert_ne!(a.abort_reason(), b.abort_reason(), "{a:?} vs {b:?}");
+                assert!(
+                    a.scope() != b.scope()
+                        || a.counts_toward_assembly_attempts()
+                            != b.counts_toward_assembly_attempts(),
+                    "{a:?} and {b:?} must differ in scope or in the count rule, not only in name"
+                );
+            }
+        }
+        assert!(ReverifyEnd::Refuted.counts_toward_assembly_attempts());
+        assert!(!ReverifyEnd::Unavailable.counts_toward_assembly_attempts());
+        assert!(!ReverifyEnd::StoreUnavailable.counts_toward_assembly_attempts());
+        assert_eq!(ReverifyEnd::StoreUnavailable.scope(), ReverifyScope::Member);
+        assert_eq!(ReverifyEnd::Refuted.scope(), ReverifyScope::Assembly);
+        assert_eq!(ReverifyEnd::Unavailable.scope(), ReverifyScope::Assembly);
     }
 }

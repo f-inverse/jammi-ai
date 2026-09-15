@@ -586,14 +586,17 @@ impl OssServer {
                 // one cannot fail in practice; still handled, never
                 // `.unwrap()`ed, since a config reload between `new` and
                 // `bind` is not something this method can rule out).
-                let lease = self
+                let intervals = self
                     .session
                     .inner_config()
                     .lease
                     .intervals()
-                    .map_err(|e| ServerError::Config(e.to_string()))?
-                    .lease();
-                let gang_server = GangServer::new(Arc::clone(&self.session), lease);
+                    .map_err(|e| ServerError::Config(e.to_string()))?;
+                let gang_server = GangServer::new(
+                    Arc::clone(&self.session),
+                    intervals.lease(),
+                    intervals.heartbeat(),
+                );
                 #[cfg(feature = "test-hooks")]
                 {
                     gang_refusal_handle = Some(gang_server.refusal_reason_handle());
@@ -1110,6 +1113,12 @@ impl BoundServer {
             };
             if let Some(preempted) = preempted {
                 readiness.begin_drain();
+                // Every gang rank held on this host ends `Drain` — with or
+                // without a claim loop to stop (the RELEASE arm's
+                // `release_and_stop`/`release_job_leases` flips the phase
+                // to `Releasing` themselves; the DRAIN arm has no
+                // worker-less entry, so the phase is flipped here).
+                session.host_admission().begin_drain();
                 // W2/R6: the outcome must reflect what THIS arm actually
                 // DID, never merely which signal fired. On EITHER exit — a
                 // signal preempting the preload, or the preload itself
@@ -1245,9 +1254,14 @@ impl BoundServer {
             let readiness_ref = Arc::clone(&readiness);
             // The gated join half: nothing here runs until DRAIN is
             // signalled, so the worker is never stopped at t = 0.
+            let session_ref = Arc::clone(&session);
             let gated_join = async move {
                 let _ = drain_gate.wait_for(|v| *v).await;
                 readiness_ref.begin_drain();
+                // Held gang ranks end `Drain` the same instant — with or
+                // without a worker (`EmbeddedWorker::begin_drain` flips the
+                // same session-owned phase; this call is idempotent).
+                session_ref.host_admission().begin_drain();
                 match worker_ref {
                     Some(w) => {
                         w.begin_drain().await;

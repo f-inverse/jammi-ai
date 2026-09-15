@@ -851,8 +851,8 @@ second-GET body threw an UNCAUGHT Python exception, and Python's own default exi
 uncaught exception (1) collided EXACTLY with the explicit `sys.exit(1)` "confirmed gone" arm,
 so a malformed re-enumeration read as a clean success (`rc=0`, "terminated N orphaned
 cluster(s)", a traceback on stderr) while the PRE-delete parse's own `try`/`except`
-(`ci/scripts/runpod_lib.sh, lines 1842-1845` at HEAD, unchanged by this round) was already
-three-valued. **Fix**: the post-delete parse (`ci/scripts/runpod_lib.sh, lines 1913-1934` at
+(`ci/scripts/runpod_lib.sh, lines 1842-1845` at that round's tree) was three-valued at the
+`json.load` only — round 5 (§2e) found the code AFTER it was not, and made every parser total. **Fix**: the post-delete parse (`ci/scripts/runpod_lib.sh, lines 1913-1934` at
 HEAD) wraps `json.load` in `try`/`except` and adds `isinstance` guards on the body and its
 `clusters` list, naming every parse/shape failure `sys.exit(2)` — never falling through to
 Python's own default exit code. `rp_cluster_create` (`ci/scripts/runpod_lib.sh, lines 1539-1571`
@@ -873,8 +873,9 @@ being echoed back, never contradicted, by the rewritten comment). **CHANGE, not 
 `return 1` on the span's own last line) now bails immediately and names the pod id, mirroring
 `rp_cluster_sweep`'s pre-existing UNAGEABLE handling — pre-fix this was a silent `continue` that
 let the sweep finish green (`rc=0`); post-fix, a genuinely-reapable orphan later in the SAME
-`out` list is left unswept for this run (picked up by the next scheduled sweep), the identical
-trade-off the cluster arm already made.
+`out` list was left unswept for this run — a trade-off round 5 refuted (§2e): a missing `createdAt` is a
+STATIC property, so "the next scheduled sweep" would bail at the same entry forever; both arms now name
+the unjudgeable resource and still sweep the rest of the list.
 
 **Oracle**: `ci/scripts/test_runpod_cluster_lib.sh` Group 9 (post-delete confirmation:
 unparseable/empty/array second-GET bodies, and a 429 on that same second GET via
@@ -984,6 +985,67 @@ the LAST closer round for this unit.** A PASS on round 5 ships M1+M2+M5+M6 whole
 kind withholds the whole unit from wave 3 (nothing merges; U7b is refiled whole, A2 + A2b, with
 all five rounds — this one included — as its spec; the reap cron keeps main's pod-only sweep).
 
+## 2e. Round 5 (final closers, 2026-09-15) — the reap path's judgement lattice; the user's takeover
+
+Round 5's closers: discipline PASS; citation BLOCK on one range endpoint (`RankReport` cited `:425-458`, the
+struct closes at `:461` — corrected above); audit BLOCK with three executed findings on M1 and two advisories.
+At that point the user took the unit over from the swarm ("implement the fixes, test and create the PRs and close
+wave 3"); the pre-committed round-5 withhold was therefore NOT applied, the lead applied the fixes below directly,
+and the closers were not re-run.
+
+**F-A — one unjudgeable resource must not suppress the sweep, and the remedy must be real.** Both sweeps bailed
+(`return 1`) on the FIRST pod or cluster with no usable `createdAt`, before the operator override was even read,
+so the override the error message named was inert and a real orphan behind the unjudgeable entry billed forever
+(executed by the audit: three runs, zero terminates). Now (`rp_cluster_sweep` and `rp_sweep`, `ci/scripts/runpod_lib.sh`
+at HEAD): an unjudgeable resource — no usable `createdAt`, OR a prefixed name with no parseable `-ttl<H>` — is
+collected and NAMED with its by-id remedy (`rp_cluster_delete <id>` / `rp_terminate <id>`; the override cannot
+help, there is no age to apply it to), the rest of the list is still judged and swept THIS run, and the sweep
+exits 1 at the end so the reap cron reddens until the resource is retired by id. Oracles: Group 12
+(`ci/scripts/test_runpod_cluster_lib.sh` — an unageable pod beside a 50 h orphan: the orphan is terminated,
+exactly once; the unageable pod is named and never terminated; rc 1; the same under `rp_sweep 8`; the cluster
+arm likewise with `rp_cluster_delete`).
+
+**F-B — a prefixed cluster with no parseable deadline was DELETED at any age.** The Python printed an
+`unparseable-deadline` row and the bash loop deleted every non-UNAGEABLE row (executed by the audit: a
+60-second-old `jammi-cluster-experiment`, gone with a green summary). Now both sweeps print `UNPARSEABLE` for
+that state and it joins the unjudgeable set above — named, never deleted. The pod mirror (pre-existing on
+`main`) is corrected the same way. Oracles: Group 13 (cluster and pod).
+
+**F-C — every parse on the reap path is total.** Round 4 wrapped `json.load` and added `isinstance` guards on
+five sites but left the code AFTER the load non-total, so a row of the wrong shape raised an uncaught exception
+whose exit 1 the callers reported as "200 but the body is missing the required 'pods'/'clusters' key" — a named,
+wrong diagnosis — or as an empty reason with a traceback. Now `rp_cluster_pods`, `rp_cluster_list`,
+`rp_cluster_sweep`'s and `rp_sweep`'s row loops run under one `try`/`except` each: a row that cannot be read is
+"could not be read (a row of the wrong shape, or unparseable)" / "could NOT enumerate …: could not read the …
+list: <reason>", exit 2/3, fail-closed. Oracles: Group 14 (a non-object cluster row, an `ssh.direct` block without
+`host`, a 503 on the member listing via `MOCK_CLUSTER_PODS_STATUS`, `[…]`/`null`/`42`/`"s"` bodies into the
+cluster sweep, an array body and a `null` pod row into the pod sweep — each named with its reason, zero
+terminates/deletes).
+
+**F-D (advisory, folded) — an id-less member row is refused, never dropped.** `rp_cluster_pods` refuses a member
+row with no readable id (exit 2), so `_rp_cluster_member_ids` fails and `rp_sweep` suspends the whole pod sweep —
+the exclusion set is complete or absent, never short (executed by the audit pre-fix: the id-less member's own pod
+was terminated as an orphan). Oracle: Group 15.
+
+**F-E (advisory, folded) — the P7 texts and the dead mock knobs.** The gate's own derivation matches the
+`rp_cluster_create` literal in THREE tracked files (`check_gpu_prove_once.py`, `test_check_gpu_prove_once.py`,
+`test_runpod_cluster_lib.sh`); the three texts (`ci/scripts/check_gpu_prove_once.py`, `docs/maintainer/dev-gpu.md`,
+`docs/plans/67-distributed-training/UNITS.md`) say so. `MOCK_REQUEST_BODY_LOG` is now exported by Group 16, which
+asserts the SENT create body carries the fixed 2×1 shape and only keys in the reviewed
+`ci/scripts/fixtures/runpod_cluster_create_request_keys.json`; `MOCK_CLUSTER_PODS_STATUS` drives
+`rp_cluster_pods`'s non-200 arm in Group 14.
+
+`docs/maintainer/dev-gpu.md`'s `rp_cluster_sweep` sentence states the judgement lattice (deleted past its
+deadline; named-and-left-alone when unjudgeable; `return 1` on a failed enumeration).
+
+Verification run by the lead at this revision: `bash -n` + `shellcheck -S warning` (only `main`'s pre-existing
+SC2034s), `test_runpod_cluster_lib.sh` 69 passed / 0 failed, `test_gpu_dev_lifecycle.sh`, `test_gpu_gang_lane.sh`,
+`test_gpu_prove_lane.sh`, `check_gpu_prove_once.py` + its 207 unit tests, `check_ci_guard_wiring.py`,
+`check_execution_surface_reachability.py`, `check_no_consumer_names.py`, `check_doc_parity.py`,
+`perf/check_citations.py`. §2d's line citations into `runpod_lib.sh` were derived at the round-4 tree
+(`b1697a1f`); this round moved lines in that file, so §2d's `at HEAD` tags are read as "at `b1697a1f`'s tree".
+The unit's suites run again on the consolidated wave-3 branch before its single PR.
+
 ## 3. M2 — the two-host NCCL test body (`gang_nccl.rs`) — changed once, by `b480f2dc`, untouched by every fix round
 
 **Restored in this revision.** This section's own heading existed in the c4 revision
@@ -1024,7 +1086,7 @@ missing (one or both, `"; "`-joined) BEFORE any NCCL work runs, so a bad metadat
 inside the `catch_unwind` closure's FIRST statement rather than letting an
 indistinguishable-from-real `"unknown"` reach a `pass` report; the existing `Err(payload)` arm
 then writes the fail report and `resume_unwind`s the same reason. `RankReport`
-(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:425-458` at `HEAD`, current tree, re-derived
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:425-461` at `HEAD`, current tree, re-derived
 this revision) has no field that could hold the NCCL id — it travels only through
 `$JAMMI_GANG_TWO_HOSTS_ID_FILE` — and is written on BOTH the pass and fail arm, never only on
 success.

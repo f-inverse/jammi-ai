@@ -1639,22 +1639,42 @@ if pods is None:
     sys.exit(1)
 if not isinstance(pods, list):
     sys.exit(2)
-for p in pods:
-    pid = p.get("id") or ""
-    cl = p.get("cluster") or {}
-    rank = cl.get("rank")
-    rank = str(rank) if rank is not None else ""
-    ip = cl.get("ip") or ""
-    ssh_direct = (p.get("ssh") or {}).get("direct") or {}
-    hostport = ("%s:%s" % (ssh_direct["host"], ssh_direct["port"])) if ssh_direct else ""
-    status = p.get("status") or ""
-    print("\t".join([pid, rank, ip, hostport, status]))
+# Total over any JSON shape (round-5 audit, F-C): a row that cannot be read
+# is exit 2 with the reason, never an uncaught-exception exit 1 (which the
+# caller would report as missing the required key). A member row with NO
+# readable id is refused outright (round-5 F-D): the exclusion set rp_sweep
+# builds from this listing must be COMPLETE or absent, never short.
+try:
+    rows = []
+    for p in pods:
+        if not isinstance(p, dict):
+            raise ValueError("pod row is not an object: %r" % (p,))
+        pid = p.get("id")
+        if not isinstance(pid, str) or not pid:
+            raise ValueError("a cluster member row carries no readable id: %r" % (p,))
+        cl = p.get("cluster") or {}
+        if not isinstance(cl, dict):
+            raise ValueError("member %s: cluster block is not an object" % pid)
+        rank = cl.get("rank")
+        rank = str(rank) if rank is not None else ""
+        ip = cl.get("ip") or ""
+        ssh = p.get("ssh") or {}
+        ssh_direct = (ssh.get("direct") if isinstance(ssh, dict) else None) or {}
+        if ssh_direct and not (isinstance(ssh_direct, dict) and "host" in ssh_direct and "port" in ssh_direct):
+            raise ValueError("member %s: ssh.direct lacks host/port" % pid)
+        hostport = ("%s:%s" % (ssh_direct["host"], ssh_direct["port"])) if ssh_direct else ""
+        status = p.get("status") or ""
+        rows.append("\t".join([str(pid), rank, str(ip), hostport, str(status)]))
+except Exception as e:
+    print("could not read the member listing: %s" % e, file=sys.stderr); sys.exit(2)
+for r in rows:
+    print(r)
 '
       prc=$?
       case "$prc" in
         0) return 0 ;;
         1) echo "::error::cluster pods ${id}: 200 but the body is missing the required 'pods' key: ${body}" >&2; return 1 ;;
-        *) echo "::error::cluster pods ${id}: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+        *) echo "::error::cluster pods ${id}: 200 but the body could not be read (a row of the wrong shape, or unparseable): $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
       esac ;;
     *)
       echo "::error::cluster pods ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
@@ -1691,14 +1711,24 @@ if cl is None:
     sys.exit(1)
 if not isinstance(cl, list):
     sys.exit(2)
-for c in cl:
-    print("\t".join([c.get("id") or "", c.get("name") or "", c.get("createdAt") or ""]))
+# Total over any JSON shape (round-5 audit, F-C): a row that cannot be read is
+# exit 2 with the reason, never an uncaught-exception exit 1.
+try:
+    rows = []
+    for c in cl:
+        if not isinstance(c, dict):
+            raise ValueError("cluster row is not an object: %r" % (c,))
+        rows.append("\t".join([str(c.get("id") or ""), str(c.get("name") or ""), str(c.get("createdAt") or "")]))
+except Exception as e:
+    print("could not read the cluster list: %s" % e, file=sys.stderr); sys.exit(2)
+for r in rows:
+    print(r)
 '
       prc=$?
       case "$prc" in
         0) return 0 ;;
         1) echo "::error::cluster list: 200 but the body is missing the required 'clusters' key: ${body}" >&2; return 1 ;;
-        *) echo "::error::cluster list: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+        *) echo "::error::cluster list: 200 but the body could not be read (a row of the wrong shape, or unparseable): $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
       esac ;;
     *)
       echo "::error::cluster list refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
@@ -1843,32 +1873,45 @@ try:
     d = json.load(sys.stdin)
 except Exception as e:
     print('could not parse RunPod response: %s' % e); sys.exit(3)
-clusters = d.get('clusters')
-if clusters is None:
+clusters = d.get('clusters') if isinstance(d, dict) else None
+if clusters is None or not isinstance(clusters, list):
     print('response contained no cluster list'); sys.exit(3)
-now = datetime.datetime.now(datetime.timezone.utc)
-for c in clusters:
-    name = c.get('name') or ''
-    if not name.startswith(prefix):
-        continue
-    cid = c.get('id') or ''
-    age = None
-    ca = c.get('createdAt')
-    if ca:
-        try:
-            age = int((now - datetime.datetime.fromisoformat(ca.replace('Z', '+00:00'))).total_seconds())
-        except Exception:
-            age = None
-    if age is None:
-        print('UNAGEABLE', cid, name); continue
-    if override:
-        limit = int(override) * 3600
-    else:
-        limit = _rp_parse_ttl_seconds(prefix, name)
-        if limit is None:
-            print(cid, age, 'unparseable-deadline'); continue
-    if age > limit:
-        print(cid, age, 'past-deadline-%ds' % limit)
+# Every read below is TOTAL (round-5 audit, F-C): a row of the wrong shape is
+# 'could not read the list' (exit 3, the sweep suspends), never Python's own
+# uncaught-exception exit 1 dressed up as a judgement.
+try:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for c in clusters:
+        if not isinstance(c, dict):
+            raise ValueError('cluster row is not an object: %r' % (c,))
+        name = c.get('name') or ''
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        cid = c.get('id') or ''
+        if not isinstance(cid, str) or not cid:
+            raise ValueError('cluster row %r carries no readable id' % (name,))
+        age = None
+        ca = c.get('createdAt')
+        if ca:
+            try:
+                age = int((now - datetime.datetime.fromisoformat(str(ca).replace('Z', '+00:00'))).total_seconds())
+            except Exception:
+                age = None
+        if age is None:
+            print('UNAGEABLE', cid, name); continue
+        if override:
+            limit = int(override) * 3600
+        else:
+            limit = _rp_parse_ttl_seconds(prefix, name)
+            if limit is None:
+                # A prefixed name with no parseable -ttl<H> is the SAME
+                # epistemic state as no createdAt: this sweep cannot judge it
+                # (round-5 audit, F-B) — named, never deleted on a guess.
+                print('UNPARSEABLE', cid, name); continue
+        if age > limit:
+            print(cid, age, 'past-deadline-%ds' % limit)
+except Exception as e:
+    print('could not read the cluster list: %s' % e); sys.exit(3)
 "
   out="$(printf '%s' "$body" | python3 -c "$script")"
   rc=$?
@@ -1877,16 +1920,21 @@ for c in clusters:
     return 1
   fi
   [ -n "$out" ] || { echo "sweep: queried OK — no orphaned ${RP_CLUSTER_PREFIX} clusters"; return 0; }
+  local unjudged=()
   while read -r id age why; do
     [ -n "$id" ] || continue
-    if [ "$id" = "UNAGEABLE" ]; then
-      # F3(b): an unexaminable resource (no usable createdAt to judge age
-      # by) is never "nothing to reap" — this cluster is BILLING with no
-      # deadline this sweep could establish, the same "could not check must
-      # never read as clean" doctrine every other enumeration failure in
-      # this file carries.
-      echo "::error::cluster ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
-      return 1
+    if [ "$id" = "UNAGEABLE" ] || [ "$id" = "UNPARSEABLE" ]; then
+      # F3(b) + round-5 audit F-A/F-B: a resource this sweep cannot JUDGE
+      # (no usable createdAt, or a prefixed name with no parseable -ttl<H>)
+      # is never "nothing to reap" — it is BILLING with no deadline this
+      # sweep could establish — and it is never DELETED on a guess either.
+      # It is named, the rest of the list is still judged and swept THIS
+      # run (one unjudgeable resource must not shield a real orphan behind
+      # it forever), and the sweep exits 1 at the end so the reap cron
+      # reddens until an operator retires it BY ID: the override cannot
+      # help (there is no age to apply it to), only `rp_cluster_delete <id>`.
+      unjudged+=("cluster ${age} (${why}): $([ "$id" = "UNAGEABLE" ] && echo 'no usable createdAt' || echo 'no parseable -ttl<H> in its name') — retire it by id with rp_cluster_delete ${age} if it is an orphan")
+      continue
     fi
     if rp_cluster_delete "$id"; then
       echo "::warning::swept cluster ${id} (${why}, age ${age}s)"
@@ -1945,7 +1993,12 @@ sys.exit(0 if any(isinstance(c, dict) and c.get('id') == '${id}' for c in cl) el
       fi
     done
   fi
-  echo "sweep: terminated ${n} orphaned cluster(s)"
+  echo "sweep: terminated ${n} orphaned cluster(s) (${#unjudged[@]} could not be judged)"
+  if [ "${#unjudged[@]}" -gt 0 ]; then
+    local u
+    for u in "${unjudged[@]}"; do echo "::error::${u}"; done
+    return 1
+  fi
 }
 
 # Deploy a live GPU pod, failing over across a candidate list of "CLOUD|GPU_TYPE"
@@ -2704,11 +2757,20 @@ if d.get('errors'):
 me = (d.get('data') or {}).get('myself')
 if me is None or me.get('pods') is None:
     print('response contained no pod list'); sys.exit(3)
-now = datetime.datetime.now(datetime.timezone.utc)
-for p in me['pods']:
+if not isinstance(me['pods'], list):
+    print('response contained no pod list'); sys.exit(3)
+# Every read below is TOTAL (round-5 audit, F-C): a row of the wrong shape is
+# 'could not read the list' (exit 3), never an uncaught exception's exit 1.
+try:
+  now = datetime.datetime.now(datetime.timezone.utc)
+  for p in me['pods']:
+    if not isinstance(p, dict):
+        raise ValueError('pod row is not an object: %r' % (p,))
     name = p.get('name') or ''
-    if not name.startswith(prefix):
+    if not isinstance(name, str) or not name.startswith(prefix):
         continue
+    if not isinstance(p.get('id'), str) or not p.get('id'):
+        raise ValueError('pod row %r carries no readable id' % (name,))
     # Age comes from createdAt, never from runtime.uptimeInSeconds. Measured on
     # live pods: uptime is null for the first minutes of a perfectly healthy pod,
     # so treating null as 'unreachable' terminates in-flight CI runs. createdAt is
@@ -2718,23 +2780,27 @@ for p in me['pods']:
     ca = p.get('createdAt')
     if ca:
         try:
-            age = int((now - datetime.datetime.fromisoformat(ca.replace('Z', '+00:00'))).total_seconds())
+            age = int((now - datetime.datetime.fromisoformat(str(ca).replace('Z', '+00:00'))).total_seconds())
         except Exception:
             age = None
     if p.get('desiredStatus') != 'RUNNING':
         print(p['id'], age if age is not None else -1, 'not-running'); continue
     if age is None:
         # Cannot establish age. Killing on this basis is how healthy pods die, so
-        # surface it instead and let an operator force-reap.
+        # surface it instead and let an operator retire it by id.
         print('UNAGEABLE', p['id'], name); continue
     if override:
         limit = int(override) * 3600
     else:
         limit = _rp_parse_ttl_seconds(prefix, name)
         if limit is None:
-            print(p['id'], age, 'unparseable-deadline'); continue
+            # A prefixed name with no parseable -ttl<H> cannot be judged
+            # either (round-5 audit, F-B) — named, never terminated on a guess.
+            print('UNPARSEABLE', p['id'], name); continue
     if age > limit:
         print(p['id'], age, 'past-deadline-%ds' % limit)
+except Exception as e:
+    print('could not read the pod list: %s' % e); sys.exit(3)
 ")"
   rc=$?
   # A failed query must never read as "nothing to clean up" — this is the
@@ -2744,22 +2810,21 @@ for p in me['pods']:
     return 1
   fi
   [ -n "$out" ] || { echo "sweep: queried OK — no orphaned ${RP_POD_PREFIX} pods"; return 0; }
+  local unjudged=()
   while read -r id age why; do
     [ -n "$id" ] || continue
-    if [ "$id" = "UNAGEABLE" ]; then
-      # CHANGE (round-4 audit, P-M1a): an unageable pod used to `continue`
-      # the loop and let the sweep finish green (rc=0, no return here) — the
-      # cluster arm's own UNAGEABLE handling (above) has always been rc=1,
-      # naming the resource and bailing immediately, never trusting the rest
-      # of this run's enumeration once one entry could not be judged. This
-      # makes the pod arm match: an unexaminable resource is BILLING with no
-      # deadline this sweep could establish, exactly the cluster doctrine —
-      # never "nothing to reap". The rest of this run's `out` list (any
-      # other genuinely reapable orphan) is left unswept THIS run, the same
-      # trade-off the cluster arm already makes; the next scheduled sweep
-      # picks it back up.
-      echo "::error::pod ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
-      return 1
+    if [ "$id" = "UNAGEABLE" ] || [ "$id" = "UNPARSEABLE" ]; then
+      # Round-4 P-M1a + round-5 audit F-A/F-B, the cluster doctrine exactly:
+      # a pod this sweep cannot JUDGE (no usable createdAt, or a prefixed
+      # name with no parseable -ttl<H>) is BILLING with no deadline this
+      # sweep could establish — never "nothing to reap", never terminated on
+      # a guess. It is named; the rest of the list is still judged and swept
+      # THIS run (one unjudgeable pod must not shield a real orphan behind
+      # it forever); the sweep exits 1 at the end so the reap cron reddens
+      # until an operator retires it BY ID (`rp_terminate <id>`) — the
+      # override cannot help, there is no age to apply it to.
+      unjudged+=("pod ${age} (${why}): $([ "$id" = "UNAGEABLE" ] && echo 'no usable createdAt' || echo 'no parseable -ttl<H> in its name') — retire it by id with rp_terminate ${age} if it is an orphan")
+      continue
     fi
     if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qxF -- "$id"; then
       echo "cluster member, skipped: ${id}"
@@ -2775,7 +2840,11 @@ for p in me['pods']:
       refused_reasons+=("${id}: ${reason_out:-unknown reason}")
     fi
   done <<< "$out"
-  echo "sweep: terminated ${n} orphaned pod(s) (${refused} terminate(s) refused)"
+  echo "sweep: terminated ${n} orphaned pod(s) (${refused} terminate(s) refused, ${#unjudged[@]} could not be judged)"
+  if [ "${#unjudged[@]}" -gt 0 ]; then
+    local u
+    for u in "${unjudged[@]}"; do echo "::error::${u}"; done
+  fi
   # F3(a): an unexpected terminate refusal (auth/rate-limit/API error -- the
   # cluster-member case is already excluded upstream, above) is never folded
   # into a silent 0 here. A refused terminate leaves a pod BILLING with no
@@ -2786,6 +2855,7 @@ for p in me['pods']:
     echo "::error::sweep: ${refused} terminate(s) refused: ${refused_reasons[*]}"
     return 1
   fi
+  [ "${#unjudged[@]}" -eq 0 ] || return 1
 }
 
 # A ref travels to the pod inside a remote command line, so it is constrained to

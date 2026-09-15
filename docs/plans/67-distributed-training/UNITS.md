@@ -349,9 +349,10 @@ makes that re-add a reviewed, human-visible act instead of a silent default.
   `runpod_lib.sh`, with `rp_cluster_create` as a SECOND renting root — it has no CALLER on this
   tree, so it contributes no derived DRIVER for P7 to hold to a table row or to
   `_check_derived_driver_cannot_rent`; the root is registered so the FIRST real caller is judged
-  the moment U7b-A2b's driver ships. Two tracked files word-match its literal name today and are
-  each cleared through that same predicate, neither exempted for being ours: the library's own
-  mocks-only test suite, which genuinely calls it, and `check_gpu_prove_once.py` itself, which
+  the moment U7b-A2b's driver ships. Three tracked files word-match its literal name today and are
+  each cleared through that same predicate, none exempted for being ours: the library's own
+  mocks-only test suite, which genuinely calls it, `test_check_gpu_prove_once.py` (whose fixtures
+  spell the literal), and `check_gpu_prove_once.py` itself, which
   self-matches its own `RENTING_ROOTS` definition — see that file's own disclosure); this unit
   extends `ci/scripts/
   check_gpu_prove_once.py` with a NEW arm, **P8** (schedule visibility): a `schedule:` trigger on

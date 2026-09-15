@@ -798,6 +798,260 @@ JSON
   fi
 )
 
+# ═════════════════════════════════════════════════════════════════════════
+# Group 12 — round-5 audit F-A: ONE unjudgeable resource must not shield a
+# real orphan behind it, and must not abort the run. An unageable pod is
+# NAMED (with the by-id remedy) and skipped; the 50h orphan after it IS
+# swept THIS run; the sweep still exits 1 so the cron reddens until the
+# unageable pod is retired by id. Pre-fix, the loop `return 1`ed on the
+# first unageable entry: zero terminates, forever, on every run.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  old="$(iso_from_epoch $(( $(date +%s) - 180000 )))"
+  cat > "$SANDBOX/g12-account.json" <<JSON
+{"data":{"myself":{"pods":[
+  {"id":"pod-unageable","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","runtime":{"uptimeInSeconds":180000}},
+  {"id":"pod-real-orphan","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","createdAt":"${old}","runtime":{"uptimeInSeconds":180000}}
+]}}}
+JSON
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g12-account.json"
+  export MOCK_TERM_COUNTER="$SANDBOX/g12-term-counter"
+  rm -f "$MOCK_TERM_COUNTER"; reset_log
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-unageable" && printf '%s' "$out" | grep -q "rp_terminate pod-unageable"; then
+    ok "G12: the unageable pod is named with its by-id remedy (rp_terminate <id>) and the sweep exits 1"
+  else
+    bad "G12: expected rc=1 naming pod-unageable with the rp_terminate remedy (got rc=$rc): $out"
+  fi
+  if grep -qF "pod-real-orphan" "$CALL_LOG" && [ "$(cat "$MOCK_TERM_COUNTER" 2>/dev/null || echo 0)" -eq 1 ]; then
+    ok "G12: the real orphan behind the unageable pod WAS swept this run (exactly one terminate, of pod-real-orphan)"
+  else
+    bad "G12: the orphan behind an unageable pod must still be swept (terminates=$(cat "$MOCK_TERM_COUNTER" 2>/dev/null || echo 0)): $out"
+  fi
+  if grep -qF "pod-unageable" "$CALL_LOG"; then
+    bad "G12: the unageable pod must never be terminated on a guess (regression!)"
+  else
+    ok "G12: the unageable pod itself was left alone"
+  fi
+  # The override cannot help an unageable pod (there is no age to apply it
+  # to): same outcome under `rp_sweep 8`, and the remedy stays by-id.
+  rm -f "$MOCK_TERM_COUNTER"; reset_log
+  out="$(rp_sweep 8 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && ! grep -qF "pod-unageable" "$CALL_LOG" && grep -qF "pod-real-orphan" "$CALL_LOG"; then
+    ok "G12: under an override the unageable pod is still named-not-guessed and the orphan is still swept"
+  else
+    bad "G12: override arm — expected rc=1, orphan swept, unageable untouched (got rc=$rc): $out"
+  fi
+)
+(
+  # The cluster arm, same doctrine: an unageable cluster is named with the
+  # by-id remedy and the ageable orphan after it is deleted this run.
+  old="$(iso_from_epoch $(( $(date +%s) - 180000 )))"
+  cat > "$SANDBOX/g12-clusters.json" <<JSON
+{"clusters":[
+  {"id":"cl-unageable","name":"jammi-cluster-ttl8"},
+  {"id":"cl-real-orphan","name":"jammi-cluster-ttl8","createdAt":"${old}"}
+]}
+JSON
+  cat > "$SANDBOX/g12-clusters-after.json" <<'JSON'
+{"clusters":[{"id":"cl-unageable","name":"jammi-cluster-ttl8"}]}
+JSON
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g12-clusters.json"
+  export MOCK_CLUSTER_LIST_RESPONSE_2="$SANDBOX/g12-clusters-after.json"
+  export MOCK_LIST_CALL_COUNTER="$SANDBOX/g12-list-counter"; rm -f "$MOCK_LIST_CALL_COUNTER"
+  export MOCK_DELETE_CALL_LOG="$SANDBOX/g12-deletes"; : > "$MOCK_DELETE_CALL_LOG"
+  out="$(rp_cluster_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "rp_cluster_delete cl-unageable" && grep -q "cl-real-orphan" "$MOCK_DELETE_CALL_LOG" && ! grep -q "cl-unageable" "$MOCK_DELETE_CALL_LOG"; then
+    ok "G12: cluster arm — the unageable cluster is named with rp_cluster_delete <id>, the orphan behind it is deleted, rc=1"
+  else
+    bad "G12: cluster arm — expected rc=1, cl-real-orphan deleted, cl-unageable named-not-deleted (got rc=$rc): $out / deletes: $(cat "$MOCK_DELETE_CALL_LOG")"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 13 — round-5 audit F-B: a prefixed cluster (or pod) whose name has
+# NO parseable -ttl<H> is the same "cannot judge" state as no createdAt.
+# Pre-fix it was printed as an `unparseable-deadline` row and DELETED at
+# any age (executed by the audit: a 60-second-old jammi-cluster-experiment,
+# gone with a green summary). Now: named, never deleted, rc=1.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  young="$(iso_from_epoch $(( $(date +%s) - 60 )))"
+  cat > "$SANDBOX/g13-clusters.json" <<JSON
+{"clusters":[{"id":"cl-manual","name":"jammi-cluster-experiment","createdAt":"${young}"}]}
+JSON
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g13-clusters.json"
+  export MOCK_DELETE_CALL_LOG="$SANDBOX/g13-deletes"; : > "$MOCK_DELETE_CALL_LOG"
+  out="$(rp_cluster_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "cl-manual" && printf '%s' "$out" | grep -q "no parseable -ttl" && ! grep -q "cl-manual" "$MOCK_DELETE_CALL_LOG"; then
+    ok "G13: a prefixed cluster with no parseable -ttl<H> is named (by-id remedy) and NOT deleted; rc=1"
+  else
+    bad "G13: expected rc=1, named, zero deletes for cl-manual (got rc=$rc): $out / deletes: $(cat "$MOCK_DELETE_CALL_LOG")"
+  fi
+)
+(
+  young="$(iso_from_epoch $(( $(date +%s) - 60 )))"
+  cat > "$SANDBOX/g13-account.json" <<JSON
+{"data":{"myself":{"pods":[{"id":"pod-manual","name":"jammi-gpu-experiment","desiredStatus":"RUNNING","createdAt":"${young}","runtime":{"uptimeInSeconds":60}}]}}}
+JSON
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g13-account.json"
+  export MOCK_TERM_COUNTER="$SANDBOX/g13-term-counter"; rm -f "$MOCK_TERM_COUNTER"; reset_log
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-manual" && ! log_has "podTerminate"; then
+    ok "G13: pod mirror — a prefixed pod with no parseable -ttl<H> is named and NOT terminated; rc=1"
+  else
+    bad "G13: pod mirror — expected rc=1, named, zero terminates (got rc=$rc): $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 14 — round-5 audit F-C: every parse on the reap path is TOTAL. A
+# row of the wrong shape is "could not be read" / "could NOT enumerate",
+# with the reason — never an uncaught-exception exit 1 that the caller
+# reports as "missing the required key" (a confidently wrong diagnosis).
+# ═════════════════════════════════════════════════════════════════════════
+(
+  echo '{"clusters":["oops"]}' > "$SANDBOX/g14-list.json"
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g14-list.json"
+  out="$(rp_cluster_list 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could not be read" && ! printf '%s' "$out" | grep -q "missing the required"; then
+    ok "G14: rp_cluster_list — a non-object row is 'could not be read', never 'missing the required key'"
+  else
+    bad "G14: rp_cluster_list on a non-object row (got rc=$rc): $out"
+  fi
+)
+(
+  echo '{"pods":[{"id":"p1","ssh":{"direct":{"port":22}}}]}' > "$SANDBOX/g14-pods.json"
+  export MOCK_CLUSTER_PODS_RESPONSE="$SANDBOX/g14-pods.json"
+  out="$(rp_cluster_pods cl-x 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could not be read" && ! printf '%s' "$out" | grep -q "missing the required"; then
+    ok "G14: rp_cluster_pods — an ssh.direct block without host is 'could not be read', never 'missing the required pods key'"
+  else
+    bad "G14: rp_cluster_pods on a malformed member row (got rc=$rc): $out"
+  fi
+)
+(
+  export MOCK_CLUSTER_PODS_STATUS="503"
+  out="$(rp_cluster_pods cl-x 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused (status 503)"; then
+    ok "G14: rp_cluster_pods — a non-200 is a named refusal (MOCK_CLUSTER_PODS_STATUS drives the arm)"
+  else
+    bad "G14: rp_cluster_pods non-200 arm (got rc=$rc): $out"
+  fi
+)
+(
+  for body in '[{"id":"x"}]' 'null' '42' '"s"'; do
+    printf '%s' "$body" > "$SANDBOX/g14-sweep.json"
+    export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g14-sweep.json"
+    export MOCK_DELETE_CALL_LOG="$SANDBOX/g14-deletes"; : > "$MOCK_DELETE_CALL_LOG"
+    out="$(rp_cluster_sweep 2>&1)"; rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT enumerate clusters" && printf '%s' "$out" | grep -q "response contained no cluster list\|could not read" && ! [ -s "$MOCK_DELETE_CALL_LOG" ]; then
+      ok "G14: rp_cluster_sweep on body ${body} — named 'could NOT enumerate' with a reason, zero deletes"
+    else
+      bad "G14: rp_cluster_sweep on body ${body} (got rc=$rc): $out"
+    fi
+  done
+)
+(
+  printf '%s' '[1,2,3]' > "$SANDBOX/g14-account.json"
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g14-account.json"
+  export MOCK_TERM_COUNTER="$SANDBOX/g14-term-counter"; rm -f "$MOCK_TERM_COUNTER"; reset_log
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT enumerate pods" && ! log_has "podTerminate"; then
+    ok "G14: rp_sweep on an array body — named 'could NOT enumerate pods', zero terminates"
+  else
+    bad "G14: rp_sweep on an array body (got rc=$rc): $out"
+  fi
+)
+(
+  # A pod row of the wrong shape INSIDE an otherwise valid list.
+  printf '%s' '{"data":{"myself":{"pods":[null]}}}' > "$SANDBOX/g14-account2.json"
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g14-account2.json"
+  export MOCK_TERM_COUNTER="$SANDBOX/g14-term-counter2"; rm -f "$MOCK_TERM_COUNTER"; reset_log
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could not read the pod list" && ! log_has "podTerminate"; then
+    ok "G14: rp_sweep on a null pod row — 'could not read the pod list: ...', zero terminates"
+  else
+    bad "G14: rp_sweep on a null pod row (got rc=$rc): $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 15 — round-5 audit F-D: a cluster member row with NO readable id is
+# refused, so the exclusion set is COMPLETE or ABSENT, never short — the
+# pod sweep is suspended (zero terminates), exactly like a failed member
+# enumeration (G6). Pre-fix the idless member was silently dropped from
+# the set and its own pod then terminated as an orphan.
+# ═════════════════════════════════════════════════════════════════════════
+(
+  old="$(iso_from_epoch $(( $(date +%s) - 180001 )))"
+  cat > "$SANDBOX/g15-clusters.json" <<'JSON'
+{"clusters":[{"id":"cl-1","name":"jammi-cluster-ttl8","createdAt":"2030-01-01T00:00:00Z"}]}
+JSON
+  cat > "$SANDBOX/g15-pods.json" <<'JSON'
+{"pods":[{"cluster":{"rank":0,"ip":"10.0.0.1"}},{"id":"pod-member2","cluster":{"rank":1,"ip":"10.0.0.2"}}]}
+JSON
+  cat > "$SANDBOX/g15-account.json" <<JSON
+{"data":{"myself":{"pods":[
+  {"id":"pod-idless-member","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","createdAt":"${old}","runtime":{"uptimeInSeconds":180001}},
+  {"id":"pod-member2","name":"jammi-gpu-ttl8","desiredStatus":"RUNNING","createdAt":"${old}","runtime":{"uptimeInSeconds":180001}}
+]}}}
+JSON
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g15-clusters.json"
+  export MOCK_CLUSTER_PODS_RESPONSE="$SANDBOX/g15-pods.json"
+  export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g15-account.json"
+  export MOCK_TERM_COUNTER="$SANDBOX/g15-term-counter"; rm -f "$MOCK_TERM_COUNTER"; reset_log
+  out="$(rp_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "sweep could NOT enumerate cluster members; pod sweep skipped" && ! log_has "podTerminate"; then
+    ok "G15: a member row with no readable id suspends the pod sweep (exclusion set incomplete → nothing terminated)"
+  else
+    bad "G15: expected rc=1, pod sweep skipped, zero terminates (got rc=$rc): $out"
+  fi
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 16 — round-5 audit F-E: the request body rp_cluster_create SENDS
+# is asserted against the reviewed key-set fixture (MOCK_REQUEST_BODY_LOG,
+# previously never exported by any test).
+# ═════════════════════════════════════════════════════════════════════════
+(
+  echo '{"id":"cl_new"}' > "$SANDBOX/g16-create-ok.json"
+  export MOCK_CLUSTER_CREATE_STATUS="201"
+  export MOCK_CLUSTER_CREATE_RESPONSE="$SANDBOX/g16-create-ok.json"
+  export MOCK_REQUEST_BODY_LOG="$SANDBOX/g16-request-body"; : > "$MOCK_REQUEST_BODY_LOG"
+  out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
+  sent_keys="$(python3 -c '
+import json, sys
+body = open(sys.argv[1]).read().strip().splitlines()[-1]
+d = json.loads(body)
+print(" ".join(sorted(d.keys())))
+print(" ".join(sorted(d["compute"].keys())))
+print(d["compute"]["podCount"], d["compute"]["gpuCountPerPod"])
+' "$MOCK_REQUEST_BODY_LOG" 2>&1)"
+  fixture_keys="$(python3 -c '
+import json, sys
+f = json.load(open(sys.argv[1]))
+print(" ".join(sorted(k for k in f["top_level_keys"])))
+print(" ".join(sorted(f["compute_keys"])))
+' "$REPO_ROOT/ci/scripts/fixtures/runpod_cluster_create_request_keys.json" 2>/dev/null || echo "fixture-unreadable")"
+  if [ "$rc" -eq 0 ] && [ -s "$MOCK_REQUEST_BODY_LOG" ] && printf '%s' "$sent_keys" | tail -n1 | grep -qx "2 1"; then
+    ok "G16: the SENT create body was captured and carries the fixed 2×1 shape (podCount 2, gpuCountPerPod 1)"
+  else
+    bad "G16: expected a captured request body with podCount 2 / gpuCountPerPod 1 (got rc=$rc): sent=[$sent_keys] out=$out"
+  fi
+  sent_top="$(printf '%s' "$sent_keys" | sed -n 1p)"; sent_compute="$(printf '%s' "$sent_keys" | sed -n 2p)"
+  fix_top="$(printf '%s' "$fixture_keys" | sed -n 1p)"; fix_compute="$(printf '%s' "$fixture_keys" | sed -n 2p)"
+  if [ "$fixture_keys" != "fixture-unreadable" ] && [ -n "$sent_top" ]; then
+    python3 - "$sent_top" "$fix_top" "$sent_compute" "$fix_compute" <<'PY' && ok "G16: every key the SENT body carries is in the reviewed CreateClusterRequest key-set fixture (top level and compute)" || bad "G16: the SENT body carries a key outside the reviewed fixture: sent_top=[$sent_top] fixture_top=[$fix_top] sent_compute=[$sent_compute] fixture_compute=[$fix_compute]"
+import sys
+sent_top, fix_top, sent_c, fix_c = (set(a.split()) for a in sys.argv[1:5])
+sys.exit(0 if sent_top <= fix_top and sent_c <= fix_c else 1)
+PY
+  else
+    bad "G16: could not compare the sent body against the fixture: sent=[$sent_keys] fixture=[$fixture_keys]"
+  fi
+)
+
 echo
 TOTAL_PASS="$(grep -c '^PASS:' "$RESULTS" || true)"
 TOTAL_FAIL="$(grep -c '^FAIL:' "$RESULTS" || true)"

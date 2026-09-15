@@ -773,8 +773,11 @@ no GraphQL surface for it at all; every `rp_cluster_*` primitive in
 `rp_cluster_create`, `rp_cluster_get`, `rp_cluster_pods` (members with
 `rank`/overlay `ip`/`ssh.direct`), `rp_cluster_delete`, `rp_cluster_list`,
 and `rp_cluster_sweep` (a cluster whose name carries `-ttl<H>` and whose age
-exceeds `H` hours is deleted; a failed enumeration is `return 1` "could NOT
-enumerate clusters", never "nothing to reap"). `gpu-dev.sh reap` runs both
+exceeds `H` hours is deleted; one this sweep cannot JUDGE — no usable
+`createdAt`, or a prefixed name with no parseable `-ttl<H>` — is named with
+its by-id remedy (`rp_cluster_delete <id>`) and left alone while the rest
+of the list is still swept, and the sweep exits 1; a failed enumeration is
+`return 1` "could NOT enumerate clusters", never "nothing to reap"). `gpu-dev.sh reap` runs both
 the pod sweep and `rp_cluster_sweep`; the pod sweep excludes every live
 cluster member by id rather than ever calling `podTerminate` on one.
 
@@ -865,11 +868,12 @@ calls it. `rp_cluster_create` has no such caller on this tree today: it
 contributes no derived DRIVER, so P7's per-driver rules (a `PAID_POD_LANE_
 TABLE` row, or `_check_derived_driver_cannot_rent`) have nothing to hold to
 those rules yet — the root is registered precisely so the FIRST real
-caller becomes that judged driver, the moment U7b-A2b's driver ships. Two
+caller becomes that judged driver, the moment U7b-A2b's driver ships. Three
 tracked files DO word-match the `rp_cluster_create` literal today and are
 each independently derived and cleared through the same predicate as any
-other file (neither is a renting driver and neither is exempted for being
-ours): `ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives
+other file (none is a renting driver and none is exempted for being ours):
+`ci/scripts/test_check_gpu_prove_once.py` (its fixtures spell the literal),
+`ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives
 suite, which genuinely calls it) and `ci/scripts/check_gpu_prove_once.py`
 itself (this very rule's own source names `rp_cluster_create` as a
 `RENTING_ROOTS` string literal, so the gate self-matches its own

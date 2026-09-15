@@ -903,8 +903,10 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     # driver ships.
     #
     # `derive_renting_drivers`'s own word-boundary scan DOES currently match
-    # the literal string "rp_cluster_create" in exactly two tracked files,
-    # for two unrelated reasons, and each is independently cleared through
+    # the literal string "rp_cluster_create" in exactly THREE tracked files
+    # (re-derived at the round-5 audit: this file, the mocks-only suite, and
+    # `test_check_gpu_prove_once.py`, whose fixtures spell the literal), for
+    # unrelated reasons, and each is independently cleared through
     # `_check_derived_driver_cannot_rent` the same way any other file would
     # be (verified: zero findings, zero notes for both, `git log`-current
     # tree) -- neither is exempted for being ours, matching this module's

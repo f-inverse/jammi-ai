@@ -397,6 +397,65 @@ and a `cargo test --workspace` in which only `jobs_cancel::a_claimed_training_jo
 failed (a poll-cadence timing assertion seen only under full-suite load, passing in isolation twice before this
 round); the unit's suites run again on the consolidated wave-3 branch before its single PR.
 
+## The consolidated PR's hermetic lane (2026-09-15) — P4's test defect, and the product defect under it
+
+**What CI found.** PR #579's "Test (hermetic)" job failed
+`training_set_stream.rs::p4_liveness_over_every_held_chunk_at_every_accepted_prefetch`
+at both consolidated tips it ran (`0672f9ca`, `2ec9f638`): `prefetch=1:
+deadlocked past the 120s timeout`. Locally the test passed on every run but
+routinely tripped `cargo test`'s "running for over 60 seconds" notice.
+
+**The test defect.** The consumer loop dropped chunk `t` BEFORE asking for
+`t+1` (`drop(chunk)` at the end of the body, the ask at the top of the next
+iteration), so it never held a chunk across the ask — the exact condition P4
+states. Its wall clock was a 5 ms sleep on every one of the 5,384 chunks per
+prefetch value (70,000 rows / 13): 27 s of sleep per prefetch value, four
+values, plus the runner's scheduling, never the property. The rewrite holds
+structurally (the ask is issued while the previous chunk is alive; the
+previous chunk is dropped only after the ask returns) and slows the consumer
+only where a full buffer matters: the first `2 × MAX_PREFETCH` chunks and
+`MAX_PREFETCH` chunks either side of the 65,536-row group boundary.
+
+**The product defect the test defect hid.** With the per-chunk sleep gone the
+test still took 171.87 s (four passes over 70,000 rows, ~43 s a pass). Cause:
+`decode::append_selected_rows` read each column through
+`extract_string_column`, which materialises the WHOLE column as owned
+`String`s, and the pump called it once per ROW (`&[row_in_batch]`) — every
+13-row chunk copied every string of an 8,192-row batch, twice. The function's
+own doc ("applied to the whole batch once … cloned ONLY for `indices`")
+described the shape the code did not have.
+
+**The fix (this commit).** `decode.rs` gains typed cell views —
+`StringCells` (`Utf8View`/`Utf8`/`LargeUtf8`, and an owned array only for the
+`cast` fallback) and `BinaryCells` — behind `string_cells`/`binary_cells`,
+which carry the extractors' type policy and both refusals; `extract_string_
+column`/`extract_binary_column` are DEFINED as the cells turned into a `Vec`,
+so there is one policy. `DecodedBatch` decodes a batch ONCE (the text/media
+views plus the whole-column numeric reads whose null/NaN policy must scan
+every slot anyway) and `append(indices, vocab, acc)` clones exactly the
+indexed cells, in the caller's order; the pump builds it lazily per batch
+(a batch this rank selects nothing from is never decoded), collects each
+step's indices, and appends at every range end and at the batch end when a
+range continues into the next batch. The one-shot `append_selected_rows`
+wrapper is deleted, not kept as a stale entry point.
+
+**Executed.** `cargo test -p jammi-ai --test it training_set_stream`: 16
+passed in 19.91 s with P4 among them (P5/P6 parity and the exact-count
+assertions are the oracles that a flush placed wrongly — a range straddling a
+batch boundary appended only at range end, or only at batch end — would
+fail). `cargo test -p jammi-ai --lib`: 749 passed, three new unit tests
+(`decode::decoded_batch_tests`: cells read by index in the caller's order
+with a NULL slot keeping the text path's `""` contract; `extract_string_
+column == cells.to_vec()` on every family including the cast fallback; a
+binary column refused as text by the view too). `cargo clippy -p jammi-ai -p
+jammi-bench --all-targets -- -D warnings` and `RUSTDOCFLAGS="-D warnings"
+cargo doc --no-deps -p jammi-ai -p jammi-db` clean. What the unit tests
+exclude: the `Utf8View` family and the pump's flush placement — both
+exercised by the `it` suite above (DataFusion returns Parquet text as
+`Utf8View`; the 70,000-row fixture spans batch boundaries at every prefetch).
+The phase-5 oracle re-runs at this tip (a mechanism change after the
+recorded PASS makes that record stale by the gate's own rule).
+
 ## Gates run at contract time
 
 **At `4b03d5a9` (the contract's first write, c4).** `cargo fmt --all --check` (0), `cargo clippy -p jammi-db --all-targets -- -D warnings` (0), `cargo test -p jammi-db` (521 lib + 480 it + 3 doc, 0 failed, 1 pre-existing ignored), `python3 ci/scripts/perf/check_citations.py` (0, 1024 files scanned). `cargo clippy -p jammi-ai`/`cargo test -p jammi-ai` are c1–c3c's own gates (unit branch, prior commits).

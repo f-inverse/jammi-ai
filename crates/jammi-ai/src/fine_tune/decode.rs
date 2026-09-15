@@ -7,8 +7,8 @@
 //! `extract_string_column`/`extract_numeric_column`/`build_training_data_loader`
 //! before this unit) so there is exactly ONE decoder both the EAGER loader
 //! (`build_training_data_loader`, called once over the whole read-back) and
-//! the STREAM (`append_selected_rows`, called per step over the rows the
-//! current chunk needs) share — a chunk either produces from an identical
+//! the STREAM (`DecodedBatch`, decoded once per batch and appended per step
+//! over the rows the current chunk needs) share — a chunk either produces from an identical
 //! Arrow batch and row set can never disagree, because both paths call the
 //! same `extract_string_column`/`extract_binary_column`/`extract_numeric_column`
 //! primitives.
@@ -24,12 +24,14 @@
 //!   can do anything (mining scores every candidate, GradCache treats the
 //!   whole set as one in-batch-negative batch, classification's label
 //!   vocabulary is a function of every row).
-//! - `append_selected_rows`: the per-row-index entry point. Given a batch
-//!   and the row indices *within that batch* the current step's chunk wants,
-//!   it extends a `ChunkAccumulator` with ONLY those rows — a row this
-//!   function is not asked to keep is never cloned into the accumulator, so a
-//!   stream walking a batch that spans several ranks' worth of rows (world >
-//!   1) allocates nothing for the rows another rank owns.
+//! - `DecodedBatch`: the stream's per-batch entry point. A batch is decoded
+//!   ONCE into typed cell views (`StringCells`/`BinaryCells`, plus the
+//!   whole-column numeric reads whose null/NaN policy must scan every slot
+//!   anyway), and the row indices *within that batch* each step's chunk wants
+//!   are then appended to a `ChunkAccumulator` at the cost of those rows
+//!   only — a row the pump does not ask for is never cloned into the
+//!   accumulator, so a stream walking a batch that spans several ranks' worth
+//!   of rows (world > 1) allocates nothing for the rows another rank owns.
 //!
 //! # Classification streams too, GIVEN a vocabulary (#500 U2c §11 F3)
 //!
@@ -45,13 +47,13 @@
 //! `ChunkAccumulator::new_for`, which accepts `DetectedFormat::
 //! Classification` GIVEN one (and refuses it, typed, without one — a
 //! per-step accumulator can never invent a vocabulary of its own).
-//! `append_selected_rows`'s Classification arm looks every row's label up
+//! `DecodedBatch::append`'s Classification arm looks every row's label up
 //! in that SAME vocabulary, so the class index a stream assigns is
 //! byte-identical to the eager `BTreeSet`'s (both are a sorted-set
 //! enumeration over the identical label set, assigned in the identical
 //! order — see [`LabelVocabulary::from_labels`]'s doc).
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use jammi_db::error::{JammiError, Result};
 
 use crate::model::ModelTask;
@@ -88,17 +90,62 @@ use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
 /// pre-existing null-handling contract of the text path, not a value this
 /// function invented.
 pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
-    use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
+    string_cells(col).map(|cells| cells.to_vec())
+}
+
+/// A string column read as CELLS: the same type acceptance and the same two
+/// refusals as [`extract_string_column`] (which IS `string_cells(col)` turned
+/// into a `Vec`, so there is exactly one policy), held as a typed view over
+/// the batch's own buffers — reading one cell costs one cell, never the
+/// column. Only the `cast` fallback owns an array (its cast result), built
+/// once per column.
+pub(crate) enum StringCells<'a> {
+    Utf8View(&'a arrow::array::StringViewArray),
+    Utf8(&'a arrow::array::StringArray),
+    LargeUtf8(&'a arrow::array::LargeStringArray),
+    Casted(arrow::array::StringArray),
+}
+
+impl StringCells<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Utf8View(a) => a.len(),
+            Self::Utf8(a) => a.len(),
+            Self::LargeUtf8(a) => a.len(),
+            Self::Casted(a) => a.len(),
+        }
+    }
+
+    /// The cell at `i`; a null slot reads `""` — the text path's historical
+    /// null contract, stated in [`extract_string_column`]'s doc.
+    pub(crate) fn value(&self, i: usize) -> &str {
+        match self {
+            Self::Utf8View(a) => a.value(i),
+            Self::Utf8(a) => a.value(i),
+            Self::LargeUtf8(a) => a.value(i),
+            Self::Casted(a) => a.value(i),
+        }
+    }
+
+    pub(crate) fn to_vec(&self) -> Vec<String> {
+        (0..self.len()).map(|i| self.value(i).to_string()).collect()
+    }
+}
+
+/// The type policy behind [`extract_string_column`] (see that doc for the two
+/// refusals), producing a [`StringCells`] view instead of an owned `Vec`.
+pub(crate) fn string_cells(col: &dyn arrow::array::Array) -> Option<StringCells<'_>> {
+    use arrow::array::{LargeStringArray, StringArray, StringViewArray};
     use arrow::datatypes::DataType;
 
     if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
+        return Some(StringCells::Utf8View(a));
     }
     if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
+        return Some(StringCells::Utf8(a));
     }
     if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
+        return Some(StringCells::LargeUtf8(a));
     }
     if matches!(
         col.data_type(),
@@ -110,11 +157,11 @@ pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec
         return None;
     }
     let casted = arrow::compute::cast(col, &DataType::Utf8).ok()?;
-    let a = casted.as_any().downcast_ref::<StringArray>()?;
+    let a = casted.as_any().downcast_ref::<StringArray>()?.clone();
     if (0..a.len()).any(|i| a.is_null(i) && !col.is_null(i)) {
         return None;
     }
-    Some((0..a.len()).map(|i| a.value(i).to_string()).collect())
+    Some(StringCells::Casted(a))
 }
 
 /// Extract a binary column into owned byte vectors, accepting the Arrow binary
@@ -122,16 +169,51 @@ pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec
 /// (`Binary`/`LargeBinary`/`BinaryView`). Returns `None` for any other type so
 /// the caller can surface a typed schema error.
 pub(crate) fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> {
-    use arrow::array::{Array, BinaryArray, BinaryViewArray, LargeBinaryArray};
+    binary_cells(col).map(|cells| cells.to_vec())
+}
+
+/// A binary column read as CELLS — [`extract_binary_column`]'s acceptance
+/// (`Binary`/`LargeBinary`/`BinaryView`) as a typed view; see [`StringCells`].
+pub(crate) enum BinaryCells<'a> {
+    Binary(&'a arrow::array::BinaryArray),
+    LargeBinary(&'a arrow::array::LargeBinaryArray),
+    BinaryView(&'a arrow::array::BinaryViewArray),
+}
+
+impl BinaryCells<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Binary(a) => a.len(),
+            Self::LargeBinary(a) => a.len(),
+            Self::BinaryView(a) => a.len(),
+        }
+    }
+
+    pub(crate) fn value(&self, i: usize) -> &[u8] {
+        match self {
+            Self::Binary(a) => a.value(i),
+            Self::LargeBinary(a) => a.value(i),
+            Self::BinaryView(a) => a.value(i),
+        }
+    }
+
+    pub(crate) fn to_vec(&self) -> Vec<Vec<u8>> {
+        (0..self.len()).map(|i| self.value(i).to_vec()).collect()
+    }
+}
+
+/// The type policy behind [`extract_binary_column`], as a [`BinaryCells`] view.
+pub(crate) fn binary_cells(col: &dyn arrow::array::Array) -> Option<BinaryCells<'_>> {
+    use arrow::array::{BinaryArray, BinaryViewArray, LargeBinaryArray};
 
     if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
+        return Some(BinaryCells::Binary(a));
     }
     if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
+        return Some(BinaryCells::LargeBinary(a));
     }
     if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
+        return Some(BinaryCells::BinaryView(a));
     }
     None
 }
@@ -682,7 +764,7 @@ impl LabelVocabulary {
 }
 
 /// A partially-built [`TextChunk`], grown incrementally by
-/// `append_selected_rows` across however many `RecordBatch`es the current
+/// [`DecodedBatch::append`] across however many `RecordBatch`es the current
 /// step's row range spans, then converted to the immutable [`TextChunk`] a
 /// consumer receives. Mirrors [`TextChunk`]'s own shapes (minus `Ner`, which
 /// a stream never builds: no producer ever writes an NER training set
@@ -807,261 +889,329 @@ impl ChunkAccumulator {
     }
 }
 
-/// Append the rows at `indices` (row positions **within `batch`**, any order
-/// the caller likes but always ascending in practice) into `acc` — the SAME
-/// column extractors [`build_training_data_loader`] uses, applied to the
-/// whole batch once (an Arrow array is columnar; there is no cheaper way to
-/// read one cell than to have the typed array reference in hand) and then
-/// cloned ONLY for `indices` — a row this function is not asked to keep by
-/// its index is never cloned into `acc`, so a stream skipping another rank's
-/// rows (world > 1) allocates nothing for them.
+/// One `RecordBatch` decoded ONCE into per-column cell views (plus the
+/// whole-column numeric reads whose null/NaN policy must scan every slot
+/// anyway), from which any number of row-index selections are appended to a
+/// [`ChunkAccumulator`] at the cost of the selected rows only.
 ///
-/// `acc` must have been built by `ChunkAccumulator::new_for` with the SAME
-/// `detected` this call receives — this is an internal invariant of
-/// [`super::stream::TrainingSetStream`]'s pump, not a caller-facing contract,
-/// so a mismatch is an internal-error panic rather than a typed `Result`.
+/// This is the stream's per-batch unit of decoding —
+/// [`super::stream::TrainingSetStream`]'s pump builds one per batch (lazily:
+/// a batch it selects nothing from is never decoded) and appends every
+/// step's range from it. It exists because the column-level extractors above
+/// read a WHOLE column: decoding "the rows this step needs" through them
+/// costs the batch per call, so a 13-row chunk over an 8,192-row batch
+/// copied every string in the batch, twice, per chunk — a 70,000-row stream
+/// took ~43 s per pass on a developer machine and timed CI's hermetic lane
+/// out. One decode per batch plus by-index cell reads is the shape the
+/// extractors' own doc ("applied to the whole batch once") describes.
 ///
-/// `vocab` is read only for the `Classification` arm (looking up each
-/// selected row's class index — see [`LabelVocabulary::index_of`]); every
-/// other arm ignores it.
-pub(crate) fn append_selected_rows(
-    detected: DetectedFormat,
-    task: ModelTask,
-    batch: &RecordBatch,
-    indices: &[usize],
-    vocab: Option<&LabelVocabulary>,
-    acc: &mut ChunkAccumulator,
-) -> Result<()> {
-    if indices.is_empty() {
-        return Ok(());
+/// The type acceptance and every error message are the extractors' own (the
+/// text/media views are [`string_cells`]/[`binary_cells`], the numeric read
+/// is [`extract_numeric_column`]), so a chunk this produces from an Arrow
+/// batch and row set is byte-identical to the eager loader's over the same
+/// rows: both read the same cells through the same policy.
+pub(crate) enum DecodedBatch<'a> {
+    Contrastive {
+        texts_a: StringCells<'a>,
+        texts_b: StringCells<'a>,
+        scores: Vec<f32>,
+    },
+    Pairs {
+        anchors: StringCells<'a>,
+        positives: StringCells<'a>,
+    },
+    Triplet {
+        anchors: StringCells<'a>,
+        positives: StringCells<'a>,
+        negatives: StringCells<'a>,
+    },
+    MediaTriplet {
+        anchors: BinaryCells<'a>,
+        positives: BinaryCells<'a>,
+        negatives: BinaryCells<'a>,
+    },
+    Regression {
+        texts: StringCells<'a>,
+        targets: Vec<f32>,
+    },
+    Classification {
+        texts: StringCells<'a>,
+        labels: StringCells<'a>,
+    },
+}
+
+impl<'a> DecodedBatch<'a> {
+    /// Decode `batch` under `detected`'s column contract. Every refusal is a
+    /// typed [`JammiError::FineTune`] naming the column (and, for the text
+    /// shapes, the task and the batch schema).
+    pub(crate) fn decode(
+        detected: DetectedFormat,
+        task: ModelTask,
+        batch: &'a RecordBatch,
+    ) -> Result<Self> {
+        let schema_info = || {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let text_column = |name: &str| -> Result<StringCells<'a>> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| string_cells(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid '{name}' column: task {task} expects text columns. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })
+        };
+        let media_column = |name: &str| -> Result<BinaryCells<'a>> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| binary_cells(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid binary '{name}' column for media triplets (task \
+                         {task}). Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })
+        };
+        Ok(match detected {
+            DetectedFormat::Contrastive => {
+                let a_col = batch
+                    .column_by_name("text_a")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
+                let b_col = batch
+                    .column_by_name("text_b")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
+                let s_col = batch
+                    .column_by_name("score")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
+                let texts_a = string_cells(a_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_a' is not a string column".into())
+                })?;
+                let texts_b = string_cells(b_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_b' is not a string column".into())
+                })?;
+                let scores = s_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .map(|arr| {
+                        (0..arr.len())
+                            .map(|i| arr.value(i) as f32)
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        s_col
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float32Array>()
+                            .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
+                    })
+                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
+                DecodedBatch::Contrastive {
+                    texts_a,
+                    texts_b,
+                    scores,
+                }
+            }
+            DetectedFormat::Pairs => DecodedBatch::Pairs {
+                anchors: text_column("anchor")?,
+                positives: text_column("positive")?,
+            },
+            DetectedFormat::Triplet => DecodedBatch::Triplet {
+                anchors: text_column("anchor")?,
+                positives: text_column("positive")?,
+                negatives: text_column("negative")?,
+            },
+            DetectedFormat::MediaTriplet => DecodedBatch::MediaTriplet {
+                anchors: media_column("anchor")?,
+                positives: media_column("positive")?,
+                negatives: media_column("negative")?,
+            },
+            DetectedFormat::Regression => {
+                let texts = batch
+                    .column_by_name("text")
+                    .and_then(|c| string_cells(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let target_col = batch
+                    .column_by_name("target")
+                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+                let targets = extract_numeric_column(target_col.as_ref()).map_err(|e| {
+                    JammiError::FineTune(match e {
+                        NumericColumnError::NotNumeric => format!(
+                            "regression 'target' is not a numeric column (its Arrow type is {})",
+                            target_col.data_type()
+                        ),
+                        NumericColumnError::Null(i) => format!(
+                            "regression 'target' has a null at row {i}; a null target cannot be \
+                             coerced (it would corrupt the scaler) — remove or fill the row"
+                        ),
+                        NumericColumnError::Nan(i) => format!(
+                            "regression 'target' has a NaN at row {i}; a NaN target cannot be \
+                             used (it would corrupt the scaler) — remove or fix the row"
+                        ),
+                    })
+                })?;
+                DecodedBatch::Regression { texts, targets }
+            }
+            DetectedFormat::Classification => {
+                let texts = batch
+                    .column_by_name("text")
+                    .and_then(|c| string_cells(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let labels = batch
+                    .column_by_name("label")
+                    .and_then(|c| string_cells(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+                DecodedBatch::Classification { texts, labels }
+            }
+        })
     }
-    let schema_info = || {
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| format!("{}:{}", f.name(), f.data_type()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    match (detected, acc) {
-        (
-            DetectedFormat::Contrastive,
-            ChunkAccumulator::Contrastive {
-                texts_a,
-                texts_b,
-                scores,
-            },
-        ) => {
-            let a_col = batch
-                .column_by_name("text_a")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
-            let b_col = batch
-                .column_by_name("text_b")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
-            let s_col = batch
-                .column_by_name("score")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
-            let a_vals = extract_string_column(a_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
-            let b_vals = extract_string_column(b_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
-            let s_vals = s_col
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .map(|arr| {
-                    (0..arr.len())
-                        .map(|i| arr.value(i) as f32)
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| {
-                    s_col
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                })
-                .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
-            for &i in indices {
-                texts_a.push(a_vals[i].clone());
-                texts_b.push(b_vals[i].clone());
-                scores.push(s_vals[i]);
-            }
-        }
-        (DetectedFormat::Pairs, ChunkAccumulator::Pairs { anchors, positives }) => {
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for &i in indices {
-                anchors.push(anchor_vals[i].clone());
-                positives.push(pos_vals[i].clone());
-            }
-        }
-        (
-            DetectedFormat::Triplet,
-            ChunkAccumulator::Triplet {
-                anchors,
-                positives,
-                negatives,
-            },
-        ) => {
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let neg_vals = batch
-                .column_by_name("negative")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'negative' column: task {task} expects text columns. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for &i in indices {
-                anchors.push(anchor_vals[i].clone());
-                positives.push(pos_vals[i].clone());
-                negatives.push(neg_vals[i].clone());
-            }
-        }
-        (
-            DetectedFormat::MediaTriplet,
-            ChunkAccumulator::MediaTriplet {
-                anchors,
-                positives,
-                negatives,
-            },
-        ) => {
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_binary_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid binary 'anchor' column for media triplets (task \
-                         {task}). Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_binary_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid binary 'positive' column for media triplets (task \
-                         {task}). Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let neg_vals = batch
-                .column_by_name("negative")
-                .and_then(|c| extract_binary_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid binary 'negative' column for media triplets (task \
-                         {task}). Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for &i in indices {
-                anchors.push(anchor_vals[i].clone());
-                positives.push(pos_vals[i].clone());
-                negatives.push(neg_vals[i].clone());
-            }
-        }
-        (DetectedFormat::Regression, ChunkAccumulator::Regression { texts, targets }) => {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let target_col = batch
-                .column_by_name("target")
-                .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
-            let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                JammiError::FineTune(match e {
-                    NumericColumnError::NotNumeric => format!(
-                        "regression 'target' is not a numeric column (its Arrow type is {})",
-                        target_col.data_type()
-                    ),
-                    NumericColumnError::Null(i) => format!(
-                        "regression 'target' has a null at row {i}; a null target cannot be \
-                         coerced (it would corrupt the scaler) — remove or fill the row"
-                    ),
-                    NumericColumnError::Nan(i) => format!(
-                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
-                         (it would corrupt the scaler) — remove or fix the row"
-                    ),
-                })
-            })?;
-            for &i in indices {
-                texts.push(text_vals[i].clone());
-                targets.push(target_vals[i]);
-            }
-        }
-        (DetectedFormat::Classification, ChunkAccumulator::Classification { texts, labels }) => {
-            let vocab = vocab.ok_or_else(|| {
-                JammiError::FineTune(
-                    "append_selected_rows: a Classification accumulator with no vocabulary — \
-                     ChunkAccumulator::new_for already refuses building one without a \
-                     vocabulary, so this is an internal invariant violation, never a caller \
-                     input error"
-                        .into(),
-                )
-            })?;
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let label_vals = batch
-                .column_by_name("label")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
-            for &i in indices {
-                texts.push(text_vals[i].clone());
-                labels.push(vocab.index_of(&label_vals[i])?);
-            }
-        }
-        (detected, acc) => {
-            unreachable!(
-                "append_selected_rows: ChunkAccumulator variant does not match detected format \
-                 {detected:?} — an internal invariant of TrainingSetStream's pump, which always \
-                 builds `acc` via `ChunkAccumulator::new_for(detected)` first: {acc:?}"
-            );
+
+    /// The format this batch was decoded under.
+    pub(crate) fn detected(&self) -> DetectedFormat {
+        match self {
+            Self::Contrastive { .. } => DetectedFormat::Contrastive,
+            Self::Pairs { .. } => DetectedFormat::Pairs,
+            Self::Triplet { .. } => DetectedFormat::Triplet,
+            Self::MediaTriplet { .. } => DetectedFormat::MediaTriplet,
+            Self::Regression { .. } => DetectedFormat::Regression,
+            Self::Classification { .. } => DetectedFormat::Classification,
         }
     }
-    Ok(())
+
+    /// Append the rows at `indices` (indices WITHIN this batch, in the order
+    /// given) to `acc`, cloning exactly those cells and nothing else.
+    ///
+    /// `acc` must have been built by `ChunkAccumulator::new_for` with the SAME
+    /// format this batch was decoded under — an internal invariant of
+    /// [`super::stream::TrainingSetStream`]'s pump, not a caller-facing
+    /// contract, so a mismatch is an internal-error panic rather than a typed
+    /// `Result`. `vocab` is read only by the `Classification` arm (each
+    /// selected row's class index — see [`LabelVocabulary::index_of`]).
+    pub(crate) fn append(
+        &self,
+        indices: &[usize],
+        vocab: Option<&LabelVocabulary>,
+        acc: &mut ChunkAccumulator,
+    ) -> Result<()> {
+        match (self, acc) {
+            (
+                Self::Contrastive {
+                    texts_a,
+                    texts_b,
+                    scores,
+                },
+                ChunkAccumulator::Contrastive {
+                    texts_a: acc_a,
+                    texts_b: acc_b,
+                    scores: acc_s,
+                },
+            ) => {
+                for &i in indices {
+                    acc_a.push(texts_a.value(i).to_string());
+                    acc_b.push(texts_b.value(i).to_string());
+                    acc_s.push(scores[i]);
+                }
+            }
+            (
+                Self::Pairs { anchors, positives },
+                ChunkAccumulator::Pairs {
+                    anchors: acc_a,
+                    positives: acc_p,
+                },
+            ) => {
+                for &i in indices {
+                    acc_a.push(anchors.value(i).to_string());
+                    acc_p.push(positives.value(i).to_string());
+                }
+            }
+            (
+                Self::Triplet {
+                    anchors,
+                    positives,
+                    negatives,
+                },
+                ChunkAccumulator::Triplet {
+                    anchors: acc_a,
+                    positives: acc_p,
+                    negatives: acc_n,
+                },
+            ) => {
+                for &i in indices {
+                    acc_a.push(anchors.value(i).to_string());
+                    acc_p.push(positives.value(i).to_string());
+                    acc_n.push(negatives.value(i).to_string());
+                }
+            }
+            (
+                Self::MediaTriplet {
+                    anchors,
+                    positives,
+                    negatives,
+                },
+                ChunkAccumulator::MediaTriplet {
+                    anchors: acc_a,
+                    positives: acc_p,
+                    negatives: acc_n,
+                },
+            ) => {
+                for &i in indices {
+                    acc_a.push(anchors.value(i).to_vec());
+                    acc_p.push(positives.value(i).to_vec());
+                    acc_n.push(negatives.value(i).to_vec());
+                }
+            }
+            (
+                Self::Regression { texts, targets },
+                ChunkAccumulator::Regression {
+                    texts: acc_t,
+                    targets: acc_y,
+                },
+            ) => {
+                for &i in indices {
+                    acc_t.push(texts.value(i).to_string());
+                    acc_y.push(targets[i]);
+                }
+            }
+            (
+                Self::Classification { texts, labels },
+                ChunkAccumulator::Classification {
+                    texts: acc_t,
+                    labels: acc_l,
+                },
+            ) => {
+                let vocab = vocab.ok_or_else(|| {
+                    JammiError::FineTune(
+                        "DecodedBatch::append: a Classification accumulator with no vocabulary — \
+                         ChunkAccumulator::new_for already refuses building one without a \
+                         vocabulary, so this is an internal invariant violation, never a caller \
+                         input error"
+                            .into(),
+                    )
+                })?;
+                for &i in indices {
+                    acc_t.push(texts.value(i).to_string());
+                    acc_l.push(vocab.index_of(labels.value(i))?);
+                }
+            }
+            (decoded, acc) => {
+                unreachable!(
+                    "DecodedBatch::append: ChunkAccumulator variant does not match the decoded \
+                     format {:?} — an internal invariant of TrainingSetStream's pump, which \
+                     always builds `acc` via `ChunkAccumulator::new_for(detected)` first: {acc:?}",
+                    decoded.detected()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Read-only column-family/null/NaN check the [`super::stream::TrainingSetStream`]
@@ -1148,5 +1298,93 @@ pub(crate) fn numeric_target_column(detected: DetectedFormat) -> Option<&'static
     match detected {
         DetectedFormat::Regression => Some("target"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod decoded_batch_tests {
+    //! The by-index reads behind the stream's per-batch decode: cells are
+    //! read at their index (in the caller's order), a null slot keeps the
+    //! text path's `""` contract, the cast fallback reads through the same
+    //! policy, and `extract_string_column` IS the cells turned into a `Vec`.
+
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    fn pairs_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("anchor", DataType::Utf8, true),
+            Field::new("positive", DataType::LargeUtf8, true),
+        ]));
+        let anchors: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a0"),
+            Some("a1"),
+            None,
+            Some("a3"),
+            Some("a4"),
+        ]));
+        let positives: ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("p0"),
+            Some("p1"),
+            Some("p2"),
+            Some("p3"),
+            Some("p4"),
+        ]));
+        RecordBatch::try_new(schema, vec![anchors, positives]).unwrap()
+    }
+
+    #[test]
+    fn append_reads_exactly_the_indexed_cells_in_the_given_order() {
+        let batch = pairs_batch();
+        let decoded =
+            DecodedBatch::decode(DetectedFormat::Pairs, ModelTask::TextEmbedding, &batch).unwrap();
+        let mut acc = ChunkAccumulator::new_for(DetectedFormat::Pairs, None).unwrap();
+        decoded.append(&[4, 1, 2], None, &mut acc).unwrap();
+        decoded.append(&[0], None, &mut acc).unwrap();
+        match acc {
+            ChunkAccumulator::Pairs { anchors, positives } => {
+                // Row 2's anchor is a NULL slot: the historical `""` reading.
+                assert_eq!(anchors, vec!["a4", "a1", "", "a0"]);
+                assert_eq!(positives, vec!["p4", "p1", "p2", "p0"]);
+            }
+            other => panic!("expected a Pairs accumulator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_string_column_is_the_cells_as_a_vec_on_every_family() {
+        let batch = pairs_batch();
+        for name in ["anchor", "positive"] {
+            let col = batch.column_by_name(name).unwrap();
+            let cells = string_cells(col.as_ref()).expect("a text column");
+            assert_eq!(extract_string_column(col.as_ref()).unwrap(), cells.to_vec());
+        }
+        // The cast fallback: an integer column read as text through the same
+        // policy, cell by cell.
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![7, 8, 9]));
+        let cells = string_cells(ints.as_ref()).expect("an Int64 column casts to text");
+        assert!(matches!(cells, StringCells::Casted(_)));
+        assert_eq!(cells.value(2), "9");
+        assert_eq!(
+            extract_string_column(ints.as_ref()).unwrap(),
+            cells.to_vec()
+        );
+    }
+
+    #[test]
+    fn a_binary_column_is_refused_as_text_by_the_cells_view_too() {
+        let bytes: ArrayRef = Arc::new(arrow::array::BinaryArray::from(vec![&b"x"[..], &b"y"[..]]));
+        assert!(string_cells(bytes.as_ref()).is_none());
+        assert!(extract_string_column(bytes.as_ref()).is_none());
+        let cells = binary_cells(bytes.as_ref()).expect("a binary column");
+        assert_eq!(cells.value(1), b"y");
+        assert_eq!(
+            extract_binary_column(bytes.as_ref()).unwrap(),
+            cells.to_vec()
+        );
     }
 }

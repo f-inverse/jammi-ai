@@ -7,10 +7,11 @@
 //! class allow-list gains NO new entry: see `training_set.rs`'s
 //! `reader_class_allow_list` module doc) — but never collects the whole read
 //! into a `Vec<RecordBatch>`. A background pump walks the DataFusion stream
-//! batch by batch, decodes ONLY the rows the current step's chunk needs
-//! (`crate::fine_tune::decode::append_selected_rows`, the same column
-//! extractors the eager loader uses), and hands finished chunks to the
-//! trainer one at a time over a bounded channel.
+//! batch by batch, decodes each batch ONCE into typed cell views
+//! (`crate::fine_tune::decode::DecodedBatch`, the same column policy the
+//! eager loader uses) and appends ONLY the rows the current step's chunk
+//! needs from it, then hands finished chunks to the trainer one at a time
+//! over a bounded channel.
 //!
 //! # Production wiring (current state, stated plainly — #500 U2c §10/§11)
 //!
@@ -455,11 +456,15 @@ impl TrainingSetStream {
 /// row 0) and `local_idx` (`global_idx - window.start`, valid once
 /// `global_idx >= window.start`). For every row inside the window,
 /// `local_idx` is compared against the CURRENT step's `range` (from
-/// [`Slice::rows_for_step`]): a row inside `range` is decoded via
-/// [`decode::append_selected_rows`]; a row outside it (another rank's row,
-/// world > 1) is skipped — `local_idx` still advances, but nothing is
-/// cloned. The instant `local_idx` reaches `range.end`, the accumulated chunk
-/// is finished and sent, `step` advances, and the next range is computed; an
+/// [`Slice::rows_for_step`]): a row inside `range` is selected by its index
+/// within the batch; a row outside it (another rank's row, world > 1) is
+/// skipped — `local_idx` still advances, but nothing is cloned. The batch is
+/// decoded ONCE, lazily, the first time a selection from it is appended
+/// ([`decode::DecodedBatch`]), and every selection is appended from that one
+/// decode — at a range end, and at the batch end when the range continues
+/// into the next batch. The instant `local_idx` reaches `range.end`, the
+/// accumulated chunk is finished and sent, `step` advances, and the next
+/// range is computed; an
 /// EMPTY next range (which [`PartitionSpec::rows_for_step`]'s clamp only ever
 /// produces once `range.start >= window.len()`) is the terminal state: emit
 /// it (an empty [`OwnedChunk`], the trainer's own end-of-epoch signal) and
@@ -471,6 +476,29 @@ impl TrainingSetStream {
 /// promised) while `local_idx < window.len()`, that is P7's early-end
 /// refusal — the ONLY way this function's post-loop code is reached, since
 /// every other termination path returns from inside the loop.
+/// Append `selected` (indices within `batch`) to `acc`, decoding `batch`
+/// into `decoded` on the first call for that batch; `selected` is drained.
+fn append_selected<'a>(
+    decoded: &mut Option<decode::DecodedBatch<'a>>,
+    detected: DetectedFormat,
+    task: ModelTask,
+    batch: &'a arrow::array::RecordBatch,
+    selected: &mut Vec<usize>,
+    vocab: Option<&LabelVocabulary>,
+    acc: &mut ChunkAccumulator,
+) -> Result<()> {
+    if selected.is_empty() {
+        return Ok(());
+    }
+    if decoded.is_none() {
+        *decoded = Some(decode::DecodedBatch::decode(detected, task, batch)?);
+    }
+    let cells = decoded.as_ref().expect("set just above");
+    cells.append(selected, vocab, acc)?;
+    selected.clear();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_pump(
     mut df_stream: datafusion::execution::SendableRecordBatchStream,
@@ -515,31 +543,42 @@ async fn run_pump(
         if n == 0 {
             continue;
         }
+        // One decode per batch, built the first time a selection is appended
+        // (a batch this rank selects nothing from is never decoded); the
+        // selected indices are appended at every range end and at the batch
+        // end, so they never outlive the batch they index.
+        let mut decoded: Option<decode::DecodedBatch<'_>> = None;
+        let mut selected: Vec<usize> = Vec::new();
         for row_in_batch in 0..n {
             if global_idx < window.start {
                 global_idx += 1;
                 continue;
             }
             if global_idx >= window.end {
-                // Past the window: nothing more for ANY rank to read here.
+                // Past the window: nothing more for ANY rank to read here. A
+                // range ends at or before `window.len()`, so its rows were
+                // appended at that range end before this point.
+                debug_assert!(selected.is_empty());
                 return;
             }
             if local_idx >= range.start && local_idx < range.end {
-                if let Err(e) = decode::append_selected_rows(
+                selected.push(row_in_batch);
+            }
+            local_idx += 1;
+            global_idx += 1;
+            if local_idx == range.end {
+                if let Err(e) = append_selected(
+                    &mut decoded,
                     detected,
                     task,
                     &batch,
-                    &[row_in_batch],
+                    &mut selected,
                     label_vocab.as_ref(),
                     &mut acc,
                 ) {
                     let _ = tx.send(Err(e)).await;
                     return;
                 }
-            }
-            local_idx += 1;
-            global_idx += 1;
-            if local_idx == range.end {
                 let finished = std::mem::replace(
                     &mut acc,
                     match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
@@ -562,6 +601,20 @@ async fn run_pump(
                     return;
                 }
             }
+        }
+        // The current range continues into the next batch: append this
+        // batch's share of it now.
+        if let Err(e) = append_selected(
+            &mut decoded,
+            detected,
+            task,
+            &batch,
+            &mut selected,
+            label_vocab.as_ref(),
+            &mut acc,
+        ) {
+            let _ = tx.send(Err(e)).await;
+            return;
         }
     }
 

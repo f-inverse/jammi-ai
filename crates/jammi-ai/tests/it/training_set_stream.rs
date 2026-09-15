@@ -217,12 +217,20 @@ async fn p6i_w1_stream_concatenation_matches_read_back_sql_at_various_partition_
 /// regression pin for the excised arm's `prefetch = 2` deadlock), the stream
 /// completes and serves exactly `window.len()` rows, under a wall-clock
 /// timeout (120s, not the contract's literal 60s: a genuine deadlock hangs
-/// FOREVER, so either bound catches it identically; the wider margin absorbs
-/// CPU contention from the rest of a `cargo test -p jammi-ai` run without
-/// weakening the property — `#[serial(training_set_stream)]` above already
-/// removes contention from this file's OWN other heavy tests) — every
-/// consuming test is `multi_thread` with the consumer on `spawn_blocking`
-/// (B3).
+/// FOREVER, so either bound catches it identically) — every consuming test
+/// is `multi_thread` with the consumer on `spawn_blocking` (B3).
+///
+/// The hold is structural: the consumer asks for chunk `k+1` while chunk
+/// `k` is still alive and drops `k` only after the ask returns. The
+/// consumer is deliberately SLOWER than the producer in two windows — the
+/// first `2 * MAX_PREFETCH` chunks, and `MAX_PREFETCH` chunks either side of
+/// every 65,536-row group boundary — so the prefetch buffer is full at
+/// exactly the moments the pinned deadlock needs (a full buffer, a held
+/// chunk, and an ask), and runs at full speed everywhere else: a sleep on
+/// every one of the 5,384 chunks per prefetch value put the test's wall
+/// clock (5ms × chunks × 4) at the mercy of the sleep and the runner's
+/// scheduling, never the property, and CI's contended hermetic lane timed
+/// the first prefetch value out at 120s twice.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(training_set_stream)]
 async fn p4_liveness_over_every_held_chunk_at_every_accepted_prefetch() {
@@ -256,21 +264,41 @@ async fn p4_liveness_over_every_held_chunk_at_every_accepted_prefetch() {
         .unwrap_or_else(|e| panic!("prefetch={prefetch}: open failed: {e}"));
 
         let drain = tokio::task::spawn_blocking(move || {
+            // The writer's row-group size the fixture's doc states (70,000
+            // rows cross it once); a slow window straddles each multiple.
+            const ROW_GROUP_ROWS: usize = 65_536;
+            const MAX_PREFETCH: usize = 4;
             let mut ts = ts;
             let mut served = 0usize;
-            while let Some(chunk) = ts.next_chunk()? {
+            let mut index = 0usize;
+            let mut held = None;
+            loop {
+                // Ask for the next chunk WHILE the previous one is still
+                // held — the deadlock this pins (`tokio::sync::mpsc` async
+                // `send`, never a sync channel a full buffer would park the
+                // runtime on) needs a held chunk, a full buffer and an ask
+                // at the same moment.
+                let next = ts.next_chunk()?;
+                drop(held.take());
+                let Some(chunk) = next else { break };
                 let n = chunk.chunk().row_count();
                 served += n;
-                let empty = n == 0;
-                // Hold the chunk across the ask for the next one — the
-                // deadlock this pins (`tokio::sync::mpsc` async `send`,
-                // never a sync channel a full buffer would park the runtime
-                // on).
-                std::thread::sleep(Duration::from_millis(5));
-                drop(chunk);
-                if empty {
+                if n == 0 {
                     break;
                 }
+                let before = served - n;
+                let near_boundary = {
+                    let margin = MAX_PREFETCH * n;
+                    let next_boundary = (before / ROW_GROUP_ROWS + 1) * ROW_GROUP_ROWS;
+                    before + margin >= next_boundary && before <= next_boundary + margin
+                };
+                if index < 2 * MAX_PREFETCH || near_boundary {
+                    // Slower than the producer: the buffer fills to
+                    // capacity before the next ask.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                index += 1;
+                held = Some(chunk);
             }
             Ok::<usize, JammiError>(served)
         });

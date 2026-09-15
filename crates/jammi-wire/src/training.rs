@@ -615,3 +615,463 @@ mod tests {
         assert_eq!(decoded.refresh_every, 1);
     }
 }
+
+/// The per-job `world_size` on `jammi.v1.job.SubmitJobRequest`.
+///
+/// The rank count is the wire form of the engine's `TrainingCommon.world_size`,
+/// so it rides beside the other two `TrainingCommon` members (`base_model`,
+/// `config`) on the submit request rather than inside a per-kind spec: both
+/// LoRA fine-tune kinds fold the same common block, and one field for both is
+/// what makes it impossible for the two kinds to diverge on it.
+///
+/// These tests pin the three properties the frozen wire surface owes for an
+/// appended scalar: the tag is the next free one and every pre-existing tag is
+/// unmoved; an unset (`0`) count encodes to bytes byte-for-byte identical to
+/// what a caller built before the field existed; and a set count survives the
+/// round trip. Resolving `0` to the engine's `1` is the engine's decode step
+/// (`jammi_ai::wire::training`), not the wire's — on the wire `0` is simply the
+/// absent field.
+#[cfg(test)]
+mod world_size_tests {
+    use prost::Message;
+    use prost_types::{field_descriptor_proto::Type, FileDescriptorSet};
+
+    use crate::proto::{job as job_pb, training as pb};
+    use crate::FILE_DESCRIPTOR_SET;
+
+    /// `SubmitJobRequest` as it was before `world_size` was appended, in the two
+    /// scalar fields a submit carries unconditionally. Encoding through this
+    /// gives a genuine pre-field byte string to compare against, rather than
+    /// re-encoding the new type and asserting it matches itself.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacySubmitJobRequest {
+        #[prost(string, tag = "4")]
+        base_model: String,
+        #[prost(string, tag = "6")]
+        idempotency_key: String,
+    }
+
+    /// The compiled `jammi.v1.job.SubmitJobRequest` descriptor — the
+    /// authoritative description of the emitted wire surface.
+    fn submit_job_request() -> prost_types::DescriptorProto {
+        let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+            .expect("the compiled jammi.v1 descriptor must decode");
+        set.file
+            .iter()
+            .filter(|f| f.package() == "jammi.v1.job")
+            .flat_map(|f| f.message_type.iter())
+            .find(|m| m.name() == "SubmitJobRequest")
+            .expect("jammi.v1.job.SubmitJobRequest is in the descriptor")
+            .clone()
+    }
+
+    /// The `SubmitJobRequest` field names and numbers.
+    fn submit_job_request_tags() -> Vec<(String, i32)> {
+        submit_job_request()
+            .field
+            .iter()
+            .map(|f| (f.name().to_string(), f.number()))
+            .collect()
+    }
+
+    /// Every field number the message holds RESERVED, flattened from the
+    /// descriptor's half-open ranges.
+    fn submit_job_request_reserved_tags() -> Vec<i32> {
+        let mut reserved: Vec<i32> = submit_job_request()
+            .reserved_range
+            .iter()
+            .flat_map(|r| r.start()..r.end())
+            .collect();
+        reserved.sort_unstable();
+        reserved.dedup();
+        reserved
+    }
+
+    /// APPEND-ONLY. Every pre-existing `SubmitJobRequest` tag keeps its number
+    /// and `world_size` takes the next free one that is not HELD — 9, because 7
+    /// and 8 are reserved for the deferred job-dependency unit (#515). A
+    /// renumbering, or taking a held tag, would decode a payload built against
+    /// either contract into the wrong field.
+    #[test]
+    fn world_size_takes_the_next_free_tag_and_moves_no_existing_one() {
+        assert_eq!(
+            submit_job_request_tags(),
+            vec![
+                ("fine_tune".to_string(), 1),
+                ("graph_fine_tune".to_string(), 2),
+                ("context_predictor".to_string(), 3),
+                ("base_model".to_string(), 4),
+                ("config".to_string(), 5),
+                ("idempotency_key".to_string(), 6),
+                ("world_size".to_string(), 9),
+                // `cache` (below, [`cache_tests`]) took the next free tag
+                // after this test was written; listed here too so this
+                // exhaustive tag inventory stays the single source of truth
+                // for the message's WHOLE field set, not merely the count.
+                ("cache".to_string(), 10),
+            ],
+        );
+    }
+
+    /// HELD. Tags 7 and 8 belong to the deferred job-dependency unit
+    /// (`depends_on = 7`, `parent_id = 8`, #515): the message reserves them, so
+    /// `protoc` refuses any later field that tries to take one and the
+    /// cherry-pick reviving that unit cannot collide with a field appended in
+    /// the meantime. Same policy as `jammi.v1.error`'s vacant 37/38.
+    #[test]
+    fn tags_seven_and_eight_are_held_for_the_deferred_dependency_unit() {
+        assert_eq!(submit_job_request_reserved_tags(), vec![7, 8]);
+        assert!(
+            !submit_job_request_tags()
+                .iter()
+                .any(|(_, number)| *number == 7 || *number == 8),
+            "no live field may occupy a reserved tag"
+        );
+    }
+
+    /// The count is an implicit-presence `uint32`, which is what makes `0` mean
+    /// "unset" on the wire: an `optional` field would make an explicit `0` a
+    /// distinct, encodable state the engine has no meaning for.
+    #[test]
+    fn world_size_is_an_implicit_presence_uint32() {
+        let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+            .expect("the compiled jammi.v1 descriptor must decode");
+        let field = set
+            .file
+            .iter()
+            .filter(|f| f.package() == "jammi.v1.job")
+            .flat_map(|f| f.message_type.iter())
+            .find(|m| m.name() == "SubmitJobRequest")
+            .expect("jammi.v1.job.SubmitJobRequest is in the descriptor")
+            .field
+            .iter()
+            .find(|f| f.name() == "world_size")
+            .expect("SubmitJobRequest carries world_size")
+            .clone();
+
+        assert_eq!(field.r#type(), Type::Uint32);
+        assert_ne!(
+            field.proto3_optional,
+            Some(true),
+            "world_size must not have explicit presence: 0 IS the unset value"
+        );
+    }
+
+    /// UNSET. A request that leaves the count at `0` encodes to exactly the
+    /// bytes a caller built before the field existed — the appended field costs
+    /// a pre-existing client nothing and changes no byte it ever sent.
+    #[test]
+    fn unset_world_size_encodes_byte_for_byte_as_the_pre_field_request() {
+        let legacy = LegacySubmitJobRequest {
+            base_model: "local:tiny-bert".to_string(),
+            idempotency_key: "dedupe-1".to_string(),
+        };
+        let current = job_pb::SubmitJobRequest {
+            spec: None,
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 0,
+            cache: 0,
+        };
+
+        assert_eq!(current.encode_to_vec(), legacy.encode_to_vec());
+    }
+
+    /// BACKWARD. Bytes produced before the field existed decode into the
+    /// current type with the count at `0` — the value the engine reads as one
+    /// rank — and lose nothing else.
+    #[test]
+    fn pre_field_bytes_decode_with_the_count_unset() {
+        let legacy = LegacySubmitJobRequest {
+            base_model: "local:tiny-bert".to_string(),
+            idempotency_key: "dedupe-1".to_string(),
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(legacy.encode_to_vec().as_slice())
+            .expect("pre-field bytes decode into the current request");
+
+        assert_eq!(decoded.world_size, 0);
+        assert_eq!(decoded.base_model, "local:tiny-bert");
+        assert_eq!(decoded.idempotency_key, "dedupe-1");
+    }
+
+    /// FORWARD. A peer that predates the field decodes a request carrying it
+    /// without error — the appended tag is an unknown field to it, skipped, and
+    /// every field it does know survives.
+    #[test]
+    fn a_pre_field_decoder_skips_a_set_count() {
+        let current = job_pb::SubmitJobRequest {
+            spec: None,
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 4,
+            cache: 0,
+        };
+
+        let decoded = LegacySubmitJobRequest::decode(current.encode_to_vec().as_slice())
+            .expect("a pre-field decoder skips the appended tag");
+
+        assert_eq!(decoded.base_model, "local:tiny-bert");
+        assert_eq!(decoded.idempotency_key, "dedupe-1");
+    }
+
+    /// SET. A full fine-tune submit carrying a multi-rank count round-trips
+    /// unchanged — the count included.
+    #[test]
+    fn a_set_world_size_round_trips_on_a_full_request() {
+        let original = job_pb::SubmitJobRequest {
+            spec: Some(job_pb::submit_job_request::Spec::FineTune(
+                pb::FineTuneSpec {
+                    source: "training".to_string(),
+                    columns: vec!["text_a".to_string(), "text_b".to_string()],
+                    method: pb::FineTuneMethod::Lora as i32,
+                    task: crate::proto::inference::ModelTask::TextEmbedding as i32,
+                },
+            )),
+            base_model: "local:tiny-bert".to_string(),
+            config: Some(pb::FineTuneConfig {
+                epochs: Some(2),
+                ..Default::default()
+            }),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 4,
+            cache: 0,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
+            .expect("a request carrying the count round-trips");
+
+        assert_eq!(decoded.world_size, 4);
+        assert_eq!(decoded, original);
+    }
+
+    /// The count rides on the request, not the kind, so the SAME field serves a
+    /// graph fine-tune: the two LoRA kinds cannot diverge on it, because there
+    /// is only one place to put it.
+    #[test]
+    fn the_same_count_field_serves_the_graph_fine_tune_kind() {
+        let original = job_pb::SubmitJobRequest {
+            spec: Some(job_pb::submit_job_request::Spec::GraphFineTune(
+                pb::GraphFineTuneSpec {
+                    sources: None,
+                    sample_config: None,
+                },
+            )),
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size: 2,
+            cache: 0,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
+            .expect("a graph fine-tune carrying the count round-trips");
+
+        assert_eq!(decoded.world_size, 2);
+        assert_eq!(decoded, original);
+    }
+}
+
+/// The per-job `cache` on `jammi.v1.job.SubmitJobRequest`.
+///
+/// Opt-in model-level cache reuse for the two LoRA fine-tune kinds, appended
+/// the same way [`world_size_tests`] appended the rank count: the next free
+/// tag, an implicit-presence field whose zero value IS the unset/default
+/// state, and the SAME `jammi.v1.inference.CachePolicy` enum every other
+/// result-table producer verb carries — imported rather than redeclared, so
+/// this field can never drift onto a second, differently-numbered cache
+/// vocabulary.
+#[cfg(test)]
+mod cache_tests {
+    use prost::Message;
+    use prost_types::{field_descriptor_proto::Type, FileDescriptorSet};
+
+    use crate::proto::{job as job_pb, training as pb};
+    use crate::FILE_DESCRIPTOR_SET;
+
+    /// `SubmitJobRequest` before `cache` was appended, carrying every scalar a
+    /// submit sends unconditionally (`base_model`, `idempotency_key`,
+    /// `world_size`) so encoding through this gives genuine pre-field bytes
+    /// rather than re-encoding the current type and comparing it with itself.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct PreCacheSubmitJobRequest {
+        #[prost(string, tag = "4")]
+        base_model: String,
+        #[prost(string, tag = "6")]
+        idempotency_key: String,
+        #[prost(uint32, tag = "9")]
+        world_size: u32,
+    }
+
+    fn submit_job_request_field(name: &str) -> prost_types::FieldDescriptorProto {
+        let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+            .expect("the compiled jammi.v1 descriptor must decode");
+        set.file
+            .iter()
+            .filter(|f| f.package() == "jammi.v1.job")
+            .flat_map(|f| f.message_type.iter())
+            .find(|m| m.name() == "SubmitJobRequest")
+            .expect("jammi.v1.job.SubmitJobRequest is in the descriptor")
+            .field
+            .iter()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("SubmitJobRequest carries a `{name}` field"))
+            .clone()
+    }
+
+    /// APPEND-ONLY. `cache` takes the next free tag after `world_size` (9) —
+    /// 10, since 7 and 8 stay reserved for the deferred job-dependency unit
+    /// (#515) — and every pre-existing field keeps its number. A renumbering,
+    /// or taking a held tag, would decode a payload built against either
+    /// contract into the wrong field.
+    #[test]
+    fn cache_takes_the_next_free_tag() {
+        assert_eq!(submit_job_request_field("cache").number(), 10);
+    }
+
+    /// `cache` is a proto3 enum, implicit presence: `0` (`UNSPECIFIED`) is
+    /// what a request that never set the field carries, matching how
+    /// `world_size`'s `0` is its unset value. It resolves to the engine's
+    /// `CachePolicy::Bypass` default at the decode
+    /// (`jammi_ai::wire::cache::cache_policy_from_proto`), never on the wire.
+    #[test]
+    fn cache_is_an_implicit_presence_enum_of_the_shared_cache_policy_type() {
+        let field = submit_job_request_field("cache");
+        assert_eq!(field.r#type(), Type::Enum);
+        assert_eq!(field.type_name(), ".jammi.v1.inference.CachePolicy");
+        assert_ne!(
+            field.proto3_optional,
+            Some(true),
+            "cache must not have explicit presence: UNSPECIFIED (0) IS the unset value"
+        );
+    }
+
+    /// UNSET. A request that leaves `cache` at `UNSPECIFIED` (`0`) encodes to
+    /// exactly the bytes a caller built before the field existed — the
+    /// appended field costs a pre-existing client nothing.
+    #[test]
+    fn unset_cache_encodes_byte_for_byte_as_the_pre_field_request() {
+        let legacy = PreCacheSubmitJobRequest {
+            base_model: "local:tiny-bert".to_string(),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+        };
+        let current = job_pb::SubmitJobRequest {
+            spec: None,
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+            cache: 0,
+        };
+
+        assert_eq!(current.encode_to_vec(), legacy.encode_to_vec());
+    }
+
+    /// BACKWARD. Bytes produced before `cache` existed decode into the current
+    /// type with the policy `UNSPECIFIED` and lose nothing else.
+    #[test]
+    fn pre_field_bytes_decode_with_cache_unspecified() {
+        let legacy = PreCacheSubmitJobRequest {
+            base_model: "local:tiny-bert".to_string(),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(legacy.encode_to_vec().as_slice())
+            .expect("pre-field bytes decode into the current request");
+
+        assert_eq!(decoded.cache, 0);
+        assert_eq!(decoded.base_model, "local:tiny-bert");
+        assert_eq!(decoded.idempotency_key, "dedupe-1");
+        assert_eq!(decoded.world_size, 2);
+    }
+
+    /// FORWARD. A peer that predates `cache` decodes a request carrying it
+    /// without error — the appended tag is unknown to it, skipped, and every
+    /// field it does know survives.
+    #[test]
+    fn a_pre_field_decoder_skips_a_set_cache() {
+        let current = job_pb::SubmitJobRequest {
+            spec: None,
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 2,
+            cache: crate::proto::inference::CachePolicy::Use as i32,
+        };
+
+        let decoded = PreCacheSubmitJobRequest::decode(current.encode_to_vec().as_slice())
+            .expect("a pre-field decoder skips the appended tag");
+
+        assert_eq!(decoded.base_model, "local:tiny-bert");
+        assert_eq!(decoded.idempotency_key, "dedupe-1");
+        assert_eq!(decoded.world_size, 2);
+    }
+
+    /// SET. A full fine-tune submit carrying `CACHE_POLICY_USE` round-trips
+    /// unchanged, alongside a non-default `world_size` — the two independent
+    /// scalars do not clobber each other.
+    #[test]
+    fn a_set_cache_round_trips_on_a_full_request() {
+        let original = job_pb::SubmitJobRequest {
+            spec: Some(job_pb::submit_job_request::Spec::FineTune(
+                pb::FineTuneSpec {
+                    source: "training".to_string(),
+                    columns: vec!["text_a".to_string(), "text_b".to_string()],
+                    method: pb::FineTuneMethod::Lora as i32,
+                    task: crate::proto::inference::ModelTask::TextEmbedding as i32,
+                },
+            )),
+            base_model: "local:tiny-bert".to_string(),
+            config: Some(pb::FineTuneConfig {
+                epochs: Some(2),
+                ..Default::default()
+            }),
+            idempotency_key: "dedupe-1".to_string(),
+            world_size: 4,
+            cache: crate::proto::inference::CachePolicy::Use as i32,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
+            .expect("a request carrying the policy round-trips");
+
+        assert_eq!(
+            decoded.cache,
+            crate::proto::inference::CachePolicy::Use as i32
+        );
+        assert_eq!(decoded.world_size, 4);
+        assert_eq!(decoded, original);
+    }
+
+    /// The policy rides on the request, not the kind, so the SAME field
+    /// serves a graph fine-tune: the two LoRA kinds cannot diverge on it,
+    /// because there is only one place to put it.
+    #[test]
+    fn the_same_cache_field_serves_the_graph_fine_tune_kind() {
+        let original = job_pb::SubmitJobRequest {
+            spec: Some(job_pb::submit_job_request::Spec::GraphFineTune(
+                pb::GraphFineTuneSpec {
+                    sources: None,
+                    sample_config: None,
+                },
+            )),
+            base_model: "local:tiny-bert".to_string(),
+            config: None,
+            idempotency_key: String::new(),
+            world_size: 0,
+            cache: crate::proto::inference::CachePolicy::Use as i32,
+        };
+
+        let decoded = job_pb::SubmitJobRequest::decode(original.encode_to_vec().as_slice())
+            .expect("a graph fine-tune carrying the policy round-trips");
+
+        assert_eq!(
+            decoded.cache,
+            crate::proto::inference::CachePolicy::Use as i32
+        );
+        assert_eq!(decoded, original);
+    }
+}

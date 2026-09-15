@@ -800,8 +800,12 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         work = Path(work_root)
 
         # --- embedded transport (the canonical matrix) ---------------------- #
-        with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi.connect(f"file://{catalog}")
+        with (
+            tempfile.TemporaryDirectory() as catalog,
+            # closed BEFORE the directory is removed: `with A, B` unwinds B first,
+            # and a live embedded engine keeps writing its catalog (Errno 39).
+            jammi.connect(f"file://{catalog}") as embedded,
+        ):
             print("== embedded engine: per-verb isolation matrix ==", flush=True)
             embedded_matrix = run_matrix(
                 embedded, work, base_model, tag="emb", cross_transport=False

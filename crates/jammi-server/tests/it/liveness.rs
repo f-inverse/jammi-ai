@@ -180,7 +180,9 @@ async fn healthz_stays_200_while_draining() {
                         warmup_steps: 0,
                         ..Default::default()
                     },
+                    world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
                 },
+                cache: jammi_db::store::CachePolicy::Bypass,
             }
             .into(),
             0,

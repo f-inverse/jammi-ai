@@ -416,6 +416,8 @@ _RECONCILE_REPORT_DICT_KEYS = {
     "unattributed_count",
     "damaged",
     "damaged_count",
+    "referenced",
+    "referenced_count",
     "truncated",
     "bytes_reclaimed",
 }
@@ -467,6 +469,8 @@ def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
         unattributed_count=12,
         damaged=["d1"],
         damaged_count=33,
+        referenced=["r1", "r2"],
+        referenced_count=44,
         truncated=True,
         bytes_reclaimed=123456,
     )
@@ -489,6 +493,8 @@ def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
         "unattributed_count": 12,
         "damaged": ["d1"],
         "damaged_count": 33,
+        "referenced": ["r1", "r2"],
+        "referenced_count": 44,
         "truncated": True,
         "bytes_reclaimed": 123456,
     }, f"every field must round-trip unchanged: {projected}"
@@ -514,7 +520,14 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
             )
             assert report["applied"] is False
             assert report["scope"] == expected_scope
-            for key in ("rows_failed", "orphans", "pending", "unattributed", "damaged"):
+            for key in (
+                "rows_failed",
+                "orphans",
+                "pending",
+                "unattributed",
+                "damaged",
+                "referenced",
+            ):
                 assert report[key] == [], f"a freshly-opened engine reports nothing: {report}"
             for key in (
                 "rows_failed_count",
@@ -522,9 +535,195 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
                 "pending_count",
                 "unattributed_count",
                 "damaged_count",
+                "referenced_count",
             ):
                 assert report[key] == 0, f"a freshly-opened engine reports nothing: {report}"
             assert report["truncated"] is False
+    finally:
+        db.close()
+
+
+def test_embed_reconcile_referenced_list_is_populated_and_matches_the_remote_key_set(
+    tmp_path,
+):
+    """`test_embed_reconcile_both_arms_return_the_report_shape` above only ever
+    exercises the embedded `Database.reconcile` on an EMPTY, freshly-opened
+    engine, so the `referenced` / `referenced_count` fields (the reap-site
+    consult's own output — see `ResultStore::reconcile`'s doc and
+    `crates/jammi-db/tests/it/reconcile.rs::a_stray_file_under_a_referenced_attempt_level_prefix_survives_via_the_reap_site_consult`)
+    are asserted structurally (always `[]` / `0`) there, never EXECUTED on a
+    non-empty case through this binding.
+
+    This test reproduces that exact it-test's scenario through the embedded
+    engine's own on-disk layout instead: a `models` row is registered naming
+    an attempt-level artifact prefix (`models/_global/{job}/worker-1/0`, the
+    `[job_id, worker_id, attempt]` shape `worker.rs` registers in production),
+    a valid bundle (`adapter.safetensors` + `manifest.json`) is published
+    under it, and a STRAY file the manifest does not name is written directly
+    alongside it. `reconcile(apply=True)` must find that stray file, consult
+    `prefix_is_referenced` on its own key, and report it under `referenced` —
+    never reclaim it — the same live-through-containment case the Rust
+    it-test proves at the engine layer, now proven not to drop across this
+    binding's serde projection.
+
+    No embedded verb exists to register a model or publish an artifact
+    bundle directly, so both are constructed the same way the engine itself
+    would lay them out on disk: a raw `sqlite3` INSERT mirroring
+    `Catalog::register_model`'s own statement (the same close-before-inject
+    discipline `test_remote_and_embedded_job_metrics_agree_on_all_three_states`
+    already uses against the `jobs` table), and `manifest.json` written by
+    hand in the exact shape `ArtifactStore::put_artifact` produces. The
+    `reconcile` CALL ITSELF — the artifact under test — is the real,
+    compiled engine's, not a stand-in.
+
+    **Close-before-inject is not optional here, it is load-bearing**: the
+    SQLite catalog's own module doc
+    (`crates/jammi-db/src/catalog/backend_sqlite.rs`, "Residual, deliberately
+    not closed") names exactly this shape — a foreign SQLite library
+    instance (CPython's own `sqlite3`, linked against the platform
+    `libsqlite3`, as opposed to the engine's bundled amalgamation) writing to
+    `catalog.db` while an engine connection is ALSO open is an
+    out-of-contract topology: the engine's own `unix-excl` VFS keeps its
+    wal-index on the HEAP (never re-reading the on-disk `-wal`), so a raw
+    write landing while an engine `Database` is live is silently invisible to
+    it, never a loud failure. Every raw `sqlite3` write below therefore runs
+    with NO embedded engine connection open at all — verified upstream by
+    `test_remote_and_embedded_job_metrics_agree_on_all_three_states`'s own
+    docstring — and only the FRESH `db` opened after is ever used to read it.
+
+    Hermetic: opens a local engine (`file://`), contacts no server.
+    """
+    import hashlib
+    import json
+    import sqlite3
+    import uuid
+
+    from jammi._database import _reconcile_report_to_dict
+    from jammi._generated.jammi.v1 import catalog_pb2
+
+    # The remote projection's own shape, computed against a POPULATED
+    # `ReconcileReport` — every list field non-empty, `referenced_count`
+    # equal to `len(referenced)`, `truncated` False — never an EMPTY
+    # message. A proto's field set is fixed by its descriptor regardless of
+    # which fields carry values, so comparing key sets against an empty
+    # message is structurally true for any message and would keep passing
+    # even if `_reconcile_report_to_dict` mis-typed or miscounted a
+    # populated field; only a populated fixture exercises that. Pinned here
+    # directly (not via `_RECONCILE_REPORT_DICT_KEYS`, which this test's
+    # non-empty case must agree with independently) so this test alone
+    # still catches a dropped `referenced` field even if the module-level
+    # constant above were wrong.
+    remote_report = catalog_pb2.ReconcileReport(
+        scope="tenant:22222222-2222-4222-8222-222222222222",
+        applied=True,
+        rows_failed=["rf1", "rf2"],
+        rows_failed_count=2,
+        orphans=["o1"],
+        orphan_count=1,
+        pending=["p1", "p2"],
+        pending_count=2,
+        unattributed=["u1"],
+        unattributed_count=1,
+        damaged=["d1"],
+        damaged_count=1,
+        referenced=["r1", "r2", "r3"],
+        referenced_count=3,
+        truncated=False,
+        bytes_reclaimed=42,
+    )
+    remote_projected = _reconcile_report_to_dict(remote_report)
+    remote_keys = set(remote_projected)
+    assert remote_projected["referenced_count"] == len(remote_projected["referenced"]), (
+        "the populated fixture itself must be internally consistent before it "
+        f"is used as the comparison oracle: {remote_projected}"
+    )
+
+    # Bootstrap: open + immediately close, so `catalog.db` and the
+    # `jammi_db/` root exist (migrations applied) with NO engine connection
+    # left attached before the raw-sqlite3 injection below.
+    bootstrap_db = jammi.connect(f"file://{tmp_path}")
+    bootstrap_db.close()
+    del bootstrap_db
+
+    job_id = str(uuid.uuid4())  # attribution requires a canonical v4 UUID
+    prefix_dir = tmp_path / "jammi_db" / "models" / "_global" / job_id / "worker-1" / "0"
+    prefix_dir.mkdir(parents=True)
+
+    weights = b"weights"
+    (prefix_dir / "adapter.safetensors").write_bytes(weights)
+    manifest = {
+        "files": [
+            {
+                "name": "adapter.safetensors",
+                "sha256": hashlib.sha256(weights).hexdigest(),
+            }
+        ]
+    }
+    # Manifest LAST, mirroring `ArtifactStore::put_artifact`'s own write
+    # order — its presence is what marks the bundle complete.
+    (prefix_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    # A stray object the manifest does not name, directly under the SAME
+    # attempt-level directory the model row's `artifact_path` will EQUAL
+    # exactly — a strict descendant of it, never reclaimable through the
+    # ordinary age-gated orphan arm regardless of age; only the reap-site's
+    # own `prefix_is_referenced` consult on this exact key protects it.
+    (prefix_dir / "debug_dump.tmp").write_bytes(b"leftover")
+
+    artifact_path = f"file://{prefix_dir}"
+    catalog_db = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(catalog_db))
+    try:
+        conn.execute(
+            "INSERT INTO models "
+            "(model_id, name, model_type, task, backend, version, status, "
+            " metadata, artifact_path, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'registered', ?, ?, NULL)",
+            (
+                "attempt-level-model::1",  # untenanted `model_pk(None, name, version)`
+                "attempt-level-model",
+                "lora",
+                "text_embedding",
+                "candle",
+                1,
+                json.dumps({"base_model_id": None, "config_json": None}),
+                artifact_path,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Fresh db, opened only AFTER the raw-sqlite3 injection above is fully
+    # committed and its own connection fully closed.
+    db = jammi.connect(f"file://{tmp_path}")
+    try:
+        # `grace_secs` need only clear the deployment's configured lease
+        # duration (default 30s; `apply=True` refuses a shorter grace) — the
+        # reap-site's `referenced` consult itself runs before any age gate,
+        # so a fresh object still lands in `referenced`, never `orphans`.
+        report = db.reconcile(apply=True, grace_secs=3600, all=False)
+
+        assert set(report) == remote_keys, (
+            f"embed reconcile(apply=True) keys {set(report)} != the remote "
+            f"projection's {remote_keys}"
+        )
+        for key in remote_keys:
+            assert type(report[key]) is type(remote_projected[key]), (
+                f"{key}: embedded value {report[key]!r} ({type(report[key])}) != "
+                f"remote-projection value type {type(remote_projected[key])}"
+            )
+        assert any(r.endswith("debug_dump.tmp") for r in report["referenced"]), (
+            f"the reap-site consult must name the stray file referenced: {report}"
+        )
+        assert report["referenced_count"] == len(report["referenced"]), (
+            f"referenced_count must be the true total: {report}"
+        )
+        assert report["truncated"] is False
+        assert all(not o.endswith("debug_dump.tmp") for o in report["orphans"]), (
+            f"a referenced stray file must never be reclaimed: {report}"
+        )
+        assert (prefix_dir / "debug_dump.tmp").exists()
     finally:
         db.close()
 
@@ -1032,6 +1231,146 @@ def test_failed_job_wait_raises_training_error_on_both_raise_sites():
     assert client_errors.TrainingError is jammi.TrainingError
 
 
+def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_transports():
+    """Tier B (converter-level) — the K2 refusal of an EMPTY training set, WHEN
+    IT SURFACES OVER THE `Recompute` RPC (`grpc/pipeline.rs:139`,
+    `jammi_ai::pipeline::recompute`'s `TrainingSet` replay arm), maps to ONE
+    class, `jammi.errors.InvalidArgument`, on both transports.
+
+    This is deliberately scoped to the `Recompute` surface, not "the" K2
+    refusal generally: the SAME typed engine error
+    (`JammiError::EmptyTrainingSet`) reaches the caller as a DIFFERENT class,
+    `jammi.errors.TrainingError`, when it is instead raised on the fine-tune
+    JOB path (`worker.rs::run_spec`'s `materialize_projection` call) — see
+    `test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_transports`
+    below. A test named "the" refusal would misstate that as one universal
+    class; it is not — which surface carried the refusal determines the class.
+
+    On the `Recompute` RPC path: the server sends the refusal as
+    `INVALID_ARGUMENT` (`jammi_server::grpc::wire::map_engine_error`), so the
+    remote client raises `InvalidArgument` — and the embedded converter must
+    not classify the same engine error as a `BackendError`, or one
+    `except InvalidArgument` would catch the caller's own degenerate input
+    remotely and miss it in-process.
+
+    Converter-level on the EMBEDDED arm BY NECESSITY, the same shape (and for the
+    same reason) as the failed-job parity test above: driving a real refusal needs
+    a fine-tune over a real source and base model, which is not hermetic. The two
+    raise-sites are therefore pinned at their converters:
+      * the REMOTE raise-site is driven directly — `_rpc_to_jammi` over a status
+        carrying the engine's own `EmptyTrainingSet` message text;
+      * the EMBEDDED raise-site (`error.rs::jammi_error_class`'s
+        `JammiError::EmptyTrainingSet` arm → `client_error("InvalidArgument", …)`)
+        is pinned in Rust by
+        `empty_training_set_raises_the_class_the_remote_transport_raises`, which
+        asserts that arm equals the class this crate maps `INVALID_ARGUMENT` to;
+        the class name it looks up is asserted here to resolve to the very object
+        the remote arm raised.
+    """
+    from jammi._database import _rpc_to_jammi
+
+    message = (
+        "training set over `SELECT text, label FROM reviews.public.rows` is "
+        "empty: the projection yielded zero rows"
+    )
+
+    class _EmptyTrainingSetStatus(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.INVALID_ARGUMENT
+
+        def details(self):
+            return message
+
+    mapped = _rpc_to_jammi(_EmptyTrainingSetStatus())
+    assert type(mapped) is jammi.InvalidArgument
+    assert mapped.code is grpc.StatusCode.INVALID_ARGUMENT
+    assert message in str(mapped)
+
+    # The embedded converter raises BY NAME out of `jammi.errors` — the same
+    # module object, so the class it resolves is the one asserted above and a
+    # caller's single `except` holds on either transport.
+    from jammi import errors as client_errors
+
+    assert client_errors.InvalidArgument is jammi.InvalidArgument
+    assert issubclass(jammi.InvalidArgument, jammi.JammiError)
+    assert issubclass(jammi.InvalidArgument, ValueError)
+
+
+def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_transports():
+    """Tier B (converter-level) — the SAME typed engine error
+    (`JammiError::EmptyTrainingSet`), WHEN IT SURFACES ON THE FINE-TUNE JOB
+    PATH instead of the `Recompute` RPC, does NOT reach the caller as
+    `InvalidArgument` on either transport: both `job.wait()` raise-sites
+    collapse it (and every other job-failure cause) to
+    `jammi.errors.TrainingError`. This is the class-equality check the
+    `Recompute`-scoped test above deliberately does not claim to cover.
+
+    On the JOB path, `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs`,
+    the `materialize_projection` call `.map_err(WorkerJobError::from)?`)
+    turns the typed `EmptyTrainingSet` into a plain string stored as the
+    job's `error_message` — the variant does not survive past that point.
+    Both raise-sites then rebuild the caller-facing error from that STORED
+    STRING alone, with NO branch on its content:
+      * the REMOTE raise-site, `RemoteJob.wait()`
+        (`clients/python/jammi/_database.py`), raises
+        `jammi.errors.TrainingError(resp.error)` for ANY `status == "failed"`
+        — driven directly here with the K2 message as the stubbed error;
+      * the EMBEDDED raise-site, `wait_for_result`
+        (`crates/jammi-python/src/job.rs:380-382`), raises
+        `JammiError::FineTune(record.error)` for ANY `JobStatus::Failed` —
+        the exact same unconditional wrap the generic
+        `test_failed_job_wait_raises_training_error_on_both_raise_sites`
+        above already pins with an unrelated message ("boom") — which
+        `jammi_error_class` (`crates/jammi-python/src/error.rs:54`) maps to
+        `TrainingError`. Neither raise-site inspects the failure's original
+        cause, so the class the two transports agree on for THIS failure is
+        the SAME class already pinned for every OTHER job failure — proven
+        by the shared code path, not restated as a separate coincidence.
+
+    Converter-level on the EMBEDDED arm for the same reason as the other
+    Tier B tests: driving a real `EmptyTrainingSet` job failure end-to-end
+    needs a real source and base model, which is not hermetic.
+    """
+    from jammi._generated.jammi.v1 import job_pb2
+
+    message = (
+        "training set over `SELECT text, label FROM reviews.public.rows` is "
+        "empty: the projection yielded zero rows"
+    )
+
+    class _EmptyTrainingSetJobStub:
+        def JobStatus(self, *_args, **_kwargs):
+            return job_pb2.JobStatusResponse(status="failed", error=message)
+
+    job = jammi.RemoteJob(
+        _EmptyTrainingSetJobStub(),
+        (),
+        job_id="job-empty-training-set",
+        kind="fine_tune",
+        output_model_id="model-empty-training-set",
+    )
+    with pytest.raises(jammi.TrainingError) as info:
+        job.wait()
+    assert type(info.value) is jammi.TrainingError
+    assert message in str(info.value)
+
+    # This is NOT the class the Recompute-RPC-scoped test above pins for the
+    # very same underlying refusal — the two surfaces genuinely disagree,
+    # which is exactly why neither test names itself as covering "the" K2
+    # refusal universally.
+    assert type(info.value) is not jammi.InvalidArgument
+
+    # The embedded raise-site binds to THIS class the same way the generic
+    # failed-job test binds it: by importing `jammi.errors.TrainingError`,
+    # the same module object asserted above, so a caller's single `except`
+    # holds on either transport for this failure too.
+    from jammi import errors as client_errors
+
+    assert client_errors.TrainingError is jammi.TrainingError
+    assert issubclass(jammi.TrainingError, jammi.JammiError)
+    assert issubclass(jammi.TrainingError, RuntimeError)
+
+
 def test_job_handle_protocol_is_satisfied_by_both_handles():
     """Both `jammi_native.Job` (native) and `jammi.RemoteJob`
     satisfy the `JobHandle` protocol — a caller treats the two
@@ -1234,6 +1573,7 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
                     "model_id": "irrelevant-for-this-test",
                     "artifact_path": "irrelevant-for-this-test",
                     "metrics": metrics_value,
+                    "cache_outcome": "computed",
                 }
             )
         )

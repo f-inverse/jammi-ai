@@ -19,8 +19,7 @@ MODEL = f"local:{FIXTURES / 'tiny_modernbert_ner'}"
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
-        db = jammi.connect(f"file://{tmp}")
+    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
 
         # 1. Register the NER corpus and the gold entity spans.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")

@@ -218,10 +218,20 @@ impl PyJob {
 
     /// Block until the job reaches a terminal state, returning the tagged
     /// terminal result as a dict: `{"kind": "model", "model_id",
-    /// "artifact_path", "metrics"}` for a training kind (`metrics` is the raw
-    /// JSON text of the run-summary blob, or `None` when the run recorded
-    /// none — read [`Self::metrics`] for the parsed form), or `{"kind":
-    /// "table", "table", "cache_outcome"}` for a compute kind. Raises
+    /// "artifact_path", "metrics", "cache_outcome"}` for a training kind
+    /// (`metrics` is the raw JSON text of the run-summary blob, or `None`
+    /// when the run recorded none — read [`Self::metrics`] for the parsed
+    /// form; `cache_outcome` is always `"computed"` — model-level cache
+    /// reuse for a `FineTune` job is refused on every durable submit edge
+    /// (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
+    /// `"reused:{model_id}"` form this field's vocabulary reserves is not
+    /// reachable; see
+    /// <https://github.com/f-inverse/jammi-ai/issues/562>), or `{"kind":
+    /// "table", "table", "cache_outcome"}` for a compute kind. This dict is
+    /// the generic `serde_json` projection of the engine's own
+    /// `jammi_ai::jobs::JobResult` (via `serializable_to_pydict`) — a field
+    /// added to that enum reaches this dict with no code change here, which
+    /// is how `cache_outcome` reached the `model` variant. Raises
     /// `jammi.errors.TrainingError` on a failed job, carrying the executor's
     /// recorded message.
     ///

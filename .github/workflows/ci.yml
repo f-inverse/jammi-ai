@@ -618,6 +618,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # `check_lint_surface_closure.py` imports
+      # `check_execution_surface_reachability.py`'s shared PyYAML-backed
+      # workflow loader (`lanes_from_workflows` -> `scan_workflows`) to
+      # read every merge-path workflow's `on:`/`jobs:` structure. This job
+      # runs INSIDE the CI container image, whose own `/usr/bin/python3`
+      # does not yet carry PyYAML on every image this job might be pinned
+      # to (`vars.JAMMI_CI_IMAGE`, or the default tag before a rebuild
+      # lands it via `.docker/ci.Dockerfile`) — an interim, leg-scoped
+      # install here keeps this job green independent of image freshness,
+      # the same `if:`-gated-exception shape the bare-runner Guard matrix
+      # already uses for its own five PyYAML-needing legs.
+      - name: Install PyYAML (lint-surface-closure needs it inside the container)
+        run: python3 -m ensurepip --user 2>/dev/null || true; python3 -m pip install --user 'PyYAML==6.*'
+
       # esc-059 (class `enforcement-surface-gap`): four
       # `clippy::doc_lazy_continuation` lints landed in
       # `jammi-kernels/tests/cuda_parity.rs` (required-features = ["cuda"])
@@ -740,6 +754,36 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+
+      # Image-ordering gate for the NCCL link surface, and the reason it is a
+      # step rather than a note in a PR description. `jammi-ai`'s `cuda`
+      # feature includes `candle-core/nccl`, so cudarc's build script emits
+      # `cargo:rustc-link-lib=dylib=nccl` and every `--features cuda` step in
+      # this job links against NCCL: it needs `nccl.h` at compile time and
+      # `libnccl.so` (the development symlink, not just the versioned object)
+      # at link time. `.docker/ci-cuda.Dockerfile` installs `libnccl` and
+      # `libnccl-devel` for exactly that; this step asserts that THE IMAGE
+      # THIS RUN PULLED actually carries them, before the first step that
+      # would otherwise die a few minutes in with a bare `cannot find -lnccl`
+      # or a missing-header error out of a build script.
+      #
+      # It fails closed in both directions and needs no bookkeeping: a run on
+      # a `:latest` published before that Dockerfile change reds here, and so
+      # does any later rebuild that loses the package. `rpm -q` (this image is
+      # RPM-based — manylinux_2_28 on AlmaLinux 8) names the exact package and
+      # version in the log, which is what a "why did the link fail" question
+      # needs; the two `test -e` legs are the file-level facts the compiler and
+      # the linker actually consume, since a package can be present with its
+      # devel half absent.
+      #
+      # Nothing registers this step anywhere: `check_lint_surface_closure.py`'s
+      # required-lane registry enumerates CLIPPY lanes (crate + feature +
+      # target-kind tuples), not job steps, so a preflight has no row there,
+      # and `check_ci_guard_wiring.py` tracks `check_*`/`test_*` SCRIPTS, of
+      # which this step invokes none. The lane as a whole is already required
+      # through `ci-summary`'s `needs:` list.
+      - name: Preflight — the image carries NCCL (header + link library)
+        run: rpm -q libnccl libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so
 
       - uses: ./.github/actions/setup-rust-ci
 
@@ -1667,6 +1711,17 @@ jobs:
           # list.
           - name: gpu prove lane suite
             cmd: bash ci/scripts/test_gpu_prove_lane.sh
+          # The gang-lane fixture suite: drives the REAL
+          # `rp_gang_verdict` over every rc arm, the GANG_GROUPS closure, the
+          # two never-vacuous arms of the `gang-proof` group as the EXPANDED
+          # remote text the driver really sends, and the lane's cost bound —
+          # re-derived from runpod_lib.sh's own `a100` candidate list, the
+          # driver's RP_SSH_WAIT_SECS/RP_TTL_HOURS and the workflow's
+          # MAX_ATTEMPTS, so a raised term or a drifted figure reds here
+          # rather than showing up on an invoice. Mocks-only: no RunPod
+          # account, no GPU, no network. See that script's own header.
+          - name: gpu gang lane suite
+            cmd: bash ci/scripts/test_gpu_gang_lane.sh
           # esc-084/#454 (prove once per commit, share the verdict): P1-P4
           # static rules (exactly-one producer + the never-in-the-critical-
           # path doctrine, no renting reusable, every manifest CUDA lane's
@@ -2307,6 +2362,13 @@ jobs:
             cmd: bash ci/scripts/assert_glibc_floor.sh --self-test
           - name: assert_image_attestations.sh self-test
             cmd: bash ci/scripts/assert_image_attestations.sh --self-test
+          # The cu12 WHEEL's half of the same question: `verify_link_set.py`'s
+          # `COVERED`, `_entry.py`'s `_CUDA_COMPONENTS` and `pyproject.toml`'s
+          # `nvidia-*-cu12` pins state one contract three times, and the wheel
+          # lane that would notice them disagreeing runs only on a release.
+          # Three file reads, stdlib only — no wheel, no binary, no network.
+          - name: cu12 wheel component contract
+            cmd: python3 ci/scripts/test_cu12_component_contract.py
           # #482 item 2 (Kubernetes reference): the shared remote-smoke
           # oracle's own suite (`check_ci_guard_wiring.py` tracks every
           # tracked `tests/**/test_*.py`, so this suite must be wired in
@@ -2350,6 +2412,19 @@ jobs:
       - name: Install safetensors (perf convert_legacy_bert_checkpoint suite only)
         if: matrix.name == 'perf convert_legacy_bert_checkpoint suite'
         run: python3 -m pip install --user safetensors
+      # `check_execution_surface_reachability.py`'s shared workflow loader
+      # (`on:`/`jobs:` YAML parsing, duplicate-key-refusing) is a declared
+      # PyYAML prerequisite -- this bare runner carries no container image
+      # (`.docker/ci.Dockerfile` pins it there instead), so the FIVE legs
+      # that actually call into that loader (directly, or via
+      # `check_gpu_prove_once.py`, which imports it, or via
+      # `test_gpu_gang_lane.sh`'s `--read-on-block` CLI shell-out) install
+      # it here -- the same `if:`-gated, leg-scoped exception the two
+      # installs above already establish, so every OTHER leg stays a bare,
+      # instant, no-install runner.
+      - name: Install PyYAML (execution-surface-reachability / gpu-prove-once / gpu-gang-lane legs only)
+        if: contains(fromJSON('["execution-surface reachability", "execution-surface reachability self-test", "gpu prove once", "gpu prove once suite", "gpu gang lane suite"]'), matrix.name)
+        run: python3 -m pip install --user 'PyYAML==6.*'
       - name: Run guard
         # `continue_on_error` is unset ('') for every leg except "doc
         # numbers have producers" (matrix.continue_on_error: "true" there) —

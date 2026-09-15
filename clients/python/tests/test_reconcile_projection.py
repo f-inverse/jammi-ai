@@ -3,11 +3,12 @@
 `Database.reconcile`'s remote arm must reproduce the embed wheel's dict shape
 EXACTLY — the embedded `reconcile` returns the engine's `ReconcileReport`
 struct through `serde_json` (`serializable_to_pydict`), so the projection
-contract is that serde shape: all 14 fields
+contract is that serde shape: all 16 fields
 (`scope`/`applied`/`rows_failed`/`rows_failed_count`/`orphans`/
 `orphan_count`/`pending`/`pending_count`/`unattributed`/
-`unattributed_count`/`damaged`/`damaged_count`/`truncated`/
-`bytes_reclaimed`), the same key names, spelled the same way.
+`unattributed_count`/`damaged`/`damaged_count`/`referenced`/
+`referenced_count`/`truncated`/`bytes_reclaimed`), the same key names,
+spelled the same way.
 
 The proto message below is hand-constructed with literal values (not built
 from any fixture the projection itself could have produced), every list
@@ -37,6 +38,8 @@ _RECONCILE_REPORT_DICT_KEYS = {
     "unattributed_count",
     "damaged",
     "damaged_count",
+    "referenced",
+    "referenced_count",
     "truncated",
     "bytes_reclaimed",
 }
@@ -56,12 +59,14 @@ def _populated_report() -> catalog_pb2.ReconcileReport:
         unattributed_count=8,
         damaged=["da"],
         damaged_count=5,
+        referenced=["fa", "fb"],
+        referenced_count=23,
         truncated=True,
         bytes_reclaimed=99999,
     )
 
 
-def test_reconcile_report_to_dict_projects_all_fourteen_fields():
+def test_reconcile_report_to_dict_projects_all_sixteen_fields():
     """The whole row and nothing else: key set matches the engine's full
     `ReconcileReport` shape."""
     projected = _reconcile_report_to_dict(_populated_report())
@@ -91,6 +96,19 @@ def test_reconcile_report_to_dict_round_trips_every_value():
         "unattributed_count": 8,
         "damaged": ["da"],
         "damaged_count": 5,
+        "referenced": ["fa", "fb"],
+        "referenced_count": 23,
         "truncated": True,
         "bytes_reclaimed": 99999,
     }
+
+
+def test_reconcile_report_to_dict_defaults_referenced_to_empty_when_unset():
+    """The additive-default property: a message that never sets `referenced`
+    / `referenced_count` (an older encoder's shape) projects them as the
+    empty/zero value, matching every other repeated field's proto3 default —
+    never a `KeyError` or an attribute-access fault."""
+    report = catalog_pb2.ReconcileReport(scope="_global", applied=False)
+    projected = _reconcile_report_to_dict(report)
+    assert projected["referenced"] == []
+    assert projected["referenced_count"] == 0

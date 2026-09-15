@@ -238,7 +238,13 @@ impl ResultStore {
     /// not prove equal inputs — a "hit" on one would be fabricated reuse. A
     /// requested set containing any unpinned anchor short-circuits to an empty
     /// candidate list.
-    async fn exact_match_candidates(
+    ///
+    /// Visible to the rest of `store` (not public) so a producer whose reuse
+    /// needs an extra predicate over the candidates — the training-set probe
+    /// filters them to [`crate::catalog::result_repo::ResultTableKind::TrainingSet`]
+    /// — matches the same `(definition, inputs)` key as
+    /// [`Self::probe_cache_record`] instead of restating it.
+    pub(super) async fn exact_match_candidates(
         &self,
         definition: &DefinitionHash,
         inputs: &[InputAnchor],

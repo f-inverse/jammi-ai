@@ -80,6 +80,25 @@
 //! and their own per-RPC stream budget (`max_subscriptions` / `max_job_waits`,
 //! released when the stream ends or the connection drops — [`PermitBody`]).
 //!
+//! `GangService.RunRank` (`crates/jammi-server/src/grpc/gang.rs`) is a THIRD
+//! server-streaming RPC (a bidi stream: `stream RankControl` in, `stream
+//! RankEvent` out, for the coordinator-to-member gang admission handshake and
+//! its rank-control frames) — [`is_streaming_path`] recognizes it too, so
+//! this predicate stays equal to the descriptor-derived server-streaming set
+//! (`is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set`,
+//! below). It carries no per-RPC stream budget of its own here, though: it
+//! never actually reaches [`MethodClassLayer`] in production —
+//! `GangService` is mounted only on the internal `[server] peer_bind`
+//! listener, which `crate::runtime::OssServer::bind` builds deliberately
+//! LAYER-FREE (no `[server.limits]` stack, no tenant layer — see that
+//! module's own doc, "no `[server.limits]` stack — its clients are
+//! coordinators (I-PEER)"). [`MethodClass::call`] still classifies its path
+//! correctly (passthrough, no stream-count budget, `wait_timeout_secs`
+//! applied as a deadline exactly like an unconfigured `max_subscriptions`/
+//! `max_job_waits` already does) rather than silently falling into
+//! `Subscribe`'s or `WaitJob`'s own budget, should this predicate's callers
+//! ever ship gang admission on the public chain someday.
+//!
 //! `wait_timeout_secs`, when configured, bounds a stream in one of three ways
 //! depending on what the caller's `grpc-timeout` header declares — the SERVER
 //! budget bounds the stream; the client imposes no deadline of its own by
@@ -111,14 +130,16 @@
 //!   with the stream still open, closes it with a `DEADLINE_EXCEEDED` trailer
 //!   — the stream ends at the budget, not at open, and never runs unbounded.
 //!
-//! [`is_streaming_path`] is a hardcoded two-path allowlist rather than a
+//! [`is_streaming_path`] is a hardcoded three-path allowlist rather than a
 //! path→class map derived from the compiled `FILE_DESCRIPTOR_SET`: this
-//! codebase mounts exactly two
-//! server-streaming RPCs today, so the derived map's only observable
-//! behaviour over THIS binary is this same two-path set. This is a
-//! documented, deliberate scope reduction — a third server-streaming RPC
-//! added later needs this list extended by hand, and no test today catches
-//! that omission.
+//! codebase's `jammi.v1.*` surface declares exactly three server-streaming
+//! RPCs (`WaitJob`, `Subscribe`, `RunRank`), so the derived map's only
+//! observable behaviour over THIS binary is this same three-path set. This
+//! is a documented, deliberate scope reduction — a fourth server-streaming
+//! RPC added later needs this list extended by hand, but
+//! `is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set`
+//! (below) fails loudly the moment it lands undeclared here, exactly the gap
+//! `RunRank`'s own addition (the `GangService` streaming RPC) left open.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -149,11 +170,18 @@ pub const WAIT_JOB_PATH: &str = "/jammi.v1.job.JobService/WaitJob";
 /// `TriggerService.Subscribe`'s wire path — the SAME exemption as
 /// [`WAIT_JOB_PATH`].
 pub const SUBSCRIBE_PATH: &str = "/jammi.v1.trigger.TriggerService/Subscribe";
+/// `GangService.RunRank`'s wire path — a bidi-streaming RPC (server-streaming
+/// on the descriptor, which is all this predicate keys on), recognized here
+/// for descriptor-set parity even though it never actually reaches
+/// [`MethodClassLayer`] in production (`GangService` is mounted only on the
+/// layer-free internal `[server] peer_bind` listener) — see the module
+/// docs' "Streaming-path exemption" section.
+pub const RUN_RANK_PATH: &str = "/jammi.v1.gang.GangService/RunRank";
 
 /// True for a path this stack treats as a long-lived server-streaming RPC.
 /// See the module docs' "Streaming-path exemption" section.
 pub fn is_streaming_path(path: &str) -> bool {
-    path == WAIT_JOB_PATH || path == SUBSCRIBE_PATH
+    path == WAIT_JOB_PATH || path == SUBSCRIBE_PATH || path == RUN_RANK_PATH
 }
 
 /// Which budget refused a request — attached to a synthesized refusal
@@ -725,6 +753,22 @@ where
                     }
                     None => deadline = Some((cap, deadline_message(cap))),
                 }
+            }
+
+            // `RunRank` carries no per-RPC stream-count budget of its own —
+            // no `server.limits.max_*` knob exists for it, and (module docs'
+            // "Streaming-path exemption" section) it never actually reaches
+            // this layer in production. It still gets the SAME `deadline`
+            // treatment every other streaming RPC gets above; a dedicated
+            // arm here (rather than falling into the `is_wait_job` ternary
+            // below) is what keeps it from being silently counted against
+            // `Subscribe`'s own `max_subscriptions` budget.
+            if path == RUN_RANK_PATH {
+                let drain = self.layer.drain.clone();
+                return Box::pin(async move {
+                    let response = inner.call(req).await?;
+                    Ok(response.map(|body| PermitBody::new(body, None, deadline, drain)))
+                });
             }
 
             let is_wait_job = path == WAIT_JOB_PATH;
@@ -1695,9 +1739,10 @@ mod tests {
     // ─── is_streaming_path / parse_grpc_timeout ─────────────────────────
 
     #[test]
-    fn is_streaming_path_matches_exactly_the_two_known_streaming_rpcs() {
+    fn is_streaming_path_matches_exactly_the_three_known_streaming_rpcs() {
         assert!(is_streaming_path(WAIT_JOB_PATH));
         assert!(is_streaming_path(SUBSCRIBE_PATH));
+        assert!(is_streaming_path(RUN_RANK_PATH));
         assert!(!is_streaming_path(
             "/jammi.v1.embedding.EmbeddingService/Search"
         ));
@@ -1706,12 +1751,14 @@ mod tests {
 
     /// [`is_streaming_path`]'s hardcoded allowlist is a documented,
     /// deliberate scope reduction (module docs' "Streaming-path exemption"
-    /// section) -- but nothing catches a THIRD server-streaming rpc landing
-    /// without the list being extended by hand. This DERIVES the actual
-    /// server-streaming method set from the compiled `jammi.v1`
-    /// `FILE_DESCRIPTOR_SET` (`MethodDescriptorProto::server_streaming`) and
-    /// asserts it equals the hardcoded set -- symmetric, so a stale entry (a
-    /// removed rpc still allowlisted) fails just as loudly as a missing one.
+    /// section) -- but nothing catches a FOURTH server-streaming rpc landing
+    /// without the list being extended by hand (a THIRD, `RunRank`, landed
+    /// with `GangService` without this list being extended). This DERIVES
+    /// the actual server-streaming method set from the compiled `jammi.v1`
+    /// `FILE_DESCRIPTOR_SET`
+    /// (`MethodDescriptorProto::server_streaming`) and asserts it equals the
+    /// hardcoded set -- symmetric, so a stale entry (a removed rpc still
+    /// allowlisted) fails just as loudly as a missing one.
     #[test]
     fn is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set() {
         use prost::Message;
@@ -1743,16 +1790,20 @@ mod tests {
             }
         }
 
-        let hardcoded: BTreeSet<String> = [WAIT_JOB_PATH.to_string(), SUBSCRIBE_PATH.to_string()]
-            .into_iter()
-            .collect();
+        let hardcoded: BTreeSet<String> = [
+            WAIT_JOB_PATH.to_string(),
+            SUBSCRIBE_PATH.to_string(),
+            RUN_RANK_PATH.to_string(),
+        ]
+        .into_iter()
+        .collect();
 
         assert_eq!(
             derived, hardcoded,
             "is_streaming_path's hardcoded allowlist has drifted from the descriptor-derived \
              server-streaming rpc set -- a new server-streaming rpc needs WAIT_JOB_PATH/\
-             SUBSCRIBE_PATH's allowlist extended by hand (module docs' 'Streaming-path \
-             exemption' section), or a removed one needs its stale entry dropped"
+             SUBSCRIBE_PATH/RUN_RANK_PATH's allowlist extended by hand (module docs' \
+             'Streaming-path exemption' section), or a removed one needs its stale entry dropped"
         );
     }
 

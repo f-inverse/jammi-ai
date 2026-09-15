@@ -120,6 +120,96 @@ enum UnderlyingFormat {
     Regression,
 }
 
+/// Every canonical training-format tag, in declaration order — the CLOSED set
+/// [`TrainingFormat::format_tag`] maps onto.
+///
+/// The set is closed by the round-trip test below rather than by convention:
+/// the tag of every variant must appear here, the entries must be pairwise
+/// distinct, and [`TrainingFormat::from_format_tag`] must recover a value with
+/// the same tag for each. A tag that changes is a *different* training set, so
+/// a rename is a breaking change to every recorded definition hash, not a
+/// cosmetic edit.
+pub const TRAINING_FORMAT_TAGS: &[&str] = &[
+    "contrastive",
+    "pairs",
+    "triplet",
+    "media_triplet",
+    "classification",
+    "ner",
+    "regression",
+    "graph_pairs",
+    "graph_triplet",
+];
+
+impl TrainingFormat {
+    /// The canonical string tag a materialised training set records this format
+    /// under — the ONE mapping from a [`TrainingFormat`] to the `format` field
+    /// of
+    /// [`ProducingDescriptor::TrainingSet`](jammi_db::store::manifest::ProducingDescriptor::TrainingSet).
+    ///
+    /// `jammi-db` depends on no jammi crate but `jammi-numerics`, so the
+    /// descriptor folds a string rather than this enum, and the completeness
+    /// burden lands here: **a format distinction this mapping does not spell is
+    /// two different training sets colliding on one definition hash.** The match
+    /// is exhaustive with no `_` arm, so a new variant cannot reach the
+    /// descriptor without being given a tag.
+    ///
+    /// The two parameterised variants deliberately drop their parameter.
+    /// `Classification`'s `num_classes` and `Ner`'s `num_labels` are *functions
+    /// of the rows* — the count of distinct labels the loader observed — not
+    /// independent choices a caller makes, so they cannot distinguish two
+    /// training sets built from the same source, columns and task, and folding
+    /// them would require reading the rows before naming the table that holds
+    /// them. `Graph`'s `has_negatives` is not in that class: it changes the
+    /// projected column set (a mined negative is a third column) and therefore
+    /// the committed bytes, so it takes two distinct tags.
+    pub fn format_tag(self) -> &'static str {
+        match self {
+            TrainingFormat::Contrastive => "contrastive",
+            TrainingFormat::Pairs => "pairs",
+            TrainingFormat::Triplet => "triplet",
+            TrainingFormat::MediaTriplet => "media_triplet",
+            TrainingFormat::Classification { .. } => "classification",
+            TrainingFormat::Ner { .. } => "ner",
+            TrainingFormat::Regression => "regression",
+            TrainingFormat::Graph {
+                has_negatives: false,
+            } => "graph_pairs",
+            TrainingFormat::Graph {
+                has_negatives: true,
+            } => "graph_triplet",
+        }
+    }
+
+    /// The inverse of [`Self::format_tag`] over [`TRAINING_FORMAT_TAGS`]: the
+    /// representative format a recorded tag names, with the two data-derived
+    /// parameters at zero (the tag never carried them — see
+    /// [`Self::format_tag`] — so no value of theirs is recoverable and zero is
+    /// the neutral stand-in, never a claim about the rows).
+    ///
+    /// `None` for a tag this build does not know, which is how a table
+    /// committed by a newer build is refused rather than read as some
+    /// near-miss format.
+    pub fn from_format_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "contrastive" => Some(TrainingFormat::Contrastive),
+            "pairs" => Some(TrainingFormat::Pairs),
+            "triplet" => Some(TrainingFormat::Triplet),
+            "media_triplet" => Some(TrainingFormat::MediaTriplet),
+            "classification" => Some(TrainingFormat::Classification { num_classes: 0 }),
+            "ner" => Some(TrainingFormat::Ner { num_labels: 0 }),
+            "regression" => Some(TrainingFormat::Regression),
+            "graph_pairs" => Some(TrainingFormat::Graph {
+                has_negatives: false,
+            }),
+            "graph_triplet" => Some(TrainingFormat::Graph {
+                has_negatives: true,
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl TrainingFormat {
     /// The concrete shape a format trains as: a graph with mined hard negatives
     /// is a `Triplet`, one without is `Pairs`; every other format is itself.
@@ -147,6 +237,7 @@ impl TrainingFormat {
 
 /// A chunk of text data for one training batch. The training loop encodes
 /// these through the base model before computing loss.
+#[derive(Debug)]
 pub enum TextChunk {
     Contrastive {
         texts_a: Vec<String>,
@@ -191,12 +282,33 @@ pub enum TextChunk {
     },
 }
 
+impl TextChunk {
+    /// The number of rows this chunk carries — every field of a well-formed
+    /// chunk is the same length, so any one of them reports it. A zero here
+    /// is a valid, well-formed state (a zero-row rank at the trailing global
+    /// batch, DESIGN.md §2, K2), not a malformed chunk: every producer of a
+    /// [`TextChunk`] (`TrainingDataLoader::rows_to_text_chunk`) builds it by
+    /// `.map().collect()` over a row slice that can itself be empty.
+    pub fn row_count(&self) -> usize {
+        match self {
+            TextChunk::Contrastive { texts_a, .. } => texts_a.len(),
+            TextChunk::Pairs { anchors, .. } => anchors.len(),
+            TextChunk::Triplet { anchors, .. } => anchors.len(),
+            TextChunk::MediaTriplet { anchors, .. } => anchors.len(),
+            TextChunk::Classification { texts, .. } => texts.len(),
+            TextChunk::Ner { texts, .. } => texts.len(),
+            TextChunk::Regression { texts, .. } => texts.len(),
+        }
+    }
+}
+
 /// The flattened in-batch-negative view of a text loader: `(anchors,
 /// positives, optional explicit negatives)`. Consumed by GradCache and
 /// hard-negative mining, which treat the dataset as one in-batch-negative batch.
 pub type InBatchNegativeTexts = (Vec<String>, Vec<String>, Option<Vec<String>>);
 
-/// Internal storage: either text rows (from source) or precomputed batches (for tests).
+/// Internal storage: text rows already resident (from source, or the tests-only
+/// synthetic constructors), or precomputed batches (tests only).
 enum LoaderData {
     TextRows(Vec<TrainingRow>),
     Precomputed(Vec<TrainingBatch>),
@@ -474,12 +586,12 @@ impl TrainingDataLoader {
     }
 
     /// Deterministic split: last `fraction` of data goes to validation.
-    pub fn split(&self, fraction: f64) -> Result<(TrainingDataLoader, TrainingDataLoader)> {
+    pub fn split(&self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
         match &self.data {
             LoaderData::TextRows(rows) => {
                 let val_count = (rows.len() as f64 * fraction).round() as usize;
                 let train_count = rows.len() - val_count;
-                Ok((
+                (
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::TextRows(rows[..train_count].to_vec()),
@@ -488,12 +600,12 @@ impl TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::TextRows(rows[train_count..].to_vec()),
                     },
-                ))
+                )
             }
             LoaderData::Precomputed(batches) => {
                 let val_count = (batches.len() as f64 * fraction).round() as usize;
                 let train_count = batches.len() - val_count;
-                Ok((
+                (
                     TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::Precomputed(batches[..train_count].to_vec()),
@@ -502,7 +614,7 @@ impl TrainingDataLoader {
                         format: self.format,
                         data: LoaderData::Precomputed(batches[train_count..].to_vec()),
                     },
-                ))
+                )
             }
         }
     }
@@ -534,146 +646,188 @@ impl TrainingDataLoader {
         match &self.data {
             LoaderData::TextRows(rows) => rows
                 .chunks(batch_size)
-                // A `Graph` loader stores `Pairs`/`Triplet` rows, so it encodes
-                // through its underlying shape — the provenance variant carries
-                // no chunk shape of its own.
-                .map(|chunk| match self.format.underlying() {
-                    UnderlyingFormat::Contrastive => TextChunk::Contrastive {
-                        texts_a: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Contrastive { text_a, .. } => text_a.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        texts_b: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Contrastive { text_b, .. } => text_b.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        scores: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Contrastive { score, .. } => *score,
-                                _ => 0.0,
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Pairs => TextChunk::Pairs {
-                        anchors: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Pairs { anchor, .. } => anchor.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        positives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Pairs { positive, .. } => positive.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Triplet => TextChunk::Triplet {
-                        anchors: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Triplet { anchor, .. } => anchor.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        positives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Triplet { positive, .. } => positive.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        negatives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Triplet { negative, .. } => negative.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::MediaTriplet => TextChunk::MediaTriplet {
-                        anchors: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::MediaTriplet { anchor, .. } => anchor.clone(),
-                                _ => Vec::new(),
-                            })
-                            .collect(),
-                        positives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::MediaTriplet { positive, .. } => positive.clone(),
-                                _ => Vec::new(),
-                            })
-                            .collect(),
-                        negatives: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::MediaTriplet { negative, .. } => negative.clone(),
-                                _ => Vec::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Classification => TextChunk::Classification {
-                        texts: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Classification { text, .. } => text.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        labels: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Classification { label, .. } => *label,
-                                _ => 0,
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Ner => TextChunk::Ner {
-                        texts: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Ner { text, .. } => text.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        entities_json: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Ner { entities_json, .. } => entities_json.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                    },
-                    UnderlyingFormat::Regression => TextChunk::Regression {
-                        texts: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Regression { text, .. } => text.clone(),
-                                _ => String::new(),
-                            })
-                            .collect(),
-                        targets: chunk
-                            .iter()
-                            .map(|r| match r {
-                                TrainingRow::Regression { target, .. } => *target,
-                                _ => 0.0,
-                            })
-                            .collect(),
-                    },
-                })
+                .map(|chunk| self.rows_to_text_chunk(chunk))
                 .collect(),
             LoaderData::Precomputed(_) => Vec::new(),
+        }
+    }
+
+    /// One [`TextChunk`] from a slice of this loader's own [`TrainingRow`]s —
+    /// the single per-chunk row→chunk converter [`Self::text_chunks`] (every
+    /// row, `batch_size` at a time) and [`Self::text_chunk_for_rank`] (one
+    /// [`super::partition::PartitionSpec`]-selected slice at a time) both
+    /// drive, so the two never risk decoding a chunk differently. `chunk` may
+    /// be EMPTY — a zero-row rank (DESIGN.md §2) still produces a well-formed
+    /// [`TextChunk`] with empty inner vectors, never a panic: every arm here
+    /// is a plain `.map().collect()` over `chunk`, which is total on an empty
+    /// slice.
+    ///
+    /// A `Graph` loader stores `Pairs`/`Triplet` rows, so it encodes through
+    /// its underlying shape — the provenance variant carries no chunk shape
+    /// of its own.
+    fn rows_to_text_chunk(&self, chunk: &[TrainingRow]) -> TextChunk {
+        match self.format.underlying() {
+            UnderlyingFormat::Contrastive => TextChunk::Contrastive {
+                texts_a: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Contrastive { text_a, .. } => text_a.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                texts_b: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Contrastive { text_b, .. } => text_b.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                scores: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Contrastive { score, .. } => *score,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Pairs => TextChunk::Pairs {
+                anchors: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Pairs { anchor, .. } => anchor.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                positives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Pairs { positive, .. } => positive.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Triplet => TextChunk::Triplet {
+                anchors: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Triplet { anchor, .. } => anchor.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                positives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Triplet { positive, .. } => positive.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                negatives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Triplet { negative, .. } => negative.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::MediaTriplet => TextChunk::MediaTriplet {
+                anchors: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::MediaTriplet { anchor, .. } => anchor.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+                positives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::MediaTriplet { positive, .. } => positive.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+                negatives: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::MediaTriplet { negative, .. } => negative.clone(),
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Classification => TextChunk::Classification {
+                texts: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Classification { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                labels: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Classification { label, .. } => *label,
+                        _ => 0,
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Ner => TextChunk::Ner {
+                texts: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Ner { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                entities_json: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Ner { entities_json, .. } => entities_json.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            },
+            UnderlyingFormat::Regression => TextChunk::Regression {
+                texts: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Regression { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                targets: chunk
+                    .iter()
+                    .map(|r| match r {
+                        TrainingRow::Regression { target, .. } => *target,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// The [`TextChunk`] rank `spec.rank` of `spec.world` holds for global
+    /// step `step`, over THIS loader's own row count as the train prefix
+    /// (DESIGN.md §2, partition rule v1 — [`super::partition::PartitionSpec::
+    /// rows_for_step`] computes the slice; this method decodes it through the
+    /// SAME `Self::rows_to_text_chunk` converter [`Self::text_chunks`]
+    /// uses). A rank whose slice is empty (a zero-row rank at the trailing
+    /// global batch, K2) yields a well-formed [`TextChunk`] with empty inner
+    /// vectors, never an out-of-bounds panic — `rows_for_step` never returns
+    /// a range past `rows.len()`.
+    ///
+    /// Text-rows-backed loaders only (`Precomputed` has no row-level
+    /// partition).
+    pub fn text_chunk_for_rank(
+        &self,
+        spec: &super::partition::PartitionSpec,
+        step: usize,
+    ) -> Result<TextChunk> {
+        match &self.data {
+            LoaderData::TextRows(rows) => {
+                let range = spec.rows_for_step(rows.len(), step);
+                Ok(self.rows_to_text_chunk(&rows[range]))
+            }
+            LoaderData::Precomputed(_) => Err(JammiError::FineTune(
+                "a precomputed loader has no row-level partition".into(),
+            )),
         }
     }
 
@@ -684,9 +838,9 @@ impl TrainingDataLoader {
 
     /// Every regression target in this loader, in row order — the whole-dataset
     /// view the trainer reduces into a fixed target scaler once before the
-    /// loop. `None` for any non-regression loader (no targets to standardise) and
-    /// for the precomputed test path (which supplies head/target tensors
-    /// directly, not text rows).
+    /// loop (K3). `None` for any non-regression loader (no targets to
+    /// standardise) and for the precomputed test path (which supplies
+    /// head/target tensors directly, not text rows).
     pub fn regression_targets(&self) -> Option<Vec<f32>> {
         if !matches!(self.format, TrainingFormat::Regression) {
             return None;
@@ -710,7 +864,7 @@ impl TrainingDataLoader {
     /// negatives) and `None` for a `Pairs` loader. Returns an error for any
     /// other format — only in-batch-negative training has this shape.
     pub fn in_batch_negative_texts(&self) -> Result<InBatchNegativeTexts> {
-        let rows = match &self.data {
+        let rows: &[TrainingRow] = match &self.data {
             LoaderData::TextRows(rows) => rows,
             LoaderData::Precomputed(_) => {
                 return Err(JammiError::FineTune(
@@ -769,6 +923,160 @@ impl TrainingDataLoader {
 mod tests {
     use super::*;
 
+    /// A `Precomputed` loader has no row-level partition, so
+    /// `text_chunk_for_rank` refuses it outright
+    /// rather than attempting to slice pre-built tensor batches by row. Dies
+    /// if the refusal is removed (the `LoaderData::Precomputed(_) => Err(...)`
+    /// arm at `text_chunk_for_rank`'s match) — the call would then need to
+    /// fall through to some OTHER arm, which does not compile for an empty
+    /// `Vec<TrainingBatch>` fed in here without inventing a bogus row slice.
+    #[test]
+    fn precomputed_loader_refuses_text_chunk_for_rank() {
+        use super::super::partition::{PartitionRule, PartitionSpec};
+        let loader = TrainingDataLoader::from_precomputed(Vec::new());
+        let spec = PartitionSpec::for_test(0, 1, 4, PartitionRule::BlockByGlobalBatch);
+        match loader.text_chunk_for_rank(&spec, 0) {
+            Err(e) => assert!(
+                e.to_string().contains("no row-level partition"),
+                "expected the typed 'no row-level partition' refusal, got: {e}"
+            ),
+            Ok(_) => panic!("a Precomputed loader must refuse text_chunk_for_rank"),
+        }
+    }
+
+    /// Every [`TrainingFormat`] value the tag mapping must cover, in
+    /// [`TRAINING_FORMAT_TAGS`] order. Hand-written, and ANCHORED to the
+    /// compiler by [`enumeration_index`] below — a new variant fails to
+    /// compile there until it is added here too, so the round-trip tests can
+    /// never range over a stale subset.
+    fn every_training_format() -> Vec<TrainingFormat> {
+        vec![
+            TrainingFormat::Contrastive,
+            TrainingFormat::Pairs,
+            TrainingFormat::Triplet,
+            TrainingFormat::MediaTriplet,
+            TrainingFormat::Classification { num_classes: 7 },
+            TrainingFormat::Ner { num_labels: 5 },
+            TrainingFormat::Regression,
+            TrainingFormat::Graph {
+                has_negatives: false,
+            },
+            TrainingFormat::Graph {
+                has_negatives: true,
+            },
+        ]
+    }
+
+    /// The compiler anchor for [`every_training_format`]: an exhaustive match
+    /// with no `_` arm mapping each variant to its position in that list.
+    fn enumeration_index(format: TrainingFormat) -> usize {
+        match format {
+            TrainingFormat::Contrastive => 0,
+            TrainingFormat::Pairs => 1,
+            TrainingFormat::Triplet => 2,
+            TrainingFormat::MediaTriplet => 3,
+            TrainingFormat::Classification { .. } => 4,
+            TrainingFormat::Ner { .. } => 5,
+            TrainingFormat::Regression => 6,
+            TrainingFormat::Graph {
+                has_negatives: false,
+            } => 7,
+            TrainingFormat::Graph {
+                has_negatives: true,
+            } => 8,
+        }
+    }
+
+    #[test]
+    fn the_format_enumeration_is_the_whole_enum() {
+        let all = every_training_format();
+        for (i, format) in all.iter().enumerate() {
+            assert_eq!(
+                enumeration_index(*format),
+                i,
+                "{format:?} is out of position in every_training_format()"
+            );
+        }
+        // Every index the anchor can return is occupied, so the list has no
+        // hole a variant could hide in.
+        let mut occupied: Vec<usize> = all.iter().map(|f| enumeration_index(*f)).collect();
+        occupied.sort_unstable();
+        assert_eq!(occupied, (0..all.len()).collect::<Vec<_>>());
+    }
+
+    /// The tag mapping is a bijection between the variants and
+    /// [`TRAINING_FORMAT_TAGS`], and it round-trips through
+    /// [`TrainingFormat::from_format_tag`].
+    ///
+    /// Injectivity is the load-bearing half: two variants sharing a tag are two
+    /// different training sets colliding on one definition hash, which is
+    /// exactly the failure the string-tag indirection risks.
+    #[test]
+    fn format_tags_are_a_bijection_and_round_trip() {
+        let all = every_training_format();
+
+        let tags: Vec<&str> = all.iter().map(|f| f.format_tag()).collect();
+        assert_eq!(
+            tags, TRAINING_FORMAT_TAGS,
+            "the declared tag set and the variants' own tags must agree, in order"
+        );
+
+        let mut distinct = tags.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            tags.len(),
+            "two formats share a tag, so two different training sets would              collide on one definition hash: {tags:?}"
+        );
+
+        for format in &all {
+            let tag = format.format_tag();
+            let recovered = TrainingFormat::from_format_tag(tag)
+                .unwrap_or_else(|| panic!("tag {tag:?} is not decodable"));
+            assert_eq!(recovered.format_tag(), tag);
+        }
+        for tag in TRAINING_FORMAT_TAGS {
+            let recovered = TrainingFormat::from_format_tag(tag)
+                .unwrap_or_else(|| panic!("declared tag {tag:?} is not decodable"));
+            assert_eq!(&recovered.format_tag(), tag);
+        }
+    }
+
+    /// The two data-derived parameters are dropped by design, and the one
+    /// byte-affecting parameter is not.
+    #[test]
+    fn the_tag_drops_row_derived_parameters_and_keeps_the_shape_one() {
+        assert_eq!(
+            TrainingFormat::Classification { num_classes: 3 }.format_tag(),
+            TrainingFormat::Classification { num_classes: 900 }.format_tag(),
+            "num_classes is a function of the rows, not of the table's identity"
+        );
+        assert_eq!(
+            TrainingFormat::Ner { num_labels: 3 }.format_tag(),
+            TrainingFormat::Ner { num_labels: 900 }.format_tag(),
+            "num_labels is a function of the rows, not of the table's identity"
+        );
+        assert_ne!(
+            TrainingFormat::Graph {
+                has_negatives: false
+            }
+            .format_tag(),
+            TrainingFormat::Graph {
+                has_negatives: true
+            }
+            .format_tag(),
+            "a mined negative is a third projected column, so it is a different table"
+        );
+    }
+
+    #[test]
+    fn an_unknown_tag_is_refused_rather_than_approximated() {
+        assert!(TrainingFormat::from_format_tag("graph").is_none());
+        assert!(TrainingFormat::from_format_tag("Contrastive").is_none());
+        assert!(TrainingFormat::from_format_tag("").is_none());
+    }
+
     /// A regression loader carries `TrainingFormat::Regression` and chunks its
     /// rows into `TextChunk::Regression { texts, targets }` — the shape the
     /// trainer encodes through the distributional head. Pins the S18 data path
@@ -807,10 +1115,119 @@ mod tests {
         let loader = TrainingDataLoader::from_regression(
             (0..10).map(|i| (format!("r{i}"), i as f32)).collect(),
         );
-        let (train, val) = loader.split(0.2).unwrap();
+        let (train, val) = loader.split(0.2);
         assert!(matches!(train.format(), TrainingFormat::Regression));
         assert!(matches!(val.format(), TrainingFormat::Regression));
         assert_eq!(train.len(), 8);
         assert_eq!(val.len(), 2);
+    }
+
+    /// Acceptance (b): for W ∈ {1, 2, 4}, the MULTISET of rows over all ranks
+    /// at each global step equals the W=1 batch at that step, on a
+    /// `train_count` (7) that is NOT a multiple of `W·B` for any tested W —
+    /// asserting a zero-row rank actually occurs for W=2 and W=4 (DESIGN.md
+    /// §2; PRESSURE round-2 design finding 6). RED at base: neither
+    /// `PartitionSpec` nor `text_chunk_for_rank` exist there.
+    ///
+    /// Per-determinant table (reported alongside this test in the
+    /// eval-verdict): the fixture is chosen so W=2 hits its zero-row rank at
+    /// the LAST step (rank 1) and W=4 hits it at the FIRST step (rank 3) —
+    /// two different positions in the epoch, not the same one twice.
+    #[test]
+    fn partition_rule_multiset_matches_the_w1_batch_with_zero_row_ranks() {
+        use super::super::partition::{PartitionRule, PartitionSpec};
+
+        let train_count = 7usize;
+        let per_rank_batch = 3usize;
+        let loader = TrainingDataLoader::from_pairs(
+            (0..train_count)
+                .map(|i| (format!("a{i}"), format!("p{i}")))
+                .collect(),
+        );
+
+        fn anchors_of(chunk: &TextChunk) -> Vec<String> {
+            match chunk {
+                TextChunk::Pairs { anchors, .. } => anchors.clone(),
+                other => panic!("expected a Pairs chunk, got a different TextChunk arm: {other:?}"),
+            }
+        }
+
+        for &world in &[1usize, 2, 4] {
+            let w1_ref = PartitionSpec::for_test(
+                0,
+                1,
+                per_rank_batch * world,
+                PartitionRule::BlockByGlobalBatch,
+            );
+            let mut zero_row_seen = false;
+            let mut step = 0usize;
+            loop {
+                let w1_range = w1_ref.rows_for_step(train_count, step);
+                if w1_range.is_empty() {
+                    break;
+                }
+                let w1_chunk = loader.text_chunk_for_rank(&w1_ref, step).unwrap();
+                let expected = anchors_of(&w1_chunk);
+
+                let mut union = Vec::new();
+                for rank in 0..world {
+                    let spec = PartitionSpec::for_test(
+                        rank,
+                        world,
+                        per_rank_batch,
+                        PartitionRule::BlockByGlobalBatch,
+                    );
+                    let chunk = loader.text_chunk_for_rank(&spec, step).unwrap();
+                    let rank_anchors = anchors_of(&chunk);
+                    if rank_anchors.is_empty() {
+                        zero_row_seen = true;
+                    }
+                    union.extend(rank_anchors);
+                }
+                assert_eq!(
+                    union, expected,
+                    "world={world} step={step}: the union over ranks must equal the W=1 batch"
+                );
+                step += 1;
+            }
+            if world > 1 {
+                assert!(
+                    zero_row_seen,
+                    "world={world} on train_count={train_count}, batch={per_rank_batch} must hit \
+                     a zero-row rank on this fixture, and none did"
+                );
+            }
+        }
+    }
+
+    /// R-A for (b): shrinking a rank's batch to a size the fixture cannot
+    /// possibly fill for a real chunk still returns a well-formed (empty)
+    /// chunk rather than panicking, and a step past every rank's data is
+    /// empty for every rank — the zero-row state is total, not a
+    /// coincidence of the one fixture above.
+    #[test]
+    fn partition_rule_a_step_past_the_train_prefix_is_zero_rows_for_every_rank() {
+        use super::super::partition::{PartitionRule, PartitionSpec};
+        let train_count = 5usize;
+        let loader = TrainingDataLoader::from_pairs(
+            (0..train_count)
+                .map(|i| (format!("a{i}"), format!("p{i}")))
+                .collect(),
+        );
+        for world in [1usize, 2, 4] {
+            for rank in 0..world {
+                let spec =
+                    PartitionSpec::for_test(rank, world, 3, PartitionRule::BlockByGlobalBatch);
+                // Step 10 is far past any row this 5-row fixture could ever
+                // reach at batch 3 for any tested world.
+                let chunk = loader.text_chunk_for_rank(&spec, 10).unwrap();
+                match &chunk {
+                    TextChunk::Pairs { anchors, positives } => {
+                        assert!(anchors.is_empty() && positives.is_empty());
+                    }
+                    _ => panic!("expected a Pairs chunk"),
+                }
+            }
+        }
     }
 }

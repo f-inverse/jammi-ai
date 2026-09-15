@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package jammi.v1.job;
 
+import "jammi/v1/inference.proto";
 import "jammi/v1/training.proto";
 
 // JobService — the wire surface over the engine's durable job queue
@@ -136,6 +137,41 @@ message SubmitJobRequest {
   // key can exceed (SQLite has none, so the two backends would otherwise
   // silently diverge on the exact same input).
   string idempotency_key = 6;
+  // Data-parallel rank count for the two LoRA fine-tune kinds: the wire form of
+  // the engine's `TrainingCommon.world_size`, which is why it sits beside
+  // `base_model`/`config` rather than inside a per-kind spec — both LoRA kinds
+  // fold the same common block, so one field serves both and the two kinds
+  // cannot diverge on it. Unused by the context-predictor kind (it carries no
+  // common block).
+  //
+  // `0` means UNSET and resolves to the engine's default of `1` (a single
+  // rank), so a caller that never sets it submits exactly the single-rank job
+  // it always did and a request encoded without the field decodes identically
+  // to one encoded with `0`. Identity-relevant, not a scheduling hint: the rank
+  // count fixes the batch layout and the summation order, so it is part of the
+  // trained model's producing identity. A count the deployment cannot serve is
+  // refused at submit with a typed error rather than silently clamped.
+  uint32 world_size = 9;
+  // Mirrors the engine's `TrainingSpec::FineTune.cache` field for field, the
+  // same shared `CachePolicy` enum every other result-table producer verb carries
+  // (`jammi.v1.inference.CachePolicy` — imported rather than redeclared, so
+  // this and every other producer's cache dial share one wire vocabulary).
+  // UNSPECIFIED maps to the engine default (`Bypass`, always train), matching
+  // how every other `*_UNSPECIFIED` arm resolves to its engine default; an
+  // absent field and an explicit `CACHE_POLICY_BYPASS` are the identical
+  // engine outcome. `USE` is REFUSED, typed (`InvalidArgument`), for BOTH LoRA
+  // fine-tune kinds: `graph_fine_tune`'s model carries no materialization to
+  // probe or record, and model-level cache reuse for the column-source
+  // `fine_tune` kind is not yet supported
+  // (https://github.com/f-inverse/jammi-ai/issues/562). `BYPASS`/unset always
+  // trains, on either kind, exactly as before this field existed. Unused by
+  // the context-predictor kind (it carries no `TrainingCommon`, so it has
+  // nothing to probe by).
+  jammi.v1.inference.CachePolicy cache = 10;
+  // Tags 7 and 8 belonged to the job-dependency unit (`depends_on = 7`,
+  // `parent_id = 8`), deferred to #515 and recoverable by cherry-pick; holding
+  // them means that recovery cannot collide with an appended field.
+  reserved 7, 8;
 }
 
 message SubmitJobResponse {
@@ -172,6 +208,13 @@ message ModelResult {
   string artifact_path = 2;
   // Run-metrics JSON, present once the run recorded any (issue #441).
   optional string metrics_json = 3;
+  // Always `"computed"`: model-level cache reuse is not yet supported for
+  // any training kind (https://github.com/f-inverse/jammi-ai/issues/562).
+  // The `"reused:{model_id}"` form mirrors `TableResult.cache_outcome`'s
+  // vocabulary field for field and is reserved for that reuse mechanism —
+  // observable on the terminal result, never merely inferred from an absent
+  // `metrics_json`, once it is produced.
+  string cache_outcome = 4;
 }
 
 // A compute kind's terminal result-table result.

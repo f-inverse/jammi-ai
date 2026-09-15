@@ -54,51 +54,75 @@ those still in force are restated here in their v4 form. Principle in parenthese
 **Substrate (the jobs fleet)**
 
 26. **The claimant is the coordinator.** A training-kind job is claimed by a `JobWorker` through
-    `claim_next` (`jobs_repo.rs:658-719`); that process is rank 0 and holds the only lease
-    (`heartbeat_job`, `jobs_repo.rs:772`). Kinds eligible for `world_size > 1`: `fine_tune` and
+    `claim_next` (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`); that process is rank 0 and holds the only lease
+    (`heartbeat_job`, `Catalog::heartbeat_job`). Kinds eligible for `world_size > 1`: `fine_tune` and
     `graph_fine_tune`; `context_predictor` is refused at `world_size > 1` (K2, typed, at submit).
-27. **A peer is a fleet worker with a busy slot.** A peer is a `JobWorker` process whose
-    `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank` takes the
-    worker's single job slot: a `JobSlot` mutex the claim loop takes **before** `claim_next`,
-    **holds across** the inline `run_claimed_job` (`worker.rs:355`), and **releases before** the
-    idle sleep (`:363`) — so a peer never claims while it runs a rank, never aborts a claim
-    transaction (OPS D6), never receives a rank while training its own job, and is reachable
-    whenever idle. Handler order: same `job_id` with a lesser attempt → abort that runner and
-    take the slot; lesser-or-equal attempt → refuse; otherwise try-lock; busy → typed
-    `Unavailable`, and the coordinator picks another member or fails the attempt. No new worker
-    state. (B1; OPS D6.)
+27. **A peer is a fleet worker with a spare admission holder.** A peer is a `JobWorker` process
+    whose `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank`
+    contends for `HostAdmission`'s single per-process holder cell — `Free` / `ClaimProbe` /
+    `JobRun` / `Rank{job_id, attempt}`, every transition a `send_if_modified` CAS, no lock held
+    across an `.await`. The claim loop acquires the holder (`Free → ClaimProbe`, in `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`)
+    immediately before `claim_next`, and `claim_next`'s `Some(record)` arm flips it
+    `ClaimProbe → JobRun` under the same lock — so a peer never claims while it
+    runs a rank, never aborts a claim transaction (OPS D6), never receives a rank while running
+    its own claimed job, and is reachable whenever idle. An admitted rank CASes `Free →
+    Rank{job_id, attempt}`; a busy holder (`JobRun` or another `Rank`) refuses `Unavailable` —
+    TRANSIENT, no assembly budget consumed, and the coordinator retries after ≥ one heartbeat or
+    picks another member. Inline `run_now` (`crates/jammi-ai/src/jobs.rs::run_now`, `ComputeSpec` only) never touches the
+    holder — it deliberately runs beside a loop-claimed job or an admitted rank, never excluded
+    by either. No new worker state beyond the holder cell itself. (B1; OPS D6.)
 28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
-    sketch (`DIST-DATA-PLANE.md:208-215`), not a plannable unit, so U5b-1 lands the substrate it
-    sketches: `[server] peer_advertise` (validate: `peer_advertise ⇒ peer_bind ⇒ result_root`),
-    the `instances.peer_addr` column (migration, numbered at rebase), the `upsert_instance`
-    signature and the session write site (`session.rs:247-251`). DIST's `RendezvousPlacement`
-    builds on it later. Peers are resolved from the catalog: `workers.kinds` ∋ kind,
-    `instances.peer_addr` set, `last_seen_at` within `[lease] duration_secs`, and — from U8b on —
-    `workers.devices` sufficient — through a new joined listing `list_gang_members(kind)` that splits
-    `workers.kinds` on `,` and compares whole tokens in Rust (`fine_tune` must not match
-    `graph_fine_tune`). No static peer list. Consequence recorded in 68's reconciliation: a
-    replica that sets `peer_advertise` to be gang-reachable also joins DIST's retrieval ring;
-    capability-scoping the ring is a 68 follow-on. (One membership mechanism; DIST D9.)
-29. **Knobs.** `[gpu] devices = [..]`; `[worker] world_size = 1`, `rank_timeout_secs = 120`,
-    `collective = "auto"`; per-job `world_size` on `TrainingCommon` (`#[serde(default)]` = 1).
-    `[training]` no longer exists on the branch.
-30. **Migrations.** 67 appends exactly three: `model_materialization` (U3, PR-B),
-    `instances_peer_addr` (U5b-1, PR-C), `compute_cluster_state` (U8b, PR-D — distributor-neutral
-    name and columns; `workers.devices` rides in it, since U8b is its first reader). No plan
-    reserves a number: each PR takes the next free number at rebase and updates **both pin
-    sites** — the const list in `crates/jammi-db/src/catalog/migrations.rs` and
-    `EXPECTED_MIGRATION_NAMES` in `crates/jammi-db/tests/it/migrations.rs:23-54` (exact-equality
+    sketch (`docs/plans/68-compute-tier-substrate/units/DIST-DATA-PLANE.md#58-unit-2--membership-post-pr-c-designed-here-not-built-in-the-first-unit`),
+    not a plannable unit, so **U5b-1a** lands the
+    substrate it sketches: `[server] peer_advertise` (validate: `peer_advertise ⇒ peer_bind ⇒
+    result_root`), the canonicalized `instances.peer_addr`/`result_root` columns (migration,
+    numbered at rebase), the `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::upsert_instance` signature and the session write site
+    (`crates/jammi-ai/src/session.rs::InferenceSession::wrap_with`, its `upsert_instance` call site). DIST's `RendezvousPlacement` builds on it later. Peers are resolved
+    from the catalog: `workers.kinds` ∋ kind, `instances.peer_addr` set, `last_seen_at` within
+    U5a-1's `instance_liveness_margin()` (merge order pinned: U5a-1 lands before U5b-1a, which
+    only consumes the margin), draining/warming and root-divergent instances excluded, and —
+    from U8b on — `workers.devices` sufficient — through a new joined listing
+    `list_gang_members(GangListing)` that splits `workers.kinds` on `,` and compares whole
+    tokens in Rust (`fine_tune` must not match `graph_fine_tune`). No static peer list.
+    Consequence recorded in 68's reconciliation: a replica that sets `peer_advertise` to be
+    gang-reachable also joins DIST's retrieval ring; capability-scoping the ring is a 68
+    follow-on. (One membership mechanism; DIST D9.)
+29. **Knobs.** `[gpu] devices = [..]`; `[worker] local_ranks = 1` (one rank per entry of
+    `[gpu] devices`, for a job this host runs entirely in-process — renamed from `world_size` in
+    U4b S8, since "world size" no longer named this host-local fact once submission moved off
+    it), `rank_timeout_secs = 120`, `collective = "auto"`; `[distributed] max_world_size = 1`
+    (the widest `Peer` gang any coordinator on this deployment may accept and dispatch — one
+    rank per FLEET MEMBER, never per local device; loads independently of `[worker] local_ranks`,
+    no cross-check between the two, U5b-1b-ii); per-job `world_size` on `TrainingCommon`
+    (`#[serde(default)]` = 1, unaffected by the rename — a different concept, checked against
+    `[distributed] max_world_size` at submit). `[training]` no longer exists on the branch.
+30. **Migrations.** 67 appends exactly four: `model_materialization` (U3, PR-B),
+    `instances_peer_addr_result_root` (U5b-1a, PR-C), `jobs_assembly_failures_next_after`
+    (U5b-1b-ii, PR-C — the durable assembly cooldown/counter columns `claim_next`'s candidate
+    subselect reads), `compute_cluster_state` (U8b, PR-D — distributor-neutral name and columns;
+    `workers.devices` rides in it, since U8b is its first reader). U5b-0's per-row-group leaf
+    digests are a sidecar-object change and append no migration. No plan reserves a number: each
+    PR takes the next free number at rebase and updates **both pin sites** — the const list in
+    `crates/jammi-db/src/catalog/migrations.rs` and
+    `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES` (exact-equality
     asserts) — and OPS's relative-position oracle; the second merger renumbers (K5). Three 68
     units (OPS, GRAPH, DELTA) also append one each.
 31. **The training set is not this attempt's partial result.** U2a materializes it with
-    `job_attempt: None`: it is a shared producer output reused by definition hash, not an
+    `job_attempt: None`: it is a shared producer output reused by definition hash **and** pinned
+    equal input anchors — the engine's existing rule
+    (`crates/jammi-db/src/store/manifest.rs::AnchorKind::UnpinnedAtInstant`): a plain, unpinned
+    source anchors as `UnpinnedAtInstant` and the cache probe short-circuits any unpinned anchor,
+    so it is honestly always a miss; a training set over a plain source is never reused, and two
+    jobs over the same plain source each materialize their own table — not an
     attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
     reached. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
-    jobs CAS, `result_repo.rs:99-130`) but outside OPS's linked release sweep, so a crashed or
+    jobs CAS, `crates/jammi-db/src/catalog/result_repo.rs::Catalog::release_building_tables_of_claimant`)
+    but outside OPS's linked release sweep, so a crashed or
     released coordinator leaves a live `building` row: the successor (or a second job over the
     same training set) that finds a live same-named `building` row **backs off** — returns the
-    `BackOff` disposition (`jobs.rs:248-261`), leaving the job `running` for the next tick — and
-    reclaims it through `claim_expired_building_table` (`store/mod.rs:1443-1470`) once the
+    `BackOff` disposition (`crates/jammi-ai/src/jobs.rs::PartialResultDisposition::BackOff`), leaving the job `running` for the next tick — and
+    reclaims it through `claim_expired_building_table`
+    (`crates/jammi-db/src/catalog/result_repo.rs::Catalog::claim_expired_building_table`) once the
     lease expires. The model artifact remains the job's result through `finish_job_with_model`.
 32. **Row order from the catalog is never trusted.** No 67 query consumes `RETURNING` order;
     every listing sorts in Rust (68 cross-cutting fact).
@@ -108,34 +132,35 @@ those still in force are restated here in their v4 form. Principle in parenthese
 33. **`GangService` is a second service on `[server] peer_bind`** (DIST D7's third listener),
     never on the tenant-scoped public chain, never advertised by `GetServerInfo`. **68 DIST unit
     1 merged is a hard precondition of U5a** (its listener commit is ~22 files on top of ~10;
-    there is no verbatim-carry fallback). PR-C(67) also waits for OPS and GRAPH, because OPS C2
-    rewrites the claim loop U5a's `JobSlot` wraps and GRAPH rewrites `claim_next`.
+    there is no verbatim-carry fallback). PR-C(67) also waits for OPS, because OPS C2 rewrites
+    the claim loop U5a's `JobSlot` wraps. GRAPH is deferred to #515 and is not a precondition:
+    its `claim_next` rewrite (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::claim_next`) does not land in this wave, so U5a's `JobSlot`
+    wraps `claim_next` as it stands on `main`.
 34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
     `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
-    tenant predicate, never admin scope (`get_job` is tenant-filtered, `jobs_repo.rs:580-596`,
+    tenant predicate, never admin scope (`get_job` is tenant-filtered, `crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::get_job`,
     and D7 forbids `with_admin_scope` on the peer path), reachable only from the gang handler —
     verifies `status = 'running'`, `claimed_by = coordinator_instance_id`, lease live, and
     **derives the tenant from the row** (`jobs.tenant_id`), pinning every subsequent catalog
     read to it. Nothing dialable travels on the wire: the assignment carries
     `peers[rank → instance_id]` and each peer resolves addresses through `instances.peer_addr`,
     refusing a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the
-    only out-of-band value). `FetchPartition` verifies the named table belongs to the job's
-    training set (the analogue of D7's segment-belongs-to-table check). The RPCs get their own
-    `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text: "served only on
-    peer_bind; tenant derived from the verified job row; deliberately not caller-scoped"),
-    unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and their
+    only out-of-band value). `RunRank` gets its own
+    `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (its text states the ground
+    the shipped W=1 lattice actually has — no tenant value read on the path; the derivation claim
+    returns with U5a-2's cross-tenant-denial case, #566), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and its
     `api_freeze_baseline.txt` lines land in the same commit. (B5; D7's single-binder rule.)
 35. **Attempt fence on `job_id`**: a `RunRank` at attempt N aborts every local runner of that
     job at attempt < N; lesser-or-equal refused.
 
 **Operability (68 OPS)**
 
-36. **An aborted attempt lands no terminal write.** `fail_job` is terminal (`jobs_repo.rs:
-    1057-1100`: `status = 'failed'`, no attempt bump); the only requeue path on the fleet is the
-    leave-`running`-for-reclaim arm (`worker.rs:670-676`) → reclaim arm 1a → `attempts + 1` at
+36. **An aborted attempt lands no terminal write.** `fail_job` is terminal
+    (`crates/jammi-db/src/catalog/jobs_repo.rs::Catalog::fail_job`: `status = 'failed'`, no attempt bump); the only requeue path on the fleet is the
+    leave-`running`-for-reclaim arm (`crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_claimed_job_under`, the lease-lost arm) → reclaim arm 1a → `attempts + 1` at
     the successor's claim. So on any rank failure the coordinator cancels every rank, aborts the
     attempt (no publish, no finalize), flips its hold's `lost` flag (the cancel flag *is*
-    `hold.lost_flag()`, `worker.rs:531-547`) so its own run exits through that arm, and the job
+    `hold.lost_flag()`, `JobWorker::run_claimed_job_under`) so its own run exits through that arm, and the job
     is requeued by reclaim within the remaining lease window (≤ `[lease] duration_secs`, 30 s
     default) — no new verb. **A released rank is a release, not a failure**: DRAIN/RELEASE on a
     peer host ends the rank with `RankEvent::Released`; the coordinator first calls OPS's
@@ -145,7 +170,8 @@ those still in force are restated here in their v4 form. Principle in parenthese
 37. **The watchdog is allowed under the actuator rule.** It is per attempt, bounded by the
     attempt's lifetime, created by the claimant for the job it holds, and only retires that
     attempt (requeue is the pre-existing reclaim semantics) — the lease keeper's shape, not a
-    standing loop. The rule (`recompute.rs:29-35`; 68 DIST D5) has no constitution ID; a
+    standing loop. The rule (`crates/jammi-ai/src/pipeline/recompute.rs`'s module doc, "the
+    engine ships the actuator; it never ships the control loop that pulls it"; 68 DIST D5) has no constitution ID; a
     human-merged constitution row is a proposed follow-on, not assumed.
 
 **The Ballista extension (U8a, U8b)**
@@ -179,12 +205,21 @@ those still in force are restated here in their v4 form. Principle in parenthese
     5).** `expire_dead_executors` (started unconditionally in `SchedulerServer::init`) sweeps
     Ballista executor heartbeats — the same class as `reclaim_expired_jobs` and `prune_instances`
     the fleet already runs each tick — but the same loop also posts `ExecutorLost`
-    (`scheduler_server/mod.rs:395`) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
+    (Ballista's `scheduler/src/scheduler_server/mod.rs`, read from source 2026-09-10) → `reset_stages_on_lost_executor`: `RunningStage::reset_tasks`
     frees the lost task's slot and `SuccessfulStage::reset_tasks` re-fails its COMPLETED tasks as
     `ResultLost` (`retryable: true, count_to_failures: false`), which `update_task_status` resets
-    **without consulting `task_max_failures`**. With both retry knobs at 0, a `GangExec` on a
-    killed executor is re-launched by Ballista on a surviving executor and the job succeeds on
-    its own — in parallel with jammi's own reclaim. U8b needs an explicit bind-time guard in
+    **without consulting `task_max_failures`**. The `ExecutorLost` arm itself
+    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    `QueryStageSchedulerEvent::ExecutorLost` match arm) only resets the freed/re-failed tasks; it posts no
+    `ReviveOffers` and no failure. **Re-launch on a surviving executor is conditional**, not
+    automatic: `ReviveOffers` fires only from a later, independent event — a new executor
+    registering under push-staged scheduling (`do_register_executor`, `scheduler_server/mod.rs:
+    419`) or a subsequent `TaskUpdating` success under push-staged scheduling
+    (`scheduler_server/query_stage_scheduler.rs::QueryStageScheduler::on_receive`, the
+    `QueryStageSchedulerEvent::TaskUpdating` match arm's `ReviveOffers` post) — so with both retry knobs at 0, a `GangExec` on a killed
+    executor is picked up only if one of those triggers fires afterward; with no other executor
+    registering and no other in-flight task reporting status, the freed task can sit unscheduled
+    with nothing to revive it. U8b needs an explicit bind-time guard in
     `CatalogClusterState::bind_schedulable_tasks` / `DevicePlacement` that refuses to re-bind a
     task whose `(job_id, stage_id, partition)` was already launched, keyed on jammi's own job row
     (Ballista's `task_attempt` counter is not bumped by this reset, so the refusal cannot key on
@@ -222,15 +257,17 @@ those still in force are restated here in their v4 form. Principle in parenthese
     through the Ballista path per device kind.
 45. **Naming pre-swept.** New pub items: `JammiCodec`, `JammiExecutionEngine`, `CatalogClusterState`,
     `CatalogJobState`, `DevicePlacement`, `BallistaConfig`, `GangExec`, `JobSlot`, `RankEvent::Released`
-    — none carries the seven governance stems (`check_no_consumer_names.py:78-80`); trait-impl
+    — none carries the seven governance stems (`ci/scripts/check_no_consumer_names.py::GOVERNANCE_VERBS`); trait-impl
     methods such as `create_query_stage_exec` are not `pub` declarations and are not scanned.
 
-**Still in force from v3.1 (restated)**: streaming loader and per-batch converters (r1);
-mining/GradCache W=1-only with the `mine`/`cached` predicate (r2); split, order and partition
+**Still in force from v3.1 (restated)**: the eager loader and per-batch converters ship in U2b
+(r1) — a residency-bounded per-rank stream is its own unit, U2c, issue #544, scheduled before
+U4b binds a per-rank reader to it; mining/GradCache W=1-only with the `mine`/`cached` predicate
+(r2); split, order and partition
 rule with zero-row ranks and the global-batch formula (r3); scaler from one collected `Vec`
 (r4); model identity with the opaque canonical encoding (r5); the gather rule with per-arm
 gather points (r6); lockstep control flow (r7); resume with per-rank `dropout_positions` (r8);
-descriptors not physical plans before Ballista (r10); U6's partition-aware operator (r12); one
+descriptors not physical plans before Ballista (r10); one
 trainer, four collectives (r13); the shared `CacheKey` (r14); K4 is remote-equals-embedded
 (r15); GPU byte oracles downgraded until S5 (r16); DataFusion 54 first (r19, ordering amended
 in r46); committed-artifact convention (r20); StatefulSet consequence, now owned by U9 after
@@ -238,10 +275,12 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 
 46. **Order against the sibling work.** PR-C(68) merged as #501 (242 files, both manifests, seven
     crates) before any 67 unit — so PR-A (U1) starts now from `main`; 68's K (PR in CI) and DIST
-    unit 1 precede PR-B; PR-C(67) needs DIST unit 2 and OPS; PR-D needs K. `SIZING.md` carries
-    the edge list. Correction to v3.1 ruling 18: the issue's "jobs table, migrations 029/030"
-    was describing #485/#486's branch, which is now merged; only the "#485 is unrelated" remark
-    in the 2026-09-10 issue comment was wrong.
+    unit 1 precede PR-B1; PR-B2 cuts from PR-B1's merge; PR-C(67) needs DIST unit 2, OPS and
+    PR-B1 (U5a-2 additionally needs PR-B2 only if its own re-attack finds it needs the
+    multi-rank run path); PR-D needs K. `SIZING.md` carries the edge list. Correction to v3.1
+    ruling 18: the issue's "jobs table, migrations 029/030" was describing #485/#486's branch,
+    which is now merged; only the "#485 is unrelated" remark in the 2026-09-10 issue comment was
+    wrong.
 
 ## Units and order
 
@@ -251,17 +290,22 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | B | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; allowlist; artifact schema | gate scripts | S4 |
 | B | 2 | U2a | `TrainingSet` producer (`job_attempt: None`; wire mirror; guide block) | hermetic + cookbook | U1 |
 | B | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; refusals | hermetic (+ pod smoke) | S1 |
-| B | 4 | U2b | Streaming loader; partition rule; scaler; whole-set arms | hermetic + cookbook | U2a, U4a |
+| B | 4 | U2b | Eager loader; partition rule; scaler; whole-set arms | hermetic + cookbook | U2a, U4a |
 | B | 5 | U3 | `FineTune` producer; `model_materialization` migration; cache reuse | hermetic | U2a |
-| B | 6 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U3, U4a, S1 |
-| B | 7 | — | pod-leg artifact | gpu-gang | U4b |
+| B | 6 | U2c | Streaming training-set loader with a residency bound (issue #544) | hermetic + cookbook | U2a, U2b, U4a |
+| B | 7 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U2c, U3, U4a, S1 |
+| B | 8 | — | pod-leg artifact | gpu-gang | U4b |
 | C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
-| C | 3 | U6 | Partition-aware inference operator | hermetic | U2b, U5a |
-| C | 4 | U5b-1 | Coordinator; `Peer` collective; membership substrate (`peer_advertise`, `instances.peer_addr`, `list_gang_members`); determinism; two-worker forward leg | distributed | U4b, U5a, U6, S1 |
-| C | 5 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg | distributed + cluster leg | U5b-1, 68 OPS |
-| C | 6 | — | cluster-leg artifact | gpu-gang | U5b-2 |
-| D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b-1, U6, S6 |
+| C | 3 | U5b-1a | Membership substrate: `peer_advertise`, `instances.peer_addr`/`result_root`, `list_gang_members` | hermetic + distributed | U5a-1, PR-B1 |
+| C | 4 | U5b-0 | Partitioned attestation inventory (per-row-group leaf digests, `MaterializationManifest`) | hermetic | none (base: PR-B2) |
+| C | 5 | U5b-1b-i | The `Peer` collective + round protocol | hermetic + distributed | U5a-1, U5b-0 |
+| C | 6 | U5b-1b-ii | Coordinator: membership → assignment → dispatch → assembly | hermetic + server it-suite | U5b-1a, U5b-1b-i, U4b, U5a-1, U5a-2 |
+| C | 7 | U5b-1b-iii | `world_size == 1` rank body; runner-role writer split; `Outcome`; resume pin | hermetic | U5b-1b-ii |
+| C | 8 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg | distributed + cluster leg | U5b-1b-ii, U5b-1b-iii, 68 OPS |
+| C | 9 | — | cluster-leg artifact | gpu-gang | U5b-2 |
+| — | — | C1 (cookbook) | AST session-lifecycle gate (issue #539), after PR-B2 | pytest + ruff | none |
+| D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b-1b-ii, U5b-1b-iii, S6 |
 | D | 2 | U8b | `CatalogClusterState`/`CatalogJobState`, `DevicePlacement`, `compute_cluster_state` migration (+ `workers.devices`), gang as one placed task | distributed | U8a, S6 |
 | D | 3 | U9a | Docs (guide, maintainer, CHANGELOG) | docs gates | all |
 | D | 4 | U9b | shape-d overlay → StatefulSet + headless service + `nvidia.com/gpu: N` (after 68 K, keeping OPS C6's grace) | kubeconform + kind smoke | 68 K, 68 OPS |
@@ -307,13 +351,20 @@ with the OpenTelemetry family #501 added.
 3. Run S3 on `main` (it carries #501); S1, S4, S5, S6 concurrently.
 4. PR-A (U1) from `main` now; one worktree, one commit. 68's PR-K is in CI and may merge
    before PR-A — rebase, no ordering constraint between them.
-5. PR-B after PR-A merges; no 68 dependency. Commit order as in the table; PR-B edits
-   `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips `SWARM_GATE_TOUCHED`, so PR-B is
-   an admin merge too;
-   U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
+5. PR-B1 after PR-A merges; no 68 dependency: U7a ∥ U2a ∥ U4a; label the PR for the pod leg.
+   PR-B1 edits `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips `SWARM_GATE_TOUCHED`,
+   so PR-B1 is an admin merge too. PR-B2 finishes in the same window as PR-C(67) (wave 3, below):
+   U2b ∥ U3 → **U2c** (the residency-bounded per-rank stream, issue #544) → U4b — U2c lands
+   before U4b binds a per-rank reader to it.
 6. PR-C(67) after DIST unit 1, OPS and GRAPH merge (they rewrite the claim loop and
-   `claim_next`). U7b ∥ U5a; U6; U5b-1; U5b-2; `distributed.yml` dispatched manually,
-   deterministic leg green before merge.
+   `claim_next`): U7b ∥ **U5a-1** → **U5b-1a** → U5b-0 → U5b-1b-i → U5b-1b-ii → U5b-1b-iii →
+   **U5a-2** → U5b-2; `distributed.yml` dispatched manually, deterministic leg green before
+   merge. Two merge-order pins, binding: **U5a-1 lands before U5b-1a** (U5a-1 creates
+   `instance_liveness_margin()`; U5b-1a only consumes it — U5a-1/U5a-2 are the wire-server U5a
+   unit's own internal split) and **U4b lands before U5b-1b-ii** (`spec.rs`'s admission fields
+   are co-owned between U4b and U5b-1b-ii; the `[worker] world_size` → `[worker] local_ranks`
+   rename lands in U4b S8, and U5b-1b-ii rebases onto U4b's `admit_and_place`). The cookbook unit
+   **C1** (AST session-lifecycle gate, issue #539) runs independently once PR-B2 merges.
 7. PR-D after 68 K: U8a, U8b (the completion gate), U9a, U9b. `distributed.yml` dispatched
    manually with the three-process arm green before merge. PR-D edits a swarm domain card, so it
    needs an admin merge (`SWARM_GATE_TOUCHED`).

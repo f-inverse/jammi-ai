@@ -11,6 +11,16 @@ use parquet::file::properties::WriterProperties;
 use super::error::StorageError;
 use super::object_store_handle::JammiObjectStore;
 
+/// The row-group row count every writer uses, in every build. A
+/// multi-row-group fixture is produced by writing more than this many rows
+/// through one writer, not by shrinking the threshold.
+const DEFAULT_MAX_ROW_GROUP_ROWS: usize = 65_536;
+
+/// Row-group row count for a newly opened writer: always the fixed default.
+fn max_row_group_row_count() -> usize {
+    DEFAULT_MAX_ROW_GROUP_ROWS
+}
+
 /// Writes Arrow `RecordBatch`es to a Parquet file using the object-store
 /// backend the handle was constructed with.
 ///
@@ -29,7 +39,7 @@ impl ObjectParquetWriter {
         let path = handle.data_path()?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_max_row_group_row_count(Some(65_536))
+            .set_max_row_group_row_count(Some(max_row_group_row_count()))
             .build();
         let inner = ParquetObjectWriter::new(handle.driver(), path.clone());
         let writer = AsyncArrowWriter::try_new(inner, schema, Some(props)).map_err(|e| {
@@ -112,5 +122,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    /// The writer's row-group row count is the fixed default in every
+    /// build; a multi-row-group fixture is produced by writing more rows
+    /// through one writer, never by shrinking this threshold.
+    #[test]
+    fn default_row_group_row_count_is_65_536() {
+        assert_eq!(max_row_group_row_count(), 65_536);
     }
 }

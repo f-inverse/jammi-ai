@@ -62,6 +62,20 @@ pub struct ModelRecord {
     pub status: String,
     /// ISO-8601 timestamp of initial registration.
     pub created_at: String,
+    /// The materialization-contract definition hash (migration
+    /// `model_materialization`) — the indexable summary of this model's
+    /// `materialization.json` sidecar (no leading dot — a fixed name under
+    /// the model's artifact prefix, `ArtifactStore::MATERIALIZATION_NAME`,
+    /// unlike a result table's `{table}.materialization.json`), mirroring
+    /// `result_tables.definition_hash`. `None` for a model with no
+    /// materialization (a directly-registered base model, a
+    /// `ContextPredictor`) or a pre-migration row.
+    pub definition_hash: Option<String>,
+    /// The materialization-contract input anchors as canonical JSON — the
+    /// indexable summary [`Catalog::probe_model_by_definition`] matches
+    /// against, mirroring `result_tables.input_anchors_json`. `None`
+    /// alongside [`Self::definition_hash`].
+    pub input_anchors_json: Option<String>,
 }
 
 /// Registry introspection for one registered model — the client-facing
@@ -120,7 +134,7 @@ pub struct RegisterModelParams<'a> {
 
 const SELECT_COLS: &str =
     "model_id, name, model_type, task, backend, version, status, metadata, artifact_path, \
-     created_at";
+     created_at, definition_hash, input_anchors_json";
 
 impl Catalog {
     /// Register or refresh a model in the catalog. The session's bound
@@ -432,6 +446,449 @@ impl Catalog {
             )
             .await?)
     }
+
+    /// Whole-catalog scan, admin-scoped BY CONSTRUCTION: every `models`
+    /// row's (non-`NULL`) `artifact_path`, across EVERY tenant and
+    /// untenanted rows, regardless of the calling task's own tenant binding
+    /// — this method issues NO tenant predicate at all (never
+    /// [`TenantBinding::current_tenant`], never
+    /// [`TenantBinding::is_admin_scope`]).
+    ///
+    /// [`crate::store::reconcile`]'s attribution set is built from THIS
+    /// scan, never from [`Self::list_models`] (tenant-scoped): a
+    /// tenant-scoped or unbound-but-not-admin-scoped listing can only ever
+    /// see its own tenant's (and untenanted) rows, so a tenant-A row
+    /// reusing a GLOBAL prefix — the cache-hit fan-out shape, where
+    /// [`Self::find_models_by_definition`] returns a `NULL`-tenant row and
+    /// the winning job registers a SECOND, tenant-A row pointing at the
+    /// same prefix — is invisible to an UNBOUND reconcile pass reading
+    /// through [`Self::list_models`]: exactly the gap this method exists to
+    /// close. The per-prefix count predicate over this same admin scan is
+    /// [`Self::count_models_naming_prefix_all_tenants`].
+    ///
+    /// Returns raw `artifact_path` strings — the exact value each row's
+    /// finalize CAS committed (a full [`crate::storage::StorageUrl`]
+    /// string) — never a [`ModelRecord`]: this is a bytes-reachability
+    /// scan, not a row read, so it never discloses a model's name, id, or
+    /// tenant to whatever tenant scope the caller is running under.
+    pub async fn list_model_artifact_paths_all_tenants(&self) -> Result<Vec<String>> {
+        let sql = "SELECT artifact_path FROM models WHERE artifact_path IS NOT NULL";
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(sql, &[], |row| row.get::<String>("artifact_path"))
+                            .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// The count of `models` rows — across EVERY tenant and untenanted
+    /// rows, admin-scoped BY CONSTRUCTION exactly like
+    /// [`Self::list_model_artifact_paths_all_tenants`] (see that method's
+    /// doc for why no tenant predicate is issued here) — whose
+    /// `artifact_path` names `key_or_prefix` as ITSELF or as its
+    /// IMMEDIATE containing directory.
+    ///
+    /// A row's `artifact_path` is a FLAT directory of files (every
+    /// `put_artifact` bundle this store ever writes — served, resume, or
+    /// epoch-checkpoint — is a flat file list, never a bundle nested inside
+    /// its own subdirectories), so a byte a row's own publish is
+    /// responsible for is either the row's `artifact_path` itself (an
+    /// epoch checkpoint published UNDER a served attempt's prefix is
+    /// itself registered as its OWN row whose `artifact_path` EQUALS that
+    /// exact checkpoint prefix — the winning finalize CAS inserts one such
+    /// row per RETAINED checkpoint) or a plain file directly inside it
+    /// (e.g. `{attempt}/adapter.safetensors`, whose CONTAINING directory
+    /// equals the row's `artifact_path`). The predicate checks both shapes
+    /// in one query — `artifact_path = $1 OR artifact_path = $2`, where
+    /// `$2` is `key_or_prefix`'s own immediate parent directory (computed
+    /// in Rust, `rsplit_once('/')`, never a SQL `LIKE`/`SUBSTR` walk) —
+    /// and DELIBERATELY stops at one level: an ANCESTOR further up (e.g.
+    /// the served attempt's row, relative to an UNRETAINED epoch
+    /// checkpoint nested two segments deeper under
+    /// `checkpoints/epoch_N/`) is NEVER treated as referencing it. Each
+    /// independently-registered nested artifact carries its OWN row when
+    /// retained; an ancestor's row is never inherited protection for a
+    /// SEPARATE artifact merely because it happens to sit somewhere below
+    /// it in the physical layout — the whole reason an unretained epoch
+    /// checkpoint must stay reclaimable even while its enclosing served
+    /// attempt is very much alive and referenced. Indexed by
+    /// `idx_models_artifact_path` (migration 033) — this predicate issues
+    /// exactly ONE indexed lookup (matching either of two exact values)
+    /// per candidate object or prefix a caller is about to delete, an
+    /// acceptable cost for a byte-deleter that already performs its own
+    /// I/O per candidate.
+    ///
+    /// `_resume/` is the one namespace this predicate is never expected to
+    /// match: it is a SIBLING of a job's attempt-level artifact paths
+    /// (`{job}/_resume` vs. `{job}/{worker}/{attempt}`), so neither
+    /// `key_or_prefix` nor its immediate parent can ever equal a served or
+    /// checkpoint row's `artifact_path` — proven by an executed test, see
+    /// `a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`
+    /// in `tests/it/reconcile.rs`.
+    ///
+    /// Discloses a COUNT ONLY — never row ids, model names, or tenant ids
+    /// — so a tenant-bound caller consulting this predicate (through
+    /// [`crate::store::ResultStore::prefix_is_referenced`]) learns only
+    /// "referenced" vs. "not", never by whom.
+    pub async fn count_models_naming_prefix_all_tenants(&self, key_or_prefix: &str) -> Result<i64> {
+        let parent = key_or_prefix
+            .rsplit_once('/')
+            .map(|(parent, _leaf)| parent.to_string());
+        let sql = "SELECT COUNT(*) AS n FROM models WHERE artifact_path = $1 OR artifact_path = $2";
+        let key_or_prefix = key_or_prefix.to_string();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            sql,
+                            &[SqlValue::TextOwned(key_or_prefix), SqlValue::from(parent)],
+                            |row| row.get::<i64>("n"),
+                        )
+                        .await
+                        .map(|opt| opt.unwrap_or(0))
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// Every SERVABLE `models` row carrying exactly `definition_hash`, newest
+    /// first — the raw candidate set [`Self::probe_model_by_definition`]
+    /// narrows with the exact anchor match. Mirrors
+    /// [`Catalog::find_ready_result_tables_by_definition`]'s shape for
+    /// `result_tables`. Tenant-scoped like every other catalog read.
+    ///
+    /// The predicate is `definition_hash = $1 AND artifact_path IS NOT NULL
+    /// AND (tenant_id = $2 OR tenant_id IS NULL)` — ONE predicate, both
+    /// halves load-bearing:
+    ///
+    /// - `definition_hash = $1` can never match a `NULL` column (SQL's
+    ///   three-valued equality), so a pre-migration or non-materialized row
+    ///   (`ContextPredictor`, a directly-registered base model) is excluded
+    ///   without a separate guard.
+    /// - `artifact_path IS NOT NULL` restricts the candidate set to rows the
+    ///   finalize CAS ([`Catalog::finish_job_with_model`]) has already
+    ///   committed: a row a losing or still-running attempt registered
+    ///   with `definition_hash` set but no committed artifact — which would
+    ///   otherwise poison every future `cache=Use` probe for that definition
+    ///   forever, since the row never becomes servable on its own — is
+    ///   excluded from the candidate set rather than merely filtered
+    ///   downstream. A miss caused by this predicate is exactly that: a
+    ///   miss, never an error, so the caller trains.
+    ///
+    /// **Tenant fan-out convention.** `(tenant_id = $2 OR tenant_id IS
+    /// NULL)` is the same relaxed READ convention every other nullable-
+    /// tenant catalog probe uses ([`Self::get_model`]/[`Self::get_model_version`]'s
+    /// global-base-model resolution, [`Catalog::find_ready_result_tables_by_definition`]):
+    /// a `NULL`-tenant model row is a cache-hit CANDIDATE FOR EVERY TENANT —
+    /// a global fine-tune output is reusable by any caller, exactly like a
+    /// global base model is loadable by any caller — while a tenant-owned
+    /// row is visible only to that exact tenant, never a peer's. When a
+    /// caller's own row exists but is unservable, the caller falls
+    /// through to a matching global row rather than missing outright; when
+    /// a caller has no own row at all, the global row is the only candidate.
+    /// This is a READ-side relaxation only: the WRITE side
+    /// ([`Self::record_model_materialization`]) stays STRICT
+    /// (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`), so a tenant
+    /// session can never populate another tenant's row, only its own or —
+    /// from an explicitly unscoped session — the global one.
+    pub async fn find_models_by_definition(
+        &self,
+        definition_hash: &str,
+    ) -> Result<Vec<ModelRecord>> {
+        let hash = definition_hash.to_string();
+        let tenant = self.current_tenant();
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM models \
+             WHERE definition_hash = $1 AND artifact_path IS NOT NULL \
+               AND (tenant_id = $2 OR tenant_id IS NULL) \
+             ORDER BY created_at DESC"
+        );
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            &sql,
+                            &[
+                                SqlValue::TextOwned(hash),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            parse_model_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// Find a model row already materialised by the EXACT same definition
+    /// over the EXACT same input anchors — the model peer of
+    /// [`crate::store::ResultStore::probe_cache_record`]'s `result_tables`
+    /// probe, restated over `models` because a fine-tuned model is not a
+    /// `result_tables` row (the reuse rule: definition hash AND pinned equal
+    /// anchors; a plain/unpinned source is never reused).
+    ///
+    /// `NULL` never matches: [`Self::find_models_by_definition`]'s own
+    /// predicate already excludes every row with no recorded
+    /// `definition_hash`, so a model with no materialization can never be a
+    /// cache-hit candidate. The candidate set is additionally restricted to
+    /// the SERVABLE set (`artifact_path IS NOT NULL`) by that same
+    /// predicate, so a hash-bearing row a losing/zombie attempt left behind
+    /// is never a hit either — this function issues no SQL of its own and so
+    /// inherits both halves automatically. An anchor set containing an
+    /// [`crate::store::manifest::AnchorKind::UnpinnedAtInstant`] anchor is
+    /// likewise never a hit — an unpinned input's current instant proves
+    /// nothing about what the training set actually was, so no recorded
+    /// model can be a sound reuse of it (the same rule
+    /// `ResultStore::exact_match_candidates` applies).
+    ///
+    /// When several rows share the exact key (a reuse chain: job C reused
+    /// job B's prefix, which reused job A's), the newest one wins, by a
+    /// deterministic TOTAL order this function imposes in Rust rather than
+    /// trusting the catalog's `ORDER BY` (r32: `RETURNING`/`ORDER BY` order
+    /// is never trusted as the tie-break of record) — `created_at` alone can
+    /// tie at whatever timestamp resolution a backend renders, so ties break
+    /// on `catalog_pk` DESCENDING, the same shape
+    /// `ResultStore::probe_ready_training_set` uses for `table_name`. This is
+    /// a pure sensor over the catalog's `definition_hash` index; it does not
+    /// check whether the row's artifact prefix still exists on disk (that
+    /// check, if the caller needs it, composes on top through
+    /// [`crate::store::ArtifactStore::read_model_materialization`]).
+    pub async fn probe_model_by_definition(
+        &self,
+        definition_hash: &str,
+        anchors: &[crate::store::manifest::InputAnchor],
+    ) -> Result<Option<ModelRecord>> {
+        use crate::store::manifest::AnchorKind;
+
+        if anchors
+            .iter()
+            .any(|a| a.kind == AnchorKind::UnpinnedAtInstant)
+        {
+            return Ok(None);
+        }
+        let mut exact = Vec::new();
+        for candidate in self.find_models_by_definition(definition_hash).await? {
+            let Some(ref anchors_json) = candidate.input_anchors_json else {
+                continue;
+            };
+            let recorded: Vec<crate::store::manifest::InputAnchor> =
+                serde_json::from_str(anchors_json)?;
+            if anchor_sets_equal(&recorded, anchors) {
+                exact.push(candidate);
+            }
+        }
+        exact.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.catalog_pk.cmp(&a.catalog_pk))
+        });
+        Ok(exact.into_iter().next())
+    }
+
+    /// Record a fine-tuned model's materialization-contract summary (the
+    /// `model_materialization` migration's two columns) — called after the
+    /// model's artifact prefix's `materialization.json` sidecar has been
+    /// written ([`crate::store::ArtifactStore::write_model_materialization`],
+    /// itself written LAST, after the bundle's own `manifest.json`), and
+    /// only AFTER the finalize CAS ([`Catalog::finish_job_with_model`]) has
+    /// already committed this exact row's `artifact_path`.
+    /// Tenant-scoped with the same STRICT predicate [`Self::delete_model`]
+    /// uses (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`).
+    ///
+    /// **The ordering guard.** `models` carries no per-attempt identity of
+    /// its own (unlike `jobs.claimed_by`/`jobs.attempts`) to bind a lease
+    /// directly against, so the predicate binds to the ONE fact only the
+    /// winning attempt's finalize CAS can have produced on this row:
+    /// `artifact_path IS NOT NULL`. `artifact_path` is written exactly once,
+    /// unconditionally, by `finish_job_with_model`'s attempt-guarded
+    /// transaction — a losing or still-running attempt's row never carries
+    /// it — so requiring it here means a losing/zombie attempt's call can
+    /// never win this `UPDATE` and leave a hash-bearing row for
+    /// [`Self::find_models_by_definition`] to have to filter out: the
+    /// row simply never becomes probe-eligible in the first place.
+    ///
+    /// Unconditional `SET` (never a `COALESCE`) for the two columns it does
+    /// write: a model's materialization summary is written exactly once, by
+    /// the same finalize sequence that already committed its `artifact_path`,
+    /// so there is no "leave unchanged on re-registration" case to protect
+    /// here.
+    ///
+    /// Refuses distinctly depending on why zero rows matched:
+    /// [`JammiError::ModelNotFound`] when no row exists at all for
+    /// `model_id` (this name), `version`, and the caller's tenant; a typed
+    /// [`JammiError::Model`] precondition failure when the row exists but
+    /// `artifact_path` is still `NULL` — the finalize CAS has not won for
+    /// this attempt yet, so recording a definition hash now would create
+    /// exactly the poisoned, hash-bearing-but-unservable row
+    /// [`Self::find_models_by_definition`]'s predicate keeps unreachable.
+    pub async fn record_model_materialization(
+        &self,
+        model_id: &str,
+        version: i32,
+        definition_hash: &str,
+        input_anchors_json: &str,
+    ) -> Result<()> {
+        let tenant = self.current_tenant();
+        let model_id_for_tx = model_id.to_string();
+        let version_i64 = version as i64;
+        let definition_hash = definition_hash.to_string();
+        let input_anchors_json = input_anchors_json.to_string();
+
+        let outcome = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
+                    let affected = tx
+                        .execute(
+                            "UPDATE models SET definition_hash = $1, input_anchors_json = $2, \
+                             updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
+                             WHERE name = $3 AND version = $4 \
+                               AND (tenant_id = $5 OR (tenant_id IS NULL AND $5 IS NULL)) \
+                               AND artifact_path IS NOT NULL",
+                            &[
+                                SqlValue::TextOwned(definition_hash),
+                                SqlValue::TextOwned(input_anchors_json),
+                                SqlValue::TextOwned(model_id_for_tx.clone()),
+                                SqlValue::Int(version_i64),
+                                tenant_val.clone(),
+                            ],
+                        )
+                        .await?;
+                    if affected == 1 {
+                        return Ok(RecordMaterializationOutcome::Recorded);
+                    }
+                    // Disambiguate a missing row from an unfinalized one so
+                    // the caller gets a precise typed refusal rather than a
+                    // misleading `ModelNotFound` for a row that DOES exist.
+                    let exists = tx
+                        .query_opt(
+                            "SELECT 1 AS one FROM models \
+                             WHERE name = $1 AND version = $2 \
+                               AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))",
+                            &[
+                                SqlValue::TextOwned(model_id_for_tx),
+                                SqlValue::Int(version_i64),
+                                tenant_val,
+                            ],
+                            |row| row.get::<i32>("one"),
+                        )
+                        .await?
+                        .is_some();
+                    Ok(if exists {
+                        RecordMaterializationOutcome::RowNotYetFinalized
+                    } else {
+                        RecordMaterializationOutcome::RowAbsent
+                    })
+                })
+            })
+            .await?;
+
+        match outcome {
+            RecordMaterializationOutcome::Recorded => Ok(()),
+            RecordMaterializationOutcome::RowAbsent => Err(JammiError::ModelNotFound {
+                model_id: model_id.to_string(),
+            }),
+            RecordMaterializationOutcome::RowNotYetFinalized => Err(JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "cannot record a materialization summary before the finalize CAS \
+                          has committed artifact_path for this attempt's row"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Delete a `models` row still in its pre-finalize state — the failure-
+    /// arm cleanup for a fine-tune attempt that registered a row
+    /// ([`Self::register_model`], `artifact_path: None`) and then lost its
+    /// lease, errored, or was superseded before the finalize CAS
+    /// ([`Catalog::finish_job_with_model`]) ever ran. Named beside
+    /// [`Self::delete_model`] (the referenced-checked hard delete for a
+    /// SERVED model) as the unfinalized-row peer: this one carries no
+    /// referential scan because an unfinalized row can carry no outbound
+    /// reference yet.
+    ///
+    /// The guard is `artifact_path IS NULL` — the same fact
+    /// [`Self::record_model_materialization`]'s ordering guard requires the
+    /// OPPOSITE of. A row the finalize CAS already committed (`artifact_path`
+    /// set) is never matched, so this can never delete a servable model out
+    /// from under a concurrent reader, even called against the wrong
+    /// attempt or a job whose finalize CAS actually won the race the caller
+    /// believed it lost. Tenant-scoped with the same STRICT predicate
+    /// [`Self::delete_model`] uses.
+    ///
+    /// Returns `true` when a row was deleted, `false` when no row matched —
+    /// already deleted, already finalized, or never registered. A caller
+    /// treats `false` as a no-op, never an error: every one of those states
+    /// is already the state this call exists to converge on.
+    pub async fn delete_registered_model_if_unfinalized(
+        &self,
+        model_id: &str,
+        version: i32,
+    ) -> Result<bool> {
+        let tenant = self.current_tenant();
+        let model_id = model_id.to_string();
+        let version_i64 = version as i64;
+        let affected = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
+                    tx.execute(
+                        "DELETE FROM models WHERE name = $1 AND version = $2 \
+                           AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL)) \
+                           AND artifact_path IS NULL",
+                        &[
+                            SqlValue::TextOwned(model_id),
+                            SqlValue::Int(version_i64),
+                            tenant_val,
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(affected == 1)
+    }
+}
+
+/// In-transaction outcome of [`Catalog::record_model_materialization`]'s
+/// guarded `UPDATE`, distinguishing "no such row" from "row exists but the
+/// finalize CAS has not committed `artifact_path` yet" so the caller gets a
+/// precise typed refusal ([`JammiError::ModelNotFound`] vs
+/// [`JammiError::Model`]) rather than one error shape standing in for two
+/// distinct preconditions.
+enum RecordMaterializationOutcome {
+    Recorded,
+    RowAbsent,
+    RowNotYetFinalized,
 }
 
 /// In-transaction outcome of [`Catalog::delete_model`]'s scan-then-delete: the
@@ -545,7 +1002,7 @@ async fn scan_model_references(
 }
 
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata,
-/// artifact_path, created_at
+/// artifact_path, created_at, definition_hash, input_anchors_json
 fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
     let catalog_pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
@@ -575,6 +1032,13 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         })
         .unwrap_or((None, None));
 
+    // Migration `model_materialization` (033): absent on a pre-migration row
+    // or a model with no materialization at all — `try_get` reads a genuinely
+    // absent column the same way as a present `NULL`, so a query that omits
+    // these columns entirely (an older wire projection) still parses.
+    let definition_hash: Option<String> = row.try_get("definition_hash")?;
+    let input_anchors_json: Option<String> = row.try_get("input_anchors_json")?;
+
     Ok(ModelRecord {
         model_id: name,
         catalog_pk,
@@ -587,5 +1051,23 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         config_json,
         status,
         created_at,
+        definition_hash,
+        input_anchors_json,
     })
+}
+
+/// Two `InputAnchor` sets are the SAME reuse key iff they are equal as SETS
+/// (order-independent — a producer's `Vec<InputAnchor>` is built in producer
+/// order, which is not itself a determinant of the reuse key). Duplicated
+/// from `crate::store::freshness`'s private helper of the same shape rather
+/// than exposed across the `catalog`/`store` boundary this file does not
+/// otherwise cross: [`Catalog::probe_model_by_definition`] is the ONE
+/// catalog-layer caller that needs it, and the module boundary between
+/// catalog primitives and the store's sensing layer is worth keeping even at
+/// the cost of this five-line duplication.
+fn anchor_sets_equal(
+    a: &[crate::store::manifest::InputAnchor],
+    b: &[crate::store::manifest::InputAnchor],
+) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x)) && b.iter().all(|y| a.contains(y))
 }

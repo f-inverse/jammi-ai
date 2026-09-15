@@ -113,6 +113,10 @@ fn start_request() -> SubmitJobRequest {
         // test runtime.
         config: None,
         idempotency_key: String::new(),
+        // Unset (`0`) rank count: the single-rank job every one of these
+        // fixtures has always submitted.
+        world_size: 0,
+        cache: 0,
     }
 }
 
@@ -181,6 +185,63 @@ async fn start_training_runs_to_completion_over_the_wire() {
         "a completed job's status carries the output model id"
     );
     assert!(resp.error.is_empty(), "a completed job carries no error");
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// End to end: `cache = USE` on a `FineTuneSpec` is refused over the wire —
+/// model-level cache reuse is not yet supported (the engine refuses it,
+/// typed, before any `jobs` row is written; see
+/// <https://github.com/f-inverse/jammi-ai/issues/562>). Pins the SERVER's own
+/// gRPC status mapping (`InvalidArgument`, naming the refusal), not merely
+/// the engine's own `JammiError` ai-core's own suite already covers.
+///
+/// Chosen over `grpc_remote_session.rs` (that file's fixtures own the
+/// embedded/remote session-parity concern, not `JobService`'s own wire
+/// shape): this file already hosts the `JobService` FineTune-over-the-wire
+/// submit harness (`start_request`) this test only needs to parameterise on
+/// `cache`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fine_tune_cache_use_submission_is_refused_over_the_wire() {
+    use jammi_server::grpc::proto::inference::CachePolicy;
+
+    let server = start_engine_server().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    let mut request = start_request();
+    request.cache = CachePolicy::Use as i32;
+
+    let status = client
+        .submit_job(request)
+        .await
+        .expect_err("cache = USE must be refused before any row is written");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("model-level cache reuse is not yet supported"),
+        "the refusal must name why: {}",
+        status.message()
+    );
+
+    // The refusal leaves no `fine_tune` row queued.
+    let listed = client
+        .list_jobs(ListJobsRequest {})
+        .await
+        .expect("list_jobs")
+        .into_inner()
+        .jobs;
+    assert!(
+        listed.is_empty(),
+        "a refused submit must never write a jobs row: {listed:?}"
+    );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
@@ -506,6 +567,8 @@ fn predictor_start_request() -> SubmitJobRequest {
         base_model: String::new(),
         config: None,
         idempotency_key: String::new(),
+        world_size: 0,
+        cache: 0,
     }
 }
 
@@ -686,6 +749,8 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
         base_model: tiny_bert_model_id(),
         config: None,
         idempotency_key: String::new(),
+        world_size: 0,
+        cache: 0,
     };
 
     let start = client
@@ -722,6 +787,8 @@ async fn start_training_rejects_unspecified_method() {
             base_model: tiny_bert_model_id(),
             config: None,
             idempotency_key: String::new(),
+            world_size: 0,
+            cache: 0,
         })
         .await
         .expect_err("unspecified method must be rejected");
@@ -747,6 +814,8 @@ async fn start_training_rejects_missing_columns() {
             base_model: tiny_bert_model_id(),
             config: None,
             idempotency_key: String::new(),
+            world_size: 0,
+            cache: 0,
         })
         .await
         .expect_err("missing columns must be rejected");

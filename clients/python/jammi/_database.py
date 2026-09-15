@@ -64,6 +64,8 @@ from ._assembly import (
     expiry_report_to_dict,
 )
 from ._capability import Capability
+from ._sessions import register as _register_session
+from ._sessions import unregister as _unregister_session
 from ._credentials import (
     AnonymousCredentials,
     BearerCredentials,
@@ -218,15 +220,15 @@ def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
 def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
     """Project a wire `ReconcileReport` into the dict a caller reads.
 
-    The whole report and nothing else — all 14 fields, the same keys, spelled
+    The whole report and nothing else — all 16 fields, the same keys, spelled
     the same way, the embedded `Database.reconcile` produces by serializing
     the identical engine struct: `scope`, `applied`, `rows_failed`,
     `rows_failed_count`, `orphans`, `orphan_count`, `pending`, `pending_count`,
     `unattributed`, `unattributed_count`, `damaged`, `damaged_count`,
-    `truncated`, `bytes_reclaimed`. Every list is already sorted by the
-    engine; this projection does not re-sort. Every `*_count` field is the
-    true total independent of whether its list was capped; `truncated` says
-    whether any list was.
+    `referenced`, `referenced_count`, `truncated`, `bytes_reclaimed`. Every
+    list is already sorted by the engine; this projection does not re-sort.
+    Every `*_count` field is the true total independent of whether its list
+    was capped; `truncated` says whether any list was.
     """
     return {
         "scope": r.scope,
@@ -241,6 +243,8 @@ def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
         "unattributed_count": r.unattributed_count,
         "damaged": list(r.damaged),
         "damaged_count": r.damaged_count,
+        "referenced": list(r.referenced),
+        "referenced_count": r.referenced_count,
         "truncated": r.truncated,
         "bytes_reclaimed": r.bytes_reclaimed,
     }
@@ -729,10 +733,16 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     the terminal payload (K4).
 
     A training kind's `model` variant projects to `{"kind": "model",
-    "model_id", "artifact_path", "metrics"}` (`metrics` the raw JSON text of
-    the run-summary blob, or `None` when the run recorded none — read
-    `RemoteJob.metrics()` for the parsed form). A compute kind's `table`
-    variant projects to `{"kind": "table", "table", "cache_outcome"}`.
+    "model_id", "artifact_path", "metrics", "cache_outcome"}` (`metrics` the
+    raw JSON text of the run-summary blob, or `None` when the run recorded
+    none — read `RemoteJob.metrics()` for the parsed form; `cache_outcome`
+    is always `"computed"` — model-level cache reuse for a `FineTune` job is
+    refused on every durable submit edge
+    (`jammi_ai::fine_tune::spec::admit_training_spec`), so the
+    `"reused:{model_id}"` form this field's vocabulary reserves is not
+    reachable; see https://github.com/f-inverse/jammi-ai/issues/562 — the
+    same vocabulary the `table` variant already carries). A compute kind's
+    `table` variant projects to `{"kind": "table", "table", "cache_outcome"}`.
     """
     which = resp.WhichOneof("result")
     if which == "model":
@@ -742,6 +752,7 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
             "model_id": m.model_id,
             "artifact_path": m.artifact_path,
             "metrics": m.metrics_json if m.HasField("metrics_json") else None,
+            "cache_outcome": m.cache_outcome,
         }
     if which == "table":
         t = resp.table
@@ -994,6 +1005,14 @@ class RemoteDatabase:
         # first (`_check_open`) — the peer of the embedded engine's FFI-boundary
         # guard, so a closed session behaves the SAME on both transports.
         self._closed = False
+        # The ONE registration point for every remote session: `open_remote`
+        # (the factory `connect()` uses) and any direct construction both run
+        # this `__init__`, so both are visible to `jammi.open_sessions()` from
+        # here — see `_sessions`. Labeled by `endpoint` — the printable target
+        # `jammi.open_session_labels()` / an `observe()` listener reports for
+        # this handle even after the session itself is collected. Called LAST
+        # so a session that exists at all is unconditionally live here.
+        self._session_handle = _register_session(self, endpoint)
 
     @property
     def session_id(self) -> str:
@@ -1692,6 +1711,8 @@ class RemoteDatabase:
         quantile_levels: Optional[List[float]] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
+        cache: Optional[str] = None,
     ) -> RemoteJob:
         """Submit a LoRA fine-tuning job to the remote engine; poll the handle.
 
@@ -1700,7 +1721,15 @@ class RemoteDatabase:
         `JobService.SubmitJob` with the `FineTuneSpec` arm; all config
         kwargs are optional, applying the engine defaults when omitted.
         `idempotency_key`, when non-empty, dedupes the submission (migration
-        030's durable per-tenant key).
+        030's durable per-tenant key). `world_size` is the number of ranks that
+        train this job cooperatively; `1` (the default) is a single process, and
+        a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
+        names model-level cache reuse (``"use"``) as opposed to the engine's
+        default recompute (``"bypass"``, the default when omitted); reuse is
+        not yet implemented, so ``"use"`` is refused with
+        :class:`jammi.errors.InvalidArgument` and the job is not submitted —
+        see https://github.com/f-inverse/jammi-ai/issues/562.
         """
         request = build_fine_tune_request(
             source=source,
@@ -1739,6 +1768,8 @@ class RemoteDatabase:
             quantile_levels=quantile_levels,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
+            cache=cache,
         )
         return self._submit_job(request)
 
@@ -1771,6 +1802,8 @@ class RemoteDatabase:
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
+        cache: Optional[str] = None,
     ) -> RemoteJob:
         """Submit a graph-supervised fine-tune (S11) to the remote engine.
 
@@ -1780,7 +1813,14 @@ class RemoteDatabase:
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
         `idempotency_key`, when non-empty, dedupes the submission (migration
-        030's durable per-tenant key).
+        030's durable per-tenant key). `world_size` is the number of ranks that
+        train this job cooperatively; `1` (the default) is a single process, and
+        a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
+        is accepted here but a graph fine-tune has no model-level materialization
+        to probe or record: ``"use"`` is refused with
+        :class:`jammi.errors.InvalidArgument`; ``"bypass"`` (the default when
+        omitted) is the only value this job kind honours — it always trains.
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -1809,6 +1849,8 @@ class RemoteDatabase:
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
+            cache=cache,
         )
         return self._submit_job(request)
 
@@ -2549,9 +2591,10 @@ class RemoteDatabase:
         produces, tagged ``{"scope", "applied", "rows_failed",
         "rows_failed_count", "orphans", "orphan_count", "pending",
         "pending_count", "unattributed", "unattributed_count", "damaged",
-        "damaged_count", "truncated", "bytes_reclaimed"}`` — all 14 fields of
-        the engine's ``ReconcileReport``, byte-for-byte the same key set the
-        embedded PyO3 arm projects. Maps to `CatalogService.Reconcile`.
+        "damaged_count", "referenced", "referenced_count", "truncated",
+        "bytes_reclaimed"}`` — all 16 fields of the engine's
+        ``ReconcileReport``, byte-for-byte the same key set the embedded
+        PyO3 arm projects. Maps to `CatalogService.Reconcile`.
         """
         request = catalog_pb2.ReconcileRequest(
             apply=apply, grace_secs=grace_secs, all=all
@@ -2862,6 +2905,7 @@ class RemoteDatabase:
             self._flight = None
         self._channel.close()
         self._closed = True
+        _unregister_session(self)
 
     def __enter__(self) -> "RemoteDatabase":
         return self

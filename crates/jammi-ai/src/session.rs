@@ -10,7 +10,6 @@ use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, ResultStore};
 
-use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
@@ -78,6 +77,31 @@ pub(crate) struct TrainingJobLinks {
     pub(crate) model_ref: String,
     /// `jobs.output_model_id`: the NAME the finished model registers under.
     pub(crate) output_model_id: String,
+}
+
+/// Refuse, at session open, a `[worker] collective` this BUILD cannot honour.
+///
+/// The predicate half lives in `jammi_db` (`CollectiveSelection::
+/// requires_cuda`), which cannot see another crate's cargo features; this is
+/// the half that knows its own build. `nccl` on a build without CUDA is
+/// refused rather than degraded: the deployment asked for the device
+/// interconnect, and silently reducing on the host at a fraction of the
+/// throughput would be a different deployment reported as the one asked for.
+/// `auto` degrades by definition and `cpu` wants no device, so neither is
+/// affected.
+///
+/// At OPEN, not at submit: a process that cannot honour its own configuration
+/// should not come up and then refuse every job it is handed.
+fn refuse_unreachable_collective(topology: &jammi_db::config::WorkerTopology) -> Result<()> {
+    if topology.collective().requires_cuda() && !cfg!(feature = "cuda") {
+        return Err(JammiError::Config(format!(
+            "[worker] collective = \"{}\" needs a build with the `cuda` feature; this binary \
+             has none, so the requested collective cannot be reached (set collective = \
+             \"auto\" to use the host reduction, or run a CUDA build)",
+            topology.collective()
+        )));
+    }
+    Ok(())
 }
 
 impl InferenceSession {
@@ -222,12 +246,30 @@ impl InferenceSession {
         let hub = HubSource::from_config(&inner.config().models, &|k: &str| std::env::var(k).ok())?;
         let resolver =
             ModelResolver::new(catalog.clone(), Arc::clone(&artifact_store), hub.clone())?;
+        // The validated rank topology, resolved ONCE per session: how many
+        // ranks this deployment runs, which device each of them gets, and
+        // which collective they reduce over. `JammiConfig::load_from` has
+        // already run these bounds, so a loaded configuration re-derives the
+        // same verdict here; a programmatically built one gets it for the
+        // first time.
+        let topology = inner.config().worker.topology(&inner.config().gpu)?;
+        refuse_unreachable_collective(&topology)?;
+
         let device_config = DeviceConfig::from_config(inner.config());
-        let scheduler = Arc::new(GpuScheduler::for_device(
-            device_config.gpu_device,
+        // One admission budget PER DEVICE, over the resolved `[gpu] devices`
+        // list. A budget is a property of a card: a single counter shared by
+        // two devices would either over-admit on one or starve the other.
+        // A single-device deployment resolves to one entry and is exactly
+        // what it was before the list existed.
+        let schedulers = crate::concurrency::DeviceSchedulers::for_devices(
+            &device_config.devices,
             device_config.memory_fraction,
+        )?;
+        let model_cache = Arc::new(ModelCache::with_device_schedulers(
+            resolver,
+            device_config.clone(),
+            schedulers,
         ));
-        let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         // Install the tenant-gating result-table schema as the context's
         // default schema before any table is loaded, so bare `jammi.{name}`
         // resolutions honour the catalog owner on every read lane and source
@@ -525,6 +567,12 @@ impl InferenceSession {
         table_name: &str,
     ) -> Result<Vec<jammi_db::catalog::segment_repo::IndexSegment>> {
         self.inner.list_index_segments(table_name).await
+    }
+
+    /// This session's loaded configuration — the deployment's own statement
+    /// of its devices, its worker knobs and its storage roots.
+    pub fn jammi_config(&self) -> &jammi_db::config::JammiConfig {
+        self.inner.config()
     }
 
     /// Access the catalog.
@@ -1735,7 +1783,65 @@ impl InferenceSession {
             common: TrainingCommon {
                 base_model: base_model.to_string(),
                 config: config.clone(),
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
+            // This loose-argument entry point has no cache parameter to
+            // carry a caller's choice; a caller that wants the model-level
+            // reuse probe builds the spec directly and submits it through
+            // `Self::run_training_spec`. Matches the pre-`cache` behaviour
+            // byte-for-byte.
+            cache: jammi_db::store::CachePolicy::Bypass,
+        };
+        self.submit_fine_tune_spec(spec).await
+    }
+
+    /// Submit a column-source fine-tune from the flattened request shape the
+    /// data-plane client also submits
+    /// ([`jammi_wire::request::FineTuneRequest`]).
+    ///
+    /// [`Self::fine_tune`]'s loose parameter list cannot carry the rank count
+    /// without growing an argument every caller that does not choose one must
+    /// still pass, so the count arrives on a request struct — the same one
+    /// `jammi_client::DataClient::submit_fine_tune` takes. One request shape
+    /// on both surfaces is what makes the remote-equals-embedded parity
+    /// oracle a comparison of the two paths rather than of two request
+    /// vocabularies.
+    ///
+    /// `world_size: None` is UNSET and submits the single-rank job
+    /// [`Self::fine_tune`] submits;
+    /// [`jammi_wire::request::FineTuneRequest::world_size`]'s `NonZeroU32`
+    /// keeps a zero-rank request unrepresentable at this edge. A count this
+    /// deployment cannot serve is refused with a typed error and enqueues
+    /// nothing.
+    pub async fn submit_fine_tune(
+        &self,
+        request: jammi_wire::request::FineTuneRequest,
+    ) -> Result<TrainingJob> {
+        let jammi_wire::request::FineTuneRequest {
+            source,
+            base_model,
+            columns,
+            method,
+            task,
+            config,
+            world_size,
+            cache,
+        } = request;
+        let config = config.unwrap_or_default();
+        config.validate()?;
+
+        let spec = TrainingSpec::FineTune {
+            source,
+            columns,
+            method,
+            task,
+            common: TrainingCommon {
+                base_model,
+                config,
+                world_size: world_size
+                    .map_or(crate::fine_tune::spec::DEFAULT_WORLD_SIZE, |w| w.get()),
+            },
+            cache,
         };
         self.submit_fine_tune_spec(spec).await
     }
@@ -1767,6 +1873,19 @@ impl InferenceSession {
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
+        // The ONE admission (per-kind validation, rank admission, the
+        // `cache = Use` refusal) is applied HERE, before anything durable
+        // exists: this method is one of the durable submit edges for a
+        // training spec, so every entry path that reaches it —
+        // [`Self::fine_tune`], [`Self::fine_tune_graph`],
+        // [`Self::submit_fine_tune`] and [`Self::run_training_spec_deduped`]
+        // (which the gRPC handler and the Python binding both drive) — is
+        // admitted by this call. [`InferenceSession::enqueue`] and
+        // `train_context_predictor_deduped` are the other two durable
+        // edges; all three call
+        // [`crate::fine_tune::spec::admit_training_spec`]. A refusal leaves
+        // no row behind, because no row has been written yet.
+        crate::fine_tune::spec::admit_training_spec(self.inner.config(), &spec)?;
         let job_id = uuid::Uuid::new_v4().to_string();
         let links = self.training_job_links(&spec, &job_id).await?;
         let spec_json = serde_json::to_string(&spec)?;
@@ -1929,6 +2048,7 @@ impl InferenceSession {
             common: TrainingCommon {
                 base_model: base_model.to_string(),
                 config: config.clone(),
+                world_size: crate::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
         };
         self.submit_fine_tune_spec(spec).await
@@ -1953,30 +2073,18 @@ impl InferenceSession {
     /// caller — the Python binding included — routes through here with
     /// `None`, byte-identical to before this method existed).
     ///
-    /// Runs the SAME per-kind validation the embedded entry points
-    /// ([`Self::fine_tune`], [`Self::fine_tune_graph`],
-    /// [`Self::train_context_predictor`]) apply, then submits directly
-    /// through the deduped catalog seam — `spec` is already fully formed
-    /// here (decoded off the wire or handed in by a caller), so there is no
-    /// need to re-destructure it through those entry points' own
-    /// loose-argument constructors only to rebuild the identical spec.
+    /// Dispatches directly through the deduped catalog seam — `spec` is
+    /// already fully formed here (decoded off the wire or handed in by a
+    /// caller), so there is no need to re-destructure it through the loose-
+    /// argument entry points' own constructors only to rebuild the
+    /// identical spec. Neither dispatch arm below skips admission: each is
+    /// itself one of the three durable submit edges for a `TrainingSpec`
+    /// and applies `admit_training_spec` before writing a row.
     pub async fn run_training_spec_deduped(
         self: &Arc<Self>,
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
-        match &spec {
-            TrainingSpec::FineTune { common, .. } => common.config.validate()?,
-            TrainingSpec::GraphFineTune {
-                common,
-                sample_config,
-                ..
-            } => {
-                common.config.validate()?;
-                sample_config.validate()?;
-            }
-            TrainingSpec::ContextPredictor { predictor_spec, .. } => predictor_spec.validate()?,
-        }
         match spec {
             TrainingSpec::ContextPredictor {
                 source,

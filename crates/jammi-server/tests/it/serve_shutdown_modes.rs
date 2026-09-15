@@ -245,6 +245,9 @@ async fn submit_fine_tune(ch: Channel, epochs: u32) -> String {
                 ..Default::default()
             }),
             idempotency_key: String::new(),
+            // Unset (`0`) rank count -- single-rank, as this fixture always was.
+            world_size: 0,
+            cache: 0,
         })
         .await
         .expect("submit_job")

@@ -409,12 +409,284 @@ only to `git ls-files`; no network, no cargo, no GPU.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# YAML loading. PyYAML is a declared prerequisite of this gate (installed by
+# `.docker/ci.Dockerfile` and, on any workflow job that runs this gate
+# outside that container, by an explicit `pip install` step) -- guarded here
+# so a missing install is ONE distinct, named message at every entry point
+# below, never a Python traceback and never silently treated as a finding or
+# a pass.
+# --------------------------------------------------------------------------- #
+try:
+    import yaml
+except ImportError as _yaml_import_exc:  # pragma: no cover -- exercised via simulated import below
+    yaml = None  # type: ignore[assignment]
+    _YAML_IMPORT_ERROR: Exception | None = _yaml_import_exc
+else:
+    _YAML_IMPORT_ERROR = None
+
+_MISSING_PYYAML_MESSAGE = (
+    "gate prerequisite missing: PyYAML ({}) -- installed by .docker/ci.Dockerfile"
+)
+
+# Set to "1" in a spawned self-test subprocess's own environment so that
+# subprocess never spawns a further subprocess of its own -- bounds the
+# self-test's real-subprocess PyYAML-dispatch-order fixture to exactly one
+# level of nesting regardless of what the code under test does.
+_SELFTEST_SUBPROCESS_GUARD_ENV = "JAMMI_ESR_SELFTEST_SUBPROCESS_GUARD"
+
+
+class WorkflowLoadError(Exception):
+    """Raised by `load_workflow_text`/`load_workflow_from_path`/
+    `job_source_spans` on anything this reader cannot examine: a missing
+    PyYAML install, a read/decode error, unparseable YAML, a document whose
+    top level is not a mapping, or a document carrying both a boolean-
+    resolved `on` key (YAML 1.1 resolves the bare word `on`/`On`/`ON`/
+    `true`/`yes`/... to the boolean `True`) and a literal `"on"` string key.
+    Every reader in this module -- the `on:` trigger set, `jobs:`, `steps:`
+    -- traces back to ONE parse of the document; there is no second,
+    independently-drifting reader of the same text."""
+
+
+if yaml is not None:
+
+    class _NoDuplicateKeysSafeLoader(yaml.SafeLoader):
+        """YAML 1.1 `safe_load` semantics, refusing a document that reuses a
+        mapping key at the SAME level -- PyYAML's own default constructor
+        silently keeps only the LAST value and never says so, which would
+        let a re-added top-level `on:` (or `jobs:`) block shadow an earlier
+        one with no signal at all."""
+
+    def _no_duplicate_keys_construct_mapping(loader: yaml.SafeLoader, node: yaml.Node, deep: bool = False):
+        if not isinstance(node, yaml.MappingNode):
+            raise yaml.constructor.ConstructorError(
+                None, None, f"expected a mapping node, got {node.id}", node.start_mark
+            )
+        mapping: dict = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key: {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    _NoDuplicateKeysSafeLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys_construct_mapping
+    )
+else:  # pragma: no cover -- exercised via simulated import below
+    _NoDuplicateKeysSafeLoader = None  # type: ignore[assignment]
+
+
+def _assert_no_github_incompatible_yaml(text: str) -> None:
+    """GitHub Actions' own workflow-file parser does not accept YAML
+    anchors, aliases (including merge keys, which are always defined via an
+    alias), or explicit tags (`!!str`, a custom `!foo`, ...) -- resolving
+    one of these here would let this reader parse a document GitHub itself
+    refuses to run at all. Walks the raw PARSER EVENT stream (`yaml.parse`,
+    never a resolved node or constructed doc) because an event's `.tag` is
+    `None` for every implicitly-typed scalar/mapping/sequence -- including a
+    QUOTED scalar -- and is only ever set to a real tag string when the
+    source text carried an EXPLICIT tag; a composed `Node`'s own `.tag`
+    cannot make that distinction; the two paths would resolve `!!str push`
+    and a bare `push` to the SAME `tag:yaml.org,2002:str`. Raises
+    `WorkflowLoadError`, naming the exact construct, the moment one is
+    seen -- before either `load_workflow_text` or `job_source_spans` trusts
+    any parse of this text."""
+    if yaml is None:
+        raise WorkflowLoadError(_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR))
+    try:
+        events = yaml.parse(text, Loader=yaml.SafeLoader)
+        for event in events:
+            if isinstance(event, yaml.AliasEvent):
+                raise WorkflowLoadError(
+                    "YAML anchors/aliases/tags are not accepted by GitHub Actions -- "
+                    f"cannot examine: alias *{event.anchor}"
+                )
+            anchor = getattr(event, "anchor", None)
+            if anchor:
+                raise WorkflowLoadError(
+                    "YAML anchors/aliases/tags are not accepted by GitHub Actions -- "
+                    f"cannot examine: anchor &{anchor}"
+                )
+            tag = getattr(event, "tag", None)
+            if tag is not None:
+                raise WorkflowLoadError(
+                    "YAML anchors/aliases/tags are not accepted by GitHub Actions -- "
+                    f"cannot examine: explicit tag {tag}"
+                )
+    except yaml.YAMLError as exc:
+        raise WorkflowLoadError(f"cannot parse YAML: {exc}") from exc
+
+
+def load_workflow_text(text: str) -> dict:
+    """The workflow document, fully parsed (`yaml.load` under
+    `_NoDuplicateKeysSafeLoader`) and validated as a top-level mapping with
+    at most one spelling of the `on:` trigger key. Raises `WorkflowLoadError`
+    -- never returns a partial or empty dict standing in for a refusal --
+    on: a missing PyYAML install; any YAML syntax error (tab indentation, an
+    inconsistent dedent, an undefined alias, ...); an anchor, alias
+    (including a merge key), or explicit tag anywhere in the document
+    (GitHub's own parser rejects all three -- see
+    `_assert_no_github_incompatible_yaml`); a document whose top level is
+    not a mapping; a duplicate mapping key at any level; or a document
+    carrying both a boolean-resolved `on` key and a literal `"on"` string
+    key (ambiguous -- GitHub's own YAML 1.1 boolean-resolution gotcha, the
+    reason some workflow authors quote `on:` in the first place)."""
+    if yaml is None:
+        raise WorkflowLoadError(_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR))
+    _assert_no_github_incompatible_yaml(text)
+    try:
+        doc = yaml.load(text, Loader=_NoDuplicateKeysSafeLoader)
+    except yaml.YAMLError as exc:
+        raise WorkflowLoadError(f"cannot parse YAML: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise WorkflowLoadError(
+            f"workflow document's top level is not a mapping (got {type(doc).__name__}) -- cannot examine"
+        )
+    if True in doc and "on" in doc:
+        raise WorkflowLoadError(
+            "on: block: the document carries both a boolean-resolved `on` key (YAML 1.1 resolves "
+            "on/On/ON/true/yes/... to True) and a literal \"on\" string key -- ambiguous, cannot examine"
+        )
+    return doc
+
+
+def load_workflow_from_path(path: Path) -> dict:
+    """`load_workflow_text`, reading `path` first -- every read error
+    (missing, a directory, permission denied, not valid UTF-8) is the SAME
+    named `WorkflowLoadError`, for every euid, never a silent `{}`."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkflowLoadError(f"cannot read file {path}: {exc}") from exc
+    return load_workflow_text(text)
+
+
+def _assert_no_duplicate_keys_in_node_tree(node) -> None:
+    """The composed-node equivalent of `_no_duplicate_keys_construct_mapping`
+    -- needed because `yaml.compose` never invokes a loader's constructors
+    (duplicate-key refusal at CONSTRUCTION time, which `load_workflow_text`
+    gets for free from `_NoDuplicateKeysSafeLoader`, does not cover a
+    caller that only composes, like `job_source_spans`). Walks EVERY
+    mapping node in the tree, at every nesting level, so a duplicate job id
+    nested under `jobs:` is caught exactly like a duplicate top-level
+    `jobs:` key -- one guard, not two independently-drifting ones."""
+    if isinstance(node, yaml.MappingNode):
+        seen: set[str] = set()
+        for key_node, value_node in node.value:
+            key = key_node.value if isinstance(key_node, yaml.ScalarNode) else repr(key_node.value)
+            if key in seen:
+                raise WorkflowLoadError(f"cannot parse YAML: found duplicate key: {key!r}")
+            seen.add(key)
+            _assert_no_duplicate_keys_in_node_tree(value_node)
+    elif isinstance(node, yaml.SequenceNode):
+        for child in node.value:
+            _assert_no_duplicate_keys_in_node_tree(child)
+
+
+def job_source_spans(text: str) -> dict[str, tuple[int, int]]:
+    """{job_id: (start_line, end_line_exclusive)} of RAW 0-based line
+    indices for each job directly under the workflow's own top-level
+    `jobs:` mapping -- derived from the REAL parsed document structure
+    (`yaml.compose`'s own node marks), never a second, independently-
+    drifting regex header match. A job's body runs from its own header
+    line through the line before the next job's header, or EOF. Returns
+    `{}` when there is no top-level `jobs:` mapping at all (the caller
+    decides whether that is itself a refusal -- see `jobs_or_fail`).
+    Raises `WorkflowLoadError`, self-sufficiently -- never relying on a
+    caller having gone through `load_workflow_text` first -- on: a missing
+    PyYAML install; an anchor/alias/tag anywhere in the text
+    (`_assert_no_github_incompatible_yaml`); a YAML syntax error; a
+    duplicate mapping key at ANY level, including two top-level `jobs:`
+    blocks and two job ids inside the same `jobs:` mapping
+    (`_assert_no_duplicate_keys_in_node_tree`, composed-node based, since
+    `yaml.compose` never runs a loader's constructors); and a flow-style
+    `jobs:` mapping, or any job entry whose own node does not occupy at
+    least one full line of its own -- both shapes make "the line span
+    between this job's header and the next" meaningless, and a real
+    GitHub Actions workflow's `jobs:` block is always block-style in this
+    repo (never silently degraded to a zero-length or wrong-job span)."""
+    if yaml is None:
+        raise WorkflowLoadError(_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR))
+    _assert_no_github_incompatible_yaml(text)
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as exc:
+        raise WorkflowLoadError(f"cannot parse YAML: {exc}") from exc
+    if root is None or not isinstance(root, yaml.MappingNode):
+        return {}
+    _assert_no_duplicate_keys_in_node_tree(root)
+    jobs_node = None
+    for key_node, value_node in root.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == "jobs":
+            jobs_node = value_node
+            break
+    if jobs_node is None or not isinstance(jobs_node, yaml.MappingNode):
+        return {}
+    if jobs_node.flow_style:
+        raise WorkflowLoadError("jobs: is flow-style -- cannot examine")
+    total_lines = len(text.splitlines())
+    starts: list[tuple[str, int]] = []
+    for key_node, value_node in jobs_node.value:
+        job_id = str(key_node.value)
+        start = key_node.start_mark.line
+        if value_node.end_mark.line <= start:
+            # W10 audit fix: `jobs:` ITSELF is block-style here (the
+            # top-level flow-style shape is the SEPARATE refusal above,
+            # `:639-640`) -- what this line actually found is a single
+            # job's own VALUE not occupying a line span of its own: either
+            # an inline flow mapping/sequence written entirely on the
+            # key's own line (`a: { runs-on: u }`), or a job id with no
+            # body at all (`b:` followed by nothing). Both make "the line
+            # span between this job's header and the next" meaningless the
+            # same way the top-level flow-style shape does, but neither IS
+            # a flow-style `jobs:` mapping -- naming the wrong construct
+            # here previously read as a correct-looking message for an
+            # incorrect diagnosis.
+            raise WorkflowLoadError(
+                f"job {job_id!r} does not occupy its own line span in a block-style jobs: "
+                "mapping -- cannot examine (its value is either empty or written entirely "
+                "on the key's own line)"
+            )
+        starts.append((job_id, start))
+    spans: dict[str, tuple[int, int]] = {}
+    for idx, (job_id, start) in enumerate(starts):
+        end = starts[idx + 1][1] if idx + 1 < len(starts) else total_lines
+        spans[job_id] = (start, end)
+    return spans
+
+
+def jobs_or_fail(text: str) -> tuple[dict[str, tuple[int, int]] | None, str | None]:
+    """(job_source_spans, error). The SAME fail-loud doctrine
+    `read_top_level_on_block` holds `on:` to, now for `jobs:`:
+    `job_source_spans` is self-sufficient (it raises `WorkflowLoadError` on
+    every unparseable/flow-style/duplicate-key shape itself -- see its own
+    docstring); this wrapper adds only the "truly zero job entries" case on
+    top, an unparseable document is a named FAIL, never a silent `{}`
+    standing in for "this file has zero jobs"; a `jobs:` block recognized
+    as truly empty is refused the same way -- a real GitHub Actions
+    workflow always has at least one job."""
+    try:
+        jobs = job_source_spans(text)
+    except WorkflowLoadError as exc:
+        return None, str(exc)
+    if not jobs:
+        return None, "no top-level jobs: block found (or it carries zero job entries)"
+    return jobs, None
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -851,233 +1123,218 @@ def discover_suspicious_lines(repo_root: Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# generic indentation-based block reader — shared by `on:`-block parsing,
-# `jobs:`-block parsing, and step/matrix-leg list-item parsing. Not a
-# general YAML parser: only enough structure to answer the specific
-# questions Rule 1 asks, for the shapes this repo's own workflows actually
-# use (plain block-style mappings and `- ` block lists; no flow-style
-# `{a: b}`/`[a, b]` mapping/list syntax for `on:`/`jobs:`/`steps:`
-# themselves — inline `[a, b]` IS supported for leaf list VALUES like
-# `branches: [main]`, which this repo uses throughout). A workflow using
-# the flow-style short forms for `on:` ITSELF (bare `on: push`, or
-# `on: [push, pull_request]` — an array of event names carrying no
-# `branches:`/`paths:` config of their own, both valid GitHub Actions
-# syntax; none of this repo's workflows use either today) would be
-# silently dropped from `scan_workflows`'s results the same way an
-# unquoted-only `on:` key spelling used to drop a `"on":`-quoted workflow
-# (B5, round-2 audit — see `_extract_top_level_key_block`'s own docstring
-# for the fix that closed the quoting half of this gap and the residual
-# consequence it names: fail-closed for Rule 1 itself, fail-OPEN for the
-# dead-waiver mirror check, since a stale waiver for a tuple reachable only
-# through a silently-dropped workflow would never be flagged dead). Needs a
-# follow-up PR to widen if this repo ever adopts either short form.
+# THE `on:`-block trigger-key reader. This is the ONE place in the whole
+# `ci/scripts` tree that reads an `on:` block down to its top-level trigger
+# KEYS (never the fuller `parse_on_block_or_fail` field shape below, which
+# stays a separate, Rule-1-specific reader over the SAME parsed document) —
+# `check_gpu_prove_once.py`'s P1, P5, P6, P7 and its `--read-on-block` CLI
+# (which `test_gpu_gang_lane.sh`'s G7 shells out to) all import this
+# function, never a second, independently-drifting copy. Every value this
+# module derives from a workflow's `on:` block -- the trigger set here, and
+# the per-trigger `branches`/`paths`/... fields `parse_on_block_or_fail`
+# reads -- comes from ONE parse of the document (`load_workflow_text`), so
+# the two readers can no longer disagree with each other the way two
+# independent regexes could.
 # --------------------------------------------------------------------------- #
-def _extract_top_level_key_block(text: str, key: str) -> str:
-    """The raw body text following a top-level (column-0) `<key>:` line, up
-    to (not including) the next column-0, non-comment, non-blank line.
-    Accepts the key spelled bare (`on:`) OR quoted (`"on":`/`'on':`) —
-    YAML 1.1 treats an unquoted `on`/`off`/`yes`/`no` as a boolean, so some
-    workflow authors quote the `on:` trigger key specifically to avoid that
-    ambiguity; GitHub Actions accepts either spelling identically (B5,
-    round-2 audit — an unquoted-only pattern silently dropped a `"on":`
-    workflow from `scan_workflows` entirely: fail-closed for Rule 1 itself
-    (an actually-reachable tuple would read as unreachable, the safe
-    direction), but fail-OPEN for the dead-waiver mirror check, since a
-    stale allowlist row waiving a tuple that IS reachable only through that
-    dropped workflow would never be flagged dead)."""
-    lines = text.splitlines()
-    start = None
-    pattern = re.compile(rf"""^(?:"{re.escape(key)}"|'{re.escape(key)}'|{re.escape(key)}):\s*(#.*)?$""")
-    for i, line in enumerate(lines):
-        if pattern.match(line):
-            start = i
-            break
-    if start is None:
-        return ""
-    body: list[str] = []
-    for line in lines[start + 1 :]:
-        if line.strip() == "" or line[:1] in (" ", "\t") or line.lstrip().startswith("#"):
-            body.append(line)
-            continue
-        break
-    return "\n".join(body)
+def _trigger_value(doc: dict) -> tuple[object, str | None]:
+    """(on_value, error). Locates the workflow's own `on:` value, handling
+    YAML 1.1's boolean resolution of a bare `on`/`On`/`ON`/`true`/`yes`/...
+    key to `True` -- `load_workflow_text` already refuses a document
+    carrying both spellings, so this only needs to pick whichever one is
+    present."""
+    if True in doc:
+        return doc[True], None
+    if "on" in doc:
+        return doc["on"], None
+    return None, "no top-level on: block found"
 
 
-def _first_indent(lines: list[str]) -> int | None:
-    for line in lines:
-        if line.strip() and not line.lstrip().startswith("#"):
-            return len(line) - len(line.lstrip())
-    return None
+def _normalize_trigger_set(on_value: object) -> tuple[list[str] | None, str | None]:
+    """(trigger_keys, error). A bare/quoted scalar is ONE trigger key; a
+    list is used as-is (every element must be a string, and it must be
+    non-empty); a mapping's own keys are the trigger set (a non-string key
+    -- impossible for a real GitHub event name -- is refused); `null`/any
+    other YAML type is a loud refusal, never `[]` standing in for "no
+    triggers"."""
+    if on_value is None:
+        return None, "on: block is empty (a null value) -- cannot examine"
+    if isinstance(on_value, str):
+        return [on_value], None
+    if isinstance(on_value, list):
+        if not on_value:
+            return None, "on: block is an empty list -- cannot examine"
+        if not all(isinstance(x, str) for x in on_value):
+            return None, f"on: block is a list containing a non-string element -- cannot examine: {on_value!r}"
+        return list(on_value), None
+    if isinstance(on_value, dict):
+        if not on_value:
+            return None, "on: block is an empty mapping -- cannot examine"
+        keys: list[str] = []
+        for k in on_value:
+            if not isinstance(k, str):
+                return None, f"on: block has a non-string trigger key -- cannot examine: {k!r}"
+            keys.append(k)
+        return keys, None
+    return None, f"on: block has an unrecognized shape -- cannot examine: {on_value!r}"
 
 
-def _split_block_entries(block: str) -> dict[str, str]:
-    """Split a block-mapping's text into `{key: body_text}` at the block's
-    OWN first-observed indentation level. `key` allows hyphens/digits/dots
-    (job ids like `dep-direction`, keys like `continue-on-error`)."""
-    lines = block.splitlines()
-    base_indent = _first_indent(lines)
-    if base_indent is None:
-        return {}
-    entries: dict[str, list[str]] = {}
-    current_key: str | None = None
-    for line in lines:
-        if not line.strip() or line.lstrip().startswith("#"):
-            if current_key is not None:
-                entries[current_key].append(line)
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent == base_indent:
-            m = re.match(r"^\s*([A-Za-z0-9_.-]+):\s*(.*)$", line)
-            if not m:
-                current_key = None
-                continue
-            current_key = m.group(1)
-            entries[current_key] = [line]
-        elif indent > base_indent and current_key is not None:
-            entries[current_key].append(line)
-        else:
-            current_key = None
-    return {k: "\n".join(v) for k, v in entries.items()}
+def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
+    """(trigger_keys, error). `error` is non-None on every shape this
+    reader cannot examine (a missing PyYAML install, unparseable YAML, a
+    duplicate key, an ambiguous `on`/`"on"` collision, a `null`/empty/
+    wrongly-typed `on:` value, an anchor/alias/tag anywhere in the
+    document); `trigger_keys` is a definite, exhaustive list only when
+    `error` is None — never a partial list silently missing a key this
+    reader could not parse. A folded/literal block scalar, a flow
+    mapping/sequence, `on :` (whitespace before the colon), a quoted
+    `"on":` key, a BOM, and CRLF line endings are all real, valid YAML and
+    are read exactly as GitHub itself would read them. An anchor, alias
+    (including a merge key, which is always defined via an alias), or an
+    explicit YAML tag is a DIFFERENT case: this is real, valid YAML too,
+    but GitHub Actions' own workflow parser does not accept any of the
+    three in a workflow file, so this reader refuses them outright
+    (naming the exact construct) rather than silently resolve a document
+    GitHub itself would refuse to run."""
+    try:
+        doc = load_workflow_text(text)
+    except WorkflowLoadError as exc:
+        return None, str(exc)
+    on_value, err = _trigger_value(doc)
+    if err is not None:
+        return None, err
+    return _normalize_trigger_set(on_value)
 
 
-def _sub_entries(entries: dict[str, str], key: str) -> dict[str, str]:
-    """`entries[key]`'s OWN body (dropping the `key:` line itself),
-    re-split into its own `{key: body}` map — nested-block traversal
-    (`strategy:` -> `matrix:` -> `include:`)."""
-    body = entries.get(key)
-    if body is None:
-        return {}
-    lines = body.splitlines()
-    return _split_block_entries("\n".join(lines[1:]))
-
-
-def _list_key_body(entries: dict[str, str], key: str) -> str:
-    """The raw list-items text following `entries[key]`'s own `key:` line
-    (dropping that line) — used for `steps:`/`include:`, always a block
-    list in this repo's workflows, never inline."""
-    body = entries.get(key)
-    if body is None:
-        return ""
-    lines = body.splitlines()
-    return "\n".join(lines[1:])
-
-
-def _entry_first_line_value(entries: dict[str, str], key: str) -> str | None:
-    body = entries.get(key)
-    if body is None:
-        return None
-    lines = body.splitlines()
-    if not lines:
-        return None
-    m = re.match(r"^\s*[A-Za-z0-9_.-]+:\s*(.*)$", lines[0])
-    if not m:
-        return None
-    val = m.group(1).strip()
-    return val or None
-
-
-def _step_body_text(entries: dict[str, str], key: str) -> str | None:
-    """The FULL value text of a (possibly multi-line, `run: |`-block-
-    scalar-shaped) entry, with the `key:` prefix stripped from its first
-    line only — suitable for feeding straight into
-    `_extract_tuples_from_text`."""
-    body = entries.get(key)
-    if body is None:
-        return None
-    lines = body.splitlines()
-    if not lines:
-        return None
-    m = re.match(r"^\s*[A-Za-z0-9_.-]+:\s*(.*)$", lines[0])
-    if not m:
-        return None
-    first_val = m.group(1)
-    return "\n".join([first_val] + lines[1:])
-
-
-def _split_step_items(list_body: str) -> list[str]:
-    """Split a `- ` block-list's raw text into one string per list item
-    (each item's OWN `- ` marker replaced by two spaces, so its first
-    line's keys align with its continuation lines the same way
-    `_split_block_entries` expects). Shared by ordinary `steps:` lists and
-    `strategy: matrix: include:` legs — structurally identical shapes."""
-    lines = list_body.splitlines()
-    marker_indent = None
-    for line in lines:
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        if s.startswith("- "):
-            marker_indent = len(line) - len(line.lstrip())
-        break
-    if marker_indent is None:
-        return []
-    items: list[list[str]] = []
-    current: list[str] | None = None
-    for line in lines:
-        if not line.strip():
-            if current is not None:
-                current.append(line)
-            continue
-        indent = len(line) - len(line.lstrip())
-        stripped = line.lstrip()
-        if indent == marker_indent and stripped.startswith("- "):
-            first = line[:marker_indent] + "  " + stripped[2:]
-            current = [first]
-            items.append(current)
-        elif current is not None:
-            current.append(line)
-    return ["\n".join(item) for item in items]
+def read_top_level_on_block_from_path(path: Path) -> tuple[list[str] | None, str | None]:
+    """(trigger_keys, error). Wraps `read_top_level_on_block` with the
+    FILE-level fail-loud rule: every read error on the workflow file --
+    missing, a directory, permission denied, not valid UTF-8 -- is a named
+    FAIL, never `([], None)` / "no key", for EVERY euid. A missing path or
+    a directory path raises `FileNotFoundError`/`IsADirectoryError` (both
+    `OSError`) regardless of the caller's privilege, so those two cases
+    hold even for a root caller; a permission-denied path is bypassed by
+    root's own DAC override and can only be exercised as a caller that is
+    genuinely not root -- callers of this function must not assume the
+    permission-denied arm ran under every euid, only that it is the same
+    named FAIL when it does. A file that is not valid UTF-8 is the SAME
+    named FAIL (`UnicodeDecodeError` is not an `OSError` subclass -- caught
+    separately so a non-UTF-8 workflow file does not raise past this
+    function as an uncaught traceback)."""
+    try:
+        doc = load_workflow_from_path(path)
+    except WorkflowLoadError as exc:
+        return None, str(exc)
+    on_value, err = _trigger_value(doc)
+    if err is not None:
+        return None, err
+    return _normalize_trigger_set(on_value)
 
 
 # --------------------------------------------------------------------------- #
-# `on:` trigger parsing (Rule 1a/1b)
+# `on:` trigger parsing (Rule 1a/1b) -- the per-trigger field shape
+# (`branches`/`branches-ignore`/`types`/`tags`/`tags-ignore`/`paths`/
+# `paths-ignore`), read directly off the SAME parsed `on:` value
+# `read_top_level_on_block` reads its trigger keys from.
 # --------------------------------------------------------------------------- #
-def _extract_list_field(body: str, field_name: str) -> list[str] | None:
-    lines = body.splitlines()
-    for i, line in enumerate(lines):
-        m = re.match(rf"^\s*{re.escape(field_name)}:\s*(.*)$", line)
-        if not m:
-            continue
-        rest = m.group(1).strip()
-        if rest.startswith("["):
-            inner = rest.strip("[]")
-            items = [x.strip().strip("\"'") for x in inner.split(",") if x.strip()]
-            return items
-        if rest and not rest.startswith("#"):
-            return [rest.strip("\"'")]
-        items = []
-        field_indent = len(line) - len(line.lstrip())
-        for l2 in lines[i + 1 :]:
-            if not l2.strip():
-                continue
-            l2_indent = len(l2) - len(l2.lstrip())
-            if l2_indent <= field_indent:
-                break
-            # A comment line NESTED inside a block list (e.g. docs.yml's
-            # own `paths:` list carries a `# the READMEs ...` line between
-            # two `- "..."` entries) must be SKIPPED, never treated as the
-            # end of the list — the bug this repo's OWN docs.yml paths list
-            # would otherwise silently truncate.
-            if l2.lstrip().startswith("#"):
-                continue
-            m2 = re.match(r"^\s*-\s*(.+)$", l2)
-            if not m2:
-                break
-            items.append(m2.group(1).strip().strip("\"'"))
-        return items if items else None
-    return None
+_ON_BLOCK_FIELDS = ("branches", "branches-ignore", "types", "tags", "tags-ignore", "paths", "paths-ignore")
+
+
+def _normalize_str_list_field(value: object, field_name: str) -> tuple[list[str] | None, str | None]:
+    """(normalized, error). A missing field is `None` (no filter); a bare
+    string is ONE item; a list must carry only strings; anything else is a
+    loud refusal, never a silently-empty or partially-read list."""
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        return [value], None
+    if isinstance(value, list):
+        if not all(isinstance(x, str) for x in value):
+            return None, f"{field_name}: list contains a non-string element -- cannot examine: {value!r}"
+        return list(value), None
+    return None, f"{field_name}: unrecognized shape (expected a string or a list of strings) -- cannot examine: {value!r}"
+
+
+def _on_block_dict(doc: dict) -> tuple[dict[str, object] | None, str | None]:
+    """(per-trigger raw child value, error) -- the `on:` value's own
+    mapping form, unresolved into fields yet. A bare/quoted scalar or list-
+    shaped `on:` normalizes to `{trigger: None}` per trigger (no fields to
+    read, matching GitHub's own "no filter" semantics for the short
+    forms)."""
+    on_value, err = _trigger_value(doc)
+    if err is not None:
+        return None, err
+    if on_value is None:
+        return None, "on: block is empty (a null value) -- cannot examine"
+    if isinstance(on_value, str):
+        return {on_value: None}, None
+    if isinstance(on_value, list):
+        if not on_value or not all(isinstance(x, str) for x in on_value):
+            return None, f"on: block is a list with a non-string or empty element set -- cannot examine: {on_value!r}"
+        return {k: None for k in on_value}, None
+    if isinstance(on_value, dict):
+        if not on_value:
+            return None, "on: block is an empty mapping -- cannot examine"
+        out: dict[str, object] = {}
+        for k, v in on_value.items():
+            if not isinstance(k, str):
+                return None, f"on: block has a non-string trigger key -- cannot examine: {k!r}"
+            out[k] = v
+        return out, None
+    return None, f"on: block has an unrecognized shape -- cannot examine: {on_value!r}"
+
+
+def parse_on_block_or_fail(text: str) -> tuple[dict[str, dict[str, list[str] | None]] | None, str | None]:
+    """(on_dict, error). `on_dict[trigger] = {field: [...] | None}` for
+    every field in `_ON_BLOCK_FIELDS` -- the Rule-1b shape
+    `merge_path_lanes` reads. `error` is set (and `on_dict` is `None`) on
+    anything this reader cannot examine -- never a partial or empty dict
+    standing in for a refusal."""
+    try:
+        doc = load_workflow_text(text)
+    except WorkflowLoadError as exc:
+        return None, str(exc)
+    return _parse_on_block_from_doc(doc)
+
+
+def _parse_on_block_from_doc(doc: dict) -> tuple[dict[str, dict[str, list[str] | None]] | None, str | None]:
+    raw, err = _on_block_dict(doc)
+    if err is not None:
+        return None, err
+    out: dict[str, dict[str, list[str] | None]] = {}
+    for trigger, child in raw.items():
+        # A trigger's own child value is a mapping ONLY for the triggers
+        # this reader's fields (branches/paths/...) actually apply to
+        # (`push:`/`pull_request:`/...); `schedule:` is a LIST of `{cron:
+        # ...}` entries, a bare `workflow_dispatch:`/`workflow_call:` child
+        # is often `None`, and other shapes are possible too -- none of
+        # them carry a branches/paths filter, so they normalize to "no
+        # filter on any field" rather than a refusal (this reader is never
+        # asked to validate a trigger's OWN schema, only to read the
+        # filter fields Rule 1b needs off whichever triggers have them).
+        child_map = child if isinstance(child, dict) else {}
+        fields: dict[str, list[str] | None] = {}
+        for field in _ON_BLOCK_FIELDS:
+            normalized, ferr = _normalize_str_list_field(child_map.get(field), f"on.{trigger}.{field}")
+            if ferr is not None:
+                return None, ferr
+            fields[field] = normalized
+        out[trigger] = fields
+    return out, None
 
 
 def parse_on_block(text: str) -> dict[str, dict[str, list[str] | None]]:
-    block = _extract_top_level_key_block(text, "on")
-    entries = _split_block_entries(block)
-    return {
-        key: {
-            field: _extract_list_field(body_text, field)
-            for field in ("branches", "branches-ignore", "types", "tags", "tags-ignore", "paths", "paths-ignore")
-        }
-        for key, body_text in entries.items()
-    }
+    """Backward-compatible view over `parse_on_block_or_fail`, for the one
+    external consumer that predates the error-aware form
+    (`check_lint_surface_closure.py`, which only ever needs
+    `.get("pull_request")` off a workflow it already trusts): returns `{}`
+    on anything this reader cannot examine, exactly as a workflow with no
+    qualifying trigger would. A caller that needs to DISTINGUISH "no
+    qualifying trigger" from "could not be examined" uses
+    `parse_on_block_or_fail` directly -- `scan_workflows` does, since
+    silently treating a refusal as "not merge-path" is exactly the
+    fail-open shape this rewrite closes."""
+    on_dict, err = parse_on_block_or_fail(text)
+    return on_dict if err is None else {}
 
 
 def _push_admits_main(push: dict[str, list[str] | None]) -> bool:
@@ -1229,37 +1486,33 @@ _MATRIX_CMD_INTERP_RE = re.compile(r"^\$\{\{\s*matrix\.cmd\s*\}\}$")
 _MATRIX_CONTINUE_ON_ERROR_EXPR = "${{ matrix.continue_on_error == 'true' }}"
 
 
-def _job_is_blocked(entries: dict[str, str]) -> bool:
+def _job_is_blocked(job: dict) -> bool:
     """Fail-closed: a job carrying ANY `if:` (this gate cannot evaluate
     arbitrary GH Actions expressions) or a `continue-on-error:` key at all
-    is excluded wholesale — `ci.yml`'s own `test-live` job
-    (`if: github.ref == 'refs/heads/main'` + `continue-on-error: true`,
+    is excluded wholesale, regardless of value — `ci.yml`'s own `test-live`
+    job (`if: github.ref == 'refs/heads/main'` + `continue-on-error: true`,
     excluded from `ci-summary`'s own required set by name) is exactly this
     shape."""
-    return "if" in entries or "continue-on-error" in entries
+    return "if" in job or "continue-on-error" in job
 
 
-def _step_is_blocked(entries: dict[str, str]) -> bool:
-    if "if" in entries:
+def _step_is_blocked(step: dict) -> bool:
+    if "if" in step:
         return True
-    coe = _entry_first_line_value(entries, "continue-on-error")
-    if coe is None:
+    if "continue-on-error" not in step:
         return False
-    if coe == _MATRIX_CONTINUE_ON_ERROR_EXPR:
+    coe = step["continue-on-error"]
+    if isinstance(coe, str) and coe.strip() == _MATRIX_CONTINUE_ON_ERROR_EXPR:
         return False  # handled per-leg via the matrix `continue_on_error` field
-    return True  # a literal `true`, or any OTHER expression — fail-closed
+    return True  # a literal `true`/`false`, or any OTHER value/expression — fail-closed
 
 
-def _job_tuples(job_body: str) -> set[str]:
-    # `job_body` is `_split_block_entries(jobs_block)`'s RAW per-job value,
-    # whose first line is still the job id's OWN `<job_id>:` line (that
-    # function's own convention, needed so `_extract_top_level_key_block`'s
-    # sibling helpers stay uniform) -- drop it before re-splitting into this
-    # job's OWN keys (`runs-on`, `if`, `steps`, `strategy`, ...), the same
-    # "drop the key line, re-split the rest" shape `_sub_entries` uses.
-    lines = job_body.splitlines()
-    entries = _split_block_entries("\n".join(lines[1:]))
-    if _job_is_blocked(entries):
+def _job_tuples(job: object) -> set[str]:
+    """`job` is this job id's own parsed value under the workflow's
+    `jobs:` mapping -- a genuine dict, read straight off the SAME parsed
+    document `load_workflow_text` produces (never a second, text-sliced
+    re-parse of it)."""
+    if not isinstance(job, dict) or _job_is_blocked(job):
         return set()
     found: set[str] = set()
     # B1 (round-2 audit): the matrix `include:` legs below are only a real
@@ -1271,13 +1524,13 @@ def _job_tuples(job_body: str) -> set[str]:
     # flag conjoins the two previously-independent loops.
     has_unblocked_matrix_cmd_step = False
 
-    for item_text in _split_step_items(_list_key_body(entries, "steps")):
-        step_entries = _split_block_entries(item_text)
-        if _step_is_blocked(step_entries):
+    steps = job.get("steps")
+    for step in steps if isinstance(steps, list) else []:
+        if not isinstance(step, dict) or _step_is_blocked(step):
             continue
         for key in ("run", "cmd"):
-            body_text = _step_body_text(step_entries, key)
-            if body_text is None:
+            body_text = step.get(key)
+            if not isinstance(body_text, str):
                 continue
             if _MATRIX_CMD_INTERP_RE.match(body_text.strip()):
                 has_unblocked_matrix_cmd_step = True
@@ -1285,26 +1538,27 @@ def _job_tuples(job_body: str) -> set[str]:
             found |= _extract_tuples_from_text(body_text)
 
     if has_unblocked_matrix_cmd_step:
-        strategy_entries = _sub_entries(entries, "strategy")
-        matrix_entries = _sub_entries(strategy_entries, "matrix")
-        for item_text in _split_step_items(_list_key_body(matrix_entries, "include")):
-            leg_entries = _split_block_entries(item_text)
-            leg_coe = _entry_first_line_value(leg_entries, "continue_on_error")
-            if leg_coe is not None and leg_coe.strip("\"'") == "true":
+        strategy = job.get("strategy")
+        matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+        include = matrix.get("include") if isinstance(matrix, dict) else None
+        for leg in include if isinstance(include, list) else []:
+            if not isinstance(leg, dict):
                 continue
-            cmd_body = _step_body_text(leg_entries, "cmd")
-            if cmd_body is not None:
+            leg_coe = leg.get("continue_on_error")
+            if leg_coe is True or (isinstance(leg_coe, str) and leg_coe.strip("\"'") == "true"):
+                continue
+            cmd_body = leg.get("cmd")
+            if isinstance(cmd_body, str):
                 found |= _extract_tuples_from_text(cmd_body)
 
     return found
 
 
-def _workflow_job_tuples(text: str) -> set[str]:
-    jobs_block = _extract_top_level_key_block(text, "jobs")
-    job_entries = _split_block_entries(jobs_block)
+def _workflow_job_tuples(doc: dict) -> set[str]:
+    jobs = doc.get("jobs")
     found: set[str] = set()
-    for _job_id, job_body in job_entries.items():
-        found |= _job_tuples(job_body)
+    for job in jobs.values() if isinstance(jobs, dict) else []:
+        found |= _job_tuples(job)
     return found
 
 
@@ -1346,31 +1600,42 @@ def scan_workflows(repo_root: Path) -> tuple[list[WorkflowScan], list[str]]:
     trigger, carrying its own lanes (Rule 1b's per-lane paths filters) and
     its job/step-scoped (Rule 1c) tuple corpus. Globs BOTH `*.yml` and
     `*.yaml` (see the module doc's disclosed narrowness note). Returns
-    `(scans, path_pattern_findings)` — the second list is EVERY unsupported
+    `(scans, findings)` — `findings` carries BOTH every unsupported
     `paths:`/`paths-ignore:` pattern finding, validated eagerly here (F1,
     round-3 audit) for every lane of every scanned merge-path workflow,
     independent of match order within a lane and independent of whether
     any gated tuple ever routes a reachability check through this
-    workflow at all."""
+    workflow at all, AND every workflow file this reader could not
+    examine at all (a read error, an unparseable document, an ambiguous
+    `on:`/`"on"` collision, ...) — never a silent `continue` standing in
+    for "this file has no qualifying trigger": a workflow this reader
+    cannot even parse might be the one genuinely-reachable merge-path
+    file for some gated tuple, and silently skipping it would read that
+    tuple as unreachable for the wrong reason, or (worse) never surface
+    that the file itself needs fixing."""
     workflows_dir = repo_root / WORKFLOWS_DIR_REL
     if not workflows_dir.is_dir():
         return [], []
     paths = sorted(set(workflows_dir.glob("*.yml")) | set(workflows_dir.glob("*.yaml")))
     scans: list[WorkflowScan] = []
-    pattern_findings: list[str] = []
+    findings: list[str] = []
     for path in paths:
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            doc = load_workflow_from_path(path)
+        except WorkflowLoadError as exc:
+            findings.append(f"{path.name}: {exc}")
             continue
-        on_dict = parse_on_block(text)
+        on_dict, err = _parse_on_block_from_doc(doc)
+        if err is not None:
+            findings.append(f"{path.name}: {err}")
+            continue
         lanes = merge_path_lanes(on_dict)
         if not lanes:
             continue
         for lane in lanes:
-            pattern_findings.extend(_validate_lane_patterns(path.name, lane))
-        scans.append(WorkflowScan(name=path.name, lanes=lanes, tuples=_workflow_job_tuples(text)))
-    return scans, pattern_findings
+            findings.extend(_validate_lane_patterns(path.name, lane))
+        scans.append(WorkflowScan(name=path.name, lanes=lanes, tuples=_workflow_job_tuples(doc)))
+    return scans, findings
 
 
 def is_tuple_reachable(tuple_text: str, origins: list[str], scans: list[WorkflowScan]) -> bool:
@@ -1534,7 +1799,38 @@ def run_gate(repo_root: Path, allowlist_path: Path) -> tuple[list[str], list[str
     return failures, info
 
 
+def require_pyyaml_or_exit(prefix: str, exit_code: int = 2) -> int | None:
+    """`None` when PyYAML is importable; otherwise prints ONE distinct,
+    named "gate prerequisite missing: PyYAML" line under `prefix` --
+    never a finding, never a pass, never a Python traceback -- and returns
+    `exit_code`. Every gate built on this module's shared loader
+    (`check_lint_surface_closure.py`, `check_gpu_prove_once.py`, and this
+    module's own `main`) calls this FIRST, before dispatching `--self-test`
+    or ANY other argv-driven behavior: a missing install reads as ONE
+    prerequisite failure, never as however many "cannot examine" findings
+    a reader produces when the underlying parser is unavailable -- the
+    property this predicate exists to hold, not a count of any one
+    battery's own case list."""
+    if yaml is None:
+        print(f"{prefix}: {_MISSING_PYYAML_MESSAGE.format(_YAML_IMPORT_ERROR)}", file=sys.stderr)
+        return exit_code
+    return None
+
+
+def _pyyaml_prerequisite_rc() -> int | None:
+    """This module's own prerequisite check, prefixed for its own gate
+    name. A thin, name-stable wrapper over `require_pyyaml_or_exit` kept so
+    the self-test can exercise this exact decision, under a simulated
+    missing import, without re-entering `main`'s own `--self-test`
+    dispatch (which would recurse into `self_test()` again)."""
+    return require_pyyaml_or_exit("execution-surface-reachability")
+
+
 def main() -> int:
+    prereq_rc = _pyyaml_prerequisite_rc()
+    if prereq_rc is not None:
+        return prereq_rc
+
     if "--self-test" in sys.argv[1:]:
         return self_test()
 
@@ -2382,15 +2678,279 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     if ok:
         failures.append("self-test FAILED: a workflow_call-only on: block was classified as merge-path")
 
+    # A quoted `"pull_request":` trigger is recognized as a qualifying
+    # merge-path lane exactly like the bare form -- the parsed `on:` value's
+    # own keys are read directly, so a quoted `"push":`/`"pull_request":`
+    # trigger is never silently invisible.
+    quoted_pr = parse_on_block('on:\n  "pull_request":\n    branches: [main]\n')
+    ok, _reason = is_merge_path(quoted_pr)
+    if not ok:
+        failures.append(f'self-test FAILED: a quoted "pull_request": trigger is not classified as merge-path: {_reason}')
+
+    # --- `read_top_level_on_block`/`parse_on_block`: the shared `on:`-block
+    # readers `check_gpu_prove_once.py`'s P1, P5, P6, P7 and its
+    # `--read-on-block` CLI all import (and `check_lint_surface_closure.py`,
+    # via `parse_on_block`). Both derive from ONE parse of the document
+    # (`load_workflow_text`), so they can no longer disagree with each
+    # other -- asserted below as an explicit AGREEMENT check over the whole
+    # battery, not just each reader's own expectation. Real, valid YAML
+    # (folded/literal block scalars, flow mappings/sequences, a BOM, CRLF,
+    # `on :` whitespace, a quoted `"on":` key) is read exactly as GitHub
+    # itself would read it -- never refused merely for being an
+    # unusual-looking spelling; a genuinely unparseable or ambiguous
+    # document (a YAML syntax error, a duplicate key, a null/empty/
+    # wrongly-typed `on:` value, an `on`/`"on"` collision) is a loud
+    # refusal, and so -- a DIFFERENT case, real valid YAML that GitHub's
+    # own parser still does not accept in a workflow file -- is any
+    # anchor, alias (including a merge key), or explicit tag. ------------
+    def _want_ok(label: str, text: str, want_keys: list[str]) -> None:
+        keys, err = read_top_level_on_block(text)
+        if err is not None or keys != want_keys:
+            failures.append(f"self-test FAILED (on: reader, {label}): expected {want_keys}, got keys={keys} err={err!r}")
+
+    def _want_refused(label: str, text: str, want_substr: str) -> None:
+        keys, err = read_top_level_on_block(text)
+        if keys is not None or err is None or want_substr not in err:
+            failures.append(f"self-test FAILED (on: reader, {label}): expected a refusal naming {want_substr!r}, got keys={keys} err={err!r}")
+
+    # The round-5 audit's 30-shape GitHub-semantics differential (each
+    # shape's own oracle is `yaml.safe_load` -- the same library this
+    # reader is now built on -- so this battery pins AGREEMENT with real
+    # YAML semantics, never a hand-guessed expectation).
+    _want_ok("inline bare", "on: push\njobs: {}\n", ["push"])
+    _want_ok("inline double-quoted", 'on: "push"\njobs: {}\n', ["push"])
+    _want_ok("inline single-quoted", "on: 'push'\njobs: {}\n", ["push"])
+    _want_ok("inline with trailing comment", "on: push # hi\njobs: {}\n", ["push"])
+    _want_ok("folded scalar >-", "name: x\non: >-\n  push\njobs:\n  a:\n    runs-on: u\n", ["push"])
+    _want_ok("literal block scalar |", "name: x\non: |\n  push\njobs:\n  a:\n    runs-on: u\n", ["push\n"])
+    _want_ok("flow sequence", "on: [push, pull_request]\njobs: {}\n", ["push", "pull_request"])
+    _want_ok("flow mapping", "on: {push: {branches: [main]}}\njobs: {}\n", ["push"])
+    _want_ok("block sequence", "on:\n  - push\n  - pull_request\njobs: {}\n", ["push", "pull_request"])
+    _want_ok("quoted top-level on (double)", '"on":\n  push:\njobs: {}\n', ["push"])
+    _want_ok("quoted top-level on (single)", "'on':\n  push:\njobs: {}\n", ["push"])
+    _want_refused(
+        "merge key with an undefined alias",
+        "on:\n  <<: *base\n  push:\njobs: {}\n",
+        "not accepted by GitHub Actions",
+    )
+    _want_ok("comment then a child key", "on:\n  # a comment\n  push:\n    branches: [main]\njobs: {}\n", ["push"])
+    _want_refused("two on: blocks (duplicate top-level key)", "on:\n  workflow_dispatch:\non:\n  push:\njobs: {}\n", "duplicate key")
+    _want_refused(
+        "child value carries an anchor",
+        "on:\n  push: &p\n    branches: [main]\njobs: {}\n",
+        "not accepted by GitHub Actions",
+    )
+    _want_ok("leading doc-start marker + comment", "# lead comment\n---\non:\n  push:\njobs: {}\n", ["push"])
+    # `True:` resolves to the SAME YAML 1.1 boolean key `on:` does -- a
+    # workflow author who forgot to quote `on:` and typed `true:` instead
+    # is reading the exact key GitHub's own parser reads too.
+    _want_ok("True: (same boolean key as on:)", "True:\n  push:\njobs: {}\n", ["push"])
+    _want_ok("on : (whitespace before the colon)", "on :\n  push:\njobs: {}\n", ["push"])
+    _want_ok("BOM + CRLF", "\ufeffon:\r\n  push:\r\njobs: {}\r\n", ["push"])
+    _want_ok("CRLF only", "on:\r\n  push:\r\n    branches: [main]\r\njobs: {}\r\n", ["push"])
+    _want_refused("empty on: (null value)", "on:\njobs: {}\n", "empty")
+    _want_refused(
+        "anchor on the whole on: value + a live schedule child",
+        'on: &trig\n  schedule:\n    - cron: "0 0 * * *"\njobs: {}\n',
+        "not accepted by GitHub Actions",
+    )
+    _want_refused(
+        "YAML tag forcing a string",
+        "on: !!str push\njobs: {}\n",
+        "not accepted by GitHub Actions",
+    )
+    _want_ok("quoted child key", 'on:\n  "pull_request":\n    branches: [main]\njobs: {}\n', ["pull_request"])
+    _want_refused("tab indentation", "on:\n\tpush:\njobs: {}\n", "cannot parse YAML")
+    _want_refused("inconsistently dedented sibling", "on:\n    push:\n  pull_request:\njobs: {}\n", "cannot parse YAML")
+    _want_ok("trailing space inside a quoted child key", 'on:\n  "push ":\njobs: {}\n', ["push "])
+    _want_ok("4-space child re-dedented to 2 for the next sibling", "on:\n  push:\n    branches:\n      - main\n  pull_request:\njobs: {}\n", ["push", "pull_request"])
+    _want_ok(
+        "a fake on:/push: pair embedded inside a run: block scalar is never confused with the real one",
+        'on:\n  push:\njobs:\n  a:\n    steps:\n      - run: |\n          cat > w.yml <<EOF\n          "on": push\n          EOF\n',
+        ["push"],
+    )
+    _want_refused("on: ~ (null value)", "on: ~\njobs: {}\n", "empty")
+    _want_ok("trailing whitespace after the on: colon", "on:  \n  push:\njobs: {}\n", ["push"])
+
+    # `read_top_level_on_block` and `parse_on_block`/`is_merge_path` can no
+    # longer disagree: both derive from the SAME `load_workflow_text` parse.
+    # Asserted directly over a representative slice of the battery above
+    # (the shapes that legitimately carry a `push`/`pull_request` trigger).
+    for label, text in (
+        ("inline bare", "on: push\njobs: {}\n"),
+        ("folded scalar", "on: >-\n  push\njobs: {}\n"),
+        ("flow sequence", "on: [push, pull_request]\njobs: {}\n"),
+        ("quoted top-level on", '"on":\n  push:\n    branches: [main]\njobs: {}\n'),
+        ("block sequence", "on:\n  - push\n  - pull_request\njobs: {}\n"),
+    ):
+        keys, err = read_top_level_on_block(text)
+        on_dict, perr = parse_on_block_or_fail(text)
+        if err is None and perr is None:
+            if sorted(keys or []) != sorted((on_dict or {}).keys()):
+                failures.append(
+                    f"self-test FAILED (reader agreement, {label}): read_top_level_on_block={keys} "
+                    f"but parse_on_block_or_fail keys={sorted((on_dict or {}).keys())}"
+                )
+        elif (err is None) != (perr is None):
+            failures.append(
+                f"self-test FAILED (reader agreement, {label}): one reader refused and the other did "
+                f"not -- on_err={err!r} parse_err={perr!r}"
+            )
+
+    # --- `job_source_spans`/`jobs_or_fail`: a flow-style `jobs:` mapping
+    # previously collapsed to zero-length or wrong-job spans instead of
+    # refusing (a real, reproduced regression: a `jobs: {sneaky: {...},
+    # tail: {...}}` shape left `sneaky`'s own body empty and credited
+    # `tail` with `sneaky`'s text); a duplicate job id, or two top-level
+    # `jobs:` blocks, silently shadowed the earlier entry. All three are
+    # now a named, loud refusal, never a partial or wrong-attributed
+    # result. -------------------------------------------------------------
+    def _want_jobs_refused(label: str, text: str, want_substr: str) -> None:
+        jobs, err = jobs_or_fail(text)
+        if jobs is not None or err is None or want_substr not in err:
+            failures.append(
+                f"self-test FAILED (jobs: reader, {label}): expected a refusal naming {want_substr!r}, "
+                f"got jobs={jobs} err={err!r}"
+            )
+
+    _want_jobs_refused(
+        "flow-style jobs: mapping",
+        "on:\n  push:\njobs: { a: { runs-on: u }, b: { runs-on: u } }\n",
+        "flow-style",
+    )
+    _want_jobs_refused(
+        "duplicate job id under jobs:",
+        "on:\n  push:\njobs:\n  x:\n    runs-on: u\n  x:\n    runs-on: u\n",
+        "duplicate key",
+    )
+    _want_jobs_refused(
+        "two top-level jobs: blocks",
+        "on:\n  push:\njobs:\n  x:\n    runs-on: u\n\njobs:\n  y:\n    runs-on: u\n",
+        "duplicate key",
+    )
+    # W10 audit fix: `jobs:` is BLOCK-style in both of these (unlike the
+    # "flow-style jobs: mapping" case above) -- what makes each one
+    # unexaminable is a single JOB's own value not occupying its own line
+    # span. The refusal must name that construct, never "flow-style" (the
+    # WRONG diagnosis this line used to give both shapes).
+    _want_jobs_refused(
+        "block jobs: with one job's value inline on its own key's line",
+        "on:\n  push:\njobs:\n  a: { runs-on: u, steps: [ { run: 'npm publish' } ] }\n",
+        "does not occupy its own line span in a block-style jobs: mapping",
+    )
+    _want_jobs_refused(
+        "block jobs: with a later empty-bodied job id",
+        "on:\n  push:\njobs:\n  a:\n    runs-on: u\n    steps:\n      - run: npm publish\n  b:\n",
+        "does not occupy its own line span in a block-style jobs: mapping",
+    )
+    for _label, _text in (
+        (
+            "block jobs: with one job's value inline on its own key's line",
+            "on:\n  push:\njobs:\n  a: { runs-on: u, steps: [ { run: 'npm publish' } ] }\n",
+        ),
+        (
+            "block jobs: with a later empty-bodied job id",
+            "on:\n  push:\njobs:\n  a:\n    runs-on: u\n    steps:\n      - run: npm publish\n  b:\n",
+        ),
+    ):
+        _jobs, _err = jobs_or_fail(_text)
+        if _err is not None and "flow-style" in _err:
+            failures.append(
+                f"self-test FAILED (jobs: reader, {_label}): refusal wrongly names 'flow-style' for a "
+                f"block-style jobs: mapping, got err={_err!r}"
+            )
+    # The P6-shape end-to-end regression (a flow-style `jobs:` mapping whose
+    # real publisher job is not the last entry, previously read as `[]`/
+    # no-finding while crediting a DIFFERENT job with the missing job's own
+    # text) is covered in `test_check_gpu_prove_once.py`'s own suite, which
+    # owns `check_p6_discovery` -- not re-derived here. The W10 "reusable
+    # this delegates into but cannot examine is a finding, never `{}`"
+    # property is ALSO owned there (`check_p6_discovery` is the only
+    # consumer of the recursive helper this fixes).
+
+    # --- gate prerequisite: a missing PyYAML install is ONE distinct
+    # message, never a finding and never a pass -- simulated by
+    # monkeypatching this module's own `yaml` name to `None` (never an
+    # actual uninstall). `main()` checks this BEFORE calling `run_gate`, so
+    # simulating it here never touches the real repo tree. -----------------
+    _saved_yaml, _saved_err = globals()["yaml"], globals()["_YAML_IMPORT_ERROR"]
+    globals()["yaml"] = None
+    globals()["_YAML_IMPORT_ERROR"] = ImportError("simulated for self-test")
+    try:
+        rc = _pyyaml_prerequisite_rc()
+        if rc != 2:
+            failures.append(
+                f"self-test FAILED: main() under a simulated missing PyYAML should exit 2 (a gate "
+                f"prerequisite failure, never a finding and never a pass), got {rc}"
+            )
+        try:
+            load_workflow_text("on: push\njobs: {}\n")
+            failures.append("self-test FAILED: load_workflow_text did not raise under a simulated missing PyYAML")
+        except WorkflowLoadError as exc:
+            if "gate prerequisite missing: PyYAML" not in str(exc):
+                failures.append(f"self-test FAILED: missing-PyYAML message is not the distinct prerequisite message: {exc}")
+    finally:
+        globals()["yaml"] = _saved_yaml
+        globals()["_YAML_IMPORT_ERROR"] = _saved_err
+
+    # --- the CLI entry point, in a REAL subprocess (never in-process): a
+    # missing PyYAML must be caught BEFORE `--self-test` is ever dispatched
+    # -- the previous ordering ran the whole ~30-case battery first, and
+    # every case that needs a real parse failed with the prerequisite
+    # message standing in for its own expected value, printed as ~20
+    # separate "self-test FAILED" findings instead of the one prerequisite
+    # line. A stub `yaml` package shadowing the real one on `PYTHONPATH`
+    # (never an actual uninstall, and never touching this process's own
+    # already-imported `yaml`) is the only way to exercise `main`'s actual
+    # argv dispatch order end to end. Guarded by `_SELFTEST_SUBPROCESS_GUARD_ENV`
+    # so this never recurses: under the EXACT mutation this fixture exists to
+    # catch (the prerequisite check moved after the `--self-test` dispatch),
+    # the spawned child would otherwise reach `self_test()` and hit this same
+    # block again, spawning a grandchild, and so on without bound -- a
+    # correctness-testing fixture must never itself become a fork bomb on the
+    # mutant it is designed to kill. ---------------------------------------
+    if os.environ.get(_SELFTEST_SUBPROCESS_GUARD_ENV) != "1":
+        with tempfile.TemporaryDirectory() as td:
+            stub_dir = Path(td) / "yaml"
+            stub_dir.mkdir()
+            (stub_dir / "__init__.py").write_text(
+                "raise ImportError('stubbed out for self-test')\n", encoding="utf-8"
+            )
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--self-test"],
+                cwd=str(REPO_ROOT),
+                env={**os.environ, "PYTHONPATH": td, _SELFTEST_SUBPROCESS_GUARD_ENV: "1"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            combined = proc.stdout + proc.stderr
+            if proc.returncode != 2:
+                failures.append(
+                    f"self-test FAILED (subprocess, missing PyYAML): expected exit 2, got "
+                    f"{proc.returncode}; output: {combined!r}"
+                )
+            if "gate prerequisite missing: PyYAML" not in combined:
+                failures.append(
+                    f"self-test FAILED (subprocess, missing PyYAML): the distinct prerequisite "
+                    f"message never appeared; output: {combined!r}"
+                )
+            if "self-test FAILED" in combined:
+                failures.append(
+                    f"self-test FAILED (subprocess, missing PyYAML): `--self-test` ran its battery "
+                    f"instead of being short-circuited by the prerequisite check first; output: "
+                    f"{combined!r}"
+                )
+
     # --- docs.yml's own shape: a comment line NESTED inside a block `paths:`
     # list must not truncate the list (the F1-adjacent bug this repo's own
     # docs.yml would have hit) ------------------------------------------
-    with_comment = _extract_list_field(
-        'push:\n  branches: [main]\n  paths:\n    - "docs/guide/**"\n    # a comment mid-list\n    - "cookbook/recipes/**"\n',
-        "paths",
+    on_dict, on_err = parse_on_block_or_fail(
+        'on:\n  push:\n    branches: [main]\n    paths:\n      - "docs/guide/**"\n      # a comment mid-list\n      - "cookbook/recipes/**"\njobs: {}\n'
     )
+    with_comment = (on_dict or {}).get("push", {}).get("paths") if on_err is None else None
     if with_comment != ["docs/guide/**", "cookbook/recipes/**"]:
-        failures.append(f"self-test FAILED: a comment line nested inside a block `paths:` list truncated it: {with_comment}")
+        failures.append(f"self-test FAILED: a comment line nested inside a block `paths:` list truncated it: {with_comment} (err={on_err!r})")
 
     if failures:
         print("execution-surface-reachability self-test: FAIL", file=sys.stderr)

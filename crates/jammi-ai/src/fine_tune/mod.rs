@@ -15,6 +15,8 @@ pub mod batch_bucket;
 #[cfg(feature = "local")]
 pub mod classifier;
 #[cfg(feature = "local")]
+pub mod collective;
+#[cfg(feature = "local")]
 pub mod data;
 #[cfg(feature = "local")]
 pub mod gradcache;
@@ -27,6 +29,8 @@ pub mod lora;
 #[cfg(feature = "local")]
 pub mod optimizer;
 #[cfg(feature = "local")]
+pub mod partition;
+#[cfg(feature = "local")]
 pub(crate) mod regression_loss;
 #[cfg(feature = "local")]
 pub mod resume;
@@ -38,6 +42,8 @@ pub mod target;
 pub mod trainer;
 #[cfg(feature = "local")]
 pub mod training_job;
+#[cfg(feature = "local")]
+pub mod training_set;
 #[cfg(feature = "local")]
 pub mod worker;
 

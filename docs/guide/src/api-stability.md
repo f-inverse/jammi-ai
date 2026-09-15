@@ -47,12 +47,13 @@ would carry elsewhere.
 
 ### 2. The wire contract — `package jammi.v1.*`
 
-The gRPC/Flight SQL wire surface is the twelve `jammi.v1.*` proto packages (ten
-served on the public listener; one, `jammi.v1.peer`, served **only on the
-internal `[server] peer_bind` listener** — the public listener answers
-`UNIMPLEMENTED` for its rpcs; `jammi.v1.lifecycle` is a **contract-only**
-surface — defined in the wire descriptor so the candle-free client can call a
-platform server that implements it, but answered by no OSS handler):
+The gRPC/Flight SQL wire surface is the thirteen `jammi.v1.*` proto packages
+(ten served on the public listener; two, `jammi.v1.peer` and `jammi.v1.gang`,
+served **only on the internal `[server] peer_bind` listener** — the public
+listener answers `UNIMPLEMENTED` for their rpcs; `jammi.v1.lifecycle` is a
+**contract-only** surface — defined in the wire descriptor so the candle-free
+client can call a platform server that implements it, but answered by no OSS
+handler):
 
 | Package | Surface |
 |---|---|
@@ -61,6 +62,7 @@ platform server that implements it, but answered by no OSS handler):
 | `jammi.v1.embedding` | embedding generation, query encode, search |
 | `jammi.v1.error` | the typed wire-error message (no rpcs) |
 | `jammi.v1.eval` | the evaluation rpcs |
+| `jammi.v1.gang` | the coordinator-to-member gang-admission seam for a multi-host training run (`GangService.RunRank`) — served **only on `peer_bind`**, never on the public listener; no tenant value is read on this path at W=1 — tenant-scoped resolution is U5a-2's, #566 (see [Security Posture](./security.md#the-gang-listener-i-gang)) |
 | `jammi.v1.inference` | bulk inference + predict |
 | `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`) |
 | `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |

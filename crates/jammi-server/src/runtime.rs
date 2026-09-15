@@ -43,6 +43,7 @@ use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
+use crate::grpc::gang::GangServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::job::JobServer;
 use crate::grpc::peer::PeerServer;
@@ -51,6 +52,7 @@ use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
+use crate::grpc::proto::gang::gang_service_server::GangServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::job::job_service_server::JobServiceServer;
 use crate::grpc::proto::peer::peer_service_server::PeerServiceServer;
@@ -556,15 +558,50 @@ impl OssServer {
         // never wrapped by the `TenantResolverLayer`, never advertised by
         // `GetServerInfo`. The public listener answers UNIMPLEMENTED for its
         // paths. Its routes are a plain `tonic::service::Routes`, so a second
-        // internal service can be mounted beside `PeerService` here later. The
-        // registry is cloned now because `MetricsLayer::new(self.metrics)`
-        // moves the `Arc` into the public chain below.
+        // internal service is mounted beside `PeerService` on the SAME
+        // `Routes` here: `GangService` (see
+        // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.7 and Addendum 3 —
+        // no tenant value is read on that path at W=1, never the caller's;
+        // the public listener answers UNIMPLEMENTED for its paths too). The registry is
+        // cloned now because `MetricsLayer::new(self.metrics)` moves the
+        // `Arc` into the public chain below.
+        // `test-hooks` only: a handle onto the SAME `GangServer` instance's
+        // refusal-reason state actually mounted below, cloned out BEFORE
+        // that instance moves (by value) into
+        // `GangServiceServer::new` — see `GangServer::refusal_reason_handle`.
+        // Declared unconditionally as `None` so the `BoundServer { .. }`
+        // literal below never needs its own `#[cfg]` branch on this binding;
+        // only the FIELD and the TYPE it holds are `test-hooks`-gated.
+        #[cfg(feature = "test-hooks")]
+        let mut gang_refusal_handle: Option<crate::grpc::gang::GangRefusalHandle> = None;
         let peer = match self.peer_addr {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
+                // `GangServer::fresh_instance` (see
+                // `docs/rigor/contracts/feat_500-C-U5a-1.md` §1.5) needs
+                // the `[lease]` window this deployment runs with — read once,
+                // here, from the already-validated config
+                // (`OssServer::new`'s own `config.lease.intervals()` call
+                // already rejected an invalid pair at construction, so this
+                // one cannot fail in practice; still handled, never
+                // `.unwrap()`ed, since a config reload between `new` and
+                // `bind` is not something this method can rule out).
+                let lease = self
+                    .session
+                    .inner_config()
+                    .lease
+                    .intervals()
+                    .map_err(|e| ServerError::Config(e.to_string()))?
+                    .lease();
+                let gang_server = GangServer::new(Arc::clone(&self.session), lease);
+                #[cfg(feature = "test-hooks")]
+                {
+                    gang_refusal_handle = Some(gang_server.refusal_reason_handle());
+                }
                 let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
                     Arc::clone(&self.session),
-                )));
+                )))
+                .add_service(GangServiceServer::new(gang_server));
                 Some((listener, routes, Arc::clone(&self.metrics)))
             }
             None => None,
@@ -609,6 +646,8 @@ impl OssServer {
             session,
             worker,
             readiness,
+            #[cfg(feature = "test-hooks")]
+            gang_refusal_handle,
         })
     }
 
@@ -705,6 +744,16 @@ pub struct BoundServer {
     worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
     /// The readiness probe, so a shutdown can flip `/readyz` to 503.
     readiness: Arc<ReadinessProbe>,
+    /// `test-hooks` only: a handle onto the SAME `GangServer` instance's
+    /// refusal-reason state actually mounted on the
+    /// peer listener above — `None` when `[server] peer_bind` is unset (no
+    /// `GangServer` exists to hold a handle onto). Lets an `it` test driving
+    /// `RunRank` over the real network still observe, same-process, which
+    /// `GangRefusalReason` the served call refused for — never reaching the
+    /// wire (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2),
+    /// Non-disclosure, only binds the `Status` a client sees).
+    #[cfg(feature = "test-hooks")]
+    gang_refusal_handle: Option<crate::grpc::gang::GangRefusalHandle>,
 }
 
 /// How [`BoundServer::serve_with_signals`] ended.
@@ -912,6 +961,17 @@ impl BoundServer {
         self.peer_addr
     }
 
+    /// `test-hooks` only: a cheaply cloneable handle onto the `GangServer`
+    /// mounted on the internal peer listener's own
+    /// refusal-reason state — `None` when `[server] peer_bind` is unset. A
+    /// test harness clones this out BEFORE `serve_with_shutdown`/
+    /// `serve_with_signals` consumes `self`, so it can keep observing the
+    /// live, serving instance's state afterward.
+    #[cfg(feature = "test-hooks")]
+    pub fn gang_refusal_handle(&self) -> Option<crate::grpc::gang::GangRefusalHandle> {
+        self.gang_refusal_handle.clone()
+    }
+
     /// Serve both halves on the already-bound listeners until `shutdown`
     /// resolves, then DRAIN: the gRPC surface drains and — concurrently,
     /// gated on the same signal so the worker is never stopped at t = 0 —
@@ -975,6 +1035,8 @@ impl BoundServer {
             session,
             worker,
             readiness,
+            #[cfg(feature = "test-hooks")]
+                gang_refusal_handle: _,
         } = self;
         tracing::info!(
             address = %health_addr,

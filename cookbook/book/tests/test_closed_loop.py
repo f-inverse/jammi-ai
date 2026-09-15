@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import collections
 
-import jammi
 import numpy as np
 import pytest
 
@@ -32,6 +31,18 @@ _ALPHA = (
     round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
     if _HAVE_CACHE else 0.1
 )
+
+
+@pytest.fixture
+def db(embedded):
+    """The live engine these conformal recomputations run on, CLOSED in teardown.
+
+    The shared `embedded` fixture (tests/conftest.py) opens it on a per-test
+    `tmp_path` rather than a fixed `/tmp` directory: `conformalize` is pure
+    compute, so the catalog location is immaterial, but a fixed path is a shared
+    catalog — and an embedded session holds its catalog until close() returns.
+    """
+    return embedded
 
 
 @_needs_cache
@@ -49,9 +60,8 @@ def test_recall_chain_reads_in_order():
 
 
 @_needs_cache
-def test_marginal_classification_conformal_recomputes_to_golden():
+def test_marginal_classification_conformal_recomputes_to_golden(db):
     """Live engine APS marginal coverage matches the frozen 0.867 — under-covers."""
-    db = jammi.connect("file:///tmp/jammi_test_cel_cls")
     preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
     cal = [r for r in preds if r["split"] == "calibration"]
     test = [r for r in preds if r["split"] == "test"]
@@ -64,9 +74,8 @@ def test_marginal_classification_conformal_recomputes_to_golden():
 
 
 @_needs_cache
-def test_regression_interval_conformal_recomputes_to_golden():
+def test_regression_interval_conformal_recomputes_to_golden(db):
     """Live conformalize_interval coverage matches the frozen golden — under-covers."""
-    db = jammi.connect("file:///tmp/jammi_test_cel_reg")
     reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
     cal = [r for r in reg if r["split"] == "calibration"]
     test = [r for r in reg if r["split"] == "test"]

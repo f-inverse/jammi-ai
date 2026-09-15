@@ -323,7 +323,9 @@ mod gauges {
                     warmup_steps: 0,
                     ..Default::default()
                 },
+                world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
             },
+            cache: jammi_db::store::CachePolicy::Bypass,
         }
         .into()
     }

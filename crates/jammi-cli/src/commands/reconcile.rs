@@ -11,6 +11,7 @@
 //! every other verb's failure takes).
 
 use jammi_admin::CatalogClient;
+use jammi_db::store::ReconcileReport;
 
 /// `--grace-secs` default: 3600 seconds. This CLI always sends an explicit
 /// value, so the server's own `grace_secs`-unset default
@@ -28,30 +29,59 @@ pub async fn run(
     all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let report = session.reconcile(apply, Some(grace_secs), all).await?;
-    println!("scope:           {}", report.scope);
-    println!("applied:         {}", report.applied);
-    println!(
+    print!("{}", render(&report));
+    Ok(())
+}
+
+/// Render a [`ReconcileReport`] into the label-shaped lines `jammi reconcile`
+/// prints — every field the report carries, none dropped, in the same order
+/// [`jammi_db::store::ReconcileReport`] declares them and the same field
+/// names the python client's `_reconcile_report_to_dict` projects (so a
+/// caller cross-referencing the two surfaces sees identical names). The six
+/// `*_count` fields are the one exception to "own printed line": each is
+/// folded into the "… and N more" suffix of the list field immediately
+/// before it (via [`join_capped`]), so its value is never dropped even
+/// though it carries no separate label of its own. Kept separate from
+/// [`run`] so a unit test can exercise it against a hand-built report with
+/// no server round trip.
+fn render(report: &ReconcileReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "scope:           {}", report.scope);
+    let _ = writeln!(out, "applied:         {}", report.applied);
+    let _ = writeln!(
+        out,
         "rows_failed:     {}",
         join_capped(&report.rows_failed, report.rows_failed_count)
     );
-    println!(
+    let _ = writeln!(
+        out,
         "orphans:         {}",
         join_capped(&report.orphans, report.orphan_count)
     );
-    println!(
+    let _ = writeln!(
+        out,
         "pending:         {}",
         join_capped(&report.pending, report.pending_count)
     );
-    println!(
+    let _ = writeln!(
+        out,
         "unattributed:    {}",
         join_capped(&report.unattributed, report.unattributed_count)
     );
-    println!(
+    let _ = writeln!(
+        out,
         "damaged:         {}",
         join_capped(&report.damaged, report.damaged_count)
     );
-    println!("bytes_reclaimed: {}", report.bytes_reclaimed);
-    Ok(())
+    let _ = writeln!(
+        out,
+        "referenced:      {}",
+        join_capped(&report.referenced, report.referenced_count)
+    );
+    let _ = writeln!(out, "truncated:       {}", report.truncated);
+    let _ = writeln!(out, "bytes_reclaimed: {}", report.bytes_reclaimed);
+    out
 }
 
 /// Render a key list as a comma-separated line, or `—` when empty — the same
@@ -79,10 +109,118 @@ fn join_capped(values: &[String], true_count: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_GRACE_SECS;
+    use super::{render, ReconcileReport, DEFAULT_GRACE_SECS};
 
     #[test]
     fn default_grace_secs_matches_the_wire_default() {
         assert_eq!(DEFAULT_GRACE_SECS, 3600);
+    }
+
+    /// Pins the exact list of labels `render` prints, in order, against the
+    /// declared field list of `ReconcileReport` — the same list the module
+    /// doc comment on `render` claims and
+    /// `clients/python/jammi/_database.py::_reconcile_report_to_dict`
+    /// projects.
+    ///
+    /// `EXPECTED_LABELS` is `ReconcileReport`'s own field list, in the
+    /// struct's declared order, with the six `*_count` fields removed: by
+    /// design (see `join_capped`) those never get a printed line of their
+    /// own — their value is folded into the "… and N more" suffix of the
+    /// list field immediately before them — so they carry no distinct
+    /// label to assert against. Every OTHER field, including `truncated`,
+    /// gets its own line, spelled exactly like its struct field name. The
+    /// exhaustive destructure below (no `..`) makes a field added to or
+    /// removed from `ReconcileReport` a compile error right here, so this
+    /// list (kept literal, not derived, because `render`'s output is
+    /// line-labelled text, not a serialization) cannot silently drift out
+    /// of sync with the struct without forcing a conscious update to this
+    /// test.
+    #[test]
+    fn render_prints_every_declared_field_in_declaration_order() {
+        let report = ReconcileReport::default();
+        let ReconcileReport {
+            scope: _,
+            applied: _,
+            rows_failed: _,
+            rows_failed_count: _,
+            orphans: _,
+            orphan_count: _,
+            pending: _,
+            pending_count: _,
+            unattributed: _,
+            unattributed_count: _,
+            damaged: _,
+            damaged_count: _,
+            referenced: _,
+            referenced_count: _,
+            truncated: _,
+            bytes_reclaimed: _,
+        } = report;
+
+        const EXPECTED_LABELS: &[&str] = &[
+            "scope",
+            "applied",
+            "rows_failed",
+            "orphans",
+            "pending",
+            "unattributed",
+            "damaged",
+            "referenced",
+            "truncated",
+            "bytes_reclaimed",
+        ];
+
+        let out = render(&ReconcileReport::default());
+        let printed_labels: Vec<&str> = out
+            .lines()
+            .map(|line| line.split(':').next().unwrap().trim())
+            .collect();
+
+        assert_eq!(printed_labels, EXPECTED_LABELS);
+    }
+
+    /// A report whose `referenced` list is non-empty (objects the reap
+    /// skipped because a live `models` row still names their prefix) renders
+    /// both the entries and the true count — the one field this command used
+    /// to drop entirely.
+    #[test]
+    fn render_prints_referenced_entries_and_count() {
+        let report = ReconcileReport {
+            scope: "_global".to_string(),
+            referenced: vec![
+                "models/tenant-a/m1/manifest.json".to_string(),
+                "models/tenant-a/m2/manifest.json".to_string(),
+            ],
+            referenced_count: 2,
+            ..Default::default()
+        };
+
+        let out = render(&report);
+
+        assert!(
+            out.contains("referenced:      models/tenant-a/m1/manifest.json, models/tenant-a/m2/manifest.json"),
+            "missing referenced entries in output:\n{out}"
+        );
+    }
+
+    /// A `referenced` list truncated below its true count still reports the
+    /// true total via the same "… and N more" suffix every other capped
+    /// field in this report uses.
+    #[test]
+    fn render_reports_the_true_referenced_count_when_truncated() {
+        let report = ReconcileReport {
+            scope: "_global".to_string(),
+            referenced: vec!["models/tenant-a/m1/manifest.json".to_string()],
+            referenced_count: 5,
+            truncated: true,
+            ..Default::default()
+        };
+
+        let out = render(&report);
+
+        assert!(
+            out.contains("referenced:      models/tenant-a/m1/manifest.json … and 4 more"),
+            "missing capped referenced count in output:\n{out}"
+        );
     }
 }

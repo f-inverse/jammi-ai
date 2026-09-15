@@ -15,25 +15,42 @@ seven crates. It is merged; every 68 unit cuts after it and so does every 67 uni
   and PR-K have no ordering constraint (disjoint files; rebase whichever lands second).
 - **Edges into 68**: U5a needs DIST unit 1 (`peer_bind`), OPS (C2 rewrites the claim loop
   `JobSlot` wraps) and GRAPH (rewrites `claim_next`); U5b-2 needs OPS (`release_job_lease`,
-  drain hooks); U9b needs K and OPS C6. DIST "unit 2" is a sketch, so U5b-1 builds the
+  drain hooks); U9b needs K and OPS C6. DIST "unit 2" is a sketch, so U5b-1a builds the
   membership substrate itself (README r28). U2a no longer needs OPS C1 (`job_attempt: None`).
   With #501 merged, K, OPS, GRAPH, DELTA and DIST-1 are all unblocked and run concurrently with
-  PR-A and PR-B. The single cross-plan schedule is `../68-compute-tier-substrate/PROGRAM.md`.
-- **Migrations**: 67 appends three (`model_materialization` U3, `instances_peer_addr` U5b-1,
-  `compute_cluster_state` U8b); no number is reserved — each PR takes the next free at rebase and
-  updates both pin sites (`catalog/migrations.rs` const list; `tests/it/migrations.rs:23-54`
-  `EXPECTED_MIGRATION_NAMES`) plus OPS's relative-position oracle; the second merger renumbers.
+  PR-A and PR-B1. The single cross-plan schedule is `../68-compute-tier-substrate/PROGRAM.md`.
+- **Migrations**: 67 appends four (`model_materialization` U3, `instances_peer_addr_result_root`
+  U5b-1a, `jobs_assembly_failures_next_after` U5b-1b-ii, `compute_cluster_state` U8b); U5b-0's
+  per-row-group leaf digests are a sidecar-object change and append none. No number is
+  reserved — each PR takes the next free at rebase and updates both pin sites
+  (`catalog/migrations.rs` const list; `crates/jammi-db/tests/it/migrations.rs::EXPECTED_MIGRATION_NAMES`)
+  plus OPS's relative-position oracle; the second merger renumbers.
 
 ```
 #501 (merged) → PR-A [U1] ∥ K (#502, in CI) ∥ DIST-1, OPS, GRAPH, DELTA (68)
-        → PR-B [U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact]          (needs PR-A only)
-        → PR-C(67) [U7b ∥ U5a → U6 → U5b-1 → U5b-2 → artifact]         (needs DIST-1, OPS, GRAPH)
+        → PR-B1 [U7a ∥ U2a ∥ U4a → artifact]                            (needs PR-A only)
+        → PR-B2 [U2b ∥ U3 → U2c → U4b → artifact]                       (needs PR-B1; U2c before
+                                                                           U4b binds a per-rank
+                                                                           reader to it — #544)
+        → PR-C(67) [U7b ∥ U5a-1 → U5b-1a → U5b-0 → U5b-1b-i → U5b-1b-ii → U5b-1b-iii → U5a-2
+                     → U5b-2 → artifact]                                 (needs DIST-1, OPS, GRAPH,
+                                                                           PR-B1; U4b lands before
+                                                                           U5b-1b-ii — spec.rs
+                                                                           co-ownership)
         → PR-D [U8a → U8b → U9a → U9b]                                  (needs K, OPS; admin merge)
 ```
 
-Serial edges: #501 → U1 → everything; U2a → U2b, U3; U4a → U2b (the `world` argument);
-U2b + U3 + U4a → U4b; U4a + DIST-1 + OPS + GRAPH → U5a; U2b + U5a → U6; U4b + U5a + U6 → U5b-1;
-U5b-1 + OPS → U5b-2; U1 + U5b-1 + U6 + S6 → U8a; U8a + S6 → U8b; all → U9a; K + OPS → U9b.
+PR-B2 and PR-C(67) build concurrently once PR-B1 merges (wave 3); the only cross-branch edge is
+the pin above (U4b before U5b-1b-ii).
+
+Serial edges: #501 → U1 → everything; U2a → U2b, U3; U4a → U2b (the `world` argument); U2b +
+U4a → U2c (the residency-bounded per-rank stream, before U4b binds a per-rank reader to it,
+issue #544); U2c + U3 + U4a → U4b; U5a-1 → U5b-1a (`instance_liveness_margin()`, merge order
+pinned); U5a-1 → U5b-1b-i (frozen `RoundContribution`/`RoundResult`); U5b-0 → U5b-1b-i (the leaf
+inventory its per-partition verify reads); U4b + U5b-1a + U5b-1b-i + U5a-1 + U5a-2 →
+U5b-1b-ii (`spec.rs` co-owned with U4b, merge order pinned); U5b-1b-ii → U5b-1b-iii; U5b-1b-ii +
+U5b-1b-iii + OPS → U5b-2; U1 + U5b-1b-ii + U5b-1b-iii + S6 → U8a; U8a + S6 → U8b; all → U9a;
+K + OPS → U9b.
 
 ## Alternatives added in v4
 
@@ -56,29 +73,38 @@ U5b-1 + OPS → U5b-2; U1 + U5b-1 + U6 + S6 → U8a; U8a + S6 → U8b; all → U
 | Unit | Size | Owners | Note |
 |---|---|---|---|
 | U4a | L | ai-core + db (+ wire-server co-owner for the spec field) | no migration |
+| U2c | M | ai-core + db | streaming training-set loader with a residency bound; issue #544 |
 | U5a | L | wire-server + ai-core + db | on the peer listener; DIST-1 merged is a hard precondition |
-| U5b-1 | L | ai-core + db + docs-ci | membership substrate + determinism |
+| U5b-1a | M | db + docs-ci | membership substrate; depends_on U5a-1 |
+| U5b-0 | S | db | partitioned attestation inventory (per-row-group leaf digests) |
+| U5b-1b-i | L | wire-server + ai-core | `Peer` collective + round protocol |
+| U5b-1b-ii | L | wire-server + ai-core + db | coordinator: assembly + dispatch; `spec.rs` co-owned with U4b |
+| U5b-1b-iii | L | ai-core | the largest unit in the split — eleven `record_failed` sites × two runner roles |
 | U5b-2 | L | ai-core + wire-server | failure semantics + chaos + cluster artifact |
 | U8a | L | wire-server + ai-core + docs-ci | new crate + three registration sites; admin merge |
 | U8b | L | wire-server + db | the completion gate; neutral migration |
 | U9a | M | docs-ci / doc-updater | docs |
 | U9b | M | docs-ci | shape-d overlay after K and OPS |
+| C1 (cookbook) | S | cookbook | AST session-lifecycle gate; issue #539; after PR-B2 |
 
 Co-ownership (order = merge order): `crates/jammi-ai/src/fine_tune/worker.rs` — **OPS C2 rewrites
 the claim loop and GRAPH rewrites `claim_next`; both merge before any 67 unit that touches the
-loop** (U5a `JobSlot`, U5b-1 coordinator, U5b-2 abort path); U2a/U2b/U3/U4b/U6 edit other
-regions and may precede them. `crates/jammi-ai/src/session.rs` (DIST c1/c2 `build_result_store`
-+ `open_with_placement`, OPS C2 release/worker gate, U4a device-plural session and the
-`TrainingCommon` sites, U5b-1 `peer_addr` write). `crates/jammi-db/src/config/mod.rs` (DIST
-`peer_bind`/`peer_local_load_bytes`, OPS knobs, U4a `[worker]` fields, U5b-1 `peer_advertise`,
-U8a `[ballista]`). `crates/jammi-server/src/runtime.rs` (DIST peer routes, OPS C2–C5, U5a, U8a).
+loop** (U5a `JobSlot`, U5b-1b-ii coordinator, U5b-1b-iii rank body, U5b-2 abort path);
+U2a/U2b/U2c/U3/U4b edit other regions and may precede them. `crates/jammi-ai/src/session.rs`
+(DIST c1/c2 `build_result_store` + `open_with_placement`, OPS C2 release/worker gate, U4a
+device-plural session and the `TrainingCommon` sites, U5b-1a `peer_addr` write).
+`crates/jammi-db/src/config/mod.rs` (DIST `peer_bind`/`peer_local_load_bytes`, OPS knobs, U4a
+`[worker]` fields (renamed `[worker] local_ranks` in U4b S8), U5b-1a `peer_advertise`, U5b-1b-ii
+`[distributed] max_world_size`, U8a `[ballista]`). `crates/jammi-server/src/runtime.rs` (DIST
+peer routes, OPS C2–C5, U5a, U5b-1b-i decode cap, U8a).
 `tenant_isolation_oracle.rs` + `api_freeze_baseline.txt` (DIST PEER bucket, then U5a GANG bucket).
 `crates/jammi-server/tests/it/main.rs` mod lines (DIST, OPS, U5a). `crates/jammi-db/src/catalog/
 {migrations.rs, tests/it/migrations.rs}` (every migration-appending unit; two pin sites).
 `jammi-wire` error-tag space (DIST takes `unavailable = 30`, DELTA 32–36, GRAPH 37–38 — 67's typed refusals
 take the next free tags at rebase; `error.proto` + `src/error.rs`). `jobs_repo.rs` (OPS
-`release_job_lease`, GRAPH `claim_next`, U5a `get_job_for_rank`, U5b-1 `upsert_instance` /
-`list_gang_members`, U8b `WorkerRecord.devices`). `deploy/kubernetes/overlays/shape-d/**` (K, OPS
+`release_job_lease`, GRAPH `claim_next`, U5a `get_job_for_rank`, U5b-1a `upsert_instance` /
+`list_gang_members`, U5b-1b-ii's cooldown term on `claim_next`'s candidate subselect, U8b
+`WorkerRecord.devices`). `deploy/kubernetes/overlays/shape-d/**` (K, OPS
 C6, then U9b).
 
 ## Spikes

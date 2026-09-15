@@ -93,16 +93,18 @@ use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::store::ArtifactStore;
+use jammi_db::storage::StorageError;
+use jammi_db::store::{ArtifactStore, ResultStore};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
-use crate::fine_tune::data::TrainingDataLoader;
+use crate::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::FineTuneConfig;
+use crate::fine_tune::training_set;
+use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
@@ -383,10 +385,35 @@ impl WorkerShared {
         self.phase.store(phase as u8, Ordering::SeqCst);
     }
 
+    /// Test-only: set the phase WITHOUT requesting a stop (`set_phase` and
+    /// `request_stop` are both private, and the `it` tests are an external
+    /// crate, so this is the only way to construct the P1 gate-direct
+    /// scenario — a phase flip with `stop` deliberately left unset — to
+    /// prove the loop-top gate refuses a new claim on the phase read alone,
+    /// never relying on a real `release_and_stop` call, which always pairs
+    /// the two).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_phase_for_test(&self, phase: WorkerPhase) {
+        self.set_phase(phase);
+    }
+
     /// Whether a stop has been requested (the level the loop's pre-claim
     /// check reads).
     pub fn stop_requested(&self) -> bool {
         *self.stop.borrow()
+    }
+
+    /// Whether the loop may initiate a new `claim_next`: no stop has been
+    /// requested AND the phase is still `Running`. `EmbeddedWorker::run_until`
+    /// reads this ONE predicate at two sites — the loop's top-of-iteration
+    /// gate and again, with no `.await` between that second read and the
+    /// `claim_next` call itself, immediately after `reclaim_expired_jobs`
+    /// returns — so the two reads can never drift apart (P1',
+    /// `CONTRACT-RELEASE-SPIN.md`): a RELEASE landing anywhere in the
+    /// reclaim round trip is caught by the second read even when the first,
+    /// now-stale read had already admitted the iteration.
+    fn admits_claim(&self) -> bool {
+        !self.stop_requested() && self.phase() == WorkerPhase::Running
     }
 
     fn request_stop(&self) {
@@ -743,8 +770,9 @@ impl JobWorker {
             .await
     }
 
-    /// Run the claim→reconstruct→train loop until `shared`'s stop is set or
-    /// the session drops.
+    /// Run the claim→reconstruct→train loop until `shared`'s stop is set,
+    /// `shared`'s phase leaves [`WorkerPhase::Running`], or the session
+    /// drops.
     ///
     /// Stack-safe: a bounded `loop`, never recursion. The task's FIRST
     /// statement upserts this process's `workers` row as `warming`; it then
@@ -753,13 +781,26 @@ impl JobWorker {
     /// selected against the stop, flips the row to `claiming` when the gate
     /// opens, and only then claims — one sequential chain, so `claiming` can
     /// never precede `warming` and a stop during the wait returns without a
-    /// claim. Each tick reclaims expired leases then attempts one claim; on a
-    /// claim it runs the job to a terminal state inline (the next claim waits
-    /// for it), on no claim it sleeps the configured idle poll `select!`ed
-    /// against the stop watch (level-triggered: no lost wakeup, no waiting
-    /// out the poll). The catalog used for reclaim/claim is unscoped — a
-    /// worker serves every tenant's queue. The terminal [`LoopState`] is
-    /// written on every exit path by an in-task guard.
+    /// claim. `WorkerShared::admits_claim` (one private predicate, two
+    /// independent signals — `stop_requested()`, the wakeup that also
+    /// interrupts an idle sleep, and `phase() == Running`) is read at TWO
+    /// sites before any `claim_next`: the top of the iteration, and again,
+    /// with no `.await` between that second read and `claim_next` itself,
+    /// immediately after `reclaim_expired_jobs` returns — so a `Releasing`
+    /// (or `Draining`) phase that lands during the reclaim round trip is
+    /// caught by the second read even though the first, now-stale read had
+    /// already admitted the iteration (P1', `CONTRACT-RELEASE-SPIN.md`); a
+    /// loop already at either read point never starts a `claim_next`
+    /// regardless of which of the two signals it observes first. The one
+    /// residual — a claim whose own catalog round trip is already in flight
+    /// when the phase flips — the arm at `:522` tests `== Releasing` only, so
+    /// under `Releasing` it self-releases via `register_job_hold_or_release`; under `Draining` no arm matches and it dispatches normally. On a claim it runs the
+    /// job to a terminal state inline (the next claim waits for it), on no
+    /// claim it sleeps the configured idle poll `select!`ed against the stop
+    /// watch (level-triggered: no lost wakeup, no waiting out the poll). The
+    /// catalog used for reclaim/claim is unscoped — a worker serves every
+    /// tenant's queue. The terminal [`LoopState`] is written on every exit
+    /// path by an in-task guard.
     pub async fn run_until(&self, shared: Arc<WorkerShared>) {
         let exit = LoopExitGuard::new(Arc::clone(&shared));
         let mut stop_rx = shared.stop_receiver();
@@ -804,7 +845,16 @@ impl JobWorker {
         loop {
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::maybe_panic(&self.worker_id);
-            if shared.stop_requested() {
+            // `admits_claim()` bundles two independent signals:
+            // `stop_requested()` is the wakeup (it also interrupts an idle
+            // sleep, see the `None` arm's `select!` below); `phase() !=
+            // Running` refuses a new claim the instant RELEASE (or DRAIN)
+            // flips the phase, even in the window before the stop watch is
+            // next polled — see `EmbeddedWorker::release_and_stop`'s 2a. Read
+            // again below, after `reclaim_expired_jobs`, so a RELEASE landing
+            // during that round trip cannot ride this now-stale read into a
+            // claim (P1', `CONTRACT-RELEASE-SPIN.md`).
+            if !shared.admits_claim() {
                 break;
             }
             let session = match self.session.upgrade() {
@@ -821,7 +871,20 @@ impl JobWorker {
                 tracing::error!(worker = %self.worker_id, error = %e, "reclaim_expired_jobs failed");
             }
 
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::maybe_park_after_reclaim(&self.worker_id).await;
+
+            // The second read: no `.await` between this and `claim_next`
+            // itself (`record_claim_next` is sync). A claim whose own
+            // catalog round trip is already in flight when 2a runs is the
+            // one residual neither read catches — under `Releasing` (`:522`)
+            // `register_job_hold_or_release` self-releases it; under `Draining` it dispatches and runs to completion.
+            if !shared.admits_claim() {
+                break;
+            }
             let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::record_claim_next(&self.worker_id);
             let claimed = match catalog
                 .claim_next(&self.worker_id, &kind_refs, self.intervals.lease)
                 .await
@@ -886,7 +949,7 @@ impl JobWorker {
     /// |---|---|---|
     /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
     /// | 2 | undeserialisable `training_spec` | same as 1 |
-    /// | 3 | source SQL / loader reconstruction error (`read_source_columns`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 3 | training-set materialization / loader reconstruction error (`training_set::materialize_projection`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
     /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
     /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
     /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |
@@ -1150,6 +1213,7 @@ impl JobWorker {
                 // lease-lost and the cancel-requested arm below.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
+                    &*session.result_store(),
                     catalog.current_tenant(),
                     &job_id,
                     &self.worker_id,
@@ -1193,6 +1257,7 @@ impl JobWorker {
                 // failure — none of which ever produced a `TrainedArtifact`.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
+                    &*session.result_store(),
                     catalog.current_tenant(),
                     &job_id,
                     &self.worker_id,
@@ -1243,6 +1308,12 @@ impl JobWorker {
         artifact: TrainedArtifact,
     ) {
         let store = session.artifact_store();
+        // The guarded port every abandon-path byte-delete in this function
+        // reaches through — never the unguarded
+        // `ArtifactStore::delete_artifact_prefix` directly. See
+        // `PrefixReferences`'s own doc.
+        let result_store = session.result_store();
+        let refs: &dyn PrefixReferences = &*result_store;
         // `catalog` is `pinned_to_tenant(record.tenant_id)` — its
         // `current_tenant()` reliably reports the JOB's tenant regardless of
         // any task-local scope, so every artifact key this function writes
@@ -1255,6 +1326,7 @@ impl JobWorker {
             register,
             metrics,
             mut epoch_checkpoints,
+            materialization,
         } = artifact;
         let model_id = register.model_id.clone();
 
@@ -1263,12 +1335,17 @@ impl JobWorker {
         // a registered model row. The registration does NOT carry the served
         // path: the finalize CAS is the sole writer of `artifact_path`, so a
         // loser's (or zombie's) register can never set the served pointer.
+        //
+        // Every attempt publishes its OWN bytes under its OWN attempt-unique
+        // prefix — no FineTune run ever shares a `models/` prefix with
+        // another run (model-level cache reuse is not yet supported; see
+        // <https://github.com/f-inverse/jammi-ai/issues/562>).
         let attempt_str = attempt.to_string();
         let prefix =
             match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
                 .await
             {
-                Ok(p) => p,
+                Ok(p) => PublishedPrefix(p),
                 Err(e) => {
                     record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
                     // The training loop DID complete and DID write epoch
@@ -1279,6 +1356,7 @@ impl JobWorker {
                     // reclaim path for every terminating arm, unit 348 F1/F2).
                     Self::gc_epoch_checkpoints(
                         &store,
+                        refs,
                         tenant,
                         job_id,
                         &self.worker_id,
@@ -1291,11 +1369,13 @@ impl JobWorker {
             };
 
         if let Err(e) = catalog.register_model(register.as_params()).await {
-            // The model row could not be registered; the prefix we wrote is
-            // orphaned. Best-effort GC it and fail the job.
-            store.delete_artifact_prefix(&prefix).await.ok();
+            // The model row could not be registered. The prefix we just
+            // wrote is orphaned — best-effort GC it via
+            // `abandon_unfinalized_attempt`.
+            abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version).await;
             Self::gc_epoch_checkpoints(
                 &store,
+                refs,
                 tenant,
                 job_id,
                 &self.worker_id,
@@ -1305,6 +1385,101 @@ impl JobWorker {
             .await;
             record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
             return;
+        }
+
+        // The model-level materialization SIDECAR OBJECT
+        // (`materialization.json`'s bytes) is still written into the
+        // prefix here, BEFORE the finalize CAS below — mirroring
+        // `ArtifactStore::put_artifact`'s own "manifest.json last"
+        // discipline. The CATALOG COLUMNS
+        // (`definition_hash`/`input_anchors_json`) are a different matter:
+        // `Catalog::record_model_materialization`'s own ordering guard now
+        // REFUSES to write them until the finalize CAS has already
+        // committed `artifact_path` for this row (matching
+        // `record_model_materialization`'s own doc), so calling it here —
+        // before that CAS ever runs — would refuse every single time for a
+        // fresh run. The two pieces of information that call needs are
+        // captured into `pending_record` now and used AFTER the CAS wins,
+        // below.
+        let mut pending_record: Option<(String, String)> = None;
+        match &materialization {
+            Some(FineTuneMaterializationOutcome::Fresh {
+                descriptor,
+                env,
+                inputs,
+            }) => {
+                let manifest = match store
+                    .write_model_materialization(
+                        prefix.url(),
+                        jammi_db::store::manifest::Materialization {
+                            descriptor,
+                            env,
+                            inputs: inputs.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        abandon_unfinalized_attempt(
+                            refs,
+                            catalog,
+                            &prefix,
+                            &model_id,
+                            register.version,
+                        )
+                        .await;
+                        Self::gc_epoch_checkpoints(
+                            &store,
+                            refs,
+                            tenant,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            epoch_checkpoint_bound,
+                        )
+                        .await;
+                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
+                            .await;
+                        return;
+                    }
+                };
+                let anchors_json = match serde_json::to_string(&manifest.input_anchors) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        abandon_unfinalized_attempt(
+                            refs,
+                            catalog,
+                            &prefix,
+                            &model_id,
+                            register.version,
+                        )
+                        .await;
+                        Self::gc_epoch_checkpoints(
+                            &store,
+                            refs,
+                            tenant,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            epoch_checkpoint_bound,
+                        )
+                        .await;
+                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
+                            .await;
+                        return;
+                    }
+                };
+                pending_record =
+                    Some((manifest.definition_hash.as_str().to_string(), anchors_json));
+            }
+            // `GraphFineTune` / a context predictor: no materialization to
+            // record. `ProducingDescriptor::FineTune` covers only the
+            // column-source `FineTune` kind — `GraphFineTune` has no `cache`
+            // field at all (it is unrepresentable on that variant, see
+            // `TrainingSpec`'s own doc), so there is never anything to
+            // record here for it.
+            None => {}
         }
 
         // Unit 348 F2: TRIM to the trailing retention window before
@@ -1358,18 +1533,24 @@ impl JobWorker {
         // The tagged terminal payload `jobs.result` carries the model
         // metrics blob: the generalised `jobs` schema has no dedicated
         // metrics column, so it folds into `result` instead (see
-        // `crate::jobs::JobResult::Model`).
+        // `crate::jobs::JobResult::Model`). `cache_outcome` shares the
+        // `Table` arm's `"computed"`/`"reused:{name}"` vocabulary, but every
+        // FineTune run always records `"computed"` today — model-level
+        // cache reuse is not yet supported (see that field's own doc).
         let job_result = crate::jobs::JobResult::Model {
             model_id: model_id.clone(),
-            artifact_path: prefix.to_string(),
+            artifact_path: prefix.url().to_string(),
             metrics: metrics.clone(),
+            cache_outcome: "computed".to_string(),
         };
         let result_json = match serde_json::to_string(&job_result) {
             Ok(j) => j,
             Err(e) => {
-                store.delete_artifact_prefix(&prefix).await.ok();
+                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
+                    .await;
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1397,12 +1578,39 @@ impl JobWorker {
                 result: &result_json,
                 output_model_id: &model_id,
                 output_model_version: register.version,
-                artifact_path: prefix.as_str(),
+                artifact_path: prefix.url().as_str(),
                 epoch_checkpoints: &epoch_rows,
             })
             .await
         {
             Ok(true) => {
+                // Record the materialization summary ONLY now that the
+                // finalize CAS above has actually committed `artifact_path`
+                // for THIS row — `record_model_materialization`'s own
+                // ordering guard requires exactly this fact, and refuses
+                // before it. Best-effort: a failure here leaves the model
+                // SERVABLE (the CAS already committed) but without a
+                // reuse-probeable definition hash — logged, never
+                // escalated, since the job itself has already completed
+                // successfully and must not be un-completed over a
+                // secondary attestation write.
+                if let Some((definition_hash, anchors_json)) = pending_record {
+                    if let Err(e) = catalog
+                        .record_model_materialization(
+                            &model_id,
+                            register.version,
+                            &definition_hash,
+                            &anchors_json,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            model_id = %model_id,
+                            error = %e,
+                            "record_model_materialization failed after a won finalize CAS"
+                        );
+                    }
+                }
                 // The finalize CAS won: the job is `completed`, so its durable
                 // resume checkpoint is dead. GC it (best-effort — a leftover
                 // resume prefix is harmless, never on the serving path, but the
@@ -1423,6 +1631,7 @@ impl JobWorker {
                 if !epoch_checkpoints.is_empty() {
                     Self::gc_epoch_checkpoints_by_index(
                         &store,
+                        refs,
                         tenant,
                         job_id,
                         &self.worker_id,
@@ -1435,12 +1644,16 @@ impl JobWorker {
             Ok(false) => {
                 // Lost the lease before finalizing: our CAS matched zero rows, so
                 // we committed neither the job status nor any served path. Our
-                // prefix is never the committed pointer — GC it best-effort and
-                // leave the job for reclaim (the re-claiming worker writes its own
-                // prefix and its CAS commits it).
-                store.delete_artifact_prefix(&prefix).await.ok();
+                // prefix is never the committed pointer —
+                // GC it best-effort and reap this attempt's own unfinalized
+                // row so no hash-less zombie survives; leave the job
+                // for reclaim (the re-claiming worker writes its own prefix
+                // and its CAS commits it).
+                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
+                    .await;
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1455,9 +1668,11 @@ impl JobWorker {
                 );
             }
             Err(e) => {
-                store.delete_artifact_prefix(&prefix).await.ok();
+                abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
+                    .await;
                 Self::gc_epoch_checkpoints(
                     &store,
+                    refs,
                     tenant,
                     job_id,
                     &self.worker_id,
@@ -1499,16 +1714,16 @@ impl JobWorker {
     /// immediately, before even the trivial `attempt.to_string()` allocation,
     /// so a legacy/default job's terminating arm issues ZERO store requests
     /// (F1: an opt-in blast radius, not a tax on every job). For an ENABLED
-    /// job, [`ArtifactStore::delete_epoch_checkpoint`] is already a no-op for
-    /// any index that was never written (an absent manifest is "nothing
-    /// durable to reclaim", not an error — the same rule
-    /// [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping the
-    /// full `[0, epochs)` configured range costs at most `epochs` no-op reads
-    /// beyond whatever indices actually existed — correct regardless of how
-    /// far training got, or whether it ever ran a single epoch boundary. This
-    /// O(epochs) failure-path reclaim cost is the accepted price of "opt-in,
-    /// bounded, and never silent" — see [`Self::gc_epoch_checkpoints_by_index`]
-    /// for the one-warning-per-sweep diagnostic.
+    /// job, an index that was never written is already a no-op (an absent
+    /// manifest is "nothing durable to reclaim", not an error — the same
+    /// rule [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping
+    /// the full `[0, epochs)` configured range costs at most `epochs` no-op
+    /// reads beyond whatever indices actually existed — correct regardless
+    /// of how far training got, or whether it ever ran a single epoch
+    /// boundary. This O(epochs) failure-path reclaim cost is the accepted
+    /// price of "opt-in, bounded, and never silent" — see
+    /// [`Self::gc_epoch_checkpoints_by_index`] for the one-warning-per-sweep
+    /// diagnostic and the referenced-vs-reclaimed accounting.
     ///
     /// This is the ONE reclaim path (family E, the term that grows — every
     /// reclaimed/failed attempt's per-epoch storage — must be bounded, not
@@ -1520,67 +1735,117 @@ impl JobWorker {
     /// [`jammi_db::catalog::jobs_repo::EpochCheckpointRow`]).
     async fn gc_epoch_checkpoints(
         store: &ArtifactStore,
+        refs: &dyn PrefixReferences,
         tenant: Option<TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: u32,
         epoch_checkpoint_bound: usize,
-    ) {
+    ) -> EpochCheckpointSweep {
         if epoch_checkpoint_bound == 0 {
-            return;
+            return EpochCheckpointSweep::default();
         }
         Self::gc_epoch_checkpoints_by_index(
             store,
+            refs,
             tenant,
             job_id,
             worker_id,
             attempt,
             0..epoch_checkpoint_bound,
         )
-        .await;
+        .await
     }
 
     /// The shared epoch-index sweep both [`Self::gc_epoch_checkpoints`] (a
     /// full `[0, bound)` range) and `publish_and_finalize`'s winner arm (the
     /// specific stale indices a persistently-failed mid-run prune left
-    /// behind, unit 348 F2) drive. Attempts a best-effort delete of every
-    /// index in `epochs`; if ANY fail, emits exactly ONE `tracing::warn!`
-    /// naming the job/worker/attempt and the failed-vs-attempted count —
-    /// never zero (a silently-swallowed sweep failure) and never one warning
-    /// per failed delete (a warning storm when the whole store is down for
-    /// this attempt).
+    /// behind, unit 348 F2) drive. For every index in `epochs`, computes the
+    /// EXACT checkpoint prefix ([`ArtifactStore::epoch_checkpoint_prefix`])
+    /// and consults the guarded [`PrefixReferences`] port on THAT prefix —
+    /// never the unguarded `ArtifactStore::delete_artifact_prefix` primitive
+    /// directly — before ever deleting a byte: a RETAINED checkpoint gets
+    /// its own `models` row whose
+    /// `artifact_path` equals this exact prefix (the winning finalize CAS
+    /// inserts one such row per retained checkpoint), so an unguarded delete
+    /// here could remove bytes a live row still names. A `Referenced`
+    /// refusal is expected and unremarkable here (this sweep's own caller,
+    /// `publish_and_finalize`'s winner arm, only ever targets the STALE
+    /// indices already excluded from `retained` — see that call site's own
+    /// doc), never escalated: it means the checkpoint survives and this
+    /// sweep leaves it alone, counted and logged, never a hard failure. Any
+    /// OTHER error counts as a failed delete; if ANY fail, emits exactly ONE
+    /// `tracing::warn!` naming the job/worker/attempt and the failed-vs-
+    /// attempted count — never zero (a silently-swallowed sweep failure) and
+    /// never one warning per failed delete (a warning storm when the whole
+    /// store is down for this attempt).
     async fn gc_epoch_checkpoints_by_index(
         store: &ArtifactStore,
+        refs: &dyn PrefixReferences,
         tenant: Option<TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: u32,
         epochs: impl Iterator<Item = usize>,
-    ) {
+    ) -> EpochCheckpointSweep {
         let attempt_str = attempt.to_string();
-        let mut attempted = 0usize;
-        let mut failed = 0usize;
+        let mut summary = EpochCheckpointSweep::default();
         for epoch in epochs {
-            attempted += 1;
-            if store
-                .delete_epoch_checkpoint(tenant.as_ref(), job_id, worker_id, &attempt_str, epoch)
-                .await
-                .is_err()
-            {
-                failed += 1;
+            summary.attempted += 1;
+            let prefix = match store.epoch_checkpoint_prefix(
+                tenant.as_ref(),
+                job_id,
+                worker_id,
+                &attempt_str,
+                epoch,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    summary.failed += 1;
+                    tracing::debug!(
+                        job_id = %job_id,
+                        worker_id = %worker_id,
+                        attempt,
+                        epoch,
+                        error = %e,
+                        "epoch-checkpoint GC sweep: could not compute this index's prefix"
+                    );
+                    continue;
+                }
+            };
+            match refs.delete_unreferenced_prefix(&prefix).await {
+                Ok(()) => {}
+                Err(JammiError::Storage(StorageError::Referenced { count, .. })) => {
+                    summary.retained += 1;
+                    tracing::debug!(
+                        job_id = %job_id,
+                        worker_id = %worker_id,
+                        attempt,
+                        epoch,
+                        referenced_by = count,
+                        "epoch-checkpoint GC sweep: a live models row still names this \
+                         checkpoint; leaving its bytes in place"
+                    );
+                }
+                Err(_) => {
+                    summary.failed += 1;
+                }
             }
         }
-        if failed > 0 {
+        if summary.failed > 0 {
             tracing::warn!(
                 job_id = %job_id,
                 worker_id = %worker_id,
                 attempt,
-                failed,
-                attempted,
-                "epoch-checkpoint GC sweep: {failed} of {attempted} delete(s) failed — those \
-                 bytes remain durable but unreachable by this sweep"
+                failed = summary.failed,
+                attempted = summary.attempted,
+                "epoch-checkpoint GC sweep: {} of {} delete(s) failed — those \
+                 bytes remain durable but unreachable by this sweep",
+                summary.failed,
+                summary.attempted
             );
         }
+        summary
     }
 
     /// Run a claimed compute-kind job (`neighbor_graph`/`propagate`/
@@ -1759,23 +2024,85 @@ impl JobWorker {
             TrainingSpec::FineTune {
                 source,
                 columns,
+                method,
                 task,
                 common,
-                ..
+                // `cache = USE` is refused, typed, by
+                // `fine_tune::spec::admit_training_spec` — the ONE admission
+                // every durable submit edge for a training spec applies
+                // before a row is ever written: a queued `fine_tune` row can
+                // therefore only ever carry `Bypass` here, and the worker
+                // has nothing left to branch on.
+                cache: _cache,
             } => {
-                // Re-run the source SQL and rebuild the loader from the persisted
-                // columns — the same loader the submitting `fine_tune` built, but
-                // reconstructed on this worker with no carryover.
-                let batches = self
-                    .read_source_columns(session, &source, &columns)
-                    .await
-                    .map_err(WorkerJobError::from)?;
+                // Materialise the projected rows into an immutable
+                // `TrainingSet` result table (or reuse the one that already
+                // carries this definition), then read that table back in its
+                // committed order. The rows a run trains on are a durable,
+                // attested artifact, not this worker's private scan.
+                let detected =
+                    detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
+                let (table, batches) = training_set::materialize_projection(
+                    session,
+                    &source,
+                    &columns,
+                    task,
+                    detected.format_tag(),
+                )
+                .await
+                .map_err(WorkerJobError::from)?;
                 let loader = build_training_data_loader(&batches, &columns, task)
                     .map_err(WorkerJobError::from)?;
+                // The tag the table was WRITTEN under and the shape its loader
+                // reports come from one classifier, so a mismatch is a broken
+                // engine invariant rather than a caller error — and it must be
+                // loud: it would mean two formats sharing one definition hash.
+                if loader.format().format_tag() != detected.format_tag() {
+                    return Err(WorkerJobError::from(JammiError::Other(format!(
+                        "training set was committed as format '{}' but its loader reports \
+                         '{}': the column classifier and the loader disagree",
+                        detected.format_tag(),
+                        loader.format().format_tag()
+                    ))));
+                }
+                // The `ProducingDescriptor::FineTune` materialization
+                // identity — the training-set table's own definition hash,
+                // artifact digest and row count, binding this fine-tune to
+                // the EXACT materialised `TrainingSet` it trained from (see
+                // that descriptor variant's own doc). Only the column-source
+                // `FineTune` kind carries this; `GraphFineTune` does not (see
+                // `FineTuneMaterializationSource`'s doc).
+                let training_set_artifact_digest = {
+                    let parquet_url =
+                        jammi_db::storage::StorageUrl::parse(&table.record.parquet_path)
+                            .map_err(JammiError::from)
+                            .map_err(WorkerJobError::from)?;
+                    session
+                        .result_store()
+                        .read_materialization_manifest(&parquet_url)
+                        .await
+                        .map_err(WorkerJobError::from)?
+                        .map(|manifest| manifest.artifact.0)
+                        .ok_or_else(|| {
+                            WorkerJobError::from(JammiError::FineTune(format!(
+                                "training set '{}' has no materialization manifest",
+                                table.record.table_name
+                            )))
+                        })?
+                };
+                let materialization_source = Some(FineTuneMaterializationSource {
+                    source: source.clone(),
+                    columns: columns.clone(),
+                    method,
+                    training_set_definition_hash: table.definition_hash.as_str().to_string(),
+                    training_set_artifact_digest,
+                    training_set_row_count: table.record.row_count as u64,
+                });
                 let run = FineTuneRun {
                     task,
                     common,
                     loader,
+                    materialization_source,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -1795,6 +2122,10 @@ impl JobWorker {
                     task: ModelTask::TextEmbedding,
                     common,
                     loader,
+                    // `ProducingDescriptor::FineTune` covers only the
+                    // column-source `FineTune` kind (its own doc); a graph
+                    // fine-tune's model row carries no materialization.
+                    materialization_source: None,
                 };
                 self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
@@ -1832,38 +2163,6 @@ impl JobWorker {
                     .map_err(|e| classify(cancel, e))
             }
         }
-    }
-
-    /// Re-run `SELECT columns FROM source` for a tabular fine-tune.
-    ///
-    /// A deterministic `ORDER BY` over the **full projected column tuple** pins
-    /// the row order. Without it, DataFusion gives no row-order guarantee
-    /// (multi-file / multi-partition scans reorder run-to-run), which would
-    /// perturb both the batching and the `TargetScaler` μ/σ reduction — breaking
-    /// bit-reproducibility. The projected columns are exactly the columns that
-    /// feed training, so the order is a *total* function of the trainable data:
-    /// the only rows that can tie are byte-identical on every selected column,
-    /// and such rows are interchangeable for both batching and the (commutative)
-    /// mean/std reduction. DataFusion may permute a tie group arbitrarily, but
-    /// that permutation cannot change any training output, so the result is a
-    /// pure function of the row multiset. (No engine-wide stable row-identity
-    /// column exists on an arbitrary registered source table, so ordering by the
-    /// projected tuple is the strongest total key available here.)
-    async fn read_source_columns(
-        &self,
-        session: &Arc<InferenceSession>,
-        source: &str,
-        columns: &[String],
-    ) -> Result<Vec<RecordBatch>> {
-        let table_name = session.find_table_name(source)?;
-        let quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
-        let select = quoted.join(", ");
-        let order_by = quoted.join(", ");
-        let query = format!(
-            "SELECT {select} FROM {} ORDER BY {order_by}",
-            source_relation(source, &table_name)
-        );
-        session.sql(&query).await
     }
 
     /// Re-read the node/edge sources and rebuild the deterministic graph sampler,
@@ -1967,6 +2266,7 @@ impl JobWorker {
             task,
             common,
             loader,
+            materialization_source,
         } = run;
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
@@ -1983,6 +2283,89 @@ impl JobWorker {
         let hidden_size = guard.model.embedding_dim().ok_or_else(|| {
             WorkerJobError::Failed("Base model does not support embeddings".into())
         })?;
+
+        // The `ProducingDescriptor::FineTune` materialization identity is
+        // built HERE, while the model guard is still held (the identity needs
+        // the loaded model's backend/precision/digest/quantization — the SAME
+        // uniform path `pipeline::embedding`'s `embedding_definition` already
+        // uses for the model it invokes).
+        let mut pending_materialization: Option<FineTuneMaterializationOutcome> = None;
+        if let Some(src) = &materialization_source {
+            let canonical_model_id = model_source.to_string();
+            let device = session.compute_device();
+            // The fused-kernel admission profile is UNCOVERED here
+            // (#546): `MaterializationEnv::kernel_admission_profile` stays
+            // declared and hash-affecting the moment a real value is
+            // written, but nothing here writes one — a re-derived
+            // prediction is not the training loop's actual per-op admission
+            // outcome, and shipping one would be a false sense of coverage
+            // (see that field's own doc).
+            let env = jammi_db::store::manifest::MaterializationEnv::new(
+                device.clone(),
+                vec![jammi_db::store::manifest::ModelIdentity {
+                    model_id: canonical_model_id.clone(),
+                    backend: guard.model.backend_kind().to_string(),
+                    compute_precision: guard.model.compute_precision(),
+                    content_digest: guard.model.content_digest().map_err(WorkerJobError::from)?,
+                    quantization: guard.model.quantization(),
+                }],
+            );
+            let spec_canonical = crate::fine_tune::spec::fine_tune_spec_canonical(
+                &src.source,
+                &src.columns,
+                src.method,
+                task,
+                &common.base_model,
+                &common.config,
+                common.world_size,
+            )
+            .map_err(WorkerJobError::from)?;
+            let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {
+                training_set_definition_hash: src.training_set_definition_hash.clone(),
+                training_set_artifact_digest: src.training_set_artifact_digest.clone(),
+                training_set_row_count: src.training_set_row_count,
+                spec_canonical,
+                spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
+                base_model_id: canonical_model_id,
+                world_size: common.world_size,
+            };
+            // NO input anchor is recorded for the `FineTune` materialization
+            // — removed, not reshaped into a new kind, because the prior
+            // anchor was both a FALSE ATTESTATION and REDUNDANT.
+            //
+            // False attestation: the prior anchor paired the fine-tune's own
+            // registered SOURCE name (`src.source`, e.g. `"training"` — a
+            // long-lived, mutable relation) with the training-set TABLE's
+            // digest (an ephemeral, single-use materialization
+            // `materialize_projection` never reuses across calls — this
+            // module's own former comment named the workaround: anchoring
+            // on the table's own fresh, never-repeating name would defeat
+            // reuse). `AnchorKind::ResultDigest`'s OWN contract
+            // (`crate::pipeline::recompute::reresolve_recorded_anchor`) is
+            // "resolve `source` as a `result_tables` row and pin its
+            // CURRENT digest" — `src.source` is not that table, so a
+            // resolver that ever read this anchor would pin the wrong
+            // relation's current state under the training-set table's old
+            // digest.
+            //
+            // Redundant: nothing above needed the anchor to DISCRIMINATE.
+            // `ProducingDescriptor::FineTune::training_set_artifact_digest`
+            // (already folded into `descriptor`) is the SAME digest the
+            // removed anchor carried — two fine-tunes over different
+            // training-set content already hash differently without an
+            // anchor's help. And no CONSUMER ever reads a FineTune-recorded
+            // anchor: the model-kind's OWN replay policy is retrain (K1,
+            // `recompute_fine_tune`), which never reads a recorded anchor at
+            // all — `reresolve_recorded_anchor` is reached only from the
+            // TrainingSet-table replay arm, over THAT table's own
+            // separately-recorded anchors, never these.
+            let inputs: Vec<jammi_db::store::manifest::InputAnchor> = Vec::new();
+            pending_materialization = Some(FineTuneMaterializationOutcome::Fresh {
+                descriptor: Box::new(descriptor),
+                env,
+                inputs,
+            });
+        }
         drop(guard);
 
         // #485 BLOCK B1 test hook: a no-op in production (the whole call
@@ -2005,6 +2388,7 @@ impl JobWorker {
         let params = RunFineTuneParams {
             catalog: Arc::clone(catalog),
             artifact_store: session.artifact_store(),
+            result_store: session.result_store(),
             artifact_dir: session.inner_config().artifact_dir.clone(),
             job_id: job_id.to_string(),
             worker_id: self.worker_id.clone(),
@@ -2091,6 +2475,7 @@ impl JobWorker {
             },
             metrics: Some(training.metrics_json),
             epoch_checkpoints: training.epoch_checkpoints,
+            materialization: pending_materialization,
         })
     }
 }
@@ -2430,7 +2815,8 @@ impl EmbeddedWorker {
     }
 
     /// RELEASE — the one mechanism, identical on the library and the server
-    /// (§3.4 2a–2h): hand every lease this loop holds back to the catalog and
+    /// (§3.4 2a–2c, 2e–2h — 2d folded into 2a, see below): hand every lease
+    /// this loop holds back to the catalog and
     /// stop the loop at once, so a successor claims the in-flight job within
     /// one idle poll (never one lease window) and the job costs no attempt
     /// — WHEN every determinant of the returned [`ReleaseReport`] confirms.
@@ -2441,9 +2827,24 @@ impl EmbeddedWorker {
     ///
     /// In order:
     ///
-    /// * **2a** phase `Releasing` — from this instant a claim that lands runs
-    ///   into `register_job_hold_or_release`, which self-releases instead of
-    ///   dispatching.
+    /// * **2a** phase `Releasing` AND stop requested, together, as
+    ///   `begin_drain` does for its own phase — from this instant `claim_next`
+    ///   is initiated only after a read of `WorkerShared::admits_claim` that
+    ///   returned `true` with no `.await` between that read and the call
+    ///   (P1', `CONTRACT-RELEASE-SPIN.md`): the loop reads it at the top of
+    ///   the iteration AND again, immediately after `reclaim_expired_jobs`
+    ///   returns, so a phase/stop flip that lands during that reclaim round
+    ///   trip is still caught by the second read even though the first,
+    ///   now-stale read had already admitted the iteration. The one
+    ///   residual — a claim whose own catalog round trip is already in
+    ///   flight when 2a runs, so no later read of this loop's own state can
+    ///   observe it — runs into `register_job_hold_or_release`, which
+    ///   self-releases instead of dispatching. Folds what was once a separate
+    ///   later `stop` step: deferring it past 2b/2c left a window in which
+    ///   the loop could reclaim and re-claim the same row under `Releasing`
+    ///   without ever tripping the attempts cap (`attempts − releases` nets
+    ///   to 0 on every self-release), spinning for up to one keeper pass plus
+    ///   one sweep.
     /// * **2b** the keeper releases every `Job` hold it holds
     ///   (`LeaseKeeper::release_job_holds`, bounded by one heartbeat): the
     ///   row's lease goes NULL and the hold's `lost` flips while the hold
@@ -2461,8 +2862,6 @@ impl EmbeddedWorker {
     ///   committed after 2b snapshotted. The loop's own `ResultTable` hold
     ///   flips `lost` through the keeper's guarded renewal within one
     ///   heartbeat.
-    /// * **2d** stop — the loop cannot enter a new `claim_next`; a claim
-    ///   already in flight began before this.
     /// * **2e** total match on the loop task's state: a handle `Abandoned`
     ///   by a previous stop attempt this process's own caller cancelled
     ///   (F1 — e.g. a DRAIN's `stop_and_join` preempted by this RELEASE) is
@@ -2486,7 +2885,12 @@ impl EmbeddedWorker {
     ///   is a genuine watch-fired transition — never when it fell back to
     ///   the last-known proxy read on a timeout/closed channel, which alone
     ///   can read `Running` on a genuine abort whose guard has not published
-    ///   yet.
+    ///   yet. Since 2a's gate now stops an idle or between-claims loop at
+    ///   once, this `wait_for` usually finds the watch ALREADY at its
+    ///   terminal value by the time it is polled (an idle loop exits before
+    ///   2b/2c even run) rather than observing a live transition; `wait_for`
+    ///   treats an already-satisfied value as witnessed, same as a live one,
+    ///   so `stop_witnessed` is unaffected.
     /// * **2g** sweep #2, unconditionally — idempotent, catches a claim or a
     ///   building row that committed after sweep #1.
     /// * **2h** delete the `workers` row — AFTER sweep #2, so the row outlives
@@ -2496,8 +2900,14 @@ impl EmbeddedWorker {
     /// catalog error inside any statement is logged and the arm continues
     /// (the affected lease falls to the expiry path).
     pub async fn release_and_stop(&self) -> Result<ReleaseReport> {
-        // 2a
+        // 2a — phase and stop together, in the same synchronous statement
+        // pair (no `.await` between them), mirroring `begin_drain`'s own
+        // shape (P2, `CONTRACT-RELEASE-SPIN.md`'s design-pass fold): a
+        // poll-once test proves both setters resolve this pair before their
+        // first yield, so exit latency after either flip is bounded by the
+        // in-flight job, never by `idle_poll`.
         self.shared.set_phase(WorkerPhase::Releasing);
+        self.shared.request_stop();
         // 2b
         let holds = match self.keeper.release_job_holds(self.heartbeat).await {
             Ok(hr) => HoldReleaseOutcome::Observed(hr),
@@ -2508,8 +2918,6 @@ impl EmbeddedWorker {
         };
         // 2c
         let sweep_one = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
-        // 2d
-        self.shared.request_stop();
         // 2e
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::fire(&self.instance_id, loop_test_hooks::Rendezvous::ReleaseAt2e);
@@ -2654,11 +3062,16 @@ impl Drop for EmbeddedWorker {
 /// mirrors `crate::jobs::compute_test_hooks`): a test parks the loop at a
 /// documented point between its claim and its hold, or observes the exact
 /// instant RELEASE reaches its 2e decision, so the shutdown arms are pinned
-/// against the mechanism rather than raced against a wall clock. No
-/// production path observes anything here beyond the `maybe_park` /
-/// `fire` calls, which return at once when nothing is armed.
+/// against the mechanism rather than raced against a wall clock. A
+/// per-instance counter records every `claim_next` call the loop makes, so a
+/// test can snapshot it beside a rendezvous and assert a delta of zero
+/// across a window it controls. No production path observes anything here
+/// beyond the `maybe_park` / `fire` / `record_claim_next` calls, which
+/// return at once (or add one to a counter nothing reads) when nothing is
+/// armed.
 #[cfg(feature = "test-hooks")]
 pub mod loop_test_hooks {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -2758,6 +3171,97 @@ pub mod loop_test_hooks {
         while !armed.released.load(Ordering::SeqCst) {
             armed.release_notify.notified().await;
         }
+    }
+
+    struct ArmedInstance {
+        instance_id: String,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn instance_armed() -> &'static Mutex<Vec<ArmedInstance>> {
+        static ARMED: OnceLock<Mutex<Vec<ArmedInstance>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Arm a one-shot park for the next time the loop of `instance_id`
+    /// reaches the post-reclaim, pre-claim gate re-read — immediately after
+    /// `reclaim_expired_jobs` returns and before `WorkerShared::admits_claim`'s
+    /// second read, the reclaim-window instant the audit's falsification
+    /// names (`CONTRACT-RELEASE-SPIN.md`'s P1'). Keyed by `instance_id`
+    /// (unlike [`arm`], there is no claimed job yet at this point).
+    pub fn arm_after_reclaim(instance_id: &str) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        instance_armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmedInstance {
+                instance_id: instance_id.to_string(),
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park_after_reclaim(instance_id: &str) {
+        let taken = {
+            let mut list = instance_armed()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.instance_id == instance_id)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
+    }
+
+    fn claim_next_counts() -> &'static Mutex<HashMap<String, u64>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Record one `claim_next` call by the loop of `instance_id` — called
+    /// from `run_until`'s loop body, immediately before it awaits
+    /// `Catalog::claim_next`. Keyed per instance so sibling tests in one
+    /// binary never read each other's counts.
+    pub(super) fn record_claim_next(instance_id: &str) {
+        *claim_next_counts()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(instance_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// How many times the loop of `instance_id` has called `claim_next`
+    /// since the process started (0 if it never has). A test snapshots this
+    /// beside a rendezvous it controls and compares the delta across a
+    /// window it also controls — never against a wall clock.
+    pub fn claim_next_calls(instance_id: &str) -> u64 {
+        claim_next_counts()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn panic_armed() -> &'static Mutex<Vec<String>> {
@@ -2873,6 +3377,51 @@ struct FineTuneRun {
     task: ModelTask,
     common: TrainingCommon,
     loader: TrainingDataLoader,
+    /// Set ONLY for the column-source `TrainingSpec::FineTune` kind — see
+    /// [`FineTuneMaterializationSource`]'s own doc for why `GraphFineTune`
+    /// carries `None` here.
+    materialization_source: Option<FineTuneMaterializationSource>,
+}
+
+/// The `ProducingDescriptor::FineTune`-specific inputs a `TrainingSpec::FineTune`
+/// run's materialization is built from — everything [`FineTuneRun`]'s shared
+/// fields (`task`, `common`) do not already carry.
+///
+/// `ProducingDescriptor::FineTune` covers only the column-source `FineTune`
+/// kind (its own doc in `jammi_db::store::manifest`): a graph fine-tune's
+/// sampled-pairs training set has no recorded fine-tune-level reuse key, so
+/// [`FineTuneRun::materialization_source`] is `None` for that kind and its
+/// model row carries no materialization.
+struct FineTuneMaterializationSource {
+    /// The registered source the rows were projected from — folds into
+    /// `spec_canonical`.
+    source: String,
+    /// The projected columns, in declared order — folds into `spec_canonical`.
+    columns: Vec<String>,
+    /// The adapter method — folds into `spec_canonical`.
+    method: FineTuneMethod,
+    /// The materialised `TrainingSet` table's own [`DefinitionHash`], hex.
+    training_set_definition_hash: String,
+    /// The materialised `TrainingSet` table's own artifact digest, hex — the
+    /// [`jammi_db::store::manifest::InputAnchor::result_digest`] anchor's value.
+    training_set_artifact_digest: String,
+    /// The materialised `TrainingSet` table's committed row count.
+    training_set_row_count: u64,
+}
+
+/// What [`JobWorker::publish_and_finalize`] does with a `TrainingSpec::FineTune`
+/// run's materialization identity, built by [`JobWorker::train_fine_tune`]
+/// before the trainer runs.
+pub(crate) enum FineTuneMaterializationOutcome {
+    /// A FRESH training run: after the worker publishes this attempt's new
+    /// prefix, `materialization.json` is written LAST (before the finalize
+    /// CAS) from this descriptor + environment + input anchors, and recorded
+    /// on the model row.
+    Fresh {
+        descriptor: Box<jammi_db::store::manifest::ProducingDescriptor>,
+        env: jammi_db::store::manifest::MaterializationEnv,
+        inputs: Vec<jammi_db::store::manifest::InputAnchor>,
+    },
 }
 
 /// A successful training run's output, awaiting the worker's unified
@@ -2888,8 +3437,9 @@ struct FineTuneRun {
 /// run-metrics JSON the CAS records (the fine-tune loop's loss/step/timing
 /// detail; `None` for a kind that records none beyond the terminal flip).
 pub struct TrainedArtifact {
-    /// Local tempdir holding the final artifact files. Removed on drop, after
-    /// the worker has published its contents.
+    /// Local tempdir holding the final artifact files, removed on drop after
+    /// the worker has published its contents under a fresh, attempt-unique
+    /// prefix (see the `materialization` field below).
     pub dir: tempfile::TempDir,
     /// The catalog model row to register for this artifact.
     pub register: ModelRegistration,
@@ -2905,6 +3455,10 @@ pub struct TrainedArtifact {
     /// row for each entry — never a separate publish step, since the bytes
     /// are already complete by the time this reaches `publish_and_finalize`.
     pub epoch_checkpoints: Vec<(usize, String)>,
+    /// `Some` for a `TrainingSpec::FineTune` run only (never `GraphFineTune`
+    /// or a context predictor) — the model-level materialization
+    /// [`JobWorker::publish_and_finalize`] writes/records.
+    pub(crate) materialization: Option<FineTuneMaterializationOutcome>,
 }
 
 /// The catalog model-row descriptor a training kind hands the worker's finalize.
@@ -2964,6 +3518,25 @@ impl ModelRegistration {
 /// the same prefix and no object is overwritten. Only top-level files are
 /// published (the trainer's checkpoint subdirectories are training scratch, not
 /// part of the served artifact).
+///
+/// **The layout invariant every `models/**` byte-deleter's guard depends
+/// on**: every object this worker ever publishes under a `models/**`
+/// attempt prefix sits either directly IN the attempt directory this
+/// function writes to (this bundle's own files, plus `manifest.json` and,
+/// for a fresh materialization, `materialization.json` — never in a
+/// subdirectory of it) or directly inside an epoch-checkpoint directory
+/// that is its OWN `models` row
+/// ([`ArtifactStore::put_epoch_checkpoint`]/[`ArtifactStore::epoch_checkpoint_prefix`]),
+/// or under the one exempt sibling namespace, `{job_id}/_resume`
+/// ([`ArtifactStore::put_resume_checkpoint`]). `ResultStore::
+/// prefix_is_referenced`'s predicate checks containment exactly ONE level
+/// deep by construction (its own doc) precisely because this invariant
+/// holds — reading `dir` non-recursively here (`entry.file_type()?.
+/// is_file()` skips any subdirectory outright) is this function's own half
+/// of keeping it true; proven directly by an executed test that walks the
+/// physical object tree a real run publishes and asserts every file's
+/// immediate parent is a known row's `artifact_path`
+/// (`fine_tune_materialization::every_published_object_sits_flat_under_its_own_row`).
 async fn publish_artifact(
     store: &ArtifactStore,
     tenant: Option<TenantId>,
@@ -2985,6 +3558,148 @@ async fn publish_artifact(
     store
         .put_artifact(tenant.as_ref(), &[job_id, worker_id, attempt], &files)
         .await
+}
+
+/// The tally [`JobWorker::gc_epoch_checkpoints_by_index`] returns: how many
+/// indices it was asked to sweep, how many it left in place because the
+/// guarded [`PrefixReferences`] port reported a live `models` row still
+/// naming that exact checkpoint, and how many it could not delete for any
+/// other reason. Every field is a plain count, never a row identity — the
+/// same disclosure discipline [`ResultStore::prefix_is_referenced`] itself
+/// keeps.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EpochCheckpointSweep {
+    /// Indices this sweep was asked to reclaim.
+    attempted: usize,
+    /// Indices the guard reported as still referenced by a live `models`
+    /// row — left in place, not an error.
+    retained: usize,
+    /// Indices whose delete failed for a reason other than being
+    /// referenced.
+    failed: usize,
+}
+
+/// The narrow port the worker's abandon path AND
+/// [`JobWorker::gc_epoch_checkpoints_by_index`]'s sweep reach the ONE
+/// guarded `models/**` byte-delete through — never the
+/// unguarded [`ArtifactStore::delete_artifact_prefix`] primitive directly.
+/// Implemented by [`ResultStore`], whose
+/// [`ResultStore::delete_unreferenced_prefix`] consults the admin-scoped
+/// [`ResultStore::prefix_is_referenced`] predicate — ANY live `models` row,
+/// in ANY tenant — before ever reaching the unguarded primitive, refusing
+/// (typed) when the count is non-zero. Naming the port as a trait rather
+/// than threading `&ResultStore` bare keeps this module's byte-deleting
+/// surface to exactly the one method a new call site can reach — it cannot
+/// accidentally call `reconcile`, `pin_current_version`, or any other
+/// `ResultStore` API through this handle.
+#[async_trait::async_trait]
+trait PrefixReferences: Send + Sync {
+    /// See [`ResultStore::delete_unreferenced_prefix`]'s own doc for the
+    /// full contract; this is a straight pass-through.
+    async fn delete_unreferenced_prefix(
+        &self,
+        prefix: &jammi_db::storage::StorageUrl,
+    ) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl PrefixReferences for ResultStore {
+    async fn delete_unreferenced_prefix(
+        &self,
+        prefix: &jammi_db::storage::StorageUrl,
+    ) -> Result<()> {
+        ResultStore::delete_unreferenced_prefix(self, prefix).await
+    }
+}
+
+/// The prefix [`JobWorker::publish_and_finalize`] is about to finalize
+/// against — always bytes this attempt published itself (no FineTune run
+/// ever shares a `models/` prefix with another run; see
+/// [`FineTuneMaterializationOutcome`]'s own doc). A newtype rather than a
+/// bare [`jammi_db::storage::StorageUrl`] so [`Self::delete`] is the ONLY
+/// way to delete a prefix reached through this type, and it never trusts
+/// its own ownership claim unconditionally: it deletes only through
+/// [`PrefixReferences`], which itself refuses if some OTHER live `models`
+/// row has, in the meantime, come to name the exact same prefix (the
+/// pre-existing `:1334`-style guard this restates so it cannot be forgotten
+/// again).
+struct PublishedPrefix(jammi_db::storage::StorageUrl);
+
+impl PublishedPrefix {
+    /// The underlying [`jammi_db::storage::StorageUrl`] — every READ (the
+    /// manifest write target, the finalize CAS's `artifact_path`, the
+    /// terminal `jobs.result`) needs the bytes; only a DELETE goes through
+    /// [`Self::delete`] instead.
+    fn url(&self) -> &jammi_db::storage::StorageUrl {
+        &self.0
+    }
+
+    /// Best-effort delete, routed EXCLUSIVELY through the guarded
+    /// [`PrefixReferences`] port — never the unguarded
+    /// [`ArtifactStore::delete_artifact_prefix`] primitive. A
+    /// [`jammi_db::error::JammiError::Storage`]`(`[`StorageError::Referenced`]`)`
+    /// refusal means some OTHER live `models` row names these exact bytes:
+    /// logged with the prefix and the referencing count, never escalated —
+    /// the bytes belong to that other row now, and this attempt's own
+    /// row-level cleanup (see [`abandon_unfinalized_attempt`]) proceeds
+    /// regardless.
+    async fn delete(&self, refs: &dyn PrefixReferences) {
+        if let Err(e) = refs.delete_unreferenced_prefix(&self.0).await {
+            match e {
+                JammiError::Storage(StorageError::Referenced { prefix, count }) => {
+                    tracing::warn!(
+                        prefix,
+                        count,
+                        "abandon: this attempt's own prefix is still referenced by another \
+                         live models row; leaving the bytes in place"
+                    );
+                }
+                other => tracing::debug!(
+                    error = %other,
+                    "abandon: best-effort prefix delete failed"
+                ),
+            }
+        }
+    }
+}
+
+/// Every exit arm between a successful `register_model` and a WON finalize
+/// CAS must leave behind neither this attempt's own unpublished bytes
+/// (`prefix`, best-effort reclaimed via [`PublishedPrefix::delete`]) nor the
+/// unfinalized `models` row `register_model` just created: a row still
+/// carrying `artifact_path IS NULL` when this attempt gives up is a
+/// permanently-unservable zombie, and
+/// [`jammi_db::catalog::Catalog::delete_registered_model_if_unfinalized`]'s
+/// own guard (`artifact_path IS NULL`) means calling this can never delete a
+/// row a WINNING finalize CAS (this attempt's or a peer's) already
+/// committed — safe to call from every abort arm unconditionally, including
+/// one where no row was ever the risk (it is then simply a no-op `false`).
+/// Best-effort on both halves: an error here is logged, never escalated,
+/// since the caller's own terminal classification (this function's return)
+/// is what the job's outcome hinges on, not this cleanup. The row-level
+/// cleanup below runs UNCONDITIONALLY, even when [`PublishedPrefix::delete`]
+/// refuses to touch the bytes because another live row now names them —
+/// the bytes are the other row's business, but this attempt's own zombie
+/// row is still this attempt's to reap.
+async fn abandon_unfinalized_attempt(
+    refs: &dyn PrefixReferences,
+    catalog: &Arc<Catalog>,
+    prefix: &PublishedPrefix,
+    model_id: &str,
+    version: i32,
+) {
+    prefix.delete(refs).await;
+    if let Err(e) = catalog
+        .delete_registered_model_if_unfinalized(model_id, version)
+        .await
+    {
+        tracing::warn!(
+            model_id,
+            version,
+            error = %e,
+            "failed to reap an unfinalized model row after an abandoned finalize attempt"
+        );
+    }
 }
 
 /// The terminal classification of a worker's run of one job.
@@ -3322,11 +4037,58 @@ fn extract_numeric_column(
 /// differs, so the caller's chosen task is the discriminator, not a parallel
 /// set of column names, and not a byte-header sniff (an encoded WAV and an
 /// encoded PNG are both binary blobs).
-fn build_training_data_loader(
-    batches: &[RecordBatch],
-    columns: &[String],
-    task: ModelTask,
-) -> Result<TrainingDataLoader> {
+/// The training format a projection's COLUMN NAMES and the job's task fix,
+/// before a single row is read — everything the training-set producer must know
+/// to name the table it is about to write.
+///
+/// The data-derived parameters of [`TrainingFormat`] (`Classification`'s
+/// `num_classes`, `Ner`'s `num_labels`) are absent by construction: they are
+/// counts of what the rows turned out to contain, which is not knowable at the
+/// point the table is named, and which the canonical tag drops for exactly that
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedFormat {
+    Contrastive,
+    Pairs,
+    Triplet,
+    MediaTriplet,
+    Classification,
+    Regression,
+}
+
+impl DetectedFormat {
+    /// The canonical tag this shape records. Every arm names the
+    /// [`TrainingFormat`] variant the loader will build and reads the tag off
+    /// [`TrainingFormat::format_tag`] — the mapping lives in exactly one place,
+    /// so the tag a table is written under and the tag its loader reports can
+    /// never be spelled differently.
+    fn format_tag(self) -> &'static str {
+        match self {
+            Self::Contrastive => TrainingFormat::Contrastive.format_tag(),
+            Self::Pairs => TrainingFormat::Pairs.format_tag(),
+            Self::Triplet => TrainingFormat::Triplet.format_tag(),
+            Self::MediaTriplet => TrainingFormat::MediaTriplet.format_tag(),
+            // `num_classes` is a function of the rows and the tag discards it
+            // (see `format_tag`), so every value names the same tag; the zero
+            // is a neutral placeholder that never leaves this expression.
+            Self::Classification => TrainingFormat::Classification { num_classes: 0 }.format_tag(),
+            Self::Regression => TrainingFormat::Regression.format_tag(),
+        }
+    }
+}
+
+/// Detect the training format from the projected column names and the job's
+/// task — the SINGLE classifier, shared by the producer (which needs the format
+/// tag before it writes the table) and by [`build_training_data_loader`] (which
+/// needs the shape to read it back). Two copies of these predicates would let a
+/// table be written under one format and read under another.
+///
+/// The arm ORDER is part of the contract: media triplets are recognised before
+/// text ones (the columns are identical; only `task` distinguishes an encoded
+/// blob from a string), and regression is tested before classification and
+/// gated on `task == Regression`, so a numeric outcome can never fall into the
+/// classification path and be gathered as a class index.
+fn detect_training_format(columns: &[String], task: ModelTask) -> Result<DetectedFormat> {
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
 
     let has_contrastive = col_names.contains(&"text_a")
@@ -3341,167 +4103,19 @@ fn build_training_data_loader(
         && col_names.contains(&"positive")
         && !col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
-    // Regression shares the `text` anchor with classification but reads a
-    // numeric `target` column instead of a string `label`. The two text-outcome
-    // formats are disambiguated by `task`, not by column names, exactly as the
-    // audio-triplet path is task-gated below: the regression arm is gated on
-    // `task == Regression` and ordered before classification, and classification
-    // is gated on `task != Regression`. So `task=regression` is authoritative —
-    // it can never fall into the classification path (which would gather a
-    // numeric outcome as a class index and CUDA-assert), and a `label`-only
-    // source under `task=regression` produces a typed "needs a numeric target"
-    // error rather than a device-side assert.
     let has_regression = col_names.contains(&"text") && col_names.contains(&"target");
 
     if has_triplet && matches!(task, ModelTask::AudioEmbedding | ModelTask::ImageEmbedding) {
-        return build_media_triplet_loader(batches, task);
-    }
-
-    if has_contrastive {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let a_col = batch
-                .column_by_name("text_a")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
-            let b_col = batch
-                .column_by_name("text_b")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
-            let s_col = batch
-                .column_by_name("score")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
-
-            let a_vals = extract_string_column(a_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
-            let b_vals = extract_string_column(b_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
-            let s_arr = s_col
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .map(|arr| {
-                    (0..arr.len())
-                        .map(|i| arr.value(i) as f32)
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| {
-                    s_col
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                })
-                .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
-
-            for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
-                rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
-            }
-        }
-        Ok(TrainingDataLoader::from_contrastive(rows))
+        Ok(DetectedFormat::MediaTriplet)
+    } else if has_contrastive {
+        Ok(DetectedFormat::Contrastive)
     } else if has_triplet {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let neg_vals = batch
-                .column_by_name("negative")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
-                         image/audio triplets submit task=image_embedding/audio_embedding. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-
-            for i in 0..batch.num_rows() {
-                rows.push((
-                    anchor_vals[i].clone(),
-                    pos_vals[i].clone(),
-                    neg_vals[i].clone(),
-                ));
-            }
-        }
-        Ok(TrainingDataLoader::from_triplets(rows))
+        Ok(DetectedFormat::Triplet)
     } else if has_pairs {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
-                         this source has the anchor/positive PAIR shape, which is read as text \
-                         for every task. Image/audio training reads encoded media bytes only \
-                         from the anchor/positive/negative TRIPLET shape under \
-                         task=image_embedding/audio_embedding — add a 'negative' column. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column: task {task} expects text columns, \
-                         and this source has the anchor/positive PAIR shape, which is read as \
-                         text for every task. Image/audio training reads encoded media bytes \
-                         only from the anchor/positive/negative TRIPLET shape under \
-                         task=image_embedding/audio_embedding — add a 'negative' column. \
-                         Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for i in 0..batch.num_rows() {
-                rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
-            }
-        }
-        Ok(TrainingDataLoader::from_pairs(rows))
+        Ok(DetectedFormat::Pairs)
     } else if task == ModelTask::Regression {
-        // Regression: a string `text` column and a numeric `target` column. The
-        // target is read into `f32` (handling int64/float64/float32/… via
-        // `extract_numeric_column`); nulls and NaNs are rejected citing the row
-        // rather than coerced, since a coerced `0.0` would silently corrupt the
-        // scaler's μ/σ. A `task=regression` request with no usable `target`
-        // column is a typed error here, never a fall-through to classification.
+        // A `task=regression` request with no usable `target` column is a typed
+        // error here, never a fall-through to classification.
         if !has_regression {
             return Err(JammiError::FineTune(format!(
                 "task=regression needs a string 'text' column and a numeric 'target' column, \
@@ -3509,70 +4123,9 @@ fn build_training_data_loader(
                  is distinct: name the numeric outcome column 'target'.)"
             )));
         }
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let target_col = batch
-                .column_by_name("target")
-                .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
-            let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                JammiError::FineTune(match e {
-                    NumericColumnError::NotNumeric => format!(
-                        "regression 'target' is not a numeric column (its Arrow type is {})",
-                        target_col.data_type()
-                    ),
-                    NumericColumnError::Null(i) => format!(
-                        "regression 'target' has a null at row {i}; a null target cannot be \
-                         coerced (it would corrupt the scaler) — remove or fill the row"
-                    ),
-                    NumericColumnError::Nan(i) => format!(
-                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
-                         (it would corrupt the scaler) — remove or fix the row"
-                    ),
-                })
-            })?;
-            for i in 0..batch.num_rows() {
-                rows.push((text_vals[i].clone(), target_vals[i]));
-            }
-        }
-        Ok(TrainingDataLoader::from_regression(rows))
+        Ok(DetectedFormat::Regression)
     } else if has_classification {
-        let mut label_set = std::collections::BTreeSet::new();
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let label_vals = batch
-                .column_by_name("label")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
-            for i in 0..batch.num_rows() {
-                label_set.insert(label_vals[i].clone());
-                rows.push((text_vals[i].clone(), label_vals[i].clone()));
-            }
-        }
-        let label_to_idx: std::collections::HashMap<String, u32> = label_set
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (l.clone(), i as u32))
-            .collect();
-        let num_classes = label_to_idx.len();
-        let indexed_rows: Vec<(String, u32)> = rows
-            .into_iter()
-            .map(|(text, label)| {
-                let idx = label_to_idx[&label];
-                (text, idx)
-            })
-            .collect();
-        Ok(TrainingDataLoader::from_classification(
-            indexed_rows,
-            num_classes,
-        ))
+        Ok(DetectedFormat::Classification)
     } else {
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
@@ -3582,6 +4135,241 @@ fn build_training_data_loader(
              same (anchor, positive, negative) columns with binary cells and \
              task=image_embedding/audio_embedding."
         )))
+    }
+}
+
+/// The training-set producer's read-back, converted into a
+/// [`TrainingDataLoader`]: dispatches on [`detect_training_format`]'s
+/// classification of the projected columns and the job's task, then decodes
+/// every `RecordBatch` the eager read-back returned into the matching
+/// `TrainingRow` shape.
+fn build_training_data_loader(
+    batches: &[RecordBatch],
+    columns: &[String],
+    task: ModelTask,
+) -> Result<TrainingDataLoader> {
+    let detected = detect_training_format(columns, task)?;
+
+    // Exhaustive on every `DetectedFormat` arm — no `_`, so a seventh variant
+    // is a compile error here rather than a silent fall-through to whatever
+    // arm happened to be last.
+    match detected {
+        DetectedFormat::MediaTriplet => build_media_triplet_loader(batches, task),
+        DetectedFormat::Contrastive => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let a_col = batch
+                    .column_by_name("text_a")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
+                let b_col = batch
+                    .column_by_name("text_b")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
+                let s_col = batch
+                    .column_by_name("score")
+                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
+
+                let a_vals = extract_string_column(a_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_a' is not a string column".into())
+                })?;
+                let b_vals = extract_string_column(b_col.as_ref()).ok_or_else(|| {
+                    JammiError::FineTune("'text_b' is not a string column".into())
+                })?;
+                let s_arr = s_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .map(|arr| {
+                        (0..arr.len())
+                            .map(|i| arr.value(i) as f32)
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        s_col
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float32Array>()
+                            .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
+                    })
+                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
+
+                for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
+                    rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
+                }
+            }
+            Ok(TrainingDataLoader::from_contrastive(rows))
+        }
+        DetectedFormat::Triplet => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let schema_info = || {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let anchor_vals = batch
+                    .column_by_name("anchor")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+                let pos_vals = batch
+                    .column_by_name("positive")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'positive' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+                let neg_vals = batch
+                    .column_by_name("negative")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+
+                for i in 0..batch.num_rows() {
+                    rows.push((
+                        anchor_vals[i].clone(),
+                        pos_vals[i].clone(),
+                        neg_vals[i].clone(),
+                    ));
+                }
+            }
+            Ok(TrainingDataLoader::from_triplets(rows))
+        }
+        DetectedFormat::Pairs => {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let schema_info = || {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let anchor_vals = batch
+                    .column_by_name("anchor")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
+                         this source has the anchor/positive PAIR shape, which is read as text \
+                         for every task. Image/audio training reads encoded media bytes only \
+                         from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
+                        schema_info()
+                    ))
+                    })?;
+                let pos_vals = batch
+                    .column_by_name("positive")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Missing/invalid 'positive' column: task {task} expects text columns, \
+                         and this source has the anchor/positive PAIR shape, which is read as \
+                         text for every task. Image/audio training reads encoded media bytes \
+                         only from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
+                            schema_info()
+                        ))
+                    })?;
+                for i in 0..batch.num_rows() {
+                    rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
+                }
+            }
+            Ok(TrainingDataLoader::from_pairs(rows))
+        }
+        DetectedFormat::Regression => {
+            // Regression: a string `text` column and a numeric `target` column. The
+            // target is read into `f32` (handling int64/float64/float32/… via
+            // `extract_numeric_column`); nulls and NaNs are rejected citing the row
+            // rather than coerced, since a coerced `0.0` would silently corrupt the
+            // scaler's μ/σ.
+            let mut rows = Vec::new();
+            for batch in batches {
+                let text_vals = batch
+                    .column_by_name("text")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let target_col = batch
+                    .column_by_name("target")
+                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+                let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
+                    JammiError::FineTune(match e {
+                        NumericColumnError::NotNumeric => format!(
+                            "regression 'target' is not a numeric column (its Arrow type is {})",
+                            target_col.data_type()
+                        ),
+                        NumericColumnError::Null(i) => format!(
+                            "regression 'target' has a null at row {i}; a null target cannot be \
+                         coerced (it would corrupt the scaler) — remove or fill the row"
+                        ),
+                        NumericColumnError::Nan(i) => format!(
+                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
+                         (it would corrupt the scaler) — remove or fix the row"
+                    ),
+                    })
+                })?;
+                for i in 0..batch.num_rows() {
+                    rows.push((text_vals[i].clone(), target_vals[i]));
+                }
+            }
+            Ok(TrainingDataLoader::from_regression(rows))
+        }
+        DetectedFormat::Classification => {
+            let mut label_set = std::collections::BTreeSet::new();
+            let mut rows = Vec::new();
+            for batch in batches {
+                let text_vals = batch
+                    .column_by_name("text")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                let label_vals = batch
+                    .column_by_name("label")
+                    .and_then(|c| extract_string_column(c.as_ref()))
+                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+                for i in 0..batch.num_rows() {
+                    label_set.insert(label_vals[i].clone());
+                    rows.push((text_vals[i].clone(), label_vals[i].clone()));
+                }
+            }
+            let label_to_idx: std::collections::HashMap<String, u32> = label_set
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (l.clone(), i as u32))
+                .collect();
+            let num_classes = label_to_idx.len();
+            let indexed_rows: Vec<(String, u32)> = rows
+                .into_iter()
+                .map(|(text, label)| {
+                    let idx = label_to_idx[&label];
+                    (text, idx)
+                })
+                .collect();
+            Ok(TrainingDataLoader::from_classification(
+                indexed_rows,
+                num_classes,
+            ))
+        }
     }
 }
 
@@ -4097,6 +4885,10 @@ async fn mark_acceleration_undetermined(
 struct RunFineTuneParams {
     catalog: Arc<Catalog>,
     artifact_store: Arc<ArtifactStore>,
+    /// The guarded port the trainer's mid-run retention prune deletes an
+    /// over-the-cap epoch checkpoint through — see
+    /// `crate::fine_tune::trainer::TrainingLoop::result_store`'s own doc.
+    result_store: Arc<ResultStore>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
     worker_id: String,
@@ -4135,6 +4927,7 @@ fn run_fine_tune_blocking(
     let RunFineTuneParams {
         catalog,
         artifact_store,
+        result_store,
         artifact_dir,
         job_id,
         worker_id,
@@ -4271,7 +5064,12 @@ fn run_fine_tune_blocking(
         .device(device.clone())
         .cancel(cancel)
         .tenant(tenant)
-        .artifact_store(Arc::clone(&artifact_store));
+        // At this commit the trainer always builds its `PartitionSpec`
+        // through `PartitionSpec::single_rank` (rank 0 of world 1) — U4b is
+        // what would ever spawn more than one rank; there is no world-size
+        // knob on the builder for this call to set.
+        .artifact_store(Arc::clone(&artifact_store))
+        .result_store(result_store);
     if let Some(restored) = resume {
         builder = builder.resume(restored);
     }
@@ -7143,6 +7941,243 @@ mod tests {
             .await
             .expect("a second stop_and_join must not hang")
             .expect("a second stop_and_join on an already-joined worker is Ok");
+    }
+
+    /// `PublishedPrefix::delete` routes through the SAME guarded
+    /// [`PrefixReferences`] port as every other `models/**` byte-delete — it
+    /// does not trust its own ownership claim unconditionally. Real traffic
+    /// can never make two attempts collide on the SAME prefix (`job_id`
+    /// uniqueness), so this fabricates the collision directly (a global
+    /// prefix a second tenant's row also names): a SECOND tenant's
+    /// already-servable model row is made to name the exact bytes this
+    /// attempt is about to abandon. Oracle: the bytes survive, the typed
+    /// refusal is observed directly, and the abandoning attempt's OWN
+    /// unfinalized row is still reaped (the two halves of
+    /// `abandon_unfinalized_attempt` are independent).
+    ///
+    /// Mutation: reverting [`PublishedPrefix::delete`] to call the unguarded
+    /// `ArtifactStore::delete_artifact_prefix` directly kills this test (the
+    /// reuser's bytes are deleted out from under it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abandon_never_deletes_an_owned_prefix_a_second_tenants_row_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+
+        // The bytes an in-flight attempt is about to abandon as `Owned`.
+        let prefix = session
+            .artifact_store()
+            .put_artifact(
+                None,
+                &["fake-owned-attempt"],
+                &[(
+                    "adapter.bin".to_string(),
+                    bytes::Bytes::from_static(b"weights"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // A SECOND TENANT's already-servable row names the SAME prefix.
+        let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
+        let catalog_b = Arc::new(session.catalog().pinned_to_tenant(Some(tenant_b)));
+        catalog_b
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "reuser-model",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: Some(prefix.as_str()),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        // The abandoning attempt's own unfinalized row (`artifact_path`
+        // NULL) — the row `abandon_unfinalized_attempt`'s OTHER half must
+        // still reap regardless of what the byte-delete half does.
+        let owner_catalog = Arc::new(session.catalog().pinned_to_tenant(None));
+        owner_catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "abandoning-attempt",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        // Typed error observed DIRECTLY: the guard refuses before any
+        // abandon path ever runs.
+        let result_store = session.result_store();
+        let err = result_store
+            .delete_unreferenced_prefix(&prefix)
+            .await
+            .expect_err("a live models row in another tenant names this prefix");
+        match err {
+            jammi_db::error::JammiError::Storage(jammi_db::storage::StorageError::Referenced {
+                count,
+                ..
+            }) => assert_eq!(count, 1, "exactly one live row names this prefix"),
+            other => panic!("expected StorageError::Referenced, got {other:?}"),
+        }
+
+        // Drive the real abandon path with a published prefix pointed at the
+        // colliding bytes.
+        let refs: &dyn PrefixReferences = &*result_store;
+        abandon_unfinalized_attempt(
+            refs,
+            &owner_catalog,
+            &PublishedPrefix(prefix.clone()),
+            "abandoning-attempt",
+            1,
+        )
+        .await;
+
+        // The reuser's bytes survive.
+        session
+            .artifact_store()
+            .fetch_artifact(&prefix)
+            .await
+            .expect("the reuser's bytes must survive an Owned-arm abandon");
+
+        // The reuser's row is untouched.
+        let reuser = catalog_b
+            .get_model("reuser-model")
+            .await
+            .unwrap()
+            .expect("the reuser's row must still exist");
+        assert_eq!(reuser.artifact_path.as_deref(), Some(prefix.as_str()));
+
+        // This attempt's OWN row-level cleanup still completed — the bytes
+        // being refused does not block the (independent) row reap.
+        assert!(
+            owner_catalog
+                .get_model("abandoning-attempt")
+                .await
+                .unwrap()
+                .is_none(),
+            "the abandoning attempt's own unfinalized row must still be reaped even though its \
+             bytes were refused"
+        );
+    }
+
+    /// [`JobWorker::gc_epoch_checkpoints_by_index`]'s guard consult, driven
+    /// through the same store/catalog wiring as the reuse-collision test
+    /// above: an epoch checkpoint whose bytes a live `models` row names
+    /// (fabricated directly — a real finalize CAS registers exactly this
+    /// shape for every RETAINED checkpoint) survives the sweep and is
+    /// counted `retained`, never `failed`; a checkpoint no row names (the
+    /// stale shape a persistently-failed mid-run prune leaves behind) is
+    /// reclaimed.
+    ///
+    /// Mutation: reverting `gc_epoch_checkpoints_by_index` to call the
+    /// unguarded `ArtifactStore::delete_epoch_checkpoint` directly (its
+    /// shape before this property) deletes the retained checkpoint's bytes
+    /// out from under its own live row — this test's `fetch_artifact` on
+    /// the retained prefix then fails, killing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_epoch_checkpoints_by_index_retains_a_referenced_checkpoint_and_reclaims_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+        let store = session.artifact_store();
+        let result_store = session.result_store();
+        let refs: &dyn PrefixReferences = &*result_store;
+
+        let job_id = "fake-epoch-sweep-job";
+        let worker_id = "fake-worker";
+        let attempt_str = "1";
+
+        // Epoch 0: the RETAINED shape — its own `models` row names this
+        // exact checkpoint prefix, exactly as the winning finalize CAS
+        // registers for every retained checkpoint (unit 348, CONTRACT item
+        // 4).
+        let retained_prefix = store
+            .put_epoch_checkpoint(
+                None,
+                job_id,
+                worker_id,
+                attempt_str,
+                0,
+                &[(
+                    "adapter.bin".to_string(),
+                    bytes::Bytes::from_static(b"epoch-0-weights"),
+                )],
+            )
+            .await
+            .unwrap();
+        // Epoch 1: the STALE shape — durable bytes with no row naming them
+        // (a persistently-failed mid-run prune, unit 348 F2).
+        let stale_prefix = store
+            .put_epoch_checkpoint(
+                None,
+                job_id,
+                worker_id,
+                attempt_str,
+                1,
+                &[(
+                    "adapter.bin".to_string(),
+                    bytes::Bytes::from_static(b"epoch-1-weights"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        session
+            .catalog()
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "epoch-0-checkpoint",
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: Some(retained_prefix.as_str()),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        let summary = JobWorker::gc_epoch_checkpoints_by_index(
+            &store,
+            refs,
+            None,
+            job_id,
+            worker_id,
+            1,
+            0..2,
+        )
+        .await;
+
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(
+            summary.retained, 1,
+            "the referenced epoch checkpoint must be reported retained, not silently skipped"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "a referenced checkpoint is an expected outcome, never a failure"
+        );
+
+        // The referenced checkpoint's bytes survive.
+        store
+            .fetch_artifact(&retained_prefix)
+            .await
+            .expect("a checkpoint a live models row names must survive the sweep");
+
+        // The unreferenced checkpoint's bytes are reclaimed.
+        let reclaimed = store.fetch_artifact(&stale_prefix).await;
+        assert!(
+            reclaimed.is_err(),
+            "an unreferenced epoch checkpoint must be reclaimed by the sweep"
+        );
     }
 
     /// Contract `CONTRACT-OPS-fix4.md` M5: `confirms_release()` checks

@@ -108,6 +108,10 @@ message JammiErrorDetail {
     // unit, deferred to #515 and recoverable by cherry-pick. Leaving them
     // reserved means that recovery cannot collide with this field.
     ParentMovedError parent_moved = 39;
+    // `JammiError::EmptyTrainingSet { source_query }` — a training set whose
+    // source projection yielded zero rows. Maps to `InvalidArgument`, the
+    // caller-input convention `InvalidKey`/`NonUniqueKey` carry.
+    EmptyTrainingSetError empty_training_set = 40;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -278,6 +282,17 @@ message NonUniqueKeyError {
   string scan = 2;
   repeated KeyCount keys = 3;
   uint64 total = 4;
+}
+
+// `JammiError::EmptyTrainingSet { source_query }`. A training set's source
+// projection yielded zero rows, so the producer refuses before any catalog row
+// or byte exists. A degenerate input the caller must change →
+// `InvalidArgument`, the same convention `InvalidKey`/`NonUniqueKey` follow.
+message EmptyTrainingSetError {
+  // The producer's query text that yielded no rows. `source_query`, not
+  // `source`: the engine variant's field carries that name so `thiserror` does
+  // not read it as the error's `std::error::Error::source()`.
+  string source_query = 1;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

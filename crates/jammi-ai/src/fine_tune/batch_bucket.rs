@@ -89,6 +89,35 @@
 /// exercising the exact names this crate's call site imports.
 pub use jammi_numerics::{bucket_seq_len, MIN_BUCKET_LEN};
 
+/// The bucket rung a batch's rows are padded to: `pinned`, if the caller
+/// supplies one, or [`bucket_seq_len`] of THIS batch's own natural width
+/// otherwise (today's only reachable arm).
+///
+/// **Why a rank ever needs to PIN one (DESIGN.md §2):** each rank buckets its
+/// own local batch independently by DEFAULT, so two ranks whose local
+/// batches happen to differ in natural width would encode to two DIFFERENT
+/// shapes — fine for a rank training alone, but a gather that concatenates
+/// ranks' hidden states along the sequence axis (§4's gather primitive)
+/// needs every rank at the SAME rung first. `pinned` is that agreed rung —
+/// derived across ranks (e.g. an all-gather-max of natural widths) by
+/// whoever coordinates the gang, never by this function, which only applies
+/// whichever rung it is handed.
+///
+/// **Unused at this commit.** `TrainingLoop::encode_texts`'s call site always
+/// passes `None` — every reachable run trains one rank alone (world 1), so
+/// there is no OTHER rank's shape to agree with yet; U4b, which spawns
+/// per-rank readers and a real cross-rank gather, is what would ever
+/// construct and pass `Some(rung)`. Landed now as the plumbing that call site
+/// will need, not as a behavior change: `None` reproduces exactly what
+/// today's unconditional `bucket_seq_len` call computes, byte-for-byte.
+pub fn resolve_bucket_rung(
+    natural_cols: usize,
+    effective_max: usize,
+    pinned: Option<usize>,
+) -> usize {
+    pinned.unwrap_or_else(|| bucket_seq_len(natural_cols, effective_max))
+}
+
 /// Extends every row of `input_ids`/`attention_masks` (in place) from their
 /// current (equal, tokenizer-padded) width out to `bucketed_len`, with the
 /// pad token id (`0`) and a fully-masked (`0`) attention entry respectively
@@ -120,6 +149,34 @@ pub fn pad_rows_to_bucket(rows: &mut [Vec<u32>], bucketed_len: usize, pad_value:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `None` reproduces exactly what an unconditional `bucket_seq_len` call
+    /// computes — the W=1 parity oracle for `resolve_bucket_rung`'s only
+    /// reachable arm today.
+    #[test]
+    fn resolve_bucket_rung_with_no_pin_matches_bucket_seq_len() {
+        for natural in [1usize, MIN_BUCKET_LEN, MIN_BUCKET_LEN + 1, 9, 200] {
+            assert_eq!(
+                resolve_bucket_rung(natural, 1024, None),
+                bucket_seq_len(natural, 1024),
+                "natural={natural}"
+            );
+        }
+    }
+
+    /// A pinned rung wins outright, regardless of what this batch's own
+    /// natural width would otherwise resolve to — the cross-rank agreement
+    /// this function exists to apply is never second-guessed by a local
+    /// recomputation.
+    #[test]
+    fn resolve_bucket_rung_pinned_overrides_the_local_natural_width() {
+        assert_eq!(resolve_bucket_rung(3, 1024, Some(64)), 64);
+        assert_eq!(
+            resolve_bucket_rung(0, 1024, Some(MIN_BUCKET_LEN)),
+            MIN_BUCKET_LEN,
+            "a zero-row chunk's natural width (0) must not defeat a pinned rung"
+        );
+    }
 
     #[test]
     fn bucket_seq_len_rounds_up_to_the_next_power_of_two() {

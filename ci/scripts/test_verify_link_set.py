@@ -3,12 +3,14 @@
 
 The property under test is fail-CLOSED classification: every `DT_NEEDED`
 soname of the cu12 binary is either platform, driver-provided or delivered by
-a declared wheel component, and anything else FAILS. The earlier predicate
-asked the opposite question — "does this soname start with `libcu` or `libnv`,
-and if not, skip it" — which passes a wheel that bundles no NCCL while its
-binary hard-links `libnccl.so.2`, because that soname starts with neither. The
-`libnccl` case below is the standing oracle for that shape; the others hold
-the classification honest in the directions it could over-reach.
+a declared wheel component, and anything else FAILS. A `libcu`/`libnv` prefix
+test alone is not sufficient: it fails OPEN on any soname that starts with
+neither prefix, which is exactly how a wheel could once print "OK" while
+bundling no NCCL and its binary hard-linked `libnccl.so.2` regardless — that
+soname is now `covered` (the `nccl` component), so the standing fail-open
+oracle below is `libmpi.so.40`, a plausible future link that starts with
+neither prefix and is declared by no component; the other cases hold the
+classification honest in the directions it could over-reach.
 
 The PASS fixture is the measured `DT_NEEDED` list of the binary the check
 actually runs on (`_pypi-server.yml:144`, `target/release/jammi-server`), read
@@ -82,12 +84,24 @@ class LinkSetCheck(unittest.TestCase):
         self.assertEqual(rc, 0, f"the shipped link set must pass; stderr={err}")
         self.assertIn("OK", out)
 
-    def test_nccl_is_not_silently_skipped(self):
-        """The fail-open shape: `libnccl` starts with neither `libcu` nor
-        `libnv`, and the wheel declares no NCCL component."""
-        rc, out, err = self.run_check(MEASURED_LINK_SET + ["libnccl.so.2"])
-        self.assertEqual(rc, 1, f"libnccl.so.2 must FAIL the check; stdout={out}")
-        self.assertIn("libnccl.so.2", err)
+    def test_an_unclassified_library_is_not_silently_skipped(self):
+        """The fail-open shape: `libmpi` starts with neither `libcu` nor
+        `libnv`, and the wheel declares no MPI component. This is the
+        standing oracle for "a soname naming no prefix and no component" —
+        `libnccl.so.2` no longer serves this role now that the `nccl`
+        component declares it (see `test_classification_of_each_measured_soname`),
+        so this soname must stay absent from every declared component or the
+        oracle silently rots the same way `libnccl` did."""
+        oracle = "libmpi.so.40"
+        declared = {s for stems in self.mod.COVERED.values() for s in stems}
+        self.assertNotIn(
+            self.mod.soname_stem(oracle),
+            declared,
+            f"{oracle} must be declared by no component for this oracle to hold",
+        )
+        rc, out, err = self.run_check(MEASURED_LINK_SET + [oracle])
+        self.assertEqual(rc, 1, f"{oracle} must FAIL the check; stdout={out}")
+        self.assertIn(oracle, err)
         self.assertNotIn("OK", out)
 
     def test_any_unclassified_library_fails(self):
@@ -129,7 +143,10 @@ class LinkSetCheck(unittest.TestCase):
         for soname, bucket in expected.items():
             with self.subTest(soname=soname):
                 self.assertEqual(self.mod.classify(soname), bucket)
-        self.assertEqual(self.mod.classify("libnccl.so.2"), "unclassified")
+        # libnccl.so.2 is delivered by the `nccl` component (a `candle-core/nccl`
+        # build links it), not by MEASURED_LINK_SET's own binary -- classified
+        # separately here rather than folded into `expected` above.
+        self.assertEqual(self.mod.classify("libnccl.so.2"), "covered")
 
     def test_loader_prefix_admits_only_the_loader(self):
         self.assertTrue(self.mod.is_platform("ld-linux-aarch64"))

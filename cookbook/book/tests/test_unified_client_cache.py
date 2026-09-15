@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import importlib.metadata as importlib_metadata
-import tempfile
 
 import grpc
 import jammi
@@ -96,20 +95,27 @@ def test_embedded_extra_pins_the_native_engine():
 
 
 @_needs_cache
-def test_file_uri_returns_embedded_backend_grpc_returns_remote():
+def test_file_uri_returns_embedded_backend_grpc_returns_remote(tmp_path):
     """The ONE front door, two arms: `connect("file://…")` returns the in-process
     `EmbeddedBackend` (direct FFI, no server), `connect("grpc://…")` a
-    `RemoteDatabase` — both off the base `jammi`, no convenience bundle."""
+    `RemoteDatabase` — both off the base `jammi`, no convenience bundle.
+
+    The two `connect` calls stay spelled out here because the identity of the
+    call IS the subject; both sessions are closed in `finally` (`tmp_path` is
+    pytest's, and outlives this test — nothing removes a directory under a live
+    engine). Every other test in this file takes the sessions from the
+    `embedded` / `remote` fixtures.
+    """
     rec = _record()["install"]
-    with tempfile.TemporaryDirectory() as d:
-        embedded = jammi.connect(f"file://{d}")
-        remote = jammi.connect("grpc://127.0.0.1:8081")
-        try:
-            assert type(embedded).__name__ == rec["file_uri_backend"] == "EmbeddedBackend"
-            assert type(embedded).__module__ == rec["file_uri_backend_module"]
-            assert type(remote).__name__ == rec["grpc_uri_backend"] == "RemoteDatabase"
-        finally:
-            remote.close()
+    embedded = jammi.connect(f"file://{tmp_path}")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
+    try:
+        assert type(embedded).__name__ == rec["file_uri_backend"] == "EmbeddedBackend"
+        assert type(embedded).__module__ == rec["file_uri_backend_module"]
+        assert type(remote).__name__ == rec["grpc_uri_backend"] == "RemoteDatabase"
+    finally:
+        embedded.close()
+        remote.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +124,7 @@ def test_file_uri_returns_embedded_backend_grpc_returns_remote():
 
 
 @_needs_cache
-def test_session_protocol_vocabulary_present_on_both_backends():
+def test_session_protocol_vocabulary_present_on_both_backends(embedded, remote):
     """Every member the shared `Session` Protocol names is present on BOTH concrete
     backends, and both satisfy `Session` structurally — the parity the one-front-
     door thesis rests on, measured member-for-member against the golden."""
@@ -126,16 +132,10 @@ def test_session_protocol_vocabulary_present_on_both_backends():
     verbs = _session_protocol_verbs()
     assert verbs == rec["session_protocol_verbs"]
     assert len(verbs) == rec["verb_count"]
-    with tempfile.TemporaryDirectory() as d:
-        embedded = jammi.connect(f"file://{d}")
-        remote = jammi.connect("grpc://127.0.0.1:8081")
-        try:
-            emb_missing = sorted(v for v in verbs if not hasattr(type(embedded), v))
-            rem_missing = sorted(v for v in verbs if not hasattr(type(remote), v))
-            assert isinstance(embedded, Session) is rec["embedded_is_session"] is True
-            assert isinstance(remote, Session) is rec["remote_is_session"] is True
-        finally:
-            remote.close()
+    emb_missing = sorted(v for v in verbs if not hasattr(type(embedded), v))
+    rem_missing = sorted(v for v in verbs if not hasattr(type(remote), v))
+    assert isinstance(embedded, Session) is rec["embedded_is_session"] is True
+    assert isinstance(remote, Session) is rec["remote_is_session"] is True
     assert emb_missing == rec["embedded_missing"] == []
     assert rem_missing == rec["remote_missing"] == []
     assert rec["both_complete"] is True
@@ -147,18 +147,12 @@ def test_session_protocol_vocabulary_present_on_both_backends():
 
 
 @_needs_cache
-def test_supports_booleans_match_and_are_complementary():
+def test_supports_booleans_match_and_are_complementary(embedded, remote):
     """`supports(Capability.X)` is the committed boolean per backend, and the two
     CLOSED-four capability sets are exactly complementary."""
     rec = _record()["capability"]
-    with tempfile.TemporaryDirectory() as d:
-        embedded = jammi.connect(f"file://{d}")
-        remote = jammi.connect("grpc://127.0.0.1:8081")
-        try:
-            emb = {c.value: embedded.supports(c) for c in Capability}
-            rem = {c.value: remote.supports(c) for c in Capability}
-        finally:
-            remote.close()
+    emb = {c.value: embedded.supports(c) for c in Capability}
+    rem = {c.value: remote.supports(c) for c in Capability}
     assert emb == rec["embedded_supports"]
     assert rem == rec["remote_supports"]
     assert all(emb[k] != rem[k] for k in emb), "the two capability sets must be complementary"
@@ -166,20 +160,14 @@ def test_supports_booleans_match_and_are_complementary():
 
 
 @_needs_cache
-def test_wrong_side_capability_raises_not_supported():
+def test_wrong_side_capability_raises_not_supported(embedded, remote):
     """A one-sided feature invoked on the backend that lacks it raises the typed
     `NotSupportedOnBackend` (never a bare `AttributeError`), naming the capability."""
     rec = _record()["capability"]
-    with tempfile.TemporaryDirectory() as d:
-        embedded = jammi.connect(f"file://{d}")
-        remote = jammi.connect("grpc://127.0.0.1:8081")
-        try:
-            with pytest.raises(NotSupportedOnBackend) as emb_info:
-                _ = embedded.session_id  # remote-only, on embedded
-            with pytest.raises(NotSupportedOnBackend) as rem_info:
-                _ = remote.audit  # embedded-only, on remote
-        finally:
-            remote.close()
+    with pytest.raises(NotSupportedOnBackend) as emb_info:
+        _ = embedded.session_id  # remote-only, on embedded
+    with pytest.raises(NotSupportedOnBackend) as rem_info:
+        _ = remote.audit  # embedded-only, on remote
     assert str(emb_info.value.capability) == rec["embedded_wrong_side"]["capability"]
     assert str(rem_info.value.capability) == rec["remote_wrong_side"]["capability"]
     assert rec["embedded_wrong_side"]["raised"] == "NotSupportedOnBackend"
@@ -244,7 +232,7 @@ class _RaisingStub:
 
 
 @_needs_cache
-def test_one_except_jammi_error_catches_both_transports():
+def test_one_except_jammi_error_catches_both_transports(embedded, remote):
     """One `except JammiError` catches a bad-argument failure on BOTH the embedded
     engine (rejected in-process) and the remote client (a server status), and both
     are the SAME `InvalidArgument` class — the two-sided parity."""
@@ -252,26 +240,20 @@ def test_one_except_jammi_error_catches_both_transports():
     caught: list[JammiError] = []
 
     # Embedded side — the in-process engine rejects a malformed tenant id.
-    with tempfile.TemporaryDirectory() as d:
-        embedded = jammi.connect(f"file://{d}")
-        try:
-            embedded.set_tenant("not-a-uuid")
-        except JammiError as exc:
-            caught.append(exc)
+    try:
+        embedded.set_tenant("not-a-uuid")
+    except JammiError as exc:
+        caught.append(exc)
 
     # Remote side — a server INVALID_ARGUMENT status arrives over the (stubbed)
     # wire and the client maps it. The SAME `except JammiError` clause catches it.
-    remote = jammi.connect("grpc://127.0.0.1:8081")
+    remote._catalog = _RaisingStub(
+        _FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, "server said bad arg")
+    )
     try:
-        remote._catalog = _RaisingStub(
-            _FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, "server said bad arg")
-        )
-        try:
-            remote.list_sources()
-        except JammiError as exc:
-            caught.append(exc)
-    finally:
-        remote.close()
+        remote.list_sources()
+    except JammiError as exc:
+        caught.append(exc)
 
     assert len(caught) == 2, "both transports must raise a JammiError caught by one clause"
     embedded_exc, remote_exc = caught
@@ -371,17 +353,18 @@ def test_finite_receive_cap_raises_backend_error_remote_returns_embedded():
 
 
 @_needs_cache
-def test_embedded_returns_the_same_scale_payload_unbounded():
+def test_embedded_returns_the_same_scale_payload_unbounded(embedded, tmp_path):
     """The embedded engine returns the same-scale payload in-process, exceeding the
-    demo cap the remote channel rejected — the unbounded in-process counterpart."""
+    demo cap the remote channel rejected — the unbounded in-process counterpart.
+
+    `tmp_path` IS the catalog directory the `embedded` fixture opened on, so the
+    parquet lands beside the catalog exactly as before."""
     rec = _record()["honest_edge"]
-    with tempfile.TemporaryDirectory() as d:
-        embedded = jammi.connect(f"file://{d}")
-        table = pa.table({"id": pa.array(range(rec["embedded_returned_rows"]), type=pa.int32())})
-        path = f"{d}/big.parquet"
-        pq.write_table(table, path)
-        embedded.add_source("big", url=path, format="parquet")
-        got = embedded.sql("SELECT id FROM big.public.big")
+    table = pa.table({"id": pa.array(range(rec["embedded_returned_rows"]), type=pa.int32())})
+    path = f"{tmp_path}/big.parquet"
+    pq.write_table(table, path)
+    embedded.add_source("big", url=path, format="parquet")
+    got = embedded.sql("SELECT id FROM big.public.big")
     assert got.num_rows == rec["embedded_returned_rows"]
     assert got.nbytes == rec["embedded_returned_bytes"]
     assert got.nbytes > rec["demo_cap_bytes"], "the embedded return exceeds the remote cap"

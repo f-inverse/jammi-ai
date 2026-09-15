@@ -53,6 +53,8 @@ import pyarrow as pa
 
 from ._capability import Capability
 from .errors import NotSupportedOnBackend
+from ._sessions import register as _register_session
+from ._sessions import unregister as _unregister_session
 from ._assembly import (
     build_add_channel_columns_request,
     build_asof_join_request,
@@ -125,9 +127,20 @@ class EmbeddedBackend:
     silent `AttributeError`.
     """
 
-    def __init__(self, native: object) -> None:
+    def __init__(self, native: object, *, label: str = "") -> None:
         # Held by composition; every verb delegates to it explicitly.
         self._native = native
+        # The ONE registration point for every embedded session: `_open_embedded`
+        # (the `file://` dispatch factory) and any direct construction both run
+        # this `__init__`, so both are visible to `jammi.open_sessions()` from
+        # here — see `_sessions`. `label` is the catalog location this session
+        # was opened on (the `artifact_dir` `_open_embedded` resolved) — the
+        # printable target `jammi.open_session_labels()` / an `observe()`
+        # listener reports for this handle even after the session itself is
+        # collected; direct construction with no `label` registers under `""`,
+        # which is still a valid (if uninformative) label. Called LAST so a
+        # session that exists at all is unconditionally live here.
+        self._session_handle = _register_session(self, label)
 
     # --- Capability contract ----------------------------------------------------
     #
@@ -217,6 +230,7 @@ class EmbeddedBackend:
         claiming process's to open. See :func:`jammi.connect`.
         """
         self._native.close(release)
+        _unregister_session(self)
 
     def __enter__(self) -> "EmbeddedBackend":
         return self
@@ -542,6 +556,8 @@ class EmbeddedBackend:
         quantile_levels: Optional[List[float]] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
+        cache: Optional[str] = None,
     ):
         """Submit a LoRA fine-tuning job to the in-process engine; poll the handle.
 
@@ -550,7 +566,15 @@ class EmbeddedBackend:
         shared `FineTuneSpec` builder and submitted through the engine's wire
         seam; all config kwargs are optional, applying the engine defaults when
         omitted. `idempotency_key`, when non-empty, dedupes the submission
-        (migration 030) the same way the remote arm's does.
+        (migration 030) the same way the remote arm's does. `world_size` is the
+        number of ranks that train this job cooperatively; `1` (the default) is
+        a single process, and a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
+        names model-level cache reuse (``"use"``) as opposed to the engine's
+        default recompute (``"bypass"``, the default when omitted); reuse is
+        not yet implemented, so ``"use"`` is refused with
+        :class:`jammi.errors.InvalidArgument` and the job is not submitted —
+        see https://github.com/f-inverse/jammi-ai/issues/562.
         """
         request = build_fine_tune_request(
             source=source,
@@ -589,6 +613,8 @@ class EmbeddedBackend:
             quantile_levels=quantile_levels,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
+            cache=cache,
         )
         return self._native._start_training_proto(
             request.SerializeToString(), idempotency_key or None
@@ -623,6 +649,8 @@ class EmbeddedBackend:
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
         idempotency_key: str = "",
+        world_size: int = 1,
+        cache: Optional[str] = None,
     ):
         """Submit a graph-supervised fine-tune (S11) to the in-process engine.
 
@@ -633,7 +661,14 @@ class EmbeddedBackend:
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
         `idempotency_key`, when non-empty, dedupes the submission (migration
-        030) the same way the remote arm's does.
+        030) the same way the remote arm's does. `world_size` is the number of
+        ranks that train this job cooperatively; `1` (the default) is a single
+        process, and a value below `1` is refused here with
+        :class:`jammi.errors.InvalidArgument` rather than submitted. `cache`
+        is accepted here but a graph fine-tune has no model-level materialization
+        to probe or record: ``"use"`` is refused with
+        :class:`jammi.errors.InvalidArgument`; ``"bypass"`` (the default when
+        omitted) is the only value this job kind honours — it always trains.
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -662,6 +697,8 @@ class EmbeddedBackend:
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
             idempotency_key=idempotency_key,
+            world_size=world_size,
+            cache=cache,
         )
         return self._native._start_training_proto(
             request.SerializeToString(), idempotency_key or None
@@ -1423,4 +1460,7 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     """
     import jammi_native
 
-    return EmbeddedBackend(jammi_native.open_local(artifact_dir=artifact_dir, config=config))
+    return EmbeddedBackend(
+        jammi_native.open_local(artifact_dir=artifact_dir, config=config),
+        label=artifact_dir,
+    )

@@ -73,7 +73,7 @@ use crate::error::{JammiError, Result};
 use crate::storage::sidecar_layout::{
     required_sidecar_extensions, sidecar_extensions, SidecarKind,
 };
-use crate::storage::{DeleteOutcome, StorageUrl};
+use crate::storage::{DeleteOutcome, StorageError, StorageUrl};
 use crate::store::layout::{self, TenantSegment};
 use crate::store::{ExpiredRowDeletion, ExpiredRowOutcome, ResultStore};
 use crate::tenant_scope::TenantBinding;
@@ -235,10 +235,35 @@ pub struct ReconcileReport {
     /// The true count of damaged keys found this pass, independent of
     /// whether [`Self::damaged`] was truncated.
     pub damaged_count: u64,
+    /// A `models/`-namespaced object this pass's reap-site consult of
+    /// [`ResultStore::prefix_is_referenced`] found still referenced by some
+    /// live `models` row, in SOME tenant scope — reported instead of
+    /// reclaimed, at any grace or `apply`. The consult is on this object's
+    /// OWN key (never a coarser enclosing prefix), so it catches both a
+    /// live row that equals it exactly and a live row whose `artifact_path`
+    /// is its immediate containing directory. This is the ONE gate every
+    /// `models/` byte-delete this
+    /// pass performs runs through right before deleting, independent of
+    /// (and in addition to) the attribution set this pass builds up front
+    /// from
+    /// [`crate::catalog::Catalog::list_model_artifact_paths_all_tenants`]
+    /// (never the tenant-scoped
+    /// [`crate::catalog::Catalog::list_models`]): the same
+    /// predicate [`ResultStore::delete_unreferenced_prefix`] consults.
+    /// Distinct from [`Self::damaged`] (a live row names the prefix but its
+    /// manifest is absent) — this field means the opposite direction of
+    /// evidence: the object itself looked unattributed, but a fresh
+    /// admin-scoped catalog consult still found a live reference. Never
+    /// names row ids, model names, or tenant ids — only the object key.
+    /// Capped at [`REPORT_LIST_CAP`]; see [`Self::referenced_count`].
+    pub referenced: Vec<String>,
+    /// The true count of [`Self::referenced`] keys found this pass,
+    /// independent of whether [`Self::referenced`] was truncated.
+    pub referenced_count: u64,
     /// `true` iff any of [`Self::rows_failed`], [`Self::orphans`],
-    /// [`Self::pending`], [`Self::unattributed`], [`Self::damaged`] was cut
-    /// to [`REPORT_LIST_CAP`] entries — the corresponding `*_count` field is
-    /// still the true total either way.
+    /// [`Self::pending`], [`Self::unattributed`], [`Self::damaged`],
+    /// [`Self::referenced`] was cut to [`REPORT_LIST_CAP`] entries — the
+    /// corresponding `*_count` field is still the true total either way.
     pub truncated: bool,
     /// Total bytes reclaimed by [`Self::orphans`] — under `apply=true`, the
     /// bytes this pass ACTUALLY deleted; under `apply=false`, the bytes the
@@ -393,6 +418,99 @@ impl ResultStore {
     pub async fn reconcile_all(&self, opts: ReconcileOptions) -> Result<ReconcileReport> {
         self.check_apply_grace(&opts)?;
         TenantBinding::admin_scope(self.reconcile_inner("all".to_string(), opts, None)).await
+    }
+
+    /// Whether ANY `models` row, in ANY tenant (or none), names
+    /// `key_or_prefix` as its OWN `artifact_path` or as the artifact_path
+    /// of `key_or_prefix`'s IMMEDIATE containing directory — the ONE
+    /// predicate every `models/`-namespaced byte-delete this store
+    /// performs consults before running, passing EXACTLY the object key or
+    /// prefix it is about to remove: [`Self::reconcile`]/[`Self::reconcile_all`]'s
+    /// reap chokepoint consults it per listed object, and
+    /// [`Self::delete_unreferenced_prefix`] (the typed refusal a
+    /// worker-facing caller composes on) consults it on the prefix it is
+    /// about to delete. Nothing that removes bytes under `models/**` may
+    /// skip it.
+    ///
+    /// `key_or_prefix` is the FULL [`StorageUrl`] — the exact string
+    /// representation of the object or prefix a caller is about to delete,
+    /// never a bare root-relative key: a caller already holding a
+    /// `StorageUrl` (every production caller does) passes it straight
+    /// through; [`Self::reconcile`] derives one from its own root-relative
+    /// coordinates the same way this store's own `delete_relative` helper
+    /// already does.
+    ///
+    /// A row's `artifact_path` is a FLAT DIRECTORY of files, not a single
+    /// file: an epoch checkpoint published under it is registered as its
+    /// OWN row whose `artifact_path` EQUALS that exact checkpoint prefix,
+    /// while any other object living directly inside a served bundle has
+    /// that bundle's `artifact_path` as its immediate containing
+    /// directory. Both shapes count as referenced — see
+    /// [`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`]
+    /// for the exact predicate (deliberately ONE level, never an arbitrary
+    /// ancestor — so an unretained, independently-registrable NESTED
+    /// artifact like an epoch checkpoint is never falsely protected by its
+    /// enclosing attempt's own row) and the one namespace (`_resume/`, a
+    /// SIBLING of every attempt-level `artifact_path`, never equal to it
+    /// or contained by it) the predicate is proven never to match.
+    ///
+    /// **Admin-scoped by construction**: the underlying catalog read
+    /// ([`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`])
+    /// issues no tenant predicate at all, so this answer is identical
+    /// regardless of whether the calling task is tenant-bound, admin-scoped,
+    /// or unbound — a tenant-scoped view can never correctly decide global
+    /// byte-reachability (a global fine-tune output a tenant-A row reuses is
+    /// invisible to a tenant-scoped OR an unbound-but-not-admin-scoped
+    /// listing, which is exactly the bug this predicate exists to close).
+    ///
+    /// Returns a COUNT, never row identities — a tenant-bound caller
+    /// consulting this predicate learns only "referenced" vs. "not", never
+    /// which tenant or model owns the reference. Costs one indexed COUNT
+    /// query per candidate object or prefix — acceptable next to the I/O
+    /// (list, read manifest, delete) every caller of this predicate already
+    /// performs per candidate.
+    ///
+    /// The `result_tables` byte-deleters (`store/mod.rs`'s segment/version/
+    /// table purge paths, the session's drop-table path) are OUT of this
+    /// predicate's quantifier entirely — a different namespace (`{tenant}/…`)
+    /// that no `models` row ever names; only a `models/**`-namespaced
+    /// prefix is ever a meaningful argument here.
+    pub async fn prefix_is_referenced(&self, key_or_prefix: &StorageUrl) -> Result<usize> {
+        let count = self
+            .catalog
+            .count_models_naming_prefix_all_tenants(key_or_prefix.as_str())
+            .await?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// The worker-facing guarded delete: consults [`Self::prefix_is_referenced`]
+    /// first and refuses, typed, when ANY live `models` row (in any tenant
+    /// scope) still names `prefix` — itself or as its immediate containing
+    /// directory — never deleting a byte a live row references. Only on a
+    /// `count == 0` answer does this delegate to
+    /// `ArtifactStore::delete_artifact_prefix`, the unguarded primitive.
+    ///
+    /// This is the ONLY sanctioned route from a worker's abandon path (a
+    /// losing cache-hit attempt, a zombie's orphaned prefix) to deleting a
+    /// `models/**` bundle. `_resume/` stays exempt from every guard (proven
+    /// never named by any row — see
+    /// [`crate::catalog::Catalog::count_models_naming_prefix_all_tenants`]'s
+    /// doc); an epoch-checkpoint delete is NOT exempt — a retained
+    /// checkpoint's own row means its caller must compute the checkpoint's
+    /// exact prefix via
+    /// [`crate::store::ArtifactStore::epoch_checkpoint_prefix`] and reach
+    /// this method with it (`ArtifactStore` itself stays catalog-free, so
+    /// the consult happens here, in the guarded port, never inside
+    /// `ArtifactStore`).
+    pub async fn delete_unreferenced_prefix(&self, prefix: &StorageUrl) -> Result<()> {
+        let count = self.prefix_is_referenced(prefix).await?;
+        if count > 0 {
+            return Err(JammiError::Storage(StorageError::Referenced {
+                prefix: prefix.as_str().to_string(),
+                count,
+            }));
+        }
+        self.artifact_store().delete_artifact_prefix(prefix).await
     }
 
     /// `apply = true` requires `grace >= ` this store's configured lease
@@ -672,7 +790,14 @@ impl ResultStore {
         // write nothing under `models/` at all, so they simply never
         // contribute a prefix here — no separate filter is needed for them.
         let jobs = self.catalog.list_jobs().await?;
-        let models = self.catalog.list_models().await?;
+        // Admin-scoped BY CONSTRUCTION (never the tenant-scoped
+        // `Catalog::list_models`, whatever binding this pass itself is
+        // running under): a tenant-A row reusing a GLOBAL prefix — the
+        // cache-hit fan-out shape — is invisible to an UNBOUND reconcile
+        // pass that reads `list_models()` instead; this admin-scoped scan
+        // closes that gap. See
+        // `Catalog::list_model_artifact_paths_all_tenants`'s own doc.
+        let model_artifact_paths = self.catalog.list_model_artifact_paths_all_tenants().await?;
         let running_prefixes: BTreeSet<String> = jobs
             .iter()
             .filter(|j| j.status == JobStatus::Running.to_string())
@@ -695,9 +820,8 @@ impl ResultStore {
                 )
             })
             .collect();
-        let artifact_prefixes: BTreeSet<String> = models
+        let artifact_prefixes: BTreeSet<String> = model_artifact_paths
             .iter()
-            .filter_map(|m| m.artifact_path.as_deref())
             .filter_map(|p| StorageUrl::parse(p).ok())
             .filter_map(|u| relative_to(&self.root, &u))
             .collect();
@@ -708,6 +832,8 @@ impl ResultStore {
         let mut unattributed_count = 0u64;
         let mut damaged = Vec::new();
         let mut damaged_count = 0u64;
+        let mut referenced = Vec::new();
+        let mut referenced_count = 0u64;
         // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are shared
         // with the expired-building pre-pass above: a cap hit on ANY list
         // (including `rows_failed`) sets the one report-wide flag, and a key
@@ -856,6 +982,43 @@ impl ResultStore {
                             }
                         }
                     }
+
+                    // Reap-site chokepoint: EVERY `models/`-
+                    // namespaced key that reaches this point — whether
+                    // because no live model prefix in the admin-scoped
+                    // attribution set above claims its job (`matched_artifact_prefix`
+                    // was `None`), or because a claimed prefix's manifest
+                    // simply does not name this exact key — gets ONE more,
+                    // fully independent consult of `Self::prefix_is_referenced`
+                    // on THIS OBJECT'S OWN KEY (never the coarser job-level
+                    // prefix: a production row's `artifact_path` is always
+                    // the deeper `{job}/{worker}/{attempt}` attempt path or
+                    // an even deeper retained-checkpoint prefix, so asking
+                    // about the bare `{job}` prefix under an equality
+                    // predicate would decide nothing — it can never equal a
+                    // production `artifact_path`) before it is ever allowed
+                    // to fall through to the general orphan/pending age
+                    // gate below. This is the SAME predicate
+                    // `Self::delete_unreferenced_prefix` consults, and it
+                    // is deliberately a SEPARATE, freshly-issued catalog
+                    // read rather than a re-check of `artifact_prefixes`
+                    // (built once, above): it also catches a model row
+                    // registered in the race window between that read and
+                    // this exact moment.
+                    let obj_url = StorageUrl::parse(&format!(
+                        "{}/{}",
+                        self.root.as_str().trim_end_matches('/'),
+                        obj.rel
+                    ))?;
+                    if self.prefix_is_referenced(&obj_url).await? > 0 {
+                        push_capped(
+                            &mut referenced,
+                            &mut referenced_count,
+                            &mut truncated,
+                            obj.rel.clone(),
+                        );
+                        continue;
+                    }
                 }
             }
 
@@ -911,6 +1074,7 @@ impl ResultStore {
         pending.sort();
         unattributed.sort();
         damaged.sort();
+        referenced.sort();
 
         Ok(ReconcileReport {
             scope,
@@ -925,6 +1089,8 @@ impl ResultStore {
             unattributed_count,
             damaged,
             damaged_count,
+            referenced,
+            referenced_count,
             truncated,
             bytes_reclaimed,
         })

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """GPU-prove-once guard (esc-084, issue #454; #454 follow-up, operator
 direction 2026-09-03: every release publisher, not only the CUDA lanes) —
-hermetic, static, no build, no GPU, no PyYAML.
+hermetic, static, no build, no GPU. Reads workflow YAML through
+`check_execution_surface_reachability.py`'s shared PyYAML-backed loader
+(a declared prerequisite of this gate, installed by `.docker/ci.Dockerfile`).
 
 **Guarded property**: a release commit is proven ONCE per shipped arch, and
 EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io, npm,
@@ -114,25 +116,108 @@ string):
      form, `ci/scripts/publish_crates.sh`, `docker buildx imagetools create`
      (never bare `imagetools` -- `imagetools inspect` is a read-only
      assertion, not a promotion) must be listed as SOME row's
-     `(workflow, promoting_job)` in `PROMOTION_TABLE`. RECURSIVE: a job that
-     merely `uses:` a LOCAL reusable workflow (job-level `uses: ./.github/
-     workflows/<X>.yml`) whose OWN jobs match a primitive is itself a
-     promoting job too — e.g. `_ci-base-image.yml`'s `build-and-push` job
-     pushes to GHCR, so `image.yml`/`image-cuda.yml`'s `build` jobs (which
-     each `uses:` it) are discovered and tabled (`gate_kind="none"`, proven
-     structurally unreachable from a tag ref per F3's own rule — never
-     reachable via `workflow_dispatch` on a tag ref, since neither image is
-     part of any release). A workflow whose OWN `on:` block is
-     `workflow_call`-only (the same "never independently starts" doctrine
-     P1/P5 hold `gpu-prove.yml`/`_gpu-proof-required.yml` to) is skipped by
-     the DIRECT scan — it is inert without a caller and is reached only via
-     that caller's recursive check above, never double-tabled against
-     itself. An unlisted match FAILS, naming the workflow and job — it can
-     never again silently promote ungated.
+     `(workflow, promoting_job)` in `PROMOTION_TABLE`. FAIL-CLOSED, NO
+     TRAVERSAL: a job that carries a job-level `uses:` delegating to ANY
+     other workflow at all (local, cross-repo, dangling, quoted, a
+     `+`-bearing filename — the raw parsed scalar's mere PRESENCE, never
+     its resolved identity; a job-level `uses:` value that is present but
+     not a string is its own finding) is ALSO a promoting job for P6's
+     purposes and must be listed too — e.g. `image.yml`/`image-cuda.yml`'s
+     `build` jobs (each a job-level `uses: ./.github/workflows/_ci-base-
+     image.yml`, which does genuinely push to GHCR) are LISTED rows
+     (`gate_kind="none"`, proven structurally unreachable from a tag ref
+     per F3's own rule — never reachable via `workflow_dispatch` on a tag
+     ref, since neither image is part of any release). This rule never
+     opens the delegate's own text to decide whether it truly promotes, is
+     examinable, or even exists — ANY delegation is presumed promoting
+     until a human reviews it and adds a row (rebuilding a real per-
+     delegate examination is tracked as issue #561). TWO narrow, hand-
+     reviewed exceptions carry their OWN direct, NON-recursive top-level
+     step scan instead of a table row: the `REVIEWED_NONPUBLISHING_
+     LOCAL_REUSABLES` allowlist, and `_gpu-proof-required.yml` (whose own
+     row's `gate_job` is exempt from THIS rule only when that job's OWN
+     parsed `uses:` scalar resolves exactly to `_gpu-proof-required.yml`
+     — any other value there is still a finding). For each of these two
+     exempted-by-name classes, EVERY job inside the exempted file is
+     scanned by the step-level publish-primitive rule directly (never
+     that file's own job-level `uses:`, if it has one): the exemption is
+     a reviewed NAME plus that scan, never an examination of what the
+     exempted file's own jobs might themselves delegate to. A workflow
+     whose OWN `on:` block is `workflow_call`-only is otherwise skipped
+     entirely — it is inert without a caller, and (outside the two named
+     exemptions above) is never itself examined; a caller reaching it via
+     a job-level `uses:` is what this rule holds accountable, not the
+     reusable it names. An unlisted/unexempted match FAILS, naming the
+     workflow and job — it can never again silently promote ungated.
 
-Mechanism: comment-stripped line scan plus a minimal indentation-based
-`jobs:` block splitter (no PyYAML, this repo's own gate convention). Every
-check function takes an explicit `workflows_dir`/`manifest_path` so
+  P7 (EVERY paid pod lane, not only the prove one). P1's three sub-rules
+     — exactly one invoker, no `push:`/`workflow_call:` in that invoker's
+     own `on:` block, nothing `uses:` it — restated over the reviewed
+     `PAID_POD_LANE_TABLE` registry (driver script -> its one workflow):
+     the prove lane, the gang lane (1 pod x 2 GPU), the perf-A/B lane and
+     the how-well lane. The doctrine was never about one script's name; it
+     is about a leg that RENTS HARDWARE, and a lane added without this rule
+     would have reproduced P1's own escape shape one file over. A row's
+     workflow missing from the tree, an unreadable `on:` block, and zero
+     invokers are each a FAIL, never a silent skip.
+
+     IDENTITY IS THE REPO-RELATIVE PATH, EVERYWHERE in this rule.
+     `PAID_POD_LANE_TABLE`'s keys are `ci/scripts/...` paths, never
+     basenames — keying (or re-keying, via `rsplit("/")`) on the basename
+     would fold `ci/scripts/perf/<x>.sh` and `ci/scripts/<x>.sh` into one
+     bucket and silently drop whichever one a lookup didn't pick (a renting
+     `ci/scripts/perf/runpod_gpu_evil.sh` beside a flat, reaping
+     `ci/scripts/runpod_gpu_evil.sh` produced zero findings and zero notes
+     under the earlier basename-keyed revision of this rule). No
+     `rsplit("/")` appears anywhere in this file — a self-test asserts it.
+
+     P7's SUBJECT SET IS DERIVED, and the table is a COMPLETENESS
+     ASSERTION over it. The deploy-capable function set is computed from
+     `ci/scripts/runpod_lib.sh` — the transitive callers of
+     `_rp_deploy_payload` — and a RENTING DRIVER is any tracked
+     `ci/scripts/**` file whose comment-stripped text calls one of them.
+
+     Each derived driver is either a table row (held to the three
+     sub-rules) or must satisfy a machine predicate — WHOLE-FILE SCOPE, no
+     verb parsing: it is a RENTER, and needs a table row, the moment its
+     repo-relative path appears ANYWHERE in a comment-stripped workflow
+     file that also carries `RUNPOD_API_KEY` at ANY scope (top-level
+     `env:`, job `env:`, step `env:`, `with:` — the capability, not its
+     spelling site). An earlier revision cleared an invocation whose first
+     argument was a literal non-renting verb (e.g. `reap`); that clearance
+     is GONE — no invocation-site parsing decides clearance any more, only
+     the driver's path and the file's secret. This over-approximates in the
+     fail-closed direction ON PURPOSE: a `paths:` filter entry mentioning a
+     derived driver inside a secret-holding workflow demands a row exactly
+     like a real invocation would, even though a filter entry alone cannot
+     run anything. That is the price of the rule, paid deliberately rather
+     than trying to parse what a `paths:` mention, a `run:` line, and every
+     other place a path can appear in YAML actually DO.
+
+     A derived driver whose repo-relative path is mentioned in NO workflow
+     file at all (comment-stripped, whole file) is a printed NOTE, not a
+     finding: nothing in the committed text says it can rent, and nothing
+     says it cannot. That NOTE fires on ABSENCE, never on "not invoked" —
+     a driver mentioned in a secret-FREE workflow only (say, a `paths:`
+     entry with no `RUNPOD_API_KEY` anywhere in that file) is mentioned
+     somewhere, so the absence rule does not apply, and that workflow
+     cannot make it rent either, so there is nothing to flag: neither a
+     finding nor a NOTE, and that silence is this rule's own stated outcome
+     for that shape, not an oversight.
+
+     A derived driver in neither state (a row, or provably unable to rent
+     anywhere), and a table row whose driver has left the derived set, are
+     both FAILs by name. `check_p7_paid_pod_lanes` takes the script map and
+     the library text as parameters (the same shape `load_workflow_texts`
+     gives the workflow scan), so its own suite injects a fifth renting
+     driver, or a new deploy wrapper, without touching this tree.
+
+Mechanism: comment-stripped line/regex scanning for `if:`/`needs:`/step
+shapes over job-body text spans, where those spans come from the ONE real
+YAML parse `check_execution_surface_reachability.py` exposes
+(`job_source_spans`/`jobs_or_fail`) -- never a second, independently-
+drifting `jobs:` header regex. Every check function takes an explicit
+`workflows_dir`/`manifest_path` so
 `test_check_gpu_prove_once.py` can drive them against synthetic fixture
 trees, including a fixture reproducing the PRE-FIX shape (esc-084: three
 publishers `uses:` a renting reusable).
@@ -151,6 +236,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,8 +248,24 @@ MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 sys.path.insert(0, str(REPO_ROOT / "ci" / "scripts"))
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
 import gpu_prove_verdict  # noqa: E402
+import check_execution_surface_reachability as exec_mod  # noqa: E402
+from check_execution_surface_reachability import (  # noqa: E402
+    WorkflowLoadError,
+    jobs_or_fail,
+    load_workflow_text,
+    read_top_level_on_block,
+    read_top_level_on_block_from_path,
+)
 
-PROVE_SCRIPT = "runpod_gpu_prove.sh"
+# Repo-relative PATH, not a basename (P7's identity discipline applies here
+# too): every real invocation site spells the full `ci/scripts/...` path
+# (`bash ci/scripts/runpod_gpu_prove.sh`), so matching on the path -- rather
+# than the basename -- also closes a same-basename-different-directory
+# collision (`ci/scripts/perf/runpod_gpu_prove.sh` would not falsely satisfy
+# this identity) and a same-basename PREFIX false-positive
+# (`other_runpod_gpu_prove.sh` no longer contains this constant as a
+# substring).
+PROVE_SCRIPT = "ci/scripts/runpod_gpu_prove.sh"
 PROVE_PRODUCER_WORKFLOW = "gpu-prove.yml"
 GATE_WORKFLOW = "_gpu-prove-gate.yml"  # the DELETED renting reusable -- must stay gone.
 PROOF_REQUIRED_WORKFLOW = "_gpu-proof-required.yml"
@@ -242,10 +344,13 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "cpu-image-selfcontained": PromotionRow(
         "server-image.yml", "build-and-push-selfcontained", None, "none"
     ),  # manual dispatch-only opt-in image (Cloudflare Containers) -- pre-existing behavior, out of this unit's scope.
-    # ---- image.yml / image-cuda.yml: CI base images (F1 audit fix -- P6's
-    # recursion discovers these two `build` jobs BECAUSE they `uses:` the
-    # LOCAL reusable `_ci-base-image.yml`, whose own `build-and-push` job
-    # pushes to GHCR). Both are reviewed UNGATED rows: they publish the
+    # ---- image.yml / image-cuda.yml: CI base images. Each `build` job
+    # carries a job-level `uses:` to the LOCAL reusable `_ci-base-image.
+    # yml` (whose own `build-and-push` job pushes to GHCR) -- P6's
+    # fail-closed job-level `uses:` rule presumes ANY such delegation
+    # promoting until reviewed, which is what LISTS these two jobs here;
+    # it also happens to be true that the delegate really does push.
+    # Both are reviewed UNGATED rows: they publish the
     # toolchain LAYER the release lanes build inside, on a merge to `main`,
     # never a release tag -- and (F3) each `build` job's own `if:` carries
     # the exact `github.ref_type != 'tag'` conjunct so a workflow_dispatch
@@ -266,8 +371,44 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
 }
 
-_USES_LOCAL_RE = re.compile(r"uses:\s*\./\.github/workflows/([A-Za-z0-9_.-]+)")
-_USES_CROSS_REPO_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/workflows/([A-Za-z0-9_.-]+)@")
+# Local reusable workflows REVIEWED, by direct human inspection, to invoke
+# NO publishing primitive anywhere in their own jobs -- a caller's
+# job-level `uses:` naming one of these is exempt from P6's fail-closed
+# rule (`check_p6_discovery`), which otherwise treats ANY job-level
+# delegation as promoting until reviewed. This is a small, hand-maintained
+# allowlist, never derived and never live-checked against the target's own
+# text (the fail-closed rule never opens a delegate's file at all) --
+# extending it is itself a reviewed act, exactly like `PROMOTION_TABLE`'s
+# own rows or `GATE_WORKFLOW` above.
+REVIEWED_NONPUBLISHING_LOCAL_REUSABLES: frozenset[str] = frozenset(
+    {
+        # A status-aggregator: `permissions: {}`, one job that runs a `jq`
+        # pass/fail assertion over its caller's own `needs` context.
+        "_summary.yml",
+        # A build-only reusable (`ci.yml`'s `pypi-server.yml`/`pypi-server-
+        # cuda.yml` callers): `permissions: contents: read`, no publish
+        # step anywhere -- its own header comment states the PyPI publish
+        # step deliberately lives in each CALLER instead, never here.
+        "_pypi-server.yml",
+    }
+)
+
+
+def _job_level_uses_is_reviewed_nonpublishing(job_node: dict) -> bool:
+    """`True` when this job's own job-level `uses:` names a LOCAL
+    reusable in `REVIEWED_NONPUBLISHING_LOCAL_REUSABLES` (either extension
+    spelling) -- never true for a cross-repo, dangling, or otherwise
+    unreviewed target, which stays fail-closed."""
+    target = _local_reusable_workflow_target(job_node)
+    if target is None:
+        return False
+    return bool(set(_workflow_name_variants(target)) & REVIEWED_NONPUBLISHING_LOCAL_REUSABLES)
+
+
+# P1 and P7 read a job-level `uses:` (local or cross-repo) from the
+# parsed document via `_scan_uses_references` (defined below), never a
+# text regex -- no `_USES_LOCAL_RE`/`_USES_CROSS_REPO_RE`-shaped constant
+# exists anywhere in this module.
 
 
 # --------------------------------------------------------------------------- #
@@ -314,72 +455,15 @@ def resolve_workflow(workflow_texts: dict[str, str], name: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# jobs: block splitter -- minimal, indentation-based (no PyYAML).
+# jobs: block spans -- `jobs_or_fail`/`job_source_spans` (imported above)
+# are the ONE reader, shared with `check_execution_surface_reachability.py`
+# itself: derived from the REAL parsed document (`yaml.compose`'s own node
+# marks), never a second, independently-drifting regex header match. An
+# unreadable/unparseable `jobs:` block (quoted, flow-style, a genuine YAML
+# syntax error anywhere in the file, ...) is a named FAIL, never a silent
+# "this file has zero jobs" -- the same doctrine `read_top_level_on_block`
+# already holds `on:` to.
 # --------------------------------------------------------------------------- #
-def split_top_level_jobs(text: str) -> dict[str, tuple[int, int]]:
-    """{job_id: (start_line, end_line_exclusive)} of RAW 0-based line
-    indices for each job directly under a top-level `jobs:` at 2-space
-    indent. A job's body runs from its own header line through the line
-    before the next 2-space-indented key, or EOF."""
-    lines = text.splitlines()
-    jobs_line = None
-    # F2 audit fix: comment-tolerant (`jobs:  # comment` reads identically
-    # to a bare `jobs:`) -- an exact `== "jobs:"` match used to miss this
-    # and silently read the file as having zero jobs.
-    jobs_header_re = re.compile(r"^jobs:\s*(#.*)?$")
-    for i, line in enumerate(lines):
-        if jobs_header_re.match(line):
-            jobs_line = i
-            break
-    if jobs_line is None:
-        return {}
-    job_re = re.compile(r"^  ([A-Za-z0-9_.-]+):\s*(#.*)?$")
-    starts: list[tuple[str, int]] = []
-    for i in range(jobs_line + 1, len(lines)):
-        line = lines[i]
-        if line.strip() == "" or line.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\S", line):  # dedent back to a top-level (0-indent) key -- jobs: block ended
-            break
-        m = job_re.match(line)
-        if m:
-            starts.append((m.group(1), i))
-    jobs: dict[str, tuple[int, int]] = {}
-    for idx, (name, start) in enumerate(starts):
-        end = starts[idx + 1][1] if idx + 1 < len(starts) else len(lines)
-        jobs[name] = (start, end)
-    return jobs
-
-
-def read_jobs_block_or_fail(text: str) -> tuple[dict[str, tuple[int, int]] | None, str | None]:
-    """(jobs, error). F2 audit fix: P6 scans EVERY workflow file (no
-    trigger filter), so a `jobs:` block it cannot read must FAIL LOUD --
-    the same doctrine `read_top_level_on_block` already holds `on:` to --
-    never silently read as "this file has zero jobs". A quoted `"jobs":`/
-    `'jobs':` key or a flow-style `jobs: {...}` is unreadable outright; a
-    `jobs:` header that IS found but under which `split_top_level_jobs`
-    recognizes zero job entries (e.g. every job header shifted to a
-    non-canonical 4-space indent) is refused too -- a real workflow file
-    always has at least one job, so an empty result here means "could not
-    be parsed", never "legitimately zero jobs"."""
-    lines = text.splitlines()
-    for line in lines:
-        stripped = line.strip()
-        if re.match(r'^"jobs":', stripped) or re.match(r"^'jobs':", stripped):
-            return None, 'jobs: block is quoted ("jobs": / \'jobs\':) -- cannot read'
-    jobs_header_found = False
-    for line in lines:
-        if re.match(r"^jobs:\s*(\{|\[)", line):
-            return None, "jobs: is flow-style -- cannot read"
-        if re.match(r"^jobs:\s*(#.*)?$", line):
-            jobs_header_found = True
-            break
-    if not jobs_header_found:
-        return None, "no top-level jobs: block found"
-    jobs = split_top_level_jobs(text)
-    if not jobs:
-        return None, "jobs: block found but no job entries recognized under it (non-canonical indentation?)"
-    return jobs, None
 
 
 # --------------------------------------------------------------------------- #
@@ -574,45 +658,14 @@ def check_promoting_if(expr: str, gate_job: str, tag_family: str | None = None) 
 
 
 # --------------------------------------------------------------------------- #
-# on: block reader (P1's fail-loud-on-unreadable rule).
+# on: block reader (P1's fail-loud-on-unreadable rule). SHARED: `read_top_
+# level_on_block`/`read_top_level_on_block_from_path` live in
+# `check_execution_surface_reachability.py` (imported above) -- the ONE
+# reader `check_p7_paid_pod_lanes` (push/workflow_call absence), P5, P6, and
+# `test_gpu_gang_lane.sh`'s G7 (schedule absence, via this module's own
+# `--read-on-block` CLI below) all read the `on:` block through, never a
+# second, independently-drifting copy.
 # --------------------------------------------------------------------------- #
-def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
-    """(trigger_keys, error). A quoted `"on":`/`'on':` or flow-style
-    `on: {...}` is a "cannot read" FAIL, never a silent pass.
-    """
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        if re.match(r'^"on":', stripped) or re.match(r"^'on':", stripped):
-            return None, 'on: block is quoted ("on": / \'on\':) -- cannot read'
-        if not line.startswith("on:"):
-            continue
-        # F2 audit fix: strip a trailing inline comment (`on:  # comment`)
-        # before deciding whether the line carries an inline value -- a
-        # bare `on:` with a trailing comment must be read exactly like a
-        # bare `on:` (look at the child keys below), never misread as a
-        # single literal trigger key of `"# comment"`.
-        rest = re.sub(r"\s*#.*$", "", line[len("on:") :]).strip()
-        if rest == "":
-            keys: list[str] = []
-            for j in range(i + 1, len(lines)):
-                l2 = lines[j]
-                if l2.strip() == "" or l2.strip().startswith("#"):
-                    continue
-                if re.match(r"^\S", l2):
-                    break
-                m2 = re.match(r"^  ([A-Za-z0-9_]+):", l2)
-                if m2:
-                    keys.append(m2.group(1))
-                elif not re.match(r"^  ", l2):
-                    break
-            return keys, None
-        if rest.startswith("{") or rest.startswith("["):
-            return None, "on: is flow-style -- cannot read"
-        return [rest], None
-    return None, "no top-level on: block found"
 
 
 # --------------------------------------------------------------------------- #
@@ -673,23 +726,473 @@ def check_p1_p2(workflow_texts: dict[str, str]) -> list[str]:
     # self-matches these patterns and needs no skip at all in practice.
     resolved_producer = producers[0] if len(producers) == 1 and producers[0] == PROVE_PRODUCER_WORKFLOW else None
 
+    # `uses:` (local or cross-repo) is read from the PARSED document --
+    # see `_scan_uses_references`'s own docstring.
+    parsed_cache = _parsed_jobs_cache(workflow_texts)
+    references, refusals = _scan_uses_references(
+        workflow_texts, parsed_cache, prove_producer_variants, resolved_producer
+    )
+    for ref in references:
+        if ref.kind == "local":
+            findings.append(f"P1: {ref.workflow} `uses:` {ref.target} -- nothing may call the prove lane")
+        else:
+            findings.append(
+                f"P1: {ref.workflow} `uses:` a cross-repo reference to {ref.target} -- "
+                "nothing may call the prove lane"
+            )
+    for name, err in refusals:
+        findings.append(
+            f"P1: {name}: cannot examine its jobs: to check whether it uses: "
+            f"{PROVE_PRODUCER_WORKFLOW} -- {err}"
+        )
+
     for name, text in workflow_texts.items():
         if resolved_producer is not None and name == resolved_producer:
             continue
         stripped = drop_comment_lines(text)
-        for m in _USES_LOCAL_RE.finditer(stripped):
-            if m.group(1) in prove_producer_variants:
-                findings.append(f"P1: {name} `uses:` {m.group(1)} -- nothing may call the prove lane")
-        for m in _USES_CROSS_REPO_RE.finditer(stripped):
-            if m.group(1) in prove_producer_variants:
-                findings.append(
-                    f"P1: {name} `uses:` a cross-repo reference to {m.group(1)} -- "
-                    "nothing may call the prove lane"
-                )
         for gate_variant in gate_workflow_variants:
             if gate_variant in stripped:
                 findings.append(f"P2: {name} references the deleted renting reusable {gate_variant}")
 
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# P7 (every PAID POD LANE, not only the prove lane)
+# --------------------------------------------------------------------------- #
+# P1 states the doctrine for ONE script by name. The doctrine is not about
+# that script: it is about a leg that RENTS HARDWARE. Every such leg costs
+# money per run, depends on intermittent third-party capacity, and must
+# therefore be started deliberately — never by a push, never by another
+# workflow calling it, and never from more than one place (two invokers
+# means two rentals for one commit, and no single lane owning the verdict).
+#
+# `PAID_POD_LANE_TABLE` is the reviewed registry of those legs: driver
+# script -> the ONE workflow allowed to invoke it. Each row is held to
+# exactly P1's three sub-rules:
+#
+#   (1) exactly one workflow's comment-stripped body invokes the driver, and
+#       it is the row's workflow (zero invokers is a FAIL too — a paid lane
+#       wired nowhere is a lane that silently stopped running);
+#   (2) that workflow's own `on:` block carries neither `push:` nor
+#       `workflow_call:` (an unreadable — quoted or flow-style — `on:` block
+#       is itself a FAIL, never a silent skip);
+#   (3) no OTHER workflow `uses:` it, local or cross-repo form.
+#
+# The prove lane is a row here as well as P1's subject: P1 additionally
+# pins the exactly-once PRODUCER identity that the release verdict depends
+# on (and reports its own findings in its own words), while this rule is
+# the class the prove lane is one member of. A new paid lane lands as a
+# row, in the same commit as its driver and its workflow.
+# Keys are repo-relative PATHS, never basenames -- see the module doc's P7
+# "IDENTITY IS THE REPO-RELATIVE PATH" paragraph.
+PAID_POD_LANE_TABLE: dict[str, str] = {
+    # The release-gating proof lane (also P1's own subject).
+    "ci/scripts/runpod_gpu_prove.sh": "gpu-prove.yml",
+    # The distributed-training gang leg: 1 pod x 2 GPU — the priciest row
+    # here per run, and the only one that rents more than one device.
+    "ci/scripts/runpod_gpu_gang.sh": "gpu-gang.yml",
+    # The within-run GPU perf A/B (two resident clones on one pod).
+    "ci/scripts/runpod_gpu_perf_ab.sh": "gpu-perf-ab.yml",
+    # The how-well A/B campaign driver.
+    "ci/scripts/runpod_gpu_howwell.sh": "gpu-howwell.yml",
+    # gpu-dev.sh IS deploy-capable (it can `up` a pod as well as `reap`
+    # one), and its one real invoker, gpu-reap.yml, carries RUNPOD_API_KEY
+    # at step scope to authenticate the reap call. The whole-file-scope
+    # predicate below has no verb parsing to clear the `reap` invocation
+    # with, so this row is the price of that rule, not a sign gpu-dev.sh
+    # actually rents from this site today -- see `test_gpu_dev_lifecycle.sh`
+    # for the lifecycle-safety assertions on what `reap` itself may do.
+    "ci/scripts/gpu-dev.sh": "gpu-reap.yml",
+}
+
+# --------------------------------------------------------------------------- #
+# P7's SUBJECT SET is DERIVED, and the table above is a COMPLETENESS
+# ASSERTION over it — never the other way round.
+#
+# A hand-maintained table of paid lanes has the failure mode its own subject
+# matter warns about: the next renting driver is added, nobody remembers the
+# table, and the doctrine silently does not apply to it. That is the exact
+# escape shape P7 was written to close one file over, reproduced inside P7.
+#
+# So the set of DEPLOY-CAPABLE functions is computed from `runpod_lib.sh`
+# itself — the transitive callers of `_rp_deploy_payload`, the one function
+# that builds a pod-creation payload — and a RENTING DRIVER is any tracked
+# `ci/scripts/**` file whose comment-stripped text calls a member of that
+# closure. Each derived driver must then be EITHER a table row (held to the
+# three sub-rules above) OR must satisfy a machine predicate showing that no
+# workflow can make it rent (below). A table row whose driver has left the
+# derived set is reported as ROT.
+#
+# WHAT THE DERIVATION DELIBERATELY DOES NOT DO:
+#
+#   * It does not follow `source`. Every `source` target in this class is
+#     variable-interpolated (`source "$DIR/runpod_lib.sh"`), so a transitive
+#     "this file sources a file that can deploy" clause is not decidable by
+#     a static scan — and a clause that pretended otherwise would be a
+#     guess. A driver is judged on the calls IT makes.
+#   * It does not parse bash. Function bodies are split at top-level
+#     `name() {` starts, and a body runs to the NEXT such start — so
+#     top-level code sitting between two functions is attributed to the
+#     preceding one. That over-approximates: it can only ADD members to the
+#     closure, never drop one, which is the fail-closed direction.
+#   * A word-boundary occurrence of a closure member's name in
+#     comment-stripped text counts as a call. That over-approximates too,
+#     again in the fail-closed direction: `test_check_gpu_prove_once.py`
+#     spells the members out in its own fixture strings and is therefore
+#     derived as a driver itself. Nothing is exempted for being ours — such
+#     a file is cleared by the same machine predicate as any other (the
+#     workflow whose guard job runs it carries no `RUNPOD_API_KEY` at any
+#     scope), which is exactly the outcome an exemption list would have
+#     hidden.
+#
+# RESIDUALS, disclosed rather than assumed away. All three are
+# UNDER-approximations — the direction that can miss a renter — so they are
+# named, not argued away:
+#
+#   * VARIABLE INVOCATION PATH: a workflow step that invokes a driver through
+#     a variable path (`bash "$SCRIPT"`) is invisible to the whole-file
+#     mention scan below, exactly as it is to every other line-shaped rule in
+#     this file. `git grep -nE 'bash +"?\$' -- .github/workflows` returns
+#     nothing on this tree, which covers that one spelling only; the scan
+#     reports what it can see, and a driver whose path is mentioned in NO
+#     workflow file is reported as a NOTE by `_check_derived_driver_cannot_rent`
+#     — printed, never a failure and never a clear.
+#   * COMPOSED CALL NAME: `_mentions` matches a closure member's name as a
+#     word in the driver's comment-stripped text, so a call whose FUNCTION
+#     NAME is assembled at run time — `p=rp_deploy_; s=arch; "${p}${s}" a100`
+#     — spells no member and the file is not derived as a driver at all. Bash
+#     name composition is not decidable by a static scan; the same limit
+#     applies to `derive_deploy_closure`'s own caller scan inside
+#     `runpod_lib.sh`. What was actually checked, and what it found:
+#     `git grep -nE '"\$\{[A-Za-z_][A-Za-z0-9_]*\}\$\{' -- ci/scripts` returns
+#     the composed-parameter form in VALUE position — string accumulators in
+#     `pod_push_stamp.sh`/`pod_seed_target.sh`/`test_pod_substrate.sh` — AND
+#     its own self-match: the very example quoted two sentences up
+#     (`"${p}${s}"`) is itself comment text inside THIS file, so the same
+#     grep also reports a hit here. It is disclosed rather than filtered out,
+#     because filtering "our own doc comment" out by hand is exactly the kind
+#     of judgment call a static scan cannot make either — none of the matches
+#     on this tree sit in COMMAND position. That is an enumeration of one
+#     spelling on one day, not a proof: a driver written this way is missed,
+#     which is why the residual is written down here instead of a claim that
+#     the derivation is complete.
+#   * COMPOSITE ACTIONS: `load_workflow_texts` globs `.github/workflows/*.yml`
+#     and `*.yaml` only. `.github/actions/**` composite actions are invisible
+#     to it, and therefore to every rule in this file, not only P7's
+#     whole-file mention scan — a composite action is never itself an entry
+#     in `workflow_texts`. It does NOT get folded into the fallback's
+#     whole-file scan (that would require a second glob and a second
+#     "carries the secret" question this module does not yet ask). On this
+#     tree: `git grep -l RUNPOD_API_KEY -- .github/actions` and
+#     `git grep -l 'ci/scripts/runpod' -- .github/actions` both return
+#     nothing, so no derived driver's path and no secret sits inside a
+#     composite action today — but a future one would be exactly as invisible
+#     here as it already is to P1-P6's own workflow-only scans.
+# --------------------------------------------------------------------------- #
+SCRIPTS_ROOT = "ci/scripts/"
+RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
+DEPLOY_PAYLOAD_FN = "_rp_deploy_payload"
+
+# The secret that turns a script that CAN deploy into a step that WILL: with
+# no `RUNPOD_API_KEY` anywhere in the invoking WORKFLOW, `rp_init` refuses
+# before any pod is created. The secret's presence is the capability — its
+# scope in the file (top-level env, job env, step env, with:) is not, and
+# neither is what verb, if any, a step hands the driver: the fallback rule
+# below has no verb parsing left to read one with.
+RUNPOD_SECRET = "RUNPOD_API_KEY"
+
+_BASH_FN_DEF_RE = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{", re.MULTILINE)
+
+
+def _bash_function_bodies(text: str) -> dict[str, str]:
+    """`{function name: its (over-approximated) body}` for every top-level
+    `name() {` definition in a comment-stripped bash file. See the section
+    comment for why the body boundary is the next definition."""
+    stripped = drop_comment_lines(text)
+    starts = list(_BASH_FN_DEF_RE.finditer(stripped))
+    bodies: dict[str, str] = {}
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(stripped)
+        bodies[m.group("name")] = bodies.get(m.group("name"), "") + stripped[m.start() : end]
+    return bodies
+
+
+def _mentions(text: str, name: str) -> bool:
+    return re.search(r"\b" + re.escape(name) + r"\b", text) is not None
+
+
+def derive_deploy_closure(lib_text: str) -> tuple[frozenset[str], list[str]]:
+    """The deploy-capable function set: the TRANSITIVE CALLERS of
+    `_rp_deploy_payload` inside `runpod_lib.sh`. Returns
+    `(closure, findings)`; a non-empty `findings` means the closure could
+    not be computed and P7 has no subject set — a FAIL, never a skip."""
+    bodies = _bash_function_bodies(lib_text)
+    if DEPLOY_PAYLOAD_FN not in bodies:
+        return frozenset(), [
+            f"P7: cannot derive the deploy closure — no `{DEPLOY_PAYLOAD_FN}() {{` definition in "
+            f"{RUNPOD_LIB_REL}. P7's subject set is computed from that function's transitive "
+            "callers; with no seed there is no set, and every renting driver would go unchecked"
+        ]
+    members: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        targets = {DEPLOY_PAYLOAD_FN} | members
+        for name, body in bodies.items():
+            if name == DEPLOY_PAYLOAD_FN or name in members:
+                continue
+            if any(_mentions(body, t) for t in targets):
+                members.add(name)
+                changed = True
+    if not members:
+        return frozenset(), [
+            f"P7: the deploy closure is EMPTY — nothing in {RUNPOD_LIB_REL} calls "
+            f"`{DEPLOY_PAYLOAD_FN}`. Either the payload builder was renamed (rename it here too) or "
+            "the deploy path moved; an empty closure would silently exempt every renting driver"
+        ]
+    return frozenset(members), []
+
+
+def derive_renting_drivers(
+    script_texts: dict[str, str], closure: frozenset[str]
+) -> dict[str, list[str]]:
+    """`{repo-relative script path: the closure members it calls}` for every
+    tracked `ci/scripts/**` file except `runpod_lib.sh` itself (which DEFINES
+    the closure — its own definitions and internal calls are the seam, not a
+    lane)."""
+    drivers: dict[str, list[str]] = {}
+    for rel, text in sorted(script_texts.items()):
+        if rel == RUNPOD_LIB_REL or not rel.startswith(SCRIPTS_ROOT):
+            continue
+        stripped = drop_comment_lines(text)
+        called = sorted(name for name in closure if _mentions(stripped, name))
+        if called:
+            drivers[rel] = called
+    return drivers
+
+
+def load_script_texts(repo_root: Path = REPO_ROOT) -> dict[str, str]:
+    """Every TRACKED `ci/scripts/**` file's text, keyed by repo-relative
+    path (`git ls-files`, the same enumeration `check_execution_surface_
+    reachability.py` and `check_ci_guard_wiring.py` already use — a script
+    CI's own checkout would not have is not a lane)."""
+    out = subprocess.run(
+        ["git", "ls-files", "ci/scripts"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    texts: dict[str, str] = {}
+    for rel in out.stdout.splitlines():
+        if not rel.startswith(SCRIPTS_ROOT):
+            continue
+        path = repo_root / rel
+        try:
+            texts[rel] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return texts
+
+
+def _check_derived_driver_cannot_rent(
+    script_rel: str, workflow_texts: dict[str, str], notes: list[str] | None = None
+) -> list[str]:
+    """The machine predicate a derived driver that is NOT a
+    `PAID_POD_LANE_TABLE` row must satisfy: its repo-relative path is
+    mentioned in NO workflow file whose comment-stripped text also carries
+    `RUNPOD_SECRET` at any scope. WHOLE-FILE SCOPE, no verb parsing: there is
+    no job/step attribution and no first-argument reading here at all — a
+    prior revision cleared an invocation whose literal first argument was a
+    non-renting verb (`reap`) and read the secret at workflow scope; both the
+    verb clearance AND the job-body scoping it was computed over are GONE.
+    The only two questions this predicate asks are "does the driver's path
+    appear in this file" and "does the secret appear in this file", each
+    over the SAME comment-stripped whole-file text.
+
+    That is an over-approximation in the FAIL-CLOSED direction, and
+    deliberately so: a `paths:` filter entry naming a derived driver inside a
+    secret-holding workflow now demands a row exactly as a real invocation
+    would, even though the filter entry alone runs nothing. Parsing what
+    kind of YAML construct a path sits inside — a `run:` command, a `paths:`
+    filter, a `with:` value — is exactly the kind of case analysis a
+    verb-parsing predicate already tried and lost fixtures over; the
+    remaining rule asks only whether the two strings share a file. The
+    remedy is unchanged — give the driver a PAID_POD_LANE_TABLE row, or drop
+    the secret from that workflow (there is no verb to hand it any more).
+
+    The text is still comment-stripped, so a commented-out or documented
+    secret, or a commented-out mention of the driver's path, is text, not a
+    capability and not a mention.
+
+    THE NOTE CHANNEL FIRES ON ABSENCE. A derived driver whose path is
+    mentioned in NO workflow file at all lands in `notes` (printed, never a
+    failure): nothing in the committed text establishes that it can rent,
+    and nothing establishes that it cannot — a state defined by missing
+    evidence gets no definite consequence, and a silent clear would have
+    made this file's own prose false. A driver mentioned in at least one
+    workflow, none of which carries the secret, produces NEITHER a finding
+    NOR a note: it is not absent (so the note does not fire), and nothing
+    that mentions it can make it rent (so there is nothing to condemn). That
+    silence is this rule's own stated outcome for that shape, not a gap —
+    see the module doc's P7 section and the test named for exactly this
+    shape."""
+    findings: list[str] = []
+    mentioned_anywhere = False
+    for name in sorted(workflow_texts):
+        stripped = drop_comment_lines(workflow_texts[name])
+        if script_rel not in stripped:
+            continue
+        mentioned_anywhere = True
+        if RUNPOD_SECRET not in stripped:
+            continue
+        findings.append(
+            f"P7: {script_rel} calls runpod_lib.sh's deploy closure and its repo-relative path "
+            f"is mentioned in {name}, whose comment-stripped text also carries {RUNPOD_SECRET} "
+            "somewhere (top-level env, job env, step env, with:, or a paths: filter — no verb "
+            "parsing clears a mention under this rule) — that workflow can RENT with this "
+            "driver. A deploy-capable driver whose path is mentioned in a secret-holding "
+            "workflow is a paid pod lane: give it a PAID_POD_LANE_TABLE row (one workflow, no "
+            "push:/workflow_call: trigger, nothing uses: it), or drop the secret from that "
+            "workflow"
+        )
+    if not mentioned_anywhere and notes is not None:
+        notes.append(
+            f"P7 NOTE: {script_rel} calls runpod_lib.sh's deploy closure, but its repo-relative "
+            "path is mentioned in no workflow file in this tree (comment-stripped, whole file) — "
+            "so nothing here establishes that it can rent, and nothing establishes that it "
+            "cannot. Reported, not judged: it is not a failure, and it is not cleared either"
+        )
+    return findings
+
+
+def check_p7_paid_pod_lanes(
+    workflow_texts: dict[str, str],
+    script_texts: dict[str, str] | None = None,
+    lib_text: str | None = None,
+    notes: list[str] | None = None,
+) -> list[str]:
+    findings: list[str] = []
+
+    # --- the DERIVED subject set (see the section comment above) ---------- #
+    if script_texts is None:
+        script_texts = load_script_texts()
+    if lib_text is None:
+        lib_text = script_texts.get(RUNPOD_LIB_REL)
+    if lib_text is None:
+        findings.append(
+            f"P7: {RUNPOD_LIB_REL} is not in the scanned ci/scripts set — the deploy closure P7's "
+            "subject set is derived from cannot be computed, so no renting driver can be checked"
+        )
+        closure: frozenset[str] = frozenset()
+        derived: dict[str, list[str]] = {}
+    else:
+        closure, closure_findings = derive_deploy_closure(lib_text)
+        findings += closure_findings
+        derived = derive_renting_drivers(script_texts, closure) if closure else {}
+
+    if closure:
+        # Identity is the repo-relative PATH here too: compare `derived`'s
+        # own keys against `PAID_POD_LANE_TABLE`'s own keys directly, never
+        # via a basename re-keying (`rel.rsplit("/", 1)[-1]`) that would fold
+        # `ci/scripts/perf/<x>.sh` and `ci/scripts/<x>.sh` into one bucket —
+        # see the module doc's P7 "IDENTITY IS THE REPO-RELATIVE PATH"
+        # paragraph. No `rsplit("/")` anywhere in this file.
+        table_paths = set(PAID_POD_LANE_TABLE)
+        # Rot: a row whose driver no longer calls the deploy closure (it was
+        # rewritten, or the closure moved) is a row asserting a fact that
+        # stopped being true.
+        for rel in sorted(table_paths - set(derived)):
+            findings.append(
+                f"P7: PAID_POD_LANE_TABLE row `{rel}` names a driver that does NOT call "
+                f"runpod_lib.sh's deploy closure ({sorted(closure)}) — the row asserts a paid pod "
+                "lane that no longer exists; delete the row, or restore the call"
+            )
+        # Completeness: a derived driver that is not a row must be provably
+        # unable to rent from any workflow.
+        for rel in sorted(derived):
+            if rel in table_paths:
+                continue
+            findings += _check_derived_driver_cannot_rent(rel, workflow_texts, notes)
+
+    # Computed ONCE, shared by every row below -- see `_parsed_jobs_
+    # cache`'s own docstring.
+    parsed_cache = _parsed_jobs_cache(workflow_texts)
+    reported_refusals: set[str] = set()
+
+    for script, workflow in sorted(PAID_POD_LANE_TABLE.items()):
+        producers = sorted(
+            name for name, text in workflow_texts.items() if script in drop_comment_lines(text)
+        )
+        resolved_workflow = resolve_workflow(workflow_texts, workflow)
+
+        if not producers:
+            findings.append(
+                f"P7: zero workflows invoke {script} — the paid pod lane it drives is wired nowhere, "
+                "so nothing runs it and nothing can be proven by it"
+            )
+        else:
+            # Two DISTINCT states, each with its own message. They used to
+            # share one ("more than one workflow") that was simply false for
+            # the commonest shape — a single invoker which is the WRONG one —
+            # and a finding that misdescribes what it found sends the reader
+            # looking for a second site that does not exist.
+            if resolved_workflow is None:
+                findings.append(
+                    f"P7: {script} is invoked by {producers}, but its PAID_POD_LANE_TABLE row names "
+                    f"{workflow}, which does not resolve to a workflow in this tree — the row's "
+                    "'exactly one invoker' claim cannot be checked against anything"
+                )
+            elif resolved_workflow not in producers:
+                findings.append(
+                    f"P7: {script} is invoked by {producers}, none of which is {workflow} — a paid pod "
+                    f"lane's driver belongs to the one workflow its row names, so either {workflow} "
+                    f"lost the invocation or the row now names the wrong workflow"
+                )
+            extra = [p for p in producers if p != resolved_workflow]
+            if extra and len(producers) > 1:
+                findings.append(
+                    f"P7: {script} is invoked by more than one workflow ({producers}) — only {workflow} "
+                    f"may rent for this lane; extra site(s): {extra}"
+                )
+
+        if resolved_workflow is None:
+            findings.append(f"P7: {workflow} is missing from the workflow tree")
+            continue
+
+        keys, err = read_top_level_on_block(workflow_texts[resolved_workflow])
+        if err is not None:
+            findings.append(f"P7: {resolved_workflow}: {err}")
+        else:
+            bad_triggers = [k for k in (keys or []) if k in ("push", "workflow_call")]
+            if bad_triggers:
+                findings.append(
+                    f"P7: {resolved_workflow}'s on: block carries {bad_triggers} — a leg that RENTS "
+                    "hardware is never started by a push and is never callable by another workflow "
+                    "(it fires on a label, a schedule, or a manual dispatch only)"
+                )
+
+        # `uses:` (local or cross-repo) is read from the PARSED document
+        # -- see `_scan_uses_references`'s own docstring.
+        workflow_variants = set(_workflow_name_variants(workflow))
+        references, refusals = _scan_uses_references(workflow_texts, parsed_cache, workflow_variants, resolved_workflow)
+        for ref in references:
+            if ref.kind == "local":
+                findings.append(f"P7: {ref.workflow} `uses:` {ref.target} — nothing may call a paid pod lane")
+            else:
+                findings.append(
+                    f"P7: {ref.workflow} `uses:` a cross-repo reference to {ref.target} — nothing may call "
+                    "a paid pod lane"
+                )
+        for name, err in refusals:
+            if name in reported_refusals:
+                continue
+            reported_refusals.add(name)
+            findings.append(
+                f"P7: {name}: cannot examine its jobs: to check whether it uses: a paid pod lane "
+                f"workflow -- {err}"
+            )
     return findings
 
 
@@ -774,7 +1277,11 @@ def find_step_if_by_name(
     reconstitutes ITS OWN `if:` at that step's own key column -- never a
     job-level `if:` or a different step's. `found` is `False` when no step
     with that name exists in this job at all (its own P3 finding, distinct
-    from an unreadable `if:`)."""
+    from an unreadable `if:`). Identification is by DISPLAY NAME ONLY --
+    two steps in the same job may share an identical `name:` (GitHub
+    Actions does not require uniqueness); this returns the FIRST match,
+    which can silently pick the wrong one of two same-named steps. See
+    https://github.com/f-inverse/jammi-ai/issues/564."""
     for s, e in _find_step_ranges(lines, job_start, job_end):
         keys = _parse_step_keys(lines, s, e)
         name = _step_display_name(keys)
@@ -796,24 +1303,37 @@ def _step_display_name(keys: dict[str, str]) -> str:
 
 
 def _other_publishing_steps(
-    lines: list[str], job_start: int, job_end: int, gated_step_name: str
-) -> list[tuple[str, str]]:
-    """F4 audit fix: `[(step_name, matched_primitive), ...]` for every step
-    in this job OTHER than `gated_step_name` whose own (comment-stripped)
-    body itself invokes a publishing primitive -- a step-gated row (P3)
-    only ever pinned the NAMED step's `if:`; a second, ungated publishing
-    step in the SAME job used to sail through unseen."""
+    job_node: dict, gated_step_name: str
+) -> tuple[list[tuple[str, str]], str | None]:
+    """(`[(step_name, matched_primitive), ...]`, error) for every step in
+    this job OTHER than `gated_step_name` -- a step-gated row (P3) only
+    ever pins the NAMED step's `if:`; a second, ungated publishing step in
+    the SAME job used to sail through unseen. Reads `steps:` from the
+    PARSED document via `_step_invokes_publish_primitive`, the SAME
+    reader `job_invokes_publish_primitive` uses -- never a hand-rolled
+    step-range text scan, which a quoted `uses:` or a flow-style
+    `steps: [...]` both escaped. `error` is set (matches always `[]`)
+    when this job's own `steps:` cannot be examined at all (missing, not
+    a list, or an entry that is not itself a mapping). `gated_step_name`
+    exclusion is by DISPLAY NAME ONLY -- a second, ungated step sharing
+    the SAME `name:` as the genuinely gated one is excluded here too and
+    stays invisible, the same identification gap `find_step_if_by_name`
+    carries. See https://github.com/f-inverse/jammi-ai/issues/564."""
+    steps = job_node.get("steps")
+    if not isinstance(steps, list):
+        return [], "steps: is missing or is not a list -- cannot examine"
     out: list[tuple[str, str]] = []
-    for s, e in _find_step_ranges(lines, job_start, job_end):
-        keys = _parse_step_keys(lines, s, e)
-        name = _step_display_name(keys)
+    for step in steps:
+        if not isinstance(step, dict):
+            return [], "a steps: entry is not a mapping -- cannot examine"
+        name = step.get("name")
+        name = name.strip() if isinstance(name, str) else ""
         if name == gated_step_name:
             continue
-        step_body = drop_comment_lines("\n".join(lines[s:e]))
-        primitive = job_invokes_publish_primitive(step_body)
+        primitive = _step_invokes_publish_primitive(step)
         if primitive is not None:
             out.append((name or "<unnamed step>", primitive))
-    return out
+    return out, None
 
 
 def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> list[str]:
@@ -845,8 +1365,15 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
         if text is None:
             findings.append(f"P3: row `{key}`: workflow file {row.workflow} is missing")
             continue
-        jobs = split_top_level_jobs(text)
+        jobs, jobs_err = jobs_or_fail(text)
+        if jobs_err is not None:
+            findings.append(f"P3: row `{key}`: {row.workflow}: {jobs_err}")
+            continue
         lines = text.splitlines()
+        # Parsed-document twin, needed only by the step-gated (`step_name`)
+        # branch below -- the second-ungated-publishing-step check reads
+        # `steps:` from here, never from a text-range scan.
+        parsed_jobs, parsed_jobs_err = _parsed_jobs_or_fail(text)
 
         promo_range = jobs.get(row.promoting_job)
         if promo_range is None:
@@ -889,12 +1416,30 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
             if gate_range is None:
                 findings.append(f"P3: row `{key}`: {row.workflow} has no gate job `{gate_job}`")
             else:
-                gate_body = drop_comment_lines("\n".join(lines[gate_range[0] : gate_range[1]]))
-                if f"uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}" not in gate_body:
+                # Reads the gate job's OWN job-level `uses:` from the
+                # PARSED document -- never a text substring, which a
+                # `name:` value carrying that same literal text could
+                # otherwise satisfy without the job actually using: it.
+                if parsed_jobs_err is not None:
                     findings.append(
-                        f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}` does not "
-                        f"`uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}`"
+                        f"P3: row `{key}`: {row.workflow}: cannot examine gate job `{gate_job}` from the "
+                        f"parsed document: {parsed_jobs_err}"
                     )
+                else:
+                    gate_node = parsed_jobs.get(gate_job)
+                    if gate_node is None:
+                        findings.append(
+                            f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}` is missing from the "
+                            "parsed document"
+                        )
+                    else:
+                        gate_target = _local_reusable_workflow_target(gate_node)
+                        proof_required_variants = set(_workflow_name_variants(PROOF_REQUIRED_WORKFLOW))
+                        if gate_target is None or gate_target not in proof_required_variants:
+                            findings.append(
+                                f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}` does not "
+                                f"`uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}`"
+                            )
                 # F7 audit fix: the gate job's OWN `if:` must also carry the
                 # row's exact tag-family conjunct -- a gate job reachable
                 # off no tag restriction (or the wrong family) would let the
@@ -941,14 +1486,31 @@ def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> lis
             # F4 audit fix: a step-gated row only pins the NAMED step's
             # `if:` -- a second, ungated step in the SAME job that itself
             # invokes a publishing primitive used to sail through unseen.
-            findings.extend(
-                f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` has a SECOND "
-                f"step (`{other_name}`) that also invokes a publishing primitive ({primitive}) but is "
-                f"not the gated step `{row.step_name}`"
-                for other_name, primitive in _other_publishing_steps(
-                    lines, promo_range[0], promo_range[1], row.step_name
+            if parsed_jobs_err is not None:
+                findings.append(
+                    f"P3: row `{key}`: {row.workflow}: cannot examine its steps: from the parsed "
+                    f"document: {parsed_jobs_err}"
                 )
-            )
+            else:
+                promo_node = parsed_jobs.get(row.promoting_job)
+                if promo_node is None:
+                    findings.append(
+                        f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` is "
+                        "missing from the parsed document -- cannot examine its steps"
+                    )
+                else:
+                    other_matches, other_err = _other_publishing_steps(promo_node, row.step_name)
+                    if other_err is not None:
+                        findings.append(
+                            f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}`'s "
+                            f"{other_err}"
+                        )
+                    findings.extend(
+                        f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` has a "
+                        f"SECOND step (`{other_name}`) that also invokes a publishing primitive "
+                        f"({primitive}) but is not the gated step `{row.step_name}`"
+                        for other_name, primitive in other_matches
+                    )
 
         if err is not None:
             findings.append(f"P3: row `{key}`: {row.workflow}'s {where}: {err}")
@@ -990,148 +1552,383 @@ _SIMPLE_PRIMITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("docker buildx imagetools create", re.compile(r"docker\s+buildx\s+imagetools\s+create\b")),
 )
 
-# `push:`-conditional primitives: matching the marker is not enough on its
-# own -- these are ALSO used for build-only verification (`push: "false"`),
-# so the marker only counts when the SAME job body also carries a `push:`
-# value that is not literally `false`/`"false"`/`'false'` (an unquoted
-# `true`, a quoted `'true'`, or any `${{ }}` expression all count, since any
-# of these MAY resolve to a push at runtime -- only a literal false
-# structurally never can).
+# `push:`-conditional primitives: matching the action is not enough on its
+# own -- both are ALSO used for build-only verification (`push: false`), so
+# the match only counts when the SAME step's own `with:` mapping does not
+# hold the literal `push: false`/`push: "false"` (see `_step_push_is_
+# promoting`, below -- read from the parsed document, never a text regex).
 _DOCKER_BUILD_PUSH_ACTION_RE = re.compile(r"docker/build-push-action(?:@|\b)")
-_LOCAL_DOCKER_PUBLISH_RE = re.compile(r"uses:\s*\./\.github/actions/docker-publish\b")
-_CROSS_REPO_DOCKER_PUBLISH_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/actions/docker-publish@")
-_PUSH_VALUE_RE = re.compile(r"^[ \t]*push:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+_LOCAL_DOCKER_PUBLISH_VALUE_RE = re.compile(r"^\./\.github/actions/docker-publish\b")
+_CROSS_REPO_DOCKER_PUBLISH_VALUE_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/docker-publish@")
 
 # `release-upload`: unconditional (unlike docker-publish, this action has no
-# `push: "false"`-shaped build-only mode -- every call is a real upload).
-_LOCAL_RELEASE_UPLOAD_RE = re.compile(r"uses:\s*\./\.github/actions/release-upload\b")
-_CROSS_REPO_RELEASE_UPLOAD_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/actions/release-upload@")
+# `push: false`-shaped build-only mode -- every call is a real upload).
+_LOCAL_RELEASE_UPLOAD_VALUE_RE = re.compile(r"^\./\.github/actions/release-upload\b")
+_CROSS_REPO_RELEASE_UPLOAD_VALUE_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/actions/release-upload@")
 
 
-def _push_value_is_promoting(job_body: str) -> bool:
-    for m in _PUSH_VALUE_RE.finditer(job_body):
-        val = m.group(1).strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-            val = val[1:-1]
-        if val.strip().lower() == "false":
-            continue
+def _step_push_is_promoting(step_node: dict) -> bool:
+    """Fail-closed: a step's own `with:` mapping decides `push:` -- absent
+    entirely, unparseable (`with:` not a mapping, or no `push:` key), or
+    ANY value other than the exact literal `False` / `"false"` is
+    PROMOTING. Read entirely from the parsed step mapping; no text regex
+    on `push:` remains anywhere in this module. Known gap: `False` here
+    is whatever PyYAML's own SafeLoader already constructed a bare
+    scalar into, and PyYAML's YAML-1.1 boolean set (`off`/`no`/`n`, ...)
+    is WIDER than GitHub Actions' own (`false`/`False`/`FALSE` only) --
+    a bare `push: off` reads as Python `False` here but is a STRING to
+    GitHub's own resolver, not a boolean. See
+    https://github.com/f-inverse/jammi-ai/issues/563."""
+    with_value = step_node.get("with")
+    if not isinstance(with_value, dict) or "push" not in with_value:
         return True
-    return False
+    push = with_value["push"]
+    return not (push is False or push == "false")
 
 
-def job_invokes_publish_primitive(job_body: str) -> str | None:
-    """`job_body` must already be comment-stripped. Returns the matched
-    primitive's display name, or `None`. A job whose body invokes ANY
-    listed primitive is a "promotion job" for P6's purposes -- it must be
-    listed in `PROMOTION_TABLE` (any row, any gate_kind) or this gate fails
-    by name. DIRECT match only -- see `job_invokes_publish_primitive_
-    recursive` for the "delegates to a local reusable that itself pushes"
-    case."""
+def _step_scalar_values(step_node: dict) -> list[str]:
+    """Every string scalar this step's own body can carry a publishing
+    marker in -- `run`, `uses`, every value under `with:`, every value
+    under `env:` -- the whole-step domain this matcher is held to,
+    including `with.command`/`with.script`/`with.args`/`with.entrypoint`/
+    `env`-carried markers, never `run`/`uses` alone.
+    `name`/`id`/`if` are deliberately EXCLUDED: identifiers and
+    conditions, never invocation content. A non-string `with:`/`env:`
+    value (a bool, a number) cannot itself match a substring pattern and
+    contributes nothing here."""
+    values: list[str] = []
+    for key in ("run", "uses"):
+        v = step_node.get(key)
+        if isinstance(v, str):
+            values.append(v)
+    for key in ("with", "env"):
+        mapping = step_node.get(key)
+        if isinstance(mapping, dict):
+            values.extend(v for v in mapping.values() if isinstance(v, str))
+    return values
+
+
+def _step_invokes_publish_primitive(step_node: dict) -> str | None:
+    """The matched primitive's display name for ONE step, read entirely
+    from the parsed document, or `None`. `_SIMPLE_PRIMITIVE_PATTERNS` are
+    searched over EVERY scalar `_step_scalar_values` returns (a shell
+    command, an action reference, or an input/env value all have no
+    YAML-quoting escape once read from the parsed value). `docker/build-
+    push-action` and the docker-publish/release-upload actions (local and
+    cross-repo) match on the parsed `uses:` scalar specifically, with
+    `push:` decided by this SAME step's own `with:` mapping
+    (`_step_push_is_promoting`). This is the ONE reader both
+    `job_invokes_publish_primitive` (every step in a job) and
+    `_other_publishing_steps` (every step but a job's gated one) use."""
+    text = "\n".join(_step_scalar_values(step_node))
     for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
-        if pattern.search(job_body):
+        if pattern.search(text):
             return label
-    if _DOCKER_BUILD_PUSH_ACTION_RE.search(job_body) and _push_value_is_promoting(job_body):
-        return "docker/build-push-action (push != false)"
-    if (
-        _LOCAL_DOCKER_PUBLISH_RE.search(job_body) or _CROSS_REPO_DOCKER_PUBLISH_RE.search(job_body)
-    ) and _push_value_is_promoting(job_body):
-        return "./.github/actions/docker-publish (push != false)"
-    if _LOCAL_RELEASE_UPLOAD_RE.search(job_body) or _CROSS_REPO_RELEASE_UPLOAD_RE.search(job_body):
+    uses = step_node.get("uses")
+    if not isinstance(uses, str):
+        return None
+    if _DOCKER_BUILD_PUSH_ACTION_RE.search(uses):
+        return "docker/build-push-action (push != false)" if _step_push_is_promoting(step_node) else None
+    if _LOCAL_DOCKER_PUBLISH_VALUE_RE.match(uses) or _CROSS_REPO_DOCKER_PUBLISH_VALUE_RE.match(uses):
+        return "./.github/actions/docker-publish (push != false)" if _step_push_is_promoting(step_node) else None
+    if _LOCAL_RELEASE_UPLOAD_VALUE_RE.match(uses) or _CROSS_REPO_RELEASE_UPLOAD_VALUE_RE.match(uses):
         return "./.github/actions/release-upload"
     return None
 
 
-def _local_reusable_workflow_targets(job_body: str) -> list[str]:
-    """Job-level `uses: ./.github/workflows/<X>.yml` targets referenced
-    directly in this job's body (never a step-level action `uses:`, which
-    `job_invokes_publish_primitive` already covers by pattern)."""
-    return [m.group(1) for m in _USES_LOCAL_RE.finditer(job_body)]
+def job_invokes_publish_primitive(job_node: dict) -> tuple[str | None, str | None]:
+    """(primitive, error). `primitive` is the matched display name for the
+    first (in order) step that invokes one -- a job whose steps invoke ANY
+    listed primitive is a "promotion job" for P6's purposes: it must be
+    listed in `PROMOTION_TABLE` (any row, any gate_kind) or this gate
+    fails by name. Reads every step from the PARSED document via
+    `_step_invokes_publish_primitive`. `error` is set (primitive always
+    `None`) the moment any step entry is not itself a mapping (never valid
+    GitHub Actions, but not assumed here) -- a named finding, never a
+    silent skip, consistent with `_other_publishing_steps`'s identical
+    rule. A job-level `uses:` (this job itself delegating to another
+    workflow, carrying no `steps:` of its own) is a SEPARATE, fail-closed
+    rule `check_p6_discovery` applies directly -- see its own docstring."""
+    for step in job_node.get("steps") or []:
+        if not isinstance(step, dict):
+            return None, "a steps: entry is not a mapping -- cannot examine"
+        found = _step_invokes_publish_primitive(step)
+        if found is not None:
+            return found, None
+    return None, None
 
 
-def _workflow_job_bodies(text: str) -> dict[str, str]:
-    stripped = drop_comment_lines(text)
-    lines = stripped.splitlines()
-    jobs = split_top_level_jobs(stripped)
-    return {name: "\n".join(lines[s:e]) for name, (s, e) in jobs.items()}
+_LOCAL_WORKFLOW_USES_PREFIX = "./.github/workflows/"
 
 
-def job_invokes_publish_primitive_recursive(
-    job_body: str,
+def _local_reusable_workflow_target(job_node: dict) -> str | None:
+    """The job-level `uses: ./.github/workflows/<X>.yml` target THIS job
+    delegates to (never a step-level action `uses:`, which lives under a
+    DIFFERENT key, `steps:`, and is `job_invokes_publish_primitive`'s own
+    concern) -- read directly from the job's own PARSED mapping
+    (`load_workflow_text`'s construction), never a text regex, so a
+    quoted value and a filename containing `+` are both read correctly
+    (a text character class truncates at `+`; the parser never does). A
+    job carries at most one job-level `uses:` (GitHub Actions itself
+    makes `uses:` and `steps:`/`runs-on:` mutually exclusive at the job
+    level), so this returns a single target, never a list. `None` when
+    this job has no job-level `uses:` at all, or that value does not name
+    a LOCAL workflow (a cross-repo or step-level reference is out of this
+    function's scope by construction). Used by P1's/P7's `_scan_uses_
+    references` (P6's own job-level `uses:` rule, `check_p6_discovery`,
+    checks only for PRESENCE of a job-level `uses:` and does not need this
+    function at all -- see its own docstring for why)."""
+    uses = job_node.get("uses")
+    if not isinstance(uses, str):
+        return None
+    uses = uses.strip()
+    if not uses.startswith(_LOCAL_WORKFLOW_USES_PREFIX):
+        return None
+    return uses[len(_LOCAL_WORKFLOW_USES_PREFIX) :]
+
+
+# `_cross_repo_reusable_workflow_target` is `_local_reusable_workflow_
+# target`'s cross-repo twin -- ANY owner/repo (basename-matched), pinned
+# ref or branch alike, read from the parsed scalar so quoting cannot hide
+# it either. Used by P1's/P7's `_scan_uses_references` only.
+_CROSS_REPO_WORKFLOW_USES_RE = re.compile(r"^[\w.-]+/[\w.-]+/\.github/workflows/(.+)@")
+
+
+def _cross_repo_reusable_workflow_target(job_node: dict) -> str | None:
+    """The `<X>` in a job-level `uses: <owner>/<repo>/.github/workflows/
+    <X>@<ref>` reference (ANY owner/repo, any ref -- branch, tag, or
+    pinned sha alike) -- read from the job's own PARSED mapping, never a
+    text regex. `None` when this job has no job-level `uses:`, or that
+    value is not a cross-repo workflow reference (a local reference is
+    `_local_reusable_workflow_target`'s own concern; the two are mutually
+    exclusive since a job carries at most one job-level `uses:`)."""
+    uses = job_node.get("uses")
+    if not isinstance(uses, str):
+        return None
+    m = _CROSS_REPO_WORKFLOW_USES_RE.match(uses.strip())
+    return m.group(1) if m else None
+
+
+def _parsed_jobs_cache(workflow_texts: dict[str, str]) -> dict[str, tuple[dict[str, dict] | None, str | None]]:
+    """{name: (parsed_jobs, error)} computed ONCE per workflow -- shared
+    across every `PAID_POD_LANE_TABLE` row P7 checks (and P1's own single
+    target), so an unexaminable workflow is reported ONCE per scan, never
+    once per row/target it happens to be compared against."""
+    return {name: _parsed_jobs_or_fail(text) for name, text in workflow_texts.items()}
+
+
+@dataclass(frozen=True)
+class _UsesReference:
+    """One job-level `uses:` (read from the parsed document) whose LOCAL
+    or CROSS-REPO target matches a guarded workflow name."""
+
+    workflow: str
+    job: str
+    kind: str  # "local" or "cross-repo"
+    target: str
+
+
+def _scan_uses_references(
     workflow_texts: dict[str, str],
-    _visited: frozenset[str] = frozenset(),
-) -> str | None:
-    """F1 audit fix (RECURSIVE discovery): a direct match first; if none,
-    and this job's body itself `uses:` a LOCAL reusable workflow (job-level
-    `uses: ./.github/workflows/<X>.yml` -- e.g. `image.yml`'s `build` job
-    calling `_ci-base-image.yml`), recurse into THAT workflow's own jobs.
-    `_ci-base-image.yml` itself pushes to GHCR (`docker/build-push-action`,
-    `push: true`); a job that merely delegates to it is still a promoting
-    job for P6's purposes. `_visited` guards a workflow-`uses:`-cycle from
-    recursing forever (never expected in this repo's tree, but a guard, not
-    an assumption)."""
-    direct = job_invokes_publish_primitive(job_body)
-    if direct is not None:
-        return direct
-    for target in _local_reusable_workflow_targets(job_body):
-        resolved = resolve_workflow(workflow_texts, target)
-        if resolved is None or resolved in _visited:
+    parsed_cache: dict[str, tuple[dict[str, dict] | None, str | None]],
+    variants: set[str],
+    skip_name: str | None,
+) -> tuple[list[_UsesReference], list[tuple[str, str]]]:
+    """(references, refusals) for every workflow OTHER than `skip_name`.
+    `references`: every job-level `uses:` -- local or cross-repo,
+    basename-matched -- naming any spelling in `variants`, read from the
+    PARSED document (`_local_reusable_workflow_target`/`_cross_repo_
+    reusable_workflow_target`), never a text regex. `refusals`:
+    `(workflow, error)` for every OTHER workflow whose own `jobs:` cannot
+    be parsed/composed at all --
+    an unexaminable workflow might be the very one hiding a forbidden
+    reference, so it is a named FAIL here too, never a silent skip (the
+    same fail-loud doctrine P1/P6 already hold an unreadable `on:`/`jobs:`
+    block to)."""
+    references: list[_UsesReference] = []
+    refusals: list[tuple[str, str]] = []
+    for name in sorted(workflow_texts):
+        if skip_name is not None and name == skip_name:
             continue
-        target_text = workflow_texts[resolved]
-        for sub_body in _workflow_job_bodies(target_text).values():
-            found = job_invokes_publish_primitive_recursive(
-                sub_body, workflow_texts, _visited=_visited | {resolved}
-            )
-            if found is not None:
-                return f"{found} (via {resolved})"
-    return None
+        jobs, err = parsed_cache[name]
+        if err is not None:
+            refusals.append((name, err))
+            continue
+        assert jobs is not None
+        for job_name, job_node in sorted(jobs.items()):
+            local_target = _local_reusable_workflow_target(job_node)
+            if local_target is not None and local_target in variants:
+                references.append(_UsesReference(name, job_name, "local", local_target))
+                continue
+            cross_target = _cross_repo_reusable_workflow_target(job_node)
+            if cross_target is not None and cross_target in variants:
+                references.append(_UsesReference(name, job_name, "cross-repo", cross_target))
+    return references, refusals
+
+
+def _parsed_jobs_or_fail(text: str) -> tuple[dict[str, dict], str | None]:
+    """(job_id -> parsed job mapping, error). The PARSED-DOCUMENT twin of
+    `jobs_or_fail`'s own text-span discovery -- `load_workflow_text(text)
+    ["jobs"]`, the SAME construction `check_execution_surface_
+    reachability.py` already exposes, never a second reader. `error` is
+    `None` on success; on failure it names why, the same fail-loud
+    doctrine `jobs_or_fail` already holds text-span discovery to -- never
+    a silent `{}` standing in for "this file has zero jobs". A job entry
+    that is not itself a mapping (never valid GitHub Actions, but not
+    assumed here) is its own named failure, never silently skipped."""
+    try:
+        doc = load_workflow_text(text)
+    except WorkflowLoadError as exc:
+        return {}, str(exc)
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return {}, "no top-level jobs: mapping"
+    result: dict[str, dict] = {}
+    for job_id, job_node in jobs.items():
+        if not isinstance(job_node, dict):
+            return {}, f"job {job_id!r} is not a mapping -- cannot examine"
+        result[str(job_id)] = job_node
+    return result, None
+
+
+def _resolved_exempt_step_scan_names(workflow_texts: dict[str, str]) -> set[str]:
+    """The discovered-on-disk spellings (either extension) of every
+    workflow this module scans directly by NAME instead of resolving via
+    a table row: `REVIEWED_NONPUBLISHING_LOCAL_REUSABLES` and
+    `PROOF_REQUIRED_WORKFLOW` (`_gpu-proof-required.yml`)."""
+    names: set[str] = set()
+    for base in (*REVIEWED_NONPUBLISHING_LOCAL_REUSABLES, PROOF_REQUIRED_WORKFLOW):
+        resolved = resolve_workflow(workflow_texts, base)
+        if resolved is not None:
+            names.add(resolved)
+    return names
 
 
 def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
+    """PROPERTY (fail-closed, no traversal into a delegate's own jobs): a
+    merge-path job is a "promotion job" for P6's purposes when EITHER (a)
+    one of its own steps invokes a listed primitive directly
+    (`job_invokes_publish_primitive`), OR (b) it carries a job-level
+    `uses:` delegating to ANY other workflow at all -- local, cross-repo,
+    a dangling target, quoted, a `+`-bearing filename, all alike, since
+    the raw parsed scalar's mere PRESENCE is what this rule reads, never
+    its resolved identity; a job-level `uses:` value that is PRESENT but
+    NOT a string is its own named finding (cannot examine at all). Either
+    way, the job must be listed in `PROMOTION_TABLE` (any row's
+    `promoting_job`) or this gate fails by name. A job-level delegation is
+    judged WITHOUT ever opening the delegate's own text: this rule does
+    not know or care whether the delegate itself promotes anything, is
+    examinable, or even exists -- ANY delegation is presumed promoting
+    until a human reviews it, with TWO narrow, hand-reviewed exceptions,
+    NEITHER of which is a traversal: (1) a `PROMOTION_TABLE` row's own
+    `gate_job` is exempt ONLY when its OWN parsed job-level `uses:`
+    scalar resolves EXACTLY to `PROOF_REQUIRED_WORKFLOW` (either
+    extension spelling) -- any other value on that same job, including a
+    non-string one, is still a finding; (2) a LOCAL target in
+    `REVIEWED_NONPUBLISHING_LOCAL_REUSABLES` is exempt by NAME. Both
+    exempted-by-name classes (`REVIEWED_NONPUBLISHING_LOCAL_REUSABLES`
+    and `PROOF_REQUIRED_WORKFLOW` itself) get a compensating, NON-
+    recursive top-level examination below: every job INSIDE the exempted
+    file is scanned by the step-level publish-primitive rule directly (a
+    match is a finding naming that file and job) -- the exemption is a
+    reviewed NAME plus that direct scan, never an examination of what the
+    exempted file's OWN jobs might themselves delegate to (rebuilding a
+    real per-delegate traversal is tracked as
+    https://github.com/f-inverse/jammi-ai/issues/561). A workflow whose
+    OWN `on:` block is `workflow_call`-only is otherwise skipped here
+    entirely -- it is inert without a caller, and (outside the two named
+    exemptions just above) is never itself examined; a caller reaching it
+    via a job-level `uses:` is what rule (b) holds accountable, not the
+    reusable it names."""
     findings: list[str] = []
     listed = {(row.workflow, row.promoting_job) for row in PROMOTION_TABLE.values()}
+    gate_jobs = {(row.workflow, row.gate_job) for row in PROMOTION_TABLE.values() if row.gate_job is not None}
     # Every table row's workflow may be discovered under either the `.yml`
     # or `.yaml` spelling actually on disk (BLOCK B7 discipline) -- widen
-    # the listed set to both spellings so a row naming the canonical `.yml`
+    # both sets to both spellings so a row naming the canonical `.yml`
     # form still matches a `.yaml` file discovered on disk.
     listed_resolved: set[tuple[str, str]] = set()
     for workflow, job in listed:
         resolved = resolve_workflow(workflow_texts, workflow)
         listed_resolved.add((resolved if resolved is not None else workflow, job))
+    gate_jobs_resolved: set[tuple[str, str]] = set()
+    for workflow, job in gate_jobs:
+        resolved = resolve_workflow(workflow_texts, workflow)
+        gate_jobs_resolved.add((resolved if resolved is not None else workflow, job))
+    proof_required_variants = set(_workflow_name_variants(PROOF_REQUIRED_WORKFLOW))
+    exempt_step_scan_names = _resolved_exempt_step_scan_names(workflow_texts)
 
     for name, text in sorted(workflow_texts.items()):
         # F2 audit fix: NO trigger filtering at all -- every workflow file
         # is in scope; a publishing primitive anywhere must be in the
-        # table, regardless of what triggers the file. A workflow whose OWN
-        # `on:` block is `workflow_call`-only (the same "never independently
-        # starts" doctrine P1/P5 hold `gpu-prove.yml`/`_gpu-proof-
-        # required.yml` to) is inert without a caller and is reached only
-        # via the recursive check below on that caller's job -- it is
-        # skipped here so it is never double-tabled against itself. An
-        # unreadable `on:`/`jobs:` block is a FAIL LOUD, never a silent
-        # skip (same doctrine P1 already holds `gpu-prove.yml`'s `on:` to).
+        # table, regardless of what triggers the file. An unreadable
+        # `on:`/`jobs:` block is a FAIL LOUD, never a silent skip (same
+        # doctrine P1 already holds `gpu-prove.yml`'s `on:` to).
         on_keys, on_err = read_top_level_on_block(text)
         if on_err is not None:
             findings.append(f"P6: {name}: {on_err}")
             continue
         if on_keys == ["workflow_call"]:
+            if name in exempt_step_scan_names:
+                # The compensating scan for a name-only exemption: EVERY
+                # job in this specific, reviewed file is examined for a
+                # DIRECT step-level primitive -- never its own job-level
+                # `uses:`, which stays this rule's own residual (#561).
+                exempt_jobs, exempt_err = _parsed_jobs_or_fail(text)
+                if exempt_err is not None:
+                    findings.append(f"P6: {name}: cannot examine (exempted-by-name file): {exempt_err}")
+                    continue
+                for exempt_job_name, exempt_job_node in sorted(exempt_jobs.items()):
+                    exempt_primitive, exempt_primitive_err = job_invokes_publish_primitive(exempt_job_node)
+                    if exempt_primitive_err is not None:
+                        findings.append(f"P6: {name}'s job `{exempt_job_name}`: {exempt_primitive_err}")
+                    elif exempt_primitive is not None:
+                        findings.append(
+                            f"P6: {name}'s job `{exempt_job_name}` invokes a publishing primitive "
+                            f"({exempt_primitive}) -- {name} is exempted from the job-level `uses:` rule "
+                            "by REVIEWED NAME only; that exemption never covers its own step content, "
+                            "which this direct scan catches"
+                        )
             continue
-        jobs, jobs_err = read_jobs_block_or_fail(text)
+        jobs, jobs_err = _parsed_jobs_or_fail(text)
         if jobs_err is not None:
             findings.append(f"P6: {name}: {jobs_err}")
             continue
-        assert jobs is not None
-        lines = text.splitlines()
-        for job_name, (start, end) in jobs.items():
-            body = drop_comment_lines("\n".join(lines[start:end]))
-            primitive = job_invokes_publish_primitive_recursive(body, workflow_texts)
-            if primitive is None:
+        for job_name, job_node in sorted(jobs.items()):
+            if (name, job_name) in listed_resolved:
                 continue
-            if (name, job_name) not in listed_resolved:
+            primitive, primitive_err = job_invokes_publish_primitive(job_node)
+            if primitive_err is not None:
+                findings.append(f"P6: {name}'s job `{job_name}`: {primitive_err}")
+                continue
+            if primitive is not None:
                 findings.append(
                     f"P6: {name}'s job `{job_name}` invokes a publishing primitive ({primitive}) but is "
                     "not listed in PROMOTION_TABLE -- an unlisted promoting job is invisible to the "
                     "gpu-prove-once guarantee; add a reviewed row for it"
                 )
+                continue
+            uses = job_node.get("uses")
+            if uses is None:
+                continue
+            if not isinstance(uses, str):
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` has a job-level `uses:` that is not a string "
+                    f"({uses!r}) -- cannot examine, presumed promoting"
+                )
+                continue
+            if (name, job_name) in gate_jobs_resolved:
+                gate_target = _local_reusable_workflow_target(job_node)
+                if gate_target is not None and gate_target in proof_required_variants:
+                    continue
+            if _job_level_uses_is_reviewed_nonpublishing(job_node):
+                continue
+            findings.append(
+                f"P6: {name}'s job `{job_name}` has a job-level `uses:` ({uses!r}) and is not listed "
+                "in PROMOTION_TABLE -- every job-level delegation to another workflow is presumed "
+                "promoting until reviewed (fail-closed: this rule never opens the delegate itself); "
+                "add a row, or see the filed issue if the delegate genuinely needs its own examination"
+            )
 
     return findings
 
@@ -1384,7 +2181,10 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
 
     stripped_text = drop_comment_lines(text)
     lines = stripped_text.splitlines()
-    jobs = split_top_level_jobs(stripped_text)
+    jobs, jobs_err = jobs_or_fail(stripped_text)
+    if jobs_err is not None:
+        findings.append(f"P5: {resolved}: {jobs_err}")
+        return findings
 
     valid_found = False
     for job_start, job_end in jobs.values():
@@ -1484,13 +2284,20 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
 def run_gate(
     workflows_dir: Path = WORKFLOWS_DIR,
     manifest_path: Path = MANIFEST_PATH,
+    script_texts: dict[str, str] | None = None,
+    notes: list[str] | None = None,
 ) -> list[str]:
+    """`notes` collects the OBSERVATIONS this gate makes that are not
+    verdicts (today: a derived renting driver no visible workflow step
+    invokes). They are printed by `main`; they never change the exit code,
+    so a note can never be read as a pass or as a failure."""
     workflow_texts = load_workflow_texts(workflows_dir)
     if not workflow_texts:
         return ["no workflow files found -- cannot verify the gpu-prove-once property"]
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     findings: list[str] = []
     findings += check_p1_p2(workflow_texts)
+    findings += check_p7_paid_pod_lanes(workflow_texts, script_texts, notes=notes)
     findings += check_gate_file_absent(workflows_dir)
     findings += check_promotion_table(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
@@ -1499,8 +2306,44 @@ def run_gate(
     return findings
 
 
+def _cli_read_on_block(path: Path) -> int:
+    """`--read-on-block <path>` CLI form of the shared `on:` block reader
+    (X1): prints each top-level trigger key on its own line and exits 0, or
+    prints the reader's own "cannot read"/"cannot examine" message to
+    stderr and exits 1 -- an unreadable path is the same FAIL, never a
+    silent "no key". `test_gpu_gang_lane.sh`'s G7 shells out to this exact
+    CLI so the bash lane suite and this gate's own P7 arm read the `on:`
+    block through one function, never two independently-drifting regexes."""
+    keys, err = read_top_level_on_block_from_path(path)
+    if err is not None:
+        print(err, file=sys.stderr)
+        return 1
+    for k in keys or []:
+        print(k)
+    return 0
+
+
 def main() -> int:
-    findings = run_gate()
+    # A missing PyYAML install is a GATE PREREQUISITE failure, never a
+    # finding and never a pass -- checked FIRST, before EITHER CLI form
+    # runs (and before any `--self-test`-shaped dispatch this script might
+    # grow), via the ONE predicate `check_execution_surface_reachability.py`
+    # exports for every importing gate. Returns a distinct code (3, never
+    # 2 -- `--read-on-block`'s own usage-error arm already returns that)
+    # so it is never mistaken for a normal usage error either.
+    prereq_rc = exec_mod.require_pyyaml_or_exit("gpu-prove-once", exit_code=3)
+    if prereq_rc is not None:
+        return prereq_rc
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--read-on-block":
+        if len(argv) != 2:
+            print("usage: check_gpu_prove_once.py --read-on-block <path>", file=sys.stderr)
+            return 2
+        return _cli_read_on_block(Path(argv[1]))
+    notes: list[str] = []
+    findings = run_gate(notes=notes)
+    for n in notes:
+        print(f"  * {n}")
     if findings:
         print("gpu-prove-once: FAIL", file=sys.stderr)
         for f in findings:
@@ -1509,7 +2352,14 @@ def main() -> int:
     print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every release "
           "publisher's promotion gates on the shared verdict (all-or-nothing, not only the CUDA "
           "lanes), consumer/producer names agree, the reusable actually consults the verdict keyed "
-          "by the promoted commit, and no publishing job in the tree is unlisted.")
+          "by the promoted commit, no publishing job in the tree is unlisted, every paid pod "
+          "lane in PAID_POD_LANE_TABLE (keyed by repo-relative path, never a basename) has exactly "
+          "one invoker whose on: block carries no push:/workflow_call: trigger and which nothing "
+          "uses:, and every renting driver DERIVED from runpod_lib.sh's own deploy closure is "
+          "either such a row or has its path mentioned in no workflow file whose comment-stripped "
+          "text carries the secret at any scope (whole-file scope, no verb parsing clears an "
+          "invocation) -- a driver mentioned in no workflow at all reported above as a NOTE rather "
+          "than cleared.")
     return 0
 
 

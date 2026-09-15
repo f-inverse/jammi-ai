@@ -490,12 +490,12 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 - **`Jammi::open(target) -> Result<Session>`** — `crates/jammi-ai/src/jammi.rs`
   (`Jammi::open`). Pure constructor: `Target::Local(config)` →
   `InferenceSession::open(config)` → `Session::with_configured_worker(engine)`
-  (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) — the
+  (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:158`)) — the
   worker is spawned only when the loaded config's `[worker] enabled` is
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2010`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:2068`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -505,7 +505,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   thin `Arc<InferenceSession>` wrapper (re-exported as `crate::Session`,
   `crates/jammi-ai/src/lib.rs`). Three constructors with a load-bearing distinction:
   - `Session::with_configured_worker(engine) -> Result<Self>`
-    (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)):
+    (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:158`)):
     the **front-door** form (`Jammi::open` threads to this one, not to
     `with_embedded_worker`). Reads `WorkerConfig::enabled` (default
     `true`) off `engine`'s loaded config: `true` spawns the worker
@@ -515,7 +515,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
     when a worker is spawned. Returns `JammiError::Config` if `[worker]`
     timing violates worker invariants.
   - `Session::with_embedded_worker(engine) -> Result<Self>`
-    (`with_embedded_worker` (`crates/jammi-ai/src/local_session.rs:120`)):
+    (`with_embedded_worker` (`crates/jammi-ai/src/local_session.rs:122`)):
     the **explicit, spawn-regardless** form — carries `Some(worker)`
     **unconditionally**, whatever `[worker] enabled` says. For a caller
     that owns the claim decision itself out of band (test harnesses that must
@@ -605,9 +605,16 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 - **Typed status enums** — `crates/jammi-db/src/catalog/status.rs`:
   `ResultTableStatus`, `JobStatus`, `EvalRunStatus`, `ModelStatus`. Each
   impls `Display`+`FromStr`. **Contract: the DB value set is total over the enum**
-  (round-trip test in `status.rs`). `ResultTableKind` (Model/NeighborGraph,
-  `crates/jammi-db/src/catalog/result_repo.rs`) is a *separate* discriminator from
-  `ModelTask`.
+  (round-trip test in `status.rs`). `ResultTableKind`
+  (Model / NeighborGraph / AsofJoin / TrainingSet,
+  `crates/jammi-db/src/catalog/result_repo.rs`) is a *separate* discriminator
+  from `ModelTask`; `ResultTableKind::ALL` is the one set its string codec's
+  round-trip oracle ranges over. A `TrainingSet` table is the immutable,
+  canonically ordered row set a training run reads from
+  (`ResultStore::materialize_training_set`); like `AsofJoin` it is data of
+  record rather than a search structure — no ANN sidecar, and excluded from
+  embedding-table resolution even though its `task` column names a genuine
+  model task (the task the rows train, not one this table is the output of).
 - **The lease module** — `crates/jammi-db/src/catalog/lease.rs`: the ONE lease
   primitive a claimed `jobs` row (training AND compute kinds share this one
   table, migration 029) and a `building` `result_tables` row both share —
@@ -715,9 +722,19 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   pass's own orphan accounting. `ReconcileReport { scope, applied,
   rows_failed, rows_failed_count, orphans, orphan_count, pending,
   pending_count, unattributed, unattributed_count, damaged, damaged_count,
-  truncated, bytes_reclaimed }`, every list sorted and capped at
-  `REPORT_LIST_CAP` (10,000 entries; `truncated` says whether any list hit the
-  cap, `*_count` is always the true total). `reconcile` runs under the
+  referenced, referenced_count, truncated, bytes_reclaimed }`, every list
+  sorted and capped at `REPORT_LIST_CAP` (10,000 entries; `truncated` says
+  whether any list hit the cap, `*_count` is always the true total).
+  `referenced` names a `models/`-namespaced object this pass's reap-site
+  consult of `ResultStore::prefix_is_referenced` found still referenced by
+  some live `models` row in some tenant scope — reported instead of
+  reclaimed, at any grace or `apply`, and never carrying row ids, model
+  names, or tenant ids, only the object key. This is the ONE gate every
+  `models/` byte-delete this pass performs runs through right before
+  deleting: it asks whether some live `models` row, in any tenant, names
+  the object's exact key or its immediate containing directory as
+  `artifact_path` — one indexed COUNT lookup per candidate object, never a
+  walk of ancestors further up. `reconcile` runs under the
   store's own binding (tenant-bound → its `{seg}/`; unbound → `_global`
   only); `reconcile_all` wraps the WHOLE pass in
   `TenantBinding::admin_scope` and covers every tenant. Wire: `CatalogService.
@@ -1868,7 +1885,69 @@ The wire mirror is one shared module: `crates/jammi-ai/src/wire/cache.rs` decode
 `invalid_argument`) and encodes `CacheOutcome`→`pb::CacheOutcome`. The proto defines the
 enum **once** in `jammi.v1.inference`
 (`crates/jammi-wire/proto/jammi/v1/inference.proto`) and the producer RPCs carry it as a
-field (e.g. `crates/jammi-wire/proto/jammi/v1/pipeline.proto`).
+field (e.g. `crates/jammi-wire/proto/jammi/v1/pipeline.proto`). `SubmitJobRequest.cache`
+(tag 10, `crates/jammi-wire/proto/jammi/v1/job.proto`) imports the same enum rather than
+declaring a second wire vocabulary for the identical concept;
+`crates/jammi-ai/src/wire/training.rs`'s `lora_common_from_proto` decodes it and returns it
+alongside `TrainingCommon` (never folded into that type — only the `FineTune` decode arm
+threads it onto `TrainingSpec::FineTune.cache`). Model-level cache reuse is not yet
+supported for `TrainingSpec::FineTune`: `Use` is refused, typed, by `admit_training_spec`
+— the one admission every durable submit edge for a training spec applies before a `jobs`
+row is written (`InferenceSession::submit_fine_tune_spec_deduped`, `InferenceSession::enqueue`,
+and `train_context_predictor_deduped`; <https://github.com/f-inverse/jammi-ai/issues/562>)
+rather than probed against a recorded materialization, a different mechanism from the
+*result-table* `probe_cache_record` path the producers above use.
+
+**`cache = Use` is refused on both fine-tune kinds.** `cache` lives on
+`TrainingSpec::FineTune` itself; `TrainingSpec::GraphFineTune` carries no `cache` field at
+all, so a `GraphFineTune` job's `FineTuneRun::materialization_source` is unconditionally
+`None` (`crates/jammi-ai/src/fine_tune/worker.rs`: the graph arm carries no materialization
+to probe or record) and `lora_common_from_proto` refuses `cache = USE` for `GraphFineTune`
+with a typed `InvalidArgument` at decode — the one place that can still see both the kind
+and the requested value, mirroring the `ContextPredictor` `world_size` refusal in the same
+module. On the column-source kind, `cache = Use` is refused later, at submit, for the
+reason above (https://github.com/f-inverse/jammi-ai/issues/562). `Bypass`/unset is
+unaffected on either kind: every fine-tune
+job always trains, exactly as it did before this field existed. A stray `cache` key found
+under `graph_fine_tune` in a persisted `jobs.spec` row is silently dropped at deserialize
+rather than refused, since the type has nowhere to decode it onto (a hard error on unknown
+keys is a separate persisted-row reshape, https://github.com/f-inverse/jammi-ai/issues/548).
+The Python client still carries `cache=` as a kwarg on both `fine_tune` and
+`fine_tune_graph` (beside `world_size`, on both transports); both are refused, not
+silently dropped.
+
+**A catalog row may be deleted at any time; bytes are reclaimed only when
+unreferenced.** `ResultStore::prefix_is_referenced` is an admin-scoped (whole-catalog)
+scan of `models.artifact_path` (the exact key or its immediate parent), and
+`ResultStore::delete_unreferenced_prefix` consults it before every `models/`-prefix
+byte-delete: this pass's reap, the worker's own abandon path, the worker's
+epoch-checkpoint sweep (`JobWorker::gc_epoch_checkpoints_by_index`, which consults it on
+each index's own exact checkpoint prefix before ever deleting), and the trainer's mid-run
+retention prune (`delete_epoch_checkpoint_guarded`) — refusing typed
+(`StorageError::Referenced { prefix, count }`) while any live `models` row, in any tenant,
+still names the prefix. The one stated exemption is `{job}/_resume`: a sibling of every
+attempt-level path, so no row's `artifact_path` can ever equal it or its immediate parent
+— proven by an executed test, not asserted, in `crates/jammi-db/tests/it/reconcile.rs`'s
+`a_resume_checkpoint_prefix_is_never_referenced_even_under_the_containment_aware_predicate`.
+`reconcile`'s attribution set is
+built from the same admin-scoped scan (never the tenant-scoped `list_models`), so a
+tenant-bound reconcile pass can never reap a prefix a peer tenant's row still serves; a
+prefix this pass's ordinary orphan check would otherwise reclaim, but which that same
+admin-scoped consult still finds referenced, is reported in `ReconcileReport.referenced`
+(and counted in `referenced_count`) instead of deleted.
+
+**The recorded device identity.** `MaterializationEnv.device`
+(`crates/jammi-db/src/store/manifest.rs`) folds `ComputeDevice::Cuda { ordinal }` /
+`Metal { ordinal }` / `Cpu` into every recorded materialization — a device **ordinal**,
+not a host or machine identity, so two invocations reporting the same ordinal are
+numerically interchangeable, including across two different physical hosts that both
+happen to enumerate a GPU at ordinal `0`. This field is recorded for every FineTune run
+but is not consulted by any reuse decision (`cache = Use` on `FineTune` is refused
+before training runs, https://github.com/f-inverse/jammi-ai/issues/562); should a future
+reuse mechanism read it, treating same-ordinal
+invocations as interchangeable is sound where accelerators are interchangeable, not a
+guarantee across heterogeneous hardware, which would need a real per-host or per-device
+identity folded into `ComputeDevice`.
 
 #### The staleness/lineage sensing model (`store/freshness.rs`)
 
@@ -1933,9 +2012,11 @@ CI if the guide and the code diverge:
 - `GraphPropagation` — K hops of feature propagation over a neighbor graph.
 - `ContextSet` — per-target pooled context vectors materialised as an embedding table.
 - `AsofJoin` — a point-in-time temporal join, each spine row matched as-of within its group.
+- `TrainingSet` — the rows a training run reads, projected from a source relation and committed in one canonical full-tuple order; replayed by re-materializing.
 - `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
 - `EmbeddingDelta` — an incremental refresh of an embedding table (only the changed rows re-embedded, deletion-mask horizons raised); replayed as a full embed into a new table.
 - `EmbeddingCompaction` — a versioned embedding table's live rows rewritten as one fragment + one segment; replayed as a full embed into a new table.
+- `FineTune` — a LoRA fine-tune run, keyed by the training-set table's definition hash + artifact digest + row count, the base model identity, and the whole `TrainingSpec::FineTune` canonical spec (`spec_canonical` + `spec_schema_version`); model-level cache reuse is not yet supported for this kind — `TrainingSpec::FineTune.cache = Use` is refused, typed, by `admit_training_spec`, the one admission every durable submit edge for a training spec applies (<https://github.com/f-inverse/jammi-ai/issues/562>), and `Bypass` (the only value a submitted job can carry past that refusal) always trains; `TrainingSpec::GraphFineTune` carries no `cache` field at all; replayed by retraining.
 <!-- END PRODUCING-DESCRIPTOR-VARIANTS -->
 
 #### The recompute verb — descriptor replay + bounded cascade (`pipeline/recompute.rs`)
@@ -3003,6 +3084,131 @@ describing a removed surface.
   **Invariant: faithful errors** — each `Status` carries the full structured detail so the
   client reconstructs the exact variant.
 
+### 2.8a GangService — multi-host gang admission (I-GANG)
+
+The coordinator-to-member admission seam for a multi-host training run.
+Proto: `crates/jammi-wire/proto/jammi/v1/gang.proto`, `service GangService`
+with one bidi RPC, `RunRank(stream RankControl) returns (stream RankEvent)`.
+Handler: `crates/jammi-server/src/grpc/gang.rs`, `GangServer::run_rank`.
+Mounted beside `PeerServiceServer` on the internal `[server] peer_bind`
+listener only (`crates/jammi-server/src/runtime.rs`, `OssServer::bind`) —
+never on the public listener, never wrapped by `TenantResolverLayer`; the
+public listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`
+(`GANG_LISTENER_ALLOWLIST`, `crates/jammi-server/tests/it/tenant_isolation_oracle.rs`).
+
+**This unit ships the `world_size == 1` lattice only.** The training-set pair
+conjunct and its sidecar verify that would admit a genuine multi-host row are
+`HostAdmission`'s to build (docs/plans/67-distributed-training/UNITS.md §
+U5a-2); this handler never attempts them — a row whose own `world_size` is
+not exactly `1` refuses the same fixed way every other determinant does,
+whether or not the caller's `Assign.world` happens to agree with it.
+
+**The RunRank refusal lattice.** A call is decided in this order, each rung
+its own status:
+
+1. **Wire K2** (`gang.rs`, before any row read): `world == 0` →
+   `InvalidArgument("world must be greater than zero")`; `rank >= world` →
+   `InvalidArgument("rank must be less than world")`.
+2. **Ambient admin scope.** `TenantBinding::is_admin_scope()` — I-GANG
+   refuses ambient admin scope outright, so this is decided before any row
+   is even read. No tenant value is read on this path at W=1 (the admission
+   row carries no tenant column); tenant-scoped resolution is U5a-2's (#566).
+3. **I-GANG, the row predicate.** `Catalog::get_job_for_rank(job_id)`
+   (`crates/jammi-db/src/catalog/jobs_repo.rs`, primary-key-only, no tenant
+   predicate, never admin scope) returns the row by primary key alone — it
+   decides nothing itself and returns `Ok(None)` only when no job with that
+   id exists. Every determinant is decided by the CALLER, the
+   `GangServer::run_rank` handler: `status = 'running'`; `claimed_by =
+   assign.coordinator_instance_id`; `attempts == assign.attempt`; the lease
+   is live (the negation of `lease_expired_clause`,
+   `crates/jammi-db/src/catalog/lease.rs` — a NULL lease column reads
+   not-live, never live-by-default). The ROW's OWN
+   `RankAdmissionRow::world_size` (a `WorldSizeFact`, decoded from the job's
+   `spec` JSON, never the caller's `Assign.world`) then decides two more
+   conjuncts, likewise inside the handler, never inside
+   `get_job_for_rank`'s own statement: `WorldSizeFact::Undecodable` (the
+   `spec` names no valid rank count, or is not valid JSON at all) is itself a
+   refusal — a ROW FACT, never a fault of the read that found it, so it never
+   maps through `admission_catalog_fault`; `assign.world != row.world_size`
+   is itself a refusal — a caller-keyed gate (deciding this conjunct on
+   `assign.world` rather than `row.world_size`) would let a `world_size > 1`
+   job admit under a caller-supplied `world = 1`, which is why the gate is
+   keyed on the row and not the caller's claim; and, separately, a row whose
+   own `world_size` (now known to equal `assign.world`) is not `1` is ALSO a
+   refusal — this unit ships the `world_size == 1` lattice only, so a
+   multi-host row that genuinely agrees with its caller's `world` still
+   refuses. Any conjunct false, or the row absent, refuses.
+4. **Coordinator freshness.** `Catalog::fresh_instance(coordinator_instance_id,
+   lease)` (`crates/jammi-db/src/catalog/jobs_repo.rs`) requires the named
+   coordinator's `instances` row present and last seen within
+   `instance_liveness_margin(lease)` — `2 × lease` on the DB clock
+   (`crates/jammi-db/src/catalog/lease.rs`, the same margin
+   `reclaim_expired_jobs`'s inline-execution arm already uses); absent or
+   stale refuses.
+5. Every refusal in rung 2, 3, or 4 is the SAME status and message —
+   `FailedPrecondition("gang admission refused")` — regardless of which
+   conjunct failed: the listener discloses neither a job's existence, its
+   claimant, nor its attempt (non-disclosure). A call that satisfies every
+   rung still ends `Unimplemented("gang admission is not implemented on
+   this build")`: the handler has decided every I-GANG determinant but has
+   no admission session to hand the call to.
+
+**Non-disclosure and the `test-hooks` seam.** A
+table-driven oracle asserts the rung-5 `Status` (code and message bytes) is
+byte-identical across every determinant above, so no leaking message ever
+distinguishes them on the wire. Behind `#[cfg(feature = "test-hooks")]`
+only, `GangServer::last_refusal_reason()` / `refusal_reason_handle()`
+(`crates/jammi-server/src/grpc/gang.rs`) expose which `GangRefusalReason`
+variant a call actually refused for — a test-only introspection point, never
+response text; the plain `cargo test -p jammi-server --test it` lane cannot
+observe it, and the `--features test-hooks` lane executes a strictly larger
+determinant-covering case count as a result. `GangRefusalReason`'s test
+witness list (`gang_service.rs`, `every_gang_refusal_reason`) is itself
+derived from an exhaustive match over one witness per variant, never a
+hardcoded array length, so a future variant fails that file to compile until
+it is added there too.
+
+**A genuine catalog fault during admission is `Unavailable`, not
+`FailedPrecondition`.** `admission_catalog_fault`
+(`crates/jammi-server/src/grpc/gang.rs`) maps `Catalog::get_job_for_rank`
+erroring, and `Catalog::fresh_instance` erroring, to `Status::unavailable(..)`
+— a transient, retriable status distinct from every rung-5
+`FailedPrecondition` refusal above, which is a genuine, non-retriable row
+fact. `map_engine_error` is never called on the `RunRank` path — every
+admission-time catalog read on it uses this same classification. This
+handler never reaches `Catalog::get_result_table_for_tenant` or
+`ResultStore::read_materialization_manifest` at all — the training-set
+sidecar lookup they backed is `HostAdmission`'s to build from the filed
+property. No such wrapper exists in this crate.
+`Catalog::get_result_table_for_tenant` itself and the strict-predicate test
+that measured its NULL-tenant-row guarantee (a NULL-tenant row never
+matches a real tenant's lookup) are deleted with the world>1 conjunct; the
+property and its rebuild are `HostAdmission`'s (UNITS.md § U5a-2;
+<https://github.com/f-inverse/jammi-ai/issues/566>). The mid-stream re-verification three-way split
+(`Refuted`/`Unavailable`/`StoreUnavailable`) is likewise built with
+`HostAdmission` once an admitted session exists to re-verify inside.
+
+**Tenant handling.** No tenant value is read on this path at W=1: caller
+metadata is never read (a caller naming a different tenant is silently
+ignored, not refused), ambient admin scope is refused before any row is
+read, and the row `get_job_for_rank` returns carries no tenant column.
+Deriving the tenant from the `jobs` row and pinning the training-set lookups
+to it is U5a-2's world>1 conjunct (#566); the `GANG_LISTENER_ALLOWLIST`
+exemption states exactly this ground, and the residual it leaves — a
+`peer_bind` caller can learn whether another tenant's job is admissible — is
+recorded on #566.
+
+**Observability.** `jammi_gang_requests_total{rpc="RunRank"}`
+(`crates/jammi-server/src/routes/health.rs`) counts every `RunRank` call
+reaching this member, incremented by the whole-server
+`crate::metrics_layer::Metrics::call` regardless of how the call is
+ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
+`PeerService`.
+
+**Config.** `instance_liveness_margin` is not its own config key: it is `2 ×`
+whatever `[lease] duration_secs` resolves to (`LeaseIntervals::lease()`),
+computed once at `OssServer::bind` and passed into `GangServer::new`.
+
 ### 2.9 Numerics (`jammi-numerics`)
 
 - **`NumericsError` / `Result`** — `crates/jammi-numerics/src/error.rs`. The only
@@ -3054,10 +3260,10 @@ describing a removed surface.
    `Arc<GpuScheduler>`), result store, ANN cache. **`ResultStore::recover` runs here,
    before `load_existing_tables`** [§3.7].
 3. → `Session::with_configured_worker(engine)`
-   (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) —
+   (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:158`)) —
    spawns via `with_embedded_worker` → `EmbeddedWorker::spawn`, storing it in
    `_worker` (RAII), only when `worker.enabled`
-   (`crates/jammi-ai/src/local_session.rs:157`) reads `true` (default `true`);
+   (`crates/jammi-ai/src/local_session.rs:159`) reads `true` (default `true`);
    `false` leaves `_worker` as `None` and nothing is spawned.
 4. A verb, e.g. `session.search(req)` — `crates/jammi-ai/src/local_session.rs`
    (`Session::search`): destructures `SearchRequest`, picks `engine.search` vs
@@ -3138,8 +3344,19 @@ then `publish_and_finalize`. A `CancelJob`/`JobHandle::cancel` request folds int
 SAME `cancel` flag a lease loss trips, via a watcher that polls `jobs.cancel_requested`
 at the keeper's own heartbeat cadence.
 
-**Train:** `JobWorker::run_spec` → FineTune arm → `read_source_columns` (`SELECT …
-ORDER BY <full tuple>` for deterministic order) → `build_training_data_loader` →
+**Train:** `JobWorker::run_spec` → FineTune arm → `training_set::materialize_projection`
+(`crates/jammi-ai/src/fine_tune/training_set.rs`): the projected columns are committed
+through `ResultStore::materialize_training_set` as an immutable `TrainingSet` result table
+— or an extant `ready` one is bound instead, on the engine's standing reuse key
+(definition hash AND every input anchor equal, no unpinned-at-an-instant anchor among
+them; a registered source is anchored unpinned, so the tabular path materialises its own
+table) — and read back on the SAME `SessionContext` through `read_back_sql`,
+`SELECT * FROM <TrainingSetTable::sql_relation> <training_set_order_by(columns)>`, the
+reader's half of the full-tuple order contract. The `GraphFineTune` arm does not reach this
+producer: `reconstruct_graph_loader` re-samples the seeded pairs and builds the loader
+straight from them in memory (`TrainingDataLoader::from_graph`); a graph training set's own
+result table is https://github.com/f-inverse/jammi-ai/issues/538.
+Then `build_training_data_loader` →
 `train_fine_tune` → `run_fine_tune_blocking` (on the blocking pool, `catch_unwind`-wrapped):
 builds the `TrainingTarget` (empty `target_modules` → projection head; non-empty →
 `build_encoder_adapters`, which resolves the backbone through `model::arch` (§2.7) and
@@ -3183,18 +3400,18 @@ retry loop re-taking the write lock:
   `estimate_memory` → **admission loop** (`try_acquire`; on `None` take the lock and
   `evict_one`; if nothing evictable, error) → `backend.load` → post-load catalog bookkeeping
   (`complete_generic_registration`,
-  `crates/jammi-ai/src/model/cache.rs:542`) → insert `CacheEntry` (permit moved in) → return
+  `crates/jammi-ai/src/model/cache.rs:659`) → insert `CacheEntry` (permit moved in) → return
   guard with refcount 1. The bookkeeping write is gated by an ALLOWLIST of the generic,
   non-terminal row kinds it exists to complete, `GENERIC_COMPLETABLE_TYPES`
-  (`crates/jammi-ai/src/model/cache.rs:549`, `&["local", "huggingface", "embedding"]`) — never a
+  (`crates/jammi-ai/src/model/cache.rs:666`, `&["local", "huggingface", "embedding"]`) — never a
   denylist of the terminal types to protect, which would fail open on every unenumerated
   `model_type` (`fine-tuned`, `context-predictor`, `bert`, `open_clip`, `clap_audio_model`, …). A
   catalog READ error also skips the write outright (`get_model_version`,
-  `crates/jammi-ai/src/model/cache.rs:559`, `warn!` and keep serving) rather than collapsing to
+  `crates/jammi-ai/src/model/cache.rs:676`, `warn!` and keep serving) rather than collapsing to
   "no row" and writing over an uninspected row; only when the read succeeds and the row is absent
   or already one of the completable kinds
-  (`can_complete`, `crates/jammi-ai/src/model/cache.rs:571`) does it proceed to `register_model`
-  (`crates/jammi-ai/src/model/cache.rs:596`), which completes a `local`/`huggingface` row or the
+  (`can_complete`, `crates/jammi-ai/src/model/cache.rs:688`) does it proceed to `register_model`
+  (`crates/jammi-ai/src/model/cache.rs:713`), which completes a `local`/`huggingface` row or the
   `embedding` FK placeholder — the one case where a `register_model` failure is still logged and
   swallowed rather than propagated. A fine-tuned id can reach this same call (`ModelSource::parse`'s
   HuggingFace fallback matches it like any other non-`local:` string), so without the allowlist
@@ -3216,7 +3433,7 @@ id and the missing field, never silently resolved as an ordinary model or served
 unadapted base.
 
 `load_context_predictor`'s own id-shape backstop
-(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1212`)
+(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1217`)
 mirrors the resolver's `FINE_TUNED_ID_PREFIX` cross-check, but a context-predictor id is
 caller-chosen — it carries no reserved prefix a fresh reload can cross-check by shape the way
 `try_catalog_lookup` does — so this surface asserts its own row-shape invariant directly,
@@ -3228,22 +3445,22 @@ id space, this defends the context-predictor id space, and each surface owns its
 rather than trusting the id's shape alone.
 
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
-(`crates/jammi-db/src/store/artifact.rs:228`) raises two DISTINCT typed storage outcomes,
+(`crates/jammi-db/src/store/artifact.rs:242`) raises two DISTINCT typed storage outcomes,
 never folding them together. A manifest that is ABSENT entirely — nothing was ever
 published at that prefix, or a catalog pointer names the wrong one — reclassifies to
 `StorageError::NotPublished` (`reclassify_missing_manifest`,
-`crates/jammi-db/src/store/artifact.rs:539`; covered by
+`crates/jammi-db/src/store/artifact.rs:540`; covered by
 `missing_manifest_is_not_published_not_corruption`,
-`crates/jammi-db/src/store/artifact.rs:742`): no manifest is in hand, so there is nothing
+`crates/jammi-db/src/store/artifact.rs:870`): no manifest is in hand, so there is nothing
 to say is corrupt. A manifest that IS present but malformed, or that names a key which is
 missing or hash-mismatched on an otherwise-published bundle, is the genuine integrity
 failure, `StorageError::Layout` (`reclassify_missing_key`,
-`crates/jammi-db/src/store/artifact.rs:570`; `verify_sha256`,
-`crates/jammi-db/src/store/artifact.rs:585`). Any OTHER storage fault off `fetch_artifact`
+`crates/jammi-db/src/store/artifact.rs:575`; `verify_sha256`,
+`crates/jammi-db/src/store/artifact.rs:576`). Any OTHER storage fault off `fetch_artifact`
 — transport/IO, a disabled scheme, driver-init failure, or a permission-denied open on a
 present key (which stays `StorageError::Io`, never reclassified —
 `permission_fault_on_a_present_key_stays_a_transport_error`,
-`crates/jammi-db/src/store/artifact.rs:816`) — is left unchanged.
+`crates/jammi-db/src/store/artifact.rs:944`) — is left unchanged.
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.
@@ -3251,29 +3468,29 @@ Both reload surfaces match on these two variants explicitly and re-type BOTH int
 fine-tuned reload arm, matches `StorageError::NotPublished`
 (`crates/jammi-ai/src/model/resolver.rs:262`) and `StorageError::Layout`
 (`crates/jammi-ai/src/model/resolver.rs:273`) into `JammiError::Model`, and
-`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1193`) matches
+`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1198`) matches
 the identical pair — `StorageError::NotPublished`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1400`) and `StorageError::Layout`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1410`) — into `JammiError::Model` as
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1405`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1415`) — into `JammiError::Model` as
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs:288`), and so does the predictor's own
-`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1363`). Any OTHER
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1362`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1419`).
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1424`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
 even reached — is the SAME `JammiError::Model` variant too: an
 absent `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1238`), an unparseable `config_json`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1239`), an unparseable `config_json`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1243`, a DISTINCT message from "absent",
 never collapsed), and a parseable-but-incomplete config (missing `head`/`architecture`/
 `feature_dim`/`context_k`/`hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/
 `target_scaler`) each name the model id and the specific field. The `varmap.load` arm — a
 manifest-verified bundle missing `model.safetensors`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1428`) — matches `CandleBackend::load`'s
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1426`) — matches `CandleBackend::load`'s
 peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
 (`crates/jammi-ai/src/model/backend/candle.rs:2767`), instead of its own
 `JammiError::Inference`.
@@ -3283,7 +3500,7 @@ At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`
 maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 `Code::Internal`, and lets every unmatched variant — including the propagated
 `JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:290`). Because both reload surfaces raise the same
+(`crates/jammi-server/src/grpc/wire.rs:300`). Because both reload surfaces raise the same
 `JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either

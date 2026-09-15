@@ -204,6 +204,94 @@ text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> outpu
 4. Only the A/B matrices receive gradients
 5. The adapter is saved as `adapter.safetensors` in the artifact directory
 
+### The training set a run reads
+
+A fine-tune trains from a committed snapshot, not from your live source
+relation. It materialises its training set once as an **immutable result table**
+of kind `TrainingSet` — a Parquet artifact carrying a definition hash and a
+materialization manifest attestation — and reads that table back in one
+canonical **full-tuple order** (every projected column, in declared order, is
+part of the sort key, so identical tuples are identical rows and the read order
+is the committed order).
+
+The definition hash folds the source query, the projected columns, the model
+task, the training format and the order rule — and nothing about how a run
+*consumes* the rows, so a run's world size, batch size or validation split never
+enters the table's identity.
+
+Sharing one table across jobs takes more than a matching definition. A `ready`
+training set is reused only when its definition hash **and every recorded input
+anchor** match the request exactly, and an input anchored unpinned-at-an-instant
+never matches: an instant is not a reproducible id, so equal anchors would not
+prove equal rows. That is the engine's standing reuse rule — the same
+`(definition, input anchors)` key the embedding and as-of producers are probed
+on — with no training-set exception. Which path ran is reported on the returned
+table rather than left to be inferred.
+
+A registered source relation exposes no version or digest surface to pin, so a
+fine-tune anchors it unpinned-at-an-instant and materialises its own training
+set on every run: two runs over the same query and columns leave two tables.
+Changing the source's rows therefore never serves a stale training set — the
+earlier table cannot be served at all. Sharing rests on the rule's other arm, an
+input pinned by content digest, as a result table is; a fine-tune source does
+not reach that arm, because a source resolves as a registered relation and a
+result table does not resolve as one. The manifest keeps the anchors either way,
+so a staleness check over the table answers the same honest `Undecidable` it
+gives for every unpinned input.
+
+A projection that yields no rows is refused with a typed `EmptyTrainingSet`
+error before any catalog row or byte exists, so a run never trains on an empty
+set in silence.
+
+A graph fine-tune does not go through this table: its sampled pairs are
+sampled in memory and trained on directly. Giving the graph arm a
+`TrainingSet` table of its own is tracked at
+<https://github.com/f-inverse/jammi-ai/issues/538>.
+
+## Model-level cache reuse (`cache = Use`) is not yet supported
+
+`fine_tune` (the column-source kind) and `fine_tune_graph` both accept the same
+opt-in `cache` dial the compute verbs (`generate_embeddings`, `infer`, …) carry,
+but neither honors `cache="use"`. It is refused, typed
+(`jammi.errors.InvalidArgument` on both transports): model-level cache reuse —
+binding a fine-tune job to an earlier run's already-published model instead of
+training — is not yet supported
+(<https://github.com/f-inverse/jammi-ai/issues/562>). `cache="bypass"` (the
+default, or omitting `cache` entirely) is unaffected on either kind: a fine-tune
+job always trains.
+
+### Python
+
+```python
+job = db.fine_tune(
+    source="training",
+    base_model="sentence-transformers/all-MiniLM-L6-v2",
+    columns=["text_a", "text_b", "score"],
+    method="lora",
+    task="embedding",
+)
+result = job.wait()
+print(result["cache_outcome"])  # always "computed"
+print(f"Model: {result['model_id']}")
+```
+
+### Rust
+
+The embedded surface's cache dial lives on `jammi_wire::request::FineTuneRequest`
+(submitted through `InferenceSession::submit_fine_tune`), not on the loose
+`InferenceSession::fine_tune`/`fine_tune_graph` methods shown above, which always
+train (`cache: CachePolicy::Bypass`, unconditionally). The remote
+`jammi_client::DataClient::submit_fine_tune` carries the same field, and `Use` is
+refused there too. Neither Rust surface returns `cache_outcome` from
+`TrainingJob::wait()` — only `model_id()` is exposed there.
+
+A stray `cache` key found under `graph_fine_tune` in a persisted `jobs.spec` row
+(the row is engine-written from an already-decoded spec, so this only arises from
+a hand-edited row) is silently dropped at deserialize rather than refused, since
+the type has nowhere to put it; making an unexpected key a hard error across the
+persisted-row format is a separate reshape
+(<https://github.com/f-inverse/jammi-ai/issues/548>).
+
 ## Encoder-adapters fine-tuning (PEFT-style adapter injection)
 
 The default flow above trains a single low-rank **projection head** sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **encoder adapters** — LoRA injected into named linear layers *inside* the encoder stack, matching the PEFT convention.

@@ -462,6 +462,47 @@ pub fn with_session(
     }
 }
 
+/// Spin up the SAME engine-backed server [`start_engine_server`] does, over a
+/// deployment that declares `devices` devices in `[gpu] devices`.
+///
+/// The rank count a submit may ask for is bounded by how many devices the
+/// deployment DECLARES, so a test of that bound has to be able to move it.
+/// Only the config key varies — the chain, the tier set, and the eager bind
+/// are the ones every other fixture here serves — so a test built on this
+/// proves the KNOB, not a construction seam.
+///
+/// The entries are real ordinals `0..devices` (with `device = 0`, the primary
+/// [`jammi_db::config::GpuConfig::validate`] requires the list to lead with),
+/// never the CPU: a multi-entry list carrying `-1` is refused at load, because
+/// a gang runs on one kind of device. Hermetic anyway — `require_gpu` stays
+/// `false`, so a host with no such device degrades to the CPU exactly as every
+/// other fixture's session does, and it is the declared COUNT, not the
+/// execution device, that the submit edge reads.
+pub async fn start_engine_server_with_devices(devices: usize) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = jammi_test_utils::test_config(dir.path());
+    cfg.gpu.device = 0;
+    cfg.gpu.devices = Some((0..devices as i32).collect());
+    cfg.gpu
+        .validate()
+        .expect("this fixture's device list is a loadable one");
+
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+        metrics,
+    }
+}
+
 /// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
 /// tier set, identical chain, identical eager bind), with `[worker] enabled`
 /// set to `enabled` **through a real `jammi.toml` loaded by
@@ -689,13 +730,31 @@ pub struct PeerEngineServer {
     /// directly (the owner's own result store).
     pub engine: Arc<InferenceSession>,
     /// The server's metrics registry — `jammi_peer_requests_total{rpc}` is the
-    /// observable that a peer call reached this owner.
+    /// observable that a peer call reached this owner; `jammi_gang_requests_total{rpc}`
+    /// is the same observable for a coordinator's `RunRank` call.
     pub metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
     pub shutdown: oneshot::Sender<()>,
     pub handle: AbortOnDropHandle<()>,
     /// RAII root of the engine's artifact dir when this fixture owns it;
     /// `None` when the caller supplied (and roots) a shared dir.
     pub _dir: Option<TempDir>,
+    /// `test-hooks` only: a handle onto the SAME
+    /// `GangServer` instance's refusal-reason state actually serving on
+    /// `peer_addr` above — `None` if `[server] peer_bind` were ever unset
+    /// (it never is for this fixture). See
+    /// `jammi_server::grpc::gang::GangServer::refusal_reason_handle`.
+    #[cfg(feature = "test-hooks")]
+    pub gang_refusal_handle: Option<jammi_server::grpc::gang::GangRefusalHandle>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl PeerEngineServer {
+    /// Which `GangRefusalReason` the most recent `RunRank` call actually
+    /// served by this fixture refused for — same-process
+    /// introspection, never anything the wire discloses.
+    pub fn gang_last_refusal_reason(&self) -> Option<jammi_server::grpc::gang::GangRefusalReason> {
+        self.gang_refusal_handle.as_ref().and_then(|h| h.get())
+    }
 }
 
 /// A `test_config` over `artifact_dir` with every listener at loopback `:0`
@@ -725,6 +784,12 @@ pub async fn start_engine_server_from_config(
     let peer_addr = bound
         .peer_addr()
         .expect("peer_bind is set, so the third listener is bound");
+    // `test-hooks` only: clone the `GangServer`'s own
+    // refusal-reason handle out of `bound` BEFORE it moves into the spawned
+    // serve task below — `serve_with_shutdown` consumes `self`, so this is
+    // the last point a caller can reach it.
+    #[cfg(feature = "test-hooks")]
+    let gang_refusal_handle = bound.gang_refusal_handle();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         bound
@@ -743,6 +808,8 @@ pub async fn start_engine_server_from_config(
         shutdown: shutdown_tx,
         handle: AbortOnDropHandle(handle),
         _dir: dir,
+        #[cfg(feature = "test-hooks")]
+        gang_refusal_handle,
     }
 }
 

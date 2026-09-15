@@ -9,12 +9,13 @@ pip install jammi-server-cu12
 jammi-server --help
 ```
 
-The CUDA runtime libraries (`libcudart`, `libcublas`, `libcublasLt`,
-`libcurand`, `libnvrtc`) are pulled in as `nvidia-*-cu12` wheel dependencies; the
-console script prepends their `lib/` directories to `LD_LIBRARY_PATH` before
-exec'ing the binary, so no system CUDA install is required (only an NVIDIA driver
-on the host). This package and `jammi-server` (CPU) both provide the
-`jammi-server` command — install exactly one.
+The CUDA libraries the binary links (`libcudart`, `libcublas`, `libcublasLt`,
+`libcurand`, `libnvrtc`, and `libnccl`, the collective-communication library the
+multi-GPU training path uses) are pulled in as `nvidia-*-cu12` wheel
+dependencies; the console script prepends their `lib/` directories to
+`LD_LIBRARY_PATH` before exec'ing the binary, so no system CUDA install is
+required (only an NVIDIA driver on the host). This package and `jammi-server`
+(CPU) both provide the `jammi-server` command — install exactly one.
 
 ## Requirements
 

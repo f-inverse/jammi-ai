@@ -14,14 +14,21 @@
 # ignored. Order does not matter (the test compares as sets); kept sorted for a
 # readable diff.
 
-# --- the twelve jammi.v1.* wire packages (the wire contract): ten served on
-# --- the public listener, one served only on `peer_bind`
-# --- (`jammi.v1.peer`), `jammi.v1.lifecycle` contract-only ---
+# --- the thirteen jammi.v1.* wire packages (the wire contract): ten served on
+# --- the public listener, two served only on `peer_bind`
+# --- (`jammi.v1.peer`, `jammi.v1.gang`), `jammi.v1.lifecycle` contract-only ---
 PACKAGE jammi.v1.audit
 PACKAGE jammi.v1.catalog
 PACKAGE jammi.v1.embedding
 PACKAGE jammi.v1.error
 PACKAGE jammi.v1.eval
+# ADDED (additive, minor-compatible): the coordinator-to-member gang-admission
+# seam for a multi-host training run. Served ONLY on the internal
+# `[server] peer_bind` listener, beside `jammi.v1.peer` — the public listener
+# answers UNIMPLEMENTED for its rpcs. No tenant value is read on this path at
+# W=1 — never the caller's, and the admission row carries no tenant column
+# (I-GANG; tenant-scoped resolution is U5a-2's, #566).
+PACKAGE jammi.v1.gang
 PACKAGE jammi.v1.inference
 # ADDED (additive, minor-compatible, #485/#486): the durable job queue's own
 # envelope package (SubmitJob/JobStatus/WaitJob/ListJobs/CancelJob/
@@ -95,6 +102,9 @@ RPC EvalService/EvalCompare
 RPC EvalService/EvalEmbeddings
 RPC EvalService/EvalInference
 RPC EvalService/EvalPerQuery
+# ADDED (additive, minor-compatible): the coordinator-to-member gang-admission
+# bidi RPC — see the PACKAGE jammi.v1.gang note above.
+RPC GangService/RunRank
 RPC InferenceService/Infer
 RPC InferenceService/Predict
 # ADDED (additive, minor-compatible, #485/#486): JobService replaces

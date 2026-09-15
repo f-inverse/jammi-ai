@@ -223,9 +223,87 @@ pub fn stale_before_clause(
     }
 }
 
+/// The SQL scalar expression for how many seconds remain in `col`'s lease
+/// window — negative once expired, `NULL` when `col` itself is `NULL` (no
+/// lease) — evaluated against the SAME clock [`lease_expired_clause`]
+/// compares against: the backend's OWN `now()` on Postgres (stable for the
+/// whole enclosing transaction, so a sibling `lease_expired_clause` call in
+/// the same statement agrees with this one even though each names `now()`
+/// independently), or the bound [`lease_now`] app-clock value on SQLite —
+/// bound HERE, once, since two independent [`lease_now`] reads do not carry
+/// Postgres's same-transaction guarantee.
+///
+/// `Catalog::get_job_for_rank` (`docs/rigor/contracts/feat_500-C-U5a-1.md` §
+/// A6) reads this alongside [`lease_expired_clause`]'s own negation in ONE
+/// statement, so "how much of
+/// the window remains" is never a caller-side subtraction against its OWN
+/// clock (SQLite: a replica-clock read no different from any other app-side
+/// timestamp; Postgres: outright wrong, since only the database's `now()`
+/// avoids replica skew — see this module's own docs) once bound to a
+/// remaining-window value read back from a row a caller then acts on.
+///
+/// Honesty about the two backends' agreement: on Postgres this expression's
+/// sign and [`lease_expired_clause`]'s boolean are exactly consistent (both
+/// compare the SAME `col::timestamptz` against the SAME `now()` call within
+/// one statement). On SQLite, `julianday(...)`'s floating-point day count
+/// carries roughly sub-100-microsecond rounding at typical lease-scale
+/// magnitudes relative to [`lease_expired_clause`]'s exact string compare
+/// (`col < $bound`, `LEASE_TS_FORMAT`'s fixed-width text, byte-for-byte) —
+/// negligible next to any `[lease] heartbeat_secs`/`duration_secs` a
+/// deployment runs, but not bit-exact the way the Postgres arm is.
+pub fn lease_remaining_seconds_expr(
+    col: &str,
+    kind: BackendKind,
+    params: &mut Vec<SqlValue<'static>>,
+) -> String {
+    match kind {
+        BackendKind::Postgres => {
+            // Postgres's `EXTRACT(...)` returns `numeric`, never `float8` —
+            // an explicit `::double precision` cast is required so every
+            // reader that decodes this column as `Option<f64>`
+            // (`Catalog::get_job_for_rank`'s row mapper) gets the SQL type
+            // it asked for; without it sqlx's Postgres decoder refuses the
+            // row with a `ColumnDecode` error (a genuine backend/driver
+            // fault, never a content defect) on every call, not just a
+            // malformed one.
+            format!("EXTRACT(EPOCH FROM ({col}::timestamptz - now()))::double precision")
+        }
+        BackendKind::Sqlite => {
+            params.push(SqlValue::TextOwned(lease_now()));
+            format!(
+                "((julianday({col}) - julianday(${})) * 86400.0)",
+                params.len()
+            )
+        }
+    }
+}
+
+/// The instance-liveness margin: `2 * lease`, against `instances.last_seen_at`
+/// (the DB clock via [`stale_before_clause`]) — the same tolerance
+/// `Catalog::reclaim_expired_jobs`'s inline-execution arm already computes
+/// inline for "owning instance dead". Named here so a second caller (a gang
+/// coordinator's own freshness check, `fresh_instance`) shares the SAME
+/// margin rather than re-deriving the `2 *` factor at its own call site.
+pub fn instance_liveness_margin(lease: Duration) -> Duration {
+    lease.saturating_mul(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_liveness_margin_is_twice_the_lease() {
+        assert_eq!(
+            instance_liveness_margin(Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
+        // `saturating_mul`, never a wrapping/panicking overflow, at the
+        // `Duration` ceiling — the same overflow shape
+        // `reclaim_expired_jobs`'s own inline `lease.saturating_mul(2)`
+        // relied on before this extraction.
+        assert_eq!(instance_liveness_margin(Duration::MAX), Duration::MAX);
+    }
 
     #[test]
     fn deadline_is_after_now_and_sorts_lexicographically() {
@@ -279,6 +357,33 @@ mod tests {
         let expr = lease_deadline_expr(BackendKind::Sqlite, Duration::from_secs(30), &mut params);
         assert_eq!(expr, "$1");
         assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn remaining_seconds_expr_postgres_binds_no_timestamp() {
+        let mut params = Vec::new();
+        let expr =
+            lease_remaining_seconds_expr("lease_expires_at", BackendKind::Postgres, &mut params);
+        assert_eq!(
+            expr,
+            "EXTRACT(EPOCH FROM (lease_expires_at::timestamptz - now()))::double precision"
+        );
+        assert!(
+            params.is_empty(),
+            "Postgres's remaining-seconds expression must bind no timestamp: {params:?}"
+        );
+    }
+
+    #[test]
+    fn remaining_seconds_expr_sqlite_binds_the_app_clock_once() {
+        let mut params = Vec::new();
+        let expr =
+            lease_remaining_seconds_expr("lease_expires_at", BackendKind::Sqlite, &mut params);
+        assert_eq!(
+            expr,
+            "((julianday(lease_expires_at) - julianday($1)) * 86400.0)"
+        );
+        assert_eq!(params.len(), 1, "one bind: lease_now(), the app clock");
     }
 
     #[test]

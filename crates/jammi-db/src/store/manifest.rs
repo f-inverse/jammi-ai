@@ -70,7 +70,40 @@ pub use jammi_numerics::ComputePrecision;
 /// typed [`ManifestError`] before the version is even read. Either rejection is
 /// clean (the signal to re-emit); a reader must never silently trust a
 /// version-mismatched or shape-mismatched manifest.
+///
+/// **An ADDITIVE new [`ProducingDescriptor`] variant does not bump this
+/// number** — [`ProducingDescriptor::TrainingSet`] landed without one. A
+/// variant an older reader's `enum` definition does not know is rejected
+/// serde-first, the same way a since-added FIELD is: deserializing an
+/// unrecognised tagged-enum variant fails before `manifest_version` is even
+/// read, so an older build can never silently misinterpret a newer
+/// descriptor shape as one of its own known variants. What DOES bump this
+/// number is a change to an EXISTING variant's determinant set (a field
+/// added, removed, or reinterpreted within a variant the older reader
+/// already knows) — that shape still deserializes under the old
+/// definition, so nothing else would catch the older reader comparing a
+/// stale hash computed over a different determinant set.
 pub const MANIFEST_VERSION: u32 = 3;
+
+/// The row-order rule version 1 of the training-set producer commits and
+/// records in [`ProducingDescriptor::TrainingSet::order_rule`]: the rows are
+/// ordered by the **full projected tuple** — every projected column, in
+/// declared order, ascending, NULLs first.
+///
+/// Ordering by the full tuple rather than by a key column is what makes the
+/// order a total function of the trainable data: the only rows that can tie
+/// are byte-identical on every projected column, and such rows are
+/// interchangeable for any consumer of the table (the reader cannot tell one
+/// from the other), so the committed order is a pure function of the row
+/// multiset even though a tie group's internal permutation is not pinned. No
+/// engine-wide stable row identity exists on an arbitrary registered source,
+/// so the projected tuple is the strongest total key available.
+///
+/// A versioned tag, not a bare `true`: a later rule (a different direction, a
+/// different NULL placement, an added tie-break column) is a *different*
+/// definition and must take a new tag, so a table committed under v1 is never
+/// silently read as if it carried the newer order.
+pub const TRAINING_SET_ORDER_RULE_V1: &str = "full_tuple_v1";
 
 /// Content hash of *how* a table was produced: a canonical encoding of the
 /// [`ProducingDescriptor`] plus the [`MaterializationEnv`] that affects its
@@ -167,17 +200,63 @@ pub struct MaterializationEnv {
     /// stable order. Empty for a producer that invokes no model (e.g. a
     /// neighbor-graph derivation, a propagation kernel).
     pub models: Vec<ModelIdentity>,
+    /// The fused-kernel admission profile the producer's compute path ran
+    /// under — a canonical, opaque string tag the producer maps its own
+    /// `jammi-kernels` admission decision to (`jammi-db` depends on no jammi
+    /// crate but `jammi-numerics`, so it cannot hold `jammi-kernels`' typed
+    /// admission report directly; this is the SAME "db-local primitive
+    /// standing in for a foreign type" shape [`ProducingDescriptor::TrainingSet::format`]
+    /// already uses). A different admission outcome (fused vs. eager) can
+    /// change the bits a training run produces at the same nominal
+    /// precision, so it is a determinant of the output like the compute
+    /// device and every invoked model's identity.
+    ///
+    /// `None` for every producer that records no kernel-admission decision
+    /// (every variant before [`ProducingDescriptor::FineTune`]).
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` means a `None`
+    /// value serialises to no JSON key at all — the same hash-preservation
+    /// contract [`ModelIdentity::quantization`] keeps — so this field's
+    /// addition changes not one byte of any [`DefinitionHash`] computed
+    /// before it existed.
+    ///
+    /// **No production caller writes this field.** `jammi-db` cannot itself
+    /// observe a training loop's per-op fused/eager admission outcomes (it
+    /// depends on no `jammi-kernels` type), so populating it is entirely the
+    /// producing caller's responsibility, and the `FineTune` producer in
+    /// `jammi-ai` does not call [`Self::with_kernel_admission_profile`]. The
+    /// kernel-admission determinant of a fine-tuned model's produced bytes is
+    /// therefore UNCOVERED by [`DefinitionHash`] at this base: two runs whose
+    /// fused/eager admission genuinely differs (e.g. a build-feature or
+    /// hardware difference that changes which ops fuse) can hash identically.
+    /// Folding a real, per-op admission outcome into this field is tracked at
+    /// <https://github.com/f-inverse/jammi-ai/issues/546>. The field stays
+    /// declared, `serde`-default and skip-if-`None`, and its builder
+    /// (below) is exercised by this crate's own hash-completeness tests —
+    /// setting it DOES move [`DefinitionHash`] — so the seam is ready the
+    /// moment #546 lands a real write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_admission_profile: Option<String>,
 }
 
 impl MaterializationEnv {
     /// Build the environment for the current engine version and the given
-    /// device + invoked models.
+    /// device + invoked models. [`Self::kernel_admission_profile`] starts
+    /// `None`; set it with [`Self::with_kernel_admission_profile`].
     pub fn new(device: ComputeDevice, models: Vec<ModelIdentity>) -> Self {
         Self {
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             device,
             models,
+            kernel_admission_profile: None,
         }
+    }
+
+    /// Record the fused-kernel admission profile the producer's compute path
+    /// ran under (see [`Self::kernel_admission_profile`]'s doc for why this
+    /// is an opaque tag rather than a typed `jammi-kernels` value).
+    pub fn with_kernel_admission_profile(mut self, profile: impl Into<String>) -> Self {
+        self.kernel_admission_profile = Some(profile.into());
+        self
     }
 }
 
@@ -523,6 +602,156 @@ pub enum ProducingDescriptor {
         /// Right-side projection columns, in output order. Empty = all non-key
         /// columns.
         project: Vec<String>,
+    },
+    /// Training-set output: the rows a training run reads, projected from a
+    /// source relation and committed in one canonical order as an immutable
+    /// Parquet table of kind
+    /// [`ResultTableKind::TrainingSet`](crate::catalog::result_repo::ResultTableKind::TrainingSet).
+    /// ([`ResultStore::materialize_training_set`](crate::store::ResultStore::materialize_training_set).)
+    ///
+    /// The determinant set is exactly what changes the committed BYTES and
+    /// their order: the source relation the rows were projected from, the
+    /// projected columns in declared order, the model task those columns are
+    /// read as, the training format the consumer parses them under, and the
+    /// order rule the write committed. Nothing about *how a run consumes the
+    /// table* is recorded — not the world size, not the per-rank batch, not
+    /// the validation split, not the topology: those partition and slice a
+    /// table that is already fixed, so folding them in would fragment one
+    /// shared artifact into a per-run copy while changing not one committed
+    /// byte. That omission is what lets runs of different shapes share one
+    /// table — the definition half of the reuse key; the recorded input
+    /// anchors must match too, and be pinned
+    /// ([`ResultStore::materialize_training_set`](crate::store::ResultStore::materialize_training_set)).
+    ///
+    /// `format` is a **canonical string tag**, not the consuming crate's
+    /// format type: `jammi-db` depends on no jammi crate but `jammi-numerics`,
+    /// so the owning crate maps its own enum to a stable tag and this
+    /// descriptor folds the tag. The completeness burden moves with it: a
+    /// format distinction the tag does not spell is two different tables
+    /// colliding on one hash, which is the mapping's contract to keep (the
+    /// same burden [`Self::External`]'s `params` carries).
+    TrainingSet {
+        /// The source relation the rows were projected from, as the canonical
+        /// text the producer actually ran — the query, never merely a source
+        /// id. Two different projections, filters or joins over one registered
+        /// source are two different training sets, and recording only the id
+        /// would collide them on a single hash.
+        source: String,
+        /// The projected columns, in declared order. Also the order key (see
+        /// `order_rule`), so their declared order is itself output-affecting:
+        /// the same column set declared differently commits a different row
+        /// order.
+        columns: Vec<String>,
+        /// The model task the projected columns are read as — the task decides
+        /// which columns are inputs and which are targets, so it changes what
+        /// the same bytes mean to a consumer.
+        task: ModelTask,
+        /// The training format the consumer parses the rows under, as its
+        /// canonical string tag: the same columns under two formats are two
+        /// different training sets.
+        format: String,
+        /// The row-order rule the write committed, as a versioned tag —
+        /// [`TRAINING_SET_ORDER_RULE_V1`] today. A change to how the producer
+        /// orders rows changes the committed byte order, so the rule is part
+        /// of the definition and takes a NEW tag rather than silently
+        /// re-ordering the rows an existing hash already names.
+        order_rule: String,
+    },
+    /// A trained model's output: a base model fine-tuned over a materialised
+    /// [`Self::TrainingSet`], keyed under the catalog name
+    /// `jammi:fine-tuned:{job_id}` (the handle and re-claim idempotency key).
+    /// Recorded on the `models` row via the `model_materialization` migration
+    /// (`models.definition_hash` / `input_anchors_json`, mirroring the
+    /// `result_tables` columns migration 021 added); the `.materialization.json`
+    /// sidecar path is derived from the artifact prefix, never recorded as a
+    /// third column. Replay
+    /// (`pipeline::recompute`, K1) for this variant is **retrain**, never a
+    /// re-derivation from the recorded fields.
+    ///
+    /// `jammi-db` depends on no jammi crate but `jammi-numerics`
+    /// (crate-layering rule, DESIGN §3), so the two foreign types this
+    /// variant would otherwise need to hold directly — `jammi-wire`'s
+    /// `FineTuneConfig` and `jammi-ai`'s `TrainingSpec`/`TrainingCommon` —
+    /// never appear here. Instead `spec_canonical` (below) is an OPAQUE,
+    /// versioned canonical (sorted-key JSON) encoding of the **whole**
+    /// `TrainingSpec::FineTune` variant (base model, the full
+    /// `FineTuneConfig` — LoRA rank/alpha/dropout, `use_rslora`,
+    /// `rank_pattern`, `init_lora_weights`, the training-time `backbone_dtype`,
+    /// the deterministic `seed`, losses, `matryoshka_dims`,
+    /// `quantile_levels`, `validation_fraction`, early stopping, `cached`,
+    /// `hard_negatives`, …, and `TrainingCommon::world_size`), produced by
+    /// `jammi-ai` from the owning types — the same "db-local primitive
+    /// standing in for a foreign type" shape `TrainingSet::format` (above)
+    /// already uses. Completeness of that whole-variant serialization (a new
+    /// `FineTuneConfig`/`TrainingCommon` field never silently escaping it) is
+    /// the exhaustive-destructuring completeness test in `jammi-wire` /
+    /// `jammi-ai` (K7) — this variant's own completeness test instead covers
+    /// every field named directly below.
+    ///
+    /// The base model's full identity (backend, compute precision, content
+    /// digest, quantization) folds in via [`MaterializationEnv::models`] —
+    /// the SAME uniform path [`Self::Embedding`]/[`Self::Inference`] already
+    /// use for the model they invoke — so `base_model_id` (below) is the
+    /// db-local mirror of `env.models[0].model_id`, not a second identity.
+    /// The fused-kernel admission profile is an environment fact, not a
+    /// spec knob, when it IS folded — but for this variant it is not: the
+    /// `FineTune` producer never calls
+    /// [`MaterializationEnv::with_kernel_admission_profile`], so
+    /// [`MaterializationEnv::kernel_admission_profile`] stays `None` here
+    /// and the real per-op fused/eager admission outcome is UNCOVERED by
+    /// this variant's [`DefinitionHash`] (that field's own doc carries the
+    /// tracking issue).
+    ///
+    /// `world_size` is the only topology field `TrainingCommon` carries;
+    /// distributed (gang) training adds per-rank batch, partition-rule
+    /// version, collective backend, and reduction policy as new named
+    /// fields on this variant when it lands (see
+    /// `docs/plans/67-distributed-training/UNITS.md`) — the completeness
+    /// test's exhaustive destructuring (no `..`) fails to compile the
+    /// moment they land until each is bound and mutated, so the
+    /// determinant set can never silently grow unaccounted-for.
+    FineTune {
+        /// The training-set table's own [`DefinitionHash`], hex — binds this
+        /// fine-tune to the EXACT materialised
+        /// [`ProducingDescriptor::TrainingSet`] definition it trained from,
+        /// not merely "a table with this name" (which could be silently
+        /// replaced by a later re-materialization under reuse rules a
+        /// bare name could never detect).
+        training_set_definition_hash: String,
+        /// The training-set table's [`ArtifactDigest`], hex — the exact
+        /// content the fine-tune consumed, distinct from the definition hash
+        /// (two materialisations of the same definition over advanced inputs
+        /// share no digest even though nothing about *how* they were built
+        /// differs).
+        training_set_artifact_digest: String,
+        /// The training-set table's committed row count — an idle-seeming
+        /// field that is nonetheless output-affecting: the same digest could
+        /// only arise from one row count, but recording it directly (rather
+        /// than requiring a reader to re-open the Parquet footer) makes the
+        /// determinant self-contained in the descriptor, matching every
+        /// other variant's "the descriptor alone states what changed the
+        /// bytes" contract.
+        training_set_row_count: u64,
+        /// Sorted-key canonical JSON of the whole `TrainingSpec::FineTune`
+        /// variant — see the variant doc above. Opaque to `jammi-db`.
+        spec_canonical: String,
+        /// The schema version `spec_canonical` (above) was encoded under —
+        /// bumped by the owning crate whenever a field is added to or
+        /// removed from the encoded shape, so a reader never compares two
+        /// canonical strings encoded under different, silently-incompatible
+        /// shapes as if they were the same kind of value.
+        spec_schema_version: u32,
+        /// The base model's canonical id — the db-local mirror of
+        /// `env.models[0].model_id` (see the variant doc above); the full
+        /// identity (backend, precision, content digest, quantization)
+        /// folds in via [`MaterializationEnv::models`], uniformly with every
+        /// other model-invoking variant.
+        base_model_id: String,
+        /// Data-parallel rank count this fine-tune trained over
+        /// (`TrainingCommon::world_size`) — the summation order
+        /// and batch layout depend on it, so two runs of the same spec at
+        /// different world sizes are two different definitions.
+        world_size: u32,
     },
     /// A table produced by a verb the engine does not own: a consumer built the
     /// rows through its own producer and asked the engine only to publish them
@@ -2174,6 +2403,297 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.unpinned_inputs(), vec!["federated".to_string()]);
+    }
+
+    /// Every field of [`ProducingDescriptor::TrainingSet`], carried as a
+    /// fixture whose shape the completeness test below destructures WITHOUT
+    /// `..`, so a field added to the variant fails to compile here instead of
+    /// silently escaping the definition hash (K7).
+    #[derive(Clone)]
+    struct TrainingSetFields {
+        source: String,
+        columns: Vec<String>,
+        task: ModelTask,
+        format: String,
+        order_rule: String,
+    }
+
+    fn training_set_descriptor(f: &TrainingSetFields) -> ProducingDescriptor {
+        // Exhaustive construction: no `..`, so the fixture and the variant
+        // stay in lock-step.
+        let TrainingSetFields {
+            source,
+            columns,
+            task,
+            format,
+            order_rule,
+        } = f.clone();
+        ProducingDescriptor::TrainingSet {
+            source,
+            columns,
+            task,
+            format,
+            order_rule,
+        }
+    }
+
+    /// A base fixture whose every field is a NON-default, distinguishable
+    /// value: a mutation test over a fixture of defaults passes vacuously
+    /// exactly where the identity is lossy.
+    fn training_set_fields() -> TrainingSetFields {
+        TrainingSetFields {
+            source: "SELECT \"q\", \"a\" FROM jammi.support_tickets WHERE \"lang\" = 'en'".into(),
+            columns: vec!["q".into(), "a".into()],
+            task: ModelTask::TextEmbedding,
+            format: "pairs".into(),
+            order_rule: TRAINING_SET_ORDER_RULE_V1.to_string(),
+        }
+    }
+
+    #[test]
+    fn training_set_hash_is_deterministic() {
+        let env = no_model_env();
+        let f = training_set_fields();
+        assert_eq!(
+            definition_hash(&training_set_descriptor(&f), &env).unwrap(),
+            definition_hash(&training_set_descriptor(&f), &env).unwrap(),
+            "the same training-set definition must hash identically"
+        );
+    }
+
+    /// K7 completeness: the field set the assertions below range over is the
+    /// variant's own, taken by exhaustive destructuring (no `..`) — a new
+    /// field breaks this test's compilation, which is the point.
+    #[test]
+    fn training_set_every_field_moves_the_hash() {
+        // The `let` below is the enumeration of record: adding a field to the
+        // variant fails to compile here until it is bound and mutated.
+        let TrainingSetFields {
+            source: _,
+            columns: _,
+            task: _,
+            format: _,
+            order_rule: _,
+        } = training_set_fields();
+
+        assert_each_change_moves_hash(
+            &training_set_fields(),
+            &no_model_env(),
+            training_set_descriptor,
+            &[
+                ("source", |f| {
+                    f.source = "SELECT \"q\", \"a\" FROM jammi.support_tickets".into()
+                }),
+                // A different column SET.
+                ("columns", |f| f.columns.push("lang".into())),
+                // …and the same set in a different ORDER: the columns are the
+                // order key, so their declared order is output-affecting on
+                // its own.
+                ("columns order", |f| f.columns.reverse()),
+                ("task", |f| f.task = ModelTask::Classification),
+                ("format", |f| f.format = "triplets".into()),
+                ("order_rule", |f| f.order_rule = "full_tuple_v2".into()),
+            ],
+        );
+    }
+
+    /// The device is part of the environment the hash folds, so the same
+    /// training-set definition materialised on two devices is two identities —
+    /// the environment leg of K7 for this variant, which the descriptor-only
+    /// mutations above cannot show.
+    #[test]
+    fn training_set_hash_moves_with_the_device() {
+        let d = training_set_descriptor(&training_set_fields());
+        assert_ne!(
+            definition_hash(&d, &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())).unwrap(),
+            definition_hash(
+                &d,
+                &MaterializationEnv::new(ComputeDevice::Cuda { ordinal: 0 }, Vec::new())
+            )
+            .unwrap(),
+        );
+    }
+
+    /// Every field [`ProducingDescriptor::FineTune`] currently carries,
+    /// captured as a fixture whose shape the completeness test below
+    /// destructures WITHOUT `..` — a field added to the variant (e.g. new
+    /// distributed-training topology fields) fails to compile here instead
+    /// of silently escaping the definition hash (K7).
+    #[derive(Clone)]
+    struct FineTuneFields {
+        training_set_definition_hash: String,
+        training_set_artifact_digest: String,
+        training_set_row_count: u64,
+        spec_canonical: String,
+        spec_schema_version: u32,
+        base_model_id: String,
+        world_size: u32,
+    }
+
+    fn fine_tune_descriptor(f: &FineTuneFields) -> ProducingDescriptor {
+        // Exhaustive construction: no `..`, so the fixture and the variant
+        // stay in lock-step.
+        let FineTuneFields {
+            training_set_definition_hash,
+            training_set_artifact_digest,
+            training_set_row_count,
+            spec_canonical,
+            spec_schema_version,
+            base_model_id,
+            world_size,
+        } = f.clone();
+        ProducingDescriptor::FineTune {
+            training_set_definition_hash,
+            training_set_artifact_digest,
+            training_set_row_count,
+            spec_canonical,
+            spec_schema_version,
+            base_model_id,
+            world_size,
+        }
+    }
+
+    /// A base fixture whose every field is a NON-default, distinguishable
+    /// value: a mutation test over a fixture of defaults passes vacuously
+    /// exactly where the identity is lossy.
+    fn fine_tune_fields() -> FineTuneFields {
+        FineTuneFields {
+            training_set_definition_hash: "a".repeat(64),
+            training_set_artifact_digest: "b".repeat(64),
+            training_set_row_count: 4096,
+            spec_canonical: r#"{"base_model":"bert-base","config":{"lora_rank":8}}"#.into(),
+            spec_schema_version: 1,
+            base_model_id: "bert-base-uncased".into(),
+            world_size: 2,
+        }
+    }
+
+    fn base_model_identity() -> ModelIdentity {
+        ModelIdentity {
+            model_id: "bert-base-uncased".into(),
+            backend: "candle".into(),
+            compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("fine-tune-fixture-digest".into()),
+            quantization: None,
+        }
+    }
+
+    #[test]
+    fn fine_tune_hash_is_deterministic() {
+        let env = env_with_model(base_model_identity());
+        let f = fine_tune_fields();
+        assert_eq!(
+            definition_hash(&fine_tune_descriptor(&f), &env).unwrap(),
+            definition_hash(&fine_tune_descriptor(&f), &env).unwrap(),
+            "the same fine-tune definition must hash identically"
+        );
+    }
+
+    /// K7 completeness: the field set the assertions below range over is the
+    /// variant's own, taken by exhaustive destructuring (no `..`) — a new
+    /// field breaks this test's compilation, which is the point.
+    #[test]
+    fn fine_tune_every_field_moves_the_hash() {
+        // The `let` below is the enumeration of record: adding a field to the
+        // variant fails to compile here until it is bound and mutated.
+        let FineTuneFields {
+            training_set_definition_hash: _,
+            training_set_artifact_digest: _,
+            training_set_row_count: _,
+            spec_canonical: _,
+            spec_schema_version: _,
+            base_model_id: _,
+            world_size: _,
+        } = fine_tune_fields();
+
+        assert_each_change_moves_hash(
+            &fine_tune_fields(),
+            &env_with_model(base_model_identity()),
+            fine_tune_descriptor,
+            &[
+                ("training_set_definition_hash", |f| {
+                    f.training_set_definition_hash = "c".repeat(64)
+                }),
+                ("training_set_artifact_digest", |f| {
+                    f.training_set_artifact_digest = "d".repeat(64)
+                }),
+                ("training_set_row_count", |f| {
+                    f.training_set_row_count = 4097
+                }),
+                ("spec_canonical", |f| {
+                    f.spec_canonical =
+                        r#"{"base_model":"bert-base","config":{"lora_rank":16}}"#.into()
+                }),
+                ("spec_schema_version", |f| f.spec_schema_version = 2),
+                ("base_model_id", |f| {
+                    f.base_model_id = "distilbert-base-uncased".into()
+                }),
+                ("world_size", |f| f.world_size = 4),
+            ],
+        );
+    }
+
+    /// The base model's full identity folds in uniformly via
+    /// `MaterializationEnv::models`, exactly like `Embedding`/`Inference` —
+    /// a different base model's content digest must change the hash even
+    /// though `base_model_id` (the descriptor's own db-local mirror) stays
+    /// the same string.
+    #[test]
+    fn fine_tune_hash_moves_with_the_base_model_content_digest() {
+        let d = fine_tune_descriptor(&fine_tune_fields());
+        let base = definition_hash(&d, &env_with_model(base_model_identity())).unwrap();
+        let mut other = base_model_identity();
+        other.content_digest = ModelContentDigest::Sha256("a-different-base-digest".into());
+        assert_ne!(base, definition_hash(&d, &env_with_model(other)).unwrap());
+    }
+
+    /// The device is part of the environment the hash folds — the
+    /// environment leg of K7 for this variant, which the descriptor-only
+    /// mutations above cannot show.
+    #[test]
+    fn fine_tune_hash_moves_with_the_device() {
+        let d = fine_tune_descriptor(&fine_tune_fields());
+        let cpu = MaterializationEnv::new(ComputeDevice::Cpu, vec![base_model_identity()]);
+        let cuda = MaterializationEnv::new(
+            ComputeDevice::Cuda { ordinal: 0 },
+            vec![base_model_identity()],
+        );
+        assert_ne!(
+            definition_hash(&d, &cpu).unwrap(),
+            definition_hash(&d, &cuda).unwrap(),
+        );
+    }
+
+    /// HASH-PRESERVATION GOLDEN: `kernel_admission_profile: None` must
+    /// serialise to no key at all, never a present `null` — the same
+    /// contract `quantization_none_serialises_to_no_key` pins for
+    /// `ModelIdentity`, restated for `MaterializationEnv` so this field's
+    /// addition changes not one byte of any pre-existing `DefinitionHash`.
+    #[test]
+    fn kernel_admission_profile_none_serialises_to_no_key() {
+        let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+        let value = serde_json::to_value(&env).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(
+            !object.contains_key("kernel_admission_profile"),
+            "kernel_admission_profile: None must serialise to no key, got {value:#?}"
+        );
+    }
+
+    /// DISTINCTNESS: a `Some` kernel-admission profile must hash differently
+    /// from `None` over an otherwise-identical environment — a fused-kernel
+    /// run is output-affecting relative to an eager run of the same spec.
+    #[test]
+    fn fine_tune_hash_moves_with_the_kernel_admission_profile() {
+        let d = fine_tune_descriptor(&fine_tune_fields());
+        let bare = env_with_model(base_model_identity());
+        let fused = MaterializationEnv::new(ComputeDevice::Cpu, vec![base_model_identity()])
+            .with_kernel_admission_profile("lora_linear_fused_v1");
+        assert_ne!(
+            definition_hash(&d, &bare).unwrap(),
+            definition_hash(&d, &fused).unwrap(),
+            "a fused-kernel admission profile must change the hash relative to none recorded"
+        );
     }
 
     #[test]

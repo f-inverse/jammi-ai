@@ -256,8 +256,10 @@ import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-with tempfile.TemporaryDirectory() as _jobs_dir:
-    jobs_db = jammi.connect(f"file://{_jobs_dir}")
+with (
+    tempfile.TemporaryDirectory() as _jobs_dir,
+    jammi.connect(f"file://{_jobs_dir}") as jobs_db,
+):
     spine_path = f"{_jobs_dir}/spine.parquet"
     facts_path = f"{_jobs_dir}/facts.parquet"
     pq.write_table(pa.table({"entity": ["e"], "as_of": [10]}), spine_path)
@@ -283,7 +285,6 @@ with tempfile.TemporaryDirectory() as _jobs_dir:
     handle = jobs_db.job(asof_job["job_id"])
     print(f"job({asof_job['job_id']}).status() = {handle.status()!r}")
     assert handle.status() == "completed" == asof_job["status"]
-    jobs_db.close()
 ```
 
 ## The boundary — mechanism, not the loop

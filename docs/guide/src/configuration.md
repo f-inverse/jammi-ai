@@ -198,18 +198,22 @@ preload_models = [
 # its `instances.peer_addr`/`result_root` columns stay NULL regardless of
 # whether `peer_bind` is set. Setting it means: this process ADVERTISES
 # itself as a gang member. Requires `peer_bind` to be set too, and the
-# `[storage] result_root` anchor (or `artifact_dir`, when `result_root` is
-# unset) must be an ABSOLUTE path -- both refused, naming the offending
-# key(s), at `MembershipConfig::validate` -- the PURE check (no filesystem
-# access at all) `JammiConfig::load_from` runs at config load time.
-# `InstanceRegistration::from_config`, called once by every session
-# construction path, runs that SAME check and then MATERIALIZES the anchor
-# (creating it if absent, exactly like the catalog's own directory creation
-# at open) before canonicalizing it -- a missing anchor is never refused,
-# only a non-directory one.
+# effective root's file:// anchor (`artifact_dir` is a local ABSOLUTE
+# path -- a URL belongs in `[storage] result_root`, never in
+# `artifact_dir`, which is NEVER parsed as one; or the explicit
+# `result_root` itself, when set) must be absolute -- both refused, naming
+# the offending key(s), at `MembershipConfig::validate` -- the PURE check
+# (no filesystem access at all) `JammiConfig::load_from` runs at config
+# load time. `InstanceRegistration::from_config`, called once by every
+# session construction path, runs that SAME check and then MATERIALIZES
+# the anchor (creating it if absent, exactly like the catalog's own
+# directory creation at open) before canonicalizing it -- a missing anchor
+# is never refused, only a non-directory one.
 # The canonical result root rule: when `[storage] result_root` is UNSET, the
-# root is `{artifact_dir}/jammi_db`, canonicalized; when it IS set, the root
-# is the canonicalized `result_root` itself, with no `jammi_db` suffix
+# root is `{artifact_dir}/jammi_db`, canonicalized; when it IS set, it is
+# parsed VERBATIM (no scheme lowercasing -- an uppercase scheme is refused,
+# consistently, by both this check and the store itself) and the root is
+# the canonicalized `result_root` itself, with no `jammi_db` suffix
 # appended; a `memory://` root is refused for a gang member. See "The gang
 # listener (I-GANG)" in security.md for the membership predicate this feeds.
 # peer_advertise = "10.0.4.7:9000"

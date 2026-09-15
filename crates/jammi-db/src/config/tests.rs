@@ -3527,15 +3527,17 @@ fn canonical_result_root_folds_dot_slash_and_trailing_slash_anchor_spellings() {
     assert_eq!(plain_root, double_slash_root, "a doubled '/' must fold");
 }
 
-/// `canonical_result_root()` is exactly `canon ∘ resolved`: for BOTH arms
+/// `canonical_result_root()` is exactly `canon ∘ resolved`: for every arm
 /// the canonical string equals the canonicalized form of the EXACT
 /// effective root `resolved_result_root()` names — arm (a) (`result_root`
-/// unset) is `{artifact_dir}/jammi_db`; arm (b) (`result_root` set) is
-/// `result_root` VERBATIM, the same string
+/// unset) is `{artifact_dir}/jammi_db`; arm (b) (`result_root` set to a
+/// `file://`/bare path) is `result_root` VERBATIM, the same string
 /// `jammi_db::store::ResultStore::with_root` roots the store at, with no
-/// `jammi_db` suffix — never a string no store is rooted under.
+/// `jammi_db` suffix; arm (c) (`result_root` set to a cloud scheme) is
+/// `resolved_result_root()`'s string itself (no scheme lowercasing, §9) —
+/// never a string no store is rooted under.
 #[test]
-fn canonical_result_root_equals_the_canonicalized_effective_root_for_both_arms() {
+fn canonical_result_root_equals_the_canonicalized_effective_root_for_every_arm() {
     // Arm (a): `result_root` unset.
     let dir_a = tempfile::tempdir().unwrap();
     let cfg_a = advertising_config(dir_a.path(), None);
@@ -3571,6 +3573,88 @@ fn canonical_result_root_equals_the_canonicalized_effective_root_for_both_arms()
     assert!(
         !canonical_b.as_str().ends_with("jammi_db"),
         "arm (b) must root at result_root verbatim, no jammi_db suffix: {canonical_b:?}"
+    );
+
+    // Arm (c): `result_root` explicitly set to a cloud scheme — no local
+    // filesystem step, so the canonical string is `resolved_result_root()`
+    // itself.
+    let root_c = "s3://bucket/prefix";
+    let cfg_c = advertising_config(std::path::Path::new("/unused"), Some(root_c));
+    assert_eq!(cfg_c.resolved_result_root().unwrap(), root_c);
+    let canonical_c = cfg_c.canonical_result_root().unwrap().unwrap();
+    assert_eq!(canonical_c.as_str(), root_c);
+}
+
+/// §9 (F-A1/F-A2 closed): `artifact_dir` is NEVER reinterpreted as a URL —
+/// a `file://`-spelled or a cloud-scheme-spelled `artifact_dir` is refused
+/// as RELATIVE (as a literal path string neither starts with `/`), naming
+/// `artifact_dir`, never silently accepted through a URL reparse.
+#[test]
+fn membership_config_validate_refuses_a_file_url_spelled_artifact_dir_as_relative() {
+    let cfg = advertising_config(std::path::Path::new("file:///var/lib/jammi"), None);
+    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_dir") && msg.contains("absolute"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn membership_config_validate_refuses_a_cloud_url_spelled_artifact_dir_as_relative() {
+    let cfg = advertising_config(std::path::Path::new("s3://bucket/prefix"), None);
+    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_dir") && msg.contains("absolute"),
+        "{msg}"
+    );
+}
+
+/// A non-UTF-8 `artifact_dir` is refused naming the key — never a lossy
+/// fold on the compared value (F-A3). Built via `OsString::from_vec` (unix
+/// only — there is no portable way to construct an invalid-UTF-8 `PathBuf`
+/// elsewhere).
+#[cfg(unix)]
+#[test]
+fn membership_config_validate_refuses_a_non_utf8_artifact_dir() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut bytes = b"/tmp/jammi-".to_vec();
+    bytes.push(0xFF); // invalid UTF-8 byte, valid on a unix filesystem
+    bytes.extend_from_slice(b"-dir");
+    let bad_path = std::path::PathBuf::from(OsString::from_vec(bytes));
+    assert!(bad_path.to_str().is_none(), "fixture must be non-UTF-8");
+
+    let cfg = advertising_config(&bad_path, None);
+    let err = crate::catalog::instance::MembershipConfig::validate(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_dir") && msg.contains("UTF-8"),
+        "{msg}"
+    );
+}
+
+/// The ENOTDIR oracle: the anchor's PARENT segment is a plain FILE, so
+/// `create_dir_all` cannot create anything under it — a structural
+/// "not a directory" failure distinct from a permission fault, so this
+/// case is refused the SAME way whether CI runs as root or not (a
+/// permission-denied case would be bypassed by root; ENOTDIR never is).
+#[test]
+fn materialize_refuses_when_the_anchor_cannot_be_created_parent_is_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_is_a_file = dir.path().join("not-a-dir");
+    std::fs::write(&parent_is_a_file, b"x").unwrap();
+    let anchor = parent_is_a_file.join("child"); // a path component IS a file
+    assert!(!anchor.exists());
+
+    let cfg = advertising_config(&anchor, None);
+    let err = cfg.canonical_result_root().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_dir") && msg.contains("failed to create"),
+        "{msg}"
     );
 }
 
@@ -3628,27 +3712,44 @@ fn canonical_result_root_refuses_a_memory_scheme() {
 /// identical string), and a trailing `/` is trimmed — no `jammi_db` leaf is
 /// ever appended for a cloud scheme.
 #[test]
-fn canonical_result_root_lowercases_and_aliases_the_cloud_scheme() {
+fn canonical_result_root_parses_a_cloud_result_root_verbatim_no_scheme_lowercasing() {
     let root_of = |root: &str| {
         advertising_config(std::path::Path::new("/unused"), Some(root))
             .canonical_result_root()
             .unwrap()
             .unwrap()
     };
+    // No scheme lowercasing (contract §9): the lowercase spelling parses
+    // and round-trips verbatim.
+    assert_eq!(root_of("gs://bucket/prefix").as_str(), "gs://bucket/prefix");
     assert_eq!(
-        root_of("GCS://bucket/prefix"),
-        root_of("gs://bucket/prefix")
-    );
-    assert_eq!(
-        root_of("ABFSS://bucket/prefix"),
-        root_of("azure://bucket/prefix")
+        root_of("azure://bucket/prefix").as_str(),
+        "azure://bucket/prefix"
     );
     assert_eq!(
         root_of("s3://bucket/prefix/"),
         root_of("s3://bucket/prefix"),
         "trailing '/' trimmed"
     );
-    assert_eq!(root_of("gs://bucket/prefix").as_str(), "gs://bucket/prefix");
+}
+
+/// §9: an UPPERCASE (or any non-lowercase) scheme token is refused —
+/// consistently — by `canonical_result_root` and by `StorageUrl::parse`
+/// itself (the SAME parser `build_result_store` uses for the identical
+/// string), never silently folded to the lowercase spelling.
+#[test]
+fn canonical_result_root_refuses_an_uppercase_cloud_scheme_consistently_with_the_store() {
+    let cfg = advertising_config(std::path::Path::new("/unused"), Some("GCS://bucket/prefix"));
+    let membership_err = cfg.canonical_result_root().unwrap_err();
+    let store_err = crate::storage::StorageUrl::parse("GCS://bucket/prefix").unwrap_err();
+    assert!(
+        membership_err.to_string().contains("unknown scheme"),
+        "{membership_err}"
+    );
+    assert!(
+        store_err.to_string().contains("unknown scheme"),
+        "the store's own parser must refuse the identical string the same way: {store_err}"
+    );
 }
 
 /// `canonical_result_root` is `Ok(None)` whenever `peer_advertise` is unset

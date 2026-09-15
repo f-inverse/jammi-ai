@@ -3254,21 +3254,40 @@ choke point every writer of them funnels through.
   enforcement points, two different verdicts on one config. The fix:
   `MembershipConfig::validate(&JammiConfig) -> Result<Option<MembershipConfig>>`
   is PURE — NO filesystem access at all: `peer_advertise` parses as a
-  `PeerAddr`; `peer_bind` is set too (else a typed error naming both keys);
-  a `file://` anchor is ABSOLUTE (a relative `artifact_dir` — including the
-  `.jammi` fallback `default_artifact_dir` returns when `ProjectDirs` is
-  unavailable — or a relative explicit `result_root` is refused naming the
-  key: a relative path's meaning depends on the process's cwd at whatever
-  moment it is later resolved, never a property of the config alone); a
-  cloud scheme folds through `Scheme`'s own alias table; `memory://` is
-  refused. `JammiConfig::load_from` calls ONLY `MembershipConfig::validate`
-  — loading a config file must never itself create a directory as a side
+  `PeerAddr`; `peer_bind` is set too (else a typed error naming both keys).
+  **`artifact_dir` is a LOCAL PATH, never a URL (contract §9, the round-2
+  redesign).** When `[storage] result_root` is UNSET, the anchor is
+  `artifact_dir`'s LITERAL `PathBuf` — the SAME value every other consumer
+  (the catalog's own directory creation, `resolved_result_root`, the local
+  cache dir, `JobWorker`) uses — checked directly with `Path::is_absolute()`
+  and `Path::to_str()`, NEVER reinterpreted as a URL: a `file://`- or
+  cloud-scheme-spelled `artifact_dir` (or the `.jammi` fallback
+  `default_artifact_dir` returns when `ProjectDirs` is unavailable) is
+  refused as RELATIVE (as a bare path string it never starts with `/`),
+  naming `artifact_dir` — the earlier round's fix parsed `artifact_dir`
+  itself as a `StorageUrl`, which let a `file:///…`-spelled path pass the
+  absoluteness check as a URL while remaining relative as the literal
+  `PathBuf` every OTHER consumer uses, and let a cloud-spelled
+  `artifact_dir` silently take the no-leaf `Cloud` arm — a false-positive
+  member naming a root the store never actually roots at; round 2 closes
+  both. **Only an explicit `result_root` is ever parsed as a URL** — and
+  VERBATIM: no scheme lowercasing (an uppercase scheme is refused by
+  `StorageUrl::parse` itself, case-sensitively, consistently with the
+  store's own parse of the identical string). `memory://` is refused.
+  `JammiConfig::load_from` calls ONLY `MembershipConfig::validate` —
+  loading a config file must never itself create a directory as a side
   effect. `InstanceRegistration::from_config` = validate PLUS MATERIALIZE:
-  for a `file://` anchor, `create_dir_all`s it if absent (idempotent with
-  `JammiSession`'s own catalog-open `create_dir_all` of `artifact_dir`, and
-  with `ResultStore`'s later one of the same `result_root` path — refusing
-  naming the key if it exists as a non-directory or cannot be created),
-  `fs::canonicalize`s it, and appends the leaf rule.
+  for a `file://` anchor (either arm), `create_dir_all`s it if absent
+  (idempotent with `JammiSession`'s own catalog-open `create_dir_all` of
+  `artifact_dir`, and with `ResultStore`'s later one of the same
+  `result_root` path — refusing naming the key if it exists as a
+  non-directory or cannot be created), `fs::canonicalize`s it, and appends
+  the leaf rule (`artifact_dir` gets `jammi_db` appended lexically after
+  canonicalizing; an explicit `result_root` already names the whole
+  effective root, no suffix). `create_dir_all` is not atomic: a failure
+  partway through can leave some parent directories created on disk even
+  though `materialize` returns `Err` — stated honestly in its own doc,
+  never papered over.
   `InferenceSession::wrap_with` (`session.rs`) calls `from_config` FIRST —
   before the lease keeper starts, before the result store creates a
   directory, before any other session-level side effect — but it is NOT
@@ -3291,15 +3310,16 @@ choke point every writer of them funnels through.
   `canonical_result_root()` is `materialize ∘ validate` (a convenience
   one-shot wrapping `MembershipConfig::validate` + `MembershipConfig::
   materialize`) — `Ok(None)` when `peer_advertise` is unset; otherwise the
-  anchor (`result_root` itself when set, else `artifact_dir`) is CREATED if
-  absent (never required to pre-exist — see the validate/materialize split
-  above), `fs::canonicalize`d once, and — ONLY when `result_root` is unset —
-  the default leaf `jammi_db` is appended lexically (never itself
-  resolved); an explicit `result_root` IS the whole effective root, no
-  suffix. Cloud schemes: the scheme token is lowercased then folded through
-  `Scheme`'s own alias table before `StorageUrl::parse` (which is
-  case-sensitive); `memory://` is refused for a gang member; a trailing `/`
-  is trimmed.
+  file:// anchor (`result_root` itself when set, else `artifact_dir`'s
+  LITERAL `PathBuf`, never a URL reparse) is CREATED if absent (never
+  required to pre-exist — see the validate/materialize split above),
+  `fs::canonicalize`d once, and — ONLY when `result_root` is unset — the
+  default leaf `jammi_db` is appended lexically (never itself resolved); an
+  explicit `result_root` IS the whole effective root, no suffix. Cloud
+  schemes (`result_root` only): parsed VERBATIM through `StorageUrl::parse`,
+  NO scheme lowercasing (an uppercase scheme is refused, case-sensitively,
+  consistently with the store's own parse of the identical string);
+  `memory://` is refused for a gang member; a trailing `/` is trimmed.
 - **The two read verbs** (`catalog/jobs_repo.rs`, both tenant-unscoped by
   construction — `instances` carries no tenant column): `peer_addr_of(id,
   lease)` is the ONE by-id resolution surface (no kind/root/self filter —

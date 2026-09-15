@@ -2503,15 +2503,20 @@ impl JammiConfig {
     ///
     /// **This is `materialize ∘ validate`, over the EXACT same effective
     /// root [`Self::resolved_result_root`] names** — never a string no store
-    /// is actually rooted under. `[storage] result_root` unset names
-    /// `{artifact_dir}/jammi_db` (the `artifact_dir` anchor, created if
-    /// absent, canonicalized, `jammi_db` appended lexically); SET names
-    /// `result_root` VERBATIM (the SAME string
-    /// `jammi_db::store::ResultStore::with_root` roots the store at — no
-    /// `jammi_db` suffix); a cloud scheme is lowercased, folded through
-    /// [`crate::storage::Scheme`]'s own alias table, and trailing-`/`-trimmed, with no local
-    /// filesystem step at all. A relative anchor (`file://` only) is refused
-    /// at `MembershipConfig::validate` before either arm's filesystem step
+    /// is actually rooted under. `[storage] result_root` UNSET names
+    /// `{artifact_dir}/jammi_db`: `artifact_dir` is `MembershipConfig`'s
+    /// anchor as a LITERAL local path (never reinterpreted as a URL —
+    /// contract §9), created if absent, canonicalized, with `jammi_db`
+    /// appended lexically. `result_root` SET is the ONLY arm parsed as a
+    /// URL, VERBATIM (no scheme lowercasing — an uppercase scheme is
+    /// refused, consistently, by this check and by the store's own parse of
+    /// the identical string): `file://` names `result_root` VERBATIM (the
+    /// SAME string `jammi_db::store::ResultStore::with_root` roots the
+    /// store at — no `jammi_db` suffix, since `result_root` already names
+    /// the whole effective root); a cloud scheme is `Scheme`'s own
+    /// rendering, trailing-`/`-trimmed, with no local filesystem step at
+    /// all. A relative anchor (either arm's `file://` case) is refused at
+    /// `MembershipConfig::validate` before either arm's filesystem step
     /// ever runs.
     pub fn canonical_result_root(&self) -> Result<Option<CanonicalRoot>> {
         match crate::catalog::instance::MembershipConfig::validate(self)? {

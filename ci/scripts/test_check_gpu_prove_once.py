@@ -23,6 +23,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -581,6 +582,81 @@ class PaidPodLaneTest(unittest.TestCase):
                 )
                 findings = cgo.check_p7_paid_pod_lanes(texts)
                 self.assertIn(f"{workflow}'s on: block carries ['push']", "\n".join(findings), script)
+
+
+class RpSshoRequiresRpInitTest(unittest.TestCase):
+    """F1 class guard (plan #500 U7b fix round 1): every real
+    `PAID_POD_LANE_TABLE` driver that references `runpod_lib.sh`'s own
+    `RP_SSHO` array must call `rp_init` -- a static scan over the table's
+    REAL drivers on disk, not a paraphrase. `RP_SSHO` is populated ONLY by
+    `rp_init` (`-i "$RP_SSH_KEY"`/`IdentitiesOnly=yes`, among other
+    options); a driver that reads it without ever calling `rp_init` runs
+    every ssh/scp/rsync call with an EMPTY option array — a silent,
+    wrong-key failure that reads exactly like 'not yet reachable', the
+    exact class `runpod_gpu_cluster.sh` itself shipped with before this
+    fix round (F1)."""
+
+    RP_INIT_CALL_RE = re.compile(r"(?m)^[ \t]*rp_init[ \t]*(?:#.*)?$")
+
+    def test_every_real_rp_ssho_referencing_driver_calls_rp_init(self) -> None:
+        offenders = []
+        for script in cgo.PAID_POD_LANE_TABLE:
+            text = (cgo.REPO_ROOT / script).read_text(encoding="utf-8")
+            if "RP_SSHO[" not in text:
+                continue  # this driver never reads the array at all -- nothing to bind.
+            if not self.RP_INIT_CALL_RE.search(text):
+                offenders.append(script)
+        self.assertEqual(
+            offenders,
+            [],
+            f"driver(s) reference RP_SSHO but never call rp_init: {offenders} -- every ssh/scp/rsync "
+            "call in that driver would run with an EMPTY RP_SSHO array",
+        )
+
+    def test_a_driver_reading_rp_ssho_without_rp_init_is_caught_red_then_green(self) -> None:
+        # RED: a fixture shaped exactly like the class this scan closes.
+        bad_text = 'echo "${RP_SSHO[@]}"\nssh "${RP_SSHO[@]}" -p "$PORT" "root@$HOST" true\n'
+        self.assertIn("RP_SSHO[", bad_text)
+        self.assertIsNone(self.RP_INIT_CALL_RE.search(bad_text))
+        # GREEN: rp_init called before the array is ever read.
+        good_text = 'rp_init\necho "${RP_SSHO[@]}"\n'
+        self.assertIsNotNone(self.RP_INIT_CALL_RE.search(good_text))
+        # A mention of rp_init inside PROSE (a comment) is never mistaken
+        # for a call -- the regex anchors the whole (stripped) line.
+        prose_only = '# see rp_init for details\necho "${RP_SSHO[@]}"\n'
+        self.assertIsNone(self.RP_INIT_CALL_RE.search(prose_only))
+
+
+class DropCommentLinesTrailingCommentTest(unittest.TestCase):
+    """Advisory (fix round 1): `drop_comment_lines` also strips a TRAILING
+    `# ...` comment, not only a full comment line -- a token that occurs
+    only after a trailing `#` is prose, never code evidence."""
+
+    def test_a_token_only_in_a_trailing_comment_does_not_resolve(self) -> None:
+        text = 'echo hello  # mentions rp_cluster_create only in this comment\n'
+        stripped = cgo.drop_comment_lines(text)
+        self.assertNotIn("rp_cluster_create", stripped)
+        self.assertIn("echo hello", stripped)
+
+    def test_a_token_in_real_code_before_a_trailing_comment_still_resolves(self) -> None:
+        text = "rp_cluster_create  # the real call, with a trailing comment\n"
+        stripped = cgo.drop_comment_lines(text)
+        self.assertIn("rp_cluster_create", stripped)
+
+    def test_a_hash_inside_a_quoted_string_is_not_treated_as_a_comment(self) -> None:
+        text = 'url="https://example.com/x#rp_cluster_create"\n'
+        stripped = cgo.drop_comment_lines(text)
+        self.assertIn("rp_cluster_create", stripped)
+
+    def test_line_count_is_preserved_never_shifted(self) -> None:
+        text = "a\nb  # c\nd\n"
+        self.assertEqual(len(cgo.drop_comment_lines(text).splitlines()), len(text.splitlines()))
+
+    def test_full_line_comments_are_still_blanked_as_before(self) -> None:
+        text = "# a whole-line comment naming rp_cluster_create\nreal code\n"
+        stripped = cgo.drop_comment_lines(text)
+        self.assertNotIn("rp_cluster_create", stripped)
+        self.assertIn("real code", stripped)
 
 
 class P7UsesReadFromTheParsedDocumentTest(unittest.TestCase):
@@ -1241,6 +1317,14 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # make `ci/scripts/check_gpu_prove_once.py` (above) derive
                 # the same way, for the same reason.
                 "ci/scripts/test_check_gpu_prove_once.py",
+                # test_gpu_cluster_lane.sh's own F2/F3(c) EXIT-trap fixtures
+                # (fix round 1) source runpod_gpu_cluster.sh in a real
+                # subshell and override `rp_cluster_delete`/`rp_cleanup` by
+                # name, in non-comment text -- the deliberately
+                # over-approximating scan derives it too. Cleared the
+                # identical way: ci.yml's guard job invokes it with no
+                # RUNPOD_API_KEY anywhere.
+                "ci/scripts/test_gpu_cluster_lane.sh",
                 "ci/scripts/test_pod_substrate.sh",
                 # test_runpod_cluster_lib.sh's own fixtures call
                 # `_rp_deploy_payload`/`rp_cluster_create` directly (Groups 1
@@ -1292,6 +1376,28 @@ class ScheduleVisibilityTest(unittest.TestCase):
     def test_the_allow_listed_prove_cron_is_clean(self):
         findings = cgo.check_p8_schedule_visibility(_positive_texts())
         self.assertFalse(any("gpu-prove.yml" in f for f in findings), findings)
+
+    def test_a_second_cron_entry_on_an_allow_listed_lane_fails(self):
+        """Advisory (fix round 1): the allow-list review covers exactly ONE
+        reviewed cadence; a SECOND `- cron:` under the same schedule: key is
+        un-reviewed paid-lane exposure the token match alone cannot see."""
+        two_crons = PROVE_YML_GOOD.replace(
+            '  schedule:\n    - cron: "47 3 * * *"\n',
+            '  schedule:\n    - cron: "47 3 * * *"\n    - cron: "0 0 * * *"\n',
+        )
+        texts = _positive_texts()
+        texts["gpu-prove.yml"] = two_crons
+        findings = cgo.check_p8_schedule_visibility(texts)
+        joined = "\n".join(findings)
+        self.assertIn("gpu-prove.yml", joined)
+        self.assertIn("2 `- cron:` entries", joined)
+        self.assertIn("un-reviewed paid-lane exposure", joined)
+
+    def test_a_single_cron_entry_on_an_allow_listed_lane_stays_clean(self):
+        # Control: the ordinary, single-cadence shape must not trip the
+        # new check on its own.
+        findings = cgo.check_p8_schedule_visibility(_positive_texts())
+        self.assertFalse(any("cron:` entries" in f for f in findings), findings)
 
     def test_an_unresolvable_allow_list_token_fails(self):
         allow = dict(cgo.PAID_LANE_CRON_ALLOWLIST)

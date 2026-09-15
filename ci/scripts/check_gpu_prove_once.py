@@ -453,8 +453,38 @@ def _job_level_uses_is_reviewed_nonpublishing(job_node: dict) -> bool:
 # Line-level helpers (comment-vs-code, the same rule check_ci_guard_wiring.py
 # and check_execution_surface_reachability.py both already apply).
 # --------------------------------------------------------------------------- #
+def _strip_trailing_comment(line: str) -> str:
+    """Blank a line from its first UNQUOTED `#` onward, when that `#` is
+    preceded by whitespace or begins the line (the same 'comment start'
+    rule bash/YAML both use -- a `#` glued to a non-whitespace character,
+    e.g. a URL fragment or a hex color literal, is never a comment start).
+    Single- and double-quoted spans are tracked so a `#` inside a string
+    literal is never mistaken for one. Best-effort, not a real
+    shell/YAML tokenizer -- good enough for 'is this token evidence, or
+    only prose' over this module's own token-resolution search, never
+    relied on for anything security-load-bearing beyond that."""
+    in_squote = in_dquote = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_dquote:
+            in_squote = not in_squote
+        elif ch == '"' and not in_squote:
+            in_dquote = not in_dquote
+        elif ch == "#" and not in_squote and not in_dquote:
+            if i == 0 or line[i - 1].isspace():
+                return line[:i]
+    return line
+
+
 def drop_comment_lines(text: str) -> str:
-    return "\n".join("" if line.strip().startswith("#") else line for line in text.splitlines())
+    """Blank (never remove) a full-line comment, AND strip a trailing
+    `# ...` comment off an otherwise-code line (`_strip_trailing_comment`)
+    -- a token that occurs ONLY after a trailing `#` is prose, not code
+    evidence, and must never resolve a P8 allow-list token or any other
+    'does this driver's own text mention X' search this helper backs."""
+    out: list[str] = []
+    for line in text.splitlines():
+        out.append("" if line.strip().startswith("#") else _strip_trailing_comment(line))
+    return "\n".join(out)
 
 
 def load_workflow_texts(workflows_dir: Path) -> dict[str, str]:
@@ -1285,6 +1315,29 @@ PAID_LANE_CRON_ALLOWLIST: dict[str, tuple[str, str]] = {
 }
 
 
+def _read_schedule_cron_entries(text: str) -> tuple[list | None, str | None]:
+    """(cron_entries, error) -- the RAW `on.schedule` list's own entries,
+    read from the SAME parse `read_top_level_on_block` uses (never a
+    second, independently-drifting reader; the same anchor/alias/
+    unreadable-doc refusals it carries apply here too). `cron_entries` is
+    `[]` when the document parses fine but `schedule` itself is absent —
+    only called once `schedule` is already known to be a key of `on:`, so
+    this arm is defensive, not expected in practice."""
+    try:
+        doc = exec_mod.load_workflow_text(text)
+    except exec_mod.WorkflowLoadError as exc:
+        return None, str(exc)
+    on_value = doc[True] if True in doc else doc.get("on")
+    if not isinstance(on_value, dict):
+        return None, f"on: block has an unrecognized shape for a schedule read -- cannot examine: {on_value!r}"
+    schedule = on_value.get("schedule")
+    if schedule is None:
+        return [], None
+    if not isinstance(schedule, list):
+        return None, f"on.schedule is not a list -- cannot examine: {schedule!r}"
+    return schedule, None
+
+
 def check_p8_schedule_visibility(
     workflow_texts: dict[str, str],
     script_texts: dict[str, str] | None = None,
@@ -1357,6 +1410,21 @@ def check_p8_schedule_visibility(
                     f"P8: {name}'s PAID_LANE_CRON_ALLOWLIST token {token!r} occurs in neither its own "
                     f"comment-stripped text nor its driver's ({driver_rel}) -- an unresolvable token is "
                     "a FAIL, exactly like a dead waiver"
+                )
+            # Advisory (fix round 1): the allow-list review covers exactly
+            # ONE reviewed cadence per lane -- a SECOND `- cron:` entry
+            # under the same `schedule:` key is un-reviewed paid-lane
+            # exposure the token match alone cannot see (the token only
+            # proves ONE cadence is explained, never that every entry is).
+            cron_entries, cron_err = _read_schedule_cron_entries(workflow_texts[name])
+            if cron_err is not None:
+                findings.append(f"P8: {name}: {cron_err}")
+            elif len(cron_entries) > 1:
+                findings.append(
+                    f"P8: {name} is PAID_LANE_CRON_ALLOWLIST-listed but carries {len(cron_entries)} "
+                    "`- cron:` entries under schedule: -- the allow-list review covers exactly ONE "
+                    "reviewed cadence per lane; an additional entry is un-reviewed paid-lane exposure, "
+                    "refused like a dead waiver"
                 )
         elif not has_schedule and allow is not None:
             findings.append(

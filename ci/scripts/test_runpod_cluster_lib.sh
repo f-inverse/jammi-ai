@@ -31,8 +31,13 @@
 #   (5) rp_sweep: a pod id in the cluster-member exclusion set is skipped
 #       with the named "cluster member, skipped" line and NEVER reaches
 #       `rp_terminate`; a `podTerminate` whose GraphQL body carries `errors`
-#       is reported as "terminate refused: <reason>" and counted separately
-#       from a genuine sweep, without failing the whole sweep.
+#       is reported as "terminate refused: <reason>" AND — F3(a), plan #500
+#       U7b fix round 1 — now fails the sweep's own exit (rc=1, naming
+#       every refused id and reason): an unexpected refusal is never folded
+#       into a silent 0.
+#   (6) rp_cluster_sweep: a cluster with no usable createdAt (F3(b)) is
+#       rc=1 naming the cluster id, never a silent `continue` back to a
+#       green summary — an unexaminable resource is never "nothing to reap".
 #
 # Every network-facing call (`curl` — both the GraphQL pod surface and the
 # REST v2 cluster surface) is mocked via a stub `curl` prepended onto PATH.
@@ -375,6 +380,33 @@ done
   fi
 )
 
+(
+  # F3(b): a cluster with no usable createdAt is an UNEXAMINABLE resource
+  # -- it is BILLING with no deadline this sweep could establish -- never
+  # "nothing to reap". Must be rc=1 naming the cluster id, never a silent
+  # `continue` back to a green summary line.
+  cat > "$SANDBOX/g3-unageable.json" <<'JSON'
+{"clusters":[
+  {"id":"cl-unageable","name":"jammi-cluster-ttl8"},
+  {"id":"cl-fresh2","name":"jammi-cluster-ttl8","createdAt":"2099-01-01T00:00:00Z"}
+]}
+JSON
+  export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g3-unageable.json"
+  export MOCK_DELETE_CALL_LOG="$SANDBOX/g3-unageable-delete.log"
+  rm -f "$MOCK_DELETE_CALL_LOG"; : > "$MOCK_DELETE_CALL_LOG"
+  out="$(rp_cluster_sweep 2>&1)"; rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "cl-unageable"; then
+    ok "G3 F3(b): a cluster with no usable createdAt is rc=1, naming the cluster id (cl-unageable)"
+  else
+    bad "G3 F3(b): expected rc=1 naming cl-unageable (got rc=$rc): $out"
+  fi
+  if [ -s "$MOCK_DELETE_CALL_LOG" ]; then
+    bad "G3 F3(b): an unageable cluster must never be deleted on a guess (regression!)"
+  else
+    ok "G3 F3(b): the unageable cluster was left alone, not deleted on a guess"
+  fi
+)
+
 # ═════════════════════════════════════════════════════════════════════════
 # Group 4 — the shared force_hours validator (_rp_validate_force_hours),
 # consulted identically by rp_sweep and rp_cluster_sweep.
@@ -455,7 +487,7 @@ JSON
     bad "G5: rp_sweep must never issue podTerminate for a known cluster member (regression!)"
   fi
   if printf '%s' "$out" | grep -q "terminate refused: pod is a cluster member (pod pod-refused)"; then
-    ok "G5: a refused podTerminate is reported by name ('terminate refused: pod is a cluster member (pod pod-refused)') and does not fail the sweep"
+    ok "G5: a refused podTerminate is reported by name ('terminate refused: pod is a cluster member (pod pod-refused)')"
   else
     bad "G5: expected the named terminate-refused line for pod-refused: $out"
   fi
@@ -464,10 +496,20 @@ JSON
   else
     bad "G5: expected pod-stale to be swept: $out"
   fi
-  if [ "$rc" -eq 0 ]; then
-    ok "G5: rp_sweep's own exit stays 0 — a terminate refusal is non-fatal, only an enumeration failure fails the sweep"
+  # F3(a) (plan #500 U7b fix round 1): an unexpected terminate refusal (the
+  # cluster-member CASE is already excluded upstream by the "cluster
+  # member, skipped" arm above — this is a DIFFERENT pod RunPod's own API
+  # refused for its own reason) is never folded into a silent 0: it is
+  # counted and named, and the sweep's own exit is now non-zero.
+  if [ "$rc" -eq 1 ]; then
+    ok "G5: rp_sweep's own exit is now 1 — an unexpected terminate refusal is never folded into a silent 0"
   else
-    bad "G5: expected rc=0 (a refusal is non-fatal) (got rc=$rc)"
+    bad "G5: expected rc=1 (F3a: a refusal is now fatal to the run's own exit) (got rc=$rc)"
+  fi
+  if printf '%s' "$out" | grep -q "1 terminate(s) refused: pod-refused: pod is a cluster member"; then
+    ok "G5: the refusal summary names the pod id and the refused reason ('1 terminate(s) refused: pod-refused: pod is a cluster member')"
+  else
+    bad "G5: expected the F3(a) refusal summary naming pod-refused and its reason: $out"
   fi
 )
 

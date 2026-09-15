@@ -92,10 +92,102 @@ if declare -f rp_cluster_rank_verdict >/dev/null \
   && declare -f _rpc_id_file_ready >/dev/null \
   && declare -f _rpc_ens1_seen >/dev/null \
   && declare -f _rpc_run_id_secrecy_scan >/dev/null \
-  && declare -f _rpc_assemble_gang_artifact >/dev/null; then
+  && declare -f _rpc_assemble_gang_artifact >/dev/null \
+  && declare -f _rpc_self_remove_status >/dev/null \
+  && declare -f _rpc_cleanup_cluster >/dev/null; then
   ok "G0: sourcing runpod_gpu_cluster.sh (no network) defines every _rpc_* helper and both verdict functions"
 else
   bad "G0: sourcing runpod_gpu_cluster.sh did not define the expected functions"
+fi
+
+# ============================================================================
+# F2/F3(c): _rpc_cleanup_cluster — chains rp_cleanup (F2) and joins a failed
+# rp_cluster_delete into the exit status (F3c, naming the cluster LEAKED).
+# Drives the REAL function (moved out of the executed-only guard specifically
+# so it is sourceable), mocking only _rp_rest/rp_cluster_delete/rp_cleanup.
+# ============================================================================
+run_cleanup_in_subshell() { # $1=cluster_id (or "" for none) $2=pending_rc
+  # Runs in a real SUBSHELL PROCESS (not `( ... )` capture alone) so
+  # `_rpc_cleanup_cluster`'s own `exit "$rc"` terminates THAT process, never
+  # this suite's own shell — exactly how a real EXIT trap fires.
+  bash -c '
+    source "'"$CLUSTER_SH"'"
+    cluster_id="$1"
+    rp_cleanup_called_marker="$2"
+    _rp_rest() { printf "%s\n%s" "$MOCK_SELF_REMOVE_STATUS" "{}"; }
+    rp_cluster_delete() { [ "$MOCK_DELETE_OK" = "1" ]; }
+    rp_cleanup() { : > "$rp_cleanup_called_marker"; }
+    ( exit "$3" )   # sets $? to the PENDING exit status _rpc_cleanup_cluster reads first.
+    _rpc_cleanup_cluster
+  ' _ "$1" "$SANDBOX/rp-cleanup-called" "$2"
+}
+
+# (a) self-remove already "ok" (404) -> rp_cleanup chained, exit stays the
+# pending rc, rp_cluster_delete never called.
+rm -f "$SANDBOX/rp-cleanup-called"
+MOCK_SELF_REMOVE_STATUS="404" MOCK_DELETE_OK="1" \
+  run_cleanup_in_subshell "cl-test-1" 0 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$SANDBOX/rp-cleanup-called" ]; then
+  ok "F2: self-remove ok (404) -> pending rc (0) preserved AND rp_cleanup still chained (rm -rf \$RP_WORK ran)"
+else
+  bad "F2: self-remove-ok case: expected rc=0 and rp_cleanup called (rc=$rc, marker=$([ -f "$SANDBOX/rp-cleanup-called" ] && echo yes || echo no))"
+fi
+
+# (b) self-remove refused, delete SUCCEEDS -> rp_cleanup still chained, exit
+# stays the pending rc (a successful driver-initiated delete is not itself a
+# failure).
+rm -f "$SANDBOX/rp-cleanup-called"
+MOCK_SELF_REMOVE_STATUS="200" MOCK_DELETE_OK="1" \
+  run_cleanup_in_subshell "cl-test-2" 0 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$SANDBOX/rp-cleanup-called" ]; then
+  ok "F2: self-remove refused, delete succeeds -> pending rc (0) preserved AND rp_cleanup chained"
+else
+  bad "F2: self-remove-refused-delete-ok case: expected rc=0 and rp_cleanup called (rc=$rc)"
+fi
+
+# (c) self-remove refused, delete FAILS -> F3(c): the cluster is LEAKED —
+# the exit status is joined to non-zero even though the pending rc was 0 —
+# and rp_cleanup is STILL chained (F2 holds even on this arm).
+rm -f "$SANDBOX/rp-cleanup-called"
+out="$(MOCK_SELF_REMOVE_STATUS="200" MOCK_DELETE_OK="0" \
+  run_cleanup_in_subshell "cl-test-3" 0 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "LEAKED cluster cl-test-3"; then
+  ok "F3(c): a failed rp_cluster_delete on exit is LEAKED, naming the cluster id, and joins the exit status non-zero"
+else
+  bad "F3(c): expected a non-zero exit naming 'LEAKED cluster cl-test-3' (rc=$rc): $out"
+fi
+if [ -f "$SANDBOX/rp-cleanup-called" ]; then
+  ok "F2: rp_cleanup is STILL chained even when the cluster delete itself failed"
+else
+  bad "F2: rp_cleanup must be chained on EVERY arm, including a failed cluster delete"
+fi
+
+# (d) a REAL failure already pending (rc=76) with a failed delete -> the
+# ORIGINAL failure code is preserved, never overwritten by the generic "1"
+# the delete failure alone would have joined.
+rm -f "$SANDBOX/rp-cleanup-called"
+out="$(MOCK_SELF_REMOVE_STATUS="200" MOCK_DELETE_OK="0" \
+  run_cleanup_in_subshell "cl-test-4" 76 2>&1)"
+rc=$?
+if [ "$rc" -eq 76 ]; then
+  ok "F3(c): a pre-existing failure (76) is preserved verbatim, not overwritten by the delete-failure join"
+else
+  bad "F3(c): expected the pre-existing rc=76 to survive a failed delete (got rc=$rc): $out"
+fi
+
+# (e) no cluster_id at all (cleanup fires before create ever ran) -> no
+# self-remove check, no delete attempt, rp_cleanup still chained, pending
+# rc preserved.
+rm -f "$SANDBOX/rp-cleanup-called"
+run_cleanup_in_subshell "" 75 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 75 ] && [ -f "$SANDBOX/rp-cleanup-called" ]; then
+  ok "F2: no cluster_id at all -> rp_cleanup still chained, pending rc (75) preserved, no delete attempted"
+else
+  bad "F2: empty-cluster_id case: expected rc=75 and rp_cleanup called (rc=$rc)"
 fi
 
 # ============================================================================
@@ -383,6 +475,25 @@ else
 fi
 
 # ============================================================================
+# F6(a): the run log lives INSIDE CLUSTER_ARTIFACT_DIR from its first byte
+# (never a bare mktemp outside the uploaded/scanned directory), and both
+# ranks' own logs are copied there too.
+# ============================================================================
+mkdir_line="$(grep -n '^mkdir -p "\$CLUSTER_ARTIFACT_DIR"$' "$CLUSTER_SH" | head -1 | cut -d: -f1)"
+runlog_line="$(grep -n '^RUN_LOG="\$CLUSTER_ARTIFACT_DIR/run.log"$' "$CLUSTER_SH" | head -1 | cut -d: -f1)"
+if [ -n "$mkdir_line" ] && [ -n "$runlog_line" ] && [ "$mkdir_line" -lt "$runlog_line" ]; then
+  ok "F6(a): CLUSTER_ARTIFACT_DIR is created (line ${mkdir_line}) BEFORE RUN_LOG is assigned inside it (line ${runlog_line})"
+else
+  bad "F6(a): expected mkdir -p \$CLUSTER_ARTIFACT_DIR before RUN_LOG=\$CLUSTER_ARTIFACT_DIR/run.log; mkdir_line=${mkdir_line:-<none>} runlog_line=${runlog_line:-<none>}"
+fi
+if grep -qF 'cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log"' "$CLUSTER_SH" \
+  && grep -qF 'cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log"' "$CLUSTER_SH"; then
+  ok "F6(a): both ranks' own logs are copied into CLUSTER_ARTIFACT_DIR"
+else
+  bad "F6(a): expected both rank0_log/rank1_log to be copied into CLUSTER_ARTIFACT_DIR"
+fi
+
+# ============================================================================
 # F5: the id-secrecy scan invocation, driven through the REAL scanner
 # against fixtures built the same way _rpc_run_id_secrecy_scan expects.
 # ============================================================================
@@ -426,6 +537,19 @@ else
   bad "F5: expected rc=2 on an archive carrier; got rc=$rc"
 fi
 rm -f "$scan_fixture_dir/pulled/bundle.tar.gz"
+
+# ============================================================================
+# F1: rp_init precedes the FIRST rp_cluster_create in the executed block —
+# a static line-number comparison over the committed driver text, never a
+# behavioral probe (rp_init itself needs no network; ssh-keygen only).
+# ============================================================================
+rp_init_line="$(grep -n '^rp_init$' "$CLUSTER_SH" | head -1 | cut -d: -f1)"
+rp_cluster_create_line="$(grep -n 'rp_cluster_create ' "$CLUSTER_SH" | grep -v '^\s*#' | head -1 | cut -d: -f1)"
+if [ -n "$rp_init_line" ] && [ -n "$rp_cluster_create_line" ] && [ "$rp_init_line" -lt "$rp_cluster_create_line" ]; then
+  ok "F1: rp_init (line ${rp_init_line}) precedes the first rp_cluster_create call (line ${rp_cluster_create_line})"
+else
+  bad "F1: expected rp_init before the first rp_cluster_create call; rp_init_line=${rp_init_line:-<none>} rp_cluster_create_line=${rp_cluster_create_line:-<none>}"
+fi
 
 # ============================================================================
 # G4: the cost bound is what the MECHANISM produces.

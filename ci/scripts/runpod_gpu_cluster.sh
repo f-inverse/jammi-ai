@@ -67,14 +67,20 @@
 # listing) for the id in every encoding the ship step could emit (raw, hex
 # either case, base64) before the staging copy is deleted.
 #
-# THE ARTIFACT: one `gang` artifact (`gang.leg = "cluster"`) assembled by
-# THIS driver (the SOLE writer — the two ranks only report) from both
-# `rank-<r>.json` reports, schema-gated by
+# THE ARTIFACT: one `gang` artifact (`gang.leg = "cluster"`, `producer.path
+# = "ci/scripts/runpod_gpu_cluster.sh"` — THIS driver names itself as the
+# sole writer, bound by `check_cuda_run_artifacts.py`'s own
+# GANG_LEG_PRODUCER_PATH so the leg cannot be misdeclared to dodge the pod
+# leg's registry) assembled by THIS driver (the two ranks only report) from
+# both `rank-<r>.json` reports, schema-gated by
 # `ci/scripts/check_cuda_run_artifacts.py`'s rule (k) cluster-leg rows
-# (`world`, `collective`, `hosts`, `ranks[]`, `reduced_vector_digest`,
-# `verdict`, `pod_count`, `gpu_count_per_pod`, `ttl_hours`). A human reviews
-# the pulled artifact and commits it under
-# `crates/jammi-kernels/artifacts/cuda-runs/`.
+# (`world`, `collective`, `hosts`, `ranks[]` — each carrying its OWN
+# `reduced_vector_digest`, kept per rank and asserted equal on `pass`,
+# never collapsed here — `verdict`, `pod_count`, `gpu_count_per_pod`,
+# `ttl_hours`). Assembly itself REFUSES (named, never an artifact) when
+# either rank's own `hostname`/`nccl_socket_ifname` is empty or `unknown`,
+# or the two ranks report the SAME host. A human reviews the pulled
+# artifact and commits it under `crates/jammi-kernels/artifacts/cuda-runs/`.
 #
 # EXIT CONTRACT: 0 pass; 75 no cluster capacity (no data center at
 # RP_CLUSTER_MIN_AVAILABILITY or better — a neutral provider condition); 76
@@ -94,9 +100,14 @@
 # Needs the `RUNPOD_API_KEY` repo secret.
 #
 # ALL of this driver's own stdout+stderr goes through ONE `tee`'d run log
-# (F6) — the SAME file the id-secrecy scan treats as a carrier and the
-# workflow step uploads, so the uploaded log IS a scanned carrier, never a
-# second, unscanned copy of one.
+# (F6) written INSIDE the pulled/uploaded directory itself
+# (`${CLUSTER_ARTIFACT_DIR}/run.log`, never a bare `mktemp` elsewhere) — the
+# SAME file the id-secrecy scan's own artifact-dir walk treats as a carrier
+# and the workflow's `actions/upload-artifact` step uploads (`path:
+# .gpu-pull/gpu-cluster/`), so the uploaded log IS a scanned carrier, never
+# a second, unscanned copy of one. Both ranks' own remote logs
+# (`rank0.log`/`rank1.log`) are copied into the same directory after both
+# ranks finish, pass or fail, for the same reason.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -447,13 +458,38 @@ except Exception as e:
     print("could not read one or both rank reports: %s" % e, file=sys.stderr)
     sys.exit(1)
 reports = sorted([r0, r1], key=lambda r: r.get("rank", 0))
+
+def _resolved(v):
+    return isinstance(v, str) and v.strip() and v.strip().lower() != "unknown"
+
+# F4: a named driver refusal, never an artifact -- this assembler is the
+# SOLE writer, and check_cuda_run_artifacts.py (rule k, F4) refuses to
+# accept "unknown" or a repeated host on the far side anyway; catching it
+# HERE means a bad run never even reaches a committed file for a human to
+# accidentally review as real evidence.
+for r in reports:
+    host, iface = r.get("hostname"), r.get("nccl_socket_ifname")
+    if not _resolved(host):
+        print("refusing to assemble: rank %r own hostname is unresolved (%r)" % (r.get("rank"), host), file=sys.stderr)
+        sys.exit(2)
+    if not _resolved(iface):
+        print("refusing to assemble: rank %r own nccl_socket_ifname is unresolved (%r)" % (r.get("rank"), iface), file=sys.stderr)
+        sys.exit(2)
+if reports[0].get("hostname") == reports[1].get("hostname"):
+    print("refusing to assemble: both ranks report the SAME host (%r) -- not the two-host bootstrap this leg proves" % reports[0].get("hostname"), file=sys.stderr)
+    sys.exit(2)
+
 ranks = []
 for r in reports:
     ranks.append({
         "rank": r.get("rank"),
-        "host": r.get("hostname") or "unknown",
+        "host": r.get("hostname"),
         "device": "cuda:%s" % r.get("device_ordinal", 0),
-        "iface": r.get("nccl_socket_ifname") or "unknown",
+        "iface": r.get("nccl_socket_ifname"),
+        # F4: kept PER RANK, never collapsed here -- the checker asserts
+        # equality across ranks itself rather than trusting an
+        # already-collapsed value.
+        "reduced_vector_digest": r.get("reduced_vector_digest_sha256"),
     })
 both_pass = all(r.get("verdict") == "pass" for r in reports)
 digests = [r.get("reduced_vector_digest_sha256") for r in reports]
@@ -479,9 +515,11 @@ artifact = {
     "git_sha": git_sha,
     "box": box,
     "producer": {
-        "path": "crates/jammi-ai/tests/gpu_capability/gang_nccl.rs",
-        "kind": "cargo-test",
-        "invocation": "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability gang_nccl_two_hosts -- --nocapture --test-threads=1",
+        # F4: bound to THIS driver -- the sole writer of the cluster-leg
+        # artifact (check_cuda_run_artifacts.py GANG_LEG_PRODUCER_PATH).
+        "path": "ci/scripts/runpod_gpu_cluster.sh",
+        "kind": "script",
+        "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
         "gating": "env:JAMMI_REQUIRE_CUDA_TWO_HOSTS",
     },
     "status": status,
@@ -520,6 +558,55 @@ _rpc_run_id_secrecy_scan() {
     --assembled-artifact "$assembled" --delete-staging
 }
 
+# The first executed run's own record of whether MEMBER SELF-REMOVAL
+# actually works on a cluster (S4: members expose `actions: []`; the
+# module doc's own header states this is otherwise UNMEASURED). Checked
+# BEFORE this driver's own delete call: a 404 on the cluster's own GET
+# means every member already self-terminated and RunPod retired the
+# cluster object on its own -- "ok". Any other status (200, meaning the
+# cluster is still present) means self-removal has NOT happened by the
+# time this driver's own EXIT trap fires -- "refused" -- and the driver's
+# own `rp_cluster_delete` call is what actually retires it.
+_rpc_self_remove_status() {
+  local id="${1:?needs a cluster id}" resp status
+  resp="$(_rp_rest GET "/v2/clusters/${id}")"
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  case "$status" in
+    404) echo "ok" ;;
+    *) echo "refused" ;;
+  esac
+}
+
+# F2/F3(c): captures the PENDING exit status FIRST ($? here is whatever the
+# script was about to exit with), chains runpod_lib.sh's own `rp_cleanup`
+# (this trap REPLACES the `trap rp_cleanup EXIT` that sourcing runpod_lib.sh
+# already installed -- rp_cleanup is not "installed by rp_init", it is
+# installed unconditionally at source time, and never runs again unless
+# called explicitly here), and — a failed cluster delete is a LEAKED
+# resource, never a warning folded into an otherwise-green exit — joins that
+# failure into the exit status this trap finally exits with. Reads the
+# GLOBAL `cluster_id` (set by the executed-only orchestration below; unset
+# when merely sourced for a fixture, which is exactly "no cluster to clean
+# up yet" — the `-n` guard below).
+_rpc_cleanup_cluster() {
+  local rc=$?
+  if [ -n "${cluster_id:-}" ]; then
+    local self_remove
+    self_remove="$(_rpc_self_remove_status "$cluster_id")"
+    echo "cluster-self-remove: ${self_remove}"
+    if [ "$self_remove" = "ok" ]; then
+      : # already gone -- a driver-initiated delete against a 404 would be a spurious failure.
+    elif rp_cluster_delete "$cluster_id"; then
+      echo "cluster deleted by the driver's own EXIT trap (member self-removal had not taken by then)"
+    else
+      echo "::error::LEAKED cluster ${cluster_id}: could not delete on exit -- gpu-reap.yml's 6-hourly sweep is the backstop"
+      [ "$rc" -eq 0 ] && rc=1
+    fi
+  fi
+  rp_cleanup  # F2: chain the library's own EXIT cleanup (rm -rf "$RP_WORK" -- the staging id file and the ssh keypair).
+  exit "$rc"
+}
+
 # --------------------------------------------------------------------------- #
 # Everything below runs only when this file is EXECUTED, never when it is
 # `source`d (the same guard runpod_gpu_gang.sh/runpod_gpu_prove.sh use) --
@@ -528,7 +615,11 @@ _rpc_run_id_secrecy_scan() {
 # --------------------------------------------------------------------------- #
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 
-RUN_LOG="$(mktemp)"
+# F6: the run log lives INSIDE the pulled/uploaded directory from the very
+# first byte -- created BEFORE the tee starts, so nothing this driver ever
+# emits is written to an unuploaded, unscanned path.
+mkdir -p "$CLUSTER_ARTIFACT_DIR"
+RUN_LOG="$CLUSTER_ARTIFACT_DIR/run.log"
 exec > >(tee -a "$RUN_LOG") 2>&1   # F6: ONE tee'd stream for every byte this driver emits.
 
 _rpc_phase() { echo "=== PHASE ($(( SECONDS )))s: $* ==="; }
@@ -553,43 +644,24 @@ if [ -z "$dcs" ]; then
 fi
 echo "candidate data center(s): ${dcs}"
 
+# F1: rp_init BEFORE the create call, exactly as runpod_gpu_gang.sh's own
+# pod leg does — it is what generates the SSH keypair (RP_PUBKEY, read by
+# `_rp_cluster_payload` into the create body's own `env.PUBLIC_KEY`) and
+# populates RP_SSHO (StrictHostKeyChecking/IdentitiesOnly/-i), which every
+# ssh/scp/rsync call below this point depends on. Without it the create
+# body ships an EMPTY authorized-key and every later ssh call runs with an
+# empty RP_SSHO array (no `-i`, no IdentitiesOnly) — a silent, wrong-key
+# failure that reads exactly like "not yet reachable".
+rp_init
+
 _rpc_phase "cluster create"
 cluster_id="$(rp_cluster_create "$RP_CLUSTER_GPU_TYPE" "$dcs")" || { echo "::error::cluster create failed"; exit 75; }
 echo "cluster ${cluster_id} created"
 
-# The first executed run's own record of whether MEMBER SELF-REMOVAL
-# actually works on a cluster (S4: members expose `actions: []`; the
-# module doc's own header states this is otherwise UNMEASURED). Checked
-# BEFORE this driver's own delete call: a 404 on the cluster's own GET
-# means every member already self-terminated and RunPod retired the
-# cluster object on its own -- "ok". Any other status (200, meaning the
-# cluster is still present) means self-removal has NOT happened by the
-# time this driver's own EXIT trap fires -- "refused" -- and the driver's
-# own `rp_cluster_delete` call is what actually retires it.
-_rpc_self_remove_status() {
-  local id="${1:?needs a cluster id}" resp status
-  resp="$(_rp_rest GET "/v2/clusters/${id}")"
-  status="$(printf '%s\n' "$resp" | head -n1)"
-  case "$status" in
-    404) echo "ok" ;;
-    *) echo "refused" ;;
-  esac
-}
-
-_rpc_cleanup_cluster() {
-  [ -n "${cluster_id:-}" ] || return 0
-  local self_remove
-  self_remove="$(_rpc_self_remove_status "$cluster_id")"
-  echo "cluster-self-remove: ${self_remove}"
-  if [ "$self_remove" = "ok" ]; then
-    return 0  # already gone -- a driver-initiated delete against a 404 would be a spurious failure.
-  fi
-  if rp_cluster_delete "$cluster_id"; then
-    echo "cluster deleted by the driver's own EXIT trap (member self-removal had not taken by then)"
-  else
-    echo "::error::could not delete cluster ${cluster_id} on exit -- gpu-reap.yml's 6-hourly sweep is the backstop"
-  fi
-}
+# `_rpc_self_remove_status`/`_rpc_cleanup_cluster` are defined ABOVE, in the
+# pure-helpers section (so test_gpu_cluster_lane.sh can drive them by
+# merely sourcing this file, mocking `_rp_rest`/`rp_cluster_delete`) — only
+# the trap REGISTRATION itself is an executed-only action.
 trap _rpc_cleanup_cluster EXIT
 
 _rpc_phase "waiting for both members RUNNING with a usable ssh path"
@@ -732,6 +804,14 @@ done
 wait "$rank0_pid"; rank0_rc=$?
 wait "$rank1_pid"; rank1_rc=$?
 
+# F6 advisory: both ranks' own logs land in the uploaded/scanned directory
+# too, pass or fail alike -- copied here, unconditionally, before any
+# pass/fail branching below, rather than only on a path that might exit
+# early.
+mkdir -p "$CLUSTER_ARTIFACT_DIR"
+cp -f "$rank0_log" "${CLUSTER_ARTIFACT_DIR}/rank0.log" 2>/dev/null || echo "::warning::could not copy rank 0's own log into ${CLUSTER_ARTIFACT_DIR}"
+cp -f "$rank1_log" "${CLUSTER_ARTIFACT_DIR}/rank1.log" 2>/dev/null || echo "::warning::could not copy rank 1's own log into ${CLUSTER_ARTIFACT_DIR}"
+
 rp_cluster_rank_verdict "$rank0_rc" "$rank0_log"; rank0_final=$?
 rp_cluster_rank_verdict "$rank1_rc" "$rank1_log"; rank1_final=$?
 rp_cluster_verdict "$rank0_final" "$rank1_final"; rc=$?
@@ -744,7 +824,8 @@ if [ "$rc" -eq 0 ]; then
 fi
 
 _rpc_phase "pulling both ranks' artifacts"
-mkdir -p "$CLUSTER_ARTIFACT_DIR"
+# CLUSTER_ARTIFACT_DIR already exists (created before the run log's own tee
+# started, F6) -- rsync below just fills it in further.
 pull_rc=0
 rsync -az -e "ssh ${RP_SSHO[*]} -p ${primary_port}" "root@${primary_host}:${CLUSTER_REMOTE_ARTIFACT_DIR}/" "${CLUSTER_ARTIFACT_DIR}/" || pull_rc=$?
 rsync -az -e "ssh ${RP_SSHO[*]} ${member_extra_sshopts[*]} -p ${member_port}" "root@${member_host}:${CLUSTER_REMOTE_ARTIFACT_DIR}/" "${CLUSTER_ARTIFACT_DIR}/" || pull_rc=$?

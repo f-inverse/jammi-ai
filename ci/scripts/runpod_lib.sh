@@ -1686,8 +1686,9 @@ _rp_validate_force_hours() {
 # TOP of that refusal, not the only thing standing between rp_sweep and a
 # live member).
 #
-# Enumerates every jammi-prefixed cluster (rp_cluster_list) then every one's
-# member pods (rp_cluster_pods). A failure at EITHER level is a hard failure
+# Enumerates every RP_CLUSTER_PREFIX-named cluster (rp_cluster_list) then
+# every one's member pods (rp_cluster_pods). A failure at EITHER level is a
+# hard failure
 # here (rc 1, nothing printed) — an INCOMPLETE exclusion set is worse than no
 # answer at all, since a caller that silently treated it as "no members"
 # would then read a live member pod as an ordinary orphan.
@@ -1787,8 +1788,13 @@ for c in clusters:
   while read -r id age why; do
     [ -n "$id" ] || continue
     if [ "$id" = "UNAGEABLE" ]; then
+      # F3(b): an unexaminable resource (no usable createdAt to judge age
+      # by) is never "nothing to reap" — this cluster is BILLING with no
+      # deadline this sweep could establish, the same "could not check must
+      # never read as clean" doctrine every other enumeration failure in
+      # this file carries.
       echo "::error::cluster ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
-      continue
+      return 1
     fi
     if rp_cluster_delete "$id"; then
       echo "::warning::swept cluster ${id} (${why}, age ${age}s)"
@@ -2532,6 +2538,7 @@ rp_wait_poll() {
 # cost of a wrong sweep is one re-run; the cost of a wrong spare is $187.
 rp_sweep() { # $1=optional override age in hours
   local override="${1:-}" body out rc id age why n=0 refused=0 member_ids="" reason_out term_rc
+  local -a refused_reasons=()
   if [ -n "$override" ]; then
     # See `_rp_validate_force_hours`'s own doc (shared with rp_cluster_sweep)
     # for why "0"/"00" refuse rather than sweeping, and why a leading zero
@@ -2636,7 +2643,7 @@ for p in me['pods']:
       echo "::error::pod ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
       continue
     fi
-    if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qx -- "$id"; then
+    if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qxF -- "$id"; then
       echo "cluster member, skipped: ${id}"
       continue
     fi
@@ -2647,9 +2654,20 @@ for p in me['pods']:
     else
       echo "::warning::terminate refused: ${reason_out:-unknown reason} (pod ${id})"
       refused=$(( refused + 1 ))
+      refused_reasons+=("${id}: ${reason_out:-unknown reason}")
     fi
   done <<< "$out"
   echo "sweep: terminated ${n} orphaned pod(s) (${refused} terminate(s) refused)"
+  # F3(a): an unexpected terminate refusal (auth/rate-limit/API error -- the
+  # cluster-member case is already excluded upstream, above) is never folded
+  # into a silent 0 here. A refused terminate leaves a pod BILLING with no
+  # further sweep attempt this run, which reap's own "could not enumerate
+  # must never read as nothing to clean up" doctrine treats identically to
+  # an enumeration failure.
+  if [ "$refused" -gt 0 ]; then
+    echo "::error::sweep: ${refused} terminate(s) refused: ${refused_reasons[*]}"
+    return 1
+  fi
 }
 
 # A ref travels to the pod inside a remote command line, so it is constrained to

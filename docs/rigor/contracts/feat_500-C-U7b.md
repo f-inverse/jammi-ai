@@ -4,19 +4,45 @@
 `ci/scripts/check_rigor_record.py` requires under `docs/rigor/contracts/**` before this unit's
 rigor record at `docs/rigor/feat_500-C-U7b.jsonl` (the lead's own export, landed separately)
 satisfies that checker's disclosure requirement. This unit is **U7b-A2** in the decomposition
-`docs/plans/67-distributed-training/UNITS.md § U7b` now states: **A1-pull** (the pod-tier smoke's
-CI scaffolding — `gpu-gang.yml`, `runpod_gpu_gang.sh`, P7) merged already, as PR-B1 (contract
+`docs/plans/67-distributed-training/UNITS.md § U7b` states: **A1-pull** (the pod-tier smoke's CI
+scaffolding — `gpu-gang.yml`, `runpod_gpu_gang.sh`, P7) merged already, as PR-B1 (contract
 `docs/rigor/contracts/feat_500-PR-B1.md`); **A2** is this unit — the cluster leg, its own reap
 arm, and P8; **A3** — a 6-hourly cron re-add on `gpu-gang.yml` — is a FUTURE, separately
-authorized unit this contract does not build, made a reviewed, human-visible act (rather than a
-silent default) by P8 below. `test_gpu_gang_lane.sh`'s G7 case (no `schedule:` key anywhere in
-`gpu-gang.yml`) is UNCHANGED by this unit and stays green — this unit never touches that workflow.
+authorized unit this contract does not build.
 
-Owner: **docs-ci** (dispatched to write this contract; commits c1-c3, the code itself, are
-already committed on this branch and lead-verified green before this dispatch). Every citation
-below was read directly against this worktree's tree at commit `ed3612e6` (branch
-`feat/500-C-U7b`, five commits atop `10787947`/`f772e2e8`) — `grep -n`/direct file reads, never a
-scratchpad working document's own line numbers.
+**This revision supersedes the original c4 contract.** The closing adversarial audit BLOCKed
+that revision on six findings (F1-F6) plus a citation-form defect: every citation there was a
+fenced `grep -n`/`sed -n` transcript, which `check_rigor_record.py`'s own cost-floor check
+(`check_path_line_citations`, matching bare `` `path.ext:NNN` `` tokens) does not scan grep
+OUTPUT lines against at all — that revision's citations passed the checker VACUOUSLY, never
+actually exercised. Every citation below is instead the bare `path:line` (or `path:line-line`)
+form that checker's own regex matches, tagged `(at <sha>)`, re-derived by direct read against
+THIS tree AFTER every fix below landed — the last thing done before this file was written.
+
+Owner: **docs-ci** (fix round 1, dispatched after the c4 revision's closing BLOCK). Commit
+history on this branch, oldest first, below the `main` merge (`git log --format='%h %s'
+main..HEAD`, ten commits, the c1-c4 owners' own units plus one ai-core fix landed after c4):
+
+```
+467dd9c9 test(ai): #500 U7b — the two-host NCCL smoke: rank 0 mints the id to a file, ...
+b984e24c ci(runpod): #500 U7b — cluster primitives on REST v2, one renting entrypoint text, ...
+c88593d8 ci(cluster): #500 U7b c3 -- the NCCL id-secrecy scan (F5)
+39eeee0f ci(cluster): #500 U7b c3 -- check_cuda_run_artifacts.py rule (k) leg discrimination (M6)
+5ebe53ab ci(cluster): #500 U7b c3 -- the cluster leg driver, its workflow, F13's shared ...
+dbadfdbf ci(cluster): #500 U7b c3 -- P8 schedule visibility, RENTING_ROOTS, and the cluster's ...
+d2497c42 ci(cluster): #500 U7b c3 -- record cluster-self-remove: ok|refused on the EXIT trap
+ed2e7c3c docs: #500 U7b -- the cluster leg's contract of record and the plan's current-state notes
+1480cacb test(ai): #500 U7b — the two-host test's skips are dominated by registered ... (KO-7)
+d12e1689 test(ai): #500 U7b — a missing hostname or NCCL iface is a fail verdict, never ...
+```
+
+(`c23049f9`, a `main` merge, sits between `ed2e7c3c` and `1480cacb` in the branch's actual
+commit graph — omitted from the list above since it carries no U7b content of its own.) This fix
+round lands as an eleventh commit, by pathspec, atop `d12e1689`; every citation to a file this
+round touched is tagged `(at HEAD)` — the fix commit's own tree, which this contract is
+committed inside — rather than a sha that does not exist until that commit lands. Every citation
+to a file this round did NOT touch is tagged at the sha that last touched it, per `git log -1
+--format=%h -- <path>` against this same tree.
 
 ## 0. What this unit is, in one paragraph
 
@@ -27,630 +53,485 @@ the cluster's own private overlay network — the only place a real cross-HOST N
 bootstrap at all. Six mechanisms: **M1** the REST v2 cluster primitives in `runpod_lib.sh` plus
 the reap arm that now treats a cluster as its own object type; **M2** the two-host NCCL test body
 (`gang_nccl.rs`); **M3** the driver, `ci/scripts/runpod_gpu_cluster.sh`; **M4** the id-secrecy
-scan; **M5** `check_gpu_prove_once.py`'s new P8 arm (schedule visibility) plus the `RENTING_ROOTS`
+scan; **M5** `check_gpu_prove_once.py`'s P8 arm (schedule visibility) plus the `RENTING_ROOTS`
 derivation that makes the cluster driver visible to the existing P7 arm at all; **M6** the
 artifact registry's leg discrimination in `check_cuda_run_artifacts.py`'s rule (k).
 
 ## 1. The pre-flight gap — stated honestly before anything else
 
-**F2 of `CONTRACT-U7b.md` (the session's own working contract) calls for a ~$0.05 pod pre-flight
-BEFORE any cluster run**: one `POST /v2/pods` (an RTX A5000 SECURE candidate, the SAME
-`_rp_entrypoint_setup` string in `args`), read back `Pod.args` and `Pod.ssh.direct`, ssh in,
-delete — to settle, on real hardware, whether RunPod's REST v2 `args` field actually reaches
-`bash -c` on `RP_IMAGE` the way the GraphQL `dockerArgs` field measurably does (S4's own probe
-measured the GraphQL path; REST v2's `args` field was never itself executed against a live pod
-by anyone on this unit). **This pre-flight has NOT been executed.** The lead's own attempt to run
-it was BLOCKED by the harness's permission classifier (a real-world transaction touching billed
-infrastructure) — it needs a human to run it or to explicitly allow it. This is not a gap in the
-driver's own design; it is a gap in what has been verified about RunPod's own API surface.
+The session's own working contract (`CONTRACT-U7b.md` §8, F2) called for a ~$0.05 pod pre-flight
+BEFORE any cluster run, to settle on real hardware whether RunPod REST v2's `args` field actually
+reaches `bash -c` on `RP_IMAGE` the way the GraphQL `dockerArgs` field measurably does (S4's own
+probe measured the GraphQL path only; REST v2's `args` field has never itself been executed
+against a live pod by anyone on this unit). **This pre-flight has NOT been executed** — the
+lead's own attempt was BLOCKED by the harness's permission classifier (a real-world transaction
+touching billed infrastructure); it needs a human to run it or explicitly allow it. This is a gap
+in what has been verified about RunPod's own API surface, not a gap in the driver's own design.
 
 Until that pre-flight runs, this unit's actual guard is the driver's own LAUNCH-TIME READ-BACK
 refusal, never an independent confirmation that the mechanism works: `_rpc_check_readback`
-(`ci/scripts/runpod_gpu_cluster.sh::_rpc_check_readback`) reads `GET /v2/clusters/{id}/pods`
-after create and refuses (exit 97) the moment either (a) a member's own `Pod.args` field does not
-contain the exact entrypoint text this driver sent, or (b) neither `ssh.direct` nor a usable
-overlay `ip` is present for it:
+(`ci/scripts/runpod_gpu_cluster.sh:258-296` at HEAD) reads `GET /v2/clusters/{id}/pods` after
+create and refuses (exit 97) the moment either (a) a member's own `Pod.args` does not contain the
+exact entrypoint text this driver sent, or (b) neither `ssh.direct` nor a usable overlay `ip` is
+present for it. This is a REFUSAL mechanism, not a proof the API behaves as documented — it can
+only catch the failure AFTER a real cluster has already been created and billed for the time it
+took to observe the mismatch (bounded by `RP_SSH_WAIT_SECS=300`s).
+
+**§8 below — "the one real cluster run" — has also NOT happened.** No real RunPod cluster has
+been created, no real cost has been billed, and no real answer exists yet to whether member
+self-removal works on a cluster object, whether the `ens1` NCCL transport line actually appears
+in a real run's log, or whether the two-host id ship completes within the driver's own wait
+budgets. Every cost figure this contract cites (`$3.816/h`, `$3.82`/run, `$26.71` worst-case) is
+a COMMITTED, re-derived-by-test figure — never a measured bill from an actual run.
+
+## 2. Fix round 1 — the six findings, each closed by name
+
+### F1 — the driver never called `rp_init`
+
+At the c4 revision, `runpod_gpu_cluster.sh` never called `rp_init` — zero calls, against seven
+`RP_SSHO[`/`$RP_PUBKEY` uses that all depend on it. `rp_init` (`ci/scripts/runpod_lib.sh:606-632`
+at `b984e24c`, unchanged by this fix) is what generates the SSH keypair (`RP_PUBKEY`, read by
+`_rp_cluster_payload` into the create body's own `env.PUBLIC_KEY`) and populates `RP_SSHO`
+(`-i`/`IdentitiesOnly=yes`/`StrictHostKeyChecking=no`, `ci/scripts/runpod_lib.sh:631` at
+`b984e24c`). Without it, the create payload ships an EMPTY authorized-key and every later
+ssh/scp/rsync call runs with an empty `RP_SSHO` array — a silent, wrong-key failure that reads
+exactly like "not yet reachable".
+
+**Fix**: `rp_init` is now called immediately before the create call, exactly as
+`runpod_gpu_gang.sh`'s own pod leg does it:
 
 ```
-$ grep -n 'READBACK_ARGS_MISMATCH\|READBACK_NO_SSH_PATH\|READBACK_OK' ci/scripts/runpod_gpu_cluster.sh
-273:        print("%s %s READBACK_ARGS_MISMATCH %s %s %s" % (pid, rank, ip, dhost, dport))
-276:        print("%s %s READBACK_NO_SSH_PATH %s %s %s" % (pid, rank, ip, dhost, dport))
-278:        print("%s %s READBACK_OK %s %s %s" % (pid, rank, ip, dhost, dport))
+$ grep -n '^rp_init$\|^cluster_id="\$(rp_cluster_create' ci/scripts/runpod_gpu_cluster.sh
+655:rp_init
+658:cluster_id="$(rp_cluster_create "$RP_CLUSTER_GPU_TYPE" "$dcs")" || { echo "::error::cluster create failed"; exit 75; }
 ```
 
-**This read-back is a REFUSAL mechanism, not a proof that the API behaves as documented** — it
-can only ever catch the failure AFTER a real cluster has already been created and billed for the
-time it took to observe the mismatch (bounded by `RP_SSH_WAIT_SECS=300`s). Nothing in this unit's
-own committed text claims the pre-flight ran, or that the REST v2 `args` field is confirmed to
-reach the container. **§2 below — "the one real cluster run" the plan document schedules at the
-end of commit c3 — has also NOT happened.** No real RunPod cluster has been created, no real cost
-has been billed, and no real answer exists yet to any of the questions a real run would settle:
-whether member self-removal works on a cluster object (S4 only measured that members expose
-`actions: []`, a LISTING attribute — never an OBSERVED refusal or success of a real termination
-attempt), whether the `ens1` NCCL transport line actually appears in a real run's log, and
-whether the two-host id ship (`scp` through a local staging copy) actually completes within the
-driver's own wait budgets. Every cost figure this contract cites below (`$3.816/h`, `$3.82`/run,
-`$26.71` worst-case) is a COMMITTED, re-derived-by-test FIGURE — never a measured bill from an
-actual run.
+`ci/scripts/runpod_gpu_cluster.sh:655` precedes `:658` (at HEAD).
 
-## 2. M1 — cluster primitives in `runpod_lib.sh`, REST v2, and the reap's fail-closed member exclusion
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh:542-551` (at HEAD) is a new static guard — a
+line-number comparison over the committed driver text (`grep -n '^rp_init$'` vs. the first
+`rp_cluster_create ` call) — asserting `rp_init` precedes the create call, never a behavioral
+probe (no network). A SECOND, class-level guard closes the general case this specific line-number
+check does not: `test_check_gpu_prove_once.py`'s `RpSshoRequiresRpInitTest`
+(`ci/scripts/test_check_gpu_prove_once.py:587-627` at HEAD) statically scans EVERY real
+`PAID_POD_LANE_TABLE` driver on disk and asserts that any driver referencing `RP_SSHO[` also
+calls `rp_init` (a bare-line regex, `RP_INIT_CALL_RE`), with its own RED-then-GREEN self-test
+proving the regex actually distinguishes a call from a mention in prose.
 
-`_rp_rest` (`ci/scripts/runpod_lib.sh::_rp_rest`) is the ONE REST v2 transport every cluster
-primitive goes through — Bearer auth, capture-then-parse via a temp file (never a pipe under
-`pipefail`, so a transport failure's own exit code is never aliased against a parse failure's):
+### F2 — the trap replaced, never chained, the library's own cleanup
 
-```
-$ sed -n '369,386p' ci/scripts/runpod_lib.sh
-```
-```
-_rp_rest() {
-  local method="${1:?_rp_rest needs a METHOD}" path="${2:?_rp_rest needs a PATH}" body="${3-}"
-  local body_file status rc
-  body_file="$(mktemp "${TMPDIR:-/tmp}/jammi-rp-rest.XXXXXX")" \
-    || { echo "::error::_rp_rest could not create a capture file" >&2; return 1; }
-  if [ -n "$body" ]; then
-    status="$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
-      -H "Authorization: Bearer ${RUNPOD_API_KEY}" -H 'Content-Type: application/json' --data-binary "$body")"
-  else
-    status="$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "https://api.runpod.io${path}" \
-      -H "Authorization: Bearer ${RUNPOD_API_KEY}")"
-  fi
-  rc=$?
-  printf '%s\n' "$status"
-  cat "$body_file"
-  rm -f "$body_file"
-  return "$rc"
-}
-```
+`trap _rpc_cleanup_cluster EXIT` REPLACED the `trap rp_cleanup EXIT` that sourcing
+`runpod_lib.sh` installs unconditionally at source time (`ci/scripts/runpod_lib.sh:598` at
+`b984e24c`, unchanged) — losing `rp_cleanup`'s own `rm -rf "$RP_WORK"` (the staging id file
+`$RP_WORK/nccl.id` and the generated ssh keypair `$RP_WORK/id_ed25519`, both left on disk after
+every run).
 
-`rc` is `_rp_rest`'s own TRANSPORT verdict (curl's exit code); `status` is the HTTP status printed
-on the first line, read separately by every caller (F14) — a caller must never conflate a
-nonzero `rc` with "not found" or "refused"; those are statuses on a SUCCESSFUL transport. Every
-`rp_cluster_*` function (`create`/`get`/`pods`/`list`/`delete`) follows the identical
-capture-then-split-then-case-on-status shape, each documenting its own success status (`201`
-create, `200` get/pods/list, `204` empty-body delete) and refusing any other status by name with
-the response body's own text, truncated.
-
-`_rp_entrypoint_setup` (`ci/scripts/runpod_lib.sh::_rp_entrypoint_setup`) is the ONE watchdog+sshd
-string shared by BOTH the pod payload builder (`_rp_deploy_payload`) and the cluster payload
-builder (`_rp_cluster_payload`) — verified by direct read that both callers pass the SAME
-function with only `RP_TTL_HOURS` differing:
+**Fix**: `_rpc_cleanup_cluster` now calls `rp_cleanup` explicitly, on every arm, before its own
+`exit`:
 
 ```
-$ grep -n '_rp_entrypoint_setup "\$RP_TTL_HOURS"' ci/scripts/runpod_lib.sh
-1393:  setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
-1481:  setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
+$ grep -n 'rp_cleanup  # F2' ci/scripts/runpod_gpu_cluster.sh
+606:  rp_cleanup  # F2: chain the library's own EXIT cleanup (rm -rf "$RP_WORK" -- the staging id file and the ssh keypair).
 ```
 
-the first call site (1393) is inside `_rp_deploy_payload`, the second (1481) inside
-`_rp_cluster_payload` — the exact "two subtly different kill-this-thing mechanisms drifting
-apart unnoticed" class this factoring closes, per the function's own module-header comment
-(`ci/scripts/runpod_lib.sh`, the "Cluster primitives" section header immediately above
-`_rp_cluster_payload`). `test_runpod_cluster_lib.sh`'s own module doc names this as covered
-property (2): "`_rp_entrypoint_setup`'s output is byte-identical whether reached via
-`_rp_deploy_payload` ... or `_rp_cluster_payload` ... for the same RP_TTL_HOURS".
+`ci/scripts/runpod_gpu_cluster.sh:591-608` (at HEAD) is `_rpc_cleanup_cluster`'s own body,
+moved OUT of the sourced-execution guard (it was previously defined only when the file is
+EXECUTED, making it untestable by sourcing) into the pure-helpers section above it — only the
+`trap _rpc_cleanup_cluster EXIT` registration itself (`ci/scripts/runpod_gpu_cluster.sh:665` at
+HEAD) remains inside the guard.
 
-**`_rp_cluster_payload`** (`ci/scripts/runpod_lib.sh::_rp_cluster_payload`) builds
-`CreateClusterRequest`'s exact documented key set — `unevaluatedProperties: false` per RunPod's
-own schema (read 2026-09-14) means any extra key is an outright API rejection:
+**Oracle**: `test_gpu_cluster_lane.sh`'s new F2/F3(c) block (`ci/scripts/test_gpu_cluster_lane.sh:104-191`
+at HEAD) drives the REAL `_rpc_cleanup_cluster` in a real subprocess (`bash -c '... source
+"$CLUSTER_SH" ...'`, so its own `exit "$rc"` terminates that subprocess exactly the way a real
+EXIT trap fires), mocking only `_rp_rest`/`rp_cluster_delete`/`rp_cleanup`: self-remove-ok,
+self-remove-refused-delete-ok, and no-cluster-id-at-all all confirm `rp_cleanup` is chained
+(a marker file it writes exists afterward) in every arm.
 
-```
-$ sed -n '1483,1498p' ci/scripts/runpod_lib.sh
-```
-```
-import json, sys
-gpu, image, pub, ttl_h, prefix, disk_gb, setup, dcs = sys.argv[1:9]
-body = {
-    "name": "%s-ttl%s" % (prefix, ttl_h),
-    "type": "TRAINING",
-    "compute": {"gpuTypeId": gpu, "gpuCountPerPod": 1, "podCount": 2},
-    "image": image,
-    # REST v2's env shape is an OBJECT (key -> value), unlike the GraphQL pod
-    # payload's array-of-{key,value} — see BaseContainerConfig.
-    "env": {"PUBLIC_KEY": pub},
-    "ports": ["22/tcp"],
-    "args": "bash -c '%s'" % setup,
-    "disk": int(disk_gb),
-}
-if dcs:
-    body["dataCenterIds"] = dcs.split()
-```
+### F3 — three retire-failure classes read green
 
-— exactly the keys the session's own live schema read named, no more; `dataCenterIds` is omitted
-entirely (never sent as an empty list) when the driver has no qualifying data center, matching
-the schema's own documented "let the scheduler choose" default (never exercised in this unit's
-own driver, which always supplies at least one — see M3 below — but preserved here as the
-primitive's own honest behavior for any OTHER future caller).
+**(a)** `rp_sweep`'s own `refused` counter collapsed an unexpected terminate refusal (auth/
+rate-limit/API error — the cluster-member case is already excluded upstream, before
+`rp_terminate` is ever called) into a silent `0` return.
 
-**F7 — one name.** `RP_CLUSTER_PREFIX="jammi-cluster"` is a SEPARATE name space from
-`RP_POD_PREFIX="jammi-gpu"` (verified: `grep -c cluster ci/scripts/runpod_lib.sh` at the file's
-own header comment states the earlier `${RP_POD_PREFIX}-cluster-...` wording is deleted):
+**Fix**: a non-zero refused count is now `return 1`, naming every refused id and reason:
 
 ```
-$ grep -n 'RP_POD_PREFIX=\|RP_CLUSTER_PREFIX=' ci/scripts/runpod_lib.sh
-115:RP_POD_PREFIX="jammi-gpu"
-126:RP_CLUSTER_PREFIX="jammi-cluster"
+$ grep -n 'sweep: \${refused} terminate' ci/scripts/runpod_lib.sh
+2668:    echo "::error::sweep: ${refused} terminate(s) refused: ${refused_reasons[*]}"
 ```
 
-so the pod sweep's prefix match (`name.startswith(RP_POD_PREFIX)`) can never accidentally match a
-cluster's own name, and vice versa — the two object types' own name spaces cannot collide by
-construction, never by convention alone.
+`ci/scripts/runpod_lib.sh:2660-2669` (at HEAD) is the full arm — `return 1` follows the `echo` on
+the very next line.
 
-**`rp_cluster_sweep`** (`ci/scripts/runpod_lib.sh::rp_cluster_sweep`) is fail-closed on every
-enumeration it needs: a failed `GET /v2/clusters` is `return 1` naming "sweep could NOT enumerate
-clusters; orphans may exist unseen" (never "nothing to reap"); an unparseable body is the same;
-an `UNAGEABLE` cluster (no usable `createdAt`) is reported and skipped, never force-terminated
-blind; the post-delete re-enumeration is fail-closed the identical way — a failed re-GET, or a
-deleted cluster still present in the second listing, is `return 1` by name, never silently
-trusted as "the delete must have worked":
+**(b)** `rp_cluster_sweep`'s `UNAGEABLE` arm (a cluster with no usable `createdAt`) `continue`d
+the loop, and the function returned `0` at the end regardless.
+
+**Fix**: `return 1`, naming the cluster id, never a `continue` back to a green summary:
 
 ```
-$ grep -n 'could NOT enumerate clusters\|still present after delete\|could NOT confirm cluster' ci/scripts/runpod_lib.sh
-1738:    || { echo "::error::sweep could NOT enumerate clusters; orphans may exist unseen: RunPod REST request failed"; return 1; }
-1742:    echo "::error::sweep could NOT enumerate clusters; orphans may exist unseen: status ${status}: $(printf '%s' "$body" | head -c 300)"
-1783:    echo "::error::sweep could NOT enumerate clusters; orphans may exist unseen: ${out}"
-1807:      || { echo "::error::sweep could NOT re-enumerate clusters after deleting; cannot confirm ${n} deletion(s) took"; return 1; }
-1827:        echo "::error::cluster ${id} still present after delete"
-1830:        echo "::error::sweep could NOT confirm cluster ${id} is gone: malformed re-enumeration body"
+$ grep -n 'cannot judge its age' ci/scripts/runpod_lib.sh
+1796:      echo "::error::cluster ${age} (${why}) has no usable createdAt — cannot judge its age; reap explicitly if it is an orphan"
 ```
 
-**F8 — the reap subject model, restated for clusters and shared with the pod sweep.**
-`_rp_cluster_member_ids` (`ci/scripts/runpod_lib.sh::_rp_cluster_member_ids`) enumerates every
-`jammi-cluster`-prefixed cluster and every one's member pod ids; a failure at EITHER level (the
-cluster list, or any one cluster's own pod list) is `return 1` with NOTHING printed — an
-INCOMPLETE exclusion set is worse than none. `rp_sweep` (`ci/scripts/runpod_lib.sh::rp_sweep`)
-consults this BEFORE it enumerates pods at all, and a failure there skips the ENTIRE pod sweep —
-not even an ordinary, genuinely orphaned pod is touched that run:
+the `return 1` follows immediately on the next line. `ci/scripts/runpod_lib.sh:1793-1797` (at
+HEAD) is the `UNAGEABLE` branch in full.
+
+**(c)** The driver's own EXIT trap: a failed `rp_cluster_delete` was logged (`::error::`) but
+never joined into the trap's own exit status.
+
+**Fix**: `_rpc_cleanup_cluster` now joins a failed delete into `rc` and names the cluster LEAKED:
 
 ```
-$ grep -n 'sweep could NOT enumerate cluster members; pod sweep skipped' ci/scripts/runpod_lib.sh
-2556:    || { echo "::error::sweep could NOT enumerate cluster members; pod sweep skipped: could not create a capture file"; return 1; }
-2558:    || { rm -f "$member_ids_file"; echo "::error::sweep could NOT enumerate cluster members; pod sweep skipped: could not create a capture file"; return 1; }
-2565:    echo "::error::sweep could NOT enumerate cluster members; pod sweep skipped: ${member_err:-unknown reason}"
+$ grep -n 'LEAKED cluster' ci/scripts/runpod_gpu_cluster.sh
+602:      echo "::error::LEAKED cluster ${cluster_id}: could not delete on exit -- gpu-reap.yml's 6-hourly sweep is the backstop"
 ```
 
-A live member that DOES pass through as a pod-sweep candidate (an enumeration race, or a bug) is
-skipped by name, never terminated:
+`ci/scripts/runpod_gpu_cluster.sh:591-608` (at HEAD, the same span F2 cites) is the full trap
+body: `rc` is captured from `$?` FIRST (the pending exit status), joined to `1` only when it was
+still `0`, and the function's own `exit "$rc"` at the end — never a bare `return` — is what makes
+the join visible to the process's real exit status (a trap's own `return` would not override an
+already-pending exit code). `gpu-dev.sh reap` (`ci/scripts/gpu-dev.sh:265-281` at `b984e24c`,
+unchanged) already joins `rp_sweep`'s and `rp_cluster_sweep`'s own rcs, so both (a) and (b) above
+already propagate to `reap`'s own exit without a further change there.
+
+**Oracle**: `test_runpod_cluster_lib.sh` Group 3 gains an `UNAGEABLE`-cluster fixture
+(`ci/scripts/test_runpod_cluster_lib.sh:378-401` at HEAD: `rc=1`, names `cl-unageable`, deletes
+nothing); Group 5's existing refused-terminate fixture is updated to assert `rc=1` and the named
+summary line (`ci/scripts/test_runpod_cluster_lib.sh:499-512` at HEAD) rather than the pre-fix
+`rc=0` it asserted before this round.
+
+### F4 — the cluster registry never established two real hosts
+
+At the c4 revision, `_gang_check_cluster_ranks` required only that `host`/`device`/`iface` be
+non-empty strings — never that `host` be DISTINCT across ranks, never that `iface` (or `host`)
+not be the driver's own `unknown` placeholder, never that `hosts == pod_count` or `world ==
+pod_count * gpu_count_per_pod`, and the reduced-vector digest was a single TOP-LEVEL field the
+driver had already collapsed at assembly time — an artifact with two ranks on the SAME host, or
+an unresolved host/iface, or a digest disagreement hidden by the collapse, would pass.
+
+**Fix, on the checker side** (`ci/scripts/check_cuda_run_artifacts.py`, at HEAD):
 
 ```
-$ sed -n '2639,2642p' ci/scripts/runpod_lib.sh
-```
-```
-    if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qx -- "$id"; then
-      echo "cluster member, skipped: ${id}"
-      continue
-    fi
+$ grep -n 'def _gang_check_cluster_ranks\|def _gang_check_cluster_shape\|def _gang_check_leg_producer_binding\|^GANG_LEG_PRODUCER_PATH' ci/scripts/check_cuda_run_artifacts.py
+1023:GANG_LEG_PRODUCER_PATH = {
+1376:def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+1463:def _gang_check_cluster_shape(gang: dict) -> list[str]:
+1496:def _gang_check_leg_producer_binding(gang: dict, data: dict, _repo_root: Path) -> list[str]:
 ```
 
-and a `podTerminate` whose GraphQL body carries `errors` is now a NAMED, non-fatal, COUNTED
-outcome (`"terminate refused: <reason>"`) rather than silently folded into "swept" — the sweep's
-own final line separately tallies terminated vs. refused (`ci/scripts/runpod_lib.sh::rp_sweep`,
-the `echo "sweep: terminated ${n} orphaned pod(s) (${refused} terminate(s) refused)"` line). This
-matters specifically BECAUSE member self-removal on a cluster pod's own accounting is UNMEASURED
-(see §1): the exclusion set is belt-and-suspenders on TOP of an assumed API refusal, never the
-only thing standing between the sweep and a live member.
+`_gang_check_cluster_ranks` (`:1376-1461`) now asserts `host` distinct across ranks
+(`:1450`), refuses `host`/`iface` matching `GANG_UNKNOWN_SENTINELS = ("unknown", "")`
+(`:1373`, `:1418-1423`), requires a PER-RANK `reduced_vector_digest`
+(hex-validated on `pass`, `:1428-1439`) and asserts those per-rank digests equal across ranks on
+`pass` (`:1456-1461`) — never trusting the already-collapsed top-level field alone.
+`_gang_check_cluster_shape` (`:1463-1494`) asserts `hosts == pod_count` and `world == pod_count *
+gpu_count_per_pod`. `_gang_check_leg_producer_binding` (`:1496-1511`), wired into
+`check_gang_artifact` right after the leg is resolved, binds `gang.leg == "cluster"` to
+`producer.path == "ci/scripts/runpod_gpu_cluster.sh"` (and `"pod"` to
+`"ci/scripts/runpod_gpu_gang.sh"`, `GANG_LEG_PRODUCER_PATH:1023-1032`) — a self-declared leg can
+no longer dodge the other leg's registry by pointing `producer.path` at a different driver.
 
-`gpu-dev.sh reap` (`ci/scripts/gpu-dev.sh`, the `reap)` case arm) runs BOTH sweeps
-unconditionally and fails non-zero if EITHER could not enumerate its own object type, even when
-the other succeeded — verified by direct read:
+**Fix, on the driver side** (`ci/scripts/runpod_gpu_cluster.sh`, at HEAD):
+`_rpc_assemble_gang_artifact` now refuses to WRITE an artifact at all when any rank's own
+`hostname`/`nccl_socket_ifname` is empty or `unknown`, or when both ranks report the same
+`hostname`:
 
 ```
-$ sed -n '265,282p' ci/scripts/gpu-dev.sh
-```
-```
-  reap)
-    # shellcheck source=ci/scripts/runpod_lib.sh
-    source "$DIR/runpod_lib.sh"
-    ...
-    pod_rc=0 cluster_rc=0
-    rp_sweep "${1:-}" || pod_rc=$?
-    rp_cluster_sweep "${1:-}" || cluster_rc=$?
-    [ "$pod_rc" -eq 0 ] && [ "$cluster_rc" -eq 0 ] && exit 0
-    exit $(( pod_rc != 0 ? pod_rc : cluster_rc ))
-    ;;
+$ grep -n 'refusing to assemble' ci/scripts/runpod_gpu_cluster.sh
+473:        print("refusing to assemble: rank %r own hostname is unresolved (%r)" % (r.get("rank"), host), file=sys.stderr)
+476:        print("refusing to assemble: rank %r own nccl_socket_ifname is unresolved (%r)" % (r.get("rank"), iface), file=sys.stderr)
+479:    print("refusing to assemble: both ranks report the SAME host (%r) -- not the two-host bootstrap this leg proves" % reports[0].get("hostname"), file=sys.stderr)
 ```
 
-`.github/workflows/gpu-reap.yml` invokes this arm every 6 hours (`cron: "23 */6 * * *"`, offset
-off the hour) plus `workflow_dispatch` with an optional `force_hours` input — this is the PRIMARY
-backstop for clusters (never merely secondary the way it is for pods), since member self-removal
-is unmeasured for a cluster object.
+— a named refusal (exit 2 from the assembler; joined into the driver's own `rc` by the existing
+`_rpc_assemble_gang_artifact ... || { ...; [ "$rc" -eq 0 ] && rc=1; }` call site), never an
+artifact synthesized from unresolved data. Each rank's report now carries its OWN
+`reduced_vector_digest` (`ci/scripts/runpod_gpu_cluster.sh:482-493` at HEAD, inside the `ranks`
+list construction), and the assembled artifact's `producer` block is now bound to this driver's
+own path (`ci/scripts/runpod_gpu_cluster.sh:518-523` at HEAD: `"path":
+"ci/scripts/runpod_gpu_cluster.sh"`, `"kind": "script"`), matching `GANG_LEG_PRODUCER_PATH` above.
+(A complementary fix on the Rust side, `crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` at
+`d12e1689` — outside this contract's own owned files, landed by an ai-core agent in the same
+worktree during this fix round — makes `hostname()` return a named `Result` instead of masking a
+failed read behind `"unknown"`, so the driver-side refusal above is checking a value that itself
+can no longer silently BE `"unknown"` on a healthy run.)
 
-**F10 (the shared `-ttl<H>` name parser and the shared `force_hours` validator).**
-`_rp_ttl_parser_pysrc` (`ci/scripts/runpod_lib.sh::_rp_ttl_parser_pysrc`) and
-`_rp_validate_force_hours` (`ci/scripts/runpod_lib.sh::_rp_validate_force_hours`) are each ONE
-definition consumed by both `rp_sweep` and `rp_cluster_sweep` — "0"/"00" are refused (rc 2) rather
-than accepted as a vacuous force-reap for EITHER object type, closing the same class for clusters
-from day one that pods needed an incident to close (the function's own doc comment names the
-round-4 pod audit finding it generalizes).
+**Oracle**: `check_cuda_run_artifacts.py --self-test`'s rule (k) self-test gains, named
+(`ci/scripts/check_cuda_run_artifacts.py:3343-3429` at HEAD): two ranks on one host FAILS; an
+`unknown` host FAILS; an `UNKNOWN` (any case) iface FAILS; a per-rank digest mismatch on `pass`
+FAILS; a missing per-rank digest on `pass` FAILS; `hosts != pod_count` FAILS; `world != pod_count
+* gpu_count_per_pod` FAILS; a cluster-leg artifact carrying the pod leg's own `producer.path`
+FAILS (and vice versa). `gang_baseline()`/`gang_cluster_baseline()`
+(`ci/scripts/check_cuda_run_artifacts.py:3148-3226` at HEAD) now stamp each leg's real producer
+path (`ci/scripts/runpod_gpu_gang.sh` / `ci/scripts/runpod_gpu_cluster.sh`), and the self-test's
+own fixture repo gains tracked stand-ins for both paths
+(`ci/scripts/check_cuda_run_artifacts.py:2745-2751` at HEAD) so rule (b)'s own
+producer.path-exists-and-is-tracked check has something real to bind against.
 
-**Oracle:** `ci/scripts/test_runpod_cluster_lib.sh` (mocks-only, `_rp_rest` shimmed via a stub
-`curl`) drives: the create body's exact key set against a reviewed schema fixture; the
-entrypoint-text byte-identity between the pod and cluster payload builders; `rp_cluster_sweep`'s
-over-TTL-deleted / under-TTL-kept / non-jammi-name-untouched / failed-GET-rc1 /
-unparseable-body-rc1 / failed-DELETE-rc1-by-id / 204-success arms, including the fail-closed
-post-delete re-enumeration; `_rp_validate_force_hours`'s "0"/"00"-refuse, leading-zero-accept,
-non-digit-refuse, and overflow-refuse arms; and `rp_sweep`'s cluster-member-exclusion skip plus
-the counted terminate-refused arm. `test_gpu_dev_lifecycle.sh` covers `gpu-dev.sh reap`'s own
-wiring — an empty account (no clusters, no pods) sweeps clean on both arms, and `reap 0`/`reap
-00` refuse (rc 2) rather than mass-terminating (its own module doc's covered-property list,
-items 1-7, cites this explicitly for the reap command).
+### F5 — the id-secrecy scan could hang, and could read a FIFO/socket forever
 
-## 3. M2 — the two-host NCCL test body (`gang_nccl.rs`)
+`scan_dir` walked the pulled artifact directory via `os.walk(root, followlinks=True)` — that
+detects no cycles at all, so a cyclic DIRECTORY symlink (`rsync -a` preserves one exactly as
+planted) recurses forever. `scan_file` called `real.read_bytes()` on ANY non-directory path
+regardless of its `st_mode` class — a `read_bytes()` against a FIFO or a UNIX socket with nothing
+on the other end blocks forever, never returning.
+
+**Fix** (`ci/scripts/gang_id_secrecy_scan.py`, at HEAD):
+
+```
+$ grep -n 'def scan_dir\|def wall_clock_budget\|class ScanTimeout' ci/scripts/gang_id_secrecy_scan.py
+190:def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, str]]:
+249:class ScanTimeout(Exception):
+254:def wall_clock_budget(seconds: int):
+```
+
+`scan_dir` (`:190-234`) no longer calls `os.walk` at all — a private recursive `walk()` closure
+tracks the REAL path of every directory it enters in a `visited_dirs` set; a directory whose real
+path repeats is one `"cyclic carrier"` UNEXAMINABLE finding, never a re-descent.
+`scan_file` (`:66-96`) now checks `stat.S_ISREG` explicitly before ever calling `read_bytes()` —
+any other mode class (FIFO, socket, device) is refused by name (UNEXAMINABLE), never opened.
+`wall_clock_budget` (`:254-271`, a `contextlib.contextmanager` over `signal.alarm`) wraps the
+WHOLE scan body (`run_scan`/`_run_scan_body`, `:179-183`); an expiry raises `ScanTimeout`, caught
+by `run_scan` and reported UNEXAMINABLE — independent of any single carrier's own shape, the
+scan's own last line of defense. Default budget 120s
+(`DEFAULT_BUDGET_SECS`/`GANG_ID_SCAN_BUDGET_SECS` env override,
+`ci/scripts/gang_id_secrecy_scan.py:91` at HEAD), overridable via `--budget-secs`.
+
+**Advisory, also fixed**: `id_needles` (`ci/scripts/gang_id_secrecy_scan.py:118-142` at HEAD) now
+computes FOUR base64 variants — standard padded, standard un-padded, URL-safe padded, URL-safe
+un-padded — rather than one.
+
+**Oracle**: `gang_id_secrecy_scan.py --self-test` gains, named: a cyclic directory symlink
+(returns promptly, UNEXAMINABLE, never hangs); a FIFO under the pulled dir (UNEXAMINABLE, "not a
+regular file"); a UNIX socket under the pulled dir (UNEXAMINABLE, same message); a wall-clock
+budget expiry (`scan_dir` mocked to sleep past a 1s budget, UNEXAMINABLE, "wall-clock budget");
+base64-urlsafe and base64-unpadded planted-id hits. 23 `unittest` cases total (up from 17 at c4),
+all passing (`python3 ci/scripts/gang_id_secrecy_scan.py --self-test`, verified this round).
+
+### F6 — the contract of record itself: the RUN_LOG claim, and this citation form
+
+**(a)** The c4 contract's own §5 claimed the tee'd run log "IS the SAME file the workflow step
+uploads" — false at that revision: `RUN_LOG="$(mktemp)"` created a file OUTSIDE
+`.gpu-pull/gpu-cluster/` (the directory `.github/workflows/gpu-cluster.yml`'s
+`actions/upload-artifact` step actually uploads,
+`.github/workflows/gpu-cluster.yml:152-156` at `5ebe53ab`, unchanged by this round), so the
+uploaded artifact never actually carried the run log, and the id-secrecy scan's own artifact-dir
+walk never actually covered it as a carrier via that path either (it was scanned only through the
+SEPARATE, explicit `--log` argument).
+
+**Fix** (`ci/scripts/runpod_gpu_cluster.sh`, at HEAD):
+
+```
+$ grep -n '^mkdir -p "\$CLUSTER_ARTIFACT_DIR"$\|^RUN_LOG="\$CLUSTER_ARTIFACT_DIR/run.log"$' ci/scripts/runpod_gpu_cluster.sh
+621:mkdir -p "$CLUSTER_ARTIFACT_DIR"
+622:RUN_LOG="$CLUSTER_ARTIFACT_DIR/run.log"
+811:mkdir -p "$CLUSTER_ARTIFACT_DIR"
+```
+
+the directory is created BEFORE the tee starts (`:623`, `exec > >(tee -a "$RUN_LOG") 2>&1`), so
+the run log lives inside the uploaded/scanned directory from its first byte; the SECOND `mkdir -p`
+match (`:811`) is a defensive, idempotent re-assertion immediately before the rank-log copies
+below — never a second, independent creation site with its own drift risk. Both ranks' own
+remote logs are now ALSO copied there, unconditionally, pass or fail:
+
+```
+$ grep -n 'cp -f "\$rank0_log"\|cp -f "\$rank1_log"' ci/scripts/runpod_gpu_cluster.sh
+```
+
+placed immediately after both `wait` calls (`ci/scripts/runpod_gpu_cluster.sh:807-813` at HEAD),
+before any pass/fail branching. The workflow's own upload step needed no change — `path:
+.gpu-pull/gpu-cluster/` already covers the directory the run log now lives inside.
+
+**Oracle**: `test_gpu_cluster_lane.sh`'s new F6(a) block
+(`ci/scripts/test_gpu_cluster_lane.sh:478-494` at HEAD) statically asserts the `mkdir` line
+precedes the `RUN_LOG=` assignment line, and that both `cp -f` lines exist.
+
+**(b) This citation form itself.** Every citation in this revision is the bare `path:line` (or
+`path:line-line`) form, tagged `(at <sha>)`, re-derived by direct read against this tree AFTER
+every fix above landed — never a fenced `grep -n`/`sed -n` transcript (the c4 revision's own
+form, which carries zero tokens `check_path_line_citations`'s regex matches, and — separately —
+had gone stale in 3 of 16 transcripts by the time of the closing audit, since a transcript's own
+output is never re-verified by that checker at all).
+
+## 3. M2 — the two-host NCCL test body (`gang_nccl.rs`) — unchanged by this fix round
 
 `gang_nccl_two_hosts_reduce_a_known_vector`
-(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs::gang_nccl_two_hosts_reduce_a_known_vector`)
-is feature-gated and reads its own, SEPARATE env contract from the pod-tier single-process test:
-`JAMMI_GANG_TWO_HOSTS_RANK`, `JAMMI_GANG_TWO_HOSTS_WORLD` (must be exactly `2`; any other value is
-a named panic, never a silent truncation), `JAMMI_GANG_TWO_HOSTS_ID_FILE`, and its OWN require
-flag `JAMMI_REQUIRE_CUDA_TWO_HOSTS` (distinct from the pod leg's `JAMMI_REQUIRE_CUDA_GANG` —
-verified: `grep -n JAMMI_REQUIRE_CUDA_TWO_HOSTS crates/jammi-ai/tests/gpu_capability/gang_nccl.rs`
-shows this is consulted BEFORE `skip_without_gpu!`-style skipping, so a device-less member on
-this leg hard-fails rather than silently skipping — the F12 fold). Rank 0 mints
-`Nccl::new_id()` and writes it ATOMICALLY (`write_id_file_atomically`: write to `<file>.tmp`,
-`rename`) so no reader can ever observe a partial write; rank 1 refuses any file whose size is not
-exactly 128 bytes (`read_id_file_exactly_128_bytes`) — the F11 fold, mirrored on the driver's own
-shipping side by `_rpc_id_file_ready`/`stat`. Both ranks then run the SAME three checks the
-single-process pod-leg test runs (`assert_gang_checks`, shared between both tests) over a REAL
-cross-host `Nccl::from_rank` communicator, and each writes its own `rank-<r>.json` report via
-`write_rank_report`.
+(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs` at `d12e1689`) is feature-gated and reads its
+own env contract (`JAMMI_GANG_TWO_HOSTS_RANK`/`_WORLD`/`_ID_FILE`,
+`JAMMI_REQUIRE_CUDA_TWO_HOSTS`). Rank 0 mints `Nccl::new_id()` and writes it atomically; rank 1
+refuses any id file whose size is not exactly 128 bytes. `d12e1689` (landed by an ai-core agent
+in this same worktree during this fix round, outside this contract's own owned files) closes a
+sibling finding to this round's own F4: `hostname()` now returns a named `Result` instead of
+masking a failed read behind `"unknown"`, and `missing_report_metadata_reason` names which of
+hostname/iface is missing before any NCCL work runs, so a bad metadata read panics rather than
+writing an indistinguishable-from-real `"unknown"` pass report.
 
-**P-M2.** Off a cluster the test skips loudly with the reason (never `#[ignore]`, never a vacuous
-pass — the same require-vs-skip doctrine every gated GPU test in this repo follows); a report is
-written on both the pass and the fail arm. The id bytes themselves are never written anywhere but
-the id file this driver ships out of band — the test process itself has no code path that copies
-them into `JAMMI_GANG_ARTIFACT_DIR` or any report field.
+**Oracle**: compiles under `cargo clippy -p jammi-ai --features live-gpu-tests --test
+gpu_capability` (the gated-surface clippy step; not itself proof the test PASSES, only that it
+compiles). The real proof is the executed run (§8) — not yet performed.
 
-**Oracle:** this construct compiles under `cargo clippy -p jammi-ai --features live-gpu-tests
---test gpu_capability` (the gated-surface clippy step; not itself proof the test PASSES, only
-that it compiles under the feature gate this repo's CI matrix exercises). The real proof is the
-executed run in §1/§8 below — NOT yet performed.
+## 4. M3 — the cluster driver, post-fix — sequence and exit contract
 
-## 4. M3 — the cluster driver `ci/scripts/runpod_gpu_cluster.sh`
+Never `runpod_gpu_gang.sh` — a fully separate driver, workflow, and RunPod object type. Sequence,
+post-fix: read per-data-center availability and pass only qualifying `dataCenterIds` (A1) → `rp_init`
+(F1, §2) → create ONE 2x1 cluster → poll both members RUNNING with a usable ssh path
+(`_rpc_check_readback`, §1) → build both members in parallel via one shared per-rank heredoc
+(`_rpc_remote_script`) → start rank 0, poll the 128-byte id file, `scp` to a local staging copy,
+`scp` up to the member, THEN start rank 1 → watch both ranks (inactivity/wrong-tree/budget) →
+copy both ranks' own logs into the artifact dir (F6, §2) → pull both `rank-<r>.json` reports (a
+failed pull joins `rc`) → assemble ONE `gang` artifact, refusing on an unresolved host/iface or a
+repeated host (F4, §2) → run the id-secrecy scan, now hang-proof (F5, §2) → on EVERY exit arm,
+the EXIT trap (`_rpc_cleanup_cluster`) records self-removal, deletes the cluster (joining a
+failed delete into `rc`, F3(c)), chains `rp_cleanup` (F2), and exits (`ci/scripts/runpod_gpu_cluster.sh:591-608`
+at HEAD).
 
-Never `runpod_gpu_gang.sh` — a fully separate driver, workflow, and RunPod object type (verified:
-`grep -n runpod_gpu_gang.sh ci/scripts/runpod_gpu_cluster.sh` finds no match; the driver's own
-module doc states this explicitly at its top). Sequence: read per-data-center availability
-(`GET /v2/catalog/gpus?include=AVAILABILITY&product=CLUSTER&count=1&cloud=SECURE`) and pass only
-data centers at `RP_CLUSTER_MIN_AVAILABILITY` (`MEDIUM`) or better as `dataCenterIds` — never left
-to the scheduler, since co-placement needs exactly ONE data center and the account-wide figure
-alone cannot establish that any single one qualifies (the A1 fold); create ONE 2x1 cluster
-(`MAX_ATTEMPTS=1` inside the driver's own retry loop lives in the WORKFLOW, `.github/workflows/
-gpu-cluster.yml`, never doubled here); poll both members RUNNING with a usable ssh path via
-`_rpc_check_readback` (§1 above); build both members in parallel via ONE shared per-rank heredoc
-function, `_rpc_remote_script` (`ci/scripts/runpod_gpu_cluster.sh::_rpc_remote_script`) — `world`,
-`pod_count`, and `gpu_count_per_pod` all derive from `RP_CLUSTER_POD_COUNT`/
-`RP_CLUSTER_GPU_COUNT_PER_POD`, never a second, independently duplicated literal per rank; start
-rank 0, poll for the 128-byte id file over ssh (`stat`), `scp` it to a local staging copy
-(`$RP_WORK/nccl.id`, mode 0600), gate the ship on `_rpc_id_file_ready` reporting exactly 128
-bytes, `scp` it up to the member, THEN start rank 1; watch both ranks together (inactivity,
-wrong-tree via `PROVE_EXPECT_SHA`, and the T-10m budget cut, F16); pull both `rank-<r>.json`
-reports (a failed `rsync` JOINS the leg's own `rc`, mirroring PR-B1's own P1 property for the pod
-leg — verified: `grep -n 'pull_rc' ci/scripts/runpod_gpu_cluster.sh` shows the identical
-`[ "$rc" -eq 0 ] && rc="$pull_rc"` join, never a silent warning); assemble ONE `gang` artifact
-(`_rpc_assemble_gang_artifact`, the SOLE writer — both ranks only report); run the id-secrecy scan
-(M4); and delete the cluster on EVERY exit arm via an EXIT trap
-(`_rpc_cleanup_cluster`/`trap _rpc_cleanup_cluster EXIT`), which ALSO records whether member
-self-removal took (see §1).
+**Exit contract**, unchanged in shape by this round, verified against the driver's own exit
+sites at HEAD: `0` pass; `75` no cluster capacity; `76` inactivity kill OR the id never crossed
+within `RP_SSH_WAIT_SECS`; `77` wrong tree; `97` wrong shape (device-count/compute-cap mismatch,
+OR a member's launch-time read-back failure); `124` budget cut at T-10m; else the driver's own
+post-run refusal (a failed pull, a failed assembly/refusal, a failed id-secrecy scan, a missing
+`ens1` line, or — new this round, F2/F3(c) — a LEAKED cluster on a failed exit-time delete), by
+name.
 
-**F3 — the no-public-port fallback.** Every member's direct ssh endpoint is read from
-`Pod.ssh.direct` (`GET /v2/clusters/{id}/pods`, which returns full `Pod` objects). When a
-member's own `ssh.direct` is null but its overlay `ip` is known, the driver proxies through the
-primary (`ssh -J`/`ProxyJump` via `member_extra_sshopts`) — the ONLY alternative path, selected by
-what the create response actually yields, never `proxy` for a data transfer:
+**Cost derivation** (committed, never re-derived per run, unchanged by this round):
+`2 x $1.908/GPU/h = $3.816/h`; terminate-succeeds `1h x $3.816/h = $3.82`/run; sweep-only `(1 +
+6)h x $3.816/h = $26.71`. `≤ 1h billed, ≤ 2 runs` is the standing spend authorization dated
+2026-09-13.
 
-```
-$ grep -n 'ProxyJump' ci/scripts/runpod_gpu_cluster.sh
-651:  member_extra_sshopts=(-o "ProxyJump=root@${primary_host}:${primary_port}")
-```
+**Oracle**: `ci/scripts/test_gpu_cluster_lane.sh` (58 cases, up from 50 at c4; verified this
+round, `bash ci/scripts/test_gpu_cluster_lane.sh`, exit 0) sources the driver, never executes it.
+Beyond the c4-era G0-G7/F2/F3/F5/F11/A5 cases (unchanged in shape), this round adds: F1 (§2), the
+F2/F3(c) EXIT-trap block (§2), F6(a) (§2).
 
-The primary itself MUST carry a direct endpoint (checked explicitly — there is no second-order
-proxy path if the primary itself has none); this is a real code path in this driver, but its
-correctness on real RunPod infrastructure is one of the facts the un-executed pre-flight (§1)
-would have settled and has not.
+## 5. M4 — the id-secrecy scan, post-fix
 
-**Exit contract**, verified against the driver's own exit sites: `0` pass; `75` no cluster
-capacity (the availability read failed, or no data center cleared the floor); `76` inactivity
-kill OR the id never crossed within `RP_SSH_WAIT_SECS`; `77` wrong tree (`PROVE_EXPECT_SHA`
-disagreement on either rank's log); `97` wrong shape (device-count/compute-cap mismatch inside the
-remote heredoc, OR a member's launch-time read-back failure); `124` budget cut at T-10m; else the
-driver's own post-run refusal (a failed pull, a failed assembly, a failed id-secrecy scan, a
-missing `ens1` line), by name — never a bare nonzero with no message.
+See §2 F5 in full. Carrier set unchanged: the pulled artifact directory (now hang-proof and
+FIFO/socket-refusing), the run log (now genuinely inside that directory, F6), the assembled `gang`
+artifact JSON, the staging copy's own directory listing. Exit lattice unchanged: `0` clean, `1`
+hit (named by carrier and encoding), `2` UNEXAMINABLE.
 
-**Cost derivation** (committed, never re-derived per run): `2 x $1.908/GPU/h = $3.816/h`;
-terminate-succeeds `1h x $3.816/h = $3.82`/run; sweep-only (member self-removal fails AND the
-EXIT trap's own delete fails) `(1 + 6)h x $3.816/h = $26.71` — the 6h term is `gpu-reap.yml`'s own
-cron period. `≤ 1h billed, ≤ 2 runs` is the standing spend authorization dated 2026-09-13, per the
-plan document and `CONTRACT-U7b.md`'s own header — a human authorization this contract cites,
-never re-derives.
+**Oracle**: `gang_id_secrecy_scan.py --self-test` (23 cases, up from 17 at c4; verified this
+round, exit 0). `test_gpu_cluster_lane.sh`'s F5 group drives the same scan through
+`_rpc_run_id_secrecy_scan` against equivalent fixtures, unchanged in shape by this round.
 
-**Oracle:** `ci/scripts/test_gpu_cluster_lane.sh` (sources the driver, never executes it — the
-sourced-execution guard skips the live network flow) drives, over the REAL functions: G0 (sourcing
-invokes no curl/ssh/scp/rsync/runpodctl — measured through a PATH shim, not asserted); G1
-(`rp_cluster_rank_verdict`/`rp_cluster_verdict` over every rc arm); G2 (the `CLUSTER_GROUPS`
-closure matches every `::group::` name in the remote heredoc minus `device`); G3 (the shared F13
-zero-test tripwire, spliced into `_rpc_remote_script`); F2/F3 (the launch-time read-back: args
-mismatch, `ssh.direct` null with no overlay ip, `ssh.direct` null with a usable overlay ip — still
-OK, the fallback path — and a parse failure); F11 (127/128/129-byte and missing-file id-ready
-arms); A5 (the `ens1` log assertion, `_rpc_ens1_seen`); G5 (the failed-pull-joins-rc property); G4
-(the cost bound re-derived from the mechanism's own constants, never a hand-typed duplicate); G7
-(no `schedule:` key anywhere in the committed `gpu-cluster.yml`).
+## 6. M5 — P8 (schedule visibility) and the `RENTING_ROOTS` derivation, post-fix
 
-## 5. M4 — the id-secrecy scan (`ci/scripts/gang_id_secrecy_scan.py`)
+Unchanged in its core property from c4 (`check_p8_schedule_visibility`,
+`ci/scripts/check_gpu_prove_once.py:1341-1435` at HEAD): a `schedule:` key on a paid-pod-lane
+workflow (or any workflow mentioning a `RENTING_ROOTS`-derived driver while carrying the secret)
+is a FINDING unless the workflow is a reviewed `PAID_LANE_CRON_ALLOWLIST`
+(`ci/scripts/check_gpu_prove_once.py:1304-1315` at HEAD) entry whose token resolves.
 
-**The id crosses hosts HEX-encoded on the wire** — the `scp` ship step moves the raw 128-byte
-file itself (never a text-encoded form in transit), but this scan's own threat model (per its
-module doc, quoting PR-B1's own precedent for the pod leg's hex-encoded crossing) is that a LEAK,
-if one occurs, could show up in any of the encodings a human or a later ship-step revision might
-plausibly emit into a text carrier: raw bytes, hex (lower AND upper, checked as two DISTINCT
-literal needles — never one case-folded search), and base64. `id_needles`
-(`ci/scripts/gang_id_secrecy_scan.py::id_needles`) computes exactly these four:
+**Advisory fix this round**: the allow-list review covers exactly ONE reviewed cadence per lane —
+a SECOND `- cron:` entry under the same `schedule:` key, which the token-resolution check alone
+cannot see, is now its own FINDING:
 
-```
-$ sed -n '99,107p' ci/scripts/gang_id_secrecy_scan.py
-```
-```
-    hex_lower = id_bytes.hex().encode("ascii")
-    hex_upper = id_bytes.hex().upper().encode("ascii")
-    b64 = base64.b64encode(id_bytes)
-    return [
-        ("raw", id_bytes),
-        ("hex-lower", hex_lower),
-        ("hex-upper", hex_upper),
-        ("base64", b64),
-    ]
-```
-(the enclosing `def id_needles(id_bytes: bytes) -> list[tuple[str, bytes]]:` sits at line 91, its
-own doc comment naming the hex-case-independence rationale above these lines.)
+`_read_schedule_cron_entries` (`ci/scripts/check_gpu_prove_once.py:1318-1338` at HEAD) reads
+`on.schedule` as a real list through the SAME PyYAML-backed parse `read_top_level_on_block` uses
+(`check_execution_surface_reachability.py`'s own loader, imported as `exec_mod`), never a second,
+independently-drifting text scan; its own finding text, naming the count, sits at
+`ci/scripts/check_gpu_prove_once.py:1425` (at HEAD).
 
-**Exit lattice**: `0` clean; `1` a carrier carries the id in some encoding (named by carrier and
-encoding — the bytes themselves are NEVER printed); `2` UNEXAMINABLE — a carrier could not be
-read at all: missing, unreadable (permission), a dangling symlink, an archive member under the
-pulled artifact directory (refused by SUFFIX match, never opened — `.tar`/`.tar.gz`/`.tgz`/
-`.tar.bz2`/`.tbz2`/`.tar.xz`/`.txz`/`.zip`/`.gz`), or a staging id file that is not exactly 128
-bytes. `2` is never read as clean — an unexaminable carrier is treated exactly as seriously as a
-confirmed hit for the purpose of deciding whether the run is trustworthy.
+**Advisory fix, also this round**: `drop_comment_lines`
+(`ci/scripts/check_gpu_prove_once.py:478-487` at HEAD) now strips a TRAILING `# ...` comment off
+an otherwise-code line (`_strip_trailing_comment`, `ci/scripts/check_gpu_prove_once.py:456-476`
+at HEAD), tracking quoted spans so a `#` inside a string literal is never mistaken for a comment
+start — a token that occurs only after a trailing `#` is prose, never code evidence, and no
+longer resolves a P8 allow-list token (or any other "does this text mention X" search this helper
+backs).
 
-**Carrier set**: the pulled artifact directory (recursively, symlinks followed); the driver's own
-`tee`'d run log (F6 — the SAME file the workflow step uploads, never a second unscanned copy —
-verified: `RUN_LOG="$(mktemp)"` then `exec > >(tee -a "$RUN_LOG") 2>&1` at the top of the driver's
-sourced-execution guard, and `_rpc_run_id_secrecy_scan` is later called with `"$RUN_LOG"` as its
-`--log` argument); the assembled `gang` artifact JSON; and the staging copy's own directory
-LISTING (a leak spelled into a FILENAME next to it, never its content a second time — the content
-is the needle SOURCE, read exactly once). The staging copy is deleted ONLY after a CLEAN scan
-(`--delete-staging`), never unconditionally — a dirty run's staging file survives for hand
-inspection.
+`RENTING_ROOTS` (`ci/scripts/check_gpu_prove_once.py:978` at HEAD, unchanged) still carries both
+roots; `PAID_POD_LANE_TABLE`'s cluster row (`ci/scripts/check_gpu_prove_once.py:879` at HEAD,
+unchanged) is unaffected by this round.
 
-**Oracle:** `gang_id_secrecy_scan.py --self-test` (17 `unittest` cases, run against a real tempdir
-fixture tree, no mock filesystem): clean scan passes and preserves staging without the flag;
-clean scan deletes staging only with the flag; raw/hex-lower/hex-upper/base64 planted hits in
-each of the four carrier kinds; a hit spelled into a directory entry NAME; an archive member
-refused without being opened; a dangling symlink UNEXAMINABLE; a symlink to a real file followed
-(clean and hit arms both); a missing log/assembled-artifact UNEXAMINABLE; an unreadable file
-UNEXAMINABLE (skipped under root — the `chmod_bypassed` class); a missing pulled dir UNEXAMINABLE;
-a staging file of the wrong byte count UNEXAMINABLE; hex-upper and hex-lower asserted as distinct
-needles. `test_gpu_cluster_lane.sh`'s F5 group drives the SAME scan through
-`_rpc_run_id_secrecy_scan` (the driver's own one-place wrapper) against equivalent fixtures.
+**Oracle**: `test_check_gpu_prove_once.py` (206 cases at HEAD, up from 201 pre-round; all
+passing, `python3 ci/scripts/test_check_gpu_prove_once.py`, exit 0). This round's additions:
+`RpSshoRequiresRpInitTest` (§2 F1), a second-cron-entry RED case plus a single-cron GREEN control
+in `ScheduleVisibilityTest`, `DropCommentLinesTrailingCommentTest` (5 cases). The pre-existing
+`DerivedRentingDriverTest`'s own hard-coded expected-derivation list
+(`ci/scripts/test_check_gpu_prove_once.py:1296-1335` at HEAD) gained
+`ci/scripts/test_gpu_cluster_lane.sh` — this round's own F2/F3(c) fixture text sources
+`runpod_gpu_cluster.sh` in a real subshell and names `rp_cluster_delete`/`rp_cleanup` in
+non-comment text, so the deliberately over-approximating derivation scan (§0's own doctrine)
+derives it too; cleared the identical way every sibling test file already is, by `ci.yml`'s guard
+job carrying no `RUNPOD_API_KEY`.
 
-## 6. M5 — P8 (schedule visibility) and the `RENTING_ROOTS` derivation
+## 7. M6 — artifact registry leg discrimination, post-fix
 
-`check_gpu_prove_once.py` ALREADY carries P1-P7 at this unit's own base (PR-B1 landed P7: every
-paid pod lane held to P1's three sub-rules — exactly one invoker, no `push:`/`workflow_call:` in
-that invoker's own `on:` block, nothing else `uses:` it — over a REVIEWED `PAID_POD_LANE_TABLE`
-registry). **This unit adds a NEW arm, P8** — never "a new P7 arm"; P7 already existed and this
-unit does not touch its own three sub-rules.
+See §2 F4 in full for the fix itself. `gang.leg` remains a required, closed-set field
+(`"pod"`|`"cluster"`), checked first. Pod-leg rows unchanged. Cluster-leg rows
+(`GANG_CLUSTER_FIELD_REGISTRY`, `ci/scripts/check_cuda_run_artifacts.py:1610-1668` at HEAD) now
+carry the strengthened `ranks[]`/cross-field/producer-binding properties §2 F4 describes.
 
-**P8's property** (`check_gpu_prove_once.py::check_p8_schedule_visibility`): for every
-`PAID_POD_LANE_TABLE` workflow AND every OTHER workflow that mentions a `RENTING_ROOTS`-derived
-driver while its own comment-stripped text ALSO carries `RUNPOD_API_KEY` at any scope, a
-`schedule:` key in its `on:` block (read via the shared `read_top_level_on_block`) is a FINDING
-unless that workflow is a reviewed key of `PAID_LANE_CRON_ALLOWLIST`:
+**Oracle**: `check_cuda_run_artifacts.py --self-test` — verified green this round
+(`python3 ci/scripts/check_cuda_run_artifacts.py --self-test`, exit 0), all rule (k) cases
+including the eight new F4 arms named in §2.
 
-```
-$ sed -n '1274,1285p' ci/scripts/check_gpu_prove_once.py
-```
-```
-PAID_LANE_CRON_ALLOWLIST: dict[str, tuple[str, str]] = {
-    "gpu-prove.yml": (
-        "capability-surface-proof",
-        "runpod_gpu_prove.sh's never-vacuous capability-surface-build/-proof groups refuse a 0-test "
-        "run -- the nightly cron can never silently pass on an empty suite",
-    ),
-    "gpu-reap.yml": (
-        "rp_cluster_sweep",
-        "gpu-dev.sh's reap arm fails closed (non-zero) when it cannot enumerate pods OR clusters -- "
-        "the 6-hourly cron never reports 'nothing to reap' from an enumeration it could not make",
-    ),
-}
-```
+## 8. The executed attempt — status, unchanged by this fix round
 
-**Why exactly these two, and why they are on the list at all**: `gpu-prove.yml` carries a
-pre-existing nightly cron that PREDATES this rule — it is reviewed and never-vacuous because
-`runpod_gpu_prove.sh`'s own `capability-surface-build`/`-proof` groups refuse a 0-test run (the
-same never-vacuous doctrine P1 already states for the prove lane). `gpu-reap.yml` carries the
-6-hourly reap cron THIS unit's own M1 depends on as the primary backstop for cluster orphans — it
-is reviewed and never-vacuous because `gpu-dev.sh reap` fails closed (non-zero) whenever EITHER
-sweep cannot enumerate, per M1 above. Neither entry is a rubber stamp: each TOKEN
-(`capability-surface-proof`, `rp_cluster_sweep`) must occur verbatim in the workflow's own
-comment-stripped text OR its `PAID_POD_LANE_TABLE` driver's comment-stripped text (F10) — an
-unresolvable token is a FAIL, exactly like a listed workflow carrying no `schedule:` at all (a
-dead waiver). `gpu-cluster.yml` and `gpu-gang.yml` are NOT on this list — neither carries a
-`schedule:` trigger today, and P8 is precisely what makes adding one to either a reviewed act
-requiring a human to add an allow-list row naming its own never-vacuous arm, rather than a silent
-default.
-
-**`RENTING_ROOTS`** (`check_gpu_prove_once.py::RENTING_ROOTS`) is what makes the cluster driver
-visible to P7 (and, through P7's own `PAID_POD_LANE_TABLE` derivation, to P8's subject set) at
-all — a REVIEWED LIST, not a single hard-coded pod-only seed:
-
-```
-$ grep -n 'RENTING_ROOTS: tuple' ci/scripts/check_gpu_prove_once.py
-948:RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create")
-```
-
-`derive_deploy_closure` (`check_gpu_prove_once.py::derive_deploy_closure`) computes the RENTING
-CLOSURE as each root's transitive callers inside `runpod_lib.sh` PLUS the roots themselves — a
-root is included because an external driver may call it with NO wrapper in between
-(`rp_cluster_create` has no `rp_deploy_live`-shaped wrapper the way `_rp_deploy_payload` does), so
-excluding the bare roots from the matched set would make P7 blind to a driver calling one
-directly. A missing root fails closed with its OWN named finding — verified BOTH roots
-independently (never one message that only names one of the two):
-
-```
-$ grep -n 'cannot derive the renting closure' ci/scripts/check_gpu_prove_once.py
-996:            f"P7: cannot derive the renting closure — no `{r}() {{` definition in {RUNPOD_LIB_REL} "
-```
-
-`PAID_POD_LANE_TABLE` gains the cluster row through this exact derivation (never a hand-added
-special case):
-
-```
-$ sed -n '844,850p' ci/scripts/check_gpu_prove_once.py
-```
-```
-    "ci/scripts/gpu-dev.sh": "gpu-reap.yml",
-    # The distributed-training CLUSTER leg: 2 hosts x 1 GPU on one RunPod
-    # CLUSTER (REST v2) -- a second, independent renting mechanism from the
-    # pod leg's GraphQL `podFindAndDeployOnDemand`, derived into P7's
-    # subject set via RENTING_ROOTS below (never a hard-coded pod-only seed).
-    "ci/scripts/runpod_gpu_cluster.sh": "gpu-cluster.yml",
-```
-
-**Oracle:** `test_check_gpu_prove_once.py`'s `DerivedRentingDriverTest` (closure equals both roots
-plus their own callers; a new deploy wrapper joins with no gate edit; a library missing EITHER
-root fails closed, independently of the other) and `ScheduleVisibilityTest` (the real tree is
-clean; RED-then-GREEN — P7 alone does not catch a planted cron on `gpu-gang.yml`, P8 does; the
-allow-listed prove cron is clean; an unresolvable allow-list token fails; a listed workflow with
-no cron is a dead waiver; an allow-list entry naming a nonexistent workflow fails; an unreadable
-`on:` block fails, never a silent skip; a derived driver with a schedule AND the secret is caught
-even OFF the table). `PreFixShapeFixtureTest` (unchanged by this unit) continues to reproduce the
-esc-084 pre-fix shape P7 itself closes.
-
-## 7. M6 — artifact registry leg discrimination (`check_cuda_run_artifacts.py` rule (k))
-
-`gang.leg` is now a REQUIRED, closed-set field (`"pod"` | `"cluster"`), checked FIRST, before
-either per-leg registry — the two legs owe DIFFERENT payloads and neither registry is optional
-padding on top of the other:
-
-```
-$ grep -n 'GANG_LEG_POD\|GANG_LEG_CLUSTER\|GANG_CLUSTER_HOSTS' ci/scripts/check_cuda_run_artifacts.py
-```
-```
-998:GANG_LEG_POD = "pod"
-999:GANG_LEG_CLUSTER = "cluster"
-1005:GANG_CLUSTER_HOSTS = 2
-```
-
-Pod-leg rows keep today's registry unchanged (`world`, `collective`, per-rank `device`, the
-same-seed digest PAIR, the measured per-step loss delta, epsilon). Cluster-leg rows
-(`GANG_CLUSTER_FIELD_REGISTRY`) instead require `hosts` (exactly `GANG_CLUSTER_HOSTS == 2` — this
-leg proves a two-host bootstrap only, never more), `ranks[]` (`rank`/`host`/`device`/`iface` per
-entry, count must equal `world`), `reduced_vector_digest` (a SINGLE bit-exact digest, required
-equal across both ranks on a `pass` — asserted by the DRIVER before assembly, never re-derived by
-the gate itself), `verdict`, `reason` on `fail`, and the rented shape as measured from the create
-response (`pod_count`, `gpu_count_per_pod`, `ttl_hours`). It carries NO `digests`/
-`per_step_loss_delta`/`epsilon` — those name a training-loss reproducibility regime this leg does
-not run; the cluster leg's own `reduced_vector_digest` equality is explicitly NEVER conflated with
-the pod leg's LoRA-shaped same-seed reproducibility pair (a different measurement this leg does
-not attempt).
-
-**Oracle:** `check_cuda_run_artifacts.py --self-test`'s rule (k) cases (verified present by direct
-read): a complete pod-leg artifact and a complete cluster-leg artifact both pass; a non-gang
-artifact is never gang-checked; a missing/out-of-set `gang.leg` fails by name; each pod-leg field
-individually missing fails by name; each cluster-leg field individually missing fails by name
-(the contract's own named example: "a cluster artifact lacking `hosts` fails by name" — verified
-present); `hosts != 2` fails; a `ranks[]` entry count that disagrees with `world` fails; a rank
-missing `iface` fails; two ranks repeating the same rank index fails; a `pass` verdict with no
-`reduced_vector_digest` fails; a `fail` verdict with a stated `reason` is legal (a `fail` is
-representable at the schema level, never refused at assembly time — matching `_rpc_
-assemble_gang_artifact`'s own behavior).
-
-## 8. The executed attempt — status
-
-`CONTRACT-U7b.md § 2` schedules "one real cluster run at the end of c3", authorized, bounded by
-M3's own cost figures, whose log would be the evidence for: the `args` entrypoint reaching bash
-on `RP_IMAGE` (REST v2, never independently confirmed — see §1); member sshd reachability;
-`ens1` as the overlay iface actually appearing in NCCL's own log; and whether member
-self-removal works on a cluster object. **This run has NOT happened as of this contract.** No
-`RUNPOD_API_KEY`-bearing session has executed `runpod_gpu_cluster.sh` against a real RunPod
-account within this unit's own commit history; no `gpu-cluster.yml` workflow run exists; no gang
-artifact under `crates/jammi-kernels/artifacts/cuda-runs/` for the cluster leg has been committed
-by this unit (verified: `git log --oneline --all -- 'crates/jammi-kernels/artifacts/cuda-runs/*cluster*'`
-finds nothing on this branch, and c4's own commit — this contract plus the plan-doc notes — adds
-no artifact file). A failed run, when one is executed, is itself a FINDING to be recorded and
-fixed (re-run once at most, within the 2-run authorization) — never silently re-tried past that
-ceiling, and never presented as a pass if it never ran clean.
+No real RunPod cluster run has happened. `CONTRACT-U7b.md §2` schedules one at the end of c3,
+authorized, bounded by §4's own cost figures — its log would be the evidence for the `args`
+entrypoint reaching bash on `RP_IMAGE` (§1), member sshd reachability, `ens1` as the overlay
+iface, and whether member self-removal works. This fix round is entirely mocks-only (per its own
+brief: never call the RunPod API, no key available to this agent) and changes nothing about this
+status. A failed run, when one is executed, is itself a FINDING to be recorded and fixed (re-run
+once at most, within the 2-run authorization).
 
 ## 9. Known-unmeasured / uncovered (named, never claimed closed)
 
-- **Member self-removal on a cluster pod.** S4 measured only that a cluster member exposes
-  `actions: []` in the RunPod API's own listing — a LISTING attribute, never an OBSERVED
-  termination attempt. Whether `runpodctl remove pod` inside a cluster member's own entrypoint
-  actually succeeds (and whether a success there is even reflected in the cluster's own billing
-  state) is unknown until §8's run executes and records `cluster-self-remove: ok|refused`
-  (`_rpc_self_remove_status`/`_rpc_cleanup_cluster`, `ci/scripts/runpod_gpu_cluster.sh`).
+- **Member self-removal on a cluster pod.** Unknown until §8's run executes and records
+  `cluster-self-remove: ok|refused` (`_rpc_self_remove_status`/`_rpc_cleanup_cluster`,
+  `ci/scripts/runpod_gpu_cluster.sh:570-608` at HEAD).
 - **The REST v2 `args` field reaching `bash -c` on `RP_IMAGE`.** Never independently confirmed —
-  see §1. The launch-time read-back (`_rpc_check_readback`) is the guard against this being
-  false, not a proof that it is true; it can only ever detect the mismatch AFTER a real cluster
-  has already been created.
-- **The `NCCL_SOCKET_IFNAME=ens1`/pin set at world >= 3.** README.md's own S5 spike result states
-  this explicitly: at world size 2 the reduction is commutative, so the `NCCL_ALGO`/`PROTO`/
-  `NCHANNELS` pin set is UNTESTED at any world size where it is not — this unit's own leg proves
-  world 2 only (`CLUSTER_TEST_FILTER=gang_nccl_two_hosts`, `RP_CLUSTER_POD_COUNT=2`, hard-pinned)
-  and cannot itself close this question. `docs/maintainer/dev-gpu.md`'s own "Known-unmeasured"
-  section for the cluster leg already states this and points back here.
-- **S5's cross-host byte identity.** S5 (README.md) measured byte-IDENTICAL forward/backward/SGD
-  across TWO PROCESSES and across two A100s with NO env pins for candle 0.11's LoRA-shaped
-  arithmetic — but that measurement did not exercise a cross-HOST NCCL collective the way this
-  unit's own leg does; this leg's `reduced_vector_digest` equality is a DIFFERENT, narrower
-  measurement (a bit-exact sum reduction, not a training step's forward/backward/SGD digest pair)
-  and does not itself extend S5's own claim across hosts. Filed here as uncovered, not silently
-  assumed to follow from S5.
+  §1. The launch-time read-back is the guard against this being false, not a proof it is true.
+- **The `NCCL_SOCKET_IFNAME=ens1`/pin set at world >= 3.** This unit's own leg proves world 2
+  only. `docs/maintainer/dev-gpu.md`'s own "Known-unmeasured" section (at `5ebe53ab`, unchanged)
+  states this and points back here.
+- **S5's cross-host byte identity.** S5 (README.md, at `9f69275b`, unchanged) measured
+  byte-identical forward/backward/SGD across two PROCESSES on two A100s, never a cross-HOST NCCL
+  collective; this leg's `reduced_vector_digest` equality is a narrower, different measurement
+  (a bit-exact sum, not a training step's digest pair) and does not itself extend S5's claim.
 
 ## 10. Invariants crossed
 
-B2 (every script and doc here names no consumer — verified by `check_no_consumer_names.py`
-below); the paid-lane doctrine (P1/P7/P8: label/dispatch only, never merge-path — `gpu-cluster.yml`
-carries neither `push:` nor `workflow_call:`, verified by direct read of its `on:` block); B6
-(the ai-core test body, M2, and the docs-ci lane, M1/M3-M6, land as one committed unit — this
-branch's own five commits, `f772e2e8` through `ed3612e6`); K2 (every parsed API body is validated
-before use — `_rp_rest`'s callers each check the required key is present before printing a
-success, never trusting a 2xx status alone).
+B2 (every script and doc here names no consumer — `python3 ci/scripts/check_no_consumer_names.py`
+verified green this round); the paid-lane doctrine (P1/P7/P8: label/dispatch only, never
+merge-path); B6 (the ai-core test body and the docs-ci lane land together — this branch's own ten
+commits below the merge, §0's header, plus this fix round's own eleventh); K2 (every parsed API
+body is validated before use).
 
 ## 11. Gate files a human must review at this unit's merge
 
 `swarm.yml`'s human-amend-only glob (`SWARM_GATE_TOUCHED`) covers gate-script edits; the reviewer
 checks:
 
-- `ci/scripts/check_gpu_prove_once.py` — the new P8 arm (`check_p8_schedule_visibility`,
-  `PAID_LANE_CRON_ALLOWLIST`), `RENTING_ROOTS` widened to two roots, the `PAID_POD_LANE_TABLE` row
-  for `ci/scripts/runpod_gpu_cluster.sh`.
-- `ci/scripts/check_cuda_run_artifacts.py` — rule (k)'s `gang.leg` discriminator and
-  `GANG_CLUSTER_FIELD_REGISTRY`.
-- `ci/scripts/runpod_lib.sh` — every `rp_cluster_*` primitive, the `RP_CLUSTER_PREFIX` name space,
-  `rp_sweep`'s cluster-member exclusion and counted terminate-refusal.
-- `.github/workflows/gpu-cluster.yml` — its own `on:` block (label + dispatch only), the
-  concurrency group, the timeout budget.
-- `.github/workflows/gpu-reap.yml` — unchanged trigger shape, now backstopping two object types.
+- `ci/scripts/check_gpu_prove_once.py` — P8's schedule-cron-count check and the trailing-comment
+  stripper (§2 F6 advisory / §6).
+- `ci/scripts/check_cuda_run_artifacts.py` — rule (k)'s strengthened cluster-leg registry and the
+  leg/producer binding (§2 F4).
+- `ci/scripts/runpod_lib.sh` — `rp_sweep`'s now-fatal refused-terminate arm and
+  `rp_cluster_sweep`'s now-fatal `UNAGEABLE` arm (§2 F3).
+- `ci/scripts/runpod_gpu_cluster.sh` — `rp_init` (§2 F1), the relocated/chained EXIT trap (§2
+  F2/F3(c)), the assembly-time refusal and RUN_LOG relocation (§2 F4/F6).
+- `ci/scripts/gang_id_secrecy_scan.py` — the cycle-safe walk, the regular-file-only read, and the
+  wall-clock budget (§2 F5).
 
 ## 12. Residuals recorded UNCOVERED
 
 - The un-executed REST v2 pre-flight (§1) and the un-executed cluster run (§8) — both named, not
   silently deferred.
 - Member self-removal on a cluster object (§9).
-- The NCCL pin set at world >= 3 (§9) — filed on this contract per `docs/maintainer/dev-gpu.md`'s
-  own "Known-unmeasured" cross-reference.
-- S5's cross-host byte identity (§9) — this leg's own `reduced_vector_digest` measurement is
-  narrower and does not extend S5's claim across hosts.
-- **U7b-A3** (the `gpu-gang.yml` 6-hourly cron re-add) is explicitly NOT part of this unit — a
-  future, separately authorized re-add, made a reviewed act by P8 rather than a silent default.
-- Every residual PR-B1's own contract (`docs/rigor/contracts/feat_500-PR-B1.md`) already recorded
-  UNCOVERED for P6/P7 (issues #561, #563, #564, #565) is UNCHANGED by this unit — this unit adds a
-  new arm (P8) beside them, touching none of their own named gaps.
+- The NCCL pin set at world >= 3 (§9).
+- S5's cross-host byte identity (§9).
+- **U7b-A3** (the `gpu-gang.yml` 6-hourly cron re-add) is explicitly NOT part of this unit.
+- Every residual PR-B1's own contract already recorded UNCOVERED for P6/P7 is unchanged by this
+  unit or this fix round.
 
 ## 13. Citations verified against which head
 
-Every construct cited above was read directly against this worktree's tree at commit `ed3612e6`
-(branch `feat/500-C-U7b`) via `grep -n`/`sed -n -p`, not against any scratchpad working document's
-own line numbers, and not against `CONTRACT-U7b.md`'s own §7/§8 fold text beyond citing its
-decisions by name. No bare `path:line` form appears in this document outside a fenced block
-quoting an executed `grep`/`sed` command and its real output.
+Every construct cited above was read directly against this worktree's tree via `grep -n`/direct
+file reads, AFTER every fix in §2 landed — the last step before this file was written — never
+against a scratchpad working document's own line numbers, and never against `CONTRACT-U7b.md`'s
+own §7/§8 fold text beyond citing its decisions by name. Every citation is the bare `path:line`
+(or `path:line-line`) form `check_rigor_record.py`'s own `check_path_line_citations` matches,
+tagged `(at <sha>)` per this file's own header convention (§0).

@@ -25,17 +25,41 @@ exactly that), the CARRIER SET the cluster driver's own run produces:
 Exit lattice (F5): 0 clean; 1 a carrier carries the id in some encoding
 (named by carrier and encoding, the bytes themselves are NEVER printed); 2 a
 carrier could not be examined at all (missing, unreadable, a dangling
-symlink, or an archive member under the pulled artifact directory — this
-scan refuses to look inside an archive rather than silently skip it). 2 is
-UNEXAMINABLE, never read as clean.
+symlink, a cyclic directory symlink, a non-regular file (FIFO/socket/device
+— `rsync -a` can pull specials, and a `read_bytes()` on a FIFO/socket blocks
+forever), an archive member under the pulled artifact directory, or the scan
+itself blowing its own wall-clock budget). 2 is UNEXAMINABLE, never read as
+clean.
 
-Symlinks are FOLLOWED (a dangling symlink is 2, never silently skipped).
+FILE symlinks are followed (a dangling one is 2, never silently skipped).
+DIRECTORY symlinks are followed too, but through a visited-realpath set: a
+directory whose real path this scan has already entered is a CYCLE — one
+UNEXAMINABLE finding naming the path, never a re-descent — so a cyclic
+directory symlink (planted or accidental, `rsync -a` preserves them as-is)
+can never recurse forever. This scan never calls `os.walk(followlinks=True)`
+for exactly that reason: it detects no cycles at all and would hang on one.
+The whole scan additionally runs under a wall-clock budget
+(`GANG_ID_SCAN_BUDGET_SECS`, default 120s, `--budget-secs` overrides) — an
+expiry is itself UNEXAMINABLE (2), independent of any single carrier's own
+shape, the last line of defense against a carrier class this module's own
+author did not anticipate.
+
+Only `S_ISREG` files are ever opened. Any other file type this scan's own
+walk reaches (a FIFO, a UNIX socket, a block/char device) is refused by
+name (2) without a `read_bytes()` ever being attempted against it.
+
 Archive members (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`,
 `.txz`, `.zip`, `.gz` — matched by suffix, not by sniffing magic bytes,
 which would itself be a second unaudited parser) anywhere under the pulled
 artifact directory are refused outright (2) rather than opened: this driver
 never legitimately ships an archive there, so one appearing is itself
 suspicious, and this scanner is not an archive-format parser.
+
+The base64 needle set carries all FOUR variants the ship step's own base64
+library could plausibly emit: standard padded, standard un-padded (a
+padded leak is also a substring hit on this needle, by construction — no
+false negative, just a redundant label), URL-safe padded, URL-safe
+un-padded.
 
 The staging copy (the local runner's own copy of the 128-byte id file,
 `$RP_WORK/nccl.id` in the driver) is deleted AFTER a clean scan, and ONLY
@@ -55,13 +79,16 @@ import base64
 import contextlib
 import io
 import os
+import signal
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 ID_BYTES_LEN = 128
+DEFAULT_BUDGET_SECS = int(os.environ.get("GANG_ID_SCAN_BUDGET_SECS", "120"))
 
 # Suffix match only (never a magic-byte sniff, which would be a second,
 # unaudited parser) — matched against the LOWERCASED basename so a
@@ -95,15 +122,23 @@ def id_needles(id_bytes: bytes) -> list[tuple[str, bytes]]:
     that merely contains the right hex digits in the wrong case pattern by
     accident far less often than it would hide a genuine same-case leak, so
     this checks lower and upper as two DISTINCT literal needles, never a
-    single case-folded one)."""
+    single case-folded one). base64 carries all FOUR variants a library call
+    could plausibly emit — standard/URL-safe crossed with padded/unpadded;
+    the padded forms are checked FIRST so a padded leak reports under its
+    own, more specific label rather than the unpadded needle it also
+    happens to contain as a substring."""
     hex_lower = id_bytes.hex().encode("ascii")
     hex_upper = id_bytes.hex().upper().encode("ascii")
-    b64 = base64.b64encode(id_bytes)
+    b64_std = base64.b64encode(id_bytes)
+    b64_url = base64.urlsafe_b64encode(id_bytes)
     return [
         ("raw", id_bytes),
         ("hex-lower", hex_lower),
         ("hex-upper", hex_upper),
-        ("base64", b64),
+        ("base64", b64_std),
+        ("base64-urlsafe", b64_url),
+        ("base64-unpadded", b64_std.rstrip(b"=")),
+        ("base64-urlsafe-unpadded", b64_url.rstrip(b"=")),
     ]
 
 
@@ -115,9 +150,12 @@ def _scan_bytes(data: bytes, needles: list[tuple[str, bytes]]) -> str | None:
 
 
 def scan_file(path: Path, needles: list[tuple[str, bytes]]) -> tuple[int, str]:
-    """(status, message) for ONE file-shaped carrier. Symlinks are followed;
+    """(status, message) for ONE file-shaped carrier. A symlink is followed;
     a dangling one is UNEXAMINABLE (2), never skipped. An archive member is
-    refused outright (2) without being opened."""
+    refused outright (2) without being opened. Only `S_ISREG` targets are
+    ever read: a FIFO, a UNIX socket, or a device node is refused by name
+    (2) — `read_bytes()` against a FIFO/socket can block forever, and none
+    of those shapes is legitimate evidence in a pulled artifact tree."""
     try:
         if path.is_symlink():
             real = path.resolve(strict=True)
@@ -129,8 +167,17 @@ def scan_file(path: Path, needles: list[tuple[str, bytes]]) -> tuple[int, str]:
         return STATUS_UNEXAMINABLE, f"{path}: archive carrier refused (never opened)"
     try:
         st = real.stat()
-        if stat.S_ISDIR(st.st_mode):
-            return STATUS_UNEXAMINABLE, f"{path}: is a directory, not a file"
+    except OSError as exc:
+        return STATUS_UNEXAMINABLE, f"{path}: unreadable ({exc})"
+    if stat.S_ISDIR(st.st_mode):
+        return STATUS_UNEXAMINABLE, f"{path}: is a directory, not a file"
+    if not stat.S_ISREG(st.st_mode):
+        return (
+            STATUS_UNEXAMINABLE,
+            f"{path}: not a regular file (mode class {stat.S_IFMT(st.st_mode):#o}) — refusing to "
+            "read a FIFO/socket/device carrier",
+        )
+    try:
         data = real.read_bytes()
     except OSError as exc:
         return STATUS_UNEXAMINABLE, f"{path}: unreadable ({exc})"
@@ -141,18 +188,89 @@ def scan_file(path: Path, needles: list[tuple[str, bytes]]) -> tuple[int, str]:
 
 
 def scan_dir(root: Path, needles: list[tuple[str, bytes]]) -> list[tuple[int, str]]:
-    """Every file under `root`, recursively, symlinks followed. A directory
-    that cannot itself be listed is one UNEXAMINABLE finding for the whole
-    subtree (fail-closed: an incomplete listing is worse than no listing at
-    all — the same doctrine `rp_cluster_sweep`'s enumeration failures use)."""
+    """Every file under `root`, recursively. NEVER `os.walk(followlinks=True)`
+    — that detects no cycles at all and hangs forever on a cyclic directory
+    symlink (`rsync -a` preserves a symlink exactly as planted). This walk
+    instead tracks the REAL path of every directory it has entered; a
+    directory whose real path repeats is a cycle — one UNEXAMINABLE finding
+    naming the path, never a re-descent. A directory that cannot itself be
+    listed is one UNEXAMINABLE finding for the whole subtree (fail-closed:
+    an incomplete listing is worse than no listing at all — the same
+    doctrine `rp_cluster_sweep`'s enumeration failures use)."""
     if not root.is_dir():
         return [(STATUS_UNEXAMINABLE, f"{root}: not a directory (pulled artifact dir missing?)")]
     findings: list[tuple[int, str]] = []
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=True):
-        dpath = Path(dirpath)
-        for fname in filenames:
-            findings.append(scan_file(dpath / fname, needles))
-    return [f for f in findings if f[0] != STATUS_CLEAN]
+    visited_dirs: set[str] = set()
+
+    def walk(d: Path) -> None:
+        try:
+            real_d = d.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            findings.append((STATUS_UNEXAMINABLE, f"{d}: dangling symlink or unresolvable ({exc})"))
+            return
+        key = str(real_d)
+        if key in visited_dirs:
+            findings.append((STATUS_UNEXAMINABLE, f"{d}: cyclic carrier — directory symlink cycle back to {real_d}"))
+            return
+        visited_dirs.add(key)
+        try:
+            entries = sorted(real_d.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            findings.append((STATUS_UNEXAMINABLE, f"{d}: unreadable directory ({exc})"))
+            return
+        for entry in entries:
+            try:
+                lst = entry.lstat()
+            except OSError as exc:
+                findings.append((STATUS_UNEXAMINABLE, f"{entry}: unreadable ({exc})"))
+                continue
+            if stat.S_ISDIR(lst.st_mode) and not stat.S_ISLNK(lst.st_mode):
+                walk(entry)
+                continue
+            if stat.S_ISLNK(lst.st_mode):
+                try:
+                    target_st = entry.stat()
+                except (OSError, RuntimeError) as exc:
+                    findings.append((STATUS_UNEXAMINABLE, f"{entry}: dangling symlink or unresolvable ({exc})"))
+                    continue
+                if stat.S_ISDIR(target_st.st_mode):
+                    walk(entry)
+                    continue
+                # A symlink to a non-directory falls through to the ordinary
+                # per-file handling below — scan_file resolves it itself.
+            status, msg = scan_file(entry, needles)
+            if status != STATUS_CLEAN:
+                findings.append((status, msg))
+
+    walk(root)
+    return findings
+
+
+class ScanTimeout(Exception):
+    """Raised when the wall-clock budget (F5) expires mid-scan."""
+
+
+@contextlib.contextmanager
+def wall_clock_budget(seconds: int):
+    """The scan's own last line of defense: independent of any single
+    carrier's shape, the WHOLE scan is cut at `seconds` of wall-clock time.
+    A budget <= 0, or a platform without SIGALRM (no POSIX signals), disables
+    the guard rather than raising — this scan's normal habitat is Linux/macOS
+    CI, and a missing SIGALRM must never turn into a spurious refusal."""
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _handler(_signum: int, _frame: object) -> None:
+        raise ScanTimeout(f"scan exceeded its {seconds}s wall-clock budget")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def scan_directory_listing(staging: Path, needles: list[tuple[str, bytes]]) -> tuple[int, str | None]:
@@ -177,6 +295,22 @@ def scan_directory_listing(staging: Path, needles: list[tuple[str, bytes]]) -> t
 
 
 def run_scan(
+    staging_file: Path,
+    artifact_dir: Path,
+    log: Path,
+    assembled_artifact: Path,
+    delete_staging: bool,
+    budget_secs: int = DEFAULT_BUDGET_SECS,
+) -> int:
+    try:
+        with wall_clock_budget(budget_secs):
+            return _run_scan_body(staging_file, artifact_dir, log, assembled_artifact, delete_staging)
+    except ScanTimeout as exc:
+        print(f"gang-id-secrecy-scan: UNEXAMINABLE: {exc}", file=sys.stderr)
+        return STATUS_UNEXAMINABLE
+
+
+def _run_scan_body(
     staging_file: Path,
     artifact_dir: Path,
     log: Path,
@@ -258,6 +392,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--log", type=Path)
     ap.add_argument("--assembled-artifact", type=Path)
     ap.add_argument("--delete-staging", action="store_true")
+    ap.add_argument(
+        "--budget-secs",
+        type=int,
+        default=DEFAULT_BUDGET_SECS,
+        help="wall-clock budget for the whole scan (F5); <=0 disables it (default: GANG_ID_SCAN_BUDGET_SECS or 120)",
+    )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
 
@@ -278,7 +418,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gang_id_secrecy_scan.py: missing required argument(s): {missing}", file=sys.stderr)
         return 2
 
-    return run_scan(args.staging_file, args.artifact_dir, args.log, args.assembled_artifact, args.delete_staging)
+    return run_scan(
+        args.staging_file,
+        args.artifact_dir,
+        args.log,
+        args.assembled_artifact,
+        args.delete_staging,
+        args.budget_secs,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +576,61 @@ class GangIdSecrecyScanTest(unittest.TestCase):
         rc, out = self._run()
         self.assertEqual(rc, STATUS_UNEXAMINABLE)
         self.assertIn("not exactly 128 bytes", out)
+
+    def test_base64_urlsafe_id_planted_in_the_artifact_dir_is_a_hit(self) -> None:
+        b64u = base64.urlsafe_b64encode(self.id_bytes).decode("ascii")
+        (self.artifact_dir / "notes.txt").write_text("leaked: " + b64u)
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_HIT)
+        self.assertIn("base64-urlsafe", out)
+
+    def test_base64_unpadded_id_planted_in_the_run_log_is_a_hit(self) -> None:
+        b64_nopad = base64.b64encode(self.id_bytes).rstrip(b"=").decode("ascii")
+        self.log.write_text("leaked: " + b64_nopad + "\n")
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_HIT)
+        self.assertIn("base64", out)  # matches "base64" or "base64-unpadded" depending on padding needed
+
+    def test_cyclic_directory_symlink_is_unexaminable_not_a_hang(self) -> None:
+        # A directory symlink pointing back at an ANCESTOR: naive
+        # `os.walk(followlinks=True)` recurses forever here. This must
+        # return promptly, never hang.
+        (self.artifact_dir / "loop").symlink_to(self.artifact_dir)
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_UNEXAMINABLE)
+        self.assertIn("cyclic carrier", out)
+
+    def test_fifo_under_the_pulled_dir_is_refused_not_opened(self) -> None:
+        fifo_path = self.artifact_dir / "a.fifo"
+        os.mkfifo(fifo_path)  # a read() against this with nothing writing would hang forever
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_UNEXAMINABLE)
+        self.assertIn("not a regular file", out)
+
+    def test_unix_socket_under_the_pulled_dir_is_refused_not_opened(self) -> None:
+        import socket
+
+        sock_path = self.artifact_dir / "a.sock"
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(s.close)
+        s.bind(str(sock_path))
+        rc, out = self._run()
+        self.assertEqual(rc, STATUS_UNEXAMINABLE)
+        self.assertIn("not a regular file", out)
+
+    def test_wall_clock_budget_expiry_is_unexaminable_not_a_hang(self) -> None:
+        import unittest.mock as mock
+
+        def _slow_scan_dir(_root: Path, _needles: object) -> list[tuple[int, str]]:
+            time.sleep(2)
+            return []
+
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch(f"{__name__}.scan_dir", _slow_scan_dir):
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = run_scan(self.staging, self.artifact_dir, self.log, self.assembled, False, budget_secs=1)
+        self.assertEqual(rc, STATUS_UNEXAMINABLE)
+        self.assertIn("wall-clock budget", buf_out.getvalue() + buf_err.getvalue())
 
     def test_hex_upper_and_lower_are_distinct_needles(self) -> None:
         # A control proving the two cases are checked independently: an id

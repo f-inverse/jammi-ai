@@ -98,7 +98,6 @@ use candle_nn::VarMap;
 use jammi_db::error::{JammiError, Result};
 
 use crate::fine_tune::adamw::AdamW;
-use crate::fine_tune::collective::Collective;
 
 /// Snapshot every trainable `Var` in `varmap`, in a DETERMINISTIC order —
 /// sorted by its `VarBuilder`-path NAME, never `VarMap::all_vars()`'s raw
@@ -661,7 +660,7 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 ///
 /// [`TrainingLoop::process_batch_loss`]: super::trainer::TrainingLoop::process_batch_loss
 pub fn canonical_reduce(
-    collective: &dyn Collective,
+    rank_ctx: &super::trainer::RankContext,
     trainable_vars: &[Var],
     grads: &mut GradStore,
 ) -> Result<()> {
@@ -687,7 +686,7 @@ pub fn canonical_reduce(
             }
         }
     }
-    collective.all_reduce_sum(&mut tensors)?;
+    rank_ctx.all_reduce_sum(&mut tensors)?;
 
     // The gang-wide presence set: `> 0` at index `i` iff SOME rank's own
     // accumulation populated canonical var `i` this window.
@@ -695,7 +694,7 @@ pub fn canonical_reduce(
     let n = trainable_vars.len();
     let mut presence_tensor = vec![Tensor::from_vec(presence, (n,), device)
         .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence tensor: {e}")))?];
-    collective.all_reduce_sum(&mut presence_tensor)?;
+    rank_ctx.all_reduce_sum(&mut presence_tensor)?;
     let presence_summed: Vec<f32> = presence_tensor[0]
         .to_vec1()
         .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence readback: {e}")))?;
@@ -945,14 +944,16 @@ mod tests {
     /// catches it directly.
     #[test]
     fn canonical_reduce_at_world_one_leaves_absence_and_presence_unchanged() {
-        use crate::fine_tune::collective::Noop;
+        use crate::fine_tune::partition::PartitionRule;
+        use crate::fine_tune::trainer::RankContext;
 
         let (w_present, mut grads, g_before) = one_var_with_grad(0.5, 4);
         let dev = Device::Cpu;
         let w_absent = Var::from_tensor(&Tensor::zeros((3,), DType::F32, &dev).unwrap()).unwrap();
         let vars = vec![w_present.clone(), w_absent.clone()];
+        let rank_ctx = RankContext::single_rank(1, PartitionRule::BlockByGlobalBatch);
 
-        canonical_reduce(&Noop::new(), &vars, &mut grads).unwrap();
+        canonical_reduce(&rank_ctx, &vars, &mut grads).unwrap();
 
         let present_after: Vec<f32> = grads.get(w_present.as_tensor()).unwrap().to_vec1().unwrap();
         let present_before: Vec<f32> = g_before.to_vec1().unwrap();
@@ -988,11 +989,19 @@ mod tests {
     #[test]
     fn canonical_reduce_sums_a_real_gang_and_restores_absence_where_no_rank_had_it() {
         use crate::fine_tune::collective::LocalGang;
+        use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
+        use crate::fine_tune::trainer::RankContext;
+        use std::sync::Arc;
 
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
         let mut handles = Vec::new();
         for rank in 0..2u32 {
             let local = gang.rank(rank).unwrap();
+            let rank_ctx = RankContext::new(
+                Arc::new(local),
+                PartitionSpec::for_gang(rank as usize, 2, 1, PartitionRule::BlockByGlobalBatch)
+                    .unwrap(),
+            );
             handles.push(std::thread::spawn(move || {
                 let dev = Device::Cpu;
                 let w_shared =
@@ -1023,7 +1032,7 @@ mod tests {
                 // the absent-on-one-rank case. Neither rank ever inserts one
                 // for `w_absent_everywhere` — the absent-on-every-rank case.
 
-                canonical_reduce(&local, &vars, &mut grads).unwrap();
+                canonical_reduce(&rank_ctx, &vars, &mut grads).unwrap();
 
                 let shared_sum: Vec<f32> =
                     grads.get(w_shared.as_tensor()).unwrap().to_vec1().unwrap();

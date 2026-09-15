@@ -359,9 +359,61 @@ impl RankContext {
         self.partition
     }
 
-    /// The collective this rank reduces over.
-    pub fn collective(&self) -> &Arc<dyn Collective> {
-        &self.collective
+    /// [`Collective::all_gather`], routed through this ONE seam — every
+    /// trainer call site goes through here rather than reaching into
+    /// `self.collective` directly, so the concurrently-built `Peer`
+    /// collective (U5b-1b-i) — which adds a per-call witness argument to
+    /// every `Collective` verb — needs to change only these five wrapper
+    /// bodies at consolidation, never every call site across the trainer.
+    pub fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
+        self.collective.all_gather(local, counts)
+    }
+
+    /// [`Collective::all_reduce_sum`], routed through this ONE seam.
+    pub fn all_reduce_sum(&self, tensors: &mut [Tensor]) -> Result<()> {
+        self.collective.all_reduce_sum(tensors)
+    }
+
+    /// [`Collective::all_reduce_max_flags`], routed through this ONE seam.
+    pub fn all_reduce_max_flags(&self, flags: u32) -> Result<u32> {
+        self.collective.all_reduce_max_flags(flags)
+    }
+
+    /// [`Collective::broadcast`], routed through this ONE seam.
+    pub fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()> {
+        self.collective.broadcast(t, root)
+    }
+
+    /// [`Collective::barrier`], routed through this ONE seam.
+    pub fn barrier(&self) -> Result<()> {
+        self.collective.barrier()
+    }
+
+    /// A stable digest of the CANONICAL `trainable_vars` name order this
+    /// gang's reduce must agree on (the same order [`super::optimizer::
+    /// sorted_trainable_vars`] produces, threaded through
+    /// [`super::optimizer::canonical_reduce`]) — exposed here for the
+    /// concurrently-built `Peer` collective (U5b-1b-i), whose round
+    /// descriptor carries this as `agreement`: a wire round only publishes
+    /// once every rank's descriptor (root, counts, tensor signatures, AND
+    /// this digest) agrees, so two ranks that would otherwise silently
+    /// reduce two DIFFERENT var orderings together fault symmetrically
+    /// instead. Computed HERE — not re-derived by that future unit — so
+    /// there is exactly one function that decides what "the canonical
+    /// layout" hashes to. A plain, non-cryptographic fold is enough: this
+    /// is a MISMATCH detector between cooperating ranks, never a security
+    /// boundary.
+    pub fn canonical_vars_digest(names: &[String]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        for name in names {
+            hasher.update(name.as_bytes());
+            // A separator byte no valid var name can itself contain (LoRA
+            // names are `.`/alnum-joined path segments), so two adjacent
+            // names can never be confused with one longer name.
+            hasher.update([0u8]);
+        }
+        format!("{:x}", hasher.finalize())
     }
 
     /// DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`".
@@ -1724,11 +1776,7 @@ impl TrainingLoop {
                 // (`process_batch_loss`'s own call site) — the trailing
                 // partial window is an optimizer-step boundary like any
                 // other and must sum across the gang before it clips/steps.
-                canonical_reduce(
-                    self.rank_ctx.collective().as_ref(),
-                    &trainable_vars,
-                    &mut accumulated_grads,
-                )?;
+                canonical_reduce(&self.rank_ctx, &trainable_vars, &mut accumulated_grads)?;
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
@@ -3144,14 +3192,11 @@ impl TrainingLoop {
         // identity, so `diverged == local_diverged` exactly — byte-identical
         // to the pre-U4b local-only check.
         let local_diverged = loss_val.is_nan() || loss_val > 100.0;
-        let flags = self
-            .rank_ctx
-            .collective()
-            .all_reduce_max_flags(if local_diverged {
-                LOCKSTEP_FLAG_DIVERGED
-            } else {
-                0
-            })?;
+        let flags = self.rank_ctx.all_reduce_max_flags(if local_diverged {
+            LOCKSTEP_FLAG_DIVERGED
+        } else {
+            0
+        })?;
         let diverged = flags & LOCKSTEP_FLAG_DIVERGED != 0;
         if diverged {
             self.divergence_count += 1;
@@ -3198,11 +3243,7 @@ impl TrainingLoop {
             // below clips and steps over the IDENTICAL, already-summed
             // gradient on every rank. At `W = 1` this is the zero-filling
             // identity (`optimizer::canonical_reduce`'s own doc).
-            canonical_reduce(
-                self.rank_ctx.collective().as_ref(),
-                ctx.trainable_vars,
-                epoch.accumulated_grads,
-            )?;
+            canonical_reduce(&self.rank_ctx, ctx.trainable_vars, epoch.accumulated_grads)?;
             clip_and_step(
                 ctx.optimizer,
                 ctx.trainable_vars,
@@ -3344,16 +3385,16 @@ impl TrainingLoop {
         counts: &[usize],
     ) -> Result<Tensor> {
         use super::data::TrainingBatch;
-        let collective = self.rank_ctx.collective();
+        let rank_ctx = &self.rank_ctx;
         match batch {
             TrainingBatch::Contrastive {
                 embeddings_a,
                 embeddings_b,
                 scores,
             } => {
-                let embeddings_a = collective.all_gather(embeddings_a, counts)?;
-                let embeddings_b = collective.all_gather(embeddings_b, counts)?;
-                let scores = collective.all_gather(scores, counts)?;
+                let embeddings_a = rank_ctx.all_gather(embeddings_a, counts)?;
+                let embeddings_b = rank_ctx.all_gather(embeddings_b, counts)?;
+                let scores = rank_ctx.all_gather(scores, counts)?;
                 self.compute_loss(&TrainingBatch::Contrastive {
                     embeddings_a,
                     embeddings_b,
@@ -3361,8 +3402,8 @@ impl TrainingLoop {
                 })
             }
             TrainingBatch::Pairs { anchors, positives } => {
-                let anchors = collective.all_gather(anchors, counts)?;
-                let positives = collective.all_gather(positives, counts)?;
+                let anchors = rank_ctx.all_gather(anchors, counts)?;
+                let positives = rank_ctx.all_gather(positives, counts)?;
                 self.compute_loss(&TrainingBatch::Pairs { anchors, positives })
             }
             TrainingBatch::Triplet {
@@ -3370,9 +3411,9 @@ impl TrainingLoop {
                 positive,
                 negative,
             } => {
-                let anchor = collective.all_gather(anchor, counts)?;
-                let positive = collective.all_gather(positive, counts)?;
-                let negative = collective.all_gather(negative, counts)?;
+                let anchor = rank_ctx.all_gather(anchor, counts)?;
+                let positive = rank_ctx.all_gather(positive, counts)?;
+                let negative = rank_ctx.all_gather(negative, counts)?;
                 self.compute_loss(&TrainingBatch::Triplet {
                     anchor,
                     positive,
@@ -3386,13 +3427,13 @@ impl TrainingLoop {
                 // before this function ever sees the batch) — gathering it
                 // is the same "downstream of every trainable parameter"
                 // rule as `Regression`'s `input`, not a special case.
-                let logits = collective.all_gather(logits, counts)?;
-                let labels = collective.all_gather(labels, counts)?;
+                let logits = rank_ctx.all_gather(logits, counts)?;
+                let labels = rank_ctx.all_gather(labels, counts)?;
                 self.compute_loss(&TrainingBatch::Classification { logits, labels })
             }
             TrainingBatch::Regression { input, target } => {
-                let input = collective.all_gather(input, counts)?;
-                let target = collective.all_gather(target, counts)?;
+                let input = rank_ctx.all_gather(input, counts)?;
+                let target = rank_ctx.all_gather(target, counts)?;
                 self.compute_loss(&TrainingBatch::Regression { input, target })
             }
             TrainingBatch::Ner { .. } => self.compute_loss(batch),
@@ -4474,10 +4515,7 @@ impl TrainingLoop {
         let local_tensor = Tensor::from_vec(values, (1, names.len()), &self.device)
             .map_err(|e| JammiError::FineTune(format!("dropout position tensor: {e}")))?;
         let counts = vec![1usize; self.rank_ctx.world() as usize];
-        let gathered = self
-            .rank_ctx
-            .collective()
-            .all_gather(&local_tensor, &counts)?;
+        let gathered = self.rank_ctx.all_gather(&local_tensor, &counts)?;
         let gathered_rows: Vec<Vec<f64>> = gathered
             .to_vec2()
             .map_err(|e| JammiError::FineTune(format!("dropout position gather readback: {e}")))?;
@@ -5629,6 +5667,72 @@ mod tests {
     fn grad_norm(g: &Tensor) -> f64 {
         let sq: f32 = g.sqr().unwrap().sum_all().unwrap().to_scalar().unwrap();
         (sq as f64).sqrt()
+    }
+
+    /// U4b (design pressure round, finding 9): `canonical_vars_digest` must
+    /// be a pure function of the NAME SEQUENCE — the same names in the same
+    /// order always hash to the same digest (two ranks agreeing on the
+    /// reduce layout independently compute the identical value), and either
+    /// a reordering or a genuinely different name set must change it (the
+    /// mismatch this digest exists to let a future `Peer` round detect).
+    #[test]
+    fn canonical_vars_digest_is_order_sensitive_and_content_sensitive() {
+        let a = vec!["aux.lora_a".to_string(), "projection.lora_a".to_string()];
+        let a_again = vec!["aux.lora_a".to_string(), "projection.lora_a".to_string()];
+        let reordered = vec!["projection.lora_a".to_string(), "aux.lora_a".to_string()];
+        let different = vec!["aux.lora_a".to_string(), "projection.lora_b".to_string()];
+        let empty: Vec<String> = Vec::new();
+
+        assert_eq!(
+            RankContext::canonical_vars_digest(&a),
+            RankContext::canonical_vars_digest(&a_again),
+            "the identical name sequence must always digest identically"
+        );
+        assert_ne!(
+            RankContext::canonical_vars_digest(&a),
+            RankContext::canonical_vars_digest(&reordered),
+            "reordering the same names must change the digest — the canonical order IS \
+             the thing two ranks must agree on"
+        );
+        assert_ne!(
+            RankContext::canonical_vars_digest(&a),
+            RankContext::canonical_vars_digest(&different),
+            "a different name set must change the digest"
+        );
+        // Never panics on the degenerate empty case (a target with no
+        // trainable vars at all is not this function's problem to refuse).
+        let _ = RankContext::canonical_vars_digest(&empty);
+    }
+
+    /// U4b: `RankContext::dropout_seed`'s own contract — rank 0 reproduces
+    /// `base_seed` EXACTLY (the W=1/rank-0 byte-parity property every
+    /// existing seeded-dropout test relies on), every other rank gets a
+    /// distinct, deterministic value, and two calls with the same inputs
+    /// agree (family J: no unseeded RNG).
+    #[test]
+    fn rank_context_dropout_seed_is_identity_at_rank_zero_and_distinct_elsewhere() {
+        let base_seed = 424_242u64;
+        let ctx0 = RankContext::single_rank(
+            4,
+            super::super::partition::PartitionRule::BlockByGlobalBatch,
+        );
+        assert_eq!(ctx0.dropout_seed(base_seed), base_seed);
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(base_seed);
+        for rank in 1..8u32 {
+            let derived = rank_dropout_seed(base_seed, rank);
+            assert_ne!(
+                derived, base_seed,
+                "rank {rank} must not collide with rank 0's own (unmodified) seed"
+            );
+            assert!(
+                seen.insert(derived),
+                "rank {rank}'s derived seed must not collide with an earlier rank's"
+            );
+            // Determinism: calling again must reproduce the identical value.
+            assert_eq!(rank_dropout_seed(base_seed, rank), derived);
+        }
     }
 
     /// Secondary to `last_step_run_harness::gradcache_arm_refuses_a_nonfinite_

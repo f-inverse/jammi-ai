@@ -38,9 +38,209 @@ plan rows carry a dated correction in the same commit.
 
 (folded at consolidation)
 
-## 4. U5a-2
+## 4. U5a-2 (landed as three commits on this branch; originals `8332a289`, `db82aef9`, `54bbe341`)
 
-(folded at consolidation)
+The implementer's contract, folded by the lead after opening the cited lines: the strict resolver takes an explicit tenant with the strict predicate and no admin arm; the holder flip is at the hold site and the prologue self-release test is intact; `dispatch_round_frame` is the one wiring site U5b-1b-i's round machinery joins; `in_flight`/`InFlightGuard` are gone. The pressure round's block 7 (no route to the job's tenant) is closed by the rebuilt tenant carrier; its advisory on the refusal-vs-abort observable split is closed by P1/P9.
+
+Branch `unit/u5a2` in worktree `wt-u5a2`, cut from `856ec8dd`. Crates touched: `jammi-db`,
+`jammi-ai`, `jammi-server` (+ one proto comment in `jammi-wire`, docs). Every claim below is
+stated as it EXISTS on the branch tip; every path is repo-relative; test names are
+`file::fn`.
+
+### 1. Scope shipped
+
+#### jammi-db (edits local to `get_job_for_rank`/`RankAdmissionRow` and the strict resolver)
+- `crates/jammi-db/src/catalog/jobs_repo.rs::RankAdmissionRow` gains `tenant_id: Option<String>`
+  (the row's `jobs.tenant_id` as RAW TEXT), `training_set_ref: Option<String>`,
+  `training_set_location: Option<String>`; `Catalog::get_job_for_rank`'s one statement selects
+  the three columns. **Deviation, stated:** the tenant is carried as text, never parsed in the row
+  mapper — the U5a-1 round-2 excision deleted `tenant_id` precisely because its `parse::<TenantId>()`
+  turned a found row into `Err` (indistinguishable from a driver fault, contradicting the method's
+  own "infallible on content" contract, `docs/rigor/contracts/feat_500-C-U5a-1.md` Addendum 3).
+  The handler parses it; an unparseable value is a row fact (`GangRefusalReason::TenantUndecodable`),
+  exactly like an undecodable `world_size`. Pinned by
+  `crates/jammi-db/tests/it/gang_rank_admission.rs::get_job_for_rank_carries_the_tenant_text_and_the_filled_pair`
+  (sqlite + postgres), whose last arm plants `tenant_id = 'not-a-uuid'` by raw SQL and asserts
+  `Ok(Some(row))` with the text verbatim.
+- `crates/jammi-db/src/catalog/result_repo.rs::Catalog::get_result_table_for_tenant(name, tenant:
+  Option<TenantId>)` — the strict predicate `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`,
+  an explicit tenant argument, **no admin arm and no read of `current_tenant()`** (deviation from
+  the excised verb, which kept the repo-wide admin-scope branch: a resolver whose tenant is an
+  explicit argument must not be widened by ambient scope; the call site guard is kept on top of it).
+  Tests: `crates/jammi-db/tests/it/result_tables.rs::get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant`
+  and `::get_result_table_for_tenant_resolves_only_the_owning_tenant`, both `test_case`-parameterized
+  sqlite/postgres, each with a `with_admin_scope` arm proving ambient scope does not widen it.
+
+#### jammi-ai (`crates/jammi-ai/src/fine_tune/worker.rs`, `crates/jammi-ai/src/session.rs`)
+- `HostAdmission { phase: watch<WorkerPhase>, holder: watch<Holder>, registry: Arc<InstanceRegistration> }`
+  owned by `InferenceSession` (`InferenceSession::host_admission()`); `instance_registration()`
+  delegates to `registry`. `phase` moves out of `WorkerShared` (`WorkerShared::phase()` delegates;
+  `set_phase_for_test` delegates). `HostAdmission::{begin_drain (Running→Draining, never regresses
+  Releasing), begin_release, phase_receiver, holder, holder_receiver, probe_claim, job_running
+  (pub(crate)), try_hold_rank, admit_rank, hold_for_test (test-hooks)}`.
+- `Holder = Free | ClaimProbe | JobRun | Rank{job_id, attempt}`; `HolderBusy = ClaimProbe | JobRun |
+  Rank{..}`; guards `ClaimGuard` (ClaimProbe/JobRun → Free on drop) and `RankHold` (→ Free on drop
+  only if the cell still names this exact `(job_id, attempt)`).
+- The claim loop (`JobWorker::run_until`): `probe_claim()` (Free→ClaimProbe) immediately before
+  `claim_next`; a held slot skips the claim and sleeps the idle poll; `register_job_hold_or_release`
+  flips ClaimProbe→JobRun once the lease hold is registered; the guard drops after
+  `run_claimed_job_under` returns. **Deviation from README r27's sketch** ("`claim_next`'s `Some`
+  arm flips ClaimProbe→JobRun"): the flip is at the HOLD SITE, so the claim→hold prologue stays a
+  `ClaimProbe` and `release_and_stop`'s 2e still waits one heartbeat for the prologue's own
+  self-release (zero net attempts, OPS D10) instead of aborting a claim whose lease would only fall
+  to expiry. Pinned by `crates/jammi-ai/tests/it/host_admission.rs::the_claim_loop_moves_the_holder_free_probe_run_free`
+  (the prologue park reads `ClaimProbe`) and the unchanged
+  `crates/jammi-ai/tests/it/jobs_shutdown.rs::release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_releases`.
+- `WorkerShared::in_flight`, `InFlightGuard` DELETED (cut, no rebuild owed: the holder kind is the
+  fact they approximated). `EmbeddedWorker` holds `admission`; `begin_drain` → `admission.begin_drain()`;
+  `release_and_stop` 2a → `begin_release()`, 2e reads the holder KIND (`JobRun` aborts now; anything
+  else waits one heartbeat). `JobWorker` holds `admission` (its own `Arc`, keeps no session alive) so
+  `run()`/`run_claimed_job` build `WorkerShared` over it; a direct `run_claimed_job` and an inline
+  `run_now` never touch the holder. `InferenceSession::release_job_leases` flips `begin_release()`
+  first. `/metrics` `jammi_worker_jobs_in_flight` = `holder == JobRun` (`crates/jammi-server/src/routes/health.rs`).
+
+#### jammi-server (`crates/jammi-server/src/grpc/gang.rs`, `runtime.rs`, tests, docs)
+- `GangServer::new(session, lease, heartbeat)`; `runtime.rs` passes `LeaseIntervals::heartbeat()`
+  and calls `session.host_admission().begin_drain()` on both DRAIN arms (a worker-less server has no
+  `EmbeddedWorker::begin_drain` to flip the phase).
+- `run_rank` order: bounded first frame → wire K2 → ambient admin scope → `get_job_for_rank`
+  (`admission_catalog_fault` on `Err`) → status/claimant/attempt/lease → `WorldSizeFact` →
+  `assign.world != row.world_size` → **world>1 conjunct on `row.world_size > 1`**: pair filled
+  (`TrainingSetPairMissing`), tenant text parses (`TenantUndecodable`), then
+  `resolve_training_set_identity(store, tenant, ref, location) -> Result<TrainingSetOutcome, JammiError>`
+  (`Err` = the strict resolver's catalog read faulting → `admission_catalog_fault`; outcomes
+  `Verified | AdminScopeRefused | Unresolved | NotReady | SidecarAbsent | DigestMismatch | StoreFault`
+  → `GangRefusalReason::{AdminScope, TrainingSetUnresolved, TrainingSetNotReady,
+  TrainingSetSidecarAbsent, TrainingSetDigestMismatch, TrainingSetStoreFault}`) → `fresh_instance`
+  (`admission_catalog_fault` on `Err`) → **only then** `HostAdmission::admit_rank(job_id,
+  row.attempts, heartbeat)` (`Err(HolderBusy)` → one fixed `Unavailable("gang admission: this
+  host's job slot is busy")`) → `Admitted` (`mpsc` channel, `ReceiverStream`) → `tokio::spawn(HeldSession::hold())`.
+  `GangRefusalReason::MultiHostUnsupported` is DELETED; the enum names sixteen determinants.
+- `HeldSession::hold`: FOUR `select!` arms — inbound (`on_control_frame`: `Cancel` →
+  `Aborted{Cancelled}`; second `Assign` → `InvalidArgument` trailer; everything else →
+  `dispatch_round_frame`, the ONE wiring site for the round protocol, today only an empty frame →
+  trailer; the client's half-close disables the arm, the session stays held; a transport error
+  ends silently), phase watch (`!= Running` or sender gone → `Aborted{Drain}`),
+  `interval_at(now + heartbeat, heartbeat)` tick → `reverify` (`ReverifyEnd::{Refuted, Unavailable,
+  StoreUnavailable}` with `abort_reason()`, `scope()`, `counts_toward_assembly_attempts()`), park
+  `sleep(lease)` → `Aborted{NoBody}`. One event (or one trailer) then the stream closes and the
+  `RankHold` drops.
+- **Observables split at admission (pressure-round fold 2):** pre-admission = `Err(Status)` (the
+  one fixed `FailedPrecondition` for every I-GANG determinant; `Unavailable` for catalog fault /
+  busy slot; `InvalidArgument` for wire K2); post-admission = in-stream `Admitted` then one
+  `Aborted{reason}`, or a status trailer for the admitted-stream K2 violation. R3 is not weakened:
+  a reason is named only on a session the caller was admitted to on the job's own coordinates.
+- Docs (same commit set): `docs/maintainer/MAINTAINER-GUIDE.md` §2.8a rewritten (the lattice incl.
+  the world>1 conjunct, `HostAdmission`, the hold loop, observables split, config);
+  `docs/guide/src/security.md` I-GANG (derivation, non-disclosure incl. the post-admission reasons,
+  admit-and-hold); `configuration.md`, `deploy-server.md`, `api-stability.md`, `gang.proto`
+  comment, `api_freeze_baseline.txt` comment, DESIGN.md/README.md allowlist sentences; seven
+  pre-existing `PATH:LINE` citations re-anchored after the line shifts.
+- Tests: `crates/jammi-server/tests/it/gang_service.rs` (rewritten around the restored world>1
+  fixtures), `gang_terminal_write_oracle.rs` (new), `gang_rank_admission_oracle.rs` (+ the strict
+  resolver's caller oracle), `gang_admission_catalog_fault_oracle.rs` (floor 2→3),
+  `tenant_isolation_oracle.rs` (derivation claim + assertion), `gang_training_spec_parity.rs`
+  (sqlite + postgres arms as two named fns over one body — this crate has no `test_case` dev-dep;
+  no dependency added), `health.rs` (gauge read off the holder).
+
+#### Cuts and their rebuilds
+- `WorkerShared::in_flight`/`InFlightGuard`: cut; rebuilt as the holder kind (above).
+- `GangRefusalReason::MultiHostUnsupported` and the `world_size != 1` refusal: cut; rebuilt as the
+  world>1 conjunct (rows in §2).
+- `run_rank_refuses_world_gt_one_when_caller_world_matches_the_row`: deleted with its determinant;
+  its role (the direction-(a) control) is now `run_rank_refuses_when_assign_world_mismatches_row_world_size`'s
+  `TrainingSetPairMissing` control.
+- The excised admin-scope arm of the strict verb: not restored (deviation above); its property is
+  the db tests' `with_admin_scope` arms.
+
+### 2. Properties (quantified) — executed oracle — executed mutation that reds it
+
+Lanes: SRV = `cargo test -p jammi-server --features test-hooks --test it -- <filter>`; SRV-plain =
+the same without `--features`; AI = `cargo test -p jammi-ai --features test-hooks --test it --`;
+DB = `cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1`
+(sqlite arm always; postgres arm with `JAMMI_TEST_PG_URL`). Mutation ids M1–M13 are the executed
+runs recorded in `u5a2-scratch/mutations.txt` (each: applied → one filtered test → reverted).
+
+| # | Property (over every input / exit arm) | Executed oracle | Executed mutation → red (first line) |
+|---|---|---|---|
+| P1 | For every `RunRank` call, the admission decision (every I-GANG determinant incl. the world>1 conjunct and freshness) is complete BEFORE the holder is consulted; a refused call never touches the holder; `Admitted` is emitted only after a successful CAS (a busy slot is `Err(Status)`, never a stream). | SRV `gang_service::run_rank_refuses_unavailable_at_once_while_a_loop_job_runs` (busy slot → `Unavailable` + no reason recorded; an absent job under a busy slot → `FailedPrecondition`/`NotFound`) | M3: slot consulted before the row read → M3 (holder checked before the row read): `gang_service.rs:2192: assertion left == right failed` (an absent job answered `Unavailable`, not `FailedPrecondition`) |
+| P2 | For every `row.world_size > 1` call and NEVER for `world_size == 1`: the pair must be filled, the row's tenant must parse, the strict resolver under the ROW's tenant must find a `ready` row, its sidecar must verify `artifact == training_set_ref`; every determinant refuses the one fixed `FailedPrecondition`; keyed on the row's decoded fact, never `assign.world`. | SRV `gang_service::run_rank_refuses_when_assign_world_mismatches_row_world_size` (both directions + controls: direction (a)'s control reaches `TrainingSetPairMissing`, direction (b)'s control is `Admitted`), `::run_rank_refuses_a_training_set_another_tenant_owns`, `::run_rank_refuses_a_null_tenant_training_set_for_a_tenant_bound_job`, `::run_rank_refuses_world_gt_one_when_the_sidecar_predates_the_leaf_inventory`, `::run_rank_world_two_own_tenant_training_set_is_admitted_held_and_parks_no_body` (the admitting control) | M1: world gate deleted → M1 (`if false && assign.world != world_size`): `gang_service.rs:1713: assertion left == right failed: must record WorldMismatch specifically, not the pair determinant`; M2: tenant forced `None` → M2 (`let tenant = None` before the resolver): `gang_service.rs:2019: the strict resolver must not resolve the NULL-tenant row (a later determinant refusing instead would mean it did)`; M7: leaf-less sidecar accepted → M7 (`Ok(None) => Verified`): `gang_service.rs:1583: every fixture this function builds must refuse` (the leaf-less sidecar admitted) |
+| P3 | Non-disclosure: all sixteen determinants refuse with pairwise-identical `(code, message)` on the wire; the `test-hooks` seam distinguishes every one. | SRV-plain + SRV `gang_service::run_rank_refusal_is_non_disclosing_across_every_determinant`; SRV `::run_rank_last_refusal_reason_distinguishes_every_determinant`; `every_gang_refusal_reason` re-validated by an exhaustive match | (shape inherited from U5a-1, unchanged: any one arm interpolating a reason reds the pairwise oracle naming the pair; not re-executed this round — the sixteen-row scenario table is the executed novelty) |
+| P4 | Tenant is derived from the job row, never accepted: no caller metadata is read; the strict resolver never resolves another tenant's or a NULL-tenant row for a real tenant, under ambient admin scope or not; the resolution site refuses ambient admin scope before the resolver runs. | SRV `gang_service::run_rank_never_reads_a_caller_supplied_tenant` (`jammi-session-id` metadata ignored → `Admitted`), `::resolution_site_refuses_under_admin_scope_before_the_strict_resolver_runs` (control `Verified` outside, `AdminScopeRefused` inside); DB `result_tables::get_result_table_for_tenant_never_matches_a_null_tenant_row_for_a_real_tenant::{sqlite,postgres}`, `::get_result_table_for_tenant_resolves_only_the_owning_tenant::{sqlite,postgres}`; the derivation claim in `tenant_isolation_oracle::gang_service_is_unimplemented_on_the_public_listener` | M11: strict predicate relaxed → M11 (predicate relaxed to `OR tenant_id IS NULL`): `result_tables.rs:550: the strict resolver must never match a NULL-tenant row for a real tenant` (sqlite arm); M2 (above) |
+| P5 | The admission row carries the row's own tenant as text and the filled pair on both backends; the read is infallible on content (a garbage tenant is `Ok(Some)`). | DB `gang_rank_admission::get_job_for_rank_carries_the_tenant_text_and_the_filled_pair::{sqlite,postgres}` | M12: tenant parsed in the mapper → M12 (`parse::<TenantId>().expect(..)` in the mapper): `jobs_repo.rs:2087: panicked` (the garbage-tenant arm is no longer `Ok(Some)`) (sqlite arm) |
+| P6 | Holder lattice (c2'): `Free` admits; `JobRun`/another `Rank` refuse at once; the same job at an equal attempt refuses, at a greater attempt supersedes in place and the elder's drop leaves the successor's hold; `ClaimProbe` is waited ≤ one bound then admits-if-freed or refuses; a hold's drop frees only its own cell. | AI `host_admission::{free_admits_a_rank_and_dropping_the_hold_frees_the_slot, a_job_run_or_another_rank_refuses_at_once, the_same_job_at_a_greater_attempt_takes_the_slot_and_the_elder_leaves_it, a_claim_probe_is_waited_out_then_admitted_if_freed_or_refused_at_the_bound}`; SRV `gang_service::{run_rank_refuses_unavailable_at_once_while_a_loop_job_runs, run_rank_waits_out_a_claim_probe_then_admits_if_freed_or_refuses_unavailable}` (test-hooks), `::a_held_rank_refuses_other_ranks_and_the_same_job_at_a_greater_attempt_takes_the_slot` (plain) | M9: `RankHold::drop` frees regardless of identity → M9 (`RankHold::drop` frees any `Rank`): `host_admission.rs:197: the superseded elder's drop must not free the successor's slot` |
+| P7 | Exclusion (d2', OPS D6): the loop moves the holder `Free→ClaimProbe→JobRun→Free` around every claim (the flip at the hold site, the prologue a probe); an idle loop never calls `claim_next` while a rank is held and claims the moment it is freed; an inline `run_now` is outside the exclusion; a `JobRun`-holding peer refuses a rank, an idle peer admits. | AI `host_admission::{the_claim_loop_moves_the_holder_free_probe_run_free, an_idle_loop_never_claims_while_a_rank_is_held, an_inline_run_now_never_touches_the_holder}`; the gauge `health::gauges::in_flight_gauge_is_one_during_a_loop_claimed_job_and_zero_during_run_now`; the reshaped `jobs_shutdown` suite (20 rows) | M8: flip at `claim_next`'s `Some` arm → M8 (`job_running()` at `claim_next`'s `Some` arm): `host_admission.rs:306: the claim committed but the hold is not registered: still a probe` (read `JobRun`); M10: probe ignores a held slot → M10 (`probe_claim` overwrites a held slot): `host_admission.rs:365: claim_next must not be called while a rank is held` |
+| P8 | OPS D10: RELEASE's abort decision reads the holder kind, never a count — a `Rank` beside an idle loop is never loop work (cooperative `Stopped`, hold untouched, phase `Releasing`); `JobRun` aborts now. | AI `host_admission::release_and_stop_beside_a_held_rank_exits_cooperatively_and_flips_the_phase`; `jobs_shutdown::release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_releases` (the prologue still self-releases) | M13: a held `Rank` treated like `JobRun` → M13 (`holder == Holder::Free` → a held `Rank` aborts now): first executed against the ORIGINAL oracle (an idle loop) it stayed GREEN — the loop had exited at 2a before 2e ran, so the arms were indistinguishable; the oracle was rewritten to park the loop after reclaim, re-executed green, then the same mutation re-executed: `host_admission.rs:457: a held Rank is not loop work: 2e waits for the cooperative exit, never aborts` (`Aborted` ≠ `Stopped`) |
+| P9 | The hold loop has exactly four arms and every end is one stream event: `Cancel` → `Cancelled`; a second `Assign` → `InvalidArgument` TRAILER (K2); phase leaving `Running` → `Drain` at once (both via the session cell and via the real server shutdown path, worker-less); park bound → `NoBody` after ≥ two ticks. | SRV `gang_service::{run_rank_cancel_on_an_admitted_stream_ends_cancelled, run_rank_second_assign_on_an_admitted_stream_is_invalid_argument, run_rank_held_session_ends_drain_when_the_host_drains, run_rank_held_session_ends_drain_on_server_shutdown, run_rank_every_i_gang_determinant_satisfied_is_admitted_held_and_parks_no_body}` | M4: drain arm never fires → M4 (phase arm replaced by `pending()`): `gang_service.rs:570: expected Aborted{Drain}, got Aborted { reason: NoBody }` (parks to `NoBody` instead) |
+| P10 | Re-verification (i2'): the three ends are pairwise distinct on the wire, in scope and in the count rule; a row fact moving → `Refuted`; the catalog faulting → `Unavailable`; THIS host's store faulting (`Storage`/`Io`) → `StoreUnavailable`; the artifact's sidecar no longer verifying → `Refuted` (never `StoreUnavailable`). | SRV `gang_service::{run_rank_held_session_ends_refuted_when_the_row_no_longer_holds, run_rank_held_session_ends_unavailable_when_the_catalog_faults, run_rank_held_session_ends_store_unavailable_when_this_hosts_store_faults, run_rank_held_session_ends_refuted_when_the_sidecar_stops_verifying}`; lib `grpc::gang::tests::reverify_ends_are_pairwise_distinguishable_in_reason_scope_and_count` | M5: store fault classified `Refuted` → M5 (`StoreFault → ReverifyEnd::Refuted`): `gang_service.rs:570: expected Aborted{StoreUnavailable}, got Aborted { reason: Refuted }` |
+| P11 | Terminal-write scope (g2'): the peer names no `jobs` writer (the set derived from `jobs_repo.rs` itself) and every end (cancel, K2 trailer, drain, refuted, unavailable, store-unavailable, park, supersession) leaves the job row byte-identical to its pre-admission snapshot. | SRV `gang_terminal_write_oracle::the_gang_handler_names_no_jobs_writer` (+ its two self-tests); the `row_facts` before/after equality in every hold-loop row above | M6: `fail_job(` named as code in `run_rank` → M6 (`let _ = stringify!(fail_job());` in `run_rank`): `gang_terminal_write_oracle.rs:283: gang.rs names the jobs writer fail_job( as code` |
+| P12 | Every admission-time catalog read maps `Err` through `admission_catalog_fault` (three sites), never `map_engine_error`; `get_job_for_rank`'s and `get_result_table_for_tenant`'s only production callers are the gang handler. | SRV `gang_admission_catalog_fault_oracle::run_rank_never_calls_map_engine_error` (floor 3), `gang_rank_admission_oracle::{only_the_gang_run_rank_handler_calls_get_job_for_rank, only_the_gang_resolution_site_calls_get_result_table_for_tenant}` | (allowlist-both-directions shape: a fourth caller file reds the oracle naming it — the U5a-1 methodology; the raised floor was exercised by the `2 → 3` self-test fixture change) |
+| P13 | Producer→consumer `world_size` parity holds on both backends. | SRV `gang_training_spec_parity::get_job_for_rank_world_size_matches_the_real_training_spec_producer_{sqlite,postgres}` (postgres executed with `JAMMI_TEST_PG_URL`) | (decode mutations inherited from U5a-1's db tests) |
+
+### 3. Uncovered
+
+- **UNCOVERED — a `StoreUnavailable` from a genuine I/O fault on a local file.** The executed
+  member-scoped store fault is `JammiError::Storage(SchemeNotEnabled)` from `open_parquet` on an
+  `s3://` URL this build compiles no driver for (hermetic, network-free). A permission/I-O error
+  on a `file://` sidecar is the same `JammiError::Storage`/`Io` arm by construction
+  (`ManifestError::Storage → JammiError::Storage`, `object_store` errors → `StorageError`) but is
+  not executed: a `chmod`-based fixture silently passes under a root CI lane (memory note
+  `jammi-ci-root-permission-fault-tests`) and no fault-injection seam exists in the store; adding
+  one was out of scope.
+- **UNCOVERED — the `FIRST_ASSIGN_BOUND` timeout arm** (a silent client for 10 s): inherited from
+  U5a-1, still not timed in the suite.
+- **UNCOVERED — `AbortReason::Drain` on the sender-dropped branch** (the `InferenceSession` dropping
+  while a rank is held): the session outlives every server in the fixtures; the arm is the same
+  `wait_for` `Err` path as a phase flip and is stated, not executed.
+- **UNCOVERED — the round-frame dispatch point receiving a real round frame**: no such frame exists
+  in `RankControl`'s oneof at this head; only the empty-frame protocol violation reaches
+  `dispatch_round_frame` and is not separately executed (a `control: None` frame cannot be built
+  by the generated client without a raw codec; the second-`Assign` row executes the same
+  end-with-trailer path).
+- **Non-disclosure over the sixteen determinants on the plain lane** is executed; the
+  "a leaking arm reds the pairwise oracle" mutation is inherited from U5a-1 and not re-executed.
+- The world>1 admission row from a REAL coordinator's `fill_training_set_identity` call on the wire
+  path (U5b-1b-ii's materialization step) does not exist yet; every world>1 fixture fills the pair
+  through the db CAS directly.
+
+### 4. Gates (trimmed set per the lead; exit codes and counts)
+
+All with `CARGO_TARGET_DIR=…/targets/u5a2`; one `--features` set per crate for the whole session
+(`jammi-db`: `live-postgres-tests,test-hooks`; `jammi-ai`/`jammi-server`: `test-hooks`). The final
+tree (tip below) is exactly the tree these ran on: every mutation was reverted by `git checkout`
+and `git status` is clean; the only edit after the server runs was the ai TEST rewrite of the
+RELEASE-beside-a-rank row, re-run green with its mutation red, then `cargo fmt --check` and
+`cargo clippy -p jammi-ai` re-run green.
+
+| Command | exit | result |
+|---|---|---|
+| `JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1:54329/jammi_test cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1 get_result_table_for_tenant get_job_for_rank_carries_the_tenant_text` | 0 | 6 passed (3 tests × sqlite + postgres); 0 failed |
+| `cargo test -p jammi-ai --features test-hooks --test it -- jobs_shutdown host_admission` | 0 | 28 passed (20 `jobs_shutdown` + 8 `host_admission`); 0 failed |
+| `cargo test -p jammi-ai --features test-hooks --test it -- release_and_stop_beside_a_held_rank` (after the oracle rewrite) | 0 | 1 passed |
+| `cargo test -p jammi-server --features test-hooks --test it -- --test-threads=4 gang tenant_isolation_oracle::gang_service_is_unimplemented` | 0 | 47 passed (gang_service 37, gang_rank_admission_oracle 4, gang_admission_catalog_fault_oracle 3, gang_terminal_write_oracle 3, gang_training_spec_parity 2 — postgres arm skipped here —, tenant_isolation_oracle 1); 0 failed |
+| `JAMMI_TEST_PG_URL=… cargo test -p jammi-server --features test-hooks --test it -- --test-threads=1 in_flight_gauge gang_training_spec_parity` | 0 | 3 passed (the gauge row; parity sqlite + postgres, postgres EXECUTED) |
+| `cargo test -p jammi-server --features test-hooks --lib -- gang` | 0 | 1 passed (`reverify_ends_are_pairwise_distinguishable_in_reason_scope_and_count`) |
+| `cargo test -p jammi-server --test it -- gang tenant_isolation_oracle::gang_service_is_unimplemented` (PLAIN lane, the count) | 0 | 44 passed; 0 failed — the `test-hooks` lane runs 3 more (`run_rank_last_refusal_reason_distinguishes_every_determinant`, `run_rank_refuses_unavailable_at_once_while_a_loop_job_runs`, `run_rank_waits_out_a_claim_probe_then_admits_if_freed_or_refuses_unavailable`), invisible to the plain lane by `#[cfg]` |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | clean (a pre-existing 4-space doc continuation in the 2e bullet tripped `doc_overindented_list_items` once I restructured that bullet; re-indented) |
+| `cargo clippy -p jammi-db --all-targets --features live-postgres-tests,test-hooks -- -D warnings` | 0 | clean |
+| `cargo fmt --all -- --check` | 0 | clean |
+| `python3 ci/scripts/perf/check_citations.py` (not in the trimmed set; run because my insertions shifted lines) | 0 | `1030 file(s) scanned, all PATH:LINE citations resolve` — after re-anchoring seven citations (six in `MAINTAINER-GUIDE.md`, one in `pinned_source_gate.rs`) that my worker.rs/runtime.rs/session.rs insertions had moved |
+| `python3 ci/scripts/check_no_consumer_names.py` | 0 | OK |
+
+Executed mutations: M1–M12 red on the first run; M13 green on the first run (vacuous oracle — an
+idle loop exits at 2a before 2e; recorded honestly), the oracle rewritten, then M13 red — see §2.
+`u5a2-scratch/mutations.txt` and `mut-M*.log` hold every run's output.
+
+### 5. Commits (`git log --oneline 856ec8dd..HEAD`)
+
+```
+54bbe341 feat(wire-server): #500 U5a-2 — admit-and-hold: the world>1 conjunct (#566), the holder CAS, the four-arm hold loop, re-verification's three ends
+db82aef9 feat(ai-core): #500 U5a-2 — HostAdmission: session-owned phase, the holder CAS lattice, the claim loop's probe
+8332a289 feat(db): #500 U5a-2 — admission row carries the job's tenant text and training-set pair; strict tenant-pinned result-table resolver
+```
+(no trailers, per the brief; 30 files, +4331/−785 against `856ec8dd`; `git status` clean.)
+
 
 ## 5. U5b-1b-ii — database slice (landed as one commit on this branch; original `6dab678b`)
 

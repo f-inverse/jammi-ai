@@ -1,7 +1,7 @@
 # CONTRACT — feat/500-C-U5b-1a: gang-membership substrate
 
 **Contract of record.** slug: `feat_500-C-U5b-1a` · branch `feat/500-C-U5b-1a`
-at `781e45b73c5a086d8240a3390d420311e8b0154f` (the code commit, tagged
+at `13663cc178ab0f74a0f2811ff9aa725ba4a198b4` (the code commit, tagged
 throughout this revision as "commit 1") · this file is the committed
 mechanism contract `ci/scripts/check_rigor_record.py` requires under
 `docs/rigor/contracts/**` (its check 3) before this unit's rigor record at
@@ -31,7 +31,7 @@ RE-DERIVED against THIS commit's tree (self-check, §11); citations by
 
 **Round-6 doc-fold re-anchor (this revision, FINAL).** "Commit 1" moves from
 `3b7c89d4125862ef0c7f9c5073dc80203b81f2cf` to
-`781e45b73c5a086d8240a3390d420311e8b0154f`: round 5's pre-committed rule
+`13663cc178ab0f74a0f2811ff9aa725ba4a198b4`: round 5's pre-committed rule
 fired (§11/§12) — `result_root` leaves `list_gang_members`'s admission
 predicate entirely (`GangListing` loses its root field; the Rust filter
 loses its fourth conjunct; `GangCandidateRow` loses its `result_root`
@@ -308,7 +308,7 @@ has a filesystem precondition to race.
   (`crates/jammi-db/src/catalog/jobs_repo.rs:2360-2367`, a WHOLE trimmed
   token, never a substring) — **and NOTHING else**: the round-3 predicate's
   fourth conjunct (`result_root.as_bytes() != listing.member_root...`) is
-  DELETED, not merely unreachable — `GangCandidateRow` (`jobs_repo.rs:566`)
+  DELETED, not merely unreachable — `GangCandidateRow` (`crates/jammi-db/src/catalog/jobs_repo.rs:566`)
   no longer even carries a `result_root` field. A surviving row's
   `peer_addr` is parsed and pushed as a `GangMember`; the final list is
   `members.sort_by(|a, b|
@@ -788,13 +788,13 @@ re-derived against commit 1's (re-anchored) tree.
   machinery pretending otherwise.
 
 `citations_reanchored`: every citation in §1–§5, §7–§9 of this revision was
-re-derived directly against the tree of `781e45b73c5a086d8240a3390d420311e8b0154f`
+re-derived directly against the tree of `13663cc178ab0f74a0f2811ff9aa725ba4a198b4`
 (commit 1, re-anchored this round — see the header's round-6 doc-fold
 re-anchor note) in this worktree by the writing agent; §6 (history) cites
 no construct at all, by design (see §6's own header).
 
 **Self-check (round-2 addendum requirement; re-run for the round-6
-citation fold, at `781e45b73c5a086d8240a3390d420311e8b0154f`).** Before this
+citation fold, at `13663cc178ab0f74a0f2811ff9aa725ba4a198b4`).** Before this
 revision was committed, every `path:line`/`path:a-b` token AND every
 `path::construct` token in §1–§5, §7–§9 (§6 excluded, cites none) was
 machine-extracted (backtick-quoted `crates/…/*.rs::Construct` and
@@ -810,7 +810,7 @@ python3 /private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/12f1
 
 (a scratch script, never committed, written fresh this round — the round-5
 `db-selfcheck-r5.py` script no longer exists in this scratchpad). **Result
-(at commit 1 = `781e45b7`): 66 `path::construct` tokens checked, 66
+(at commit 1 = `13663cc1`): 66 `path::construct` tokens checked, 66
 resolved (their last segment occurs in the named file); 58 unique
 `path:line`/`path:a-b` tokens checked, 58 resolved (the named file has at
 least that many lines) — both counts 100%, zero unresolved.** (This is a
@@ -895,7 +895,7 @@ LAST — no round 7) is the fold that executes the firing:
   IPv6 literal — `host.contains(':') && !(host.starts_with('[') && host.ends_with(']'))` is checked
   BEFORE the port parse (`crates/jammi-db/src/catalog/instance.rs:66-70`, inside `parse` at `:57`)
   — accepting a bracketed IPv6 host (`[::1]:9000`, `[2001:db8::1]:9000`), an IPv4 literal
-  (`10.0.0.1:9000`), or a DNS hostname (`coordinator.internal:9000`), refusing an unbracketed one
+  (`10.0.0.1`, port 9000), or a DNS hostname (`coordinator.internal`, port 9000), refusing an unbracketed one
   (`2001:db8::1:9000`, `::1:9000`) — oracles for each (§8 table, this revision).
   `crates/jammi-ai/src/fine_tune/worker.rs::JobWorker::run_until`'s FIRST `upsert_worker` call
   (`:827-830`) now sets the registration's worker cell (`:832-838`) only on `Ok(())`; an `Err`

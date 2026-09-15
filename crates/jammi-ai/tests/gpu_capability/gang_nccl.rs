@@ -75,7 +75,12 @@
 //! contract of record (`docs/rigor/contracts/feat_500-C-U7b.md`) rather than
 //! silently assumed.
 
-#[cfg(feature = "cuda")]
+// Unconditional (not `#[cfg(feature = "cuda")]`): `harness::serial_cuda_device`
+// and `harness::SerialGpu` need no `cuda` feature to name — the device
+// acquisition itself always returns `None` when the CUDA backend is not
+// compiled in — and `serial_cuda_device_or_require_two_hosts` below relies on
+// exactly that to make its own require-gate decision correctly on EITHER
+// build.
 use crate::harness;
 use crate::skip_without_gpu;
 
@@ -131,15 +136,24 @@ fn second_cuda_device_or_require(test: &str) -> Option<candle_core::Device> {
 /// `JAMMI_REQUIRE_CUDA_TWO_HOSTS` rather than skipping — the two-host leg's
 /// OWN require flag (module doc, "driver env contract"), never the
 /// single-process leg's `JAMMI_REQUIRE_CUDA_GANG`.
-#[cfg(feature = "cuda")]
-fn serial_cuda_device_or_require_two_hosts(
-    test: &str,
-    require: bool,
-) -> Option<harness::SerialGpu> {
+///
+/// Unlike [`serial_cuda_device_or_require`], this is NOT `#[cfg(feature =
+/// "cuda")]`: `harness::serial_cuda_device` always returns `None` when the
+/// CUDA backend is not compiled in, so this fn reads the require flag and
+/// decides skip-vs-hard-fail correctly on EITHER build — the caller's own
+/// `#[cfg(feature = "cuda")]` block (the NCCL-specific code) starts only
+/// AFTER this decision, so a `cuda`-less build still hard-fails under the
+/// require flag rather than silently doing nothing. Registered in
+/// `ci/kernel-oracle-helpers.txt` (KO-7): a real runtime env-read
+/// (`std::env::var_os`) of a `JAMMI_REQUIRE_*` literal via `if`, whose
+/// taken-when-set branch is exactly one `panic!` — mirrors
+/// [`serial_cuda_device_or_require`]'s own canonical shape, only the env
+/// name differs.
+fn serial_cuda_device_or_require_two_hosts(test: &str) -> Option<harness::SerialGpu> {
     match harness::serial_cuda_device() {
         Some(slot) => Some(slot),
         None => {
-            if require {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some() {
                 panic!(
                     "{test}: JAMMI_REQUIRE_CUDA_TWO_HOSTS is set but no usable CUDA device \
                      could be acquired on this host — a silent skip is not acceptable on the \
@@ -149,6 +163,76 @@ fn serial_cuda_device_or_require_two_hosts(
             None
         }
     }
+}
+
+/// The two-host leg's four env vars, parsed and validated — see the module
+/// doc's "The two-host leg's driver env contract".
+struct TwoHostsEnv {
+    rank: u32,
+    world: u32,
+    id_file: std::path::PathBuf,
+    artifact_dir: std::path::PathBuf,
+}
+
+/// Read, validate, and hand back the two-host leg's four env vars — or a
+/// hard failure under `JAMMI_REQUIRE_CUDA_TWO_HOSTS` when they are
+/// incomplete, or `None` (a loud skip) when the flag is not set. Consulted
+/// FIRST, before [`serial_cuda_device_or_require_two_hosts`]'s availability
+/// check (module doc: "Consulted BEFORE the availability check").
+///
+/// Registered in `ci/kernel-oracle-helpers.txt` (KO-7): the `_` match arm's
+/// `if std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some() { panic!(..)
+/// }` is the canonical shape a caller's own `let Some(env) =
+/// two_hosts_env_or_require(TEST) else { return; };` skip is gated against.
+fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
+    let (rank_s, world_s, id_file_s, artifact_dir_s) = match (
+        std::env::var("JAMMI_GANG_TWO_HOSTS_RANK"),
+        std::env::var("JAMMI_GANG_TWO_HOSTS_WORLD"),
+        std::env::var("JAMMI_GANG_TWO_HOSTS_ID_FILE"),
+        std::env::var("JAMMI_GANG_ARTIFACT_DIR"),
+    ) {
+        (Ok(r), Ok(w), Ok(f), Ok(a)) => (r, w, f, a),
+        _ => {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some() {
+                panic!(
+                    "{test}: JAMMI_REQUIRE_CUDA_TWO_HOSTS is set but the two-host gang env \
+                     (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / JAMMI_GANG_ARTIFACT_DIR) \
+                     is incomplete — a silent skip is not acceptable on the cluster lane"
+                );
+            }
+            tracing::warn!(
+                "SKIP: no two-host gang env (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / \
+                 JAMMI_GANG_ARTIFACT_DIR set); this leg only runs from \
+                 ci/scripts/runpod_gpu_cluster.sh"
+            );
+            return None;
+        }
+    };
+
+    // `JAMMI_GANG_TWO_HOSTS_WORLD` must be exactly 2: this leg proves world
+    // 2 only (module doc, "Known-unmeasured"), so any other value is a named
+    // refusal rather than a silently truncated or padded gang.
+    let world: u32 = world_s.parse().unwrap_or_else(|_| {
+        panic!("{test}: JAMMI_GANG_TWO_HOSTS_WORLD must be an integer, got {world_s:?}")
+    });
+    if world != 2 {
+        panic!(
+            "{test}: JAMMI_GANG_TWO_HOSTS_WORLD must be 2 (this leg is world-2 only), got {world}"
+        );
+    }
+    let rank: u32 = rank_s.parse().unwrap_or_else(|_| {
+        panic!("{test}: JAMMI_GANG_TWO_HOSTS_RANK must be an integer, got {rank_s:?}")
+    });
+    if rank >= world {
+        panic!("{test}: JAMMI_GANG_TWO_HOSTS_RANK must be 0 or 1 for world 2, got {rank}");
+    }
+
+    Some(TwoHostsEnv {
+        rank,
+        world,
+        id_file: std::path::PathBuf::from(id_file_s),
+        artifact_dir: std::path::PathBuf::from(artifact_dir_s),
+    })
 }
 
 /// Run the three checks both legs prove — the rank-ordered sum of a known
@@ -494,161 +578,114 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[test]
 fn gang_nccl_two_hosts_reduce_a_known_vector() {
     const TEST: &str = "gang_nccl_two_hosts_reduce_a_known_vector";
-    let require_cuda = std::env::var_os("JAMMI_REQUIRE_CUDA_TWO_HOSTS").is_some();
 
-    let (rank_s, world_s, id_file_s, artifact_dir_s) = match (
-        std::env::var("JAMMI_GANG_TWO_HOSTS_RANK"),
-        std::env::var("JAMMI_GANG_TWO_HOSTS_WORLD"),
-        std::env::var("JAMMI_GANG_TWO_HOSTS_ID_FILE"),
-        std::env::var("JAMMI_GANG_ARTIFACT_DIR"),
-    ) {
-        (Ok(r), Ok(w), Ok(f), Ok(a)) => (r, w, f, a),
-        _ => {
-            if require_cuda {
-                panic!(
-                    "{TEST}: JAMMI_REQUIRE_CUDA_TWO_HOSTS is set but the two-host gang env \
-                     (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / JAMMI_GANG_ARTIFACT_DIR) \
-                     is incomplete — a silent skip is not acceptable on the cluster lane"
-                );
-            }
-            tracing::warn!(
-                "SKIP: no two-host gang env (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / \
-                 JAMMI_GANG_ARTIFACT_DIR set); this leg only runs from \
-                 ci/scripts/runpod_gpu_cluster.sh"
-            );
-            return;
-        }
+    // Consulted FIRST (module doc: "Consulted BEFORE the availability
+    // check") — `env` is genuinely read on EITHER build (the `tracing::info!`
+    // just below reads every field), so this is never a decorative binding.
+    let Some(env) = two_hosts_env_or_require(TEST) else {
+        return;
     };
-
-    // `JAMMI_GANG_TWO_HOSTS_WORLD` must be exactly 2: this leg proves world
-    // 2 only (module doc, "Known-unmeasured"), so any other value is a named
-    // refusal rather than a silently truncated or padded gang.
-    let world: u32 = world_s.parse().unwrap_or_else(|_| {
-        panic!("{TEST}: JAMMI_GANG_TWO_HOSTS_WORLD must be an integer, got {world_s:?}")
-    });
-    if world != 2 {
-        panic!(
-            "{TEST}: JAMMI_GANG_TWO_HOSTS_WORLD must be 2 (this leg is world-2 only), got {world}"
-        );
-    }
-    let rank: u32 = rank_s.parse().unwrap_or_else(|_| {
-        panic!("{TEST}: JAMMI_GANG_TWO_HOSTS_RANK must be an integer, got {rank_s:?}")
-    });
-    if rank >= world {
-        panic!("{TEST}: JAMMI_GANG_TWO_HOSTS_RANK must be 0 or 1 for world 2, got {rank}");
-    }
-    let id_file = std::path::PathBuf::from(&id_file_s);
-    let artifact_dir = std::path::PathBuf::from(&artifact_dir_s);
     tracing::info!(
         test = TEST,
-        rank,
-        world,
-        id_file = %id_file.display(),
-        artifact_dir = %artifact_dir.display(),
+        rank = env.rank,
+        world = env.world,
+        id_file = %env.id_file.display(),
+        artifact_dir = %env.artifact_dir.display(),
         "two-host gang env parsed"
     );
 
-    // Consulted BEFORE this would otherwise fall through to a plain skip —
-    // module doc: a device-less cluster member hard-fails under the require
-    // flag rather than silently doing nothing while its peer waits forever.
-    //
-    // The `else` (rather than an early `return`) matters under a `cuda`-less
-    // build: there `gpu_available()` is always `false`, so the `else` arm —
-    // and with it the whole `#[cfg(feature = "cuda")]` block below — is
-    // never reached, and the function simply ends after the skip/panic
-    // decision; an early `return` there would be a needless-return lint on
-    // exactly that build.
-    if !crate::harness::gpu_available() {
-        if require_cuda {
-            panic!(
-                "{TEST}: JAMMI_REQUIRE_CUDA_TWO_HOSTS is set but no usable CUDA device could be \
-                 acquired — a silent skip is not acceptable on the cluster lane"
-            );
-        }
+    // `slot` is only consumed inside the `#[cfg(feature = "cuda")]` block
+    // below — under a `cuda`-less build nothing past this point references
+    // it, hence the targeted `allow` (the binding itself, and the require-
+    // gate decision above it, are real on every build).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let Some(slot) = serial_cuda_device_or_require_two_hosts(TEST) else {
         tracing::warn!(
             "SKIP: no usable CUDA device (build the suite with `--features cuda,live-gpu-tests` \
              on a GPU host to run it)"
         );
-    } else {
-        #[cfg(feature = "cuda")]
-        {
-            use jammi_ai::fine_tune::collective::nccl::{Nccl, NcclIdBytes};
+        return;
+    };
 
-            let Some(slot) = serial_cuda_device_or_require_two_hosts(TEST, require_cuda) else {
-                tracing::warn!("SKIP: no usable CUDA device");
-                return;
-            };
-            let device = slot.device().clone();
-            let nccl_socket_ifname = std::env::var("NCCL_SOCKET_IFNAME").ok();
-            let host = hostname();
-            let device_ordinal: i64 = 0;
+    #[cfg(feature = "cuda")]
+    {
+        use jammi_ai::fine_tune::collective::nccl::{Nccl, NcclIdBytes};
 
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Vec<f32> {
-                let id: NcclIdBytes = if rank == 0 {
-                    let id = Nccl::new_id().unwrap_or_else(|e| {
-                        panic!("{TEST}: ncclGetUniqueId failed on rank 0: {e}")
-                    });
-                    write_id_file_atomically(&id_file, id).unwrap_or_else(|e| {
-                        panic!(
-                            "{TEST}: failed to write the NCCL id to {}: {e}",
-                            id_file.display()
-                        )
-                    });
-                    id
-                } else {
-                    read_id_file_exactly_128_bytes(TEST, &id_file)
-                };
-                // Rank 0 blocks here until rank 1 joins with the same id — that
-                // order (mint → write → join) is correct: the file must exist
-                // before either side can complete `ncclCommInitRank`.
-                let joined = Nccl::from_rank(&device, rank, world, id).unwrap_or_else(|e| {
-                    panic!("{TEST}: ncclCommInitRank failed for rank {rank} of {world}: {e}")
+        let TwoHostsEnv {
+            rank,
+            world,
+            id_file,
+            artifact_dir,
+        } = env;
+        let device = slot.device().clone();
+        let nccl_socket_ifname = std::env::var("NCCL_SOCKET_IFNAME").ok();
+        let host = hostname();
+        let device_ordinal: i64 = 0;
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Vec<f32> {
+            let id: NcclIdBytes = if rank == 0 {
+                let id = Nccl::new_id()
+                    .unwrap_or_else(|e| panic!("{TEST}: ncclGetUniqueId failed on rank 0: {e}"));
+                write_id_file_atomically(&id_file, id).unwrap_or_else(|e| {
+                    panic!(
+                        "{TEST}: failed to write the NCCL id to {}: {e}",
+                        id_file.display()
+                    )
                 });
-                let reduced = assert_gang_checks(&joined, &device);
-                assert!(!joined.is_aborted(), "rank {rank} must not have aborted");
-                reduced
-            }));
+                id
+            } else {
+                read_id_file_exactly_128_bytes(TEST, &id_file)
+            };
+            // Rank 0 blocks here until rank 1 joins with the same id — that
+            // order (mint → write → join) is correct: the file must exist
+            // before either side can complete `ncclCommInitRank`.
+            let joined = Nccl::from_rank(&device, rank, world, id).unwrap_or_else(|e| {
+                panic!("{TEST}: ncclCommInitRank failed for rank {rank} of {world}: {e}")
+            });
+            let reduced = assert_gang_checks(&joined, &device);
+            assert!(!joined.is_aborted(), "rank {rank} must not have aborted");
+            reduced
+        }));
 
-            match outcome {
-                Ok(reduced) => {
-                    let report = RankReport {
-                        rank,
-                        world,
-                        hostname: host,
-                        device_ordinal,
-                        nccl_socket_ifname,
-                        reduced_vector_digest_sha256: Some(reduced_vector_digest_sha256(&reduced)),
-                        verdict: "pass".to_string(),
-                        reason: String::new(),
-                    };
-                    write_rank_report(&artifact_dir, &report).unwrap_or_else(|e| {
-                        panic!(
-                            "{TEST}: rank {rank} passed but failed to write its report to {}: {e}",
-                            artifact_dir.display()
-                        )
-                    });
-                }
-                Err(payload) => {
-                    let reason = panic_message(&payload);
-                    let report = RankReport {
-                        rank,
-                        world,
-                        hostname: host,
-                        device_ordinal,
-                        nccl_socket_ifname,
-                        reduced_vector_digest_sha256: None,
-                        verdict: "fail".to_string(),
-                        reason: reason.clone(),
-                    };
-                    if let Err(e) = write_rank_report(&artifact_dir, &report) {
-                        eprintln!(
-                            "{TEST}: rank {rank} ALSO failed to write its fail report to {}: {e} \
+        match outcome {
+            Ok(reduced) => {
+                let report = RankReport {
+                    rank,
+                    world,
+                    hostname: host,
+                    device_ordinal,
+                    nccl_socket_ifname,
+                    reduced_vector_digest_sha256: Some(reduced_vector_digest_sha256(&reduced)),
+                    verdict: "pass".to_string(),
+                    reason: String::new(),
+                };
+                write_rank_report(&artifact_dir, &report).unwrap_or_else(|e| {
+                    panic!(
+                        "{TEST}: rank {rank} passed but failed to write its report to {}: {e}",
+                        artifact_dir.display()
+                    )
+                });
+            }
+            Err(payload) => {
+                let reason = panic_message(&payload);
+                let report = RankReport {
+                    rank,
+                    world,
+                    hostname: host,
+                    device_ordinal,
+                    nccl_socket_ifname,
+                    reduced_vector_digest_sha256: None,
+                    verdict: "fail".to_string(),
+                    reason: reason.clone(),
+                };
+                if let Err(e) = write_rank_report(&artifact_dir, &report) {
+                    eprintln!(
+                        "{TEST}: rank {rank} ALSO failed to write its fail report to {}: {e} \
                          (original failure: {reason})",
-                            artifact_dir.display()
-                        );
-                    }
-                    std::panic::resume_unwind(payload);
+                        artifact_dir.display()
+                    );
                 }
+                std::panic::resume_unwind(payload);
             }
         }
     }

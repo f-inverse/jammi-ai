@@ -484,6 +484,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # The same trap the hermetic lane documents: the container's git does
+      # not see the safe.directory `actions/checkout` set, so every test that
+      # shells out to `git ls-files` (the pinned-source gate) died with
+      # "dubious ownership" on every main run of this lane.
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Run live tests
         env:
           # esc-096: live, up through `HubSource`'s token fallback chain

@@ -28,18 +28,18 @@ pub enum PartitionRule {
 
 /// `(rank, world, batch, rule)` — the per-run partition assignment.
 ///
-/// At this commit [`super::trainer::TrainingLoop`]'s production run loop
-/// always builds [`PartitionSpec::single_rank`] (rank 0 of world 1) — U4b is
-/// what would ever spawn more than one rank and make a larger world
-/// meaningful. `batch` is the PER-RANK batch size (`FineTuneConfig::
-/// batch_size`), never the global `W·B` batch.
+/// `batch` is the PER-RANK batch size (`FineTuneConfig::batch_size`), never
+/// the global `W·B` batch.
 ///
-/// Fields are PRIVATE: [`Self::single_rank`] is the only constructor reachable
-/// outside this module in a release build, so no code path can hand the
-/// trainer a `rank != 0` or `world != 1` spec at this commit. Tests that need
-/// an arbitrary `(rank, world)` assignment — to exercise the partition RULE
-/// itself, never the trainer — use the `#[cfg(test)]`-only `Self::for_test`
-/// instead, which does not exist in a release build.
+/// Fields are PRIVATE: [`Self::single_rank`] (rank 0 of world 1, W=1's only
+/// value) and [`Self::for_gang`] (U4b's validated arbitrary-rank
+/// constructor, for a real `Local`/`Peer`/`Nccl` gang) are the only
+/// constructors reachable outside this module in a release build, so every
+/// `PartitionSpec` a running trainer ever holds has already cleared
+/// `for_gang`'s bounds (or is the trivially-valid `single_rank`). Tests that
+/// need an arbitrary `(rank, world)` assignment to exercise the partition
+/// RULE itself (never a real trainer/gang) use the `#[cfg(test)]`-only
+/// [`Self::for_test`] instead, which does not exist in a release build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionSpec {
     rank: usize,
@@ -78,14 +78,14 @@ impl PartitionSpec {
 
     /// A VALIDATED arbitrary-rank constructor (#500 U2c §9 advisory): `world
     /// >= 1`, `rank < world`, `batch >= 1`, refused by name otherwise. Gated
-    /// `#[cfg(any(test, feature = "test-hooks"))]` — reachable from
+    /// `#[cfg(any(test, feature = "test-hooks"))]`, reachable from
     /// `tests/it` only through this crate's own `test-hooks` dev-dependency
-    /// (`Cargo.toml`), never from a release build — so [`Self::single_rank`]
-    /// stays the ONLY production route to a [`PartitionSpec`] (the struct's
-    /// own doc's compile-time property, unchanged by this constructor's
-    /// existence). Used by the per-rank stream's `P5` oracle (`world = 2`),
-    /// which needs a real, out-of-this-module `PartitionSpec` value rather
-    /// than `for_test`'s `pub(crate)`-only visibility.
+    /// (`Cargo.toml`), never from a release build. Thin wrapper over
+    /// [`Self::for_gang`] — see that constructor's own doc for the bounds and
+    /// for why a release build's own multi-rank route is that one, not this
+    /// one. Used by the per-rank stream's `P5` oracle (`world = 2`), which
+    /// needs a real, out-of-this-module `PartitionSpec` value rather than
+    /// `for_test`'s `pub(crate)`-only visibility.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn for_rank(
         rank: usize,
@@ -93,19 +93,39 @@ impl PartitionSpec {
         batch: usize,
         rule: PartitionRule,
     ) -> jammi_db::error::Result<Self> {
+        Self::for_gang(rank, world, batch, rule)
+    }
+
+    /// U4b's validated, PRODUCTION arbitrary-rank constructor: `world >= 1`,
+    /// `rank < world`, `batch >= 1`, refused by name otherwise — a real
+    /// `Local`/`Peer`/`Nccl` gang's rank builds its own
+    /// [`super::trainer::RankContext`] through this, one call per rank, every
+    /// rank agreeing on `world`/`batch`/`rule` and differing only in `rank`.
+    ///
+    /// This is the ONE place outside [`Self::single_rank`] a release build
+    /// can construct a [`PartitionSpec`] with `rank != 0` or `world != 1` —
+    /// every value is bounds-checked here, once, so nothing downstream (the
+    /// gather-count derivation in [`Self::counts_for_step`], `rows_for_step`)
+    /// ever sees an inconsistent `(rank, world)` pair.
+    pub fn for_gang(
+        rank: usize,
+        world: usize,
+        batch: usize,
+        rule: PartitionRule,
+    ) -> jammi_db::error::Result<Self> {
         if world == 0 {
             return Err(jammi_db::error::JammiError::FineTune(format!(
-                "PartitionSpec::for_rank: world must be >= 1, got {world}"
+                "PartitionSpec::for_gang: world must be >= 1, got {world}"
             )));
         }
         if rank >= world {
             return Err(jammi_db::error::JammiError::FineTune(format!(
-                "PartitionSpec::for_rank: rank {rank} must be < world {world}"
+                "PartitionSpec::for_gang: rank {rank} must be < world {world}"
             )));
         }
         if batch == 0 {
             return Err(jammi_db::error::JammiError::FineTune(
-                "PartitionSpec::for_rank: batch must be >= 1, got 0".into(),
+                "PartitionSpec::for_gang: batch must be >= 1, got 0".into(),
             ));
         }
         Ok(Self {
@@ -114,6 +134,18 @@ impl PartitionSpec {
             batch,
             rule,
         })
+    }
+
+    /// This rank's index in `0..world` (`rank()`) — the trainer's own
+    /// [`super::trainer::RankContext::rank`] delegates here so the two
+    /// numbers can never independently drift apart.
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// How many ranks this partition spans.
+    pub fn world(&self) -> usize {
+        self.world
     }
 
     /// The row range THIS rank holds for global step `step`, over a train
@@ -142,6 +174,37 @@ impl PartitionSpec {
             .saturating_add((self.rank + 1) * self.batch)
             .min(train_count);
         start..end.max(start)
+    }
+
+    /// The gather-count vector for global step `step` over a train prefix of
+    /// `train_count` rows: `counts[r]` is the row count [`Self::rows_for_step`]
+    /// would compute for rank `r` — EVERY rank's, not just `self.rank`'s.
+    ///
+    /// DESIGN.md §4's "Counts are derived, never exchanged": every rank knows
+    /// `train_count` (the shared training set) and its own `(world, batch,
+    /// rule)` (the shared spec), so every rank computes the IDENTICAL
+    /// `counts` vector locally, with no round-trip — this is the pure
+    /// function every [`super::collective::Collective::all_gather`] caller in
+    /// the trainer derives its `counts` argument from. Reuses the exact
+    /// per-rank width arithmetic [`Self::rows_for_step`] uses (for rank `r`
+    /// instead of `self.rank`), so the two can never drift apart: the sum of
+    /// this vector for a given `(train_count, step)` always equals the total
+    /// row count [`Self::rows_for_step`]'s union over ranks would produce.
+    pub fn counts_for_step(&self, train_count: usize, step: usize) -> Vec<usize> {
+        (0..self.world)
+            .map(|r| {
+                if self.world == 0 || self.batch == 0 {
+                    return 0;
+                }
+                let global_batch = self.world * self.batch;
+                let global_start = step.saturating_mul(global_batch);
+                let start = global_start.saturating_add(r * self.batch).min(train_count);
+                let end = global_start
+                    .saturating_add((r + 1) * self.batch)
+                    .min(train_count);
+                end.saturating_sub(start)
+            })
+            .collect()
     }
 }
 
@@ -257,5 +320,54 @@ mod tests {
             rule: PartitionRule::BlockByGlobalBatch,
         };
         assert_eq!(rank0.rows_for_step(6, 1), 6..6);
+    }
+
+    /// U4b: `for_gang` clears its bounds, `for_rank` (its test/`test-hooks`
+    /// wrapper) agrees with it byte-for-byte, and every out-of-bounds input
+    /// is refused by name rather than panicking downstream.
+    #[test]
+    fn for_gang_validates_and_for_rank_agrees_with_it() {
+        let gang = PartitionSpec::for_gang(1, 3, 4, PartitionRule::BlockByGlobalBatch).unwrap();
+        let rank = PartitionSpec::for_rank(1, 3, 4, PartitionRule::BlockByGlobalBatch).unwrap();
+        assert_eq!(gang, rank);
+        assert_eq!(gang.rank(), 1);
+        assert_eq!(gang.world(), 3);
+
+        assert!(PartitionSpec::for_gang(0, 0, 4, PartitionRule::BlockByGlobalBatch).is_err());
+        assert!(PartitionSpec::for_gang(3, 3, 4, PartitionRule::BlockByGlobalBatch).is_err());
+        assert!(PartitionSpec::for_gang(0, 3, 0, PartitionRule::BlockByGlobalBatch).is_err());
+    }
+
+    /// U4b acceptance (b)/(d)'s own primitive: `counts_for_step` computes
+    /// EVERY rank's row count from one rank's spec, agreeing with
+    /// `rows_for_step` for each rank it stands in for, with no exchange.
+    /// `train_count = 8`, `W = 2`, `B = 3`: global batch 6; step 0 is full
+    /// (3, 3); step 1 is the zero-row-rank case DESIGN.md §2 names (train
+    /// count 8 mod 6 = 2, so rank 1's slice `[9, 12)` clamped to `[8, 8)` is
+    /// empty while rank 0's `[6, 9)` clamped to `[6, 8)` still holds 2 rows).
+    #[test]
+    fn counts_for_step_matches_rows_for_step_for_every_rank_including_a_zero_row_rank() {
+        let rule = PartitionRule::BlockByGlobalBatch;
+        let train_count = 8usize;
+        for step in 0..3usize {
+            let counts = PartitionSpec::for_gang(0, 2, 3, rule)
+                .unwrap()
+                .counts_for_step(train_count, step);
+            assert_eq!(counts.len(), 2);
+            for (r, &count) in counts.iter().enumerate() {
+                let spec = PartitionSpec::for_gang(r, 2, 3, rule).unwrap();
+                let range = spec.rows_for_step(train_count, step);
+                assert_eq!(
+                    count,
+                    range.end - range.start,
+                    "rank {r} step {step}: counts_for_step disagrees with rows_for_step"
+                );
+            }
+        }
+        // step 1 is the zero-row-rank case named above.
+        let counts = PartitionSpec::for_gang(0, 2, 3, rule)
+            .unwrap()
+            .counts_for_step(train_count, 1);
+        assert_eq!(counts, vec![2, 0]);
     }
 }

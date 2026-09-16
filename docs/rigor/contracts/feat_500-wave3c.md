@@ -30,9 +30,254 @@ lead opened every cited line and re-ran every named oracle on the consolidated t
 deviation from `docs/plans/67-distributed-training/UNITS.md` is stated with its reason and the
 plan rows carry a dated correction in the same commit.
 
-## 2. U4b
+## 2. U4b (landed as twelve commits on this branch; original tip `c987001f`)
 
-(folded at consolidation)
+The implementer's contract, folded by the lead after checking: the presence-set reduce, the step-bounded epoch loop, the flag-reduced divergence decision, the `world > 1` refusals for the streamed, mining, GradCache and precomputed arms, `TrainingBatch::Classification { logits, .. }`, `RESUME_STATE_SCHEMA_VERSION = 2` with `load_bundle -> Ok(None)` on a version mismatch. The pressure round's blocks 1–4 are closed by this shape. Three cuts the implementer named are SCHEDULED on this branch, not accepted: (i) `run_spec` spawning `[worker] local_ranks` ranks over `Local` (built with the coordinator body, §6, the same `run_spec` topology site); (ii) the per-rank dropout seed wiring, which needs the LoRA init seed split from the dropout seed (§2a); (iii) the streamed arm's zero-row-rank fix in `stream.rs`, so a residency-bounded stream trains at `world > 1` instead of being refused (§2a). Consolidation notes: the twelve commits applied without conflict; the `Collective` trait now takes a per-call `&BlockingCall` (U5b-1b-i), so `RankContext`'s five wrappers are threaded with the witness in the integration commit (§2b).
+
+### 1. Scope shipped
+
+**`crates/jammi-ai/src/fine_tune/trainer.rs`**
+- `RankContext { collective: Arc<dyn Collective>, partition: PartitionSpec }` — the trainer's
+  own gang identity. `RankContext::single_rank` (Noop over `PartitionSpec::single_rank`) is
+  `TrainingLoopBuilder`'s default when `.rank_context(..)` is never called, so every pre-U4b
+  caller/test is unaffected byte-for-byte. Five wrapper methods
+  (`all_gather`/`all_reduce_sum`/`all_reduce_max_flags`/`broadcast`/`barrier`) are the ONLY
+  route the trainer/optimizer use to reach the underlying `Collective` (design pressure round
+  finding 9 — the seam the concurrently-built `Peer` collective, U5b-1b-i, needs to add a
+  per-call witness argument to). `RankContext::canonical_vars_digest(names)` — a stable digest
+  of the canonical `trainable_vars` order, exposed for U5b-1b-i's round descriptor
+  (`agreement`). `RankContext::dropout_seed`/the free `rank_dropout_seed(base_seed, rank)` —
+  `f(seed, rank)` per DESIGN.md §4, rank 0 reproducing `base_seed` exactly. **Deviation**: this
+  function is unit-tested in isolation
+  (`rank_context_dropout_seed_is_identity_at_rank_zero_and_distinct_elsewhere`) but is NOT wired
+  into any model-construction call site (production or test) in this unit — see Uncovered §3.
+- `compute_loss_gathered` — the gather rule. `Contrastive`/`Pairs`/`Triplet` gather the
+  post-projection encoder outputs + scores (already computed locally by `encode_chunk`).
+  `Classification` gathers the LOGITS: `TrainingBatch::Classification` was reshaped
+  (`data.rs`) to carry `logits` instead of `embeddings` — `classify()` now runs inside
+  `encode_chunk`, on this rank's own local embeddings, symmetric with `Regression`'s
+  `head_forward`-before-loss shape (design pressure round finding 5). `Ner` stays refused.
+  Every arm's gathered tensor is downstream of every trainable parameter, so `all_gather`'s
+  detached-remote-slot backward closes the W× gradient hazard (proved by an executed
+  RED-PROOF mutation, §2).
+- The Resident production epoch loop is now bounded by the fixed, once-computed
+  `train_batches_per_epoch` (a function of `self.rank_ctx.world()`, not a hardcoded `1`),
+  never "this rank's own chunk came back empty" — the two coincide at W=1 (proved: a
+  zero-row chunk can only ever fall at `step == train_batches_per_epoch`, one past the loop)
+  but diverge at W>1, where a zero-row RANK's slice at a step a PEER rank still has data for
+  would otherwise skew the gang's collective-call count (executed RED-PROOF: a hang, §2).
+  `encode_texts` gained an empty-batch guard: a real encoder forward errors on a zero token
+  count (measured: `rope_fused: cos/sin element count 0 is not a positive multiple of
+  head_dim`), so a zero-row tensor of the right trailing width is built directly, no model
+  call at all.
+- `process_batch_loss`'s divergence decision now reduces through `all_reduce_max_flags`
+  BEFORE the accumulate/divergence-count decision (a forced divergence on one rank is seen,
+  and acted on identically, by every rank); at W=1 (`Noop`) this is the identity, so the W=1
+  window is byte-unchanged.
+- `save_resume_checkpoint`/`save_epoch_checkpoint` are no-ops for `rank_ctx.rank() != 0`
+  (DESIGN.md §4: rank 0 alone writes/publishes) — the artifact-store-presence check and the
+  new `gather_dropout_positions` collective call both happen BEFORE the rank gate, so every
+  rank still takes the same collective calls in lockstep.
+- `gather_dropout_positions` — an `all_gather` of every rank's own per-layer dropout Philox
+  positions to rank 0 (real collective call, every rank participates even though only rank 0's
+  caller reads the result). `restore_from_checkpoint` selects THIS rank's own entry from the
+  per-rank map (never rank 0's).
+- The Streamed arm is refused, typed, at `world > 1` (its own `next_chunk` still collapses an
+  empty-but-in-bound chunk into end-of-epoch — a named, deferred gap, Uncovered §1); mining/
+  GradCache/a Precomputed loader are likewise refused at `world > 1` (design pressure round
+  finding 4) — restating (mining/GradCache) or newly adding (Precomputed) the run-time edge of
+  the submit-time refusal `RankAdmission::admit` already applies.
+- Rung pinning: NOT wired (design pressure round finding 6 — the gather is dim-0 over pooled
+  `[rows, hidden]`, so dim-1, which a bucket rung governs, is irrelevant to gather agreement;
+  every call site still passes `None`). `batch_bucket.rs`'s doc corrected to state this.
+
+**`crates/jammi-ai/src/fine_tune/partition.rs`**: `PartitionSpec::for_gang` (the production,
+un-gated, validated arbitrary-rank constructor — `for_rank`, test/`test-hooks`-only, is now a
+thin wrapper over it), `PartitionSpec::rank()`/`world()` accessors, `PartitionSpec::
+counts_for_step` (every rank's row count for a step, derived — never exchanged).
+
+**`crates/jammi-ai/src/fine_tune/optimizer.rs`**: `canonical_reduce(rank_ctx, trainable_vars,
+grads)` — lays `grads` out in canonical order, `all_reduce_sum`s it AND a second presence-set
+reduce (a per-var 1.0/0.0 indicator), and writes a var back to `grads` only when present on at
+least one rank — absent-on-every-rank stays absent (design pressure round finding 2: absent is
+not zero for `AdamW::step`, which skips an absent `Var` entirely — moment decay, bias
+correction, weight decay all move `θ`).
+
+**`crates/jammi-ai/src/fine_tune/resume.rs`**: `RESUME_STATE_SCHEMA_VERSION` bumped 1→2;
+`dropout_positions: HashMap<u32, HashMap<String, u64>>` (per rank, was flat).
+`ResumeState::schema_version` gets `#[serde(default = "unversioned_schema_version")]` (→ `0`,
+never a real version); `load_bundle` now returns `Result<Option<RestoredCheckpoint>>` — a
+version mismatch (including the now-parseable absent-field case) is `Ok(None)` + one
+`tracing::warn!`, never a hard `Err` (design pressure round finding 7 — greenfield, no reader
+for an old shape, so a hard failure would strand every live older checkpoint). A genuinely
+torn moments file still hard-errors once the version check passes.
+`crates/jammi-ai/src/fine_tune/worker.rs::discover_resume` updated to match.
+
+**`crates/jammi-ai/src/fine_tune/data.rs`**: `TrainingBatch::Classification { logits, labels }`
+(was `{ embeddings, labels }`).
+
+**`crates/jammi-ai/src/pipeline/recompute.rs`**: the K1 `FineTune` (retrain) arm's exhaustive
+destructuring extended with `collective: _, local_ranks: _` (bound the moment the manifest
+fields landed, as designed).
+
+**`crates/jammi-db/src/store/manifest.rs`** (co-owned with U2a/U3, authorized for this unit):
+`ProducingDescriptor::FineTune` gains `collective: String` (canonical lowercase token) and
+`local_ranks: u32`; the completeness test (`FineTuneFields`/`fine_tune_descriptor`/
+`fine_tune_fields`/`fine_tune_every_field_moves_the_hash`) extended for both.
+**`crates/jammi-db/src/store/artifact.rs`**: its own `fine_tune_descriptor()` test fixture
+updated to match (the only other production-shape construction site in that crate).
+
+**`crates/jammi-ai/src/fine_tune/worker.rs`**: `train_fine_tune`'s manifest-descriptor
+construction populates `collective`/`local_ranks` from `session.inner_config().worker` at
+claim time.
+
+**`crates/jammi-db/src/config/mod.rs`, `config/tests.rs`, `config/host_memory.rs`,
+`crates/jammi-ai/src/fine_tune/collective/mod.rs`, `docs/guide/src/configuration.md`**:
+`WorkerConfig::world_size` → `local_ranks`, `WorkerTopology::world_size()` → `local_ranks()`
+(U4b S8) — every OTHER `world_size` (spec.rs, manifest.rs's `FineTune::world_size`,
+jobs_repo.rs, gang.rs, the wire) is a DIFFERENT concept and is untouched, per the design
+pressure round's explicit instruction. `docs/guide/src/configuration.md` documented no
+`[worker] world_size` at all before this unit, so this is an ADD of the whole gang-knobs block
+(`local_ranks`, `collective`, `rank_timeout_secs`), not a rename in the guide.
+
+#### Deviations from UNITS.md / the brief, with reasons
+
+1. **`run_spec` does not spawn `[worker] local_ranks` local ranks.** UNITS.md's own text names
+   this ("`run_spec` spawns `[worker] local_ranks` ranks on one host over `Local`"). Not built.
+   The gather rule, lockstep, canonical reduce, and per-rank resume are fully built and tested
+   hermetically by constructing `RankContext`/`Local`/`LocalGang` directly and driving the REAL
+   `TrainingLoop::run` (never a mock), which is what every acceptance oracle in UNITS.md
+   actually asks for — none of the five hermetic oracles names `run_spec` as part of what it
+   measures. Wiring `run_spec` itself to fan out N ranks (own model load per rank, own
+   `RankContext`, per-rank dropout seed derivation, thread lifecycle inside the worker's
+   existing claim/heartbeat/cancel machinery) is a distinct, large orchestration change I judged
+   out of proportion to attempt and verify soundly in the remaining time without risking a
+   half-tested regression in worker.rs's existing (heavily-tested) claim loop. Named as a
+   follow-up, not silently absorbed. See Uncovered §2.
+2. **`RankContext::dropout_seed`/`rank_dropout_seed` is not wired into any model-construction
+   call site.** Investigated concretely (not merely deferred by assertion): every existing
+   LoRA-layer constructor (`LoraLinear::new`, `LoraBuildConfig`) takes ONE `seed` field that
+   governs BOTH weight init and dropout. Per-rank-varying that ONE field (as a naive wiring
+   would) would ALSO vary weight INIT per rank, breaking "every rank starts with identical
+   weights" — a real correctness hazard, not a style question. Splitting the init seed from
+   the dropout seed is a LoRA-layer change this unit's files_in_scope does not include. The
+   free function and its own property (rank 0 identity, other ranks distinct and
+   deterministic) are built and tested in isolation; wiring it is filed as a follow-up. See
+   Uncovered §3.
+3. **The Streamed arm's own zero-row-rank hazard is not fixed, only refused at `world > 1`.**
+   `EpochSource`'s `next_chunk` (now serving the Streamed arm alone; the dead `Resident`
+   variant was removed) still collapses an empty-but-in-bound chunk into end-of-epoch — the
+   SAME hazard the Resident arm's fix closes. Fixing it requires threading the
+   `train_batches_per_epoch` bound through the stream's own pump/consumer protocol
+   (`stream.rs`), which U2c built under its own, separate contract; reworking it was judged
+   out of this unit's scope (files_in_scope names `trainer.rs`'s stream CONSUMER, not
+   `stream.rs`'s pump). A typed refusal at `world > 1` (K2: refuse rather than compute past a
+   valid domain) closes the gap honestly instead of leaving it silently reachable.
+4. **Acceptance (c) is not a separately-built test.** UNITS.md's (c) ("W=2 × B vs W=1 × 2B
+   within pre-registered ε at `lora_dropout=0`") is, on inspection, the SAME comparison as (b)
+   under the framing this unit already built: `gather_exactness_w2_matches_w1_within_pre_
+   registered_epsilon` runs W=2 at per-rank batch 2 (global batch 4) against a W=1 reference at
+   batch 4 (`= 2×B`), both at `lora_dropout` effectively disabled via eval mode (see that
+   test's own doc for why), within a pre-registered ε. I did not duplicate it as a second test;
+   the contract's Properties table below cites it for both (b) and (c).
+
+### 2. Properties
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| At every world size, `RankContext`/`Noop` wiring changes ZERO bytes of a W=1 run | `cargo test -p jammi-ai --features test-hooks --lib fine_tune::` (319 passed) — the WHOLE pre-existing suite is this oracle | Not re-mutated (this is the pre-existing K4 regression suite, unchanged); any of the wiring changes in this unit would have reported here first if it had perturbed W=1 |
+| `PartitionSpec::for_gang`/`for_rank` agree and validate their bounds; `counts_for_step` matches `rows_for_step` per rank, including the zero-row-rank case | `fine_tune::partition::tests::for_gang_validates_and_for_rank_agrees_with_it`, `..::counts_for_step_matches_rows_for_step_for_every_rank_including_a_zero_row_rank` | Covered by construction (assertions on out-of-bounds inputs; the zero-row case is asserted directly, `vec![2,0]`) |
+| `canonical_reduce`: at W=1, changes NOTHING (absence and presence both survive unchanged); at a real gang, sums a shared var, resolves a rank-absent var to the other rank's own value, and restores absence where NO rank had the var | `fine_tune::optimizer::tests::canonical_reduce_at_world_one_leaves_absence_and_presence_unchanged`, `..::canonical_reduce_sums_a_real_gang_and_restores_absence_where_no_rank_had_it` (a real 2-thread `Local` gang) | RED-PROOF (executed, reverted before commit — see commit `989dc3ff`'s own message): the FIRST-CUT shape of this function (before the presence-set fix) unconditionally inserted a zero-filled tensor for every var; reverting to that shape makes the absent-var assertion fail (`grads.get(..).is_none()` becomes `Some`) |
+| `RankContext::canonical_vars_digest`: order- and content-sensitive | `fine_tune::trainer::tests::canonical_vars_digest_is_order_sensitive_and_content_sensitive` | Covered by construction (asserts reordering and content changes both move the digest) |
+| `RankContext::dropout_seed`/`rank_dropout_seed`: rank 0 is the identity; every other rank is distinct and deterministic | `fine_tune::trainer::tests::rank_context_dropout_seed_is_identity_at_rank_zero_and_distinct_elsewhere` | Covered by construction (asserts rank 0 == base_seed exactly, ranks 1..8 pairwise distinct, and repeat-call determinism) |
+| **(b/c) Gather exactness**: on a REAL 2-rank `Local` gang, the global loss AND the summed adapter gradient equal a W=1 reference (same rows, one combined batch) within a PRE-REGISTERED ε = `1e-4`, on a fixture whose per-rank batches bucket to DIFFERENT natural widths | `fine_tune::trainer::encode_texts_bucketing_oracle::gather_exactness_w2_matches_w1_within_pre_registered_epsilon` | EXECUTED (applied, run, reverted — see commit `bb6a3c12`): `compute_loss_gathered`'s `Contrastive` arm changed to `.clone()` instead of gathering; red output: `rank 0: gathered global loss 0.37497652 must match the W=1 reference 1.0657526 within 0.0001` |
+| **(d) Lockstep — zero-row rank**: a gang whose last global step gives one rank zero rows completes (no hang, no rank-count skew) | `fine_tune::trainer::gang_lockstep_oracle::a_zero_row_rank_the_gang_completes` (a real 2-rank `Local` gang through the FULL production `run()`) | EXECUTED (applied, run, reverted — commit `b1ffecf6`): restored the pre-U4b "this rank's own empty chunk ends the epoch" loop termination; confirmed a HANG (did not complete in 25 s vs 0.34 s healthy), left to resolve naturally at `Local`'s own 120 s rendezvous timeout: `all_gather: timed out after 120s waiting for every peer to arrive` |
+| **(d) Lockstep — a Var absent from one rank's `GradStore`**: the gang completes | `..::a_var_absent_from_one_ranks_gradstore_the_gang_completes` (a real gang, `after_backward` removes rank 1's gradient for one Var at step 1) | Covered directly by `canonical_reduce`'s own presence-set RED-PROOF above (same mechanism); this test is the run()-level integration proof that the mechanism is actually wired into the production step boundary |
+| **(d) Lockstep — forced divergence on one rank**: both ranks end in the SAME typed refusal, never one erroring while its peer hangs/trains on | `..::forced_divergence_on_one_rank_both_ranks_end_in_the_same_refusal` (a real gang, `after_backward` poisons rank 1's gradient to NaN at step 1) | This property IS its own RED-PROOF-shaped test: before U4b, `RankContext`/`canonical_reduce` do not exist, so there is no second rank for a poisoned gradient to propagate to at all — the assertion (`both ranks' errors name step 1`) has no meaning pre-U4b |
+| **(a) Equal-topology reproducibility, W=2 twice**: two independent from-scratch 2-rank gangs (same seed/data) produce byte-identical rank-0 final weights | `fine_tune::trainer::gang_determinism_oracle::w2_twice_is_byte_identical` | EXECUTED (applied, run, reverted — commit `68299c5d`): changed the second run's epoch count 2→3; confirmed red, reverted |
+| **(a) Equal-topology reproducibility, resume across a kill**: a 2-rank gang cooperatively cancelled after one epoch, then resumed from the SAME shared artifact store, reproduces an uninterrupted run's final weights byte-for-byte | `..::resume_after_a_kill_matches_an_uninterrupted_run` | EXECUTED (applied, run, reverted — commit `68299c5d`'s own message): commented out `optimizer.load_state(..)` in `restore_from_checkpoint`; confirmed a real byte divergence, then reverted. (This test's own construction ALSO caught two real test-harness bugs along the way — a shrunk `config.epochs` for the "killed" leg, and firing `cancel` during the checkpointed epoch's own last step — both of which silently made the test pass for the WRONG reason (no resume ever happened); both are recorded in the test's own doc as the reason an executed RED-PROOF, not a green result alone, is load-bearing here.) |
+| **(e) W=1 via `Noop` is byte-identical to the existing golden(s)** | The WHOLE pre-existing `fine_tune::` suite (319 tests, unchanged pass) is this oracle — no new test needed since `RankContext::single_rank`/`Noop` is a pure addition | N/A — regression-only claim |
+| Manifest `collective`/`local_ranks` are real hash determinants on `ProducingDescriptor::FineTune` | `jammi-db::store::manifest::tests::fine_tune_every_field_moves_the_hash` (extended) | Covered by construction (`assert_each_change_moves_hash` over both new fields) |
+| The K1 retrain arm's exhaustive destructuring cannot silently drop a new manifest field | `cargo check -p jammi-ai` failed to compile before `recompute.rs` was updated (E0027, "pattern does not mention fields `collective`, `local_ranks`") | The compile error itself IS the executed proof — the completeness test is the type system |
+| `WorkerConfig`/`WorkerTopology`'s rename preserves every existing validation/round-trip behavior under the new name | `jammi-db::config::tests` (216 passed, including the renamed `load_refuses_local_ranks_zero`/`..wider_than_the_devices`) | Renaming is the only change; the pre-existing assertions are the oracle |
+
+### 3. Uncovered
+
+1. **The Streamed arm's per-rank zero-row-rank hazard** (see Deviation §3 above) — refused,
+   typed, at `world > 1`, never fixed. A real gang against a residency-bounded per-rank stream
+   is therefore not exercised at all; only the Resident (eager) production arm is proven at
+   `world > 1`.
+2. **`worker.rs::run_spec` spawning `[worker] local_ranks` local ranks** — not built (Deviation
+   §1). The claim-loop-to-gang-spawn wiring, per-rank model loading, and per-rank seed
+   derivation (which needs Uncovered §3 first) are a named follow-up.
+3. **`RankContext::dropout_seed` wiring** — built and unit-tested in isolation, not connected
+   to any model constructor (Deviation §2). Consequently `gang_determinism_oracle`'s two tests
+   use `lora_dropout = 0.0` and do NOT exercise the per-rank dropout-position gather/restore
+   determinant specifically (restoring the wrong rank's positions is vacuous when every rank's
+   map is empty) — stated plainly in that test's own doc, not hidden.
+4. **Acceptance (f)**: "two real devices in one session hold two entries in the production
+   model-cache map for one model id" — hermetically UNCOVERED, exactly as UNITS.md itself
+   states ("only one device exists off the pod... a pod-leg obligation, not a hermetic one").
+   Not attempted, not faked. U4a's own hermetic assertion (a mirror map, not the production
+   insert) is the only hermetic proxy this plan defines for it, and it is unit U4a's, not this
+   one's, to ship.
+5. **The pod leg** (`Nccl`, 2×A100; digest pair + per-step delta against a GPU-measured ε) —
+   explicitly named in UNITS.md as NOT this unit's; labelled UNCOVERED, not attempted.
+6. **`docs/maintainer/MAINTAINER-GUIDE.md`'s `PRODUCING-DESCRIPTOR-VARIANTS` block** — not
+   updated for the two new manifest fields. U4b's own `files_in_scope` in UNITS.md does not
+   name this file (only U2a's and U3's do); left for the lead's doc-parity pass
+   (`check_doc_parity.py`), which I did not run myself (outside the trimmed gate list I was
+   given).
+7. **Live-Postgres arm for the jammi-db tests touched** — not run. Every jammi-db test I added
+   or renamed in this unit (`config::tests`, `store::manifest::tests`, `store::artifact::
+   tests`) is pure Rust logic (config parsing/validation, hash-determinism fixtures) with no
+   catalog/SQL backend involved, so no `::postgres` arm exists for them to run under.
+
+### 4. Gates
+
+Per the lead's mid-task gate-trim message (COMMON.md's Gates section rewritten): only the
+crates/tests touched, one filter per module, no workspace-wide builds, no `cargo doc`, no
+live-Postgres lane (none applicable — see Uncovered §7), no `merge_path.sh`.
+
+| Command | Exit | Notes |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | |
+| `cargo clippy -p jammi-db --all-targets -- -D warnings` | 0 | |
+| `cargo test -p jammi-ai --features test-hooks --lib fine_tune::` | 0 | 319 passed, 0 failed |
+| `cargo test -p jammi-ai --features test-hooks --lib pipeline::` | 0 | 33 passed, 0 failed |
+| `cargo test -p jammi-db --lib store::` | 0 | 121 passed, 0 failed |
+| `cargo test -p jammi-db --lib config::` | 0 | 216 passed, 0 failed |
+
+`RUSTDOCFLAGS="-D warnings" cargo doc -p jammi-ai --no-deps` was NOT run per the lead's trimmed
+gate instruction (explicitly excluded: "no `cargo doc`"); the lead runs the full merge path once
+on the consolidated tip.
+
+### 5. Commits
+
+```
+c987001f feat(db,ai): #500 U4b — manifest topology fields: collective, local_ranks on ProducingDescriptor::FineTune
+68299c5d test(ai): #500 U4b acceptance (a) — equal-topology reproducibility, a real two-rank Local gang, from scratch and across a resume
+b1ffecf6 test(ai): #500 U4b acceptance (d) — lockstep, a real two-rank Local gang driven through the full production run()
+bb6a3c12 test(ai): #500 U4b acceptance (b) — gather exactness, a real two-rank Local gang vs a W=1 reference
+c6f8c213 feat(db,ai,docs): #500 U4b S8 — rename [worker] world_size to local_ranks
+9001f0cb feat(ai): #500 U4b — route every collective call through RankContext; expose the canonical-vars digest
+5a342266 feat(ai): #500 U4b — per-rank resume, rank-0-only checkpoint writes, and a soft schema-version fallback
+49b6d9b3 feat(ai): #500 U4b — no-gather-story arms refused at world > 1; Classification carries logits
+989dc3ff fix(ai): #500 U4b — canonical_reduce restores presence, not just the sum (design pressure round)
+2eb0ba1a feat(ai): #500 U4b — RankContext, the gather rule, lockstep divergence flags, and the step-bounded epoch loop
+f4d84145 feat(ai): #500 U4b — canonical_reduce: zero-filled, canonical-order all_reduce_sum at the optimizer-step boundary
+11c26ddc feat(ai): #500 U4b — PartitionSpec::for_gang/counts_for_step, the production multi-rank constructor and the gather-count primitive
+```
+
+
+## 2a. U4b tail — streamed arm at `world > 1`; LoRA init/dropout seed split; per-rank dropout seed wired
+
+(built after the integration commit)
+
+## 2b. Integration — the witness through `RankContext`; the round inbox in the hold loop; the trybuild oracle as a `compile_fail` doctest; doc parity for the manifest fields
+
+(built after every wave-A unit landed)
 
 ## 3. U5b-1b-i (landed as one commit on this branch; original `7f653e20`)
 

@@ -1383,6 +1383,35 @@ async fn refusal_scenario(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assign_frame_full("nd-job-lease-dead", attempt, 0, 1, "nd-coord-lease-dead")
         }
+        GangRefusalReason::LeaseUndecodable => {
+            // Issue #574's own row fact: `lease_expires_at` text that does
+            // not parse as a timestamp on THIS backend — refused the same
+            // fixed way `LeaseDead` is, under its own distinguishable
+            // variant, never surfaced as `admission_catalog_fault`.
+            fresh_coordinator(&server, "nd-coord-lease-undecodable").await;
+            let attempt = submit_and_claim(
+                &server,
+                "nd-job-lease-undecodable",
+                "nd-coord-lease-undecodable",
+                std::time::Duration::from_secs(30),
+                WORLD1_SPEC,
+            )
+            .await;
+            raw_sql(
+                &server,
+                "UPDATE jobs SET lease_expires_at = 'not-a-timestamp' \
+                 WHERE job_id = 'nd-job-lease-undecodable'"
+                    .into(),
+            )
+            .await;
+            assign_frame_full(
+                "nd-job-lease-undecodable",
+                attempt,
+                0,
+                1,
+                "nd-coord-lease-undecodable",
+            )
+        }
         GangRefusalReason::NotFound => {
             assign_frame_full("nd-job-not-found", 0, 0, 1, "nd-coord-not-found")
         }
@@ -1839,6 +1868,7 @@ fn every_gang_refusal_reason() -> Vec<jammi_server::grpc::gang::GangRefusalReaso
         R::WrongClaimant,
         R::WrongAttempt,
         R::LeaseDead,
+        R::LeaseUndecodable,
         R::SpecUndecodable,
         R::WorldMismatch,
         R::TrainingSetPairMissing,
@@ -1859,6 +1889,7 @@ fn every_gang_refusal_reason() -> Vec<jammi_server::grpc::gang::GangRefusalReaso
             | R::WrongClaimant
             | R::WrongAttempt
             | R::LeaseDead
+            | R::LeaseUndecodable
             | R::SpecUndecodable
             | R::WorldMismatch
             | R::TrainingSetPairMissing
@@ -1879,10 +1910,11 @@ fn every_gang_refusal_reason() -> Vec<jammi_server::grpc::gang::GangRefusalReaso
 
 /// The ONE non-disclosure oracle. Every I-GANG determinant
 /// (ambient admin scope / not found / not running / wrong claimant / wrong
-/// attempt / lease dead / undecodable world_size / world mismatch / the
-/// world>1 conjunct's seven — pair missing, tenant undecodable, unresolved
-/// under the job's tenant, not ready, sidecar absent, digest mismatch, this
-/// host's store faulting — / coordinator not fresh — sixteen total) refuses with
+/// attempt / lease dead / lease undecodable (#574) / undecodable world_size /
+/// world mismatch / the world>1 conjunct's seven — pair missing, tenant
+/// undecodable, unresolved under the job's tenant, not ready, sidecar
+/// absent, digest mismatch, this host's store faulting — / coordinator not
+/// fresh — seventeen total) refuses with
 /// the PAIRWISE-IDENTICAL `(code, message)` — compared pairwise so a single
 /// differing pair fails naming exactly that pair, never merely "some
 /// determinant's message differs somewhere". Mutation proof: make any ONE
@@ -1911,7 +1943,7 @@ async fn run_rank_refusal_is_non_disclosing_across_every_determinant() {
     }
 }
 
-/// `test-hooks` only: drives the SAME sixteen scenarios
+/// `test-hooks` only: drives the SAME seventeen scenarios
 /// [`run_rank_refusal_is_non_disclosing_across_every_determinant`] does, but
 /// asserts `PeerEngineServer::gang_last_refusal_reason` names the EXACT
 /// determinant each one refused for — the seam that lets this lane
@@ -1921,7 +1953,7 @@ async fn run_rank_refusal_is_non_disclosing_across_every_determinant() {
 /// execute ONE MORE gang-prefixed test-fn than the plain lane (this
 /// function itself is compiled only under `test-hooks`; the plain lane's
 /// case above still runs the same ten RPC calls, just without this
-/// additional reason assertion). One of the sixteen (`AdminScope`) is driven
+/// additional reason assertion). One of the seventeen (`AdminScope`) is driven
 /// in-process by `refusal_scenario` itself (see its own doc) rather than
 /// over the real listener — this test's own assertion still holds, since it
 /// reads `PeerEngineServer::gang_last_refusal_reason`, which `refusal_scenario`

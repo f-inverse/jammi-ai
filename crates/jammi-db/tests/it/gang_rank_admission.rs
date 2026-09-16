@@ -7,17 +7,24 @@
 //! private tempdir per test); `world_size` decoding (a targeted JSON field
 //! read with no backend-specific SQL of its own, but still worth the same
 //! `test_case`-parameterized sqlite/postgres shape `migrations.rs` uses) and
-//! `lease_live`/`remaining` (`super::lease::lease_remaining_seconds_expr`
-//! renders a DIFFERENT SQL expression per backend, so these have no oracle
-//! at all on Postgres without it) also run a `::postgres` arm gated by
-//! `live-postgres-tests`, skipping (never failing) when `JAMMI_TEST_PG_URL`
-//! is unset.
+//! `lease` (`jammi_db::catalog::lease::decode_lease_expires_at` parses a
+//! DIFFERENT text shape per backend — Postgres's own default
+//! `timestamptz`-cast-to-`text` rendering versus SQLite's app-clock
+//! `LEASE_TS_FORMAT` — so these have no oracle at all on Postgres without a
+//! live one) also run a `::postgres` arm gated by `live-postgres-tests`,
+//! skipping (never failing) when `JAMMI_TEST_PG_URL` is unset. Issue #574's
+//! parity oracle (`get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends`)
+//! is the one test in this file that MUST run identically on both backends
+//! whenever Postgres is available — it is the property this whole file split
+//! exists to pin: a malformed `lease_expires_at` is `Ok(Some(row))` with
+//! `LeaseFact::Undecodable`, never a backend-dependent `Err`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::jobs_repo::{SubmitJobParams, TrainingSetFillOutcome, WorldSizeFact};
+use jammi_db::catalog::lease::LeaseFact;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
@@ -126,13 +133,13 @@ async fn get_job_for_rank_returns_none_for_an_absent_job() {
     );
 }
 
-/// The row's `status`/`claimed_by`/`attempts`/`lease_live` mirror a genuine
-/// claim exactly, and `lease_live` is `true` for a freshly-claimed lease.
-/// Parameterized (sqlite/postgres, the `migrations.rs` shape):
-/// `lease_remaining_seconds_expr` renders a DIFFERENT SQL expression per
-/// backend (`lease.rs`), so `lease_live`/`remaining` have no oracle at all on
-/// the Postgres arm without this; the postgres arm skips (never fails) when
-/// `JAMMI_TEST_PG_URL` is unset.
+/// The row's `status`/`claimed_by`/`attempts`/`lease` mirror a genuine
+/// claim exactly, and `lease` is `LeaseFact::Live` for a freshly-claimed
+/// lease. Parameterized (sqlite/postgres, the `migrations.rs` shape):
+/// `decode_lease_expires_at` parses a DIFFERENT text shape per backend
+/// (`lease.rs`), so `lease` has no oracle at all on the Postgres arm without
+/// this; the postgres arm skips (never fails) when `JAMMI_TEST_PG_URL` is
+/// unset.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -170,20 +177,23 @@ async fn get_job_for_rank_reflects_a_live_claim(kind: BackendKind) {
     assert_eq!(row.status, "running");
     assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
     assert_eq!(row.attempts, 1);
-    assert!(row.lease_live, "a freshly-claimed 30s lease must be live");
     assert!(
-        row.remaining > Duration::from_secs(20) && row.remaining <= Duration::from_secs(31),
-        "remaining must be close to the freshly-stamped 30s window (the deadline stamp and the read's own clock are two application-clock reads, so the window may overshoot by the documented sub-millisecond rounding), got {:?}",
-        row.remaining
+        row.lease.is_live(),
+        "a freshly-claimed 30s lease must be live, got {:?}",
+        row.lease
+    );
+    let remaining = row.lease.remaining();
+    assert!(
+        remaining > Duration::from_secs(20) && remaining <= Duration::from_secs(31),
+        "remaining must be close to the freshly-stamped 30s window (the deadline stamp and the read's own clock are two application-clock reads, so the window may overshoot by the documented sub-millisecond rounding), got {remaining:?}"
     );
 }
 
 /// A lease forced to `NULL` (the state both reclaim arms leave behind, and
 /// migration invariant `lease.rs` documents: `NULL` means remaining 0, never
-/// live-by-default) reads back `lease_live == false`, `remaining ==
-/// Duration::ZERO` — never a panic, never a "live" default. Parameterized
-/// (sqlite/postgres): the postgres arm skips (never fails) when
-/// `JAMMI_TEST_PG_URL` is unset.
+/// live-by-default) reads back `lease == LeaseFact::Dead` — never a panic,
+/// never a "live" default. Parameterized (sqlite/postgres): the postgres arm
+/// skips (never fails) when `JAMMI_TEST_PG_URL` is unset.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -226,17 +236,17 @@ async fn get_job_for_rank_treats_a_null_lease_as_not_live(kind: BackendKind) {
         .unwrap();
 
     let row = catalog.get_job_for_rank("job-2").await.unwrap().unwrap();
-    assert!(
-        !row.lease_live,
+    assert_eq!(
+        row.lease,
+        LeaseFact::Dead,
         "a NULL lease column must never read as live"
     );
-    assert_eq!(row.remaining, Duration::ZERO);
 }
 
-/// An expired (past) lease reads back `lease_live == false` with zero
-/// remaining — the boundary the `< now()` / `< $now` clause names.
-/// Parameterized (sqlite/postgres): the postgres arm skips (never fails)
-/// when `JAMMI_TEST_PG_URL` is unset.
+/// An expired (past) lease reads back `lease == LeaseFact::Dead` — the
+/// boundary [`jammi_db::catalog::lease::decode_lease_expires_at`]'s
+/// `deadline >= now` test names. Parameterized (sqlite/postgres): the
+/// postgres arm skips (never fails) when `JAMMI_TEST_PG_URL` is unset.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -267,8 +277,82 @@ async fn get_job_for_rank_treats_an_expired_lease_as_not_live(kind: BackendKind)
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let row = catalog.get_job_for_rank("job-3").await.unwrap().unwrap();
-    assert!(!row.lease_live, "an expired lease must never read as live");
-    assert_eq!(row.remaining, Duration::ZERO);
+    assert_eq!(
+        row.lease,
+        LeaseFact::Dead,
+        "an expired lease must never read as live"
+    );
+}
+
+/// #574's own parity oracle: a `lease_expires_at` that is neither `NULL` nor
+/// a parseable timestamp for THIS backend (planted by raw SQL — nothing in
+/// this crate writes such a value) is `Ok(Some(row))` with
+/// `LeaseFact::Undecodable` on BOTH backends, identically — never a fault on
+/// either. Before the fix (`get_job_for_rank` computing `remaining_secs` via
+/// a SQL-side `col::timestamptz` cast / `EXTRACT(...)`), this same planted
+/// value read as `Ok(Some(row))` with `lease_live = false` on SQLite
+/// (`julianday(...)` silently returns `NULL` for unparseable text) but `Err`
+/// on Postgres (the cast raises a genuine SQL error) — the exact
+/// backend-dependent classification issue #574 reports. Parameterized
+/// (sqlite/postgres): the postgres arm skips (never fails) when
+/// `JAMMI_TEST_PG_URL` is unset; every OTHER column stays populated, proving
+/// the malformed lease is isolated to `RankAdmissionRow::lease` alone.
+#[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends(kind: BackendKind) {
+    // The require-gate itself: a direct, crate-qualified call to the
+    // registered `shared:` helper (`ci/kernel-oracle-helpers.txt`), textually
+    // in THIS test fn's own body — `base_catalog_kind`'s internal `?` on
+    // `make_test_session` is one function away and does not dominate this
+    // skip for the KO-7 scanner, which is per-`#[test]`-fn textual, not
+    // whole-file (`migrations.rs`'s own parameterized tests use this exact
+    // shape).
+    if matches!(kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none() {
+        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+        return;
+    }
+    let (_dir, catalog) = base_catalog_kind(kind).await.expect(
+        "base_catalog_kind only returns None for an unconfigured postgres arm, already skipped above",
+    );
+    let job_id = format!(
+        "job-lease-undecodable-{}",
+        jammi_test_utils::unique_suffix()
+    );
+    catalog.submit_job(job_params(&job_id)).await.unwrap();
+    catalog
+        .claim_next("coord-1", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let sql =
+        format!("UPDATE jobs SET lease_expires_at = 'not-a-timestamp' WHERE job_id = '{job_id}'");
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            let sql = sql.clone();
+            Box::pin(async move { tx.execute(&sql, &[]).await })
+        })
+        .await
+        .unwrap();
+
+    let row = catalog
+        .get_job_for_rank(&job_id)
+        .await
+        .expect("a malformed lease_expires_at must be a row fact, never a read fault, on EITHER backend")
+        .expect("row present");
+    assert_eq!(
+        row.lease,
+        LeaseFact::Undecodable,
+        "a lease that does not parse as a timestamp on this backend must be Undecodable"
+    );
+    assert_eq!(row.status, "running", "every other column stays populated");
+    assert_eq!(row.claimed_by.as_deref(), Some("coord-1"));
+    assert_eq!(row.attempts, 1);
 }
 
 /// The row's OWN `world_size`, decoded from `spec`

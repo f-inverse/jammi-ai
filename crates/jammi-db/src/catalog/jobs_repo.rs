@@ -366,13 +366,15 @@ pub struct RankAdmissionRow {
     /// [`Self::tenant_id`], then verifies against the sidecar manifest's
     /// `artifact` digest (must equal [`Self::training_set_ref`]).
     pub training_set_location: Option<String>,
-    /// `NOT(lease_expired_clause)`, computed against the SAME clock
-    /// [`super::lease::lease_remaining_seconds_expr`] used for
-    /// [`Self::remaining`] — `false` for a `NULL` lease column (no
-    /// live-by-default), matching `lease.rs`'s own stated semantics.
-    pub lease_live: bool,
-    /// The remaining lease window, floored at zero once expired (or absent).
-    pub remaining: Duration,
+    /// [`super::lease::LeaseFact`], decoded in RUST from `lease_expires_at`'s
+    /// raw stored text (never a SQL-side `col::timestamptz` cast) via
+    /// [`super::lease::decode_lease_expires_at`] — infallible by
+    /// construction on EITHER backend, exactly like [`Self::world_size`]:
+    /// text that does not parse is [`super::lease::LeaseFact::Undecodable`],
+    /// a ROW FACT the caller refuses, never a fault of the read that found
+    /// it (the resolution of
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
+    pub lease: super::lease::LeaseFact,
     /// The ROW's own rank count, decoded from the SAME `spec` JSON the
     /// claiming worker reconstructs its run from — never the caller's own
     /// `Assign.world`. A gang admission gate keyed on the caller's claim
@@ -394,11 +396,11 @@ pub struct RankAdmissionRow {
     /// about the content this claimant wrote, never a fault of the read that
     /// found it: [`Catalog::get_job_for_rank`] still returns `Ok(Some(row))`
     /// with every other column populated, and the caller (the gang admission
-    /// handler) decides how to refuse it. `Err` from `get_job_for_rank`
-    /// means the read itself faulted, never that this row's `spec` failed to
-    /// decode; a malformed `lease_expires_at` is still re-parsed in SQL on
-    /// Postgres and surfaces there as `Err` (tracked at
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>).
+    /// handler) decides how to refuse it. `Err` from `get_job_for_rank` means
+    /// the read itself faulted — never that this row's `spec` failed to
+    /// decode a `world_size`, and never (since
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>) that this row's
+    /// `lease_expires_at` failed to decode a lease: see [`Self::lease`].
     pub world_size: WorldSizeFact,
 }
 
@@ -2290,26 +2292,29 @@ impl Catalog {
     /// (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P3)) — together with
     /// the training-set identity pair the `world_size > 1` conjunct
     /// resolves under that tenant.
-    /// ONE statement: the row's `status`/`claimed_by`/`attempts`
-    /// alongside [`super::lease::lease_remaining_seconds_expr`]'s computed
-    /// remaining window, from which [`RankAdmissionRow::lease_live`] is
-    /// derived — never a second round trip, and never the caller's OWN
-    /// clock standing in for the remaining-window computation (see that
-    /// function's docs). `Ok(None)` when no such job exists. `Err` means the
-    /// read itself faulted, or — on Postgres only — that the row's
-    /// `lease_expires_at` text did not parse as a timestamp (tracked at
-    /// <https://github.com/f-inverse/jammi-ai/issues/574>); never that the
-    /// row's `spec` failed to decode a `world_size`: that outcome is a ROW
-    /// FACT, represented in
-    /// [`RankAdmissionRow::world_size`] as [`WorldSizeFact::Undecodable`],
-    /// and still returned `Ok(Some(row))` with every other column populated
-    /// (see that type's docs).
+    /// ONE statement: the row's `status`/`claimed_by`/`attempts`/`spec`/
+    /// `tenant_id`/training-set pair, alongside `lease_expires_at`'s RAW
+    /// stored text — no SQL-side `col::timestamptz` cast or `EXTRACT(...)`
+    /// here, unlike the CLAIM/RECLAIM path's
+    /// [`super::lease::lease_expired_clause`] /
+    /// [`super::lease::lease_remaining_seconds_expr`]. The text is decoded in
+    /// RUST, after the read, via [`super::lease::decode_lease_expires_at`]
+    /// into [`RankAdmissionRow::lease`] — never a second round trip. `Ok(None)`
+    /// when no such job exists. `Err` means the READ ITSELF faulted — never
+    /// that a row's content failed to decode: neither `spec` failing to
+    /// decode a `world_size` ([`RankAdmissionRow::world_size`] as
+    /// [`WorldSizeFact::Undecodable`]) nor (since
+    /// <https://github.com/f-inverse/jammi-ai/issues/574>) `lease_expires_at`
+    /// failing to parse ([`RankAdmissionRow::lease`] as
+    /// [`super::lease::LeaseFact::Undecodable`]) is ever conflated with the
+    /// read faulting — both are returned `Ok(Some(row))` with every other
+    /// column populated (see each type's docs).
     ///
     /// This method decides NOTHING beyond that lookup — it is a plain
     /// row-by-primary-key read, never itself the I-GANG decider. Every
     /// determinant the returned [`RankAdmissionRow`] feeds (`status`,
-    /// `claimed_by`, `attempts`, `lease_live`, and — critically —
-    /// [`RankAdmissionRow::world_size`], the ROW's own rank count, never a
+    /// `claimed_by`, `attempts`, [`RankAdmissionRow::lease`], and — critically
+    /// — [`RankAdmissionRow::world_size`], the ROW's own rank count, never a
     /// caller-supplied `Assign.world`) is decided by the caller
     /// (`GangService::run_rank`, the gang admission handler). A gate keyed
     /// on the caller's own claim about `world` rather than this field's
@@ -2332,33 +2337,20 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        let mut params: Vec<SqlValue<'static>> = Vec::new();
-                        let remaining_expr = super::lease::lease_remaining_seconds_expr(
-                            "lease_expires_at",
-                            kind,
-                            &mut params,
-                        );
-                        params.push(SqlValue::TextOwned(job_id));
-                        let job_bind = params.len();
-                        let sql = format!(
-                            "SELECT status, claimed_by, attempts, spec, tenant_id, \
-                                 training_set_ref, training_set_location, \
-                                 {remaining_expr} AS remaining_secs \
-                             FROM jobs WHERE job_id = ${job_bind}"
-                        );
-                        tx.query_opt(&sql, &params, |row| {
+                        let params: Vec<SqlValue<'static>> = vec![SqlValue::TextOwned(job_id)];
+                        let sql = "SELECT status, claimed_by, attempts, spec, tenant_id, \
+                                 training_set_ref, training_set_location, lease_expires_at \
+                             FROM jobs WHERE job_id = $1";
+                        tx.query_opt(sql, &params, |row| {
                             let spec: String = row.get("spec")?;
                             let world_size = world_size_from_spec_json(&spec);
-                            let remaining_secs: Option<f64> = row.try_get("remaining_secs")?;
-                            // NULL (no lease) is treated exactly like an
-                            // expired one -- zero remaining, never live --
-                            // matching `lease_expired_clause`'s own `col IS
-                            // NULL` arm (`lease.rs`'s module docs: NULL means
-                            // remaining 0, never live-by-default).
-                            let remaining = remaining_secs
-                                .map(|s| Duration::from_secs_f64(s.max(0.0)))
-                                .unwrap_or(Duration::ZERO);
-                            let lease_live = remaining_secs.is_some_and(|s| s >= 0.0);
+                            let lease_expires_at: Option<String> =
+                                row.try_get("lease_expires_at")?;
+                            let lease = super::lease::decode_lease_expires_at(
+                                kind,
+                                lease_expires_at.as_deref(),
+                                chrono::Utc::now(),
+                            );
                             Ok(RankAdmissionRow {
                                 status: row.get("status")?,
                                 claimed_by: row.try_get("claimed_by")?,
@@ -2366,8 +2358,7 @@ impl Catalog {
                                 tenant_id: row.try_get("tenant_id")?,
                                 training_set_ref: row.try_get("training_set_ref")?,
                                 training_set_location: row.try_get("training_set_location")?,
-                                lease_live,
-                                remaining,
+                                lease,
                                 world_size,
                             })
                         })
@@ -2516,14 +2507,25 @@ impl Catalog {
     /// present, and last seen within [`super::lease::instance_liveness_margin`]
     /// (`2 * lease`) on the DB clock? Primary-key lookup; `instances` carries
     /// no tenant column, so there is no tenant predicate to drop or keep.
-    /// `false` for an absent OR a stale row alike — the caller (a gang rank
-    /// checking its coordinator) maps either to the same member-scoped
-    /// `FailedPrecondition`, disclosing nothing about which.
+    /// `false` for an absent, a malformed, OR a stale row alike — the caller
+    /// (a gang rank checking its coordinator) maps every one to the same
+    /// member-scoped `FailedPrecondition`, disclosing nothing about which.
+    /// `last_seen_at`'s raw stored text is decoded in RUST
+    /// ([`super::lease::last_seen_at_is_fresh`]) — never a SQL-side
+    /// `col::timestamptz` cast — so a malformed value never faults the read
+    /// (the resolution of
+    /// <https://github.com/f-inverse/jammi-ai/issues/574> for this column);
+    /// this column is ALWAYS an application-clock stamp on either backend
+    /// (`Catalog::upsert_instance` / `Catalog::reregister_instance` /
+    /// `Catalog::touch_instance` never write the database clock here), so
+    /// the decode needs no [`BackendKind`](super::backend::BackendKind) at
+    /// all.
     pub async fn fresh_instance(&self, instance_id: &str, lease: Duration) -> Result<bool> {
         let instance_id = instance_id.to_string();
-        let kind = self.backend().backend_kind();
         let margin = instance_liveness_margin(lease);
-        Ok(self
+        // `last_seen_at TEXT NOT NULL` (`schema.rs`) — a present row always
+        // carries SOME text; an absent row is the only `None` here.
+        let last_seen_at: Option<String> = self
             .backend()
             .transaction(
                 TxOptions {
@@ -2532,21 +2534,18 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        let mut params: Vec<SqlValue<'static>> = Vec::new();
-                        let stale = stale_before_clause("last_seen_at", kind, margin, &mut params);
-                        params.push(SqlValue::TextOwned(instance_id));
-                        let id_bind = params.len();
-                        let sql = format!(
-                            "SELECT 1 AS present FROM instances \
-                             WHERE instance_id = ${id_bind} AND NOT ({stale})"
-                        );
-                        tx.query_opt(&sql, &params, |row| row.get::<i32>("present"))
-                            .await
+                        let sql = "SELECT last_seen_at FROM instances WHERE instance_id = $1";
+                        tx.query_opt(sql, &[SqlValue::TextOwned(instance_id)], |row| {
+                            row.get::<String>("last_seen_at")
+                        })
+                        .await
                     })
                 },
             )
-            .await?
-            .is_some())
+            .await?;
+        Ok(last_seen_at.is_some_and(|last_seen_at| {
+            super::lease::last_seen_at_is_fresh(&last_seen_at, margin, chrono::Utc::now())
+        }))
     }
 
     /// The ONE by-id peer-address resolution verb (DESIGN.md § 4): `Some`

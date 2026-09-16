@@ -131,10 +131,11 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   nothing beyond what that job's row names.
 - **Non-disclosure on refusal; reasons only after admission.** Every admission
   determinant — job not found, not running, wrong claimant, wrong attempt,
-  lease not live, world size undecodable or not the caller's, the training-set
-  pair missing, the tenant undecodable, the training set unresolved under the
-  job's tenant / not ready / its sidecar absent / its digest mismatching /
-  this host's store faulting, coordinator not fresh — collapses to the SAME
+  lease not live or undecodable, world size undecodable or not the caller's,
+  the training-set pair missing, the tenant undecodable, the training set
+  unresolved under the job's tenant / not ready / its sidecar absent / its
+  digest mismatching / this host's store faulting, coordinator not fresh —
+  collapses to the SAME
   status (`FAILED_PRECONDITION`) with a fixed message, as the call's own
   result: the listener discloses neither a job's existence, its claimant, its
   attempt, its tenant, nor another tenant's table; tests distinguish
@@ -149,10 +150,20 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   every held rank at once, and with no rank body to run yet the session parks
   and ends `NoBody` after one lease window. The member writes nothing to the
   job row on behalf of a rank.
-- **Multi-host gang admission is a Postgres-only deployment shape.** The
-  admission row predicate's remaining-lease computation is sound only against
-  a shared, single-writer clock (Postgres's `now()`); a SQLite deployment
-  (single process, no second host to admit) never exercises this seam.
+- **Multi-host gang admission is a Postgres-only deployment shape** — a
+  SQLite deployment is a single embedded process; there is no second host to
+  admit at all, so this seam is never exercised there. The admission read's
+  lease/freshness facts (`lease_expires_at`, `instances.last_seen_at`) are
+  decoded CLIENT-SIDE from the row's raw stored text
+  (`jammi_db::catalog::lease::{decode_lease_expires_at, last_seen_at_is_fresh}`),
+  never a SQL-side cast, so a malformed value is a row fact the handler
+  refuses on EITHER backend, never a read fault on one and a live-row fact on
+  the other (<https://github.com/f-inverse/jammi-ai/issues/574>); the CLAIM
+  and RECLAIM predicates (`Catalog::claim_next`, `Catalog::reclaim_expired_jobs`)
+  are the ones that still require a shared, single-writer clock (Postgres's
+  `now()`) — those WRITE, and a wrongly-reaped live claimant is destructive in
+  a way a stale admission read (self-correcting at the next heartbeat) is
+  not.
 - **The public listener never reaches it.** The gang routes are mounted beside
   `PeerService` outside `assemble_grpc_chain`, never wrapped by the
   tenant-binding layer, never advertised by `GetServerInfo`; the public

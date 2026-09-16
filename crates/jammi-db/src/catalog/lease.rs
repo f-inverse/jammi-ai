@@ -278,6 +278,170 @@ pub fn lease_remaining_seconds_expr(
     }
 }
 
+/// The outcome of decoding a lease/freshness TEXT column in RUST, never a
+/// row FAULT — the [`super::jobs_repo::WorldSizeFact`] pattern applied to
+/// `jobs.lease_expires_at` (via [`decode_lease_expires_at`]). A CLAIM/RECLAIM
+/// write predicate ([`lease_expired_clause`], [`lease_remaining_seconds_expr`])
+/// still re-parses the column IN SQL, against the backend's own clock — that
+/// split is deliberate (see [`decode_lease_expires_at`]'s docs) and is the
+/// resolution of <https://github.com/f-inverse/jammi-ai/issues/574>: on
+/// Postgres, `col::timestamptz` faults the WHOLE statement the instant one
+/// row's text does not parse, turning a garbage row into a read FAULT
+/// (`Err`) there while SQLite's `julianday(...)` silently returns `NULL` for
+/// the same text, turning it into `Ok(Some(row))` with `lease_live = false`
+/// — the identical malformed row refusing `Unavailable` on one backend and
+/// `FailedPrecondition` on the other. Decoding client-side, from the raw
+/// TEXT, is infallible by construction on both backends: a value that does
+/// not parse is `Undecodable`, a ROW FACT the caller (the gang admission
+/// handler) refuses the same fixed way it refuses any other undecodable
+/// content — never a fault of the read that found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseFact {
+    /// The column parsed and names an instant strictly after `now`: this
+    /// many seconds remain.
+    Live { remaining: Duration },
+    /// The column was `NULL` (no lease — matching [`lease_expired_clause`]'s
+    /// own `col IS NULL` arm: `NULL` means "remaining zero", never
+    /// live-by-default) or parsed to an instant at or before `now`.
+    Dead,
+    /// The column held non-`NULL` text that did not parse as a timestamp
+    /// under THIS backend's own write format (see [`decode_lease_expires_at`]).
+    /// A ROW FACT about this claimant's own row content, never a fault of
+    /// the read that found it.
+    Undecodable,
+}
+
+impl LeaseFact {
+    /// `true` only for [`Self::Live`] — the same predicate
+    /// [`RankAdmissionRow::lease_live`](super::jobs_repo::RankAdmissionRow)
+    /// used to carry directly; `Dead` and `Undecodable` both refuse
+    /// admission, distinguished only for the `test-hooks` non-disclosure
+    /// seam (`GangRefusalReason::{LeaseDead, LeaseUndecodable}`).
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Live { .. })
+    }
+
+    /// The remaining lease window, floored at zero for `Dead` and
+    /// `Undecodable` alike.
+    pub fn remaining(self) -> Duration {
+        match self {
+            Self::Live { remaining } => remaining,
+            Self::Dead | Self::Undecodable => Duration::ZERO,
+        }
+    }
+}
+
+/// Parse an APPLICATION-CLOCK ISO-8601-with-trailing-`Z` stamp — the shape
+/// every `now_sortable()` write uses (`instances.last_seen_at`,
+/// `instances.started_at`: see `Catalog::upsert_instance` — that column is
+/// NEVER database-clock stamped, on EITHER backend, so decoding it needs no
+/// [`BackendKind`] at all) and the shape SQLite's own [`lease_now`] /
+/// [`lease_deadline`] write for `jobs.lease_expires_at`. Accepts any
+/// fractional-second width (`now_sortable` writes 9 digits, [`lease_now`] /
+/// [`lease_deadline`] write 6 — [`LEASE_TS_FORMAT`] is a fixed-width special
+/// case of this same shape); `None` for text that is not this shape at all.
+fn parse_app_clock_stamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ")
+        .ok()
+        .map(|naive| chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
+}
+
+/// Parse `jobs.lease_expires_at`'s stored text into a UTC instant, per the
+/// shape THIS BACKEND's own write path ([`lease_deadline_expr`]) actually
+/// stamps it in: [`parse_app_clock_stamp`] (an application-clock stamp) on
+/// SQLite, Postgres's own default `timestamptz`-cast-to-`text` rendering (a
+/// DATABASE-clock stamp — `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]`, the
+/// fractional part omitted entirely when it is exactly zero, the offset
+/// without a leading zero and without a colon at whole-hour magnitudes, e.g.
+/// `2026-09-15 22:46:57.675567-04` or `2026-01-01 00:00:00-05`, verified
+/// against a live Postgres 16) on Postgres. `None` for text that does not
+/// parse under that backend's own shape — [`LeaseFact::Undecodable`].
+fn parse_lease_expires_at(kind: BackendKind, text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    match kind {
+        BackendKind::Sqlite => parse_app_clock_stamp(text),
+        BackendKind::Postgres => chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc)),
+    }
+}
+
+/// Decode `jobs.lease_expires_at`'s raw stored text (never a SQL-side
+/// `col::timestamptz` cast — see [`LeaseFact`]'s docs) into a [`LeaseFact`]
+/// against `now`, on either backend, infallibly.
+///
+/// **The split, and why it is the same clock discipline as
+/// [`lease_expired_clause`] / [`lease_remaining_seconds_expr`].** Those two
+/// functions stay exactly as they are and remain the ONLY lease predicate the
+/// CLAIM (`Catalog::claim_next`) and RECLAIM (`Catalog::reclaim_expired_jobs`)
+/// paths use: those paths WRITE — a claim believes a lease dead and takes the
+/// row, a reclaim believes a claimant dead and fails it — so they must
+/// compare against the ONE clock every replica agrees on (Postgres's own
+/// `now()`, per this module's top-level docs) or risk reaping a claimant that
+/// is very much alive. This function backs a READ-ONLY admission decision
+/// (`Catalog::get_job_for_rank`, consumed by the gang `RunRank` handler) that
+/// never writes or reaps anything: the worst an app-clock-relative answer
+/// here can do is admit (or refuse) a rank a few hundred milliseconds earlier
+/// or later than a hypothetical DB-clock answer would have — bounded by
+/// ordinary inter-host clock skew, self-correcting at the very next
+/// re-verification tick (`heartbeat`-cadence), and never destructive the way
+/// a wrongful reap is. Both disciplines share the same rule: a WRITE that can
+/// reap a live claimant always compares against the shared DB clock; a READ
+/// that only refuses never does.
+pub fn decode_lease_expires_at(
+    kind: BackendKind,
+    text: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> LeaseFact {
+    let Some(text) = text else {
+        return LeaseFact::Dead;
+    };
+    match parse_lease_expires_at(kind, text) {
+        None => LeaseFact::Undecodable,
+        // `lease_expired_clause`'s predicate is `col < now()` (expired);
+        // live is its negation, `col >= now()` — matching the OLD SQL-side
+        // `remaining_secs >= 0.0` boundary exactly (`remaining_secs` was
+        // `deadline - now` in seconds).
+        Some(deadline) if deadline >= now => LeaseFact::Live {
+            remaining: (deadline - now).to_std().unwrap_or(Duration::ZERO),
+        },
+        Some(_) => LeaseFact::Dead,
+    }
+}
+
+/// Decode `instances.last_seen_at`'s raw stored text (never a SQL-side
+/// `col::timestamptz` cast) into "is this row fresh" — present, parseable,
+/// and within `margin` of `now` — against `now`, infallibly, on EITHER
+/// backend: this column is ALWAYS an application-clock
+/// [`parse_app_clock_stamp`] stamp (`Catalog::upsert_instance` /
+/// `Catalog::reregister_instance` / `Catalog::touch_instance` all write
+/// `now_sortable()`, never the database clock, on either backend), so unlike
+/// [`decode_lease_expires_at`] this needs no [`BackendKind`] at all. Text
+/// that does not parse is treated exactly like text that parses but is stale
+/// — NOT fresh, a ROW FACT (`Catalog::fresh_instance`'s own docs: "`false`
+/// for an absent OR a stale row alike... disclosing nothing about which" —
+/// undecodable joins that same class) — never a read fault (the resolution
+/// of <https://github.com/f-inverse/jammi-ai/issues/574> for this column:
+/// [`stale_before_clause`]'s Postgres arm casts `last_seen_at::timestamptz`
+/// in SQL and would otherwise fault the whole statement on the same
+/// malformed text SQLite's `julianday(...)`-based comparison merely
+/// evaluates to a stale answer for).
+pub fn last_seen_at_is_fresh(
+    last_seen_at: &str,
+    margin: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    match parse_app_clock_stamp(last_seen_at) {
+        None => false,
+        Some(seen) => {
+            let margin = chrono::Duration::from_std(margin).unwrap_or(chrono::Duration::MAX);
+            // `stale_before_clause`'s predicate is `col < cutoff` (stale);
+            // fresh is its negation, `col >= cutoff` — never the strict
+            // `>`, to agree exactly at the boundary.
+            seen >= now - margin
+        }
+    }
+}
+
 /// The instance-liveness margin: `2 * lease`, against `instances.last_seen_at`
 /// (the DB clock via [`stale_before_clause`]) — the same tolerance
 /// `Catalog::reclaim_expired_jobs`'s inline-execution arm already computes
@@ -305,6 +469,158 @@ pub fn instance_prune_window(lease: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn utc(
+        y: i32,
+        mo: u32,
+        d: u32,
+        h: u32,
+        mi: u32,
+        s: u32,
+        micro: u32,
+    ) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .unwrap()
+            + chrono::Duration::microseconds(micro as i64)
+    }
+
+    #[test]
+    fn parse_app_clock_stamp_accepts_now_sortable_and_lease_ts_widths() {
+        // `now_sortable()`'s 9-digit width.
+        assert_eq!(
+            parse_app_clock_stamp("2026-01-01T00:00:00.123456789Z"),
+            Some(utc(2026, 1, 1, 0, 0, 0, 123456) + chrono::Duration::nanoseconds(789))
+        );
+        // `LEASE_TS_FORMAT`'s 6-digit width.
+        assert_eq!(
+            parse_app_clock_stamp("2026-01-01T00:00:00.000000Z"),
+            Some(utc(2026, 1, 1, 0, 0, 0, 0))
+        );
+        assert_eq!(parse_app_clock_stamp("not-a-timestamp"), None);
+        assert_eq!(parse_app_clock_stamp(""), None);
+    }
+
+    #[test]
+    fn parse_lease_expires_at_postgres_accepts_its_own_default_text_rendering() {
+        // Captured verbatim from a live Postgres 16:
+        // `select (now() + make_interval(secs => 30))::text;`
+        assert_eq!(
+            parse_lease_expires_at(BackendKind::Postgres, "2026-09-15 22:46:57.675567-04"),
+            Some(utc(2026, 9, 16, 2, 46, 57, 675567)),
+        );
+        // The fractional part is OMITTED ENTIRELY when it is exactly zero
+        // (captured: `select ('2026-01-01 00:00:00'::timestamptz)::text`).
+        assert_eq!(
+            parse_lease_expires_at(BackendKind::Postgres, "2026-01-01 00:00:00-05"),
+            Some(utc(2026, 1, 1, 5, 0, 0, 0)),
+        );
+        // A positive, two-part offset.
+        assert_eq!(
+            parse_lease_expires_at(BackendKind::Postgres, "2026-01-01 00:00:00+05:30"),
+            Some(utc(2025, 12, 31, 18, 30, 0, 0)),
+        );
+        assert_eq!(
+            parse_lease_expires_at(BackendKind::Postgres, "not-a-timestamp"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_lease_expires_at_sqlite_uses_the_app_clock_shape_only() {
+        assert_eq!(
+            parse_lease_expires_at(BackendKind::Sqlite, "2026-01-01T00:00:00.000000Z"),
+            Some(utc(2026, 1, 1, 0, 0, 0, 0)),
+        );
+        // Postgres's OWN rendering must NOT parse under the SQLite arm (a
+        // mismatch here would silently cross-decode a value this backend
+        // never wrote in this shape).
+        assert_eq!(
+            parse_lease_expires_at(BackendKind::Sqlite, "2026-09-15 22:46:57.675567-04"),
+            None,
+        );
+        assert_eq!(parse_lease_expires_at(BackendKind::Sqlite, "garbage"), None);
+    }
+
+    #[test]
+    fn decode_lease_expires_at_is_infallible_on_every_input() {
+        let now = utc(2026, 1, 1, 0, 0, 30, 0);
+        // NULL column: Dead, matching `lease_expired_clause`'s own `IS NULL`
+        // arm — never live-by-default.
+        assert_eq!(
+            decode_lease_expires_at(BackendKind::Postgres, None, now),
+            LeaseFact::Dead
+        );
+        // Malformed text on EITHER backend: `Undecodable`, `Ok(Some(row))`
+        // territory — never propagated as a read fault (issue #574).
+        assert_eq!(
+            decode_lease_expires_at(BackendKind::Postgres, Some("not-a-timestamp"), now),
+            LeaseFact::Undecodable
+        );
+        assert_eq!(
+            decode_lease_expires_at(BackendKind::Sqlite, Some("not-a-timestamp"), now),
+            LeaseFact::Undecodable
+        );
+        // A deadline strictly in the future: Live, with the exact remaining
+        // duration.
+        let future = "2026-01-01T00:01:00.000000Z";
+        assert_eq!(
+            decode_lease_expires_at(BackendKind::Sqlite, Some(future), now),
+            LeaseFact::Live {
+                remaining: Duration::from_secs(30)
+            }
+        );
+        // Exactly `now`: still Live (the boundary `lease_expired_clause`
+        // itself draws: expired is strict `<`).
+        let exactly_now = "2026-01-01T00:00:30.000000Z";
+        assert_eq!(
+            decode_lease_expires_at(BackendKind::Sqlite, Some(exactly_now), now),
+            LeaseFact::Live {
+                remaining: Duration::ZERO
+            }
+        );
+        // A deadline in the past: Dead.
+        let past = "2026-01-01T00:00:00.000000Z";
+        assert_eq!(
+            decode_lease_expires_at(BackendKind::Sqlite, Some(past), now),
+            LeaseFact::Dead
+        );
+    }
+
+    #[test]
+    fn last_seen_at_is_fresh_matches_stale_before_clauses_boundary() {
+        let now = utc(2026, 1, 1, 1, 0, 0, 0);
+        let margin = Duration::from_secs(60);
+        // Exactly at the margin: fresh (`stale_before_clause` is a strict
+        // `<`; fresh is its negation, `>=`).
+        assert!(last_seen_at_is_fresh(
+            "2026-01-01T00:59:00.000000000Z",
+            margin,
+            now
+        ));
+        // One microsecond stale.
+        assert!(!last_seen_at_is_fresh(
+            "2026-01-01T00:58:59.999999000Z",
+            margin,
+            now
+        ));
+        // Malformed text: not fresh, never a fault (issue #574).
+        assert!(!last_seen_at_is_fresh("not-a-timestamp", margin, now));
+    }
+
+    #[test]
+    fn lease_fact_is_live_and_remaining() {
+        assert!(LeaseFact::Live {
+            remaining: Duration::from_secs(5)
+        }
+        .is_live());
+        assert!(!LeaseFact::Dead.is_live());
+        assert!(!LeaseFact::Undecodable.is_live());
+        assert_eq!(LeaseFact::Dead.remaining(), Duration::ZERO);
+        assert_eq!(LeaseFact::Undecodable.remaining(), Duration::ZERO);
+    }
 
     #[test]
     fn instance_liveness_margin_is_twice_the_lease() {

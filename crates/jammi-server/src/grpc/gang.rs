@@ -101,6 +101,7 @@ use jammi_ai::fine_tune::collective::MemberLink;
 use jammi_ai::fine_tune::worker::{HolderBusy, RankHold, WorkerPhase};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::{RankAdmissionRow, WorldSizeFact};
+use jammi_db::catalog::lease::LeaseFact;
 use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
 use jammi_db::error::JammiError;
 use jammi_db::storage::StorageUrl;
@@ -173,8 +174,15 @@ pub enum GangRefusalReason {
     WrongClaimant,
     /// `attempts` did not match `assign.attempt`.
     WrongAttempt,
-    /// The lease was not live (`NOT(lease_expired_clause)` was false).
+    /// The lease was not live: [`jammi_db::catalog::lease::LeaseFact::Dead`]
+    /// (a `NULL` column, or a deadline at or before now).
     LeaseDead,
+    /// The row's `lease_expires_at` column held text that did not parse as a
+    /// timestamp for this backend
+    /// ([`jammi_db::catalog::lease::LeaseFact::Undecodable`]) — a row fact
+    /// about this claimant's own row, never a fault of the read that found
+    /// it (<https://github.com/f-inverse/jammi-ai/issues/574>).
+    LeaseUndecodable,
     /// The row's `spec` column did not decode a `world_size`
     /// (`WorldSizeFact::Undecodable`) — a row fact about the content this
     /// claimant wrote, never a fault of the read that found it.
@@ -564,7 +572,7 @@ async fn reverify(
     let row_holds = row.status == JobStatus::Running.to_string()
         && row.claimed_by.as_deref() == Some(assign.coordinator_instance_id.as_str())
         && i64::from(row.attempts) == assign.attempt
-        && row.lease_live;
+        && matches!(row.lease, LeaseFact::Live { .. });
     if !row_holds {
         return Err(ReverifyEnd::Refuted);
     }
@@ -881,9 +889,22 @@ impl GangService for GangServer {
             self.record_refusal(GangRefusalReason::WrongAttempt);
             return Err(i_gang_refused());
         }
-        if !row.lease_live {
-            self.record_refusal(GangRefusalReason::LeaseDead);
-            return Err(i_gang_refused());
+        // The row's own `lease_expires_at` is a ROW FACT
+        // (`jammi_db::catalog::lease::LeaseFact`), decoded in Rust from the
+        // raw stored text on EITHER backend — never a fault of the read
+        // that found it (issue #574): a value that does not parse for this
+        // backend refuses the SAME fixed way `LeaseDead` does, under its own
+        // `test-hooks`-distinguishable variant, never conflated with it.
+        match row.lease {
+            LeaseFact::Live { .. } => {}
+            LeaseFact::Dead => {
+                self.record_refusal(GangRefusalReason::LeaseDead);
+                return Err(i_gang_refused());
+            }
+            LeaseFact::Undecodable => {
+                self.record_refusal(GangRefusalReason::LeaseUndecodable);
+                return Err(i_gang_refused());
+            }
         }
 
         // The row's own `world_size` is a ROW FACT

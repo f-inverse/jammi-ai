@@ -3368,13 +3368,20 @@ is complete:
    predicate, never admin scope) returns the row by primary key alone — it
    decides nothing itself, returns `Ok(None)` only when no job with that id
    exists, and carries the row's OWN `tenant_id` (raw text), its
-   `training_set_ref`/`training_set_location` pair, and its `world_size`
-   (`WorldSizeFact`, decoded from the job's `spec` JSON). Every determinant
-   is decided by the CALLER, `GangServer::run_rank`: `status = 'running'`;
-   `claimed_by = assign.coordinator_instance_id`; `attempts ==
-   assign.attempt`; the lease is live (the negation of
-   `lease_expired_clause`, `crates/jammi-db/src/catalog/lease.rs` — a NULL
-   lease column reads not-live, never live-by-default);
+   `training_set_ref`/`training_set_location` pair, its `world_size`
+   (`WorldSizeFact`, decoded from the job's `spec` JSON), and its lease
+   (`LeaseFact`, decoded from `lease_expires_at`'s raw stored text). Every
+   determinant is decided by the CALLER, `GangServer::run_rank`: `status =
+   'running'`; `claimed_by = assign.coordinator_instance_id`; `attempts ==
+   assign.attempt`; the lease is `LeaseFact::Live` (a `NULL` lease column, or
+   one at/before now, is `Dead`, never live-by-default;
+   `crates/jammi-db/src/catalog/lease.rs`'s `decode_lease_expires_at`
+   PARSES THE RAW TEXT IN RUST, never a SQL-side `col::timestamptz` cast, so
+   a malformed value is `LeaseFact::Undecodable` — refused under its own
+   `GangRefusalReason::LeaseUndecodable`, the SAME fixed status as every
+   other determinant — rather than surfacing as a genuine read fault on one
+   backend and a live-lease row fact on the other,
+   <https://github.com/f-inverse/jammi-ai/issues/574>);
    `WorldSizeFact::Undecodable` is itself a refusal — a ROW FACT, never a
    fault of the read, so it never maps through `admission_catalog_fault`;
    `assign.world != row.world_size` is itself a refusal — the lattice is
@@ -3406,8 +3413,15 @@ is complete:
    non-`Verified` arm is rung 5.
 5. **Coordinator freshness.** `Catalog::fresh_instance(coordinator_instance_id,
    lease)` requires the named coordinator's `instances` row present and last
-   seen within `instance_liveness_margin(lease)` — `2 × lease` on the DB
-   clock; absent or stale refuses.
+   seen within `instance_liveness_margin(lease)` — `2 × lease`. Decoded in
+   RUST from `last_seen_at`'s raw stored text
+   (`lease::last_seen_at_is_fresh`), never a SQL-side cast: this column is
+   ALWAYS an application-clock stamp on either backend
+   (`Catalog::upsert_instance` never writes the database clock here), so a
+   value that does not parse reads as not-fresh — a row fact, joining the
+   same "absent OR stale" class `fresh_instance` already collapses to one
+   answer, never a fault (issue #574); absent or stale otherwise still
+   refuses.
 6. Every refusal in rungs 2–5 is the SAME status and message —
    `FailedPrecondition("gang admission refused")` — regardless of which
    determinant failed: the listener discloses neither a job's existence, its
@@ -3499,7 +3513,7 @@ and after every end.
 
 **Non-disclosure and the `test-hooks` seam.** A table-driven oracle asserts
 the rung-6 `Status` (code and message bytes) is byte-identical across every
-determinant above — sixteen, `GangRefusalReason` — so no leaking message
+determinant above — seventeen, `GangRefusalReason` — so no leaking message
 ever distinguishes them on the wire. Behind `#[cfg(feature = "test-hooks")]`
 only, `GangServer::last_refusal_reason()` / `refusal_reason_handle()`
 (`gang.rs`) expose which variant a call actually refused for — a test-only

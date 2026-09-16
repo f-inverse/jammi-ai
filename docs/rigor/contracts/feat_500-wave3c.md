@@ -271,9 +271,257 @@ f4d84145 feat(ai): #500 U4b — canonical_reduce: zero-filled, canonical-order a
 ```
 
 
-## 2a. U4b tail — streamed arm at `world > 1`; LoRA init/dropout seed split; per-rank dropout seed wired
+## 2a. U4b tail (landed as one commit; original `1261041b`) — streamed arm at `world > 1`; LoRA init/dropout seed split; per-rank dropout positions exercised
 
-(built after the integration commit)
+The implementer's contract, folded by the lead after checking: the `world > 1` refusal for a streamed source is gone and both epoch loops are `for step in 0..train_batches_per_epoch`; `EpochSource::next_chunk` returns the chunk, never a sentinel; `LoraLinear::{new_seeded, new_with_base_seeded}` split the init seed from the dropout seed with the original constructors as `seed, seed` wrappers; the coordinator's files were not touched. Its two Uncovered items (the worker's construction call sites wired to the `_for_rank` builders with a per-rank dropout seed; the `LoraBuildConfig`/`EncoderAdapters` seed split) belong to the same `run_spec` topology site the coordinator body owns and are folded into §6's scope.
+
+Base: `feat/500-wave3c` @ `9b0dcb57`. Branch `unit/u4bt`, tip `1261041b`.
+Worktree `(the unit worktree)`
+(the harness-assigned worktree; already detached at the named base tip — no
+second worktree was created). Target dir
+`(scratchpad)/targets/u4bt`,
+`RUSTC_WRAPPER=sccache`, one `--features test-hooks` set for `jammi-ai` for
+the whole session.
+
+#### 1. Scope shipped
+
+**Item 1 — the streamed arm at `world > 1`** (`crates/jammi-ai/src/fine_tune/stream.rs`,
+`crates/jammi-ai/src/fine_tune/trainer.rs`):
+
+- `stream.rs::run_pump` computes a `step_bound: Option<usize>` once at pump
+  start: `Some(partition::batches_per_epoch(window.len(), spec.world(),
+  spec.batch()))` for `Slice::PerRank`, `None` for `Slice::All` (unchanged
+  contract — validation is never per-rank-partitioned, so an empty range
+  there stays unconditionally terminal). A new helper,
+  `walk_past_empty_steps`, replaces the two "if range.is_empty() { emit
+  terminal; return; }" call sites: for `PerRank`, an empty range short of
+  the bound is sent as a REAL, non-terminal chunk (the zero-row-rank case,
+  DESIGN.md §4) and the loop advances to the next step; the bound itself
+  is the only terminal condition, and at the bound nothing further is sent
+  (the last real, possibly-empty step already went out). `Slice::All`
+  keeps sending its one terminal chunk exactly as before.
+- `EpochSource::next_chunk(step) -> Result<TextChunk>` (was
+  `Result<Option<TextChunk>>`): always the real chunk for `step <
+  train_batches_per_epoch` — the caller's own bounded loop is now the ONLY
+  end-of-epoch signal, never a sentinel this method returns. A `None` from
+  the underlying stream this early is a typed internal-invariant error.
+- `trainer.rs::run`'s Streamed arm: deleted the `world > 1` refusal (kept
+  the F6 whole-set-arm invariant check, unrelated to this item); the loop
+  changed from `loop { let Some(chunk) = epoch_source.next_chunk(step)?
+  else { break }; ... step += 1 }` to `for step in 0..
+  train_batches_per_epoch { let chunk = epoch_source.next_chunk(step)?;
+  ... }`, mirroring the Resident arm's own step-bounded loop exactly. Also
+  switched `compute_loss` → `compute_loss_gathered(call, &batch, &counts)`
+  (with `counts = partition_spec.counts_for_step(train_count, step)`) since
+  `world > 1` is now reachable here and DESIGN.md §4 requires every rank to
+  compute the identical GLOBAL loss over the gathered batch — at `world ==
+  1` `all_gather` is `Noop`'s identity, so this is byte-identical to the
+  prior `compute_loss` call there (no new W=1 oracle needed; the existing
+  `fine_tune::` suite pins it).
+- `partition.rs`: added `PartitionSpec::batch()` (the per-rank batch size
+  the spec was built with) — `run_pump` needs it to derive its own
+  `step_bound`; no other change to `partition.rs`.
+
+**Deviation from a literal reading of the brief**: the brief's citation for
+where the refusal/fix lives (`trainer.rs` ~1065–1080) matched; no deviation
+here beyond the `compute_loss` → `compute_loss_gathered` switch, which the
+brief's own text ("removing U4b's typed refusal by fixing the stream's
+epoch bound") implies but does not spell out — I judged it required, not
+optional: without it, two ranks reading a Streamed source at `world > 1`
+would each compute a DIFFERENT local loss, never lockstep, defeating the
+whole point of lifting the refusal.
+
+**Item 2 — the LoRA init seed split from the dropout seed**
+(`crates/jammi-lora/src/lora_linear.rs`, `crates/jammi-lora/src/seeded.rs`,
+`crates/jammi-ai/src/fine_tune/lora.rs`):
+
+- `LoraLinear::new`/`new_with_base` (jammi-lora) are now thin
+  `init_seed == dropout_seed` wrappers over two NEW functions,
+  `new_seeded`/`new_with_base_seeded`, which take `init_seed`/`dropout_seed`
+  independently: the A/B weight-init draw (`seed_for_param`) is keyed by
+  `init_seed`, the dropout-mask draw (`DropoutMasks::new`) by
+  `dropout_seed`. Every EXISTING call site in the workspace (worker.rs,
+  jammi-encoders' `lora_site.rs`, every test) is unaffected byte-for-byte —
+  none of them were touched, since `new`/`new_with_base` keep their exact
+  original signatures.
+- `DropoutMasks` (seeded.rs) gains `seed(&self) -> u64` (`pub(crate)`,
+  returns `run_seed`); `LoraLinear` gains `dropout_run_seed(&self) ->
+  Option<u64>` (public), exposing the per-layer Philox SEED for the oracle
+  — `dropout_position()` (the forward COUNT) is deliberately
+  rank-invariant (both ranks of a gang take the same number of training
+  forwards per step in the common, no-zero-row-rank case), so it cannot by
+  itself distinguish two ranks whose dropout SEED differs; `dropout_run_seed`
+  can.
+- `jammi-ai/src/fine_tune/lora.rs`: `build_head_layer` (the shared
+  per-layer builder) is now `build_head_layer_for_rank(.., dropout_seed:
+  u64)`, calling `LoraLinear::new_seeded` with `init_seed = config.seed`,
+  `dropout_seed` from the caller. Each of the four public builders
+  (`build_classification_head`, `build_distribution_head`, `build_ner_head`,
+  `build_projection_head`) is now a thin `dropout_seed == config.seed`
+  wrapper over a new `_for_rank` sibling (`build_classification_head_for_rank`,
+  etc.) that takes an explicit `dropout_seed: u64` and threads it to every
+  layer it builds. The four original functions keep their EXACT original
+  signatures — every existing call site (worker.rs, ~30 trainer.rs tests,
+  jammi-bench) is unaffected byte-for-byte.
+
+**Deviation, with the reason** (named, not silently absorbed): the brief
+cites `fine_tune/target.rs` as "the LoRA build path" to wire the split
+into. `target.rs` has no construction call sites at all (verified: it is
+the `TrainingTarget` enum + its dispatch methods only); the ACTUAL
+production LoRA construction happens in `worker.rs` (excluded from this
+unit — the concurrent implementer's file) for BOTH the `ProjectionHead`
+path (`lora::build_*_head`) and the `EncoderAdapters` path
+(`jammi_lora::LoraBuildConfig`, consumed by `jammi-encoders::lora_site.rs`).
+I could not wire the ACTUAL per-rank dropout seed into worker.rs's
+construction call without touching a file I was told not to touch. What I
+shipped instead: the split itself (jammi-lora's `_seeded` constructors),
+threaded all the way through jammi-ai's OWN `lora.rs` builders via
+`_for_rank` siblings that DO NOT exist yet at worker.rs's call sites — the
+same shape U4b's own already-landed contract chose for
+`RankContext::dropout_seed`'s wiring (Deviation 2 there: "the free function
+and its own property... are built and tested in isolation; wiring it is
+filed as a follow-up") and for `run_spec`'s N-rank fan-out (Deviation 1
+there). This unit closes ONE MORE LAYER of that same, previously-declared
+gap (the LoRA-layer seed split itself, plus `gang_determinism_oracle`'s own
+in-tree wiring via `run_gang_rank`, which builds models directly and
+bypasses worker.rs entirely — exactly how every other gang oracle in this
+file already proves the mechanism). Wiring `worker.rs`'s actual
+construction call sites (`build_classification_head_for_rank` etc. with a
+REAL per-rank `dropout_seed` derived at claim time) is still a named,
+deferred follow-up, together with `run_spec`'s N-rank fan-out itself (the
+same follow-up U4b already named — deriving a per-rank dropout seed is
+part of "per-rank model load per rank... per-rank dropout seed derivation"
+in that unit's own Deviation 1 text).
+
+The `EncoderAdapters`/`LoraBuildConfig` path is UNCOVERED by this unit for
+the same reason: `LoraBuildConfig.seed` (jammi-lora's `config.rs`) is a
+single field consumed by `jammi-encoders::lora_site.rs`; splitting it would
+require editing every `LoraBuildConfig { .. }` construction site across
+jammi-encoders/jammi-bench AND worker.rs's own construction at
+`worker.rs:6154` — the same worker.rs-exclusion blocks it. Not attempted;
+see Uncovered §2 below.
+
+**Item 3 — the per-rank dropout-position gather/restore, exercised**
+(`crates/jammi-ai/src/fine_tune/trainer.rs`, `gang_determinism_oracle`):
+
+- `gang_config` (dropout always `0.0`) replaced by `gang_config_with_dropout(epochs,
+  lora_dropout)`; `drive_gang`/`run_gang_rank` gained `lora_dropout: f64` and
+  `train_rows: usize` parameters (every existing call site updated to pass
+  `0.0`/`8`, unchanged behavior). `run_gang_rank` now builds the model via
+  `build_projection_head_for_rank(HIDDEN, &config, &varmap, &vb,
+  rank_ctx.dropout_seed(config.seed))` instead of the old rank-blind
+  `build_projection_head`.
+- Two new tests: `w2_twice_is_byte_identical_with_dropout` (the SAME
+  property as `w2_twice_is_byte_identical`, at `lora_dropout = 0.3`, `8`
+  rows — equal partition, no zero-row-rank) and
+  `resume_after_a_kill_matches_an_uninterrupted_run_with_dropout` (the SAME
+  property as its sibling, at `lora_dropout = 0.3`, but `6` rows — chosen
+  so `W=2, B=2` leaves rank 1 with a real zero-row trailing step every
+  epoch, i.e. the two ranks' own `dropout_position()` COUNTS genuinely
+  diverge over the run). The `8`-row equal-partition fixture would make a
+  cross-rank position swap numerically vacuous (both ranks' counts always
+  coincide), which is exactly why the resume-with-dropout row uses `6`
+  instead — stated in that test's own doc.
+
+#### 2. Properties
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| A `Streamed` source at `world > 1`, whose last global step leaves one rank empty, completes through the REAL production `run()` (no hang, no rank-count skew) | `fine_tune::trainer::gang_lockstep_oracle::a_zero_row_rank_via_a_streamed_source_the_gang_completes` (a real 2-rank `Local` gang over a materialised table) | EXECUTED (applied, run to resolution, reverted): restored the pre-unit "row_count()==0 ends the epoch" check in the Streamed consumer loop; rank 1 exits one step early, rank 0 deadlocks — `all_gather: timed out after 120s waiting for every peer to arrive`, 120.23s wall clock vs ~0.2s healthy |
+| At `W=1`, the Streamed arm's per-step body is byte-unchanged (Noop gather is the identity) | The whole pre-existing `fine_tune::` suite (347 tests) — no new W=1 oracle needed | N/A — regression-only claim; any perturbation would have reported here first |
+| `PartitionSpec::batch()` returns the value the spec was built with | Covered by construction (`run_pump`'s own `step_bound` derivation, exercised by every `Slice::PerRank` streamed test, `p1`–`p_t2` in `tests/it/training_set_stream.rs`, 16 tests, all green) | N/A — a pure accessor; the zero-row-rank oracle above is the load-bearing proof of its CONSUMER |
+| Two ranks built with the SAME `init_seed` (`config.seed`) and DIFFERENT `dropout_seed` report byte-identical `lora_a`/`lora_b` before any forward, and two DIFFERENT `dropout_run_seed()` values, each equal to the seed it was constructed with | `fine_tune::trainer::lora_seed_split_oracle::dropout_seed_split_leaves_init_identical_and_dropout_distinct` | EXECUTED (applied, run, reverted): threaded `dropout_seed` into BOTH `LoraLinear::new_seeded`'s `init_seed` and `dropout_seed` arguments inside `build_head_layer_for_rank` — pre-forward `lora_a` bytes diverge between rank 0/1; reverted |
+| `LoraLinear::new`/`new_with_base`'s existing `init_seed == dropout_seed` behavior is unchanged | The whole pre-existing `jammi-lora`/`jammi-ai` test suites (unchanged pass) | N/A — regression-only; `new`/`new_with_base`'s bodies are pure delegation to the `_seeded` siblings with `seed, seed` |
+| A 2-rank gang at `lora_dropout > 0`: two independent from-scratch runs produce byte-identical rank-0 final weights | `fine_tune::trainer::gang_determinism_oracle::w2_twice_is_byte_identical_with_dropout` | EXECUTED (applied, run, reverted): changed the second call's epoch count `2` → `3` — confirmed a real byte divergence (`lora_a`/`lora_b` differ between the two "independent" runs), then reverted; `git status --short` empty afterwards |
+| A 2-rank gang at `lora_dropout > 0`, with a fixture whose two ranks' own forward COUNTS genuinely diverge (a real zero-row-rank step every epoch): a gang killed after 1 epoch and resumed reproduces an uninterrupted run byte-for-byte | `fine_tune::trainer::gang_determinism_oracle::resume_after_a_kill_matches_an_uninterrupted_run_with_dropout` | EXECUTED (applied, run, reverted): changed `restore_from_checkpoint`'s `state.dropout_positions.get(&self.rank_ctx.rank())` to `state.dropout_positions.get(&0u32)` (always rank 0's entry) — confirmed a real byte divergence between the uninterrupted and resumed legs' final weights (`lora_a`/`lora_b` differ), then reverted |
+| `check_citations.py`: every `PATH:LINE` citation still resolves after the jammi-lora insertion shifted lines | `python3 ci/scripts/perf/check_citations.py` | Covered directly: ran once BEFORE re-anchoring (6 stale citations reported, all at the exact two lines the insertion moved), fixed, ran again (0 stale, 1036 files scanned) |
+
+#### 3. Uncovered
+
+1. **`LoraBuildConfig`/`EncoderAdapters`'s dropout seed is NOT split.**
+   `jammi_encoders::lora_site.rs` still derives one seed for both A/B init
+   and dropout from `LoraBuildConfig.seed`, itself constructed from a single
+   field at every call site (including `worker.rs:6154`, excluded from this
+   unit). A real gang training an `EncoderAdapters` target still shares one
+   dropout seed across ranks today. Named, not silently absorbed — same
+   shape as U4b's own Deviation 2 (the ProjectionHead path this unit closes
+   was the SAME kind of gap).
+2. **`worker.rs`'s actual construction call sites are not wired to the
+   `_for_rank` builders.** `build_classification_head`/`build_distribution_head`/
+   `build_ner_head`/`build_projection_head`'s ORIGINAL (rank-blind)
+   signatures are still what worker.rs calls; the per-rank dropout seed
+   this unit built is only exercised in-tree, by `gang_determinism_oracle`'s
+   own direct construction (bypassing worker.rs), exactly as U4b's own
+   `run_spec`-fan-out deviation was left. A real production multi-rank
+   `Local` gang (once `run_spec` itself spawns N ranks — still not built,
+   per U4b's own named Deviation 1) would need this wiring too.
+3. **The Streamed arm's `world > 1` fix is proven only for `Slice::PerRank`
+   with a SINGLE trailing empty step per rank per epoch.** `walk_past_empty_
+   steps`'s `while` loop is written to handle a RUN of consecutive empty
+   steps (defensively), but I did not construct a fixture where more than
+   one leading/trailing step is empty for the same rank in one epoch — per
+   `partition.rs`'s own module doc, this can only happen when `world *
+   batch > train_count` even at step 0 (a single-step epoch), which the
+   `a_zero_row_rank_via_a_streamed_source_the_gang_completes` fixture does
+   not construct (it has 3 real steps, one trailing empty). The multi-step
+   generalization is exercised by construction (the loop's own shape) but
+   not by a dedicated fixture.
+4. **Live-Postgres arm** — not applicable; no `jammi-db` test was added or
+   touched by this unit.
+
+#### 4. Gates
+
+| Command | Exit | Notes |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | |
+| `cargo clippy -p jammi-lora --all-targets -- -D warnings` | 0 | run in addition to the brief's list since this unit touches jammi-lora (COMMON.md: "ONLY the crates you touched") |
+| `cargo test -p jammi-ai --features test-hooks --lib fine_tune::` | 0 | 347 passed, 0 failed (includes the gang oracles and every new test this unit adds) |
+| `cargo test -p jammi-ai --features test-hooks --lib stream::` | 0 | 0 tests matched (unchanged from base — `stream.rs` has no unit tests of its own; every oracle for it lives in `tests/it`) |
+| `cargo test -p jammi-ai --features test-hooks --test it -- streamed` | 0 | 1 test matched (the literal substring `streamed`); see the next row for the real filter |
+| `cargo test -p jammi-ai --features test-hooks --test it -- training_set_stream` | 0 | 16 passed, 0 failed — the real filter for U2c's per-rank stream it-rows |
+| `cargo test -p jammi-ai --features test-hooks --test it -- training_set::` | 0 | 13 passed, 0 failed — the eager-path it-rows in the same file family |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1036 file(s) scanned, all PATH:LINE citations resolve` (after re-anchoring the 6 citations the jammi-lora insertion shifted) |
+
+`RUSTDOCFLAGS="-D warnings" cargo doc -p jammi-ai --no-deps` was NOT run —
+outside this unit's trimmed gate list (COMMON.md: the lead runs the full
+merge path once on the consolidated tip).
+
+#### 5. Commits
+
+```
+1261041b feat(ai,lora): #500 U4b tail — streamed arm at world>1, LoRA init/dropout seed split, per-rank dropout position exercised
+```
+
+#### Files touched (repo-relative)
+
+- `crates/jammi-ai/src/fine_tune/stream.rs` (item 1)
+- `crates/jammi-ai/src/fine_tune/trainer.rs` (items 1, 2, 3)
+- `crates/jammi-ai/src/fine_tune/partition.rs` (item 1, `PartitionSpec::batch()`)
+- `crates/jammi-ai/src/fine_tune/lora.rs` (item 2)
+- `crates/jammi-lora/src/lora_linear.rs` (item 2 — outside `jammi-ai`; see
+  the deviation note above for why: `LoraLinear::new`/`new_with_base`, the
+  actual seed-split site, live here, not in `jammi-ai`)
+- `crates/jammi-lora/src/seeded.rs` (item 2, `DropoutMasks::seed`)
+- `ci/scripts/perf/finetune_ab.sh`, `crates/jammi-kernels/src/admission.rs`,
+  `crates/jammi-kernels/src/ops/mod.rs` (mechanical: re-anchored 6 stale
+  `PATH:LINE` citations the jammi-lora insertion shifted — no behavior
+  change)
+
+#### Scope amendments (for the lead)
+
+- Touched `crates/jammi-lora/**` (a crate not named in my dispatch's
+  "crate owned" framing) because `LoraLinear::new`/`new_with_base` — the
+  ACTUAL definition site of the seed the brief describes as
+  "`crates/jammi-ai/src/fine_tune/lora.rs`" — live there, not in jammi-ai;
+  jammi-ai's `lora.rs` is a thin wrapper crate over it. No conflict with the
+  concurrent implementer (their exclusions are `worker.rs`/`spec.rs`/
+  `crates/jammi-server/src/grpc/**`, none of which touch jammi-lora).
+- Touched `crates/jammi-kernels/src/{admission.rs,ops/mod.rs}` and
+  `ci/scripts/perf/finetune_ab.sh` ONLY to re-anchor `PATH:LINE` citations
+  that my jammi-lora insertion shifted (mechanical, no behavior change) —
+  `check_citations.py` failed until this was done.
+
 
 ## 2b. Integration (landed as one commit; original `18e0db19`) — the witness through `RankContext`; the round inbox in the hold loop; the trybuild oracle as `compile_fail` doctests; doc parity and citations
 

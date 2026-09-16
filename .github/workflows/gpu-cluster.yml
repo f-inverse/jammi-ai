@@ -46,6 +46,24 @@ name: GPU cluster (RunPod)
 
 on:
   workflow_dispatch:
+    inputs:
+      gpu_type:
+        description: >-
+          RunPod gpuTypeId for BOTH hosts (a cluster is homogeneous). The leg
+          proves two-host NCCL bit-exactness on whatever CUDA part it rents; the
+          default is the plan's A100 SXM4 shape. A cheaper part keeps the cost
+          bound below an upper bound; a dearer one is a deliberate cost decision.
+        required: false
+        default: "NVIDIA A100-SXM4-80GB"
+        type: string
+      min_availability:
+        description: >-
+          The per-data-center availability floor the driver requires before it
+          rents (LOW, MEDIUM or HIGH; co-placement needs ONE data center at or
+          above it).
+        required: false
+        default: "MEDIUM"
+        type: string
   pull_request:
     types: [labeled]
 
@@ -56,7 +74,7 @@ permissions:
 
 jobs:
   gpu-cluster:
-    name: GPU cluster on RunPod (2 hosts x 1 A100)
+    name: GPU cluster on RunPod (2 hosts x 1 GPU; A100 SXM4 by default)
     # Label event only runs for the `run-cluster` label; dispatch always
     # runs -- the same shape gpu-gang.yml's own `run-gang` gate uses.
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-cluster'
@@ -99,7 +117,7 @@ jobs:
       # per-data-center availability read), so there is no candidate walk
       # to double the way the pod lane's does -- raising this is still a
       # deliberate, human cost decision, not a default.
-      - name: Run the two-host NCCL proof on a real 2x1 A100 cluster (retry on capacity, fail closed)
+      - name: Run the two-host NCCL proof on a real 2x1 cluster (retry on capacity, fail closed)
         id: cluster
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
@@ -107,6 +125,9 @@ jobs:
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           PROVE_EXPECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           MAX_ATTEMPTS: "1"
+          # Empty on the label path: the driver then applies its own defaults.
+          RP_CLUSTER_GPU_TYPE: ${{ inputs.gpu_type }}
+          RP_CLUSTER_MIN_AVAILABILITY: ${{ inputs.min_availability }}
         run: |
           set +e
           attempt=1

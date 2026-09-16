@@ -1616,13 +1616,13 @@ impl WorkerTopology {
 /// The widest `Peer` gang any coordinator on this deployment may accept —
 /// bounds a job's per-job `world_size` (`TrainingCommon`, checked at
 /// submit against [`Self::max_world_size`] by the submit edge) ACROSS FLEET
-/// MEMBERS (67 U5b-1b-ii). Orthogonal to [`WorkerConfig::world_size`]
-/// (renamed `local_ranks` in 67 U4b), which bounds how many ranks THIS HOST
+/// MEMBERS (67 U5b-1b-ii). Orthogonal to [`WorkerConfig::local_ranks`],
+/// which bounds how many ranks THIS HOST
 /// places on its own `[gpu] devices` for a job it runs entirely in-process:
 /// the two knobs load independently, with no cross-check between them
 /// (`docs/plans/67-distributed-training/DESIGN.md` § 7) — a deployment can
 /// set one without the other, and this crate never reads
-/// [`WorkerConfig::world_size`] while validating this section or vice
+/// [`WorkerConfig::local_ranks`] while validating this section or vice
 /// versa.
 ///
 /// This crate only loads and validates the knob; the submit-time check

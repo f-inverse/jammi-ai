@@ -58,7 +58,7 @@ fn assign_frame(world: u32, rank: u32) -> jammi_wire::proto::gang::RankControl {
     assign_frame_full("job-1", 0, rank, world, "coord-1")
 }
 
-fn assign_frame_full(
+pub(crate) fn assign_frame_full(
     job_id: &str,
     attempt: i64,
     rank: u32,
@@ -89,10 +89,10 @@ fn cancel_frame() -> RankControl {
 /// exit) and `fresh_instance`'s margin input. Short, so a park is observed
 /// in seconds; strictly more than twice [`HEARTBEAT`], as the config
 /// validator requires.
-const LEASE: Duration = Duration::from_secs(3);
+pub(crate) const LEASE: Duration = Duration::from_secs(3);
 /// The re-verification cadence and the longest a `ClaimProbe` is waited
 /// on.
-const HEARTBEAT: Duration = Duration::from_secs(1);
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// A peer-bound server with `[worker] enabled = false` — every fixture below
 /// drives `Catalog::submit_job`/`claim_next` directly (matching
@@ -101,7 +101,7 @@ const HEARTBEAT: Duration = Duration::from_secs(1);
 /// raced by this same process's own production claim loop (`[worker] enabled`
 /// defaults to `true`, `config/mod.rs`) — and with the fast `[lease]`
 /// timing above.
-async fn start_no_worker_server() -> crate::common::grpc::PeerEngineServer {
+pub(crate) async fn start_no_worker_server() -> crate::common::grpc::PeerEngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = crate::common::grpc::peer_bind_config(dir.path());
     cfg.worker.enabled = false;
@@ -114,7 +114,7 @@ async fn start_no_worker_server() -> crate::common::grpc::PeerEngineServer {
 /// decodes it to `1`, `jammi_db`'s own `WORLD_SIZE_IF_ABSENT` default (see
 /// `jobs_repo.rs`), the shape a non-training job kind (or a spec predating
 /// `world_size`) persists.
-const WORLD1_SPEC: &str = "{}";
+pub(crate) const WORLD1_SPEC: &str = "{}";
 
 /// A job whose `spec` names `world_size: 2` under the `common` key — the
 /// SAME shape `jammi-ai`'s `TrainingCommon` actually persists, and the SAME
@@ -129,7 +129,7 @@ const WORLD2_SPEC: &str = r#"{"common":{"world_size":2}}"#;
 /// The freshness fixture: the coordinator's own `instances` row, upserted
 /// so the "coordinator not fresh" determinant is satisfied and every other
 /// row isolates the ONE determinant it names.
-async fn fresh_coordinator(server: &crate::common::grpc::PeerEngineServer, coord: &str) {
+pub(crate) async fn fresh_coordinator(server: &crate::common::grpc::PeerEngineServer, coord: &str) {
     server
         .engine
         .catalog()
@@ -152,7 +152,7 @@ async fn fresh_coordinator(server: &crate::common::grpc::PeerEngineServer, coord
 /// model FK target (the column is nullable). Returns the `attempts` value
 /// the claim landed at (always `1`, the first claim), for the caller to
 /// build a matching `Assign` frame with.
-async fn submit_and_claim(
+pub(crate) async fn submit_and_claim(
     server: &crate::common::grpc::PeerEngineServer,
     job_id: &str,
     coordinator_instance_id: &str,
@@ -244,7 +244,7 @@ async fn submit_and_claim_for_tenant(
 /// training_set_ref, parquet_path)` triple — the table name, the digest read
 /// back from the SAME sidecar the handler itself verifies against, and the
 /// Parquet URL a fixture rewrites the sidecar beside.
-struct ReadyTable {
+pub(crate) struct ReadyTable {
     table: String,
     digest: String,
     parquet_path: String,
@@ -436,7 +436,7 @@ async fn fill_pair(
 /// a session end's "row untouched" claim is a before/after equality over
 /// the WHOLE row, not one column.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RowFacts {
+pub(crate) struct RowFacts {
     status: String,
     claimed_by: Option<String>,
     attempts: i32,
@@ -448,7 +448,10 @@ struct RowFacts {
     result: Option<String>,
 }
 
-async fn row_facts(server: &crate::common::grpc::PeerEngineServer, job_id: &str) -> RowFacts {
+pub(crate) async fn row_facts(
+    server: &crate::common::grpc::PeerEngineServer,
+    job_id: &str,
+) -> RowFacts {
     use jammi_db::catalog::backend::{SqlValue, TxOptions};
     let job_id = job_id.to_string();
     server
@@ -494,9 +497,9 @@ async fn row_facts(server: &crate::common::grpc::PeerEngineServer, job_id: &str)
 /// An open bidi `RunRank` stream: the client's send side kept open (so a
 /// later `Cancel` or second `Assign` can be sent) and the server's event
 /// stream.
-struct OpenRank {
-    outbound: tokio::sync::mpsc::Sender<RankControl>,
-    events: tonic::Streaming<RankEvent>,
+pub(crate) struct OpenRank {
+    pub(crate) outbound: tokio::sync::mpsc::Sender<RankControl>,
+    pub(crate) events: tonic::Streaming<RankEvent>,
 }
 
 impl std::fmt::Debug for OpenRank {
@@ -512,8 +515,17 @@ async fn open_rank(
     server: &crate::common::grpc::PeerEngineServer,
     first: RankControl,
 ) -> Result<OpenRank, tonic::Status> {
+    open_rank_at(server.peer_addr, first).await
+}
+
+/// [`open_rank`] against any `GangService` listener — a standalone
+/// `GangServer` a test mounted itself, or `server.peer_addr`.
+pub(crate) async fn open_rank_at(
+    addr: std::net::SocketAddr,
+    first: RankControl,
+) -> Result<OpenRank, tonic::Status> {
     use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
-    let channel = crate::common::grpc::channel(server.peer_addr).await;
+    let channel = crate::common::grpc::channel(addr).await;
     let mut client = GangServiceClient::new(channel);
     let (outbound, rx) = tokio::sync::mpsc::channel::<RankControl>(4);
     outbound.send(first).await.unwrap();
@@ -529,7 +541,7 @@ async fn open_rank(
 /// The next event on an admitted stream within `within` — `Ok(None)` once
 /// the server closed it, `Err(status)` for a status trailer (a protocol
 /// violation on the admitted stream).
-async fn next_event(
+pub(crate) async fn next_event(
     events: &mut tonic::Streaming<RankEvent>,
     within: Duration,
 ) -> Result<Option<RankEvent>, tonic::Status> {
@@ -549,7 +561,7 @@ fn aborted_reason(event: &RankEvent) -> Option<AbortReason> {
     }
 }
 
-async fn expect_admitted(rank: &mut OpenRank) {
+pub(crate) async fn expect_admitted(rank: &mut OpenRank) {
     let event = next_event(&mut rank.events, Duration::from_secs(5))
         .await
         .expect("an admitted stream carries events, not a status")
@@ -598,15 +610,17 @@ async fn admitted_world_one(
     (rank, attempt, before)
 }
 
-/// An admitted `world_size == 2` session over `server` for `tenant`: a
-/// genuinely materialized, ready, digest-verifying training set under the
-/// job's OWN tenant — the admitting control of the world>1 conjunct.
-async fn admitted_world_two(
+/// Everything an admitting `world_size == 2` session needs on the row side
+/// — a genuinely materialized, ready, digest-verifying training set under
+/// the job's OWN tenant, a fresh coordinator, the claimed row, the filled
+/// pair — with the stream NOT yet opened: the caller opens it on the
+/// listener of its choice.
+pub(crate) async fn world_two_ready(
     server: &crate::common::grpc::PeerEngineServer,
     tenant: TenantId,
     job_id: &str,
     coord: &str,
-) -> (OpenRank, i64, RowFacts, ReadyTable) {
+) -> (i64, RowFacts, ReadyTable) {
     let source_id = format!("gang_w2_src_{}", jammi_test_utils::unique_suffix());
     let ready = materialize_ready_table_for_tenant(server, tenant, &source_id).await;
     fresh_coordinator(server, coord).await;
@@ -621,6 +635,19 @@ async fn admitted_world_two(
     .await;
     fill_pair(server, job_id, coord, attempt, &ready.digest, &ready.table).await;
     let before = row_facts(server, job_id).await;
+    (attempt, before, ready)
+}
+
+/// An admitted `world_size == 2` session over `server` for `tenant` — the
+/// admitting control of the world>1 conjunct ([`world_two_ready`], then the
+/// stream opened on `server.peer_addr`).
+async fn admitted_world_two(
+    server: &crate::common::grpc::PeerEngineServer,
+    tenant: TenantId,
+    job_id: &str,
+    coord: &str,
+) -> (OpenRank, i64, RowFacts, ReadyTable) {
+    let (attempt, before, ready) = world_two_ready(server, tenant, job_id, coord).await;
     let mut rank = open_rank(server, assign_frame_full(job_id, attempt, 0, 2, coord))
         .await
         .expect("a pair that resolves and verifies for the job's own tenant admits");
@@ -628,7 +655,7 @@ async fn admitted_world_two(
     (rank, attempt, before, ready)
 }
 
-fn tenant(n: u8) -> TenantId {
+pub(crate) fn tenant(n: u8) -> TenantId {
     TenantId::from_str(&format!("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e{n:02x}")).unwrap()
 }
 
@@ -2431,6 +2458,34 @@ async fn run_rank_second_assign_on_an_admitted_stream_is_invalid_argument() {
         .expect_err("a second Assign is a status, never an event");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert_eq!(row_facts(&server, "job-second-assign").await, before);
+}
+
+/// K2: an EMPTY `RankControl` frame (`control: None`) on an admitted stream
+/// — the one value of the oneof that is neither the session's (`Assign`,
+/// `Cancel`) nor the round protocol's — is a protocol violation: the stream
+/// ends with `InvalidArgument`, the row untouched. This is the refusal arm
+/// of `HeldSession::dispatch_round_frame`, beside its delivery arm. Mutation
+/// proof: a dispatch that hands EVERY frame to the round inbox (the
+/// `is_round_frame` guard skipped) keeps the session held — no trailer
+/// arrives within this test's bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rank_empty_frame_on_an_admitted_stream_is_invalid_argument() {
+    let server = start_no_worker_server().await;
+    let (mut rank, _attempt, before) =
+        admitted_world_one(&server, "job-empty-frame", "coord-empty-frame").await;
+    rank.outbound
+        .send(RankControl { control: None })
+        .await
+        .unwrap();
+    let err = next_event(&mut rank.events, Duration::from_secs(5))
+        .await
+        .expect_err("an empty frame is a status, never an event");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("empty RankControl frame"),
+        "the trailer names the violation: {err}"
+    );
+    assert_eq!(row_facts(&server, "job-empty-frame").await, before);
 }
 
 /// The host DRAIN arm: flipping the session's own `HostAdmission` phase

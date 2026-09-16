@@ -660,6 +660,7 @@ pub const DEFAULT_NORM_CHECK_INTERVAL: usize = 50;
 ///
 /// [`TrainingLoop::process_batch_loss`]: super::trainer::TrainingLoop::process_batch_loss
 pub fn canonical_reduce(
+    call: &super::collective::BlockingCall,
     rank_ctx: &super::trainer::RankContext,
     trainable_vars: &[Var],
     grads: &mut GradStore,
@@ -686,7 +687,7 @@ pub fn canonical_reduce(
             }
         }
     }
-    rank_ctx.all_reduce_sum(&mut tensors)?;
+    rank_ctx.all_reduce_sum(call, &mut tensors)?;
 
     // The gang-wide presence set: `> 0` at index `i` iff SOME rank's own
     // accumulation populated canonical var `i` this window.
@@ -694,7 +695,7 @@ pub fn canonical_reduce(
     let n = trainable_vars.len();
     let mut presence_tensor = vec![Tensor::from_vec(presence, (n,), device)
         .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence tensor: {e}")))?];
-    rank_ctx.all_reduce_sum(&mut presence_tensor)?;
+    rank_ctx.all_reduce_sum(call, &mut presence_tensor)?;
     let presence_summed: Vec<f32> = presence_tensor[0]
         .to_vec1()
         .map_err(|e| JammiError::FineTune(format!("canonical_reduce: presence readback: {e}")))?;
@@ -953,7 +954,10 @@ mod tests {
         let vars = vec![w_present.clone(), w_absent.clone()];
         let rank_ctx = RankContext::single_rank(1, PartitionRule::BlockByGlobalBatch);
 
-        canonical_reduce(&rank_ctx, &vars, &mut grads).unwrap();
+        crate::fine_tune::collective::witness(|call| {
+            canonical_reduce(&call, &rank_ctx, &vars, &mut grads)
+        })
+        .unwrap();
 
         let present_after: Vec<f32> = grads.get(w_present.as_tensor()).unwrap().to_vec1().unwrap();
         let present_before: Vec<f32> = g_before.to_vec1().unwrap();
@@ -1002,49 +1006,51 @@ mod tests {
                 PartitionSpec::for_gang(rank as usize, 2, 1, PartitionRule::BlockByGlobalBatch)
                     .unwrap(),
             );
-            handles.push(std::thread::spawn(move || {
-                let dev = Device::Cpu;
-                let w_shared =
-                    Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
-                let w_only_rank0 =
-                    Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
-                let w_absent_everywhere =
-                    Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
-                let vars = vec![
-                    w_shared.clone(),
-                    w_only_rank0.clone(),
-                    w_absent_everywhere.clone(),
-                ];
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| {
+                    let dev = Device::Cpu;
+                    let w_shared =
+                        Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
+                    let w_only_rank0 =
+                        Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
+                    let w_absent_everywhere =
+                        Var::from_tensor(&Tensor::zeros((2,), DType::F32, &dev).unwrap()).unwrap();
+                    let vars = vec![
+                        w_shared.clone(),
+                        w_only_rank0.clone(),
+                        w_absent_everywhere.clone(),
+                    ];
 
-                let mut grads = GradStore::default();
-                let shared_value = if rank == 0 { 1.0f32 } else { 2.0f32 };
-                grads.insert(
-                    w_shared.as_tensor(),
-                    Tensor::full(shared_value, (2,), &dev).unwrap(),
-                );
-                if rank == 0 {
+                    let mut grads = GradStore::default();
+                    let shared_value = if rank == 0 { 1.0f32 } else { 2.0f32 };
                     grads.insert(
-                        w_only_rank0.as_tensor(),
-                        Tensor::full(5.0f32, (2,), &dev).unwrap(),
+                        w_shared.as_tensor(),
+                        Tensor::full(shared_value, (2,), &dev).unwrap(),
                     );
-                }
-                // rank 1 never inserts an entry for `w_only_rank0` at all —
-                // the absent-on-one-rank case. Neither rank ever inserts one
-                // for `w_absent_everywhere` — the absent-on-every-rank case.
+                    if rank == 0 {
+                        grads.insert(
+                            w_only_rank0.as_tensor(),
+                            Tensor::full(5.0f32, (2,), &dev).unwrap(),
+                        );
+                    }
+                    // rank 1 never inserts an entry for `w_only_rank0` at all —
+                    // the absent-on-one-rank case. Neither rank ever inserts one
+                    // for `w_absent_everywhere` — the absent-on-every-rank case.
 
-                canonical_reduce(&rank_ctx, &vars, &mut grads).unwrap();
+                    canonical_reduce(&call, &rank_ctx, &vars, &mut grads).unwrap();
 
-                let shared_sum: Vec<f32> =
-                    grads.get(w_shared.as_tensor()).unwrap().to_vec1().unwrap();
-                let only0_sum: Vec<f32> = grads
-                    .get(w_only_rank0.as_tensor())
-                    .unwrap()
-                    .to_vec1()
-                    .unwrap();
-                let absent_everywhere_stayed_absent =
-                    grads.get(w_absent_everywhere.as_tensor()).is_none();
-                (shared_sum, only0_sum, absent_everywhere_stayed_absent)
-            }));
+                    let shared_sum: Vec<f32> =
+                        grads.get(w_shared.as_tensor()).unwrap().to_vec1().unwrap();
+                    let only0_sum: Vec<f32> = grads
+                        .get(w_only_rank0.as_tensor())
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let absent_everywhere_stayed_absent =
+                        grads.get(w_absent_everywhere.as_tensor()).is_none();
+                    (shared_sum, only0_sum, absent_everywhere_stayed_absent)
+                },
+            ));
         }
         let results: Vec<(Vec<f32>, Vec<f32>, bool)> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();

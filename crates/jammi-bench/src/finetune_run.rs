@@ -96,6 +96,7 @@ use std::time::Instant;
 use candle_core::Device;
 use candle_nn::VarMap;
 
+use jammi_ai::fine_tune::collective::BlockingCall;
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::resume::load_bundle;
 use jammi_ai::fine_tune::source::TrainingSource;
@@ -1552,9 +1553,10 @@ pub(crate) fn fused_dispatch_proof_gate(
 /// `eval_cadence` and unconditionally on the last epoch. See this module's
 /// own doc for the full design rationale.
 pub fn run(
+    call: &BlockingCall,
     params: &FinetuneRunParams,
 ) -> Result<FinetuneRunTier, Box<dyn std::error::Error + Send + Sync>> {
-    run_impl(params, true).map(|(tier, _final_varmap)| tier)
+    run_impl(call, params, true).map(|(tier, _final_varmap)| tier)
 }
 
 /// [`run`]'s real body, plus a test-only `probe_at_init` escape hatch and the
@@ -1567,6 +1569,7 @@ pub fn run(
 /// including the actual trained weights, not merely the reported numbers —
 /// bit for bit.
 fn run_impl(
+    call: &BlockingCall,
     params: &FinetuneRunParams,
     probe_at_init: bool,
 ) -> Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>> {
@@ -2140,7 +2143,7 @@ fn run_impl(
         // epoch leg before the timed span starts.
         let train_loader = train_rows.loader(params.objective)?;
         let train_run_t0 = Instant::now();
-        let result = training_loop.run(TrainingSource::Resident(train_loader))?;
+        let result = training_loop.run(call, TrainingSource::Resident(train_loader))?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
         // The DIRECT media front-end wall (contract P1-b(v)), summed across
         // resume legs exactly as `train_run_wall_s` above is —
@@ -3441,12 +3444,12 @@ mod tests {
         let params_without = non_perturbation_test_params(work_dir_without.path().to_path_buf());
 
         let (tier_with, varmap_with) =
-            tokio::task::spawn_blocking(move || run_impl(&params_with, true))
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params_with, true))
                 .await
                 .expect("join with-probe task")
                 .expect("finetune-run WITH the init probe");
         let (tier_without, varmap_without) =
-            tokio::task::spawn_blocking(move || run_impl(&params_without, false))
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params_without, false))
                 .await
                 .expect("join without-probe task")
                 .expect("finetune-run WITHOUT the init probe");
@@ -3504,10 +3507,11 @@ mod tests {
         let work_dir = tempfile::tempdir().expect("tempdir");
         let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         let outer_t0 = Instant::now();
-        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
-            .await
-            .expect("join run_impl task")
-            .expect("finetune-run");
+        let (tier, _varmap) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .expect("finetune-run");
         let outer_wall_s = outer_t0.elapsed().as_secs_f64();
 
         assert!(
@@ -3559,10 +3563,10 @@ mod tests {
         let work_dir = tempfile::tempdir().expect("tempdir");
         let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         const INJECTED_MS: u64 = 250;
-        let (run_result, outer_wall_s) = tokio::task::spawn_blocking(move || {
+        let (run_result, outer_wall_s) = BlockingCall::spawn_blocking(move |call| {
             LOADER_BUILD_SLEEP_MS_FOR_TEST.with(|c| c.set(INJECTED_MS));
             let outer_t0 = Instant::now();
-            let result = run_impl(&params, true);
+            let result = run_impl(&call, &params, true);
             let outer_wall_s = outer_t0.elapsed().as_secs_f64();
             // Reset before this blocking-pool thread is returned to the pool
             // and might serve a different, unrelated test.
@@ -3631,10 +3635,11 @@ mod tests {
     async fn finetune_run_tier_json_actually_emits_layers_to_transform_and_train_run_wall_s() {
         let work_dir = tempfile::tempdir().expect("tempdir");
         let params = non_perturbation_test_params(work_dir.path().to_path_buf());
-        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
-            .await
-            .expect("join run_impl task")
-            .expect("finetune-run");
+        let (tier, _varmap) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .expect("finetune-run");
 
         let report = crate::report::Report::new(
             "finetune-run",
@@ -3968,10 +3973,11 @@ mod tests {
         params.mutant_base_sha = Some(format!("  {}  ", "f".repeat(40)));
         params.mutant_patch_sha256 = Some(format!("\t{}\n", "a".repeat(64)));
 
-        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
-            .await
-            .expect("join run_impl task")
-            .expect("a fully-supplied, non-empty (once trimmed) trio must be accepted");
+        let (tier, _varmap) =
+            BlockingCall::spawn_blocking(move |call| run_impl(&call, &params, true))
+                .await
+                .expect("join run_impl task")
+                .expect("a fully-supplied, non-empty (once trimmed) trio must be accepted");
 
         assert_eq!(tier.mutant_id, Some("eps-0.10".to_string()));
         assert_eq!(tier.mutant_base_sha, Some("f".repeat(40)));

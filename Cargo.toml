@@ -177,7 +177,6 @@ prost = "0.14"
 prost-types = "0.14"
 tokio = { version = "1.44", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-trybuild = "1"
 tower = "0.5"
 # Low-level HTTP body framing — the gRPC-Web trailers-only repair layer builds
 # the in-body trailer frame `tonic-web` omits for a trailers-only error.

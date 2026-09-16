@@ -136,6 +136,8 @@ pub mod peer;
 mod peer_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::witness;
 
 pub use local::{Local, LocalGang};
 pub use noop::Noop;
@@ -151,6 +153,73 @@ pub use peer::{CoordinatorLink, LinkFault, MemberLink, Peer, RankReadFault};
 /// worker thread. Every [`Collective`] verb takes one; [`Peer`] is the arm
 /// that needs it (it blocks on stream I/O), and every arm is compile-checked
 /// by it: a verb called from a worker thread has no witness to pass.
+///
+/// # The compile-time claim, as doctests
+///
+/// The four blocks below are the oracle for that claim: rustdoc compiles
+/// each one, requires the three `compile_fail` blocks to FAIL with the
+/// error code named on the fence, and requires the control to pass
+/// (`cargo test -p jammi-ai --doc -- BlockingCall`). Making the witness
+/// `Send` (a `PhantomData<()>`) turns the `E0277` block into a successful
+/// compile, which fails the doctest.
+///
+/// The control — the same verb from a `spawn_blocking` closure compiles
+/// and runs:
+///
+/// ```
+/// use jammi_ai::fine_tune::collective::{BlockingCall, Collective, Noop};
+///
+/// let rt = tokio::runtime::Builder::new_current_thread()
+///     .enable_all()
+///     .build()
+///     .unwrap();
+/// rt.block_on(async {
+///     let noop = Noop::new();
+///     BlockingCall::spawn_blocking(move |call| noop.barrier(&call))
+///         .await
+///         .unwrap()
+///         .unwrap();
+/// });
+/// ```
+///
+/// A witness minted on a blocking thread cannot be carried into a
+/// `tokio::spawn`ed future — it is not `Send` — so the verb cannot run on a
+/// runtime worker thread:
+///
+/// ```compile_fail,E0277
+/// use jammi_ai::fine_tune::collective::{BlockingCall, Collective, Noop};
+///
+/// let rt = tokio::runtime::Runtime::new().unwrap();
+/// rt.block_on(async {
+///     let noop = Noop::new();
+///     let handle = BlockingCall::spawn_blocking(move |call| {
+///         tokio::spawn(async move { noop.barrier(&call) })
+///     });
+///     let _ = handle;
+/// });
+/// ```
+///
+/// On a worker thread there is no witness to pass, so the verb cannot be
+/// called at all:
+///
+/// ```compile_fail,E0061
+/// use jammi_ai::fine_tune::collective::{Collective, Noop};
+///
+/// let rt = tokio::runtime::Runtime::new().unwrap();
+/// rt.block_on(async {
+///     let noop = Noop::new();
+///     noop.barrier().unwrap();
+/// });
+/// ```
+///
+/// The constructor is private — there is no fourth minting site:
+///
+/// ```compile_fail,E0624
+/// use jammi_ai::fine_tune::collective::{BlockingCall, Collective, Noop};
+///
+/// let call = BlockingCall::mint();
+/// Noop::new().barrier(&call).unwrap();
+/// ```
 #[derive(Debug, Clone)]
 pub struct BlockingCall {
     _thread_bound: PhantomData<*const ()>,

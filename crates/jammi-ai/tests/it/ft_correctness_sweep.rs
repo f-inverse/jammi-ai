@@ -125,10 +125,11 @@ async fn oracle_epochs_honored_exactly_precomputed() {
         .build()
         .unwrap();
 
-        let result = tokio::task::spawn_blocking(move || {
-            tl.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-                loader,
-            ))
+        let result = jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            tl.run(
+                &call,
+                jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+            )
         })
         .await
         .unwrap()
@@ -200,10 +201,11 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || {
-        tl.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-            loader,
-        ))
+    let result = jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+        tl.run(
+            &call,
+            jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+        )
     })
     .await
     .unwrap()
@@ -277,10 +279,11 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || {
-        tl.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-            loader,
-        ))
+    let result = jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+        tl.run(
+            &call,
+            jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+        )
     })
     .await
     .unwrap()

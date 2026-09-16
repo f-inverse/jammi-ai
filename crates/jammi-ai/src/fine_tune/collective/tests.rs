@@ -16,7 +16,7 @@ use super::{BlockingCall, Collective, Local, LocalGang, Noop};
 /// the test's own thread is a runtime-free OS thread too, but the witness
 /// has no constructor outside the three minting sites, so a test body that
 /// calls a verb directly routes through one of them.
-pub(super) fn witness<T: Send>(f: impl FnOnce(BlockingCall) -> T + Send) -> T {
+pub(crate) fn witness<T: Send>(f: impl FnOnce(BlockingCall) -> T + Send) -> T {
     std::thread::scope(|scope| {
         BlockingCall::spawn_scoped(scope, f)
             .join()

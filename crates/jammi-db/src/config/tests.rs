@@ -815,16 +815,16 @@ fn distributed_config_loads_independently_of_worker() {
     let cfg: JammiConfig = toml::from_str("[distributed]\nmax_world_size = 4\n").unwrap();
     assert_eq!(cfg.distributed.max_world_size, 4);
     assert_eq!(
-        cfg.worker.world_size, 1,
+        cfg.worker.local_ranks, 1,
         "[worker]'s own default must be untouched by [distributed]"
     );
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("jammi.toml");
-    // `[worker] world_size = 1` alone (a single device) must load a
+    // `[worker] local_ranks = 1` alone (a single device) must load a
     // deployment-wide gang bound of the DEFAULT (1), never a value derived
     // from or checked against `[worker]`.
-    std::fs::write(&path, "[worker]\nworld_size = 1\n").unwrap();
+    std::fs::write(&path, "[worker]\nlocal_ranks = 1\n").unwrap();
     let loaded = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap();
     assert_eq!(loaded.distributed.max_world_size, 1);
 }

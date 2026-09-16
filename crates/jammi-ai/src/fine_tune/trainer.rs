@@ -21,7 +21,7 @@ use sha2::Digest;
 use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
-use super::collective::{Collective, Noop};
+use super::collective::{BlockingCall, Collective, Noop};
 use super::data::{TextChunk, TrainingDataLoader, TrainingFormat};
 use super::optimizer::{
     accumulate_grads, canonical_reduce, clip_and_step, DEFAULT_NORM_CHECK_INTERVAL,
@@ -361,32 +361,41 @@ impl RankContext {
 
     /// [`Collective::all_gather`], routed through this ONE seam — every
     /// trainer call site goes through here rather than reaching into
-    /// `self.collective` directly, so the concurrently-built `Peer`
-    /// collective (U5b-1b-i) — which adds a per-call witness argument to
-    /// every `Collective` verb — needs to change only these five wrapper
-    /// bodies at consolidation, never every call site across the trainer.
-    pub fn all_gather(&self, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
-        self.collective.all_gather(local, counts)
+    /// `self.collective` directly. Each wrapper takes the [`BlockingCall`]
+    /// witness every `Collective` verb requires and forwards it unchanged:
+    /// the trainer receives ONE witness at [`TrainingLoop::run`] and threads
+    /// it down every path that reaches a wrapper (the gather, the flag
+    /// reduce, `optimizer::canonical_reduce`, the checkpoint gates), so a
+    /// verb is reachable only from a thread that may block — a
+    /// `spawn_blocking` thread or a plain OS thread, never a runtime worker
+    /// (the collective module doc, "The blocking-call witness").
+    pub fn all_gather(
+        &self,
+        call: &BlockingCall,
+        local: &Tensor,
+        counts: &[usize],
+    ) -> Result<Tensor> {
+        self.collective.all_gather(call, local, counts)
     }
 
     /// [`Collective::all_reduce_sum`], routed through this ONE seam.
-    pub fn all_reduce_sum(&self, tensors: &mut [Tensor]) -> Result<()> {
-        self.collective.all_reduce_sum(tensors)
+    pub fn all_reduce_sum(&self, call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
+        self.collective.all_reduce_sum(call, tensors)
     }
 
     /// [`Collective::all_reduce_max_flags`], routed through this ONE seam.
-    pub fn all_reduce_max_flags(&self, flags: u32) -> Result<u32> {
-        self.collective.all_reduce_max_flags(flags)
+    pub fn all_reduce_max_flags(&self, call: &BlockingCall, flags: u32) -> Result<u32> {
+        self.collective.all_reduce_max_flags(call, flags)
     }
 
     /// [`Collective::broadcast`], routed through this ONE seam.
-    pub fn broadcast(&self, t: &mut Tensor, root: u32) -> Result<()> {
-        self.collective.broadcast(t, root)
+    pub fn broadcast(&self, call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
+        self.collective.broadcast(call, t, root)
     }
 
     /// [`Collective::barrier`], routed through this ONE seam.
-    pub fn barrier(&self) -> Result<()> {
-        self.collective.barrier()
+    pub fn barrier(&self, call: &BlockingCall) -> Result<()> {
+        self.collective.barrier(call)
     }
 
     /// A stable digest of the CANONICAL `trainable_vars` name order this
@@ -1021,7 +1030,21 @@ impl TrainingLoop {
     /// - With `base_model`: text-based loaders encode through the frozen base
     ///   model, project through LoRA, and compute loss on the projected embeddings.
     /// - Without `base_model`: precomputed tensor batches go directly to loss.
-    pub fn run(&mut self, source: super::source::TrainingSource) -> Result<TrainingResult> {
+    ///
+    /// `call` is the [`BlockingCall`] witness: the ONE place the trainer
+    /// receives it. Every collective the run makes — the per-step gather
+    /// ([`Self::compute_loss_gathered`]), the lockstep flag reduce and the
+    /// window-boundary `canonical_reduce` ([`Self::process_batch_loss`]),
+    /// the trailing-window `canonical_reduce`, and the epoch-boundary
+    /// dropout-position gather ([`Self::save_resume_checkpoint`]) — takes
+    /// this same witness, so `run` is callable only from a thread that may
+    /// block: production mints it at the worker's `spawn_blocking`
+    /// boundary (`worker.rs`), never here.
+    pub fn run(
+        &mut self,
+        call: &BlockingCall,
+        source: super::source::TrainingSource,
+    ) -> Result<TrainingResult> {
         use super::source::TrainingSource;
 
         // Reset the media front-end accumulator for THIS `run` call — see
@@ -1581,6 +1604,7 @@ impl TrainingLoop {
                             Self::accumulate_sim_stats(&batch, &mut sim_stats);
                             let loss = self.compute_loss(&batch)?;
                             self.process_batch_loss(
+                                call,
                                 loss,
                                 EpochState {
                                     batch_count: &mut batch_count,
@@ -1669,9 +1693,10 @@ impl TrainingLoop {
                             let chunk = epoch_loader.text_chunk_for_rank(&partition_spec, step)?;
                             let counts = partition_spec.counts_for_step(train_count, step);
                             let batch = self.encode_chunk(&chunk)?;
-                            let loss = self.compute_loss_gathered(&batch, &counts)?;
+                            let loss = self.compute_loss_gathered(call, &batch, &counts)?;
                             Self::accumulate_sim_stats(&batch, &mut sim_stats);
                             self.process_batch_loss(
+                                call,
                                 loss,
                                 EpochState {
                                     batch_count: &mut batch_count,
@@ -1726,6 +1751,7 @@ impl TrainingLoop {
                         let loss = self.compute_loss(&batch)?;
                         Self::accumulate_sim_stats(&batch, &mut sim_stats);
                         self.process_batch_loss(
+                            call,
                             loss,
                             EpochState {
                                 batch_count: &mut batch_count,
@@ -1776,7 +1802,12 @@ impl TrainingLoop {
                 // (`process_batch_loss`'s own call site) — the trailing
                 // partial window is an optimizer-step boundary like any
                 // other and must sum across the gang before it clips/steps.
-                canonical_reduce(&self.rank_ctx, &trainable_vars, &mut accumulated_grads)?;
+                canonical_reduce(
+                    call,
+                    &self.rank_ctx,
+                    &trainable_vars,
+                    &mut accumulated_grads,
+                )?;
                 clip_and_step(
                     &mut optimizer,
                     &trainable_vars,
@@ -1923,6 +1954,7 @@ impl TrainingLoop {
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
                 self.save_resume_checkpoint(
+                    call,
                     &checkpoint_dir,
                     epoch,
                     global_step,
@@ -3100,6 +3132,7 @@ impl TrainingLoop {
     /// is taken once every `gradient_accumulation_steps` micro-batches.
     fn process_batch_loss(
         &mut self,
+        call: &BlockingCall,
         loss: Tensor,
         epoch: EpochState<'_>,
         ctx: StepContext<'_>,
@@ -3192,11 +3225,14 @@ impl TrainingLoop {
         // identity, so `diverged == local_diverged` exactly — byte-identical
         // to the pre-U4b local-only check.
         let local_diverged = loss_val.is_nan() || loss_val > 100.0;
-        let flags = self.rank_ctx.all_reduce_max_flags(if local_diverged {
-            LOCKSTEP_FLAG_DIVERGED
-        } else {
-            0
-        })?;
+        let flags = self.rank_ctx.all_reduce_max_flags(
+            call,
+            if local_diverged {
+                LOCKSTEP_FLAG_DIVERGED
+            } else {
+                0
+            },
+        )?;
         let diverged = flags & LOCKSTEP_FLAG_DIVERGED != 0;
         if diverged {
             self.divergence_count += 1;
@@ -3243,7 +3279,12 @@ impl TrainingLoop {
             // below clips and steps over the IDENTICAL, already-summed
             // gradient on every rank. At `W = 1` this is the zero-filling
             // identity (`optimizer::canonical_reduce`'s own doc).
-            canonical_reduce(&self.rank_ctx, ctx.trainable_vars, epoch.accumulated_grads)?;
+            canonical_reduce(
+                call,
+                &self.rank_ctx,
+                ctx.trainable_vars,
+                epoch.accumulated_grads,
+            )?;
             clip_and_step(
                 ctx.optimizer,
                 ctx.trainable_vars,
@@ -3381,6 +3422,7 @@ impl TrainingLoop {
     /// to close).
     fn compute_loss_gathered(
         &self,
+        call: &BlockingCall,
         batch: &super::data::TrainingBatch,
         counts: &[usize],
     ) -> Result<Tensor> {
@@ -3392,9 +3434,9 @@ impl TrainingLoop {
                 embeddings_b,
                 scores,
             } => {
-                let embeddings_a = rank_ctx.all_gather(embeddings_a, counts)?;
-                let embeddings_b = rank_ctx.all_gather(embeddings_b, counts)?;
-                let scores = rank_ctx.all_gather(scores, counts)?;
+                let embeddings_a = rank_ctx.all_gather(call, embeddings_a, counts)?;
+                let embeddings_b = rank_ctx.all_gather(call, embeddings_b, counts)?;
+                let scores = rank_ctx.all_gather(call, scores, counts)?;
                 self.compute_loss(&TrainingBatch::Contrastive {
                     embeddings_a,
                     embeddings_b,
@@ -3402,8 +3444,8 @@ impl TrainingLoop {
                 })
             }
             TrainingBatch::Pairs { anchors, positives } => {
-                let anchors = rank_ctx.all_gather(anchors, counts)?;
-                let positives = rank_ctx.all_gather(positives, counts)?;
+                let anchors = rank_ctx.all_gather(call, anchors, counts)?;
+                let positives = rank_ctx.all_gather(call, positives, counts)?;
                 self.compute_loss(&TrainingBatch::Pairs { anchors, positives })
             }
             TrainingBatch::Triplet {
@@ -3411,9 +3453,9 @@ impl TrainingLoop {
                 positive,
                 negative,
             } => {
-                let anchor = rank_ctx.all_gather(anchor, counts)?;
-                let positive = rank_ctx.all_gather(positive, counts)?;
-                let negative = rank_ctx.all_gather(negative, counts)?;
+                let anchor = rank_ctx.all_gather(call, anchor, counts)?;
+                let positive = rank_ctx.all_gather(call, positive, counts)?;
+                let negative = rank_ctx.all_gather(call, negative, counts)?;
                 self.compute_loss(&TrainingBatch::Triplet {
                     anchor,
                     positive,
@@ -3427,13 +3469,13 @@ impl TrainingLoop {
                 // before this function ever sees the batch) — gathering it
                 // is the same "downstream of every trainable parameter"
                 // rule as `Regression`'s `input`, not a special case.
-                let logits = rank_ctx.all_gather(logits, counts)?;
-                let labels = rank_ctx.all_gather(labels, counts)?;
+                let logits = rank_ctx.all_gather(call, logits, counts)?;
+                let labels = rank_ctx.all_gather(call, labels, counts)?;
                 self.compute_loss(&TrainingBatch::Classification { logits, labels })
             }
             TrainingBatch::Regression { input, target } => {
-                let input = rank_ctx.all_gather(input, counts)?;
-                let target = rank_ctx.all_gather(target, counts)?;
+                let input = rank_ctx.all_gather(call, input, counts)?;
+                let target = rank_ctx.all_gather(call, target, counts)?;
                 self.compute_loss(&TrainingBatch::Regression { input, target })
             }
             TrainingBatch::Ner { .. } => self.compute_loss(batch),
@@ -4507,7 +4549,10 @@ impl TrainingLoop {
     /// always has exactly the one entry for rank 0 — the pre-U4b flat
     /// `dropout_positions` shape, now wrapped one level deeper (see
     /// [`ResumeState::dropout_positions`]'s own doc).
-    fn gather_dropout_positions(&self) -> Result<HashMap<u32, HashMap<String, u64>>> {
+    fn gather_dropout_positions(
+        &self,
+        call: &BlockingCall,
+    ) -> Result<HashMap<u32, HashMap<String, u64>>> {
         let local = self.target.dropout_positions()?;
         let mut names: Vec<String> = local.keys().cloned().collect();
         names.sort();
@@ -4515,7 +4560,7 @@ impl TrainingLoop {
         let local_tensor = Tensor::from_vec(values, (1, names.len()), &self.device)
             .map_err(|e| JammiError::FineTune(format!("dropout position tensor: {e}")))?;
         let counts = vec![1usize; self.rank_ctx.world() as usize];
-        let gathered = self.rank_ctx.all_gather(&local_tensor, &counts)?;
+        let gathered = self.rank_ctx.all_gather(call, &local_tensor, &counts)?;
         let gathered_rows: Vec<Vec<f64>> = gathered
             .to_vec2()
             .map_err(|e| JammiError::FineTune(format!("dropout position gather readback: {e}")))?;
@@ -4536,6 +4581,7 @@ impl TrainingLoop {
     /// routine both the durable save and the test's reference snapshot drive.
     fn capture_resume_bundle(
         &self,
+        call: &BlockingCall,
         scratch_dir: &Path,
         last_completed_epoch: usize,
         global_step: usize,
@@ -4547,7 +4593,7 @@ impl TrainingLoop {
         // A real collective call every rank takes part in — see this
         // function's own doc and `Self::save_resume_checkpoint`'s rank-0-only
         // write gate immediately after its own call to this function.
-        let dropout_positions = self.gather_dropout_positions()?;
+        let dropout_positions = self.gather_dropout_positions(call)?;
         let state = ResumeState {
             schema_version: RESUME_STATE_SCHEMA_VERSION,
             last_completed_epoch,
@@ -4574,6 +4620,7 @@ impl TrainingLoop {
     /// gather, a real collective call every rank must make in lockstep.
     fn save_resume_checkpoint(
         &self,
+        call: &BlockingCall,
         checkpoint_dir: &Path,
         epoch: usize,
         global_step: usize,
@@ -4584,8 +4631,14 @@ impl TrainingLoop {
             return Ok(());
         };
         let scratch = checkpoint_dir.join("_resume_scratch");
-        let bundle =
-            self.capture_resume_bundle(&scratch, epoch, global_step, optimizer, optim_param_names)?;
+        let bundle = self.capture_resume_bundle(
+            call,
+            &scratch,
+            epoch,
+            global_step,
+            optimizer,
+            optim_param_names,
+        )?;
         if self.rank_ctx.rank() != 0 {
             return Ok(());
         }
@@ -6876,27 +6929,30 @@ mod host_read_discipline {
 
         let loss_before = per_micro_batch_host_read_count();
         let clip_before = crate::fine_tune::optimizer::sync_read_count();
-        loop_
-            .process_batch_loss(
-                loss,
-                EpochState {
-                    batch_count: &mut batch_count,
-                    epoch_loss: &mut epoch_loss,
-                    accumulated_grads: &mut accumulated_grads,
-                    grads_pending: &mut grads_pending,
-                    global_step: &mut global_step,
-                },
-                StepContext {
-                    trainable_vars: &trainable_vars,
-                    optimizer: &mut optimizer,
-                    checkpoint_dir: checkpoint_dir.path(),
-                    checkpoint_interval: 0,
-                    lr_horizon: 1,
-                    last_step_horizon: &mut LastStepHorizon::new(1),
-                    batches_per_epoch: 1,
-                },
-            )
-            .unwrap();
+        crate::fine_tune::collective::witness(|call| {
+            loop_
+                .process_batch_loss(
+                    &call,
+                    loss,
+                    EpochState {
+                        batch_count: &mut batch_count,
+                        epoch_loss: &mut epoch_loss,
+                        accumulated_grads: &mut accumulated_grads,
+                        grads_pending: &mut grads_pending,
+                        global_step: &mut global_step,
+                    },
+                    StepContext {
+                        trainable_vars: &trainable_vars,
+                        optimizer: &mut optimizer,
+                        checkpoint_dir: checkpoint_dir.path(),
+                        checkpoint_interval: 0,
+                        lr_horizon: 1,
+                        last_step_horizon: &mut LastStepHorizon::new(1),
+                        batches_per_epoch: 1,
+                    },
+                )
+                .unwrap()
+        });
 
         assert_eq!(
             per_micro_batch_host_read_count(),
@@ -7522,9 +7578,12 @@ mod f6_streamed_refusal_oracle {
                     .unwrap();
 
             let streamed = tiny_streamed_set().await;
-            let err = loop_
-                .run(TrainingSource::Streamed(Box::new(streamed)))
-                .unwrap_err();
+            let err = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+                loop_.run(&call, TrainingSource::Streamed(Box::new(streamed)))
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("Streamed") && msg.contains("whole-set arm") && msg.contains("Mining"),
@@ -7621,6 +7680,7 @@ mod last_step_run_harness {
     /// given, resuming from a hand-built bundle whose `global_step` is that
     /// value (the current weights, zero moments, epoch 0 completed).
     pub(super) fn run_text_loop(
+        call: &crate::fine_tune::collective::BlockingCall,
         tag: &str,
         config: FineTuneConfig,
         loader: TrainingDataLoader,
@@ -7690,7 +7750,10 @@ mod last_step_run_harness {
         });
         loop_.after_backward = hook;
         let _enter = rt.enter();
-        loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(loader),
+        )
     }
     /// The typed grad-norm refusal, discriminated from every other error the
     /// run could end in: it must name the poisoned step.
@@ -7712,24 +7775,34 @@ mod last_step_run_harness {
     /// `refuse_nonfinite_params`'s epoch-boundary refusal, not this one).
     #[test]
     fn accumulation_window_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = FineTuneConfig {
-            gradient_accumulation_steps: 2,
-            ..text_config()
-        };
-        let healthy =
-            run_text_loop("last-step-accum-ok", config.clone(), pairs(8), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
-        assert!(healthy.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                gradient_accumulation_steps: 2,
+                ..text_config()
+            };
+            let healthy = run_text_loop(
+                &call,
+                "last-step-accum-ok",
+                config.clone(),
+                pairs(8),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
+            assert!(healthy.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
 
-        let err = run_text_loop(
-            "last-step-accum",
-            config,
-            pairs(8),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's last window must be refused");
-        assert_grad_norm_refusal(&err, 2);
+            let err = run_text_loop(
+                &call,
+                "last-step-accum",
+                config,
+                pairs(8),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's last window must be refused");
+            assert_grad_norm_refusal(&err, 2);
+        });
     }
 
     /// Arm: the trailing partial-window flush at `run`'s epoch end — 6
@@ -7741,23 +7814,33 @@ mod last_step_run_harness {
     /// `clip_and_step` in `run` — RED.
     #[test]
     fn trailing_flush_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = FineTuneConfig {
-            gradient_accumulation_steps: 2,
-            ..text_config()
-        };
-        let healthy =
-            run_text_loop("last-step-flush-ok", config.clone(), pairs(6), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                gradient_accumulation_steps: 2,
+                ..text_config()
+            };
+            let healthy = run_text_loop(
+                &call,
+                "last-step-flush-ok",
+                config.clone(),
+                pairs(6),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 2, "control: the arm's horizon");
 
-        let err = run_text_loop(
-            "last-step-flush",
-            config,
-            pairs(6),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's trailing flush must be refused");
-        assert_grad_norm_refusal(&err, 2);
+            let err = run_text_loop(
+                &call,
+                "last-step-flush",
+                config,
+                pairs(6),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's trailing flush must be refused");
+            assert_grad_norm_refusal(&err, 2);
+        });
     }
 
     /// Arm: plain per-batch stepping (`grad_accum: 1`) — 6 pairs = 3
@@ -7769,20 +7852,30 @@ mod last_step_run_harness {
     /// `clip_and_step` — RED.
     #[test]
     fn per_batch_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = text_config();
-        let healthy =
-            run_text_loop("last-step-plain-ok", config.clone(), pairs(6), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 3, "control: the arm's horizon");
+        crate::fine_tune::collective::witness(|call| {
+            let config = text_config();
+            let healthy = run_text_loop(
+                &call,
+                "last-step-plain-ok",
+                config.clone(),
+                pairs(6),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 3, "control: the arm's horizon");
 
-        let err = run_text_loop(
-            "last-step-plain",
-            config,
-            pairs(6),
-            Some(poison_grad_at(3)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's last per-batch step must be refused");
-        assert_grad_norm_refusal(&err, 3);
+            let err = run_text_loop(
+                &call,
+                "last-step-plain",
+                config,
+                pairs(6),
+                Some(poison_grad_at(3)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's last per-batch step must be refused");
+            assert_grad_norm_refusal(&err, 3);
+        });
     }
 
     /// Arm: GradCache (non-precomputed loader, `cached` + in-batch-negative
@@ -7796,25 +7889,35 @@ mod last_step_run_harness {
     /// (step 2 is then neither the horizon nor past it).
     #[test]
     fn gradcache_arm_refuses_a_nonfinite_gradient_on_the_runs_last_step() {
-        let config = FineTuneConfig {
-            cached: true,
-            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
-            epochs: 2,
-            ..text_config()
-        };
-        let healthy =
-            run_text_loop("last-step-gc-ok", config.clone(), pairs(6), None, None).unwrap();
-        assert_eq!(healthy.total_steps, 2, "control: one step per epoch");
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                cached: true,
+                embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+                epochs: 2,
+                ..text_config()
+            };
+            let healthy = run_text_loop(
+                &call,
+                "last-step-gc-ok",
+                config.clone(),
+                pairs(6),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(healthy.total_steps, 2, "control: one step per epoch");
 
-        let err = run_text_loop(
-            "last-step-gc",
-            config,
-            pairs(6),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
-        assert_grad_norm_refusal(&err, 2);
+            let err = run_text_loop(
+                &call,
+                "last-step-gc",
+                config,
+                pairs(6),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN gradient on the run's last GradCache epoch must be refused");
+            assert_grad_norm_refusal(&err, 2);
+        });
     }
 
     /// The epoch-boundary backstop: a NaN gradient on a step that is neither
@@ -7831,19 +7934,22 @@ mod last_step_run_harness {
     /// saves a NaN adapter).
     #[test]
     fn checkpoint_best_refuses_a_nonfinite_parameter_the_monitored_loss_cannot_see() {
-        let err = run_text_loop(
-            "ckpt-best-nan",
-            text_config(),
-            pairs(6),
-            Some(poison_grad_at(2)),
-            None,
-        )
-        .expect_err("a NaN adapter must not be saved as checkpoint_best");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("checkpoint_best") && msg.contains("non-finite trainable parameter"),
-            "expected the checkpoint_best refusal, got: {msg}"
-        );
+        crate::fine_tune::collective::witness(|call| {
+            let err = run_text_loop(
+                &call,
+                "ckpt-best-nan",
+                text_config(),
+                pairs(6),
+                Some(poison_grad_at(2)),
+                None,
+            )
+            .expect_err("a NaN adapter must not be saved as checkpoint_best");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("checkpoint_best") && msg.contains("non-finite trainable parameter"),
+                "expected the checkpoint_best refusal, got: {msg}"
+            );
+        });
     }
 }
 
@@ -7932,6 +8038,7 @@ mod gang_lockstep_oracle {
     /// `Handle::current()` while ALSO rendezvousing with its peer through a
     /// REAL `Local` collective on a separate OS thread.
     fn run_gang_rank(
+        call: &crate::fine_tune::collective::BlockingCall,
         tag: String,
         config: FineTuneConfig,
         loader: TrainingDataLoader,
@@ -7963,7 +8070,10 @@ mod gang_lockstep_oracle {
         });
         loop_.after_backward = hook;
         let _enter = rt.enter();
-        loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(loader),
+        )
     }
 
     /// A gang whose gang-wide `train_count` (5) is NOT a multiple of `W·B`
@@ -7997,9 +8107,9 @@ mod gang_lockstep_oracle {
                     .unwrap();
             let rank_ctx = RankContext::new(Arc::new(local), partition);
             let tag = format!("zero-row-rank-{rank}");
-            handles.push(std::thread::spawn(move || {
-                run_gang_rank(tag, gang_config(1), pairs(5), rank_ctx, None)
-            }));
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| run_gang_rank(&call, tag, gang_config(1), pairs(5), rank_ctx, None),
+            ));
         }
         for (rank, handle) in handles.into_iter().enumerate() {
             let result = handle
@@ -8031,9 +8141,9 @@ mod gang_lockstep_oracle {
             } else {
                 None
             };
-            handles.push(std::thread::spawn(move || {
-                run_gang_rank(tag, gang_config(2), pairs(4), rank_ctx, hook)
-            }));
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| run_gang_rank(&call, tag, gang_config(2), pairs(4), rank_ctx, hook),
+            ));
         }
         for (rank, handle) in handles.into_iter().enumerate() {
             let result = handle
@@ -8072,9 +8182,9 @@ mod gang_lockstep_oracle {
             } else {
                 None
             };
-            handles.push(std::thread::spawn(move || {
-                run_gang_rank(tag, gang_config(2), pairs(4), rank_ctx, hook)
-            }));
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| run_gang_rank(&call, tag, gang_config(2), pairs(4), rank_ctx, hook),
+            ));
         }
         let results: Vec<jammi_db::error::Result<TrainingResult>> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -8201,7 +8311,11 @@ mod gang_determinism_oracle {
     /// `K + 1`'s top-check bails before doing any work. Net effect: exactly
     /// epochs `0..K` are durable; epoch `K`'s in-memory work is discarded,
     /// matching a real crash mid-epoch-`K`.
+    // The rank's whole configuration is this helper's argument list; the
+    // witness makes it eight.
+    #[allow(clippy::too_many_arguments)]
     fn run_gang_rank(
+        call: &crate::fine_tune::collective::BlockingCall,
         tag: String,
         job_id: String,
         config: FineTuneConfig,
@@ -8253,7 +8367,10 @@ mod gang_determinism_oracle {
             }));
         }
         let _enter = rt.enter();
-        let result = loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader));
+        let result = loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(loader),
+        );
         (result, loop_)
     }
 
@@ -8281,17 +8398,20 @@ mod gang_determinism_oracle {
             let tag = format!("{job_prefix}-{rank}-{job_id}");
             let job_id = job_id.to_string();
             let store = Arc::clone(&store);
-            handles.push(std::thread::spawn(move || {
-                run_gang_rank(
-                    tag,
-                    job_id,
-                    gang_config(total_epochs),
-                    pairs(8),
-                    rank_ctx,
-                    store,
-                    cancel_after_step,
-                )
-            }));
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| {
+                    run_gang_rank(
+                        &call,
+                        tag,
+                        job_id,
+                        gang_config(total_epochs),
+                        pairs(8),
+                        rank_ctx,
+                        store,
+                        cancel_after_step,
+                    )
+                },
+            ));
         }
         let mut rank0_weights = None;
         for (rank, handle) in handles.into_iter().enumerate() {
@@ -8475,15 +8595,18 @@ mod last_step_horizon_run_oracles {
     /// (always) and step 3 (the exact last step); step 2 is neither.
     #[test]
     fn fresh_short_run_reads_the_norm_on_step_one_and_the_last_step_only() {
-        let before = thread_sync_read_count();
-        let result = run_text_loop("horizon-fresh", text_config(), pairs(6), None, None).unwrap();
-        assert_eq!(result.total_steps, 3, "control: the run's horizon");
-        assert!(result.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
-        assert_eq!(
-            thread_sync_read_count() - before,
-            2,
-            "a fresh 3-step run must read the norm on step 1 and step 3 only"
-        );
+        crate::fine_tune::collective::witness(|call| {
+            let before = thread_sync_read_count();
+            let result =
+                run_text_loop(&call, "horizon-fresh", text_config(), pairs(6), None, None).unwrap();
+            assert_eq!(result.total_steps, 3, "control: the run's horizon");
+            assert!(result.total_steps < DEFAULT_NORM_CHECK_INTERVAL);
+            assert_eq!(
+                thread_sync_read_count() - before,
+                2,
+                "a fresh 3-step run must read the norm on step 1 and step 3 only"
+            );
+        });
     }
 
     /// PR #381 fix-round item 2 (the 246-vs-249 `clip_gradients` call-count
@@ -8574,24 +8697,27 @@ mod last_step_horizon_run_oracles {
     /// paragraph replaces it with a mutant that was actually run.)
     #[test]
     fn clip_call_count_matches_total_optimizer_steps_for_a_fixed_config() {
-        let config = FineTuneConfig {
-            epochs: 3,
-            ..text_config()
-        };
-        let clip_calls_before = thread_clip_call_count();
-        let result = run_text_loop("clip-count-fixed", config, pairs(8), None, None).unwrap();
-        assert_eq!(
-            result.total_steps, 12,
-            "control: 8 pairs / batch_size 2 = 4 steps/epoch * 3 epochs"
-        );
-        let clip_calls = thread_clip_call_count() - clip_calls_before;
-        assert_eq!(
-            clip_calls, result.total_steps as u64,
-            "clip_gradients must be invoked exactly once per optimizer step: {clip_calls} \
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                epochs: 3,
+                ..text_config()
+            };
+            let clip_calls_before = thread_clip_call_count();
+            let result =
+                run_text_loop(&call, "clip-count-fixed", config, pairs(8), None, None).unwrap();
+            assert_eq!(
+                result.total_steps, 12,
+                "control: 8 pairs / batch_size 2 = 4 steps/epoch * 3 epochs"
+            );
+            let clip_calls = thread_clip_call_count() - clip_calls_before;
+            assert_eq!(
+                clip_calls, result.total_steps as u64,
+                "clip_gradients must be invoked exactly once per optimizer step: {clip_calls} \
              clip-path calls vs {} trainer-path steps for this fixed (n_pairs=8, batch_size=2, \
              epochs=3) config",
-            result.total_steps
-        );
+                result.total_steps
+            );
+        });
     }
 
     /// The shrunk-horizon resume fixture: 8 pairs at `batch_size: 2`
@@ -8618,28 +8744,31 @@ mod last_step_horizon_run_oracles {
     /// this fixture is pinned alongside it.
     #[test]
     fn resumed_run_past_a_shrunk_horizon_checks_the_overshoot_once() {
-        let before = thread_sync_read_count();
-        let result = run_text_loop(
-            "horizon-overshoot",
-            shrunk_horizon_config(),
-            pairs(8),
-            None,
-            Some(100),
-        )
-        .unwrap();
-        let n = result.total_steps - 100;
-        assert_eq!(n, 8, "control: epochs 1 and 2 of 3, 4 steps each");
-        let reads = thread_sync_read_count() - before;
-        let bound = (n.div_ceil(DEFAULT_NORM_CHECK_INTERVAL) + 2) as u64;
-        assert!(
+        crate::fine_tune::collective::witness(|call| {
+            let before = thread_sync_read_count();
+            let result = run_text_loop(
+                &call,
+                "horizon-overshoot",
+                shrunk_horizon_config(),
+                pairs(8),
+                None,
+                Some(100),
+            )
+            .unwrap();
+            let n = result.total_steps - 100;
+            assert_eq!(n, 8, "control: epochs 1 and 2 of 3, 4 steps each");
+            let reads = thread_sync_read_count() - before;
+            let bound = (n.div_ceil(DEFAULT_NORM_CHECK_INTERVAL) + 2) as u64;
+            assert!(
             reads <= bound,
             "a resumed run past its horizon must not re-sync on every step: {reads} reads over \
              {n} steps, bound {bound}"
         );
-        assert_eq!(
-            reads, 1,
-            "exactly one overshoot check (step 101), then the cadence decides"
-        );
+            assert_eq!(
+                reads, 1,
+                "exactly one overshoot check (step 101), then the cadence decides"
+            );
+        });
     }
 
     /// Cell `step > horizon`, armed: the one-shot overshoot check is a REAL
@@ -8651,19 +8780,22 @@ mod last_step_horizon_run_oracles {
     /// the NaN trains in).
     #[test]
     fn resumed_run_past_a_shrunk_horizon_refuses_a_nan_on_its_first_overshoot_step() {
-        let err = run_text_loop(
-            "horizon-overshoot-nan",
-            shrunk_horizon_config(),
-            pairs(8),
-            Some(poison_grad_at(101)),
-            Some(100),
-        )
-        .expect_err("the one-shot overshoot check must refuse a NaN on step 101");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-finite total gradient norm") && msg.contains("step 101"),
-            "expected the grad-norm refusal naming step 101, got: {msg}"
-        );
+        crate::fine_tune::collective::witness(|call| {
+            let err = run_text_loop(
+                &call,
+                "horizon-overshoot-nan",
+                shrunk_horizon_config(),
+                pairs(8),
+                Some(poison_grad_at(101)),
+                Some(100),
+            )
+            .expect_err("the one-shot overshoot check must refuse a NaN on step 101");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("non-finite total gradient norm") && msg.contains("step 101"),
+                "expected the grad-norm refusal naming step 101, got: {msg}"
+            );
+        });
     }
 
     /// Cell `step > horizon`, disarmed: after the one-shot check, later
@@ -8675,26 +8807,29 @@ mod last_step_horizon_run_oracles {
     /// adapter such a run leaves behind.
     #[test]
     fn resumed_run_past_a_shrunk_horizon_leaves_later_overshoot_steps_to_the_cadence() {
-        let before = thread_sync_read_count();
-        let outcome = run_text_loop(
-            "horizon-overshoot-later",
-            shrunk_horizon_config(),
-            pairs(8),
-            Some(poison_grad_at(102)),
-            Some(100),
-        );
-        let err = outcome.expect_err("the NaN adapter is refused at the epoch boundary");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("gradient norm") && msg.contains("checkpoint_best"),
-            "step 102 is past the one-shot check and off the cadence; the epoch-boundary \
+        crate::fine_tune::collective::witness(|call| {
+            let before = thread_sync_read_count();
+            let outcome = run_text_loop(
+                &call,
+                "horizon-overshoot-later",
+                shrunk_horizon_config(),
+                pairs(8),
+                Some(poison_grad_at(102)),
+                Some(100),
+            );
+            let err = outcome.expect_err("the NaN adapter is refused at the epoch boundary");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("gradient norm") && msg.contains("checkpoint_best"),
+                "step 102 is past the one-shot check and off the cadence; the epoch-boundary \
              backstop must be what refuses it: {msg}"
-        );
-        assert_eq!(
-            thread_sync_read_count() - before,
-            1,
-            "the disarmed overshoot must not read the norm again"
-        );
+            );
+            assert_eq!(
+                thread_sync_read_count() - before,
+                1,
+                "the disarmed overshoot must not read the norm again"
+            );
+        });
     }
 }
 
@@ -8874,82 +9009,85 @@ mod loss_curve_metrics {
     /// KNOWN, not merely "however many happened to run".
     #[test]
     fn metrics_json_loss_curves_match_the_epoch_complete_tracing_event() {
-        install();
-        TRAIN_CAPTURE.with(|c| c.borrow_mut().clear());
-        VAL_CAPTURE.with(|c| c.borrow_mut().clear());
+        crate::fine_tune::collective::witness(|call| {
+            install();
+            TRAIN_CAPTURE.with(|c| c.borrow_mut().clear());
+            VAL_CAPTURE.with(|c| c.borrow_mut().clear());
 
-        let config = FineTuneConfig {
-            epochs: 3,
-            validation_fraction: 0.34,
-            early_stopping_metric: EarlyStoppingMetric::ValLoss,
-            ..text_config()
-        };
-        let result = run_text_loop("loss-curve-metrics", config, pairs(20), None, None).unwrap();
+            let config = FineTuneConfig {
+                epochs: 3,
+                validation_fraction: 0.34,
+                early_stopping_metric: EarlyStoppingMetric::ValLoss,
+                ..text_config()
+            };
+            let result =
+                run_text_loop(&call, "loss-curve-metrics", config, pairs(20), None, None).unwrap();
 
-        let metrics: serde_json::Value =
-            serde_json::from_str(&result.metrics_json).expect("metrics_json must be valid JSON");
-        let train_curve = metrics["train_loss_curve"]
-            .as_array()
-            .expect("train_loss_curve must be present and an array");
-        let val_curve = metrics["val_loss_curve"]
-            .as_array()
-            .expect("val_loss_curve must be present (this run measures ValLoss every epoch)");
+            let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json)
+                .expect("metrics_json must be valid JSON");
+            let train_curve = metrics["train_loss_curve"]
+                .as_array()
+                .expect("train_loss_curve must be present and an array");
+            let val_curve = metrics["val_loss_curve"]
+                .as_array()
+                .expect("val_loss_curve must be present (this run measures ValLoss every epoch)");
 
-        let captured_train = TRAIN_CAPTURE.with(|c| c.borrow().clone());
-        let captured_val = VAL_CAPTURE.with(|c| c.borrow().clone());
+            let captured_train = TRAIN_CAPTURE.with(|c| c.borrow().clone());
+            let captured_val = VAL_CAPTURE.with(|c| c.borrow().clone());
 
-        assert_eq!(
-            train_curve.len(),
-            3,
-            "no early stopping fires (patience 10_000): all 3 configured epochs must have a \
+            assert_eq!(
+                train_curve.len(),
+                3,
+                "no early stopping fires (patience 10_000): all 3 configured epochs must have a \
              train_loss_curve row, got {train_curve:?}"
-        );
-        assert_eq!(
+            );
+            assert_eq!(
             val_curve.len(),
             3,
             "ValLoss is measured every epoch: val_loss_curve must have 3 rows too, got {val_curve:?}"
         );
-        assert_eq!(
-            train_curve.len(),
-            captured_train.len(),
-            "metrics_json's train_loss_curve must be exactly as long as the tracing capture: \
-             {captured_train:?}"
-        );
-        assert_eq!(
-            val_curve.len(),
-            captured_val.len(),
-            "metrics_json's val_loss_curve must be exactly as long as the tracing capture: \
-             {captured_val:?}"
-        );
-
-        for (row, (epoch, loss)) in train_curve.iter().zip(captured_train.iter()) {
-            let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
-            let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
-            assert!(
-                json_loss.is_finite(),
-                "train_loss_curve row must be finite: {row:?}"
-            );
-            assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
             assert_eq!(
-                json_loss, *loss,
-                "metrics_json's avg_train_loss must be the SAME f64 the tracing event carried \
+                train_curve.len(),
+                captured_train.len(),
+                "metrics_json's train_loss_curve must be exactly as long as the tracing capture: \
+             {captured_train:?}"
+            );
+            assert_eq!(
+                val_curve.len(),
+                captured_val.len(),
+                "metrics_json's val_loss_curve must be exactly as long as the tracing capture: \
+             {captured_val:?}"
+            );
+
+            for (row, (epoch, loss)) in train_curve.iter().zip(captured_train.iter()) {
+                let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
+                let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
+                assert!(
+                    json_loss.is_finite(),
+                    "train_loss_curve row must be finite: {row:?}"
+                );
+                assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
+                assert_eq!(
+                    json_loss, *loss,
+                    "metrics_json's avg_train_loss must be the SAME f64 the tracing event carried \
                  (bit-identical: both read off the same in-memory `avg_train_loss` local, never \
                  re-derived)"
-            );
-        }
-        for (row, (epoch, loss)) in val_curve.iter().zip(captured_val.iter()) {
-            let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
-            let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
-            assert!(
-                json_loss.is_finite(),
-                "val_loss_curve row must be finite: {row:?}"
-            );
-            assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
-            assert_eq!(
-                json_loss, *loss,
-                "metrics_json's avg_val_loss must be the SAME f64 the tracing event carried"
-            );
-        }
+                );
+            }
+            for (row, (epoch, loss)) in val_curve.iter().zip(captured_val.iter()) {
+                let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
+                let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
+                assert!(
+                    json_loss.is_finite(),
+                    "val_loss_curve row must be finite: {row:?}"
+                );
+                assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
+                assert_eq!(
+                    json_loss, *loss,
+                    "metrics_json's avg_val_loss must be the SAME f64 the tracing event carried"
+                );
+            }
+        });
     }
 
     /// The `TrainLoss`-monitored arm: `avg_val_loss` is never measured
@@ -8959,26 +9097,30 @@ mod loss_curve_metrics {
     /// claim from the honest "not applicable to this run").
     #[test]
     fn metrics_json_omits_val_loss_curve_when_only_train_loss_is_monitored() {
-        let config = FineTuneConfig {
-            epochs: 2,
-            ..text_config()
-        };
-        let result = run_text_loop("loss-curve-train-only", config, pairs(6), None, None).unwrap();
-        let metrics: serde_json::Value =
-            serde_json::from_str(&result.metrics_json).expect("metrics_json must be valid JSON");
-        let train_curve = metrics["train_loss_curve"]
-            .as_array()
-            .expect("train_loss_curve must still be present");
-        assert_eq!(
-            train_curve.len(),
-            2,
-            "both configured epochs must have a row"
-        );
-        assert!(
+        crate::fine_tune::collective::witness(|call| {
+            let config = FineTuneConfig {
+                epochs: 2,
+                ..text_config()
+            };
+            let result =
+                run_text_loop(&call, "loss-curve-train-only", config, pairs(6), None, None)
+                    .unwrap();
+            let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json)
+                .expect("metrics_json must be valid JSON");
+            let train_curve = metrics["train_loss_curve"]
+                .as_array()
+                .expect("train_loss_curve must still be present");
+            assert_eq!(
+                train_curve.len(),
+                2,
+                "both configured epochs must have a row"
+            );
+            assert!(
             metrics.get("val_loss_curve").is_none(),
             "a TrainLoss-monitored run must never measure avg_val_loss, so val_loss_curve must \
              be absent, not an empty array: {metrics:?}"
         );
+        });
     }
 }
 
@@ -11429,16 +11571,27 @@ mod resume_invariant {
     async fn persist(
         store: &Arc<ArtifactStore>,
         job: &str,
-        loop_: &TrainingLoop,
+        loop_: &mut TrainingLoop,
         scratch: &std::path::Path,
         last_completed_epoch: usize,
         global_step: usize,
         opt: &AdamW,
         names: &[String],
     ) {
-        let bundle = loop_
-            .capture_resume_bundle(scratch, last_completed_epoch, global_step, opt, names)
-            .unwrap();
+        // The capture's dropout-position gather is a collective call, so it
+        // runs under a witness on a scoped OS thread (`&mut TrainingLoop` is
+        // `Send`; `&TrainingLoop` is not, the loop holds a `Cell`).
+        let bundle = crate::fine_tune::collective::witness(move |call| {
+            loop_.capture_resume_bundle(
+                &call,
+                scratch,
+                last_completed_epoch,
+                global_step,
+                opt,
+                names,
+            )
+        })
+        .unwrap();
         store
             .put_resume_checkpoint(None, job, &bundle)
             .await
@@ -11465,7 +11618,7 @@ mod resume_invariant {
         let store = file_store();
 
         // ── Reference ──────────────────────────────────────────────────────────
-        let (ref_loop, ref_varmap) =
+        let (mut ref_loop, ref_varmap) =
             build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job")
                 .await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
@@ -11481,7 +11634,7 @@ mod resume_invariant {
         persist(
             &store,
             "ref-job",
-            &ref_loop,
+            &mut ref_loop,
             scratch.path(),
             K - 1,
             K,
@@ -11507,7 +11660,7 @@ mod resume_invariant {
         let w_ref: HashMap<String, Tensor> = ref_loop.target.named_trainable_weights().unwrap();
 
         // ── Crashed ────────────────────────────────────────────────────────────
-        let (crash_loop, crash_varmap) =
+        let (mut crash_loop, crash_varmap) =
             build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
                 .await;
         let (mut crash_opt, crash_names) = build_opt(&crash_varmap, &crash_loop);
@@ -11518,7 +11671,7 @@ mod resume_invariant {
         persist(
             &store,
             "crash-job",
-            &crash_loop,
+            &mut crash_loop,
             crash_scratch.path(),
             K - 1,
             K,
@@ -11668,7 +11821,7 @@ mod resume_invariant {
         let feats = features(n, &device);
         let store = file_store();
 
-        let (ref_loop, ref_varmap) =
+        let (mut ref_loop, ref_varmap) =
             build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
                 .await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
@@ -11679,7 +11832,7 @@ mod resume_invariant {
         persist(
             &store,
             "wo-ref-job",
-            &ref_loop,
+            &mut ref_loop,
             scratch.path(),
             K - 1,
             K,
@@ -11903,8 +12056,11 @@ mod resume_invariant {
                 .unwrap();
 
         // The cancelled run bails at the first epoch-boundary check.
-        let err = tokio::task::spawn_blocking(move || {
-            zombie.run(crate::fine_tune::source::TrainingSource::Resident(loader))
+        let err = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            zombie.run(
+                &call,
+                crate::fine_tune::source::TrainingSource::Resident(loader),
+            )
         })
         .await
         .unwrap()
@@ -13635,12 +13791,16 @@ mod media_front_end_wall_tests {
         let loader = one_row_audio_loader();
 
         let started = Instant::now();
-        let result: TrainingResult = tokio::task::spawn_blocking(move || {
-            audio_loop.run(crate::fine_tune::source::TrainingSource::Resident(loader))
-        })
-        .await
-        .unwrap()
-        .expect("the audio EncoderAdapters run must complete");
+        let result: TrainingResult =
+            crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+                audio_loop.run(
+                    &call,
+                    crate::fine_tune::source::TrainingSource::Resident(loader),
+                )
+            })
+            .await
+            .unwrap()
+            .expect("the audio EncoderAdapters run must complete");
         let total_wall = started.elapsed();
 
         assert!(
@@ -13697,10 +13857,11 @@ mod media_front_end_wall_tests {
         .artifact_dir(dir.path().to_path_buf())
         .build()
         .unwrap();
-        let text_result = tokio::task::spawn_blocking(move || {
-            text_loop.run(crate::fine_tune::source::TrainingSource::Resident(
-                text_loader,
-            ))
+        let text_result = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            text_loop.run(
+                &call,
+                crate::fine_tune::source::TrainingSource::Resident(text_loader),
+            )
         })
         .await
         .unwrap()
@@ -14476,43 +14637,51 @@ mod encode_texts_bucketing_oracle {
             // forward even from an identical seed.
             loop_.set_training(false);
             let rows = rows.clone();
-            handles.push(std::thread::spawn(move || {
-                let range = partition.rows_for_step(rows.len(), 0);
-                let slice = &rows[range];
-                let chunk = TextChunk::Contrastive {
-                    texts_a: slice.iter().map(|(a, _, _)| a.clone()).collect(),
-                    texts_b: slice.iter().map(|(_, b, _)| b.clone()).collect(),
-                    scores: slice.iter().map(|(_, _, s)| *s).collect(),
-                };
-                let batch = loop_.encode_chunk(&chunk).unwrap();
-                let counts = partition.counts_for_step(rows.len(), 0);
-                let loss = loop_.compute_loss_gathered(&batch, &counts).unwrap();
-                let loss_val: f32 = loss.to_scalar().unwrap();
-                let trainable_vars = optimizer::sorted_trainable_vars(&varmap);
-                let names: Vec<String> = {
-                    let data = varmap.data().lock().unwrap();
-                    let id_to_name: std::collections::HashMap<_, _> = data
+            handles.push(crate::fine_tune::collective::BlockingCall::spawn_thread(
+                move |call| {
+                    let range = partition.rows_for_step(rows.len(), 0);
+                    let slice = &rows[range];
+                    let chunk = TextChunk::Contrastive {
+                        texts_a: slice.iter().map(|(a, _, _)| a.clone()).collect(),
+                        texts_b: slice.iter().map(|(_, b, _)| b.clone()).collect(),
+                        scores: slice.iter().map(|(_, _, s)| *s).collect(),
+                    };
+                    let batch = loop_.encode_chunk(&chunk).unwrap();
+                    let counts = partition.counts_for_step(rows.len(), 0);
+                    let loss = loop_.compute_loss_gathered(&call, &batch, &counts).unwrap();
+                    let loss_val: f32 = loss.to_scalar().unwrap();
+                    let trainable_vars = optimizer::sorted_trainable_vars(&varmap);
+                    let names: Vec<String> = {
+                        let data = varmap.data().lock().unwrap();
+                        let id_to_name: std::collections::HashMap<_, _> = data
+                            .iter()
+                            .map(|(name, var)| (var.id(), name.clone()))
+                            .collect();
+                        trainable_vars
+                            .iter()
+                            .map(|v| id_to_name[&v.id()].clone())
+                            .collect()
+                    };
+                    let mut grads = loss.backward().unwrap();
+                    optimizer::canonical_reduce(
+                        &call,
+                        &loop_.rank_ctx,
+                        &trainable_vars,
+                        &mut grads,
+                    )
+                    .unwrap();
+                    let grad_by_name: HashMap<String, Vec<f32>> = names
                         .iter()
-                        .map(|(name, var)| (var.id(), name.clone()))
+                        .zip(&trainable_vars)
+                        .filter_map(|(name, var)| {
+                            grads.remove(var.as_tensor()).map(|g| {
+                                (name.clone(), g.flatten_all().unwrap().to_vec1().unwrap())
+                            })
+                        })
                         .collect();
-                    trainable_vars
-                        .iter()
-                        .map(|v| id_to_name[&v.id()].clone())
-                        .collect()
-                };
-                let mut grads = loss.backward().unwrap();
-                optimizer::canonical_reduce(&loop_.rank_ctx, &trainable_vars, &mut grads).unwrap();
-                let grad_by_name: HashMap<String, Vec<f32>> = names
-                    .iter()
-                    .zip(&trainable_vars)
-                    .filter_map(|(name, var)| {
-                        grads
-                            .remove(var.as_tensor())
-                            .map(|g| (name.clone(), g.flatten_all().unwrap().to_vec1().unwrap()))
-                    })
-                    .collect();
-                (loss_val, grad_by_name)
-            }));
+                    (loss_val, grad_by_name)
+                },
+            ));
         }
         let results: Vec<(f32, HashMap<String, Vec<f32>>)> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();

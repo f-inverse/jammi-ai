@@ -2941,10 +2941,13 @@ impl JobWorker {
         // The blocking trainer runs on the blocking pool so it never starves the
         // heartbeat / poll tasks on the async runtime. Panics are caught so a
         // crashing loop still resolves to a terminal classification rather than
-        // a wedged `running` row.
-        let result = tokio::task::spawn_blocking(move || {
+        // a wedged `running` row. `BlockingCall::spawn_blocking` is the
+        // production minting site of the collective's witness: the trainer's
+        // every collective call takes the `call` minted here, on this
+        // blocking-pool thread, and nowhere else (the collective module doc).
+        let result = crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_fine_tune_blocking(params)
+                run_fine_tune_blocking(&call, params)
             }));
             // Counted INSIDE the blocking closure: this thread keeps running
             // after the owning future is aborted, and a test observing that
@@ -5011,8 +5014,12 @@ struct RunFineTuneParams {
 /// but writes no terminal status — the worker registers the output model and
 /// runs the lease-guarded finalize after this returns. Returns the
 /// [`crate::fine_tune::trainer::TrainingResult`] (adapter path + run metrics)
-/// the worker threads into that finalization.
+/// the worker threads into that finalization. `call` is the collective's
+/// witness minted by the `spawn_blocking` boundary that entered this
+/// function; `TrainingLoop::run` takes it, and through it every collective
+/// verb the run makes.
 fn run_fine_tune_blocking(
+    call: &crate::fine_tune::collective::BlockingCall,
     params: RunFineTuneParams,
 ) -> Result<crate::fine_tune::trainer::TrainingResult> {
     use candle_core::DType;
@@ -5190,7 +5197,7 @@ fn run_fine_tune_blocking(
     }
     let mut training_loop = builder.build()?;
 
-    training_loop.run(training_source)
+    training_loop.run(call, training_source)
 }
 
 /// Fetch and load a job's durable resume checkpoint, if any. `None` when no

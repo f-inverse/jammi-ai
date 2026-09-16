@@ -148,11 +148,6 @@ tracing-subscriber = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The compile-FAIL oracle for the collective's `BlockingCall` witness
-# (`tests/it/blocking_call.rs`): a `Collective` verb reached from a runtime
-# worker thread must not compile, and only `trybuild` can assert a
-# non-compilation.
-trybuild.workspace = true
 # A recording `ObjectStore` wrapper for the rank read-path oracle: proves
 # `verify_partition_leaves` issues one BOUNDED ranged read per leaf and
 # never an unbounded (whole-object) read.

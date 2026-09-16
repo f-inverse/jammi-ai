@@ -145,11 +145,12 @@ async fn run_and_capture_adapter_bytes(tag: &str, seed: u64) -> Vec<u8> {
         .build()
         .unwrap();
 
-    tokio::task::spawn_blocking(move || {
+    jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
         let result = tl
-            .run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-                loader,
-            ))
+            .run(
+                &call,
+                jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+            )
             .unwrap();
         std::fs::read(result.artifact_dir.path().join("adapter.safetensors")).unwrap()
     })

@@ -2916,7 +2916,7 @@ provider: every training-set `source_sql` this tree builds is `source_relation`
 (`crates/jammi-db/src/sql/ident.rs:50`, `"<source>".public."<table>"`) — a plain
 registered-source relation, reached through `materialize_projection_table`
 (`crates/jammi-ai/src/fine_tune/training_set.rs:142`) and `recompute_training_set`
-(`crates/jammi-ai/src/pipeline/recompute.rs:525`) — and a pinned/versioned provider is
+(`crates/jammi-ai/src/pipeline/recompute.rs:533`) — and a pinned/versioned provider is
 read only through `ResultStore::pinned_provider`/`ctx.read_table`, never through a source's
 registered SQL relation. A training set built from a versioned table's rows would need to
 name that fact explicitly; nothing in this tree does.
@@ -2926,19 +2926,19 @@ reads the SAME committed order the eager path reads (`read_back_sql`,
 `crates/jammi-ai/src/fine_tune/training_set.rs:74`) but never collects the whole read into
 a `Vec<RecordBatch>`: a background pump walks the DataFusion stream batch by batch,
 decoding ONLY the rows the current step's chunk needs. `RowWindow`
-(`crates/jammi-ai/src/fine_tune/stream.rs:151`) is the `[start, end)` slice a stream serves
+(`crates/jammi-ai/src/fine_tune/stream.rs:152`) is the `[start, end)` slice a stream serves
 — the training prefix `[0, train_count)` or the validation suffix `[train_count, total)`;
-`Slice` (`crates/jammi-ai/src/fine_tune/stream.rs:180`) is which rows WITHIN that window
+`Slice` (`crates/jammi-ai/src/fine_tune/stream.rs:181`) is which rows WITHIN that window
 this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for validation.
-`StreamConfig`'s `new` (`crates/jammi-ai/src/fine_tune/stream.rs:133`) refuses a zero
+`StreamConfig`'s `new` (`crates/jammi-ai/src/fine_tune/stream.rs:134`) refuses a zero
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
-(`crates/jammi-ai/src/fine_tune/stream.rs:120`, `= 2`) — a named constant, the regression
+(`crates/jammi-ai/src/fine_tune/stream.rs:121`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
 `StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:2545`). `open`
-(`crates/jammi-ai/src/fine_tune/stream.rs:378`) runs ONE bounded-memory pre-pass over its
+(`crates/jammi-ai/src/fine_tune/stream.rs:379`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
-rows of training compute; `next_chunk` (`crates/jammi-ai/src/fine_tune/stream.rs:441`) is
+rows of training compute; `next_chunk` (`crates/jammi-ai/src/fine_tune/stream.rs:442`) is
 the blocking call the trainer's per-step loop drives.
 
 **Resident vs Streamed: one predicate.** `whole_set_arm`
@@ -2957,7 +2957,7 @@ worker calls only `training_set::materialize_projection_table`
 `read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:238`) — and
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`
-(`crates/jammi-ai/src/fine_tune/data.rs:603`) — held for the loader's own lifetime (moved
+(`crates/jammi-ai/src/fine_tune/data.rs:607`) — held for the loader's own lifetime (moved
 into whichever half of a later `split`, `crates/jammi-ai/src/fine_tune/data.rs:680`,
 carries it), not checked-then-released, so the pool's `reserved()` genuinely reflects a
 Resident job's residency while it trains. A table whose eager collected size exceeds the
@@ -2974,7 +2974,7 @@ blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `Str
 captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:746`) on
 `InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:2413`) is still
 executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
-(`crates/jammi-ai/src/fine_tune/trainer.rs:3512`) drives the stream's own `open` through
+(`crates/jammi-ai/src/fine_tune/trainer.rs:3985`) drives the stream's own `open` through
 `Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
 different OS thread — it does NOT inherit the async task's task-local (`current`
 (`crates/jammi-db/src/tenant_scope.rs:128`) on `TenantBinding` only ever reads the override
@@ -3454,9 +3454,18 @@ gauge `jammi_worker_jobs_in_flight` is `1` iff the holder is `JobRun`.
   `Assign` is the K2 protocol violation, a status trailer
   (`InvalidArgument`), never a second admission; every other frame goes
   through `HeldSession::dispatch_round_frame`, the ONE site the round
-  protocol is wired at (today only an empty frame reaches it — a protocol
-  violation). The client half-closing its send side disables the arm; the
-  session stays held.
+  protocol is wired at: a round frame (`RoundInbox::is_round_frame` —
+  `RoundResult`, `RoundChunk`, `RoundCommit`, `RoundFault`) is delivered to
+  the session's `RoundInbox` and the session stays held; a delivery the
+  inbox refuses (the session's `MemberLink` is gone) ends the session with a
+  `FailedPrecondition` trailer; an empty frame is a protocol violation
+  (`InvalidArgument`). The inbox and the link are built at admission over
+  the session's own event sender (`gang_rounds::member_link`), before
+  `Admitted` is queued; no rank body consumes the link yet, so the session
+  keeps it for its whole life and drops it last — which is what closes the
+  response stream. A transport error on the inbound side is reported to the
+  inbox (`RoundInbox::fail`) before the session ends silently. The client
+  half-closing its send side disables the arm; the session stays held.
 - **drain** — the host's phase leaving `Running` (a DRAIN or a RELEASE) ends
   the session `Aborted{Drain}` at once: the only host-initiated cut.
 - **re-verification tick** — every heartbeat, the SAME determinants
@@ -3684,11 +3693,23 @@ a `tokio::spawn`ed future or stored where a worker thread could reach it.
 TRAIT, not on `Peer` alone, because the trainer never names `Peer` — a
 guarantee on `Peer`'s inherent methods would be invisible at the one call
 site that matters. `Noop`, `Local` and `Nccl` accept it and ignore it. The
-compile-time claim has an executed oracle: `crates/jammi-ai/tests/it/blocking_call.rs`
-runs `trybuild` over `crates/jammi-ai/tests/ui/` (a verb from a
-`tokio::spawn`ed future — `BlockingCall` is not `Send`; a verb with no
-witness to pass; the private constructor) and `tests/ui_pass/` (the same
-verb from `spawn_blocking` compiles).
+trainer threads the witness rather than minting one: `TrainingLoop::run`
+takes a `&BlockingCall` (`crates/jammi-ai/src/fine_tune/trainer.rs`) and
+passes it down every path that reaches one of `RankContext`'s five wrapper
+verbs — the per-step gather, the lockstep flag reduce and both
+`canonical_reduce` call sites, the epoch-boundary dropout-position gather —
+and the worker mints it at exactly one place, the `BlockingCall::spawn_blocking`
+that enters `run_fine_tune_blocking` (`crates/jammi-ai/src/fine_tune/worker.rs`);
+tests mint theirs with `spawn_thread`/`spawn_scoped` (U4b's gang oracles run
+each rank on such a thread). The compile-time claim has an executed oracle:
+four doctests on `BlockingCall`'s own docs
+(`crates/jammi-ai/src/fine_tune/collective/mod.rs`; `cargo test -p jammi-ai
+--doc -- BlockingCall`) — `compile_fail,E0277` for a verb from a
+`tokio::spawn`ed future (`BlockingCall` is not `Send`), `compile_fail,E0061`
+for a verb with no witness to pass, `compile_fail,E0624` for the private
+constructor, and the control (the same verb from `spawn_blocking` compiles
+and runs). rustdoc checks the error codes, so a witness made `Send` fails the
+`E0277` block by compiling.
 
 **The round descriptor.** `Descriptor` and `TensorSignature` live in
 `crates/jammi-ai/src/fine_tune/collective/mod.rs`, shared by `Local` and
@@ -3780,8 +3801,12 @@ a transport error the loop read); `dial_member(addr, assign,
 max_message_bytes)` is the coordinator's dial over a `PeerAddr`. The hold
 loop itself — admission, the holder CAS, the `select!` whose inbound arm
 calls `deliver` — is `GangServer::run_rank`'s admitted-session machinery
-(§2.8a); `crates/jammi-server/tests/it/gang_rounds.rs` drives one real
-round through a hold-loop-shaped handler, the inbox and `dial_member`.
+(§2.8a). `crates/jammi-server/tests/it/gang_rounds.rs` drives one real
+round two ways: through a hold-loop-shaped handler, and through the REAL
+`run_rank` on a loopback listener, where the member's `Peer` is built over
+the admitted session's own `MemberLink` (taken through the `test-hooks`
+seam `GangServer::take_member_links`, the seat the rank body will take) and
+folds byte-for-byte what `Local` folds.
 
 **The decode cap on every listener.** `[server.limits] max_message_bytes`
 bounds every listener's inbound decode: the public chain's services in

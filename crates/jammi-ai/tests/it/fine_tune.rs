@@ -1454,10 +1454,11 @@ async fn training_divergence_detection() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || {
-        training_loop.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-            loader,
-        ))
+    let result = jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+        training_loop.run(
+            &call,
+            jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+        )
     })
     .await
     .unwrap();
@@ -1587,10 +1588,11 @@ async fn training_early_stopping_triggers() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || {
-        training_loop.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-            loader,
-        ))
+    let result = jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+        training_loop.run(
+            &call,
+            jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+        )
     })
     .await
     .unwrap()
@@ -3209,10 +3211,11 @@ async fn training_bails_when_lease_lost_mid_run() {
     .build()
     .unwrap();
 
-    let result = tokio::task::spawn_blocking(move || {
-        training_loop.run(jammi_ai::fine_tune::source::TrainingSource::Resident(
-            loader,
-        ))
+    let result = jammi_ai::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+        training_loop.run(
+            &call,
+            jammi_ai::fine_tune::source::TrainingSource::Resident(loader),
+        )
     })
     .await
     .unwrap();

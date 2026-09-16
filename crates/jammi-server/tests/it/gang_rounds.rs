@@ -285,3 +285,182 @@ async fn a_round_delivered_through_the_inbox_and_dialed_through_dial_member_equa
     assert_eq!(member, local[1]);
     assert_eq!(coordinator.2, 0b10, "the control word crossed the seam");
 }
+
+// ── The REAL handler: an admitted session's inbox and link ─────────────────
+
+/// The REAL `GangServer` over `engine`, mounted on its own loopback
+/// listener with the `test-hooks` link tap registered BEFORE the instance
+/// moves into tonic's wrapper — the same `max_decoding_message_size` the
+/// `peer_bind` listener applies. Returns the address and the tap's
+/// receiver. A long lease so no park bound or freshness margin cuts the
+/// session under the round; the re-verification tick stays at `HEARTBEAT`.
+#[cfg(feature = "test-hooks")]
+async fn mount_real_gang_server(
+    engine: Arc<jammi_ai::session::InferenceSession>,
+    cap: usize,
+) -> (std::net::SocketAddr, mpsc::UnboundedReceiver<MemberLink>) {
+    use jammi_server::grpc::gang::GangServer;
+
+    let gang = GangServer::new(
+        engine,
+        Duration::from_secs(60),
+        crate::gang_service::HEARTBEAT,
+    );
+    let links = gang.take_member_links();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(GangServiceServer::new(gang).max_decoding_message_size(cap))
+            .serve_with_incoming(TcpIncoming::from(listener))
+            .await
+            .expect("serve");
+    });
+    (addr, links)
+}
+
+/// Through the REAL `GangServer::run_rank` on a loopback listener: a
+/// `world_size == 2` job whose every I-GANG determinant holds admits the
+/// coordinator's `dial_member` call; the admitted session's hold loop
+/// delivers one round's frames (`RoundResult`/`RoundChunk`/`RoundCommit`,
+/// chunked under a 1 KiB cap) to its `RoundInbox`, and a `Peer` member
+/// built over the session's OWN `MemberLink` — taken through the
+/// `test-hooks` tap, the rank body's future seat — folds every tensor verb
+/// byte-for-byte to what `Local` folds. Mutation proof: a hold loop whose
+/// `dispatch_round_frame` refuses round frames as protocol violations (the
+/// base tree) ends the session with a trailer at the first `RoundResult`,
+/// and the coordinator's round faults instead of folding.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_through_the_real_run_rank_handler_reaches_the_member_link_and_equals_local() {
+    let server = crate::gang_service::start_no_worker_server().await;
+    let (attempt, before, _ready) = crate::gang_service::world_two_ready(
+        &server,
+        crate::gang_service::tenant(0xb1),
+        "job-w2-real-round",
+        "coord-w2-real-round",
+    )
+    .await;
+    let cap = 1024usize;
+    let (addr, mut links) = mount_real_gang_server(Arc::clone(&server.engine), cap).await;
+
+    let member = BlockingCall::spawn_blocking(move |call| {
+        let link = links
+            .blocking_recv()
+            .expect("the admitted session offered its MemberLink to the tap");
+        let peer = Peer::member(1, 2, link, Device::Cpu, cap).expect("member");
+        step(&peer, &call)
+    });
+    let peer_addr = PeerAddr::parse(&addr.to_string()).expect("peer addr");
+    let link = dial_member(
+        &peer_addr,
+        Assign {
+            job_id: "job-w2-real-round".into(),
+            attempt,
+            rank: 1,
+            world: 2,
+            coordinator_instance_id: "coord-w2-real-round".into(),
+        },
+        cap,
+    )
+    .await
+    .expect("every I-GANG determinant holds: dialed and admitted through the real handler");
+    let coordinator = Peer::coordinator(vec![link], Device::Cpu, cap)
+        .expect("coordinator")
+        .with_timeout(Duration::from_secs(20))
+        .expect("timeout");
+    let coordinator = BlockingCall::spawn_blocking(move |call| step(&coordinator, &call));
+    let (member, coordinator) = tokio::join!(member, coordinator);
+    let (member, coordinator) = (member.expect("member"), coordinator.expect("coordinator"));
+
+    let gang = Arc::new(LocalGang::new(vec![Device::Cpu; 2]).expect("gang"));
+    let local: Vec<_> = (0..2)
+        .map(|rank| {
+            let local = gang.rank(rank).expect("rank");
+            BlockingCall::spawn_thread(move |call| step(&local, &call))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().expect("local"))
+        .collect();
+    assert_eq!(
+        coordinator, local[0],
+        "the coordinator's fold equals Local's rank 0"
+    );
+    assert_eq!(
+        member, local[1],
+        "the member's fold, over the session's own link, equals Local's rank 1"
+    );
+    assert_eq!(
+        coordinator.2, 0b10,
+        "the control word crossed the real handler"
+    );
+    // The peer wrote nothing terminal on the job row under the round.
+    assert_eq!(
+        crate::gang_service::row_facts(&server, "job-w2-real-round").await,
+        before
+    );
+}
+
+/// The delivery arm's refusal: a round frame on an admitted stream whose
+/// `MemberLink` is gone — its owner (here the tap) dropped it, so
+/// `RoundInbox::deliver` reports no member — ends the session with a
+/// `FailedPrecondition` trailer naming the closed link, never buffering a
+/// round nobody will read and never a bare close. A `world_size == 1`
+/// session suffices: the hold loop is the same on every world size.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_frame_after_the_member_link_closed_ends_the_session_with_a_trailer() {
+    use jammi_wire::proto::gang::RoundFault;
+
+    let server = crate::gang_service::start_no_worker_server().await;
+    crate::gang_service::fresh_coordinator(&server, "coord-link-closed").await;
+    let attempt = crate::gang_service::submit_and_claim(
+        &server,
+        "job-link-closed",
+        "coord-link-closed",
+        Duration::from_secs(300),
+        crate::gang_service::WORLD1_SPEC,
+    )
+    .await;
+    let before = crate::gang_service::row_facts(&server, "job-link-closed").await;
+    let (addr, mut links) = mount_real_gang_server(Arc::clone(&server.engine), 1024).await;
+    let mut rank = crate::gang_service::open_rank_at(
+        addr,
+        crate::gang_service::assign_frame_full(
+            "job-link-closed",
+            attempt,
+            0,
+            1,
+            "coord-link-closed",
+        ),
+    )
+    .await
+    .expect("every determinant holds: admitted");
+    crate::gang_service::expect_admitted(&mut rank).await;
+    let link = links.recv().await.expect("the session offered its link");
+    drop(link);
+    rank.outbound
+        .send(RankControl {
+            control: Some(rank_control::Control::RoundFault(RoundFault {
+                round: 0,
+                detail: "the coordinator gave up".into(),
+            })),
+        })
+        .await
+        .expect("the admitted stream is open");
+    let err = crate::gang_service::next_event(&mut rank.events, Duration::from_secs(5))
+        .await
+        .expect_err("a round frame with no member to read it is a status, never an event");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(
+        err.message().contains("member link has closed"),
+        "the trailer names the closed link: {err}"
+    );
+    assert_eq!(
+        crate::gang_service::row_facts(&server, "job-link-closed").await,
+        before
+    );
+}

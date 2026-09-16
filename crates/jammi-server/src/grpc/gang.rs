@@ -34,7 +34,10 @@
 //! only once the CAS succeeded is `Admitted` emitted. The stream is then
 //! HELD by a spawned loop owning the [`RankHold`] guard, with exactly four
 //! arms: the inbound stream (`Cancel` ends the session cooperatively; a
-//! second `Assign` is a protocol violation, `InvalidArgument` — K2), the
+//! second `Assign` is a protocol violation, `InvalidArgument` — K2; a round
+//! frame — `RoundInbox::is_round_frame` — is delivered to the session's
+//! round inbox and the session stays held; an empty frame is a protocol
+//! violation), the
 //! host's phase watch (a DRAIN or RELEASE ends every held rank with
 //! `Drain`, the only host-initiated cut), the re-verification tick (one per
 //! heartbeat: the row predicate, the training-set identity, and the
@@ -94,6 +97,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::Stream;
+use jammi_ai::fine_tune::collective::MemberLink;
 use jammi_ai::fine_tune::worker::{HolderBusy, RankHold, WorkerPhase};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::{RankAdmissionRow, WorldSizeFact};
@@ -108,6 +112,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
+use crate::grpc::gang_rounds::{member_link, RoundInbox};
 use crate::grpc::proto::gang::gang_service_server::GangService;
 use crate::grpc::proto::gang::{
     rank_control, rank_event, AbortReason, Aborted, Admitted, Assign, RankControl, RankEvent,
@@ -239,6 +244,11 @@ pub struct GangServer {
     /// state before `self` is moved into tonic's generated service wrapper.
     #[cfg(feature = "test-hooks")]
     last_refusal: Arc<Mutex<Option<GangRefusalReason>>>,
+    /// `test-hooks` only: the taker an admitted session hands its
+    /// [`MemberLink`] to instead of keeping it — see
+    /// [`Self::take_member_links`]. Absent from a plain build.
+    #[cfg(feature = "test-hooks")]
+    member_link_tap: Arc<Mutex<Option<mpsc::UnboundedSender<MemberLink>>>>,
 }
 
 impl GangServer {
@@ -249,7 +259,41 @@ impl GangServer {
             heartbeat,
             #[cfg(feature = "test-hooks")]
             last_refusal: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-hooks")]
+            member_link_tap: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The owner an admitted session's [`MemberLink`] goes to: the session
+    /// itself (`Some` — it keeps the link for its whole life, see
+    /// [`HeldSession::member`]), or, under `test-hooks` with a taker
+    /// registered by [`Self::take_member_links`], that taker (`None`). A
+    /// taker that has gone away leaves the link with the session.
+    fn offer_member_link(&self, member: MemberLink) -> Option<MemberLink> {
+        #[cfg(feature = "test-hooks")]
+        {
+            if let Some(tap) = self.member_link_tap.lock().unwrap().as_ref() {
+                return match tap.send(member) {
+                    Ok(()) => None,
+                    Err(mpsc::error::SendError(member)) => Some(member),
+                };
+            }
+        }
+        Some(member)
+    }
+
+    /// `test-hooks` only: every session this `GangServer` admits from now
+    /// on hands its [`MemberLink`] to the returned receiver instead of
+    /// keeping it. This is the seat the rank body (U5b-1b-iii) will take —
+    /// the member's `Peer` is built over exactly this link — and, until it
+    /// exists, the one way an oracle drives `Peer` through the REAL
+    /// `run_rank` handler. Call BEFORE mounting (tonic's wrapper takes the
+    /// instance by value).
+    #[cfg(feature = "test-hooks")]
+    pub fn take_member_links(&self) -> mpsc::UnboundedReceiver<MemberLink> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.member_link_tap.lock().unwrap() = Some(tx);
+        rx
     }
 
     /// Records which [`GangRefusalReason`] the call in progress refused for.
@@ -585,47 +629,90 @@ struct HeldSession {
     heartbeat: Duration,
     inbound: tonic::Streaming<RankControl>,
     events: mpsc::Sender<Result<RankEvent, Status>>,
+    /// Where the hold loop delivers every round frame it reads off the
+    /// inbound stream (`RoundInbox::deliver`), and reports a transport error
+    /// on it (`RoundInbox::fail`). Dropped with the session.
+    inbox: RoundInbox,
+    /// The member's end of the round protocol over THIS session — the link
+    /// the member's `Peer` is built over (`gang_rounds::member_link`), whose
+    /// outbound events ride the session's own response stream. No rank body
+    /// consumes it yet (U5b-1b-iii): the session keeps it for its whole
+    /// life and drops it last, which is what lets the response stream close
+    /// (the link's event forwarder holds its own clone of `events` until the
+    /// link is gone). `None` only under `test-hooks`, when the taker
+    /// registered by [`GangServer::take_member_links`] took it at admission.
+    member: Option<MemberLink>,
+}
+
+/// What one inbound control frame does to an admitted session.
+enum FrameOutcome {
+    /// A round frame, delivered to the member's inbox: the session stays
+    /// held.
+    Held,
+    /// The session ends — one `Aborted{reason}` event, or one status
+    /// trailer for a protocol violation.
+    End(Result<AbortReason, Status>),
 }
 
 impl HeldSession {
     /// The inbound arm's decision for one control frame on an ADMITTED
-    /// stream — every frame decided here ENDS the session: `Cancel`
-    /// cooperatively (`Aborted{Cancelled}`); a second `Assign` as the K2
-    /// protocol violation (a status trailer, never a second admission);
-    /// every OTHER frame through [`Self::dispatch_round_frame`], the one
-    /// site the round protocol is wired at.
-    fn on_control_frame(
-        &mut self,
-        control: Option<rank_control::Control>,
-    ) -> Result<AbortReason, Status> {
-        match control {
-            Some(rank_control::Control::Cancel(_)) => Ok(AbortReason::Cancelled),
-            Some(rank_control::Control::Assign(_)) => Err(Status::invalid_argument(
-                "a second Assign on an admitted RunRank stream is a protocol violation",
-            )),
-            other => self.dispatch_round_frame(other),
+    /// stream: `Cancel` ends the session cooperatively
+    /// (`Aborted{Cancelled}`); a second `Assign` ends it as the K2 protocol
+    /// violation (a status trailer, never a second admission); every OTHER
+    /// frame goes through [`Self::dispatch_round_frame`], the one site the
+    /// round protocol is wired at — a round frame keeps the session held.
+    async fn on_control_frame(&mut self, frame: RankControl) -> FrameOutcome {
+        match &frame.control {
+            Some(rank_control::Control::Cancel(_)) => FrameOutcome::End(Ok(AbortReason::Cancelled)),
+            Some(rank_control::Control::Assign(_)) => {
+                FrameOutcome::End(Err(Status::invalid_argument(
+                    "a second Assign on an admitted RunRank stream is a protocol violation",
+                )))
+            }
+            _ => self.dispatch_round_frame(frame).await,
         }
     }
 
     /// THE dispatch point for every inbound control frame on an admitted
-    /// stream that is neither `Assign` nor `Cancel` — where the Peer
-    /// collective's round machinery (`grpc/gang_rounds.rs`, its own unit)
-    /// is wired, at this ONE site, once its round frames join
-    /// `RankControl`'s oneof. Today no such frame exists: the only value
-    /// that reaches here is an EMPTY frame (`control: None`), a protocol
-    /// violation that ends the session with a status trailer.
-    fn dispatch_round_frame(
-        &mut self,
-        control: Option<rank_control::Control>,
-    ) -> Result<AbortReason, Status> {
-        match control {
-            None => Err(Status::invalid_argument(
+    /// stream that is neither `Assign` nor `Cancel`. A round frame
+    /// (`RoundInbox::is_round_frame`: `RoundResult`, `RoundChunk`,
+    /// `RoundCommit`, `RoundFault`) is delivered to the session's inbox —
+    /// waiting for inbox room, which is the member's `Peer` reading at its
+    /// own pace — and the session stays held; a delivery the inbox refuses
+    /// (the member's link is gone: its owner dropped it, so no round can be
+    /// in progress and none can start) ends the session with a
+    /// `FailedPrecondition` trailer rather than buffering a round nobody
+    /// will read. Everything else is a protocol violation ending the
+    /// session with an `InvalidArgument` trailer: today that is exactly the
+    /// EMPTY frame (`control: None`), and the match below is exhaustive on
+    /// `RankControl`'s oneof so a NEW arm is a compile error here, never a
+    /// silent delivery or refusal.
+    async fn dispatch_round_frame(&mut self, frame: RankControl) -> FrameOutcome {
+        if RoundInbox::is_round_frame(&frame) {
+            return if self.inbox.deliver(frame).await {
+                FrameOutcome::Held
+            } else {
+                FrameOutcome::End(Err(Status::failed_precondition(
+                    "a round frame on an admitted RunRank stream whose member link has closed",
+                )))
+            };
+        }
+        FrameOutcome::End(Err(match frame.control {
+            None => Status::invalid_argument(
                 "an empty RankControl frame on an admitted RunRank stream is a protocol violation",
-            )),
-            Some(rank_control::Control::Assign(_)) | Some(rank_control::Control::Cancel(_)) => {
+            ),
+            Some(rank_control::Control::Assign(_) | rank_control::Control::Cancel(_)) => {
                 unreachable!("Assign and Cancel are decided by on_control_frame, never dispatched")
             }
-        }
+            Some(
+                rank_control::Control::RoundResult(_)
+                | rank_control::Control::RoundChunk(_)
+                | rank_control::Control::RoundCommit(_)
+                | rank_control::Control::RoundFault(_),
+            ) => unreachable!(
+                "every round arm is recognised by RoundInbox::is_round_frame and delivered above"
+            ),
+        }))
     }
 
     /// The HOLD loop: exactly four arms — the inbound stream, the host's
@@ -651,8 +738,15 @@ impl HeldSession {
         let end: Result<AbortReason, Status> = loop {
             tokio::select! {
                 frame = self.inbound.next(), if inbound_open => match frame {
-                    Some(Ok(frame)) => break self.on_control_frame(frame.control),
+                    Some(Ok(frame)) => match self.on_control_frame(frame).await {
+                        FrameOutcome::Held => {}
+                        FrameOutcome::End(end) => break end,
+                    },
                     Some(Err(status)) => {
+                        // The member's link learns the inbound stream FAILED
+                        // (its round in progress ends naming the reason,
+                        // never a bare close) before the session goes.
+                        self.inbox.fail(&status).await;
                         tracing::debug!(
                             job_id = %self.assign.job_id,
                             %status,
@@ -693,6 +787,12 @@ impl HeldSession {
         // has nobody to tell; the hold is freed regardless, below.
         let _ = self.events.send(item).await;
         drop(self.events);
+        // The round protocol's ends go with the session: the inbox first
+        // (no further delivery), then the link — whose event forwarder holds
+        // the last clone of the event sender, so the response stream closes
+        // only now — then the slot.
+        drop(self.inbox);
+        drop(self.member);
         drop(self.hold);
     }
 }
@@ -912,6 +1012,16 @@ impl GangService for GangServer {
         // `Admitted` is emitted only after the CAS succeeded; the guard
         // moves into the spawned HOLD loop with the inbound stream.
         let (events, rx) = mpsc::channel::<Result<RankEvent, Status>>(4);
+        // The round protocol's member end, over this session's OWN event
+        // sender: the hold loop delivers round frames to `inbox`, and the
+        // link's events ride the same response stream as `Admitted` and the
+        // session's end. Built before `Admitted` is queued, so an admitted
+        // stream always has its inbox. `member_link` fails only outside a
+        // runtime context, which a tonic handler never is.
+        let (inbox, member) = member_link(events.clone()).map_err(|e| {
+            Status::internal(format!("gang admission: building the member link: {e}"))
+        })?;
+        let member = self.offer_member_link(member);
         if events.try_send(Ok(admitted_event())).is_err() {
             // A fresh channel with room for four frames cannot refuse the
             // first; stated rather than unwrapped.
@@ -926,6 +1036,8 @@ impl GangService for GangServer {
             heartbeat: self.heartbeat,
             inbound,
             events,
+            inbox,
+            member,
         };
         tokio::spawn(held.hold());
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))

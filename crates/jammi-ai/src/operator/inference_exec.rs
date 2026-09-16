@@ -81,6 +81,7 @@ impl InferenceExecBuilder {
     /// `feat_500-wave4` §9 B3) — a submitter placing this plan onto a device
     /// kind other than its own session's builds with that kind directly;
     /// there is no separate optional override setter.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         source: ModelSource,

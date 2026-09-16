@@ -545,11 +545,22 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
     let record = claim(&engine, &worker, Duration::from_secs(20)).await;
     assert_eq!(record.attempts, 2, "the next attempt, after the cooldown");
     worker.run_claimed_job(&engine, record).await;
-    let member_run = member.await.expect("the member thread joined");
 
+    // The attempt's end FIRST: a member parked on the tap (a dial that was
+    // refused after all) must surface as the end's own text, never as a
+    // silent wait on the member thread.
     let ends = training_test_hooks::coordinator_ends_for(&job_id);
     assert_eq!(ends.len(), 2, "{ends:?}");
     assert_eq!(ends[1].0, 2);
+    assert!(
+        ends[1].2 == 12 || ends[1].2 == 11,
+        "attempt 2 must reach the run (Published or a run failure), got: {}",
+        ends[1].1
+    );
+    let member_run = tokio::time::timeout(Duration::from_secs(60), member)
+        .await
+        .expect("the member thread ends within the bound once the coordinator ended its session")
+        .expect("the member thread joined");
     let listings = training_test_hooks::assembly_listings_for(&job_id);
     assert_eq!(
         listings,

@@ -1584,9 +1584,415 @@ cherry-pick on a branch that already has it). Tip: `a8ab966725b4b7d3ede7641e5549
 
 (built after §6)
 
-## 8. U5b-2
+## 8. U5b-2 (landed as two commits; original tip `81dc653a`)
 
-(built after §7)
+The implementer's contract, folded by the lead after checking: `run_claimed_job_under` carries a zero diff; `lease_settlement` is a total match with no wildcard; the hermetic chaos rows live in the server it-suite over a two-host loopback fleet and the SIGKILL rows in `tests/distributed` with their names in the workflow matrix. Three deviations accepted with their code: no flag flip (every watchdog-named failure is detected inside rank 0's own collective call, so the run has already returned through `Abandoned`; the flag would have no reader); no `BackOff` disposition (the live same-named `building` row is unreachable at this tip — table names carry nanos + a uuid — refuted by an executed oracle rather than shipped as dead code); mid-run uncounted member faults spend the attempt per DESIGN §4, narrowing §6's release rule to assembly ends and `Drain`. One finding filed for U5b-1b-iii: a rank resumed out of lockstep folds rounds whose descriptors agree and fails late — the agreement digest must bind the resume epoch.
+
+Worktree `wt-u5b2`, branch `unit/u5b2`, base `feat/500-wave3c` @ `82f80b84`. Every path is
+repo-relative; every oracle named was executed on the tip (§4); every mutation in §2 was applied
+to the committed tree, run through ONE filtered test, and reverted (`git checkout -- <file>`,
+`git status --short` empty after each — `u5b2-scratch/mutations.py`, logs `mut-M*.log`,
+`mutations.out`). One `--features` set per crate for the session (`jammi-ai`, `jammi-server`:
+`test-hooks`; the distributed target: `live-distributed-tests`, its own required feature),
+`RUSTC_WRAPPER=sccache`, `CARGO_TARGET_DIR=…/targets/u5b2`. `jammi-db` is untouched.
+
+#### 1. Scope shipped
+
+**`crates/jammi-ai/src/fine_tune/worker.rs`** (the coordinator's failure path only; the rank
+body, `RankEvent::Outcome`'s producer and every job-row-writing site are U5b-1b-iii's and are
+untouched — `run_claimed_job_under` carries a zero diff):
+- `LeaseSettlement { Release, Expire, Untouched }` and `lease_settlement(&CoordinatorEnd)`, a
+  TOTAL match (no wildcard; a new end is a compile error): `MemberAborted{Drain}` → `Release`
+  (OPS D10); `MemberAborted{Refuted | Unavailable | StoreUnavailable | NoBody | Cancelled |
+  Unspecified}` and `LinkFault` → `Expire` (a rank failure spends the attempt at the successor's
+  claim; `attempts + 1` is `claim_next`'s, never the coordinator's); every assembly end
+  (`HostCannotCoordinate`, `CatalogFault`, `ShortListed`, `MemberUnreachable`, `MemberRefused`,
+  `PeerRefused`, `Drain`) → by its recorded outcome's counting class (§6's rule, kept: all
+  uncounted today → `Release`); `Moved`, `Published`, `TrainingFailed`, `Cancelled` →
+  `Untouched` (the caller's arms).
+- `JobWorker::coordinate` settles by `lease_settlement` after recording the assembly outcome
+  (`Release` → `release_job_lease`; `Expire` → a warn line naming the end; the end returns
+  `Abandoned(end)` — no terminal write), logs the settlement on the "coordinator attempt ended"
+  line, and its doc states the watchdog (below), the split and OPS D6.
+- `WorkerJobError::Abandoned`'s doc re-anchored on the split. The §6 table oracle's settle
+  sentence and one assertion message re-worded (the counting class only); a NEW lib oracle
+  pins the settlement over every variant (§2).
+
+**The per-attempt watchdog is the coordinator's own `Peer`, stated, not a second task.** Every
+member's stream is read by rank 0's rounds: a member's `Aborted{reason}` is recorded typed on its
+link (`CoordinatorLink::session_abort`), a dropped stream ends the wait `Transport`/
+`Disconnected`, a rank silent past `[worker] rank_timeout_secs` ends it `Timeout` (the round
+deadline `Peer::with_timeout`) — each fails rank 0's collective call, faults every member in the
+same round (`fault_all` → `RoundFault`) and, at the body's step (7), ends every session
+(`Peer::end_members` → `Cancel`, the stream close); `assemble_and_run` classifies the end from
+the links. The `Peer` is built for the attempt and dropped with it: a fault retires exactly the
+attempt it belongs to. OPS D6: a member's slot is `Rank` for its whole session and a peer never
+claims while it holds a rank (`HostAdmission`), so ending a session aborts no claim transaction.
+
+**`crates/jammi-server/tests/it/gang_chaos.rs`** (new) — the hermetic chaos rows over a
+two-HOST loopback fleet: a coordinator engine (its own `InferenceSession`, the production
+`GangDialer` installed by the one statement `OssServer::bind` performs) and a member engine
+(its own session; the REAL `GangServer::run_rank` mounted on a tokio runtime of its own, so
+"the member process died" is that runtime dropped: listener, connections, hold loops, tapped
+links' forwarders), both over ONE shared SQLite catalog and ONE shared `file://` result root —
+the shape two `jammi-server` replicas take. Rank 1 is the test's thread over the tapped
+`MemberLink` (the `test-hooks` tap, the rank body's seat) running the real `TrainingLoop`,
+wrapped in a chaos collective (`ChaosRank`) that fires at the FIFTH `all_reduce_sum` — epoch 2's
+first optimizer step (`canonical_reduce` is two reduces per step, two steps per epoch), past
+epoch 1's resume checkpoint. Rank 1 performs the rank body's resume discovery
+(`fetch_resume_checkpoint` for the real job from the fleet's artifact store, `load_bundle`,
+`TrainingLoopBuilder::resume`) so the successor gang resumes in lockstep. Four rows (§2), each
+completing under a new gang with published bytes EQUAL to an uninterrupted `LocalGang` run.
+**`gang_coordinator.rs`** (server it): thirteen §6 helpers made `pub(crate)` for the sibling.
+
+**`crates/jammi-ai/tests/it/gang_coordinator.rs`** — the planted live `building` row oracle
+(the `BackOff` refutation, §1 deviation 2).
+
+**`crates/jammi-ai/tests/distributed/{gang_chaos.rs (new), harness.rs, main.rs}`,
+`.github/workflows/distributed.yml`** — the process-level SIGKILL rows: every spawned worker is
+gang-capable (`worker_toml` renders `[server] peer_bind`/`peer_advertise` on a per-process peer
+port, `[distributed] max_world_size = 2`, `[worker] rank_timeout_secs = 10`; `shared_config`
+submits at the same bound), `submit_gang_fine_tune` submits a `world_size = 2` spec through
+`run_training_spec`; `killed_peer_job_is_reclaimed_and_completed_by_a_new_gang` and
+`killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang` SIGKILL rank 1 / rank 0 of a
+three-process fleet mid-run and require `completed` by a new gang, `attempts - releases >= 2`
+(the crashed attempt spent), one model row, the resume checkpoint reaped; both names added to
+the chaos leg's matrix (advisory, as the plan's lane says). Compiled by the workflow's own
+compile-check command (§4); NOT executed here (§3).
+
+**Docs (same commit set):** `docs/maintainer/MAINTAINER-GUIDE.md` §2.8d (the settlement
+paragraph rewritten; a new "per-attempt watchdog" paragraph incl. the BackOff refutation and
+the chaos oracles), `docs/guide/src/deploy-server.md` (DRAIN: a held rank ends `Drain`, the
+job's lease handed back; every other mid-run loss spends an attempt),
+`docs/guide/src/fine-tuning.md` (Training safety: multi-host runs),
+`docs/guide/src/configuration.md` (`rank_timeout_secs`).
+
+##### Deviations from UNITS.md / the brief, with the reason and the code
+
+1. **No flag flip; the run exits through `Abandoned`, not the lease-lost arm.** The brief:
+   "flip the hold's `lost` flag so the run exits through `run_claimed_job_under`'s lease-lost
+   arm". At the coordinator every failure the watchdog names is detected INSIDE rank 0's own
+   collective call (`peer.rs`: `Link::recv` → `WaitEnd::{Timeout, Disconnected, Transport}` and
+   `Frame::Session` for a member's `Aborted`; `Peer::round` sets `fault`), so `train_fine_tune`
+   has RETURNED with the error before `coordinate` classifies the end — the hold and the cancel
+   watcher are dropped at `run_spec`'s return (`worker.rs::run_claimed_job_under`, `drop(hold);
+   drop(cancel_watcher);`), and a flag flipped then has no reader (the trainer checks `cancel`
+   only at its epoch-boundary top and before the checkpoint write, both already past). The
+   lease-lost arm and the `Abandoned` arm perform the same actions (checkpoint GC, a warn, no
+   write; `run_claimed_job_under`'s two arms); `Abandoned(end)` carries the reason, the
+   lease-lost arm would log "lease lost" for a lease that was not lost. Routing through the
+   flag would be a mechanism with no observable and a misleading log — cut; the property
+   (no terminal write on every mid-run end) is P3 with its executed mutation M3.
+2. **No `BackOff` disposition on the training path — the state is unreachable at this tip,
+   refutation executed.** `ResultStore::create_table` names every table
+   `{source}__{task}__{model}__{nanos}_{uuid8}` (`store/mod.rs`, "Nanoseconds plus a short uuid
+   suffix"); `training_set::materialize_projection_table` anchors a registered source
+   `InputAnchor::unpinned_at_instant`, and `exact_match_candidates` (`store/freshness.rs`)
+   short-circuits any unpinned anchor and only ever considers `ready` rows
+   (`find_ready_result_tables_by_definition`); the job row's write-once pair is built from the
+   FINISHED table (`run_spec`'s FineTune arm, `table.record.table_name` after
+   `materialize_projection_table`/`bind_recorded_training_set`, which requires `ready`) and
+   written by the coordinator body's CAS after it. So no successor — a retry, or a second job —
+   ever finds a live same-named `building` row: it materializes its own table (README r31's own
+   "honestly always a miss"). Executed: `it::gang_coordinator::
+   a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never_met_by_the_successor`
+   plants a `building` TrainingSet row over the same source/task under a live renewing lease,
+   runs the attempt, and asserts the attempt's own `ready` table is recorded, the body is
+   reached, and the orphan is byte-untouched (still `building`, same writer, lease live) — the
+   lease's to reap after expiry (`ResultStore::recover` → `claim_expired_building_table`, which
+   exists and is exercised by the store's own recovery tests). M6 (deterministic naming) reds
+   it: that is what "same-named" would cost. Shipping a disposition nothing can reach would be
+   dead code and an oracle that cannot go red.
+3. **A mid-run `MemberAborted{Unavailable | StoreUnavailable | NoBody}` and every `LinkFault`
+   spend the attempt** although their recorded `AssemblyOutcome` is uncounted (§6 deviation 2
+   released every uncounted outcome). DESIGN.md §4 is explicit ("reclaim requeues the job within
+   the remaining lease window"; only the DRAIN/RELEASE case releases) and the brief's "every
+   other reason → the failed-attempt path"; §6's own §3 named the consequence of releasing:
+   a deterministic member fault retries forever under the cooldown. The counting class still
+   governs the cooldown (`record_assembly_outcome` unchanged) and every ASSEMBLY end (no run
+   started), so §6's rule is narrowed, not replaced. Consequence stated: at this tip a member
+   with no rank body parks `NoBody` after the member's lease, which now spends an attempt —
+   correct for the design (a member that never runs a body is a failed rank) and moot once
+   U5b-1b-iii's body consumes the link.
+4. **The drain hook in `gang.rs` is untouched.** U5a-2's phase arm already ends every held
+   session `Aborted{Drain}` on `begin_drain`; the coordinator receives it typed
+   (`session_abort`, P4's executed row) and no determinant is missing — nothing to extend.
+5. **`tests/distributed/gang_chaos.rs` is written and compiled, not executed** (§3); the
+   `harness.rs` gang knobs apply to EVERY spawned worker (greenfield: one fleet shape, no
+   per-test flag) — the pre-existing rows submit `world_size = 1` and are unaffected by an idle
+   gang listener.
+6. **The chaos rows live in `crates/jammi-server/tests/it/`**, not `jammi-ai/tests/it`: the
+   real `run_rank` hold loop is `jammi-server`'s, and the two-host fleet needs it.
+
+#### 2. Properties
+
+Lanes: SRV = `cargo test -p jammi-server --features test-hooks --test it -- --test-threads=1
+<filter>`; AI = `cargo test -p jammi-ai --features test-hooks --test it -- <filter>`; LIB =
+`cargo test -p jammi-ai --features test-hooks --lib -- <filter>`. "M0" is the base tree's
+`worker.rs` (`git show 82f80b84:…`) under this unit's tests — the RED-at-base check.
+
+| # | Property (over every input / exit arm) | Executed oracle | Executed mutation → first red line |
+|---|---|---|---|
+| P1 | The settlement is a total function of the end: for EVERY `CoordinatorEnd` (one sample per ordinal in `0..VARIANTS`, a variant without a sample reds it) and every frozen `AbortReason`: exactly `MemberAborted{Drain}` releases; every other `MemberAborted` and `LinkFault` expire; every assembly end settles by its outcome's counting class; `Moved`/`Published`/`TrainingFailed`/`Cancelled` are untouched | LIB `fine_tune::worker::tests::every_coordinator_end_settles_its_lease_by_the_released_vs_failed_split` | M1 (`LinkFault`/non-drain aborts → `Release`): `worker.rs` (line 7928 at the unit tip): the settlement of the gang faulted: timed out (ordinal 10)` (left `Release`, right `Expire`); M2 (`Drain` → `Expire`): `worker.rs` (line 7928 at the unit tip): the settlement of rank 1 ended its session: Aborted(Drain) (ordinal 9)` |
+| P2 (a) | A member's stream dropped mid-round (its process gone) retires the attempt as `LinkFault` naming the round and the transport (`all_reduce_sum: round N: the stream failed/ended …`), recorded `Unavailable` (cooled, `assembly_failures` 0); the row is `running`, `error` NULL, `attempts` 1, `releases` 0, the lease armed (left to expire); epoch 1's resume checkpoint exists; the member's slot frees; the successor's claim is attempt 2 with `releases` 0 (the attempt spent), only after the lease expired; attempt 2 over the restarted member publishes bytes equal to the `LocalGang` reference; one model row | SRV `gang_chaos::a_member_stream_dropped_mid_round_retires_the_attempt_spent_and_a_new_gang_completes_it` | **M0 (base) RED:** `gang_chaos.rs` (line 671 at the unit tip): a rank failure spends the attempt: the lease is never released — left: 1, right: 0`; M1: the same line; M7 (rank 0 never resumes: `discover_resume` → `Ok(None)`): `gang_chaos.rs` (line 795 at the unit tip): attempt 2 publishes: the gang faulted: all_gather: round 11: timed out … waiting for rank 1's contribution` (a gang out of lockstep with its checkpoint never publishes) |
+| P3 (a) | A member silent past `[worker] rank_timeout_secs` mid-round retires the attempt after ≥ the deadline as `LinkFault` naming `timed out after 3s waiting for rank 1` and the round; the same row facts as P2 (no terminal write, attempt spent); the coordinator's `Cancel` frees the member's slot within 5 s WHILE its rank thread is still stalled; the next gang completes with `(attempts, releases) == (2, 0)` and the reference bytes | SRV `gang_chaos::a_member_silent_past_the_rank_timeout_retires_the_attempt_spent_and_a_new_gang_completes_it` | **M0 RED** and M1: `gang_chaos.rs` (line 671 at the unit tip) (as P2); M3 (mid-run ends returned as `Failed` → `record_failed`): `gang_chaos.rs` (line 661 at the unit tip): no terminal write: Row { status: "failed", … error: Some("the gang faulted: all_reduce_sum: round 14: timed out after 3s …") }`; M5 (`end_members` removed): `gang_chaos.rs` (line 383 at the unit tip): the member's slot must free once the session ended, holder: Rank { .. attempt: 1 }` — the slot then frees only at the member's re-verification after the lease expiry, not on the stream close |
+| P4 | A member's host DRAINing mid-round ends its session `Aborted{Drain}`; the coordinator ends `MemberAborted{Drain}` ("rank 1 ended its session: Aborted(Drain)"), records `Drain` (neither counted nor cooled: `assembly_failures` 0, `next_assembly_after` NULL) and RELEASES: `releases` 1, lease NULL, `attempts` 1, `running`, no error; the rank's own round ends on its closed link ("nothing applied"); the next attempt is claimable within one poll (< the lease window) over a fresh member (the draining host is listed no more; the assignment names each host per attempt) and completes: `(attempts, releases) == (2, 1)` — zero net attempts (OPS D10) — with the reference bytes | SRV `gang_chaos::a_member_aborted_drain_mid_round_releases_the_lease_and_the_next_attempt_completes_at_once` | M2: `gang_chaos.rs` (line 665 at the unit tip): Released: the lease is handed back (OPS D10) — left: 0, right: 1`. Green at base (M0): §6's counting-class rule already released `Drain`; this row pins it against M2 |
+| P5 | Split brain: attempt 1's coordinator loses its lease (its keeper dies) while its rank 1 is held and stalled; a second coordinator reclaims only after the expiry (attempt 2, `releases` 0), dials the same member, whose `RunRank` at the greater attempt takes the slot from the elder hold (U5a-2's fence) on the FIRST dial; the elder session is refuted at its next tick, the stale runner's attempt ends `Cancelled` (its own lost lease) or `MemberAborted{Refuted}` and writes nothing (`record_assembly_outcome` is a moved claim; its arm is lease-lost/`Abandoned`); attempt 2 completes with `(attempts, releases) == (2, 0)`, `claimed_by` the successor, one model row, the reference bytes | SRV `gang_chaos::an_older_attempts_stale_runner_is_fenced_by_the_successor_and_writes_nothing` | M4 (`try_hold_rank` refuses a greater attempt): `gang_chaos.rs` (line 1053 at the unit tip): the successor's attempt publishes — left: 5, right: 12` (the successor's dial was refused `Unavailable` → `MemberRefused`; a third attempt would follow). Green at base (M0): the fence and the lease-lost arm are U5a-2's/the loop's; pinned end to end here |
+| P6 | The successor attempt of every retired attempt resumes from epoch 1's job-level checkpoint and publishes bytes EQUAL to an uninterrupted two-rank `LocalGang` run of the same fixture; exactly one model row exists after the retry | the byte-equality and model-count assertions in P2–P5 (`assert_completed_like_the_reference`); P2's `fetch_resume_checkpoint(..).is_some()` after attempt 1 | M7 (above): attempt 2 never publishes |
+| P7 | A crashed coordinator's live `building` training-set row over the same source/task is never met by the successor: the attempt materializes its OWN `ready` table, records ITS name on the job row, reaches the coordinator body, and leaves the orphan byte-untouched (`building`, same writer, lease live) | AI `gang_coordinator::a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never_met_by_the_successor` | M6 (`create_table` names tables `{source}__{task}__{model}`, no nanos/uuid): `gang_coordinator.rs` (line 772 at the unit tip): assertion left == right failed: [] — left: 0, right: 1` (the successor's `create_table` collides with the orphan's name; no attempt reaches the body) |
+| P8 | Every U5b-1b-ii coordinator oracle and every admission/shutdown row of the loop is unchanged by the split | AI `gang_coordinator rank_admission jobs_shutdown host_admission` (42 passed: 4 + 10 + 19 + 9); SRV `gang_coordinator` (the §6 Peer row, `attempt-2 end: published`) | regression-only |
+
+#### 3. Uncovered
+
+- **The process-level SIGKILL rows** (`tests/distributed/gang_chaos.rs`): no MinIO here and,
+  at this tip, no rank body in the server (U5b-1b-iii), so a cross-process gang cannot complete
+  at all (a member parks `NoBody` — spending an attempt under this split — and three attempts
+  fail the job). Written to the plan's shape, compiled by the workflow's own compile-check
+  command, listed advisory in `distributed.yml`; first executed by the nightly lane after
+  consolidation with U5b-1b-iii. Two timing choices are stated, not measured: the 4 s settle
+  before the kill (the gang must be mid-run) and rank 1's selection by the sorted `workers`
+  listing (`assign_ranks`'s order without the root predicate — every spawned worker shares the
+  root).
+- **The cluster leg (2 pods × 2 GPUs, `Nccl`)** — not this unit's; UNCOVERED.
+- **A resumed gang out of lockstep is not refused, only fails late** (found by this unit's
+  rows, M7 and the first run before rank 1 resumed): a rank that starts from a different epoch
+  than rank 0 folds rounds whose descriptors agree (same shapes, same round index) over
+  different weight states until the shorter run ends; the round descriptor carries no epoch/
+  step and the agreement slot is bound nowhere (§6 deviation 8, scheduled for U5b-1b-iii). The
+  rank body must resume from the same `_resume` bundle (the test's rank 1 does); nothing in the
+  wire enforces it. Filed here for the lead; not fixed (the rank body's seam).
+- **The elder session's end reason in P5** admits both `Cancelled` (the keeper's exit guard
+  flips the flag before the member's refutation arrives) and `MemberAborted{Refuted}`; which
+  one lands is a race between the keeper thread's death and the member's 3 s tick — the row
+  facts are identical either way and asserted; the reason is not pinned.
+- **`Peer::fault_all`'s `RoundFault` reaching a member mid-round** is exercised only as the
+  member's link closing (P4's "nothing applied" is the `Disconnected` arm; the stalled rank of
+  P3 never reads its inbox); a member reading the fault frame itself is U5b-1b-i's oracles.
+- **A member's `Aborted{Refuted | Unavailable | StoreUnavailable}` mid-run** is settled by the
+  same `Expire` arm as P2/P3 (P1 pins the mapping); only `Drain` and the fence's `Refuted` are
+  produced end to end here.
+- **The `Release` failure arm** (`release_job_lease` erroring after a `Drain`, "left to
+  expiry") is a warn; not executed.
+- **Two real processes over Postgres** for the hermetic rows: two engines in one process over
+  one SQLite file (WAL, 5 s busy timeout) — the Postgres arm of the same fleet is the
+  distributed lane's.
+
+#### 4. Gates
+
+COMMON.md's trimmed set on the final tip (every command with `RUSTC_WRAPPER=sccache`,
+`CARGO_TARGET_DIR=…/targets/u5b2`; logs in `u5b2-scratch/`: `gates.log`, `t-*.log`,
+`mut-*.log`, `mutations.out`).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p jammi-ai --features test-hooks --lib -- lease_settlement every_coordinator_end` | 0 | 2 passed (the new settlement oracle + the §6 table oracle) |
+| `cargo test -p jammi-ai --features test-hooks --test it -- gang_coordinator rank_admission jobs_shutdown host_admission` | 0 | 42 passed, 0 failed (gang_coordinator 4 incl. P7, rank_admission 10, jobs_shutdown 19, host_admission 9) — `t-ai-it1.log` |
+| `cargo test -p jammi-server --features test-hooks --test it -- --test-threads=1 gang_chaos` | 0 | 4 passed, 0 failed, 22.5 s — `t-chaos3.log` (the four rows of §2) |
+| `cargo test -p jammi-server --features test-hooks --test it -- gang_coordinator` (the §6 Peer row, run on the base binary for timing: `attempt-2 end: published`) | 0 | 1 passed — `timing-base.log`; re-executed inside the M-round binaries unchanged |
+| M0 (base `worker.rs`, this unit's rows) | 101 | 2 failed (P2, P3 at `gang_chaos.rs` (line 671 at the unit tip), `releases` 1 ≠ 0), 2 passed (P4, P5) — `mut-M0.log` |
+| M1–M7 (`mutations.py`, one filtered test each, reverted, tree clean after each) | 101 each | every run red on its first try; first red lines quoted in §2 — `mutations.out`, `mut-M*.log` |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo test -p jammi-ai --features live-distributed-tests --test distributed --no-run` (the workflow's compile-check step) | 0 | compiles — `gates.log`, `gates2.log` |
+| `cargo clippy -p jammi-ai --features live-distributed-tests --test distributed -- -D warnings` | 0 | clean after the `WorkerPorts` fold (a first run tripped `too_many_arguments` on `worker_toml`, `gates.log`; refactored, not allowed) |
+| `cargo fmt --all -- --check` | 0 | clean |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1040 file(s) scanned, all PATH:LINE citations resolve (…; 2 exempt as non-ancestor legacy evidence)` — no PATH:LINE citation shifted (the guide edits are prose; the cited `worker.rs` anchors are symbol-level) |
+| `python3 ci/scripts/check_no_consumer_names.py` | 0 | OK |
+| `git status --short` at the tip | — | 0 entries |
+
+The chaos rows, the ai filters and the lib oracles were executed on the tree of `4fec9ce3`
+(commit 2 touches only the `distributed` target, its harness and the workflow — none of it in
+the `it`/lib binaries); the clippy runs on the two crates preceded the `WorkerPorts` fold, which
+lives in the `distributed` target alone (not compiled by `--all-targets --features test-hooks`:
+`required-features`), whose own clippy and compile check ran after it.
+
+Not run, per COMMON.md: `cargo doc`, the live-Postgres lane (no `jammi-db` change),
+`merge_path.sh`, workspace builds, the distributed rows themselves.
+
+#### 5. Commits (`git log --oneline 82f80b84..HEAD`)
+
+```
+81dc653a test(ai,ci): #500 U5b-2 — the process-level SIGKILL rows for a two-rank gang; every distributed-lane worker gang-capable
+4fec9ce3 feat(ai,server,docs): #500 U5b-2 — the released-vs-failed split on the coordinator's failure path; hermetic chaos rows over a two-host loopback fleet
+```
+(no trailers, per the brief; `git status --short` clean.) Tip:
+`81dc653a4432e2cd7954777aa808a1d0fe7fd31b`.
+
+
+## 8a. Issue #574 (landed as one commit; original `96da013d`)
+
+The implementer's contract, folded by the lead after checking: `LeaseFact::{Live, Dead, Undecodable}` decoded in Rust on the admission read; the SQL-side parse stays on the claim/reclaim path (the backend clock matters there; the admission read never writes or reaps); `GangRefusalReason::LeaseUndecodable` is the seventeenth determinant, non-disclosing on the wire.
+
+Branch `unit/i574` in worktree `wt-i574`, cut from `feat/500-wave3c` @ `82f80b84`.
+Crate touched: `jammi-db` (`catalog::{jobs_repo, lease}`, `tests/it/{gang_rank_admission,
+gang_instance_freshness}`), `jammi-server` (`grpc::gang`, `tests/it/gang_service`), docs
+(`docs/maintainer/MAINTAINER-GUIDE.md` §2.8a, `docs/guide/src/security.md` I-GANG). Every
+claim below is stated as it EXISTS on the branch tip; every path is repo-relative; test
+names are `file::fn`.
+
+#### 1. Scope shipped
+
+- `crates/jammi-db/src/catalog/lease.rs` gains `LeaseFact` (`Live { remaining: Duration } |
+  Dead | Undecodable` — the `WorldSizeFact` pattern from U5a-2), `parse_app_clock_stamp`
+  (the app-clock ISO-8601-with-`Z` shape `now_sortable()`/`lease_now()`/`lease_deadline()`
+  all write, flexible fractional width), `parse_lease_expires_at` (backend-aware:
+  `parse_app_clock_stamp` on SQLite, Postgres's own default `timestamptz`-cast-to-`text`
+  rendering — `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]`, fractional part omitted when zero —
+  on Postgres, format verified against a live Postgres 16 via `psql`), `decode_lease_expires_at`
+  (`kind, text: Option<&str>, now -> LeaseFact`, infallible), and
+  `last_seen_at_is_fresh(text: &str, margin, now) -> bool` (backend-INDEPENDENT: `last_seen_at`
+  is always an app-clock stamp on either backend, since `Catalog::upsert_instance` /
+  `reregister_instance` / `touch_instance` never write the database clock there). Both
+  boundaries match the SQL predicates they replace exactly: `Live` iff `deadline >= now`
+  (the negation of `lease_expired_clause`'s strict `<`); fresh iff `seen >= now - margin`
+  (the negation of `stale_before_clause`'s strict `<`).
+- `crates/jammi-db/src/catalog/jobs_repo.rs`: `RankAdmissionRow::{lease_live: bool,
+  remaining: Duration}` REPLACED by `RankAdmissionRow::lease: LeaseFact` (a reshape, not a
+  bolt-on — every call site updated atomically, no compatibility field kept).
+  `Catalog::get_job_for_rank`'s SELECT drops the SQL-side `lease_remaining_seconds_expr`
+  computed column entirely and selects `lease_expires_at` as raw TEXT; the row mapper calls
+  `decode_lease_expires_at(kind, text, chrono::Utc::now())`. `Catalog::fresh_instance` drops
+  the SQL-side `stale_before_clause` predicate from its `WHERE`, selects only `last_seen_at`
+  by primary key, and calls `last_seen_at_is_fresh` in Rust.
+- `crates/jammi-server/src/grpc/gang.rs`: `GangRefusalReason` gains `LeaseUndecodable`
+  (doc'd against `LeaseFact::Undecodable`, issue #574). `run_rank`'s lease check becomes a
+  `match row.lease { Live => admit, Dead => LeaseDead, Undecodable => LeaseUndecodable }`,
+  same fixed `FailedPrecondition` either way. `reverify`'s `row_holds` conjunct becomes
+  `matches!(row.lease, LeaseFact::Live { .. })` — `Undecodable` mid-hold collapses into
+  `Refuted` exactly like every other row fact that stops holding (no new `ReverifyEnd`
+  needed).
+- `crates/jammi-db/tests/it/{gang_rank_admission,gang_instance_freshness}.rs`: every
+  `row.lease_live`/`row.remaining` call site ported to `row.lease.is_live()`/
+  `row.lease.remaining()`/`LeaseFact` matches; two new parity oracles added (below).
+- `crates/jammi-server/tests/it/gang_service.rs`: `refusal_scenario` gains a
+  `GangRefusalReason::LeaseUndecodable` arm (raw SQL plants `lease_expires_at =
+  'not-a-timestamp'` on an otherwise-admitting world-1 fixture); `every_gang_refusal_reason`'s
+  `WITNESSES` list and its exhaustive `assert_every_variant_is_a_witness` match both gain the
+  variant (the match has NO wildcard arm — a future variant fails this file to compile until
+  matched, per U5a-2's own methodology); doc counts updated sixteen → seventeen.
+- Docs: `MAINTAINER-GUIDE.md` §2.8a rung 3 (the lease row fact, `LeaseUndecodable`) and rung 5
+  (`fresh_instance` decodes client-side now) rewritten; the "sixteen, `GangRefusalReason`"
+  non-disclosure sentence → seventeen. `docs/guide/src/security.md`'s I-GANG section: the
+  determinant list gains "or undecodable"; the "Multi-host gang admission is a Postgres-only
+  deployment shape" bullet rewritten — it no longer claims the ADMISSION read needs Postgres's
+  shared clock (that claim became false the moment the read moved to Rust); the real reason
+  (SQLite is a single process, no second host) is kept, and the CLAIM/RECLAIM write paths are
+  named as the ones that still require the shared clock, with the reasoning (a wrongful reap is
+  destructive; a stale admission read self-corrects at the next heartbeat).
+
+##### Deviations from the brief, with the reason and the code
+
+- **The brief's candidate shape `LeaseFact::{Live { remaining }, Dead, Undecodable}` was
+  taken verbatim** (not "the shape you derive") — it is exactly the `WorldSizeFact` pattern
+  already established in this file (`jobs_repo.rs` (lines 414–424 at the unit tip)), so no alternate shape was
+  justified.
+- **`fresh_instance` was NOT given its own 3-state fact type.** The brief says "a malformed
+  `last_seen_at` is 'not fresh', a row fact, never a read fault" — it does not ask for a new
+  `GangRefusalReason` variant for freshness, and `Catalog::fresh_instance`'s own doc
+  (`jobs_repo.rs`, cited above) already states `false` covers "an absent OR a stale row
+  alike... disclosing nothing about which". A malformed value joins that SAME class; adding a
+  distinguishable enum there would be a variant with no consumer (family L: no generic-nucleus
+  seam asked for it, and `GangServer::run_rank` has exactly one `CoordinatorNotFresh` site that
+  reads a `bool`). If a future caller needs the distinction, `last_seen_at_is_fresh` already
+  returns a clean boundary to build a fact type on top of.
+- **The split decision (SQL stays on claim/reclaim, Rust decodes on the admission read) is
+  argued in `lease.rs`'s own doc on `decode_lease_expires_at`, not merely asserted**: reaping
+  a live claimant under app-clock skew is destructive (the module's own pre-existing "whose
+  clock" doc, `lease.rs` (lines 13–25 at the unit tip)); the admission read never writes or reaps, so a few-hundred-ms
+  skew self-corrects at the next re-verification tick (`heartbeat`-cadence). This is the one
+  place this unit reasons beyond mechanical translation, and it is the property the RED-first
+  Postgres mutations (below) exist to keep honest: if the split were wrong in the OTHER
+  direction (claim/reclaim also needing to move to Rust), that is out of this issue's scope
+  and not touched.
+
+#### 2. Properties (quantified) — executed oracle — executed mutation that reds it
+
+Lanes: DB = `cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it --
+<filter> --test-threads=1` (sqlite arm always; postgres arm EXECUTED against
+`JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1 port 54329/jammi_test`, a live Postgres 16); DB-lib =
+`cargo test -p jammi-db --features live-postgres-tests,test-hooks --lib -- <filter>`; SRV =
+`cargo test -p jammi-server --features test-hooks --test it -- <filter>`.
+
+| # | Property (over every input / exit arm) | Executed oracle | Executed mutation → red (first line) |
+|---|---|---|---|
+| P1 | For a `jobs.lease_expires_at` value that is neither `NULL` nor parseable for a backend, `Catalog::get_job_for_rank` returns `Ok(Some(row))` with `RankAdmissionRow::lease == LeaseFact::Undecodable`, IDENTICALLY on sqlite and (EXECUTED, live) postgres — never `Err` on either. | DB `gang_rank_admission::get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends::{sqlite,postgres}` | M1: reintroduce `lease_remaining_seconds_expr`'s computed column into the SELECT (even though nothing reads it back) → postgres arm reds: `BackendDriver(Sqlx(Database(PgDatabaseError { ... code: "22007", message: "invalid input syntax for type timestamp with time zone: \"not-a-timestamp\"" ...})))` — the EXACT fault class issue #574 reports; sqlite arm stays green (proving the divergence, not just a regression) |
+| P2 | For an `instances.last_seen_at` value that does not parse as a timestamp, `Catalog::fresh_instance` returns `Ok(false)`, IDENTICALLY on sqlite and (EXECUTED, live) postgres — never `Err` on either. | DB `gang_instance_freshness::fresh_instance_malformed_last_seen_at_is_not_fresh_on_both_backends::{sqlite,postgres}` | M2: reintroduce `stale_before_clause`'s computed predicate into the SELECT (unread) → postgres arm reds with the same `22007 invalid input syntax` `PgDatabaseError`; sqlite arm stays green |
+| P3 | `decode_lease_expires_at`'s Live/Dead boundary is EXACTLY `lease_expired_clause`'s own negation (`deadline >= now`, never the strict `>`), for `NULL`, malformed, exactly-`now`, future, and past inputs. | DB-lib `catalog::lease::tests::decode_lease_expires_at_is_infallible_on_every_input` | M3: `deadline >= now` → `deadline > now` in `decode_lease_expires_at`: `lease.rs` (line 578 at the unit tip): assertion left == right failed / left: Dead / right: Live { remaining: 0ns }` (the exactly-`now` case moved off the boundary) |
+| P4 | `parse_lease_expires_at` decodes STRICTLY per-backend: SQLite's arm never accepts Postgres's own text rendering and vice versa (a cross-decode would silently misread a value this backend never wrote in that shape). | DB-lib `catalog::lease::tests::{parse_lease_expires_at_postgres_accepts_its_own_default_text_rendering, parse_lease_expires_at_sqlite_uses_the_app_clock_shape_only}` | M4: swap the two `match kind` arms in `parse_lease_expires_at` → BOTH tests red: `lease.rs` (line 512 at the unit tip)/535: assertion left == right failed / left: None / right: Some(...)` (each backend's own format text no longer parses under its own arm) |
+| P5 | `last_seen_at_is_fresh`'s boundary is EXACTLY `stale_before_clause`'s own negation (`seen >= now - margin`); a value that does not parse is never fresh. | DB-lib `catalog::lease::tests::last_seen_at_is_fresh_matches_stale_before_clauses_boundary`; DB `gang_instance_freshness::{fresh_instance_true_just_inside_the_liveness_margin, fresh_instance_false_just_outside_the_liveness_margin}::{sqlite,postgres}` (the pre-existing boundary pair, unaffected by the reshape, re-run green on live postgres) | (boundary asserted directly in the unit test; the pre-existing just-inside/just-outside pair already carries its own mutation proof per U5a-2's era — not re-executed this round, since `last_seen_at_is_fresh`'s comparator is a direct, unchanged port of `stale_before_clause`'s) |
+| P6 | The gang admission handler refuses `LeaseFact::Undecodable` under its OWN `GangRefusalReason::LeaseUndecodable`, distinguishable from `LeaseDead` only under `test-hooks`, with the SAME fixed wire status as every other determinant (non-disclosure, now over seventeen determinants). | SRV `gang_service::{run_rank_refusal_is_non_disclosing_across_every_determinant, run_rank_last_refusal_reason_distinguishes_every_determinant}` (both re-execute all seventeen `refusal_scenario`s, `LeaseUndecodable` among them) | M5: conflate `LeaseUndecodable`'s `record_refusal` call with `GangRefusalReason::LeaseDead` in `gang.rs` → `run_rank_last_refusal_reason_distinguishes_every_determinant` reds: `gang_service.rs` (line 1968 at the unit tip): assertion left == right failed / left: Some(LeaseDead) / right: Some(LeaseUndecodable)` |
+| P7 | Every OTHER column on the admission row stays populated when the lease is undecodable (the malformed lease is isolated to `RankAdmissionRow::lease` alone, never contaminating `status`/`claimed_by`/`attempts`). | DB `gang_rank_admission::get_job_for_rank_undecodable_lease_is_a_row_fact_on_both_backends::{sqlite,postgres}` (asserts `status`/`claimed_by`/`attempts` after planting the malformed lease) | (structural: the same test as P1; not separately mutated — the row-mapper shape makes a partial decode a compile error, the same argument U5a-2's own analogous property relies on) |
+
+Every mutation above was applied → the SINGLE filtered test that names it re-run → the red
+output captured verbatim → `git diff` reverted with `Edit` back to the exact committed text
+→ `git status` clean confirmed before the next mutation. No mutation round left residue in
+the committed tree (verified: `git status --short` empty and `git diff --stat` empty after
+the last revert, before writing this contract).
+
+#### 3. Uncovered
+
+- **UNCOVERED — a mid-hold lease going `Undecodable` at re-verification.** `reverify`'s
+  `row_holds` conjunct (`matches!(row.lease, LeaseFact::Live { .. })`) collapses `Undecodable`
+  into `Refuted` by construction (the same boolean-AND shape that already collapses a `status`
+  change), and the row-holds machinery is exercised generically by
+  `run_rank_held_session_ends_refuted_when_the_row_no_longer_holds` (a `status` mutation, not a
+  lease one) plus every admitted-and-parked test implicitly proving `row.lease` still reads
+  `Live` across multiple heartbeats post-admission (`run_rank_every_i_gang_determinant_satisfied_is_admitted_held_and_parks_no_body`,
+  `HEARTBEAT * 3`+ waits with no `Refuted`). No test plants `lease_expires_at =
+  'not-a-timestamp'` on an ALREADY-ADMITTED session and asserts the SPECIFIC `Refuted` end from
+  THAT determinant — the generic "row no longer holds → Refuted" shape is proven, the
+  lease-specific instance of it is not separately isolated. Adding one is a same-shape
+  extension of `run_rank_held_session_ends_refuted_when_the_row_no_longer_holds`'s own pattern,
+  left for a follow-up since the brief's deliverable is the ADMISSION read (rung 3), not
+  re-verification's determinant enumeration.
+- **UNCOVERED — `peer_addr_of`'s own `stale_before_clause("last_seen_at", ...)` call
+  (`jobs_repo.rs`, a different verb than `fresh_instance`).** The SAME backend-divergence class
+  exists there (a malformed `last_seen_at` would fault on Postgres, read as absent-or-stale on
+  SQLite) but `peer_addr_of` is not on the `RunRank` admission path and the brief scopes this
+  unit to `get_job_for_rank`/`fresh_instance` by name ("the only other read on the RunRank
+  admission path") — out of scope, not touched, and not claimed fixed.
+- **UNCOVERED — `list_gang_members`'s own `stale_before_clause("i.last_seen_at", ...)`
+  call** (a THIRD site with the same class, used for gang membership listing, not
+  admission) — likewise out of the brief's named scope.
+- The Postgres timestamptz text format (`parse_lease_expires_at`'s Postgres arm) was verified
+  against ONE live Postgres 16 instance's DEFAULT `DateStyle` (`ISO, MDY`). A deployment that
+  changes `DateStyle` (a session/database-level Postgres setting, not exposed by this crate's
+  config) would write and read a DIFFERENT text rendering than this parser expects — this was
+  already true before the fix in the sense that the OLD code's `col::timestamptz` cast was
+  DateStyle-independent (Postgres compares typed values, not text), so this is a genuinely NEW
+  determinant this fix introduces: a `DateStyle` this crate never configures becoming
+  non-default would turn every WELL-FORMED lease into `Undecodable` on read, not merely a
+  malformed one. Labelled here, not defended: this crate does not set `DateStyle` anywhere
+  (grepped `crates/jammi-db` for `DateStyle`/`datestyle`, no hits), so the deployment's default
+  (which every fresh Postgres ships as `ISO, MDY`) is relied on implicitly.
+
+#### 4. Gates (trimmed set per the brief; exit codes and counts)
+
+All with `CARGO_TARGET_DIR=<scratchpad>/targets/i574`, `RUSTC_WRAPPER=sccache`; one
+`--features` set per crate for the whole session (`jammi-db`: `live-postgres-tests,test-hooks`;
+`jammi-server`: `test-hooks`).
+
+| Command | exit | result |
+|---|---|---|
+| `JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1 port 54329/jammi_test cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- gang_rank_admission gang_instance_freshness --test-threads=1` | 0 | 37 passed (postgres arm EXECUTED live, not skipped); 0 failed |
+| `cargo test -p jammi-db --features live-postgres-tests,test-hooks --lib -- catalog::lease::` | 0 | 18 passed; 0 failed |
+| `cargo test -p jammi-server --features test-hooks --test it -- gang_service gang_rank_admission_oracle gang_admission_catalog_fault_oracle` | 0 | 43 passed; 0 failed |
+| `cargo clippy -p jammi-db --all-targets --features live-postgres-tests,test-hooks -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo fmt --all -- --check` | 0 | clean |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `1038 file(s) scanned, all PATH:LINE citations resolve` (2 pre-existing EXEMPT historical artifacts, unrelated to this unit) |
+
+Executed mutations: M1–M5 all red on their first run (see §2); every mutation reverted via
+`Edit` back to the exact committed text before the next; `git status --short` empty and
+`git diff --stat` empty confirmed after the last revert.
+
+#### 5. Commits (`git log --oneline 82f80b84..HEAD`)
+
+```
+96da013d fix(db,server): #500 #574 — gang admission decodes lease/freshness facts in Rust, never SQL, on both backends
+```
+(no trailers, per COMMON.md; 8 files, +690/−136 against `82f80b84`; `git status` clean.)
+
 
 ## 9. Pressure round (phase 1, executed at `856ec8dd` before the code landed) — REFINE, eight blocks folded
 

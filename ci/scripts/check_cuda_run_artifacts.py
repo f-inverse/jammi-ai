@@ -1571,6 +1571,30 @@ def _gang_check_ttl_hours(gang: dict, _data: dict, _repo_root: Path) -> list[str
     return []
 
 
+# M7 (plan #500 U7b's `pods` transport): the two-HOST bootstrap can be
+# rented over TWO independent RunPod object types -- an INSTANT CLUSTER
+# (`POST /v2/clusters`, near-zero capacity) or two ORDINARY pods joined by
+# Global Networking (`POST /v2/pods` x2, the default -- ordinary pods
+# provision reliably where clusters do not). `gang.leg` stays `"cluster"`
+# either way (the two-HOST leg is the fact that matters to every OTHER
+# reader of this registry); `gang.transport` is the sub-fact naming WHICH
+# mechanism actually carried it, closed-set, required, so a reader can
+# never mistake a Global-Networking run for an Instant-Cluster one.
+GANG_TRANSPORT_INSTANT_CLUSTER = "instant-cluster"
+GANG_TRANSPORT_GLOBAL_NETWORKING = "global-networking"
+GANG_TRANSPORTS = (GANG_TRANSPORT_INSTANT_CLUSTER, GANG_TRANSPORT_GLOBAL_NETWORKING)
+
+
+def _gang_check_transport(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
+    v = gang.get("transport")
+    if v not in GANG_TRANSPORTS:
+        return [
+            f"`gang.transport` must be exactly one of {list(GANG_TRANSPORTS)} -- which RENTAL MECHANISM "
+            f"actually carried this two-host run, got {v!r}"
+        ]
+    return []
+
+
 # The POD-leg registry -- unchanged from before M6 (this rule's original
 # shape). Renamed from `GANG_FIELD_REGISTRY` to `GANG_POD_FIELD_REGISTRY`;
 # nothing outside this module referenced the old name.
@@ -1686,6 +1710,12 @@ GANG_CLUSTER_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
         "ttl_hours",
         _gang_check_ttl_hours,
         "the cluster's own deadline, baked into its entrypoint at create time",
+    ),
+    (
+        "transport",
+        _gang_check_transport,
+        f"which RENTAL MECHANISM carried this two-host run -- exactly one of {list(GANG_TRANSPORTS)} -- so "
+        "a reader never mistakes a Global-Networking run for an Instant-Cluster one",
     ),
 )
 
@@ -3243,6 +3273,7 @@ def self_test() -> int:
                 "pod_count": 2,
                 "gpu_count_per_pod": 1,
                 "ttl_hours": 1,
+                "transport": "instant-cluster",
             }
             return d
 
@@ -3292,12 +3323,31 @@ def self_test() -> int:
             "pod_count",
             "gpu_count_per_pod",
             "ttl_hours",
+            "transport",
         ):
             bad = gang_cluster_baseline()
             del bad["gang"][field]
             expect_hit(
                 bad, "x.json", f"`gang.{field}` is missing", f"rule (k): cluster leg missing gang.{field}"
             )
+
+        # M7: `transport` -- closed set, both spellings accepted, anything
+        # else refused.
+        for good_transport in ("instant-cluster", "global-networking"):
+            ok = gang_cluster_baseline()
+            ok["gang"]["transport"] = good_transport
+            expect_clean(ok, "x.json", f"rule (k): transport={good_transport!r} is accepted")
+        bad = gang_cluster_baseline()
+        bad["gang"]["transport"] = "carrier-pigeon"
+        expect_hit(bad, "x.json", "`gang.transport` must be exactly one of", "rule (k): transport outside the closed set")
+        bad = gang_cluster_baseline()
+        bad["gang"]["transport"] = "cluster"
+        expect_hit(
+            bad,
+            "x.json",
+            "`gang.transport` must be exactly one of",
+            "rule (k): transport must not be confused with `gang.leg`'s own value",
+        )
 
         bad = gang_cluster_baseline()
         bad["gang"]["hosts"] = 3

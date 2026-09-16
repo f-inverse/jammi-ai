@@ -2726,6 +2726,287 @@ worktree shows the same single commit — local `main` is already at
 `b5a7aab9`, the wave-3b merge tip, so the base and the branch point coincide.)
 
 
+## 8c. U7b-A2b — the two-host cluster driver, its workflow and the id-secrecy scan (landed as four commits; original tip `a180db21`)
+
+The implementer's contract, folded by the lead after checking the four deliverable files, the label-only trigger with no `schedule:`, the re-registered cluster producer, and the F1–F3/A1–A4 revert-red oracles. It was "filed, not scheduled" in the plan; it is built here because the wave's cluster-leg artifact (row C9) cannot exist without it. The one real cluster run is the lead's, through the new `gpu-cluster.yml` dispatch on this branch.
+
+Base: `feat/500-wave3c` @ `b3978107`. Branch `unit/a2b`. Four commits:
+`0fdffde5` (driver/workflow/scan, re-registered gates, docs), `53c5d44e`
+(dedicated F1/F2/F3/A1 oracles + the `_rpc_wait_for_members_ready`
+extraction), `c752cccd` (a flaky test-harness bug in F1's own SIGINT arm,
+found and fixed — §3), `a180db21` (one stale present-tense doc claim in
+dev-gpu.md's own P8 paragraph, found and fixed — §1).
+
+#### 1. Scope shipped
+
+- **`ci/scripts/runpod_gpu_cluster.sh`** (new, 1084→~1140 lines): restored
+  from the pre-excision tree (`git show 23ef24a9:ci/scripts/
+  runpod_gpu_cluster.sh`, the commit immediately before U7b's own round-3
+  excision `55276624`) and patched to close every round-3 finding (§2
+  below). Deviation from a byte-for-byte restore: the reachability wait
+  loop (originally inline in the executed-only block) is extracted into a
+  new sourceable function, `_rpc_wait_for_members_ready` (`ci/scripts/
+  `runpod_gpu_cluster.sh` (lines 350–431 at the unit tip)) — required to make A1 testable at all
+  (the inline loop was reachable only by executing the whole driver).
+  Behavior-preserving: `bash ci/scripts/test_gpu_cluster_lane.sh` stayed
+  green across the extraction, before any new test was added.
+- **`ci/scripts/gang_id_secrecy_scan.py`** (new, 824→~840 lines): restored
+  verbatim from the same pre-excision tree, then patched for A2 (§2).
+- **`.github/workflows/gpu-cluster.yml`** (new, 158 lines): restored
+  verbatim — `run-cluster` PR label or `workflow_dispatch` only, no
+  `schedule:`, `permissions: contents: read`, job-level (never workflow-
+  level) `concurrency` with `cancel-in-progress: false` (a cancel would
+  SIGKILL the runner, the EXIT trap never runs, and the rented cluster is
+  orphaned).
+- **`ci/scripts/test_gpu_cluster_lane.sh`** (new, 986→~1290 lines):
+  restored verbatim, then extended with the F1/F2/F3/A1 oracles (§3).
+- **Re-registered** (each REVERTED from the round-3 excision, since a
+  driver now exists again): `check_cuda_run_artifacts.py`'s
+  `GANG_LEG_PRODUCER_PATH["cluster"]` row and its self-test fixtures (the
+  `expect_hit`/`expect_hit_only` P-E2 arms reverted to `expect_clean`, the
+  F4 leg/producer-mismatch pair reverted to compare BOTH real drivers, a
+  tracked `runpod_gpu_cluster.sh` stand-in re-added) — `_gang_check_leg_
+  producer_binding`'s own fail-closed-on-no-row behavior (P-E2) is KEPT as
+  a permanent invariant for any future third leg, only its docstring
+  restated; `check_gpu_prove_once.py`'s `PAID_POD_LANE_TABLE["ci/scripts/
+  runpod_gpu_cluster.sh"] = "gpu-cluster.yml"` row; `execution_surface_
+  reachability_allowlist.txt`'s cluster-leg tuple row (plus the shared
+  `--no-run` compile-check row's comment updated "two origins" →
+  "three origins"); `ci.yml`'s two cluster-only guard-matrix rows (`gpu
+  cluster lane suite`, `gang id secrecy scan self-test`) plus the PyYAML
+  install condition extended to cover the lane's own `--read-on-block` use;
+  `test_check_gpu_prove_once.py`'s `CLUSTER_YML_GOOD` fixture and the
+  real-tree derived-driver-set assertions (both list sites, alphabetically
+  re-sorted).
+- **`ci/scripts/runpod_lib.sh`** (shared, +19/-4 lines): `_rp_rest`'s two
+  `curl` calls gain `--max-time "$RP_REST_MAX_TIME"` (new var, default 30s,
+  `ci/scripts/runpod_lib.sh:119`, `_rp_rest` at `:384`) — F1's other half
+  (§2); the F13 tripwire comment reverted from "today the pod leg... a
+  future cluster leg" back to "the pod leg... and the cluster leg... alike"
+  (the cluster leg's remote text does call `_rp_zero_test_tripwire_lines`
+  again, verified: `ci/scripts/runpod_gpu_cluster.sh:196-201`).
+- **`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs`** (doc-comments +
+  one runtime skip-message string only, no logic changed): restated to
+  describe the shipped driver as the primary path and the by-hand
+  procedure (dev-gpu.md) as its fallback. Deviation from the round-3
+  excision's own inverse: the file has ALSO been rebuilt on the
+  `BlockingCall`-witness API by other wave-3c work landed on the shared
+  base branch since 23ef24a9 (unrelated to this unit); I edited the
+  CURRENT tree's doc comments in place rather than reverting to the old
+  23ef24a9 text, to avoid clobbering that unrelated, already-landed change.
+- **`docs/maintainer/dev-gpu.md`**: cluster-leg section rewritten to
+  describe the shipped driver as primary, the by-hand steps as fallback;
+  states the cost bounds as the literal `$3.82`/`$26.71` figures (G4's own
+  test greps for these exact strings — previously only `$3.816/h` was
+  stated, which is the RATE, not either derived bound); folds in the
+  lead's own executed pre-flight (below).
+- **`docs/plans/67-distributed-training/UNITS.md`**: U7b-A2b's own section
+  gets a dated correction (2026-09-16: built in wave 3c, no longer "filed,
+  NOT scheduled"), restating each of F1-F3/A1-A4 as closed by construction;
+  two forward-referencing claims inside U7a's own section ("no producer is
+  registered... until U7b-A2b ships a driver", "has nothing to scan until
+  U7b-A2b's driver exists") corrected to past tense now that both are
+  false as CURRENT-state claims.
+- **`docs/maintainer/pod-build-guide.md`** (NOT in the brief's own touch
+  list — a forced, mechanical follow-on): `runpod_lib.sh`'s own comment
+  restatements shifted every `PATH:LINE` citation into it by a constant
+  offset per region (+8 for old lines 112-369, +15 for old lines ≥370, +0
+  before); re-anchored by that exact mapping (verified against the actual
+  new-tree content at each target line before accepting), with one
+  hand-fix (`RP_TTL_HOURS` citations, old line 111, inside the +8 region's
+  own insertion point, so 0 offset there specifically) — `check_citations.py`
+  0 stale, 1038 files scanned, is the executed proof this mapping is
+  correct, not merely plausible. **Scope amendment**: recorded below.
+- **A4** (advisory, already resolved on this base tree before this unit —
+  no code change needed): `_rp_cluster_payload`'s request shape stays the
+  fixed 2×1 literal (`compute.gpuCountPerPod: 1, compute.podCount: 2`,
+  `ci/scripts/runpod_lib.sh:1500-1509`-ish) — no caller needs any other
+  shape; verified unchanged since M1 landed.
+
+**No engine crate touched beyond gang_nccl.rs's doc comments/skip message**
+(no Rust logic, no doctest blocks — verified: `grep -c '```' gang_nccl.rs`
+finds none near my edits). No live RunPod call in this unit.
+
+#### 2. Round-3 findings F1–F3 and advisories A1–A4, each closed by construction
+
+- **F1 — the scan reachable only from a skippable EXIT-only trap sequenced
+  behind untimed REST calls.** Closed two ways: (a) `_rpc_cleanup_cluster`
+  (`ci/scripts/runpod_gpu_cluster.sh:869-1004`) now calls `_rpc_scan_or_
+  destroy` FIRST, before `_rpc_self_remove_status`/`rp_cluster_delete`; (b)
+  the trap registration (`:1016-1019`) is `EXIT`, `HUP`, `INT`, `TERM` —
+  never `EXIT` alone — each signal passing its own conventional 128+n code
+  explicitly (`local rc="${1:-$?}"`, deterministic regardless of what `$?`
+  holds when a signal, rather than a normal `exit`, invokes the trap); the
+  function disarms all four traps at its own entry (`trap - EXIT INT TERM
+  HUP`) to prevent re-entry. `_rp_rest`'s own curl calls (`ci/scripts/
+  `runpod_lib.sh` (lines 384–403 at the unit tip)) now carry `--max-time "$RP_REST_MAX_TIME"`
+  (default 30s, `:119`) — previously unbounded.
+- **F2 — a false "WILL BE DESTROYED" claim under `RP_SESSION`.**
+  `_rpc_scan_or_destroy` (`ci/scripts/runpod_gpu_cluster.sh:813-864`) now
+  `rm -rf`s the relocated quarantine directory SYNCHRONOUSLY, in the same
+  function call, never deferring to `rp_cleanup`'s own `RP_WORK_IS_TEMP`-
+  conditional teardown (which an exported `RP_SESSION` clears at
+  `runpod_lib.sh` source time — the by-hand fallback's own exact shape).
+  The log line is now past tense ("destroyed there, now, unconditionally"),
+  stated truthfully.
+- **F3 — the in-place fallback's globs missing `..`-prefixed names.** The
+  fallback `rm -rf` (`ci/scripts/runpod_gpu_cluster.sh:850` area) gains a
+  third glob, `..?*`, alongside `*` and `.[!.]*`.
+- **A1 — `rp_cluster_pods`'s member-count check used `-ge` rather than an
+  exact match.** The wait loop (now `_rpc_wait_for_members_ready`) tracks
+  two DISTINCT boolean flags (`rank0_seen`/`rank1_seen`), never a raw tally
+  — a duplicate/stale row naming the same rank twice can no longer satisfy
+  readiness without both real ranks ever being seen.
+- **A2 — the scan's hex needles were not whitespace-stripped.**
+  `_scan_bytes` (`ci/scripts/gang_id_secrecy_scan.py:179-200`) extends the
+  whitespace-stripped fallback (previously `base64`-only) to `hex`-prefixed
+  needles too; `raw` deliberately excluded (stripping whitespace from
+  arbitrary binary risks a different false-negative class).
+- **A3 — the tee'd run log was never explicitly flushed/waited.** The
+  driver captures `_RPC_TEE_PID=$!` immediately after `exec > >(tee -a
+  "$RUN_LOG") 2>&1`; `_rpc_cleanup_cluster`'s own last act, after `rp_
+  cleanup`, is `exec 1>&- 2>&-` (closing the fds feeding `tee`, so it sees
+  EOF) then `wait "$_RPC_TEE_PID"`, before the final `exit "$rc"`.
+- **A4 — `_rp_cluster_payload`'s request shape was hardcoded.** Kept FIXED,
+  as already disposed at the excision commit — no caller on this tree
+  needs any other shape; verified unchanged (§1).
+
+#### 3. Properties (a table)
+
+| Property (quantified) | Executed oracle | Executed mutation (red output, first line) |
+|---|---|---|
+| F1: the cleanup trap invokes the scan strictly before either of its own REST calls, on every path through `_rpc_cleanup_cluster` | `ci/scripts/test_gpu_cluster_lane.sh` "F1: the id-secrecy scan runs BEFORE..." (:413) | Executed: swapped the two blocks in `_rpc_cleanup_cluster` (cluster-id REST block first, scan call after) on the committed file, reran `bash ci/scripts/test_gpu_cluster_lane.sh` — `FAIL - F1: expected 'SCAN_CALLED REST_CALLED '; got order: 'REST_CALLED SCAN_CALLED ' — the scan is no longer sequenced first` (87 passed, 1 failed); restored the original file byte-for-byte (`git status --short` clean afterward), reran — 88 passed, 0 failed. |
+| F1: the trap fires under SIGTERM/SIGHUP (dynamic), and all four registrations (EXIT/HUP/INT/TERM) exist verbatim (static, for INT — see below) | `test_gpu_cluster_lane.sh` "F1: the cleanup trap fires under SIG${sig}..." (TERM/HUP, dynamic) + "F1: all four trap registrations..." (static) | Dropping the three signal-specific `trap` lines (only `trap _rpc_cleanup_cluster EXIT` left) reds both the dynamic TERM/HUP arms AND the static all-four-present check — not independently re-executed as a fresh mutation in this unit (the design-time repro that led to this shape already exercised it; the static check's own executed history is below). |
+| F1's own test-harness bug, found and fixed mid-unit: the SIGINT-delivery arm was flaky, not a driver defect | n/a (a defect in the TEST, not the property) | Executed: a dynamic SIGINT-delivery arm (send SIGINT to a `&`-backgrounded subshell registering all four traps) was added first, passed 4/4 direct runs, then FAILED under `merge_path.sh --only guards`'s own nested invocation (`gpu-cluster-lane: 87 passed, 1 failed`, naming exactly the SIGINT arm). Isolated with two standalone repros: `sigtest.sh` (backgrounded via `&`, job control off) — SIGINT never arrives, the trap never fires, the process stays alive; `sigtest2.sh` (the identical script run in the FOREGROUND, no backgrounding) — SIGINT fires the trap immediately (`GOT_INT` then `GOT_EXIT`, exit 130). This is bash's own documented behavior (SIGINT/SIGQUIT, and ONLY those two, forced to SIG_IGN for an asynchronous list command in a job-control-off shell, before that child's own `trap` ever runs — irreversible once already SIG_IGN at shell entry) — an artifact of THIS test's own need to background a driver-emulating subshell to signal it while running, never something the real driver (which runs in the foreground of its own CI step) is subject to. Replaced the dynamic SIGINT arm with a static grep-based check (matching this file's own `RpSshoRequiresRpInitTest`-class precedent for properties a dynamic test cannot reliably exercise); a first version of that static check itself had a bug (BSD grep's basic-regex mode does not treat `\|` as alternation — only one of the four patterns matched), caught the same way — `FAIL - F1: expected exactly 4 trap registration lines...; got: 1019:trap '_rpc_cleanup_cluster 143' TERM` (one line, not four) — fixed with `grep -nE` and unescaped `|`; reran, 4/4 lines matched. `bash ci/scripts/test_gpu_cluster_lane.sh` run 5x consecutively after the fix: 88 passed, 0 failed every time; `merge_path.sh --only guards` rerun after the fix: `gpu cluster lane suite` is `ok` (§5). |
+| F2: a dirty carrier is destroyed synchronously regardless of `RP_SESSION`/`RP_WORK_IS_TEMP` | `test_gpu_cluster_lane.sh` "F2: under RP_SESSION..." (:519) + "F2 revert-RED..." (:565) | Reverting `_rpc_scan_or_destroy`'s destroy step to the original quarantine-and-defer text (move only, no `rm -rf`, "WILL BE DESTROYED" restored) on a scratch copy: `gpu-cluster-destroy-*` now SURVIVES under `$RP_WORK` — executed, `find "$F2_SESSION_ROOT" ... -name "gpu-cluster-destroy-*"` finds a match (red for the FIXED assertion, green for the revert-RED's own inverted assertion). |
+| F3: the in-place destroy fallback matches `..`-prefixed names | `test_gpu_cluster_lane.sh` "F3: the in-place fallback..." (:602) + "F3 revert-RED..." (:641) | Reverting the glob set to `*`/`.[!.]*` only (dropping `..?*`) on a scratch copy: the planted `..leak` file SURVIVES — executed, `[ -e "$F3_ARTIFACT_REVERT/..leak" ]` true (red for the fixed assertion). |
+| A1: readiness requires rank 0 AND rank 1 each seen, never a raw count | `test_gpu_cluster_lane.sh` "A1: two rows BOTH claiming rank 0..." (:904), "A1: rank 0 and rank 1..." (:917), "A1 revert-RED..." (:984) | Reverting to `ok_count`/`-ge 2` (both the loop's own break condition and the post-loop refusal check) on a scratch copy: the duplicate-rank-0/no-rank-1 fixture breaks the loop "ready" and proceeds into the member-resolution phase with rank 1 unset — executed, a DIFFERENT (generic) downstream failure than the fixed code's accurate, named refusal for the SAME fixture. |
+| A2: hex-encoded, line-wrapped ids are still detected (whitespace-stripped fallback, not base64-only) | `gang_id_secrecy_scan.py --self-test`: `test_line_wrapped_hex_lower_is_still_a_hit` (:778), `test_line_wrapped_hex_upper_is_still_a_hit` (:791) | Reverting `_scan_bytes`'s guard from `name.startswith("base64") or name.startswith("hex")` back to `name.startswith("base64")`: both new tests FAIL — executed, `Ran 31 tests ... FAILED (failures=2)`, both naming the two hex-wrap tests; restored, `OK`. |
+| A3: this process explicitly waits for its own `tee` process substitution before exiting | Not independently oracled by a NEW dedicated test in this unit (see §4, Uncovered) — closed by construction, reviewable by inspection (`ci/scripts/runpod_gpu_cluster.sh` around `_RPC_TEE_PID=$!` and the `exec 1>&- 2>&-`/`wait` pair). | None executed — see §4. |
+| The re-registered cluster-leg producer row: a complete cluster-leg `gang` artifact is accepted, and a leg/producer mismatch (either direction) is refused | `check_cuda_run_artifacts.py --self-test` (whole-suite oracle, gang-leg rows) | Reverting `GANG_LEG_PRODUCER_PATH` to omit the `cluster` key (the round-3 P-E2 state) while running the reverted-back self-test fixtures (which now assert `expect_clean` for a complete cluster artifact) reproduces the round-3-era `expect_hit` self-test failure class — verified by construction (the round-3 excision commit's own diff is the executed record of this exact class; not independently re-executed as a fresh mutation in this unit, since the pre/post states are the two historical commits themselves, `23ef24a9`→`55276624`→this unit). |
+
+#### 4. Uncovered (named, never claimed closed)
+
+- **A3's own oracle**: no NEW dedicated mocks-only test drives the
+  tee-wait mechanism end-to-end (e.g. a stubbed slow `tee` in `PATH` with a
+  timing race) — the mechanism is reviewable by inspection and the
+  existing P-A oracles all pass through `_rpc_cleanup_cluster` (which now
+  includes the wait), but none specifically PROVES bytes would otherwise
+  be lost without it. Labelled UNCOVERED, not claimed closed by a test.
+- **The one real cluster run** (member sshd reachability on a genuine
+  cluster, `ens1` as the overlay iface, member self-removal): still
+  UNMEASURED. The lead's own executed pre-flight (2026-09-16, pod
+  `rln5hfmn4viu06`, REST v2, RTX A4000, SECURE, `EUR-IS-1`) settled ONLY
+  whether REST v2's `args` reaches `bash -c` on `RP_IMAGE` — confirmed yes,
+  matching the GraphQL path S4 already measured — but that probe was a
+  single ordinary POD, never a cluster: it showed only `eth0`/`lo` on
+  `/sys/class/net`, no overlay network. This unit ships no live RunPod
+  call; the one real cluster run moves to the lead, after merge, under the
+  standing authorization (≤ 1h billed, ≤ 2 runs, label-only until a
+  flake-free streak).
+- **Pre-existing findings on the base tree, NOT introduced by this unit**
+  (verified via `git diff b3978107..HEAD --stat` touching none of these
+  paths): `merge_path.sh --only guards --skip-pg --skip-mdbook` (run 3
+  times across this unit's own commits — §5) reports 3 FAILs out of 89
+  commands every time it is at its own steady state (runs 1 and 3; run 2's
+  own 4th FAIL was this unit's own flaky test-harness bug, found and fixed
+  — §3, not a pre-existing finding): (a) "pod build substrate"
+  (`test_pod_substrate.sh`) — environment gaps in this dispatched agent's
+  own shell (`cargo: command not found`, no `--reflink` support), unrelated
+  to any file this unit touches; (b) "kernel oracle standard"
+  (`check_kernel_oracles.py`) — a stale `fn-in-literal reviewed` marker in
+  `crates/jammi-server/tests/it/gang_terminal_write_oracle.rs`, last
+  touched by commit `456a4937` (U5a-2, a different unit, before this
+  unit's own base tip); (c) "arch validation freshness"
+  (`check_arch_validation_freshness.py`) — `crates/jammi-kernels/src/
+  admission.rs` outdated the arch-80/86/89/90 waivers, a different unit's
+  own concurrent change. None of these three logs name any file this
+  unit's own diff touches.
+
+#### 5. Gates (real exit codes)
+
+| Command | Exit | Notes |
+|---|---|---|
+| `bash -n ci/scripts/runpod_lib.sh` | 0 | |
+| `bash -n ci/scripts/runpod_gpu_cluster.sh` | 0 | |
+| `bash -n ci/scripts/test_gpu_cluster_lane.sh` | 0 | |
+| `shellcheck -S warning ci/scripts/runpod_gpu_cluster.sh` | 0 | |
+| `shellcheck -S warning ci/scripts/test_gpu_cluster_lane.sh` | 0 | |
+| `shellcheck -S warning ci/scripts/runpod_lib.sh` | 1 | SC2034, `group_rcs_assoc_keys` — pre-existing on the base tree (verified against `git show HEAD:ci/scripts/runpod_lib.sh` before my commit; now shifted +15 lines), unrelated to this unit's own hunks |
+| `bash ci/scripts/test_runpod_cluster_lib.sh` | 0 | 69 passed |
+| `bash ci/scripts/test_gpu_cluster_lane.sh` | 0 | 88 passed; stable across 9+ consecutive runs (5 direct, 4 inside `merge_path.sh`'s own wrapping), after the SIGINT-oracle fix (§3) |
+| `python3 ci/scripts/gang_id_secrecy_scan.py --self-test` | 0 | 31 passed (29 pre-existing + 2 new hex-wrap arms) |
+| `python3 ci/scripts/check_gpu_prove_once.py` | 0 | |
+| `python3 ci/scripts/test_check_gpu_prove_once.py` | 0 | 207 passed |
+| `python3 ci/scripts/check_cuda_run_artifacts.py --self-test` | 0 | |
+| `python3 ci/scripts/check_cuda_run_artifacts.py` | 0 | |
+| `python3 ci/scripts/check_execution_surface_reachability.py` | 0 | one pre-existing, unrelated "suspicious unregistered line" note (`ci/scripts/perf/test_grad_oracle_cross_producer_parity.py:37`) |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | 1038 files scanned, 0 stale, 2 exempt (pre-existing, unrelated legacy artifact citations) |
+| `python3 ci/scripts/check_no_consumer_names.py` | 0 | |
+| `python3 ci/scripts/check_doc_parity.py` | 0 | |
+| `bash ci/scripts/test_gpu_dev_lifecycle.sh` | 0 | 157 passed |
+| `bash ci/scripts/test_gpu_gang_lane.sh` | 0 | 54 passed |
+| `bash ci/scripts/test_gpu_prove_lane.sh` | 0 | 74 passed (one printed FAIL line is an intentional RED-control fixture assertion, not a suite failure — pre-existing shape) |
+| `bash ci/scripts/merge_path.sh --only guards --skip-pg --skip-mdbook` | 1 (runs 1, 2, 3 — each `merge_path`'s OWN summary line, not the shell's, since it reports per-command results and exits 1 whenever ANY command failed) | Run 1 (before the F1/F2/F3/A1 oracle commit): `RAN 89 FAILED 3` — the three pre-existing, out-of-scope findings named in §4. Run 2 (after that commit, before the SIGINT-oracle fix): `RAN 89 FAILED 4` — the same 3, PLUS `gpu cluster lane suite` (the flaky SIGINT arm, §3) — this is what surfaced the flake. Run 3 (final, after all four commits including the SIGINT fix): **`RAN 89 FAILED 3`** — back to exactly the three pre-existing findings; `gpu cluster lane suite` is `ok`, confirmed under the exact nested `bash -e -c` invocation shape that caught the flake in run 2. Full log: `(scratchpad)/a2b-scratch/merge_path_guards4.out`. |
+
+#### 6. Cost ceiling restated
+
+`2 × $1.908/GPU/h = $3.816/h` (S4's measured SECURE-cluster rate). (i)
+terminate-succeeds: `1h × $3.816/h = $3.82` per run. (ii) sweep-only (the
+EXIT trap's own delete fails, member self-removal unmeasured): `(1+6)h ×
+$3.816/h = $26.71`. Standing authorization (2026-09-13): ≤ 1h billed wall
+per run, ≤ 2 runs, label-only (`run-cluster`) until a flake-free streak.
+This unit ships NO live RunPod call; the one real cluster run belongs to
+the lead, after merge.
+
+#### 7. The lead's own pre-flight (folded into this unit's record)
+
+Mid-task, the lead reported an executed pre-flight I had not run and could
+not run myself (a real billable RunPod transaction): a single-pod REST v2
+create (pod `rln5hfmn4viu06`, RTX A4000, SECURE, `EUR-IS-1`, created
+2026-09-16T02:55:54Z, deleted 03:07Z) with `args: "bash -c '...'"` on
+`ghcr.io/f-inverse/jammi-ai-ci-cuda:latest`. The container log printed the
+args-echoed marker (`PREFLIGHT-ARGS-OK`), then `nvidia-smi -L` (`GPU 0:
+NVIDIA RTX A4000`), then `/sys/class/net` (`bonding_masters eth0 lo`); the
+read-back `Pod.args` on a subsequent GET matched the sent text exactly.
+This closes U7b's own contract §1 gap (whether REST v2's `args` field
+reaches `bash -c` the way the pod path's GraphQL `dockerArgs` field
+measurably does) as EXECUTED — folded into `docs/maintainer/dev-gpu.md`'s
+cluster-leg section and `docs/plans/67-distributed-training/UNITS.md`'s
+own dated correction (§1 above). Still unmeasured, honestly, because this
+probe was a single ordinary pod, never a cluster (§4): `ens1` as a cluster
+member's own overlay iface, member sshd reachability on a real cluster,
+and member self-removal.
+
+#### 8. Scope amendment
+
+`docs/maintainer/pod-build-guide.md` is outside the brief's own touch list
+(`ci/scripts/**`, `.github/workflows/**`, `docs/maintainer/dev-gpu.md`, the
+plan rows) but was forced into scope by `runpod_lib.sh`'s own comment
+restatements shifting every `PATH:LINE` citation into it — COMMON.md's own
+warning ("your insertions shift other files' PATH:LINE anchors") names
+exactly this class. Re-anchored by the shift's own exact mapping, verified
+against `check_citations.py` (0 stale, 1038 files). No other file outside
+the brief's list was touched.
+
+#### 9. Commits
+
+```
+$ git log --oneline b3978107..HEAD
+a180db21 docs(maintainer): #500 U7b-A2b — dev-gpu.md's P8/schedule-visibility paragraph named the driver as still absent
+c752cccd fix(ci): #500 U7b-A2b — F1's own SIGINT oracle was flaky, unrelated to the driver
+53c5d44e test(ci): #500 U7b-A2b — dedicated RED-then-GREEN oracles for round-3's F1/F2/F3/A1, each with an executed revert-RED mutation
+0fdffde5 feat(ci,docs): #500 U7b-A2b — the two-host cluster driver, its own workflow, and the id-secrecy scan (re-attempt, round-3 findings closed by construction)
+```
+
+
+## 8d. Residuals found by the full local run and the draft PR's CI (each root-caused; two filed)
+
+- Four server tests red on the consolidated tree: the terminal-write oracle's source mask kept the CHAR count while its offsets are BYTES (a multi-byte character in a comment shifted the fn-body slice) — the mask is byte-preserving now, in both oracles; three remote-compute rows submit two-rank specs under the new serveable-world bound — the server fixture declares `n` ranks serveable beside `n` devices.
+- The Postgres test-hooks lane: #574's malformed-stamp row, left on the shared database, faulted the sibling prune test's SQL-side sweep — the test deletes its row; the product-side residual (one unreadable stamp faults every SQL-side sweep: `prune_instances`, `list_gang_members`, `peer_addr_of`, claim/reclaim) is **issue #585**, UNCOVERED here; the root fix is a schema-edge domain on the stamp columns, which would also retire #574's `Undecodable` arm.
+- Four CI lanes (OSS-only build, Python, Smoke, dep-DAG freshness) red on one cause: a `rank` binding in the rank body read only under test-hooks, dead under every other build's denied warnings.
+- The pod leg: run 3 measured the property (§2c) and its artifact is committed; run 4 (workflow 35054325406, on `ddd68928`) is the fully green job after the pod's clone was deepened blobless for the registry's ancestry rule.
+
 ## 9. Pressure round (phase 1, executed at `856ec8dd` before the code landed) — REFINE, eight blocks folded
 
 The design of the four wave-A units was attacked read-only against the base tree; the lead

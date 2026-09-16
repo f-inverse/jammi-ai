@@ -275,9 +275,167 @@ f4d84145 feat(ai): #500 U4b — canonical_reduce: zero-filled, canonical-order a
 
 (built after the integration commit)
 
-## 2b. Integration — the witness through `RankContext`; the round inbox in the hold loop; the trybuild oracle as a `compile_fail` doctest; doc parity for the manifest fields
+## 2b. Integration (landed as one commit; original `18e0db19`) — the witness through `RankContext`; the round inbox in the hold loop; the trybuild oracle as `compile_fail` doctests; doc parity and citations
 
-(built after every wave-A unit landed)
+The implementer's contract, folded by the lead after checking: one production minting site (`worker.rs`, `BlockingCall::spawn_blocking`), no `cfg` added to the trainer, `trybuild` and `tests/ui/**` gone, `FrameOutcome` exhaustive over the oneof with `unreachable!` arms. The consolidated tree compiles and every unit's filtered oracle is green on it; the second seam the brief did not name (`config/tests.rs` still naming `world_size`) is closed. The empty-frame arm U5a-2 labelled UNCOVERED is executed here.
+
+Worktree `wt-int`, branch `unit/int`, base `feat/500-wave3c` @ `00b1ad38`, tip `18e0db19`.
+Every path is repo-relative; every oracle named was executed on the tip (§4 has the commands, exit
+codes and counts); every mutation in §2 was applied to the committed tip, run through ONE filtered
+oracle, and reverted (`git checkout -- <file>`; `git status --short` empty afterwards). Target dir
+`…/scratchpad/targets/int`, `RUSTC_WRAPPER=sccache`, one `--features` set per crate for the whole
+session (`jammi-ai`/`jammi-server`: `test-hooks`; `jammi-db`: `live-postgres-tests,test-hooks`).
+
+#### 1. Scope shipped
+
+The consolidated base did not compile at TWO seams (the brief named one): (a) `RankContext`'s five
+wrappers called the `Collective` verbs without the witness — the five `E0061`s
+`cargo clippy -p jammi-ai` reports at `trainer.rs:369–389` on the base; (b) `jammi-db`'s lib-test
+target: the db slice's `config/tests.rs::distributed_config_loads_independently_of_worker` and
+`DistributedConfig`'s two intra-doc links still named `WorkerConfig::world_size`, which U4b S8
+renamed to `local_ranks` (`E0609` at `config/tests.rs:818`; the links would fail the docs lane).
+Both are closed; nothing else was touched beyond the four items.
+
+**Item 1 — the witness through `RankContext`** (`crates/jammi-ai/src/fine_tune/trainer.rs`,
+`optimizer.rs`, `worker.rs`):
+- `RankContext::{all_gather, all_reduce_sum, all_reduce_max_flags, broadcast, barrier}` take
+  `call: &BlockingCall` first and forward it (doc rewritten to the shipped shape: the wrappers
+  forward the ONE witness `run` receives).
+- `TrainingLoop::run(&mut self, call: &BlockingCall, source)` is the ONE place the trainer receives
+  it; `call` is threaded to every path that reaches a wrapper: `compute_loss_gathered(call, ..)`
+  (12 gathers), `process_batch_loss(call, ..)` (the lockstep flag reduce and the window-boundary
+  `canonical_reduce`), the trailing-window `canonical_reduce`, `save_resume_checkpoint(call, ..)` →
+  `capture_resume_bundle(call, ..)` → `gather_dropout_positions(call)`.
+  `optimizer::canonical_reduce(call, rank_ctx, vars, grads)`. No other production path reaches a
+  wrapper (`save_epoch_checkpoint`, `restore_from_checkpoint`, `evaluate*`, `run_gradcache_epoch`
+  make no collective call — verified by grep over every `rank_ctx.` / verb call site).
+- Production mints at exactly one place: `worker.rs` `train_fine_tune`'s
+  `BlockingCall::spawn_blocking(move |call| …run_fine_tune_blocking(&call, params)…)`;
+  `run_fine_tune_blocking(call, params)` passes it to `training_loop.run(call, source)`.
+- Tests mint only through the three minting sites: `collective::tests::witness` (a scoped
+  `spawn_scoped` helper) is now `pub(crate)` and re-exported under `cfg(test)` from
+  `collective/mod.rs`; `run_text_loop`/`run_gang_rank` take `call`; the 12 `run_text_loop` tests
+  wrap their bodies in `witness` (the thread-local counter reads stay on the run's own thread);
+  the gang oracles spawn each rank with `BlockingCall::spawn_thread`; the `it` tests
+  (`fine_tune.rs` ×3, `ft_correctness_sweep.rs` ×3, `ft_determinism.rs`) and jammi-bench's
+  `finetune_run::{run, run_impl}` (+ `main.rs`, 6 test call sites) use
+  `BlockingCall::spawn_blocking`; `persist` (resume test helper) takes `&mut TrainingLoop` and
+  captures under `witness` (a `&TrainingLoop` is not `Send`: the loop holds a `Cell`).
+  `tests/gpu_capability/gang_nccl.rs` (CUDA-gated) threads the witness by inspection (§3).
+- No second minting site, the token is not `Send`, no test-only constructor.
+
+**Item 2 — the round inbox in the hold loop** (`crates/jammi-server/src/grpc/gang.rs`):
+- `run_rank` builds `(inbox, member) = gang_rounds::member_link(events.clone())` BEFORE `Admitted`
+  is queued (fails only outside a runtime context → `Status::internal`, unreachable in a handler);
+  `HeldSession { inbox: RoundInbox, member: Option<MemberLink> }`.
+- `dispatch_round_frame(frame) -> FrameOutcome`: a round frame (`RoundInbox::is_round_frame`) is
+  `deliver`ed and the session stays held (`FrameOutcome::Held`); a refused delivery (the link is
+  gone) ends the session with a `FailedPrecondition` trailer; the refusal match is EXHAUSTIVE on
+  `RankControl`'s oneof (`None` → the `InvalidArgument` empty-frame violation as before;
+  `Assign`/`Cancel` and the four round arms are `unreachable!` with the reason — a new oneof arm is
+  a compile error here). `on_control_frame` is async and returns `FrameOutcome`; the hold loop's
+  inbound arm breaks only on `End`. A transport error is reported to the inbox
+  (`RoundInbox::fail`) before the silent end. Still exactly four `select!` arms.
+- The session keeps the link for its whole life and drops `inbox` then `member` last at the end of
+  `hold` (the link's forwarder holds the last clone of the event sender — this is what closes the
+  response stream; every pre-existing "stream closes after `Aborted`" oracle still passes).
+- The seat U5b-1b-iii takes: `member: Option<MemberLink>` on the held session plus the `test-hooks`
+  seam `GangServer::take_member_links() -> UnboundedReceiver<MemberLink>` (`offer_member_link` hands
+  each admitted session's link to the registered taker; `None` when taken). Deviation from
+  "the session keeps it": under `test-hooks` with a taker registered, the taker owns it — the ONLY
+  way an oracle can build the member's `Peer` over the REAL handler's link (the type is not
+  `Clone`); a plain build has no taker and the session always keeps it.
+- Fixtures: `gang_service.rs` gained `world_two_ready` (the admitted world-2 row without the stream
+  opened), `open_rank_at(addr, first)`, and `pub(crate)` on the fixtures the new oracles reuse.
+
+**Item 3 — the trybuild oracle as doctests** (`crates/jammi-ai/src/fine_tune/collective/mod.rs`):
+four doctests on `BlockingCall`'s docs — the passing `spawn_blocking` control;
+`compile_fail,E0277` (the witness carried into a `tokio::spawn`ed future); `compile_fail,E0061`
+(no witness to pass); `compile_fail,E0624` (the private `mint`). Removed:
+`tests/it/blocking_call.rs` (+ `mod blocking_call;`), `tests/ui/**`, `tests/ui_pass/**`, the
+`trybuild` dev-dependency and the workspace `trybuild = "1"` (`Cargo.lock` pruned: `trybuild`,
+`toml`, `toml_writer`, `serde_spanned`, `target-tuple`). Deviation from UNITS.md's "(g) … a compile
+error (`trybuild`)": the brief's own instruction; UNITS.md's plan row is the lead's to date.
+
+**Item 4 — docs and citations**: `docs/maintainer/MAINTAINER-GUIDE.md` §2.8a (the inbound arm's
+delivery/refusal/closed-link ends, the link built at admission, `RoundInbox::fail`), §2.8c (the
+witness threading and its one production minting site; the doctest oracle replacing trybuild; the
+real-handler round oracle). `check_doc_parity.py` green (unchanged). Eleven stale `PATH:LINE`
+citations re-anchored by identifier: nine were stale at the consolidated base
+(`MAINTAINER-GUIDE.md` → `stream.rs` ×6, `data.rs`, `recompute.rs`, `trainer.rs`;
+`gguf.rs` → `config/mod.rs`), two moved under my `finetune_run.rs` insertions
+(`jammi-encoders/src/test_support.rs`).
+
+#### 2. Properties
+
+| Property (quantified) | Executed oracle (path::name; lane) | Executed mutation that reds it (first red line) |
+|---|---|---|
+| P21 (compile-time): for every `Collective` verb, a call whose witness would reach a runtime worker thread does not compile — a `BlockingCall` cannot cross into a `tokio::spawn`ed future, no witness exists to pass on a worker thread, no fourth minting site exists — while the same verb from `spawn_blocking` compiles and runs | `cargo test -p jammi-ai --features test-hooks --doc -- BlockingCall`: `BlockingCall (line 169)` control ok; `(line 189) compile fail` (E0277) ok; `(line 205)` (E0061) ok; `(line 217)` (E0624) ok — 4 passed | M1: `_thread_bound: PhantomData<*const ()>` → `PhantomData<()>` (the witness made `Send`) → RED: `BlockingCall (line 189) - compile fail ... FAILED` / `Test compiled successfully, but it's marked compile_fail` (the other three stay red-as-expected: they do not depend on `Send`) |
+| P21 at the trainer's production entry: `run_fine_tune_blocking` (hence `TrainingLoop::run` and every wrapper) is reachable only under the witness minted at `worker.rs`'s `BlockingCall::spawn_blocking`; handing the run to a runtime worker is a compile error | the compiler on the tip: `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` exit 0 | M2: inside the production closure, `run_fine_tune_blocking(&call, params)` → `Handle::current().block_on(tokio::spawn(async move { run_fine_tune_blocking(&call, params) })).unwrap()` → RED: `error: future cannot be sent between threads safely --> crates/jammi-ai/src/fine_tune/worker.rs:2951:31` (`could not compile jammi-ai (lib)`) |
+| Every path that reaches a wrapper receives the ONE witness `run` was given — no wrapper is reachable without it | the compiler (the five `E0061`s on the base become zero on the tip; every call site enumerated in §1 compiles) + `cargo test -p jammi-ai --features test-hooks --lib fine_tune::` 343 passed (the U4b gang oracles — lockstep, gather exactness, determinism/resume — drive real 2-rank `Local` gangs through the full production `run` under `spawn_thread` witnesses) | Covered by construction: removing `call` from any one wrapper call is the base's `E0061` (the executed base clippy run, `int-scratch/clippy-ai-0.log`, is that red) |
+| W=1 is byte-unchanged and the trainer is never `cfg`-forked | the WHOLE pre-existing `fine_tune::` suite (343, up from U4b's 319 by U5b-1b-i's own additions) and `--test it -- peer_gang host_admission jobs_shutdown` (32) pass unchanged in substance; no `cfg` was added to the trainer (`git diff 00b1ad38..HEAD -- crates/jammi-ai/src/fine_tune/trainer.rs` adds no `#[cfg`) | Regression-only claim (as U4b's contract states it): a perturbation of the W=1 window reports here first |
+| Item 2: through the REAL `GangServer::run_rank` on a loopback listener, an admitted `world_size == 2` member session delivers one round's frames to its inbox, and the `Peer` member built over the session's own `MemberLink` folds every tensor verb (gather, reduce, flags; chunked under a 1 KiB cap) byte-for-byte to `Local`; the job row is untouched | `crates/jammi-server/tests/it/gang_rounds.rs::a_round_through_the_real_run_rank_handler_reaches_the_member_link_and_equals_local` (`test-hooks`; admitted via `dial_member` against the real handler, the link taken through `take_member_links`) | M4: `dispatch_round_frame` refuses round frames with an `InvalidArgument` trailer (the base tree's dispatch) instead of delivering → RED: `panicked at crates/jammi-server/tests/it/gang_rounds.rs:220:10: gather: FineTune("all_gather: round 0: the stream ended while waiting for the coordinator's result — nothing applied")` |
+| Item 2: a non-round, non-session frame (`control: None`, the only such value of the oneof) on an admitted stream still ends the session with the `InvalidArgument` protocol-violation trailer, the row untouched | `crates/jammi-server/tests/it/gang_service.rs::run_rank_empty_frame_on_an_admitted_stream_is_invalid_argument` (the empty frame IS sendable by the generated client — U5a-2's "cannot be built without a raw codec" was wrong; this row executes the arm U5a-2 labelled UNCOVERED) | M3: the `is_round_frame` guard skipped (`|| true`: every frame routed to `deliver`) → RED: `panicked at crates/jammi-server/tests/it/gang_service.rs:2482:10: an empty frame is a status, never an event: Some(RankEvent { event: Some(Aborted(Aborted { reason: NoBody })) })` (the session stayed held and parked) |
+| Item 2: a round frame after the member's link closed (its owner dropped it) ends the session with a `FailedPrecondition` trailer naming the closed link — never buffered, never a bare close; row untouched | `gang_rounds.rs::a_round_frame_after_the_member_link_closed_ends_the_session_with_a_trailer` (`test-hooks`; world 1) | M5: a refused delivery treated as `Held` (`deliver(..).await \|\| true`) → RED: `panicked at crates/jammi-server/tests/it/gang_service.rs:550:29: no stream event within 5s` |
+| Item 2: every pre-existing hold-loop end (Cancel, second Assign, drain, refuted/unavailable/store-unavailable, park, supersession, busy slot) is unchanged, and the stream still closes after its terminal event with the link now dropped last | `cargo test -p jammi-server --features test-hooks --test it -- gang api_freeze tenant_isolation_oracle`: 59 passed (56 pre-existing + 3 new) | unchanged oracles (the "stream must close after Aborted" assertion in `expect_aborted` is the one a link dropped too early or too late would red) |
+| Item 4: every `PATH:LINE` citation resolves at HEAD; every documented enumeration matches its enum | `python3 ci/scripts/perf/check_citations.py` → `check-citations: 1036 file(s) scanned, all PATH:LINE citations resolve (…; 2 exempt as non-ancestor legacy evidence)`; `python3 ci/scripts/check_doc_parity.py` → `doc-parity: all bindings in parity.` | mechanical gates; on the base the citation gate is RED with 12 stale anchors (executed: the first run on the tree, before re-anchoring) |
+| Second seam: `jammi-db`'s lib-test target compiles and the `[distributed]`/`[worker]` independence test holds under the renamed knob | `cargo clippy -p jammi-db --all-targets --features test-hooks -- -D warnings` exit 0; `cargo test -p jammi-db --features live-postgres-tests,test-hooks --lib config::tests::distributed_config_loads_independently_of_worker` 1 passed | the base's `E0609` at `config/tests.rs:818` is the executed red (`int-scratch/clippy-db.log`) |
+
+#### 3. Uncovered
+
+- **`tests/gpu_capability/gang_nccl.rs`** (`required-features = ["live-gpu-tests"]`, the verb calls
+  inside `#[cfg(feature = "cuda")]`): threaded by inspection (`assert_gang_checks(call, ..)` under
+  `spawn_thread`/`spawn_scoped`; the post-abort `all_reduce_max_flags` under a scoped witness) —
+  not compiled here (no CUDA toolchain on this host); CI's gated-surface clippy step is the oracle.
+  At the base this file did not compile under `cuda` either (it called the verbs without the
+  witness — U5b-1b-i's own Uncovered).
+- **`RoundInbox::fail` on a transport error**: wired in the hold loop's `Some(Err(status))` arm; no
+  hermetic oracle injects a transport error into an admitted inbound stream (the existing suite has
+  none either). Stated, not executed.
+- **Backpressure while delivering**: `deliver` awaits inbox room (64 frames) inside the inbound arm's
+  handler, so the drain/re-verify/park arms are not polled during that wait. Reachable only once a
+  consumer exists that stalls (U5b-1b-iii's body; the watchdog is U5b-2's). Not exercised.
+- **`member_link` failing at admission** (`Status::internal`): needs a handler outside a runtime
+  context; unreachable under tonic, not executed.
+- **jammi-bench's own test targets** (`crates/jammi-bench` `run`/`run_impl` callers): compiled by the
+  workspace clippy of the merge path, not run here (outside the brief's gate list; the edits are the
+  `spawn_blocking` → `BlockingCall::spawn_blocking` shape at 7 sites and the two signatures).
+- **Trainer-level (b) with `Peer` substituted for `Local`** (U5b-1b-i's deferred row): not built —
+  it needs the coordinator body's assignment (§6), outside these four items.
+- **The E0277 code on the `tokio::spawn` doctest**: rustdoc reports the doctest green under the
+  `compile_fail,E0277` fence and M1 turns exactly that block green-compiling (red test); clippy on
+  the same shape at the production site prints the diagnostic without a bracketed code (M2). I did
+  not separately capture rustdoc's raw stderr for the block.
+
+#### 4. Gates (all on the tip `18e0db19`; logs in `<scratchpad>/int-scratch/`)
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | 0 warnings (`clippy-ai-3.log`) |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | 0 warnings (`clippy-server-1.log`) |
+| `cargo clippy -p jammi-db --all-targets --features test-hooks -- -D warnings` | 0 | 0 warnings (`clippy-db-2.log`; the base: `E0609`, `clippy-db.log`) |
+| `cargo test -p jammi-ai --features test-hooks --lib fine_tune::` | 0 | 343 passed; 0 failed |
+| `cargo test -p jammi-ai --features test-hooks --lib collective` | 0 | 69 passed; 0 failed |
+| `cargo test -p jammi-ai --features test-hooks --test it -- peer_gang host_admission jobs_shutdown` | 0 | 32 passed; 0 failed |
+| `cargo test -p jammi-ai --features test-hooks --doc -- BlockingCall` | 0 | 4 passed (3 compile-fail + control); 0 failed |
+| `cargo test -p jammi-server --features test-hooks --test it -- gang api_freeze tenant_isolation_oracle` | 0 | 59 passed; 0 failed |
+| `JAMMI_TEST_PG_URL=postgres://jammi@127.0.0.1:54329/jammi_test cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- assembly_outcome migrations gang_rank_admission --test-threads=1` | 0 | 73 passed (22 `::postgres` arms executed); 0 failed |
+| `cargo test -p jammi-db --features live-postgres-tests,test-hooks --lib config::tests::distributed_config_loads_independently_of_worker` | 0 | 1 passed |
+| `python3 ci/scripts/check_doc_parity.py` | 0 | `doc-parity: all bindings in parity.` |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1036 file(s) scanned, all PATH:LINE citations resolve (HEAD for living files, each artifact's own recorded git_sha for committed evidence reachable from HEAD; 2 exempt as non-ancestor legacy evidence).` |
+| `git status --short` after every gate and every mutation revert | — | 0 entries |
+
+Mutation runs (each `exit=101`, reverted): `mut-M1.log` … `mut-M5.log`; runner `mutations.sh`.
+
+#### 5. Commits (`git log --oneline 00b1ad38..HEAD`; the worktree's local `main` is not the base)
+
+```
+18e0db19 feat(ai,server,db,docs): #500 int — the witness through RankContext; the round inbox in the hold loop; the trybuild oracle as compile_fail doctests; doc parity and citations on the consolidated tree
+```
+
+31 files, +1224/−732 (`trainer.rs` +927/− mostly the 12 wrapped test bodies re-indented by rustfmt).
+
 
 ## 3. U5b-1b-i (landed as one commit on this branch; original `7f653e20`)
 

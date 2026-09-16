@@ -541,29 +541,10 @@ pub async fn host_executor(
 /// (the CPU sentinel `-1` becomes `0` — a `DeviceFact` ordinal is never
 /// negative), or empty when this process runs no local ranks (`[worker]
 /// enabled = false` / `local_ranks` unset — an executor-only process is not
-/// itself a worker). Reproduces `jammi_ai::fine_tune::worker`'s own private
-/// `worker_devices` two-line mapping verbatim (that function is not `pub`
-/// and outside this unit's file grant) rather than re-deriving a different
-/// shape.
+/// itself a worker). Calls `jammi_ai::fine_tune::worker::worker_devices`
+/// (now `pub`) rather than reproducing its mapping — one mapping, never two.
 fn device_facts(session: &Arc<InferenceSession>) -> Vec<jammi_db::catalog::instance::DeviceFact> {
-    let cfg = session.jammi_config();
-    let kind = match session.compute_device() {
-        jammi_db::store::manifest::ComputeDevice::Cpu => "cpu",
-        jammi_db::store::manifest::ComputeDevice::Cuda { .. } => "cuda",
-        jammi_db::store::manifest::ComputeDevice::Metal { .. } => "metal",
-    };
-    cfg.worker
-        .topology(&cfg.gpu)
-        .map(|t| {
-            t.rank_devices()
-                .iter()
-                .map(|&ordinal| jammi_db::catalog::instance::DeviceFact {
-                    kind: kind.to_string(),
-                    ordinal: ordinal.max(0) as u32,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    jammi_ai::fine_tune::worker::worker_devices(session.jammi_config(), session.compute_device())
 }
 
 #[cfg(test)]

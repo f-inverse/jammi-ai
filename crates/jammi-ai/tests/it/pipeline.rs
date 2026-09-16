@@ -567,7 +567,10 @@ fn write_two_file_source(dir: &std::path::Path) -> String {
         let texts: Vec<String> = rows.iter().map(|(_, t)| t.to_string()).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(ids)), Arc::new(StringArray::from(texts))],
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(texts)),
+            ],
         )
         .unwrap();
         let file = std::fs::File::create(src_dir.join(format!("part{f}.parquet"))).unwrap();
@@ -647,14 +650,10 @@ async fn build_embedding_plan_collected_in_process_matches_generates_written_row
         }
     }
     assert!(!ok_batches.is_empty(), "the independent plan realized rows");
-    let independent = arrow::compute::concat_batches(&ok_batches[0].schema(), &ok_batches)
-        .unwrap();
-    let sort_indices = arrow::compute::sort_to_indices(
-        independent.column_by_name("_row_id").unwrap(),
-        None,
-        None,
-    )
-    .unwrap();
+    let independent = arrow::compute::concat_batches(&ok_batches[0].schema(), &ok_batches).unwrap();
+    let sort_indices =
+        arrow::compute::sort_to_indices(independent.column_by_name("_row_id").unwrap(), None, None)
+            .unwrap();
     let independent = arrow::compute::take_record_batch(&independent, &sort_indices).unwrap();
 
     assert_eq!(

@@ -1200,7 +1200,7 @@ pub(crate) async fn release_sweep(
 /// `Err` arm below; it is kept typed rather than a panic so a future
 /// caller that skips that validation degrades to "no devices registered"
 /// instead of crashing the loop.
-fn worker_devices(
+pub fn worker_devices(
     config: &jammi_db::config::JammiConfig,
     compute_device: ComputeDevice,
 ) -> Vec<DeviceFact> {

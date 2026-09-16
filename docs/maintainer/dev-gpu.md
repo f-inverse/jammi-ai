@@ -768,6 +768,41 @@ land it, or re-measure.
 
 ## The cluster leg — two hosts, one GPU each
 
+**Two transports, one proof.** `RP_TWO_HOST_TRANSPORT` selects which RunPod
+object type carries the two-HOST NCCL bootstrap: `pods` (default) or
+`cluster`. `pods` rents TWO ORDINARY pods (`POST /v2/pods`,
+`rp_two_host_pod_create` — `cloud: SECURE`, `globalNetworking: true`, one
+GPU each), co-located in ONE data center chosen by intersecting the pod
+catalog's own per-data-center availability (`GET /v2/catalog/gpus?
+include=AVAILABILITY&product=POD&count=1&cloud=SECURE`) with the data
+centers RunPod's own `GET /v2/datacenters` reports `globalNetwork: true`
+for — read LIVE at run time, never a hard-coded list (a snapshot verified
+2026-09-16: CA-MTL-1, CA-MTL-3, EU-CZ-1, EU-FR-1, EU-NL-1, EU-RO-1, EU-SE-1,
+EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-NC-1,
+US-TX-3, US-TX-4, US-WA-1). Rank is assigned by CREATION ORDER (the first
+pod created is rank 0, the second rank 1), and each member DERIVES its own
+`NCCL_SOCKET_IFNAME` from its Global-Networking ip at run time
+(`ip -o -4 addr show`, matching the interface whose own CIDR carries that
+ip) rather than the cluster path's `ens1` literal — a member with no
+matching interface refuses (97) by name, echoing `DERIVED_NCCL_IFACE=` so
+the driver's own post-run proof reads which interface it actually used.
+`cluster` is kept, byte-for-byte what it always was (below) — the SAME
+proof over a different, near-zero-capacity rental mechanism (measured: 8 of
+9 cluster creates refused `Insufficient resources` in one session). Both
+transports assemble the SAME `gang` artifact (`gang.leg` stays `"cluster"`
+either way — the two-HOST leg is the fact that matters downstream);
+`gang.transport` (`instant-cluster` | `global-networking`) is the sub-fact
+naming which mechanism actually carried the run, closed-set and required by
+`check_cuda_run_artifacts.py` rule (k). Cost bound (both parts at S4/the
+catalog's own measured rates, `RP_TTL_HOURS=1`): `cluster` bills
+`2 x $1.908/GPU/h = $3.816/h` (`1 h x $3.816/h = $3.82` terminate-succeeds;
+`(1 + 6) h x $3.816/h = $26.71` sweep-only); `pods` bills
+`2 x $1.59/GPU/h = $3.18/h` (`1 h x $3.18/h = $3.18` terminate-succeeds;
+`(1 + 6) h x $3.18/h = $22.26` sweep-only — both pods fall under the
+ORDINARY pod sweep's own name-shape match, so `gpu-reap.yml`'s SAME
+6-hourly cadence is the backstop, no separate sweep primitive for this
+transport).
+
 A CLUSTER is a SEPARATE RunPod object type from a pod: member pods on one
 private overlay network, created and destroyed as a unit — it is retired by
 deleting the CLUSTER, never by terminating one of its member pods. This

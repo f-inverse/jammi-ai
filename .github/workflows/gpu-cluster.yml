@@ -1,37 +1,58 @@
 name: GPU cluster (RunPod)
 
-# Runs the two-HOST NCCL leg (`gang_nccl_two_hosts_reduce_a_known_vector`) on
-# a RunPod CLUSTER — two pods, one GPU each (A100 SXM4 by default; the
-# `gpu_type` input may name another sm_80/86/89/90 part, which the driver
-# maps to the compute capability the members build for and refuses outside
-# that domain before renting), joined over the cluster's own private overlay
-# network. Driven by `ci/scripts/runpod_gpu_cluster.sh` (see
-# that script's own header for the exit contract, the cost derivation, and
-# the artifact it assembles and pulls back). NEVER `gpu-gang.yml` — a
-# separate driver, a separate RunPod object type (a cluster is retired by
-# deleting the CLUSTER, never a member pod).
+# Runs the two-HOST NCCL leg (`gang_nccl_two_hosts_reduce_a_known_vector`)
+# over TWO transports, selected by `transport` (`RP_TWO_HOST_TRANSPORT`):
 #
-# COST BOUND (human-approved, S4's measured $1.908/GPU/h for a SECURE
-# cluster GPU):
+#   `pods` (default) -- two ORDINARY RunPod pods, one GPU each, co-located
+#       in ONE data center and joined by RunPod's Global Networking. Chosen
+#       as the default because ordinary pods provision reliably where
+#       INSTANT CLUSTERs do not (near-zero capacity, below).
+#   `cluster` -- a RunPod INSTANT CLUSTER — two pods, one GPU each (A100
+#       SXM4 by default; the `gpu_type` input may name another
+#       sm_80/86/89/90 part, which the driver maps to the compute
+#       capability the members build for and refuses outside that domain
+#       before renting), joined over the cluster's own private overlay
+#       network. This product has near-zero capacity (measured: 8 of 9
+#       creates refused `Insufficient resources` in one session) — kept as
+#       the non-default transport, never removed, since the two are the
+#       SAME proof over two different rental mechanisms.
 #
-#   2 GPUs x $1.908/GPU/h = $3.816/h.
+# Driven by `ci/scripts/runpod_gpu_cluster.sh` (see that script's own header
+# for the exit contract, the cost derivation per transport, and the
+# artifact it assembles and pulls back — `gang.transport` records which
+# mechanism actually carried the run). NEVER `gpu-gang.yml` — a separate
+# driver, and (under `cluster`) a separate RunPod object type (a cluster is
+# retired by deleting the CLUSTER, never a member pod).
 #
-#   (i) terminate-succeeds (the ordinary path): ONE create (a cluster names
-#       its data center directly -- no candidate walk), billing to
-#       RP_TTL_HOURS=1:
-#         1 h x $3.816/h = $3.82 per run.
-#   (ii) sweep-only (the worst path -- member self-removal is UNMEASURED,
-#       see runpod_lib.sh's own cluster-primitives header, and the EXIT
-#       trap's own delete fails too): the cluster bills to its own TTL, then
-#       gpu-reap.yml's 6-hourly `rp_cluster_sweep` is the backstop:
+# COST BOUND, per transport (human-approved):
+#
+#   `cluster` (S4's measured $1.908/GPU/h for a SECURE cluster GPU):
+#     2 GPUs x $1.908/GPU/h = $3.816/h.
+#     (i) terminate-succeeds (the ordinary path): ONE create (a cluster
+#         names its data center directly -- no candidate walk), billing to
+#         RP_TTL_HOURS=1: 1 h x $3.816/h = $3.82 per run.
+#     (ii) sweep-only (the worst path -- member self-removal is UNMEASURED,
+#         see runpod_lib.sh's own cluster-primitives header, and the EXIT
+#         trap's own delete fails too): the cluster bills to its own TTL,
+#         then gpu-reap.yml's 6-hourly `rp_cluster_sweep` is the backstop:
 #         (1 + 6) h x $3.816/h = $26.71.
 #
-# `ci/scripts/test_gpu_cluster_lane.sh` re-derives both figures from the
-# driver's own RP_TTL_HOURS and the $1.908 rate and fails if the printed
-# figure and the mechanism disagree. Standing spend authorization
-# (2026-09-13): <= 1 h billed, <= 2 runs. The figures are for the DEFAULT
-# part: an operator-chosen `gpu_type` bills at RunPod's cluster rate for that
-# part, which nothing here bounds — choosing it is the cost decision.
+#   `pods` (the catalog's own SECURE POD rate, $1.59/GPU/h for the same
+#   default A100 SXM4 part -- a DIFFERENT rate from the cluster's):
+#     2 GPUs x $1.59/GPU/h = $3.18/h.
+#     (i) terminate-succeeds: 1 h x $3.18/h = $3.18 per run.
+#     (ii) sweep-only (both pods fall under the ORDINARY pod sweep's own
+#         name-shape match, so gpu-reap.yml's SAME 6-hourly cadence is the
+#         backstop -- no separate sweep primitive):
+#         (1 + 6) h x $3.18/h = $22.26.
+#
+# `ci/scripts/test_gpu_cluster_lane.sh` re-derives every one of these four
+# figures from the driver's own RP_TTL_HOURS and each transport's own rate,
+# and fails if the printed figure and the mechanism disagree. Standing spend
+# authorization (2026-09-13): <= 1 h billed, <= 2 runs. The figures are for
+# the DEFAULT part: an operator-chosen `gpu_type` bills at RunPod's own rate
+# for that part on either transport, which nothing here bounds — choosing
+# it is the cost decision.
 #
 # Off the merge path, and NEVER in the critical path of an automated
 # workflow (the same doctrine gpu-prove.yml/gpu-gang.yml both state): GPU
@@ -52,6 +73,17 @@ name: GPU cluster (RunPod)
 on:
   workflow_dispatch:
     inputs:
+      transport:
+        description: >-
+          Which RunPod object type carries the two-HOST NCCL bootstrap:
+          `pods` (two ordinary pods joined by Global Networking -- the
+          default, since ordinary pods provision reliably where instant
+          clusters do not) or `cluster` (a RunPod INSTANT CLUSTER --
+          near-zero capacity, kept as the non-default). The cluster path
+          is byte-for-byte what it always was.
+        required: false
+        default: "pods"
+        type: string
       gpu_type:
         description: >-
           RunPod gpuTypeId for BOTH hosts (a cluster is homogeneous). The driver
@@ -134,6 +166,8 @@ jobs:
           PROVE_EXPECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           MAX_ATTEMPTS: "1"
           # Empty on the label path: the driver then applies its own defaults.
+          # Empty on the label path too: the driver defaults to "pods".
+          RP_TWO_HOST_TRANSPORT: ${{ inputs.transport }}
           RP_CLUSTER_GPU_TYPE: ${{ inputs.gpu_type }}
           RP_CLUSTER_MIN_AVAILABILITY: ${{ inputs.min_availability }}
         run: |

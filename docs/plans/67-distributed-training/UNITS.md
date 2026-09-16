@@ -414,6 +414,41 @@ CLOSED, executed 2026-09-16 against a real single-pod REST v2 create (pod `rln5h
 member's own overlay iface, member sshd reachability on a real cluster, and member self-removal
 remain unmeasured until the one real cluster run above executes.
 
+Dated correction, 2026-09-16 (a second transport): the INSTANT CLUSTER product this unit's driver
+originally targeted measured near-zero capacity in practice (eight of nine creates in one session
+refused `Insufficient resources`), while ordinary RunPod pods provision reliably and RunPod's
+Global Networking gives two pods a private network between them — the same proof
+(`gang_nccl_two_hosts_reduce_a_known_vector`) does not care which fabric carries the bytes. The
+driver now selects `RP_TWO_HOST_TRANSPORT=pods|cluster` (env; `gpu-cluster.yml`'s own `transport`
+workflow_dispatch input; default `pods`) — `cluster` is UNCHANGED, byte-for-byte, from the shape
+this unit shipped above. Under `pods` the driver reads pod availability
+(`GET /v2/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=SECURE`, the same read
+`_rpc_pick_data_centers` already performs) and Global-Networking data centers
+(`GET /v2/datacenters`, `globalNetwork: true`, read live — never a hard-coded list), intersects
+the two, and picks ONE data center for BOTH pods (`_rpc_intersect_data_centers`); creates two
+ordinary pods (`rp_two_host_pod_create`, the RENTING ROOT `check_gpu_prove_once.py`'s P7 now
+tracks alongside `_rp_deploy_payload`/`rp_cluster_create`) with `cloud: SECURE`,
+`globalNetworking: true`, one GPU each; rank is assigned by creation order (first pod = rank 0,
+second = rank 1); waits for both RUNNING with Global Networking enabled, the SAME `dataCenterId`,
+and a direct ssh endpoint on each (`_rpc_wait_for_two_host_pods_ready`, refusing 97 before any
+build otherwise — the pods transport never uses the cluster path's overlay-ip proxy fallback,
+since `scp`/`rsync` cannot ride through it); each member DERIVES its own `NCCL_SOCKET_IFNAME`
+from its Global-Networking ip at run time (`ip -o -4 addr show`, never a literal), refusing 97 by
+name when no local interface carries it; and terminates BOTH pods on every exit arm via the SAME
+`rp_terminate`/`rp_pod_gone` primitives every other pod lane uses (no new termination primitive).
+`gang.leg` stays `"cluster"` either way (the two-HOST leg is the fact that matters downstream);
+`gang.transport` (`instant-cluster` | `global-networking`, closed set, required) is the sub-fact,
+bound into `check_cuda_run_artifacts.py` rule (k)'s `GANG_CLUSTER_FIELD_REGISTRY`. Cost bound at
+the catalog's own SECURE POD rate ($1.59/GPU/h for the default A100 SXM4 part):
+`2 x $1.59/GPU/h = $3.18/h`; `1 h x $3.18/h = $3.18` terminate-succeeds,
+`(1 + 6) h x $3.18/h = $22.26` sweep-only (both pods fall under the ordinary pod sweep's own
+name-shape match, so `gpu-reap.yml`'s SAME 6-hourly cadence is the backstop — no separate sweep
+primitive for this transport). Spec: `ci/scripts/test_gpu_cluster_lane.sh`'s own TWOPODS section
+(P1–P10, each with an executed oracle and a revert-RED against the real driver); prose updated in
+this driver's own header, `gpu-cluster.yml`, and `docs/maintainer/dev-gpu.md`'s cluster-leg
+section. The lead's own one real run (standing authorization) is unaffected: this unit still
+ships no live RunPod call.
+
 ## U5a — `GangService` on `peer_bind`; I-GANG authorization; admit-and-hold (PR-C commit 2)
 
 One bidi RPC, `GangService.RunRank(stream RankControl) returns (stream

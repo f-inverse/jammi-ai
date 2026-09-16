@@ -353,6 +353,12 @@ max_job_waits = 1024
 # onto a DIFFERENT registered executor when one exists, and runs in-process
 # otherwise (there is no other role combination to configure -- placement
 # is a property of the cluster view, not a third knob).
+# Trust class: every listener this table opens (the scheduler's gRPC below,
+# the executor's task gRPC and Flight shuffle in `[ballista.executor]`) is
+# the peer listener's class, I-PEER -- unauthenticated, every client a jammi
+# role, tenant scope enforced at the submitting session (see the security
+# guide, "The Ballista listeners"). Bind them on the cluster-internal
+# network and owe them the same network policy as `[server] peer_bind`.
 # This process hosts a Ballista scheduler bound here iff set.
 # scheduler_bind = "0.0.0.0:50050"
 

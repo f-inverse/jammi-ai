@@ -555,6 +555,34 @@ advisories are folded here; #6 is terminal.
 - **A7 (`free_port`'s properties unasserted).** `free_port_stays_below_the_ephemeral_floor_and_never_repeats`
   (crates/jammi-ballista/tests/distributed/main.rs): 64 picks, all in 20000..32000, no repeat.
 
+### 9e. Oracle round (phase-5 oracle HARD_BLOCK at `5de2ab11`, 2026-09-16 20:15 UTC — tenant isolation per RPC; fixed at the root)
+
+The oracle's mechanical gates passed (dep direction, cookbook one-way, lockstep version,
+append-only migration 038, frozen `jammi.v1` surface with `jammi.ballista.v1` outside it,
+embedded⇄remote byte parity, per-variant codec oracles). The hard block: the `[ballista]` roles
+open three unauthenticated listeners (scheduler gRPC, executor task gRPC, Flight shuffle), the
+codec's `AnnSearchExec` decode performs a tenant-parameterized catalog read whose tenant comes off
+the wire, and (1) no executed cross-tenant-denial case exercised that decode site (the only codec
+test read a NULL-tenant table, so it passed identically without the predicate); (2) the standing
+tenant-isolation partition derives its universe from `jammi.v1`, so the Ballista services sat
+outside `every_rpc_is_covered`; (3) the allowlist's "I-PEER" justification existed only in a test
+comment — `docs/guide/src/security.md` named no Ballista listener. Fixed:
+
+- **Oracle at the decode site.** `ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_of_a_bound_one`
+  (crates/jammi-ballista/tests/it/codec.rs): a table created under tenant A; a descriptor built
+  directly on the wire package (`jammi_ballista::codec::pb`, `MAGIC`, `NodeTag` made public for
+  exactly this) naming it under tenant B → refused (not-found); under no tenant → refused; under
+  A → resolves. Mutation: relaxing the decode to the ambient read resolves both refusal arms.
+- **The listeners inside the partition.** `BALLISTA_LISTENER_ALLOWLIST`
+  (crates/jammi-server/tests/it/tenant_isolation_oracle.rs) names `SchedulerGrpc`, `ExecutorGrpc`
+  and `FlightService` with the I-PEER text the peer allowlist requires, and
+  `ballista_services_are_unimplemented_on_the_public_listener` proves the public tenant layer
+  answers `UNIMPLEMENTED` for `SchedulerGrpc` (a real `SchedulerGrpcClient` call), the premise of
+  the exemption.
+- **Prose.** `docs/guide/src/security.md` enumerates the three listeners in the "does NOT defend"
+  list and carries "The Ballista listeners (I-PEER)"; `docs/guide/src/configuration.md`'s
+  `[ballista]` block states the trust class and the network-policy duty.
+
 ## 10. Gate table
 
 Logs live in the session scratchpad (`scratchpad/logs/`), named per row; CI runs are the GitHub
@@ -574,10 +602,15 @@ Actions run ids. Every row is an executed run at the named tip.
 | e2dd094e | lane 7/7 (59.1 s) with the reserved-range port picker | green | `fix5-lane-3.log` |
 | e2dd094e | CI `distributed.yml` run 35136370236 | ballista red: killed-executor successor at epoch 734/900 at the 150 s bound (§9c) | 35136370236 |
 | 3d936a5a | test_gpu_cluster_lane.sh 99, clippy ×2, ballista it 31 + roles_drain 1 + roles_begin_drain 1, worker unit 2, gang_placed 10, lane 7/7 (50.3 s then 32.9 s with the 450-epoch job), citations 1067, KO-7, names | all green | `fix7-tests.log`, `fix7-lane-2.log` |
-| a149b334 | merge path guards stage | 96/96 green; swarm stage's R12 mutation sweep in flight (41 min in the 6e717f1c run) | `fix6-guards.log` |
-| 3d936a5a | CI `distributed.yml` run 35138563225 | (recorded when complete) | 35138563225 |
-| 3d936a5a | closing audit #6 (scoped, terminal) | (recorded when complete) | ledger |
-| final tip | full merge path incl. records; PR CI | (recorded at close) | |
+| a149b334 | merge path guards + swarm stages | 105/106; the sole red is SWARM_GATE_TOUCHED (`.claude/agents/wire-server.md` `owns:` edited — admin-merge authorized) | `fix6-guards.log` |
+| 3d936a5a | CI `distributed.yml` run 35138563225 | all three legs red on the build: `cluster_state` written-never-read under `-D warnings` (§9d) | 35138563225 |
+| 3d936a5a | closing audit #6 (scoped, terminal) | BLOCK (2 blocks, 7 advisories) → §9d | ledger row 19:18:08 |
+| 13abddd9 | clippy `-D warnings` libs + every test target, it 32 + roles_drain 1 + roles_begin_drain 1, unit 2, gang_placed 10, lane 8/8 (32.9 s), lane script 101 | all green | `fix8-tests.log` |
+| 13abddd9 | CI `distributed.yml` run 35140741552 | deterministic green, **ballista green**; chaos red (pre-existing advisory, §8d) | 35140741552 |
+| 13abddd9 | merge path static + tests stages | 13/13 green (incl. the three Postgres lanes) | `final-static-tests.log`, `mp-final-1/` |
+| 5de2ab11 | rigor record committed (7 rows); anticipation record (43 files, 8 gate rows) at cdbb4f96; `check_rigor_record.py` OK | green | — |
+| 5de2ab11 | phase-5 oracle | HARD_BLOCK (tenant isolation per RPC) → §9e | ledger |
+| final tip | oracle re-run; records stage; PR CI | (recorded at close) | |
 
 ## 11. Units as built — the implementers' contract files, folded by the lead
 

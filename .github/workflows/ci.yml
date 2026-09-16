@@ -1376,6 +1376,20 @@ jobs:
           # cookbook/book/.
           - name: cookbook one-way
             cmd: bash ci/scripts/check_cookbook_one_way.sh
+          # AST gate (issue #539): every embedded engine opened under
+          # cookbook/**'s NON-pytest lanes (build scripts, recipes, the
+          # quickstart, executed .qmd chapter cells) on a TemporaryDirectory
+          # is closed on every exit path before that directory is removed —
+          # a with-item whose context manager IS the session, never a
+          # wrapper, an assignment, or a `finally:` close (unsound to credit
+          # statically; see the module docstring). The pytest lane
+          # (cookbook/book/tests/**) is out of this gate's scope: it is
+          # already covered by conftest.py's `_no_leaked_sessions` registry
+          # rail.
+          - name: cookbook session-lifecycle gate
+            cmd: python3 ci/scripts/check_cookbook_session_lifecycle.py
+          - name: cookbook session-lifecycle gate (self-test)
+            cmd: python3 ci/scripts/check_cookbook_session_lifecycle.py --self-test
           # A cheap, hermetic, toolchain-free grep over crates/jammi-db/src for
           # backend-specific SQL tokens (SQLite-only rowid/AUTOINCREMENT/PRAGMA/
           # strftime(/glob(, and — bidirectionally — Postgres-only ctid). This

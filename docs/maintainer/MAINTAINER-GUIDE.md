@@ -378,7 +378,7 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
 `pyproject.toml` states it "never vendors or edits engine source"
 (`cookbook/book/pyproject.toml`).
 
-**The four coupling artifacts.**
+**The five coupling artifacts.**
 
 1. **The API-surface guard — `cookbook/book/scripts/check_api_reference.py`.** This
    is the staleness oracle. It introspects the *live installed* `jammi` wheel
@@ -426,6 +426,43 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
 4. **The grounded reference — `cookbook/book/chapters/api-reference.qmd`** renders
    `jammi_cookbook/_api_reference.md` (the single source of truth) and is the page
    `check_api_reference.py` guards.
+
+5. **The session-lifecycle rail, in two halves.** Property: every embedded engine
+   opened under `cookbook/**` on a `tempfile.TemporaryDirectory` is `close()`d
+   before that directory is removed — an in-process catalog held open past the
+   `rmtree` races its own background writes and fails `OSError: [Errno 39]
+   Directory not empty` (Linux) / `Errno 66` (macOS). Two mechanisms cover two
+   disjoint lanes, because neither alone reaches both:
+   - **The pytest lane** — `cookbook/book/tests/conftest.py`'s
+     `_no_leaked_sessions` autouse fixture subscribes to the client's own live
+     registry (`clients/python/jammi/_sessions.py`'s `observe()`) for the
+     duration of each test and fails it *by label* if any session that
+     registered during the test never unregistered, independent of what name
+     the test bound `connect`'s result to, and independent of whether the
+     object was ever collected. `test_session_lifecycle_guard.py` is its
+     non-vacuity control, run via `pytester` against the real committed
+     `conftest.py`.
+   - **The non-pytest lanes** (build scripts under `cookbook/book/scripts/`,
+     `cookbook/recipes/*/example.py`, `cookbook/quickstart/quickstart.py`, and
+     every executed `python` cell of a `.qmd` chapter) have no test harness to
+     hang a runtime observer on, so this half is a static AST gate instead —
+     `ci/scripts/check_cookbook_session_lifecycle.py`, wired into `ci.yml`'s
+     `guard` matrix (`cookbook session-lifecycle gate` /
+     `cookbook session-lifecycle gate (self-test)`). It walks every
+     `with tempfile.TemporaryDirectory() as X:` statement's real AST extent (no
+     line or indentation heuristics — this replaces an earlier regex/indent
+     gate an audit found unsound on five shapes; the module's own docstring
+     names them) and flags a `jammi.connect(...)` call tainted by `X` unless
+     that call is *itself* a with-item — of the same statement or of a `with`
+     nested inside it — whose context manager is the connect call directly.
+     Crediting only that shape is what makes the gate sound on every exit path
+     (a normal return, an exception, or a `return` inside a nested
+     `try/finally`): Python's `with` statement guarantees `__exit__` runs
+     regardless of how the block exits, which a textual `finally:` search
+     cannot promise (it cannot tell an unconditional close from one guarded by
+     an `if`, on an aliasing name, or inside an unrelated function). The
+     runtime rail needs no static counterpart: it already sees every
+     construction route a pytest lane can take.
 
 **How the loop closes in CI (the atomicity guarantee).** The book is tested
 against the engine commit it ships beside. The PR gate

@@ -75,7 +75,9 @@ reported at all, against the test that OPENED it, never the one that
 eventually closes it. That gap — plus the registry ledger's unbounded size
 and its ``label=""`` default — is filed as issue #552. What this guard does
 NOT reach at all is the non-pytest lanes (scripts, recipes, quickstart, the
-executed chapter cells) — a static gate over those is filed as issue #539.
+executed chapter cells) — those are covered instead by the AST gate
+``ci/scripts/check_cookbook_session_lifecycle.py`` (issue #539), which reads
+the tree statically rather than running under any test harness.
 """
 
 from __future__ import annotations

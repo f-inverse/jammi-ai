@@ -783,9 +783,10 @@ workspace ships every publishable crate at the same
   of an already-transferred task can never take it) — the executor then
   runs the exact same coordinator body a claimed `Peer` gang runs
   in-process, so the published bytes are identical either way, per device
-  kind. Retries are jammi's alone: Ballista's own task/stage retry is
-  pinned to zero on every role, so a task fault surfaces to the job's own
-  `attempts`/reclaim accounting, never a second competing retry loop.
+  kind. Retries are jammi's alone: the scheduler pins `task_max_failures =
+  stage_max_failures = 0` for the whole cluster, so a task fault surfaces
+  to the job's own `attempts`/reclaim accounting, never a second competing
+  retry loop.
   `CatalogClusterState`/`CatalogJobState` back the scheduler's cluster/job
   state with the shared catalog (migration `038_compute_cluster_state`:
   `compute_executors` with `devices` — a JSON `[{kind, ordinal}]` claim

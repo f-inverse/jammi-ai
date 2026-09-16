@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 037) -- a new migration is added here
+/// (K5: append-only, currently ending at 038) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -58,6 +58,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "035_instances_peer_addr_result_root",
     "036_instances_result_root_identity",
     "037_jobs_assembly_failures_next_after",
+    "038_compute_cluster_state",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -848,7 +849,14 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // table the current `SELECT_COLS` cannot read — the
                 // manufactured state is pre-029, so the ledger must say so
                 // for everything from 029 onwards that alters
-                // `jobs`/`instances`/`workers`.
+                // `jobs`/`instances`/`workers`. 038 is deliberately left
+                // applied despite also `ALTER TABLE workers ADD COLUMN
+                // devices`: it bundles that ALTER with two `CREATE TABLE`s
+                // (`compute_executors`, `compute_jobs`) this test never
+                // drops, and those are non-idempotent — replaying 038 would
+                // fail on "table already exists". The reopened `workers`
+                // table below is missing `devices` as a result, which this
+                // test's `jobs`-only assertions never observe.
                 tx.execute(
                     "DELETE FROM applied_migrations WHERE name IN ( \
                        '029_jobs_instances_workers', '030_jobs_idempotency_key', \
@@ -2425,4 +2433,296 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
         .expect("the inserted row must be readable");
     assert_eq!(failures, 0, "assembly_failures defaults to 0");
     assert_eq!(next_after, None, "next_assembly_after defaults to NULL");
+}
+
+/// Migration `038_compute_cluster_state`
+/// (`docs/plans/67-distributed-training/UNITS.md` § U8b) is present, ordered
+/// AFTER BOTH `035_instances_peer_addr_result_root` (its
+/// `compute_executors.instance_id` join target) and
+/// `037_jobs_assembly_failures_next_after` (K5: relative position, never
+/// `.last()`), creates `compute_executors`/`compute_jobs`, and adds
+/// `workers.devices` (`NOT NULL DEFAULT '[]'`) on both backends.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::{BackendKind, SqlValue};
+
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("038_compute_cluster_state") > position("035_instances_peer_addr_result_root"),
+        "the compute-cluster-state migration must follow 035 (its instance_id join target)"
+    );
+    assert!(
+        position("038_compute_cluster_state") > position("037_jobs_assembly_failures_next_after"),
+        "the compute-cluster-state migration must follow 037"
+    );
+
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    // Both new tables exist.
+    for table in ["compute_executors", "compute_jobs"] {
+        let exists: bool = backend
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        match kind {
+                            BackendKind::Sqlite => {
+                                let rows: Vec<i64> = tx
+                                    .query(
+                                        "SELECT 1 AS one FROM sqlite_master \
+                                         WHERE type='table' AND name=$1",
+                                        &[SqlValue::TextOwned(table.to_string())],
+                                        |row| row.get::<i64>("one"),
+                                    )
+                                    .await?;
+                                Ok(!rows.is_empty())
+                            }
+                            BackendKind::Postgres => {
+                                let rows: Vec<i64> = tx
+                                    .query(
+                                        "SELECT 1::bigint AS one FROM information_schema.tables \
+                                         WHERE table_schema = 'public' AND table_name = $1",
+                                        &[SqlValue::TextOwned(table.to_string())],
+                                        |row| row.get::<i64>("one"),
+                                    )
+                                    .await?;
+                                Ok(!rows.is_empty())
+                            }
+                        }
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert!(exists, "'{table}' must exist after migration 038");
+    }
+
+    // `compute_executors.devices` is a NOT NULL column -- the placement
+    // policy's own device authority (pressure-round delta 3), distinct
+    // from `workers.devices` below.
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('compute_executors') \
+                                 WHERE name = 'devices'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable FROM information_schema.columns \
+                                 WHERE table_name = 'compute_executors' AND column_name = 'devices'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns
+            .iter()
+            .any(|(c, notnull)| c == "devices" && *notnull),
+        "compute_executors.devices must be a NOT NULL column; got {columns:?}"
+    );
+
+    // The default is `'[]'` for a freshly registered executor row --
+    // inserting with `devices` unnamed must not fail and must read back
+    // the documented default.
+    let executor_id = format!("mig038_executor_{}", jammi_test_utils::unique_suffix());
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let executor_id = executor_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO compute_executors \
+                     (executor_id, instance_id, host, port, grpc_port, task_slots, \
+                      available_slots, status, heartbeat_at, metadata) \
+                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, 'live', 'now', '{}')",
+                    &[SqlValue::TextOwned(executor_id.clone())],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("a compute_executors row naming no `devices` must be a valid insert");
+    let devices: String = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let executor_id = executor_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT devices FROM compute_executors WHERE executor_id = $1",
+                        &[SqlValue::TextOwned(executor_id)],
+                        |row| row.get::<String>("devices"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the inserted row must be readable");
+    assert_eq!(
+        devices, "[]",
+        "compute_executors.devices defaults to the empty JSON array"
+    );
+
+    // `workers.devices` is a NOT NULL column.
+    let columns: Vec<(String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            tx.query(
+                                "SELECT name, \"notnull\" FROM pragma_table_info('workers') \
+                                 WHERE name = 'devices'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("name")?;
+                                    let notnull: i32 = row.get("notnull")?;
+                                    Ok((name, notnull == 1))
+                                },
+                            )
+                            .await
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT column_name, is_nullable FROM information_schema.columns \
+                                 WHERE table_name = 'workers' AND column_name = 'devices'",
+                                &[],
+                                |row| {
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns
+            .iter()
+            .any(|(c, notnull)| c == "devices" && *notnull),
+        "workers.devices must be a NOT NULL column; got {columns:?}"
+    );
+
+    // The default is `'[]'` for a freshly migrated worker row -- inserting
+    // with neither `devices` nor `state` named must not fail and must read
+    // back the documented default.
+    let instance_id = format!("mig038_default_{}", jammi_test_utils::unique_suffix());
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let instance_id = instance_id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO instances (instance_id, started_at, last_seen_at) \
+                     VALUES ($1, 'now', 'now')",
+                    &[SqlValue::TextOwned(instance_id.clone())],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO workers (instance_id, kinds) VALUES ($1, 'all')",
+                    &[SqlValue::TextOwned(instance_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("a worker row naming neither `devices` nor `state` must be a valid insert");
+    let devices: String = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let instance_id = instance_id.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT devices FROM workers WHERE instance_id = $1",
+                        &[SqlValue::TextOwned(instance_id)],
+                        |row| row.get::<String>("devices"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the inserted row must be readable");
+    assert_eq!(
+        devices, "[]",
+        "workers.devices defaults to the empty JSON array"
+    );
 }

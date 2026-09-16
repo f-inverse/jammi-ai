@@ -1,0 +1,15 @@
+# No `type:` -> ClusterIP: reachable from the compute StatefulSet's pods
+# (they dial `jammi-server-scheduler:50050` as their `[ballista.executor]
+# scheduler_address`, and this Service's stable DNS name doubles as this
+# pod's `[server] peer_advertise`, jammi-scheduler.toml), never externally.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jammi-server-scheduler
+spec:
+  selector: { app: jammi-server-scheduler }
+  ports:
+    - { name: flight, port: 8081, targetPort: 8081 }
+    - { name: health, port: 8080, targetPort: 8080 }
+    - { name: peer, port: 9000, targetPort: 9000 }
+    - { name: ballista-sched, port: 50050, targetPort: 50050 }

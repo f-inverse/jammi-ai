@@ -13,6 +13,16 @@
 # `nvidia.com/gpu: 2` matches `[worker] local_ranks = 2` in
 # jammi-compute.toml: one device per local rank (`[gpu] devices = [0, 1]`).
 #
+# Each pod ALSO registers as a Ballista executor with the scheduler
+# Deployment (deployment-scheduler.yaml): `ballista-flt`/`ballista-grpc`
+# below are the shuffle/task listeners `[ballista.executor]`
+# (jammi-compute.toml) binds, advertised at this same pod's stable DNS name
+# (`JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST` below) -- a training job
+# claimed by the scheduler pod is PLACED onto whichever of these pods the
+# scheduler's device-aware policy picks; a training job claimed by one of
+# these pods itself runs here in-process (design contract
+# `feat_500-wave4.md` §9 B7).
+#
 # kubeconform-validated only -- no GPU node is available in CI, so this
 # StatefulSet never runs a real pod in the kind smoke.
 apiVersion: apps/v1
@@ -56,6 +66,8 @@ spec:
             - { containerPort: 8081, name: flight }
             - { containerPort: 8080, name: health }
             - { containerPort: 9000, name: peer }
+            - { containerPort: 50051, name: ballista-flt }
+            - { containerPort: 50052, name: ballista-grpc }
           env:
             # The downward API's pod-field env source
             # (EnvVarSource.fieldRef; `metadata.name` / `metadata.namespace`
@@ -80,6 +92,12 @@ spec:
             # per-pod identity that file cannot express.
             - name: JAMMI_SERVER__PEER_ADVERTISE
               value: "$(POD_NAME).jammi-server-compute.$(POD_NAMESPACE).svc.cluster.local:9000"
+            # The SAME per-pod stable DNS name, host only (no port -- this
+            # key is `[ballista.executor] advertise_host`, jammi-compute.toml,
+            # a bare host the scheduler dials back on the flight/grpc ports
+            # THAT config table already names).
+            - name: JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST
+              value: "$(POD_NAME).jammi-server-compute.$(POD_NAMESPACE).svc.cluster.local"
           readinessProbe:
             httpGet: { path: /readyz, port: 8080 }
             periodSeconds: 5

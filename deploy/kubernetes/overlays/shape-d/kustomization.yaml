@@ -5,11 +5,16 @@ resources:
   - ../../base
   - statefulset-compute.yaml
   - service-compute-headless.yaml
+  - deployment-scheduler.yaml
+  - service-scheduler.yaml
 
 configMapGenerator:
   - name: jammi-compute-config
     files:
       - jammi-compute.toml
+  - name: jammi-scheduler-config
+    files:
+      - jammi-scheduler.toml
 
 generatorOptions:
   disableNameSuffixHash: true

@@ -29,3 +29,5 @@ spec:
     - { name: flight, port: 8081, targetPort: 8081 }
     - { name: health, port: 8080, targetPort: 8080 }
     - { name: peer, port: 9000, targetPort: 9000 }
+    - { name: ballista-flt, port: 50051, targetPort: 50051 }
+    - { name: ballista-grpc, port: 50052, targetPort: 50052 }

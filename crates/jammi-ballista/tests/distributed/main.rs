@@ -16,12 +16,12 @@
 //! UNCOVERED in THIS unit's pass (named here and in the contract file,
 //! never silently skipped in the exit code the CI step reads):
 //!
-//! - **(a3)** the embedding-across-two-executors oracle needs a public
-//!   `jammi_ai::pipeline::embedding::build_embedding_plan` constructor the
-//!   brief authorized adding "if nothing public exists" — that file
-//!   (`crates/jammi-ai/src/pipeline/embedding.rs`) is outside this unit's
-//!   four-file jammi-ai grant, so this test cannot build the real embedding
-//!   plan without a scope amendment the lead grants at consolidation.
+//! - **(a3)** `jammi_ai::pipeline::embedding::build_embedding_plan` LANDED
+//!   (LANEAI, `244894c8`), so the file-grant blocker this module's doc
+//!   previously named no longer applies — the remaining gap is purely
+//!   BUDGET: this unit's pass did not reach porting the three-process
+//!   harness or writing the real byte-comparison assertion before hand-off.
+//!   A concrete follow-up, not a structural blocker.
 //! - **(a4)/(a5)** the gang oracles need the full fine-tune job submission
 //!   stack (a registered training source, a claimed `fine_tune`/
 //!   `graph_fine_tune` job whose claimant is process 1) to exercise
@@ -65,13 +65,14 @@ async fn embedding_job_across_two_executors_matches_in_process() {
             return;
         }
     };
-    let _ = backends; // stand up the three processes here once the
-                      // `build_embedding_plan` scope amendment lands
+    let _ = backends; // stand up the three processes here — build_embedding_plan
+                      // is public now (LANEAI, 244894c8); this pass ran out of
+                      // budget before porting the harness/assertion.
     eprintln!(
         "SKIPPED embedding_job_across_two_executors_matches_in_process: backends were \
-         available but the plan-construction seam (jammi_ai::pipeline::embedding::\
-         build_embedding_plan) is outside this unit's jammi-ai file grant — see this test's \
-         module doc and this crate's contract file's Uncovered section"
+         available but this unit's pass did not port the three-process harness/byte-comparison \
+         before hand-off (jammi_ai::pipeline::embedding::build_embedding_plan is public and \
+         ready) — see this test's module doc and this crate's contract file's Uncovered section"
     );
 }
 

@@ -3827,7 +3827,8 @@ fn ballista_executor_work_dir_empty_is_refused() {
 #[test]
 fn ballista_executor_scheduler_address_accepts_hostname_and_refuses_malformed() {
     let cfg = JammiConfig::parse_from(
-        "[ballista.executor]\nscheduler_address = \"ballista-scheduler.default.svc:50050\"\n",
+        "[ballista.executor]\nscheduler_address = \"ballista-scheduler.default.svc:50050\"\n\
+         advertise_host = \"10.0.4.8\"\n",
         vec![],
     )
     .unwrap();
@@ -3941,5 +3942,39 @@ fn ballista_ephemeral_ports_never_collide() {
         ("server.flight_listen", ZERO),
         ("server.peer_bind", ZERO),
     ]);
+    assert!(BallistaConfig::validate(&cfg).is_ok());
+}
+
+/// The executor's dialable host: the scheduler dials the executor back at
+/// the host it registers, and an unspecified `bind` host (`0.0.0.0` / `::`)
+/// names none — so `advertise_host` is REQUIRED whenever `bind`'s host is
+/// unspecified (refused naming both keys), and not required when `bind`
+/// names a concrete host (the bind host is the dialable host by default).
+#[test]
+fn ballista_executor_advertise_host_is_required_iff_the_bind_host_is_unspecified() {
+    // The default bind (`0.0.0.0:50051`) with no advertise host: refused.
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"10.0.0.1:50050\"\n",
+        vec![],
+    )
+    .unwrap();
+    let err = BallistaConfig::validate(&cfg).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("advertise_host") && m.contains("bind")),
+        "got {err:?}"
+    );
+    // An IPv6 unspecified bind is the same statement.
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"10.0.0.1:50050\"\nbind = \"[::]:50051\"\n",
+        vec![],
+    )
+    .unwrap();
+    assert!(BallistaConfig::validate(&cfg).is_err());
+    // A concrete bind host needs no advertise host.
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"10.0.0.1:50050\"\nbind = \"10.0.4.8:50051\"\n",
+        vec![],
+    )
+    .unwrap();
     assert!(BallistaConfig::validate(&cfg).is_ok());
 }

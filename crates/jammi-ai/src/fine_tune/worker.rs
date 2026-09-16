@@ -3189,10 +3189,10 @@ impl JobWorker {
                 }
                 let mut rank_device_configs = Vec::with_capacity(world as usize);
                 let mut rank_devices = Vec::with_capacity(world as usize);
-                for rank in 0..world as usize {
+                for &device in devices.iter().take(world as usize) {
                     let device_config = session
                         .device_config()
-                        .for_device(devices[rank])
+                        .for_device(device)
                         .map_err(WorkerJobError::from)?;
                     rank_devices.push(
                         crate::model::backend::candle::select_device(&device_config)
@@ -7083,7 +7083,6 @@ fn build_acceleration_report_json(
 // bespoke params struct would, for two calls that already differ only in
 // `varmap`/`encoder`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn compute_and_persist_acceleration_report(
     catalog: &Arc<Catalog>,
     job_id: &str,
@@ -7794,7 +7793,7 @@ mod tests {
             }
             heap(k - 1, a, out);
             for i in 0..k - 1 {
-                if k % 2 == 0 {
+                if k.is_multiple_of(2) {
                     a.swap(i, k - 1);
                 } else {
                     a.swap(0, k - 1);

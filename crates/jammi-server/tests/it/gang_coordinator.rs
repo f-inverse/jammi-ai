@@ -559,6 +559,8 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
     let ends = training_test_hooks::coordinator_ends_for(&job_id);
     assert_eq!(ends.len(), 2, "{ends:?}");
     assert_eq!(ends[1].0, 2);
+    // On record under `--nocapture`: which admissible end this tree took.
+    eprintln!("attempt-2 end: {} (ordinal {})", ends[1].1, ends[1].2);
     assert!(
         ends[1].2 == 12 || ends[1].2 == 11,
         "attempt 2 must reach the run (Published or a run failure), got: {}",

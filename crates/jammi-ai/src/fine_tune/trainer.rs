@@ -459,7 +459,7 @@ pub(crate) fn encode_dropout_positions(positions: &[u64]) -> Vec<f32> {
 /// typed error — a gathered row that is not this encoding is a gang whose
 /// ranks disagree about what they gathered.
 pub(crate) fn decode_dropout_positions(limbs: &[f32]) -> Result<Vec<u64>> {
-    if limbs.len() % 4 != 0 {
+    if !limbs.len().is_multiple_of(4) {
         return Err(JammiError::FineTune(format!(
             "dropout position gather: a row of {} limbs is not four per position",
             limbs.len()

@@ -97,6 +97,8 @@
 // build.
 use crate::harness;
 use crate::skip_without_gpu;
+#[cfg(feature = "cuda")]
+use jammi_ai::fine_tune::collective::Collective;
 
 /// [`harness::serial_cuda_device`], or a hard failure when `JAMMI_REQUIRE_CUDA`
 /// is set and no usable CUDA device opens. Same require-gate idiom as
@@ -269,7 +271,6 @@ fn assert_gang_checks(
     device: &candle_core::Device,
 ) -> Vec<f32> {
     use candle_core::Tensor;
-    use jammi_ai::fine_tune::collective::Collective;
 
     let r = rank.rank();
     assert_eq!(rank.world(), 2);

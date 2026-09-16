@@ -8,6 +8,7 @@ mod caching;
 mod catalog_ping;
 mod channels;
 mod common;
+mod compute_repo;
 mod concurrent_writers;
 mod datafusion_version;
 mod docs_config_fences;

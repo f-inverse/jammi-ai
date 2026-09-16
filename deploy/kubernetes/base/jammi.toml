@@ -13,6 +13,14 @@ region = "us-east-1"
 duration_secs = 30
 heartbeat_secs = 10
 
+[distributed]
+# Read at the submit edge only (this query tier is where jobs are
+# enqueued; a compute pod never reads it): admits a `world_size` up to the
+# compute pod's two devices. A cross-pod `Peer` gang needs this bound
+# raised to the target world size here, and at least that many compute
+# pods able to hold a rank.
+max_world_size = 2
+
 [server]
 services = ["core", "event", "eval"]
 

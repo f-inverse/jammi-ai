@@ -78,6 +78,11 @@ them supplies them above the engine.
   `[server] peer_bind` listener also serves the coordinator-to-member gang
   admission seam for a multi-host training run and trusts the channel — see
   [The gang listener](#the-gang-listener-i-gang) below.
+- **The Ballista listeners authenticate nothing either (I-PEER).** `[ballista]
+  scheduler_bind` and `[ballista.executor] bind`/`grpc_bind` (all unset by
+  default) open the compute plane's scheduler gRPC, executor task gRPC and
+  Arrow Flight shuffle ports and trust the channel — see
+  [The Ballista listeners](#the-ballista-listeners-i-peer) below.
 
 ## The peer listener (I-PEER)
 
@@ -226,6 +231,41 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   tested boundary; the first RPC that calls one of them owes the enumerating
   unreachability-or-scoping oracle this listener's own precedent
   (`GANG_LISTENER_ALLOWLIST`/`PEER_LISTENER_ALLOWLIST`) already sets.
+
+## The Ballista listeners (I-PEER)
+
+A process with a `[ballista]` role opens up to three more internal
+listeners, none of them on the public tenant layer: the scheduler's gRPC
+(`[ballista] scheduler_bind`, Ballista's `SchedulerGrpc`), the executor's task
+gRPC (`[ballista.executor] grpc_bind`, `ExecutorGrpc`) and the executor's
+Arrow Flight shuffle port (`[ballista.executor] bind`). They serve Ballista's
+own wire package, not `jammi.v1`, and their threat model is the peer
+listener's, **I-PEER**:
+
+- **Every client of these ports is a jammi role.** A scheduler is dialled by
+  the executors it places on and by the scheduler-role process's own
+  submitter; an executor is dialled by its scheduler and by sibling executors
+  for shuffle reads. The listeners carry no tenant of their own and bind
+  none.
+- **Tenant scope is enforced once, at the submitting session.** The plan a
+  scheduler places carries the submitter's tenant inside the operator
+  descriptor (`JammiCodec` writes it; a plan the codec did not encode is
+  refused by magic). An executor rebuilding a result-table read resolves the
+  table through the strict tenant-pinned catalog read under exactly that
+  tenant — never the executor process's ambient scope, which a scheduler or
+  executor process does not have. A descriptor naming another tenant's table
+  is refused with the same non-disclosing not-found the public layer answers.
+- **The public listener never serves them.** No Ballista service is mounted
+  on `assemble_grpc_chain`'s routes; the tenant-isolation oracle proves the
+  public listener answers `UNIMPLEMENTED` for `SchedulerGrpc`, the same way it
+  does for `PeerService` and `GangService`.
+- **Binding them on a routable interface without network policy / mTLS
+  exposes the compute plane** — task submission, shuffle reads, executor
+  registration — to anyone who can reach the ports, exactly as for
+  `peer_bind`. The shape-d overlay binds them on the pod network and the
+  deployer owes the network policy that keeps them cluster-internal;
+  encryption and peer authentication are the runtime's (a mesh, mTLS at a
+  sidecar). Default unset = no listener.
 
 ## Transport encryption is the deployer's runtime, not the engine's
 

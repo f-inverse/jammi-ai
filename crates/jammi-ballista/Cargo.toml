@@ -1,0 +1,89 @@
+[package]
+name = "jammi-ballista"
+description = "The Ballista compute plane: JammiCodec, JammiExecutionEngine, scheduler/executor role hosting, and the submit client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+
+[dependencies]
+jammi-ai.workspace = true
+jammi-db.workspace = true
+jammi-wire.workspace = true
+
+datafusion.workspace = true
+datafusion-proto.workspace = true
+ballista-core.workspace = true
+ballista-scheduler.workspace = true
+ballista-executor.workspace = true
+
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-flight.workspace = true
+
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+jammi-ai = { workspace = true, features = ["test-hooks"] }
+jammi-db = { workspace = true, features = ["test-hooks"] }
+jammi-test-utils.workspace = true
+tempfile = "3"
+libc.workspace = true
+parquet.workspace = true
+
+[features]
+default = []
+# Test-only hooks in jammi-ai/jammi-db the hermetic `it` suite needs (test
+# session construction, deterministic fixtures).
+test-hooks = ["jammi-ai/test-hooks", "jammi-db/test-hooks"]
+# The three-process distributed lane (tests/distributed): spawns real
+# `jammi-server` binaries and builds an in-process comparison plan on the
+# harness session, which needs the candle-backed local inference backend —
+# mirrors jammi-ai's own `live-distributed-tests` feature
+# (`crates/jammi-ai/Cargo.toml`). No cargo feature gates the crate's own
+# code — roles are config-shaped (B4) — this feature gates the test target
+# only.
+live-distributed-tests = ["jammi-ai/local", "jammi-db/storage-s3"]
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# ITS OWN test binary/process — see the file's module doc: shares a process
+# with `it`'s executor-hosting tests and `ballista_executor::executor_server::
+# TERMINATING` (a crate-wide static) leaks Terminating status across them.
+[[test]]
+name = "roles_drain"
+path = "tests/roles_drain.rs"
+
+# ITS OWN process too: `begin_drain` stores the same crate-wide
+# `TERMINATING` static (see tests/roles_begin_drain.rs's module doc).
+[[test]]
+name = "roles_begin_drain"
+path = "tests/roles_begin_drain.rs"
+
+[[test]]
+name = "distributed"
+path = "tests/distributed/main.rs"
+required-features = ["live-distributed-tests"]

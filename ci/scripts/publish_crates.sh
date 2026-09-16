@@ -46,6 +46,7 @@ PUBLISH_ORDER=(
   jammi-admin
   jammi-client
   jammi-ai
+  jammi-ballista
   jammi-server
   jammi-cli
 )

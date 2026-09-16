@@ -134,6 +134,34 @@ Three properties this preserves, and that a consumer evaluating Jammi should be 
   backend drivers; the engine code, schema, catalog discipline, and trigger-stream contract are
   unchanged.
 
+## Extending third-party libraries at their seams
+
+Where a capability is better bought than built, the engine extends the
+library at the seam it already exposes for exactly that — its own
+extension points, never a fork and never a vendored copy — and keeps the
+retry/actuator/ownership discipline (attempts, terminal writes, who is
+allowed to write a row) on jammi's own side of that seam. Two examples,
+one pattern:
+
+- **Fused CUDA kernels extend candle**, never replace it: a jammi kernel is
+  a candle `CustomOp` with a CPU reference arm and an optional fused CUDA
+  arm, so the same tensor graph runs identically (bit-for-bit on the CPU
+  arm, parity-tested on CUDA) whether or not the fused kernel compiles in.
+  Candle's own eager composition is always the fallback, never a second
+  implementation to keep in sync.
+- **The Ballista compute plane extends Ballista**, never forks it: a codec
+  (`PhysicalExtensionCodec`), an execution engine wrapper, and a custom task
+  distribution policy are all extension points Ballista ships for exactly
+  this — a scheduler/executor role hosts them inside the SAME
+  `jammi-server` binary, on jammi's own shutdown (never Ballista's own
+  process-level `start_server`/`start_executor_process`, which install
+  their own signal handlers). Every operator the codec does not know still
+  crosses the wire through Ballista's own codec unchanged, so extending the
+  plan surface never touches Ballista's own node set. Retries stay off on
+  the Ballista side entirely (`task_max_failures = stage_max_failures =
+  0`) — a task fault surfaces to jammi's own `attempts`/reclaim accounting,
+  never a second, competing retry loop.
+
 ## Positioning
 
 With these primitives the engine is, precisely: *an embeddable AI engine — federated SQL,

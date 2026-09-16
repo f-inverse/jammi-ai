@@ -35,15 +35,15 @@ pub async fn run(
 
 fn print_header() {
     println!(
-        "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} Last Seen",
-        "Instance ID", "Label", "Host", "Kinds", "State", "Started"
+        "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} {:<26} Devices",
+        "Instance ID", "Label", "Host", "Kinds", "State", "Started", "Last Seen"
     );
-    println!("{}", "-".repeat(140));
+    println!("{}", "-".repeat(160));
 }
 
 fn print_row(w: &WorkerSummary) {
     println!(
-        "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} {}",
+        "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} {:<26} {}",
         w.instance_id,
         if w.label.is_empty() { "—" } else { &w.label },
         w.host,
@@ -51,5 +51,19 @@ fn print_row(w: &WorkerSummary) {
         w.state,
         w.started_at,
         w.last_seen_at,
+        format_devices(&w.devices),
     );
+}
+
+/// `kind0, kind1, ...` in rank order (the configured `[gpu] devices` order), `—` for an empty device list —
+/// matching the empty-label convention above.
+fn format_devices(devices: &[jammi_admin::DeviceFact]) -> String {
+    if devices.is_empty() {
+        return "—".to_string();
+    }
+    devices
+        .iter()
+        .map(|d| format!("{}{}", d.kind, d.ordinal))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

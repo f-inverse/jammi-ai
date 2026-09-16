@@ -943,6 +943,7 @@ impl InferenceSession {
             params.key_column.clone(),
             params.source_id.clone(),
             Arc::clone(self.model_cache()),
+            self.compute_device().kind(),
         )
         .batch_size(self.inner_config().inference.batch_size)
         .observer(self.observer().clone())

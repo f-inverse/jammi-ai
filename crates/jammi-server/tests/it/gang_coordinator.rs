@@ -185,7 +185,7 @@ async fn register_member(engine: &Arc<InferenceSession>, id: &str, addr: std::ne
         .unwrap();
     engine
         .catalog()
-        .upsert_worker(id, "fine_tune", WorkerState::Claiming)
+        .upsert_worker(id, "fine_tune", WorkerState::Claiming, &[])
         .await
         .unwrap();
 }

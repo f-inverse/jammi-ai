@@ -178,7 +178,7 @@ async fn seed_member(
     );
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(instance_id, kinds, state)
+        .upsert_worker(instance_id, kinds, state, &[])
         .await
         .unwrap();
 }
@@ -603,7 +603,7 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
     let reg = InstanceRegistration::new(&id, None, None, None, None);
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(&id, "fine_tune", WorkerState::Claiming)
+        .upsert_worker(&id, "fine_tune", WorkerState::Claiming, &[])
         .await
         .unwrap();
     let members = catalog
@@ -641,7 +641,7 @@ async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind
     );
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(&id, "fine_tune", WorkerState::Claiming)
+        .upsert_worker(&id, "fine_tune", WorkerState::Claiming, &[])
         .await
         .unwrap();
     let full_id = format!("addr-full-{}", jammi_test_utils::unique_suffix());
@@ -1196,10 +1196,11 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
     reg.set_worker(Some(WorkerFacts {
         kinds: "fine_tune".into(),
         state: WorkerState::Claiming,
+        devices: vec![],
     }));
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(&instance_id, "fine_tune", WorkerState::Claiming)
+        .upsert_worker(&instance_id, "fine_tune", WorkerState::Claiming, &[])
         .await
         .unwrap();
 

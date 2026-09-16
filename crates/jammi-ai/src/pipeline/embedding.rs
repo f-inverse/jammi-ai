@@ -61,6 +61,65 @@ pub(crate) async fn embedding_definition(
     })
 }
 
+/// Build the embedding plan: scan `source_id`'s catalog table for
+/// `key_column` + `columns` → the one deterministic ordered-input shape
+/// (`operator::ordered_input`) → `InferenceExec` over `model_source`/`task`
+/// with the `_content_hash` passthrough — the SAME shape [`EmbeddingPipeline::
+/// run`] executes in-process, so it and a Ballista submitter build
+/// byte-identical plans by construction (one plan-building site, contract
+/// `feat_500-wave4` §2.5/§9 B3).
+///
+/// `embedding_dim` and `model_source` are the caller's own (already resolved
+/// via `embedding_definition`) rather than re-derived here, so this
+/// function never re-loads the model.
+pub async fn build_embedding_plan(
+    session: &InferenceSession,
+    source_id: &str,
+    model_source: ModelSource,
+    task: ModelTask,
+    columns: &[String],
+    key_column: &str,
+    embedding_dim: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let table_name = session.find_table_name(source_id)?;
+    let query = session.build_source_query(source_id, &table_name, key_column, columns);
+
+    let df = session
+        .context()
+        .sql(&query)
+        .await
+        .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
+    let input_plan = df
+        .create_physical_plan()
+        .await
+        .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+    // One plan shape at every model-facing site: coalesce → null-key check →
+    // the deterministic total order (see `operator::ordered_input`).
+    let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
+
+    // Create InferenceExec — the source scan's `_content_hash` projection
+    // rides through to the sink as the table's fifth column.
+    let inference_exec = InferenceExecBuilder::new(
+        input_plan,
+        model_source,
+        task,
+        columns.to_vec(),
+        key_column.to_string(),
+        source_id.to_string(),
+        Arc::clone(session.model_cache()),
+        session.compute_device().kind(),
+    )
+    .batch_size(session.inner_config().inference.batch_size)
+    .observer(session.observer().clone())
+    .embedding_dim(Some(embedding_dim))
+    .passthrough(vec![
+        jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
+    ])
+    .build()?;
+
+    Ok(Arc::new(inference_exec))
+}
+
 /// Orchestrates embedding generation: source scan → InferenceExec → ResultSink → index.
 ///
 /// Modality-agnostic — works for both text (`ModelTask::TextEmbedding`) and
@@ -164,44 +223,20 @@ impl<'a> EmbeddingPipeline<'a> {
             )
             .await?;
 
-        // Build scan plan over source
-        let table_name = self.session.find_table_name(source_id)?;
-        let query = self
-            .session
-            .build_source_query(source_id, &table_name, key_column, columns);
-
-        let df = self
-            .session
-            .context()
-            .sql(&query)
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
-        let input_plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
-        // One plan shape at every model-facing site: coalesce → null-key
-        // check → the deterministic total order (see `operator::ordered_input`).
-        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
-
-        // Create InferenceExec — the source scan's `_content_hash` projection
-        // rides through to the sink as the table's fifth column.
-        let inference_exec = InferenceExecBuilder::new(
-            input_plan,
+        // Build the plan through the one plan-building site (contract
+        // `feat_500-wave4` §2.5): in-process here and a Ballista submitter
+        // both call `build_embedding_plan`, so both build byte-identical
+        // plans by construction.
+        let inference_exec = build_embedding_plan(
+            self.session,
+            source_id,
             model_source,
             self.task,
-            columns.to_vec(),
-            key_column.to_string(),
-            source_id.to_string(),
-            Arc::clone(self.session.model_cache()),
+            columns,
+            key_column,
+            embedding_dim,
         )
-        .batch_size(self.session.inner_config().inference.batch_size)
-        .observer(self.session.observer().clone())
-        .embedding_dim(Some(embedding_dim))
-        .passthrough(vec![
-            jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
-        ])
-        .build()?;
+        .await?;
 
         // Create ResultSink
         let embedding_schema = jammi_db::store::schema::embedding_table_schema(embedding_dim);

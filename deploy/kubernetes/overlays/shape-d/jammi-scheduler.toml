@@ -1,0 +1,43 @@
+# env wins over this file (the JAMMI_<PATH> layer resolves after it); secrets
+# never here -- see base/jammi.toml's header.
+
+[storage]
+result_root = "s3://jammi-results/prod"
+
+[storage.cloud.s3]
+region = "us-east-1"
+
+[lease]
+duration_secs = 30
+heartbeat_secs = 10
+
+[ballista]
+# This pod hosts the ONE Ballista scheduler: it claims a training job and
+# PLACES it on a registered compute-pod executor (configuration.md's
+# semantics: this table's presence makes a process a scheduler). No
+# `[ballista.executor]` here -- this pod never itself registers as an
+# executor, so a task it places can never be bound back to it (a task's own
+# submitter is excluded from placement in any case).
+scheduler_bind = "0.0.0.0:50050"
+
+# This pod claims the training kinds a placed run handles (`fine_tune`,
+# `graph_fine_tune`) and places each claimed job on a compute executor; while
+# no compute executor is registered it runs the job in-process, exactly like
+# any other worker-enabled process (the bytes are identical either way).
+# `context_predictor` has no placed arm, so it is left to the compute pods:
+# listing it here would train it on this CPU pod.
+[worker]
+enabled = true
+kinds = ["fine_tune", "graph_fine_tune"]
+
+# This pod's own peer/gang listener -- needed because a training job this
+# pod claims and runs in-process (no placement available) may still assemble
+# a multi-host gang across the compute StatefulSet's pods.
+[server]
+peer_bind = "0.0.0.0:9000"
+# The stable Service DNS name this pod is always reachable at (a single
+# replica behind a normal ClusterIP Service never needs a downward-API pod
+# name the way the compute StatefulSet's per-pod `peer_advertise` does).
+peer_advertise = "jammi-server-scheduler:9000"
+# Pure scheduler node: mounts no query-tier gRPC service.
+services = []

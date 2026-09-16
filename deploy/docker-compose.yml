@@ -15,6 +15,12 @@
 #
 # `secrets` live in a git-ignored `.env` file next to this compose file;
 # `deploy/.env.example` documents the one required key.
+#
+# This file has no compute-tier service: Kubernetes runs the compute tier as
+# a `StatefulSet` (`deploy/kubernetes/overlays/shape-d`) because a rank's
+# peer address must survive a pod restart; Compose has no ordinal-stable
+# identity primitive, so a multi-rank Compose deployment lists each rank as
+# its own named service instead (`deploy/kubernetes/README.md`).
 
 services:
   jammi-server:

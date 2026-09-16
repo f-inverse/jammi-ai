@@ -220,21 +220,79 @@ the state a fresh pod recovers.
 ## Shape D — disaggregated
 
 **Artifact:** the query tier above (Shape C's Deployment) unchanged, plus a
-second Deployment on GPU nodes running the SAME image family, scheduled
-separately.
+GPU-scheduled `StatefulSet` compute tier and a single-replica CPU scheduler
+Deployment, both running the SAME image family, scheduled separately.
 
 Running jobs is not a service tier (see [Service
 tiers](./deploy-server.md#service-tiers)): whether a process *claims and
 executes* the jobs it accepted is `[worker] enabled`. Every query-tier
 replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) —
-it still mounts `core`/`event`/`eval` and accepts every submission — and the
-GPU-node Deployment runs `[worker] enabled = true` (`JAMMI_WORKER__ENABLED=true`,
-optionally `JAMMI_WORKER__KINDS='["fine_tune", "graph_fine_tune", "context_predictor"]'`
-to claim only the training kinds) so only it runs the job worker's claim
-loop against the shared catalog. Its `[server] services` is whatever the
-compute node should also serve — `services = []` for a pure compute node.
+it still mounts `core`/`event`/`eval` and accepts every submission — and
+both compute-tier roles below run `[worker] enabled = true`
+(`JAMMI_WORKER__ENABLED=true`) so only they run the job worker's claim
+loop against the shared catalog. Their `kinds` differ: the compute
+StatefulSet's pods claim `["fine_tune", "graph_fine_tune",
+"context_predictor"]`, the scheduler Deployment claims `["fine_tune",
+"graph_fine_tune"]` only — `context_predictor` has no placed arm, so
+listing it on the CPU scheduler pod would train it there instead of on a
+device. `[server] services = []` on both — a pure compute/scheduler node
+serves no query-tier gRPC.
 
-The compute tier's Deployment carries `terminationGracePeriodSeconds: 600`
+**Two compute-tier roles, one config knob.** Whether a process hosts a
+Ballista scheduler or executor (or neither) is `[ballista]`
+(`scheduler_bind` / `executor`, see [Configuration](./configuration.md)) —
+a process with neither role runs exactly as it always has:
+
+- **The scheduler** is ONE dedicated single-replica `Deployment`
+  (`jammi-server-scheduler`): `[ballista] scheduler_bind` set, no
+  `[ballista.executor]`, CPU image. It claims a training job and PLACES it
+  — as one Ballista task — on a registered compute-pod executor; when no
+  executor is registered yet it claims and runs the job in-process instead
+  (byte-identical either way, per device kind), since it is also a plain
+  worker-enabled fleet member. A third arm: when a live registered executor
+  exists but none of its own devices lists the plan's device kind (a row a
+  dead executor left behind is not live and never counts), the
+  submission is refused typed BEFORE it ever reaches the scheduler — the
+  row is left `running` for reclaim (an attempt spent), never run
+  in-process on the claiming pod.
+- **The compute tier's `StatefulSet` pods** (`jammi-server-compute`) each
+  host a Ballista EXECUTOR (`[ballista.executor]` pointed at the
+  scheduler's Service) alongside their own `[worker] enabled = true` claim
+  loop: a pod claims and runs a job in-process exactly like the scheduler
+  can, or accepts a gang the scheduler placed on it. `GangExec`'s `world`
+  is informational only — topology is decided on the pod that actually
+  runs the body, from its OWN `[worker] local_ranks`, never from the
+  submitter's.
+
+Placement is decided BEFORE topology, for every `fine_tune`/
+`graph_fine_tune` attempt a scheduler-role process claims (any process
+whose `HostAdmission` exposes a placement submitter): it always attempts
+to place the whole job as one Ballista task on a registered compute-pod
+executor, regardless of `W` versus `[worker] local_ranks`. Only the pod
+that ends up running the job's coordinator body — the placed executor, or
+the claiming process itself when no submitter seam exists or no other
+executor is registered — decides `Single`/`Local`/`Peer` from its OWN
+`local_ranks`: this overlay admits single-pod gangs (`W ≤ 2`, `Local` on
+one pod's two devices); a cross-pod `Peer` gang of world `W` needs `W >
+local_ranks`, `max_world_size ≥ W` on the submit edge (`base/jammi.toml` — the key is read
+only where jobs are enqueued), and at least `W` compute pods able to hold a rank (the coordinator's
+included) — the submitting host moves to an `Awaiting` holder state for
+the whole placement (it runs no compute meanwhile, but can still serve a
+`RunRank` session). Placement always excludes a task's own submitter: a
+claimant's host is never bound its own gang, so a lone compute pod placing
+its own claim would deadlock against itself — this is why the scheduler is
+a SEPARATE role rather than "whichever compute pod claims first places its
+own siblings."
+
+Each `jammi-server-compute` pod's `peer_advertise` is its own stable DNS
+name under the headless Service
+(`<pod>.jammi-server-compute.<namespace>.svc.cluster.local`,
+`publishNotReadyAddresses: true` so a rank can dial a sibling that is still
+warming), the property a plain `Deployment`'s churning pod names cannot
+hold; its Ballista `advertise_host` is the SAME per-pod name, since the
+scheduler must dial the executor back on the identical stable address.
+
+Both compute-tier roles carry `terminationGracePeriodSeconds: 600`
 — SIGTERM drains (the in-flight training job finishes, every epoch bundle
 lands) and SIGKILL follows the grace; SIGINT, or `jammi-server release` from
 a `preStop` hook, RELEASES — on a CONFIRMED release (exit 0), the job's
@@ -244,24 +302,44 @@ attempt universally, and its per-lease outcome depends on which determinant
 degraded (see the RELEASE breakdown in `deploy/kubernetes/README.md` and
 `deploy-server.md` below — never assume the CONFIRMED cost here for a
 degraded exit). The grace must cover one epoch's wall time; on spot
-capacity use RELEASE. The operative rule, the rollout arithmetic and both
-`preStop` recipes are in `deploy/kubernetes/README.md` ("Shutdown: DRAIN
-and RELEASE"); the modes themselves are in
-[Shutdown](./deploy-server.md#shutdown-drain-and-release).
+capacity use RELEASE. DRAIN on an executor pod additionally stops Ballista
+task admission at once — the executor reports `Terminating` to the scheduler
+the instant DRAIN begins, before the in-flight worker job is joined, and a
+terminating executor is never bound; a gang the pod is still dialled with
+inside its grace is refused before any claim transfer — but waits for any
+in-flight placed gang before the process itself stops — only
+RELEASE tears the executor down immediately. The operative rule, the
+rollout arithmetic and both `preStop` recipes are in
+`deploy/kubernetes/README.md` ("Shutdown: DRAIN and RELEASE"); the modes
+themselves are in [Shutdown](./deploy-server.md#shutdown-drain-and-release).
 
-The compute tier is a plain Deployment today and is **provisional**:
-[#500](https://github.com/f-inverse/jammi-ai/issues/500) decides the gang
-primitive for multi-GPU and multi-node training; once ranks need stable
-per-rank identity and ordered startup, this overlay becomes a `StatefulSet`
-or an indexed `Job`. The Shape C base is unaffected. This overlay is
-validated by `kubeconform` only — CI has no GPU node.
+The compute tier is a `StatefulSet` — each rank's peer address (and
+Ballista `advertise_host`) must stay stable across a pod restart, which a
+Deployment's churning pod names cannot hold. This overlay is validated by
+`kubeconform` only — CI has no GPU node.
 
 ```yaml
-{{#include ../../../deploy/kubernetes/overlays/shape-d/deployment-compute.yaml}}
+{{#include ../../../deploy/kubernetes/overlays/shape-d/statefulset-compute.yaml}}
+```
+
+```yaml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/service-compute-headless.yaml}}
 ```
 
 ```toml
 {{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-compute.toml}}
+```
+
+```yaml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/deployment-scheduler.yaml}}
+```
+
+```yaml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/service-scheduler.yaml}}
+```
+
+```toml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-scheduler.toml}}
 ```
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a

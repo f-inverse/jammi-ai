@@ -79,6 +79,11 @@ workspace ships every publishable crate at the same
   `ResultStore::pin_current_version(record).await?.input_anchor()` instead;
   for a versioned table this method already delegated to exactly that
   internally, so the returned value is unchanged.
+- **`jammi_db::catalog::Catalog::upsert_worker` gains a `devices:
+  &[DeviceFact]` parameter (#500).** A `pub` `jammi-db` API; every
+  out-of-tree caller adds the argument (`&[]` reproduces the previous
+  behaviour — an empty device list, and every existing row's `devices`
+  column already defaults to `[]`).
 
 ### Added
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
@@ -753,6 +758,59 @@ workspace ships every publishable crate at the same
   is layered on top. `compose-smoke.yml` gains a native
   `ubuntu-24.04-arm` leg (its own within-leg parity assertions only, no cross-arch byte
   comparison).
+
+- **The Ballista compute plane: a training job can run on ANY registered
+  compute host, not only the one that claimed it (#500).** A new
+  publishable, lockstep crate, `jammi-ballista`, extends Apache DataFusion
+  Ballista 54.1 at its own extension seams — a `PhysicalExtensionCodec`
+  (`JammiCodec`) that carries `InferenceExec`/`AnnSearchExec`/
+  `AsofJoinExec`/`KeyCheckExec`/`GangExec` as its own `jammi.ballista.v1`
+  wire package (a 4-byte magic prefix so a jammi buffer and a Ballista
+  buffer can never alias; delegating every other node to Ballista's own
+  codec unchanged), an execution-engine wrapper that refuses typed rather
+  than silently mis-running a stage whose `InferenceExec` or `GangExec` names a
+  device kind this executor does not run, and a custom task-distribution policy
+  (`DevicePlacement`) — never a fork, never a vendored copy. A process
+  hosts a Ballista scheduler and/or executor role purely by `[ballista]`
+  config (`scheduler_bind` / `executor`); unset means today's process,
+  byte-for-byte. A multi-host `Peer` gang runs under placement as ONE
+  Ballista task (`GangExec`), placed on a device-bearing executor other
+  than its own submitter; the submitting host's `HostAdmission` holder
+  moves to a new `Awaiting` state for the wait (it runs no compute
+  meanwhile, but can still serve a gang-membership session for a DIFFERENT
+  attempt), and the hand-off is a zero-net-attempts row transfer
+  (`Catalog::transfer_claim`, guarded so a stale runner or a second launch
+  of an already-transferred task can never take it) — the executor then
+  runs the exact same coordinator body a claimed `Peer` gang runs
+  in-process, so the published bytes are identical either way, per device
+  kind. Retries are jammi's alone: the scheduler pins `task_max_failures =
+  stage_max_failures = 0` for the whole cluster, so a task fault surfaces
+  to the job's own `attempts`/reclaim accounting, never a second competing
+  retry loop.
+  `CatalogClusterState`/`CatalogJobState` back the scheduler's cluster/job
+  state with the shared catalog (migration `038_compute_cluster_state`:
+  `compute_executors` (whose `devices`, a JSON `[{kind, ordinal}]`, is the
+  placement policy's sole authority) and `compute_jobs`; `ALTER TABLE
+  workers ADD COLUMN devices` mirrors it on `ListWorkers` as
+  `WorkerSummary.devices` (field 8, `repeated DeviceFact {kind, ordinal}`),
+  additive to the frozen surface), so a scheduler restart keeps every executor
+  registration and job status row, and two schedulers may share one
+  catalog for sequential jobs. Placement matches the plan's own device
+  KIND (`InferenceExec::device_kind`, `GangDescriptor.device_kind`, both
+  stamped by the submitter's session; "cpu" is a kind too, so a CPU fleet
+  places CPU-stamped work on CPU executors) — an executor binds a task
+  only when its OWN registered devices list that kind:
+  `submit_physical_plan` refuses a typed submission before it is ever sent
+  when no LIVE registered executor lists the plan's kind — live is the one
+  predicate the scheduler's binder applies too (`Active` status and a
+  heartbeat within the liveness window, 180 s; a row a killed executor
+  left behind stops counting after the window, a `Terminating` one at
+  once) — and the execution engine's own device-pinning refusal (K7) is
+  the second line, never parked unschedulable. DRAIN reports `Terminating`
+  the instant it begins (before the in-flight worker job is joined), so
+  the binder stops binding to a draining executor at once, and a gang the
+  executor is still dialled with inside its grace is refused before any
+  claim transfer.
 
 ### Changed
 - **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**
@@ -1797,6 +1855,19 @@ workspace ships every publishable crate at the same
   width, Float32/64, Utf8, Binary) now round-trips through publish, replay, and every driver's
   live path byte-for-byte. `UInt64` values above `i64::MAX` are refused at publish (BIGINT is the
   storage type on both backends) rather than silently wrapped or truncated.
+- **The shape-D overlay's compute tier is a `StatefulSet`, not a
+  `Deployment` (#500).** `jammi-server-compute` behind a headless Service
+  (`publishNotReadyAddresses: true`) so each pod's peer/Ballista identity
+  (`[server] peer_advertise` / `[ballista.executor] advertise_host`) is
+  its own stable per-pod DNS name across a restart — the property the old
+  Deployment's churning pod names could not hold. An operator on an
+  existing shape-D deployment cannot `kubectl apply` this overlay in
+  place: `kubectl delete deployment jammi-server-compute` (a `Deployment`
+  and a `StatefulSet` are different kinds under the same name and
+  Kubernetes refuses to convert one into the other) before applying the
+  new overlay, which also gains a single-replica scheduler `Deployment`
+  (`jammi-server-scheduler`) each compute pod registers with as a Ballista
+  executor — see `deploy/kubernetes/README.md`'s "Compute plane".
 
 ## [0.49.1] - 2026-09-03
 

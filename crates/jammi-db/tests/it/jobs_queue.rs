@@ -3477,7 +3477,7 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
         .await
         .unwrap();
     catalog
-        .upsert_worker("w-state", "all", WorkerState::Warming)
+        .upsert_worker("w-state", "all", WorkerState::Warming, &[])
         .await
         .unwrap();
     assert_eq!(
@@ -3502,7 +3502,7 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
     );
     // A re-upsert (a restarted loop on the same instance) resets the state.
     catalog
-        .upsert_worker("w-state", "fine_tune", WorkerState::Warming)
+        .upsert_worker("w-state", "fine_tune", WorkerState::Warming, &[])
         .await
         .unwrap();
     let again = catalog
@@ -3524,4 +3524,419 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
         "no row, no state write"
     );
     assert!(catalog.delete_worker("w-state").await.unwrap());
+}
+
+/// `upsert_worker`'s `devices` param round-trips through `list_workers`
+/// (67 wave-4 U8b): unset (`&[]`) reads back as an empty list, a written
+/// device list reads back exactly, and a re-upsert REPLACES the device list
+/// (never merges).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upsert_worker_devices_round_trips_through_list_workers(backend: BackendKind) {
+    use jammi_db::catalog::instance::DeviceFact;
+
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let devices_of = |workers: Vec<jammi_db::catalog::jobs_repo::WorkerRecord>| {
+        workers
+            .into_iter()
+            .find(|w| w.instance_id == "w-devices")
+            .map(|w| w.devices)
+    };
+
+    catalog
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "w-devices",
+            Some("lbl"),
+            Some("host"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    catalog
+        .upsert_worker("w-devices", "all", WorkerState::Warming, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        devices_of(catalog.list_workers().await.unwrap()),
+        Some(Vec::new()),
+        "no devices named = an empty list, never NULL"
+    );
+
+    let devices = vec![
+        DeviceFact {
+            kind: "cuda".to_string(),
+            ordinal: 0,
+        },
+        DeviceFact {
+            kind: "cuda".to_string(),
+            ordinal: 1,
+        },
+    ];
+    catalog
+        .upsert_worker("w-devices", "all", WorkerState::Claiming, &devices)
+        .await
+        .unwrap();
+    assert_eq!(
+        devices_of(catalog.list_workers().await.unwrap()),
+        Some(devices),
+        "the written device list reads back exactly"
+    );
+
+    // A re-upsert with no devices REPLACES, never merges.
+    catalog
+        .upsert_worker("w-devices", "all", WorkerState::Claiming, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        devices_of(catalog.list_workers().await.unwrap()),
+        Some(Vec::new()),
+        "a re-upsert with no devices clears the previous list"
+    );
+}
+
+/// A malformed `workers.devices` value (planted out-of-band — never through
+/// `upsert_worker`) is a ROW FACT: `list_workers` still returns the row,
+/// with `devices` decoded as an empty list, never a read fault (issue
+/// #574's shape).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_worker_devices_is_a_row_fact_not_a_read_fault(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .upsert_instance(&jammi_db::catalog::instance::InstanceRegistration::new(
+            "w-corrupt",
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    catalog
+        .upsert_worker("w-corrupt", "all", WorkerState::Warming, &[])
+        .await
+        .unwrap();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE workers SET devices = $1 WHERE instance_id = $2",
+                    &[SqlValue::Text("not json"), SqlValue::Text("w-corrupt")],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    let workers = catalog
+        .list_workers()
+        .await
+        .expect("a malformed devices value must never fault the whole read");
+    let row = workers
+        .into_iter()
+        .find(|w| w.instance_id == "w-corrupt")
+        .expect("the row itself must still be returned");
+    assert_eq!(
+        row.devices,
+        Vec::new(),
+        "malformed devices decodes to an empty list, never propagated as an error"
+    );
+}
+
+// ─── transfer_claim: the placed-gang hand-off (67 wave-4 U8b, design
+// contract feat_500-wave4.md § 2.4) ─────────────────────────────────────────
+
+/// A transfer moves `claimed_by` and stamps a fresh lease deadline, leaving
+/// `attempts`/`releases`/`status` untouched (zero net attempts: a hand-off,
+/// never a re-claim).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_claim_moves_the_row_leaving_attempts_releases_status_unchanged(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog.submit_job(job_params("xfer-ok")).await.unwrap();
+    let claimed = catalog
+        .claim_next("scheduler-a", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.attempts, 1);
+    let first_lease = claimed.lease_expires_at.clone().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let moved = catalog
+        .transfer_claim(
+            "xfer-ok",
+            "scheduler-a",
+            "executor-b",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        moved,
+        "a live claim with the matching from/attempts must transfer"
+    );
+
+    let after = catalog.get_job("xfer-ok").await.unwrap();
+    assert_eq!(after.claimed_by.as_deref(), Some("executor-b"));
+    assert_eq!(
+        after.attempts, 1,
+        "transfer_claim must never touch attempts"
+    );
+    assert_eq!(
+        after.releases, 0,
+        "transfer_claim must never touch releases"
+    );
+    assert_eq!(
+        after.status, "running",
+        "transfer_claim must never touch status"
+    );
+    assert!(
+        after.lease_expires_at.as_deref().unwrap() > first_lease.as_str(),
+        "the new lease deadline must be a fresh window, not the old deadline"
+    );
+}
+
+/// A wrong `from`, a stale `attempts`, and a SECOND transfer with the OLD
+/// `from` (after a first transfer already moved the row) all fail — the
+/// last is the bind-time re-launch guard's second half: once the first
+/// transfer lands, `claimed_by = $from` no longer matches the OLD holder.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_claim_refuses_wrong_from_stale_attempts_and_a_second_launch(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog.submit_job(job_params("xfer-stale")).await.unwrap();
+    catalog
+        .claim_next("scheduler-a", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("job claimed");
+
+    let wrong_from = catalog
+        .transfer_claim(
+            "xfer-stale",
+            "not-the-holder",
+            "executor-b",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(!wrong_from, "a transfer naming the wrong `from` must fail");
+
+    let stale_attempts = catalog
+        .transfer_claim(
+            "xfer-stale",
+            "scheduler-a",
+            "executor-b",
+            99,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !stale_attempts,
+        "a transfer naming a stale attempts must fail"
+    );
+
+    let first = catalog
+        .transfer_claim(
+            "xfer-stale",
+            "scheduler-a",
+            "executor-b",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(first, "the first, correctly-guarded transfer must succeed");
+
+    let second_from_old = catalog
+        .transfer_claim(
+            "xfer-stale",
+            "scheduler-a",
+            "executor-c",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !second_from_old,
+        "a second transfer naming the OLD from must fail: it no longer holds the claim"
+    );
+
+    let after = catalog.get_job("xfer-stale").await.unwrap();
+    assert_eq!(after.claimed_by.as_deref(), Some("executor-b"));
+    assert_eq!(after.attempts, 1, "no transfer_claim ever touches attempts");
+}
+
+/// A transfer of an EXPIRED lease fails — the placement guard's
+/// `lease_live_clause` conjunct.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_claim_after_lease_expiry_fails(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .submit_job(job_params("xfer-expired"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next("scheduler-a", KINDS, Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let moved = catalog
+        .transfer_claim(
+            "xfer-expired",
+            "scheduler-a",
+            "executor-b",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(!moved, "an expired lease must never transfer");
+}
+
+/// Pressure-round delta 2: a RELEASE ([`Catalog::release_job_lease`]) NULLs
+/// the lease, and `transfer_claim`'s lease conjunct is a POSITIVE
+/// comparison (`lease_expires_at > now`), never `IS NULL OR …` — so a
+/// transfer of a released claim must fail, not succeed. The row is left
+/// exactly as `release_job_lease` wrote it: no transfer ever ran.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_claim_after_release_fails(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .submit_job(job_params("xfer-released"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next("scheduler-a", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.attempts, 1);
+
+    let released = catalog
+        .release_job_lease("xfer-released", "scheduler-a", 1)
+        .await
+        .unwrap();
+    assert!(released, "the release itself must succeed");
+
+    let moved = catalog
+        .transfer_claim(
+            "xfer-released",
+            "scheduler-a",
+            "executor-b",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !moved,
+        "a transfer of a RELEASED (NULL-leased) claim must fail"
+    );
+
+    let after = catalog.get_job("xfer-released").await.unwrap();
+    assert_eq!(
+        after.claimed_by.as_deref(),
+        Some("scheduler-a"),
+        "an unchanged row: no transfer happened"
+    );
+    assert!(
+        after.lease_expires_at.is_none(),
+        "the lease stays NULL: no transfer wrote a new deadline"
+    );
+}
+
+/// After a transfer, the NEW holder's `heartbeat_job` succeeds and the OLD
+/// holder's fails — the hand-off is real, not merely a row update the old
+/// holder can still act on.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_claim_new_holder_can_heartbeat_old_holder_cannot(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog.submit_job(job_params("xfer-hb")).await.unwrap();
+    catalog
+        .claim_next("scheduler-a", KINDS, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    let moved = catalog
+        .transfer_claim(
+            "xfer-hb",
+            "scheduler-a",
+            "executor-b",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(moved);
+
+    let old_holder = catalog
+        .heartbeat_job("xfer-hb", "scheduler-a", 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(!old_holder, "the old holder no longer owns the claim");
+
+    let new_holder = catalog
+        .heartbeat_job("xfer-hb", "executor-b", 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(new_holder, "the new holder owns the claim and can renew it");
 }

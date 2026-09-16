@@ -326,6 +326,14 @@ impl JobService for JobServer {
                     started_at: w.started_at,
                     last_seen_at: w.last_seen_at,
                     state: w.state,
+                    devices: w
+                        .devices
+                        .into_iter()
+                        .map(|d| pb::DeviceFact {
+                            kind: d.kind,
+                            ordinal: d.ordinal,
+                        })
+                        .collect(),
                 })
                 .collect(),
         }))

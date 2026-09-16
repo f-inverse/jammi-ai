@@ -11,12 +11,47 @@ region = "us-east-1"
 duration_secs = 30
 heartbeat_secs = 10
 
+[gpu]
+# The ordered device list this pod's ranks place on: rank i on devices[i].
+# devices[0] must equal `device` (unset here, default 0), so no separate
+# `device` key is needed. Two entries for the shape's two local ranks below.
+devices = [0, 1]
+
+# This pod also hosts a Ballista EXECUTOR -- it registers with the
+# scheduler Deployment's Service and accepts a PLACED training job (one
+# `GangExec` task) alongside the jobs it claims and runs on its own,
+# in-process. One task slot: a placed gang and this pod's own in-process
+# claim both take the SAME `HostAdmission` job slot (this pod coordinates
+# one placed task at a time), so a second bound task is refused typed at
+# the slot rather than left to contend for `[gpu] devices` capacity.
+[ballista.executor]
+scheduler_address = "jammi-server-scheduler:50050"
+bind = "0.0.0.0:50051"
+grpc_bind = "0.0.0.0:50052"
+# The per-pod stable DNS name (statefulset-compute.yaml's downward-API
+# `JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST`, same construction as
+# `peer_advertise` below) -- never set here, since every replica shares this
+# one ConfigMap and the value differs per pod.
+task_slots = 1
+
 # Pure compute node: mounts no query-tier gRPC service, only claims and runs
-# queued jobs.
+# queued jobs (in-process or as a placed Ballista task).
 [server]
 services = []
+# This pod's own peer/gang listener, identical on every replica of this
+# StatefulSet: "0.0.0.0:PORT" accepts a connection on any interface. The
+# per-pod dial-in address other replicas use is `peer_advertise`, set from
+# the downward API in statefulset-compute.yaml's `env` -- never here, since
+# every replica shares this one ConfigMap and `peer_advertise` differs per
+# pod.
+peer_bind = "0.0.0.0:9000"
 
 [worker]
 enabled = true
 # The training kinds; "all" would also claim every other compiled kind.
 kinds = ["fine_tune", "graph_fine_tune", "context_predictor"]
+# One rank per [gpu] devices entry: a claimed job with world_size <= 2 runs
+# both ranks in this pod over a Local gang (no peer dial); a wider job makes
+# this pod rank 0 of a Peer gang whose other rank is the StatefulSet's other
+# replica.
+local_ranks = 2

@@ -1289,3 +1289,93 @@ pub(super) const MIGRATION_037_JOBS_ASSEMBLY_FAILURES_NEXT_AFTER: &str = r#"
 ALTER TABLE jobs ADD COLUMN assembly_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 "#;
+
+/// Migration 038 (`docs/plans/67-distributed-training/UNITS.md` § U8b;
+/// design contract `feat_500-wave4.md` § 3, pressure-round delta 3):
+/// `compute_cluster_state` — the catalog-backed cluster state a Ballista
+/// scheduler role reads/writes through `catalog::compute_repo`, and
+/// `workers.devices` — a per-worker device MIRROR, informational only, for
+/// `ListWorkers`. DISTRIBUTOR-NEUTRAL (B1/K5): no `ballista` in any
+/// identifier here, so the tables carry no distributor vocabulary into the
+/// engine's own catalog.
+///
+/// * `compute_executors` — one row per registered compute executor:
+///   `executor_id` (PK, the distributor's own executor identity — opaque to
+///   this crate), `instance_id` (FK-shaped, not enforced — carried for
+///   display/correlation only; see `devices` below for why it is NOT the
+///   placement join key), `host`/`port`/`grpc_port` (the executor's two
+///   listeners), `task_slots` (total capacity) and `available_slots`
+///   (capacity not currently bound — `available_slots <= task_slots`
+///   always, enforced by
+///   `compute_repo::Catalog::adjust_compute_slots`/`bind_compute_slots`,
+///   never by a schema `CHECK`, since a batch adjustment's intermediate
+///   per-row state during its one transaction is not itself required to
+///   satisfy the bound, only the committed result), `status` (the
+///   executor's own free-text state, opaque here), `heartbeat_at` (last
+///   liveness signal, `TEXT` in the same lease-timestamp family other
+///   catalog clocks use), `metadata` (free-form `TEXT`, e.g. the
+///   distributor's own JSON executor description — never parsed by this
+///   crate), and **`devices`** — the JSON `[{kind, ordinal}]`
+///   (`instance.rs::DeviceFact`) THIS EXECUTOR itself registers with,
+///   written by `compute_repo::Catalog::upsert_compute_executor` from
+///   `ComputeExecutorRecord.devices`. This is the executor's OWN
+///   registration fact and the placement join's ONLY authority —
+///   `catalog::compute_repo::Catalog::list_compute_executor_devices` reads
+///   THIS column directly, never `workers.devices` and never a join on
+///   `instance_id`: an executor process and a `[worker]` process are
+///   different roles that may run in different containers with different
+///   device visibility, so the executor's own device claim, not another
+///   table's, is what a placement decision must trust. `NOT NULL DEFAULT
+///   '[]'` so an executor registered before this column existed (or one
+///   that never names a device) reads back an empty list, never `NULL`.
+/// * `compute_jobs` — one row per submitted compute job: `job_id` (PK,
+///   opaque), `owner`, `status`, `queued_at`, `updated_at`. The execution
+///   GRAPH itself has no serialisation in Ballista 54.1 (contract § 3), so
+///   it is deliberately NOT a column here — a scheduler restart keeps this
+///   row's status but never revives the in-flight graph; jammi's own
+///   reclaim re-runs the job, never Ballista's.
+/// * `workers.devices` — the JSON `[{kind, ordinal}]` device inventory
+///   `catalog::jobs_repo::Catalog::upsert_worker` writes from
+///   `WorkerFacts.devices`; `NOT NULL DEFAULT '[]'` so every pre-existing
+///   row (and every row a caller that still passes `&[]` writes) reads back
+///   an empty device list rather than `NULL` — the same "additive column,
+///   zero behaviour change for a row this migration does not itself write"
+///   shape as 034's/037's own `ADD COLUMN ... DEFAULT`. This column is a
+///   `ListWorkers` mirror ONLY, read back verbatim on
+///   `jammi.v1.job.WorkerSummary.devices` (field 8, an additive field on
+///   the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`)
+///   — `compute_executors.devices` above is the placement policy's sole
+///   authority, never this one, because a `[worker]` row and a
+///   compute-executor row describe potentially different processes.
+///
+/// Ordered after BOTH `035_instances_peer_addr_result_root` (`instances`/
+/// `workers` at their U5b-1a shape) and `037_jobs_assembly_failures_next_after`
+/// (the `jobs` table this crate's other 67-wave migrations touch is at its
+/// final wave-3 shape before this wave-4 addition) — asserted by
+/// `tests/it/migrations.rs::migration_038_is_ordered_after_035_and_037_and_creates_compute_tables`
+/// on both backends, the same relative-position style
+/// `migration_037_is_ordered_after_036...` uses (K5: relative position,
+/// never `.last()`).
+pub(super) const MIGRATION_038_COMPUTE_CLUSTER_STATE: &str = r#"
+CREATE TABLE compute_executors (
+    executor_id     TEXT PRIMARY KEY,
+    instance_id     TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    port            INTEGER NOT NULL,
+    grpc_port       INTEGER NOT NULL,
+    task_slots      INTEGER NOT NULL,
+    available_slots INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    heartbeat_at    TEXT NOT NULL,
+    metadata        TEXT NOT NULL,
+    devices         TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE compute_jobs (
+    job_id     TEXT PRIMARY KEY,
+    owner      TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    queued_at  TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
+"#;

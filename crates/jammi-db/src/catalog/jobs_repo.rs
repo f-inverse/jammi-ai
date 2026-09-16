@@ -35,9 +35,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{now_sortable, BackendError, BackendKind, Row, SqlValue, TxOptions};
-use super::instance::{GangListing, GangMember, InstanceRegistration, PeerAddr};
+use super::instance::{
+    decode_devices_json, DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr,
+};
 use super::lease::{
-    instance_liveness_margin, lease_deadline_expr, lease_expired_clause, stale_before_clause,
+    instance_liveness_margin, lease_deadline_expr, lease_expired_clause, lease_live_clause,
+    stale_before_clause,
 };
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
@@ -706,19 +709,33 @@ pub struct WorkerRecord {
     pub state: String,
     pub started_at: String,
     pub last_seen_at: String,
+    /// This worker's device inventory, as `Catalog::upsert_worker` wrote
+    /// it. A `ListWorkers` MIRROR only (mapped verbatim onto
+    /// `jammi.v1.job.WorkerSummary.devices`, field 8, an additive field on
+    /// the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`)
+    /// — never the placement policy's authority; see
+    /// `super::compute_repo::ComputeExecutorRecord::devices`'s doc. A
+    /// malformed stored value decodes to an empty list with a
+    /// `tracing::warn!` naming `instance_id` (the #574 row-fact rule; see
+    /// [`super::instance::decode_devices_json`]), never a read fault.
+    pub devices: Vec<DeviceFact>,
 }
 
 fn parse_worker_row(
     row: &Row<'_>,
 ) -> std::result::Result<WorkerRecord, super::backend::BackendError> {
+    let instance_id: String = row.get("instance_id")?;
+    let devices_json: String = row.get("devices")?;
+    let devices = decode_devices_json(&devices_json, &instance_id);
     Ok(WorkerRecord {
-        instance_id: row.get("instance_id")?,
         label: row.try_get("label")?,
         host: row.try_get("host")?,
         kinds: row.get("kinds")?,
         state: row.get("state")?,
         started_at: row.get("started_at")?,
         last_seen_at: row.get("last_seen_at")?,
+        instance_id,
+        devices,
     })
 }
 
@@ -1208,6 +1225,78 @@ impl Catalog {
             "UPDATE jobs SET lease_expires_at = {deadline_expr}, updated_at = $2 \
              WHERE job_id = $3 AND status = $4 AND claimed_by = $5 AND attempts = $6 \
                AND lease_expires_at IS NOT NULL"
+        );
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move { tx.execute(&sql, &params).await })
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// The placed-gang hand-off (design contract `feat_500-wave4.md` §
+    /// 2.4): move `job_id`'s claim from `from_instance` to `to_instance` —
+    /// `claimed_by = $to`, a fresh `lease` deadline, `updated_at` — WITHOUT
+    /// touching `attempts` or `releases` (zero net attempts: this is a
+    /// hand-off, never a re-claim). `Ok(false)` when the guard misses:
+    ///
+    /// - `claimed_by != from_instance` — a stale runner (a superseded
+    ///   attempt, or a SECOND launch of the same task, Ballista's own
+    ///   reset-on-`ExecutorLost`) cannot transfer a claim it does not hold;
+    ///   this is also the bind-time re-launch guard's second half (the
+    ///   first half is the placement policy refusing to bind a task whose
+    ///   row is already `claimed_by` an executor);
+    /// - `attempts` does not match — a stale runner of an OLDER attempt
+    ///   cannot transfer a claim a newer attempt already moved past;
+    /// - `status != 'running'` — a terminal or queued row has no claim to
+    ///   hand off;
+    /// - the lease is not LIVE — [`lease_live_clause`], a POSITIVE
+    ///   comparison (`lease_expires_at IS NOT NULL AND lease_expires_at >
+    ///   now`), never [`lease_expired_clause`]'s `IS NULL OR …` shape: a
+    ///   RELEASE ([`Self::release_job_lease`]) sets `lease_expires_at =
+    ///   NULL`, and that NULL must make a transfer FAIL, the opposite of
+    ///   what `lease_expired_clause`'s own `OR` would read a NULL as for a
+    ///   RECLAIM sweep's purposes. See [`lease_live_clause`]'s doc for why
+    ///   this is its own predicate, not `NOT lease_expired_clause(..)`.
+    pub async fn transfer_claim(
+        &self,
+        job_id: &str,
+        from_instance: &str,
+        to_instance: &str,
+        attempts: u32,
+        lease: Duration,
+    ) -> Result<bool> {
+        let running = JobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let from_instance = from_instance.to_string();
+        let to_instance = to_instance.to_string();
+        let attempts = attempts as i64;
+        let now = now_sortable();
+        let kind = self.backend().backend_kind();
+
+        let mut params: Vec<SqlValue<'static>> = Vec::new();
+        params.push(SqlValue::TextOwned(to_instance));
+        let to_bind = params.len();
+        let deadline_expr = lease_deadline_expr(kind, lease, &mut params);
+        params.push(SqlValue::TextOwned(now));
+        let updated_at_bind = params.len();
+        params.push(SqlValue::TextOwned(job_id));
+        let job_id_bind = params.len();
+        params.push(SqlValue::TextOwned(from_instance));
+        let from_bind = params.len();
+        params.push(SqlValue::Int(attempts));
+        let attempts_bind = params.len();
+        params.push(SqlValue::TextOwned(running));
+        let status_bind = params.len();
+        let live_clause = lease_live_clause("lease_expires_at", kind, &mut params);
+
+        let sql = format!(
+            "UPDATE jobs SET claimed_by = ${to_bind}, lease_expires_at = {deadline_expr}, \
+                 updated_at = ${updated_at_bind} \
+             WHERE job_id = ${job_id_bind} AND claimed_by = ${from_bind} \
+               AND attempts = ${attempts_bind} AND status = ${status_bind} \
+               AND {live_clause}"
         );
         let updated = self
             .backend()
@@ -2445,7 +2534,18 @@ impl Catalog {
             .member_root
             .as_ref()
             .map(|c| c.identity().as_str().to_string());
-        let worker = reg.worker_snapshot();
+        // `devices` is JSON-encoded up front (outside the transaction, the
+        // same shape `upsert_worker` uses) so a re-upsert here writes the
+        // snapshot's device inventory too, never leaving `workers.devices`
+        // behind while the rest of the row rejoins.
+        let worker = reg
+            .worker_snapshot()
+            .map(|w| {
+                let devices_json = serde_json::to_string(&w.devices)
+                    .map_err(|e| JammiError::Catalog(format!("devices encode: {e}")))?;
+                Ok::<_, JammiError>((w, devices_json))
+            })
+            .transpose()?;
         let now = now_sortable();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
@@ -2471,15 +2571,18 @@ impl Catalog {
                         ],
                     )
                     .await?;
-                    if let Some(w) = worker {
+                    if let Some((w, devices_json)) = worker {
                         tx.execute(
-                            "INSERT INTO workers (instance_id, kinds, state) VALUES ($1, $2, $3) \
+                            "INSERT INTO workers (instance_id, kinds, state, devices) \
+                             VALUES ($1, $2, $3, $4) \
                              ON CONFLICT(instance_id) DO UPDATE \
-                             SET kinds = excluded.kinds, state = excluded.state",
+                             SET kinds = excluded.kinds, state = excluded.state, \
+                                 devices = excluded.devices",
                             &[
                                 SqlValue::TextOwned(instance_id),
                                 SqlValue::TextOwned(w.kinds),
                                 SqlValue::Text(w.state.as_db_str()),
+                                SqlValue::TextOwned(devices_json),
                             ],
                         )
                         .await?;
@@ -2733,7 +2836,11 @@ impl Catalog {
     /// instant (the loop task writes `warming` as its FIRST statement and
     /// re-upserts `claiming` once its gate opens — never a bare `UPDATE`,
     /// so a row the first write failed to create is created at the
-    /// transition). A re-upsert on an existing row resets both.
+    /// transition); `devices` is this `[worker]` process's own device
+    /// inventory (`ListWorkers` mirror only, read back verbatim on
+    /// `jammi.v1.job.WorkerSummary.devices` — see [`WorkerRecord::devices`]'s
+    /// doc), JSON-encoded verbatim into `workers.devices`. A re-upsert on an
+    /// existing row resets all three.
     ///
     /// # Errors
     ///
@@ -2750,6 +2857,7 @@ impl Catalog {
         instance_id: &str,
         kinds: &str,
         state: WorkerState,
+        devices: &[DeviceFact],
     ) -> Result<()> {
         #[cfg(feature = "test-hooks")]
         if super::worker_test_hooks::take_armed(instance_id) {
@@ -2760,17 +2868,22 @@ impl Catalog {
         let instance_id = instance_id.to_string();
         let kinds = kinds.to_string();
         let state = state.as_db_str();
+        let devices_json = serde_json::to_string(devices)
+            .map_err(|e| JammiError::Catalog(format!("devices encode: {e}")))?;
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "INSERT INTO workers (instance_id, kinds, state) VALUES ($1, $2, $3) \
+                        "INSERT INTO workers (instance_id, kinds, state, devices) \
+                         VALUES ($1, $2, $3, $4) \
                          ON CONFLICT(instance_id) DO UPDATE \
-                         SET kinds = excluded.kinds, state = excluded.state",
+                         SET kinds = excluded.kinds, state = excluded.state, \
+                             devices = excluded.devices",
                         &[
                             SqlValue::TextOwned(instance_id),
                             SqlValue::TextOwned(kinds),
                             SqlValue::Text(state),
+                            SqlValue::TextOwned(devices_json),
                         ],
                     )
                     .await
@@ -2886,7 +2999,8 @@ impl Catalog {
                         tx.query(
                             "SELECT w.instance_id AS instance_id, i.label AS label, \
                                     i.host AS host, w.kinds AS kinds, w.state AS state, \
-                                    i.started_at AS started_at, i.last_seen_at AS last_seen_at \
+                                    i.started_at AS started_at, i.last_seen_at AS last_seen_at, \
+                                    w.devices AS devices \
                              FROM workers w JOIN instances i ON w.instance_id = i.instance_id \
                              ORDER BY i.started_at",
                             &[],

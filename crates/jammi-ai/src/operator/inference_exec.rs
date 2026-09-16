@@ -15,6 +15,7 @@ use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, ModelSource, ModelTask};
+use jammi_db::store::manifest::ComputeDeviceKind;
 
 /// InferenceExec — the core intelligence operator.
 /// Reads input RecordBatches, runs model inference, and outputs
@@ -36,6 +37,14 @@ pub struct InferenceExec {
     regression_form: Option<DistributionForm>,
     /// Input columns copied verbatim to the end of every output batch.
     passthrough: Vec<String>,
+    /// The device KIND (contract `feat_500-wave4` §9 B3) this descriptor
+    /// declares it must run on: a REQUIRED constructor argument, stamped at
+    /// every call site from `session.compute_device().kind()` (or, for a
+    /// submitter placing this plan onto another kind, that kind directly —
+    /// there is no separate override setter). The wire carries exactly this
+    /// value; a decoding codec never invents or rewrites it (`jammi-
+    /// ballista`'s codec, `codec.rs`).
+    device_kind: ComputeDeviceKind,
     properties: Arc<PlanProperties>,
 }
 
@@ -64,9 +73,15 @@ pub struct InferenceExecBuilder {
     embedding_dim: Option<usize>,
     regression_form: Option<DistributionForm>,
     passthrough: Vec<String>,
+    device_kind: ComputeDeviceKind,
 }
 
 impl InferenceExecBuilder {
+    /// `device_kind` is a REQUIRED constructor argument (contract
+    /// `feat_500-wave4` §9 B3) — a submitter placing this plan onto a device
+    /// kind other than its own session's builds with that kind directly;
+    /// there is no separate optional override setter.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         source: ModelSource,
@@ -75,6 +90,7 @@ impl InferenceExecBuilder {
         key_column: String,
         source_id: String,
         model_cache: Arc<ModelCache>,
+        device_kind: ComputeDeviceKind,
     ) -> Self {
         Self {
             input,
@@ -90,6 +106,7 @@ impl InferenceExecBuilder {
             embedding_dim: None,
             regression_form: None,
             passthrough: Vec::new(),
+            device_kind,
         }
     }
 
@@ -103,6 +120,16 @@ impl InferenceExecBuilder {
 
     pub fn batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Explicit backend override (`None` defers to the model cache's own
+    /// resolution). Needed to round-trip a decoded node's exact backend
+    /// choice (`jammi-ballista`'s codec); `with_new_children` below now
+    /// threads it through too (a pre-existing gap this fixes as a side
+    /// effect of adding the setter).
+    pub fn backend(mut self, backend: Option<BackendType>) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -145,12 +172,75 @@ impl InferenceExecBuilder {
             embedding_dim: self.embedding_dim,
             regression_form: self.regression_form,
             passthrough: self.passthrough,
+            device_kind: self.device_kind,
             properties: Arc::new(properties),
         })
     }
 }
 
 impl InferenceExec {
+    /// The model source this node runs inference against.
+    pub fn source(&self) -> &ModelSource {
+        &self.source
+    }
+
+    /// The inference task this node performs.
+    pub fn task(&self) -> ModelTask {
+        self.task
+    }
+
+    /// The input columns whose content this node reads.
+    pub fn content_columns(&self) -> &[String] {
+        &self.content_columns
+    }
+
+    /// The row-identity column threaded through to the output.
+    pub fn key_column(&self) -> &str {
+        &self.key_column
+    }
+
+    /// The catalog source id this node's output is attributed to.
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    /// The explicit backend override, if any (`None` defers to the model
+    /// cache's own resolution).
+    pub fn backend(&self) -> Option<BackendType> {
+        self.backend
+    }
+
+    /// The inference batch size.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// The embedding output width, for tasks that produce one.
+    pub fn embedding_dim(&self) -> Option<usize> {
+        self.embedding_dim
+    }
+
+    /// The served regression head's persisted distribution form, if any.
+    pub fn regression_form(&self) -> Option<&DistributionForm> {
+        self.regression_form.as_ref()
+    }
+
+    /// Input columns copied verbatim to the end of every output batch.
+    pub fn passthrough(&self) -> &[String] {
+        &self.passthrough
+    }
+
+    /// The child plan this node reads from.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// The device kind this descriptor declares it must run on (contract
+    /// `feat_500-wave4` §9 B3).
+    pub fn device_kind(&self) -> ComputeDeviceKind {
+        self.device_kind
+    }
+
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -197,8 +287,10 @@ impl ExecutionPlan for InferenceExec {
                 self.key_column.clone(),
                 self.source_id.clone(),
                 Arc::clone(&self.model_cache),
+                self.device_kind,
             )
             .batch_size(self.batch_size)
+            .backend(self.backend)
             .observer(self.observer.clone())
             .embedding_dim(self.embedding_dim)
             .regression_form(self.regression_form.clone())

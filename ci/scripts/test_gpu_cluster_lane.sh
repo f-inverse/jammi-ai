@@ -935,8 +935,8 @@ python3 - "$CLUSTER_SH" "$A1_SCRATCH" <<'PY'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch'''
-new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch ok_count=0'''
+old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" r0_direct r1_direct'''
+new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" r0_direct r1_direct ok_count=0'''
 assert old in text, "A1 revert-RED fixture: local-vars line not found verbatim"
 text = text.replace(old, new, 1)
 old2 = '''            READBACK_OK)
@@ -958,7 +958,20 @@ new2 = '''            READBACK_OK)
               fi ;;'''
 assert old2 in text, "A1 revert-RED fixture: READBACK_OK arm not found verbatim"
 text = text.replace(old2, new2, 1)
-old3 = '        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'
+old3 = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ]; then
+          r0_direct=0; r1_direct=0
+          [ -n "$primary_host" ] && [ "$primary_host" != "-" ] && r0_direct=1
+          [ -n "$member_host" ] && [ "$member_host" != "-" ] && r1_direct=1
+          if [ "$r0_direct" = 1 ] && [ "$r1_direct" = 1 ]; then
+            break
+          fi
+          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
+          fi
+        fi'''
 new3 = '        [ "$ok_count" -ge 2 ] && break'
 assert old3 in text, "A1 revert-RED fixture: break condition not found verbatim"
 text = text.replace(old3, new3, 1)
@@ -984,6 +997,207 @@ if printf '%s' "$out" | grep -q "neither a direct ssh endpoint nor an overlay ip
   ok "A1 revert-RED: the pre-fix raw-count shape (ok_count -ge 2) breaks the wait loop 'ready' on the duplicate-rank-0/no-rank-1 fixture (proceeds past it into the member-resolution phase with rank 1 unset) — confirms the fix above is genuinely load-bearing, not vacuous"
 else
   bad "A1 revert-RED: expected the REVERTED (pre-fix) shape to break out of the wait loop early (a different, generic downstream failure, never the accurate 'not every member reached' refusal); got rc=$rc out=$out — the revert-RED fixture itself may be stale"
+fi
+
+# ============================================================================
+# A2 (wave 4): a member read back with its overlay ip assigned but its
+# `ssh.direct` still null is PROVISIONING, not ready. Run 35127869122 (the
+# first cluster run ever to reach phase 4) refused 1 s after create on
+# exactly that read ("the primary (rank 0) member carries no direct ssh
+# endpoint"). The loop must keep polling until a read carries the direct
+# endpoints, and refuse only at the deadline. Drives the REAL function with
+# a STATEFUL _rp_rest mock: read 1 answers overlay-only, every later read
+# answers with both direct endpoints.
+# ============================================================================
+run_wait_two_reads() { # $1=first body $2=later body $3=RP_SSH_WAIT_SECS $4=driver path -> stdout: "<rc>\t<out>"
+  local first="$1" later="$2" wait_secs="$3" driver="${4:-$CLUSTER_SH}" out rc
+  local counter="$SANDBOX/a2-reads-$$-$RANDOM"
+  rm -f "$counter"
+  out="$(A2_FIRST_BODY="$first" A2_LATER_BODY="$later" A2_COUNTER="$counter" bash -c '
+    source "'"$driver"'"
+    _rp_entrypoint_setup() { printf "%s" "the-shared-entrypoint-text"; }
+    _rp_rest() {
+      local n=0
+      [ -f "$A2_COUNTER" ] && n="$(cat "$A2_COUNTER")"
+      printf "%s" $((n + 1)) > "$A2_COUNTER"
+      if [ "$n" -eq 0 ]; then printf "200\n%s" "$A2_FIRST_BODY"; else printf "200\n%s" "$A2_LATER_BODY"; fi
+    }
+    _rpc_wait_for_members_ready "cl-a2" "$1" "1"
+  ' _ "$wait_secs" 2>&1)"
+  rc=$?
+  printf '%s\t%s\n' "$rc" "$out"
+}
+
+provisioning_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+pod = lambda pid, rank, ip: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"rank": rank, "ip": ip}, "ssh": {"direct": None, "proxy": {"host": "ssh.runpod.io", "port": 22}}}
+print(json.dumps({"pods": [pod("a", 0, "10.0.0.2"), pod("b", 1, "10.0.0.3")]}))
+')"
+ready_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+pod = lambda pid, rank, ip, host: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"rank": rank, "ip": ip}, "ssh": {"direct": {"host": host, "port": 22}}}
+print(json.dumps({"pods": [pod("a", 0, "10.0.0.2", "1.2.3.4"), pod("b", 1, "10.0.0.3", "5.6.7.8")]}))
+')"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 5.6.7.8 22 10.0.0.3 0$"; then
+  ok "A2: overlay-only first read (ssh.direct null on both ranks) -> the loop keeps polling and returns the direct endpoints the second read carries (rc=0, proxy_flag 0)"
+else
+  bad "A2: expected rc=0 with both direct endpoints from the second read; got rc=$rc out=$out"
+fi
+
+# The deadline arm is unchanged: a rank 0 that NEVER gains a direct
+# endpoint within RP_SSH_WAIT_SECS is refused by name (97), not carried
+# forward as a jump host it cannot be.
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$provisioning_body" 1)"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
+  ok "A2: rank 0 overlay-only through the deadline -> refused by name (97: no direct ssh endpoint / no jump host)"
+else
+  bad "A2: expected rc=97 naming the missing direct endpoint at the deadline; got rc=$rc out=$out"
+fi
+
+# revert-RED (A2): on a SCRATCH COPY put the pre-fix break condition back
+# (ready the moment both ranks are READBACK_OK, direct or not) and confirm
+# the SAME two-read fixture now refuses at once, on the first read, with
+# the run-35127869122 message -- the fix above is load-bearing.
+A2_SCRATCH_DIR="$SANDBOX/a2-revert-red"
+mkdir -p "$A2_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$A2_SCRATCH_DIR/runpod_lib.sh"
+A2_SCRATCH="$A2_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$A2_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ]; then
+          r0_direct=0; r1_direct=0
+          [ -n "$primary_host" ] && [ "$primary_host" != "-" ] && r0_direct=1
+          [ -n "$member_host" ] && [ "$member_host" != "-" ] && r1_direct=1
+          if [ "$r0_direct" = 1 ] && [ "$r1_direct" = 1 ]; then
+            break
+          fi
+          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
+          fi
+        fi'''
+new = '''        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'''
+assert old in text, "A2 revert-RED fixture: break condition not found verbatim"
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20 "$A2_SCRATCH")"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
+  ok "A2 revert-RED: the pre-fix break condition refuses the provisioning read at once (97, the run-35127869122 message) on the fixture the fix waits through -- the fix is load-bearing"
+else
+  bad "A2 revert-RED: expected the REVERTED shape to refuse at once with 'carries no direct ssh endpoint'; got rc=$rc out=$out -- the revert-RED fixture itself may be stale"
+fi
+
+# ============================================================================
+# A4 (closing round 3, audit #5 A5): the MIXED arm -- rank 0 direct, rank 1
+# overlay-only -- settles for F3's proxy fallback after a bounded grace
+# (RP_SSH_MIXED_GRACE_SECS), never the whole window; the result line
+# carries the overlay ip as the member host with proxy_flag 1.
+# ============================================================================
+mixed_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.0.0.2"}, "ssh": {"direct": {"host": "1.2.3.4", "port": 22}}}
+p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": None}}
+print(json.dumps({"pods": [p0, p1]}))
+')"
+a4_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40)"
+a4_elapsed=$(( SECONDS - a4_t0 ))
+# The property is the TIME: the pre-fix loop reaches the same line by
+# running to the deadline (40 s here); the grace settles it within two polls.
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$" && [ "$a4_elapsed" -lt 20 ]; then
+  ok "A4: rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1) in ${a4_elapsed}s, not the 40 s window"
+else
+  bad "A4: expected rc=0 with the proxy-fallback line within 20 s (grace 1 s); got rc=$rc elapsed=${a4_elapsed}s out=$out"
+fi
+
+# The symmetric mixed state -- rank 1 direct, rank 0 overlay-only -- can
+# never succeed (rank 0 must be the direct jump host); after the grace it
+# refuses AT ONCE with the named message, never after the whole window.
+mixed_r1_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.0.0.2"}, "ssh": {"direct": None}}
+p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": {"host": "5.6.7.8", "port": 22}}}
+print(json.dumps({"pods": [p0, p1]}))
+')"
+a4_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_r1_body" "$mixed_r1_body" 40)"
+a4_elapsed=$(( SECONDS - a4_t0 ))
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint" && [ "$a4_elapsed" -lt 20 ]; then
+  ok "A4: rank 1 direct + rank 0 overlay-only past the grace -> refused by name (97) in ${a4_elapsed}s, not the 40 s window"
+else
+  bad "A4: expected rc=97 naming the missing rank-0 endpoint within 20 s; got rc=$rc elapsed=${a4_elapsed}s out=$out"
+fi
+
+# revert-RED (A4): on a SCRATCH COPY drop the grace (the pre-grace break
+# condition: both direct or nothing) and confirm the SAME mixed fixture now
+# takes the whole 40 s window -- the timing assertion above is load-bearing.
+A4_SCRATCH_DIR="$SANDBOX/a4-revert-red"
+mkdir -p "$A4_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$A4_SCRATCH_DIR/runpod_lib.sh"
+A4_SCRATCH="$A4_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$A4_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
+          fi'''
+assert old in text, "A4 revert-RED fixture: grace block not found verbatim"
+open(dst, "w").write(text.replace(old, "", 1))
+PY
+a4_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40 "$A4_SCRATCH")"
+a4_elapsed=$(( SECONDS - a4_t0 ))
+if [ "$rc" -eq 0 ] && [ "$a4_elapsed" -ge 35 ]; then
+  ok "A4 revert-RED: without the grace the same mixed fixture burns the whole window (${a4_elapsed}s of 40) before the same proxy-fallback line -- the timing assertion is load-bearing"
+else
+  bad "A4 revert-RED: expected the graceless copy to take >= 35 s; got rc=$rc elapsed=${a4_elapsed}s out=$out -- the revert-RED fixture itself may be stale"
+fi
+
+# ============================================================================
+# A3 (wave 4, closing round 2 F1): the rented part's compute capability is
+# DERIVED from the gpuTypeId at source time (never a second literal), and a
+# gpuTypeId outside the sm_80/86/89/90 domain leaves NATIVE_COMPUTE_CAP
+# empty so the main path refuses BEFORE phase 0 (exit 2) -- never on the
+# members after a cluster is billing. Sourced with the netprobe guard
+# (G0 above) so no rent path can run.
+# ============================================================================
+cap_for() { # $1=gpuTypeId -> stdout: NATIVE_COMPUTE_CAP after sourcing with that id
+  RP_CLUSTER_GPU_TYPE="$1" bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; printf "%s" "$NATIVE_COMPUTE_CAP"'
+}
+for pair in "NVIDIA A100-SXM4-80GB:80" "NVIDIA A40:86" "NVIDIA GeForce RTX 4090:89" "NVIDIA L40S:89" "NVIDIA H100 80GB HBM3:90"; do
+  gpu="${pair%:*}"; want="${pair##*:}"
+  got="$(cap_for "$gpu")"
+  if [ "$got" = "$want" ]; then
+    ok "A3: RP_CLUSTER_GPU_TYPE='$gpu' -> NATIVE_COMPUTE_CAP=$want (derived, no literal)"
+  else
+    bad "A3: expected NATIVE_COMPUTE_CAP=$want for '$gpu'; got '$got'"
+  fi
+done
+got="$(cap_for "NVIDIA Tesla V100-SXM2-16GB")"
+if [ -z "$got" ]; then
+  ok "A3: an out-of-domain gpuTypeId (V100, sm_70) leaves NATIVE_COMPUTE_CAP empty -- the main path's pre-rent refusal arm"
+else
+  bad "A3: expected an empty NATIVE_COMPUTE_CAP for an out-of-domain id; got '$got'"
+fi
+if grep -q 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" \
+  && awk '/-z "\$NATIVE_COMPUTE_CAP"/{f=1} f && /exit 2/{print "refuses"; exit}' "$CLUSTER_SH" | grep -q refuses \
+  && [ "$(grep -n 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" | cut -d: -f1)" -lt "$(grep -n '_rpc_phase "availability read' "$CLUSTER_SH" | cut -d: -f1)" ]; then
+  ok "A3: the empty-cap refusal (exit 2) sits BEFORE phase 0's availability read -- nothing is rented on an out-of-domain id"
+else
+  bad "A3: the empty-cap refusal is missing or sits after phase 0"
 fi
 
 # ============================================================================

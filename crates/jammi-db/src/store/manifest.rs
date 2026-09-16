@@ -185,6 +185,33 @@ pub enum ComputeDevice {
     },
 }
 
+/// The device KIND, discarding the ordinal — the determinant `jammi-ballista`'s
+/// `InferenceExec::device_kind` and `JammiExecutionEngine`'s K7 refusal
+/// compare against. Ordinals are never compared: a plan built on CUDA
+/// ordinal 0 runs on an executor whose only CUDA device is ordinal 1 (the
+/// ordinal is not output-affecting, and the codec carries none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeDeviceKind {
+    /// CPU.
+    Cpu,
+    /// A CUDA device, any ordinal.
+    Cuda,
+    /// An Apple Metal device, any ordinal.
+    Metal,
+}
+
+impl ComputeDevice {
+    /// This device's kind, discarding the ordinal.
+    pub fn kind(&self) -> ComputeDeviceKind {
+        match self {
+            ComputeDevice::Cpu => ComputeDeviceKind::Cpu,
+            ComputeDevice::Cuda { .. } => ComputeDeviceKind::Cuda,
+            ComputeDevice::Metal { .. } => ComputeDeviceKind::Metal,
+        }
+    }
+}
+
 /// The execution environment that affects a producer's output, hashed into the
 /// [`DefinitionHash`] alongside the [`ProducingDescriptor`].
 ///

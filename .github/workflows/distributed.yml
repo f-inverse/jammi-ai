@@ -5,7 +5,7 @@ name: Distributed validation
 # (MinIO), proving the durable-worker fleet-safety properties under real
 # distribution.
 #
-# One job, two matrix legs split by failure character (each leg re-provisions
+# One job, three matrix legs split by failure character (each leg re-provisions
 # its own Postgres + MinIO so they stay independent):
 #
 #   * `deterministic` — the claim-correctness tests (exactly-one claim,
@@ -21,7 +21,13 @@ name: Distributed validation
 #     `continue-on-error: true` (`advisory: true`) to surface a red without
 #     blocking. Promote (flip `advisory` to false) after a flake-free streak.
 #
-# Both are the heaviest lanes (process spawn + a real object store), so neither
+#   * `ballista` — the compute-plane tests (three `jammi-server` processes
+#     hosting a Ballista scheduler and executors over the shared catalog: the
+#     placed gang, device-kind refusal, drain/stop). Their outcome is decided
+#     by catalog CAS and Ballista's own task binding, so this leg runs WITHOUT
+#     `continue-on-error` (`advisory: false`) like `deterministic`.
+#
+# All three are the heaviest lanes (process spawn + a real object store), so none
 # is on the default hermetic PR path. There is no `pull_request` trigger: this
 # lane never gates a merge (it would be branch protection by another name).
 on:
@@ -42,12 +48,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pinned MinIO + mc versions. A versioned `archive/` release URL is immutable,
-  # so the lane is reproducible and a `dl.min.io` "latest" reshuffle can never
-  # silently change the binary under us; the `actions/cache` step below means a
-  # `dl.min.io` outage on a re-run can't red the lane either.
+  # Pinned MinIO + mc versions, fetched from each project's GitHub release
+  # (an immutable, per-release asset) and verified against the checksum the
+  # release publishes, so the lane is reproducible and no "latest" reshuffle
+  # can change the binary under us. `dl.min.io`'s versioned `archive/` URLs
+  # answer 410 since 2025-09 (MinIO withdrew binary hosting there), which is
+  # why the GitHub release is the source; the `actions/cache` step below means
+  # a GitHub outage on a re-run can't red the lane either.
   MINIO_RELEASE: "RELEASE.2025-09-07T16-13-09Z"
+  MINIO_SHA256: "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f"
   MC_RELEASE: "RELEASE.2025-08-13T08-35-41Z"
+  MC_SHA256: "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
 
 jobs:
   distributed:
@@ -63,6 +74,7 @@ jobs:
           # regression the nightly watcher acts on.
           - name: deterministic
             display: Deterministic claim correctness
+            crate: jammi-ai
             advisory: false
             tests: >-
               one_job_n_workers_exactly_one_wins
@@ -76,6 +88,7 @@ jobs:
           # cross-process gang to complete.
           - name: chaos
             display: SIGKILL crash-window chaos
+            crate: jammi-ai
             advisory: true
             tests: >-
               killed_worker_job_is_reclaimed_and_completed_once
@@ -83,6 +96,29 @@ jobs:
               artifact_written_on_worker_is_readable_by_a_different_client
               killed_peer_job_is_reclaimed_and_completed_by_a_new_gang
               killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang
+          # The Ballista compute-plane lane (plan 67 PR-D, contract
+          # `feat_500-wave4` §2.5/§7/§9): a real three(+)-process
+          # `jammi-server` fleet with `[ballista]` roles configured, proving
+          # embedding-across-two-executors (a3), placed-gang-completes-
+          # elsewhere (a4/b5), killed-executor-mid-gang reclaim (a5),
+          # scheduler restart (b1), two schedulers over one catalog (b2), the
+          # device-less/KIND-MATCH refusal (b3), and `list_workers`/
+          # `list_compute_executor_devices` device reporting (b4). Not a
+          # SIGKILL-race chaos leg (a5 IS a SIGKILL test, but its own
+          # completion is driven by jammi's lease timer, not a publish-window
+          # race) — `advisory: false`.
+          - name: ballista
+            display: Ballista compute plane (three processes)
+            crate: jammi-ballista
+            advisory: false
+            tests: >-
+              embedding_job_across_two_executors_matches_in_process
+              placed_gang_completes_on_a_registered_executor_other_than_the_submitter
+              killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes
+              scheduler_restart_keeps_executors_and_serves_a_new_job
+              two_schedulers_over_one_catalog_serve_jobs_sequentially
+              device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan
+              list_workers_and_compute_executor_devices_report_registered_devices
     continue-on-error: ${{ matrix.advisory }}
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
@@ -121,17 +157,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/minio-bin
-          key: minio-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}
+          key: minio-${{ env.MINIO_RELEASE }}-${{ env.MINIO_SHA256 }}-mc-${{ env.MC_RELEASE }}-${{ env.MC_SHA256 }}
 
       - name: Download the pinned MinIO + mc binaries (cache miss)
         if: steps.minio-cache.outputs.cache-hit != 'true'
-        # Pull the exact pinned versions from the immutable `archive/` path. On a
-        # cache hit this step is skipped entirely, so a `dl.min.io` outage on a
-        # re-run cannot red the lane.
+        # Pull the exact pinned release assets from GitHub and verify each
+        # against the checksum that release publishes. On a cache hit this step
+        # is skipped entirely, so a GitHub outage on a re-run cannot red the lane.
         run: |
+          set -euo pipefail
           mkdir -p /opt/minio-bin
-          curl -fsSL "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}" -o /opt/minio-bin/minio
-          curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_RELEASE}" -o /opt/minio-bin/mc
+          curl -fsSL "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/minio.linux-amd64.${MINIO_RELEASE}" -o /opt/minio-bin/minio
+          echo "${MINIO_SHA256}  /opt/minio-bin/minio" | sha256sum -c -
+          curl -fsSL "https://github.com/minio/mc/releases/download/${MC_RELEASE}/mc.linux-amd64.${MC_RELEASE}" -o /opt/minio-bin/mc
+          echo "${MC_SHA256}  /opt/minio-bin/mc" | sha256sum -c -
           chmod +x /opt/minio-bin/minio /opt/minio-bin/mc
 
       - name: Start MinIO + create the bucket
@@ -190,7 +229,7 @@ jobs:
         run: cargo build -p jammi-server --bin jammi-server --features storage-s3
 
       - name: Compile-check the distributed harness
-        run: cargo test -p jammi-ai --features live-distributed-tests --test distributed --no-run
+        run: cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed --no-run
 
       - name: Run the ${{ matrix.name }} tests
         # Serialise: every test spawns its own worker fleet and races on the
@@ -198,9 +237,15 @@ jobs:
         # generous) terminal-state timeouts honest and the per-run unique
         # prefixes the sole isolation needed. One cargo invocation per test
         # filter, aborting on the first red (default `-e` shell).
+        # `JAMMI_REQUIRE_DISTRIBUTED=1` doubly enforces the "Require the
+        # distributed backends" step above: a skip inside the harness itself
+        # (rather than a misconfigured env var) is ALSO a hard failure here,
+        # never a silent hollow green.
+        env:
+          JAMMI_REQUIRE_DISTRIBUTED: "1"
         run: |
           for t in ${{ matrix.tests }}; do
-            cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1 "$t"
+            cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed -- --test-threads=1 "$t"
           done
 
       - name: MinIO log (on failure)

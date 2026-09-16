@@ -350,6 +350,16 @@ async fn an_idle_loop_never_claims_while_a_rank_is_held() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The counter ticks while the loop still holds `ClaimProbe` (it is
+    // recorded before `claim_next` returns), so a hold taken the instant it
+    // moves races that probe and is refused `ClaimProbe`. Wait for the probe
+    // to resolve to `Free` — the state the hold is meant to observe.
+    wait_holder(
+        &admission,
+        |h| *h == Holder::Free,
+        "Free after the first probe",
+    )
+    .await;
     let hold = admission.try_hold_rank("rank-job", 1).unwrap();
     // Any probe already past the gate resolves within one iteration.
     tokio::time::sleep(Duration::from_millis(1200)).await;

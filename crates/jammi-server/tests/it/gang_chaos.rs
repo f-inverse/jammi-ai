@@ -261,7 +261,12 @@ impl Member {
         let session = Arc::new(InferenceSession::new(cfg).await.expect("member"));
         session
             .catalog()
-            .upsert_worker(session.instance_id(), "fine_tune", WorkerState::Claiming)
+            .upsert_worker(
+                session.instance_id(),
+                "fine_tune",
+                WorkerState::Claiming,
+                &[],
+            )
             .await
             .expect("workers row");
         let runtime = Self::serve(&session, std_listener);

@@ -343,6 +343,59 @@ max_subscriptions = 256
 # Default: 1024.
 max_job_waits = 1024
 
+# [ballista]
+# A process hosts a Ballista scheduler iff `scheduler_bind` is set, and an
+# executor iff `[ballista.executor]` is present. Unset (the default, the
+# whole `[ballista]` table absent) means neither role -- the process runs
+# exactly as it always has, byte-for-byte. Both roles on one process is the
+# single-node cluster, with one refinement: that process's own executor is
+# excluded from its own placement decisions, so a claimant on it places
+# onto a DIFFERENT registered executor when one exists, and runs in-process
+# otherwise (there is no other role combination to configure -- placement
+# is a property of the cluster view, not a third knob).
+# Trust class: every listener this table opens (the scheduler's gRPC below,
+# the executor's task gRPC and Flight shuffle in `[ballista.executor]`) is
+# the peer listener's class, I-PEER -- unauthenticated, every client a jammi
+# role, tenant scope enforced at the submitting session (see the security
+# guide, "The Ballista listeners"). Bind them on the cluster-internal
+# network and owe them the same network policy as `[server] peer_bind`.
+# This process hosts a Ballista scheduler bound here iff set.
+# scheduler_bind = "0.0.0.0:50050"
+
+# [ballista.executor]
+# This process hosts a Ballista executor iff this table is present. Unset
+# (the default, table absent) means no executor role.
+# The scheduler this executor registers with and takes tasks from,
+# `host:port` -- a `SocketAddr` literal or a DNS name and port (the
+# Kubernetes case). Required whenever `[ballista.executor]` is present.
+# scheduler_address = "10.0.4.7:50050"
+# This executor's Arrow Flight (shuffle) listener. Default: "0.0.0.0:50051".
+# bind = "0.0.0.0:50051"
+# This executor's gRPC (task) listener. Default: "0.0.0.0:50052".
+# grpc_bind = "0.0.0.0:50052"
+# The host other executors/the scheduler dial to reach this executor.
+# REQUIRED when `bind`'s host is unspecified (`0.0.0.0`/`::`) -- the
+# scheduler dials this address back to register the executor and push
+# tasks, and an unspecified host never resolves on the scheduler's side of
+# that connection. Unset (the default) means the `bind` host, valid only
+# when `bind` already names a real interface.
+# advertise_host = "10.0.4.8"
+# Local directory Ballista's shuffle writer stages files under. Unset (the
+# default) means a fresh temporary directory per process (no object-store
+# shuffle in v1).
+# work_dir = "/var/lib/jammi/shuffle"
+# Concurrent task slots this executor offers the scheduler. Must be >= 1.
+# Default: 1.
+# task_slots = 1
+#
+# `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+# `[server] health_listen`/`flight_listen`/`peer_bind` (configuration.md's
+# `[server]` block) may never share a fixed port -- a collision is refused
+# at load time naming both keys. Two addresses collide iff their ports are
+# equal and non-zero AND their hosts are equal or either host is
+# unspecified (`0.0.0.0`/`::` overlaps every interface, including
+# `127.0.0.1`); an ephemeral `:0` never collides with anything.
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error". Default: "info".
 level = "info"

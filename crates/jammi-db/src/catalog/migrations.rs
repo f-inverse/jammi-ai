@@ -130,6 +130,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "037_jobs_assembly_failures_next_after",
         schema::MIGRATION_037_JOBS_ASSEMBLY_FAILURES_NEXT_AFTER,
     ),
+    (
+        "038_compute_cluster_state",
+        schema::MIGRATION_038_COMPUTE_CLUSTER_STATE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

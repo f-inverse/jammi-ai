@@ -73,6 +73,26 @@ impl AnnSearchExec {
         })
     }
 
+    /// The catalog record for the table this node searches.
+    pub fn table(&self) -> &ResultTableRecord {
+        &self.table
+    }
+
+    /// The validated query vector.
+    pub fn query_vector(&self) -> &ValidatedQuery {
+        &self.query_vector
+    }
+
+    /// The number of results requested.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// The per-request oversample override, if any.
+    pub fn oversample_override(&self) -> Option<usize> {
+        self.oversample_override
+    }
+
     fn output_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("_row_id", DataType::Utf8, false),

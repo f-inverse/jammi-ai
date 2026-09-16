@@ -8095,6 +8095,326 @@ mod gang_lockstep_oracle {
     }
 }
 
+/// U4b acceptance (a): equal-topology reproducibility on a REAL two-rank
+/// `Local` gang — two independent runs from scratch produce byte-identical
+/// weights, and a run interrupted at an epoch boundary and resumed produces
+/// weights byte-identical to an uninterrupted run over the same epoch count.
+#[cfg(test)]
+mod gang_determinism_oracle {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::partition::{PartitionRule, PartitionSpec};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::{RankContext, TrainingLoop, TrainingLoopBuilder, TrainingResult};
+    use crate::fine_tune::collective::LocalGang;
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    fn gang_config(epochs: usize) -> FineTuneConfig {
+        FineTuneConfig {
+            epochs,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            seed: 99,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-4,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
+        )
+    }
+
+    /// A fresh `file://` artifact store under a kept tempdir — mirrors
+    /// `resume_invariant::file_store`'s own precedent.
+    fn file_store() -> Arc<ArtifactStore> {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache = tempfile::tempdir().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
+    }
+
+    /// Flatten a weights map to a sorted `(key, bytes)` list for byte-equality
+    /// assertions independent of `HashMap` order.
+    fn weight_bytes(map: &HashMap<String, Tensor>) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = map
+            .iter()
+            .map(|(k, t)| {
+                let v: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+                let bytes = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                (k.clone(), bytes)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Run one rank of a 2-rank gang against a CALLER-SUPPLIED artifact store
+    /// — so two independent calls sharing the SAME `job_id` and the SAME
+    /// store observe the SAME durable `{job_id}/_resume/` bundle (only rank
+    /// 0 ever writes or reads it; every other rank's own artifact_store
+    /// argument is present only to satisfy the builder, never actually read
+    /// from or written to). Discovers a resume bundle itself (mirroring
+    /// `worker.rs::discover_resume`) before building, so a second call with
+    /// the SAME `job_id`/store after a shorter first call resumes from where
+    /// that first call left off.
+    ///
+    /// `cancel_after_step`, when set, installs a cooperative-cancellation
+    /// flag that flips true once the `after_backward` seam observes optimizer
+    /// step `>= cancel_after_step` — simulating a crash WITHOUT shrinking
+    /// `config.epochs` (a shrunk config would give the LR schedule a
+    /// DIFFERENT horizon than the run being "interrupted" actually has,
+    /// which is a real trajectory divergence, not the property under test).
+    ///
+    /// The epoch-boundary cancel check (`self.cancel`, at the TOP of each
+    /// epoch's iteration) and the epoch-boundary checkpoint SAVE (at the
+    /// BOTTOM of that same iteration, gated on `!self.cancel`) share the
+    /// SAME flag read — so a flag that flips true DURING epoch `E`'s own
+    /// last step is ALSO visible to epoch `E`'s own end-of-iteration save
+    /// gate, skipping it (there is no step boundary between "last batch of
+    /// epoch `E` processed" and "epoch `E`'s own save gate checked" for this
+    /// hook to land in between). The caller that wants epoch `K − 1`'s
+    /// checkpoint to durably survive must therefore set `cancel_after_step`
+    /// to a step INSIDE epoch `K` (never epoch `K − 1`'s own last step) —
+    /// epoch `K` still runs to completion (its OWN top-check already passed
+    /// before the flag flipped) but its OWN save is skipped, and epoch
+    /// `K + 1`'s top-check bails before doing any work. Net effect: exactly
+    /// epochs `0..K` are durable; epoch `K`'s in-memory work is discarded,
+    /// matching a real crash mid-epoch-`K`.
+    fn run_gang_rank(
+        tag: String,
+        job_id: String,
+        config: FineTuneConfig,
+        loader: TrainingDataLoader,
+        rank_ctx: RankContext,
+        store: Arc<ArtifactStore>,
+        cancel_after_step: Option<usize>,
+    ) -> (jammi_db::error::Result<TrainingResult>, TrainingLoop) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut loop_ = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let mut builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device.clone())
+                    .job_id(job_id.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .artifact_store(Arc::clone(&store))
+                    .cancel(Arc::clone(&cancel))
+                    .rank_context(rank_ctx);
+            if let Some(local) = store.fetch_resume_checkpoint(None, &job_id).await.unwrap() {
+                if let Some(restored) =
+                    super::super::resume::load_bundle(local.dir(), &device).unwrap()
+                {
+                    builder = builder.resume(restored);
+                }
+            }
+            builder.build().unwrap()
+        });
+        if let Some(cancel_after_step) = cancel_after_step {
+            let cancel = Arc::clone(&cancel);
+            loop_.after_backward = Some(Box::new(move |s, _grads, _vars| {
+                if s >= cancel_after_step {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }));
+        }
+        let _enter = rt.enter();
+        let result = loop_.run(crate::fine_tune::source::TrainingSource::Resident(loader));
+        (result, loop_)
+    }
+
+    /// Drive a fresh (or resuming) 2-rank gang, always at `config.epochs =
+    /// TOTAL_EPOCHS` (the REAL intended horizon — see `run_gang_rank`'s own
+    /// doc for why a shrunk config would give a different LR schedule), from
+    /// scratch or resuming from `store`'s existing bundle if `job_id` already
+    /// has one. `cancel_after_step` simulates a crash partway through, when
+    /// set. Returns rank 0's final trainable weights.
+    fn drive_gang(
+        job_prefix: &str,
+        job_id: &str,
+        total_epochs: usize,
+        store: Arc<ArtifactStore>,
+        cancel_after_step: Option<usize>,
+    ) -> HashMap<String, Tensor> {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        let mut handles = Vec::new();
+        for rank in 0..2u32 {
+            let local = gang.rank(rank).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(local), partition);
+            let tag = format!("{job_prefix}-{rank}-{job_id}");
+            let job_id = job_id.to_string();
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                run_gang_rank(
+                    tag,
+                    job_id,
+                    gang_config(total_epochs),
+                    pairs(8),
+                    rank_ctx,
+                    store,
+                    cancel_after_step,
+                )
+            }));
+        }
+        let mut rank0_weights = None;
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let (result, loop_) = handle.join().unwrap();
+            if cancel_after_step.is_some() {
+                let err = result.expect_err("a cancelled leg must return the cancellation Err");
+                assert!(
+                    err.to_string().contains("training cancelled"),
+                    "rank {rank}: expected the cooperative-cancellation error, got: {err}"
+                );
+            } else {
+                result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
+            }
+            if rank == 0 {
+                rank0_weights = Some(loop_.target.named_trainable_weights().unwrap());
+            }
+        }
+        rank0_weights.expect("rank 0 must have run")
+    }
+
+    /// Two independent from-scratch gangs (same seed, same data) produce
+    /// byte-identical rank-0 final weights — a real two-thread `Local` gang
+    /// each time, not a single-rank stand-in.
+    ///
+    /// An unseeded RNG anywhere on the trainable-parameter path (init,
+    /// dropout) would make this flaky across the two calls; this crate's
+    /// `family J` discipline (fixed fold order, no unseeded RNG) is what
+    /// makes it deterministic instead.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted): changed the second call
+    /// from `drive_gang("det-b", .., 2, ..)` to `drive_gang("det-b", .., 3,
+    /// ..)` (3 epochs instead of 2) — confirming the byte-comparison itself
+    /// discriminates a real difference rather than vacuously passing;
+    /// reverted to `2` before this test was committed.
+    #[test]
+    fn w2_twice_is_byte_identical() {
+        let store_a = file_store();
+        let store_b = file_store();
+        let weights_a = drive_gang("det-a", "det-job-a", 2, store_a, None);
+        let weights_b = drive_gang("det-b", "det-job-b", 2, store_b, None);
+        assert_eq!(
+            weight_bytes(&weights_a),
+            weight_bytes(&weights_b),
+            "two independent W=2 runs from the same seed/data must produce byte-identical \
+             final weights"
+        );
+    }
+
+    /// A gang killed at epoch boundary `K` and resumed must reproduce an
+    /// UNINTERRUPTED run's final weights byte-for-byte. 8 pairs at
+    /// `batch_size: 2`, `W = 2` → global batch 4 → 2 optimizer steps/epoch
+    /// (`STEPS_PER_EPOCH`); the kill fires via `cancel_after_step`, never by
+    /// shrinking `config.epochs` (see `run_gang_rank`'s own doc for why that
+    /// would be a different LR-schedule horizon, not the property under
+    /// test).
+    ///
+    /// This fixture's `lora_dropout = 0.0`, so `dropout_positions` is empty
+    /// on every rank and this test does NOT exercise the per-rank
+    /// dropout-position gather/restore specifically (see this unit's
+    /// contract, Uncovered, for that determinant — restoring the WRONG
+    /// rank's positions is vacuous when every rank's own map is empty). What
+    /// this test DOES exercise, end to end, on a REAL two-rank gang: weight
+    /// restore, optimizer-moment restore (by name, positionally reordered),
+    /// and the LR schedule computed from the FULL (never-shrunk)
+    /// `config.epochs` on both legs.
+    ///
+    /// EXECUTED RED-PROOF (applied, run, reverted): commented out
+    /// `optimizer.load_state(&ordered, state.step_t)` in `restore_from_
+    /// checkpoint` (a no-op stand-in), leaving every rank's optimizer at its
+    /// freshly-constructed zero moments post-resume instead of the
+    /// persisted trajectory. Confirmed red — panicked with a real (if
+    /// small) byte divergence between `left`/`right`, e.g. `lora_a[0]`
+    /// `178` vs `229` — then reverted. This is also what caught this test's
+    /// OWN first-draft bug (using a shrunk `config.epochs` for the "killed"
+    /// leg, and cancelling mid-epoch's own last step): both silently made
+    /// the "resumed" leg train from scratch, matching "uninterrupted" for
+    /// the wrong reason (identical fresh runs, not a real resume) — this
+    /// mutation still passed under that bug, which is exactly why an
+    /// executed RED-PROOF is required rather than trusting the test's own
+    /// green result at face value.
+    #[test]
+    fn resume_after_a_kill_matches_an_uninterrupted_run() {
+        const TOTAL_EPOCHS: usize = 3;
+        const STEPS_PER_EPOCH: usize = 2;
+        const KILL_AFTER_EPOCHS: usize = 1;
+
+        // ── Uninterrupted: TOTAL_EPOCHS straight through, never cancelled ──
+        let uninterrupted_store = file_store();
+        let uninterrupted = drive_gang(
+            "uninterrupted",
+            "det-job-uninterrupted",
+            TOTAL_EPOCHS,
+            uninterrupted_store,
+            None,
+        );
+
+        // ── Killed after KILL_AFTER_EPOCHS, then resumed to TOTAL_EPOCHS,
+        // SAME job_id/store, `config.epochs = TOTAL_EPOCHS` on BOTH calls ──
+        let resume_store = file_store();
+        let job_id = "det-job-resume";
+        let _ = drive_gang(
+            "killed",
+            job_id,
+            TOTAL_EPOCHS,
+            Arc::clone(&resume_store),
+            // One step INTO epoch `KILL_AFTER_EPOCHS` (never epoch
+            // `KILL_AFTER_EPOCHS - 1`'s own last step) — see `run_gang_rank`'s
+            // own doc for why: epoch `KILL_AFTER_EPOCHS` still runs to
+            // completion but its OWN save is skipped, so exactly epochs
+            // `0..KILL_AFTER_EPOCHS` end up durable.
+            Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+        );
+        let resumed = drive_gang("resumed", job_id, TOTAL_EPOCHS, resume_store, None);
+
+        assert_eq!(
+            weight_bytes(&uninterrupted),
+            weight_bytes(&resumed),
+            "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
+             epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte"
+        );
+    }
+}
+
 /// `refuse_nonfinite_params`'s fold over per-`Var` sums must be `+` (mutants
 /// sweep finding, P4b R3 finishing round). A finite/non-finite gate cannot
 /// distinguish `+`/`-`/`*` when the only corruption on offer is NaN — NaN

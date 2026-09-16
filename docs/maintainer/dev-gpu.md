@@ -718,14 +718,22 @@ never reads as a code regression):
 **The artifact.** The gang tests write their evidence into
 `JAMMI_GANG_ARTIFACT_DIR` on the pod; the driver pulls that directory back
 before the EXIT trap tears the pod down (the pod is the only place it exists)
-and the workflow uploads it. A human reviews it and commits it under
-`crates/jammi-kernels/artifacts/cuda-runs/`, where
-`ci/scripts/check_cuda_run_artifacts.py`'s `gang` kind is its schema gate. That
-schema requires the topology the run actually had (`world`, the collective, and
-one device per rank), the same-seed digest pair, the measured per-step loss
-delta, and the epsilon it is read against — with epsilon's own derivation and
-the commit it was registered at. An epsilon chosen after seeing the delta it
-excuses is not a tolerance, and the gate refuses it by name.
+and the workflow uploads it. The pod-leg's own producer is
+`gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1`
+(`crates/jammi-ai/tests/gpu_capability/gang_pod_leg.rs`, selected by the
+`gang_` filter like every other test in this suite): it trains a real
+two-rank gang over `Nccl` twice from the same seed (a reproducible adapter
+digest pair) against a W=1 reference at double the per-rank batch (the
+per-epoch training-loss delta), then writes the ONE `gang`-kind artifact
+into that directory itself — nothing else on this tree does. A human
+reviews it and commits it under `crates/jammi-kernels/artifacts/cuda-runs/`,
+where `ci/scripts/check_cuda_run_artifacts.py`'s `gang` kind is its schema
+gate. That schema requires the topology the run actually had (`world`, the
+collective, and one device per rank), the same-seed digest pair, the
+measured per-step loss delta, and the epsilon it is read against — with
+epsilon's own derivation and the commit it was registered at. An epsilon
+chosen after seeing the delta it excuses is not a tolerance, and the gate
+refuses it by name.
 
 **A failing run is representable.** The artifact carries the leg's own
 `verdict`, exactly `pass` or `fail`. A `fail` is *admitted* with its deltas and

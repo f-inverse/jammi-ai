@@ -1,0 +1,31 @@
+# Headless (clusterIP: None): ranks resolve each other by pod DNS name
+# (`<pod>.jammi-server-compute.<namespace>.svc.cluster.local`, the value
+# `[server] peer_advertise` is set to per-pod in statefulset-compute.yaml's
+# `env`) and dial that name directly on the peer port -- never a virtual IP,
+# never through this Service acting as a load balancer.
+#
+# `publishNotReadyAddresses: true`: the peer/gang listener is bound and
+# already serving `PeerService`/`GangService` connections as soon as
+# `OssServer::bind` returns (`crates/jammi-server/src/runtime.rs`), which
+# happens BEFORE the process's own `/readyz` reports ready --
+# `/readyz` gates the catalog ping and, when `[server] preload_models` is
+# set, model preload (`docs/guide/src/deploy-server.md`'s "Preloading
+# models": the claim loop "waits at its gate with its `workers.state` row
+# reading `warming`" until then). A coordinator only dials a peer AFTER it
+# claims a job, i.e. after its OWN `/readyz` is ready, but the PEER it
+# dials may still be warming. Without this flag a not-yet-ready pod has no
+# DNS record on a headless Service (the default EndpointSlice/DNS behaviour
+# publishes only Ready pod addresses), so the coordinator would get NXDOMAIN
+# resolving a peer whose `GangService` is already live and reachable.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jammi-server-compute
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: jammi-server-compute }
+  ports:
+    - { name: flight, port: 8081, targetPort: 8081 }
+    - { name: health, port: 8080, targetPort: 8080 }
+    - { name: peer, port: 9000, targetPort: 9000 }

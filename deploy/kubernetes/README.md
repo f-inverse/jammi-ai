@@ -17,14 +17,17 @@ knobs.
   (`replicas: 3`), a `Service`, and a `ConfigMap` carrying `jammi.toml`'s
   non-secret knobs. Every replica runs `[worker] enabled = false` — it
   accepts every job submission but claims none.
-- **`overlays/shape-d/`** — the compute tier: a GPU-scheduled `Deployment`
-  (`jammi-server-compute`) running the `cu12` image, `[worker] enabled =
-  true` claiming the training job kinds. **PROVISIONAL**: a plain
-  `Deployment` today. #500 (multi-GPU / multi-node gangs as engine
-  mechanism) decides the gang primitive; once ranks need stable per-rank
-  identity and ordered startup this becomes a `StatefulSet` or an indexed
-  `Job`. The Shape C base is unaffected.
-  https://github.com/f-inverse/jammi-ai/issues/500. This overlay is
+- **`overlays/shape-d/`** — the compute tier: a GPU-scheduled `StatefulSet`
+  (`jammi-server-compute`, `replicas: 2`) behind a headless `Service`
+  (`clusterIP: None`), running the `cu12` image with `[worker] enabled =
+  true` claiming the training job kinds and `nvidia.com/gpu: 2` per pod
+  (one device per `[worker] local_ranks`). Each pod's `peer_advertise` is
+  its own stable DNS name under the headless Service
+  (`<pod>.jammi-server-compute.<namespace>.svc.cluster.local`), so a rank's
+  peer identity survives a pod restart — the property a plain `Deployment`
+  cannot hold. A job with `world_size <= 2` runs on one pod's two devices
+  (a `Local` gang); a wider job assembles a `Peer` gang across both pods,
+  bounded by `[distributed] max_world_size`. This overlay is
   kubeconform-validated only — no GPU node is available in CI, so it never
   runs a real pod there.
 - **`overlays/ci/`** — the kind smoke's stack: upstream `postgres:16` and
@@ -158,7 +161,7 @@ whether a replica is busy.
 `:latest` is re-pointed by every `v*` release tag. Pin an exact `:vX.Y.Z`
 tag for reproducible deploys — this applies to both the CPU image
 (`base/deployment.yaml`) and the GPU image
-(`overlays/shape-d/deployment-compute.yaml`).
+(`overlays/shape-d/statefulset-compute.yaml`).
 
 ## Notes
 

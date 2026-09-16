@@ -3,7 +3,8 @@ kind: Kustomization
 
 resources:
   - ../../base
-  - deployment-compute.yaml
+  - statefulset-compute.yaml
+  - service-compute-headless.yaml
 
 configMapGenerator:
   - name: jammi-compute-config

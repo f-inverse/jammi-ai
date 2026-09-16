@@ -1,0 +1,101 @@
+# jammi-server-compute ships as a StatefulSet, not a Deployment: each rank's
+# peer address must stay stable across a pod restart for `instances.peer_addr`
+# gang membership (`[server] peer_advertise`, DESIGN.md §7) -- a Deployment's
+# pod names churn on every reschedule and cannot serve as that identity. The
+# headless Service (service-compute-headless.yaml) is the DNS half of the
+# same fact: ranks dial each other directly on the peer listener
+# (`peer_advertise`), never through a load balancer or a virtual IP.
+#
+# `podManagementPolicy: Parallel`: ranks assemble by catalog membership
+# (`instances` rows, DESIGN.md §7), never by ordinal start order, so no rank
+# waits on a lower-ordinal sibling to become Ready before it starts.
+#
+# `nvidia.com/gpu: 2` matches `[worker] local_ranks = 2` in
+# jammi-compute.toml: one device per local rank (`[gpu] devices = [0, 1]`).
+#
+# kubeconform-validated only -- no GPU node is available in CI, so this
+# StatefulSet never runs a real pod in the kind smoke.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jammi-server-compute
+spec:
+  serviceName: jammi-server-compute
+  replicas: 2
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels: { app: jammi-server-compute }
+  template:
+    metadata:
+      labels: { app: jammi-server-compute }
+    spec:
+      # DRAIN on SIGTERM finishes the in-flight job; RELEASE (SIGINT /
+      # `jammi-server release` via preStop) hands it to a successor at once.
+      # 600 s = cluster-autoscaler `--max-graceful-termination-sec` default; a
+      # larger value is honoured only by rollouts/`kubectl delete` — raise both
+      # together. The operative rule and the rollout arithmetic are in the
+      # README ("Shutdown: DRAIN and RELEASE").
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        gpu-node-pool: "true" # your cluster's own GPU node label
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: jammi-server
+          # amd64 only. Pin-advice: `:latest` is re-pointed by every `v*`
+          # release tag; pin an exact `:vX.Y.Z` tag for reproducible
+          # GPU-node deploys.
+          image: ghcr.io/f-inverse/jammi-ai-server-cu12:latest
+          resources:
+            limits: { nvidia.com/gpu: 2 }
+          ports:
+            - { containerPort: 8081, name: flight }
+            - { containerPort: 8080, name: health }
+            - { containerPort: 9000, name: peer }
+          env:
+            # The downward API's pod-field env source
+            # (EnvVarSource.fieldRef; `metadata.name` / `metadata.namespace`
+            # resolve to THIS pod's own values, not a template string).
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            # Kubernetes expands `$(VAR)` in an `env[].value` string only for
+            # a variable name declared EARLIER in this same list (the
+            # `EnvVar.value` field doc: "Variable references $(VAR_NAME) are
+            # expanded using the previously defined environment variables in
+            # the container and any service environment variables" --
+            # https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.34/#envvar-v1-core)
+            # -- POD_NAME/POD_NAMESPACE above must stay ordered before this
+            # key. This is the pod's stable identity for gang membership: the
+            # ordinal-indexed DNS name the headless Service publishes
+            # (`<pod>.jammi-server-compute.<namespace>.svc.cluster.local`),
+            # never a virtual IP. `[server] peer_bind` (the listen side, the
+            # same on every replica) lives in jammi-compute.toml instead --
+            # one non-secret knob file for the shared value, env only for the
+            # per-pod identity that file cannot express.
+            - name: JAMMI_SERVER__PEER_ADVERTISE
+              value: "$(POD_NAME).jammi-server-compute.$(POD_NAMESPACE).svc.cluster.local:9000"
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          envFrom:
+            # Same catalog/broker Secret as the query tier.
+            - secretRef: { name: jammi-server-secrets, optional: false }
+          volumeMounts:
+            - { name: config, mountPath: /etc/jammi, readOnly: true }
+            - { name: scratch, mountPath: /var/lib/jammi }
+      volumes:
+        - name: config
+          configMap: { name: jammi-compute-config }
+        - name: scratch
+          # The cu12 image also keeps CUDA_CACHE_PATH under /var/lib/jammi
+          # alongside HF_HOME -- local scratch only, no durable state here.
+          emptyDir: {}

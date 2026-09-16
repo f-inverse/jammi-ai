@@ -257,7 +257,11 @@ or an indexed `Job`. The Shape C base is unaffected. This overlay is
 validated by `kubeconform` only — CI has no GPU node.
 
 ```yaml
-{{#include ../../../deploy/kubernetes/overlays/shape-d/deployment-compute.yaml}}
+{{#include ../../../deploy/kubernetes/overlays/shape-d/statefulset-compute.yaml}}
+```
+
+```yaml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/service-compute-headless.yaml}}
 ```
 
 ```toml

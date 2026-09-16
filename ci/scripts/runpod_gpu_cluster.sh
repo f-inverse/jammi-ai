@@ -21,7 +21,7 @@
 #   RP_CLUSTER_MIN_AVAILABILITY or better" (`GET /v2/catalog/gpus?
 #   include=AVAILABILITY&product=POD&count=1&cloud=SECURE`, the SAME read
 #   `runpod_gpu_prove.sh`/`runpod_gpu_gang.sh` already make) with "carries
-#   Global Networking" (`GET /v2/datacenters`, `globalNetwork: true` — READ
+#   Global Networking" (`GET /v2/catalog/datacenters`, `globalNetwork: true` — READ
 #   LIVE at run time, never a hard-coded list; snapshot verified 2026-09-16:
 #   CA-MTL-1, CA-MTL-3, EU-CZ-1, EU-FR-1, EU-NL-1, EU-RO-1, EU-SE-1,
 #   EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2,
@@ -537,7 +537,7 @@ _rpc_ens1_seen() {
 # performs.
 # ─────────────────────────────────────────────────────────────────────────
 
-# $1(stdin)=the raw `GET /v2/datacenters` response BODY. Prints a
+# $1(stdin)=the raw `GET /v2/catalog/datacenters` response BODY. Prints a
 # SPACE-SEPARATED, SORTED list of every data center id carrying
 # `globalNetwork: true` — read LIVE at run time (never a hard-coded list;
 # see the module doc for the snapshot this was verified against on
@@ -1614,7 +1614,7 @@ case "$pod_dcs" in
 esac
 
 _rpc_phase "global-networking data center read"
-gn_resp="$(_rp_rest GET /v2/datacenters)"
+gn_resp="$(_rp_rest GET /v2/catalog/datacenters)"
 gn_status="$(printf '%s\n' "$gn_resp" | head -n1)"
 gn_body="$(printf '%s\n' "$gn_resp" | tail -n +2)"
 if [ "$gn_status" != "200" ]; then

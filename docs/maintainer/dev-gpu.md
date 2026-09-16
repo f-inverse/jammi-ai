@@ -775,7 +775,7 @@ object type carries the two-HOST NCCL bootstrap: `pods` (default) or
 GPU each), co-located in ONE data center chosen by intersecting the pod
 catalog's own per-data-center availability (`GET /v2/catalog/gpus?
 include=AVAILABILITY&product=POD&count=1&cloud=SECURE`) with the data
-centers RunPod's own `GET /v2/datacenters` reports `globalNetwork: true`
+centers RunPod's own `GET /v2/catalog/datacenters` reports `globalNetwork: true`
 for — read LIVE at run time, never a hard-coded list (a snapshot verified
 2026-09-16: CA-MTL-1, CA-MTL-3, EU-CZ-1, EU-FR-1, EU-NL-1, EU-RO-1, EU-SE-1,
 EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-NC-1,

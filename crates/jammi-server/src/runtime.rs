@@ -2562,10 +2562,8 @@ mod audit_master_key_tests {
 ///   (`stop_and_join`, unbounded by design) takes the handle — deterministically,
 ///   via a single hand-driven poll rather than a scheduler race — and waits
 ///   on an in-flight job the test parks mid-materialization with a real hold
-///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock or
-///   the process-global `training_test_hooks::arm_pause_before_spawn_blocking`,
-///   which is not scoped per test and was measured to let a concurrently
-///   running fine-tune test steal the park), and a concurrent RELEASE loses
+///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock),
+///   and a concurrent RELEASE loses
 ///   the handle race (`stop_resolved == false`) and then times out at 2f
 ///   within one heartbeat (`state_witnessed == false`) because the
 ///   still-parked loop never transitions. A prior round of this doc claimed

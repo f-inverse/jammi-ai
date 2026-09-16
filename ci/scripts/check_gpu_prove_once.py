@@ -1542,22 +1542,32 @@ def find_step_if_by_name(
     reconstitutes ITS OWN `if:` at that step's own key column -- never a
     job-level `if:` or a different step's. `found` is `False` when no step
     with that name exists in this job at all (its own P3 finding, distinct
-    from an unreadable `if:`). Identification is by DISPLAY NAME ONLY --
-    two steps in the same job may share an identical `name:` (GitHub
-    Actions does not require uniqueness); this returns the FIRST match,
-    which can silently pick the wrong one of two same-named steps. See
-    https://github.com/f-inverse/jammi-ai/issues/564."""
-    for s, e in _find_step_ranges(lines, job_start, job_end):
-        keys = _parse_step_keys(lines, s, e)
-        name = _step_display_name(keys)
-        if name != step_name:
-            continue
-        key_col = _step_key_column(lines, s, e)
-        if key_col is None:
-            return None, f"step `{step_name}`: could not determine its key column", True
-        expr, err = reconstruct_if_expr(lines, s, e, indent=key_col)
-        return expr, err, True
-    return None, None, False
+    from an unreadable `if:`). GitHub Actions does not require a step's
+    `name:` to be unique within a job; a display name matching MORE THAN
+    ONE step in this job is itself a named, fail-closed finding (`error`
+    set, `found=True`) rather than silently trusting the FIRST match --
+    the same ambiguity discipline P3's other rules already hold to (never
+    guess). See https://github.com/f-inverse/jammi-ai/issues/564."""
+    matches = [
+        (s, e)
+        for s, e in _find_step_ranges(lines, job_start, job_end)
+        if _step_display_name(_parse_step_keys(lines, s, e)) == step_name
+    ]
+    if not matches:
+        return None, None, False
+    if len(matches) > 1:
+        return (
+            None,
+            f"step `{step_name}` is not unique in this job -- {len(matches)} steps share that "
+            "display name, cannot determine which one is gated",
+            True,
+        )
+    s, e = matches[0]
+    key_col = _step_key_column(lines, s, e)
+    if key_col is None:
+        return None, f"step `{step_name}`: could not determine its key column", True
+    expr, err = reconstruct_if_expr(lines, s, e, indent=key_col)
+    return expr, err, True
 
 
 def _step_display_name(keys: dict[str, str]) -> str:
@@ -1579,20 +1589,29 @@ def _other_publishing_steps(
     step-range text scan, which a quoted `uses:` or a flow-style
     `steps: [...]` both escaped. `error` is set (matches always `[]`)
     when this job's own `steps:` cannot be examined at all (missing, not
-    a list, or an entry that is not itself a mapping). `gated_step_name`
-    exclusion is by DISPLAY NAME ONLY -- a second, ungated step sharing
-    the SAME `name:` as the genuinely gated one is excluded here too and
-    stays invisible, the same identification gap `find_step_if_by_name`
-    carries. See https://github.com/f-inverse/jammi-ai/issues/564."""
+    a list, or an entry that is not itself a mapping) -- OR when
+    `gated_step_name` itself is not unique among this job's own steps
+    (the same ambiguity `find_step_if_by_name` now refuses; see
+    https://github.com/f-inverse/jammi-ai/issues/564): silently
+    excluding every step sharing the gated display name (the old
+    behaviour) could exclude the wrong one of two, so an ambiguous
+    exclusion is a named, fail-closed error instead of a guess."""
     steps = job_node.get("steps")
     if not isinstance(steps, list):
         return [], "steps: is missing or is not a list -- cannot examine"
-    out: list[tuple[str, str]] = []
+    names: list[str] = []
     for step in steps:
         if not isinstance(step, dict):
             return [], "a steps: entry is not a mapping -- cannot examine"
         name = step.get("name")
-        name = name.strip() if isinstance(name, str) else ""
+        names.append(name.strip() if isinstance(name, str) else "")
+    if names.count(gated_step_name) > 1:
+        return [], (
+            f"step `{gated_step_name}` is not unique in this job -- {names.count(gated_step_name)} "
+            "steps share that display name, cannot determine which one is gated"
+        )
+    out: list[tuple[str, str]] = []
+    for step, name in zip(steps, names):
         if name == gated_step_name:
             continue
         primitive = _step_invokes_publish_primitive(step)

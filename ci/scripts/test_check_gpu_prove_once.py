@@ -1805,6 +1805,32 @@ class StepGatedTest(unittest.TestCase):
             findings,
         )
 
+    def test_duplicate_gated_step_name_is_a_named_ambiguity_not_a_silent_first_match(self):
+        # #564: two steps in the SAME job share the display name `Publish`
+        # -- the first genuinely gated, the second NOT gated and itself
+        # publishing. Neither `find_step_if_by_name` (which used to return
+        # the FIRST match unconditionally) nor `_other_publishing_steps`
+        # (which used to exclude EVERY step sharing that name from its own
+        # scan, hiding the second) may silently trust the first: both now
+        # refuse the ambiguity by name instead of guessing.
+        texts = _positive_texts()
+        texts["npm.yml"] = _wf(
+            "v*",
+            _gate_job("gpu-proof")
+            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - uses: actions/checkout@v4\n"
+            "      - name: Publish\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        run: npm publish --provenance --access public\n"
+            "      - name: Publish\n"
+            "        run: npm publish --tag sneak\n",
+        )
+        findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
+        self.assertTrue(
+            any("Publish" in f and "not unique" in f for f in findings),
+            findings,
+        )
+
     def test_a_steps_entry_that_is_not_a_mapping_is_a_named_finding(self):
         # A bare scalar list item under `steps:` (never valid GitHub
         # Actions, but not assumed here) makes `steps:` unparseable as a

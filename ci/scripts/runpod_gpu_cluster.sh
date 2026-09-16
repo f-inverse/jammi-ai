@@ -357,10 +357,11 @@ for p in pods:
 # A1) so it is sourceable and testable exactly like `_rpc_check_readback`
 # above, which it calls. $1=cluster id $2=RP_SSH_WAIT_SECS $3=RP_TTL_HOURS.
 # Polls `GET /v2/clusters/{id}/pods` every 5s until the deadline; the loop
-# is satisfied early only when BOTH members carry a direct endpoint, and
-# otherwise runs to the deadline and settles for what the last read back
-# carried (rank 0 direct + rank 1 overlay-only = the F3 proxy fallback; rank
-# 0 without a direct endpoint = refusal). On success prints ONE line: `<primary_host> <primary_port> <member_host> <member_port>
+# is satisfied at once when BOTH members carry a direct endpoint; a MIXED
+# state (one direct, one overlay-only) is given RP_SSH_MIXED_GRACE_SECS and
+# then settled (rank 0 direct + rank 1 overlay-only = the F3 proxy fallback;
+# rank 0 without a direct endpoint = the refusal, at once); both overlay-only
+# runs to the deadline. On success prints ONE line: `<primary_host> <primary_port> <member_host> <member_port>
 # <member_ip> <proxy_flag>` and returns 0 -- `proxy_flag` is `1` when the
 # member's own `ssh.direct` was absent and its overlay `ip` is what the
 # caller must proxy through (F3's no-public-port fallback), `0` when the
@@ -382,7 +383,7 @@ _rpc_wait_for_members_ready() {
         wait_ssh_secs="${2:?_rpc_wait_for_members_ready needs RP_SSH_WAIT_SECS}" \
         wait_ttl_hours="${3:?_rpc_wait_for_members_ready needs RP_TTL_HOURS}"
   local primary_host="" primary_port="" member_host="" member_port="" member_ip="" pods_body=""
-  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since=""
+  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" r0_direct r1_direct
   local deadline_ssh=$(( SECONDS + wait_ssh_secs ))
   while [ "$SECONDS" -lt "$deadline_ssh" ]; do
     resp="$(_rp_rest GET "/v2/clusters/${wait_cluster_id}/pods")"
@@ -415,19 +416,25 @@ _rpc_wait_for_members_ready() {
         # Ready at once when BOTH members carry a direct endpoint. A member
         # whose overlay ip is assigned seconds after create while its
         # `ssh.direct` is still null is PROVISIONING, not ready (run
-        # 35127869122 refused 1 s into phase 4 on exactly that read), so
-        # the mixed state -- rank 0 direct, rank 1 overlay-only -- waits a
-        # bounded grace (RP_SSH_MIXED_GRACE_SECS) for rank 1's own direct
-        # endpoint and then settles for F3's proxy fallback through rank 0,
-        # instead of burning the whole window on a billing cluster.
-        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \
-           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ]; then
-          if [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+        # 35127869122 refused 1 s into phase 4 on exactly that read), so a
+        # MIXED state -- one member direct, the other overlay-only -- waits
+        # a bounded grace (RP_SSH_MIXED_GRACE_SECS) for the other member's
+        # own direct endpoint and then settles: rank 0 direct -> F3's proxy
+        # fallback through rank 0; rank 0 still overlay-only -> the
+        # post-loop refusal, at once, never after the whole window on a
+        # billing cluster.
+        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ]; then
+          r0_direct=0; r1_direct=0
+          [ -n "$primary_host" ] && [ "$primary_host" != "-" ] && r0_direct=1
+          [ -n "$member_host" ] && [ "$member_host" != "-" ] && r1_direct=1
+          if [ "$r0_direct" = 1 ] && [ "$r1_direct" = 1 ]; then
             break
           fi
-          [ -n "$mixed_since" ] || mixed_since="$SECONDS"
-          if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
-            break
+          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
           fi
         fi
       fi

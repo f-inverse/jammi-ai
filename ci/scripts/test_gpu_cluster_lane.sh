@@ -935,8 +935,8 @@ python3 - "$CLUSTER_SH" "$A1_SCRATCH" <<'PY'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since=""'''
-new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" ok_count=0'''
+old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" r0_direct r1_direct'''
+new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" r0_direct r1_direct ok_count=0'''
 assert old in text, "A1 revert-RED fixture: local-vars line not found verbatim"
 text = text.replace(old, new, 1)
 old2 = '''            READBACK_OK)
@@ -958,14 +958,18 @@ new2 = '''            READBACK_OK)
               fi ;;'''
 assert old2 in text, "A1 revert-RED fixture: READBACK_OK arm not found verbatim"
 text = text.replace(old2, new2, 1)
-old3 = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \\
-           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ]; then
-          if [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+old3 = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ]; then
+          r0_direct=0; r1_direct=0
+          [ -n "$primary_host" ] && [ "$primary_host" != "-" ] && r0_direct=1
+          [ -n "$member_host" ] && [ "$member_host" != "-" ] && r1_direct=1
+          if [ "$r0_direct" = 1 ] && [ "$r1_direct" = 1 ]; then
             break
           fi
-          [ -n "$mixed_since" ] || mixed_since="$SECONDS"
-          if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
-            break
+          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
           fi
         fi'''
 new3 = '        [ "$ok_count" -ge 2 ] && break'
@@ -1065,14 +1069,18 @@ python3 - "$CLUSTER_SH" "$A2_SCRATCH" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \\
-           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ]; then
-          if [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+old = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ]; then
+          r0_direct=0; r1_direct=0
+          [ -n "$primary_host" ] && [ "$primary_host" != "-" ] && r0_direct=1
+          [ -n "$member_host" ] && [ "$member_host" != "-" ] && r1_direct=1
+          if [ "$r0_direct" = 1 ] && [ "$r1_direct" = 1 ]; then
             break
           fi
-          [ -n "$mixed_since" ] || mixed_since="$SECONDS"
-          if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
-            break
+          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
           fi
         fi'''
 new = '''        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'''
@@ -1099,11 +1107,63 @@ p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.
 p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": None}}
 print(json.dumps({"pods": [p0, p1]}))
 ')"
-IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 30)"
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$"; then
-  ok "A4: rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1), not the whole window"
+a4_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40)"
+a4_elapsed=$(( SECONDS - a4_t0 ))
+# The property is the TIME: the pre-fix loop reaches the same line by
+# running to the deadline (40 s here); the grace settles it within two polls.
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$" && [ "$a4_elapsed" -lt 20 ]; then
+  ok "A4: rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1) in ${a4_elapsed}s, not the 40 s window"
 else
-  bad "A4: expected rc=0 with the proxy-fallback line after the grace; got rc=$rc out=$out"
+  bad "A4: expected rc=0 with the proxy-fallback line within 20 s (grace 1 s); got rc=$rc elapsed=${a4_elapsed}s out=$out"
+fi
+
+# The symmetric mixed state -- rank 1 direct, rank 0 overlay-only -- can
+# never succeed (rank 0 must be the direct jump host); after the grace it
+# refuses AT ONCE with the named message, never after the whole window.
+mixed_r1_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.0.0.2"}, "ssh": {"direct": None}}
+p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": {"host": "5.6.7.8", "port": 22}}}
+print(json.dumps({"pods": [p0, p1]}))
+')"
+a4_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_r1_body" "$mixed_r1_body" 40)"
+a4_elapsed=$(( SECONDS - a4_t0 ))
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint" && [ "$a4_elapsed" -lt 20 ]; then
+  ok "A4: rank 1 direct + rank 0 overlay-only past the grace -> refused by name (97) in ${a4_elapsed}s, not the 40 s window"
+else
+  bad "A4: expected rc=97 naming the missing rank-0 endpoint within 20 s; got rc=$rc elapsed=${a4_elapsed}s out=$out"
+fi
+
+# revert-RED (A4): on a SCRATCH COPY drop the grace (the pre-grace break
+# condition: both direct or nothing) and confirm the SAME mixed fixture now
+# takes the whole 40 s window -- the timing assertion above is load-bearing.
+A4_SCRATCH_DIR="$SANDBOX/a4-revert-red"
+mkdir -p "$A4_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$A4_SCRATCH_DIR/runpod_lib.sh"
+A4_SCRATCH="$A4_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$A4_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''          if [ "$r0_direct" = 1 ] || [ "$r1_direct" = 1 ]; then
+            [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+            if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+              break
+            fi
+          fi'''
+assert old in text, "A4 revert-RED fixture: grace block not found verbatim"
+open(dst, "w").write(text.replace(old, "", 1))
+PY
+a4_t0=$SECONDS
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 40 "$A4_SCRATCH")"
+a4_elapsed=$(( SECONDS - a4_t0 ))
+if [ "$rc" -eq 0 ] && [ "$a4_elapsed" -ge 35 ]; then
+  ok "A4 revert-RED: without the grace the same mixed fixture burns the whole window (${a4_elapsed}s of 40) before the same proxy-fallback line -- the timing assertion is load-bearing"
+else
+  bad "A4 revert-RED: expected the graceless copy to take >= 35 s; got rc=$rc elapsed=${a4_elapsed}s out=$out -- the revert-RED fixture itself may be stale"
 fi
 
 # ============================================================================

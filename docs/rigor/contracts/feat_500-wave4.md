@@ -1648,8 +1648,7 @@ gates below).
   above.
 - **b1** (scheduler restart, read back through a NEW process) needs a real
   process kill/restart, not exercised hermetically.
-- `check_citations.py` reports 3 PRE-EXISTING stale citations (`MAINTAINER-
-  GUIDE.md:538`/`:3019`, `crates/jammi-ai/tests/it/pinned_source_gate.rs:1374`) whose line numbers
+- `check_citations.py` reports 3 PRE-EXISTING stale citations (`docs/maintainer/MAINTAINER-GUIDE.md:538`/`:3019`, `crates/jammi-ai/tests/it/pinned_source_gate.rs:1374`) whose line numbers
   drifted from OTHER units' edits on this consolidated tip — none of them
   touch code I authored; not fixed here (out of this unit's file grant and
   not introduced by this unit's commits).

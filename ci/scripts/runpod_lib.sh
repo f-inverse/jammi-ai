@@ -1767,6 +1767,126 @@ rp_cluster_delete() {
   esac
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# Two-host POD-transport primitives (REST v2, `POST/GET /v2/pods`). A THIRD
+# renting shape, distinct from BOTH the single-pod GraphQL payload
+# (`_rp_deploy_payload`, `podFindAndDeployOnDemand`) and the cluster's own
+# REST payload (`_rp_cluster_payload`, `POST /v2/clusters`): two ORDINARY
+# pods, rented individually, joined by RunPod's Global Networking rather
+# than a CLUSTER object — `runpod_gpu_cluster.sh`'s own `RP_TWO_HOST_
+# TRANSPORT=pods` path. Named identically to an ordinary single pod
+# ("<RP_POD_PREFIX>-ttl<H>", no rank suffix — the shape `rp_sweep`'s own
+# TTL-name parser already recognizes, so BOTH two-host pods fall under the
+# ordinary pod sweep's existing backstop with no separate sweep primitive;
+# rank is tracked by this tooling's own local id-to-rank mapping, never by
+# name) — the caller supplies WHICH data center (co-placement is decided by
+# the driver, not this primitive).
+# ═════════════════════════════════════════════════════════════════════════
+
+# $1=gpuTypeId $2=dataCenterId $3=rank (0 or 1 — name-shape validation only;
+# the created pod's own id, not its name, is what the caller tracks per
+# rank). Prints the REST v2 `POST /v2/pods` request body. Shares
+# `_rp_entrypoint_setup` with both other payload builders (the SAME
+# watchdog+sshd text on every leg).
+_rp_two_host_pod_payload() {
+  local gpu="${1:?_rp_two_host_pod_payload needs a gpuTypeId}" dc="${2:?_rp_two_host_pod_payload needs a dataCenterId}" \
+        rank="${3:?_rp_two_host_pod_payload needs a rank}" setup name
+  setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
+  name="${RP_POD_PREFIX}-ttl${RP_TTL_HOURS}"
+  rp_name_allowlist_check "two-host pod name (rank ${rank})" "$name" || return 2
+  python3 - "$gpu" "$dc" "$RP_IMAGE" "$RP_PUBKEY" "$name" "$setup" <<'PY'
+import json, sys
+gpu, dc, image, pub, name, setup = sys.argv[1:7]
+body = {
+    "name": name,
+    "cloudType": "SECURE",
+    "globalNetworking": True,
+    "dataCenterIds": [dc],
+    "gpu": {"id": gpu, "count": 1},
+    "imageName": image,
+    "ports": ["22/tcp"],
+    "startSsh": True,
+    "args": "bash -c '%s'" % setup,
+    "env": {"PUBLIC_KEY": pub},
+}
+print(json.dumps(body))
+PY
+}
+
+# POST /v2/pods — the RENTING ROOT for the two-host pods transport
+# (`RENTING_ROOTS` in `check_gpu_prove_once.py`; P7's closure/derivation
+# scan is seeded from this name). $1=gpuTypeId $2=dataCenterId $3=rank.
+# Prints the new pod's id on success — the SAME three-way judged 201 body
+# (yes-id / no-id / unparseable) as `rp_cluster_create`'s own doc.
+rp_two_host_pod_create() {
+  local gpu="${1:?rp_two_host_pod_create needs a gpuTypeId}" dc="${2:?rp_two_host_pod_create needs a dataCenterId}" \
+        rank="${3:?rp_two_host_pod_create needs a rank}" payload resp status body id prc
+  payload="$(_rp_two_host_pod_payload "$gpu" "$dc" "$rank")" \
+    || { echo "::error::two-host pod create (rank ${rank}): could not build the request body" >&2; return 1; }
+  resp="$(_rp_rest POST /v2/pods "$payload")" \
+    || { echo "::error::two-host pod create (rank ${rank}): REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    201)
+      id="$(printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
+i = d.get("id")
+if not i:
+    sys.exit(1)
+print(i)
+' 2>/dev/null)"
+      prc=$?
+      case "$prc" in
+        0) printf '%s\n' "$id"; return 0 ;;
+        1) echo "::error::two-host pod create (rank ${rank}): 201 but the response body carried no id: ${body}" >&2; return 1 ;;
+        *) echo "::error::two-host pod create (rank ${rank}): 201 but the response body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
+    *)
+      echo "::error::two-host pod create (rank ${rank}) refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
+# GET /v2/pods/{id}. Prints the raw Pod body on success (200 with the
+# required `id` key present) — the SAME three-way judged shape as
+# `rp_cluster_get`'s own doc. $1=podId.
+rp_pod_get() {
+  local id="${1:?rp_pod_get needs a pod id}" resp status body prc
+  resp="$(_rp_rest GET "/v2/pods/${id}")" \
+    || { echo "::error::pod get ${id}: REST request failed (transport)" >&2; return 1; }
+  status="$(printf '%s\n' "$resp" | head -n1)"
+  body="$(printf '%s\n' "$resp" | tail -n +2)"
+  case "$status" in
+    200)
+      printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.exit(2)
+sys.exit(0 if d.get("id") else 1)
+' 2>/dev/null
+      prc=$?
+      case "$prc" in
+        0) printf '%s' "$body"; return 0 ;;
+        1) echo "::error::pod get ${id}: 200 but the body is missing the required 'id' key: ${body}" >&2; return 1 ;;
+        *) echo "::error::pod get ${id}: 200 but the body is unparseable: $(printf '%s' "$body" | head -c 300)" >&2; return 1 ;;
+      esac ;;
+    *)
+      echo "::error::pod get ${id} refused (status ${status}): $(printf '%s' "$body" | head -c 300)" >&2
+      return 1 ;;
+  esac
+}
+
 # The ONE `-ttl<H>` deadline-NAME parser shared by rp_sweep (pods) and
 # rp_cluster_sweep (clusters) — a `python3` SOURCE FRAGMENT, not a bash
 # function, because both sweeps already do their age/deadline math in ONE

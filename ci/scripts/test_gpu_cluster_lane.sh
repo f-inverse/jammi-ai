@@ -89,11 +89,13 @@ if declare -f rp_cluster_rank_verdict >/dev/null \
   && declare -f rp_cluster_verdict >/dev/null \
   && declare -f _rpc_remote_script >/dev/null \
   && declare -f _rpc_check_readback >/dev/null \
+  && declare -f _rpc_wait_for_members_ready >/dev/null \
   && declare -f _rpc_id_file_ready >/dev/null \
   && declare -f _rpc_ens1_seen >/dev/null \
   && declare -f _rpc_run_id_secrecy_scan >/dev/null \
   && declare -f _rpc_assemble_gang_artifact >/dev/null \
   && declare -f _rpc_self_remove_status >/dev/null \
+  && declare -f _rpc_scan_or_destroy >/dev/null \
   && declare -f _rpc_cleanup_cluster >/dev/null; then
   ok "G0: sourcing runpod_gpu_cluster.sh (no network) defines every _rpc_* helper and both verdict functions"
 else
@@ -382,6 +384,251 @@ fi
 rm -rf "$SANDBOX/pa-unlanded"
 
 # ============================================================================
+# F1 (round 3): the id-secrecy scan runs FIRST in _rpc_cleanup_cluster,
+# strictly before either of its own REST calls (_rpc_self_remove_status,
+# rp_cluster_delete). Drives the REAL trap in a real subshell, instrumenting
+# BOTH the scan wrapper and _rp_rest to append to a shared, ordered log —
+# the assertion is on ORDER, never merely "both happened".
+# ============================================================================
+F1_ORDER_LOG="$SANDBOX/f1-order.log"
+: > "$F1_ORDER_LOG"
+bash -c '
+  source "'"$CLUSTER_SH"'"
+  cluster_id="cl-f1"
+  id_landed=1
+  CLUSTER_ARTIFACT_DIR="'"$SANDBOX"'/f1-artifact"
+  RUN_LOG="'"$SANDBOX"'/f1-artifact/run.log"
+  STAGING_ID_FILE="'"$SANDBOX"'/f1-artifact/nccl.id"
+  mkdir -p "$CLUSTER_ARTIFACT_DIR"
+  echo "clean" > "$RUN_LOG"
+  _rpc_run_id_secrecy_scan() { echo "SCAN_CALLED" >> "'"$F1_ORDER_LOG"'"; return 0; }
+  _rp_rest() { echo "REST_CALLED" >> "'"$F1_ORDER_LOG"'"; printf "404\n{}"; }
+  rp_cluster_delete() { echo "REST_CALLED" >> "'"$F1_ORDER_LOG"'"; return 0; }
+  rp_cleanup() { : ; }
+  ( exit 0 )
+  _rpc_cleanup_cluster
+' >/dev/null 2>&1
+order="$(cat "$F1_ORDER_LOG" | tr '\n' ' ')" # tripwire-ok: a `useless cat`, deliberately -- the ORDER the shell wrote these lines in is exactly what this assertion reads, and `tr` alone does not read a file argument.
+if [ "$order" = "SCAN_CALLED REST_CALLED " ]; then
+  ok "F1: the id-secrecy scan runs BEFORE the self-remove-status/cluster-delete REST calls in the cleanup trap (order: ${order})"
+else
+  bad "F1: expected 'SCAN_CALLED REST_CALLED '; got order: '${order}' — the scan is no longer sequenced first"
+fi
+rm -rf "$SANDBOX/f1-artifact" "$F1_ORDER_LOG"
+
+# F1 (round 3): the cleanup trap is registered on EXIT, INT, TERM AND HUP —
+# never EXIT alone (an untrapped SIGINT otherwise skips an EXIT-only trap
+# entirely on a non-interactive shell). Drives a REAL background process
+# that registers the SAME four traps this driver's own executed block does
+# (calling the REAL, sourced `_rpc_cleanup_cluster`), sends each signal in
+# turn, and asserts the trap's own marker file was written every time —
+# proving the registration, not merely the function body, closes F1.
+# set -m (job control): a bash job backgrounded (`&`) from a shell with job
+# control OFF (the default for a non-interactive script) has SIGINT/SIGQUIT
+# -- and ONLY those two -- forced to SIG_IGN by bash ITSELF before the child
+# ever runs its own `trap`, purely because it is asynchronous (POSIX/bash's
+# own documented behavior, unrelated to anything this driver does); a
+# directly-run foreground process (exactly how a CI runner's own cancel
+# signal reaches this driver) is never subject to that override. `set -m`
+# here restores per-job process groups the way an interactive shell has
+# them, so the signal genuinely reaches this test's own backgrounded child
+# and its `trap INT` fires -- proven irrelevant to TERM/HUP below, which
+# `set -m` does not change (only SIGINT/SIGQUIT are special-cased).
+set -m
+for sig in INT TERM HUP; do
+  F1_SIG_MARKER="$SANDBOX/f1-sig-${sig}.marker"
+  rm -f "$F1_SIG_MARKER"
+  bash -c '
+    source "'"$CLUSTER_SH"'"
+    cluster_id=""
+    rp_cleanup() { : > "'"$F1_SIG_MARKER"'"; }
+    trap _rpc_cleanup_cluster EXIT
+    trap "_rpc_cleanup_cluster 129" HUP
+    trap "_rpc_cleanup_cluster 130" INT
+    trap "_rpc_cleanup_cluster 143" TERM
+    sleep 30 &
+    wait "$!"
+  ' &
+  driver_pid=$!
+  # Give the subshell a moment to reach the `wait` (its traps must be
+  # registered by then) before signalling it -- traps are registered as
+  # the very first thing this subshell does, well before the 30s sleep, so
+  # a short fixed wait is generous rather than a race.
+  sleep 0.5
+  kill "-${sig}" "$driver_pid" 2>/dev/null
+  wait_deadline=$((SECONDS + 5))
+  while kill -0 "$driver_pid" 2>/dev/null && [ "$SECONDS" -lt "$wait_deadline" ]; do sleep 0.1; done
+  if [ -f "$F1_SIG_MARKER" ]; then
+    ok "F1: the cleanup trap fires under SIG${sig} (registered on EXIT/INT/TERM/HUP, never EXIT alone)"
+  else
+    bad "F1: SIG${sig} did not fire the cleanup trap (registered on EXIT alone would miss this) — marker never written"
+  fi
+  rm -f "$F1_SIG_MARKER"
+done
+set +m
+
+# ============================================================================
+# F2 (round 3): a dirty carrier is destroyed SYNCHRONOUSLY, in the SAME
+# trap invocation, never left to rp_cleanup's own RP_SESSION-conditional
+# `$RP_WORK` teardown. Sources the REAL runpod_lib.sh (never mocking
+# rp_cleanup this time) with RP_SESSION set BEFORE sourcing -- the exact
+# condition that clears RP_WORK_IS_TEMP (runpod_lib.sh's own source-time
+# logic) and would leave the relocated dirty carrier on disk under the
+# ORIGINAL (round-3-excised) design.
+# ============================================================================
+F2_SESSION_ROOT="$SANDBOX/f2-session-root"
+F2_ARTIFACT="$SANDBOX/f2-artifact"
+mkdir -p "$F2_ARTIFACT/nested"
+echo "clean log" > "$F2_ARTIFACT/run.log"
+id_hex="$(python3 -c "$PA_ID_BYTES_PY" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
+echo "leaked: ${id_hex}" > "$F2_ARTIFACT/nested/leak.txt"
+# The session dir must exist BEFORE the trap runs -- `mv`'s own target
+# parent must already be there, or `mv` itself fails (ENOENT) and this
+# fixture would exercise the in-place fallback (F3) instead of the
+# quarantine-then-destroy path (F2) this test means to drive.
+mkdir -p "$F2_SESSION_ROOT/f2-test-session"
+f2_out="$(RP_SESSION="f2-test-session" RP_SESSION_ROOT="$F2_SESSION_ROOT" RUNPOD_API_KEY="test-dummy-key" bash -c '
+  source "'"$CLUSTER_SH"'"
+  cluster_id=""
+  id_landed=1
+  CLUSTER_ARTIFACT_DIR="'"$F2_ARTIFACT"'"
+  RUN_LOG="'"$F2_ARTIFACT"'/run.log"
+  STAGING_ID_FILE="'"$F2_ARTIFACT"'/nccl.id"
+  echo -n x > "$STAGING_ID_FILE"
+  _rpc_cleanup_cluster
+' 2>&1)"
+if [ -n "$(find "$F2_SESSION_ROOT" -mindepth 1 -name "gpu-cluster-destroy-*" 2>/dev/null)" ]; then
+  bad "F2: a quarantined dirty carrier survived under RP_WORK (RP_SESSION set) -- destruction was left to rp_cleanup's own RP_SESSION-conditional teardown; out=$f2_out"
+elif carrier_is_clean "$F2_ARTIFACT"; then
+  ok "F2: under RP_SESSION (RP_WORK_IS_TEMP=0, rp_cleanup's own conditional rm -rf never fires), the dirty carrier is STILL destroyed synchronously — nothing survives under \$RP_WORK either"
+else
+  bad "F2: expected the original carrier path emptied too; out=$f2_out"
+fi
+rm -rf "$F2_ARTIFACT" "$F2_SESSION_ROOT"
+
+# F2 revert-RED: reproduce the round-3 defect on a SCRATCH COPY by
+# reverting `_rpc_scan_or_destroy`'s destroy step to the ORIGINAL
+# quarantine-and-defer shape (move only, no synchronous rm -rf; the
+# now-past-tense log line put back to "WILL BE DESTROYED"), and confirm
+# the SAME RP_SESSION fixture above now leaves a surviving quarantine
+# directory under $RP_WORK -- proving the fix is genuinely load-bearing.
+F2_SCRATCH_DIR="$SANDBOX/f2-revert-red"
+mkdir -p "$F2_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$F2_SCRATCH_DIR/runpod_lib.sh"
+cp "$DIR/gang_id_secrecy_scan.py" "$F2_SCRATCH_DIR/gang_id_secrecy_scan.py"
+F2_SCRATCH="$F2_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$F2_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was moved to ${pending_destroy_dir} (outside ${CLUSTER_ARTIFACT_DIR}) and destroyed there, now, unconditionally (never left to rp_cleanup's own RP_SESSION-conditional teardown -- F2); the upload step finds nothing there"
+      # F2: destroyed HERE, synchronously -- never deferred to rp_cleanup's
+      # own conditional `rm -rf "$RP_WORK"`, which a real RP_SESSION run
+      # would skip entirely, leaving this exact directory on disk.
+      rm -rf "${pending_destroy_dir:?}" 2>/dev/null'''
+new = '''      echo "::error::id-secrecy scan was not clean (rc=${scan_rc}) -- the carrier directory was moved to ${pending_destroy_dir} (outside ${CLUSTER_ARTIFACT_DIR}) and WILL BE DESTROYED when this process exits (rp_cleanup rm -rf's \\$RP_WORK); the upload step finds nothing there"'''
+assert old in text, "F2 revert-RED fixture: synchronous-destroy block not found verbatim"
+text = text.replace(old, new, 1)
+open(dst, "w").write(text)
+PY
+mkdir -p "$F2_SESSION_ROOT/f2-test-session-revert"
+f2_revert_out="$(RP_SESSION="f2-test-session-revert" RP_SESSION_ROOT="$F2_SESSION_ROOT" RUNPOD_API_KEY="test-dummy-key" bash -c '
+  source "'"$F2_SCRATCH"'"
+  cluster_id=""
+  id_landed=1
+  CLUSTER_ARTIFACT_DIR="'"$F2_ARTIFACT"'"
+  RUN_LOG="'"$F2_ARTIFACT"'/run.log"
+  STAGING_ID_FILE="'"$F2_ARTIFACT"'/nccl.id"
+  mkdir -p "$CLUSTER_ARTIFACT_DIR/nested"
+  echo "clean log" > "$RUN_LOG"
+  echo -n x > "$STAGING_ID_FILE"
+  echo "leaked: '"$id_hex"'" > "$CLUSTER_ARTIFACT_DIR/nested/leak.txt"
+  _rpc_cleanup_cluster
+' 2>&1)"
+if [ -n "$(find "$F2_SESSION_ROOT" -mindepth 1 -name "gpu-cluster-destroy-*" 2>/dev/null)" ]; then
+  ok "F2 revert-RED: the pre-fix quarantine-and-defer shape DOES leave a surviving dirty carrier under \$RP_WORK when RP_SESSION is set — confirms the fix above is genuinely load-bearing"
+else
+  bad "F2 revert-RED: expected the REVERTED (pre-fix) shape to leave a surviving quarantine dir under RP_WORK; none found -- the revert-RED fixture itself may be stale; out=$f2_revert_out"
+fi
+rm -rf "$F2_SESSION_ROOT" "$F2_SCRATCH_DIR"
+
+# ============================================================================
+# F3 (round 3): the in-place destroy fallback (used when the `mv` itself
+# fails) matches `..`-prefixed names too, not only `*` and `.[!.]*`. Forces
+# the `mv` branch to fail with a PATH-shimmed `mv` stub, plants a
+# `..leak`-named file alongside a normally-named leak, and asserts BOTH are
+# gone after the trap runs.
+# ============================================================================
+F3_ARTIFACT="$SANDBOX/f3-artifact"
+mkdir -p "$F3_ARTIFACT"
+echo "clean log" > "$F3_ARTIFACT/run.log"
+echo "leaked: ${id_hex}" > "$F3_ARTIFACT/normal-leak.txt"
+echo "leaked: ${id_hex}" > "$F3_ARTIFACT/..leak"
+F3_MV_STUB_BIN="$SANDBOX/f3-mv-stub"
+mkdir -p "$F3_MV_STUB_BIN"
+cat > "$F3_MV_STUB_BIN/mv" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$F3_MV_STUB_BIN/mv"
+f3_out="$(PATH="$F3_MV_STUB_BIN:$PATH" bash -c '
+  source "'"$CLUSTER_SH"'"
+  cluster_id=""
+  id_landed=1
+  CLUSTER_ARTIFACT_DIR="'"$F3_ARTIFACT"'"
+  RUN_LOG="'"$F3_ARTIFACT"'/run.log"
+  STAGING_ID_FILE="'"$F3_ARTIFACT"'/nccl.id"
+  echo -n x > "$STAGING_ID_FILE"
+  rp_cleanup() { : ; }
+  _rpc_cleanup_cluster
+' 2>&1)"
+if [ ! -e "$F3_ARTIFACT/normal-leak.txt" ] && [ ! -e "$F3_ARTIFACT/..leak" ]; then
+  ok "F3: the in-place fallback (mv forced to fail) destroys BOTH a normally-named leak and a '..'-prefixed one"
+else
+  bad "F3: expected both leaks destroyed in place; normal-leak.txt exists=$([ -e "$F3_ARTIFACT/normal-leak.txt" ] && echo yes || echo no) ..leak exists=$([ -e "$F3_ARTIFACT/..leak" ] && echo yes || echo no); out=$f3_out"
+fi
+
+# F3 revert-RED: the ORIGINAL glob set (`*` and `.[!.]*` only) on a SCRATCH
+# COPY misses the `..`-prefixed name -- confirms the fix is genuinely
+# load-bearing, not vacuous.
+F3_SCRATCH_DIR="$SANDBOX/f3-revert-red"
+mkdir -p "$F3_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$F3_SCRATCH_DIR/runpod_lib.sh"
+cp "$DIR/gang_id_secrecy_scan.py" "$F3_SCRATCH_DIR/gang_id_secrecy_scan.py"
+F3_SCRATCH="$F3_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$F3_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''      rm -rf "${CLUSTER_ARTIFACT_DIR:?}"/* "${CLUSTER_ARTIFACT_DIR:?}"/.[!.]* "${CLUSTER_ARTIFACT_DIR:?}"/..?* 2>/dev/null'''
+new = '''      rm -rf "${CLUSTER_ARTIFACT_DIR:?}"/* "${CLUSTER_ARTIFACT_DIR:?}"/.[!.]* 2>/dev/null'''
+assert old in text, "F3 revert-RED fixture: in-place fallback glob line not found verbatim"
+text = text.replace(old, new, 1)
+open(dst, "w").write(text)
+PY
+F3_ARTIFACT_REVERT="$SANDBOX/f3-artifact-revert"
+mkdir -p "$F3_ARTIFACT_REVERT"
+echo "clean log" > "$F3_ARTIFACT_REVERT/run.log"
+echo "leaked: ${id_hex}" > "$F3_ARTIFACT_REVERT/..leak"
+f3_revert_out="$(PATH="$F3_MV_STUB_BIN:$PATH" bash -c '
+  source "'"$F3_SCRATCH"'"
+  cluster_id=""
+  id_landed=1
+  CLUSTER_ARTIFACT_DIR="'"$F3_ARTIFACT_REVERT"'"
+  RUN_LOG="'"$F3_ARTIFACT_REVERT"'/run.log"
+  STAGING_ID_FILE="'"$F3_ARTIFACT_REVERT"'/nccl.id"
+  echo -n x > "$STAGING_ID_FILE"
+  rp_cleanup() { : ; }
+  _rpc_cleanup_cluster
+' 2>&1)"
+if [ -e "$F3_ARTIFACT_REVERT/..leak" ]; then
+  ok "F3 revert-RED: the pre-fix glob set (missing ..?*) DOES leave the '..'-prefixed leak behind — confirms the fix above is genuinely load-bearing"
+else
+  bad "F3 revert-RED: expected the REVERTED (pre-fix) glob set to miss the '..'-prefixed leak; it was removed anyway -- the revert-RED fixture itself may be stale; out=$f3_revert_out"
+fi
+rm -rf "$F3_ARTIFACT" "$F3_ARTIFACT_REVERT" "$F3_SCRATCH_DIR"
+
+# ============================================================================
 # G2: CLUSTER_GROUPS closure — {::group:: names} - {device} == CLUSTER_GROUPS.
 # ============================================================================
 mapfile -t script_groups < <(grep -oE '::group::[a-z0-9-]+' "$CLUSTER_SH" | sed 's/::group:://' | sort -u)
@@ -608,6 +855,119 @@ if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "PARSE_ERROR"; then
   ok "F2/F3: an unparseable pods response -> rc=2, named PARSE_ERROR"
 else
   bad "F2/F3: expected rc=2 + PARSE_ERROR on unparseable body; got rc=$rc out=$out"
+fi
+
+# ============================================================================
+# A1 (round 3): _rpc_wait_for_members_ready tracks readiness by DISTINCT
+# rank, never a raw count -- a response naming rank 0 TWICE and rank 1
+# NEVER must never read as ready. Drives the REAL function in a real
+# subshell (a real `while`/`sleep` loop; RP_SSH_WAIT_SECS is kept small so
+# the refusal arm's own timeout is fast), mocking only _rp_rest and
+# _rp_entrypoint_setup.
+# ============================================================================
+run_wait_for_members_ready() { # $1=pods_body_json $2=RP_SSH_WAIT_SECS $3=driver path (default CLUSTER_SH) -> stdout: "<rc>\t<out>"
+  local body="$1" wait_secs="$2" driver="${3:-$CLUSTER_SH}" out rc
+  out="$(A1_FIXTURE_BODY="$body" bash -c '
+    source "'"$driver"'"
+    _rp_entrypoint_setup() { printf "%s" "the-shared-entrypoint-text"; }
+    _rp_rest() { printf "200\n%s" "$A1_FIXTURE_BODY"; }
+    _rpc_wait_for_members_ready "cl-a1" "$1" "1"
+  ' _ "$wait_secs" 2>&1)"
+  rc=$?
+  printf '%s\t%s\n' "$rc" "$out"
+}
+
+dup_rank0_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+pod = lambda pid, rank: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"rank": rank, "ip": None}, "ssh": {"direct": {"host": "1.2.3.4", "port": 22}}}
+print(json.dumps({"pods": [pod("a", 0), pod("b", 0)]}))
+')"
+IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$dup_rank0_body" 1)"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "rank 0 seen: 1, rank 1 seen: 0"; then
+  ok "A1: two rows BOTH claiming rank 0 (rank 1 never seen) -> refused (97), never read as ready by a raw count"
+else
+  bad "A1: expected rc=97 naming 'rank 0 seen: 1, rank 1 seen: 0'; got rc=$rc out=$out"
+fi
+
+ok_ranks_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+pod = lambda pid, rank: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"rank": rank, "ip": None}, "ssh": {"direct": {"host": "1.2.3.4", "port": 22}}}
+print(json.dumps({"pods": [pod("a", 0), pod("b", 1)]}))
+')"
+IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$ok_ranks_body" 10)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 1.2.3.4 22 "; then
+  ok "A1: rank 0 and rank 1 each seen exactly once -> ready (0), both endpoints carried"
+else
+  bad "A1: expected rc=0 with both endpoints; got rc=$rc out=$out"
+fi
+
+# revert-RED (A1): reproduce the round-3 raw-count defect on a SCRATCH COPY
+# by replacing the exact-rank tracking with the original `ok_count -ge 2`
+# shape, and confirm the SAME duplicate-rank-0 fixture above now reads
+# "ready" -- proving the fix above is genuinely load-bearing, not vacuous.
+# The scratch copy lives in its OWN directory alongside a copy of
+# runpod_lib.sh (the driver's own `DIR="$(dirname "${BASH_SOURCE[0]}")"`
+# sourcing resolves `$DIR/runpod_lib.sh` next to wherever the driver file
+# itself sits, not next to the real ci/scripts/ tree).
+A1_SCRATCH_DIR="$SANDBOX/a1-revert-red"
+mkdir -p "$A1_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$A1_SCRATCH_DIR/runpod_lib.sh"
+A1_SCRATCH="$A1_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$A1_SCRATCH" <<'PY'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch'''
+new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch ok_count=0'''
+assert old in text, "A1 revert-RED fixture: local-vars line not found verbatim"
+text = text.replace(old, new, 1)
+old2 = '''            READBACK_OK)
+              if [ "$rank" = "0" ]; then
+                rank0_seen=1
+                primary_host="$dhost"; primary_port="$dport"
+              elif [ "$rank" = "1" ]; then
+                rank1_seen=1
+                member_host="$dhost"; member_port="$dport"; member_ip="$ip"
+              fi ;;'''
+new2 = '''            READBACK_OK)
+              ok_count=$((ok_count + 1))
+              if [ "$rank" = "0" ]; then
+                rank0_seen=1
+                primary_host="$dhost"; primary_port="$dport"
+              else
+                rank1_seen=1
+                member_host="$dhost"; member_port="$dport"; member_ip="$ip"
+              fi ;;'''
+assert old2 in text, "A1 revert-RED fixture: READBACK_OK arm not found verbatim"
+text = text.replace(old2, new2, 1)
+old3 = '        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'
+new3 = '        [ "$ok_count" -ge 2 ] && break'
+assert old3 in text, "A1 revert-RED fixture: break condition not found verbatim"
+text = text.replace(old3, new3, 1)
+old4 = '  if [ "$rank0_seen" != "1" ] || [ "$rank1_seen" != "1" ]; then'
+new4 = '  if [ "$ok_count" -lt 2 ]; then'
+assert old4 in text, "A1 revert-RED fixture: post-loop refusal condition not found verbatim"
+text = text.replace(old4, new4, 1)
+open(dst, "w").write(text)
+PY
+# The reverted shape's own wait loop breaks out claiming readiness the
+# MOMENT ok_count hits 2 (both entries are the SAME rank-0 row) -- it never
+# reaches the timeout/refusal branch this suite's own fixed-code assertion
+# above names ("not every member reached a usable ssh path"). Proceeding
+# past the loop with rank 1 never actually resolved, it instead trips the
+# SEPARATE, unrelated proxy-fallback check ("neither a direct ssh endpoint
+# nor an overlay ip") on the still-empty member fields -- a DIFFERENT
+# failure than the accurate, named one the fix produces for the IDENTICAL
+# fixture, proving the loop's own readiness gate broke out wrongly (and
+# early) under the reverted shape.
+IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$dup_rank0_body" 10 "$A1_SCRATCH")"
+if printf '%s' "$out" | grep -q "neither a direct ssh endpoint nor an overlay ip" \
+  && ! printf '%s' "$out" | grep -q "not every member reached a usable ssh path"; then
+  ok "A1 revert-RED: the pre-fix raw-count shape (ok_count -ge 2) breaks the wait loop 'ready' on the duplicate-rank-0/no-rank-1 fixture (proceeds past it into the member-resolution phase with rank 1 unset) — confirms the fix above is genuinely load-bearing, not vacuous"
+else
+  bad "A1 revert-RED: expected the REVERTED (pre-fix) shape to break out of the wait loop early (a different, generic downstream failure, never the accurate 'not every member reached' refusal); got rc=$rc out=$out — the revert-RED fixture itself may be stale"
 fi
 
 # ============================================================================

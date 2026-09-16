@@ -326,6 +326,89 @@ for p in pods:
 ' "$body" "$setup"
 }
 
+# The reachability wait loop, extracted into its own function (round 3
+# A1) so it is sourceable and testable exactly like `_rpc_check_readback`
+# above, which it calls. $1=cluster id $2=RP_SSH_WAIT_SECS $3=RP_TTL_HOURS.
+# Polls `GET /v2/clusters/{id}/pods` every 5s until the deadline. On success
+# prints ONE line: `<primary_host> <primary_port> <member_host> <member_port>
+# <member_ip> <proxy_flag>` and returns 0 -- `proxy_flag` is `1` when the
+# member's own `ssh.direct` was absent and its overlay `ip` is what the
+# caller must proxy through (F3's no-public-port fallback), `0` when the
+# member has its own direct endpoint. On any refusal, prints nothing to
+# stdout, names the reason on stderr, and returns 97.
+#
+# A1 (round 3): a raw tally (`ok_count -ge RP_CLUSTER_POD_COUNT`) was
+# satisfiable by the SAME rank appearing twice in one `pods` response (a
+# duplicate/stale row RunPod's own listing is under no documented obligation
+# never to return) without rank 1 ever having actually been seen at all --
+# the loop would have broken "ready" on a cluster that is not. This driver's
+# own shape is FIXED at exactly ranks {0, 1} (A4: podCount=2 is a literal,
+# not a parameter), so readiness is tracked as two DISTINCT rank flags,
+# never a count: the loop exits only when rank 0 AND rank 1 have EACH been
+# read back READBACK_OK at least once, regardless of how many rows the
+# response carries or in what order.
+_rpc_wait_for_members_ready() {
+  local wait_cluster_id="${1:?_rpc_wait_for_members_ready needs a cluster id}" \
+        wait_ssh_secs="${2:?_rpc_wait_for_members_ready needs RP_SSH_WAIT_SECS}" \
+        wait_ttl_hours="${3:?_rpc_wait_for_members_ready needs RP_TTL_HOURS}"
+  local primary_host="" primary_port="" member_host="" member_port="" member_ip="" pods_body=""
+  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch
+  local deadline_ssh=$(( SECONDS + wait_ssh_secs ))
+  while [ "$SECONDS" -lt "$deadline_ssh" ]; do
+    resp="$(_rp_rest GET "/v2/clusters/${wait_cluster_id}/pods")"
+    status="$(printf '%s\n' "$resp" | head -n1)"
+    pods_body="$(printf '%s\n' "$resp" | tail -n +2)"
+    if [ "$status" = "200" ]; then
+      readback="$(_rpc_check_readback "$pods_body" "$(_rp_entrypoint_setup "$wait_ttl_hours")")"
+      readback_rc=$?
+      if [ "$readback_rc" -eq 0 ]; then
+        mismatch=0
+        while IFS=' ' read -r _pid rank state ip dhost dport; do
+          [ -n "$rank" ] || continue
+          case "$state" in
+            READBACK_ARGS_MISMATCH) mismatch=1 ;;
+            READBACK_NO_SSH_PATH) : ;;
+            READBACK_OK)
+              if [ "$rank" = "0" ]; then
+                rank0_seen=1
+                primary_host="$dhost"; primary_port="$dport"
+              elif [ "$rank" = "1" ]; then
+                rank1_seen=1
+                member_host="$dhost"; member_port="$dport"; member_ip="$ip"
+              fi ;;
+          esac
+        done <<< "$readback"
+        if [ "$mismatch" -eq 1 ]; then
+          echo "::error::a member's Pod.args does not echo the shared entrypoint text -- refusing" >&2
+          return 97
+        fi
+        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break
+      fi
+    fi
+    sleep 5
+  done
+  if [ "$rank0_seen" != "1" ] || [ "$rank1_seen" != "1" ]; then
+    echo "::error::not every member reached a usable ssh path (direct or overlay-proxy) within ${wait_ssh_secs}s (rank 0 seen: ${rank0_seen}, rank 1 seen: ${rank1_seen})" >&2
+    return 97
+  fi
+  if [ "$primary_host" = "-" ] || [ -z "$primary_host" ]; then
+    echo "::error::the primary (rank 0) member carries no direct ssh endpoint -- there is no jump host for the no-public-port fallback either" >&2
+    return 97
+  fi
+  local proxy_flag=0
+  if [ "$member_host" = "-" ] || [ -z "$member_host" ]; then
+    if [ -z "$member_ip" ] || [ "$member_ip" = "-" ]; then
+      echo "::error::the member carries neither a direct ssh endpoint nor an overlay ip -- no path reaches it" >&2
+      return 97
+    fi
+    member_host="$member_ip"
+    member_port=22
+    proxy_flag=1
+  fi
+  printf '%s %s %s %s %s %s\n' "$primary_host" "$primary_port" "$member_host" "$member_port" "$member_ip" "$proxy_flag"
+  return 0
+}
+
 # F11's reader-side gate, mirrored on the SHIPPING side: refuses to `scp` a
 # staging copy anywhere unless `stat` reports EXACTLY 128 bytes. $1=path.
 # Returns 0 only at exactly 128 bytes; 1 otherwise (any other size,
@@ -952,74 +1035,19 @@ fi
 echo "measured cluster shape: ${MEASURED_POD_COUNT}x${MEASURED_GPU_COUNT_PER_POD}"
 
 _rpc_phase "waiting for both members RUNNING with a usable ssh path"
-# A1 (round 3): a raw tally (`ok_count -ge RP_CLUSTER_POD_COUNT`) is
-# satisfiable by the SAME rank appearing twice in one `pods` response (a
-# duplicate/stale row RunPod's own listing is under no documented obligation
-# never to return) without rank 1 ever having actually been seen at all --
-# the loop would break "ready" on a cluster that is not. This driver's own
-# shape is FIXED at exactly ranks {0, 1} (A4: podCount=2 is a literal, not a
-# parameter), so readiness is tracked as two DISTINCT rank flags, never a
-# count: `break` only when rank 0 AND rank 1 have EACH been read back
-# READBACK_OK at least once, regardless of how many rows the response
-# carries or in what order.
-primary_host="" primary_port="" member_host="" member_port="" member_ip="" pods_body=""
-rank0_seen=0 rank1_seen=0
-deadline_ssh=$(( SECONDS + RP_SSH_WAIT_SECS ))
-while [ "$SECONDS" -lt "$deadline_ssh" ]; do
-  resp="$(_rp_rest GET "/v2/clusters/${cluster_id}/pods")"
-  status="$(printf '%s\n' "$resp" | head -n1)"
-  pods_body="$(printf '%s\n' "$resp" | tail -n +2)"
-  if [ "$status" = "200" ]; then
-    readback="$(_rpc_check_readback "$pods_body" "$(_rp_entrypoint_setup "$RP_TTL_HOURS")")"
-    readback_rc=$?
-    if [ "$readback_rc" -eq 0 ]; then
-      mismatch=0
-      while IFS=' ' read -r _pid rank state ip dhost dport; do
-        [ -n "$rank" ] || continue
-        case "$state" in
-          READBACK_ARGS_MISMATCH) mismatch=1 ;;
-          READBACK_NO_SSH_PATH) : ;;
-          READBACK_OK)
-            if [ "$rank" = "0" ]; then
-              rank0_seen=1
-              primary_host="$dhost"; primary_port="$dport"
-            elif [ "$rank" = "1" ]; then
-              rank1_seen=1
-              member_host="$dhost"; member_port="$dport"; member_ip="$ip"
-            fi ;;
-        esac
-      done <<< "$readback"
-      if [ "$mismatch" -eq 1 ]; then
-        echo "::error::a member's Pod.args does not echo the shared entrypoint text -- refusing"
-        exit 97
-      fi
-      [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break
-    fi
-  fi
-  sleep 5
-done
-if [ "$rank0_seen" != "1" ] || [ "$rank1_seen" != "1" ]; then
-  echo "::error::not every member reached a usable ssh path (direct or overlay-proxy) within ${RP_SSH_WAIT_SECS}s (rank 0 seen: ${rank0_seen}, rank 1 seen: ${rank1_seen})"
-  exit 97
-fi
-if [ "$primary_host" = "-" ] || [ -z "$primary_host" ]; then
-  echo "::error::the primary (rank 0) member carries no direct ssh endpoint -- there is no jump host for the no-public-port fallback either"
-  exit 97
-fi
-# F3's no-public-port fallback: the member's own `ssh.direct` was absent
-# (dhost="-") but its overlay `ip` is known -- proxy through the primary,
-# which the check above already confirmed carries a direct endpoint.
-# `member_extra_sshopts` carries ONLY the proxy option (never a port flag,
-# which differs between ssh's `-p` and scp/rsync's `-P` -- each call site
-# below supplies its own port flag explicitly instead of one shared array
-# with an embedded, flag-specific `-p`/`-P`).
+members_line="$(_rpc_wait_for_members_ready "$cluster_id" "$RP_SSH_WAIT_SECS" "$RP_TTL_HOURS")"
+wait_rc=$?
+[ "$wait_rc" -eq 0 ] || exit "$wait_rc"
+IFS=' ' read -r primary_host primary_port member_host member_port member_ip proxy_flag <<< "$members_line"
 member_extra_sshopts=()
-if [ "$member_host" = "-" ] || [ -z "$member_host" ]; then
-  [ -n "$member_ip" ] && [ "$member_ip" != "-" ] || { echo "::error::the member carries neither a direct ssh endpoint nor an overlay ip -- no path reaches it"; exit 97; }
-  member_host="$member_ip"
-  member_port=22
-  member_extra_sshopts=(-o "ProxyJump=root@${primary_host}:${primary_port}")
-fi
+# F3's no-public-port fallback: `_rpc_wait_for_members_ready` already proxies
+# the member's ssh endpoint through the overlay ip when its own `ssh.direct`
+# was absent -- `proxy_flag=1` says so; `member_extra_sshopts` carries ONLY
+# the proxy option (never a port flag, which differs between ssh's `-p` and
+# scp/rsync's `-P` -- each call site below supplies its own port flag
+# explicitly instead of one shared array with an embedded, flag-specific
+# `-p`/`-P`).
+[ "$proxy_flag" = "1" ] && member_extra_sshopts=(-o "ProxyJump=root@${primary_host}:${primary_port}")
 
 _rpc_phase "build + two-host proof"
 rank0_log="$(mktemp)"; rank1_log="$(mktemp)"

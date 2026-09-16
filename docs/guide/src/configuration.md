@@ -343,6 +343,35 @@ max_subscriptions = 256
 # Default: 1024.
 max_job_waits = 1024
 
+# [ballista]
+# This process hosts a Ballista scheduler bound here iff set. Unset (the
+# default, and the whole `[ballista]` table absent) means no scheduler
+# role -- the process runs exactly as it always has, byte-for-byte. Both
+# roles (scheduler + executor) on one process is the single-node cluster.
+# scheduler_bind = "0.0.0.0:50050"
+
+# [ballista.executor]
+# This process hosts a Ballista executor iff this table is present. Unset
+# (the default, table absent) means no executor role.
+# The scheduler this executor registers with and takes tasks from,
+# `host:port` -- a `SocketAddr` literal or a DNS name and port (the
+# Kubernetes case). Required whenever `[ballista.executor]` is present.
+# scheduler_address = "10.0.4.7:50050"
+# This executor's Arrow Flight (shuffle) listener. Default: "0.0.0.0:50051".
+# bind = "0.0.0.0:50051"
+# This executor's gRPC (task) listener. Default: "0.0.0.0:50052".
+# grpc_bind = "0.0.0.0:50052"
+# The host other executors/the scheduler dial to reach this executor.
+# Unset (the default) means the `bind` host.
+# advertise_host = "10.0.4.8"
+# Local directory Ballista's shuffle writer stages files under. Unset (the
+# default) means a fresh temporary directory per process (no object-store
+# shuffle in v1).
+# work_dir = "/var/lib/jammi/shuffle"
+# Concurrent task slots this executor offers the scheduler. Must be >= 1.
+# Default: 1.
+# task_slots = 1
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error". Default: "info".
 level = "info"

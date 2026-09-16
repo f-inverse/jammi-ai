@@ -65,6 +65,7 @@ const TOP_LEVEL_FIELDS: &[&str] = &[
     "jobs",
     "cache",
     "server",
+    "ballista",
     "logging",
     "observability",
     "catalog",

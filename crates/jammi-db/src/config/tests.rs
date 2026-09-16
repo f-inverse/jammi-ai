@@ -2564,6 +2564,7 @@ fn top_level_fields_matches_jammi_config() {
         "jobs",
         "cache",
         "server",
+        "ballista",
         "logging",
         "observability",
         "catalog",
@@ -3729,4 +3730,213 @@ fn resolved_result_root_mirrors_the_two_derivation_sites() {
         ..JammiConfig::default()
     };
     assert_eq!(set.resolved_result_root().unwrap(), "r2://bucket/prefix");
+}
+
+// ─── `[ballista]` (67 U8a-cfg / CFGDB) ──────────────────────────────────────
+
+/// Unset `[ballista]` = no roles = today's process, byte-for-byte: neither
+/// accessor reports a role, and validation against a default `[server]`
+/// passes trivially (there is nothing to check).
+#[test]
+fn ballista_unset_means_no_roles() {
+    let cfg = JammiConfig::default();
+    assert!(!cfg.ballista.hosts_scheduler());
+    assert!(!cfg.ballista.hosts_executor());
+    assert!(cfg.ballista.validate(&cfg.server).is_ok());
+}
+
+/// `JAMMI_BALLISTA__SCHEDULER_BIND` (the `__`-segmented env form) reaches
+/// `ballista.scheduler_bind` — the `TOP_LEVEL_FIELDS` namespace-registration
+/// half of adding a new top-level section (esc-095: an unregistered section
+/// name is a typed "unknown top-level config section" error, never a silent
+/// no-op).
+#[test]
+fn ballista_env_override_reaches_scheduler_bind() {
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_BALLISTA__SCHEDULER_BIND".to_string(),
+            "10.0.0.1:50050".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.ballista.scheduler_bind.as_deref(),
+        Some("10.0.0.1:50050")
+    );
+    assert!(cfg.ballista.hosts_scheduler());
+}
+
+/// An unknown key under `[ballista]` or `[ballista.executor]` is refused at
+/// parse time (`deny_unknown_fields`), never silently dropped.
+#[test]
+fn ballista_unknown_key_is_refused() {
+    let err = JammiConfig::parse_from("[ballista]\nbogus = 1\n", vec![]).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("bogus")),
+        "got {err:?}"
+    );
+
+    let err = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"10.0.0.1:50050\"\nbogus = 1\n",
+        vec![],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("bogus")),
+        "got {err:?}"
+    );
+}
+
+/// `[ballista.executor] task_slots = 0` is refused, naming the key —
+/// `task_slots` defaults to `1` and must stay at least one real slot.
+#[test]
+fn ballista_task_slots_zero_is_refused() {
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"10.0.0.1:50050\"\ntask_slots = 0\n",
+        vec![],
+    )
+    .unwrap();
+    let err = cfg.ballista.validate(&cfg.server).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("task_slots")),
+        "got {err:?}"
+    );
+}
+
+/// `[ballista.executor] work_dir = ""` is refused, naming the key — an
+/// explicit empty string is not the same as omitting the key (which means
+/// "a fresh temp dir per process").
+#[test]
+fn ballista_executor_work_dir_empty_is_refused() {
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"10.0.0.1:50050\"\nwork_dir = \"\"\n",
+        vec![],
+    )
+    .unwrap();
+    let err = cfg.ballista.validate(&cfg.server).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("work_dir")),
+        "got {err:?}"
+    );
+}
+
+/// `executor.scheduler_address` accepts a bare hostname (the Kubernetes
+/// case), not only a `SocketAddr` literal, and refuses an empty or
+/// malformed value naming the key.
+#[test]
+fn ballista_executor_scheduler_address_accepts_hostname_and_refuses_malformed() {
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"ballista-scheduler.default.svc:50050\"\n",
+        vec![],
+    )
+    .unwrap();
+    assert!(cfg.ballista.validate(&cfg.server).is_ok());
+
+    // The unset default is empty, and empty is refused (required field,
+    // enforced at validation rather than a hand-rolled `Deserialize`).
+    let cfg = JammiConfig::parse_from("[ballista.executor]\n", vec![]).unwrap();
+    let err = cfg.ballista.validate(&cfg.server).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("scheduler_address")),
+        "got {err:?}"
+    );
+
+    let cfg = JammiConfig::parse_from(
+        "[ballista.executor]\nscheduler_address = \"no-port-here\"\n",
+        vec![],
+    )
+    .unwrap();
+    let err = cfg.ballista.validate(&cfg.server).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("scheduler_address")),
+        "got {err:?}"
+    );
+}
+
+/// Builds a `[ballista]` + `[server]` pair whose six fixed-port fields
+/// (`ballista.scheduler_bind`, `ballista.executor.bind`,
+/// `ballista.executor.grpc_bind`, `server.health_listen`,
+/// `server.flight_listen`, `server.peer_bind`) are all distinct by default,
+/// then applies `overrides` (a slice of `(key, value)` pairs, keyed by the
+/// same names `BallistaConfig::validate`'s error messages use) on top.
+fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> (BallistaConfig, ServerConfig) {
+    let mut ballista = BallistaConfig {
+        scheduler_bind: Some("127.0.0.1:41000".to_string()),
+        executor: Some(BallistaExecutorConfig {
+            scheduler_address: "127.0.0.1:41000".to_string(),
+            bind: "127.0.0.1:41001".to_string(),
+            grpc_bind: "127.0.0.1:41002".to_string(),
+            ..BallistaExecutorConfig::default()
+        }),
+    };
+    let mut server = ServerConfig {
+        health_listen: "127.0.0.1:41003".to_string(),
+        flight_listen: "127.0.0.1:41004".to_string(),
+        peer_bind: Some("127.0.0.1:41005".to_string()),
+        ..ServerConfig::default()
+    };
+    for (key, value) in overrides {
+        match *key {
+            "ballista.scheduler_bind" => ballista.scheduler_bind = Some((*value).to_string()),
+            "ballista.executor.bind" => {
+                ballista.executor.as_mut().unwrap().bind = (*value).to_string();
+            }
+            "ballista.executor.grpc_bind" => {
+                ballista.executor.as_mut().unwrap().grpc_bind = (*value).to_string();
+            }
+            "server.health_listen" => server.health_listen = (*value).to_string(),
+            "server.flight_listen" => server.flight_listen = (*value).to_string(),
+            "server.peer_bind" => server.peer_bind = Some((*value).to_string()),
+            other => panic!("unknown fixture key {other}"),
+        }
+    }
+    (ballista, server)
+}
+
+/// Every pair among the six fixed-port fields collides when set to the same
+/// FIXED address, and the refusal names BOTH keys — the property is "every
+/// pair", enumerated here rather than spot-checked on one or two.
+#[test]
+fn ballista_every_fixed_port_collision_pair_is_refused_naming_both_keys() {
+    const KEYS: [&str; 6] = [
+        "ballista.scheduler_bind",
+        "ballista.executor.bind",
+        "ballista.executor.grpc_bind",
+        "server.health_listen",
+        "server.flight_listen",
+        "server.peer_bind",
+    ];
+    let collide = "127.0.0.1:49999";
+    for (i, key_i) in KEYS.iter().enumerate() {
+        for key_j in KEYS.iter().skip(i + 1) {
+            let (ballista, server) = ballista_ports_fixture(&[(key_i, collide), (key_j, collide)]);
+            let err = ballista
+                .validate(&server)
+                .expect_err(&format!("pair ({key_i}, {key_j}) must collide"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(key_i) && msg.contains(key_j),
+                "pair ({key_i}, {key_j}): message must name both keys, got {msg}"
+            );
+        }
+    }
+}
+
+/// An ephemeral `:0` address never collides, even when every fixed-port
+/// field shares the literal string `"127.0.0.1:0"` — the kernel assigns
+/// each bind a distinct free port, so identical `:0` addresses are the one
+/// case the pairwise check must let through.
+#[test]
+fn ballista_ephemeral_ports_never_collide() {
+    const ZERO: &str = "127.0.0.1:0";
+    let (ballista, server) = ballista_ports_fixture(&[
+        ("ballista.scheduler_bind", ZERO),
+        ("ballista.executor.bind", ZERO),
+        ("ballista.executor.grpc_bind", ZERO),
+        ("server.health_listen", ZERO),
+        ("server.flight_listen", ZERO),
+        ("server.peer_bind", ZERO),
+    ]);
+    assert!(ballista.validate(&server).is_ok());
 }

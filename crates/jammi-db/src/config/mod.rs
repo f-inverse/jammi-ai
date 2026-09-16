@@ -308,6 +308,10 @@ pub struct JammiConfig {
     pub cache: CacheConfig,
     /// HTTP and Arrow Flight server bind addresses.
     pub server: ServerConfig,
+    /// Whether this process hosts a Ballista scheduler and/or executor
+    /// role for the distributed compute plane. Default: neither role
+    /// (today's process, byte-for-byte). See [`BallistaConfig`].
+    pub ballista: BallistaConfig,
     /// Tracing/logging configuration.
     pub logging: LoggingConfig,
     /// Vendor-neutral OTLP trace export: collector endpoint, request headers,
@@ -2206,6 +2210,189 @@ impl ServerConfig {
     }
 }
 
+/// `[ballista]`: whether this process hosts a Ballista scheduler and/or
+/// executor role for the distributed compute plane. Unset (the default)
+/// means neither role — the process runs exactly as it always has,
+/// byte-for-byte (B4: roles are config, never a cargo feature). Both roles
+/// on one process is the single-node cluster.
+///
+/// # TOML
+///
+/// ```toml
+/// [ballista]
+/// scheduler_bind = "0.0.0.0:50050"          # Some = host a scheduler
+///
+/// [ballista.executor]
+/// scheduler_address = "10.0.4.7:50050"      # Some = host an executor
+/// bind = "0.0.0.0:50051"                    # shuffle (Arrow Flight) listener
+/// grpc_bind = "0.0.0.0:50052"               # task (gRPC) listener
+/// advertise_host = "10.0.4.8"               # default: the bind host
+/// work_dir = "/var/lib/jammi/shuffle"       # default: a fresh temp dir
+/// task_slots = 1                            # >= 1
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallistaConfig {
+    /// This process hosts a Ballista scheduler bound here iff `Some`.
+    /// `None` (the default) means no scheduler role.
+    pub scheduler_bind: Option<String>,
+    /// This process hosts a Ballista executor iff `Some`. `None` (the
+    /// default) means no executor role.
+    pub executor: Option<BallistaExecutorConfig>,
+}
+
+/// `[ballista.executor]`: an executor role's listeners, the scheduler it
+/// registers with, and its task-slot capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallistaExecutorConfig {
+    /// The scheduler this executor registers with and takes tasks from:
+    /// `host:port` (a `SocketAddr`, or a DNS name and port — the
+    /// Kubernetes case). Required: the unset default (empty) is refused by
+    /// [`BallistaConfig::validate`].
+    pub scheduler_address: String,
+    /// This executor's Arrow Flight (shuffle) listener. Default:
+    /// `"0.0.0.0:50051"`.
+    pub bind: String,
+    /// This executor's gRPC (task) listener. Default: `"0.0.0.0:50052"`.
+    pub grpc_bind: String,
+    /// The host other executors and the scheduler dial to reach this
+    /// executor. `None` (the default) means the `bind` host.
+    pub advertise_host: Option<String>,
+    /// Local directory Ballista's shuffle writer stages files under.
+    /// `None` (the default) means a fresh temporary directory per process
+    /// (no object-store shuffle in v1).
+    pub work_dir: Option<PathBuf>,
+    /// Concurrent task slots this executor offers the scheduler. Must be
+    /// `>= 1`. Default: 1.
+    pub task_slots: u32,
+}
+
+impl Default for BallistaExecutorConfig {
+    fn default() -> Self {
+        Self {
+            scheduler_address: String::new(),
+            bind: "0.0.0.0:50051".into(),
+            grpc_bind: "0.0.0.0:50052".into(),
+            advertise_host: None,
+            work_dir: None,
+            task_slots: 1,
+        }
+    }
+}
+
+impl BallistaConfig {
+    /// Whether this process hosts a Ballista scheduler role.
+    pub fn hosts_scheduler(&self) -> bool {
+        self.scheduler_bind.is_some()
+    }
+
+    /// Whether this process hosts a Ballista executor role.
+    pub fn hosts_executor(&self) -> bool {
+        self.executor.is_some()
+    }
+
+    /// Validate the `[ballista]` section against `server` (the same class
+    /// as [`ServerConfig::validate`]): every configured bind address
+    /// parses; `executor.scheduler_address` parses as a validated
+    /// `host:port` DIAL target ([`crate::catalog::instance::PeerAddr`] —
+    /// hostnames are the Kubernetes case, so this is never restricted to a
+    /// `SocketAddr`, and a `:0` scheduler address is refused the same way
+    /// `PeerAddr` refuses one for any dial target); a FIXED-port collision
+    /// among `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+    /// `server.health_listen`, `server.flight_listen`, `server.peer_bind`
+    /// is refused naming BOTH keys (an ephemeral `:0` never collides — each
+    /// resolves to a distinct kernel-assigned port, the same rule
+    /// [`ServerConfig::validate`] applies to its own three listeners);
+    /// `executor.task_slots == 0` and `executor.work_dir = Some("")` are
+    /// refused.
+    pub fn validate(&self, server: &ServerConfig) -> Result<()> {
+        use std::net::SocketAddr;
+
+        // Every currently-configured FIXED listener this section and
+        // `server` own, named, so a collision names both keys. `server`'s
+        // own three are re-parsed here rather than threaded through as
+        // already-parsed `SocketAddr`s; an unparseable one is
+        // `ServerConfig::validate`'s own refusal, not this function's, so
+        // it is silently skipped here (`.ok()`) — leaving the other
+        // listeners checked against each other exactly as if it were
+        // absent, never a spurious ballista-side error about a server key
+        // this function does not own.
+        let mut fixed: Vec<(&'static str, SocketAddr)> = Vec::new();
+
+        if let Some(raw) = &self.scheduler_bind {
+            let addr: SocketAddr = raw.parse().map_err(|e| {
+                JammiError::Config(format!(
+                    "Invalid ballista.scheduler_bind address '{raw}': {e}"
+                ))
+            })?;
+            fixed.push(("ballista.scheduler_bind", addr));
+        }
+
+        if let Some(executor) = &self.executor {
+            let bind: SocketAddr = executor.bind.parse().map_err(|e| {
+                JammiError::Config(format!(
+                    "Invalid ballista.executor.bind address '{}': {e}",
+                    executor.bind
+                ))
+            })?;
+            fixed.push(("ballista.executor.bind", bind));
+
+            let grpc_bind: SocketAddr = executor.grpc_bind.parse().map_err(|e| {
+                JammiError::Config(format!(
+                    "Invalid ballista.executor.grpc_bind address '{}': {e}",
+                    executor.grpc_bind
+                ))
+            })?;
+            fixed.push(("ballista.executor.grpc_bind", grpc_bind));
+
+            crate::catalog::instance::PeerAddr::parse(&executor.scheduler_address).map_err(
+                |e| JammiError::Config(format!("Invalid ballista.executor.scheduler_address: {e}")),
+            )?;
+
+            if executor.task_slots == 0 {
+                return Err(JammiError::Config(
+                    "ballista.executor.task_slots must be >= 1".into(),
+                ));
+            }
+
+            if let Some(dir) = &executor.work_dir {
+                if dir.as_os_str().is_empty() {
+                    return Err(JammiError::Config(
+                        "ballista.executor.work_dir must not be empty when set".into(),
+                    ));
+                }
+            }
+        }
+
+        if let Ok(addr) = server.health_listen.parse::<SocketAddr>() {
+            fixed.push(("server.health_listen", addr));
+        }
+        if let Ok(addr) = server.flight_listen.parse::<SocketAddr>() {
+            fixed.push(("server.flight_listen", addr));
+        }
+        if let Some(raw) = &server.peer_bind {
+            if let Ok(addr) = raw.parse::<SocketAddr>() {
+                fixed.push(("server.peer_bind", addr));
+            }
+        }
+
+        for i in 0..fixed.len() {
+            for j in (i + 1)..fixed.len() {
+                let (name_a, addr_a) = fixed[i];
+                let (name_b, addr_b) = fixed[j];
+                if addr_a == addr_b && addr_a.port() != 0 {
+                    return Err(JammiError::Config(format!(
+                        "{name_a} and {name_b} must not bind the same fixed address ({addr_a})"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Tracing/logging configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2412,6 +2599,7 @@ impl Default for JammiConfig {
             jobs: JobsConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
+            ballista: BallistaConfig::default(),
             logging: LoggingConfig::default(),
             observability: ObservabilityConfig::default(),
             catalog: CatalogConfig::default(),
@@ -2717,6 +2905,12 @@ impl JammiConfig {
         // zero timeout) at load time, naming the offending key, rather than
         // at server startup deep inside `OssServer::new`.
         config.server.limits.validate()?;
+        // Reject an out-of-domain `[ballista]` knob (an unparseable bind, a
+        // fixed-port collision with itself or with `[server]`'s three
+        // listeners, a zero `task_slots`, an empty `work_dir`) at load
+        // time, naming the offending key — never at the first
+        // `jammi-server` role-hosting call.
+        config.ballista.validate(&config.server)?;
         // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
         // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)
         // `otlp_endpoint`) at load time, naming the offending key, rather

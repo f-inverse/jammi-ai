@@ -871,6 +871,17 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   base); (c) killing an executor mid-gang fails the job and requeues it through jammi's lease path.
 - **lane**: hermetic + distributed. **depends_on**: U1, U5b-1b-ii, U5b-1b-iii (the full U5b-1
   coordinator/rank-body split), S6. **size**: L.
+- **dated correction 2026-09-16**: SHIPPED on `feat/500-wave4` — contract §9. `roles.rs` hosts
+  the scheduler/executor on jammi's own shutdown, never Ballista's `start_server`/
+  `start_executor_process` (§2.2/§9); the codec's package is `jammi.ballista.v1`, the crate's
+  own, never U5's `jammi.v1.*` descriptor messages (§2.2's dated correction to this unit's own
+  "↔ U5 descriptor messages"); `BallistaConfig` (`jammi-db`, not a `config.rs` in this crate)
+  has no `work_dir` on the top-level `executor` variant this row sketched — it is
+  `BallistaExecutorConfig.work_dir`, one level down; placement excludes a task's own submitter
+  by construction, decided BEFORE topology, and `InferenceExec` carries an explicit
+  `device_kind` (§9 B1/B3); the codec magic is `0x07` (§9 A1); the six-address collision rule
+  is a `&JammiConfig` cross-section validator (§9 A2); `advertise_host` is required whenever
+  `bind` is unspecified (§9 A3).
 
 ## U8b — Catalog-backed cluster state; device-aware placement (PR-D commit 2; the completion gate)
 
@@ -899,6 +910,18 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   state.
 - **lane**: distributed. **depends_on**: U8a, S6 (restart, two-scheduler and executor-identity
   probes recorded). **size**: L.
+- **dated correction 2026-09-16**: SHIPPED on `feat/500-wave4` — contract §9. `compute_jobs`
+  carries no `graph` column — the execution graph itself has no serialisation in Ballista 54.1,
+  so it is deliberately not a column (§3); `compute_executors.devices` carries `{kind,
+  ordinal}` with no `memory` field (the tree has no source for it) and is the placement join's
+  SOLE authority, never `workers.devices` and never a join on `instance_id` (§9 B5, a
+  correction to this row's own `workers.devices` ↔ `executor id` sketch); `DevicePlacement`
+  reads the live `RunningStage.plan` in `active_jobs` directly, so no second decode through
+  `JammiCodec` is needed (§3, a correction to this row's own "decoded through `JammiCodec`");
+  DRAIN stops task admission and waits for an in-flight placed gang, only RELEASE tears an
+  executor down at once (§9 B6); the scheduler's slot CAS runs before the graph's task info is
+  stamped, and `ballista-scheduler`'s `default-features = false` (no REST API) is load-bearing
+  for the restart property (§9 A10).
 
 ## U9a — Docs (PR-D commit 3)
 
@@ -908,6 +931,15 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
   lands with U2a and U3), `CHANGELOG.md`.
 - **acceptance**: docs gates green; reference-topologies states the StatefulSet consequence.
 - **lane**: docs. **depends_on**: all. **size**: M.
+- **dated correction 2026-09-16**: SHIPPED on `feat/500-wave4` — contract §9. Also wrote the
+  shape-d scheduler `Deployment`/`Service`/`ConfigMap` (`deployment-scheduler.yaml`,
+  `service-scheduler.yaml`, `jammi-scheduler.toml`) and wired `[ballista.executor]` into the
+  compute overlay (`jammi-compute.toml`, `statefulset-compute.yaml`'s ports and per-pod
+  `advertise_host`, `service-compute-headless.yaml`'s ports) — U9b's own scope (below) predates
+  the pressure round's §9 B7 disposition (a dedicated scheduler role, the compute pods as
+  worker-enabled executors) and never built either side; re-anchored three stale citations
+  found by `check_citations.py` at this tip ahead of the doc pass (unrelated to this unit's own
+  scope, `MAINTAINER-GUIDE.md:538`/`:3019`, `pinned_source_gate.rs:1374`).
 
 ## U9b — shape-d overlay (PR-D commit 4)
 
@@ -919,3 +951,7 @@ reference to "U5b-1's peer-based run" below means the assembled behaviour of all
 - **acceptance**: kubeconform strict + kind smoke on the amended overlay; K3/K4b guards green;
   the `issues/500` note count as K's oracle expects after replacement.
 - **lane**: kubeconform + kind smoke. **depends_on**: 68 K merged, 68 OPS merged. **size**: M.
+- **dated correction 2026-09-16**: SHIPPED on `feat/500-wave4` — contract §4. The StatefulSet /
+  headless Service / `nvidia.com/gpu: 2` shape and the `issues/500` note replacement landed as
+  scoped; the scheduler `Deployment` and the compute overlay's Ballista executor wiring that
+  contract §9 B7 later decided are U9a's own dated correction (above), built after this unit.

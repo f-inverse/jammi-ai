@@ -1001,7 +1001,7 @@ RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
 # root's transitive callers PLUS the roots themselves; a root name that
 # stops existing in runpod_lib.sh is caught the same way an empty closure
 # always was (see `derive_deploy_closure` below).
-RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create")
+RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create", "rp_two_host_pod_create")
 # Retained as an alias: several comments/messages below still read most
 # naturally naming the ORIGINAL (and still first) root; nothing outside
 # this module depends on the name.

@@ -24,14 +24,15 @@
 //! leg (`ncclCommInitAll` over two devices in one process — the RunPod POD
 //! lane, `ci/scripts/runpod_gpu_gang.sh`). [`gang_nccl_two_hosts_reduce_a_known_vector`]
 //! is the TWO-HOST leg (`ncclCommInitRank` on each of two separate processes,
-//! one per host). It has no automated driver or workflow on this tree today
-//! — that two-host cluster driver is filed as unit U7b-A2b. Until it ships,
-//! a maintainer drives this leg BY HAND with `ci/scripts/runpod_lib.sh`'s own
-//! cluster primitives (`rp_cluster_create`/`rp_cluster_get`/`rp_cluster_pods`/
-//! `rp_cluster_delete`): rent a 2×1 cluster, `scp` the 128-byte NCCL id
-//! between the two members, and export each rank's `JAMMI_GANG_TWO_HOSTS_*`
-//! env below before running this test on each host — see
-//! `docs/maintainer/dev-gpu.md`'s cluster-leg section for the exact steps.
+//! one per host — the RunPod CLUSTER lane, `ci/scripts/runpod_gpu_cluster.sh`,
+//! U7b-A2b). Until a run of that lane has actually happened, or as a
+//! fallback if it is ever unavailable, a maintainer may still drive this leg
+//! BY HAND with `ci/scripts/runpod_lib.sh`'s own cluster primitives
+//! (`rp_cluster_create`/`rp_cluster_get`/`rp_cluster_pods`/`rp_cluster_delete`):
+//! rent a 2×1 cluster, `scp` the 128-byte NCCL id between the two members,
+//! and export each rank's `JAMMI_GANG_TWO_HOSTS_*` env below before running
+//! this test on each host — see `docs/maintainer/dev-gpu.md`'s cluster-leg
+//! section for the exact steps, now the fallback the driver automates.
 //! Both call the SAME [`assert_gang_checks`] helper so the two legs prove the
 //! identical property (rank-ordered sum, unequal-count gather, lockstep
 //! flags, barrier, not-aborted) rather than two hand-maintained copies that
@@ -41,7 +42,8 @@
 //!
 //! The two-host leg is a no-op with none of this env set: without it it
 //! skips loudly (never `#[ignore]`, never a vacuous pass). Whoever runs it —
-//! U7b-A2b's driver once it ships, or a maintainer by hand until then — sets:
+//! U7b-A2b's driver (`ci/scripts/runpod_gpu_cluster.sh`), or a maintainer by
+//! hand as the fallback — sets:
 //!
 //! - `JAMMI_GANG_TWO_HOSTS_RANK` — this process's rank, `0` or `1`.
 //! - `JAMMI_GANG_TWO_HOSTS_WORLD` — must be `2`; any other value is a named
@@ -218,8 +220,8 @@ fn two_hosts_env_or_require(test: &str) -> Option<TwoHostsEnv> {
             }
             tracing::warn!(
                 "SKIP: no two-host gang env (JAMMI_GANG_TWO_HOSTS_RANK / _WORLD / _ID_FILE / \
-                 JAMMI_GANG_ARTIFACT_DIR set); this leg has no automated driver on this tree \
-                 today (U7b-A2b) and is otherwise run by hand"
+                 JAMMI_GANG_ARTIFACT_DIR set); this leg runs from \
+                 ci/scripts/runpod_gpu_cluster.sh, or by hand as the fallback"
             );
             return None;
         }
@@ -650,8 +652,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// See the module doc's "The two-host leg's env contract" for the four env
 /// vars this test reads and what an incomplete/malformed one means. Without
 /// them this test skips loudly (never `#[ignore]`) — it is a no-op unless
-/// something sets that env: U7b-A2b's driver once it ships, or a maintainer
-/// running it by hand today (see the module doc's own procedure).
+/// something sets that env: U7b-A2b's driver (`ci/scripts/runpod_gpu_cluster.sh`),
+/// or a maintainer running it by hand as the fallback (module doc procedure).
 #[test]
 fn gang_nccl_two_hosts_reduce_a_known_vector() {
     const TEST: &str = "gang_nccl_two_hosts_reduce_a_known_vector";

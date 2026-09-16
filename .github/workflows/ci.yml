@@ -1747,6 +1747,27 @@ jobs:
           # account, no GPU, no network. See that script's own header.
           - name: gpu gang lane suite
             cmd: bash ci/scripts/test_gpu_gang_lane.sh
+          # The cluster-lane fixture suite (plan #500 U7b): drives the REAL
+          # `rp_cluster_rank_verdict`/`rp_cluster_verdict`, the
+          # CLUSTER_GROUPS closure, the F13 shared zero-test tripwire (the
+          # SAME text runpod_gpu_gang.sh shares), the F2/F3 launch-time
+          # read-back refusal (`_rpc_check_readback`), the F11 128-byte
+          # id-file-ready gate, the A5 `ens1` log assertion, the
+          # failed-pull-joins-rc arm, the F5 id-secrecy scan invocation
+          # against planted-id/archive/clean fixtures, and the lane's cost
+          # bound re-derived from runpod_lib.sh's own S4-measured
+          # $1.908/GPU/h rate and this lane's RP_TTL_HOURS. Mocks-only: no
+          # RunPod account, no GPU, no network. See that script's own header.
+          - name: gpu cluster lane suite
+            cmd: bash ci/scripts/test_gpu_cluster_lane.sh
+          # The NCCL id-secrecy scanner's own self-test (F5): every arm
+          # named in its module doc (raw/hex-lower/hex-upper/base64 hits,
+          # an archive carrier refused unopened, a dangling symlink, a
+          # followed symlink in both directions, missing carriers, a
+          # malformed staging id, and the --delete-staging arm) driven
+          # against a real tempdir fixture tree — no mock filesystem.
+          - name: gang id secrecy scan self-test
+            cmd: python3 ci/scripts/gang_id_secrecy_scan.py --self-test
           # esc-084/#454 (prove once per commit, share the verdict): P1-P4
           # static rules (exactly-one producer + the never-in-the-critical-
           # path doctrine, no renting reusable, every manifest CUDA lane's
@@ -2440,15 +2461,16 @@ jobs:
       # `check_execution_surface_reachability.py`'s shared workflow loader
       # (`on:`/`jobs:` YAML parsing, duplicate-key-refusing) is a declared
       # PyYAML prerequisite -- this bare runner carries no container image
-      # (`.docker/ci.Dockerfile` pins it there instead), so the FIVE legs
+      # (`.docker/ci.Dockerfile` pins it there instead), so the SIX legs
       # that actually call into that loader (directly, or via
       # `check_gpu_prove_once.py`, which imports it, or via
-      # `test_gpu_gang_lane.sh`'s `--read-on-block` CLI shell-out) install
-      # it here -- the same `if:`-gated, leg-scoped exception the two
-      # installs above already establish, so every OTHER leg stays a bare,
-      # instant, no-install runner.
-      - name: Install PyYAML (execution-surface-reachability / gpu-prove-once / gpu-gang-lane legs only)
-        if: contains(fromJSON('["execution-surface reachability", "execution-surface reachability self-test", "gpu prove once", "gpu prove once suite", "gpu gang lane suite"]'), matrix.name)
+      # `test_gpu_gang_lane.sh`'s/`test_gpu_cluster_lane.sh`'s own
+      # `--read-on-block` CLI shell-out) install it here -- the same
+      # `if:`-gated, leg-scoped exception the two installs above already
+      # establish, so every OTHER leg stays a bare, instant, no-install
+      # runner.
+      - name: Install PyYAML (execution-surface-reachability / gpu-prove-once / gpu-gang-lane / gpu-cluster-lane legs only)
+        if: contains(fromJSON('["execution-surface reachability", "execution-surface reachability self-test", "gpu prove once", "gpu prove once suite", "gpu gang lane suite", "gpu cluster lane suite"]'), matrix.name)
         run: python3 -m pip install --user 'PyYAML==6.*'
       - name: Run guard
         # `continue_on_error` is unset ('') for every leg except "doc

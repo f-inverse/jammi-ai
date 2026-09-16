@@ -803,14 +803,21 @@ flags, barrier), over a real cross-host communicator instead of
 `ncclCommInitAll`'s single-process one, and each writes its own
 `rank-<r>.json` report into `$JAMMI_GANG_ARTIFACT_DIR`.
 
-**No automated driver ships this leg today.** The cluster leg's own driver
-(rent a 2×1 cluster, ship the id between hosts, pull both ranks' reports,
-assemble the one committed artifact, scan every carrier for the id before
-anything is uploaded, tear down on every exit arm) and its workflow are a
-separate, filed unit — **U7b-A2b** — with no invocation on this tree; the
-artifact registry (below) refuses any artifact claiming this leg until that
-unit ships a registered producer. Until then, a maintainer drives the
-two-host test BY HAND with the primitives above:
+**The driver: `ci/scripts/runpod_gpu_cluster.sh`.** It rents a 2×1 cluster,
+waits for both members reachable (tracked by DISTINCT rank, never a raw
+count — two rows both reading back as rank 0 must never satisfy readiness),
+ships the id between hosts, pulls both ranks' reports, assembles the one
+committed `gang` artifact (shape MEASURED from the create/get response,
+never a literal), scans every carrier for the id BEFORE anything is
+uploaded, and tears the cluster down on every exit arm — including a
+SIGINT/SIGTERM/SIGHUP cancellation, not only a normal `exit` — via its own
+cleanup trap, which runs the scan FIRST, ahead of its own (bounded) REST
+calls, and destroys a dirty carrier synchronously rather than deferring to
+a session-conditional cleanup. Its own workflow, `.github/workflows/
+gpu-cluster.yml`, is `run-cluster` PR-label or `workflow_dispatch` only —
+never a `schedule:`, and nothing else `uses:` it. As a FALLBACK — before
+the driver's first real run, or if it is ever unavailable — a maintainer
+may still drive the two-host test BY HAND with the primitives above:
 
 1. Read per-data-center availability (`GET /v2/catalog/gpus?include=
    AVAILABILITY&product=CLUSTER&count=1&cloud=SECURE`) and pick a data
@@ -842,15 +849,37 @@ two-host test BY HAND with the primitives above:
 **Member self-removal is honestly unmeasured.** RunPod's REST v2 surface
 reports member pods with `actions: []`, so even a successful in-pod
 `runpodctl remove pod` self-termination's effect on cluster accounting is
-unconfirmed for a cluster member. The enforcers, in order: (1) whoever ran
-the cluster deleting it by hand (`rp_cluster_delete`) when done, (2) the
-cluster's own name TTL plus `gpu-reap.yml`'s 6-hourly `rp_cluster_sweep`,
-(3) a human, via the RunPod console. Worst case for one orphaned cluster
-caught only by the periodic sweep: at S4's MEASURED `$1.908/GPU/h` cluster
-rate (the catalog's own `$1.59` is the POD price, a different rate), the
-2×1 shape bills `2 x $1.908/GPU/h = $3.816/h`, so `(TTL + 6) h x $3.816/h`.
-The standing spend authorization (2026-09-13) for the one real run this
-leg's own driver unit (U7b-A2b) needs is: <= 1 h billed, <= 2 runs.
+unconfirmed for a cluster member — the driver's own `_rpc_self_remove_status`
+treats a 404 on the cluster's own GET as "ok" and otherwise falls back to
+its own `rp_cluster_delete` call, from its cleanup trap, on every exit arm.
+The enforcers, in order: (1) the driver's own trap, (2) the cluster's own
+name TTL plus `gpu-reap.yml`'s 6-hourly `rp_cluster_sweep`, (3) a human, via
+the RunPod console. Cost bound, at S4's MEASURED `$1.908/GPU/h` cluster rate
+(the catalog's own `$1.59` is the POD price, a different rate) and the
+driver's own `RP_TTL_HOURS=1`: the 2×1 shape bills `2 x $1.908/GPU/h =
+$3.816/h`, so (i) terminate-succeeds (the ordinary path): `1 h x $3.816/h =
+$3.82` per run; (ii) sweep-only (the worst path — the trap's own delete call
+fails): `(1 + 6) h x $3.816/h = $26.71`. The standing spend authorization
+(2026-09-13) for the driver's own one real run is: <= 1 h billed, <= 2 runs,
+label-only (`run-cluster`) until a flake-free streak.
+
+**Pre-flight, executed (2026-09-16).** Before U7b-A2b's driver shipped, the
+one open question was whether REST v2's `args` field reaches `bash -c` on
+`RP_IMAGE` the way the pod path's GraphQL `dockerArgs` field measurably
+does (S4 measured only the GraphQL path). A real, single-pod REST v2 create
+settled it: pod `rln5hfmn4viu06` (RTX A4000, SECURE, `EUR-IS-1`, created
+2026-09-16T02:55:54Z, deleted 03:07Z) with `args: "bash -c '...'"` on
+`ghcr.io/f-inverse/jammi-ai-ci-cuda:latest` — the container log printed the
+exact marker that `args` command echoed (`PREFLIGHT-ARGS-OK`), followed by
+`nvidia-smi -L` (`GPU 0: NVIDIA RTX A4000`) and `/sys/class/net` (`bonding_masters
+eth0 lo`); the read-back `Pod.args` on a subsequent GET returned the exact
+text sent. REST v2's `args` reaches `bash -c` exactly as the pod path's
+GraphQL `dockerArgs` does, and the launch-time read-back refusal
+(`_rpc_check_readback`) reads a real field. Still unmeasured, honestly,
+because this was a single ordinary POD, never a cluster: `ens1` as a
+cluster member's own overlay iface (this probe's own pod showed only
+`eth0`/`lo` — no cluster overlay network), member sshd reachability on a
+real cluster, and member self-removal (above).
 
 **The artifact registry.** `ci/scripts/check_cuda_run_artifacts.py`'s `gang`
 kind (rule (k)) discriminates by `gang.leg`: the pod leg's registry is
@@ -862,10 +891,12 @@ pair, the measured delta, epsilon). The cluster leg's own registry —
 reproducibility pair, a different regime this leg does not measure), and
 the shape/deadline it was rented at (`pod_count`, `gpu_count_per_pod`,
 `ttl_hours`), with no `digests`/`per_step_loss_delta`/`epsilon` row at all —
-stays on this tree, but EVERY artifact claiming `gang.leg == "cluster"` is
-REFUSED regardless of shape: no producer is registered for that leg until
-U7b-A2b ships a driver (`GANG_LEG_PRODUCER_PATH` carries no `cluster` entry;
-the refusal fires before `producer.path` is ever compared).
+stays on this tree. `GANG_LEG_PRODUCER_PATH` now binds `gang.leg ==
+"cluster"` to `producer.path == "ci/scripts/runpod_gpu_cluster.sh"` — THIS
+driver is the sole writer of that leg's artifact, exactly as the pod leg's
+own driver is bound to its own registry, and a leg naming any other path
+(or no registered leg at all) is still refused before any shape is even
+read.
 
 **Schedule visibility (P8).** `ci/scripts/check_gpu_prove_once.py`'s P7 rule
 derives its renting-closure subject set from a REVIEWED ROOT LIST —

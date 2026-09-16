@@ -1022,10 +1022,11 @@ GANG_LEGS = (GANG_LEG_POD, GANG_LEG_CLUSTER)
 # bound together here, never left as two independently-editable fields. A
 # leg with NO entry here has no registered producer at all -- see
 # `_gang_check_leg_producer_binding`'s own refusal for that shape (fail
-# closed, never a silent pass): the cluster leg's own driver is filed as a
-# future unit (U7b-A2b) and is not on this tree, so it carries no row.
+# closed, never a silent pass, P-E2): U7b-A2b's cluster driver ships in
+# this same revision, so the cluster leg is registered again below.
 GANG_LEG_PRODUCER_PATH = {
     GANG_LEG_POD: "ci/scripts/runpod_gpu_gang.sh",
+    GANG_LEG_CLUSTER: "ci/scripts/runpod_gpu_cluster.sh",
 }
 
 # The cluster leg proves EXACTLY two hosts -- the plan's own shape; a
@@ -1507,11 +1508,12 @@ def _gang_check_leg_producer_binding(gang: dict, data: dict, _repo_root: Path) -
     bound to `producer.path` so a self-declared leg cannot dodge the other
     leg's (stricter- or differently-shaped) registry by pointing at a
     different driver, or at no driver at all. A leg with NO
-    `GANG_LEG_PRODUCER_PATH` entry (P-E2: the cluster leg today, its driver
-    filed but not shipped) has no registered producer to bind against at
-    ALL -- that is a REFUSAL, never a silent pass just because there is
-    nothing to compare `producer.path` to; an artifact cannot claim a leg
-    this tree has no producer for."""
+    `GANG_LEG_PRODUCER_PATH` entry (P-E2: every registered leg has a
+    shipped driver today, but a THIRD leg added later without a row would
+    land here) has no registered producer to bind against at ALL -- that is
+    a REFUSAL, never a silent pass just because there is nothing to compare
+    `producer.path` to; an artifact cannot claim a leg this tree has no
+    producer for."""
     leg = gang.get("leg")
     if leg not in GANG_LEG_PRODUCER_PATH:
         return [
@@ -2760,17 +2762,13 @@ def self_test() -> int:
         # be tracked (rule (b)) so its own findings never contaminate the
         # marker-specific `expect_hit` needle below.
         (perf_dir / "profile_421_legs.sh").write_text("# stub source-identity-declaring producer\n")
-        # F4: a tracked stand-in for the pod leg's renting driver, so
+        # F4: tracked stand-ins for the two gang-leg renting drivers, so
         # `_gang_check_leg_producer_binding`'s own path=="the leg's own
         # driver" assertion has a real, `git ls-files`-tracked file to bind
-        # against (rule (b) — producer.path exists and is tracked). The
-        # cluster leg has no such stand-in: P-E2 refuses that leg before
-        # `producer.path` is ever compared (no producer is registered for
-        # it at all), so a second tracked file would exercise nothing this
-        # kind's own fixtures below do not already cover with the pod leg's
-        # real path — see `gang_cluster_baseline`'s own comment.
+        # against (rule (b) — producer.path exists and is tracked).
         (repo / "ci" / "scripts").mkdir(parents=True, exist_ok=True)
         (repo / "ci" / "scripts" / "runpod_gpu_gang.sh").write_text("# stub pod-leg gang driver\n")
+        (repo / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text("# stub cluster-leg gang driver\n")
 
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "root"], repo)
@@ -2836,20 +2834,6 @@ def self_test() -> int:
             got = validate_artifact(data, relpath, repo, tracked, allowlist)
             if not any(needle in g for g in got):
                 failures.append(f"self-test FAILED: {label} expected a finding containing {needle!r}, got {got}")
-
-        def expect_hit_only(data: dict, relpath: str, needle: str, absent_needle: str, label: str) -> None:
-            """Like `expect_hit`, but also asserts `absent_needle` is NOT
-            among the findings -- for fixtures (P-E2's cluster-leg baseline)
-            that always carry one expected finding, so a field-specific
-            mutation's own expected finding can be told apart from that
-            standing one."""
-            got = validate_artifact(data, relpath, repo, tracked, allowlist)
-            if not any(needle in g for g in got):
-                failures.append(f"self-test FAILED: {label} expected a finding containing {needle!r}, got {got}")
-            if any(absent_needle in g for g in got):
-                failures.append(
-                    f"self-test FAILED: {label} expected NO finding containing {absent_needle!r}, got {got}"
-                )
 
         # GREEN controls -----------------------------------------------------
         expect_clean(baseline(), "control-ignore.json", "cargo-test + #[ignore] baseline")
@@ -3225,16 +3209,12 @@ def self_test() -> int:
             d = baseline()
             d["git_sha"] = second_sha
             d["artifact_kind"] = "gang"
-            # P-E2: the cluster leg has NO registered producer on this tree
-            # (its driver is filed, not shipped -- U7b-A2b) -- EVERY
-            # cluster-leg artifact is refused regardless of `producer.path`,
-            # this one included. `path` here is a placeholder text (not a
-            # tracked file), distinct from the pod leg's own real driver
-            # path so the F4 mismatch fixtures below stay meaningful.
+            # F4: producer bound to the cluster leg's OWN renting driver
+            # (P-E2: registered again now that U7b-A2b's driver ships).
             d["producer"] = {
-                "path": "ci/scripts/runpod_gpu_second_root.sh",
+                "path": "ci/scripts/runpod_gpu_cluster.sh",
                 "kind": "script",
-                "invocation": "bash ci/scripts/runpod_gpu_second_root.sh",
+                "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
                 "gating": "env:JAMMI_REQUIRE_CUDA_TWO_HOSTS",
             }
             d["gang"] = {
@@ -3267,15 +3247,10 @@ def self_test() -> int:
             return d
 
         expect_clean(gang_baseline(), "2026-01-01-gang-2xa100.json", "rule (k): complete pod-leg gang artifact")
-        # P-E2: the cluster leg's shape/rank checks and field registry stay
-        # (below), but NO producer is registered for it on this tree (its
-        # driver is filed, not shipped) -- even an otherwise-complete
-        # cluster-leg artifact is refused, never a silent clean.
-        expect_hit(
+        expect_clean(
             gang_cluster_baseline(),
             "2026-01-01-gang-cluster-2x1.json",
-            "no registered producer on this tree",
-            "rule (k) P-E2: an otherwise-complete cluster-leg artifact is REFUSED (no producer registered)",
+            "rule (k): complete cluster-leg gang artifact",
         )
 
         # A non-gang artifact is untouched by this rule (every artifact
@@ -3358,16 +3333,7 @@ def self_test() -> int:
         ok["gang"]["reason"] = "rank 1 disagreed with rank 0's reduced vector"
         ok["gang"]["reduced_vector_digest"] = None
         ok["status"] = "RED"
-        # P-E2 still refuses this fixture (no registered cluster-leg
-        # producer), but the digest-required-on-pass rule must NOT ALSO
-        # fire on a `fail` verdict recording no digest.
-        expect_hit_only(
-            ok,
-            "control-cluster-fail-no-digest.json",
-            "no registered producer on this tree",
-            "must be a 64-lowercase-hex digest",
-            "rule (k): a cluster fail may record no digest at all",
-        )
+        expect_clean(ok, "control-cluster-fail-no-digest.json", "rule (k): a cluster fail may record no digest at all")
 
         bad = gang_cluster_baseline()
         bad["gang"]["pod_count"] = 0
@@ -3389,14 +3355,9 @@ def self_test() -> int:
         odd = gang_cluster_baseline()
         odd["gang"]["per_step_loss_delta"] = [999.0]
         odd["gang"]["epsilon"] = {"value": 1e-9}
-        # P-E2 still refuses this fixture (no registered cluster-leg
-        # producer), but the pod-only ε/delta cross-field check must NOT
-        # ALSO fire on stray pod-only fields present on a cluster artifact.
-        expect_hit_only(
+        expect_clean(
             odd,
             "control-cluster-extra-pod-fields-ignored.json",
-            "no registered producer on this tree",
-            "exceeds `gang.epsilon.value`",
             "rule (k): cluster leg ignores stray pod-only fields rather than cross-checking them",
         )
 
@@ -3483,28 +3444,23 @@ def self_test() -> int:
             "rule (k) F4: gang.world != pod_count x gpu_count_per_pod FAILS",
         )
 
-        # (v) P-E2: the cluster leg is refused for having NO registered
-        # producer at all -- even naming the pod leg's own REAL driver as
-        # `producer.path` does not save it, because the refusal fires on
-        # `leg` alone, before any path comparison.
+        # (v) leg/producer mismatch FAILS -- a self-declared leg cannot
+        # dodge the other leg's registry by pointing at a different driver.
         bad = gang_cluster_baseline()
-        bad["producer"] = dict(gang_baseline()["producer"])  # the POD leg's own real driver
+        bad["producer"] = dict(gang_baseline()["producer"])  # the POD leg's own driver
         expect_hit(
             bad,
             "x.json",
-            "no registered producer on this tree",
-            "rule (k) P-E2: gang.leg == cluster is refused even naming the pod leg's real driver",
+            "requires `producer.path` == 'ci/scripts/runpod_gpu_cluster.sh'",
+            "rule (k) F4: gang.leg == cluster with the pod leg's producer.path FAILS",
         )
-        # F4 (pod leg only, which IS registered): a self-declared `leg ==
-        # pod` cannot dodge its own registry by pointing at a different
-        # (unregistered) driver path either.
         bad = gang_baseline()
-        bad["producer"] = dict(gang_cluster_baseline()["producer"])  # a non-pod-leg placeholder path
+        bad["producer"] = dict(gang_cluster_baseline()["producer"])  # the CLUSTER leg's own driver
         expect_hit(
             bad,
             "x.json",
             "requires `producer.path` == 'ci/scripts/runpod_gpu_gang.sh'",
-            "rule (k) F4: gang.leg == pod with a different producer.path FAILS",
+            "rule (k) F4: gang.leg == pod with the cluster leg's producer.path FAILS",
         )
 
         bad = gang_baseline()

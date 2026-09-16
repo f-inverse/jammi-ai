@@ -137,10 +137,9 @@ PERF_AB_YML_GOOD = _paid_lane_yml(
 HOWWELL_YML_GOOD = _paid_lane_yml(
     "GPU how-well (RunPod)", "gpu-howwell", "runpod_gpu_howwell.sh", "run-howwell"
 )
-# The cluster leg's own workflow fixture (`CLUSTER_YML_GOOD`) was removed
-# with the U7b round-3 excision (see PAID_POD_LANE_TABLE's own comment in
-# check_gpu_prove_once.py) and returns when U7b-A2b lands a driver and a
-# row to fixture against.
+CLUSTER_YML_GOOD = _paid_lane_yml(
+    "GPU cluster (RunPod)", "gpu-cluster", "runpod_gpu_cluster.sh", "run-cluster"
+)
 
 
 def _gate_job(gate_name: str = "gpu-proof", tag_family: str = "v") -> str:
@@ -364,6 +363,7 @@ def positive_workflows() -> dict[str, str]:
         "gpu-gang.yml": GANG_YML_GOOD,
         "gpu-perf-ab.yml": PERF_AB_YML_GOOD,
         "gpu-howwell.yml": HOWWELL_YML_GOOD,
+        "gpu-cluster.yml": CLUSTER_YML_GOOD,
         # gpu-dev.sh's own row (whole-file scope gave it one: gpu-reap.yml
         # is its only invoker and carries RUNPOD_API_KEY at step scope).
         "gpu-reap.yml": REAP_YML,
@@ -593,10 +593,8 @@ class RpSshoRequiresRpInitTest(unittest.TestCase):
     options); a driver that reads it without ever calling `rp_init` runs
     every ssh/scp/rsync call with an EMPTY option array — a silent,
     wrong-key failure that reads exactly like 'not yet reachable', the
-    exact class the U7b cluster-leg driver itself shipped with before this
-    fix round (F1) -- that driver is since excised (U7b round 3); this
-    guard stays because it ranges over the CURRENT `PAID_POD_LANE_TABLE`
-    regardless of which drivers it lists."""
+    exact class `runpod_gpu_cluster.sh` itself shipped with before this
+    fix round (F1)."""
 
     RP_INIT_CALL_RE = re.compile(r"(?m)^[ \t]*rp_init[ \t]*(?:#.*)?$")
 
@@ -832,14 +830,10 @@ def fixture_scripts() -> dict[str, str]:
         "ci/scripts/runpod_gpu_howwell.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/gpu-dev.sh": _driver("rp_deploy_arch \"$ARCH\""),
         "ci/scripts/test_pod_substrate.sh": _driver("rp_deploy_live \"SECURE|X\""),
-        # A synthetic driver calling the SECOND root, `rp_cluster_create`,
-        # directly (there is no wrapper the way `_rp_deploy_payload` has
-        # `rp_deploy_arch`/`rp_deploy_live`) -- no PAID_POD_LANE_TABLE row on
-        # this tree names a real cluster-leg driver (U7b-A2b, filed, not yet
-        # shipped), so this fixture stands in for "a driver that calls the
-        # second root with no table row" (below, in
-        # `test_a_driver_calling_the_cluster_root_directly_demands_a_row`).
-        "ci/scripts/runpod_gpu_second_root.sh": _driver('rp_cluster_create "NVIDIA A100-SXM4-80GB"'),
+        # The cluster leg's own row -- calls the SECOND root, `rp_cluster_
+        # create`, directly (there is no wrapper the way `_rp_deploy_payload`
+        # has `rp_deploy_arch`/`rp_deploy_live`).
+        "ci/scripts/runpod_gpu_cluster.sh": _driver('rp_cluster_create "NVIDIA A100-SXM4-80GB"'),
         # A tracked script that calls NOTHING in the closure: the derivation
         # must not sweep the whole directory in.
         "ci/scripts/check_something.py": "print('no deploy here')\n",
@@ -963,11 +957,11 @@ class DerivedRentingDriverTest(unittest.TestCase):
             sorted(derived),
             [
                 "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_gpu_cluster.sh",
                 "ci/scripts/runpod_gpu_gang.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
                 "ci/scripts/runpod_gpu_perf_ab.sh",
                 "ci/scripts/runpod_gpu_prove.sh",
-                "ci/scripts/runpod_gpu_second_root.sh",
                 "ci/scripts/test_pod_substrate.sh",
             ],
         )
@@ -1322,6 +1316,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # THIS file (see below) sorts before gpu-dev.sh.
                 "ci/scripts/check_gpu_prove_once.py",
                 "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_gpu_cluster.sh",
                 "ci/scripts/runpod_gpu_gang.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
                 "ci/scripts/runpod_gpu_perf_ab.sh",
@@ -1338,6 +1333,14 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # make `ci/scripts/check_gpu_prove_once.py` (above) derive
                 # the same way, for the same reason.
                 "ci/scripts/test_check_gpu_prove_once.py",
+                # test_gpu_cluster_lane.sh's own F2/F3(c) EXIT-trap fixtures
+                # (fix round 1) source runpod_gpu_cluster.sh in a real
+                # subshell and override `rp_cluster_delete`/`rp_cleanup` by
+                # name, in non-comment text -- the deliberately
+                # over-approximating scan derives it too. Cleared the
+                # identical way: ci.yml's guard job invokes it with no
+                # RUNPOD_API_KEY anywhere.
+                "ci/scripts/test_gpu_cluster_lane.sh",
                 "ci/scripts/test_pod_substrate.sh",
                 # test_runpod_cluster_lib.sh calls `_rp_deploy_payload`
                 # directly (Group 2 -- comparing the pod and cluster

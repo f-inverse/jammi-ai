@@ -2552,7 +2552,11 @@ impl Catalog {
             )
             .await?;
         Ok(last_seen_at.is_some_and(|last_seen_at| {
-            super::lease::last_seen_at_is_fresh(&last_seen_at, margin, super::lease::app_clock_now())
+            super::lease::last_seen_at_is_fresh(
+                &last_seen_at,
+                margin,
+                super::lease::app_clock_now(),
+            )
         }))
     }
 

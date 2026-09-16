@@ -801,9 +801,16 @@ workspace ships every publishable crate at the same
   places CPU-stamped work on CPU executors) — an executor binds a task
   only when its OWN registered devices list that kind:
   `submit_physical_plan` refuses a typed submission before it is ever sent
-  when no registered executor lists the plan's kind, and the execution
-  engine's own device-pinning refusal (K7) is the second line, never
-  parked unschedulable.
+  when no LIVE registered executor lists the plan's kind — live is the one
+  predicate the scheduler's binder applies too (`Active` status and a
+  heartbeat within the liveness window, 180 s; a row a killed executor
+  left behind stops counting after the window, a `Terminating` one at
+  once) — and the execution engine's own device-pinning refusal (K7) is
+  the second line, never parked unschedulable. DRAIN reports `Terminating`
+  the instant it begins (before the in-flight worker job is joined), so
+  the binder stops binding to a draining executor at once, and a gang the
+  executor is still dialled with inside its grace is refused before any
+  claim transfer.
 
 ### Changed
 - **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**

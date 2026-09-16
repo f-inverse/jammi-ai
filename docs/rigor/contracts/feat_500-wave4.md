@@ -317,7 +317,11 @@ above are read WITH these corrections.
 - **B6 — DRAIN must not tear down the executor under a running placed gang.** Disposition:
   DRAIN stops task admission (the executor reports `Terminating`; the scheduler stops binding
   to it) and WAITS for its in-flight tasks; only RELEASE fires the `ShutdownNotifier`. The
-  scheduler role stops last, after the process's own drain completes.
+  scheduler role stops last, after the process's own drain completes. (Closing round 2, §9b
+  F2: "stops admission" holds AT THE DRAIN INSTANT for every entry — `ExecutorRole::begin_drain`
+  runs before the worker join in both shutdown arms, the binder and the submit edge share one
+  liveness predicate that excludes a `Terminating` row, and `HostAdmission::probe_claim` refuses
+  outside `Running`, so the placed-gang runner refuses a gang before any claim transfer.)
 - **B7 — per-pod DNS and one scheduler.** Disposition: `publishNotReadyAddresses: true` on the
   headless Service (shipped in U9b). The scheduler is ONE dedicated single-replica
   `Deployment` (`jammi-server-scheduler`: `[ballista] scheduler_bind`, `[worker] enabled =

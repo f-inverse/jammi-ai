@@ -197,8 +197,9 @@ device:
   training job like any fleet member; if a `jammi-server-compute` executor
   is registered, it PLACES the claim there as one Ballista task instead of
   running it itself — otherwise it runs the job in-process (byte-identical
-  either way, per device kind). A third arm: when an executor is
-  registered but none of its own devices lists the plan's device kind, the
+  either way, per device kind). A third arm: when a live executor is
+  registered but none of its own devices lists the plan's device kind (a
+  row a dead executor left behind is not live and never counts), the
   submission is refused typed before it ever reaches the scheduler — the
   row is left `running` for reclaim (an attempt spent), never run
   in-process on the claiming pod.
@@ -209,7 +210,10 @@ device:
   same coordinator body under its own `[worker] local_ranks` topology.
 
 DRAIN on a `jammi-server-compute` pod stops Ballista task admission at once
-(the scheduler stops binding new tasks to it) but WAITS for any in-flight
+— the executor reports `Terminating` to the scheduler the instant DRAIN
+begins, before the pod's in-flight worker job is joined, a terminating
+executor is never bound, and a gang the pod is still dialled with inside its
+grace is refused before any claim transfer — but WAITS for any in-flight
 placed task to finish before the pod itself stops — the same "finish what's
 running, refuse what's new" shape DRAIN already gives an in-process claim.
 RELEASE tears the executor down immediately regardless of an in-flight

@@ -249,8 +249,9 @@ a process with neither role runs exactly as it always has:
   — as one Ballista task — on a registered compute-pod executor; when no
   executor is registered yet it claims and runs the job in-process instead
   (byte-identical either way, per device kind), since it is also a plain
-  worker-enabled fleet member. A third arm: when a registered executor
-  exists but none of its own devices lists the plan's device kind, the
+  worker-enabled fleet member. A third arm: when a live registered executor
+  exists but none of its own devices lists the plan's device kind (a row a
+  dead executor left behind is not live and never counts), the
   submission is refused typed BEFORE it ever reaches the scheduler — the
   row is left `running` for reclaim (an attempt spent), never run
   in-process on the claiming pod.
@@ -302,8 +303,11 @@ degraded (see the RELEASE breakdown in `deploy/kubernetes/README.md` and
 `deploy-server.md` below — never assume the CONFIRMED cost here for a
 degraded exit). The grace must cover one epoch's wall time; on spot
 capacity use RELEASE. DRAIN on an executor pod additionally stops Ballista
-task admission at once (the scheduler stops binding new tasks to it) but
-waits for any in-flight placed gang before the process itself stops — only
+task admission at once — the executor reports `Terminating` to the scheduler
+the instant DRAIN begins, before the in-flight worker job is joined, and a
+terminating executor is never bound; a gang the pod is still dialled with
+inside its grace is refused before any claim transfer — but waits for any
+in-flight placed gang before the process itself stops — only
 RELEASE tears the executor down immediately. The operative rule, the
 rollout arithmetic and both `preStop` recipes are in
 `deploy/kubernetes/README.md` ("Shutdown: DRAIN and RELEASE"); the modes

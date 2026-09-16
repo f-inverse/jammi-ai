@@ -17,7 +17,7 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use jammi_ai::session::InferenceSession;
 
 use crate::codec::JammiCodec;
-use crate::engine::stage_device_kind;
+use crate::engine::required_device_kind;
 use crate::error::{Error, Result};
 
 /// Submit `plan` to the scheduler at `scheduler_url` (`http://host:port`)
@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 /// options the submitter's plan was built under.
 ///
 /// The KIND MATCH refusal (contract §3, LANE pressure-round correction):
-/// when `plan` requires a device kind ([`stage_device_kind`] — the SAME
+/// when `plan` requires a device kind ([`required_device_kind`] — the SAME
 /// predicate `placement::DevicePlacement` uses — a `GangExec`'s stamped
 /// kind or an `InferenceExec`'s, CPU included) and NO registered compute
 /// executor lists THAT EXACT kind, this call refuses typed, naming the
@@ -41,7 +41,7 @@ pub async fn submit_physical_plan(
     scheduler_url: &str,
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<SendableRecordBatchStream> {
-    if let Some(required_kind) = stage_device_kind(&plan) {
+    if let Some(required_kind) = required_device_kind(&plan) {
         let devices = session
             .catalog()
             .list_compute_executor_devices()

@@ -1,7 +1,7 @@
 //! The three(+)-process Ballista lane's harness: spawning real `jammi-server`
 //! binaries with `[ballista]` roles configured (one hosting the scheduler +
 //! an executor, the rest hosting executors only), plus the fine-tune
-//! submission helpers (`register_training_source`, `submit_gang_fine_tune`,
+//! submission helpers (`add_training_source`, `submit_gang_fine_tune`,
 //! `submit_fine_tune`, `JobSize`, `await_job`, `unique_source_name`,
 //! `training_pairs_url`, `tiny_bert_model`, `label_of`) ported from
 //! `crates/jammi-ai/tests/distributed/harness.rs`.
@@ -682,7 +682,7 @@ pub fn unique_source_name(role: &str) -> String {
     format!("{role}-{}", uuid::Uuid::new_v4().simple())
 }
 
-pub async fn register_training_source(session: &Arc<InferenceSession>, name: &str) {
+pub async fn add_training_source(session: &Arc<InferenceSession>, name: &str) {
     session
         .add_source(
             name,

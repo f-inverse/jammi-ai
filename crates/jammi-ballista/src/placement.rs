@@ -16,7 +16,7 @@
 //!    whose plan carries a required device kind — a `GangExec` (its
 //!    descriptor's own stamped `device_kind`, CPU included) or an
 //!    `InferenceExec` (its `device_kind()`) —
-//!    [`crate::engine::stage_device_kind`], the ONE predicate this policy
+//!    [`crate::engine::required_device_kind`], the ONE predicate this policy
 //!    and `client::submit_physical_plan`'s pre-submission refusal both use
 //!    — binds only to an executor whose OWN registration lists THAT EXACT
 //!    kind (`compute_executors.devices`,
@@ -206,7 +206,7 @@ impl DistributionPolicy for DevicePlacement {
                     }
                 }
                 let gang_submitter = gang_descriptor.as_ref().map(|d| d.submitter.clone());
-                let required_kind = crate::engine::stage_device_kind(&stage.plan);
+                let required_kind = crate::engine::required_device_kind(&stage.plan);
                 let runnable_partitions: Vec<usize> = stage
                     .task_infos
                     .iter()

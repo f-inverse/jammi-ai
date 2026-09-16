@@ -12,7 +12,7 @@
 //! JobWorker::submit_placed`). A stage whose `InferenceExec`/`GangExec`
 //! names a kind different from THIS executor's own `InferenceSession::
 //! compute_device().kind()` is refused typed, never silently run on the
-//! wrong device — [`stage_device_kind`] is the ONE predicate this engine's
+//! wrong device — [`required_device_kind`] is the ONE predicate this engine's
 //! K7 check, `placement::DevicePlacement`'s binding eligibility, and
 //! `client::submit_physical_plan`'s pre-submission refusal all read: the
 //! required kind is the PLAN's own (KIND MATCH), never "does any GPU exist
@@ -97,14 +97,14 @@ fn contains_gang(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// MATCH, never "is this GPU-shaped": a `GangExec` carries whatever kind
 /// its submitter stamped (CPU included), so this predicate is `Some` for
 /// EVERY gang stage and EVERY inference stage, not only a GPU-bound one.
-pub fn stage_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDeviceKind> {
+pub fn required_device_kind(plan: &Arc<dyn ExecutionPlan>) -> Option<ComputeDeviceKind> {
     if let Some(exec) = plan.downcast_ref::<GangExec>() {
         return Some(exec.descriptor().device_kind);
     }
     if let Some(exec) = plan.downcast_ref::<InferenceExec>() {
         return Some(exec.device_kind());
     }
-    plan.children().into_iter().find_map(stage_device_kind)
+    plan.children().into_iter().find_map(required_device_kind)
 }
 
 impl ExecutionEngine for JammiExecutionEngine {
@@ -118,7 +118,7 @@ impl ExecutionEngine for JammiExecutionEngine {
         config: &SessionConfig,
     ) -> DfResult<Arc<dyn QueryStageExecutor>> {
         let own_kind = self.session.compute_device().kind();
-        if let Some(required_kind) = stage_device_kind(&plan) {
+        if let Some(required_kind) = required_device_kind(&plan) {
             if required_kind != own_kind {
                 return Err(DataFusionError::Execution(format!(
                     "jammi-ballista K7: stage {stage_id} of job {job_id} requires device_kind \

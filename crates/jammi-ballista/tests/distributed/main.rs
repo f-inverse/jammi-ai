@@ -371,7 +371,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST);
-    harness::register_training_source(&session, &source).await;
+    harness::add_training_source(&session, &source).await;
 
     let (mut fleet, job_id, expected_model, claimant) =
         submit_and_await_placed_claim(&backends, &result_root, &session, &source, JobSize::Quick)
@@ -422,7 +422,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
     // locally), same base model / config / device kind (CPU).
     let plain_result_root = backends.unique_result_root(&format!("{TEST}-plain"));
     let plain_source = harness::unique_source_name(&format!("{TEST}-plain"));
-    harness::register_training_source(&session, &plain_source).await;
+    harness::add_training_source(&session, &plain_source).await;
     let plain_specs = vec![
         ProcSpec::fresh(
             BallistaRole::None,
@@ -505,7 +505,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
     let source = harness::unique_source_name(TEST);
-    harness::register_training_source(&session, &source).await;
+    harness::add_training_source(&session, &source).await;
 
     // The SAME 3-process fleet a4 uses (proven: lane-0 is the ONLY
     // `fine_tune`-kind claimant/submitter, deterministically placed onto
@@ -836,7 +836,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     // executor at all). Executed: registering AFTER `Fleet::spawn` reds
     // with "Source '…' not found" on the claiming executor.
     let source = harness::unique_source_name(TEST);
-    harness::register_training_source(&session, &source).await;
+    harness::add_training_source(&session, &source).await;
 
     // Scheduler 4 hosts its OWN local executor too (`SchedulerAndExecutor`,
     // never `SchedulerOnly`). Executed refutation: a `SchedulerOnly`

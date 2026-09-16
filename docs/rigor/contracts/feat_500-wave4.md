@@ -351,7 +351,7 @@ are fixed at the root, never reconciled in prose. Dispositions:
 - **Placement matched "any GPU", not the plan's device kind** (finding 6; and, once read
   against a CPU fleet, the reason an all-CPU gang could never bind at all): the predicate
   becomes a KIND MATCH — `GangDescriptor` gains `device_kind` stamped by the submitter's
-  session (as `InferenceExec` already carries), `stage_device_kind(plan) -> Option<
+  session (as `InferenceExec` already carries), `required_device_kind(plan) -> Option<
   ComputeDeviceKind>` replaces the boolean, `DevicePlacement` binds only to an executor whose
   registered devices list that kind (`cpu` is a kind), `submit_physical_plan` refuses typed
   when no registered executor lists the plan's kind, and the engine's K7 refusal compares the
@@ -1920,7 +1920,7 @@ the lane tests landed:
    `stage_is_gpu_bound` predicate would have refused every `GangExec` on an
    all-CPU fleet (a gang is unconditionally "GPU-bound" by node type,
    regardless of what device it actually needs). Replaced with
-   `stage_device_kind(plan) -> Option<ComputeDeviceKind>` (engine.rs);
+   `required_device_kind(plan) -> Option<ComputeDeviceKind>` (engine.rs);
    `GangDescriptor` gained `device_kind`, stamped by the submitter
    (`JobWorker::submit_placed`, the one construction site the lead granted)
    and carried on the wire (`GangExecNode.device_kind`, encoded/decoded like

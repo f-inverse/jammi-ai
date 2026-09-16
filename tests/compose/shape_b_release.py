@@ -19,8 +19,11 @@ arm end to end on the shipped image, against the Postgres catalog:
      `restart: unless-stopped` once the process exits, so step 4 could never
      observe the container come back — this is exactly how this script failed
      on every `main` run from its first (2026-09-14) until it was rewritten;
-  3. `psql` reads the row `lease_expires_at IS NULL AND releases = 1` —
-     the lease was handed back, no status invented, no attempt consumed;
+  3. `psql` reads the row: `releases = 1`, status still `running`, and either
+     `lease_expires_at IS NULL AND attempts = 1` (released, not yet reclaimed)
+     or the lease set again with `attempts = 2` (already reclaimed by the
+     restarted worker — the restart takes a few hundred milliseconds, so this
+     read races the reclaim and must accept both);
   4. `restart: unless-stopped` brings the container back (`/readyz` 200
      again) and its worker reclaims the row within one idle poll:
      `attempts = 2`.
@@ -159,10 +162,24 @@ def run(target: str, health_url: str) -> int:
     )
     print(f"row after release: {row}")
     status, lease_null, releases, attempts = row.split("|")
+    # The restart policy brings the container back within a few hundred
+    # milliseconds of the exit line, and its worker reclaims the released row
+    # on its first poll — so by the time this read lands the row is in ONE of
+    # two states, and which one is a race this script must not bet on:
+    #   released, not yet reclaimed: lease NULL, attempts still 1;
+    #   reclaimed by the successor:  lease set again, attempts 2 (the
+    #                                successor's claim is what increments it).
+    # What a RELEASE guarantees in BOTH states: the row is `running` (no
+    # status invented), `releases = 1` (the release was recorded), and the
+    # release itself consumed no attempt — attempts is 1 until a claim, 2
+    # after exactly one; a failure path would show 2 with the lease NULL.
     assert status == "running", row
-    assert lease_null == "t", f"the lease must be NULL after a release: {row}"
     assert releases == "1", f"releases must be 1: {row}"
-    assert attempts == "1", f"a release costs no attempt: {row}"
+    assert (lease_null, attempts) in {("t", "1"), ("f", "2")}, (
+        f"after a release the row is either released-not-yet-reclaimed "
+        f"(lease NULL, attempts 1) or reclaimed by the restarted worker "
+        f"(lease set, attempts 2); got: {row}"
+    )
 
     # `restart: unless-stopped` brings the container back; its worker claims.
     remote_smoke.wait_for_ready(health_url, timeout_secs=120)

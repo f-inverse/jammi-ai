@@ -298,7 +298,6 @@ fn jobs_writers_scanner_recognises_writes_and_ignores_reads_and_comments() {
     let writer = "pub async fn bump(&self) -> Result<()> { tx.execute(\"UPDATE jobs SET x = 1\", &[]).await }\n";
     // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a reader
     let reader = "pub async fn peek(&self) -> Result<()> { tx.query_opt(\"SELECT status FROM jobs\", &[], f).await }\n";
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code — a comment, not a declaration
     let commented = "// pub async fn ghost(&self) { \"DELETE FROM jobs\" }\n";
     let fixture = format!("{writer}{reader}{commented}");
     let writers = jobs_writers(&fixture);

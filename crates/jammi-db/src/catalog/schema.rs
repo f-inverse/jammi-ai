@@ -1341,10 +1341,12 @@ ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 ///   an empty device list rather than `NULL` — the same "additive column,
 ///   zero behaviour change for a row this migration does not itself write"
 ///   shape as 034's/037's own `ADD COLUMN ... DEFAULT`. This column is a
-///   `ListWorkers` mirror ONLY (an additive field on the frozen RPC
-///   surface) — `compute_executors.devices` above is the placement
-///   policy's sole authority, never this one, because a `[worker]` row and
-///   a compute-executor row describe potentially different processes.
+///   `ListWorkers` mirror ONLY, read back verbatim on
+///   `jammi.v1.job.WorkerSummary.devices` (field 8, an additive field on
+///   the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`)
+///   — `compute_executors.devices` above is the placement policy's sole
+///   authority, never this one, because a `[worker]` row and a
+///   compute-executor row describe potentially different processes.
 ///
 /// Ordered after BOTH `035_instances_peer_addr_result_root` (`instances`/
 /// `workers` at their U5b-1a shape) and `037_jobs_assembly_failures_next_after`

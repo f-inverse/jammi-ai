@@ -316,6 +316,20 @@ message WorkerSummary {
   // `claiming` (the loop is live), `draining` (a DRAIN is finishing the
   // in-flight job). The row is deleted once the loop has exited.
   string state = 7;
+  // This worker's device inventory, as `workers.devices` carries it
+  // (`jammi_db::catalog::jobs_repo::WorkerRecord::devices`) — a MIRROR of
+  // the process's own registration, informational only (never the
+  // placement policy's authority). An ADDITIVE field on this frozen RPC:
+  // field 8, no prior field renumbered.
+  repeated DeviceFact devices = 8;
+}
+
+// One device a worker process names as its own: a KIND (`"cpu"` / `"cuda"`
+// / `"metal"`, opaque here) and its ORDINAL within that kind. Mirrors
+// `jammi_db::catalog::instance::DeviceFact` field for field.
+message DeviceFact {
+  string kind = 1;
+  uint32 ordinal = 2;
 }
 
 message PruneJobsRequest {}

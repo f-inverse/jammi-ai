@@ -710,8 +710,10 @@ pub struct WorkerRecord {
     pub started_at: String,
     pub last_seen_at: String,
     /// This worker's device inventory, as `Catalog::upsert_worker` wrote
-    /// it. A `ListWorkers` MIRROR only (an additive field on the frozen
-    /// RPC surface) — never the placement policy's authority; see
+    /// it. A `ListWorkers` MIRROR only (mapped verbatim onto
+    /// `jammi.v1.job.WorkerSummary.devices`, field 8, an additive field on
+    /// the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`)
+    /// — never the placement policy's authority; see
     /// `super::compute_repo::ComputeExecutorRecord::devices`'s doc. A
     /// malformed stored value decodes to an empty list with a
     /// `tracing::warn!` naming `instance_id` (the #574 row-fact rule; see
@@ -2835,7 +2837,8 @@ impl Catalog {
     /// re-upserts `claiming` once its gate opens — never a bare `UPDATE`,
     /// so a row the first write failed to create is created at the
     /// transition); `devices` is this `[worker]` process's own device
-    /// inventory (`ListWorkers` mirror only — see [`WorkerRecord::devices`]'s
+    /// inventory (`ListWorkers` mirror only, read back verbatim on
+    /// `jammi.v1.job.WorkerSummary.devices` — see [`WorkerRecord::devices`]'s
     /// doc), JSON-encoded verbatim into `workers.devices`. A re-upsert on an
     /// existing row resets all three.
     ///

@@ -311,6 +311,14 @@ impl CatalogClient {
                 started_at: w.started_at,
                 last_seen_at: w.last_seen_at,
                 state: w.state,
+                devices: w
+                    .devices
+                    .into_iter()
+                    .map(|d| DeviceFact {
+                        kind: d.kind,
+                        ordinal: d.ordinal,
+                    })
+                    .collect(),
             })
             .collect())
     }
@@ -825,4 +833,18 @@ pub struct WorkerSummary {
     pub state: String,
     pub started_at: String,
     pub last_seen_at: String,
+    /// This worker's device inventory — a `ListWorkers` mirror only (never
+    /// the placement policy's authority; see
+    /// `jammi_wire::proto::job::WorkerSummary::devices`'s doc).
+    pub devices: Vec<DeviceFact>,
+}
+
+/// One device a worker process names as its own, mirrored from the wire's
+/// `jammi.v1.job.DeviceFact` field for field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceFact {
+    /// The device kind (`"cpu"` / `"cuda"` / `"metal"`, opaque here).
+    pub kind: String,
+    /// The device's ordinal within `kind`.
+    pub ordinal: u32,
 }

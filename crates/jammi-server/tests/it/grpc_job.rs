@@ -1546,6 +1546,76 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
     let _ = server.handle.await;
 }
 
+/// `ListWorkers` carries the claiming worker's device inventory over the
+/// wire: `WorkerSummary.devices` (field 8, an additive field on the frozen
+/// RPC surface) mirrors `workers.devices` byte for byte. The
+/// `start_engine_server_with_worker_enabled` fixture's `[gpu] device = -1`
+/// (the default, CPU) registers exactly one fact, `{kind: "cpu", ordinal:
+/// 0}` (`jammi_ai::fine_tune::worker::worker_devices`'s own oracle for that
+/// config) — this is the SAME embedded worker process, so the wire read and
+/// the embedded `list_workers()` read must agree on both the list and the
+/// state it was read from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_workers_carries_the_claiming_workers_devices() {
+    let server = start_engine_server_with_worker_enabled(true).await;
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    let mut wire_workers = Vec::new();
+    for _ in 0..600 {
+        wire_workers = client
+            .list_workers(jammi_server::grpc::proto::job::ListWorkersRequest {})
+            .await
+            .expect("list_workers")
+            .into_inner()
+            .workers;
+        if !wire_workers.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        wire_workers.len(),
+        1,
+        "exactly the one embedded worker this fixture spawns must be listed"
+    );
+    let worker = &wire_workers[0];
+    assert_eq!(
+        worker.devices,
+        vec![jammi_server::grpc::proto::job::DeviceFact {
+            kind: "cpu".into(),
+            ordinal: 0,
+        }],
+        "a `[gpu] device = -1` (CPU) worker registers exactly one device fact, \
+         ordinal 0 — got {:?}",
+        worker.devices
+    );
+
+    let embedded = server
+        .engine
+        .catalog()
+        .list_workers()
+        .await
+        .expect("embedded list_workers");
+    assert_eq!(
+        embedded.len(),
+        1,
+        "the embedded read must see the same single worker row"
+    );
+    assert_eq!(
+        embedded[0].devices,
+        vec![jammi_db::catalog::instance::DeviceFact {
+            kind: "cpu".into(),
+            ordinal: 0,
+        }],
+        "K4: the wire-read device list and the embedded catalog's device list \
+         must agree for the same worker row"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
 /// Shutting a `[worker] enabled = false` server down must not await a worker that was
 /// never started: no hang, no panic.
 ///

@@ -445,7 +445,9 @@ pub struct WorkerFacts {
     /// The claim loop's lifecycle state at this instant.
     pub state: WorkerState,
     /// This `[worker]` process's own device inventory —
-    /// `workers.devices`, a `ListWorkers` MIRROR only (never the placement
+    /// `workers.devices`, a `ListWorkers` MIRROR only (read back verbatim on
+    /// `jammi.v1.job.WorkerSummary.devices`, field 8 —
+    /// `crates/jammi-wire/proto/jammi/v1/job.proto`; never the placement
     /// join's authority: `compute_executors.devices`,
     /// `super::compute_repo::ComputeExecutorRecord::devices`, is that,
     /// since a compute-executor process and a `[worker]` process may be

@@ -791,12 +791,19 @@ workspace ships every publishable crate at the same
   state with the shared catalog (migration `038_compute_cluster_state`:
   `compute_executors` with `devices` — a JSON `[{kind, ordinal}]` claim
   the placement policy's own authority — and `compute_jobs`; `ALTER TABLE
-  workers ADD COLUMN devices` mirrors it on `ListWorkers`, additive to the
-  frozen surface), so a scheduler restart keeps every executor
+  workers ADD COLUMN devices` mirrors it on `ListWorkers` as
+  `WorkerSummary.devices` (field 8, `repeated DeviceFact {kind, ordinal}`),
+  additive to the frozen surface), so a scheduler restart keeps every executor
   registration and job status row, and two schedulers may share one
-  catalog for sequential jobs. A GPU-bound submission is refused typed,
-  before it is ever submitted, when no registered executor lists a
-  matching device — never parked unschedulable.
+  catalog for sequential jobs. Placement matches the plan's own device
+  KIND (`InferenceExec::device_kind`, `GangDescriptor.device_kind`, both
+  stamped by the submitter's session; "cpu" is a kind too, so a CPU fleet
+  places CPU-stamped work on CPU executors) — an executor binds a task
+  only when its OWN registered devices list that kind:
+  `submit_physical_plan` refuses a typed submission before it is ever sent
+  when no registered executor lists the plan's kind, and the execution
+  engine's own device-pinning refusal (K7) is the second line, never
+  parked unschedulable.
 ### Changed
 - **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**
   `8081` (gRPC + Flight SQL) and `8080` (the HTTP side-channel) now publish

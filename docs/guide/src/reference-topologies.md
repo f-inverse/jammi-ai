@@ -229,10 +229,13 @@ executes* the jobs it accepted is `[worker] enabled`. Every query-tier
 replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) —
 it still mounts `core`/`event`/`eval` and accepts every submission — and
 both compute-tier roles below run `[worker] enabled = true`
-(`JAMMI_WORKER__ENABLED=true`, `JAMMI_WORKER__KINDS='["fine_tune",
-"graph_fine_tune", "context_predictor"]'` to claim only the training
-kinds) so only they run the job worker's claim loop against the shared
-catalog. `[server] services = []` on both — a pure compute/scheduler node
+(`JAMMI_WORKER__ENABLED=true`) so only they run the job worker's claim
+loop against the shared catalog. Their `kinds` differ: the compute
+StatefulSet's pods claim `["fine_tune", "graph_fine_tune",
+"context_predictor"]`, the scheduler Deployment claims `["fine_tune",
+"graph_fine_tune"]` only — `context_predictor` has no placed arm, so
+listing it on the CPU scheduler pod would train it there instead of on a
+device. `[server] services = []` on both — a pure compute/scheduler node
 serves no query-tier gRPC.
 
 **Two compute-tier roles, one config knob.** Whether a process hosts a
@@ -246,7 +249,11 @@ a process with neither role runs exactly as it always has:
   — as one Ballista task — on a registered compute-pod executor; when no
   executor is registered yet it claims and runs the job in-process instead
   (byte-identical either way, per device kind), since it is also a plain
-  worker-enabled fleet member.
+  worker-enabled fleet member. A third arm: when a registered executor
+  exists but none of its own devices lists the plan's device kind, the
+  submission is refused typed BEFORE it ever reaches the scheduler — the
+  row is left `running` for reclaim (an attempt spent), never run
+  in-process on the claiming pod.
 - **The compute tier's `StatefulSet` pods** (`jammi-server-compute`) each
   host a Ballista EXECUTOR (`[ballista.executor]` pointed at the
   scheduler's Service) alongside their own `[worker] enabled = true` claim
@@ -256,17 +263,25 @@ a process with neither role runs exactly as it always has:
   runs the body, from its OWN `[worker] local_ranks`, never from the
   submitter's.
 
-A placed `Peer` gang of world `W` needs `W` hosts able to hold a rank, the
-submitter's own host included — the submitting host moves to an `Awaiting`
-holder state for the whole placement (it runs no compute meanwhile, but can
-still serve a `RunRank` session), so a two-replica compute tier's widest
-placed gang spans both replicas, never the submitter alone. `W <=
-[worker] local_ranks` runs as a `Local` gang on one pod with no placement
-and no peer dial at all. Placement always excludes a task's own submitter:
-a claimant's host is never bound its own gang, so a lone compute pod
-placing its own claim would deadlock against itself — this is why the
-scheduler is a SEPARATE role rather than "whichever compute pod claims
-first places its own siblings."
+Placement is decided BEFORE topology, for every `fine_tune`/
+`graph_fine_tune` attempt a scheduler-role process claims (any process
+whose `HostAdmission` exposes a placement submitter): it always attempts
+to place the whole job as one Ballista task on a registered compute-pod
+executor, regardless of `W` versus `[worker] local_ranks`. Only the pod
+that ends up running the job's coordinator body — the placed executor, or
+the claiming process itself when no submitter seam exists or no other
+executor is registered — decides `Single`/`Local`/`Peer` from its OWN
+`local_ranks`: this overlay admits single-pod gangs (`W ≤ 2`, `Local` on
+one pod's two devices); a cross-pod `Peer` gang of world `W` needs `W >
+local_ranks`, `max_world_size ≥ W` on BOTH the submit edge and the compute
+pods, and at least `W` compute pods able to hold a rank (the coordinator's
+included) — the submitting host moves to an `Awaiting` holder state for
+the whole placement (it runs no compute meanwhile, but can still serve a
+`RunRank` session). Placement always excludes a task's own submitter: a
+claimant's host is never bound its own gang, so a lone compute pod placing
+its own claim would deadlock against itself — this is why the scheduler is
+a SEPARATE role rather than "whichever compute pod claims first places its
+own siblings."
 
 Each `jammi-server-compute` pod's `peer_advertise` is its own stable DNS
 name under the headless Service

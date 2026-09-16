@@ -13,6 +13,14 @@ region = "us-east-1"
 duration_secs = 30
 heartbeat_secs = 10
 
+[distributed]
+# The submit edge admits up to the compute pod's two devices (shape D's
+# `jammi-server-compute` runs `task_slots = 1` but assembles a rank-0 +
+# rank-1 pair from `[worker] local_ranks = 2`); a cross-pod `Peer` gang
+# needs this bound raised to the target world size on BOTH this ConfigMap
+# and every compute pod's own `[distributed] max_world_size`.
+max_world_size = 2
+
 [server]
 services = ["core", "event", "eval"]
 

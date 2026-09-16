@@ -385,8 +385,10 @@ max_job_waits = 1024
 # `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
 # `[server] health_listen`/`flight_listen`/`peer_bind` (configuration.md's
 # `[server]` block) may never share a fixed port -- a collision is refused
-# at load time naming both keys; an ephemeral `:0` never collides with
-# anything.
+# at load time naming both keys. Two addresses collide iff their ports are
+# equal and non-zero AND their hosts are equal or either host is
+# unspecified (`0.0.0.0`/`::` overlaps every interface, including
+# `127.0.0.1`); an ephemeral `:0` never collides with anything.
 
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error". Default: "info".

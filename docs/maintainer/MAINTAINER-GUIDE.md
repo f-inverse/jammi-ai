@@ -675,8 +675,10 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   see different device sets); `compute_jobs` (`job_id` PK, `owner`,
   `status`, `queued_at`, `updated_at` — ownership/status only, since the
   execution GRAPH itself has no serialisation in Ballista 54.1); `ALTER
-  TABLE workers ADD COLUMN devices` — a `ListWorkers` MIRROR only (additive
-  to the frozen RPC surface), never the placement join's authority.
+  TABLE workers ADD COLUMN devices` — a `ListWorkers` MIRROR only, surfaced
+  as `WorkerSummary.devices` (field 8, `repeated DeviceFact {kind,
+  ordinal}`, additive to the frozen RPC surface), never the placement
+  join's authority.
   `compute_repo.rs` (generic CRUD, no distributor vocabulary):
   `upsert_compute_executor`, `list_compute_executors`,
   `record_compute_heartbeat`, `remove_compute_executor`,
@@ -4200,7 +4202,7 @@ is a no-op, a different one a typed error).
 
 ### 2.8f `jammi-ballista` — the Ballista compute plane
 
-Design contract `docs/rigor/contracts/feat_500-wave4.md`. Sits between the
+`jammi-ballista` sits between the
 engine (`jammi-ai`/`jammi-db`/`jammi-wire`) and `jammi-server`
 (`crates/jammi-ballista/src/lib.rs`'s crate doc): publishable, lockstep
 with the rest of the workspace, no cargo feature — a process's role is
@@ -4241,12 +4243,15 @@ with the rest of the workspace, no cargo feature — a process's role is
   never the in-memory one. The scheduler role installs `jammi_ai::
   fine_tune::worker::PlacedGangSubmitter`; the executor role installs
   `PlacedGangRunner` and writes this process's own device claim to its
-  `compute_executors` row right after registering (contract §9 B5).
+  `compute_executors` row right after registering.
 - **Client** (`client.rs`) — `submit_physical_plan`: the seam a
   scheduler-role process's `PlacedGangSubmitter` calls to place a plan
-  instead of running it in-process; refuses a GPU-bound plan typed BEFORE
-  submitting when no registered executor lists a matching device, reading
-  the same catalog `DevicePlacement` reads from.
+  instead of running it in-process; matches the plan's own device KIND
+  (`InferenceExec::device_kind`, "cpu" is a kind too) and refuses it typed
+  BEFORE submitting when no registered executor lists that kind, reading
+  the same catalog `DevicePlacement` reads from — `JammiExecutionEngine`'s
+  own device-pinning refusal above (K7) is the second line, never a
+  silent mis-run.
 - **`CatalogClusterState`/`CatalogJobState`** (`cluster.rs`) — the
   catalog-backed `ballista_scheduler::cluster::{ClusterState, JobState}`
   over `jammi_db::catalog::compute_repo`'s generic, distributor-neutral CRUD
@@ -4257,14 +4262,16 @@ with the rest of the workspace, no cargo feature — a process's role is
 - **`DevicePlacement`** (`placement.rs`, `TaskDistributionPolicy::Custom`)
   — round-robin over executor slots with three refinements: never binds a
   `GangExec` stage to the executor equal to its own `submitter` (deadlock
-  avoidance, contract §9 B1); a GPU-bound task binds only to an executor
-  whose OWN registration lists a matching device; a `GangExec` stage whose
-  job row is already `claimed_by` a DIFFERENT executor is never bound at
-  all (the bind-time half of the re-launch guard, §2.8g below).
+  avoidance); a stage binds only to an executor whose OWN registered
+  devices list its `GangDescriptor.device_kind`/`InferenceExec::
+  device_kind()` (a CPU-stamped stage binds a CPU executor, never only a
+  GPU refinement); a `GangExec` stage whose job row is already
+  `claimed_by` a DIFFERENT executor is never bound at all (the bind-time
+  half of the re-launch guard, §2.8g below).
 
 ### 2.8g The placed gang — `transfer_claim` and the hand-off arms
 
-Plan 67 wave 4. Under Ballista placement a `Peer` gang runs as ONE task,
+Under Ballista placement a `Peer` gang runs as ONE task,
 `GangExec { job_id, attempt, world, submitter }`
 (`crates/jammi-ai/src/operator/gang_exec.rs`), placed by the scheduler on a
 device-bearing executor other than the submitter. Two more `HostAdmission`

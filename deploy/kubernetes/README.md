@@ -29,12 +29,15 @@ knobs.
   peer identity survives a pod restart — the property a plain `Deployment`
   cannot hold; the same name is its Ballista `advertise_host`, since each
   pod also registers as a Ballista executor with `jammi-server-scheduler`.
-  A job with `world_size <= 2` runs on one pod's two devices (a `Local`
-  gang); a wider job assembles a `Peer` gang across both pods, bounded by
-  `[distributed] max_world_size`, whether claimed directly by a
-  `jammi-server-compute` pod or PLACED there by the scheduler (see
-  "Compute plane" below). This overlay is kubeconform-validated only — no
-  GPU node is available in CI, so it never runs a real pod there.
+  This overlay admits single-pod gangs (`W ≤ 2`, `Local` on one pod's two
+  devices); a cross-pod `Peer` gang of world `W` needs `W > local_ranks`,
+  `max_world_size ≥ W` on BOTH the submit edge (`base/jammi.toml`) and the
+  compute pods (`jammi-compute.toml`), and at least `W` compute pods able
+  to hold a rank (the coordinator's included) — whether the job is claimed
+  directly by a `jammi-server-compute` pod or PLACED there by the
+  scheduler (see "Compute plane" below). This overlay is
+  kubeconform-validated only — no GPU node is available in CI, so it never
+  runs a real pod there.
 - **`overlays/ci/`** — the kind smoke's stack: upstream `postgres:16` and
   `nats:2.10-alpine` `StatefulSet`s alongside the base query tier, pinned to
   the image the workflow already built and `kind load`ed. Never a production
@@ -123,9 +126,10 @@ anchor a scale-down honours; a larger value is honoured only by rollouts and
 Kubernetes default (30 s) — its query replicas hold no training job.
 
 **Rollout arithmetic** for the `jammi-server-compute` `StatefulSet` (2
-replicas): a `StatefulSet`'s `RollingUpdate` has no `maxSurge`/
-`maxUnavailable` knob at all — it always replaces one ordinal at a time, in
-DESCENDING order (pod `-1` first, then pod `-0`), each wait for the
+replicas): a `StatefulSet`'s `RollingUpdate` has no `maxSurge`;
+`maxUnavailable` exists only behind the alpha `MaxUnavailableStatefulSet`
+feature gate — assume strictly serial, one ordinal at a time in descending
+order (pod `-1` first, then pod `-0`), each wait for the
 PREVIOUS ordinal's own DRAIN (≤ 600 s) to finish before it is touched, so
 the worst case is strictly serial: 2 × 600 s = 20 min of drains for this
 overlay's 2 replicas. `rollingUpdate.partition` (unset here, default `0`)
@@ -180,16 +184,24 @@ whether a replica is busy.
 
 ## Compute plane
 
-Two roles, both `[worker] enabled = true` fleet members claiming the
-training kinds, distinguished by `[ballista]` (`docs/guide/src/
-configuration.md`):
+Two roles, both `[worker] enabled = true` fleet members, distinguished by
+`[ballista]` (`docs/guide/src/configuration.md`). Their `kinds` differ:
+`jammi-server-compute` claims `["fine_tune", "graph_fine_tune",
+"context_predictor"]`, `jammi-server-scheduler` claims `["fine_tune",
+"graph_fine_tune"]` only — `context_predictor` has no placed arm, so
+listing it on the CPU scheduler pod would train it there instead of on a
+device:
 
 - **`jammi-server-scheduler`** (a single-replica CPU `Deployment`):
   `[ballista] scheduler_bind` set, no `[ballista.executor]`. It claims a
   training job like any fleet member; if a `jammi-server-compute` executor
   is registered, it PLACES the claim there as one Ballista task instead of
   running it itself — otherwise it runs the job in-process (byte-identical
-  either way, per device kind).
+  either way, per device kind). A third arm: when an executor is
+  registered but none of its own devices lists the plan's device kind, the
+  submission is refused typed before it ever reaches the scheduler — the
+  row is left `running` for reclaim (an attempt spent), never run
+  in-process on the claiming pod.
 - **`jammi-server-compute`** (the GPU `StatefulSet`): `[ballista.executor]`
   pointed at `jammi-server-scheduler`'s Service. Each pod claims and runs
   jobs on its own exactly like the scheduler can, AND accepts a gang the

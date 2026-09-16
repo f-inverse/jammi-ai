@@ -20,8 +20,7 @@
 # (`JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST` below) -- a training job
 # claimed by the scheduler pod is PLACED onto whichever of these pods the
 # scheduler's device-aware policy picks; a training job claimed by one of
-# these pods itself runs here in-process (design contract
-# `feat_500-wave4.md` §9 B7).
+# these pods itself runs here in-process.
 #
 # kubeconform-validated only -- no GPU node is available in CI, so this
 # StatefulSet never runs a real pod in the kind smoke.

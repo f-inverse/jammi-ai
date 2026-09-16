@@ -17,13 +17,13 @@ heartbeat_secs = 10
 # `device` key is needed. Two entries for the shape's two local ranks below.
 devices = [0, 1]
 
-# This pod also hosts a Ballista EXECUTOR (design contract
-# `feat_500-wave4.md` §9 B7: "the compute StatefulSet pods host executors
-# and are worker-enabled fleet members") -- it registers with the scheduler
-# Deployment's Service and accepts a PLACED training job (one `GangExec`
-# task) alongside the jobs it claims and runs on its own, in-process. Two
-# task slots -- one per `[gpu] devices` entry -- so a placed gang and this
-# pod's own in-process claim never contend for the same Ballista capacity.
+# This pod also hosts a Ballista EXECUTOR -- it registers with the
+# scheduler Deployment's Service and accepts a PLACED training job (one
+# `GangExec` task) alongside the jobs it claims and runs on its own,
+# in-process. One task slot: a placed gang and this pod's own in-process
+# claim both take the SAME `HostAdmission` job slot (this pod coordinates
+# one placed task at a time), so a second bound task is refused typed at
+# the slot rather than left to contend for `[gpu] devices` capacity.
 [ballista.executor]
 scheduler_address = "jammi-server-scheduler:50050"
 bind = "0.0.0.0:50051"
@@ -32,7 +32,7 @@ grpc_bind = "0.0.0.0:50052"
 # `JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST`, same construction as
 # `peer_advertise` below) -- never set here, since every replica shares this
 # one ConfigMap and the value differs per pod.
-task_slots = 2
+task_slots = 1
 
 # Pure compute node: mounts no query-tier gRPC service, only claims and runs
 # queued jobs (in-process or as a placed Ballista task).
@@ -57,7 +57,9 @@ kinds = ["fine_tune", "graph_fine_tune", "context_predictor"]
 local_ranks = 2
 
 [distributed]
-# The widest Peer gang a coordinator on this two-pod shape may admit: a
-# submitted world_size past it is refused at submit; one within it may span
-# both replicas.
+# What THIS pod's coordinator body may assemble once a job lands here
+# (placed or claimed): a `Peer` gang needs `max_world_size >= W` on EVERY
+# compute pod that could hold a rank, not just the coordinator's. The
+# submit edge's own admission is `base/jammi.toml`'s `[distributed]`,
+# a separate bound checked at enqueue, before any pod is chosen.
 max_world_size = 2

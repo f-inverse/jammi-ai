@@ -201,6 +201,12 @@ async fn unbind_tasks_is_all_or_none() {
             ok_row.available_slots, 4,
             "the in-bounds executor's row must be untouched by a batch that failed elsewhere"
         );
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&ok_id).await.ok();
+        catalog.remove_compute_executor(&bad_id).await.ok();
     })
     .await;
 }
@@ -221,6 +227,11 @@ async fn two_cluster_states_over_one_catalog_see_each_others_registrations() {
         a.register_executor(meta, spec).await.unwrap();
         let seen_by_b = b.registered_executor_metadata().await;
         assert!(seen_by_b.iter().any(|m| m.id == id));
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&id).await.ok();
     })
     .await;
 }
@@ -315,6 +326,12 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor() {
             bound[0].0, gpu_id,
             "a Cuda-stamped task must bind to the cuda-bearing executor, never the device-less one"
         );
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&cpu_id).await.ok();
+        catalog.remove_compute_executor(&gpu_id).await.ok();
     })
     .await;
 }
@@ -411,6 +428,12 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor() {
             "a Cuda-stamped stage must bind to the cuda-bearing executor, never a properly \
              registered cpu-only one"
         );
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&cpu_id).await.ok();
+        catalog.remove_compute_executor(&gpu_id).await.ok();
     })
     .await;
 }
@@ -480,6 +503,11 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor() {
             "a Cpu-stamped stage must bind to the properly-registered cpu-only executor"
         );
         assert_eq!(bound[0].0, cpu_id);
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&cpu_id).await.ok();
     })
     .await;
 }
@@ -567,6 +595,11 @@ async fn already_transferred_gang_is_never_bound() {
             "a gang whose claim already transferred to {transferee} (!= submitter {submitter}) \
              must never be bound: {bound:?}"
         );
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&exec_id).await.ok();
     })
     .await;
 }
@@ -617,6 +650,11 @@ async fn a_slot_less_executor_never_gets_a_task_stamped() {
             "the catalog's committed available_slots (0) must win over the in-memory \
              snapshot (1): {bound:?}"
         );
+        // Tests own their rows: the Postgres arm shares one database with every
+        // other lane on this host, so the executors this test registered are
+        // removed on the way out (a device a later test never registered must
+        // never be listed for it).
+        catalog.remove_compute_executor(&exec_id).await.ok();
     })
     .await;
 }

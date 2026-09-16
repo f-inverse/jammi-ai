@@ -339,6 +339,12 @@ impl ExecutorRole {
     }
 }
 
+/// How long an executor role waits for its scheduler to accept a connection
+/// before refusing typed (the scheduler is another process and may still be
+/// starting), and the pause between attempts.
+pub const SCHEDULER_CONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const SCHEDULER_CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Build the executor role: the Flight shuffle service on `cfg.bind`, the
 /// task/heartbeat gRPC service + scheduler registration on `cfg.grpc_bind`
 /// via `executor_server::startup` (push-staged), both under jammi's own
@@ -495,7 +501,33 @@ pub async fn host_executor(
     let endpoint =
         create_grpc_client_endpoint(format!("http://{scheduler_host}:{scheduler_port}"), None)
             .map_err(|e| Error::Role(format!("could not build scheduler endpoint: {e}")))?;
-    let channel = endpoint.connect().await?;
+    // The scheduler is another process that may still be starting (a compute
+    // pod and its scheduler pod come up together; a fleet's three processes
+    // spawn concurrently): an executor waits for its scheduler for a bounded
+    // window rather than failing on the first refused connect, and refuses
+    // typed — naming the address and the window — only when the window ends.
+    let channel = {
+        let deadline = std::time::Instant::now() + SCHEDULER_CONNECT_WINDOW;
+        loop {
+            match endpoint.connect().await {
+                Ok(channel) => break channel,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    tracing::warn!(
+                        scheduler = %format!("{scheduler_host}:{scheduler_port}"),
+                        error = %e,
+                        "scheduler not reachable yet; retrying"
+                    );
+                    tokio::time::sleep(SCHEDULER_CONNECT_RETRY).await;
+                }
+                Err(e) => {
+                    return Err(Error::Role(format!(
+                        "scheduler at {scheduler_host}:{scheduler_port} unreachable for {}s: {e}",
+                        SCHEDULER_CONNECT_WINDOW.as_secs()
+                    )));
+                }
+            }
+        }
+    };
     let scheduler_client = SchedulerGrpcClient::new(channel);
 
     let ballista_codec: BallistaCodec = BallistaCodec::new(

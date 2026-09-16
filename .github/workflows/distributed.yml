@@ -5,7 +5,7 @@ name: Distributed validation
 # (MinIO), proving the durable-worker fleet-safety properties under real
 # distribution.
 #
-# One job, two matrix legs split by failure character (each leg re-provisions
+# One job, three matrix legs split by failure character (each leg re-provisions
 # its own Postgres + MinIO so they stay independent):
 #
 #   * `deterministic` — the claim-correctness tests (exactly-one claim,
@@ -21,7 +21,7 @@ name: Distributed validation
 #     `continue-on-error: true` (`advisory: true`) to surface a red without
 #     blocking. Promote (flip `advisory` to false) after a flake-free streak.
 #
-# Both are the heaviest lanes (process spawn + a real object store), so neither
+# All three are the heaviest lanes (process spawn + a real object store), so none
 # is on the default hermetic PR path. There is no `pull_request` trigger: this
 # lane never gates a merge (it would be branch protection by another name).
 on:
@@ -151,7 +151,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/minio-bin
-          key: minio-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}
+          key: minio-${{ env.MINIO_RELEASE }}-${{ env.MINIO_SHA256 }}-mc-${{ env.MC_RELEASE }}-${{ env.MC_SHA256 }}
 
       - name: Download the pinned MinIO + mc binaries (cache miss)
         if: steps.minio-cache.outputs.cache-hit != 'true'

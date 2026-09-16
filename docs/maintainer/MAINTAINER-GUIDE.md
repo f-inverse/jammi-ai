@@ -4282,7 +4282,7 @@ depends on `jammi-ballista`.
 
 **The submitting host's holder.** `Holder` (`worker.rs:327`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs:346`): a claimant that has SUBMITTED a `GangDescriptor` and is
+(`worker.rs:346`): a claimant that is submitting a `GangDescriptor` (the move precedes the submit) or is
 awaiting its stream runs no compute for that attempt, so it can still serve
 a `RunRank` session for some OTHER attempt — `HostAdmission::
 try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a
@@ -4290,8 +4290,8 @@ two-host fleet could not otherwise assemble a `Peer` gang if its only
 free-looking host were the one awaiting its own placement result.
 `probe_claim` still refuses `Awaiting`, exactly like `JobRun`.
 
-**`submit_placed`** (`worker.rs:2193`) submits the descriptor and awaits the
-stream; its exit arms are total (`worker.rs:2169`'s doc): the stream ends
+`submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2195`) submits the descriptor and awaits the
+stream; its exit arms are total — `submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs:2195`) documents them: the stream ends
 with at least one batch → `WorkerJobError::HandedOff` (the executor owns
 the attempt now: no terminal write, no release); the stream ends in an
 error or with no batch → re-read the row — `claimed_by` still this
@@ -4299,8 +4299,7 @@ instance → `Abandoned` (left `running` for reclaim, an attempt spent at the
 successor's claim); `claimed_by` moved → `HandedOff` (the executor's own
 lease expiry requeues it, never this instance's).
 
-**`Catalog::transfer_claim`** (`crates/jammi-db/src/catalog/
-jobs_repo.rs:1260`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
+`transfer_claim` (`crates/jammi-db/src/catalog/jobs_repo.rs:1262`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
 `claimed_by = $from` (a stale runner, or a SECOND launch of the same task
 via Ballista's own reset-on-`ExecutorLost`, cannot transfer a claim it does
 not hold — the re-launch guard's second half, `DevicePlacement`'s bind-time
@@ -4312,7 +4311,7 @@ must FAIL a transfer, the opposite of how a reclaim sweep reads that same
 `NULL`). `attempts`/`releases` are untouched by design: a hand-off is zero
 net attempts, never a re-claim.
 
-**`JobWorker::run_placed_gang`** (`worker.rs:2298`, called from the
+`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs:2334`, called from the
 executor role's `PlacedGangRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,

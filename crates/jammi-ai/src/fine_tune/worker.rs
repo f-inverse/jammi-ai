@@ -11757,8 +11757,8 @@ mod tests {
     }
 
     /// Contract `feat_500-wave4` §9 block B2: `Awaiting` (the state a
-    /// claim's own `submit_placed` puts the holder in right after a
-    /// successful submit) admits a `RunRank` session EXACTLY like `Free`
+    /// claim's own `submit_placed` puts the holder in BEFORE it submits —
+    /// the move precedes the submit) admits a `RunRank` session EXACTLY like `Free`
     /// (a two-host fleet could not otherwise assemble if its only
     /// free-looking host were the one awaiting its own placement result)
     /// and refuses a second claim EXACTLY like `JobRun`; once the claim's

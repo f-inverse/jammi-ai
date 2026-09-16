@@ -31,6 +31,8 @@
 
 mod harness;
 
+use harness::required_backends;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -172,7 +174,11 @@ async fn instance_id_of_label(session: &InferenceSession, label: &str) -> String
 /// (SIGKILL never runs a graceful `remove_executor`), so a count-based
 /// wait can spuriously observe stale rows and return before THIS fleet's
 /// own processes are actually up.
-async fn await_fleet_registered(session: &Arc<InferenceSession>, labels: &[&str]) -> Vec<String> {
+async fn await_fleet_registered(
+    session: &Arc<InferenceSession>,
+    fleet: &Fleet,
+    labels: &[&str],
+) -> Vec<String> {
     let ok = harness::await_condition(Duration::from_secs(60), || {
         futures::executor::block_on(async {
             let workers = session.catalog().list_workers().await.unwrap_or_default();
@@ -182,6 +188,9 @@ async fn await_fleet_registered(session: &Arc<InferenceSession>, labels: &[&str]
         })
     })
     .await;
+    if !ok {
+        fleet.dump_diagnostics("workers rows never appeared");
+    }
     assert!(ok, "timed out waiting for `workers` rows for {labels:?}");
 
     let mut ids = Vec::with_capacity(labels.len());
@@ -214,7 +223,7 @@ async fn await_fleet_registered(session: &Arc<InferenceSession>, labels: &[&str]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedding_job_across_two_executors_matches_in_process() {
     const TEST: &str = "embedding_job_across_two_executors_matches_in_process";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -277,8 +286,12 @@ async fn embedding_job_across_two_executors_matches_in_process() {
     // Across the fleet, through the scheduler.
     let (specs, scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids =
-        await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    let ids = await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
@@ -347,7 +360,12 @@ async fn submit_and_await_placed_claim(
     let (specs, scheduler_port) = standard_fleet_specs();
     let _ = scheduler_port;
     let mut fleet = Fleet::spawn(backends, result_root, specs);
-    await_fleet_registered(session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    await_fleet_registered(
+        session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
 
     let (job_id, expected_model) = harness::submit_gang_fine_tune(session, source, size, 2).await;
     let record = harness::await_job(
@@ -365,7 +383,7 @@ async fn submit_and_await_placed_claim(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter() {
     const TEST: &str = "placed_gang_completes_on_a_registered_executor_other_than_the_submitter";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -499,7 +517,7 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
 async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes() {
     const TEST: &str =
         "killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -668,7 +686,7 @@ async fn killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_co
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
     const TEST: &str = "scheduler_restart_keeps_executors_and_serves_a_new_job";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -676,8 +694,12 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
 
     let (specs, scheduler_port) = standard_fleet_specs();
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids =
-        await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    let ids = await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
     let (lane2_id, lane3_id) = (ids[1].clone(), ids[2].clone());
     let lane1_label = fleet.label(0).to_string();
 
@@ -821,7 +843,7 @@ async fn scheduler_restart_keeps_executors_and_serves_a_new_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     const TEST: &str = "two_schedulers_over_one_catalog_serve_jobs_sequentially";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -869,7 +891,12 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
         },
     ));
     let mut fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
     let ok = harness::await_condition(Duration::from_secs(30), || {
         futures::executor::block_on(async {
             let workers = session.catalog().list_workers().await.unwrap_or_default();
@@ -973,7 +1000,7 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     const TEST: &str = "device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -981,7 +1008,12 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
 
     let (specs, scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
     // KIND MATCH (LANE pressure-round correction): a GangExec's required
@@ -1074,7 +1106,7 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_workers_and_compute_executor_devices_report_registered_devices() {
     const TEST: &str = "list_workers_and_compute_executor_devices_report_registered_devices";
-    let Some(backends) = harness::required_backends(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);
@@ -1082,8 +1114,12 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
 
     let (specs, _scheduler_port) = standard_fleet_specs();
     let fleet = Fleet::spawn(&backends, &result_root, specs);
-    let ids =
-        await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
+    let ids = await_fleet_registered(
+        &session,
+        &fleet,
+        &[fleet.label(0), fleet.label(1), fleet.label(2)],
+    )
+    .await;
 
     let cpu = jammi_db::catalog::instance::DeviceFact {
         kind: "cpu".to_string(),

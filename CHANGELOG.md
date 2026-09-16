@@ -804,6 +804,7 @@ workspace ships every publishable crate at the same
   when no registered executor lists the plan's kind, and the execution
   engine's own device-pinning refusal (K7) is the second line, never
   parked unschedulable.
+
 ### Changed
 - **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**
   `8081` (gRPC + Flight SQL) and `8080` (the HTTP side-channel) now publish

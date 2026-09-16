@@ -85,7 +85,6 @@ async fn build_shuffle_plan() -> (Arc<dyn ExecutionPlan>, SessionContext) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scheduler_and_executor_host_in_one_process_and_submit_round_trips() {
-    let _ = env_logger::builder().is_test(true).try_init();
     let session = session().await;
 
     let cluster = BallistaCluster::new_memory(
@@ -163,4 +162,52 @@ async fn unset_ballista_config_hosts_no_roles() {
     let cfg = jammi_db::config::BallistaConfig::default();
     assert!(!cfg.hosts_scheduler());
     assert!(!cfg.hosts_executor());
+}
+
+/// An executor role started BEFORE its scheduler is bound waits for it (a
+/// bounded window, `SCHEDULER_CONNECT_WINDOW`) and registers once the
+/// scheduler comes up, instead of refusing on the first refused connect —
+/// the shape of a fleet whose processes start concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn executor_waits_for_a_scheduler_that_binds_later() {
+    let session = session().await;
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("probe addr").port()
+    };
+    let executor_cfg = BallistaExecutorConfig {
+        scheduler_address: format!("127.0.0.1:{port}"),
+        bind: "127.0.0.1:0".to_string(),
+        grpc_bind: "127.0.0.1:0".to_string(),
+        advertise_host: Some("127.0.0.1".to_string()),
+        work_dir: None,
+        task_slots: 1,
+    };
+    let executor_session = Arc::clone(&session);
+    let executor_task =
+        tokio::spawn(async move { host_executor(&executor_session, &executor_cfg).await });
+    // The scheduler binds only after the executor has already been refused
+    // at least a few times (250 ms between attempts).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let cluster = BallistaCluster::new_memory(
+        "jammi-ballista-it-late",
+        Arc::new(default_session_builder),
+        Arc::new(default_config_producer),
+    );
+    let scheduler = host_scheduler(
+        &session,
+        &format!("127.0.0.1:{port}"),
+        cluster,
+        TaskDistributionPolicy::RoundRobin,
+    )
+    .await
+    .expect("scheduler role hosts on the pre-chosen port");
+    let executor = tokio::time::timeout(Duration::from_secs(30), executor_task)
+        .await
+        .expect("the executor registered within the window")
+        .expect("executor task joins")
+        .expect("executor role hosts and registers after the scheduler came up");
+    assert_eq!(executor.executor_id(), session.instance_id());
+    executor.stop().await;
+    scheduler.stop().await;
 }

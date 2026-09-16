@@ -145,3 +145,4 @@ crates/jammi-db/tests/it/segment.rs::open_backend
 crates/jammi-db/tests/it/sources.rs::build_backend
 crates/jammi-db/tests/it/trigger.rs::build_harness_with_broker
 crates/jammi-db/tests/it/trigger.rs::build_harness_with_in_memory_broker
+shared:crates/jammi-ballista/tests/distributed/harness.rs::required_backends

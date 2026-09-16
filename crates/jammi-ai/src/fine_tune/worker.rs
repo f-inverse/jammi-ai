@@ -119,6 +119,8 @@
 //! | 15 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
 //! | 16 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
 //! | 17 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
+//! | 18 | placed hand-off (contract `feat_500-wave4` §2.3/§9): the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
+//! | 19 | placed hand-off: the EXECUTOR, running [`JobWorker::run_placed_gang`] | writes as `Coordinator` (`run_claimed_job_under(.., placed = true)` is the SAME body as row 17 and every row above it) |
 //!
 //! `finish_job` (the compute arm's CAS) is reachable only from
 //! `run_claimed_compute_job`, a `LoopClaimer` by construction. The trainer's
@@ -135,9 +137,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
+use arrow::array::RecordBatch;
 use bytes::Bytes;
+use datafusion::error::DataFusionError;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use jammi_db::catalog::instance::{
-    GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
+    DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
 };
 use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerState};
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
@@ -147,6 +153,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::storage::StorageError;
+use jammi_db::store::manifest::ComputeDevice;
 use jammi_db::store::{ArtifactStore, ResultStore};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
@@ -170,6 +177,7 @@ use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
+use crate::operator::gang_exec::{GangDescriptor, PlacedOutcome};
 use crate::session::InferenceSession;
 use jammi_wire::proto::gang::{AbortReason, Assign};
 
@@ -325,6 +333,17 @@ pub enum Holder {
     ClaimProbe,
     /// A loop-claimed job runs under a registered lease hold.
     JobRun,
+    /// A loop-claimed attempt has SUBMITTED a `GangDescriptor` through an
+    /// installed `PlacedGangSubmitter` and is awaiting its stream (plan 67
+    /// wave 4, contract `feat_500-wave4` §9 block B2): this host runs no
+    /// compute for `(job_id, attempt)` while it waits, so it can still
+    /// serve a `RunRank` session for some OTHER attempt —
+    /// [`HostAdmission::try_hold_rank`] admits out of this state exactly as
+    /// it does out of `Free` — a two-host fleet could not otherwise
+    /// assemble if its only free-looking host were the one awaiting a
+    /// placement result. [`HostAdmission::probe_claim`] still refuses it,
+    /// exactly like `JobRun`.
+    Awaiting { job_id: String, attempt: u32 },
     /// An admitted gang rank is held for `(job_id, attempt)`.
     Rank { job_id: String, attempt: u32 },
 }
@@ -364,6 +383,79 @@ pub struct HostAdmission {
     /// ([`CoordinatorEnd::HostCannotCoordinate`]). Write-once: a second
     /// install is refused, never a silent swap under a running body.
     dialer: OnceLock<Arc<dyn MemberDialer>>,
+    /// Installed ONCE by the SCHEDULER role (`crates/jammi-ballista`): how a
+    /// claimant on this host submits its OWN training job as one Ballista
+    /// task instead of running it in-process (plan 67 wave 4, contract
+    /// `feat_500-wave4` §2.3). Absent on a process that hosts no scheduler.
+    placed_gang_submitter: OnceLock<Arc<dyn PlacedGangSubmitter>>,
+    /// Installed ONCE by the EXECUTOR role: how `GangExec::execute` — which
+    /// runs with only a Ballista `TaskContext` in hand, never a session —
+    /// reaches this process's coordinator body (see [`placed_gang_runner`]'s
+    /// doc for the process-global seam this backs).
+    placed_gang_runner: OnceLock<Arc<dyn PlacedGangRunner>>,
+}
+
+/// The process-global weak link to whichever session's [`HostAdmission`]
+/// installed a [`PlacedGangRunner`] — set the one time
+/// [`HostAdmission::install_placed_gang_runner`] succeeds anywhere in this
+/// process, never a second, independent global (see
+/// `crate::operator::gang_exec`'s module doc for the refutation of a
+/// `TaskContext`-extension alternative).
+static PLACED_GANG_HOST: OnceLock<Weak<HostAdmission>> = OnceLock::new();
+
+/// The process's installed [`PlacedGangRunner`], if this process's session
+/// hosts a Ballista executor — the ONLY way
+/// `GangExec::execute` reaches it, since its
+/// `execute` runs with no session in hand. `None` both when no session on
+/// this process ever installed one, and when the installing session has
+/// since dropped (the weak upgrade fails).
+pub fn placed_gang_runner() -> Option<Arc<dyn PlacedGangRunner>> {
+    PLACED_GANG_HOST
+        .get()
+        .and_then(Weak::upgrade)
+        .and_then(|admission| admission.placed_gang_runner())
+}
+
+/// Submit a training job as one Ballista task instead of running it
+/// in-process — installed by the SCHEDULER role (`crates/jammi-ballista`)
+/// through [`HostAdmission::install_placed_gang_submitter`].
+/// `run_claimed_job_under` checks this seam, before `run_spec`/topology are
+/// ever reached, for every claimed `fine_tune`/`graph_fine_tune` attempt a
+/// non-placed run makes (contract `feat_500-wave4` §9, pressure-round delta
+/// 1): `placement_available()` true means SOME OTHER registered executor
+/// exists to place the job on. The stream's items are DataFusion's own
+/// `Result` — this is exactly Ballista's `execute_physical_plan` result,
+/// carried unwrapped, never re-typed through `JammiError`.
+pub trait PlacedGangSubmitter: Send + Sync {
+    /// Submit `descriptor` and hand back the physical plan's own output
+    /// stream (Ballista's), or a jammi-side error raised BEFORE any task
+    /// was ever scheduled (a dial failure, a device-less cluster refusing
+    /// the submission typed).
+    fn submit(
+        &self,
+        descriptor: GangDescriptor,
+    ) -> BoxFuture<
+        'static,
+        Result<BoxStream<'static, std::result::Result<RecordBatch, DataFusionError>>>,
+    >;
+
+    /// Whether SOME OTHER registered executor exists to place a job on
+    /// right now (the scheduler role answers this from its own executor
+    /// registrations) — `false` degrades every claim on this host straight
+    /// to its in-process run, never a submission with nowhere to land.
+    fn placement_available(&self) -> bool;
+}
+
+/// Run a placed gang's coordinator body on THIS process — installed by the
+/// EXECUTOR role through [`HostAdmission::install_placed_gang_runner`];
+/// `GangExec::execute` dispatches through it
+/// via the process-global [`placed_gang_runner`] (that function's doc states
+/// why: a Ballista executor's `TaskContext` carries no jammi session).
+pub trait PlacedGangRunner: Send + Sync {
+    fn run(
+        &self,
+        descriptor: GangDescriptor,
+    ) -> BoxFuture<'static, Result<crate::operator::gang_exec::PlacedOutcome>>;
 }
 
 /// The coordinator's one transport seam: open `RunRank` on a member's
@@ -383,7 +475,8 @@ pub trait MemberDialer: Send + Sync {
 }
 
 impl HostAdmission {
-    /// Fresh admission state: phase `Running`, holder `Free`, no dialer.
+    /// Fresh admission state: phase `Running`, holder `Free`, no dialer, no
+    /// placed-gang seam.
     pub fn new(registry: Arc<InstanceRegistration>) -> Arc<Self> {
         let (phase, _) = watch::channel(WorkerPhase::Running);
         let (holder, _) = watch::channel(Holder::Free);
@@ -392,6 +485,8 @@ impl HostAdmission {
             holder,
             registry,
             dialer: OnceLock::new(),
+            placed_gang_submitter: OnceLock::new(),
+            placed_gang_runner: OnceLock::new(),
         })
     }
 
@@ -405,6 +500,65 @@ impl HostAdmission {
     /// listener.
     pub fn member_dialer(&self) -> Option<Arc<dyn MemberDialer>> {
         self.dialer.get().cloned()
+    }
+
+    /// Install the process's [`PlacedGangSubmitter`] — once. `false` when
+    /// one is already installed (the [`MemberDialer`] shape).
+    pub fn install_placed_gang_submitter(&self, submitter: Arc<dyn PlacedGangSubmitter>) -> bool {
+        self.placed_gang_submitter.set(submitter).is_ok()
+    }
+
+    /// The installed [`PlacedGangSubmitter`], if this process mounted a
+    /// Ballista scheduler.
+    pub fn placed_gang_submitter(&self) -> Option<Arc<dyn PlacedGangSubmitter>> {
+        self.placed_gang_submitter.get().cloned()
+    }
+
+    /// Install the process's [`PlacedGangRunner`] — once — and, on that
+    /// first install only, register this admission as the process-global
+    /// `PLACED_GANG_HOST` a body-less `GangExec::execute` reaches it
+    /// through (`false` on a second install, the same [`MemberDialer`]
+    /// shape; the global is set only alongside a WINNING install, never on
+    /// a losing one).
+    pub fn install_placed_gang_runner(self: &Arc<Self>, runner: Arc<dyn PlacedGangRunner>) -> bool {
+        let installed = self.placed_gang_runner.set(runner).is_ok();
+        if installed {
+            let _ = PLACED_GANG_HOST.set(Arc::downgrade(self));
+        }
+        installed
+    }
+
+    /// The installed [`PlacedGangRunner`], if this process mounted a
+    /// Ballista executor.
+    pub fn placed_gang_runner(&self) -> Option<Arc<dyn PlacedGangRunner>> {
+        self.placed_gang_runner.get().cloned()
+    }
+
+    /// `JobRun → Awaiting{job_id, attempt}` — the claim loop's own attempt
+    /// has SUBMITTED a `GangDescriptor` and awaits its stream (contract
+    /// `feat_500-wave4` §9 block B2): this host runs no compute for the
+    /// attempt meanwhile, so it can still serve a `RunRank` session
+    /// ([`Self::try_hold_rank`]'s `Awaiting` arm admits exactly as `Free`
+    /// does) — a two-host fleet could not otherwise assemble if its only
+    /// free-looking host were the one busy awaiting a placement result. A
+    /// no-op (`false`) unless the holder is exactly `JobRun` — a direct
+    /// `run_claimed_job`/an inline `run_now` (no [`ClaimGuard`]) or a slot
+    /// already superseded never observes this transition. No corresponding
+    /// "end awaiting" call is needed: the loop's own [`ClaimGuard`], still
+    /// held across the whole submit-and-await, resets `Awaiting` to `Free`
+    /// on drop exactly as it resets `ClaimProbe`/`JobRun`.
+    pub(crate) fn begin_awaiting_placement(&self, job_id: &str, attempt: u32) -> bool {
+        self.holder.send_if_modified(|h| {
+            if *h == Holder::JobRun {
+                *h = Holder::Awaiting {
+                    job_id: job_id.to_string(),
+                    attempt,
+                };
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// This process's registration — the ONE carrier its `instances` row
@@ -530,6 +684,20 @@ impl HostAdmission {
                 };
                 true
             }
+            // A host awaiting its OWN placed attempt's stream runs no
+            // compute meanwhile, so it can still serve a rank of some
+            // OTHER attempt — admitted exactly like `Free` (§9 block B2).
+            // The awaited attempt's own eventual `ClaimGuard::drop` no
+            // longer finds `Awaiting` in the cell in this case and is a
+            // no-op, leaving this rank's hold untouched — the same rule a
+            // superseded `Rank`'s elder guard already follows.
+            Holder::Awaiting { .. } => {
+                *h = Holder::Rank {
+                    job_id: job_id.to_string(),
+                    attempt,
+                };
+                true
+            }
             Holder::Rank {
                 job_id: held_job,
                 attempt: held_attempt,
@@ -625,7 +793,10 @@ pub struct ClaimGuard {
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
         self.admission.holder.send_if_modified(|h| {
-            if matches!(h, Holder::ClaimProbe | Holder::JobRun) {
+            if matches!(
+                h,
+                Holder::ClaimProbe | Holder::JobRun | Holder::Awaiting { .. }
+            ) {
                 *h = Holder::Free;
                 true
             } else {
@@ -1014,6 +1185,50 @@ pub(crate) async fn release_sweep(
     ReleaseSweep { jobs, building }
 }
 
+/// This host's compute devices, in rank order — the `workers.devices`
+/// `ListWorkers` mirror (contract `feat_500-wave4` §3): config alone
+/// decides the list, with no GPU needed to compute it. Every entry's
+/// `ordinal` is [`jammi_db::config::WorkerTopology::rank_devices`]'s own
+/// configured ordinal, `.max(0)` (the CPU sentinel `-1` becomes the honest
+/// `0` — a `DeviceFact` ordinal is never negative); every entry's `kind` is
+/// this SESSION's own [`ComputeDevice`] discriminant (one gang runs on one
+/// kind of device — `GpuConfig::validate` already refuses a mixed list —
+/// so the session's own backend kind applies uniformly, never re-probed
+/// per ordinal). `[worker]`/`[gpu]` are validated together at
+/// `InferenceSession` construction (`session.rs`'s own `worker.topology(&gpu)`
+/// call), so a live session reaching the claim loop can never see the
+/// `Err` arm below; it is kept typed rather than a panic so a future
+/// caller that skips that validation degrades to "no devices registered"
+/// instead of crashing the loop.
+fn worker_devices(
+    config: &jammi_db::config::JammiConfig,
+    compute_device: ComputeDevice,
+) -> Vec<DeviceFact> {
+    let kind = match compute_device {
+        ComputeDevice::Cpu => "cpu",
+        ComputeDevice::Cuda { .. } => "cuda",
+        ComputeDevice::Metal { .. } => "metal",
+    };
+    match config.worker.topology(&config.gpu) {
+        Ok(topology) => topology
+            .rank_devices()
+            .iter()
+            .map(|&ordinal| DeviceFact {
+                kind: kind.to_string(),
+                ordinal: ordinal.max(0) as u32,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "worker devices: [worker]/[gpu] topology invalid on a live session (unreachable \
+                 if session construction validated it)"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// The gauge sampler: one `count_jobs_by_kind_status` per `every`, on its
 /// own task — never on a `/metrics` scrape (a scrape storm must not become a
 /// catalog storm) and never on the claim loop (which does not tick during a
@@ -1042,7 +1257,7 @@ async fn write_worker_facts(
     let previous = registration.worker_snapshot();
     registration.set_worker(Some(facts.clone()));
     match catalog
-        .upsert_worker(worker_id, &facts.kinds, facts.state)
+        .upsert_worker(worker_id, &facts.kinds, facts.state, &facts.devices)
         .await
     {
         Ok(()) => true,
@@ -1294,6 +1509,7 @@ impl JobWorker {
             WorkerFacts {
                 kinds: self.kinds.join(","),
                 state: WorkerState::Warming,
+                devices: worker_devices(session.inner_config(), session.compute_device()),
             },
             "warming",
         )
@@ -1325,6 +1541,7 @@ impl JobWorker {
                 WorkerFacts {
                     kinds: self.kinds.join(","),
                     state: WorkerState::Claiming,
+                    devices: worker_devices(session.inner_config(), session.compute_device()),
                 },
                 "claiming",
             )
@@ -1405,7 +1622,8 @@ impl JobWorker {
                     // the run re-upgrades the Weak through the `Arc` it captures.
                     // The probe guard lives across the run: `ClaimProbe → JobRun`
                     // at the hold site, `→ Free` here when the run returns.
-                    self.run_claimed_job_under(&session, record, &shared).await;
+                    self.run_claimed_job_under(&session, record, &shared, false)
+                        .await;
                     drop(claim);
                 }
                 None => {
@@ -1538,18 +1756,27 @@ impl JobWorker {
         // leave the session's holder exactly as they found it (a direct run
         // sits beside the loop's slot the way an inline `run_now` does).
         let shared = WorkerShared::new(Arc::clone(&self.admission), self.worker_id.clone());
-        self.run_claimed_job_under(session, record, &shared).await
+        self.run_claimed_job_under(session, record, &shared, false)
+            .await;
     }
 
     /// [`Self::run_claimed_job`] under the loop's [`WorkerShared`]: the two
     /// hold sites register through [`register_job_hold_or_release`] against
     /// `shared`'s phase and account the job in `shared.in_flight`.
+    ///
+    /// `placed = true` is the ONE recursion guard (contract `feat_500-wave4`
+    /// §9, pressure-round delta 1): a run [`Self::run_placed_gang`] is
+    /// already coordinating on THIS process never re-checks the placement
+    /// seam, however many gang listeners this process happens to host —
+    /// every OTHER caller (the claim loop, [`Self::run_claimed_job`]) passes
+    /// `false`.
     async fn run_claimed_job_under(
         &self,
         session: &Arc<InferenceSession>,
         record: jammi_db::catalog::jobs_repo::JobRecord,
         shared: &Arc<WorkerShared>,
-    ) {
+        placed: bool,
+    ) -> AttemptEnd {
         let job_id = record.job_id.clone();
         // The attempt counter makes the artifact prefix unique per (job, worker,
         // attempt): a reclaimed job re-runs under a higher `attempts`, so its
@@ -1559,6 +1786,10 @@ impl JobWorker {
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
         if is_compute_kind(&record.kind) {
+            // Unreachable for `placed`: a `GangDescriptor` only ever names a
+            // `fine_tune`/`graph_fine_tune` attempt (§9's placement check,
+            // below, is the only producer of one) — a compute kind never
+            // reaches `run_placed_gang`.
             self.run_claimed_compute_job(
                 session,
                 &catalog,
@@ -1570,7 +1801,7 @@ impl JobWorker {
                 record.tenant_id,
             )
             .await;
-            return;
+            return AttemptEnd::LeftForReclaim;
         }
 
         let spec: TrainingSpec = match serde_json::from_str(&record.spec) {
@@ -1590,16 +1821,17 @@ impl JobWorker {
                     attempt,
                 )
                 .await;
+                let reason = format!("undeserialisable training_spec: {e}");
                 record_failed(
                     LeaseHolder::LoopClaimer,
                     &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    format!("undeserialisable training_spec: {e}"),
+                    reason.clone(),
                 )
                 .await;
-                return;
+                return AttemptEnd::Failed { reason };
             }
         };
         // Who this attempt runs as — derived ONCE from the spec and this
@@ -1632,7 +1864,7 @@ impl JobWorker {
         let Some(hold) =
             register_job_hold_or_release(session, &catalog, shared, &job_id, attempt, holder).await
         else {
-            return;
+            return AttemptEnd::LeftForReclaim;
         };
         let cancel = hold.lost_flag();
 
@@ -1699,36 +1931,69 @@ impl JobWorker {
             }
             _ => None,
         };
-        let outcome = match record.tenant_id {
-            Some(tenant) => {
-                let recorded_pair = recorded_pair.clone();
-                session
-                    .with_tenant_scoped(tenant, |_scope| {
-                        self.run_spec(
-                            session,
-                            &catalog,
-                            &job_id,
-                            spec,
-                            &cancel,
-                            attempt,
-                            recorded_pair,
-                            holder,
-                        )
-                    })
-                    .await
+
+        // Placement is decided BEFORE topology and applies to every
+        // FineTune/GraphFineTune attempt this run is not itself placed
+        // (contract `feat_500-wave4` §9, pressure-round delta 1) — never a
+        // `ContextPredictor`, which carries no `world_size`/gang concept at
+        // all. `world` travels as informational only: the executor decides
+        // ITS OWN topology from the spec's `world_size` and its OWN
+        // `[worker] local_ranks` when it runs `run_claimed_job_under`
+        // itself, so no materialization/loader work happens here for a
+        // placed attempt — it happens once, on whichever process actually
+        // trains.
+        let placement_world = if placed {
+            None
+        } else {
+            match &spec {
+                TrainingSpec::FineTune { common, .. } => Some(common.world_size),
+                TrainingSpec::GraphFineTune { common, .. } => Some(common.world_size),
+                TrainingSpec::ContextPredictor { .. } => None,
             }
-            None => {
-                self.run_spec(
-                    session,
-                    &catalog,
-                    &job_id,
-                    spec,
-                    &cancel,
-                    attempt,
-                    recorded_pair,
-                    holder,
-                )
+        };
+        let placement = placement_world.and_then(|world| {
+            session
+                .host_admission()
+                .placed_gang_submitter()
+                .filter(|submitter| submitter.placement_available())
+                .map(|submitter| (world, submitter))
+        });
+
+        let outcome = if let Some((world, submitter)) = placement {
+            self.submit_placed(session, &catalog, &job_id, attempt, world, submitter)
                 .await
+        } else {
+            match record.tenant_id {
+                Some(tenant) => {
+                    let recorded_pair = recorded_pair.clone();
+                    session
+                        .with_tenant_scoped(tenant, |_scope| {
+                            self.run_spec(
+                                session,
+                                &catalog,
+                                &job_id,
+                                spec,
+                                &cancel,
+                                attempt,
+                                recorded_pair,
+                                holder,
+                            )
+                        })
+                        .await
+                }
+                None => {
+                    self.run_spec(
+                        session,
+                        &catalog,
+                        &job_id,
+                        spec,
+                        &cancel,
+                        attempt,
+                        recorded_pair,
+                        holder,
+                    )
+                    .await
+                }
             }
         };
 
@@ -1747,16 +2012,49 @@ impl JobWorker {
 
         match outcome {
             Ok(artifact) => {
-                self.publish_and_finalize(
-                    holder,
-                    session,
-                    &catalog,
-                    &job_id,
-                    attempt,
-                    epoch_checkpointing,
-                    artifact,
-                )
-                .await;
+                // Computed BEFORE the artifact's directory is handed to
+                // `publish_and_finalize` (which consumes it) — the SAME
+                // bytes a member/an in-process `Peer` rank digests (K4), so
+                // a placed run's `PlacedOutcome::Trained` carries an
+                // identical digest without a second row read.
+                let digest = adapter_files_digest(artifact.dir.path());
+                match self
+                    .publish_and_finalize(
+                        holder,
+                        session,
+                        &catalog,
+                        &job_id,
+                        attempt,
+                        epoch_checkpointing,
+                        artifact,
+                    )
+                    .await
+                {
+                    PublishOutcome::Completed => match digest {
+                        Ok(artifact_digest) => AttemptEnd::Published { artifact_digest },
+                        Err(e) => {
+                            // The publish itself already read every file in
+                            // the SAME directory successfully (it just
+                            // committed `completed`) — a digest re-read
+                            // failing here is an I/O fault in the narrow
+                            // window between those two reads, not a
+                            // training/publish failure; the row IS
+                            // genuinely `completed`. UNCOVERED: no fixture
+                            // manufactures this race.
+                            tracing::error!(
+                                job_id = %job_id, worker = %self.worker_id, error = %e,
+                                "completed job's artifact digest could not be re-read"
+                            );
+                            AttemptEnd::Failed {
+                                reason: format!(
+                                    "artifact published but its digest could not be re-read: {e}"
+                                ),
+                            }
+                        }
+                    },
+                    PublishOutcome::Failed(reason) => AttemptEnd::Failed { reason },
+                    PublishOutcome::LeftForReclaim => AttemptEnd::LeftForReclaim,
+                }
             }
             Err(WorkerJobError::Cancelled) => {
                 // No `TrainedArtifact` was ever built on this path (the run
@@ -1785,23 +2083,26 @@ impl JobWorker {
                     // their own checkpoints (`JammiError::JobCancelled`),
                     // never the lease-lost log line below.
                     tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording failed");
+                    let reason = JammiError::JobCancelled {
+                        job_id: job_id.clone(),
+                    }
+                    .to_string();
                     record_failed(
                         holder,
                         &catalog,
                         &job_id,
                         &self.worker_id,
                         attempt,
-                        JammiError::JobCancelled {
-                            job_id: job_id.clone(),
-                        }
-                        .to_string(),
+                        reason.clone(),
                     )
                     .await;
+                    AttemptEnd::Failed { reason }
                 } else {
                     // Lease lost: leave the job `running` for reclaim to
                     // re-queue. Do not record a terminal status — a
                     // different worker now owns, or will own, this job.
                     tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (lease lost); left for reclaim");
+                    AttemptEnd::LeftForReclaim
                 }
             }
             Err(WorkerJobError::Abandoned(why)) => {
@@ -1822,10 +2123,31 @@ impl JobWorker {
                     epoch_checkpoint_bound,
                 )
                 .await;
+                AttemptEnd::LeftForReclaim
+            }
+            Err(WorkerJobError::HandedOff) => {
+                // §2.3's placed hand-off: this process wrote NOTHING under
+                // its own worker id for this attempt (the placement check
+                // runs before any materialization/training starts), so
+                // there is nothing here to sweep — the row, and its lease
+                // keeper registration, are the executor's now.
+                tracing::info!(
+                    job_id = %job_id, worker = %self.worker_id,
+                    "gang attempt handed off to a placed executor"
+                );
+                AttemptEnd::LeftForReclaim
             }
             Err(WorkerJobError::Failed(msg)) => {
                 tracing::error!(job_id = %job_id, error = %msg, "training job failed");
-                record_failed(holder, &catalog, &job_id, &self.worker_id, attempt, msg).await;
+                record_failed(
+                    holder,
+                    &catalog,
+                    &job_id,
+                    &self.worker_id,
+                    attempt,
+                    msg.clone(),
+                )
+                .await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
                 // a `spawn_blocking` join error, and any typed training
                 // failure — none of which ever produced a `TrainedArtifact`.
@@ -1839,7 +2161,210 @@ impl JobWorker {
                     epoch_checkpoint_bound,
                 )
                 .await;
+                AttemptEnd::Failed { reason: msg }
             }
+        }
+    }
+
+    /// Submit this attempt as one Ballista task through the installed
+    /// [`PlacedGangSubmitter`] and await its stream, instead of running it
+    /// in-process (contract `feat_500-wave4` §2.3/§9). The submitter's exit
+    /// arms are total (this function's only return values):
+    ///
+    /// - the stream ends with AT LEAST ONE batch → [`WorkerJobError::
+    ///   HandedOff`] (the executor owns the attempt from here: no terminal
+    ///   write, no release);
+    /// - the stream ends in an error, or ends with no batch and no error
+    ///   (the submission itself never reached a running task) → re-read the
+    ///   row: `claimed_by` is STILL this instance (the transfer never
+    ///   happened, or the executor refused before the CAS) →
+    ///   [`WorkerJobError::Abandoned`] (left `running` for reclaim, an
+    ///   attempt spent at the successor's claim — wave 3 §8's shape);
+    ///   `claimed_by` moved → [`WorkerJobError::HandedOff`] (the executor
+    ///   owns the attempt; if it died, its own lease expiry requeues it,
+    ///   never this instance's).
+    ///
+    /// This host's holder moves `JobRun → Awaiting{job_id, attempt}` right
+    /// after a successful submit (`HostAdmission::begin_awaiting_placement`,
+    /// §9 block B2): the host runs no compute while it waits, so it can
+    /// still serve a `RunRank` session — a two-host fleet could not
+    /// otherwise assemble if its only free-looking host were the one
+    /// awaiting its own placement result.
+    async fn submit_placed(
+        &self,
+        session: &Arc<InferenceSession>,
+        catalog: &Arc<Catalog>,
+        job_id: &str,
+        attempt: u32,
+        world: u32,
+        submitter: Arc<dyn PlacedGangSubmitter>,
+    ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
+        #[cfg(feature = "test-hooks")]
+        training_test_hooks::note_placed(job_id, attempt);
+        let descriptor = GangDescriptor {
+            job_id: job_id.to_string(),
+            attempt,
+            world,
+            submitter: session.instance_id().to_string(),
+        };
+        let mut stream = match submitter.submit(descriptor).await {
+            Ok(stream) => stream,
+            Err(e) => return Err(self.placed_submit_end(catalog, job_id, e).await),
+        };
+        session
+            .host_admission()
+            .begin_awaiting_placement(job_id, attempt);
+        use futures::StreamExt;
+        let mut saw_batch = false;
+        let mut end_err: Option<JammiError> = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_batch) => saw_batch = true,
+                Err(e) => {
+                    end_err = Some(e.into());
+                    break;
+                }
+            }
+        }
+        if saw_batch {
+            return Err(WorkerJobError::HandedOff);
+        }
+        let e = end_err.unwrap_or_else(|| {
+            JammiError::FineTune("the placed gang's stream ended with no batch and no error".into())
+        });
+        Err(self.placed_submit_end(catalog, job_id, e).await)
+    }
+
+    /// Re-read the row after a submission fault (before any batch arrived):
+    /// still this instance's claim → [`WorkerJobError::Abandoned`]; moved
+    /// (or the re-read itself faults) → [`WorkerJobError::HandedOff`] — see
+    /// [`Self::submit_placed`]'s doc.
+    async fn placed_submit_end(
+        &self,
+        catalog: &Arc<Catalog>,
+        job_id: &str,
+        e: JammiError,
+    ) -> WorkerJobError {
+        let still_mine = matches!(
+            catalog.get_job(job_id).await,
+            Ok(record) if record.claimed_by.as_deref() == Some(self.worker_id.as_str())
+        );
+        let end = if still_mine {
+            WorkerJobError::Abandoned(format!("placement failed before transfer: {e}"))
+        } else {
+            WorkerJobError::HandedOff
+        };
+        #[cfg(feature = "test-hooks")]
+        training_test_hooks::note_placed_submit_end(
+            job_id,
+            matches!(end, WorkerJobError::Abandoned(_)),
+        );
+        end
+    }
+
+    /// Run a placed gang's coordinator body on THIS process — the seam
+    /// `GangExec::execute` dispatches through
+    /// as the process's installed [`PlacedGangRunner`] (contract
+    /// `feat_500-wave4` §2.3). Reuses `Self::run_claimed_job_under`
+    /// VERBATIM (`placed = true`, the recursion guard) — assembly →
+    /// dispatch → rounds → publish → finalize, `LeaseHolder::Coordinator`
+    /// — the SAME body a `Peer` gang's claimant runs, so the published
+    /// bytes are U5b's (K4). An ASSOCIATED function, not a method: the
+    /// caller (the executor role, `crates/jammi-ballista`) holds only the
+    /// session, never a `JobWorker`.
+    ///
+    /// (i) takes this host's job slot through [`HostAdmission::probe_claim`]
+    /// — exactly as the claim loop does (`Free → ClaimProbe`; a host
+    /// already holding a rank, a loop-claimed job, or another placement's
+    /// probe/await refuses typed BEFORE any row write — OPS D6); (ii)
+    /// [`Catalog::transfer_claim`] moves `claimed_by` from
+    /// `descriptor.submitter` to this instance at the SAME `attempts`,
+    /// arming a fresh lease (`false` — the transfer never happened, a
+    /// stale runner, or a second launch of an already-transferred attempt
+    /// — is a typed refusal, the slot released, no row write); (iii)
+    /// re-reads the row (`Catalog::get_job`) and runs
+    /// `Self::run_claimed_job_under` — which registers THIS process's own
+    /// [`LeaseKeeper`] hold (`register_job_hold_or_release`, the SAME verb
+    /// the claim loop uses after `claim_next`) and flips the claim guard's
+    /// `ClaimProbe → JobRun` (`HostAdmission::job_running`) itself, so
+    /// nothing here duplicates that registration; (iv) maps the body's
+    /// `AttemptEnd` to [`PlacedOutcome`] (`Published` → `Trained`;
+    /// `Failed` → `Failed`; `LeftForReclaim` → a typed `Err`, so the
+    /// Ballista task itself ends in error and Ballista's own zero-retry
+    /// policy — `task_max_failures = 0`, README r40 — never re-runs THIS
+    /// task; jammi's own reclaim, from a FUTURE claim, is the only path
+    /// back); (v) releases the slot on every exit arm (the claim guard's
+    /// own `Drop`).
+    pub async fn run_placed_gang(
+        session: &Arc<InferenceSession>,
+        descriptor: GangDescriptor,
+    ) -> Result<PlacedOutcome> {
+        let admission = session.host_admission();
+        let Some(claim) = admission.probe_claim() else {
+            return Err(JammiError::FineTune(
+                "run_placed_gang: this host's job slot is busy (a rank is held, a loop-claimed \
+                 job already runs, or another placement is in flight)"
+                    .into(),
+            ));
+        };
+        let catalog = session.catalog();
+        let lease = session.inner_config().lease.intervals()?.lease();
+        let worker = JobWorker::new(session)?;
+        let transferred = catalog
+            .transfer_claim(
+                &descriptor.job_id,
+                &descriptor.submitter,
+                worker.worker_id(),
+                descriptor.attempt,
+                lease,
+            )
+            .await;
+        let transferred = match transferred {
+            Ok(t) => t,
+            Err(e) => {
+                drop(claim);
+                return Err(e);
+            }
+        };
+        if !transferred {
+            drop(claim);
+            return Err(JammiError::FineTune(format!(
+                "run_placed_gang: the transfer for job '{}' attempt {} did not land (already \
+                 transferred, a stale attempt, or the row moved)",
+                descriptor.job_id, descriptor.attempt
+            )));
+        }
+        // `get_job` is tenant-SCOPED (a caller-facing read); the claim it
+        // stands in for here is the unscoped kind every claim-loop read is
+        // (the module doc: "the catalog used for reclaim/claim is
+        // unscoped — a worker serves every tenant's queue") — admin scope
+        // for this ONE re-read, exactly as a claim's own row read would see
+        // it regardless of tenant.
+        let record = match session
+            .with_admin_scope(|_scope| catalog.get_job(&descriptor.job_id))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                drop(claim);
+                return Err(e);
+            }
+        };
+        let shared = WorkerShared::new(Arc::clone(admission), worker.worker_id.clone());
+        let end = worker
+            .run_claimed_job_under(session, record, &shared, true)
+            .await;
+        drop(claim);
+        match end {
+            AttemptEnd::Published { artifact_digest } => {
+                Ok(PlacedOutcome::Trained { artifact_digest })
+            }
+            AttemptEnd::Failed { reason } => Ok(PlacedOutcome::Failed { reason }),
+            AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
+                "run_placed_gang: job '{}' attempt {} left running for reclaim (no terminal \
+                 write)",
+                descriptor.job_id, descriptor.attempt
+            ))),
         }
     }
 
@@ -1882,7 +2407,7 @@ impl JobWorker {
         attempt: u32,
         epoch_checkpointing: Option<(usize, u32)>,
         artifact: TrainedArtifact,
-    ) {
+    ) -> PublishOutcome {
         let store = session.artifact_store();
         // The guarded port every abandon-path byte-delete in this function
         // reaches through — never the unguarded
@@ -1948,7 +2473,7 @@ impl JobWorker {
                         epoch_checkpoint_bound,
                     )
                     .await;
-                    return;
+                    return PublishOutcome::Failed(e.to_string());
                 }
             };
 
@@ -1976,7 +2501,7 @@ impl JobWorker {
                 e.to_string(),
             )
             .await;
-            return;
+            return PublishOutcome::Failed(e.to_string());
         }
 
         // The model-level materialization SIDECAR OBJECT
@@ -2040,7 +2565,7 @@ impl JobWorker {
                             e.to_string(),
                         )
                         .await;
-                        return;
+                        return PublishOutcome::Failed(e.to_string());
                     }
                 };
                 let anchors_json = match serde_json::to_string(&manifest.input_anchors) {
@@ -2073,7 +2598,7 @@ impl JobWorker {
                             e.to_string(),
                         )
                         .await;
-                        return;
+                        return PublishOutcome::Failed(e.to_string());
                     }
                 };
                 pending_record =
@@ -2164,16 +2689,17 @@ impl JobWorker {
                     epoch_checkpoint_bound,
                 )
                 .await;
+                let reason = format!("job result serialisation failed: {e}");
                 record_failed(
                     holder,
                     catalog,
                     job_id,
                     &self.worker_id,
                     attempt,
-                    format!("job result serialisation failed: {e}"),
+                    reason.clone(),
                 )
                 .await;
-                return;
+                return PublishOutcome::Failed(reason);
             }
         };
 
@@ -2249,6 +2775,7 @@ impl JobWorker {
                     )
                     .await;
                 }
+                PublishOutcome::Completed
             }
             Ok(false) => {
                 // Lost the lease before finalizing: our CAS matched zero rows, so
@@ -2276,6 +2803,7 @@ impl JobWorker {
                     %holder,
                     "lost lease before finalize; not finalizing (left for reclaim)"
                 );
+                PublishOutcome::LeftForReclaim
             }
             Err(e) => {
                 abandon_unfinalized_attempt(refs, catalog, &prefix, &model_id, register.version)
@@ -2291,6 +2819,7 @@ impl JobWorker {
                 )
                 .await;
                 tracing::error!(job_id = %job_id, %holder, error = %e, "finish_job_with_model failed");
+                PublishOutcome::LeftForReclaim
             }
         }
     }
@@ -5372,6 +5901,17 @@ impl JobWorker {
             // coordinator body's own classification); folded, not
             // wildcarded, so the match stays total.
             Err(WorkerJobError::Abandoned(why)) => (CoordinatorEnd::TrainingFailed(why), None),
+            // `train_fine_tune` never produces this arm either — `HandedOff`
+            // is `submit_placed`'s own classification, reached ONLY from
+            // `run_claimed_job_under`'s placement check, before topology is
+            // ever decided (a `Peer` rank's own `train_fine_tune` call never
+            // reaches it). Folded, not wildcarded, so the match stays total.
+            Err(WorkerJobError::HandedOff) => (
+                CoordinatorEnd::TrainingFailed(
+                    "unreachable: HandedOff surfaced from train_fine_tune".into(),
+                ),
+                None,
+            ),
             Err(WorkerJobError::Failed(msg)) => {
                 if let Some((rank, raw)) = coordinator.member_aborts().into_iter().next() {
                     let reason = AbortReason::try_from(raw).unwrap_or(AbortReason::Unspecified);
@@ -5991,6 +6531,38 @@ async fn abandon_unfinalized_attempt(
     }
 }
 
+/// What [`JobWorker::publish_and_finalize`] did — the ONE fact
+/// [`JobWorker::run_claimed_job_under`] needs to derive its own
+/// [`AttemptEnd`] without re-deriving it from a second row read.
+enum PublishOutcome {
+    /// The finalize CAS committed `completed`.
+    Completed,
+    /// A terminal `failed` was already recorded (by this function), with
+    /// this reason.
+    Failed(String),
+    /// No terminal write: the finalize CAS lost the race (this instance's
+    /// lease was gone by the time it ran) — left `running` for reclaim.
+    LeftForReclaim,
+}
+
+/// What one attempt of [`JobWorker::run_claimed_job_under`] ended as — the
+/// fact [`JobWorker::run_placed_gang`] maps onto
+/// [`crate::operator::gang_exec::PlacedOutcome`] without a second row read.
+/// `run_claimed_job`/the claim loop discard it; both already observe every
+/// row write this type merely reports.
+enum AttemptEnd {
+    /// The attempt published `completed`; this is the artifact's own digest
+    /// (`adapter_files_digest`, computed over the SAME directory
+    /// `publish_and_finalize` just uploaded from — K4).
+    Published { artifact_digest: String },
+    /// A terminal `failed` was recorded, with this reason.
+    Failed { reason: String },
+    /// No terminal write: left `running` for reclaim (a lease loss, a
+    /// finalize race lost, a mid-run gang abandon, or a hand-off to a
+    /// placed executor).
+    LeftForReclaim,
+}
+
 /// The terminal classification of a worker's run of one job.
 enum WorkerJobError {
     /// The lease was lost mid-training; the job is left `running` for reclaim.
@@ -6007,6 +6579,18 @@ enum WorkerJobError {
     /// re-assembles once its cooldown passes. The string is the reason, for
     /// the log.
     Abandoned(String),
+    /// The claim moved to a placed executor mid-attempt (contract
+    /// `feat_500-wave4` §2.3): the submitter's stream ended with at least
+    /// one batch, or ended in error/emptily AFTER `Catalog::transfer_claim`
+    /// already moved `claimed_by` off this instance. NO terminal write, NO
+    /// release — the row is another process's now, and this process's
+    /// lease keeper registration for the attempt is already dropped by the
+    /// time this arm is reached (the same `drop(hold); drop(cancel_watcher);`
+    /// every other end goes through) — a heartbeat from this stale holder
+    /// can never resurrect the lease (`Catalog::heartbeat_job` keys on
+    /// `claimed_by`, proven by
+    /// `crates/jammi-ai/tests/it/gang_placed.rs::the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_lease`).
+    HandedOff,
 }
 
 /// Render a terminal training failure's message for `record_failed` to
@@ -6758,6 +7342,63 @@ pub mod training_test_hooks {
             .iter()
             .filter(|(id, _, _, _)| id == job_id)
             .map(|(_, attempt, end, ordinal)| (*attempt, end.clone(), *ordinal))
+            .collect()
+    }
+
+    fn placed_submissions() -> &'static Mutex<Vec<(String, u32)>> {
+        static SLOTS: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Recorded by [`super::JobWorker::submit_placed`] the instant a claim
+    /// takes the `Placed` arm — the oracle that a claim with a submitter
+    /// installed took `Placed`, not [`super::JobWorker::coordinate`] (p1,
+    /// contract `feat_500-wave4`).
+    pub(super) fn note_placed(job_id: &str, attempt: u32) {
+        placed_submissions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), attempt));
+    }
+
+    /// Every attempt of `job_id` that took the `Placed` arm, oldest first.
+    pub fn placed_attempts_for(job_id: &str) -> Vec<u32> {
+        placed_submissions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _)| id == job_id)
+            .map(|(_, attempt)| *attempt)
+            .collect()
+    }
+
+    fn placed_submit_ends() -> &'static Mutex<Vec<(String, bool)>> {
+        static SLOTS: OnceLock<Mutex<Vec<(String, bool)>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Recorded by [`super::JobWorker::placed_submit_end`]: whether the row
+    /// was STILL this instance's (`Abandoned`) or had already moved
+    /// (`HandedOff`) at the re-read — the oracle that the two arms are
+    /// distinguished by the row's OWN `claimed_by`, never guessed (p4/p5,
+    /// contract `feat_500-wave4`).
+    pub(super) fn note_placed_submit_end(job_id: &str, still_mine: bool) {
+        placed_submit_ends()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), still_mine));
+    }
+
+    /// Every `placed_submit_end` classification recorded for `job_id`, oldest
+    /// first: `true` = `Abandoned` (still this instance's claim), `false` =
+    /// `HandedOff` (the row had already moved).
+    pub fn placed_submit_ends_for(job_id: &str) -> Vec<bool> {
+        placed_submit_ends()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _)| id == job_id)
+            .map(|(_, still_mine)| *still_mine)
             .collect()
     }
 
@@ -9091,6 +9732,60 @@ mod tests {
         );
     }
 
+    /// `WorkerFacts.devices` (contract `feat_500-wave4` §3, item 6): config
+    /// alone decides the list, no GPU needed. A `[gpu] device = -1` (the
+    /// CPU) single-device session registers one fact, ordinal `0` (never
+    /// `-1`); a two-configured-device session registers two facts in RANK
+    /// order — the ordinals come straight from `rank_devices()`, unaffected
+    /// by which backend this build actually runs on (the session's OWN
+    /// `ComputeDevice` decides `kind`, uniformly, since one gang runs on
+    /// one kind of device — `GpuConfig::validate` already refuses a mixed
+    /// list).
+    #[test]
+    fn worker_devices_is_decided_from_configuration_alone() {
+        let mut config = jammi_db::config::JammiConfig {
+            gpu: jammi_db::config::GpuConfig {
+                device: -1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let devices = worker_devices(&config, ComputeDevice::Cpu);
+        assert_eq!(
+            devices,
+            vec![DeviceFact {
+                kind: "cpu".into(),
+                ordinal: 0,
+            }],
+            "{devices:?}"
+        );
+
+        config.gpu.device = 0;
+        config.gpu.devices = Some(vec![0, 1]);
+        config.worker.local_ranks = 2;
+        let devices = worker_devices(&config, ComputeDevice::Cpu);
+        assert_eq!(
+            devices,
+            vec![
+                DeviceFact {
+                    kind: "cpu".into(),
+                    ordinal: 0,
+                },
+                DeviceFact {
+                    kind: "cpu".into(),
+                    ordinal: 1,
+                },
+            ],
+            "two configured devices register two facts in rank order: {devices:?}"
+        );
+
+        let cuda = worker_devices(&config, ComputeDevice::Cuda { ordinal: 0 });
+        assert_eq!(
+            cuda[0].kind, "cuda",
+            "the session's own ComputeDevice decides kind, uniformly"
+        );
+    }
+
     /// Campaign #446 finding 3, the honest-negative half:
     /// [`reason_from_probe_window`] returns the window's OWN verbatim
     /// predicate for an op it recorded, and [`REASON_UNAVAILABLE`] — never a
@@ -11012,6 +11707,82 @@ mod tests {
         assert!(
             consistent.confirms_release(),
             "every attempted hold is accounted for and none failed"
+        );
+    }
+
+    fn cell() -> Arc<HostAdmission> {
+        HostAdmission::new(Arc::new(InstanceRegistration::new(
+            "awaiting-cell",
+            None,
+            None,
+            None,
+            None,
+        )))
+    }
+
+    /// Contract `feat_500-wave4` §9 block B2: `Awaiting` (the state a
+    /// claim's own `submit_placed` puts the holder in right after a
+    /// successful submit) admits a `RunRank` session EXACTLY like `Free`
+    /// (a two-host fleet could not otherwise assemble if its only
+    /// free-looking host were the one awaiting its own placement result)
+    /// and refuses a second claim EXACTLY like `JobRun`; once the claim's
+    /// own guard drops with no rank having taken the cell over, the host is
+    /// `Free` again. Mutation: `probe_claim`'s admitting predicate widened
+    /// to `matches!(h, Holder::Free | Holder::Awaiting { .. })` (admitting
+    /// a SECOND claim while awaiting) reds this test's second assertion.
+    #[test]
+    fn awaiting_admits_a_rank_and_refuses_a_second_claim_and_frees_when_the_claim_ends() {
+        let cell = cell();
+        let claim = cell.probe_claim().expect("Free admits the claim's probe");
+        // `register_job_hold_or_release`'s own transition, mimicked
+        // directly (it needs a live catalog/session to call for real).
+        cell.job_running();
+        assert_eq!(cell.holder(), Holder::JobRun);
+        assert!(
+            cell.begin_awaiting_placement("job-a", 1),
+            "JobRun -> Awaiting"
+        );
+        assert_eq!(
+            cell.holder(),
+            Holder::Awaiting {
+                job_id: "job-a".into(),
+                attempt: 1
+            }
+        );
+        assert!(
+            cell.probe_claim().is_none(),
+            "Awaiting refuses a second claim exactly like JobRun"
+        );
+
+        // A RunRank admission on the submitter's host succeeds.
+        let rank = cell
+            .try_hold_rank("job-b", 7)
+            .expect("Awaiting admits a rank exactly like Free");
+        assert_eq!(
+            cell.holder(),
+            Holder::Rank {
+                job_id: "job-b".into(),
+                attempt: 7
+            }
+        );
+        drop(rank);
+        assert_eq!(cell.holder(), Holder::Free);
+        // The original claim's own guard, dropped after a rank already
+        // took the cell over, is a no-op (the cell no longer names
+        // `Awaiting`) — never resurrects a hold that already ended.
+        drop(claim);
+        assert_eq!(cell.holder(), Holder::Free);
+
+        // The plain case: no rank ever takes the cell — the claim's own
+        // guard alone returns the host to `Free` once the await ends.
+        let claim2 = cell.probe_claim().expect("Free admits the claim's probe");
+        cell.job_running();
+        assert!(cell.begin_awaiting_placement("job-c", 1));
+        drop(claim2);
+        assert_eq!(
+            cell.holder(),
+            Holder::Free,
+            "the claim guard resets Awaiting to Free exactly as it resets JobRun"
         );
     }
 }

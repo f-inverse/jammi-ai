@@ -108,14 +108,14 @@ pub(crate) fn write_pairs_csv(dir: &std::path::Path) -> String {
 
 /// The graph fixture (`graph_finetune.rs`'s end-to-end shape): six nodes in
 /// two triangles joined by one bridge, edges directed both ways.
-fn graph_nodes() -> Vec<(String, String)> {
+pub(crate) fn graph_nodes() -> Vec<(String, String)> {
     ["a0", "a1", "a2", "b0", "b1", "b2"]
         .iter()
         .map(|id| (id.to_string(), format!("document about topic {id}")))
         .collect()
 }
 
-fn graph_edges() -> Vec<(String, String)> {
+pub(crate) fn graph_edges() -> Vec<(String, String)> {
     [
         ("a0", "a1"),
         ("a1", "a0"),
@@ -136,7 +136,12 @@ fn graph_edges() -> Vec<(String, String)> {
     .collect()
 }
 
-fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, String)]) -> String {
+pub(crate) fn write_csv(
+    dir: &std::path::Path,
+    name: &str,
+    header: &str,
+    rows: &[(String, String)],
+) -> String {
     let mut body = String::from(header);
     body.push('\n');
     for (a, b) in rows {
@@ -175,7 +180,7 @@ fn graph_sources() -> GraphFineTuneSources {
 
 /// The loader the worker's `reconstruct_graph_loader` builds — the same
 /// nodes and edges in source order through the same seeded sampler.
-fn graph_loader() -> TrainingDataLoader {
+pub(crate) fn graph_loader() -> TrainingDataLoader {
     let nodes = graph_nodes()
         .into_iter()
         .map(|(id, text)| TextNode::new(id, text))
@@ -194,11 +199,11 @@ fn graph_loader() -> TrainingDataLoader {
 
 /// The fan-out fixture: `lora_dropout = 0.3`, so the per-rank dropout seed
 /// is a live determinant of the run (and of the byte equality below).
-fn fan_out_config() -> FineTuneConfig {
+pub(crate) fn fan_out_config() -> FineTuneConfig {
     gang_config_with_dropout(2, 0.3)
 }
 
-fn two_rank_graph_spec() -> TrainingSpec {
+pub(crate) fn two_rank_graph_spec() -> TrainingSpec {
     TrainingSpec::GraphFineTune {
         sources: graph_sources(),
         sample_config: graph_sample_config(),
@@ -214,7 +219,7 @@ fn two_rank_graph_spec() -> TrainingSpec {
 /// two, fast lease timing, and a membership (`peer_bind` + `peer_advertise`,
 /// so the registration carries a `MemberRoot` — the address is never
 /// dialed by anything here). `tune` adjusts the rest.
-async fn coordinating_session(
+pub(crate) async fn coordinating_session(
     tune: impl FnOnce(&mut JammiConfig),
 ) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -254,7 +259,7 @@ async fn coordinating_session(
     (session, dir)
 }
 
-fn two_rank_spec() -> TrainingSpec {
+pub(crate) fn two_rank_spec() -> TrainingSpec {
     TrainingSpec::FineTune {
         source: "pairs".into(),
         columns: vec!["anchor".into(), "positive".into()],
@@ -271,7 +276,7 @@ fn two_rank_spec() -> TrainingSpec {
 
 /// Submit through the real submit edge and claim as this session's own
 /// worker — the record `run_claimed_job` takes.
-async fn submit_and_claim(
+pub(crate) async fn submit_and_claim(
     session: &Arc<InferenceSession>,
     worker: &JobWorker,
     spec: TrainingSpec,

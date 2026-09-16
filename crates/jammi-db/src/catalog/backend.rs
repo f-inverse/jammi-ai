@@ -195,6 +195,16 @@ impl BackendImpl {
             BackendImpl::Postgres(b) => b.pool_size(),
         }
     }
+
+    /// The park on this backend's connection returns (see
+    /// [`super::pool_test_hooks`]).
+    #[cfg(feature = "test-hooks")]
+    pub fn return_park(&self) -> &std::sync::Arc<super::pool_test_hooks::ReturnPark> {
+        match self {
+            BackendImpl::Sqlite(b) => b.return_park(),
+            BackendImpl::Postgres(b) => b.return_park(),
+        }
+    }
 }
 
 /// Options applied to a transaction at `BEGIN` time.
@@ -789,21 +799,36 @@ pub(crate) async fn shutdown_wait_step() {
 /// so the SQLite backend follows this with a wait on SQLite's own release
 /// evidence. The loop waits through [`shutdown_wait_step`], which leaves the
 /// runtime free to actually run the return tasks it is waiting on.
-pub(crate) async fn close_pool_and_drain<DB: sqlx::Database>(pool: &sqlx::Pool<DB>) {
+pub(crate) async fn close_pool_and_drain<DB: sqlx::Database>(
+    pool: &sqlx::Pool<DB>,
+    kind: BackendKind,
+) {
     pool.close().await;
     let deadline = std::time::Instant::now() + CLOSE_DRAIN_CEILING;
     while pool.size() > 0 {
         if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                remaining = pool.size(),
-                ceiling_secs = CLOSE_DRAIN_CEILING.as_secs(),
-                "catalog pool close timed out with connections still open; the backing file may \
-                 still be held"
-            );
+            warn_close_ceiling(pool, kind);
             return;
         }
         shutdown_wait_step().await;
     }
+}
+
+/// The ceiling warning, with the consequence stated for the backend at hand:
+/// a SQLite connection that never closed still holds the catalog file (the
+/// process-exclusive lock and the `-wal` with it); a Postgres one is a pooled
+/// server connection this process keeps open until it exits.
+fn warn_close_ceiling<DB: sqlx::Database>(pool: &sqlx::Pool<DB>, kind: BackendKind) {
+    let consequence = match kind {
+        BackendKind::Sqlite => "the backing file may still be held",
+        BackendKind::Postgres => "a pooled server connection stays open until this process exits",
+    };
+    tracing::warn!(
+        remaining = pool.size(),
+        idle = pool.num_idle(),
+        ceiling_secs = CLOSE_DRAIN_CEILING.as_secs(),
+        "catalog pool close timed out with connections still open; {consequence}"
+    );
 }
 
 /// Classify a raw `sqlx::Error` into the engine-owned [`BackendError`]
@@ -867,5 +892,122 @@ fn bind_postgres<'q>(
         SqlValue::Uuid(u) => q.bind(*u),
         SqlValue::Json(j) => q.bind(j.clone()),
         SqlValue::Timestamp(t) => q.bind(*t),
+    }
+}
+
+#[cfg(test)]
+mod close_barrier_tests {
+    //! [`close_pool_and_drain`] against the race its documentation names: a
+    //! connection whose return began before the close and lands on the idle
+    //! queue after the close's final sweep. The return is held open inside
+    //! `after_release` (the slot the `test-hooks` park uses too) and the close
+    //! starts only once that return has announced it is there, so the
+    //! interleaving is fixed, never raced. Both backends, since the pool is
+    //! `sqlx`'s on both.
+
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::mpsc;
+
+    use super::{close_pool_and_drain, BackendKind};
+
+    /// How long a return is held open. Far above the joins a real close
+    /// waits behind (milliseconds), far below `CLOSE_DRAIN_CEILING`.
+    const RETURN_PARK: Duration = Duration::from_millis(300);
+    /// A close that waits out the ceiling on the leaked connection takes
+    /// `CLOSE_DRAIN_CEILING`; one that sweeps it takes about `RETURN_PARK`.
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// Every return announces itself on `entered` as it begins its park.
+    fn park_returns<DB: sqlx::Database>(
+        options: sqlx::pool::PoolOptions<DB>,
+        entered: mpsc::UnboundedSender<()>,
+    ) -> sqlx::pool::PoolOptions<DB> {
+        options.after_release(move |_conn, _meta| {
+            let entered = entered.clone();
+            Box::pin(async move {
+                let _ = entered.send(());
+                tokio::time::sleep(RETURN_PARK).await;
+                Ok(true)
+            })
+        })
+    }
+
+    /// Check one connection out and drop it, and start the close only once
+    /// that return is inside its park — the closed flag read as unset, the
+    /// idle push still ahead. (The pool's connect-time validation connection
+    /// is released to the idle queue directly, never through the return
+    /// task, so the first parked return is this one.) Returns the close's
+    /// wall clock; asserts the pool's accounting reads empty afterwards.
+    async fn close_against_one_in_flight_return<DB: sqlx::Database>(
+        pool: &sqlx::Pool<DB>,
+        entered: &mut mpsc::UnboundedReceiver<()>,
+        kind: BackendKind,
+    ) -> Duration {
+        let conn = pool.acquire().await.expect("acquire");
+        drop(conn);
+        entered
+            .recv()
+            .await
+            .expect("the dropped connection's return parks");
+        let started = Instant::now();
+        close_pool_and_drain(pool, kind).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            pool.size(),
+            0,
+            "the barrier returned with connections still counted (idle = {})",
+            pool.num_idle()
+        );
+        elapsed
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_barrier_closes_a_connection_returned_during_the_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pool = park_returns(
+            sqlx::sqlite::SqlitePoolOptions::new().max_connections(8),
+            tx,
+        )
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("catalog.db"))
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open sqlite pool");
+        let elapsed = close_against_one_in_flight_return(&pool, &mut rx, BackendKind::Sqlite).await;
+        assert!(
+            elapsed < BOUND,
+            "the close took {elapsed:?}: it waited out the ceiling on a connection it never swept"
+        );
+    }
+
+    /// Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`)
+    /// otherwise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_barrier_closes_a_connection_returned_during_the_close() {
+        let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+            eprintln!(
+                "skipping postgres_barrier_closes_a_connection_returned_during_the_close: \
+                 JAMMI_TEST_PG_URL unset"
+            );
+            return;
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pool = park_returns(sqlx::postgres::PgPoolOptions::new().max_connections(8), tx)
+            .connect_with(
+                url.parse::<sqlx::postgres::PgConnectOptions>()
+                    .expect("pg url"),
+            )
+            .await
+            .expect("open postgres pool");
+        let elapsed =
+            close_against_one_in_flight_return(&pool, &mut rx, BackendKind::Postgres).await;
+        assert!(
+            elapsed < BOUND,
+            "the close took {elapsed:?}: it waited out the ceiling on a connection it never swept"
+        );
     }
 }

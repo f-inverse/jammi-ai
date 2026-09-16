@@ -208,6 +208,10 @@ pub struct SqliteBackend {
     /// can wait on SQLite's own release evidence — the disappearance of the
     /// sidecars — rather than only on the pool's connection accounting.
     path: std::path::PathBuf,
+    /// The park on this pool's connection returns (see
+    /// [`super::pool_test_hooks`]).
+    #[cfg(feature = "test-hooks")]
+    return_park: Arc<super::pool_test_hooks::ReturnPark>,
 }
 
 impl SqliteBackend {
@@ -247,29 +251,32 @@ impl SqliteBackend {
         // reaped, another process can take the file, and this process's next
         // query is refused with the `SQLITE_BUSY` error `open` documents,
         // never a corrupted WAL.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(opts)
-            .await
-            .map_err(|err| {
-                if is_busy(&err) {
-                    BackendError::Unavailable(format!(
-                        "SQLite catalog {} is locked and could not be opened within the 5 s busy \
+        #[cfg(feature = "test-hooks")]
+        let return_park = Arc::new(super::pool_test_hooks::ReturnPark::default());
+        let options = SqlitePoolOptions::new().max_connections(8);
+        #[cfg(feature = "test-hooks")]
+        let options = super::pool_test_hooks::install(options, &return_park);
+        let pool = options.connect_with(opts).await.map_err(|err| {
+            if is_busy(&err) {
+                BackendError::Unavailable(format!(
+                    "SQLite catalog {} is locked and could not be opened within the 5 s busy \
                          timeout. The SQLite catalog is single-process only (one jammi process \
                          per catalog directory) and that contract is enforced by a \
                          process-exclusive lock, so the expected cause is another process holding \
                          this directory: stop it, or move to the Postgres backend to share one \
                          catalog across processes. Underlying error: {err}",
-                        path.display()
-                    ))
-                } else {
-                    classify(err)
-                }
-            })?;
+                    path.display()
+                ))
+            } else {
+                classify(err)
+            }
+        })?;
 
         Ok(Arc::new(Self {
             pool,
             path: path.to_path_buf(),
+            #[cfg(feature = "test-hooks")]
+            return_park,
         }))
     }
 
@@ -279,6 +286,13 @@ impl SqliteBackend {
         let mut name = self.path.clone().into_os_string();
         name.push(suffix);
         std::path::PathBuf::from(name)
+    }
+
+    /// The park on this pool's connection returns (see
+    /// [`super::pool_test_hooks`]).
+    #[cfg(feature = "test-hooks")]
+    pub fn return_park(&self) -> &Arc<super::pool_test_hooks::ReturnPark> {
+        &self.return_park
     }
 }
 
@@ -437,7 +451,7 @@ impl CatalogBackend for SqliteBackend {
     /// sent hunting for a leak that is not there.
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            super::backend::close_pool_and_drain(&self.pool).await;
+            super::backend::close_pool_and_drain(&self.pool, BackendKind::Sqlite).await;
 
             // Then wait for SQLite's own evidence of release, and require it
             // to be STABLE rather than merely observed once. `sqlx` returns a

@@ -2,10 +2,10 @@
 //! adds jammi's own per-stage duties before delegating (contract
 //! `feat_500-wave4` §2.2, refined by §9 B3).
 //!
-//! K7 device pinning: `InferenceExec::device_kind()` is ALWAYS `Some` by the
-//! time a plan reaches an executor (`JammiCodec::try_encode` stamps it from
-//! the submitting session's own `compute_device().kind()` when a
-//! construction call site left it unset — see `codec.rs`). A stage whose
+//! K7 device pinning: `InferenceExec::device_kind()` is a required
+//! constructor argument, so every `InferenceExec` — decoded or in-process —
+//! names a concrete kind (`InferenceExecBuilder::new`, `inference_exec.rs`;
+//! the codec never invents or rewrites it, `codec.rs`). A stage whose
 //! `InferenceExec` names a kind different from THIS executor's own
 //! `InferenceSession::compute_device().kind()` is refused typed, never
 //! silently run on the wrong device.
@@ -50,7 +50,7 @@ impl JammiExecutionEngine {
 }
 
 /// The first `InferenceExec` device-kind mismatch found in `plan` against
-/// `own_kind`, if any: `Some((descriptor_kind, own_kind))`.
+/// `own_kind`, if any: `Some(descriptor_kind)`.
 fn first_device_kind_mismatch(
     plan: &Arc<dyn ExecutionPlan>,
     own_kind: jammi_db::store::manifest::ComputeDeviceKind,
@@ -58,15 +58,10 @@ fn first_device_kind_mismatch(
     let mut mismatch = None;
     plan.apply(|node| {
         if let Some(exec) = node.downcast_ref::<InferenceExec>() {
-            // Stamped unconditionally by the codec on decode (see module
-            // doc); a `None` here would mean this plan was never decoded
-            // through `JammiCodec` — an in-process, non-Ballista call path,
-            // which never reaches this engine.
-            if let Some(kind) = exec.device_kind() {
-                if kind != own_kind {
-                    mismatch = Some(kind);
-                    return Ok(TreeNodeRecursion::Stop);
-                }
+            let kind = exec.device_kind();
+            if kind != own_kind {
+                mismatch = Some(kind);
+                return Ok(TreeNodeRecursion::Stop);
             }
         }
         Ok(TreeNodeRecursion::Continue)

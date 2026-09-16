@@ -1033,6 +1033,7 @@ impl InferenceSession {
             key_column.to_string(),
             String::new(),
             Arc::clone(&self.model_cache),
+            self.compute_device().kind(),
         )
         .batch_size(self.inner.config().inference.batch_size)
         .observer(self.observer.clone())
@@ -1545,6 +1546,7 @@ impl InferenceSession {
             key_column.to_string(),
             source_id.to_string(),
             Arc::clone(&self.model_cache),
+            self.compute_device().kind(),
         )
         .batch_size(self.inner.config().inference.batch_size)
         .observer(self.observer.clone())

@@ -84,11 +84,11 @@ async fn inference_exec_round_trips() {
         "text".to_string(),
         "src-1".to_string(),
         Arc::clone(session.model_cache()),
+        session.compute_device().kind(),
     )
     .batch_size(8)
     .embedding_dim(Some(4))
     .passthrough(vec![])
-    .device_kind(Some(session.compute_device().kind()))
     .build()
     .expect("inference exec builds");
     let node: Arc<dyn ExecutionPlan> = Arc::new(node);
@@ -117,20 +117,30 @@ async fn inference_exec_round_trips() {
         assert_eq!(d.source_id(), "src-1");
         assert_eq!(d.batch_size(), 8);
         assert_eq!(d.embedding_dim(), Some(4));
-        assert_eq!(d.device_kind(), Some(session.compute_device().kind()));
+        assert_eq!(d.device_kind(), session.compute_device().kind());
     }
 
     // Re-encoding the SAME decoded `Arc<dyn ExecutionPlan>` reproduces the
-    // same bytes: device_kind was already concrete on the wire (this test
-    // set it explicitly), so the second encode stamps nothing new.
+    // same bytes: device_kind is stamped once, at construction, so the
+    // second encode stamps nothing new.
     let mut buf2 = Vec::new();
     codec.try_encode(decoded, &mut buf2).expect("re-encode");
     assert_eq!(buf, buf2, "encode -> decode -> encode is byte-identical");
 }
 
+/// Replaces `inference_exec_device_kind_defaults_to_the_submitting_sessions_own`
+/// (contract `feat_500-wave4` §9 B3): the codec never invents or rewrites a
+/// `device_kind` — it carries exactly the constructed value across the wire,
+/// even when the constructing session's own device kind differs from the
+/// descriptor's.
 #[tokio::test]
-async fn inference_exec_device_kind_defaults_to_the_submitting_sessions_own() {
-    let session = session().await;
+async fn codec_never_rewrites_device_kind() {
+    let session = session().await; // a CPU session (`jammi_test_utils::test_config`)
+    assert_eq!(
+        session.compute_device().kind(),
+        jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+        "precondition: the fixture session runs on CPU"
+    );
     let scan = string_scan("text", &["hello"]);
     let node = InferenceExecBuilder::new(
         scan,
@@ -140,11 +150,16 @@ async fn inference_exec_device_kind_defaults_to_the_submitting_sessions_own() {
         "text".to_string(),
         "src-1".to_string(),
         Arc::clone(session.model_cache()),
+        jammi_db::store::manifest::ComputeDeviceKind::Cuda,
     )
     .embedding_dim(Some(2))
     .build()
     .unwrap();
-    assert_eq!(node.device_kind(), None, "unset at construction");
+    assert_eq!(
+        node.device_kind(),
+        jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        "constructed explicitly onto a kind other than the session's own"
+    );
     let node: Arc<dyn ExecutionPlan> = Arc::new(node);
 
     let codec = JammiCodec::new(&session);
@@ -158,8 +173,8 @@ async fn inference_exec_device_kind_defaults_to_the_submitting_sessions_own() {
         .unwrap();
     assert_eq!(
         decoded.device_kind(),
-        Some(session.compute_device().kind()),
-        "the codec stamps the submitting session's own kind when unset at construction"
+        jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        "the codec never rewrites device_kind to the decoding/encoding session's own kind"
     );
 }
 
@@ -409,6 +424,7 @@ async fn dead_session_is_refused_typed() {
         "text".to_string(),
         "src-1".to_string(),
         Arc::clone(session.model_cache()),
+        session.compute_device().kind(),
     )
     .embedding_dim(Some(2))
     .build()

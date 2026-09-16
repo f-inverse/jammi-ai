@@ -158,10 +158,7 @@ impl PhysicalExtensionCodec for JammiCodec {
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DfResult<()> {
         if let Some(exec) = node.downcast_ref::<InferenceExec>() {
-            // Needs the SUBMITTING session to stamp a default device_kind
-            // when the descriptor left it unset (contract §9 B3).
-            let session = self.session().map_err(Error::into_df_error)?;
-            return encode_inference(exec, &session, buf);
+            return encode_inference(exec, buf);
         }
         if let Some(exec) = node.downcast_ref::<AnnSearchExec>() {
             return encode_ann_search(exec, buf);
@@ -212,11 +209,7 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
     }
 }
 
-fn encode_inference(
-    exec: &InferenceExec,
-    session: &InferenceSession,
-    buf: &mut Vec<u8>,
-) -> DfResult<()> {
+fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
     let source = match exec.source() {
         ModelSource::HuggingFace(id) => pb::model_source::Source::HuggingFace(id.clone()),
         ModelSource::Local(path) => {
@@ -225,12 +218,9 @@ fn encode_inference(
     };
     let backend_json = exec.backend().map(|b| to_json_string(&b)).transpose()?;
     let regression_form_json = exec.regression_form().map(to_json_string).transpose()?;
-    // Stamp the SUBMITTING session's own device kind when the descriptor
-    // left it unset (contract §9 B3) — every field is present on the wire
-    // even when absent at construction.
-    let device_kind = exec
-        .device_kind()
-        .unwrap_or_else(|| session.compute_device().kind());
+    // The wire carries exactly the constructed value — the codec never
+    // invents or rewrites a device kind (contract §9 B3).
+    let device_kind = exec.device_kind();
     let msg = pb::InferenceExecNode {
         source: Some(pb::ModelSource {
             source: Some(source),
@@ -290,13 +280,13 @@ fn decode_inference(
         msg.key_column,
         msg.source_id,
         Arc::clone(session.model_cache()),
+        device_kind_from_str(&msg.device_kind)?,
     )
     .batch_size(msg.batch_size as usize)
     .backend(backend)
     .embedding_dim(msg.embedding_dim.map(|d| d as usize))
     .regression_form(regression_form)
     .passthrough(msg.passthrough)
-    .device_kind(Some(device_kind_from_str(&msg.device_kind)?))
     .build()
     .map_err(|e| Error::Catalog(e).into_df_error())?;
     Ok(Arc::new(node))

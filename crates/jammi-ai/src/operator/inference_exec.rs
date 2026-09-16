@@ -38,15 +38,13 @@ pub struct InferenceExec {
     /// Input columns copied verbatim to the end of every output batch.
     passthrough: Vec<String>,
     /// The device KIND (contract `feat_500-wave4` §9 B3) this descriptor
-    /// declares it must run on. `None` when unset at construction — every
-    /// in-process pipeline call site today (unmodified: out of this file's
-    /// grant) — in which case a decoding executor treats the descriptor as
-    /// "run on whatever this executor's own session runs on" (`jammi-
-    /// ballista`'s codec fills this from the SUBMITTING session's
-    /// `compute_device().kind()` at encode time when `None`, which is the
-    /// same effective default this field's doc names, applied at the wire
-    /// boundary rather than at every construction call site).
-    device_kind: Option<ComputeDeviceKind>,
+    /// declares it must run on: a REQUIRED constructor argument, stamped at
+    /// every call site from `session.compute_device().kind()` (or, for a
+    /// submitter placing this plan onto another kind, that kind directly —
+    /// there is no separate override setter). The wire carries exactly this
+    /// value; a decoding codec never invents or rewrites it (`jammi-
+    /// ballista`'s codec, `codec.rs`).
+    device_kind: ComputeDeviceKind,
     properties: Arc<PlanProperties>,
 }
 
@@ -75,10 +73,14 @@ pub struct InferenceExecBuilder {
     embedding_dim: Option<usize>,
     regression_form: Option<DistributionForm>,
     passthrough: Vec<String>,
-    device_kind: Option<ComputeDeviceKind>,
+    device_kind: ComputeDeviceKind,
 }
 
 impl InferenceExecBuilder {
+    /// `device_kind` is a REQUIRED constructor argument (contract
+    /// `feat_500-wave4` §9 B3) — a submitter placing this plan onto a device
+    /// kind other than its own session's builds with that kind directly;
+    /// there is no separate optional override setter.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         source: ModelSource,
@@ -87,6 +89,7 @@ impl InferenceExecBuilder {
         key_column: String,
         source_id: String,
         model_cache: Arc<ModelCache>,
+        device_kind: ComputeDeviceKind,
     ) -> Self {
         Self {
             input,
@@ -102,7 +105,7 @@ impl InferenceExecBuilder {
             embedding_dim: None,
             regression_form: None,
             passthrough: Vec::new(),
-            device_kind: None,
+            device_kind,
         }
     }
 
@@ -141,15 +144,6 @@ impl InferenceExecBuilder {
 
     pub fn regression_form(mut self, form: Option<DistributionForm>) -> Self {
         self.regression_form = form;
-        self
-    }
-
-    /// Explicit device-kind override — a submitter placing this plan onto a
-    /// different device kind than its own sets this. `None` (the default)
-    /// means "run on whatever executes this plan" (see the field's doc on
-    /// [`InferenceExec`]).
-    pub fn device_kind(mut self, kind: Option<ComputeDeviceKind>) -> Self {
-        self.device_kind = kind;
         self
     }
 
@@ -240,9 +234,9 @@ impl InferenceExec {
         &self.input
     }
 
-    /// The device-kind override this descriptor declares, if any (contract
-    /// `feat_500-wave4` §9 B3). See the field's doc for the `None` case.
-    pub fn device_kind(&self) -> Option<ComputeDeviceKind> {
+    /// The device kind this descriptor declares it must run on (contract
+    /// `feat_500-wave4` §9 B3).
+    pub fn device_kind(&self) -> ComputeDeviceKind {
         self.device_kind
     }
 
@@ -292,6 +286,7 @@ impl ExecutionPlan for InferenceExec {
                 self.key_column.clone(),
                 self.source_id.clone(),
                 Arc::clone(&self.model_cache),
+                self.device_kind,
             )
             .batch_size(self.batch_size)
             .backend(self.backend)
@@ -299,7 +294,6 @@ impl ExecutionPlan for InferenceExec {
             .embedding_dim(self.embedding_dim)
             .regression_form(self.regression_form.clone())
             .passthrough(self.passthrough.clone())
-            .device_kind(self.device_kind)
             .build()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))

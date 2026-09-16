@@ -53,9 +53,9 @@ async fn refuses_a_stage_whose_inference_exec_names_a_different_device_kind() {
         "text".to_string(),
         "src-1".to_string(),
         Arc::clone(session.model_cache()),
+        ComputeDeviceKind::Cuda,
     )
     .embedding_dim(Some(2))
-    .device_kind(Some(ComputeDeviceKind::Cuda))
     .build()
     .unwrap();
     let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
@@ -96,9 +96,9 @@ async fn does_not_refuse_a_matching_device_kind() {
         "text".to_string(),
         "src-1".to_string(),
         Arc::clone(session.model_cache()),
+        own_kind,
     )
     .embedding_dim(Some(2))
-    .device_kind(Some(own_kind))
     .build()
     .unwrap();
     let plan: Arc<dyn ExecutionPlan> = Arc::new(node);

@@ -31,6 +31,7 @@ use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss
 use super::resume::{
     capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION,
 };
+use super::role::RunnerRole;
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -425,6 +426,21 @@ impl RankContext {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Bind [`Self::canonical_vars_digest`] of `names` — the canonical
+    /// trainable-variable layout this rank's reduce walks — on the
+    /// collective as the round descriptor's `agreement`
+    /// ([`Collective::bind_agreement`]): the post-target-build seam
+    /// [`TrainingLoop::run`] calls once the varmap is final and before the
+    /// first collective, so a rank whose layout differs from its peers'
+    /// (a different trainable set, a different name order) is a typed
+    /// descriptor disagreement on EVERY rank at the next round, never a
+    /// silently wrong fold of mismatched positions. At W=1 the `Noop`
+    /// accepts and ignores it.
+    pub fn bind_agreement(&self, names: &[String]) -> Result<()> {
+        self.collective
+            .bind_agreement(Self::canonical_vars_digest(names))
+    }
+
     /// DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`".
     /// Rank 0 gets `base_seed` back UNCHANGED — the W=1/rank-0 byte-parity
     /// property every existing seeded-dropout test already pins (this
@@ -636,6 +652,17 @@ pub struct TrainingLoop {
     /// the same value every pre-U4b caller's absence of a setting produces
     /// today, so this field's mere existence changes zero bytes at W=1.
     rank_ctx: RankContext,
+    /// What this loop runs AS (`super::role`): the lease holder — the ONE
+    /// writer of the job's durable state — or a rank `>= 1` of a gang,
+    /// which writes nothing durable. The gate every durable write in this
+    /// loop consults ([`Self::save_resume_checkpoint`],
+    /// [`Self::save_epoch_checkpoint`]) — HERE, in the trainer, never
+    /// inside the store, which stays role-agnostic. Agrees with
+    /// `rank_ctx.rank()` by construction ([`TrainingLoopBuilder::build`]
+    /// derives it from the rank when unset and refuses a mismatch when
+    /// set), so rank 0 alone may write and the single-rank default is the
+    /// loop claimer — byte-identical to every pre-role run.
+    role: RunnerRole,
     /// Test seam: runs on the gradients every optimizer step is about to
     /// consume, right after `backward` (and, on the GradCache arm, after the
     /// two-pass `gradcache_backward`), keyed by the 1-based index of that
@@ -684,6 +711,10 @@ pub struct TrainingLoopBuilder {
     /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
     /// over `config.batch_size` — every pre-U4b caller's W=1 shape.
     rank_ctx: Option<RankContext>,
+    /// See [`TrainingLoop::role`]. `None` until [`Self::runner_role`] is
+    /// called; [`Self::build`] then derives it from the rank context
+    /// (`RunnerRole::implied_by_rank`).
+    runner_role: Option<RunnerRole>,
 }
 
 impl TrainingLoopBuilder {
@@ -711,7 +742,19 @@ impl TrainingLoopBuilder {
             resume: None,
             tenant: None,
             rank_ctx: None,
+            runner_role: None,
         }
+    }
+
+    /// Set what this loop runs AS — see [`TrainingLoop::role`]. The
+    /// production worker sets it on every rank (the lease holder on rank 0,
+    /// `Rank { rank }` on every other); omit it and [`Self::build`] derives
+    /// the role the rank context implies (rank 0 → the loop claimer, the
+    /// pre-gang default; rank `r` → `Rank { r }`). A role that disagrees
+    /// with the rank context's own rank is refused at `build`.
+    pub fn runner_role(mut self, role: RunnerRole) -> Self {
+        self.runner_role = Some(role);
+        self
     }
 
     /// Set this rank's [`RankContext`] — the collective it reduces over and
@@ -880,6 +923,23 @@ impl TrainingLoopBuilder {
         let rank_ctx = self.rank_ctx.unwrap_or_else(|| {
             RankContext::single_rank(self.config.batch_size, PartitionRule::BlockByGlobalBatch)
         });
+        // The role agrees with the rank by construction: derived from it
+        // when unset, refused when set to a value the rank contradicts — so
+        // "rank 0 alone writes" and "a `Rank` never writes" are the same
+        // fact stated once.
+        let role = match self.runner_role {
+            None => RunnerRole::implied_by_rank(rank_ctx.rank()),
+            Some(role) if role.rank() == rank_ctx.rank() => role,
+            Some(role) => {
+                return Err(JammiError::FineTune(format!(
+                    "TrainingLoopBuilder: runner role {role} names rank {} but the rank \
+                     context is rank {} of {}: the role and the rank must agree",
+                    role.rank(),
+                    rank_ctx.rank(),
+                    rank_ctx.world()
+                )));
+            }
+        };
         let mut training_loop = TrainingLoop {
             target: self.target,
             base_model: self.base_model,
@@ -904,6 +964,7 @@ impl TrainingLoopBuilder {
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             rank_ctx,
+            role,
             #[cfg(test)]
             after_backward: None,
         };
@@ -1499,6 +1560,17 @@ impl TrainingLoop {
         // name. The names come from `varmap.data()` keyed by tensor identity, so
         // the correlation is independent of any HashMap iteration order.
         let optim_param_names = self.optimizer_param_names(&trainable_vars)?;
+
+        // The agreement binding (DESIGN.md §4, the canonical layout): the
+        // target is built and the varmap is final, so this rank's canonical
+        // trainable-variable NAME order is known and is bound on the
+        // collective before the first collective call — a rank whose layout
+        // differs from its peers' is a typed descriptor disagreement at the
+        // next round on every rank (`RankContext::bind_agreement`), never a
+        // wrong fold. The names come from the SAME lock and sort as
+        // `trainable_vars` above (`sorted_trainable_var_names`).
+        self.rank_ctx
+            .bind_agreement(&super::optimizer::sorted_trainable_var_names(&self.varmap))?;
 
         // Restore from a discovered resume bundle (weights + optimizer moments +
         // scaler + dropout positions). The persisted scaler is authoritative — it
@@ -4659,10 +4731,13 @@ impl TrainingLoop {
     /// exit the same way (no lockstep hazard). The caller has already confirmed
     /// the lease is held (`!cancel`).
     ///
-    /// DESIGN.md §4: rank 0 alone writes the durable resume checkpoint; every
-    /// OTHER rank's call is a no-op — but only past the point where it has
-    /// already taken part in [`Self::capture_resume_bundle`]'s dropout-position
-    /// gather, a real collective call every rank must make in lockstep.
+    /// DESIGN.md §4: the lease holder (rank 0) alone writes the durable
+    /// resume checkpoint; every OTHER rank's call is a no-op — the runner
+    /// role is the gate ([`TrainingLoop::role`]: a `Rank` holds no
+    /// `LeaseHolder`, so it never writes) — but only past the point where it
+    /// has already taken part in [`Self::capture_resume_bundle`]'s
+    /// dropout-position gather, a real collective call every rank must make
+    /// in lockstep.
     fn save_resume_checkpoint(
         &self,
         call: &BlockingCall,
@@ -4684,7 +4759,7 @@ impl TrainingLoop {
             optimizer,
             optim_param_names,
         )?;
-        if self.rank_ctx.rank() != 0 {
+        if self.role.lease_holder().is_none() {
             return Ok(());
         }
         tokio::runtime::Handle::current().block_on(store.put_resume_checkpoint(
@@ -4792,11 +4867,12 @@ impl TrainingLoop {
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
-        // DESIGN.md §4: rank 0 alone publishes; every other rank's call is a
-        // no-op. No collective call happens anywhere in this function (unlike
+        // DESIGN.md §4: the lease holder alone publishes; every other rank's
+        // call is a no-op (the runner role is the gate — `TrainingLoop::role`).
+        // No collective call happens anywhere in this function (unlike
         // `Self::save_resume_checkpoint`'s dropout-position gather), so an
         // early return here carries no lockstep hazard.
-        if self.rank_ctx.rank() != 0 {
+        if self.role.lease_holder().is_none() {
             return Ok(());
         }
         let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
@@ -8434,6 +8510,279 @@ mod gang_lockstep_oracle {
                 "rank {rank}: expected the grad-norm refusal naming step 1, got: {msg}"
             );
         }
+    }
+}
+
+/// Plan 67 U5b-1b-iii: the runner role as the trainer's durable-write gate,
+/// and the agreement binding at the post-target-build seam — both on a REAL
+/// two-rank `Local` gang through the full production `TrainingLoop::run`.
+#[cfg(test)]
+mod runner_role_and_agreement_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    use super::super::collective::{BlockingCall, LocalGang};
+    use super::super::data::TrainingDataLoader;
+    use super::super::lora::build_projection_head;
+    use super::super::partition::{PartitionRule, PartitionSpec};
+    use super::super::role::{LeaseHolder, RunnerRole};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::{RankContext, TrainingLoopBuilder, TrainingResult};
+
+    const HIDDEN: usize = 32; // tiny_bert's hidden width.
+
+    fn gang_config() -> FineTuneConfig {
+        FineTuneConfig {
+            epochs: 1,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_rank: 2,
+            lora_dropout: 0.0,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    fn pairs(n: usize) -> TrainingDataLoader {
+        TrainingDataLoader::from_pairs(
+            (0..n)
+                .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
+                .collect(),
+        )
+    }
+
+    fn file_store() -> Arc<ArtifactStore> {
+        let root_dir = tempfile::TempDir::new().unwrap().keep();
+        let cache = tempfile::TempDir::new().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
+    }
+
+    /// One rank's `TrainingLoop` over `rank_ctx`, built with its OWN
+    /// artifact store (so what each rank wrote durably is observable per
+    /// rank) and, when `rename` is set, over a varmap whose keys carry that
+    /// prefix — the SAME `Var`s under different names, so the tensors, the
+    /// shapes and the sorted order all agree with an unrenamed rank and ONLY
+    /// the canonical layout's digest differs. Run on the current thread.
+    fn run_rank(
+        call: &BlockingCall,
+        tag: String,
+        store: Arc<ArtifactStore>,
+        rename: Option<&str>,
+        rank_ctx: RankContext,
+        role: Option<RunnerRole>,
+    ) -> jammi_db::error::Result<TrainingResult> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = gang_config();
+        let (loop_, _dir) = rt.block_on(async {
+            let base_model = super::test_fixtures::tiny_bert().await;
+            let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
+            let device = Device::Cpu;
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+            let varmap = match rename {
+                None => varmap,
+                Some(prefix) => {
+                    let renamed = VarMap::new();
+                    for (name, var) in varmap.data().lock().unwrap().iter() {
+                        renamed
+                            .data()
+                            .lock()
+                            .unwrap()
+                            .insert(format!("{prefix}{name}"), var.clone());
+                    }
+                    renamed
+                }
+            };
+            let mut builder =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(device)
+                    .job_id(tag.clone())
+                    .worker_id(format!("{tag}-worker"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base_model)
+                    .artifact_store(store)
+                    .rank_context(rank_ctx);
+            if let Some(role) = role {
+                builder = builder.runner_role(role);
+            }
+            (builder.build(), dir)
+        });
+        let mut loop_ = loop_?;
+        let _enter = rt.enter();
+        loop_.run(
+            call,
+            crate::fine_tune::source::TrainingSource::Resident(pairs(4)),
+        )
+    }
+
+    fn two_rank_contexts() -> Vec<RankContext> {
+        let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+        (0..2u32)
+            .map(|rank| {
+                let partition =
+                    PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                        .unwrap();
+                RankContext::new(Arc::new(gang.rank(rank).unwrap()), partition)
+            })
+            .collect()
+    }
+
+    /// The single-writer rule at the trainer's own durable write: over a
+    /// real two-rank gang, every rank takes the epoch-boundary
+    /// dropout-position gather (lockstep — both complete), the lease holder
+    /// (rank 0) writes the resume checkpoint into ITS store, and the `Rank`
+    /// (rank 1) writes NOTHING into its own. Mutation: the role gate in
+    /// `save_resume_checkpoint` removed → rank 1's store holds a bundle →
+    /// RED.
+    #[test]
+    fn a_rank_of_a_gang_never_writes_the_resume_checkpoint_and_the_holder_does() {
+        let stores: Vec<Arc<ArtifactStore>> = (0..2).map(|_| file_store()).collect();
+        let mut handles = Vec::new();
+        for (rank, rank_ctx) in two_rank_contexts().into_iter().enumerate() {
+            let tag = format!("role-gate-r{rank}");
+            let store = Arc::clone(&stores[rank]);
+            handles.push(BlockingCall::spawn_thread(move |call| {
+                run_rank(&call, tag, store, None, rank_ctx, None)
+            }));
+        }
+        for (rank, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .unwrap()
+                .unwrap_or_else(|e| panic!("rank {rank} must complete: {e}"));
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let written: Vec<bool> = (0..2)
+            .map(|rank| {
+                rt.block_on(
+                    stores[rank].fetch_resume_checkpoint(None, &format!("role-gate-r{rank}")),
+                )
+                .unwrap()
+                .is_some()
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![true, false],
+            "the lease holder (rank 0) alone writes the resume checkpoint; the Rank writes nothing"
+        );
+    }
+
+    /// The agreement binding: two ranks whose canonical trainable-variable
+    /// layouts differ (the same `Var`s, the same shapes and order, different
+    /// NAMES on rank 1) are refused at the first reduce — on BOTH ranks,
+    /// naming BOTH digests — never folded. Mutation: the `bind_agreement`
+    /// call in `run` removed → both ranks complete `Ok` (the positions
+    /// happen to line up, so the fold proceeds silently) → RED.
+    #[test]
+    fn two_ranks_whose_canonical_layouts_differ_are_refused_naming_both_digests() {
+        let mut handles = Vec::new();
+        for (rank, rank_ctx) in two_rank_contexts().into_iter().enumerate() {
+            let tag = format!("agreement-r{rank}");
+            let rename = (rank == 1).then_some("zz_");
+            handles.push(BlockingCall::spawn_thread(move |call| {
+                run_rank(&call, tag, file_store(), rename, rank_ctx, None)
+            }));
+        }
+        let results: Vec<jammi_db::error::Result<TrainingResult>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // The two digests, from the same names and the same function the
+        // trainer binds with: a head built exactly as each rank's was.
+        let names = {
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+            let _head = build_projection_head(HIDDEN, &gang_config(), &varmap, &vb).unwrap();
+            super::super::optimizer::sorted_trainable_var_names(&varmap)
+        };
+        assert!(!names.is_empty());
+        let digest0 = RankContext::canonical_vars_digest(&names);
+        let renamed: Vec<String> = names.iter().map(|n| format!("zz_{n}")).collect();
+        let digest1 = RankContext::canonical_vars_digest(&renamed);
+        assert_ne!(digest0, digest1);
+        for (rank, result) in results.iter().enumerate() {
+            let msg = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!(
+                    "rank {rank} must refuse: the ranks' canonical layouts differ, yet the fold \
+                     proceeded"
+                ),
+            };
+            assert!(
+                msg.contains("disagree about what this round computes"),
+                "rank {rank}: a typed descriptor disagreement, got: {msg}"
+            );
+            assert!(
+                msg.contains(&digest0) && msg.contains(&digest1),
+                "rank {rank}: the refusal names BOTH digests ({digest0}, {digest1}): {msg}"
+            );
+        }
+    }
+
+    /// The role and the rank must agree at `build`: a holder role on a
+    /// rank-1 context, or a `Rank` naming another index, is a typed
+    /// refusal; the matching role (and no role at all) builds.
+    #[test]
+    fn a_runner_role_that_contradicts_the_rank_context_is_refused_at_build() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let build = |rank: u32, role: Option<RunnerRole>| -> Result<(), String> {
+            let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
+            let partition =
+                PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
+                    .unwrap();
+            let rank_ctx = RankContext::new(Arc::new(gang.rank(rank).unwrap()), partition);
+            rt.block_on(async {
+                let (catalog, dir) = super::test_fixtures::claimed_job("role-build").await;
+                let config = gang_config();
+                let varmap = VarMap::new();
+                let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+                let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+                let mut builder = TrainingLoopBuilder::new(
+                    TrainingTarget::ProjectionHead { head },
+                    varmap,
+                    config,
+                )
+                .job_id("role-build".into())
+                .worker_id("w".into())
+                .catalog(catalog)
+                .artifact_dir(dir.path().to_path_buf())
+                .rank_context(rank_ctx);
+                if let Some(role) = role {
+                    builder = builder.runner_role(role);
+                }
+                builder.build().map(|_| ()).map_err(|e| e.to_string())
+            })
+        };
+        let refused = |rank: u32, role: RunnerRole| {
+            let err = build(rank, Some(role)).expect_err("the role contradicts the rank");
+            assert!(
+                err.contains("the role and the rank must agree"),
+                "rank {rank}, role {role}: {err}"
+            );
+        };
+        refused(1, RunnerRole::Holder(LeaseHolder::LoopClaimer));
+        refused(1, RunnerRole::Holder(LeaseHolder::Coordinator));
+        refused(1, RunnerRole::Rank { rank: 2 });
+        refused(0, RunnerRole::Rank { rank: 1 });
+        build(0, Some(RunnerRole::Holder(LeaseHolder::Coordinator))).unwrap();
+        build(1, Some(RunnerRole::Rank { rank: 1 })).unwrap();
+        build(1, None).unwrap();
+        build(0, None).unwrap();
     }
 }
 

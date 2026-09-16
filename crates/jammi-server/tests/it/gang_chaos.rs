@@ -5,12 +5,16 @@
 //! tokio runtime — so "the member process died" is one runtime dropped),
 //! both over ONE shared catalog and ONE shared result root, exactly the
 //! shape two `jammi-server` replicas take in a deployment. The member's rank
-//! body is the test's own thread over the session's tapped `MemberLink`
-//! (the `test-hooks` tap, the rank body's seat), wrapped in a chaos
-//! collective that injects the failure at a chosen step of the real
-//! training loop — the first optimizer step of the SECOND epoch (the fifth
-//! `all_reduce_sum`), so epoch 1's resume checkpoint exists when the attempt
-//! is retired and the successor attempt resumes from it.
+//! body is the REAL one (`run_member_rank`, spawned by the member's handler
+//! at admission), its `Peer` wrapped — through the `test-hooks` seam
+//! `training_test_hooks::wrap_member_collective`, armed per job before the
+//! coordinator dials — in a chaos collective that injects the failure at a
+//! chosen step of the real training loop — the first optimizer step of the
+//! SECOND epoch (the fifth `all_reduce_sum`), so epoch 1's resume checkpoint
+//! exists when the attempt is retired and the successor attempt's bodies
+//! (rank 0 and the member's) resume from it out of the shared store. Each
+//! body's end is read back through `training_test_hooks::rank_outcomes_for`
+//! (recorded whether or not its session lived to emit it).
 //!
 //! Every row pins DESIGN.md §4 "Failure and release" over the real
 //! machinery: the coordinator's round deadline and its links' typed record
@@ -44,15 +48,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
-use jammi_ai::fine_tune::collective::{BlockingCall, Collective, MemberLink, Peer};
-use jammi_ai::fine_tune::data::TrainingDataLoader;
-use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
-use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
-use jammi_ai::fine_tune::source::TrainingSource;
-use jammi_ai::fine_tune::target::TrainingTarget;
-use jammi_ai::fine_tune::trainer::{RankContext, TrainingLoopBuilder};
+use candle_core::Tensor;
+use jammi_ai::fine_tune::collective::{BlockingCall, Collective};
 use jammi_ai::fine_tune::worker::{training_test_hooks, Holder, JobWorker};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
@@ -60,17 +57,16 @@ use jammi_db::catalog::jobs_repo::{JobRecord, WorkerState};
 use jammi_db::config::{CatalogConfig, JammiConfig};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::store::ArtifactStore;
 use jammi_server::grpc::gang::GangServer;
 use jammi_server::grpc::gang_rounds::GangDialer;
 use jammi_wire::proto::gang::gang_service_server::GangServiceServer;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tonic::transport::server::TcpIncoming;
 
 use crate::gang_coordinator::{
-    file_store, gang_config, pairs, published_adapter_bytes, rank_env,
-    reference_rank0_adapter_bytes, row, two_rank_spec, write_pairs_csv, RankEnv, Row,
+    published_adapter_bytes, reference_rank0_adapter_bytes, row, two_rank_spec, write_pairs_csv,
+    Row,
 };
 
 /// The coordinator hosts' lease: a retired attempt whose lease is left to
@@ -231,27 +227,19 @@ impl Coordinator {
     async fn run(&self, record: JobRecord) {
         self.worker.run_claimed_job(&self.session, record).await;
     }
-
-    fn cap(&self) -> usize {
-        usize::try_from(self.session.inner_config().server.limits.max_message_bytes).unwrap()
-    }
 }
-
-/// The tap onto every session the member's real handler admits, shared
-/// with the rank threads that consume one link each.
-type Links = Arc<Mutex<mpsc::UnboundedReceiver<MemberLink>>>;
 
 /// A member host: an engine whose `instances` row advertises its gang
 /// listener and whose `workers` row is `claiming` over `fine_tune` (what
 /// the coordinator's listing selects), and the REAL `GangServer::run_rank`
 /// mounted on a tokio runtime of its own — the member "process" whose death
 /// is that runtime dropped (its listener, every accepted connection, every
-/// spawned hold loop and the tapped links' forwarders go with it).
+/// spawned hold loop and every rank body's task go with it; a body's
+/// blocking thread runs on to its next collective, which fails).
 struct Member {
     session: Arc<InferenceSession>,
     addr: SocketAddr,
     runtime: Option<tokio::runtime::Runtime>,
-    links: Links,
     _dir: TempDir,
 }
 
@@ -276,12 +264,11 @@ impl Member {
             .upsert_worker(session.instance_id(), "fine_tune", WorkerState::Claiming)
             .await
             .expect("workers row");
-        let (runtime, links) = Self::serve(&session, std_listener);
+        let runtime = Self::serve(&session, std_listener);
         Self {
             session,
             addr,
             runtime: Some(runtime),
-            links: Arc::new(Mutex::new(links)),
             _dir: dir,
         }
     }
@@ -289,7 +276,7 @@ impl Member {
     fn serve(
         session: &Arc<InferenceSession>,
         std_listener: std::net::TcpListener,
-    ) -> (tokio::runtime::Runtime, mpsc::UnboundedReceiver<MemberLink>) {
+    ) -> tokio::runtime::Runtime {
         std_listener.set_nonblocking(true).expect("nonblocking");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -297,7 +284,6 @@ impl Member {
             .build()
             .expect("gang runtime");
         let gang = GangServer::new(Arc::clone(session), MEMBER_LEASE, MEMBER_HEARTBEAT);
-        let links = gang.take_member_links();
         let cap = usize::try_from(session.inner_config().server.limits.max_message_bytes).unwrap();
         runtime.spawn(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
@@ -307,7 +293,7 @@ impl Member {
                 .await
                 .expect("serve");
         });
-        (runtime, links)
+        runtime
     }
 
     /// The member process dies mid-run: the gang runtime is dropped with
@@ -355,9 +341,7 @@ impl Member {
                 listener
             }
         };
-        let (runtime, links) = Self::serve(&self.session, std_listener);
-        self.runtime = Some(runtime);
-        self.links = Arc::new(Mutex::new(links));
+        self.runtime = Some(Self::serve(&self.session, std_listener));
     }
 
     /// The member's host DRAINs (68 OPS): the phase leaves `Running`, so
@@ -410,18 +394,20 @@ enum Resume {
 }
 
 /// The chaos seam: at the [`CHAOS_AT_REDUCE`]-th `all_reduce_sum` the rank
-/// thread tells the test (`tell`), blocks until the test resumes it, and
-/// then proceeds or fails. Every other verb is the real `Peer`'s.
+/// body tells the test (`tell`), blocks until the test resumes it, and
+/// then proceeds or fails. Every other verb is the real `Peer`'s — the
+/// wrapper the real body applies through
+/// `training_test_hooks::wrap_member_collective`.
 struct ChaosRank {
-    inner: Arc<Peer>,
+    inner: Arc<dyn Collective>,
     reduces: AtomicUsize,
     tell: Mutex<Option<oneshot::Sender<()>>>,
     resume: Mutex<Option<std::sync::mpsc::Receiver<Resume>>>,
 }
 
-/// The rank thread's ends of the chaos channels — built with the
-/// [`ChaosControl`] before the thread exists, wrapped around the `Peer`
-/// once the session is admitted.
+/// The rank body's ends of the chaos channels — built with the
+/// [`ChaosControl`] before the body exists, wrapped around its `Peer`
+/// once the session is admitted and the body reaches the seam.
 struct ChaosSeam {
     tell: oneshot::Sender<()>,
     resume: std::sync::mpsc::Receiver<Resume>,
@@ -449,7 +435,7 @@ fn chaos_channels() -> (ChaosSeam, ChaosControl) {
 }
 
 impl ChaosRank {
-    fn new(inner: Arc<Peer>, seam: ChaosSeam) -> Self {
+    fn new(inner: Arc<dyn Collective>, seam: ChaosSeam) -> Self {
         Self {
             inner,
             reduces: AtomicUsize::new(0),
@@ -510,124 +496,66 @@ impl Collective for ChaosRank {
     fn world(&self) -> u32 {
         self.inner.world()
     }
-}
 
-/// Rank 1's run (`gang_coordinator::try_run_rank`'s shape) plus the resume
-/// discovery every rank body performs: the job-level resume checkpoint
-/// (`{job_id}/_resume/`, rank 0's epoch-boundary write into the fleet's
-/// artifact store) is fetched for the REAL job and restored, so a rank of
-/// the successor attempt starts from the same epoch boundary rank 0
-/// resumes from — the lockstep a resumed gang needs. The rank's own
-/// catalog row, artifact dir and checkpoint store stay private (`env`).
-fn run_rank_1(
-    call: &BlockingCall,
-    env: RankEnv,
-    tag: &str,
-    rank_ctx: RankContext,
-    resume_from: &(Arc<ArtifactStore>, String),
-) -> std::result::Result<Vec<u8>, String> {
-    let config = gang_config(2);
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-    let head = build_projection_head_for_rank(
-        env.hidden,
-        &config,
-        &varmap,
-        &vb,
-        rank_ctx.dropout_seed(config.seed),
-    )
-    .unwrap();
-    let mut builder =
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(Device::Cpu)
-            .job_id(tag.to_string())
-            .worker_id(tag.to_string())
-            .catalog(env.catalog)
-            .artifact_dir(env.dir.path().to_path_buf())
-            .base_model(env.base)
-            .artifact_store(env.store)
-            .rank_context(rank_ctx);
-    let (store, job_id) = resume_from;
-    let handle = tokio::runtime::Handle::current();
-    if let Some(local) = handle
-        .block_on(store.fetch_resume_checkpoint(None, job_id))
-        .map_err(|e| e.to_string())?
-    {
-        if let Some(restored) = jammi_ai::fine_tune::resume::load_bundle(local.dir(), &Device::Cpu)
-            .map_err(|e| e.to_string())?
-        {
-            builder = builder.resume(restored);
-        }
+    fn bind_agreement(&self, digest: String) -> Result<()> {
+        self.inner.bind_agreement(digest)
     }
-    let mut training_loop = builder.build().unwrap();
-    let result = training_loop
-        .run(
-            call,
-            TrainingSource::Resident(TrainingDataLoader::from_pairs(pairs())),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(std::fs::read(result.artifact_dir.path().join("adapter.safetensors")).unwrap())
 }
 
-/// One rank-1 thread over the next session the member's handler admits:
-/// the real `TrainingLoop` over the tapped link, resuming from the job's
-/// checkpoint if one exists, with or without the chaos seam. Resolves to
-/// the adapter bytes, or the run's own error.
-fn spawn_rank_1(
-    coordinator: &Coordinator,
-    member: &Member,
-    env: RankEnv,
-    tag: &str,
-    job_id: &str,
-    chaos: bool,
-) -> (
-    tokio::task::JoinHandle<std::result::Result<Vec<u8>, String>>,
-    Option<ChaosControl>,
-) {
-    let cap = coordinator.cap();
-    let links = Arc::clone(&member.links);
-    let tag = tag.to_string();
-    let resume_from = (coordinator.session.artifact_store(), job_id.to_string());
-    let (seam, control) = if chaos {
-        let (seam, control) = chaos_channels();
-        (Some(seam), Some(control))
-    } else {
-        (None, None)
-    };
-    let handle = BlockingCall::spawn_blocking(move |call| {
-        let link = links
-            .lock()
-            .unwrap()
-            .blocking_recv()
-            .expect("the admitted session offered its MemberLink to the tap");
-        let peer = Peer::member(1, 2, link, Device::Cpu, cap)
-            .expect("member")
-            .with_timeout(Duration::from_secs(120))
-            .expect("timeout");
-        let partition =
-            PartitionSpec::for_gang(1, 2, 2, PartitionRule::BlockByGlobalBatch).unwrap();
-        let collective: Arc<dyn Collective> = match seam {
-            Some(seam) => Arc::new(ChaosRank::new(Arc::new(peer), seam)),
-            None => Arc::new(peer),
-        };
-        run_rank_1(
-            &call,
-            env,
-            &tag,
-            RankContext::new(collective, partition),
-            &resume_from,
-        )
-    });
-    (handle, control)
+/// Arm the member's NEXT rank body for `job_id`: with `chaos`, its `Peer`
+/// is wrapped in a [`ChaosRank`] (the fault at [`CHAOS_AT_REDUCE`]) and
+/// the test holds the [`ChaosControl`]; without, the body runs the real
+/// `Peer` bare. The body itself is the REAL one the member's handler
+/// spawns at admission — it reconstructs the job from the row, resumes
+/// from the job's checkpoint in the shared store if one exists, and trains
+/// rank 1 over the session's own link.
+fn arm_rank_1(job_id: &str, chaos: bool) -> Option<ChaosControl> {
+    if !chaos {
+        return None;
+    }
+    let (seam, control) = chaos_channels();
+    training_test_hooks::wrap_member_collective(
+        job_id,
+        Box::new(move |inner| Arc::new(ChaosRank::new(inner, seam))),
+    );
+    Some(control)
 }
 
-async fn joined(
-    handle: tokio::task::JoinHandle<std::result::Result<Vec<u8>, String>>,
-) -> std::result::Result<Vec<u8>, String> {
-    tokio::time::timeout(Duration::from_secs(60), handle)
-        .await
-        .expect("the rank thread ends within the bound")
-        .expect("the rank thread joined")
+/// Every rank body's end recorded for `job_id` once at least `count` have
+/// been (`training_test_hooks::rank_outcomes_for`: `(rank, the
+/// `RankOutcome`'s Debug)`), within a bound. A body whose task died with
+/// its member's runtime never records one.
+async fn wait_rank_ends(job_id: &str, count: usize) -> Vec<(u32, String)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let ends = training_test_hooks::rank_outcomes_for(job_id);
+        if ends.len() >= count {
+            return ends;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{count} rank-body end(s) within the bound; recorded: {ends:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn assert_trained(end: &(u32, String)) {
+    assert_eq!(end.0, 1);
+    assert!(
+        end.1.starts_with("Trained { artifact_digest: \""),
+        "rank 1's body completed: {}",
+        end.1
+    );
+}
+
+fn assert_failed_naming(end: &(u32, String), what: &str) {
+    assert_eq!(end.0, 1);
+    assert!(
+        end.1.starts_with("Failed { reason: ") && end.1.contains(what),
+        "rank 1's body ended Failed naming {what:?}: {}",
+        end.1
+    );
 }
 
 async fn submit(coordinator: &Coordinator) -> String {
@@ -725,9 +653,7 @@ async fn a_member_stream_dropped_mid_round_retires_the_attempt_spent_and_a_new_g
     let job_id = submit(&coordinator).await;
 
     // ── attempt 1: rank 1 dies at epoch 2's first optimizer step ──────────────
-    let env = rank_env(&coordinator.session, "drop-rank-1", file_store()).await;
-    let (rank_1, control) = spawn_rank_1(&coordinator, &member, env, "drop-rank-1", &job_id, true);
-    let control = control.expect("chaos");
+    let control = arm_rank_1(&job_id, true).expect("chaos");
     let record = coordinator.claim(Duration::from_secs(5)).await;
     assert_eq!(record.attempts, 1);
     let injector = tokio::spawn(async move {
@@ -766,21 +692,17 @@ async fn a_member_stream_dropped_mid_round_retires_the_attempt_spent_and_a_new_g
             .is_some(),
         "epoch 1's resume checkpoint exists when the attempt is retired in epoch 2"
     );
-    let rank_1 = joined(rank_1).await.expect_err("rank 1 was retired");
-    assert!(rank_1.contains("chaos"), "{rank_1}");
+    // The body's task died with the member's runtime: its end is never
+    // recorded (its blocking thread returned the chaos error into a dropped
+    // handle).
+    assert!(
+        training_test_hooks::rank_outcomes_for(&job_id).is_empty(),
+        "a body killed with its process records no end"
+    );
     member.wait_slot_free(Duration::from_secs(5)).await;
 
     // ── attempt 2: the member is back; the lease expired; a new gang ────
     member.restart().await;
-    let env = rank_env(&coordinator.session, "drop-rank-1-again", file_store()).await;
-    let (rank_1, _) = spawn_rank_1(
-        &coordinator,
-        &member,
-        env,
-        "drop-rank-1-again",
-        &job_id,
-        false,
-    );
     let started = tokio::time::Instant::now();
     let record = coordinator
         .claim(COORDINATOR_LEASE + Duration::from_secs(10))
@@ -797,7 +719,9 @@ async fn a_member_stream_dropped_mid_round_retires_the_attempt_spent_and_a_new_g
         started.elapsed() >= Duration::from_millis(500),
         "the lease was left to expire, never handed back"
     );
-    joined(rank_1).await.expect("rank 1 completed attempt 2");
+    let ends = wait_rank_ends(&job_id, 1).await;
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_trained(&ends[0]);
     let after_two = row(&coordinator.session, &job_id).await;
     assert_eq!(after_two.attempts, 2);
     assert_eq!(after_two.releases, 0);
@@ -819,10 +743,7 @@ async fn a_member_silent_past_the_rank_timeout_retires_the_attempt_spent_and_a_n
     let job_id = submit(&coordinator).await;
 
     // ── attempt 1: rank 1 stalls at epoch 2's first optimizer step ────────────
-    let env = rank_env(&coordinator.session, "silent-rank-1", file_store()).await;
-    let (rank_1, control) =
-        spawn_rank_1(&coordinator, &member, env, "silent-rank-1", &job_id, true);
-    let control = control.expect("chaos");
+    let control = arm_rank_1(&job_id, true).expect("chaos");
     let record = coordinator.claim(Duration::from_secs(5)).await;
     assert_eq!(record.attempts, 1);
     let started = tokio::time::Instant::now();
@@ -853,20 +774,11 @@ async fn a_member_silent_past_the_rank_timeout_retires_the_attempt_spent_and_a_n
     control
         .resume
         .send(Resume::Fail)
-        .expect("the rank thread waits");
-    let rank_1 = joined(rank_1).await.expect_err("rank 1 was retired");
-    assert!(rank_1.contains("chaos"), "{rank_1}");
+        .expect("the rank body waits");
+    let ends = wait_rank_ends(&job_id, 1).await;
+    assert_failed_naming(&ends[0], "chaos");
 
     // ── attempt 2 ───────────────────────────────────────────────────────
-    let env = rank_env(&coordinator.session, "silent-rank-1-again", file_store()).await;
-    let (rank_1, _) = spawn_rank_1(
-        &coordinator,
-        &member,
-        env,
-        "silent-rank-1-again",
-        &job_id,
-        false,
-    );
     let record = coordinator
         .claim(COORDINATOR_LEASE + Duration::from_secs(10))
         .await;
@@ -874,7 +786,8 @@ async fn a_member_silent_past_the_rank_timeout_retires_the_attempt_spent_and_a_n
     assert_eq!(record.releases, 0);
     coordinator.run(record).await;
     assert_eq!(end_of(&job_id, 2).1, 12, "attempt 2 publishes");
-    joined(rank_1).await.expect("rank 1 completed attempt 2");
+    let ends = wait_rank_ends(&job_id, 2).await;
+    assert_trained(&ends[1]);
     let after_two = row(&coordinator.session, &job_id).await;
     assert_eq!((after_two.attempts, after_two.releases), (2, 0));
     assert_completed_like_the_reference(&coordinator, &job_id, "silent").await;
@@ -897,21 +810,18 @@ async fn a_member_aborted_drain_mid_round_releases_the_lease_and_the_next_attemp
     let job_id = submit(&coordinator).await;
 
     // ── attempt 1: the member host drains at rank 1's first step of epoch 2 ────────
-    let env = rank_env(&coordinator.session, "drain-rank-1", file_store()).await;
-    let (rank_1, control) =
-        spawn_rank_1(&coordinator, &draining, env, "drain-rank-1", &job_id, true);
-    let control = control.expect("chaos");
+    let control = arm_rank_1(&job_id, true).expect("chaos");
     let record = coordinator.claim(Duration::from_secs(5)).await;
     assert_eq!(record.attempts, 1);
     let injector = tokio::spawn(async move {
         control.told.await.expect("the chaos point is reached");
         draining.drain().await;
-        // The rank thread enters its round on a session that has ended:
-        // the closed link ends it.
+        // The rank body enters its round on a session that has ended:
+        // the severed link ends it.
         control
             .resume
             .send(Resume::Proceed)
-            .expect("the rank thread waits");
+            .expect("the rank body waits");
         draining
     });
     coordinator.run(record).await;
@@ -927,26 +837,12 @@ async fn a_member_aborted_drain_mid_round_releases_the_lease_and_the_next_attemp
         after_one.next_assembly_after, None,
         "Drain is not cooled: the next attempt is admissible at once"
     );
-    let rank_1 = joined(rank_1)
-        .await
-        .expect_err("rank 1's session ended under it");
-    assert!(
-        rank_1.contains("nothing applied"),
-        "the rank's round ends on its closed link: {rank_1}"
-    );
+    let ends = wait_rank_ends(&job_id, 1).await;
+    assert_failed_naming(&ends[0], "nothing applied");
     draining.wait_slot_free(Duration::from_secs(5)).await;
 
     // ── attempt 2: a fresh member (the restarted host); claimable now ───
     let restarted = Member::start(&fleet).await;
-    let env = rank_env(&coordinator.session, "drain-rank-1-again", file_store()).await;
-    let (rank_1, _) = spawn_rank_1(
-        &coordinator,
-        &restarted,
-        env,
-        "drain-rank-1-again",
-        &job_id,
-        false,
-    );
     let started = tokio::time::Instant::now();
     let record = coordinator.claim(Duration::from_secs(5)).await;
     assert!(
@@ -957,7 +853,8 @@ async fn a_member_aborted_drain_mid_round_releases_the_lease_and_the_next_attemp
     assert_eq!(record.releases, 1);
     coordinator.run(record).await;
     assert_eq!(end_of(&job_id, 2).1, 12, "attempt 2 publishes");
-    joined(rank_1).await.expect("rank 1 completed attempt 2");
+    let ends = wait_rank_ends(&job_id, 2).await;
+    assert_trained(&ends[1]);
     let listings = training_test_hooks::assembly_listings_for(&job_id);
     assert_eq!(listings.len(), 2);
     assert_eq!(
@@ -995,13 +892,13 @@ async fn an_older_attempts_stale_runner_is_fenced_by_the_successor_and_writes_no
     // The elder waits on its stalled rank far beyond the successor's fence.
     let elder = Coordinator::start(&fleet, 60).await;
     elder.add_pairs_source(&fleet).await;
-    let member = Member::start(&fleet).await;
+    // The member host both attempts dial: its handler spawns the elder's
+    // body and, later, the successor's.
+    let _member = Member::start(&fleet).await;
     let job_id = submit(&elder).await;
 
     // ── attempt 1 on the elder: rank 1 stalls; the elder's keeper dies ──
-    let env = rank_env(&elder.session, "split-rank-1", file_store()).await;
-    let (elder_rank_1, control) = spawn_rank_1(&elder, &member, env, "split-rank-1", &job_id, true);
-    let control = control.expect("chaos");
+    let control = arm_rank_1(&job_id, true).expect("chaos");
     let record = elder.claim(Duration::from_secs(5)).await;
     assert_eq!(record.attempts, 1);
     let elder_session = Arc::clone(&elder.session);
@@ -1020,15 +917,6 @@ async fn an_older_attempts_stale_runner_is_fenced_by_the_successor_and_writes_no
     let successor = Coordinator::start(&fleet, RANK_TIMEOUT_SECS).await;
     let successor_run = async {
         let resume = keeper_killer.await.expect("killer");
-        let env = rank_env(&successor.session, "split-rank-1-again", file_store()).await;
-        let (rank_1, _) = spawn_rank_1(
-            &successor,
-            &member,
-            env,
-            "split-rank-1-again",
-            &job_id,
-            false,
-        );
         let record = successor
             .claim(COORDINATOR_LEASE + Duration::from_secs(10))
             .await;
@@ -1038,9 +926,9 @@ async fn an_older_attempts_stale_runner_is_fenced_by_the_successor_and_writes_no
         );
         assert_eq!(record.releases, 0);
         successor.run(record).await;
-        (resume, rank_1)
+        resume
     };
-    let ((), (resume, successor_rank_1)) = tokio::join!(elder_run, successor_run);
+    let ((), resume) = tokio::join!(elder_run, successor_run);
 
     // The elder's attempt: refuted through the member (its session was
     // superseded and refuted at the next tick) or cancelled through its
@@ -1057,14 +945,22 @@ async fn an_older_attempts_stale_runner_is_fenced_by_the_successor_and_writes_no
     );
     resume
         .send(Resume::Fail)
-        .expect("the elder's rank thread waits");
-    let elder_rank_1 = joined(elder_rank_1)
-        .await
-        .expect_err("the elder's rank was retired");
-    assert!(elder_rank_1.contains("chaos"), "{elder_rank_1}");
-    joined(successor_rank_1)
-        .await
-        .expect("rank 1 completed attempt 2");
+        .expect("the elder's rank body waits");
+    // Two bodies ran on the member for this job: the elder attempt's,
+    // retired by the test, and the successor's, which completed — in
+    // either recording order.
+    let ends = wait_rank_ends(&job_id, 2).await;
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    let failed = ends
+        .iter()
+        .find(|e| e.1.starts_with("Failed"))
+        .unwrap_or_else(|| panic!("the elder's body ended Failed: {ends:?}"));
+    assert_failed_naming(failed, "chaos");
+    let trained = ends
+        .iter()
+        .find(|e| e.1.starts_with("Trained"))
+        .unwrap_or_else(|| panic!("the successor's body completed: {ends:?}"));
+    assert_trained(trained);
 
     let after = row(&successor.session, &job_id).await;
     assert_eq!(

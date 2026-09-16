@@ -147,9 +147,12 @@ training run. Its threat model is stated as one invariant, **I-GANG**:
   peer never claims while it holds a rank, never admits a rank while it runs
   a job; a busy slot refuses `UNAVAILABLE`, transient) and is re-verified every
   heartbeat against the same determinants; a DRAIN or RELEASE of the host ends
-  every held rank at once, and with no rank body to run yet the session parks
-  and ends `NoBody` after one lease window. The member writes nothing to the
-  job row on behalf of a rank.
+  every held rank at once. A `world_size > 1` session runs its rank body
+  (trained over the session's own stream as a rank of the gang) and ends with
+  that body's one `Outcome`; a `world_size == 1` session has no body to run,
+  parks, and ends `NoBody` after one lease window. The member writes nothing
+  to the job row and nothing into the job's artifact prefix on behalf of a
+  rank: only the lease holder writes.
 - **Multi-host gang admission is a Postgres-only deployment shape** — a
   SQLite deployment is a single embedded process; there is no second host to
   admit at all, so this seam is never exercised there. The admission read's

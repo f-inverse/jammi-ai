@@ -60,4 +60,9 @@ impl Collective for Noop {
     fn world(&self) -> u32 {
         1
     }
+
+    fn bind_agreement(&self, _digest: String) -> Result<()> {
+        // A gang of one has no peer to disagree with.
+        Ok(())
+    }
 }

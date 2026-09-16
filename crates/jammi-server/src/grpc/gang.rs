@@ -31,24 +31,35 @@
 //! compare-and-set on the holder cell (`Free` admits; a `ClaimProbe` is
 //! waited on for at most one heartbeat; `JobRun` or another `Rank` refuse
 //! `Unavailable` at once — transient, no assembly budget consumed) — and
-//! only once the CAS succeeded is `Admitted` emitted. The stream is then
-//! HELD by a spawned loop owning the [`RankHold`] guard, with exactly four
-//! arms: the inbound stream (`Cancel` ends the session cooperatively; a
-//! second `Assign` is a protocol violation, `InvalidArgument` — K2; a round
-//! frame — `RoundInbox::is_round_frame` — is delivered to the session's
-//! round inbox and the session stays held; an empty frame is a protocol
-//! violation), the
-//! host's phase watch (a DRAIN or RELEASE ends every held rank with
-//! `Drain`, the only host-initiated cut), the re-verification tick (one per
-//! heartbeat: the row predicate, the training-set identity, and the
-//! coordinator's liveness are re-decided, ending the session `Refuted` /
-//! `Unavailable` / `StoreUnavailable` — see [`ReverifyEnd`] for why those
-//! three are pairwise distinct in scope and in whether they count), and the
-//! park bound (one lease window: with no rank body to hand the session to,
-//! it ends `NoBody`). The peer writes NOTHING terminal on behalf of a rank:
-//! every end is a stream event, the job row untouched — a source-scan
-//! oracle over this file enumerates the catalog's `jobs` writers and asserts
-//! none is named here.
+//! only once the CAS succeeded is `Admitted` emitted. A `world_size > 1`
+//! session then hands its `MemberLink` to the RANK BODY
+//! (`jammi_ai::fine_tune::worker::run_member_rank`, spawned here: rank
+//! `assign.rank` of the gang, trained over the session's own stream as
+//! `RunnerRole::Rank`); a `world_size == 1` session has no body to run.
+//! Either way the stream is HELD by a spawned loop owning the [`RankHold`]
+//! guard, with exactly five arms, of which a session takes four: the
+//! inbound stream (`Cancel` ends the session cooperatively; a second
+//! `Assign` is a protocol violation, `InvalidArgument` — K2; a round frame
+//! — `RoundInbox::is_round_frame` — is delivered to the session's round
+//! inbox and the session stays held; an empty frame is a protocol
+//! violation), the host's phase watch (a DRAIN or RELEASE ends every held
+//! rank with `Drain`, the only host-initiated cut), the re-verification
+//! tick (one per heartbeat: the row predicate, the training-set identity,
+//! and the coordinator's liveness are re-decided, ending the session
+//! `Refuted` / `Unavailable` / `StoreUnavailable` — see [`ReverifyEnd`] for
+//! why those three are pairwise distinct in scope and in whether they
+//! count), and — one or the other, never both — the rank body's end (a
+//! body-bearing session ends with the body's ONE `RankEvent::Outcome`:
+//! `Trained{artifact_digest}` or `Failed{reason}`; or its prologue's
+//! `Aborted{reason}`) or the park bound (a body-less session ends `NoBody`
+//! one lease window after admission). A session that ends for any reason
+//! but its own body's end tells the body to stop (its cancel flag; the
+//! round inbox severed, so the body's next collective faults) and never
+//! forwards a later frame of it. The peer writes NOTHING terminal on
+//! behalf of a rank: every end is a stream event, the job row untouched —
+//! a source-scan oracle over this file enumerates the catalog's `jobs`
+//! writers and asserts none is named here; the body itself runs as a
+//! `RunnerRole::Rank`, a type that holds no `LeaseHolder` to write as.
 //!
 //! **A catalog fault at admission is `Unavailable`, never
 //! `FailedPrecondition`**: see `admission_catalog_fault`; every
@@ -71,10 +82,10 @@
 //! for a catalog fault or a busy slot, `InvalidArgument` for the wire K2
 //! edges — and no stream ever exists. AFTER admission the call has
 //! returned `Ok(stream)`, so every later outcome is delivered IN the
-//! stream: `Admitted`, then exactly one `Aborted{reason}` (the session's
-//! end), or — for a protocol violation on the admitted stream (a second
-//! `Assign`, K2) — a status TRAILER ending the stream, never a second
-//! initial result. An admitted session's ends may name their reason
+//! stream: `Admitted`, then exactly one terminal event — `Aborted{reason}`,
+//! or a body-bearing session's `Outcome` — or, for a protocol violation on
+//! the admitted stream (a second `Assign`, K2), a status TRAILER ending the
+//! stream, never a second initial result. An admitted session's ends may name their reason
 //! (`Refuted`/`Unavailable`/`StoreUnavailable`/`Drain`/`Cancelled`/
 //! `NoBody`): the caller already holds the job's own coordinates and was
 //! admitted on them, so a reason discloses nothing a pre-admission refusal
@@ -91,6 +102,7 @@
 //! wrapped by the tenant-binding layer.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
 use std::sync::Mutex;
@@ -98,7 +110,9 @@ use std::time::Duration;
 
 use futures::Stream;
 use jammi_ai::fine_tune::collective::MemberLink;
-use jammi_ai::fine_tune::worker::{HolderBusy, RankHold, WorkerPhase};
+use jammi_ai::fine_tune::worker::{
+    run_member_rank, HolderBusy, MemberAssignment, RankHold, RankOutcome, WorkerPhase,
+};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::{RankAdmissionRow, WorldSizeFact};
 use jammi_db::catalog::lease::LeaseFact;
@@ -116,7 +130,8 @@ use tonic::{Request, Response, Status};
 use crate::grpc::gang_rounds::{member_link, RoundInbox};
 use crate::grpc::proto::gang::gang_service_server::GangService;
 use crate::grpc::proto::gang::{
-    rank_control, rank_event, AbortReason, Aborted, Admitted, Assign, RankControl, RankEvent,
+    outcome, rank_control, rank_event, AbortReason, Aborted, Admitted, Assign, FailedOutcome,
+    Outcome, RankControl, RankEvent, TrainedOutcome,
 };
 
 /// Non-disclosure (`docs/rigor/contracts/feat_500-C-U5a-1.md` §2 (P2); #566
@@ -272,11 +287,13 @@ impl GangServer {
         }
     }
 
-    /// The owner an admitted session's [`MemberLink`] goes to: the session
-    /// itself (`Some` — it keeps the link for its whole life, see
-    /// [`HeldSession::member`]), or, under `test-hooks` with a taker
-    /// registered by [`Self::take_member_links`], that taker (`None`). A
-    /// taker that has gone away leaves the link with the session.
+    /// The owner a BODY-LESS (`world_size == 1`) session's [`MemberLink`]
+    /// goes to: the session itself (`Some` — it keeps the link for its
+    /// whole life, see [`HeldSession::member`]), or, under `test-hooks`
+    /// with a taker registered by [`Self::take_member_links`], that taker
+    /// (`None`). A taker that has gone away leaves the link with the
+    /// session. A body-bearing session never offers its link: the rank
+    /// body owns it.
     fn offer_member_link(&self, member: MemberLink) -> Option<MemberLink> {
         #[cfg(feature = "test-hooks")]
         {
@@ -290,13 +307,13 @@ impl GangServer {
         Some(member)
     }
 
-    /// `test-hooks` only: every session this `GangServer` admits from now
-    /// on hands its [`MemberLink`] to the returned receiver instead of
-    /// keeping it. This is the seat the rank body (U5b-1b-iii) will take —
-    /// the member's `Peer` is built over exactly this link — and, until it
-    /// exists, the one way an oracle drives `Peer` through the REAL
-    /// `run_rank` handler. Call BEFORE mounting (tonic's wrapper takes the
-    /// instance by value).
+    /// `test-hooks` only: every BODY-LESS (`world_size == 1`) session this
+    /// `GangServer` admits from now on hands its [`MemberLink`] to the
+    /// returned receiver instead of keeping it — the seam an oracle drops
+    /// a held session's link through to reach the "round frame after the
+    /// link closed" trailer. A `world_size > 1` session's link is the rank
+    /// body's and is never offered. Call BEFORE mounting (tonic's wrapper
+    /// takes the instance by value).
     #[cfg(feature = "test-hooks")]
     pub fn take_member_links(&self) -> mpsc::UnboundedReceiver<MemberLink> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -626,6 +643,17 @@ fn aborted_event(reason: AbortReason) -> RankEvent {
     }
 }
 
+/// The rank body's natural end as the session's one terminal event
+/// (`gang.proto`'s `Outcome`, frozen by U5a-1): a completed run's
+/// `Trained{artifact_digest}`, a typed failure's `Failed{reason}`.
+fn outcome_event(result: outcome::Result) -> RankEvent {
+    RankEvent {
+        event: Some(rank_event::Event::Outcome(Outcome {
+            result: Some(result),
+        })),
+    }
+}
+
 /// An admitted session: everything the spawned hold loop owns. The
 /// [`RankHold`] is dropped with it, on every exit path, freeing the slot.
 struct HeldSession {
@@ -641,15 +669,35 @@ struct HeldSession {
     /// inbound stream (`RoundInbox::deliver`), and reports a transport error
     /// on it (`RoundInbox::fail`). Dropped with the session.
     inbox: RoundInbox,
-    /// The member's end of the round protocol over THIS session — the link
-    /// the member's `Peer` is built over (`gang_rounds::member_link`), whose
-    /// outbound events ride the session's own response stream. No rank body
-    /// consumes it yet (U5b-1b-iii): the session keeps it for its whole
-    /// life and drops it last, which is what lets the response stream close
-    /// (the link's event forwarder holds its own clone of `events` until the
-    /// link is gone). `None` only under `test-hooks`, when the taker
-    /// registered by [`GangServer::take_member_links`] took it at admission.
+    /// A BODY-LESS session's end of the round protocol — the link built at
+    /// admission (`gang_rounds::member_link`), which a `world_size == 1`
+    /// session keeps for its whole life (or, under `test-hooks`, handed to
+    /// the taker registered by [`GangServer::take_member_links`]). `None`
+    /// for a body-bearing session: its link is the rank body's, moved into
+    /// [`Self::body`]'s task at admission.
     member: Option<MemberLink>,
+    /// The rank body (`run_member_rank`), for a `world_size > 1` session:
+    /// the task training rank `assign.rank` over this session's link. Its
+    /// end is the session's end (the fifth arm); `None` for a body-less
+    /// session, which parks instead.
+    body: Option<tokio::task::JoinHandle<RankOutcome>>,
+    /// The body's cooperative stop flag — the trainer's epoch-boundary
+    /// check reads it exactly as rank 0 reads its lease flag. Set when the
+    /// session ends for any reason but the body's own end.
+    body_cancel: Arc<AtomicBool>,
+}
+
+/// How a held session ends: the one stream event (or one trailer) the hold
+/// loop emits before the stream closes.
+enum SessionEnd {
+    /// `Aborted{reason}` — a session arm's end (cancel, drain, a refuted or
+    /// unavailable re-verification, the park bound), or the rank body's own
+    /// pre-collective refusal.
+    Aborted(AbortReason),
+    /// The rank body's natural end: `Outcome{Trained | Failed}`.
+    Outcome(outcome::Result),
+    /// A protocol violation on the admitted stream: a status trailer.
+    Violation(Status),
 }
 
 /// What one inbound control frame does to an admitted session.
@@ -723,11 +771,18 @@ impl HeldSession {
         }))
     }
 
-    /// The HOLD loop: exactly four arms — the inbound stream, the host's
-    /// phase (drain) watch, the re-verification tick, the park bound. No
-    /// fifth arm: nothing else ends a held session. Every end is ONE
-    /// stream event (or, for a protocol violation, one status) followed by
-    /// the stream closing; the job row is never written here.
+    /// The HOLD loop: exactly five arms, of which a session takes four —
+    /// the inbound stream, the host's phase (drain) watch, the
+    /// re-verification tick, and EITHER the rank body's end (a
+    /// body-bearing session) OR the park bound (a body-less one). Nothing
+    /// else ends a held session. Every end is ONE stream event (or, for a
+    /// protocol violation, one status) followed by the stream closing; the
+    /// job row is never written here. A session that ends for any reason
+    /// but its body's own end tells the body to stop (`body_cancel`) and
+    /// severs the round inbox (`RoundInbox::sever`: the body's next
+    /// collective ends `Disconnected`, and no frame of the body's reaches
+    /// the stream after the terminal event); the body's task runs on to
+    /// that fault on its own and its result is discarded.
     async fn hold(mut self) {
         let admission = Arc::clone(self.session.host_admission());
         let mut phase = admission.phase_receiver();
@@ -736,19 +791,24 @@ impl HeldSession {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let park = tokio::time::sleep(self.lease);
         tokio::pin!(park);
+        // The body, taken out of `self` so the arm below can await it
+        // mutably beside the other arms' borrows.
+        let mut body = self.body.take();
         // The client half-closing its send side (it sent its one `Assign`
         // and has nothing more to say) is NOT an end: the session stays
         // held and the arm is simply disabled. A transport error on the
         // inbound side means the client is gone — there is nobody to send
-        // a reason to, so the loop ends silently.
+        // a reason to, so the loop ends silently (the body, if any, is told
+        // to stop exactly as on every other foreign end).
         let mut inbound_open = true;
 
-        let end: Result<AbortReason, Status> = loop {
+        let end: SessionEnd = loop {
             tokio::select! {
                 frame = self.inbound.next(), if inbound_open => match frame {
                     Some(Ok(frame)) => match self.on_control_frame(frame).await {
                         FrameOutcome::Held => {}
-                        FrameOutcome::End(end) => break end,
+                        FrameOutcome::End(Ok(reason)) => break SessionEnd::Aborted(reason),
+                        FrameOutcome::End(Err(status)) => break SessionEnd::Violation(status),
                     },
                     Some(Err(status)) => {
                         // The member's link learns the inbound stream FAILED
@@ -760,12 +820,34 @@ impl HeldSession {
                             %status,
                             "gang hold: the inbound stream errored; ending the session"
                         );
+                        self.body_cancel.store(true, Ordering::SeqCst);
+                        self.inbox.sever();
                         return;
                     }
                     None => {
                         inbound_open = false;
                     }
                 },
+                // The rank body's end — a body-bearing session's own end.
+                // A task that did not return an outcome (a panic in the
+                // body's async prologue) is that body's failure.
+                joined = async { body.as_mut().expect("guarded by the arm's condition").await },
+                    if body.is_some() =>
+                {
+                    body = None;
+                    break match joined {
+                        Ok(RankOutcome::Trained { artifact_digest }) => SessionEnd::Outcome(
+                            outcome::Result::Trained(TrainedOutcome { artifact_digest }),
+                        ),
+                        Ok(RankOutcome::Failed { reason }) => {
+                            SessionEnd::Outcome(outcome::Result::Failed(FailedOutcome { reason }))
+                        }
+                        Ok(RankOutcome::Aborted(reason)) => SessionEnd::Aborted(reason),
+                        Err(e) => SessionEnd::Outcome(outcome::Result::Failed(FailedOutcome {
+                            reason: format!("rank {}: the rank body's task ended: {e}", self.assign.rank),
+                        })),
+                    };
+                }
                 // The `watch::Ref` `wait_for` yields is consumed inside this
                 // arm's own future (never held in the `select!`'s output
                 // across another arm's await), so the hold loop stays
@@ -774,33 +856,44 @@ impl HeldSession {
                 // away either way.
                 () = async {
                     let _ = phase.wait_for(|p| *p != WorkerPhase::Running).await;
-                } => break Ok(AbortReason::Drain),
+                } => break SessionEnd::Aborted(AbortReason::Drain),
                 _ = tick.tick() => {
                     if let Err(end) =
                         reverify(&self.session, &self.assign, self.identity.as_ref(), self.lease)
                             .await
                     {
-                        break Ok(end.abort_reason());
+                        break SessionEnd::Aborted(end.abort_reason());
                     }
                 }
-                _ = &mut park => break Ok(AbortReason::NoBody),
+                // The park bound: a body-less session only. A body-bearing
+                // session's bound is its body's — the gang deadline on its
+                // every round wait, and the re-verification tick above.
+                _ = &mut park, if body.is_none() => break SessionEnd::Aborted(AbortReason::NoBody),
             }
         };
 
+        // A foreign end while the body runs: stop it cooperatively. Its
+        // task is detached (dropped with `body` below), never joined — it
+        // ends at its next collective, which the severed inbox fails.
+        if body.is_some() {
+            self.body_cancel.store(true, Ordering::SeqCst);
+        }
         let item = match end {
-            Ok(reason) => Ok(aborted_event(reason)),
-            Err(status) => Err(status),
+            SessionEnd::Aborted(reason) => Ok(aborted_event(reason)),
+            SessionEnd::Outcome(result) => Ok(outcome_event(result)),
+            SessionEnd::Violation(status) => Err(status),
         };
         // A receiver already gone (the client dropped the response stream)
         // has nobody to tell; the hold is freed regardless, below.
         let _ = self.events.send(item).await;
         drop(self.events);
-        // The round protocol's ends go with the session: the inbox first
-        // (no further delivery), then the link — whose event forwarder holds
-        // the last clone of the event sender, so the response stream closes
-        // only now — then the slot.
-        drop(self.inbox);
+        // The round protocol's ends go with the session: the inbox severed
+        // first (no further delivery either way — the forwarder held the
+        // last clone of the event sender, so the response stream closes
+        // now), then the body-less session's link, then the slot.
+        self.inbox.sever();
         drop(self.member);
+        drop(body);
         drop(self.hold);
     }
 }
@@ -1042,7 +1135,37 @@ impl GangService for GangServer {
         let (inbox, member) = member_link(events.clone()).map_err(|e| {
             Status::internal(format!("gang admission: building the member link: {e}"))
         })?;
-        let member = self.offer_member_link(member);
+        // The rank body: a `world_size > 1` session (the identity is the
+        // world>1 conjunct's product) hands its link to the body, which
+        // trains rank `assign.rank` over it as `RunnerRole::Rank`; a
+        // `world_size == 1` session keeps (or, under `test-hooks`, offers)
+        // the link and parks. The body is spawned BEFORE `Admitted` is
+        // queued, so an admitted stream always has its body reading its
+        // link before the coordinator's first round frame arrives.
+        let body_cancel = Arc::new(AtomicBool::new(false));
+        let (member, body) = match &identity {
+            Some(identity) => {
+                let assignment = MemberAssignment {
+                    job_id: assign.job_id.clone(),
+                    attempt: row.attempts,
+                    rank: assign.rank,
+                    world: assign.world,
+                    coordinator_instance_id: assign.coordinator_instance_id.clone(),
+                    tenant: identity.tenant,
+                    training_set_ref: identity.training_set_ref.clone(),
+                    training_set_location: identity.training_set_location.clone(),
+                    spec_json: row.spec.clone(),
+                };
+                let body = tokio::spawn(run_member_rank(
+                    Arc::clone(&self.session),
+                    assignment,
+                    member,
+                    Arc::clone(&body_cancel),
+                ));
+                (None, Some(body))
+            }
+            None => (self.offer_member_link(member), None),
+        };
         if events.try_send(Ok(admitted_event())).is_err() {
             // A fresh channel with room for four frames cannot refuse the
             // first; stated rather than unwrapped.
@@ -1059,6 +1182,8 @@ impl GangService for GangServer {
             events,
             inbox,
             member,
+            body,
+            body_cancel,
         };
         tokio::spawn(held.hold());
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))

@@ -92,7 +92,7 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, Float16Array, Float32Array, UInt16Array};
@@ -107,8 +107,9 @@ use jammi_db::storage::JammiObjectStore;
 use jammi_db::store::manifest::{ArtifactDigest, LeafDigest, LeafKey};
 use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 use jammi_wire::proto::gang::{
-    rank_control, rank_event, AbortReason, Assign, Cancel, Counts, RankControl, RankEvent,
-    RoundAck, RoundChunk, RoundCommit, RoundDescriptor, RoundFault, RoundPayload, RoundVerb,
+    outcome, rank_control, rank_event, AbortReason, Assign, Cancel, Counts, Outcome, RankControl,
+    RankEvent, RoundAck, RoundChunk, RoundCommit, RoundDescriptor, RoundFault, RoundPayload,
+    RoundVerb,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -155,6 +156,11 @@ struct Link<In, Out> {
     /// the coordinator body maps through the assembly reason table after a
     /// round faulted (`Frame::Session` carries only its description).
     session_abort: Option<i32>,
+    /// The `Outcome` the far side's rank body ended with, if an `Outcome`
+    /// frame was ever read on this link — only a member's `RankEvent`
+    /// carries one; the coordinator collects it after its own run
+    /// ([`Peer::collect_member_ends`]).
+    outcome: Option<Outcome>,
 }
 
 impl<In, Out> fmt::Debug for Link<In, Out> {
@@ -213,6 +219,7 @@ impl MemberLink {
             outbound,
             handle: current_handle("MemberLink::from_channels")?,
             session_abort: None,
+            outcome: None,
         }))
     }
 }
@@ -241,6 +248,7 @@ impl CoordinatorLink {
                 outbound,
                 handle: current_handle("CoordinatorLink::from_channels")?,
                 session_abort: None,
+                outcome: None,
             },
         })
     }
@@ -312,6 +320,7 @@ impl CoordinatorLink {
                 outbound: out_tx,
                 handle,
                 session_abort: None,
+                outcome: None,
             },
         })
     }
@@ -379,6 +388,11 @@ trait Inbound: Send + 'static {
     fn abort_reason(&self) -> Option<i32> {
         None
     }
+    /// The `Outcome` when this frame is the far side's rank body's end —
+    /// only a member's `RankEvent` carries one.
+    fn outcome(&self) -> Option<Outcome> {
+        None
+    }
 }
 
 impl Inbound for RankControl {
@@ -403,6 +417,13 @@ impl Inbound for RankEvent {
     fn abort_reason(&self) -> Option<i32> {
         match &self.event {
             Some(rank_event::Event::Aborted(aborted)) => Some(aborted.reason),
+            _ => None,
+        }
+    }
+
+    fn outcome(&self) -> Option<Outcome> {
+        match &self.event {
+            Some(rank_event::Event::Outcome(outcome)) => Some(outcome.clone()),
             _ => None,
         }
     }
@@ -499,6 +520,9 @@ impl<In: Inbound, Out: Outbound> Link<In, Out> {
             Ok(Some(Ok(frame))) => {
                 if let Some(reason) = frame.abort_reason() {
                     self.session_abort = Some(reason);
+                }
+                if let Some(outcome) = frame.outcome() {
+                    self.outcome = Some(outcome);
                 }
                 Ok(frame.into_frame())
             }
@@ -1015,7 +1039,10 @@ pub struct Peer {
     device: Device,
     timeout: Duration,
     chunk_bytes: usize,
-    agreement: Option<String>,
+    /// The caller-bound [`Descriptor::agreement`] this rank signs every
+    /// round with; unset until [`Self::with_agreement`] or
+    /// [`Collective::bind_agreement`] binds one.
+    agreement: OnceLock<String>,
     inner: Mutex<Inner>,
 }
 
@@ -1028,6 +1055,38 @@ impl fmt::Debug for Peer {
             .field("chunk_bytes", &self.chunk_bytes)
             .field("agreement", &self.agreement)
             .finish_non_exhaustive()
+    }
+}
+
+/// How one member's session ended after the run, as
+/// [`Peer::collect_member_ends`] read it off the member's link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberEnd {
+    /// The member's rank body completed: `Outcome{Trained}` with the digest
+    /// of the adapter files it holds — equal to the coordinator's own when
+    /// the gang converged to one artifact.
+    Trained { artifact_digest: String },
+    /// The member's rank body ended in a typed failure: `Outcome{Failed}`.
+    Failed { reason: String },
+    /// The member's session ended `Aborted{reason}` (the raw wire value)
+    /// instead of an `Outcome`.
+    Aborted(i32),
+    /// No `Outcome` was read: the stream closed, faulted, or fell silent
+    /// past the gang deadline; or the `Outcome` frame carried no result.
+    Ended(String),
+}
+
+impl MemberEnd {
+    fn from_wire(outcome: Outcome) -> Self {
+        match outcome.result {
+            Some(outcome::Result::Trained(trained)) => Self::Trained {
+                artifact_digest: trained.artifact_digest,
+            },
+            Some(outcome::Result::Failed(failed)) => Self::Failed {
+                reason: failed.reason,
+            },
+            None => Self::Ended("an Outcome frame with no result".into()),
+        }
     }
 }
 
@@ -1069,7 +1128,7 @@ impl Peer {
             device,
             timeout: DEFAULT_RENDEZVOUS_TIMEOUT,
             chunk_bytes: chunk_bytes(max_message_bytes)?,
-            agreement: None,
+            agreement: OnceLock::new(),
             inner: Mutex::new(Inner {
                 endpoint: Endpoint::Coordinator(members),
                 next_round: 0,
@@ -1104,7 +1163,7 @@ impl Peer {
             device,
             timeout: DEFAULT_RENDEZVOUS_TIMEOUT,
             chunk_bytes: chunk_bytes(max_message_bytes)?,
-            agreement: None,
+            agreement: OnceLock::new(),
             inner: Mutex::new(Inner {
                 endpoint: Endpoint::Member(link),
                 next_round: 0,
@@ -1129,7 +1188,7 @@ impl Peer {
     /// Bind the opaque [`Descriptor::agreement`] digest this rank signs
     /// every round with — see `Local::with_agreement`.
     pub fn with_agreement(mut self, digest: impl Into<String>) -> Self {
-        self.agreement = Some(digest.into());
+        self.agreement = OnceLock::from(digest.into());
         self
     }
 
@@ -1179,6 +1238,64 @@ impl Peer {
         }
     }
 
+    /// Coordinator only: how every member's session ENDED after the run —
+    /// read off each link, in rank order, once rank 0's own run has
+    /// returned. A member's rank body ends its session with exactly one
+    /// `Outcome` (`Trained{artifact_digest}` for a completed run,
+    /// `Failed{reason}` for a typed failure); a session that ended
+    /// `Aborted{reason}` instead, or whose stream closed, faulted or fell
+    /// silent past the gang deadline, is reported as such. Each link is
+    /// read until one of those, under this rank's own round deadline
+    /// (`with_timeout`); a frame already read during a round (an `Outcome`
+    /// or `Aborted` that arrived while a wait was in progress) is honoured
+    /// without another read. The coordinator body maps every arm to a
+    /// [`super::super::worker`] `CoordinatorEnd`: no publish over a gang
+    /// whose members did not all end `Trained` with the coordinator's own
+    /// digest. Empty on a member. Blocks on the links' runtime, hence the
+    /// witness.
+    pub fn collect_member_ends(&self, _call: &BlockingCall) -> Vec<(u32, MemberEnd)> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let Endpoint::Coordinator(members) = &mut inner.endpoint else {
+            return Vec::new();
+        };
+        let timeout = self.timeout;
+        members
+            .iter_mut()
+            .map(|link| {
+                let rank = link.rank;
+                let deadline = Instant::now() + timeout;
+                let end = loop {
+                    if let Some(outcome) = link.link.outcome.take() {
+                        break MemberEnd::from_wire(outcome);
+                    }
+                    if let Some(reason) = link.link.session_abort {
+                        break MemberEnd::Aborted(reason);
+                    }
+                    match link.link.recv(deadline) {
+                        // `recv` records an `Outcome`/`Aborted` as a side
+                        // effect; any other frame after the last round is
+                        // stale round traffic, read past.
+                        Ok(_frame) => continue,
+                        Err(WaitEnd::Disconnected) => {
+                            break MemberEnd::Ended(
+                                "the session's stream closed before an Outcome".into(),
+                            )
+                        }
+                        Err(WaitEnd::Transport(reason)) => {
+                            break MemberEnd::Ended(format!("transport fault: {reason}"))
+                        }
+                        Err(WaitEnd::Timeout) => {
+                            break MemberEnd::Ended(format!(
+                                "no Outcome within the {timeout:?} gang deadline"
+                            ))
+                        }
+                    }
+                };
+                (rank, end)
+            })
+            .collect()
+    }
+
     fn descriptor(
         &self,
         verb: Verb,
@@ -1194,7 +1311,7 @@ impl Peer {
             root,
             counts,
             tensors,
-            agreement: self.agreement.clone(),
+            agreement: self.agreement.get().cloned(),
         }
     }
 
@@ -1947,6 +2064,10 @@ impl Collective for Peer {
 
     fn world(&self) -> u32 {
         self.world
+    }
+
+    fn bind_agreement(&self, digest: String) -> Result<()> {
+        super::bind_agreement_once(&self.agreement, digest)
     }
 }
 

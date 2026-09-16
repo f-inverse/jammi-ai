@@ -138,6 +138,18 @@ pub fn sorted_trainable_vars(varmap: &VarMap) -> Vec<Var> {
     named.into_iter().map(|(_, v)| v.clone()).collect()
 }
 
+/// The NAMES of [`sorted_trainable_vars`], in the same order — the canonical
+/// layout a gang's reduce walks, which every rank binds on its collective as
+/// the round descriptor's `agreement` digest
+/// (`super::trainer::RankContext::bind_agreement`). One lock, one sort, so
+/// the names and the vars cannot drift apart.
+pub fn sorted_trainable_var_names(varmap: &VarMap) -> Vec<String> {
+    let data = varmap.data().lock().unwrap_or_else(|e| e.into_inner());
+    let mut names: Vec<String> = data.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 

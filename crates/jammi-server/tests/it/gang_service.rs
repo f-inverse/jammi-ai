@@ -13,17 +13,21 @@
 //! and distinctly under `test-hooks`, with an ADMITTING control that
 //! genuinely resolves for the job's own tenant), the coordinator's
 //! freshness, and then admission itself: a call satisfying every
-//! determinant receives `Admitted`, is HELD under re-verification, and —
-//! absent an earlier exit — ends `Aborted{NoBody}` at the park bound
-//! (no rank body runs in this unit, B4).
+//! determinant receives `Admitted` and is HELD under re-verification; a
+//! `world_size == 1` session has no rank body and — absent an earlier exit
+//! — ends `Aborted{NoBody}` at the park bound; a `world_size > 1` session
+//! hands its link to the REAL rank body (`run_member_rank`) and never
+//! parks: the body's end is the session's end.
 //!
-//! The held session's four arms each have their own rows: `Cancel`
+//! The held session's arms each have their own rows: `Cancel`
 //! (`Aborted{Cancelled}`), a second `Assign` (`InvalidArgument` — K2), the
 //! host's DRAIN (`Aborted{Drain}`, both through the session's own
 //! `HostAdmission` and through the real server shutdown path), the
 //! re-verification tick's three ends (`Refuted` / `Unavailable` /
 //! `StoreUnavailable`, pairwise distinct on the wire, each manufactured
-//! AFTER admission), and the park bound. Holder contention (a running loop
+//! AFTER admission — on `world_size == 2` sessions whose body is alive at
+//! its first collective when the tick fires), the park bound, and the
+//! body-bearing session that outlives the park bound. Holder contention (a running loop
 //! job, a claim probe waited out, another rank, a duplicate assignment, and
 //! the same job's greater attempt taking the slot) refuses `Unavailable`
 //! or supersedes exactly as the lattice states. Every session end leaves
@@ -325,6 +329,129 @@ async fn materialize_ready_table_for_tenant(
     }
 }
 
+/// The U4b gang oracle's fixture rows, as the `pairs` CSV source the
+/// world-2 sessions' rank body trains from.
+fn write_pairs_csv(dir: &std::path::Path) -> String {
+    let path = dir.join("gang_service_pairs.csv");
+    let mut body = String::from("anchor,positive\n");
+    for i in 0..8 {
+        body.push_str(&format!("anchor text {i},positive text {i}\n"));
+    }
+    std::fs::write(&path, body).unwrap();
+    format!("file://{}", path.display())
+}
+
+fn tiny_bert_model() -> String {
+    "local:".to_string()
+        + jammi_test_utils::cookbook_fixture("tiny_bert")
+            .to_str()
+            .unwrap()
+}
+
+/// The `world_size == 2` job's REAL spec — the SAME shape `jammi-ai`'s
+/// `TrainingCommon` persists (a column-source `fine_tune` over `pairs`,
+/// `world_size: 2`), so the admitted session's rank body reconstructs a
+/// runnable job from the row: it decodes, binds the training set below,
+/// verifies its leaves, loads tiny_bert and waits at its first collective
+/// for a coordinator that never sends a round.
+fn world_two_spec_json() -> String {
+    use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
+    use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
+    use jammi_ai::model::ModelTask;
+    use jammi_db::store::CachePolicy;
+
+    serde_json::to_string(&TrainingSpec::FineTune {
+        source: "pairs".into(),
+        columns: vec!["anchor".into(), "positive".into()],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        common: TrainingCommon {
+            base_model: tiny_bert_model(),
+            config: FineTuneConfig {
+                epochs: 2,
+                batch_size: 2,
+                validation_fraction: 0.0,
+                warmup_steps: 0,
+                gradient_accumulation_steps: 1,
+                lora_rank: 2,
+                lora_dropout: 0.0,
+                seed: 99,
+                early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+                early_stopping_patience: 10_000,
+                learning_rate: 1e-4,
+                ..Default::default()
+            },
+            world_size: 2,
+        },
+        cache: CachePolicy::Bypass,
+    })
+    .unwrap()
+}
+
+/// A genuinely materialized, ready `TrainingSet` table (Parquet + sidecar
+/// with its leaf inventory — the same producer a coordinator's own
+/// materialization runs, `jammi_ai::fine_tune::training_set::
+/// materialize_projection_table`) over the `pairs` source under `tenant`,
+/// and what the row carries — the SAME triple [`materialize_ready_table_for_tenant`]
+/// returns for an embedding table.
+async fn materialize_training_set_for_tenant(
+    server: &crate::common::grpc::PeerEngineServer,
+    tenant: TenantId,
+) -> ReadyTable {
+    use jammi_ai::fine_tune::data::TrainingFormat;
+    use jammi_ai::model::ModelTask;
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+    // Registered once per engine (an idempotent upsert of the same URL).
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    let url = write_pairs_csv(&dir);
+    server
+        .engine
+        .add_source(
+            "pairs",
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let columns = vec!["anchor".to_string(), "positive".to_string()];
+    // `(anchor, positive)` is the pairs shape; the tag is read off the SAME
+    // `TrainingFormat::format_tag` the classifier's own tag comes from.
+    let format = TrainingFormat::Pairs.format_tag().to_string();
+    let engine_for_scope = Arc::clone(&server.engine);
+    let record = server
+        .engine
+        .with_tenant_scoped(tenant, move |_scope| async move {
+            jammi_ai::fine_tune::training_set::materialize_projection_table(
+                &engine_for_scope,
+                "pairs",
+                &columns,
+                ModelTask::TextEmbedding,
+                &format,
+            )
+            .await
+            .unwrap()
+            .record
+        })
+        .await;
+    let store = server.engine.result_store();
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let manifest = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("the materialization wrote the sidecar");
+    ReadyTable {
+        table: record.table_name.clone(),
+        digest: manifest.artifact.0.clone(),
+        parquet_path: record.parquet_path.clone(),
+    }
+}
+
 /// A `result_tables` row created with NO tenant scope active (its
 /// `tenant_id` lands NULL) whose `parquet_path` names nothing real — the
 /// strict resolver must never hand it to a real tenant, so nothing past the
@@ -572,13 +699,37 @@ pub(crate) async fn expect_admitted(rank: &mut OpenRank) {
     );
 }
 
+fn is_round_event(event: &RankEvent) -> bool {
+    matches!(
+        event.event,
+        Some(
+            rank_event::Event::RoundContribution(_)
+                | rank_event::Event::RoundChunk(_)
+                | rank_event::Event::RoundAck(_)
+                | rank_event::Event::RoundFault(_)
+        )
+    )
+}
+
 /// The stream's ONE terminal event — `Aborted{reason}` — followed by the
-/// stream closing, within `within`.
+/// stream closing, within `within`. A body-bearing (`world_size > 1`)
+/// session's stream carries the body's round traffic before its end (its
+/// round-0 contribution to a coordinator that never answers); round frames
+/// are read past, never mistaken for the end. A body-less session's stream
+/// carries none.
 async fn expect_aborted(rank: &mut OpenRank, reason: AbortReason, within: Duration) {
-    let event = next_event(&mut rank.events, within)
-        .await
-        .expect("an Aborted event, not a status")
-        .expect("Aborted, not a closed stream");
+    let deadline = tokio::time::Instant::now() + within;
+    let event = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "no terminal event within {within:?}");
+        let event = next_event(&mut rank.events, remaining)
+            .await
+            .expect("an Aborted event, not a status")
+            .expect("Aborted, not a closed stream");
+        if !is_round_event(&event) {
+            break event;
+        }
+    };
     assert_eq!(
         aborted_reason(&event),
         Some(reason),
@@ -611,18 +762,18 @@ async fn admitted_world_one(
 }
 
 /// Everything an admitting `world_size == 2` session needs on the row side
-/// — a genuinely materialized, ready, digest-verifying training set under
-/// the job's OWN tenant, a fresh coordinator, the claimed row, the filled
-/// pair — with the stream NOT yet opened: the caller opens it on the
-/// listener of its choice.
+/// — a genuinely materialized, ready, digest-verifying TRAINING SET under
+/// the job's OWN tenant, a REAL `fine_tune` spec naming it (the rank body
+/// the admitted session runs reconstructs its job from these two), a fresh
+/// coordinator, the claimed row, the filled pair — with the stream NOT yet
+/// opened: the caller opens it on the listener of its choice.
 pub(crate) async fn world_two_ready(
     server: &crate::common::grpc::PeerEngineServer,
     tenant: TenantId,
     job_id: &str,
     coord: &str,
 ) -> (i64, RowFacts, ReadyTable) {
-    let source_id = format!("gang_w2_src_{}", jammi_test_utils::unique_suffix());
-    let ready = materialize_ready_table_for_tenant(server, tenant, &source_id).await;
+    let ready = materialize_training_set_for_tenant(server, tenant).await;
     fresh_coordinator(server, coord).await;
     let attempt = submit_and_claim_for_tenant(
         server,
@@ -630,7 +781,7 @@ pub(crate) async fn world_two_ready(
         job_id,
         coord,
         Duration::from_secs(300),
-        WORLD2_SPEC,
+        &world_two_spec_json(),
     )
     .await;
     fill_pair(server, job_id, coord, attempt, &ready.digest, &ready.table).await;
@@ -640,7 +791,8 @@ pub(crate) async fn world_two_ready(
 
 /// An admitted `world_size == 2` session over `server` for `tenant` — the
 /// admitting control of the world>1 conjunct ([`world_two_ready`], then the
-/// stream opened on `server.peer_addr`).
+/// stream opened on `server.peer_addr` as rank 1: rank 0 is the
+/// coordinator's own, in-process, and a member body is a rank `>= 1`).
 async fn admitted_world_two(
     server: &crate::common::grpc::PeerEngineServer,
     tenant: TenantId,
@@ -648,7 +800,7 @@ async fn admitted_world_two(
     coord: &str,
 ) -> (OpenRank, i64, RowFacts, ReadyTable) {
     let (attempt, before, ready) = world_two_ready(server, tenant, job_id, coord).await;
-    let mut rank = open_rank(server, assign_frame_full(job_id, attempt, 0, 2, coord))
+    let mut rank = open_rank(server, assign_frame_full(job_id, attempt, 1, 2, coord))
         .await
         .expect("a pair that resolves and verifies for the job's own tenant admits");
     expect_admitted(&mut rank).await;
@@ -2161,31 +2313,60 @@ async fn resolution_site_refuses_under_admin_scope_before_the_strict_resolver_ru
 /// over both backends). Here: the ADMITTING CONTROL — a pair that
 /// genuinely resolves and verifies for the job's own tenant reaches
 /// `Admitted` (proving the conjunct was DECIDED, not blanket-refused), is
-/// held under at least two re-verification ticks that re-resolve and
-/// re-verify the same identity, and ends `Aborted{NoBody}` at the park
-/// bound with the row untouched — j2', the `world_size > 1` arm. Mutation
-/// proof: a conjunct that refuses every `world_size > 1` row
-/// (`MultiHostUnsupported`) fails at `open_rank`; a re-verification that
-/// resolves through the relaxed read still admits, but a re-verification
-/// that drops the identity check is caught by the `StoreUnavailable` row
-/// below, which needs it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rank_world_two_own_tenant_training_set_is_admitted_held_and_parks_no_body() {
+/// held under re-verification ticks that re-resolve and re-verify the same
+/// identity while its REAL rank body runs — it reconstructs the job from
+/// the row, binds and verifies the training set, loads the model, and
+/// sends its round-0 contribution (the ONLY frames the stream carries:
+/// round traffic, to a coordinator that never answers) — and NEVER parks:
+/// past the park bound (`LEASE`) no TERMINAL event has been emitted, and
+/// the session ends only when the coordinator's `Cancel` ends it
+/// `Aborted{Cancelled}` — the stream closing right after, with no frame of
+/// the body's following it — the row untouched, and the slot free.
+/// Mutation proof: a hold loop whose park arm fires for a body-bearing
+/// session emits `Aborted{NoBody}` inside the bound; a handler that spawns
+/// no body parks the same way and never sends a round frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_rank_world_two_own_tenant_training_set_is_admitted_runs_its_body_and_never_parks() {
     let server = start_no_worker_server().await;
-    let started = tokio::time::Instant::now();
     let (mut rank, _attempt, before, _ready) =
         admitted_world_two(&server, tenant(0xa1), "job-w2-own-tenant", "coord-w2-own").await;
-    expect_aborted(
-        &mut rank,
-        AbortReason::NoBody,
-        LEASE + Duration::from_secs(5),
-    )
-    .await;
+    // Past the park bound and at least two ticks: round frames only, no
+    // terminal event, and the body did reach its first collective.
+    let deadline = tokio::time::Instant::now() + LEASE + Duration::from_secs(1);
+    let mut round_frames = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rank.events.message()).await {
+            Err(_elapsed) => break,
+            Ok(Ok(Some(event))) => {
+                assert!(
+                    is_round_event(&event),
+                    "a body-bearing session emits no terminal event at the park bound: {event:?}"
+                );
+                round_frames += 1;
+            }
+            Ok(other) => panic!("the stream must stay open past the park bound: {other:?}"),
+        }
+    }
     assert!(
-        started.elapsed() >= HEARTBEAT * 2,
-        "held under at least two re-verification ticks before the park bound"
+        round_frames > 0,
+        "the rank body reached its first collective and sent its contribution"
     );
+    rank.outbound.send(cancel_frame()).await.unwrap();
+    expect_aborted(&mut rank, AbortReason::Cancelled, Duration::from_secs(5)).await;
     assert_eq!(row_facts(&server, "job-w2-own-tenant").await, before);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.engine.host_admission().holder() != jammi_ai::fine_tune::worker::Holder::Free {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slot is freed with the session, holder: {:?}",
+            server.engine.host_admission().holder()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2698,6 +2879,61 @@ async fn run_rank_held_session_ends_refuted_when_the_sidecar_stops_verifying() {
     strip_leaves_from_sidecar(&server, &ready.parquet_path).await;
     expect_aborted(&mut rank, AbortReason::Refuted, HEARTBEAT * 3).await;
     assert_eq!(row_facts(&server, "job-sidecar-refuted").await, before);
+}
+
+/// The rank body's own pre-collective verify (U5b-1b-i's per-partition
+/// leaf inventory, consumed here): a `world_size == 2` session whose
+/// training set's Parquet bytes were corrupted inside a row group AFTER
+/// the sidecar attested them — a fault the sidecar-level re-verification
+/// tick cannot see (it compares the sidecar's own digest, never the
+/// object's bytes) — ends `Aborted{StoreUnavailable}` from the body's
+/// leaf verify, member-scoped, within the body's prologue, the row
+/// untouched. Mutation proof: a body that skips `verify_partition_leaves`
+/// binds the corrupted table, loads the model and waits at its first
+/// collective — no event inside the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_rank_body_refuses_a_partition_whose_leaf_does_not_verify_as_store_unavailable() {
+    let server = start_no_worker_server().await;
+    let (attempt, before, ready) =
+        world_two_ready(&server, tenant(0xe1), "job-bad-leaf", "coord-bad-leaf").await;
+    // The first leaf's byte range, from the sidecar's own inventory.
+    let store = server.engine.result_store();
+    let url = jammi_db::storage::StorageUrl::parse(&ready.parquet_path).unwrap();
+    let manifest = store
+        .read_materialization_manifest(&url)
+        .await
+        .unwrap()
+        .expect("the sidecar");
+    let (offset, length) = match &manifest.leaves[0].key {
+        jammi_db::store::manifest::LeafKey::RowGroup { offset, length, .. } => (*offset, *length),
+        other => panic!("a Parquet leaf: {other:?}"),
+    };
+    assert!(length > 0);
+    // Flip one byte inside the row group's range on the file-backed store.
+    let path = url
+        .as_str()
+        .strip_prefix("file://")
+        .map(str::to_string)
+        .unwrap_or_else(|| url.as_str().to_string());
+    let mut bytes = std::fs::read(&path).expect("the parquet object is a local file");
+    let at = (offset + length / 2) as usize;
+    bytes[at] ^= 0xFF;
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut rank = open_rank(
+        &server,
+        assign_frame_full("job-bad-leaf", attempt, 1, 2, "coord-bad-leaf"),
+    )
+    .await
+    .expect("admission reads the sidecar, not the bytes: admitted");
+    expect_admitted(&mut rank).await;
+    expect_aborted(
+        &mut rank,
+        AbortReason::StoreUnavailable,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(row_facts(&server, "job-bad-leaf").await, before);
 }
 
 /// I-GANG, "tenant is derived, never accepted", on the wire: the request

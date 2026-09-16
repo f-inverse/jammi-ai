@@ -37,6 +37,7 @@ use jammi_ai::fine_tune::graph_sampler::{
 };
 use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
 use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
+use jammi_ai::fine_tune::role::{LeaseHolder, RunnerRole};
 use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::target::TrainingTarget;
@@ -648,6 +649,22 @@ async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_pub
         training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
         "an in-process gang never enters the coordinator body"
     );
+    // The roles: the claimant runs the whole job in-process — its hold is
+    // the loop claimer's, rank 0 runs as `Holder(LoopClaimer)`, rank 1 as
+    // `Rank { 1 }` — never the coordinator.
+    assert_eq!(
+        training_test_hooks::lease_holders_for(&job_id),
+        vec![(1, LeaseHolder::LoopClaimer)]
+    );
+    let mut roles = training_test_hooks::runner_roles_for(&job_id);
+    roles.sort_by_key(|r| r.rank());
+    assert_eq!(
+        roles,
+        vec![
+            RunnerRole::Holder(LeaseHolder::LoopClaimer),
+            RunnerRole::Rank { rank: 1 }
+        ]
+    );
     let after = row(session.catalog(), &job_id).await;
     assert_eq!(after.status, "completed", "{after:?}");
     assert_eq!(after.error, None);
@@ -806,4 +823,62 @@ async fn a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never
         "the orphan's lease is still live: {orphan_after:?}"
     );
     orphan.abort().await.expect("the fixture's own abort");
+}
+
+/// K4, pinned (UNITS.md § U5b-1b-iii): a `world_size == 1` job through the
+/// REAL claim → `run_claimed_job` → `run_spec` path is today's loop path —
+/// the topology is `Single`, the attempt's hold is registered as the
+/// `LoopClaimer`, rank 0 runs as `Holder(LoopClaimer)` and nothing else
+/// runs, the coordinator body is never entered, and the row completes
+/// through the loop's own finalize. Mutation: `TopologyDecision::decide`
+/// answering `Peer` for `world_size <= 1` sends the job through the
+/// coordinator (a `ShortListed` end, the `Coordinator` role) → RED.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_rank_job_runs_as_the_loop_claimer_and_never_traverses_the_coordinator() {
+    let (session, _dir) = coordinating_session(|_| {}).await;
+    let worker = JobWorker::new(&session).unwrap();
+    let spec = TrainingSpec::FineTune {
+        source: "pairs".into(),
+        columns: vec!["anchor".into(), "positive".into()],
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        common: TrainingCommon {
+            base_model: tiny_bert_model(),
+            config: gang_config(1),
+            world_size: 1,
+        },
+        cache: CachePolicy::Bypass,
+    };
+    let record = submit_and_claim(&session, &worker, spec).await;
+    let job_id = record.job_id.clone();
+
+    worker.run_claimed_job(&session, record).await;
+
+    assert_eq!(
+        training_test_hooks::topology_for(&job_id),
+        Some(TopologyDecision::Single)
+    );
+    assert!(
+        training_test_hooks::coordinator_ends_for(&job_id).is_empty(),
+        "W == 1 never traverses the coordinator body"
+    );
+    assert!(training_test_hooks::assembly_listings_for(&job_id).is_empty());
+    assert_eq!(
+        training_test_hooks::lease_holders_for(&job_id),
+        vec![(1, LeaseHolder::LoopClaimer)],
+        "the single-rank attempt's hold is the loop claimer's"
+    );
+    assert_eq!(
+        training_test_hooks::runner_roles_for(&job_id),
+        vec![RunnerRole::Holder(LeaseHolder::LoopClaimer)],
+        "exactly one rank ran, as the loop claimer"
+    );
+    let after = row(session.catalog(), &job_id).await;
+    assert_eq!(after.status, "completed", "{after:?}");
+    assert_eq!(after.error, None);
+    assert_eq!(
+        after.training_set_ref, None,
+        "no coordinator CAS ever wrote the identity pair: {after:?}"
+    );
+    assert!(!published_adapter_bytes(&session, &job_id).await.is_empty());
 }

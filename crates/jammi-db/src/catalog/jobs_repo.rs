@@ -375,6 +375,13 @@ pub struct RankAdmissionRow {
     /// it (the resolution of
     /// <https://github.com/f-inverse/jammi-ai/issues/574>).
     pub lease: super::lease::LeaseFact,
+    /// The row's `spec` column VERBATIM — the same JSON the claiming worker
+    /// reconstructs its run from, and what an admitted member's rank body
+    /// reconstructs ITS run from (`jammi-ai`'s `run_member_rank`): the
+    /// job's training spec is a row fact a member reads through the
+    /// admission it was granted, never a value the coordinator sends on the
+    /// wire (DESIGN.md §4: no URL and no spec travels in the `Assign`).
+    pub spec: String,
     /// The ROW's own rank count, decoded from the SAME `spec` JSON the
     /// claiming worker reconstructs its run from — never the caller's own
     /// `Assign.world`. A gang admission gate keyed on the caller's claim
@@ -2358,6 +2365,7 @@ impl Catalog {
                                 tenant_id: row.try_get("tenant_id")?,
                                 training_set_ref: row.try_get("training_set_ref")?,
                                 training_set_location: row.try_get("training_set_location")?,
+                                spec,
                                 lease,
                                 world_size,
                             })

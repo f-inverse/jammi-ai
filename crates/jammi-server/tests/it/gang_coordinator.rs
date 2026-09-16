@@ -1,41 +1,40 @@
-//! Plan 67 U5b-1b-ii — the coordinator body end to end over the REAL
-//! `GangServer::run_rank` hold loop: coordinator rank 0 in-process (the real
-//! claim → `run_claimed_job` → `run_spec` → `coordinate` path over the
-//! server's own engine) plus one admitted member session over loopback,
-//! whose `Peer` is built over the session's own `MemberLink` (taken through
-//! the `test-hooks` tap, the rank body's future seat — for this unit the
-//! member runs no rank body of its own: the test drives rank 1's
-//! `TrainingLoop` over that link, the exact collective participation
-//! U5b-1b-iii's body will own).
+//! Plan 67 U5b-1b-ii/iii — the coordinator body and the REAL rank body end
+//! to end over the REAL `GangServer::run_rank` hold loop on the production
+//! `peer_bind` listener: coordinator rank 0 in-process (the real claim →
+//! `run_claimed_job` → `run_spec` → `coordinate` path over the server's
+//! own engine) plus one admitted member session over loopback whose rank
+//! body (`run_member_rank`, spawned by the handler at admission) trains
+//! rank 1 over the session's own `MemberLink` and ends the session with
+//! `RankEvent::Outcome`.
 //!
-//! One scenario, two attempts, RED at the base on both halves (no
-//! coordinator body; a submit edge that refused a two-rank job on a
-//! one-device host):
+//! Two scenarios, RED at the base (no rank body: the handler parked every
+//! admitted session; no runner role; no `Outcome` producer or consumer):
 //!
-//! - **attempt 1** — the member's slot is busy (`Holder::JobRun`
-//!   manufactured on its `HostAdmission`), so the real handler answers
-//!   `Unavailable` and the dial is refused: the attempt ends
-//!   `MemberRefused` → `AssemblyOutcome::Unavailable`, recorded on the row
-//!   COOLED and NOT COUNTED (`next_assembly_after` set,
-//!   `assembly_failures = 0`), the lease handed back (`releases = 1`, lease
-//!   NULL), nothing terminal;
-//! - **attempt 2** — after the cooldown the job is claimed again and the
-//!   body RE-LISTS (a second assignment is recorded, for attempt 2); the
-//!   slot is free, the real handler admits the coordinator's dial, the
-//!   coordinator's `Peer` is built over the admitted link and rank 0's run
-//!   starts, with rank 1 on the far end of the real hold loop; the run's
-//!   end is recorded `Success` (assembly proceeded), and the member session
-//!   is ended by the coordinator's `Cancel` — its slot is free afterwards.
-//!   The run itself has two admissible ends, pinned exactly: `Published`,
-//!   in which case the adapter's bytes must EQUAL a U4b-shaped `LocalGang`
-//!   run of the same fixture (the loopback rounds through the real
-//!   `run_rank` equal `Local`); or the trainer's typed refusal of a
-//!   `Streamed` source at `world > 1` — the ONE failure admitted, because
-//!   at this tip a column-source `fine_tune` binds `Streamed` and U4b's
-//!   streamed arm is not yet built; the moment it lands, this row demands
-//!   the byte equality. Any other end is red.
+//! - **the healthy gang, two attempts** — attempt 1: the member's slot is
+//!   busy (`Holder::JobRun` manufactured on its `HostAdmission`), so the
+//!   real handler answers `Unavailable` and the dial is refused: the
+//!   attempt ends `MemberRefused` → `AssemblyOutcome::Unavailable`,
+//!   recorded on the row COOLED and NOT COUNTED, the lease handed back,
+//!   nothing terminal, and the attempt's hold registered as the
+//!   `Coordinator`; attempt 2: after the cooldown the job is claimed again
+//!   and the body RE-LISTS, the slot is free, the real handler admits the
+//!   coordinator's dial and spawns the rank body, rank 0 runs as
+//!   `Holder(Coordinator)` and the member as `Rank { 1 }` (both recorded),
+//!   the member's session ends `Outcome{Trained{digest}}`, the coordinator
+//!   reads it, finds it equal to its own adapter digest, and ONLY THEN
+//!   publishes: the row is `completed` through the same
+//!   `finish_job_with_model` CAS a loop-claimed run takes, the published
+//!   adapter is byte-identical to a U4b-shaped `LocalGang` run of the same
+//!   fixture, and the member's slot is free afterwards;
+//! - **a member whose body fails** — the member's rank body completes its
+//!   run but reports `Outcome{Failed{reason}}` (a `test-hooks` fault
+//!   injection at the body's natural end): the coordinator ends the attempt
+//!   `TrainingFailed("rank 1: …")`, records `failed` on the row under the
+//!   `Coordinator` role with that reason, registers no model row and
+//!   publishes nothing — the terminal write on receipt, in its failure
+//!   arm.
 //!
-//! No substitution ever happens: the same member serves both attempts, at
+//! No substitution ever happens: the same member serves every attempt, at
 //! rank 1, from the same sorted listing.
 
 #![cfg(feature = "test-hooks")]
@@ -45,10 +44,11 @@ use std::time::Duration;
 
 use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
-use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang, Peer};
+use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang};
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::lora::build_projection_head_for_rank;
 use jammi_ai::fine_tune::partition::{PartitionRule, PartitionSpec};
+use jammi_ai::fine_tune::role::{LeaseHolder, RunnerRole};
 use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::target::TrainingTarget;
@@ -65,10 +65,10 @@ use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::{ArtifactStore, CachePolicy};
 use tempfile::TempDir;
 
-/// The deployment lease for this scenario: long enough that no park bound
-/// or freshness margin (`2 * lease`) cuts a session or a member row under
-/// a training run; the uncounted outcome RELEASES the lease, so no attempt
-/// ever waits for it to expire.
+/// The deployment lease for this scenario: long enough that no freshness
+/// margin (`2 * lease`) cuts a member row under a training run; the
+/// uncounted outcome RELEASES the lease, so no attempt ever waits for it to
+/// expire.
 const LEASE: Duration = Duration::from_secs(30);
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
@@ -77,6 +77,10 @@ pub(crate) fn pairs() -> Vec<(String, String)> {
     (0..8)
         .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
         .collect()
+}
+
+fn pairs_loader() -> TrainingDataLoader {
+    TrainingDataLoader::from_pairs(pairs())
 }
 
 pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
@@ -113,11 +117,12 @@ pub(crate) fn write_pairs_csv(dir: &std::path::Path) -> String {
     format!("file://{}", path.display())
 }
 
-/// A peer-bound server that can COORDINATE: `[worker] enabled = false` (the
-/// test drives the claim itself), a serveable world of two, a membership
-/// (`peer_advertise` set, so the engine's registration carries a
-/// `MemberRoot` — the advertised address is never dialed), the CSV source
-/// registered. The production `bind` installed the member dialer.
+/// A peer-bound server that can COORDINATE and SERVE A RANK: `[worker]
+/// enabled = false` (the test drives the claim itself), a serveable world
+/// of two, a membership (`peer_advertise` set, so the engine's registration
+/// carries a `MemberRoot` — the advertised address is never dialed), the
+/// CSV source registered. The production `bind` mounted the gang listener
+/// on `peer_addr` and installed the member dialer.
 async fn coordinating_server() -> crate::common::grpc::PeerEngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = crate::common::grpc::peer_bind_config(dir.path());
@@ -162,7 +167,9 @@ pub(crate) fn two_rank_spec() -> TrainingSpec {
 /// One fleet member for the coordinator to list and dial: an `instances`
 /// row at `addr` carrying the SAME result-root identity as the engine's own
 /// registration (the listing's root predicate), and a `claiming` `workers`
-/// row over the `fine_tune` kind.
+/// row over the `fine_tune` kind. `addr` is the server's own `peer_bind`
+/// listener: the member is this same process, serving its rank through the
+/// production handler.
 async fn register_member(engine: &Arc<InferenceSession>, id: &str, addr: std::net::SocketAddr) {
     let root = MemberRoot::resolved(engine.inner_config()).expect("the engine's own root");
     engine
@@ -267,17 +274,24 @@ pub(crate) async fn row(engine: &Arc<InferenceSession>, job_id: &str) -> Row {
         .expect("the job row exists")
 }
 
+/// The registered fine-tuned model row for `job_id`, if any.
+async fn fine_tuned_model(
+    engine: &Arc<InferenceSession>,
+    job_id: &str,
+) -> Option<jammi_db::catalog::model_repo::ModelRecord> {
+    let models = engine.catalog().list_models().await.unwrap();
+    models.into_iter().find(|m| {
+        m.model_id
+            .starts_with(&format!("jammi:fine-tuned:{job_id}"))
+    })
+}
+
 pub(crate) async fn published_adapter_bytes(
     engine: &Arc<InferenceSession>,
     job_id: &str,
 ) -> Vec<u8> {
-    let models = engine.catalog().list_models().await.unwrap();
-    let model = models
-        .iter()
-        .find(|m| {
-            m.model_id
-                .starts_with(&format!("jammi:fine-tuned:{job_id}"))
-        })
+    let model = fine_tuned_model(engine, job_id)
+        .await
         .expect("the completed job registered its fine-tuned model");
     let prefix = model
         .artifact_path
@@ -342,21 +356,13 @@ pub(crate) fn file_store() -> Arc<ArtifactStore> {
     Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
 }
 
-/// Everything a directly-built rank's `TrainingLoop` needs, prepared on
-/// the runtime (async) so the rank's own thread only builds and runs.
-pub(crate) struct RankEnv {
-    pub(crate) base: Arc<jammi_ai::model::LoadedModel>,
-    pub(crate) hidden: usize,
-    pub(crate) catalog: Arc<jammi_db::catalog::Catalog>,
-    pub(crate) dir: TempDir,
-    pub(crate) store: Arc<ArtifactStore>,
-}
-
-pub(crate) async fn rank_env(
+/// The reference: a two-rank `LocalGang` on the CPU, each rank driven
+/// directly through `TrainingLoop::run` on its own `spawn_thread` (the U4b
+/// gang oracle's shape); rank 0's `adapter.safetensors` bytes.
+pub(crate) async fn reference_rank0_adapter_bytes(
     engine: &Arc<InferenceSession>,
     tag: &str,
-    store: Arc<ArtifactStore>,
-) -> RankEnv {
+) -> Vec<u8> {
     let guard = engine
         .model_cache()
         .get_or_load(
@@ -369,77 +375,6 @@ pub(crate) async fn rank_env(
     let base = Arc::clone(&guard.model);
     let hidden = guard.model.embedding_dim().unwrap();
     drop(guard);
-    let (catalog, dir) = claimed_loop_env(tag).await;
-    RankEnv {
-        base,
-        hidden,
-        catalog,
-        dir,
-        store,
-    }
-}
-
-/// Build one rank's `TrainingLoop` over `rank_ctx` (the U4b gang oracle's
-/// shape) and run it on the current thread: the saved `adapter.safetensors`
-/// bytes, or the run's own error.
-pub(crate) fn try_run_rank(
-    call: &BlockingCall,
-    env: RankEnv,
-    job_id: &str,
-    worker_id: &str,
-    rank_ctx: RankContext,
-) -> Result<Vec<u8>, String> {
-    let config = gang_config(2);
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-    let head = build_projection_head_for_rank(
-        env.hidden,
-        &config,
-        &varmap,
-        &vb,
-        rank_ctx.dropout_seed(config.seed),
-    )
-    .unwrap();
-    let mut training_loop =
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(Device::Cpu)
-            .job_id(job_id.to_string())
-            .worker_id(worker_id.to_string())
-            .catalog(env.catalog)
-            .artifact_dir(env.dir.path().to_path_buf())
-            .base_model(env.base)
-            .artifact_store(env.store)
-            .rank_context(rank_ctx)
-            .build()
-            .unwrap();
-    let result = training_loop
-        .run(
-            call,
-            TrainingSource::Resident(TrainingDataLoader::from_pairs(pairs())),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(std::fs::read(result.artifact_dir.path().join("adapter.safetensors")).unwrap())
-}
-
-/// [`try_run_rank`] for a rank that must complete.
-fn run_rank(
-    call: &BlockingCall,
-    env: RankEnv,
-    job_id: &str,
-    worker_id: &str,
-    rank_ctx: RankContext,
-) -> Vec<u8> {
-    try_run_rank(call, env, job_id, worker_id, rank_ctx)
-        .unwrap_or_else(|e| panic!("{worker_id} must complete: {e}"))
-}
-
-/// The reference: a two-rank `LocalGang` on the CPU, each rank driven
-/// directly through `TrainingLoop::run` on its own `spawn_thread`; rank 0's
-/// adapter bytes.
-pub(crate) async fn reference_rank0_adapter_bytes(
-    engine: &Arc<InferenceSession>,
-    tag: &str,
-) -> Vec<u8> {
     let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
     let store = file_store();
     let runtime = tokio::runtime::Handle::current();
@@ -451,12 +386,43 @@ pub(crate) async fn reference_rank0_adapter_bytes(
             PartitionSpec::for_gang(rank as usize, 2, 2, PartitionRule::BlockByGlobalBatch)
                 .unwrap();
         let rank_ctx = RankContext::new(Arc::new(local), partition);
-        let env = rank_env(engine, &format!("{tag}-ref-{rank}"), Arc::clone(&store)).await;
+        let (catalog, dir) = claimed_loop_env(&format!("{tag}-ref-{rank}")).await;
+        let base = Arc::clone(&base);
+        let store = Arc::clone(&store);
         let runtime = runtime.clone();
         let job_id = job_id.clone();
         threads.push(BlockingCall::spawn_thread(move |call| {
             let _runtime = runtime.enter();
-            run_rank(&call, env, &job_id, &format!("reference-{rank}"), rank_ctx)
+            let config = gang_config(2);
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+            let head = build_projection_head_for_rank(
+                hidden,
+                &config,
+                &varmap,
+                &vb,
+                rank_ctx.dropout_seed(config.seed),
+            )
+            .unwrap();
+            let mut training_loop =
+                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                    .device(Device::Cpu)
+                    .job_id(job_id)
+                    .worker_id(format!("reference-{rank}"))
+                    .catalog(catalog)
+                    .artifact_dir(dir.path().to_path_buf())
+                    .base_model(base)
+                    .artifact_store(store)
+                    .rank_context(rank_ctx)
+                    .build()
+                    .unwrap();
+            let result = training_loop
+                .run(&call, TrainingSource::Resident(pairs_loader()))
+                .unwrap_or_else(|e| panic!("reference rank {rank} must complete: {e}"));
+            let bytes =
+                std::fs::read(result.artifact_dir.path().join("adapter.safetensors")).unwrap();
+            drop(dir);
+            bytes
         }));
     }
     let mut rank0 = None;
@@ -469,17 +435,27 @@ pub(crate) async fn reference_rank0_adapter_bytes(
     rank0.expect("rank 0 ran")
 }
 
-/// Acceptance (e), end to end, plus the loopback-equals-`Local` oracle —
-/// see the module doc.
+/// Wait until the engine's job slot is free — the member session ended
+/// and its `RankHold` dropped.
+async fn expect_slot_free(engine: &Arc<InferenceSession>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.host_admission().holder() != Holder::Free {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the member session must end with the attempt and free its slot, holder: {:?}",
+            engine.host_admission().holder()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The healthy gang, end to end (the module doc's first scenario).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_attempt_relists_and_runs_the_gang(
+async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_attempt_runs_the_real_rank_body_to_a_published_artifact(
 ) {
     let server = coordinating_server().await;
     let engine = Arc::clone(&server.engine);
-    let cap = usize::try_from(engine.inner_config().server.limits.max_message_bytes).unwrap();
-    let (addr, mut links) =
-        crate::gang_rounds::mount_real_gang_server(Arc::clone(&engine), cap).await;
-    register_member(&engine, "member-1", addr).await;
+    register_member(&engine, "member-1", server.peer_addr).await;
 
     let job = engine
         .run_training_spec(two_rank_spec())
@@ -508,12 +484,6 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
         "the real handler's Unavailable ends the attempt naming the member: {}",
         ends[0].1
     );
-    let listings = training_test_hooks::assembly_listings_for(&job_id);
-    assert_eq!(
-        listings,
-        vec![(1, vec![(1, "member-1".to_string())])],
-        "attempt 1 assigned rank 1 to the one listed member"
-    );
     let after_one = row(&engine, &job_id).await;
     assert_eq!(
         after_one.status, "running",
@@ -532,64 +502,78 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
         "the CAS wrote the pair"
     );
     assert_eq!(
-        engine.host_admission().holder(),
-        Holder::Free,
-        "no member session was admitted, nothing holds the slot"
+        training_test_hooks::lease_holders_for(&job_id),
+        vec![(1, LeaseHolder::Coordinator)],
+        "a Peer gang's attempt registers its hold as the Coordinator"
     );
+    assert_eq!(engine.host_admission().holder(), Holder::Free);
 
-    // ── attempt 2: the member is free; rank 1 runs over the real hold loop ─
-    let store = file_store();
-    let member_env = rank_env(&engine, "member-rank-1", store).await;
-    let member = BlockingCall::spawn_blocking(move |call| {
-        let link = links
-            .blocking_recv()
-            .expect("the admitted session offered its MemberLink to the tap");
-        let peer = Peer::member(1, 2, link, Device::Cpu, cap)
-            .expect("member")
-            .with_timeout(Duration::from_secs(120))
-            .expect("timeout");
-        let partition =
-            PartitionSpec::for_gang(1, 2, 2, PartitionRule::BlockByGlobalBatch).unwrap();
-        try_run_rank(
-            &call,
-            member_env,
-            "member-rank-1",
-            "member-rank-1",
-            RankContext::new(Arc::new(peer), partition),
-        )
-    });
-
+    // ── attempt 2: the member is free; the REAL rank body runs rank 1 ───
     let record = claim(&engine, &worker, Duration::from_secs(20)).await;
     assert_eq!(record.attempts, 2, "the next attempt, after the cooldown");
     worker.run_claimed_job(&engine, record).await;
 
-    // The attempt's end FIRST: a member parked on the tap (a dial that was
-    // refused after all) must surface as the end's own text, never as a
-    // silent wait on the member thread.
     let ends = training_test_hooks::coordinator_ends_for(&job_id);
     assert_eq!(ends.len(), 2, "{ends:?}");
     assert_eq!(ends[1].0, 2);
-    // On record under `--nocapture`: which admissible end this tree took.
-    eprintln!("attempt-2 end: {} (ordinal {})", ends[1].1, ends[1].2);
-    assert!(
-        ends[1].2 == 12 || ends[1].2 == 11,
-        "attempt 2 must reach the run (Published or a run failure), got: {}",
+    assert_eq!(
+        (ends[1].1.as_str(), ends[1].2),
+        ("published", 12),
+        "attempt 2 publishes over the real rank body: {}",
         ends[1].1
     );
-    let member_run = tokio::time::timeout(Duration::from_secs(60), member)
-        .await
-        .expect("the member thread ends within the bound once the coordinator ended its session")
-        .expect("the member thread joined");
-    let listings = training_test_hooks::assembly_listings_for(&job_id);
     assert_eq!(
-        listings,
+        training_test_hooks::assembly_listings_for(&job_id),
         vec![
             (1, vec![(1, "member-1".to_string())]),
             (2, vec![(1, "member-1".to_string())]),
         ],
         "the NEXT attempt re-listed and assigned the same sorted listing"
     );
+    assert_eq!(
+        training_test_hooks::lease_holders_for(&job_id),
+        vec![(1, LeaseHolder::Coordinator), (2, LeaseHolder::Coordinator)]
+    );
+    // Both ranks' bodies ran in this process and recorded their roles:
+    // rank 0 as the coordinator (attempt 2's only rank-0 run), rank 1 as
+    // the member's body.
+    let roles = training_test_hooks::runner_roles_for(&job_id);
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|r| **r == RunnerRole::Holder(LeaseHolder::Coordinator))
+            .count(),
+        1,
+        "{roles:?}"
+    );
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|r| **r == RunnerRole::Rank { rank: 1 })
+            .count(),
+        1,
+        "{roles:?}"
+    );
+    assert!(
+        !roles.contains(&RunnerRole::Holder(LeaseHolder::LoopClaimer)),
+        "a Peer gang never runs as the loop claimer: {roles:?}"
+    );
+    // The terminal write on receipt: the coordinator read the member's
+    // `Outcome{Trained}` and its digest equalled rank 0's own.
+    let member_ends = training_test_hooks::member_ends_for(&job_id);
+    assert_eq!(member_ends.len(), 1, "{member_ends:?}");
+    assert_eq!(member_ends[0].0, 1);
+    assert!(
+        member_ends[0]
+            .1
+            .starts_with("Trained { artifact_digest: \""),
+        "the member ended Trained: {}",
+        member_ends[0].1
+    );
+
     let after_two = row(&engine, &job_id).await;
+    assert_eq!(after_two.status, "completed", "{after_two:?}");
+    assert_eq!(after_two.error, None);
     assert_eq!(after_two.assembly_failures, 0);
     assert_eq!(
         after_two.next_assembly_after, None,
@@ -597,60 +581,84 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
     );
     assert_eq!(after_two.attempts, 2);
 
-    const STREAMED_REFUSAL: &str = "a Streamed training source at world > 1 is refused";
-    match ends[1].1.as_str() {
-        "published" => {
-            assert_eq!(after_two.status, "completed", "{after_two:?}");
-            assert_eq!(after_two.error, None);
-            let member_bytes =
-                member_run.expect("rank 1 completed its run over the real hold loop");
-            assert!(!member_bytes.is_empty());
-            // The published artifact equals the LocalGang reference for
-            // the same fixture: the loopback rounds through the real hold
-            // loop folded exactly as Local does.
-            let published = published_adapter_bytes(&engine, &job_id).await;
-            let reference = reference_rank0_adapter_bytes(&engine, "peer-e2e").await;
-            assert_eq!(
-                published, reference,
-                "rank 0's published adapter over Peer must be byte-identical to Local's rank 0"
-            );
-        }
-        end if end.starts_with("the run failed:") => {
-            // The one admissible run failure at this tip: the trainer's
-            // typed refusal of the Streamed source at world > 1 (U4b's
-            // streamed arm not yet built) — recorded `failed` by the
-            // caller, exactly as a W=1 run's own failure would be, AFTER
-            // assembly proceeded (Success above). Any other failure is red.
-            assert!(
-                end.contains(STREAMED_REFUSAL),
-                "the only run failure this oracle admits is the streamed refusal: {end}"
-            );
-            assert_eq!(after_two.status, "failed", "{after_two:?}");
-            assert!(
-                after_two
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.contains(STREAMED_REFUSAL)),
-                "{after_two:?}"
-            );
-            let member_error =
-                member_run.expect_err("with no round ever opened, rank 1's first collective ends");
-            assert!(
-                member_error.contains("nothing applied"),
-                "rank 1 ends on the coordinator's stream close, never on a fold: {member_error}"
-            );
-        }
-        other => panic!("attempt 2 must end Published or in the streamed refusal, got {other}"),
-    }
+    // The published artifact equals the LocalGang reference for the same
+    // fixture: the loopback rounds through the real hold loop and the real
+    // rank body folded exactly as Local does.
+    let published = published_adapter_bytes(&engine, &job_id).await;
+    let reference = reference_rank0_adapter_bytes(&engine, "peer-e2e").await;
+    assert_eq!(
+        published, reference,
+        "rank 0's published adapter over Peer must be byte-identical to Local's rank 0"
+    );
+    expect_slot_free(&engine).await;
+}
 
-    // The coordinator ended the member's session: its slot is free again.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while engine.host_admission().holder() != Holder::Free {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the member session must end on the coordinator's Cancel and free its slot, holder: {:?}",
-            engine.host_admission().holder()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+/// The failure arm of the terminal write on receipt (the module doc's
+/// second scenario).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_whose_body_fails_ends_the_attempt_failed_under_the_coordinator_and_publishes_nothing(
+) {
+    let server = coordinating_server().await;
+    let engine = Arc::clone(&server.engine);
+    register_member(&engine, "member-1", server.peer_addr).await;
+
+    let job = engine
+        .run_training_spec(two_rank_spec())
+        .await
+        .expect("a two-rank job within the serveable world submits");
+    let job_id = job.job_id.clone();
+    training_test_hooks::fail_member_outcome(&job_id, "injected member failure");
+    let worker = JobWorker::new(&engine).unwrap();
+
+    let record = claim(&engine, &worker, Duration::from_secs(5)).await;
+    assert_eq!(record.attempts, 1);
+    worker.run_claimed_job(&engine, record).await;
+
+    let ends = training_test_hooks::coordinator_ends_for(&job_id);
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(
+        ends[0].2, 11,
+        "the attempt ends TrainingFailed on the member's Outcome{{Failed}}: {}",
+        ends[0].1
+    );
+    assert_eq!(
+        ends[0].1,
+        "the run failed: rank 1: rank 1: injected member failure"
+    );
+    let member_ends = training_test_hooks::member_ends_for(&job_id);
+    assert_eq!(
+        member_ends,
+        vec![(
+            1,
+            "Failed { reason: \"rank 1: injected member failure\" }".to_string()
+        )]
+    );
+    let after = row(&engine, &job_id).await;
+    assert_eq!(after.status, "failed", "{after:?}");
+    assert!(
+        after
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("rank 1: injected member failure")),
+        "the member's reason is the row's error: {after:?}"
+    );
+    assert_eq!(
+        after.next_assembly_after, None,
+        "assembly proceeded to a run (Success): {after:?}"
+    );
+    assert!(
+        fine_tuned_model(&engine, &job_id).await.is_none(),
+        "nothing is published over a gang that did not complete"
+    );
+    assert_eq!(
+        training_test_hooks::lease_holders_for(&job_id),
+        vec![(1, LeaseHolder::Coordinator)]
+    );
+    let roles = training_test_hooks::runner_roles_for(&job_id);
+    assert!(
+        roles.contains(&RunnerRole::Holder(LeaseHolder::Coordinator))
+            && roles.contains(&RunnerRole::Rank { rank: 1 }),
+        "{roles:?}"
+    );
+    expect_slot_free(&engine).await;
 }

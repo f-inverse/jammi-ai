@@ -79,6 +79,55 @@
 //! started is honoured only in the sense that it stays recorded on the
 //! row (`jobs.cancel_requested` remains `true`) — the run completes and the
 //! row finishes `completed`, never retroactively `failed`.
+//!
+//! ## Runner roles and the job-row writers (the single-writer rule as types)
+//!
+//! DESIGN.md §4: the lease holder is the ONE writer of a job's row, of its
+//! durable checkpoints and of its published artifact; every other rank of a
+//! gang writes nothing durable. [`crate::fine_tune::role`] states it as two
+//! types — a [`LeaseHolder`] (`LoopClaimer`, today's in-process path incl. a
+//! `Local` gang's rank 0; `Coordinator`, rank 0 of a `Peer` gang) and a
+//! [`RunnerRole`] (`Holder(LeaseHolder)` or `Rank { rank }`) — and EVERY
+//! job-row-writing site on the run path takes a `LeaseHolder` as a REQUIRED
+//! parameter, so a missed site is a compile error and a `Rank` body, which
+//! holds no `LeaseHolder`, has nothing to pass: the write is unreachable by
+//! type. The holder of one attempt is derived ONCE, from the claimed spec
+//! and this host's `[worker] local_ranks` ([`lease_holder_for`]: the
+//! `Coordinator` exactly when a column-source `fine_tune` decides
+//! `TopologyDecision::Peer`, the `LoopClaimer` otherwise — `W == 1` is
+//! always the loop claimer and never traverses the coordinator body, K4),
+//! and threaded to every site. The sites, derived from
+//! `grep -n 'record_failed(\|finish_job_with_model(\|persist_acceleration_report(\|register_job_hold_or_release(' worker.rs`
+//! minus doc lines, each with the holder role(s) that can reach it:
+//!
+//! | # | site (function, arm) | holder(s) |
+//! |---|---|---|
+//! | 1 | [`register_job_hold_or_release`] — the lease-hold registration, the `Releasing` self-release arm, the holder accounting (`HostAdmission::job_running`) | training arm: `LoopClaimer`, `Coordinator`; compute arm: `LoopClaimer` |
+//! | 2 | `run_claimed_job_under` — undeserialisable training spec (`mark_acceleration_undetermined` then `record_failed`) | `LoopClaimer` (no spec, no topology) |
+//! | 3 | `run_claimed_job_under` — `Cancelled` with a cancel request observed (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 4 | `run_claimed_job_under` — `Failed` (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 5 | `publish_and_finalize` — final-artifact publish failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 6 | `publish_and_finalize` — `register_model` failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 7 | `publish_and_finalize` — materialization sidecar write failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 8 | `publish_and_finalize` — input-anchor serialisation failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 9 | `publish_and_finalize` — job-result serialisation failure (`record_failed`) | `LoopClaimer`, `Coordinator` |
+//! | 10 | `publish_and_finalize` — the finalize CAS (`finish_job_with_model`) | `LoopClaimer`, `Coordinator` |
+//! | 11 | `run_claimed_compute_job` — undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
+//! | 12 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_failed`) | `LoopClaimer` |
+//! | 13 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
+//! | 14 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
+//! | 15 | `run_claimed_compute_job` — `execute_compute` failure (`record_failed`) | `LoopClaimer` |
+//! | 16 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → [`persist_acceleration_report`]; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
+//! | 17 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
+//!
+//! `finish_job` (the compute arm's CAS) is reachable only from
+//! `run_claimed_compute_job`, a `LoopClaimer` by construction. The trainer's
+//! own durable writes (the resume and epoch checkpoints) are gated on the
+//! same role inside `TrainingLoop` (`TrainingLoopBuilder::runner_role`),
+//! never inside the store. A `Peer` member's body ([`run_member_rank`]) runs
+//! as `RunnerRole::Rank` and ends its session with `RankEvent::Outcome`;
+//! the coordinator publishes only on receipt of every member's `Trained`
+//! outcome carrying its own artifact digest ([`JobWorker::assemble_and_run`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -102,7 +151,9 @@ use jammi_db::store::{ArtifactStore, ResultStore};
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
-use crate::fine_tune::collective::{BlockingCall, Collective, CoordinatorLink, LocalGang, Peer};
+use crate::fine_tune::collective::{
+    BlockingCall, Collective, CoordinatorLink, LocalGang, MemberEnd, MemberLink, Peer,
+};
 use crate::fine_tune::data::TrainingDataLoader;
 use crate::fine_tune::decode::{
     build_training_data_loader, detect_training_format, extract_string_column,
@@ -111,6 +162,7 @@ use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
 use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
+use crate::fine_tune::role::{LeaseHolder, RunnerRole};
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::trainer::RankContext;
 use crate::fine_tune::training_set;
@@ -873,15 +925,22 @@ impl Drop for LoopExitGuard {
 ///
 /// An inline `run_now` registers its hold directly (`crate::jobs`) and never
 /// calls this, so it never touches the holder and is never released here.
+///
+/// `holder` is who this attempt runs as (the module doc's writer table,
+/// row 1): a `LeaseHolder`, never a rank — a rank holds no lease and
+/// registers none.
 async fn register_job_hold_or_release(
     session: &Arc<InferenceSession>,
     catalog: &Arc<Catalog>,
     shared: &WorkerShared,
     job_id: &str,
     attempts: u32,
+    holder: LeaseHolder,
 ) -> Option<LeaseHold> {
     #[cfg(feature = "test-hooks")]
     loop_test_hooks::maybe_park(job_id, loop_test_hooks::ParkPoint::BeforeHold).await;
+    #[cfg(feature = "test-hooks")]
+    training_test_hooks::note_lease_holder(job_id, attempts, holder);
     let hold = session.lease_keeper().hold(LeaseTarget::Job {
         job_id: job_id.to_string(),
         instance_id: shared.instance_id.clone(),
@@ -894,6 +953,7 @@ async fn register_job_hold_or_release(
         {
             Ok(true) => tracing::info!(
                 job_id,
+                %holder,
                 "claim landed during RELEASE: lease handed back before dispatch"
             ),
             Ok(false) => tracing::debug!(
@@ -1522,8 +1582,16 @@ impl JobWorker {
                 // marker first (still `running`, satisfying the lease guard)
                 // so the record never reads `{"state":"pending"}` past this
                 // job's `failed` status below.
-                mark_acceleration_undetermined(&catalog, &job_id, &self.worker_id, attempt).await;
+                mark_acceleration_undetermined(
+                    LeaseHolder::LoopClaimer,
+                    &catalog,
+                    &job_id,
+                    &self.worker_id,
+                    attempt,
+                )
+                .await;
                 record_failed(
+                    LeaseHolder::LoopClaimer,
                     &catalog,
                     &job_id,
                     &self.worker_id,
@@ -1534,6 +1602,10 @@ impl JobWorker {
                 return;
             }
         };
+        // Who this attempt runs as — derived ONCE from the spec and this
+        // host's `[worker] local_ranks` (the module doc's writer table), and
+        // threaded to every job-row-writing site below.
+        let holder = lease_holder_for(&spec, session.inner_config().worker.local_ranks);
         // Whether epoch checkpointing is enabled for THIS run, and if so its
         // epoch bound and retention cap — read from the spec's own
         // `FineTuneConfig` before `spec` moves into `run_spec` below, never
@@ -1558,7 +1630,7 @@ impl JobWorker {
         // through the one RELEASE-aware helper: a claim that landed during a
         // RELEASE hands its lease straight back and never dispatches.
         let Some(hold) =
-            register_job_hold_or_release(session, &catalog, shared, &job_id, attempt).await
+            register_job_hold_or_release(session, &catalog, shared, &job_id, attempt, holder).await
         else {
             return;
         };
@@ -1640,6 +1712,7 @@ impl JobWorker {
                             &cancel,
                             attempt,
                             recorded_pair,
+                            holder,
                         )
                     })
                     .await
@@ -1653,6 +1726,7 @@ impl JobWorker {
                     &cancel,
                     attempt,
                     recorded_pair,
+                    holder,
                 )
                 .await
             }
@@ -1674,6 +1748,7 @@ impl JobWorker {
         match outcome {
             Ok(artifact) => {
                 self.publish_and_finalize(
+                    holder,
                     session,
                     &catalog,
                     &job_id,
@@ -1711,6 +1786,7 @@ impl JobWorker {
                     // never the lease-lost log line below.
                     tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording failed");
                     record_failed(
+                        holder,
                         &catalog,
                         &job_id,
                         &self.worker_id,
@@ -1749,7 +1825,7 @@ impl JobWorker {
             }
             Err(WorkerJobError::Failed(msg)) => {
                 tracing::error!(job_id = %job_id, error = %msg, "training job failed");
-                record_failed(&catalog, &job_id, &self.worker_id, attempt, msg).await;
+                record_failed(holder, &catalog, &job_id, &self.worker_id, attempt, msg).await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
                 // a `spawn_blocking` join error, and any typed training
                 // failure — none of which ever produced a `TrainedArtifact`.
@@ -1796,8 +1872,10 @@ impl JobWorker {
     /// the served `artifact_path` is set only by whichever worker's finalize CAS
     /// wins. A loser's prefix is therefore never the committed pointer and is the
     /// one GC'd.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_and_finalize(
         &self,
+        holder: LeaseHolder,
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         job_id: &str,
@@ -1845,7 +1923,15 @@ impl JobWorker {
             {
                 Ok(p) => PublishedPrefix(p),
                 Err(e) => {
-                    record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+                    record_failed(
+                        holder,
+                        catalog,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        e.to_string(),
+                    )
+                    .await;
                     // The training loop DID complete and DID write epoch
                     // checkpoints (we have a `TrainedArtifact`) — but the
                     // FINAL artifact publish failed, so this attempt never
@@ -1881,7 +1967,15 @@ impl JobWorker {
                 epoch_checkpoint_bound,
             )
             .await;
-            record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+            record_failed(
+                holder,
+                catalog,
+                job_id,
+                &self.worker_id,
+                attempt,
+                e.to_string(),
+            )
+            .await;
             return;
         }
 
@@ -1937,8 +2031,15 @@ impl JobWorker {
                             epoch_checkpoint_bound,
                         )
                         .await;
-                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
-                            .await;
+                        record_failed(
+                            holder,
+                            catalog,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            e.to_string(),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -1963,8 +2064,15 @@ impl JobWorker {
                             epoch_checkpoint_bound,
                         )
                         .await;
-                        record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string())
-                            .await;
+                        record_failed(
+                            holder,
+                            catalog,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            e.to_string(),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -2057,6 +2165,7 @@ impl JobWorker {
                 )
                 .await;
                 record_failed(
+                    holder,
                     catalog,
                     job_id,
                     &self.worker_id,
@@ -2068,6 +2177,8 @@ impl JobWorker {
             }
         };
 
+        // The finalize CAS — the module doc's writer table, row 10: reached
+        // only with the attempt's `LeaseHolder` in hand.
         match catalog
             .finish_job_with_model(jammi_db::catalog::jobs_repo::FinishJobWithModelParams {
                 job_id,
@@ -2162,6 +2273,7 @@ impl JobWorker {
                 tracing::debug!(
                     job_id = %job_id,
                     worker = %self.worker_id,
+                    %holder,
                     "lost lease before finalize; not finalizing (left for reclaim)"
                 );
             }
@@ -2178,7 +2290,7 @@ impl JobWorker {
                     epoch_checkpoint_bound,
                 )
                 .await;
-                tracing::error!(job_id = %job_id, error = %e, "finish_job_with_model failed");
+                tracing::error!(job_id = %job_id, %holder, error = %e, "finish_job_with_model failed");
             }
         }
     }
@@ -2372,6 +2484,7 @@ impl JobWorker {
             Ok(s) => s,
             Err(e) => {
                 record_failed(
+                    LeaseHolder::LoopClaimer,
                     catalog,
                     job_id,
                     &self.worker_id,
@@ -2387,7 +2500,15 @@ impl JobWorker {
         // `queued` is honoured before any prior-attempt dispatch or
         // producer runs (`execute_compute` re-checks before dispatch).
         if let Err(e) = crate::jobs::check_cancel(catalog, job_id).await {
-            record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+            record_failed(
+                LeaseHolder::LoopClaimer,
+                catalog,
+                job_id,
+                &self.worker_id,
+                attempt,
+                e.to_string(),
+            )
+            .await;
             return;
         }
 
@@ -2426,6 +2547,7 @@ impl JobWorker {
                     }
                     Err(e) => {
                         record_failed(
+                            LeaseHolder::LoopClaimer,
                             catalog,
                             job_id,
                             &self.worker_id,
@@ -2451,8 +2573,15 @@ impl JobWorker {
             }
         }
 
-        let Some(hold) =
-            register_job_hold_or_release(session, catalog, shared, job_id, attempt).await
+        let Some(hold) = register_job_hold_or_release(
+            session,
+            catalog,
+            shared,
+            job_id,
+            attempt,
+            LeaseHolder::LoopClaimer,
+        )
+        .await
         else {
             return;
         };
@@ -2486,6 +2615,7 @@ impl JobWorker {
                 }
                 Err(e) => {
                     record_failed(
+                        LeaseHolder::LoopClaimer,
                         catalog,
                         job_id,
                         &self.worker_id,
@@ -2496,7 +2626,15 @@ impl JobWorker {
                 }
             },
             Err(e) => {
-                record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+                record_failed(
+                    LeaseHolder::LoopClaimer,
+                    catalog,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    e.to_string(),
+                )
+                .await;
             }
         }
     }
@@ -2514,6 +2652,14 @@ impl JobWorker {
     /// fresh one — a registered source is anchored unpinned, so a fresh
     /// materialization would mint a new table and the write-once CAS would
     /// read the retry as a moved claim.
+    ///
+    /// `holder` is who this attempt runs as ([`lease_holder_for`], derived
+    /// by the caller from this same spec): rank 0's `RunnerRole` on the
+    /// in-process arms, and the writer of the acceleration marker on the
+    /// predictor arm. The `Peer` arm is the coordinator body, which runs as
+    /// `LeaseHolder::Coordinator` by its own name — the same value
+    /// `lease_holder_for` derives for it, since both decide from
+    /// `TopologyDecision::decide` over the same inputs.
     #[allow(clippy::too_many_arguments)]
     async fn run_spec(
         &self,
@@ -2524,6 +2670,7 @@ impl JobWorker {
         cancel: &Arc<AtomicBool>,
         attempt: u32,
         recorded_pair: Option<TrainingSetIdentityPair>,
+        holder: LeaseHolder,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
         match spec {
             TrainingSpec::FineTune {
@@ -2547,22 +2694,16 @@ impl JobWorker {
                 let detected =
                     detect_training_format(&columns, task).map_err(WorkerJobError::from)?;
 
-                // #500 U2c §11 F6: the ONE predicate deciding Resident vs
-                // Streamed — the SAME `source::whole_set_arm` the trainer's
-                // own dispatch (`trainer.rs::run`) refuses a mismatch
-                // against. `run_fine_tune_blocking` always loads a base
-                // model for a `FineTune` spec (unconditionally calls
-                // `.base_model(base_model_arc)` below), so `has_base_model`
-                // is always `true` here.
-                let whole_set_arm = crate::fine_tune::source::whole_set_arm(&common.config, true);
-
                 // The table: a retry binds the one the row already names
                 // (the job's identity, write-once); a first attempt
                 // materialises (or reuses on the engine's own key).
                 let table = match &recorded_pair {
-                    Some(pair) => bind_recorded_training_set(session, catalog, pair)
-                        .await
-                        .map_err(WorkerJobError::from)?,
+                    Some(pair) => {
+                        bind_recorded_training_set(session, catalog, pair)
+                            .await
+                            .map_err(WorkerJobError::from)?
+                            .0
+                    }
                     None => training_set::materialize_projection_table(
                         session,
                         &source,
@@ -2574,112 +2715,14 @@ impl JobWorker {
                     .map_err(WorkerJobError::from)?,
                 };
 
-                let (table, training_source) = if whole_set_arm.is_some() {
-                    // Resident: the eager arm — read the whole table back
-                    // into memory, HOLDING the eager read's pool reservation
-                    // for the loader's own lifetime (#500 U2c c3c, P-R)
-                    // rather than checking-then-releasing it
-                    // (`training_set::read_back`'s own contract, which every
-                    // OTHER caller still gets).
-                    let (batches, reservation) =
-                        training_set::read_back_with_reservation(session, &table, &columns)
-                            .await
-                            .map_err(WorkerJobError::from)?;
-                    let loader = build_training_data_loader(&batches, &columns, task)
-                        .map_err(WorkerJobError::from)?
-                        .with_reservation(reservation);
-                    // The tag the table was WRITTEN under and the shape its
-                    // loader reports come from one classifier, so a
-                    // mismatch is a broken engine invariant rather than a
-                    // caller error — and it must be loud: it would mean two
-                    // formats sharing one definition hash.
-                    if loader.format().format_tag() != detected.format_tag() {
-                        return Err(WorkerJobError::from(JammiError::Other(format!(
-                            "training set was committed as format '{}' but its loader reports \
-                             '{}': the column classifier and the loader disagree",
-                            detected.format_tag(),
-                            loader.format().format_tag()
-                        ))));
-                    }
-                    (
-                        table,
-                        crate::fine_tune::source::TrainingSource::Resident(loader),
-                    )
-                } else {
-                    // Streamed (#500 U2c §10/§11): table only — no row is
-                    // ever collected into memory for this arm (F1).
-                    let total_rows = table.record.row_count;
-                    let train_count = crate::fine_tune::data::split_index(
-                        total_rows,
-                        common.config.validation_fraction,
-                    );
-
-                    // F5: the whole-table refusal pre-pass, ONCE, over
-                    // `[0, total_rows)`, BEFORE the first training step —
-                    // not lazily discovered mid-run.
-                    crate::fine_tune::stream::validate_window(
-                        session,
-                        &table,
-                        &columns,
-                        detected,
-                        task,
-                        crate::fine_tune::stream::RowWindow::new(0, total_rows),
-                    )
-                    .await
-                    .map_err(WorkerJobError::from)?;
-
-                    // F3: the classification label vocabulary spans the
-                    // WHOLE table (train + val), built ONCE here — never
-                    // re-derived per-epoch or per-window.
-                    let label_vocab = if matches!(
-                        detected,
-                        crate::fine_tune::decode::DetectedFormat::Classification
-                    ) {
-                        Some(
-                            crate::fine_tune::stream::build_label_vocabulary(
-                                session, &table, &columns,
-                            )
-                            .await
-                            .map_err(WorkerJobError::from)?,
-                        )
-                    } else {
-                        None
-                    };
-
-                    // `PRODUCTION_PREFETCH_DEPTH` — see its own doc for why
-                    // this is a named constant, never a literal here.
-                    let stream_cfg = crate::fine_tune::stream::StreamConfig::new(
-                        crate::fine_tune::stream::PRODUCTION_PREFETCH_DEPTH,
-                    )
-                    .map_err(WorkerJobError::from)?;
-
-                    // Captured HERE, inside `run_spec`'s own task, which is
-                    // still running under the caller's `with_tenant_scoped`
-                    // task-local (`worker.rs::run_claimed_job_under`'s doc) —
-                    // `session.tenant()` reads that override, not the
-                    // session's sticky binding. `TrainingSetStream::open`
-                    // later runs on the `spawn_blocking` pool via
-                    // `Handle::block_on`, which does NOT inherit this
-                    // task-local, so the value is captured now and re-applied
-                    // explicitly per open (#500 U2c c3d).
-                    let tenant = session.tenant();
-                    let streamed = crate::fine_tune::source::StreamedSet {
-                        session: Arc::clone(session),
-                        table: table.clone(),
-                        columns: columns.clone(),
-                        task,
-                        total_rows,
-                        train_count,
-                        batch: common.config.batch_size,
-                        stream_cfg,
-                        label_vocab,
-                        tenant,
-                    };
-                    (
-                        table,
-                        crate::fine_tune::source::TrainingSource::Streamed(Box::new(streamed)),
-                    )
-                };
+                // The ONE source binding every rank of this job performs
+                // over the same table — rank 0 here, a `Peer` member in
+                // `run_member_rank` — so the ranks' loaders agree by
+                // construction.
+                let training_source =
+                    bind_training_source(session, &table, &columns, task, detected, &common)
+                        .await
+                        .map_err(WorkerJobError::from)?;
                 #[cfg(feature = "test-hooks")]
                 training_test_hooks::note_source_kind(
                     job_id,
@@ -2759,6 +2802,7 @@ impl JobWorker {
                             run,
                             cancel,
                             attempt,
+                            holder,
                             RankTopology::Single,
                         )
                         .await
@@ -2771,6 +2815,7 @@ impl JobWorker {
                             run,
                             cancel,
                             attempt,
+                            holder,
                             RankTopology::Local { world },
                         )
                         .await
@@ -2841,8 +2886,10 @@ impl JobWorker {
                         )));
                     }
                 };
-                self.train_fine_tune(session, catalog, job_id, run, cancel, attempt, topology)
-                    .await
+                self.train_fine_tune(
+                    session, catalog, job_id, run, cancel, attempt, holder, topology,
+                )
+                .await
             }
             TrainingSpec::ContextPredictor {
                 source,
@@ -2857,6 +2904,7 @@ impl JobWorker {
                 // status, regardless of whether training below succeeds or
                 // fails.
                 mark_acceleration_not_applicable(
+                    holder,
                     catalog,
                     job_id,
                     &self.worker_id,
@@ -2977,6 +3025,10 @@ impl JobWorker {
     /// OS threads pinned to their devices, each under the witness minted at
     /// ITS OWN `BlockingCall::spawn_thread` boundary — the second
     /// production minting site (the collective module doc).
+    ///
+    /// `holder` is rank 0's role: the lease holder this attempt runs as
+    /// (`RunnerRole::Holder(holder)`); every other local rank runs as
+    /// `RunnerRole::Rank { rank }` and writes nothing durable.
     #[allow(clippy::too_many_arguments)]
     async fn train_fine_tune(
         &self,
@@ -2986,6 +3038,7 @@ impl JobWorker {
         run: FineTuneRun,
         cancel: &Arc<AtomicBool>,
         attempt: u32,
+        holder: LeaseHolder,
         topology: RankTopology,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
         let FineTuneRun {
@@ -3123,7 +3176,7 @@ impl JobWorker {
         // (it owns the eager read's pool reservation and the primary device),
         // the other local ranks replicate the source over their own devices.
         let rank_params =
-            |rank: u32,
+            |role: RunnerRole,
              rank_ctx: Option<RankContext>,
              source: crate::fine_tune::source::TrainingSource,
              base_model_arc: Arc<crate::model::LoadedModel>,
@@ -3135,7 +3188,7 @@ impl JobWorker {
                 job_id: job_id.to_string(),
                 worker_id: self.worker_id.clone(),
                 attempt,
-                rank,
+                role,
                 rank_ctx,
                 base_model: base_model.clone(),
                 task,
@@ -3224,7 +3277,7 @@ impl JobWorker {
                     let base_model_arc = Arc::clone(&model.model);
                     drop(model);
                     others.push(rank_params(
-                        rank,
+                        RunnerRole::Rank { rank },
                         Some(context_for(rank)?),
                         training_source.replicate(),
                         base_model_arc,
@@ -3238,7 +3291,13 @@ impl JobWorker {
                 )
             }
         };
-        let params = rank_params(0, rank0_ctx, training_source, base_model_arc, rank0_device);
+        let params = rank_params(
+            RunnerRole::Holder(holder),
+            rank0_ctx,
+            training_source,
+            base_model_arc,
+            rank0_device,
+        );
 
         // The other local ranks, if any, start FIRST as OS threads
         // (`BlockingCall::spawn_thread` — the second production minting
@@ -3253,7 +3312,7 @@ impl JobWorker {
         for rank_params in other_ranks.drain(..) {
             let runtime = runtime.clone();
             rank_threads.push((
-                rank_params.rank,
+                rank_params.role.rank(),
                 BlockingCall::spawn_thread(move |call| {
                     let _runtime = runtime.enter();
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4499,8 +4558,9 @@ pub(crate) enum CoordinatorEnd {
     /// did not fault on (a typed training refusal, a divergence, a panic):
     /// the job's own terminal failure, recorded as `failed` by the caller.
     TrainingFailed(String),
-    /// Assembly proceeded, the run completed and rank 0 holds the artifact
-    /// the caller publishes.
+    /// Assembly proceeded, the run completed, every member ended
+    /// `Outcome{Trained}` with rank 0's own artifact digest, and rank 0
+    /// holds the artifact the caller publishes.
     Published,
 }
 
@@ -4724,6 +4784,140 @@ pub(crate) fn assign_ranks(
         .collect())
 }
 
+/// Who one attempt of `spec` runs as on this host (the module doc's writer
+/// table): the `Coordinator` exactly when a column-source `fine_tune`
+/// decides [`TopologyDecision::Peer`] over this host's `[worker]
+/// local_ranks` — the one shape `run_spec` hands to the coordinator body —
+/// and the `LoopClaimer` for every other shape: a single rank, an
+/// in-process `Local` gang, a `graph_fine_tune` (a `Peer` one is refused at
+/// the coordinator's edge before any assembly) and a context predictor
+/// (single-rank by admission). Decided from the SAME `TopologyDecision::
+/// decide` call `run_spec` makes, over the same inputs, so the two cannot
+/// diverge. `W == 1` is the loop claimer on every arm (K4).
+pub fn lease_holder_for(spec: &TrainingSpec, local_ranks: u32) -> LeaseHolder {
+    match spec {
+        TrainingSpec::FineTune { common, .. } => {
+            match TopologyDecision::decide(common.world_size, local_ranks) {
+                TopologyDecision::Peer { .. } => LeaseHolder::Coordinator,
+                TopologyDecision::Single | TopologyDecision::Local { .. } => {
+                    LeaseHolder::LoopClaimer
+                }
+            }
+        }
+        TrainingSpec::GraphFineTune { .. } | TrainingSpec::ContextPredictor { .. } => {
+            LeaseHolder::LoopClaimer
+        }
+    }
+}
+
+/// The training source every rank of a column-source `fine_tune` binds over
+/// its (shared, attested) training-set table — `Resident` for the whole-set
+/// arms (`source::whole_set_arm`: mining, GradCache — both refused at
+/// `world > 1` by admission, so a gang's ranks always take the `Streamed`
+/// arm), `Streamed` otherwise. Called by rank 0 in `run_spec` and by a
+/// `Peer` member's rank body ([`run_member_rank`]) over the SAME table
+/// (bound by name and digest through the job row), so the ranks' loaders
+/// derive from one definition. Runs under the caller's tenant scope: the
+/// streamed set captures `session.tenant()` here, inside that scope, and
+/// re-applies it per open (#500 U2c c3d).
+async fn bind_training_source(
+    session: &Arc<InferenceSession>,
+    table: &jammi_db::store::TrainingSetTable,
+    columns: &[String],
+    task: ModelTask,
+    detected: crate::fine_tune::decode::DetectedFormat,
+    common: &TrainingCommon,
+) -> Result<crate::fine_tune::source::TrainingSource> {
+    // #500 U2c §11 F6: the ONE predicate deciding Resident vs Streamed —
+    // the SAME `source::whole_set_arm` the trainer's own dispatch
+    // (`trainer.rs::run`) refuses a mismatch against. A `FineTune` spec
+    // always loads a base model (`train_fine_tune` unconditionally calls
+    // `.base_model(..)`), so `has_base_model` is always `true` here.
+    let whole_set_arm = crate::fine_tune::source::whole_set_arm(&common.config, true);
+    if whole_set_arm.is_some() {
+        // Resident: the eager arm — read the whole table back into memory,
+        // HOLDING the eager read's pool reservation for the loader's own
+        // lifetime (#500 U2c c3c, P-R) rather than checking-then-releasing
+        // it (`training_set::read_back`'s own contract, which every OTHER
+        // caller still gets).
+        let (batches, reservation) =
+            training_set::read_back_with_reservation(session, table, columns).await?;
+        let loader =
+            build_training_data_loader(&batches, columns, task)?.with_reservation(reservation);
+        // The tag the table was WRITTEN under and the shape its loader
+        // reports come from one classifier, so a mismatch is a broken
+        // engine invariant rather than a caller error — and it must be
+        // loud: it would mean two formats sharing one definition hash.
+        if loader.format().format_tag() != detected.format_tag() {
+            return Err(JammiError::Other(format!(
+                "training set was committed as format '{}' but its loader reports '{}': the \
+                 column classifier and the loader disagree",
+                detected.format_tag(),
+                loader.format().format_tag()
+            )));
+        }
+        return Ok(crate::fine_tune::source::TrainingSource::Resident(loader));
+    }
+    // Streamed (#500 U2c §10/§11): table only — no row is ever collected
+    // into memory for this arm (F1).
+    let total_rows = table.record.row_count;
+    let train_count =
+        crate::fine_tune::data::split_index(total_rows, common.config.validation_fraction);
+
+    // F5: the whole-table refusal pre-pass, ONCE, over `[0, total_rows)`,
+    // BEFORE the first training step — not lazily discovered mid-run.
+    crate::fine_tune::stream::validate_window(
+        session,
+        table,
+        columns,
+        detected,
+        task,
+        crate::fine_tune::stream::RowWindow::new(0, total_rows),
+    )
+    .await?;
+
+    // F3: the classification label vocabulary spans the WHOLE table (train
+    // + val), built ONCE here — never re-derived per-epoch or per-window.
+    let label_vocab = if matches!(
+        detected,
+        crate::fine_tune::decode::DetectedFormat::Classification
+    ) {
+        Some(crate::fine_tune::stream::build_label_vocabulary(session, table, columns).await?)
+    } else {
+        None
+    };
+
+    // `PRODUCTION_PREFETCH_DEPTH` — see its own doc for why this is a named
+    // constant, never a literal here.
+    let stream_cfg = crate::fine_tune::stream::StreamConfig::new(
+        crate::fine_tune::stream::PRODUCTION_PREFETCH_DEPTH,
+    )?;
+
+    // Captured HERE, inside the caller's task, which is still running under
+    // its `with_tenant_scoped` task-local (`run_claimed_job_under`'s doc;
+    // `run_member_rank`'s scope) — `session.tenant()` reads that override,
+    // not the session's sticky binding. `TrainingSetStream::open` later
+    // runs on the `spawn_blocking` pool via `Handle::block_on`, which does
+    // NOT inherit this task-local, so the value is captured now and
+    // re-applied explicitly per open (#500 U2c c3d).
+    let tenant = session.tenant();
+    let streamed = crate::fine_tune::source::StreamedSet {
+        session: Arc::clone(session),
+        table: table.clone(),
+        columns: columns.to_vec(),
+        task,
+        total_rows,
+        train_count,
+        batch: common.config.batch_size,
+        stream_cfg,
+        label_vocab,
+        tenant,
+    };
+    Ok(crate::fine_tune::source::TrainingSource::Streamed(
+        Box::new(streamed),
+    ))
+}
+
 /// Bind the training set a prior attempt recorded on the job row (the
 /// write-once identity pair) for THIS attempt to train from — the retry's
 /// half of "the coordinator materializes or reuses the training set"
@@ -4735,12 +4929,26 @@ pub(crate) fn assign_ranks(
 /// verifies has lost its identity, and a fresh materialization would train
 /// a different job under the same row. The table is bound on the session
 /// context exactly as the producer's own reuse arm binds one, so the eager
-/// read-back and the streamed opens resolve it like a fresh table.
+/// read-back and the streamed opens resolve it like a fresh table. Also the
+/// binding a `Peer` member performs ([`run_member_rank`]) over the pair it
+/// was admitted against; the sidecar it verified is returned beside the
+/// table so the member can verify its partition's leaves against it.
+///
+/// Error classes, by construction of this function: every REFUSAL — the
+/// table is gone, not ready, carries no sidecar, or its digest no longer
+/// verifies — is `JammiError::FineTune`; every other variant is a read
+/// itself faulting (the catalog, or the store — `Storage`/`Io`). A member
+/// maps the two classes to `Aborted{Refuted}` and
+/// `Aborted{StoreUnavailable}`/`Aborted{Unavailable}` respectively, the
+/// SAME split the gang handler's re-verification tick applies.
 async fn bind_recorded_training_set(
     session: &Arc<InferenceSession>,
     catalog: &Arc<Catalog>,
     pair: &TrainingSetIdentityPair,
-) -> Result<jammi_db::store::TrainingSetTable> {
+) -> Result<(
+    jammi_db::store::TrainingSetTable,
+    jammi_db::store::manifest::MaterializationManifest,
+)> {
     let Some(record) = catalog
         .get_result_table(&pair.training_set_location)
         .await?
@@ -4773,13 +4981,16 @@ async fn bind_recorded_training_set(
         )));
     }
     store.bind_result_table(session.context(), &record).await?;
-    Ok(jammi_db::store::TrainingSetTable {
-        record,
-        definition_hash: manifest.definition_hash,
-        outcome: jammi_db::store::CacheOutcome::Reused {
-            table: pair.training_set_location.clone(),
+    Ok((
+        jammi_db::store::TrainingSetTable {
+            record,
+            definition_hash: manifest.definition_hash.clone(),
+            outcome: jammi_db::store::CacheOutcome::Reused {
+                table: pair.training_set_location.clone(),
+            },
         },
-    })
+        manifest,
+    ))
 }
 
 /// End every admitted member session in `links` cooperatively (one
@@ -4831,6 +5042,8 @@ impl JobWorker {
     /// member's slot is `Rank` for the whole session and a peer never
     /// claims while it holds a rank (`HostAdmission`), so ending a session
     /// never aborts a claim transaction anywhere.
+    /// Runs as `LeaseHolder::Coordinator` — the module doc's writer table,
+    /// row 17 — on every write it makes here and on rank 0's own run.
     #[allow(clippy::too_many_arguments)]
     async fn coordinate(
         &self,
@@ -4853,13 +5066,16 @@ impl JobWorker {
         training_test_hooks::note_coordinator_end(job_id, attempt, &end);
         let outcome = assembly_outcome(&end);
         if let Some(outcome) = outcome {
+            // Row 17 of the module doc's writer table: the coordinator's
+            // own writes, as the coordinator.
+            let holder = LeaseHolder::Coordinator;
             match catalog
                 .record_assembly_outcome(job_id, attempt, outcome)
                 .await
             {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!(
-                    job_id = %job_id, attempt, ?outcome,
+                    job_id = %job_id, attempt, ?outcome, %holder,
                     "assembly outcome not recorded: the attempt moved under the coordinator"
                 ),
                 Err(e) => tracing::warn!(
@@ -5087,6 +5303,7 @@ impl JobWorker {
                 run,
                 cancel,
                 attempt,
+                LeaseHolder::Coordinator,
                 RankTopology::Peer {
                     world,
                     coordinator: Arc::clone(&coordinator),
@@ -5094,9 +5311,27 @@ impl JobWorker {
             )
             .await;
 
-        // (7) The stream close: every member's session is ended
+        // (7) Every member's end — the terminal write on receipt: rank 0's
+        // run completed, but the attempt is `Published` only once every
+        // member's session ended `Outcome{Trained}` carrying rank 0's OWN
+        // artifact digest (the gang converged to one artifact); a member's
+        // `Outcome{Failed}`, a differing digest, an `Aborted` or a silent
+        // end is that member's end of the attempt, and nothing is published
+        // over a gang that did not complete (DESIGN.md §4).
+        let result = match result {
+            Ok(artifact) => match reconcile_member_ends(&coordinator, &artifact).await {
+                Ok(()) => Ok(artifact),
+                Err(end) => {
+                    coordinator.end_members();
+                    return (end, None);
+                }
+            },
+            Err(e) => Err(e),
+        };
+
+        // (8) The stream close: every member's session is ended
         // cooperatively whichever way the run ended, so a member's slot is
-        // freed now rather than at its park bound.
+        // freed now rather than left to the member's own bounds.
         coordinator.end_members();
 
         match result {
@@ -5117,6 +5352,370 @@ impl JobWorker {
                 }
             }
         }
+    }
+}
+
+/// [`JobWorker::assemble_and_run`]'s step (7): read every member's end off
+/// the coordinator's links ([`Peer::collect_member_ends`], on a blocking
+/// thread under its own witness) and require each to be `Trained` with
+/// rank 0's own adapter digest ([`adapter_files_digest`] over the files
+/// rank 0 is about to publish). The first member that is not ends the
+/// attempt, typed: a differing digest or a `Failed{reason}` is the run's
+/// own failure (`TrainingFailed`, recorded `failed` by the caller), an
+/// `Aborted{reason}` maps one to one through the assembly table
+/// (`MemberAborted`), a closed/faulted/silent stream is a `LinkFault`.
+async fn reconcile_member_ends(
+    coordinator: &Arc<Peer>,
+    artifact: &TrainedArtifact,
+) -> std::result::Result<(), CoordinatorEnd> {
+    let own = adapter_files_digest(artifact.dir.path())
+        .map_err(|e| CoordinatorEnd::TrainingFailed(format!("rank 0's adapter digest: {e}")))?;
+    let peer = Arc::clone(coordinator);
+    let ends = BlockingCall::spawn_blocking(move |call| peer.collect_member_ends(&call))
+        .await
+        .map_err(|e| CoordinatorEnd::LinkFault(format!("collecting the members' outcomes: {e}")))?;
+    for (rank, end) in ends {
+        #[cfg(feature = "test-hooks")]
+        training_test_hooks::note_member_end(&artifact.register.model_id, rank, &end);
+        match end {
+            MemberEnd::Trained { artifact_digest } if artifact_digest == own => {}
+            MemberEnd::Trained { artifact_digest } => {
+                return Err(CoordinatorEnd::TrainingFailed(format!(
+                    "rank {rank} ended Trained with adapter digest {artifact_digest} where rank \
+                     0's is {own}: the gang did not converge to one artifact"
+                )))
+            }
+            MemberEnd::Failed { reason } => {
+                return Err(CoordinatorEnd::TrainingFailed(format!(
+                    "rank {rank}: {reason}"
+                )))
+            }
+            MemberEnd::Aborted(raw) => {
+                let reason = AbortReason::try_from(raw).unwrap_or(AbortReason::Unspecified);
+                return Err(CoordinatorEnd::MemberAborted { rank, reason });
+            }
+            MemberEnd::Ended(why) => {
+                return Err(CoordinatorEnd::LinkFault(format!(
+                    "rank {rank} ended without an Outcome: {why}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The digest of the adapter files a rank holds after its run — exactly the
+/// file set [`publish_artifact`] publishes (every regular file directly in
+/// `dir`, in name order; subdirectories are scratch and are skipped), each
+/// folded as `name`, a NUL, the byte length, the bytes. What a `Peer`
+/// member reports in `Outcome{Trained}` and what the coordinator computes
+/// over its own files to compare against
+/// ([`reconcile_member_ends`]): every rank holds identical weights after
+/// the last step (DESIGN.md §4), so a gang that converged reports one
+/// digest. Not the store's per-file manifest hash: this is a rank-side
+/// fact about local bytes, computed by the ONE function on both sides.
+pub fn adapter_files_digest(dir: &std::path::Path) -> Result<String> {
+    use sha2::Digest;
+    let mut names: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        names.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            entry.path(),
+        ));
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = sha2::Sha256::new();
+    for (name, path) in names {
+        let bytes = std::fs::read(path)?;
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// What an admitted member session hands its rank body: the assignment the
+/// coordinator's `Assign` carried and the row facts the gang handler
+/// verified at admission (`GangService::run_rank`, `jammi-server`) — the
+/// row's own tenant, the training-set identity pair, the `spec` column
+/// verbatim. Nothing here came from the coordinator but the coordinates
+/// (job, attempt, rank, world, the coordinator's instance id).
+#[derive(Debug, Clone)]
+pub struct MemberAssignment {
+    pub job_id: String,
+    pub attempt: u32,
+    pub rank: u32,
+    pub world: u32,
+    /// The lease holder's instance id (`claimed_by`) — the coordinator.
+    pub coordinator_instance_id: String,
+    /// The row's own tenant, derived at admission (never the caller's).
+    pub tenant: Option<TenantId>,
+    /// The training-set identity pair the member was admitted against.
+    pub training_set_ref: String,
+    pub training_set_location: String,
+    /// The row's `spec` column, verbatim.
+    pub spec_json: String,
+}
+
+/// How a rank body ended — what the member's session ends with, as ONE
+/// terminal stream event emitted by the session's hold loop: `Trained` and
+/// `Failed` are `RankEvent::Outcome`; `Aborted` is `RankEvent::Aborted`
+/// with a reason the pre-collective prologue decided (the training-set
+/// identity no longer holds, this host's store faulted, the catalog did
+/// not answer) — the SAME reason class the hold loop's re-verification tick
+/// uses, so the wire says the same thing whichever of the two saw it first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RankOutcome {
+    /// The run completed; the digest of the adapter files this rank holds
+    /// ([`adapter_files_digest`]).
+    Trained { artifact_digest: String },
+    /// A typed failure of the run itself.
+    Failed { reason: String },
+    /// The prologue refused before the first collective.
+    Aborted(AbortReason),
+}
+
+/// The rank body (DESIGN.md §4; UNITS.md § U5b-1b-iii): an admitted member
+/// session runs `TrainingLoop::run` as rank `assignment.rank` of a `Peer`
+/// gang of `assignment.world` over `link`, and returns how it ended. In
+/// order, under the row's own tenant scope: the spec is reconstructed from
+/// the row (a column-source `fine_tune`, the one kind a `Peer` gang
+/// serves); the recorded training set is bound by name and digest exactly
+/// as a retrying coordinator binds it ([`bind_recorded_training_set`] —
+/// the identity U5a-2 verified at admission, re-verified here); every leaf
+/// of the table this rank's partition reads is verified against the
+/// sidecar's inventory BEFORE the first collective
+/// (`collective::peer::verify_partition_leaves` — under
+/// `BlockByGlobalBatch` every row group carries rows of every rank, so the
+/// partition's leaves are the object's; a bad leaf is the member-scoped
+/// `Aborted{StoreUnavailable}`); the source is bound through the SAME
+/// [`bind_training_source`] rank 0 used; the base model is loaded; the
+/// member's `Peer` is built over `link` at the deployment's rank timeout
+/// and cap; and `run_fine_tune_blocking` runs on the blocking pool under
+/// the witness minted at ITS OWN `BlockingCall::spawn_blocking` — the third
+/// production minting site — as `RunnerRole::Rank { rank }`: the same
+/// target construction, seed split and acceleration probe as rank 0, no
+/// persisted report, no checkpoint write (the trainer's role gate), no
+/// job-row write (nothing here holds a `LeaseHolder` to pass), no artifact
+/// publish. `cancel` is the session's: the hold loop flips it when the
+/// session ends for another reason, and the trainer's epoch-boundary check
+/// reads it exactly as rank 0 reads its lease flag.
+pub async fn run_member_rank(
+    session: Arc<InferenceSession>,
+    assignment: MemberAssignment,
+    link: MemberLink,
+    cancel: Arc<AtomicBool>,
+) -> RankOutcome {
+    #[cfg(feature = "test-hooks")]
+    let (job_id, rank) = (assignment.job_id.clone(), assignment.rank);
+    let outcome = match assignment.tenant {
+        Some(tenant) => {
+            session
+                .with_tenant_scoped(tenant, |_scope| {
+                    member_rank_body(&session, assignment, link, cancel)
+                })
+                .await
+        }
+        None => member_rank_body(&session, assignment, link, cancel).await,
+    };
+    #[cfg(feature = "test-hooks")]
+    training_test_hooks::note_rank_outcome(&job_id, rank, &outcome);
+    outcome
+}
+
+/// [`run_member_rank`]'s body, inside the tenant scope.
+async fn member_rank_body(
+    session: &Arc<InferenceSession>,
+    assignment: MemberAssignment,
+    link: MemberLink,
+    cancel: Arc<AtomicBool>,
+) -> RankOutcome {
+    let MemberAssignment {
+        job_id,
+        attempt,
+        rank,
+        world,
+        coordinator_instance_id,
+        tenant,
+        training_set_ref,
+        training_set_location,
+        spec_json,
+    } = assignment;
+    let failed = |reason: String| RankOutcome::Failed {
+        reason: format!("rank {rank}: {reason}"),
+    };
+    let catalog = Arc::new(session.catalog().pinned_to_tenant(tenant));
+
+    let spec: TrainingSpec = match serde_json::from_str(&spec_json) {
+        Ok(spec) => spec,
+        Err(e) => return failed(format!("undeserialisable training_spec: {e}")),
+    };
+    let TrainingSpec::FineTune {
+        columns,
+        task,
+        common,
+        ..
+    } = spec
+    else {
+        return failed(format!(
+            "a Peer gang serves a column-source fine_tune only; the row's spec is a {}",
+            spec.kind()
+        ));
+    };
+    if common.world_size != world {
+        return failed(format!(
+            "the row's spec names world_size {} where the assignment names {world}",
+            common.world_size
+        ));
+    }
+
+    // The identity, re-verified by the SAME binding a retrying coordinator
+    // performs; its refusal classes are the hold loop's re-verification
+    // classes (`bind_recorded_training_set`'s doc).
+    let pair = TrainingSetIdentityPair {
+        training_set_ref,
+        training_set_location,
+    };
+    let (table, manifest) = match bind_recorded_training_set(session, &catalog, &pair).await {
+        Ok(bound) => bound,
+        Err(JammiError::FineTune(why)) => {
+            tracing::warn!(job_id = %job_id, rank, %why, "rank body: the training-set identity no longer holds");
+            return RankOutcome::Aborted(AbortReason::Refuted);
+        }
+        Err(e @ (JammiError::Storage(_) | JammiError::Io(_))) => {
+            tracing::warn!(job_id = %job_id, rank, error = %e, "rank body: this host's store faulted binding the training set");
+            return RankOutcome::Aborted(AbortReason::StoreUnavailable);
+        }
+        Err(e) => {
+            tracing::warn!(job_id = %job_id, rank, error = %e, "rank body: the catalog faulted binding the training set");
+            return RankOutcome::Aborted(AbortReason::Unavailable);
+        }
+    };
+
+    // The per-partition leaf verify (U5b-1b-i), before the first collective.
+    let parquet_url = match jammi_db::storage::StorageUrl::parse(&table.record.parquet_path) {
+        Ok(url) => url,
+        Err(e) => return failed(format!("the training set's parquet path: {e}")),
+    };
+    let handle = match session.result_store().open_parquet(&parquet_url) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(job_id = %job_id, rank, error = %e, "rank body: this host's store cannot open the training set");
+            return RankOutcome::Aborted(AbortReason::StoreUnavailable);
+        }
+    };
+    if let Err(fault) =
+        crate::fine_tune::collective::peer::verify_partition_leaves(&handle, &manifest.leaves).await
+    {
+        tracing::warn!(job_id = %job_id, rank, %fault, "rank body: a leaf of this rank's partition did not verify");
+        return RankOutcome::Aborted(fault.abort_reason());
+    }
+
+    let detected = match detect_training_format(&columns, task) {
+        Ok(detected) => detected,
+        Err(e) => return failed(e.to_string()),
+    };
+    let training_source =
+        match bind_training_source(session, &table, &columns, task, detected, &common).await {
+            Ok(source) => source,
+            Err(e) => return failed(e.to_string()),
+        };
+
+    let model_source = ModelSource::parse(&common.base_model);
+    let guard = match session
+        .model_cache()
+        .get_or_load(&model_source, task, None)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(e) => return failed(e.to_string()),
+    };
+    let base_model_arc = Arc::clone(&guard.model);
+    let Some(hidden_size) = guard.model.embedding_dim() else {
+        return failed("Base model does not support embeddings".into());
+    };
+    drop(guard);
+
+    let device_config = session.device_config().clone();
+    let device = match crate::model::backend::candle::select_device(&device_config) {
+        Ok(device) => device,
+        Err(e) => return failed(e.to_string()),
+    };
+    let max_message_bytes = usize::try_from(session.inner_config().server.limits.max_message_bytes)
+        .unwrap_or(usize::MAX);
+    let rank_timeout = Duration::from_secs(session.inner_config().worker.rank_timeout_secs);
+    let peer = match Peer::member(rank, world, link, device, max_message_bytes)
+        .and_then(|peer| peer.with_timeout(rank_timeout))
+    {
+        Ok(peer) => peer,
+        Err(e) => return failed(e.to_string()),
+    };
+    let partition = match PartitionSpec::for_gang(
+        rank as usize,
+        world as usize,
+        common.config.batch_size,
+        PartitionRule::BlockByGlobalBatch,
+    ) {
+        Ok(partition) => partition,
+        Err(e) => return failed(e.to_string()),
+    };
+    let collective: Arc<dyn Collective> = Arc::new(peer);
+    // `test-hooks`: a chaos wrapper an oracle armed for this job's next
+    // member body (the chaos rows' fault injection inside the real body).
+    #[cfg(feature = "test-hooks")]
+    let collective = match training_test_hooks::take_member_collective_wrap(&job_id) {
+        Some(wrap) => wrap(collective),
+        None => collective,
+    };
+    let rank_ctx = RankContext::new(collective, partition);
+
+    let params = RunFineTuneParams {
+        catalog,
+        artifact_store: session.artifact_store(),
+        result_store: session.result_store(),
+        artifact_dir: session.inner_config().artifact_dir.clone(),
+        job_id: job_id.clone(),
+        worker_id: coordinator_instance_id,
+        attempt,
+        role: RunnerRole::Rank { rank },
+        rank_ctx: Some(rank_ctx),
+        base_model: common.base_model.clone(),
+        task,
+        config: common.config,
+        source: training_source,
+        base_model_arc,
+        hidden_size,
+        device_config,
+        cancel,
+        hub: session.hub().clone(),
+    };
+
+    // The third production minting site: this rank's `TrainingLoop::run`
+    // receives the witness minted at its own blocking-pool boundary.
+    let result = BlockingCall::spawn_blocking(move |call| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_fine_tune_blocking(&call, params)
+        }))
+    })
+    .await;
+    let training = match result {
+        Ok(Ok(Ok(training))) => training,
+        Ok(Ok(Err(e))) => return failed(e.to_string()),
+        Ok(Err(payload)) => return failed(format!("Panic: {}", panic_message(payload.as_ref()))),
+        Err(join_err) => return failed(format!("training task join error: {join_err}")),
+    };
+    #[cfg(feature = "test-hooks")]
+    if let Some(reason) = training_test_hooks::take_member_failure(&job_id) {
+        return failed(reason);
+    }
+    match adapter_files_digest(training.artifact_dir.path()) {
+        Ok(artifact_digest) => RankOutcome::Trained { artifact_digest },
+        Err(e) => failed(format!("this rank's adapter digest: {e}")),
     }
 }
 
@@ -5930,6 +6529,177 @@ pub mod training_test_hooks {
             .collect()
     }
 
+    /// One recorded lease holder per hold registration: `(job, attempt,
+    /// holder)` — what `register_job_hold_or_release` was told this attempt
+    /// runs as (the module doc's writer table, row 1).
+    fn lease_holders() -> &'static Mutex<Vec<(String, u32, super::LeaseHolder)>> {
+        static PROBES: OnceLock<Mutex<Vec<(String, u32, super::LeaseHolder)>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_lease_holder(job_id: &str, attempt: u32, holder: super::LeaseHolder) {
+        lease_holders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), attempt, holder));
+    }
+
+    /// Every lease holder recorded for `job_id`, per attempt, oldest first
+    /// — the K4 oracle: a `W == 1` job is the `LoopClaimer` on every
+    /// attempt; a `Peer` gang's attempts are the `Coordinator`.
+    pub fn lease_holders_for(job_id: &str) -> Vec<(u32, super::LeaseHolder)> {
+        lease_holders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _, _)| id == job_id)
+            .map(|(_, attempt, holder)| (*attempt, *holder))
+            .collect()
+    }
+
+    /// One recorded runner role per `run_fine_tune_blocking` entry, keyed by
+    /// job — every rank of a gang records its own (rank 0's holder, each
+    /// other rank's `Rank { rank }`), in entry order.
+    fn runner_roles() -> &'static Mutex<Vec<(String, super::RunnerRole)>> {
+        static PROBES: OnceLock<Mutex<Vec<(String, super::RunnerRole)>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_runner_role(job_id: &str, role: super::RunnerRole) {
+        runner_roles()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), role));
+    }
+
+    /// Every runner role recorded for `job_id`, in entry order.
+    pub fn runner_roles_for(job_id: &str) -> Vec<super::RunnerRole> {
+        runner_roles()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _)| id == job_id)
+            .map(|(_, role)| *role)
+            .collect()
+    }
+
+    /// One recorded member end per `reconcile_member_ends` reading, keyed by
+    /// the output MODEL id (`jammi:fine-tuned:{job_id}` — what the artifact
+    /// in hand names; the job id is not on it): `(rank, the end's Debug)`.
+    fn member_ends() -> &'static Mutex<Vec<(String, u32, String)>> {
+        static PROBES: OnceLock<Mutex<Vec<(String, u32, String)>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_member_end(
+        model_id: &str,
+        rank: u32,
+        end: &crate::fine_tune::collective::MemberEnd,
+    ) {
+        member_ends()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((model_id.to_string(), rank, format!("{end:?}")));
+    }
+
+    /// Every member end the coordinator read for `job_id`'s output model
+    /// (`fine_tuned_model_id(job_id)`), in reading order: `(rank, Debug)`.
+    pub fn member_ends_for(job_id: &str) -> Vec<(u32, String)> {
+        let model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        member_ends()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _, _)| *id == model_id)
+            .map(|(_, rank, end)| (*rank, end.clone()))
+            .collect()
+    }
+
+    /// A chaos wrapper for the NEXT member body of `job_id`: applied to the
+    /// body's `Peer` right after it is built, before the first collective,
+    /// so an oracle's own `Collective` (the chaos rows' `ChaosRank`) sits
+    /// between the trainer and the wire — the fault injection at a chosen
+    /// step of the REAL rank body. One-shot: taken by the first body of that
+    /// job to reach the seam.
+    pub type MemberCollectiveWrap = Box<
+        dyn FnOnce(
+                Arc<dyn crate::fine_tune::collective::Collective>,
+            ) -> Arc<dyn crate::fine_tune::collective::Collective>
+            + Send,
+    >;
+
+    fn member_wraps() -> &'static Mutex<Vec<(String, MemberCollectiveWrap)>> {
+        static SLOTS: OnceLock<Mutex<Vec<(String, MemberCollectiveWrap)>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub fn wrap_member_collective(job_id: &str, wrap: MemberCollectiveWrap) {
+        member_wraps()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), wrap));
+    }
+
+    pub(super) fn take_member_collective_wrap(job_id: &str) -> Option<MemberCollectiveWrap> {
+        let mut slots = member_wraps()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let index = slots.iter().position(|(id, _)| id == job_id)?;
+        Some(slots.remove(index).1)
+    }
+
+    /// One recorded rank-body end per `run_member_rank` return, keyed by
+    /// job: `(rank, the outcome's Debug)`, in end order — how an oracle
+    /// observes a member body's end whether or not the session lived to
+    /// emit it.
+    fn rank_outcomes() -> &'static Mutex<Vec<(String, u32, String)>> {
+        static PROBES: OnceLock<Mutex<Vec<(String, u32, String)>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn note_rank_outcome(job_id: &str, rank: u32, outcome: &super::RankOutcome) {
+        rank_outcomes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), rank, format!("{outcome:?}")));
+    }
+
+    /// Every rank-body end recorded for `job_id`, in end order.
+    pub fn rank_outcomes_for(job_id: &str) -> Vec<(u32, String)> {
+        rank_outcomes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(id, _, _)| id == job_id)
+            .map(|(_, rank, end)| (*rank, end.clone()))
+            .collect()
+    }
+
+    /// Arm a member-side failure for `job_id`: the NEXT rank body that
+    /// completes its run for that job reports `Outcome{Failed{reason}}`
+    /// instead of `Trained` — the fault injection that lets an oracle drive
+    /// the coordinator's terminal-write-on-receipt through a member's
+    /// failure without a real defect. Taken (disarmed) by the body.
+    pub fn fail_member_outcome(job_id: &str, reason: &str) {
+        member_failures()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job_id.to_string(), reason.to_string()));
+    }
+
+    fn member_failures() -> &'static Mutex<Vec<(String, String)>> {
+        static SLOTS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn take_member_failure(job_id: &str) -> Option<String> {
+        let mut slots = member_failures()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let index = slots.iter().position(|(id, _)| id == job_id)?;
+        Some(slots.remove(index).1)
+    }
+
     /// One recorded coordinator end per attempt: `(attempt, the end's
     /// `Display`, its `ordinal`)`.
     type End = (String, u32, String, usize);
@@ -6154,7 +6924,12 @@ mod training_test_hooks_tests {
 /// status = 'running' AND attempts = attempt`). A worker that lost its lease
 /// before failing does not stamp `failed` over a job the re-claiming worker is
 /// running — that case is left for the new owner (logged at debug).
+///
+/// `holder` is the writer — REQUIRED at every call site (the module doc's
+/// writer table): a job-row write is reachable only with the attempt's
+/// `LeaseHolder` in hand, and a rank body holds none.
 async fn record_failed(
+    holder: LeaseHolder,
     catalog: &Arc<Catalog>,
     job_id: &str,
     worker_id: &str,
@@ -6167,6 +6942,7 @@ async fn record_failed(
             tracing::debug!(
                 job_id = %job_id,
                 worker = %worker_id,
+                %holder,
                 "lost lease before recording failure; left for reclaim"
             );
         }
@@ -6192,7 +6968,11 @@ async fn record_failed(
 /// retired at the catalog's terminal edge, not compensated for here; see
 /// [`JobWorker::run_claimed_job`]'s "The SUCCESS path is not exempt"
 /// section.
+///
+/// `holder` is the writer (the module doc's writer table, row 16): a job-row
+/// write, reachable only with the attempt's `LeaseHolder`.
 async fn persist_acceleration_report(
+    holder: LeaseHolder,
     catalog: &Arc<Catalog>,
     job_id: &str,
     worker_id: &str,
@@ -6209,6 +6989,7 @@ async fn persist_acceleration_report(
                 job_id = %job_id,
                 worker_id = %worker_id,
                 attempt,
+                %holder,
                 "esc-075: record_acceleration_report's lease guard did not match (lease lost or \
                  stale attempt); continuing without a persisted acceleration report"
             );
@@ -6240,6 +7021,7 @@ async fn persist_acceleration_report(
 /// training starts, under the SAME lease-guarded
 /// `record_acceleration_report` every other esc-075 write uses.
 async fn mark_acceleration_not_applicable(
+    holder: LeaseHolder,
     catalog: &Arc<Catalog>,
     job_id: &str,
     worker_id: &str,
@@ -6247,6 +7029,7 @@ async fn mark_acceleration_not_applicable(
     reason: &str,
 ) {
     persist_acceleration_report(
+        holder,
         catalog,
         job_id,
         worker_id,
@@ -6291,12 +7074,14 @@ async fn mark_acceleration_not_applicable(
 /// and it has exactly ONE producer (jammi-db's own `INSERT` const), which is
 /// what makes the catalog edge's byte match on it sound.
 async fn mark_acceleration_undetermined(
+    holder: LeaseHolder,
     catalog: &Arc<Catalog>,
     job_id: &str,
     worker_id: &str,
     attempt: u32,
 ) {
     persist_acceleration_report(
+        holder,
         catalog,
         job_id,
         worker_id,
@@ -6328,11 +7113,13 @@ struct RunFineTuneParams {
     /// checkpoints under (`{job_id}/{worker_id}/{attempt}/checkpoints/…`,
     /// unit 348).
     attempt: u32,
-    /// This rank's index in the gang (`0` for a single-rank run and for the
-    /// coordinator): rank 0 alone persists the acceleration report — every
-    /// rank still computes it (the probe's forward/backward runs identically
-    /// on every rank, so no rank's state drifts from its peers').
-    rank: u32,
+    /// What this rank runs AS (`crate::fine_tune::role`): the lease holder
+    /// (rank 0 — the single rank, a `Local` gang's rank 0, a `Peer` gang's
+    /// coordinator) persists the acceleration report and, through the
+    /// trainer's own gate, the checkpoints; a `Rank` computes the same
+    /// probe (the forward/backward runs identically on every rank, so no
+    /// rank's state drifts from its peers') and persists nothing.
+    role: RunnerRole,
     /// This rank's [`RankContext`], or `None` for the single-rank run (the
     /// builder's own `RankContext::single_rank` default — byte-identical to
     /// every pre-gang run).
@@ -6378,7 +7165,7 @@ fn run_fine_tune_blocking(
         job_id,
         worker_id,
         attempt,
-        rank,
+        role,
         rank_ctx,
         base_model,
         task,
@@ -6390,7 +7177,9 @@ fn run_fine_tune_blocking(
         cancel,
         hub,
     } = params;
-    let persist_report = rank == 0;
+    let rank = role.rank();
+    #[cfg(feature = "test-hooks")]
+    training_test_hooks::note_runner_role(&job_id, role);
     // DESIGN.md §4: "each rank's dropout seed derives as `f(seed, rank)`" —
     // `RankContext::dropout_seed` (rank 0 is the identity, so the single-rank
     // run and every rank 0 keep `config.seed` exactly). The A/B INIT seed is
@@ -6480,7 +7269,7 @@ fn run_fine_tune_blocking(
             &job_id,
             &worker_id,
             attempt,
-            persist_report,
+            role,
             &device,
             config.backbone_dtype,
             None,
@@ -6512,7 +7301,7 @@ fn run_fine_tune_blocking(
             &job_id,
             &worker_id,
             attempt,
-            persist_report,
+            role,
             &device,
             config.backbone_dtype,
             Some(&varmap),
@@ -6570,6 +7359,10 @@ fn run_fine_tune_blocking(
     if let Some(rank_ctx) = rank_ctx {
         builder = builder.rank_context(rank_ctx);
     }
+    // The role, stated explicitly on every production rank: the trainer's
+    // own durable-write gate (and its agreement with the rank context is
+    // checked at `build`).
+    builder = builder.runner_role(role);
     if let Some(restored) = resume {
         builder = builder.resume(restored);
     }
@@ -7270,7 +8063,7 @@ fn compute_and_persist_acceleration_report(
     job_id: &str,
     worker_id: &str,
     attempt: u32,
-    persist: bool,
+    role: RunnerRole,
     device: &candle_core::Device,
     backbone_dtype: jammi_numerics::ComputePrecision,
     varmap: Option<&candle_nn::VarMap>,
@@ -7278,12 +8071,15 @@ fn compute_and_persist_acceleration_report(
 ) {
     let report_json =
         build_acceleration_report_json(attempt, device, backbone_dtype, varmap, encoder);
-    // Rank 0 alone writes the row's report (one writer per attempt); every
-    // other rank of a gang computed the same probe and discards it.
-    if !persist {
+    // The lease holder alone writes the row's report (one writer per
+    // attempt — the module doc's writer table, row 16); every other rank of
+    // a gang computed the same probe and discards it: a `Rank` holds no
+    // `LeaseHolder` to write as.
+    let Some(holder) = role.lease_holder() else {
         return;
-    }
+    };
     tokio::runtime::Handle::current().block_on(persist_acceleration_report(
+        holder,
         catalog,
         job_id,
         worker_id,
@@ -8056,6 +8852,71 @@ mod tests {
         }
     }
 
+    /// The holder derivation (the module doc's writer table): the
+    /// `Coordinator` exactly when a column-source `fine_tune` decides
+    /// `Peer` over this host's `local_ranks`; the `LoopClaimer` for every
+    /// other `(kind, world_size, local_ranks)` — `W == 1` on every kind and
+    /// every host (K4), an in-process `Local` gang, a `graph_fine_tune` of
+    /// any width, a context predictor.
+    #[test]
+    fn the_lease_holder_is_the_coordinator_exactly_when_a_fine_tune_decides_peer() {
+        use crate::fine_tune::spec::TrainingCommon;
+        use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+        use jammi_db::store::CachePolicy;
+
+        let common = |world_size: u32| TrainingCommon {
+            base_model: "m".into(),
+            config: FineTuneConfig::default(),
+            world_size,
+        };
+        let fine_tune = |world_size: u32| TrainingSpec::FineTune {
+            source: "s".into(),
+            columns: vec!["a".into(), "b".into()],
+            method: FineTuneMethod::Lora,
+            task: ModelTask::TextEmbedding,
+            common: common(world_size),
+            cache: CachePolicy::Bypass,
+        };
+        for local_ranks in 1..=3u32 {
+            for world_size in 1..=4u32 {
+                let expected = match TopologyDecision::decide(world_size, local_ranks) {
+                    TopologyDecision::Peer { .. } => LeaseHolder::Coordinator,
+                    _ => LeaseHolder::LoopClaimer,
+                };
+                assert_eq!(
+                    lease_holder_for(&fine_tune(world_size), local_ranks),
+                    expected,
+                    "fine_tune W={world_size} L={local_ranks}"
+                );
+                if world_size == 1 {
+                    assert_eq!(
+                        expected,
+                        LeaseHolder::LoopClaimer,
+                        "K4: W == 1 never coordinates"
+                    );
+                }
+                let graph = TrainingSpec::GraphFineTune {
+                    sources: crate::fine_tune::graph_sampler::GraphFineTuneSources {
+                        node_source: "n".into(),
+                        edge_source: "e".into(),
+                        id_column: "id".into(),
+                        text_column: "text".into(),
+                        src_column: "src".into(),
+                        dst_column: "dst".into(),
+                        provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
+                    },
+                    sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),
+                    common: common(world_size),
+                };
+                assert_eq!(
+                    lease_holder_for(&graph, local_ranks),
+                    LeaseHolder::LoopClaimer,
+                    "graph_fine_tune W={world_size} L={local_ranks}: never the coordinator"
+                );
+            }
+        }
+    }
+
     /// UNITS.md § U5b-1b-ii (e): rank assignment is a pure function of the
     /// SORTED listing — every permutation of the same members yields the
     /// same `rank -> instance_id` map; the ranks are `1..world` over the
@@ -8402,7 +9263,15 @@ mod tests {
 
         // The worker records the failure as the job's terminal status, under the
         // lease guard (it still owns the job).
-        record_failed(&catalog, "panic-job", "worker-x", claimed.attempts, msg).await;
+        record_failed(
+            LeaseHolder::LoopClaimer,
+            &catalog,
+            "panic-job",
+            "worker-x",
+            claimed.attempts,
+            msg,
+        )
+        .await;
 
         let job = catalog.get_job("panic-job").await.unwrap();
         assert_eq!(
@@ -8726,7 +9595,15 @@ mod tests {
 
         // The worker records the failure as the job's terminal status, under the
         // lease guard (it still owns the job).
-        record_failed(&catalog, "oom-job", "worker-x", claimed.attempts, msg).await;
+        record_failed(
+            LeaseHolder::LoopClaimer,
+            &catalog,
+            "oom-job",
+            "worker-x",
+            claimed.attempts,
+            msg,
+        )
+        .await;
 
         let job = catalog.get_job("oom-job").await.unwrap();
         assert_eq!(

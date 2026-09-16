@@ -359,6 +359,15 @@ impl Collective for Nccl {
     fn world(&self) -> u32 {
         self.world
     }
+
+    fn bind_agreement(&self, _digest: String) -> Result<()> {
+        // NCCL exchanges the buffers a collective names and nothing else:
+        // there is no descriptor for a digest to ride on (the module doc's
+        // last paragraph). Accepted and ignored; the layout is kept in
+        // agreement upstream, by every rank walking the same canonical
+        // order.
+        Ok(())
+    }
 }
 
 /// Zero-pad `t` to `rows` rows along dim 0. Every rank must send the same

@@ -141,7 +141,7 @@ pub(crate) use tests::witness;
 
 pub use local::{Local, LocalGang};
 pub use noop::Noop;
-pub use peer::{CoordinatorLink, LinkFault, MemberLink, Peer, RankReadFault};
+pub use peer::{CoordinatorLink, LinkFault, MemberEnd, MemberLink, Peer, RankReadFault};
 
 /// A thread-bound witness that the current thread may block.
 ///
@@ -228,7 +228,10 @@ pub struct BlockingCall {
 impl BlockingCall {
     /// The one constructor, private: reachable only from the three minting
     /// sites below, each of which is by construction on a thread that is not
-    /// a runtime worker.
+    /// a runtime worker. Production mints at three places, all in
+    /// `worker.rs`: rank 0's `spawn_blocking` and a `Local` gang's per-rank
+    /// `spawn_thread` (both in `train_fine_tune`), and an admitted member's
+    /// `spawn_blocking` in `run_member_rank` (the rank body).
     fn mint() -> Self {
         Self {
             _thread_bound: PhantomData,
@@ -236,10 +239,13 @@ impl BlockingCall {
     }
 
     /// Run `f` on tokio's blocking pool with a fresh witness — the first
-    /// of the two production minting sites: the worker spawns rank 0's
-    /// training thread (the single rank, a `Local` gang's rank 0, or a
-    /// `Peer` gang's coordinator) exactly here (`worker.rs`,
-    /// `train_fine_tune`).
+    /// and the third of the three production minting sites: the worker
+    /// spawns rank 0's training thread (the single rank, a `Local` gang's
+    /// rank 0, or a `Peer` gang's coordinator) here (`worker.rs`,
+    /// `train_fine_tune`), and an admitted member's rank body spawns ITS
+    /// training thread here too (`worker.rs`, `run_member_rank` — the
+    /// member's `TrainingLoop::run` receives the witness minted at its own
+    /// boundary, exactly as rank 0 does).
     pub fn spawn_blocking<F, T>(f: F) -> tokio::task::JoinHandle<T>
     where
         F: FnOnce(BlockingCall) -> T + Send + 'static,
@@ -470,6 +476,42 @@ pub trait Collective: Send + Sync {
 
     /// How many ranks are in the gang.
     fn world(&self) -> u32;
+
+    /// Bind the opaque agreement digest this rank signs every round's
+    /// [`Descriptor`] with — the trainer's canonical trainable-variable
+    /// layout (`RankContext::bind_agreement`), bound once the target is
+    /// built and before the first collective, so two ranks whose layouts
+    /// differ are a typed descriptor disagreement on every rank rather
+    /// than a wrong fold. Binding the SAME digest again is a no-op; a
+    /// DIFFERENT digest on a rank already bound is a typed error (a rank
+    /// has exactly one layout per run). [`Noop`] has no peer to disagree
+    /// with and `Nccl` carries no descriptor at all (the module doc's last
+    /// paragraph): both accept and ignore it.
+    fn bind_agreement(&self, digest: String) -> Result<()>;
+}
+
+/// The ONE rule behind [`Collective::bind_agreement`] on the arms that carry
+/// a descriptor (`Local`, `Peer`): a slot binds once; the same digest again
+/// is a no-op; a different digest on a bound slot is a typed error naming
+/// both, since a rank has exactly one canonical layout per run.
+pub(crate) fn bind_agreement_once(
+    slot: &std::sync::OnceLock<String>,
+    digest: String,
+) -> Result<()> {
+    match slot.set(digest) {
+        Ok(()) => Ok(()),
+        Err(rejected) => {
+            let bound = slot.get().expect("set failed because a value is bound");
+            if *bound == rejected {
+                Ok(())
+            } else {
+                Err(JammiError::FineTune(format!(
+                    "bind_agreement: this rank already signs its rounds with agreement {bound} \
+                     and cannot be rebound to {rejected} — one canonical layout per run"
+                )))
+            }
+        }
+    }
 }
 
 /// Check `counts` against the gang's shape and the caller's own tensor —

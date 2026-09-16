@@ -29,7 +29,7 @@
 //!   with opposite verdicts.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use jammi_db::error::{JammiError, Result};
@@ -469,7 +469,7 @@ impl LocalGang {
         Ok(Local {
             rank,
             shared: Arc::clone(&self.shared),
-            agreement: None,
+            agreement: OnceLock::new(),
         })
     }
 }
@@ -480,8 +480,9 @@ pub struct Local {
     rank: u32,
     shared: Arc<Shared>,
     /// The caller-bound [`Descriptor::agreement`] this rank signs every
-    /// round with; `None` until [`Self::with_agreement`] binds one.
-    agreement: Option<String>,
+    /// round with; unset until [`Self::with_agreement`] or
+    /// [`Collective::bind_agreement`] binds one.
+    agreement: OnceLock<String>,
 }
 
 impl Local {
@@ -496,7 +497,7 @@ impl Local {
     /// derived a different digest disagrees at the next round on every
     /// rank, symmetrically — which is the property the slot exists for.
     pub fn with_agreement(mut self, digest: impl Into<String>) -> Self {
-        self.agreement = Some(digest.into());
+        self.agreement = OnceLock::from(digest.into());
         self
     }
 
@@ -516,7 +517,7 @@ impl Local {
             root,
             counts,
             tensors,
-            agreement: self.agreement.clone(),
+            agreement: self.agreement.get().cloned(),
         }
     }
 
@@ -729,6 +730,10 @@ impl Collective for Local {
 
     fn world(&self) -> u32 {
         self.shared.world as u32
+    }
+
+    fn bind_agreement(&self, digest: String) -> Result<()> {
+        super::bind_agreement_once(&self.agreement, digest)
     }
 }
 

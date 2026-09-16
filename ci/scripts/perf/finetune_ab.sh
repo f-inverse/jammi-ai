@@ -336,7 +336,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # `crates/jammi-encoders/src/modernbert.rs:485`, `softmax_last_dim_fused`
 # `crates/jammi-encoders/src/attention_cascade.rs:636` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
-# `crates/jammi-lora/src/lora_linear.rs:1007`, `adamw_step_fused`
+# `crates/jammi-lora/src/lora_linear.rs:1079`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
 # `crates/jammi-encoders/src/attention_cascade.rs:859` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention

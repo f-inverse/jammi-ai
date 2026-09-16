@@ -148,6 +148,15 @@ impl PartitionSpec {
         self.world
     }
 
+    /// The PER-RANK batch size this spec was built with (never the global
+    /// `world * batch` batch) — `stream.rs::run_pump` reads this to derive
+    /// its own `step_bound` (`batches_per_epoch(train_count, world, batch)`)
+    /// identically to the trainer's `train_batches_per_epoch`, so the two
+    /// can never drift apart (U4b tail).
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
     /// The row range THIS rank holds for global step `step`, over a train
     /// prefix of `train_count` rows.
     ///

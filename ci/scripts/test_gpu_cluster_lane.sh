@@ -958,7 +958,11 @@ new2 = '''            READBACK_OK)
               fi ;;'''
 assert old2 in text, "A1 revert-RED fixture: READBACK_OK arm not found verbatim"
 text = text.replace(old2, new2, 1)
-old3 = '        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'
+old3 = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \\
+           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ] \\
+           && [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+          break
+        fi'''
 new3 = '        [ "$ok_count" -ge 2 ] && break'
 assert old3 in text, "A1 revert-RED fixture: break condition not found verbatim"
 text = text.replace(old3, new3, 1)
@@ -984,6 +988,92 @@ if printf '%s' "$out" | grep -q "neither a direct ssh endpoint nor an overlay ip
   ok "A1 revert-RED: the pre-fix raw-count shape (ok_count -ge 2) breaks the wait loop 'ready' on the duplicate-rank-0/no-rank-1 fixture (proceeds past it into the member-resolution phase with rank 1 unset) — confirms the fix above is genuinely load-bearing, not vacuous"
 else
   bad "A1 revert-RED: expected the REVERTED (pre-fix) shape to break out of the wait loop early (a different, generic downstream failure, never the accurate 'not every member reached' refusal); got rc=$rc out=$out — the revert-RED fixture itself may be stale"
+fi
+
+# ============================================================================
+# A2 (wave 4): a member read back with its overlay ip assigned but its
+# `ssh.direct` still null is PROVISIONING, not ready. Run 35127869122 (the
+# first cluster run ever to reach phase 4) refused 1 s after create on
+# exactly that read ("the primary (rank 0) member carries no direct ssh
+# endpoint"). The loop must keep polling until a read carries the direct
+# endpoints, and refuse only at the deadline. Drives the REAL function with
+# a STATEFUL _rp_rest mock: read 1 answers overlay-only, every later read
+# answers with both direct endpoints.
+# ============================================================================
+run_wait_two_reads() { # $1=first body $2=later body $3=RP_SSH_WAIT_SECS $4=driver path -> stdout: "<rc>\t<out>"
+  local first="$1" later="$2" wait_secs="$3" driver="${4:-$CLUSTER_SH}" out rc
+  local counter="$SANDBOX/a2-reads-$$-$RANDOM"
+  rm -f "$counter"
+  out="$(A2_FIRST_BODY="$first" A2_LATER_BODY="$later" A2_COUNTER="$counter" bash -c '
+    source "'"$driver"'"
+    _rp_entrypoint_setup() { printf "%s" "the-shared-entrypoint-text"; }
+    _rp_rest() {
+      local n=0
+      [ -f "$A2_COUNTER" ] && n="$(cat "$A2_COUNTER")"
+      printf "%s" $((n + 1)) > "$A2_COUNTER"
+      if [ "$n" -eq 0 ]; then printf "200\n%s" "$A2_FIRST_BODY"; else printf "200\n%s" "$A2_LATER_BODY"; fi
+    }
+    _rpc_wait_for_members_ready "cl-a2" "$1" "1"
+  ' _ "$wait_secs" 2>&1)"
+  rc=$?
+  printf '%s\t%s\n' "$rc" "$out"
+}
+
+provisioning_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+pod = lambda pid, rank, ip: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"rank": rank, "ip": ip}, "ssh": {"direct": None, "proxy": {"host": "ssh.runpod.io", "port": 22}}}
+print(json.dumps({"pods": [pod("a", 0, "10.0.0.2"), pod("b", 1, "10.0.0.3")]}))
+')"
+ready_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+pod = lambda pid, rank, ip, host: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"rank": rank, "ip": ip}, "ssh": {"direct": {"host": host, "port": 22}}}
+print(json.dumps({"pods": [pod("a", 0, "10.0.0.2", "1.2.3.4"), pod("b", 1, "10.0.0.3", "5.6.7.8")]}))
+')"
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 5.6.7.8 22 10.0.0.3 0$"; then
+  ok "A2: overlay-only first read (ssh.direct null on both ranks) -> the loop keeps polling and returns the direct endpoints the second read carries (rc=0, proxy_flag 0)"
+else
+  bad "A2: expected rc=0 with both direct endpoints from the second read; got rc=$rc out=$out"
+fi
+
+# The deadline arm is unchanged: a rank 0 that NEVER gains a direct
+# endpoint within RP_SSH_WAIT_SECS is refused by name (97), not carried
+# forward as a jump host it cannot be.
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$provisioning_body" 1)"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
+  ok "A2: rank 0 overlay-only through the deadline -> refused by name (97: no direct ssh endpoint / no jump host)"
+else
+  bad "A2: expected rc=97 naming the missing direct endpoint at the deadline; got rc=$rc out=$out"
+fi
+
+# revert-RED (A2): on a SCRATCH COPY put the pre-fix break condition back
+# (ready the moment both ranks are READBACK_OK, direct or not) and confirm
+# the SAME two-read fixture now refuses at once, on the first read, with
+# the run-35127869122 message -- the fix above is load-bearing.
+A2_SCRATCH_DIR="$SANDBOX/a2-revert-red"
+mkdir -p "$A2_SCRATCH_DIR"
+cp "$DIR/runpod_lib.sh" "$A2_SCRATCH_DIR/runpod_lib.sh"
+A2_SCRATCH="$A2_SCRATCH_DIR/runpod_gpu_cluster.sh"
+python3 - "$CLUSTER_SH" "$A2_SCRATCH" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \\
+           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ] \\
+           && [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+          break
+        fi'''
+new = '''        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'''
+assert old in text, "A2 revert-RED fixture: break condition not found verbatim"
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20 "$A2_SCRATCH")"
+if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
+  ok "A2 revert-RED: the pre-fix break condition refuses the provisioning read at once (97, the run-35127869122 message) on the fixture the fix waits through -- the fix is load-bearing"
+else
+  bad "A2 revert-RED: expected the REVERTED shape to refuse at once with 'carries no direct ssh endpoint'; got rc=$rc out=$out -- the revert-RED fixture itself may be stale"
 fi
 
 # ============================================================================

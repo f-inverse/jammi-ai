@@ -329,8 +329,11 @@ for p in pods:
 # The reachability wait loop, extracted into its own function (round 3
 # A1) so it is sourceable and testable exactly like `_rpc_check_readback`
 # above, which it calls. $1=cluster id $2=RP_SSH_WAIT_SECS $3=RP_TTL_HOURS.
-# Polls `GET /v2/clusters/{id}/pods` every 5s until the deadline. On success
-# prints ONE line: `<primary_host> <primary_port> <member_host> <member_port>
+# Polls `GET /v2/clusters/{id}/pods` every 5s until the deadline; the loop
+# is satisfied early only when BOTH members carry a direct endpoint, and
+# otherwise runs to the deadline and settles for what the last read back
+# carried (rank 0 direct + rank 1 overlay-only = the F3 proxy fallback; rank
+# 0 without a direct endpoint = refusal). On success prints ONE line: `<primary_host> <primary_port> <member_host> <member_port>
 # <member_ip> <proxy_flag>` and returns 0 -- `proxy_flag` is `1` when the
 # member's own `ssh.direct` was absent and its overlay `ip` is what the
 # caller must proxy through (F3's no-public-port fallback), `0` when the
@@ -382,7 +385,18 @@ _rpc_wait_for_members_ready() {
           echo "::error::a member's Pod.args does not echo the shared entrypoint text -- refusing" >&2
           return 97
         fi
-        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break
+        # Ready only when rank 0 carries its DIRECT endpoint (it is the jump
+        # host for F3's fallback and the scp/rsync peer, which the proxy path
+        # cannot serve) and rank 1 has been read back at all; a member whose
+        # overlay ip is assigned seconds after create while its `ssh.direct`
+        # is still null is PROVISIONING, not ready -- keep polling until the
+        # deadline instead of refusing on the first read (run 35127869122
+        # refused 1 s into phase 4 on exactly that read).
+        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \
+           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ] \
+           && [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+          break
+        fi
       fi
     fi
     sleep 5

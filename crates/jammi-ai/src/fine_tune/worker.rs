@@ -2856,6 +2856,12 @@ impl JobWorker {
                 spec_schema_version: crate::fine_tune::spec::FINE_TUNE_SPEC_SCHEMA_VERSION,
                 base_model_id: canonical_model_id,
                 world_size: common.world_size,
+                // #500 U4b: this deployment's own gang topology at claim
+                // time — `[worker] collective`'s canonical `Display` token
+                // and `[worker] local_ranks` — recorded alongside (never
+                // instead of) the job's own declared `world_size` above.
+                collective: session.inner_config().worker.collective.to_string(),
+                local_ranks: session.inner_config().worker.local_ranks,
             };
             // NO input anchor is recorded for the `FineTune` materialization
             // — removed, not reshaped into a new kind, because the prior

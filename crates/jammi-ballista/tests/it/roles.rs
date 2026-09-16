@@ -27,6 +27,7 @@ use ballista_scheduler::config::TaskDistributionPolicy;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
+use jammi_ballista::cluster::{executor_is_live, CatalogClusterState, CatalogJobState};
 use jammi_ballista::roles::{host_executor, host_scheduler};
 use jammi_db::config::BallistaExecutorConfig;
 
@@ -210,4 +211,72 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
     assert_eq!(executor.executor_id(), session.instance_id());
     executor.stop().await;
     scheduler.stop().await;
+}
+
+/// The DRAIN instant (contract §9 B6): `ExecutorRole::begin_drain` reports
+/// `Terminating` to the scheduler and, over the catalog-backed cluster
+/// state, the executor's OWN row reads `Terminating` and not live — the
+/// binder stops binding here before the process's worker has finished
+/// draining. Mutation: make `begin_drain` flip only the local `TERMINATING`
+/// flag (no heartbeat) and the row stays `Active`/live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn begin_drain_reports_terminating_to_the_catalog_before_the_executor_stops() {
+    let session = session().await;
+    let catalog = Arc::clone(session.catalog_arc());
+    let cluster = BallistaCluster::new(
+        Arc::new(CatalogClusterState::new(Arc::clone(&catalog))),
+        Arc::new(CatalogJobState::new(
+            Arc::clone(&catalog),
+            "jammi-ballista-it-drain",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )),
+    );
+    let scheduler = host_scheduler(
+        &session,
+        "127.0.0.1:0",
+        cluster,
+        TaskDistributionPolicy::RoundRobin,
+    )
+    .await
+    .expect("scheduler role hosts");
+    let executor_cfg = BallistaExecutorConfig {
+        scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+        bind: "127.0.0.1:0".to_string(),
+        grpc_bind: "127.0.0.1:0".to_string(),
+        advertise_host: Some("127.0.0.1".to_string()),
+        work_dir: None,
+        task_slots: 1,
+    };
+    let executor = host_executor(&session, &executor_cfg)
+        .await
+        .expect("executor role hosts and registers");
+    let id = executor.executor_id().to_string();
+    let before = catalog
+        .get_compute_executor(&id)
+        .await
+        .unwrap()
+        .expect("registered row");
+    assert_eq!(before.status, "Active");
+    assert!(executor_is_live(&before, chrono::Utc::now()));
+
+    executor.begin_drain().await;
+
+    let after = catalog
+        .get_compute_executor(&id)
+        .await
+        .unwrap()
+        .expect("the row is still there while the executor drains");
+    assert_eq!(
+        after.status, "Terminating",
+        "the DRAIN instant's own report"
+    );
+    assert!(
+        !executor_is_live(&after, chrono::Utc::now()),
+        "a terminating executor is not live to the binder or the submit edge"
+    );
+
+    executor.stop().await;
+    scheduler.stop().await;
+    catalog.remove_compute_executor(&id).await.ok();
 }

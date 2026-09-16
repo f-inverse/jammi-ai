@@ -472,6 +472,49 @@ async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_tra
     drop(busy_rank);
 }
 
+/// p9 (contract §9 B6, "refuse what's new" for EVERY entry): a host that
+/// has begun a DRAIN refuses a placed gang BEFORE any transfer — the row
+/// stays the submitter's, so a successor (never this terminating process)
+/// runs it. Mutation: drop `probe_claim`'s phase check and this reds (the
+/// holder is `Free`, so the CAS would admit and `transfer_claim` would move
+/// the row onto a process inside its termination grace).
+#[tokio::test(flavor = "multi_thread")]
+async fn p9_run_placed_gang_refuses_a_draining_host_before_any_transfer() {
+    let (submitter, executor, _dir) = fleet().await;
+    let worker = JobWorker::new(&submitter).unwrap();
+    let record = submit_and_claim(&submitter, &worker, two_rank_graph_spec()).await;
+    let job_id = record.job_id.clone();
+    let submitter_id = submitter.instance_id().to_string();
+
+    assert!(
+        executor.host_admission().begin_drain(),
+        "Running -> Draining"
+    );
+
+    let descriptor = GangDescriptor {
+        job_id: job_id.clone(),
+        attempt: 1,
+        world: 2,
+        submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
+    };
+    let err = JobWorker::run_placed_gang(&executor, descriptor)
+        .await
+        .expect_err("a draining host must refuse a new gang");
+    assert!(
+        err.to_string().contains("has begun a Draining"),
+        "the refusal names the phase, not a busy slot: {err}"
+    );
+
+    let unchanged = row(submitter.catalog(), &job_id).await;
+    assert_eq!(unchanged.status, "running");
+    assert_eq!(
+        unchanged.claimed_by.as_deref(),
+        Some(submitter_id.as_str()),
+        "no transfer happened before the drain refusal"
+    );
+}
+
 /// p8: a placed run whose OWN process also has a submitter installed does
 /// NOT re-submit — `note_placed` fires exactly once, on the original
 /// submitter's own claim, never from inside the executor's

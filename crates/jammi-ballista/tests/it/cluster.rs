@@ -3,7 +3,9 @@
 //! UNITS §U8b; acceptance b2/b3/b6's substrate, the `unbind_tasks`
 //! atomicity property, and A10's CAS-before-stamp ordering).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,12 +14,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
+use futures::FutureExt;
 
 use ballista_core::serde::scheduler::{
     ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
 };
 use ballista_core::JobId;
 use ballista_scheduler::cluster::{ClusterState, DistributionPolicy, ExecutorSlot};
+use ballista_scheduler::config::TaskDistributionPolicy;
 use ballista_scheduler::planner::DefaultDistributedPlanner;
 use ballista_scheduler::state::execution_graph::{ExecutionGraphBox, StaticExecutionGraph};
 use ballista_scheduler::state::task_manager::JobInfoCache;
@@ -25,7 +29,8 @@ use ballista_scheduler::state::task_manager::JobInfoCache;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::InferenceExecBuilder;
-use jammi_ballista::cluster::CatalogClusterState;
+use jammi_ballista::client::submit_physical_plan;
+use jammi_ballista::cluster::{executor_is_live, CatalogClusterState, EXECUTOR_LIVENESS_WINDOW};
 use jammi_ballista::placement::DevicePlacement;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
@@ -109,6 +114,27 @@ fn active_jobs(job_id: JobId, cache: JobInfoCache) -> Arc<HashMap<JobId, JobInfo
     Arc::new(map)
 }
 
+/// Tests own their rows: the Postgres arm shares one database with every
+/// other lane on this host, so every executor row a test registers is
+/// removed on the way out — on the GREEN arm and on a PANIC alike (the
+/// body runs under `catch_unwind`, the rows are removed, then the panic
+/// resumes). A `cuda` row a red test left behind would make a later lane's
+/// device-kind refusal admit a plan no live executor can run.
+async fn with_owned_rows<F: std::future::Future<Output = ()>>(
+    catalog: &Arc<Catalog>,
+    owned: &RefCell<Vec<String>>,
+    body: F,
+) {
+    let outcome = AssertUnwindSafe(body).catch_unwind().await;
+    let ids = owned.borrow().clone();
+    for id in ids {
+        catalog.remove_compute_executor(&id).await.ok();
+    }
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 async fn run_both_backends<F, Fut>(f: F)
 where
     F: Fn(BackendKind) -> Fut,
@@ -131,39 +157,110 @@ where
 async fn register_heartbeat_remove_round_trip() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let state = CatalogClusterState::new(Arc::clone(&catalog));
-        let id = format!("exec-{}", jammi_test_utils::unique_suffix());
-        let (meta, spec) = executor_metadata(&id, 4);
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let state = CatalogClusterState::new(Arc::clone(&catalog));
+            let id = format!("exec-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(id.clone());
+            let (meta, spec) = executor_metadata(&id, 4);
 
-        state
-            .register_executor(meta.clone(), spec)
-            .await
-            .expect("register_executor");
-        assert_eq!(state.get_executor_heartbeat(&id).map(|_| ()), Some(()));
-        assert!(state.executor_heartbeats().contains_key(&id));
-        let listed = state.registered_executor_metadata().await;
-        assert!(listed.iter().any(|m| m.id == id));
+            state
+                .register_executor(meta.clone(), spec)
+                .await
+                .expect("register_executor");
+            assert_eq!(state.get_executor_heartbeat(&id).map(|_| ()), Some(()));
+            assert!(state.executor_heartbeats().contains_key(&id));
+            let listed = state.registered_executor_metadata().await;
+            assert!(listed.iter().any(|m| m.id == id));
 
-        state
-            .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
-                executor_id: id.clone(),
-                timestamp: 123,
-                metrics: vec![],
-                status: None,
-                peak_proc_physical_memory: 0,
-                peak_proc_virtual_memory: 0,
-            })
-            .await
-            .expect("save_executor_heartbeat");
-        assert_eq!(
-            state.get_executor_heartbeat(&id).map(|h| h.timestamp),
-            Some(123)
-        );
+            state
+                .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
+                    executor_id: id.clone(),
+                    timestamp: 123,
+                    metrics: vec![],
+                    status: None,
+                    peak_proc_physical_memory: 0,
+                    peak_proc_virtual_memory: 0,
+                })
+                .await
+                .expect("save_executor_heartbeat");
+            assert_eq!(
+                state.get_executor_heartbeat(&id).map(|h| h.timestamp),
+                Some(123)
+            );
 
-        state.remove_executor(&id).await.expect("remove_executor");
-        assert!(state.get_executor_heartbeat(&id).is_none());
-        let listed = state.registered_executor_metadata().await;
-        assert!(!listed.iter().any(|m| m.id == id));
+            state.remove_executor(&id).await.expect("remove_executor");
+            assert!(state.get_executor_heartbeat(&id).is_none());
+            let listed = state.registered_executor_metadata().await;
+            assert!(!listed.iter().any(|m| m.id == id));
+        })
+        .await;
+    })
+    .await;
+}
+
+/// Ballista removes an executor whose task launch failed and THEN unbinds
+/// the slots it had reserved there: `unbind_tasks` over a removed
+/// executor's id is a no-op for that id, never a refusal, and the live
+/// executors in the same batch still get their slots back. Mutation: drop
+/// the `registered` filter in `CatalogClusterState::unbind_tasks` and this
+/// reds (`adjust_compute_slots` refuses the whole batch on the missing row,
+/// so the live executor's slot is never returned).
+#[tokio::test]
+async fn unbind_tasks_drops_a_removed_executors_slots_and_returns_the_rest() {
+    run_both_backends(|kind| async move {
+        let catalog = catalog(kind).await.expect("catalog opens");
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let state = CatalogClusterState::new(Arc::clone(&catalog));
+            let live_id = format!("live-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(live_id.clone());
+            let gone_id = format!("gone-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(gone_id.clone());
+            let (live_meta, live_spec) = executor_metadata(&live_id, 4);
+            let (gone_meta, gone_spec) = executor_metadata(&gone_id, 4);
+            state.register_executor(live_meta, live_spec).await.unwrap();
+            state.register_executor(gone_meta, gone_spec).await.unwrap();
+            // Reserve one slot on each (the bind path's own CAS), then lose
+            // `gone_id` the way the scheduler does on a failed launch.
+            assert!(catalog
+                .bind_compute_slots(&live_id, 1)
+                .await
+                .expect("bind live"));
+            assert!(catalog
+                .bind_compute_slots(&gone_id, 1)
+                .await
+                .expect("bind gone"));
+            state
+                .remove_executor(&gone_id)
+                .await
+                .expect("remove_executor");
+
+            let batch: Vec<ExecutorSlot> = vec![(live_id.clone(), 1), (gone_id.clone(), 1)];
+            state
+                .unbind_tasks(batch)
+                .await
+                .expect("a removed executor's slots are dropped, not refused");
+
+            let live_row = catalog
+                .get_compute_executor(&live_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                live_row.available_slots, 4,
+                "the live executor's slot came back (3 -> 4)"
+            );
+            assert!(
+                catalog
+                    .get_compute_executor(&gone_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the removed executor stays removed (no resurrection by unbind)"
+            );
+        })
+        .await;
     })
     .await;
 }
@@ -179,34 +276,34 @@ async fn register_heartbeat_remove_round_trip() {
 async fn unbind_tasks_is_all_or_none() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let state = CatalogClusterState::new(Arc::clone(&catalog));
-        let ok_id = format!("ok-{}", jammi_test_utils::unique_suffix());
-        let bad_id = format!("bad-{}", jammi_test_utils::unique_suffix());
-        let (ok_meta, ok_spec) = executor_metadata(&ok_id, 4);
-        let (bad_meta, bad_spec) = executor_metadata(&bad_id, 2);
-        state.register_executor(ok_meta, ok_spec).await.unwrap();
-        state.register_executor(bad_meta, bad_spec).await.unwrap();
-        // `bad_id` starts at 2/2 available; unbinding +1 would take it to 3,
-        // above its `task_slots = 2` — the whole batch (including `ok_id`'s
-        // in-bounds +1) must be refused.
-        let batch: Vec<ExecutorSlot> = vec![(ok_id.clone(), 1), (bad_id.clone(), 1)];
-        let err = state.unbind_tasks(batch).await;
-        assert!(
-            err.is_err(),
-            "an out-of-bounds executor must fail the whole batch"
-        );
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let state = CatalogClusterState::new(Arc::clone(&catalog));
+            let ok_id = format!("ok-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(ok_id.clone());
+            let bad_id = format!("bad-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(bad_id.clone());
+            let (ok_meta, ok_spec) = executor_metadata(&ok_id, 4);
+            let (bad_meta, bad_spec) = executor_metadata(&bad_id, 2);
+            state.register_executor(ok_meta, ok_spec).await.unwrap();
+            state.register_executor(bad_meta, bad_spec).await.unwrap();
+            // `bad_id` starts at 2/2 available; unbinding +1 would take it to 3,
+            // above its `task_slots = 2` — the whole batch (including `ok_id`'s
+            // in-bounds +1) must be refused.
+            let batch: Vec<ExecutorSlot> = vec![(ok_id.clone(), 1), (bad_id.clone(), 1)];
+            let err = state.unbind_tasks(batch).await;
+            assert!(
+                err.is_err(),
+                "an out-of-bounds executor must fail the whole batch"
+            );
 
-        let ok_row = catalog.get_compute_executor(&ok_id).await.unwrap().unwrap();
-        assert_eq!(
-            ok_row.available_slots, 4,
-            "the in-bounds executor's row must be untouched by a batch that failed elsewhere"
-        );
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&ok_id).await.ok();
-        catalog.remove_compute_executor(&bad_id).await.ok();
+            let ok_row = catalog.get_compute_executor(&ok_id).await.unwrap().unwrap();
+            assert_eq!(
+                ok_row.available_slots, 4,
+                "the in-bounds executor's row must be untouched by a batch that failed elsewhere"
+            );
+        })
+        .await;
     })
     .await;
 }
@@ -220,18 +317,18 @@ async fn unbind_tasks_is_all_or_none() {
 async fn two_cluster_states_over_one_catalog_see_each_others_registrations() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let a = CatalogClusterState::new(Arc::clone(&catalog));
-        let b = CatalogClusterState::new(Arc::clone(&catalog));
-        let id = format!("shared-{}", jammi_test_utils::unique_suffix());
-        let (meta, spec) = executor_metadata(&id, 2);
-        a.register_executor(meta, spec).await.unwrap();
-        let seen_by_b = b.registered_executor_metadata().await;
-        assert!(seen_by_b.iter().any(|m| m.id == id));
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&id).await.ok();
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let a = CatalogClusterState::new(Arc::clone(&catalog));
+            let b = CatalogClusterState::new(Arc::clone(&catalog));
+            let id = format!("shared-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(id.clone());
+            let (meta, spec) = executor_metadata(&id, 2);
+            a.register_executor(meta, spec).await.unwrap();
+            let seen_by_b = b.registered_executor_metadata().await;
+            assert!(seen_by_b.iter().any(|m| m.id == id));
+        })
+        .await;
     })
     .await;
 }
@@ -248,90 +345,90 @@ async fn two_cluster_states_over_one_catalog_see_each_others_registrations() {
 async fn cuda_stamped_stage_never_binds_to_a_device_less_executor() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let cpu_id = format!("cpu-{}", jammi_test_utils::unique_suffix());
-        let gpu_id = format!("gpu-{}", jammi_test_utils::unique_suffix());
-        // `cpu_id` registers FIRST so plain round-robin would try it first.
-        let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let cpu_id = format!("cpu-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(cpu_id.clone());
+            let gpu_id = format!("gpu-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(gpu_id.clone());
+            // `cpu_id` registers FIRST so plain round-robin would try it first.
+            let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: cpu_id.clone(),
+                    instance_id: cpu_id.clone(),
+                    host: cpu_meta.host.clone(),
+                    port: cpu_meta.port,
+                    grpc_port: cpu_meta.grpc_port,
+                    task_slots: cpu_spec.total_task_slots,
+                    available_slots: cpu_spec.available_task_slots,
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    devices: vec![],
+                })
+                .await
+                .unwrap();
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: gpu_id.clone(),
+                    instance_id: gpu_id.clone(),
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                    grpc_port: 0,
+                    task_slots: 1,
+                    available_slots: 1,
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    devices: vec![DeviceFact {
+                        kind: "cuda".to_string(),
+                        ordinal: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+
+            let session = inference_session().await;
+            let node = InferenceExecBuilder::new(
+                scan(),
+                ModelSource::hf("m"),
+                ModelTask::TextEmbedding,
+                vec!["text".to_string()],
+                "text".to_string(),
+                "src-1".to_string(),
+                Arc::clone(session.model_cache()),
+                jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            )
+            .embedding_dim(Some(2))
+            .build()
+            .unwrap();
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+
+            let job_id: JobId = "job-gpu".to_string().into();
+            let cache = job_info_cache(&job_id, plan);
+            let jobs = active_jobs(job_id, cache);
+
+            let policy = DevicePlacement::new(Arc::clone(&catalog));
+            let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
                 executor_id: cpu_id.clone(),
-                instance_id: cpu_id.clone(),
-                host: cpu_meta.host.clone(),
-                port: cpu_meta.port,
-                grpc_port: cpu_meta.grpc_port,
-                task_slots: cpu_spec.total_task_slots,
-                available_slots: cpu_spec.available_task_slots,
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                devices: vec![],
-            })
-            .await
-            .unwrap();
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
+                slots: 1,
+            };
+            let mut gpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
                 executor_id: gpu_id.clone(),
-                instance_id: gpu_id.clone(),
-                host: "127.0.0.1".to_string(),
-                port: 0,
-                grpc_port: 0,
-                task_slots: 1,
-                available_slots: 1,
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                devices: vec![DeviceFact {
-                    kind: "cuda".to_string(),
-                    ordinal: 0,
-                }],
-            })
-            .await
-            .unwrap();
-
-        let session = inference_session().await;
-        let node = InferenceExecBuilder::new(
-            scan(),
-            ModelSource::hf("m"),
-            ModelTask::TextEmbedding,
-            vec!["text".to_string()],
-            "text".to_string(),
-            "src-1".to_string(),
-            Arc::clone(session.model_cache()),
-            jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-        )
-        .embedding_dim(Some(2))
-        .build()
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
-
-        let job_id: JobId = "job-gpu".to_string().into();
-        let cache = job_info_cache(&job_id, plan);
-        let jobs = active_jobs(job_id, cache);
-
-        let policy = DevicePlacement::new(Arc::clone(&catalog));
-        let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: cpu_id.clone(),
-            slots: 1,
-        };
-        let mut gpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: gpu_id.clone(),
-            slots: 1,
-        };
-        let bound = policy
-            .bind_tasks(vec![&mut cpu_slot, &mut gpu_slot], jobs)
-            .await
-            .expect("bind_tasks");
-        assert_eq!(bound.len(), 1, "exactly one task to bind");
-        assert_eq!(
+                slots: 1,
+            };
+            let bound = policy
+                .bind_tasks(vec![&mut cpu_slot, &mut gpu_slot], jobs)
+                .await
+                .expect("bind_tasks");
+            assert_eq!(bound.len(), 1, "exactly one task to bind");
+            assert_eq!(
             bound[0].0, gpu_id,
             "a Cuda-stamped task must bind to the cuda-bearing executor, never the device-less one"
         );
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&cpu_id).await.ok();
-        catalog.remove_compute_executor(&gpu_id).await.ok();
+        })
+        .await;
     })
     .await;
 }
@@ -347,93 +444,93 @@ async fn cuda_stamped_stage_never_binds_to_a_device_less_executor() {
 async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let cpu_id = format!("cpu-only-{}", jammi_test_utils::unique_suffix());
-        let gpu_id = format!("gpu-only-{}", jammi_test_utils::unique_suffix());
-        let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let cpu_id = format!("cpu-only-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(cpu_id.clone());
+            let gpu_id = format!("gpu-only-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(gpu_id.clone());
+            let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: cpu_id.clone(),
+                    instance_id: cpu_id.clone(),
+                    host: cpu_meta.host.clone(),
+                    port: cpu_meta.port,
+                    grpc_port: cpu_meta.grpc_port,
+                    task_slots: cpu_spec.total_task_slots,
+                    available_slots: cpu_spec.available_task_slots,
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    devices: vec![DeviceFact {
+                        kind: "cpu".to_string(),
+                        ordinal: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: gpu_id.clone(),
+                    instance_id: gpu_id.clone(),
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                    grpc_port: 0,
+                    task_slots: 1,
+                    available_slots: 1,
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    devices: vec![DeviceFact {
+                        kind: "cuda".to_string(),
+                        ordinal: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+
+            let session = inference_session().await;
+            let node = InferenceExecBuilder::new(
+                scan(),
+                ModelSource::hf("m"),
+                ModelTask::TextEmbedding,
+                vec!["text".to_string()],
+                "text".to_string(),
+                "src-1".to_string(),
+                Arc::clone(session.model_cache()),
+                jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            )
+            .embedding_dim(Some(2))
+            .build()
+            .unwrap();
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+
+            let job_id: JobId = "job-cuda".to_string().into();
+            let cache = job_info_cache(&job_id, plan);
+            let jobs = active_jobs(job_id, cache);
+
+            let policy = DevicePlacement::new(Arc::clone(&catalog));
+            let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
                 executor_id: cpu_id.clone(),
-                instance_id: cpu_id.clone(),
-                host: cpu_meta.host.clone(),
-                port: cpu_meta.port,
-                grpc_port: cpu_meta.grpc_port,
-                task_slots: cpu_spec.total_task_slots,
-                available_slots: cpu_spec.available_task_slots,
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                devices: vec![DeviceFact {
-                    kind: "cpu".to_string(),
-                    ordinal: 0,
-                }],
-            })
-            .await
-            .unwrap();
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
+                slots: 1,
+            };
+            let mut gpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
                 executor_id: gpu_id.clone(),
-                instance_id: gpu_id.clone(),
-                host: "127.0.0.1".to_string(),
-                port: 0,
-                grpc_port: 0,
-                task_slots: 1,
-                available_slots: 1,
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                devices: vec![DeviceFact {
-                    kind: "cuda".to_string(),
-                    ordinal: 0,
-                }],
-            })
-            .await
-            .unwrap();
-
-        let session = inference_session().await;
-        let node = InferenceExecBuilder::new(
-            scan(),
-            ModelSource::hf("m"),
-            ModelTask::TextEmbedding,
-            vec!["text".to_string()],
-            "text".to_string(),
-            "src-1".to_string(),
-            Arc::clone(session.model_cache()),
-            jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-        )
-        .embedding_dim(Some(2))
-        .build()
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
-
-        let job_id: JobId = "job-cuda".to_string().into();
-        let cache = job_info_cache(&job_id, plan);
-        let jobs = active_jobs(job_id, cache);
-
-        let policy = DevicePlacement::new(Arc::clone(&catalog));
-        let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: cpu_id.clone(),
-            slots: 1,
-        };
-        let mut gpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: gpu_id.clone(),
-            slots: 1,
-        };
-        let bound = policy
-            .bind_tasks(vec![&mut cpu_slot, &mut gpu_slot], jobs)
-            .await
-            .expect("bind_tasks");
-        assert_eq!(bound.len(), 1, "exactly one task to bind");
-        assert_eq!(
-            bound[0].0, gpu_id,
-            "a Cuda-stamped stage must bind to the cuda-bearing executor, never a properly \
+                slots: 1,
+            };
+            let bound = policy
+                .bind_tasks(vec![&mut cpu_slot, &mut gpu_slot], jobs)
+                .await
+                .expect("bind_tasks");
+            assert_eq!(bound.len(), 1, "exactly one task to bind");
+            assert_eq!(
+                bound[0].0, gpu_id,
+                "a Cuda-stamped stage must bind to the cuda-bearing executor, never a properly \
              registered cpu-only one"
-        );
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&cpu_id).await.ok();
-        catalog.remove_compute_executor(&gpu_id).await.ok();
+            );
+        })
+        .await;
     })
     .await;
 }
@@ -446,68 +543,68 @@ async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor() {
 async fn cpu_stamped_stage_binds_to_a_cpu_only_executor() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let cpu_id = format!("cpu-only-{}", jammi_test_utils::unique_suffix());
-        let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
-                executor_id: cpu_id.clone(),
-                instance_id: cpu_id.clone(),
-                host: cpu_meta.host.clone(),
-                port: cpu_meta.port,
-                grpc_port: cpu_meta.grpc_port,
-                task_slots: cpu_spec.total_task_slots,
-                available_slots: cpu_spec.available_task_slots,
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                devices: vec![DeviceFact {
-                    kind: "cpu".to_string(),
-                    ordinal: 0,
-                }],
-            })
-            .await
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let cpu_id = format!("cpu-only-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(cpu_id.clone());
+            let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: cpu_id.clone(),
+                    instance_id: cpu_id.clone(),
+                    host: cpu_meta.host.clone(),
+                    port: cpu_meta.port,
+                    grpc_port: cpu_meta.grpc_port,
+                    task_slots: cpu_spec.total_task_slots,
+                    available_slots: cpu_spec.available_task_slots,
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    devices: vec![DeviceFact {
+                        kind: "cpu".to_string(),
+                        ordinal: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+
+            let session = inference_session().await;
+            let node = InferenceExecBuilder::new(
+                scan(),
+                ModelSource::hf("m"),
+                ModelTask::TextEmbedding,
+                vec!["text".to_string()],
+                "text".to_string(),
+                "src-1".to_string(),
+                Arc::clone(session.model_cache()),
+                jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+            )
+            .embedding_dim(Some(2))
+            .build()
             .unwrap();
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
 
-        let session = inference_session().await;
-        let node = InferenceExecBuilder::new(
-            scan(),
-            ModelSource::hf("m"),
-            ModelTask::TextEmbedding,
-            vec!["text".to_string()],
-            "text".to_string(),
-            "src-1".to_string(),
-            Arc::clone(session.model_cache()),
-            jammi_db::store::manifest::ComputeDeviceKind::Cpu,
-        )
-        .embedding_dim(Some(2))
-        .build()
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+            let job_id: JobId = "job-cpu".to_string().into();
+            let cache = job_info_cache(&job_id, plan);
+            let jobs = active_jobs(job_id, cache);
 
-        let job_id: JobId = "job-cpu".to_string().into();
-        let cache = job_info_cache(&job_id, plan);
-        let jobs = active_jobs(job_id, cache);
-
-        let policy = DevicePlacement::new(Arc::clone(&catalog));
-        let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: cpu_id.clone(),
-            slots: 1,
-        };
-        let bound = policy
-            .bind_tasks(vec![&mut cpu_slot], jobs)
-            .await
-            .expect("bind_tasks");
-        assert_eq!(
-            bound.len(),
-            1,
-            "a Cpu-stamped stage must bind to the properly-registered cpu-only executor"
-        );
-        assert_eq!(bound[0].0, cpu_id);
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&cpu_id).await.ok();
+            let policy = DevicePlacement::new(Arc::clone(&catalog));
+            let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
+                executor_id: cpu_id.clone(),
+                slots: 1,
+            };
+            let bound = policy
+                .bind_tasks(vec![&mut cpu_slot], jobs)
+                .await
+                .expect("bind_tasks");
+            assert_eq!(
+                bound.len(),
+                1,
+                "a Cpu-stamped stage must bind to the properly-registered cpu-only executor"
+            );
+            assert_eq!(bound[0].0, cpu_id);
+        })
+        .await;
     })
     .await;
 }
@@ -521,85 +618,88 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor() {
 async fn already_transferred_gang_is_never_bound() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let exec_id = format!("exec-{}", jammi_test_utils::unique_suffix());
-        let (meta, spec) = executor_metadata(&exec_id, 2);
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let exec_id = format!("exec-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(exec_id.clone());
+            let (meta, spec) = executor_metadata(&exec_id, 2);
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: exec_id.clone(),
+                    instance_id: exec_id.clone(),
+                    host: meta.host.clone(),
+                    port: meta.port,
+                    grpc_port: meta.grpc_port,
+                    task_slots: spec.total_task_slots,
+                    available_slots: spec.available_task_slots,
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    // The descriptor below is stamped `Cuda` — this executor
+                    // must list a matching device so the ONLY reason binding
+                    // can fail is the claim guard under test (refinement 3),
+                    // never refinement 2's kind match.
+                    devices: vec![DeviceFact {
+                        kind: "cuda".to_string(),
+                        ordinal: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+
+            let job_id_s = format!("gang-job-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(job_id_s.clone());
+            catalog
+                .submit_job(SubmitJobParams {
+                    job_id: &job_id_s,
+                    kind: "gang_test",
+                    execution: JobExecution::Inline,
+                    spec: "{}",
+                    model_ref: None,
+                    output_model_id: None,
+                    model_source: None,
+                    priority: 0,
+                })
+                .await
+                .expect("submit_job");
+            let transferee = format!("transferee-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(transferee.clone());
+            catalog
+                .claim_by_id(&job_id_s, &transferee, Duration::from_secs(300))
+                .await
+                .expect("claim_by_id")
+                .expect("row claimed");
+
+            let submitter = format!("submitter-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(submitter.clone());
+            let descriptor = GangDescriptor {
+                job_id: job_id_s.clone(),
+                attempt: 0,
+                world: 2,
+                submitter: submitter.clone(),
+                device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            };
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+            let job_id: JobId = job_id_s.clone().into();
+            let cache = job_info_cache(&job_id, plan);
+            let jobs = active_jobs(job_id, cache);
+
+            let policy = DevicePlacement::new(Arc::clone(&catalog));
+            let mut slot = ballista_core::serde::protobuf::AvailableTaskSlots {
                 executor_id: exec_id.clone(),
-                instance_id: exec_id.clone(),
-                host: meta.host.clone(),
-                port: meta.port,
-                grpc_port: meta.grpc_port,
-                task_slots: spec.total_task_slots,
-                available_slots: spec.available_task_slots,
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                // The descriptor below is stamped `Cuda` — this executor
-                // must list a matching device so the ONLY reason binding
-                // can fail is the claim guard under test (refinement 3),
-                // never refinement 2's kind match.
-                devices: vec![DeviceFact {
-                    kind: "cuda".to_string(),
-                    ordinal: 0,
-                }],
-            })
-            .await
-            .unwrap();
-
-        let job_id_s = format!("gang-job-{}", jammi_test_utils::unique_suffix());
-        catalog
-            .submit_job(SubmitJobParams {
-                job_id: &job_id_s,
-                kind: "gang_test",
-                execution: JobExecution::Inline,
-                spec: "{}",
-                model_ref: None,
-                output_model_id: None,
-                model_source: None,
-                priority: 0,
-            })
-            .await
-            .expect("submit_job");
-        let transferee = format!("transferee-{}", jammi_test_utils::unique_suffix());
-        catalog
-            .claim_by_id(&job_id_s, &transferee, Duration::from_secs(300))
-            .await
-            .expect("claim_by_id")
-            .expect("row claimed");
-
-        let submitter = format!("submitter-{}", jammi_test_utils::unique_suffix());
-        let descriptor = GangDescriptor {
-            job_id: job_id_s.clone(),
-            attempt: 0,
-            world: 2,
-            submitter: submitter.clone(),
-            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
-        };
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
-        let job_id: JobId = job_id_s.clone().into();
-        let cache = job_info_cache(&job_id, plan);
-        let jobs = active_jobs(job_id, cache);
-
-        let policy = DevicePlacement::new(Arc::clone(&catalog));
-        let mut slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: exec_id.clone(),
-            slots: 2,
-        };
-        let bound = policy
-            .bind_tasks(vec![&mut slot], jobs)
-            .await
-            .expect("bind_tasks");
-        assert!(
+                slots: 2,
+            };
+            let bound = policy
+                .bind_tasks(vec![&mut slot], jobs)
+                .await
+                .expect("bind_tasks");
+            assert!(
             bound.is_empty(),
             "a gang whose claim already transferred to {transferee} (!= submitter {submitter}) \
              must never be bound: {bound:?}"
         );
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&exec_id).await.ok();
+        })
+        .await;
     })
     .await;
 }
@@ -613,48 +713,258 @@ async fn already_transferred_gang_is_never_bound() {
 async fn a_slot_less_executor_never_gets_a_task_stamped() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
-        let exec_id = format!("full-{}", jammi_test_utils::unique_suffix());
-        catalog
-            .upsert_compute_executor(&ComputeExecutorRecord {
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let exec_id = format!("full-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(exec_id.clone());
+            catalog
+                .upsert_compute_executor(&ComputeExecutorRecord {
+                    executor_id: exec_id.clone(),
+                    instance_id: exec_id.clone(),
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                    grpc_port: 0,
+                    task_slots: 1,
+                    available_slots: 0, // fully booked in the catalog
+                    status: "Active".to_string(),
+                    heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                    metadata: String::new(),
+                    devices: vec![],
+                })
+                .await
+                .unwrap();
+
+            let plan = scan();
+            let job_id: JobId = "job-full".to_string().into();
+            let cache = job_info_cache(&job_id, plan);
+            let jobs = active_jobs(job_id, cache);
+
+            let policy = DevicePlacement::new(Arc::clone(&catalog));
+            // The in-memory snapshot says 1 free slot (a stale read, or a
+            // concurrent scheduler's own optimistic guess) — the CAS against the
+            // catalog's REAL count of 0 must still refuse it.
+            let mut slot = ballista_core::serde::protobuf::AvailableTaskSlots {
                 executor_id: exec_id.clone(),
-                instance_id: exec_id.clone(),
-                host: "127.0.0.1".to_string(),
-                port: 0,
-                grpc_port: 0,
-                task_slots: 1,
-                available_slots: 0, // fully booked in the catalog
-                status: "Active".to_string(),
-                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
-                metadata: String::new(),
-                devices: vec![],
-            })
-            .await
-            .unwrap();
-
-        let plan = scan();
-        let job_id: JobId = "job-full".to_string().into();
-        let cache = job_info_cache(&job_id, plan);
-        let jobs = active_jobs(job_id, cache);
-
-        let policy = DevicePlacement::new(Arc::clone(&catalog));
-        // The in-memory snapshot says 1 free slot (a stale read, or a
-        // concurrent scheduler's own optimistic guess) — the CAS against the
-        // catalog's REAL count of 0 must still refuse it.
-        let mut slot = ballista_core::serde::protobuf::AvailableTaskSlots {
-            executor_id: exec_id.clone(),
-            slots: 1,
-        };
-        let bound = policy.bind_tasks(vec![&mut slot], jobs).await.unwrap();
-        assert!(
-            bound.is_empty(),
-            "the catalog's committed available_slots (0) must win over the in-memory \
+                slots: 1,
+            };
+            let bound = policy.bind_tasks(vec![&mut slot], jobs).await.unwrap();
+            assert!(
+                bound.is_empty(),
+                "the catalog's committed available_slots (0) must win over the in-memory \
              snapshot (1): {bound:?}"
-        );
-        // Tests own their rows: the Postgres arm shares one database with every
-        // other lane on this host, so the executors this test registered are
-        // removed on the way out (a device a later test never registered must
-        // never be listed for it).
-        catalog.remove_compute_executor(&exec_id).await.ok();
+            );
+        })
+        .await;
     })
     .await;
+}
+
+fn record(id: &str, status: &str, heartbeat_at: String) -> ComputeExecutorRecord {
+    ComputeExecutorRecord {
+        executor_id: id.to_string(),
+        instance_id: id.to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        grpc_port: 0,
+        task_slots: 1,
+        available_slots: 1,
+        status: status.to_string(),
+        heartbeat_at,
+        metadata: String::new(),
+        devices: vec![],
+    }
+}
+
+/// `executor_is_live` — the ONE predicate the binder and the submit-edge
+/// refusal share — is `Active` AND a heartbeat within
+/// `EXECUTOR_LIVENESS_WINDOW`; every other row (a `Terminating` heartbeat,
+/// an `Unknown` one, a stale timestamp, an unparseable one) is not live.
+/// Mutation: drop the status arm and the `Terminating` row reads live;
+/// drop the window and the stale row reads live.
+#[test]
+fn executor_is_live_table() {
+    let now = chrono::Utc::now();
+    let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
+    let fresh = stamp(now);
+    assert!(executor_is_live(&record("e", "Active", fresh.clone()), now));
+    assert!(!executor_is_live(
+        &record("e", "Terminating", fresh.clone()),
+        now
+    ));
+    assert!(!executor_is_live(&record("e", "Unknown", fresh), now));
+    let inside = stamp(now - EXECUTOR_LIVENESS_WINDOW + chrono::Duration::seconds(1));
+    assert!(executor_is_live(&record("e", "Active", inside), now));
+    let outside = stamp(now - EXECUTOR_LIVENESS_WINDOW - chrono::Duration::seconds(1));
+    assert!(!executor_is_live(&record("e", "Active", outside), now));
+    assert!(!executor_is_live(
+        &record("e", "Active", "2026-01-01T00:00:00.000000000Z".into()),
+        now
+    ));
+    assert!(!executor_is_live(
+        &record("e", "Active", "not-a-timestamp".into()),
+        now
+    ));
+}
+
+/// The binder never binds to an executor that is not live: a `Terminating`
+/// heartbeat (`ExecutorRole::begin_drain`'s report at the DRAIN instant)
+/// and a stale `heartbeat_at` (a process that never ran its graceful
+/// `remove_executor`) both drop the row from the candidate slots, so the
+/// task lands on the one live executor even though all three have a free
+/// slot. Mutation: drop `executor_is_live` from `bind_schedulable_tasks`'s
+/// filter and the terminating or stale executor (registered FIRST, so
+/// round-robin would try it first) takes the task.
+#[tokio::test]
+async fn terminating_and_stale_executors_are_never_bound() {
+    run_both_backends(|kind| async move {
+        let catalog = catalog(kind).await.expect("catalog opens");
+        let owned = RefCell::new(Vec::<String>::new());
+        with_owned_rows(&catalog, &owned, async {
+            let state = CatalogClusterState::new(Arc::clone(&catalog));
+            let term_id = format!("a-term-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(term_id.clone());
+            let stale_id = format!("b-stale-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(stale_id.clone());
+            let live_id = format!("c-live-{}", jammi_test_utils::unique_suffix());
+            owned.borrow_mut().push(live_id.clone());
+
+            let (meta, spec) = executor_metadata(&term_id, 1);
+            state.register_executor(meta, spec).await.unwrap();
+            state
+                .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
+                    executor_id: term_id.clone(),
+                    timestamp: 1,
+                    metrics: vec![],
+                    status: Some(ballista_core::serde::protobuf::ExecutorStatus {
+                        status: Some(
+                            ballista_core::serde::protobuf::executor_status::Status::Terminating(
+                                String::new(),
+                            ),
+                        ),
+                    }),
+                    peak_proc_physical_memory: 0,
+                    peak_proc_virtual_memory: 0,
+                })
+                .await
+                .unwrap();
+            catalog
+                .upsert_compute_executor(&record(
+                    &stale_id,
+                    "Active",
+                    "2026-01-01T00:00:00.000000000Z".to_string(),
+                ))
+                .await
+                .unwrap();
+            let (meta, spec) = executor_metadata(&live_id, 1);
+            state.register_executor(meta, spec).await.unwrap();
+
+            let plan = scan();
+            let job_id: JobId = "job-liveness".to_string().into();
+            let jobs = active_jobs(job_id.clone(), job_info_cache(&job_id, plan));
+            // Scoped to this test's three executors (the trait's own
+            // `executors` filter) so a concurrent test's live executor on
+            // the shared Postgres never takes the task instead.
+            let scope: std::collections::HashSet<String> =
+                [term_id.clone(), stale_id.clone(), live_id.clone()]
+                    .into_iter()
+                    .collect();
+            let bound = state
+                .bind_schedulable_tasks(
+                    TaskDistributionPolicy::Custom(Arc::new(DevicePlacement::new(Arc::clone(
+                        &catalog,
+                    )))),
+                    jobs,
+                    Some(scope),
+                )
+                .await
+                .unwrap();
+            let ids: Vec<&str> = bound.iter().map(|(id, _)| id.as_str()).collect();
+            assert!(!ids.is_empty(), "the live executor takes the task");
+            assert!(
+                ids.iter().all(|id| *id == live_id),
+                "only the live executor is ever bound; got {ids:?}"
+            );
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The submit edge's device-kind refusal reads LIVE executors only: a
+/// `cuda` row a killed GPU executor left behind (stale `heartbeat_at`) never
+/// admits a Cuda-stamped plan — it is refused before submitting, the
+/// outcome the prose promises ("never parked unschedulable") — while a
+/// fresh `cuda` row does admit it (the call then proceeds to the scheduler
+/// and fails on the unreachable address, a DIFFERENT error). Mutation: drop
+/// `executor_is_live` from `submit_physical_plan`'s read and the stale row
+/// admits the plan (the first call no longer returns the refusal).
+#[tokio::test]
+async fn a_stale_cuda_row_never_admits_a_cuda_plan_at_the_submit_edge() {
+    let session = inference_session().await;
+    let catalog = session.catalog();
+    let stale_id = format!("stale-cuda-{}", jammi_test_utils::unique_suffix());
+    let cuda = vec![DeviceFact {
+        kind: "cuda".to_string(),
+        ordinal: 0,
+    }];
+    let mut stale = record(
+        &stale_id,
+        "Active",
+        "2026-01-01T00:00:00.000000000Z".to_string(),
+    );
+    stale.devices = cuda.clone();
+    catalog.upsert_compute_executor(&stale).await.unwrap();
+
+    let cuda_plan = || -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            InferenceExecBuilder::new(
+                scan(),
+                ModelSource::hf("m"),
+                ModelTask::TextEmbedding,
+                vec!["text".to_string()],
+                "text".to_string(),
+                "src-1".to_string(),
+                Arc::clone(session.model_cache()),
+                jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+            )
+            .embedding_dim(Some(2))
+            .build()
+            .unwrap(),
+        )
+    };
+    let unreachable = "http://127.0.0.1:9";
+    let err = submit_physical_plan(&session, unreachable, cuda_plan())
+        .await
+        .err()
+        .expect("a stale cuda row admits nothing");
+    assert!(
+        err.to_string()
+            .contains("no live registered compute executor lists a cuda device"),
+        "refused by name at the submit edge: {err}"
+    );
+
+    let fresh_id = format!("fresh-cuda-{}", jammi_test_utils::unique_suffix());
+    let mut fresh = record(
+        &fresh_id,
+        "Active",
+        jammi_db::catalog::backend::now_sortable(),
+    );
+    fresh.devices = cuda;
+    catalog.upsert_compute_executor(&fresh).await.unwrap();
+    let err = tokio::time::timeout(
+        Duration::from_secs(30),
+        submit_physical_plan(&session, unreachable, cuda_plan()),
+    )
+    .await
+    .expect("the unreachable scheduler fails fast")
+    .err()
+    .expect("no scheduler listens on the address");
+    assert!(
+        !err.to_string()
+            .contains("no live registered compute executor"),
+        "a fresh cuda row admits the plan past the refusal: {err}"
+    );
+
+    catalog.remove_compute_executor(&stale_id).await.ok();
+    catalog.remove_compute_executor(&fresh_id).await.ok();
 }

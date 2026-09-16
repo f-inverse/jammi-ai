@@ -427,13 +427,19 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         Some(expected_model.as_str())
     );
 
-    // HandedOff evidence on the submitter's (lane-1's) own log.
-    let lane1_log = fleet.log_contents(fleet.label(0));
-    assert!(
-        lane1_log.contains("run_placed_gang: submitter HandedOff"),
-        "lane-1's log must show the HandedOff arm this unit's `tracing::info!` line names; \
-         log:\n{lane1_log}"
-    );
+    // HandedOff evidence on the submitter's (lane-1's) own log. The line
+    // lands after the gang's result stream drains, which is after the
+    // coordinator's `completed` row the wait above returned on -- so the
+    // read polls (harness::await_log_contains) instead of asserting one
+    // snapshot.
+    let lane1_label = fleet.label(0).to_string();
+    harness::await_log_contains(
+        &mut fleet,
+        &lane1_label,
+        "run_placed_gang: submitter HandedOff",
+        "the HandedOff arm this unit's `tracing::info!` line names",
+    )
+    .await;
 
     // K4 (b5): the placed run's artifact bytes equal a SECOND fleet's
     // wave-3-path run (no `[ballista]` at all — process 1 coordinates

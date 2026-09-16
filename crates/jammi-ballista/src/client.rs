@@ -42,19 +42,25 @@ pub async fn submit_physical_plan(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<SendableRecordBatchStream> {
     if let Some(required_kind) = required_device_kind(&plan) {
-        let devices = session
+        // LIVE executors only (`cluster::executor_is_live`, the same
+        // predicate the scheduler's binder applies): a row a killed GPU
+        // executor left behind must not admit a plan the binder can never
+        // place — that would park it, the outcome this refusal exists to
+        // prevent.
+        let rows = session
             .catalog()
-            .list_compute_executor_devices()
+            .list_compute_executors()
             .await
             .map_err(Error::Catalog)?;
+        let now = chrono::Utc::now();
         let wire = crate::engine::device_kind_wire_str(required_kind);
-        let has_match = devices
-            .iter()
-            .any(|(_, ds)| ds.iter().any(|d| d.kind == wire));
+        let has_match = rows.iter().any(|r| {
+            crate::cluster::executor_is_live(r, now) && r.devices.iter().any(|d| d.kind == wire)
+        });
         if !has_match {
             return Err(Error::Config(format!(
                 "jammi-ballista: this plan requires device_kind {required_kind:?} but no \
-                 registered compute executor lists a {wire} device — refused before \
+                 live registered compute executor lists a {wire} device — refused before \
                  submitting, never parked unschedulable"
             )));
         }

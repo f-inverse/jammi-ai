@@ -1252,6 +1252,13 @@ impl BoundServer {
                     // `StopOutcome` (F4b), never `worker.is_some()` — that
                     // would read `true` even when the join itself errored
                     // or found nothing left to join.
+                    // `[ballista]`: the executor stops admitting tasks the
+                    // same instant (`Terminating` to the scheduler), before
+                    // the in-flight worker job is joined — the drain below
+                    // still waits for the executor's own in-flight task.
+                    if let Some(e) = executor.as_ref() {
+                        e.begin_drain().await;
+                    }
                     let worker_joined = match worker.as_ref() {
                         Some(w) => match w.stop_and_join().await {
                             Ok(jammi_ai::fine_tune::worker::StopOutcome::Joined) => true,
@@ -1375,6 +1382,7 @@ impl BoundServer {
             // The gated join half: nothing here runs until DRAIN is
             // signalled, so the worker is never stopped at t = 0.
             let session_ref = Arc::clone(&session);
+            let executor_ref = executor.as_ref();
             let gated_join = async move {
                 let _ = drain_gate.wait_for(|v| *v).await;
                 readiness_ref.begin_drain();
@@ -1382,6 +1390,13 @@ impl BoundServer {
                 // without a worker (`EmbeddedWorker::begin_drain` flips the
                 // same session-owned phase; this call is idempotent).
                 session_ref.host_admission().begin_drain();
+                // `[ballista]`: the executor reports `Terminating` the same
+                // instant, so the scheduler stops binding new tasks here
+                // while the worker below drains; the executor's own drain
+                // (after this join) still waits for its in-flight task.
+                if let Some(e) = executor_ref {
+                    e.begin_drain().await;
+                }
                 match worker_ref {
                     Some(w) => {
                         w.begin_drain().await;

@@ -633,6 +633,16 @@ impl HostAdmission {
     /// the iteration it covers (the claim finding nothing, the run
     /// returning, a panic, the loop future being aborted).
     pub fn probe_claim(self: &Arc<Self>) -> Option<ClaimGuard> {
+        // A host that has begun a DRAIN or RELEASE admits nothing new — the
+        // claim loop's own gate stops it claiming, and the placed-gang
+        // runner (`JobWorker::run_placed_gang`, dialled by the executor)
+        // is refused here the same way, so a gang bound to this host inside
+        // its termination grace is never started on a process about to
+        // exit (contract `feat_500-wave4` §9 B6: "finish what's running,
+        // refuse what's new" holds for every entry, not only the loop's).
+        if *self.phase.borrow() != WorkerPhase::Running {
+            return None;
+        }
         let taken = self.holder.send_if_modified(|h| {
             if *h == Holder::Free {
                 *h = Holder::ClaimProbe;
@@ -2186,7 +2196,11 @@ impl JobWorker {
     ///   never this instance's).
     ///
     /// This host's holder moves `JobRun → Awaiting{job_id, attempt}` BEFORE
-    /// the descriptor is submitted (`HostAdmission::begin_awaiting_placement`;
+    /// the descriptor is submitted — a CAS from exactly `JobRun`; on its
+    /// refusal a `Free` holder (a direct `run_claimed_job` with no
+    /// `ClaimGuard`, which admits ranks already) still submits, any other
+    /// holder ends this call typed with nothing submitted
+    /// (`HostAdmission::begin_awaiting_placement`;
     /// an in-process scheduler can bind the task and the placed executor can
     /// dial this host's `RunRank` before `submit()` returns): the host runs no compute while it waits, so it can
     /// still serve a `RunRank` session — a two-host fleet could not
@@ -2228,9 +2242,35 @@ impl JobWorker {
         // Awaiting was found still refusing every dial with "this host's
         // job slot is busy" (`Holder::JobRun`, `admit_rank`'s busy arm) —
         // red until this line moved ahead of the submit call.
-        session
+        if !session
             .host_admission()
-            .begin_awaiting_placement(job_id, attempt);
+            .begin_awaiting_placement(job_id, attempt)
+        {
+            // The move is a CAS from exactly `JobRun` (the claim loop's
+            // hold, `register_job_hold_or_release` -> `job_running`). Its
+            // refusal has two readings: a `Free` holder is a direct
+            // `run_claimed_job` with no `ClaimGuard` (the documented
+            // no-op arm — `Free` admits every `RunRank` dial already, so
+            // the gang can assemble and the submit proceeds); ANY other
+            // holder (a rank held, a probe in flight, an `Awaiting` for
+            // another job) would leave this host refusing every dial while
+            // its gang assembles, so the descriptor is refused BEFORE the
+            // submit, typed — the row is still this instance's claim and is
+            // left for reclaim.
+            let holder = session.host_admission().holder();
+            if holder != Holder::Free {
+                return Err(self
+                    .placed_submit_end(
+                        catalog,
+                        job_id,
+                        JammiError::FineTune(format!(
+                            "submit_placed: this host's job slot is neither JobRun nor Free \
+                             (holder {holder:?}); the descriptor was not submitted"
+                        )),
+                    )
+                    .await);
+            }
+        }
         let mut stream = match submitter.submit(descriptor).await {
             Ok(stream) => stream,
             Err(e) => return Err(self.placed_submit_end(catalog, job_id, e).await),
@@ -2337,11 +2377,17 @@ impl JobWorker {
     ) -> Result<PlacedOutcome> {
         let admission = session.host_admission();
         let Some(claim) = admission.probe_claim() else {
-            return Err(JammiError::FineTune(
+            let phase = *admission.phase_receiver().borrow();
+            return Err(JammiError::FineTune(if phase == WorkerPhase::Running {
                 "run_placed_gang: this host's job slot is busy (a rank is held, a loop-claimed \
                  job already runs, or another placement is in flight)"
-                    .into(),
-            ));
+                    .into()
+            } else {
+                format!(
+                    "run_placed_gang: this host has begun a {phase:?} and admits no new gang \
+                     (refuse what's new); the row is left with its submitter"
+                )
+            }));
         };
         let catalog = session.catalog();
         let lease = session.inner_config().lease.intervals()?.lease();
@@ -11756,6 +11802,26 @@ mod tests {
         )))
     }
 
+    /// Contract `feat_500-wave4` §9 block B6, every entry: a host that has
+    /// begun a DRAIN (or a RELEASE) admits no new claim through
+    /// `probe_claim` — the loop's gate AND the placed-gang runner's
+    /// admission are this one predicate. Mutation: drop the phase check at
+    /// the top of `probe_claim` and the `Draining` assertion reds (the
+    /// holder cell is `Free`, so the CAS alone would admit).
+    #[test]
+    fn probe_claim_refuses_once_a_drain_or_release_has_begun() {
+        let cell = cell();
+        assert!(cell.probe_claim().is_some(), "Running admits");
+        assert!(cell.begin_drain());
+        assert!(cell.probe_claim().is_none(), "Draining refuses a new claim");
+        assert_eq!(cell.holder(), Holder::Free, "the refusal moved nothing");
+        cell.begin_release();
+        assert!(
+            cell.probe_claim().is_none(),
+            "Releasing refuses a new claim"
+        );
+    }
+
     /// Contract `feat_500-wave4` §9 block B2: `Awaiting` (the state a
     /// claim's own `submit_placed` puts the holder in BEFORE it submits —
     /// the move precedes the submit) admits a `RunRank` session EXACTLY like `Free`
@@ -11777,6 +11843,12 @@ mod tests {
         assert!(
             cell.begin_awaiting_placement("job-a", 1),
             "JobRun -> Awaiting"
+        );
+        assert!(
+            !cell.begin_awaiting_placement("job-a", 1),
+            "the move is a CAS from exactly JobRun: from Awaiting it refuses (false); \
+             `submit_placed` submits on that refusal only from Free, and ends typed \
+             from any other holder"
         );
         assert_eq!(
             cell.holder(),

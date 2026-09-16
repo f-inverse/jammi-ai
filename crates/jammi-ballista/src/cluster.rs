@@ -57,6 +57,39 @@ fn ballista_err(e: jammi_db::error::JammiError) -> BallistaError {
     BallistaError::Internal(format!("jammi-ballista: catalog error: {e}"))
 }
 
+/// How long a registered executor's last heartbeat may lie in the past
+/// before the catalog stops treating the row as a LIVE executor. Equal to
+/// Ballista's own scheduler liveness notion (`SchedulerConfig::
+/// executor_timeout_seconds`, 180 s by default — the window after which
+/// `ballista-scheduler` expires an executor it has stopped hearing from),
+/// so "live to placement" and "live to Ballista" are one definition.
+pub const EXECUTOR_LIVENESS_WINDOW: chrono::Duration = chrono::Duration::seconds(180);
+
+/// The ONE liveness predicate every read that decides on executors shares
+/// (`bind_schedulable_tasks`, `client::submit_physical_plan`'s device-kind
+/// refusal): the row's `status` is `Active` (a `Terminating` heartbeat —
+/// `roles::ExecutorRole::begin_drain` — or an `Unknown` one is not) AND its
+/// `heartbeat_at` lies within [`EXECUTOR_LIVENESS_WINDOW`] of `now`. A row
+/// left behind by a process that never ran its graceful `remove_executor`
+/// (SIGKILL, a crashed pod) therefore stops counting after the window, and
+/// a test row written with a stale timestamp never counts at all. A
+/// `heartbeat_at` this predicate cannot parse is not live (the row-fact
+/// rule: the row is wrong, not the read).
+pub fn executor_is_live(
+    rec: &jammi_db::catalog::compute_repo::ComputeExecutorRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if rec.status != "Active" {
+        return false;
+    }
+    match chrono::DateTime::parse_from_rfc3339(&rec.heartbeat_at) {
+        Ok(hb) => {
+            now.signed_duration_since(hb.with_timezone(&chrono::Utc)) <= EXECUTOR_LIVENESS_WINDOW
+        }
+        Err(_) => false,
+    }
+}
+
 /// The catalog-backed [`ClusterState`]. Registrations, slots, and heartbeats
 /// live in `compute_executors` (B1/K5); the ONE thing kept only in this
 /// process's memory is the executor-heartbeat CACHE the trait's own
@@ -167,10 +200,12 @@ impl ClusterState for CatalogClusterState {
             .list_compute_executors()
             .await
             .map_err(ballista_err)?;
+        let now = chrono::Utc::now();
         let mut slots: Vec<ballista_core::serde::protobuf::AvailableTaskSlots> = rows
             .into_iter()
             .filter(|r| {
                 r.available_slots > 0
+                    && executor_is_live(r, now)
                     && executors
                         .as_ref()
                         .map(|e| e.contains(&r.executor_id))
@@ -208,7 +243,38 @@ impl ClusterState for CatalogClusterState {
         for (executor_id, n) in executor_slots {
             *increments.entry(executor_id).or_insert(0) += i64::from(n);
         }
-        let deltas: Vec<(&str, i64)> = increments.iter().map(|(id, n)| (id.as_str(), *n)).collect();
+        // Ballista's scheduler removes an executor whose task launch failed
+        // (`remove_executor` deletes its row) and THEN unbinds the slots it
+        // had reserved on it. Slots on a row that no longer exists have
+        // nothing to return to: they are dropped here, not refused, so the
+        // rest of the batch (a live executor's slots) is still returned. CI
+        // run 35127543679 hit the refusal ("adjust_compute_slots: no row
+        // for executor_id") on exactly that ordering.
+        let registered: std::collections::HashSet<String> = self
+            .catalog
+            .list_compute_executors()
+            .await
+            .map_err(ballista_err)?
+            .into_iter()
+            .map(|r| r.executor_id)
+            .collect();
+        let deltas: Vec<(&str, i64)> = increments
+            .iter()
+            .filter(|(id, _)| {
+                let live = registered.contains(id.as_str());
+                if !live {
+                    tracing::debug!(
+                        executor_id = %id,
+                        "unbind_tasks: executor row already removed; its slots are dropped"
+                    );
+                }
+                live
+            })
+            .map(|(id, n)| (id.as_str(), *n))
+            .collect();
+        if deltas.is_empty() {
+            return Ok(());
+        }
         self.catalog
             .adjust_compute_slots(&deltas)
             .await

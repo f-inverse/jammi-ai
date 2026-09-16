@@ -321,10 +321,25 @@ impl ExecutorRole {
     /// `heart_beat_from_executor` call) so the scheduler stops binding new
     /// tasks here — then wait for every in-flight task to finish, THEN stop
     /// (contract §9 B6; never tear down a running placed gang).
-    pub async fn drain(mut self) {
+    pub async fn drain(self) {
+        self.begin_drain().await;
+        TasksDrainedFuture(Arc::clone(&self.executor)).await;
+        self.stop().await;
+    }
+
+    /// The DRAIN INSTANT's half of [`Self::drain`], callable while the
+    /// process's own worker is still draining (the server's DRAIN arm calls
+    /// it the moment DRAIN is signalled, before the in-flight worker job is
+    /// joined): flip `TERMINATING` and report `Terminating` to the scheduler
+    /// so the catalog row stops reading as live (`cluster::executor_is_live`)
+    /// and the binder stops binding new tasks here NOW, not after the grace
+    /// period. Idempotent; the heartbeat is best-effort (a scheduler already
+    /// gone cannot bind anything anyway).
+    pub async fn begin_drain(&self) {
         TERMINATING.store(true, std::sync::atomic::Ordering::Release);
         let _ = self
             .scheduler_client
+            .clone()
             .heart_beat_from_executor(HeartBeatParams {
                 executor_id: self.executor_id.clone(),
                 metrics: vec![],
@@ -334,8 +349,6 @@ impl ExecutorRole {
                 metadata: Some(self.metadata.clone()),
             })
             .await;
-        TasksDrainedFuture(Arc::clone(&self.executor)).await;
-        self.stop().await;
     }
 }
 

@@ -593,6 +593,48 @@ pub async fn await_job(
     }
 }
 
+/// Poll the captured log of the worker labelled `label` until it contains
+/// `needle`, returning the log. A log line a worker writes AFTER the catalog
+/// fact a test already awaited (the placed submitter's `HandedOff` line
+/// lands only once the gang's result stream has drained, which is after the
+/// coordinator committed `completed`) is never a single read: CI run
+/// 35127543679 read the submitter's log 240 ms after the job finished and
+/// found the line absent. Fails loudly (fleet diagnostics) on an early
+/// unexpected worker exit or the timeout.
+pub async fn await_log_contains(
+    fleet: &mut Fleet,
+    label: &str,
+    needle: &str,
+    what: &str,
+) -> String {
+    let deadline = Instant::now() + TERMINAL_TIMEOUT;
+    loop {
+        let log = fleet.log_contents(label);
+        if log.contains(needle) {
+            return log;
+        }
+        if let Some((worker, status)) = fleet.first_unexpected_exit() {
+            fleet.dump_diagnostics(&format!(
+                "worker {worker} exited unexpectedly ({status}) while awaiting the log line: {what}"
+            ));
+            panic!(
+                "distributed ballista lane: worker {worker} exited unexpectedly ({status}) \
+                 before {label}'s log showed: {what}."
+            );
+        }
+        if Instant::now() >= deadline {
+            fleet.dump_diagnostics(&format!(
+                "timed out after {TERMINAL_TIMEOUT:?} awaiting the log line: {what}"
+            ));
+            panic!(
+                "distributed ballista lane: timed out after {TERMINAL_TIMEOUT:?}: {label}'s log \
+                 never showed: {what}; log:\n{log}"
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Poll for a plain condition over the catalog with no `Fleet` diagnostics
 /// (used where no fleet failure is expected to interrupt the wait, e.g. a
 /// `submit_physical_plan` result already resolved).

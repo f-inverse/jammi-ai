@@ -935,8 +935,8 @@ python3 - "$CLUSTER_SH" "$A1_SCRATCH" <<'PY'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch'''
-new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch ok_count=0'''
+old = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since=""'''
+new = '''  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since="" ok_count=0'''
 assert old in text, "A1 revert-RED fixture: local-vars line not found verbatim"
 text = text.replace(old, new, 1)
 old2 = '''            READBACK_OK)
@@ -959,9 +959,14 @@ new2 = '''            READBACK_OK)
 assert old2 in text, "A1 revert-RED fixture: READBACK_OK arm not found verbatim"
 text = text.replace(old2, new2, 1)
 old3 = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \\
-           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ] \\
-           && [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
-          break
+           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ]; then
+          if [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+            break
+          fi
+          [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+          if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+            break
+          fi
         fi'''
 new3 = '        [ "$ok_count" -ge 2 ] && break'
 assert old3 in text, "A1 revert-RED fixture: break condition not found verbatim"
@@ -1061,9 +1066,14 @@ import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
 old = '''        if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \\
-           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ] \\
-           && [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
-          break
+           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ]; then
+          if [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+            break
+          fi
+          [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+          if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+            break
+          fi
         fi'''
 new = '''        [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] && break'''
 assert old in text, "A2 revert-RED fixture: break condition not found verbatim"
@@ -1074,6 +1084,26 @@ if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpo
   ok "A2 revert-RED: the pre-fix break condition refuses the provisioning read at once (97, the run-35127869122 message) on the fixture the fix waits through -- the fix is load-bearing"
 else
   bad "A2 revert-RED: expected the REVERTED shape to refuse at once with 'carries no direct ssh endpoint'; got rc=$rc out=$out -- the revert-RED fixture itself may be stale"
+fi
+
+# ============================================================================
+# A4 (closing round 3, audit #5 A5): the MIXED arm -- rank 0 direct, rank 1
+# overlay-only -- settles for F3's proxy fallback after a bounded grace
+# (RP_SSH_MIXED_GRACE_SECS), never the whole window; the result line
+# carries the overlay ip as the member host with proxy_flag 1.
+# ============================================================================
+mixed_body="$(python3 -c '
+import json
+setup = "the-shared-entrypoint-text"
+p0 = {"id": "a", "args": "bash -c %r" % setup, "cluster": {"rank": 0, "ip": "10.0.0.2"}, "ssh": {"direct": {"host": "1.2.3.4", "port": 22}}}
+p1 = {"id": "b", "args": "bash -c %r" % setup, "cluster": {"rank": 1, "ip": "10.0.0.3"}, "ssh": {"direct": None}}
+print(json.dumps({"pods": [p0, p1]}))
+')"
+IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_body" "$mixed_body" 30)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$"; then
+  ok "A4: rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1), not the whole window"
+else
+  bad "A4: expected rc=0 with the proxy-fallback line after the grace; got rc=$rc out=$out"
 fi
 
 # ============================================================================

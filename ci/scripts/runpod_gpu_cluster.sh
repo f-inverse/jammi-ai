@@ -382,7 +382,7 @@ _rpc_wait_for_members_ready() {
         wait_ssh_secs="${2:?_rpc_wait_for_members_ready needs RP_SSH_WAIT_SECS}" \
         wait_ttl_hours="${3:?_rpc_wait_for_members_ready needs RP_TTL_HOURS}"
   local primary_host="" primary_port="" member_host="" member_port="" member_ip="" pods_body=""
-  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch
+  local rank0_seen=0 rank1_seen=0 resp status readback readback_rc mismatch mixed_since=""
   local deadline_ssh=$(( SECONDS + wait_ssh_secs ))
   while [ "$SECONDS" -lt "$deadline_ssh" ]; do
     resp="$(_rp_rest GET "/v2/clusters/${wait_cluster_id}/pods")"
@@ -412,17 +412,23 @@ _rpc_wait_for_members_ready() {
           echo "::error::a member's Pod.args does not echo the shared entrypoint text -- refusing" >&2
           return 97
         fi
-        # Ready only when rank 0 carries its DIRECT endpoint (it is the jump
-        # host for F3's fallback and the scp/rsync peer, which the proxy path
-        # cannot serve) and rank 1 has been read back at all; a member whose
-        # overlay ip is assigned seconds after create while its `ssh.direct`
-        # is still null is PROVISIONING, not ready -- keep polling until the
-        # deadline instead of refusing on the first read (run 35127869122
-        # refused 1 s into phase 4 on exactly that read).
+        # Ready at once when BOTH members carry a direct endpoint. A member
+        # whose overlay ip is assigned seconds after create while its
+        # `ssh.direct` is still null is PROVISIONING, not ready (run
+        # 35127869122 refused 1 s into phase 4 on exactly that read), so
+        # the mixed state -- rank 0 direct, rank 1 overlay-only -- waits a
+        # bounded grace (RP_SSH_MIXED_GRACE_SECS) for rank 1's own direct
+        # endpoint and then settles for F3's proxy fallback through rank 0,
+        # instead of burning the whole window on a billing cluster.
         if [ "$rank0_seen" = "1" ] && [ "$rank1_seen" = "1" ] \
-           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ] \
-           && [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
-          break
+           && [ -n "$primary_host" ] && [ "$primary_host" != "-" ]; then
+          if [ -n "$member_host" ] && [ "$member_host" != "-" ]; then
+            break
+          fi
+          [ -n "$mixed_since" ] || mixed_since="$SECONDS"
+          if [ $(( SECONDS - mixed_since )) -ge "${RP_SSH_MIXED_GRACE_SECS:-45}" ]; then
+            break
+          fi
         fi
       fi
     fi

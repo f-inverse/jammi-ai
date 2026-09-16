@@ -137,13 +137,47 @@ pub fn jammi_server_binary() -> PathBuf {
     bin
 }
 
-/// An ephemeral, unused TCP port on localhost (bind-then-release).
+/// An unused TCP port on localhost for a listener a SPAWNED process binds
+/// later. Never `bind(:0)`-then-release: that hands out a port from the
+/// kernel's ephemeral range, the same range every outgoing `connect()` this
+/// test process makes (Postgres, MinIO) draws its local port from, so the
+/// released port can be taken by a client socket before the child binds it
+/// (CI run 35134806942, lane-1: "failed to bind OSS server listeners:
+/// Address already in use"). Ports come from a range BELOW every platform's
+/// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
+/// time, and never handed out twice by this process.
 pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::Mutex;
+    static HANDED_OUT: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+    const LO: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    let mut guard = HANDED_OUT.lock().expect("port ledger lock poisoned");
+    let handed = guard.get_or_insert_with(HashSet::new);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let mut cursor = (h.finish() % u64::from(SPAN)) as u32;
+    for _ in 0..SPAN {
+        let port = (LO + cursor) as u16;
+        cursor = (cursor + 1) % SPAN;
+        if handed.contains(&port) {
+            continue;
+        }
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            handed.insert(port);
+            return port;
+        }
+    }
+    panic!(
+        "no bindable port in {LO}..{} for the lane's fleet",
+        LO + SPAN
+    );
 }
 
 const TEST_AUDIT_MASTER_KEY: &str =

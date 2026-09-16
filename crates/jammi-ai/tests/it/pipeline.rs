@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::physical_plan::ExecutionPlan;
 use parquet::arrow::ArrowWriter;
 
 use crate::common;
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::pipeline::embedding::build_embedding_plan;
+use jammi_ai::pipeline::result_sink::filter_ok_and_extract_vectors;
 use jammi_ai::session::InferenceSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -534,5 +537,141 @@ async fn cache_use_on_embeddings_always_recomputes_unpinned_source() {
     assert_ne!(
         first.table_name, second.table_name,
         "each Use embedding run materialises a fresh table (no reuse)"
+    );
+}
+
+// ─── `build_embedding_plan` is THE one plan-building site (contract
+// `feat_500-wave4` §2.5) ───────────────────────────────────────────────────
+//
+// `EmbeddingPipeline::run` (behind `generate_text_embeddings`) calls
+// `build_embedding_plan` rather than building its own copy of the plan, so
+// collecting the SAME construction inputs through `build_embedding_plan`
+// directly — bypassing `run`/`generate` entirely — must produce rows
+// byte-identical to what `generate` persisted, over a multi-partition
+// (two-file) source.
+
+/// A 2-file directory source, disjoint keys, small enough to embed fast.
+fn write_two_file_source(dir: &std::path::Path) -> String {
+    let src_dir = dir.join("two_files");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let files: [[(i64, &str); 2]; 2] = [
+        [(0, "alpha widget"), (1, "beta widget")],
+        [(2, "gamma gadget"), (3, "delta gadget")],
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    for (f, rows) in files.iter().enumerate() {
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        let texts: Vec<String> = rows.iter().map(|(_, t)| t.to_string()).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(StringArray::from(texts))],
+        )
+        .unwrap();
+        let file = std::fs::File::create(src_dir.join(format!("part{f}.parquet"))).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+    format!("file://{}", src_dir.display())
+}
+
+#[tokio::test]
+async fn build_embedding_plan_collected_in_process_matches_generates_written_rows() {
+    let dir = TempDir::new().unwrap();
+    let url = write_two_file_source(dir.path());
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "two_files",
+            SourceType::File,
+            SourceConnection {
+                url: Some(url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = tiny_bert_model();
+    let (record, _) = session
+        .generate_text_embeddings(
+            "two_files",
+            &model,
+            &["text".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.row_count, 4, "both files' rows land in one table");
+
+    let persisted = session
+        .sql(&format!(
+            "SELECT _row_id, _source_id, _model_id, vector, _content_hash FROM \"jammi.{}\" \
+             ORDER BY _row_id",
+            record.table_name
+        ))
+        .await
+        .unwrap();
+
+    // Independently, through `build_embedding_plan` alone — never through
+    // `generate_text_embeddings`/`EmbeddingPipeline::run` — with the SAME
+    // construction inputs `generate` resolved above.
+    let plan: Arc<dyn ExecutionPlan> = build_embedding_plan(
+        &session,
+        "two_files",
+        ModelSource::parse(&model),
+        ModelTask::TextEmbedding,
+        &["text".to_string()],
+        "id",
+        record.dimensions().expect("dimensions recorded").get(),
+    )
+    .await
+    .unwrap();
+    let task_ctx = session.context().task_ctx();
+    let stream = plan.execute(0, task_ctx).unwrap();
+    let raw_batches = datafusion::physical_plan::common::collect(stream)
+        .await
+        .unwrap();
+    let mut ok_batches = Vec::new();
+    for batch in &raw_batches {
+        let (ok_batch, _row_ids, _vectors) = filter_ok_and_extract_vectors(batch).unwrap();
+        if ok_batch.num_rows() > 0 {
+            ok_batches.push(ok_batch);
+        }
+    }
+    assert!(!ok_batches.is_empty(), "the independent plan realized rows");
+    let independent = arrow::compute::concat_batches(&ok_batches[0].schema(), &ok_batches)
+        .unwrap();
+    let sort_indices = arrow::compute::sort_to_indices(
+        independent.column_by_name("_row_id").unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
+    let independent = arrow::compute::take_record_batch(&independent, &sort_indices).unwrap();
+
+    assert_eq!(
+        persisted.iter().map(|b| b.num_rows()).sum::<usize>(),
+        independent.num_rows(),
+        "row counts must match between generate's written table and the independently \
+         collected plan"
+    );
+    let persisted_str = arrow::util::pretty::pretty_format_batches(&persisted)
+        .unwrap()
+        .to_string();
+    let independent_str = arrow::util::pretty::pretty_format_batches(&[independent])
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        persisted_str, independent_str,
+        "build_embedding_plan collected in-process must equal generate's written rows \
+         byte-for-byte — one plan-building site, contract feat_500-wave4 §2.5"
     );
 }

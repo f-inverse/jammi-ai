@@ -30,8 +30,8 @@ use jammi_ballista::placement::DevicePlacement;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::catalog::instance::DeviceFact;
-use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 
 async fn catalog(kind: BackendKind) -> Option<Arc<Catalog>> {
@@ -191,7 +191,10 @@ async fn unbind_tasks_is_all_or_none() {
         // in-bounds +1) must be refused.
         let batch: Vec<ExecutorSlot> = vec![(ok_id.clone(), 1), (bad_id.clone(), 1)];
         let err = state.unbind_tasks(batch).await;
-        assert!(err.is_err(), "an out-of-bounds executor must fail the whole batch");
+        assert!(
+            err.is_err(),
+            "an out-of-bounds executor must fail the whole batch"
+        );
 
         let ok_row = catalog.get_compute_executor(&ok_id).await.unwrap().unwrap();
         assert_eq!(
@@ -282,9 +285,9 @@ async fn gpu_bound_stage_never_binds_to_a_device_less_executor() {
             "text".to_string(),
             "src-1".to_string(),
             Arc::clone(session.model_cache()),
+            jammi_db::store::manifest::ComputeDeviceKind::Cuda,
         )
         .embedding_dim(Some(2))
-        .device_kind(Some(jammi_db::store::manifest::ComputeDeviceKind::Cuda))
         .build()
         .unwrap();
         let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
@@ -449,4 +452,3 @@ async fn a_slot_less_executor_never_gets_a_task_stamped() {
     })
     .await;
 }
-

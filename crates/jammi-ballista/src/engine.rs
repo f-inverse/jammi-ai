@@ -86,8 +86,8 @@ fn contains_gang(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// `GangExec` anywhere, or an `InferenceExec` whose stamped `device_kind()`
 /// is `Cuda` or `Metal`. The ONE predicate both `placement::DevicePlacement`
 /// (this crate's scheduler policy) and `client::submit_physical_plan`'s
-/// device-less refusal use — factored here beside [`contains_gang`]/
-/// [`first_device_kind_mismatch`], the two building blocks it composes, so
+/// device-less refusal use — factored here beside `contains_gang`/
+/// `first_device_kind_mismatch`, the two building blocks it composes, so
 /// neither call site re-derives its own notion of "needs a device".
 pub fn stage_is_gpu_bound(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if contains_gang(plan) {
@@ -100,8 +100,8 @@ pub fn stage_is_gpu_bound(plan: &Arc<dyn ExecutionPlan>) -> bool {
         if let Some(exec) = node.downcast_ref::<InferenceExec>() {
             if matches!(
                 exec.device_kind(),
-                Some(jammi_db::store::manifest::ComputeDeviceKind::Cuda)
-                    | Some(jammi_db::store::manifest::ComputeDeviceKind::Metal)
+                jammi_db::store::manifest::ComputeDeviceKind::Cuda
+                    | jammi_db::store::manifest::ComputeDeviceKind::Metal
             ) {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);

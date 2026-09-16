@@ -661,9 +661,9 @@ impl OssServer {
             Some(bind) => {
                 let catalog = Arc::clone(self.session.catalog_arc());
                 let cluster = ballista_scheduler::cluster::BallistaCluster::new(
-                    Arc::new(jammi_ballista::cluster::CatalogClusterState::new(Arc::clone(
-                        &catalog,
-                    ))),
+                    Arc::new(jammi_ballista::cluster::CatalogClusterState::new(
+                        Arc::clone(&catalog),
+                    )),
                     Arc::new(jammi_ballista::cluster::CatalogJobState::new(
                         Arc::clone(&catalog),
                         self.session.instance_id().to_string(),
@@ -675,9 +675,14 @@ impl OssServer {
                     Arc::new(jammi_ballista::placement::DevicePlacement::new(catalog)),
                 );
                 Some(
-                    jammi_ballista::roles::host_scheduler(&self.session, bind, cluster, distribution)
-                        .await
-                        .map_err(|e| ServerError::Config(e.to_string()))?,
+                    jammi_ballista::roles::host_scheduler(
+                        &self.session,
+                        bind,
+                        cluster,
+                        distribution,
+                    )
+                    .await
+                    .map_err(|e| ServerError::Config(e.to_string()))?,
                 )
             }
             None => None,

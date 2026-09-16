@@ -21,12 +21,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
 use async_trait::async_trait;
-use tokio::sync::RwLock as AsyncRwLock;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::RwLock as AsyncRwLock;
 
 use ballista_core::error::{BallistaError, Result as BallistaResult};
 use ballista_core::serde::protobuf::{
-    ExecutorHeartbeat, FailedJob, JobStatus, QueuedJob, RunningJob, SuccessfulJob, job_status,
+    job_status, ExecutorHeartbeat, FailedJob, JobStatus, QueuedJob, RunningJob, SuccessfulJob,
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
@@ -44,8 +44,8 @@ use ballista_scheduler::state::task_manager::JobInfoCache;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
 
-use jammi_db::catalog::Catalog;
 use jammi_db::catalog::compute_repo::{ComputeExecutorRecord, ComputeJobRecord};
+use jammi_db::catalog::Catalog;
 
 use crate::placement::bind_round_robin;
 
@@ -119,7 +119,10 @@ impl ClusterState for CatalogClusterState {
             .list_compute_executors()
             .await
             .map_err(ballista_err)?;
-        let mut cache = self.heartbeats.write().expect("heartbeat cache lock poisoned");
+        let mut cache = self
+            .heartbeats
+            .write()
+            .expect("heartbeat cache lock poisoned");
         for rec in rows {
             let status = if rec.status == "Terminating" {
                 ballista_core::serde::protobuf::executor_status::Status::Terminating(
@@ -205,10 +208,7 @@ impl ClusterState for CatalogClusterState {
         for (executor_id, n) in executor_slots {
             *increments.entry(executor_id).or_insert(0) += i64::from(n);
         }
-        let deltas: Vec<(&str, i64)> = increments
-            .iter()
-            .map(|(id, n)| (id.as_str(), *n))
-            .collect();
+        let deltas: Vec<(&str, i64)> = increments.iter().map(|(id, n)| (id.as_str(), *n)).collect();
         self.catalog
             .adjust_compute_slots(&deltas)
             .await
@@ -261,9 +261,11 @@ impl ClusterState for CatalogClusterState {
             timestamp: unix_seconds_now(),
             metrics: vec![],
             status: Some(ballista_core::serde::protobuf::ExecutorStatus {
-                status: Some(ballista_core::serde::protobuf::executor_status::Status::Active(
-                    String::default(),
-                )),
+                status: Some(
+                    ballista_core::serde::protobuf::executor_status::Status::Active(
+                        String::default(),
+                    ),
+                ),
             }),
             peak_proc_physical_memory: 0,
             peak_proc_virtual_memory: 0,
@@ -750,7 +752,10 @@ impl JobState for CatalogJobState {
         self.job_event_sender.send(&JobStateEvent::SessionAccessed {
             session_id: session_id.to_string(),
         });
-        Ok(create_datafusion_context(config, self.session_builder.clone())?)
+        Ok(create_datafusion_context(
+            config,
+            self.session_builder.clone(),
+        )?)
     }
 
     async fn remove_session(&self, session_id: &str) -> BallistaResult<()> {

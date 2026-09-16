@@ -41,7 +41,7 @@
 //! `bind_task_round_robin`/`bind_task_bias` (Ballista's own built-in
 //! policies) are `pub(crate)` to `ballista-scheduler` and not reachable from
 //! here. [`DevicePlacement`] is jammi's own re-implementation of that
-//! algorithm, extended as above. [`bind_round_robin`] below is a SEPARATE,
+//! algorithm, extended as above. `bind_round_robin` below is a SEPARATE,
 //! much smaller re-implementation with none of these three refinements —
 //! `CatalogClusterState::bind_schedulable_tasks`'s fallback for the
 //! `TaskDistributionPolicy::Bias`/`RoundRobin` built-in arms, which
@@ -100,7 +100,9 @@ impl std::fmt::Debug for DevicePlacement {
 }
 
 fn has_gpu_device(devices: &[jammi_db::catalog::instance::DeviceFact]) -> bool {
-    devices.iter().any(|d| d.kind == "cuda" || d.kind == "metal")
+    devices
+        .iter()
+        .any(|d| d.kind == "cuda" || d.kind == "metal")
 }
 
 #[async_trait]
@@ -116,17 +118,17 @@ impl DistributionPolicy for DevicePlacement {
         }
 
         // Refinement 2's sole authority, read once per call (module doc).
-        let executor_devices: HashMap<String, Vec<jammi_db::catalog::instance::DeviceFact>> =
-            self.catalog
-                .list_compute_executor_devices()
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "jammi-ballista DevicePlacement: device read: {e}"
-                    ))
-                })?
-                .into_iter()
-                .collect();
+        let executor_devices: HashMap<String, Vec<jammi_db::catalog::instance::DeviceFact>> = self
+            .catalog
+            .list_compute_executor_devices()
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "jammi-ballista DevicePlacement: device read: {e}"
+                ))
+            })?
+            .into_iter()
+            .collect();
 
         // Refinement 3: one row read per running job id present this round.
         // `None` (unclaimed, should not occur for a `running` row but is not
@@ -312,7 +314,8 @@ pub(crate) async fn bind_round_robin(
                 let executor_id = slots[idx].executor_id.clone();
                 let task_id = *task_id_gen;
                 *task_id_gen += 1;
-                stage.task_infos[partition_id] = Some(create_task_info(executor_id.clone(), task_id));
+                stage.task_infos[partition_id] =
+                    Some(create_task_info(executor_id.clone(), task_id));
                 let partition = PartitionId {
                     job_id: job_id.to_owned(),
                     stage_id: stage.stage_id,

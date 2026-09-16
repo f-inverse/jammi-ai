@@ -37,6 +37,7 @@ use datafusion::physical_plan::{
     stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, ExecutionPlan,
     Partitioning, PlanProperties,
 };
+use jammi_db::store::manifest::ComputeDeviceKind;
 use serde::{Deserialize, Serialize};
 
 /// The coordinates of a placed gang's one Ballista task — everything
@@ -58,6 +59,17 @@ pub struct GangDescriptor {
     /// against this, and [`Catalog::transfer_claim`](jammi_db::catalog::Catalog::transfer_claim)'s
     /// `$from` conjunct is this value verbatim.
     pub submitter: String,
+    /// The device kind this gang must run on — the submitter's own
+    /// [`crate::session::InferenceSession::compute_device`] kind, stamped at
+    /// [`crate::fine_tune::worker::JobWorker::submit_placed`] (the K7 rule
+    /// this descriptor carries, the same one `InferenceExec::device_kind`
+    /// carries: the required kind is the PLAN's own, never re-derived from
+    /// "any GPU exists"). `placement::DevicePlacement` binds a `GangExec`
+    /// stage only to an executor whose `compute_executors.devices` lists
+    /// this exact kind; `JammiExecutionEngine`'s K7 refusal compares it
+    /// against the executing session's own kind the same way it does for
+    /// `InferenceExec`.
+    pub device_kind: ComputeDeviceKind,
 }
 
 /// What a placed gang's coordinator body ended as — the ONE thing `GangExec`
@@ -225,6 +237,7 @@ mod tests {
             attempt: 1,
             world: 2,
             submitter: "submitter-1".to_string(),
+            device_kind: ComputeDeviceKind::Cpu,
         }
     }
 

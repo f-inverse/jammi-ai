@@ -12,14 +12,22 @@
 //!    — the submitter's own host holds a rank/job admission for the whole
 //!    await (contract §9 B1/B2), so binding the gang task back to it would
 //!    deadlock the placed run against itself.
-//! 2. A GPU-bound task (contract §3: a stage containing a `GangExec`, or an
-//!    `InferenceExec` naming a `Cuda`/`Metal` device —
-//!    [`crate::engine::stage_is_gpu_bound`], the ONE predicate this policy
-//!    and `client::submit_physical_plan`'s device-less refusal both use)
-//!    binds only to an executor whose OWN registration lists a matching
-//!    device (`compute_executors.devices`,
+//! 2. KIND MATCH (contract §3, LANE pressure-round correction): a stage
+//!    whose plan carries a required device kind — a `GangExec` (its
+//!    descriptor's own stamped `device_kind`, CPU included) or an
+//!    `InferenceExec` (its `device_kind()`) —
+//!    [`crate::engine::stage_device_kind`], the ONE predicate this policy
+//!    and `client::submit_physical_plan`'s pre-submission refusal both use
+//!    — binds only to an executor whose OWN registration lists THAT EXACT
+//!    kind (`compute_executors.devices`,
 //!    [`jammi_db::catalog::Catalog::list_compute_executor_devices`] — never
-//!    a join through `workers.instance_id`, see that method's doc).
+//!    a join through `workers.instance_id`, see that method's doc). A stage
+//!    carrying no device kind (a plain scan/shuffle stage) is unconstrained
+//!    by this refinement. This replaced an earlier "is this GPU-bound"
+//!    predicate that would have refused every `GangExec` on an all-CPU
+//!    cluster (a gang's kind is a property of its DESCRIPTOR, not of the
+//!    node type — a CPU-stamped gang must bind to a CPU executor, exactly
+//!    as a CPU-stamped `InferenceExec` does).
 //! 3. A `GangExec` stage whose job row is already `claimed_by` an executor
 //!    OTHER than this stage's own submitter is never bound to ANY slot —
 //!    the bind-time half of the re-launch guard (contract §2.4's `
@@ -99,10 +107,14 @@ impl std::fmt::Debug for DevicePlacement {
     }
 }
 
-fn has_gpu_device(devices: &[jammi_db::catalog::instance::DeviceFact]) -> bool {
-    devices
-        .iter()
-        .any(|d| d.kind == "cuda" || d.kind == "metal")
+/// Whether `devices` lists `kind` — the KIND MATCH refinement 2 needs
+/// (module doc), never "any GPU exists" or "any device exists".
+fn lists_kind(
+    devices: &[jammi_db::catalog::instance::DeviceFact],
+    kind: jammi_db::store::manifest::ComputeDeviceKind,
+) -> bool {
+    let wire = crate::engine::device_kind_wire_str(kind);
+    devices.iter().any(|d| d.kind == wire)
 }
 
 #[async_trait]
@@ -180,7 +192,7 @@ impl DistributionPolicy for DevicePlacement {
                         }
                     }
                 }
-                let gpu_bound = crate::engine::stage_is_gpu_bound(&stage.plan);
+                let required_kind = crate::engine::stage_device_kind(&stage.plan);
                 let runnable_partitions: Vec<usize> = stage
                     .task_infos
                     .iter()
@@ -202,11 +214,13 @@ impl DistributionPolicy for DevicePlacement {
                         let executor_id = slots[idx].executor_id.clone();
                         let eligible = slots[idx].slots > 0
                             && gang_submitter.as_deref() != Some(executor_id.as_str())
-                            && (!gpu_bound
-                                || executor_devices
+                            && match required_kind {
+                                None => true,
+                                Some(kind) => executor_devices
                                     .get(&executor_id)
-                                    .map(|ds| has_gpu_device(ds))
-                                    .unwrap_or(false));
+                                    .map(|ds| lists_kind(ds, kind))
+                                    .unwrap_or(false),
+                            };
                         if !eligible {
                             idx += 1;
                             attempts += 1;

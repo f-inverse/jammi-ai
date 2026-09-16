@@ -225,15 +225,16 @@ async fn two_cluster_states_over_one_catalog_see_each_others_registrations() {
     .await;
 }
 
-/// (b3) A GPU-bound stage (an `InferenceExec` naming `Cuda`) never binds to
-/// a device-less executor, even when it is the ONLY registered executor and
-/// even when a device-bearing one is also available — it binds to the
-/// device-bearing one. Mutation: drop the device predicate in
-/// `DevicePlacement::bind_tasks` (`eligible = slots[idx].slots > 0 && ...`
-/// with the `gpu_bound` conjunct removed) and this reds (the task lands on
-/// the device-less executor first, by round-robin order).
+/// (b3) KIND MATCH: a `Cuda`-stamped `InferenceExec` never binds to a
+/// device-LESS executor (empty `devices`), even when it is the ONLY
+/// registered executor and even when a `cuda`-bearing one is also
+/// available — it binds to the `cuda`-bearing one. Mutation: drop the
+/// device predicate in `DevicePlacement::bind_tasks` (`eligible =
+/// slots[idx].slots > 0 && ...` with the kind-match conjunct removed) and
+/// this reds (the task lands on the device-less executor first, by
+/// round-robin order).
 #[tokio::test]
-async fn gpu_bound_stage_never_binds_to_a_device_less_executor() {
+async fn cuda_stamped_stage_never_binds_to_a_device_less_executor() {
     run_both_backends(|kind| async move {
         let catalog = catalog(kind).await.expect("catalog opens");
         let cpu_id = format!("cpu-{}", jammi_test_utils::unique_suffix());
@@ -312,8 +313,173 @@ async fn gpu_bound_stage_never_binds_to_a_device_less_executor() {
         assert_eq!(bound.len(), 1, "exactly one task to bind");
         assert_eq!(
             bound[0].0, gpu_id,
-            "a GPU-bound task must bind to the device-bearing executor, never the device-less one"
+            "a Cuda-stamped task must bind to the cuda-bearing executor, never the device-less one"
         );
+    })
+    .await;
+}
+
+/// (b3) KIND MATCH, the properly-registered case: a `Cuda`-stamped
+/// `InferenceExec` never binds to a CPU-ONLY executor (`devices =
+/// [{cpu,0}]`, a legitimate registration, not an empty one) — it binds to
+/// the `cuda`-bearing one. The companion positive case
+/// (`cpu_stamped_stage_binds_to_a_cpu_only_executor`) proves the SAME
+/// uniform rule does not accidentally exclude CPU workloads when CPU
+/// devices are properly registered.
+#[tokio::test]
+async fn cuda_stamped_stage_never_binds_to_a_cpu_only_executor() {
+    run_both_backends(|kind| async move {
+        let catalog = catalog(kind).await.expect("catalog opens");
+        let cpu_id = format!("cpu-only-{}", jammi_test_utils::unique_suffix());
+        let gpu_id = format!("gpu-only-{}", jammi_test_utils::unique_suffix());
+        let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
+        catalog
+            .upsert_compute_executor(&ComputeExecutorRecord {
+                executor_id: cpu_id.clone(),
+                instance_id: cpu_id.clone(),
+                host: cpu_meta.host.clone(),
+                port: cpu_meta.port,
+                grpc_port: cpu_meta.grpc_port,
+                task_slots: cpu_spec.total_task_slots,
+                available_slots: cpu_spec.available_task_slots,
+                status: "Active".to_string(),
+                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                metadata: String::new(),
+                devices: vec![DeviceFact {
+                    kind: "cpu".to_string(),
+                    ordinal: 0,
+                }],
+            })
+            .await
+            .unwrap();
+        catalog
+            .upsert_compute_executor(&ComputeExecutorRecord {
+                executor_id: gpu_id.clone(),
+                instance_id: gpu_id.clone(),
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                grpc_port: 0,
+                task_slots: 1,
+                available_slots: 1,
+                status: "Active".to_string(),
+                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                metadata: String::new(),
+                devices: vec![DeviceFact {
+                    kind: "cuda".to_string(),
+                    ordinal: 0,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let session = inference_session().await;
+        let node = InferenceExecBuilder::new(
+            scan(),
+            ModelSource::hf("m"),
+            ModelTask::TextEmbedding,
+            vec!["text".to_string()],
+            "text".to_string(),
+            "src-1".to_string(),
+            Arc::clone(session.model_cache()),
+            jammi_db::store::manifest::ComputeDeviceKind::Cuda,
+        )
+        .embedding_dim(Some(2))
+        .build()
+        .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+
+        let job_id: JobId = "job-cuda".to_string().into();
+        let cache = job_info_cache(&job_id, plan);
+        let jobs = active_jobs(job_id, cache);
+
+        let policy = DevicePlacement::new(Arc::clone(&catalog));
+        let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
+            executor_id: cpu_id.clone(),
+            slots: 1,
+        };
+        let mut gpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
+            executor_id: gpu_id.clone(),
+            slots: 1,
+        };
+        let bound = policy
+            .bind_tasks(vec![&mut cpu_slot, &mut gpu_slot], jobs)
+            .await
+            .expect("bind_tasks");
+        assert_eq!(bound.len(), 1, "exactly one task to bind");
+        assert_eq!(
+            bound[0].0, gpu_id,
+            "a Cuda-stamped stage must bind to the cuda-bearing executor, never a properly \
+             registered cpu-only one"
+        );
+    })
+    .await;
+}
+
+/// (b3) The positive KIND MATCH case: a `Cpu`-stamped `InferenceExec` DOES
+/// bind to a properly-registered CPU-only executor (`devices =
+/// [{cpu,0}]`), never refused by the uniform kind-match rule the previous
+/// test exercises negatively.
+#[tokio::test]
+async fn cpu_stamped_stage_binds_to_a_cpu_only_executor() {
+    run_both_backends(|kind| async move {
+        let catalog = catalog(kind).await.expect("catalog opens");
+        let cpu_id = format!("cpu-only-{}", jammi_test_utils::unique_suffix());
+        let (cpu_meta, cpu_spec) = executor_metadata(&cpu_id, 1);
+        catalog
+            .upsert_compute_executor(&ComputeExecutorRecord {
+                executor_id: cpu_id.clone(),
+                instance_id: cpu_id.clone(),
+                host: cpu_meta.host.clone(),
+                port: cpu_meta.port,
+                grpc_port: cpu_meta.grpc_port,
+                task_slots: cpu_spec.total_task_slots,
+                available_slots: cpu_spec.available_task_slots,
+                status: "Active".to_string(),
+                heartbeat_at: jammi_db::catalog::backend::now_sortable(),
+                metadata: String::new(),
+                devices: vec![DeviceFact {
+                    kind: "cpu".to_string(),
+                    ordinal: 0,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let session = inference_session().await;
+        let node = InferenceExecBuilder::new(
+            scan(),
+            ModelSource::hf("m"),
+            ModelTask::TextEmbedding,
+            vec!["text".to_string()],
+            "text".to_string(),
+            "src-1".to_string(),
+            Arc::clone(session.model_cache()),
+            jammi_db::store::manifest::ComputeDeviceKind::Cpu,
+        )
+        .embedding_dim(Some(2))
+        .build()
+        .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(node);
+
+        let job_id: JobId = "job-cpu".to_string().into();
+        let cache = job_info_cache(&job_id, plan);
+        let jobs = active_jobs(job_id, cache);
+
+        let policy = DevicePlacement::new(Arc::clone(&catalog));
+        let mut cpu_slot = ballista_core::serde::protobuf::AvailableTaskSlots {
+            executor_id: cpu_id.clone(),
+            slots: 1,
+        };
+        let bound = policy
+            .bind_tasks(vec![&mut cpu_slot], jobs)
+            .await
+            .expect("bind_tasks");
+        assert_eq!(
+            bound.len(),
+            1,
+            "a Cpu-stamped stage must bind to the properly-registered cpu-only executor"
+        );
+        assert_eq!(bound[0].0, cpu_id);
     })
     .await;
 }
@@ -341,9 +507,10 @@ async fn already_transferred_gang_is_never_bound() {
                 status: "Active".to_string(),
                 heartbeat_at: jammi_db::catalog::backend::now_sortable(),
                 metadata: String::new(),
-                // A `GangExec` is always GPU-bound (`stage_is_gpu_bound`) —
-                // this executor needs a device so the ONLY reason binding
-                // can fail is the claim guard under test, not refinement 2.
+                // The descriptor below is stamped `Cuda` — this executor
+                // must list a matching device so the ONLY reason binding
+                // can fail is the claim guard under test (refinement 3),
+                // never refinement 2's kind match.
                 devices: vec![DeviceFact {
                     kind: "cuda".to_string(),
                     ordinal: 0,
@@ -379,6 +546,7 @@ async fn already_transferred_gang_is_never_bound() {
             attempt: 0,
             world: 2,
             submitter: submitter.clone(),
+            device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
         };
         let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
         let job_id: JobId = job_id_s.clone().into();

@@ -123,6 +123,44 @@ async fn does_not_refuse_a_matching_device_kind() {
     );
 }
 
+/// LANE pressure-round correction: K7 also covers `GangExec` — its
+/// descriptor's own stamped `device_kind` is compared against this
+/// executor's kind the same way `InferenceExec`'s is. The test session's
+/// default device is CPU, so a descriptor explicitly stamped `Cuda`
+/// mismatches it.
+#[tokio::test]
+async fn refuses_a_gang_exec_stage_whose_descriptor_names_a_different_device_kind() {
+    let session = session().await;
+    assert_eq!(
+        session.compute_device().kind(),
+        ComputeDeviceKind::Cpu,
+        "test precondition: the fixture session runs on CPU"
+    );
+    let descriptor = jammi_ai::operator::gang_exec::GangDescriptor {
+        job_id: "job-1".to_string(),
+        attempt: 0,
+        world: 2,
+        submitter: "submitter-1".to_string(),
+        device_kind: ComputeDeviceKind::Cuda,
+    };
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
+
+    let engine = JammiExecutionEngine::new(Arc::clone(&session));
+    let err = engine
+        .create_query_stage_exec(
+            "job-1".to_string().into(),
+            0,
+            0,
+            plan,
+            "/tmp",
+            &SessionConfig::default(),
+        )
+        .expect_err("a device-kind mismatch on a GangExec must be refused, never silently run");
+    let msg = err.to_string();
+    assert!(msg.contains("K7"), "the refusal must name the property: {msg}");
+    assert!(msg.contains("Cuda") && msg.contains("Cpu"), "{msg}");
+}
+
 /// README r41 (contract §2.2/§9): a stage plan wrapping a `GangExec` under a
 /// MULTI-partition node is refused typed — one gang mechanism, never a
 /// multi-partition fan-out of the coordinator body. Two `GangExec` leaves
@@ -137,6 +175,7 @@ async fn refuses_a_gang_exec_stage_with_more_than_one_partition() {
         attempt: 0,
         world: 2,
         submitter: "submitter-1".to_string(),
+        device_kind: ComputeDeviceKind::Cpu,
     };
     let left: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor.clone()));
     let right: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));

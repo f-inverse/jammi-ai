@@ -25,6 +25,7 @@ use jammi_ai::fine_tune::worker::{training_test_hooks, JobWorker, PlacedGangSubm
 use jammi_ai::operator::gang_exec::{GangDescriptor, PlacedOutcome};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::Catalog;
+use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -391,6 +392,7 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
         attempt: 99,
         world: 2,
         submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
     };
     let err = JobWorker::run_placed_gang(&executor, stale)
         .await
@@ -406,6 +408,7 @@ async fn p6_run_placed_gang_refuses_a_stale_attempt_and_a_second_launch() {
         attempt: 1,
         world: 2,
         submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
     };
     let outcome = JobWorker::run_placed_gang(&executor, real.clone())
         .await
@@ -452,6 +455,7 @@ async fn p7_run_placed_gang_refuses_a_host_already_holding_a_rank_before_any_tra
         attempt: 1,
         world: 2,
         submitter: submitter_id.clone(),
+        device_kind: ComputeDeviceKind::Cpu,
     };
     let err = JobWorker::run_placed_gang(&executor, descriptor)
         .await

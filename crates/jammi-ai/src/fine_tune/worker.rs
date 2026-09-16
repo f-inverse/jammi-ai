@@ -2206,6 +2206,13 @@ impl JobWorker {
             attempt,
             world,
             submitter: session.instance_id().to_string(),
+            // K7 (contract §9 B3's rule, extended to the gang): the required
+            // kind is the SUBMITTER's own device, never re-derived from "a
+            // GPU exists somewhere" — `DevicePlacement`/`submit_physical_plan`
+            // bind/refuse on this exact kind, and the executing session's
+            // K7 check compares against it the same way it does for
+            // `InferenceExec`.
+            device_kind: session.compute_device().kind(),
         };
         let mut stream = match submitter.submit(descriptor).await {
             Ok(stream) => stream,

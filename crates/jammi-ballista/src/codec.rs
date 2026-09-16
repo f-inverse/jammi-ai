@@ -424,6 +424,7 @@ fn encode_gang(exec: &GangExec, buf: &mut Vec<u8>) -> DfResult<()> {
         attempt: d.attempt,
         world: d.world,
         submitter: d.submitter.clone(),
+        device_kind: device_kind_str(d.device_kind).to_string(),
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::Gang as u8);
@@ -439,6 +440,7 @@ fn decode_gang(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
         attempt: msg.attempt,
         world: msg.world,
         submitter: msg.submitter,
+        device_kind: device_kind_from_str(&msg.device_kind)?,
     };
     Ok(Arc::new(GangExec::new(descriptor)))
 }

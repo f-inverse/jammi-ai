@@ -796,15 +796,19 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     await_fleet_registered(&session, &[fleet.label(0), fleet.label(1), fleet.label(2)]).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
-    // A GangExec plan (dummy descriptor — never actually run) is GPU-bound
-    // by construction (`crate::engine::stage_is_gpu_bound`'s `contains_gang`
-    // arm) and this cluster has no cuda/metal device anywhere: refused
-    // typed, client-side, before submission.
+    // KIND MATCH (LANE pressure-round correction): a GangExec's required
+    // kind is its OWN descriptor's stamp, never "is this node type
+    // GPU-shaped" — a dummy descriptor (never actually run) stamped `Cuda`
+    // is refused on this all-CPU cluster (no registered executor lists a
+    // `cuda` device); a `Cpu`-stamped one would be accepted (exercised
+    // below by the real embedding plan, whose `InferenceExec` is stamped
+    // from the harness session's own CPU device).
     let gang_plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(GangDescriptor {
         job_id: "dummy-job".to_string(),
         attempt: 0,
         world: 2,
         submitter: "dummy-submitter".to_string(),
+        device_kind: jammi_db::store::manifest::ComputeDeviceKind::Cuda,
     }));
     // The device check is a fast, purely client-side catalog read before
     // any RPC (contract §3/§9): a 20s timeout is generous headroom, never
@@ -832,8 +836,8 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
         Err(e) => e.to_string(),
     };
     assert!(
-        msg.contains("cuda") || msg.contains("metal") || msg.contains("GPU-bound"),
-        "the refusal must name the missing device kind: {msg}"
+        msg.contains("Cuda") && msg.contains("cuda"),
+        "the refusal must name the required kind (Debug) and the missing wire kind (cuda): {msg}"
     );
 
     // A CPU InferenceExec plan (the harness session's own device kind) is

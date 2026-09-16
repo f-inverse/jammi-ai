@@ -18,6 +18,7 @@ use jammi_ballista::codec::JammiCodec;
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::StoragePrecision;
+use jammi_db::store::manifest::ComputeDeviceKind;
 
 async fn session() -> Arc<InferenceSession> {
     let dir = tempfile::tempdir().unwrap();
@@ -204,6 +205,12 @@ async fn gang_exec_round_trips() {
         attempt: 3,
         world: 2,
         submitter: "instance-a".to_string(),
+        // Deliberately NOT the session's own kind (Cpu): the wire must
+        // carry exactly what was constructed, never the decoding session's
+        // own default (LANE pressure-round correction, the same "codec
+        // never rewrites device_kind" rule `InferenceExec` round-trips
+        // under).
+        device_kind: ComputeDeviceKind::Cuda,
     };
     let node = jammi_ai::operator::gang_exec::GangExec::new(descriptor.clone());
     let node: Arc<dyn ExecutionPlan> = Arc::new(node);
@@ -222,6 +229,12 @@ async fn gang_exec_round_trips() {
     assert_eq!(decoded.descriptor().attempt, descriptor.attempt);
     assert_eq!(decoded.descriptor().world, descriptor.world);
     assert_eq!(decoded.descriptor().submitter, descriptor.submitter);
+    assert_eq!(
+        decoded.descriptor().device_kind,
+        descriptor.device_kind,
+        "the wire must carry the constructed device_kind verbatim, never the decoding \
+         session's own kind"
+    );
 }
 
 #[tokio::test]

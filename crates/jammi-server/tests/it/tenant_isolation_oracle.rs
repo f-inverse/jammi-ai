@@ -3323,6 +3323,76 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
     }
 }
 
+/// The Ballista listeners a `[ballista]` role opens — the scheduler's gRPC
+/// (`[ballista] scheduler_bind`), the executor's task gRPC and Arrow Flight
+/// shuffle (`[ballista.executor] grpc_bind`/`bind`) — serve Ballista's own
+/// `ballista.protobuf.*` services, which are NOT in the `jammi.v1` universe
+/// [`wire_rpcs`] derives, so this partition names them here explicitly, the
+/// way [`PEER_LISTENER_ALLOWLIST`] names the peer verbs: the SAME trust
+/// class (I-PEER — every client of these ports is a jammi role on the
+/// compute plane's network; the ports are as unauthenticated as
+/// `peer_bind`, and `docs/guide/src/security.md` states the deployer's
+/// network-policy duty for them). Tenant scope is enforced ONCE, at the
+/// submitting session: `JammiCodec` carries the submitter's tenant onto the
+/// wire and rebuilds a tenant-scoped operator on the executor through the
+/// strict pinned read (`get_result_table_for_tenant`), never the decoding
+/// process's ambient scope; the executed cross-tenant-denial case is
+/// `crates/jammi-ballista/tests/it/codec.rs::
+/// ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_of_a_bound_one`.
+/// The exemption's premise — that none of these services is reachable on
+/// the PUBLIC listener — is proven by
+/// [`ballista_services_are_unimplemented_on_the_public_listener`].
+const BALLISTA_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
+    (
+        "ballista.protobuf.SchedulerGrpc",
+        "*",
+        "served only on scheduler_bind; tenant enforced by the coordinator (the submitting session's codec); deliberately tenant-free",
+    ),
+    (
+        "ballista.protobuf.ExecutorGrpc",
+        "*",
+        "served only on executor grpc_bind; tenant enforced by the coordinator (the submitting session's codec); deliberately tenant-free",
+    ),
+    (
+        "arrow.flight.protocol.FlightService",
+        "*",
+        "served only on executor bind (shuffle); tenant enforced by the coordinator (the submitting session's codec); deliberately tenant-free",
+    ),
+];
+
+/// The PUBLIC listener answers `UNIMPLEMENTED` for Ballista's scheduler
+/// service: no `[ballista]` service is ever mounted on the public tenant
+/// layer — the roles open their own listeners (`jammi_ballista::roles`),
+/// never `assemble_grpc_chain`'s `Routes`. This is what makes
+/// [`BALLISTA_LISTENER_ALLOWLIST`] sound; every entry carries the I-PEER
+/// text the peer allowlist requires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ballista_services_are_unimplemented_on_the_public_listener() {
+    use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
+    use ballista_core::serde::protobuf::HeartBeatParams;
+
+    let server = crate::common::grpc::start_engine_server().await;
+    let channel = crate::common::grpc::channel(server.addr).await;
+    let mut client = SchedulerGrpcClient::new(channel);
+    let err = client
+        .heart_beat_from_executor(HeartBeatParams::default())
+        .await
+        .expect_err("the public listener must not serve Ballista's SchedulerGrpc");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "public listener must answer UNIMPLEMENTED for SchedulerGrpc/HeartBeatFromExecutor: {err:?}"
+    );
+    for (service, rpc, why) in BALLISTA_LISTENER_ALLOWLIST {
+        assert!(
+            why.contains("served only on")
+                && why.contains("tenant enforced by the coordinator")
+                && why.contains("deliberately tenant-free"),
+            "{service}/{rpc}: the allowlist entry must carry the I-PEER text"
+        );
+    }
+}
+
 /// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`:
 /// `GangServiceServer` is mounted only on the internal `peer_bind` `Routes`
 /// (`OssServer::bind`), beside `PeerServiceServer`, and is never added to the

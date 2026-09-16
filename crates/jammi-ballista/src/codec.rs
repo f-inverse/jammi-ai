@@ -58,20 +58,24 @@ use jammi_db::TenantId;
 
 use crate::error::Error;
 
-#[allow(clippy::all, dead_code)]
-mod pb {
+/// The crate's own wire package (`jammi.ballista.v1`, compiled by this
+/// crate's `build.rs`; NOT part of the frozen `jammi.v1` surface). Public so
+/// an oracle can construct a descriptor the codec never would — a plan
+/// naming another tenant's table — and prove the decode refuses it.
+#[allow(clippy::all, dead_code, missing_docs)]
+pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/jammi.ballista.v1.rs"));
 }
 
 /// The 4-byte magic every jammi-encoded buffer starts with: an illegal
 /// prost tag byte (`0x07`, field 0 / wire type 7 — never legal) followed by
 /// `JMB`. See the module doc for why this can never alias a Ballista buffer.
-const MAGIC: [u8; 4] = [0x07, b'J', b'M', b'B'];
+pub const MAGIC: [u8; 4] = [0x07, b'J', b'M', b'B'];
 
 /// Node-type tag, the byte immediately after the magic.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum NodeTag {
+pub enum NodeTag {
     Inference = 0,
     AnnSearch = 1,
     AsofJoin = 2,

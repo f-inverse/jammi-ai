@@ -455,3 +455,85 @@ async fn dead_session_is_refused_typed() {
         .expect_err("a codec whose session has gone away must refuse typed, never panic");
     assert!(err.to_string().to_lowercase().contains("session"));
 }
+
+/// Tenant isolation at the codec's decode site (the oracle's per-RPC
+/// invariant, applied to the Ballista listeners): `AnnSearchExec` is rebuilt
+/// on an executor from the table name AND the tenant the SUBMITTER's session
+/// carried onto the wire, through the strict tenant-pinned read
+/// `get_result_table_for_tenant`. A descriptor naming tenant A's table under
+/// tenant B, or under no tenant, must NOT resolve; under A it does. The
+/// descriptors are built directly on the wire package — the codec's own
+/// encoder would never produce the cross-tenant ones. Mutation: relax the
+/// decode to `get_result_table` (the ambient read) and both refusal arms
+/// resolve.
+#[tokio::test(flavor = "multi_thread")]
+async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_of_a_bound_one() {
+    use jammi_ballista::codec::{pb, NodeTag, MAGIC};
+    use jammi_db::tenant::TenantId;
+    use prost::Message;
+
+    let session = session().await;
+    let tenant_a = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
+    let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
+    let table_name = format!("bal_tenant_{}", uuid::Uuid::new_v4().simple());
+    session
+        .catalog()
+        .pinned_to_tenant(Some(tenant_a))
+        .create_result_table(CreateResultTableParams {
+            table_name: &table_name,
+            source_id: "src-1",
+            model_id: "model-1",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: "",
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+            writer_id: None,
+            lease: None,
+            job_attempt: None,
+        })
+        .await
+        .expect("seed tenant A's result table row");
+
+    let descriptor = |tenant: Option<String>| {
+        let msg = pb::AnnSearchExecNode {
+            table_name: table_name.clone(),
+            tenant_id: tenant,
+            query_vector: vec![0.1, 0.2, 0.3, 0.4],
+            k: 5,
+            oversample_override: None,
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.push(NodeTag::AnnSearch as u8);
+        msg.encode(&mut buf).unwrap();
+        buf
+    };
+    let codec = JammiCodec::new(&session);
+    let ctx = session.context().task_ctx();
+
+    let err = codec
+        .try_decode(&descriptor(Some(tenant_b.to_string())), &[], &ctx)
+        .expect_err("tenant B must not resolve tenant A's table");
+    assert!(
+        err.to_string().contains("not found"),
+        "the refusal is the non-disclosing not-found, never a widened read: {err}"
+    );
+    let err = codec
+        .try_decode(&descriptor(None), &[], &ctx)
+        .expect_err("a tenant-free read must not resolve a tenant-bound table");
+    assert!(err.to_string().contains("not found"), "{err}");
+
+    let decoded = codec
+        .try_decode(&descriptor(Some(tenant_a.to_string())), &[], &ctx)
+        .expect("the owning tenant resolves its own table");
+    let decoded = decoded
+        .downcast_ref::<jammi_ai::operator::ann_search_exec::AnnSearchExec>()
+        .unwrap();
+    assert_eq!(decoded.table().table_name, table_name);
+}

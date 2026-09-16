@@ -1701,6 +1701,45 @@ fi
 rm -rf "$P2_SCRATCH_DIR"
 
 # ----------------------------------------------------------------------------
+# P2b: the create body speaks REST v2's field names (`cloud`, `image`,
+# `disk`, `gpu{id,count}`, `globalNetworking`, `dataCenterIds`, `ports`,
+# `startSsh`, `args`, `env`) -- never the v1 GraphQL `cloudType`/`imageName`
+# the pod leg's `_rp_deploy_payload` speaks (lead's review: the first cut
+# carried both v1 names onto `POST /v2/pods`).
+# ----------------------------------------------------------------------------
+p2b_json="$(RP_DISK_GB=60 RP_TTL_HOURS=1 bash -c '
+  source "'"$CLUSTER_SH"'" >/dev/null 2>&1
+  RP_PUBKEY="ssh-ed25519 AAAAtest"
+  _rp_two_host_pod_payload "NVIDIA A40" "US-IL-1" 0
+' 2>&1)"
+p2b_verdict="$(printf '%s' "$p2b_json" | python3 -c '
+import json, sys
+try:
+    b = json.loads(sys.stdin.read())
+except Exception as e:
+    print("PARSE_ERROR %s" % e); sys.exit(0)
+want = {"name", "cloud", "globalNetworking", "dataCenterIds", "gpu", "image", "disk", "ports", "startSsh", "args", "env"}
+got = set(b)
+bad = []
+if got != want: bad.append("keys=%s" % sorted(got ^ want))
+if b.get("cloud") != "SECURE": bad.append("cloud")
+if b.get("globalNetworking") is not True: bad.append("globalNetworking")
+if b.get("dataCenterIds") != ["US-IL-1"]: bad.append("dataCenterIds")
+if b.get("gpu") != {"id": "NVIDIA A40", "count": 1}: bad.append("gpu")
+if not isinstance(b.get("disk"), int) or b["disk"] != 60: bad.append("disk")
+if b.get("ports") != ["22/tcp"]: bad.append("ports")
+if b.get("startSsh") is not True: bad.append("startSsh")
+if not str(b.get("args", "")).startswith("bash -c "): bad.append("args")
+if b.get("env", {}).get("PUBLIC_KEY") != "ssh-ed25519 AAAAtest": bad.append("env")
+print("OK" if not bad else "BAD " + ",".join(bad))
+')"
+if [ "$p2b_verdict" = "OK" ]; then
+  ok "P2b: the two-host pod create body carries exactly REST v2's field names (cloud/image/disk/gpu{id,count}/globalNetworking/dataCenterIds/ports/startSsh/args/env) -- no v1 cloudType/imageName"
+else
+  bad "P2b: the create body is off: ${p2b_verdict}; body=${p2b_json}"
+fi
+
+# ----------------------------------------------------------------------------
 # P3: rank assignment is deterministic and RECORDED -- rank 0 is created
 # FIRST, rank 1 SECOND (static ordering over the committed text, the same
 # "F10" precedent this file already uses for rp_init/rp_cluster_create).

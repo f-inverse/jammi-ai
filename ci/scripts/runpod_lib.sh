@@ -1794,16 +1794,21 @@ _rp_two_host_pod_payload() {
   setup="$(_rp_entrypoint_setup "$RP_TTL_HOURS")" || return 1
   name="${RP_POD_PREFIX}-ttl${RP_TTL_HOURS}"
   rp_name_allowlist_check "two-host pod name (rank ${rank})" "$name" || return 2
-  python3 - "$gpu" "$dc" "$RP_IMAGE" "$RP_PUBKEY" "$name" "$setup" <<'PY'
+  # REST v2 `POST /v2/pods` field names (docs.runpod.io/api-reference-v2/pods/
+  # create-a-pod): `cloud` and `image` -- NOT the v1 GraphQL `cloudType`/
+  # `imageName` the pod leg's `_rp_deploy_payload` speaks; `disk` is the
+  # container disk in GB (the same RP_DISK_GB the cluster payload sends).
+  python3 - "$gpu" "$dc" "$RP_IMAGE" "$RP_PUBKEY" "$name" "$setup" "$RP_DISK_GB" <<'PY'
 import json, sys
-gpu, dc, image, pub, name, setup = sys.argv[1:7]
+gpu, dc, image, pub, name, setup, disk_gb = sys.argv[1:8]
 body = {
     "name": name,
-    "cloudType": "SECURE",
+    "cloud": "SECURE",
     "globalNetworking": True,
     "dataCenterIds": [dc],
     "gpu": {"id": gpu, "count": 1},
-    "imageName": image,
+    "image": image,
+    "disk": int(disk_gb),
     "ports": ["22/tcp"],
     "startSsh": True,
     "args": "bash -c '%s'" % setup,

@@ -1994,6 +1994,176 @@ Executed mutations: M1–M5 all red on their first run (see §2); every mutation
 (no trailers, per COMMON.md; 8 files, +690/−136 against `82f80b84`; `git status` clean.)
 
 
+## 8b. C1 — the cookbook session-lifecycle gate for the non-pytest lanes, issue #539 (landed as one commit; original `1124512c`)
+
+The implementer's contract, folded by the lead after running the gate and its 13-check self-test on the merged tree (clean over 80 files). Mechanism (b), the AST gate, was chosen over the registry observer with the reason stated (a quarto chapter is one persistent kernel with no wrappable entry point; a static gate reds on the PR with no render). Its four labelled limits (intra-procedural taint only; `jammi.connect` attribute-call only; the support library out of the scanned roots; with-item ordering) each carry the grep that shows zero live sites today.
+
+#### Scope shipped
+
+- `ci/scripts/check_cookbook_session_lifecycle.py` (new): an AST gate over
+  `cookbook/book/scripts/**`, `cookbook/quickstart/**`, `cookbook/recipes/**`
+  (every `.py`) and `cookbook/book/chapters/**/*.qmd` (every executed
+  ```{python}``` cell). It walks the real AST block extent of every
+  `with tempfile.TemporaryDirectory() as X:` statement (its own `.items` and
+  `.body`, at any nesting depth — `ast.walk`, no line count, no indentation
+  column) and flags a `jammi.connect(...)` call whose first argument
+  (positional or `target=` keyword) mentions `X` — an f-string, a `BoolOp`
+  (`args.target or f"file://{X}"`), string concatenation, or `X.name` — unless
+  that call is itself a with-item's own `context_expr` (of the same statement
+  or of a nested `with` inside the block). `--self-test` runs 13 fixture
+  checks and exits non-zero on any failure.
+- `.github/workflows/ci.yml`: two new `guard` matrix legs — `cookbook
+  session-lifecycle gate` (the real scan) and `cookbook session-lifecycle gate
+  (self-test)` — so `ci/scripts/merge_path.sh --only guards` runs both.
+- `cookbook/book/tests/conftest.py`: the module docstring's closing sentence
+  ("a static gate over those is filed as issue #539") is rewritten to name the
+  shipped gate instead of the filed issue (current-state docs, same commit).
+- `docs/maintainer/MAINTAINER-GUIDE.md` §1.5: "four coupling artifacts" ->
+  "five", with a new item 5 describing both session-lifecycle mechanisms (the
+  pytest registry rail and this gate) and why crediting only a with-item is
+  sound on every exit path.
+
+##### Deviations from the brief, with the code cited for each
+
+- **Mechanism chosen: (b), the static AST analysis — not (a), the registry
+  observer.** The issue itself frames this as an open choice ("or both if
+  each covers what the other cannot"). Rejected (a) because none of the four
+  non-pytest lanes has one process entry point this repo controls the way
+  `pytest`'s `conftest.py` controls test collection: `cookbook/book/scripts/*.py`
+  and `cookbook/recipes/*/example.py` are each `python <file>.py` — a
+  standalone process a harness could wrap, sure, but the fourth lane, a
+  `.qmd` chapter, is executed by quarto as a persistent kernel across many
+  cells (confirmed by reading a real chapter, e.g.
+  `cookbook/book/chapters/21-`unified-client/unified-client.qmd` (lines 122–126 at the unit tip) binds
+  `embedded`/`remote` in one cell and both names are read by cells nearly 300
+  lines later) — there is no importable module boundary a Python-level
+  `atexit`/`observe()` harness could wrap around "one `.qmd` chapter's
+  render" without reimplementing quarto's own render loop, and doing so would
+  only report a leak once the WHOLE chapter finished (deep in the nightly
+  render, `.github/workflows/cookbook-render.yml`, never a PR gate) — failing
+  the "RED on a PR, no render needed" requirement the brief's own "runs in
+  `ci.yml`'s guard matrix" line states. (b) runs over the committed source
+  text directly, in every PR, with no render.
+- **Scope excludes `cookbook/book/tests/**`.** The issue's own body states
+  "No static shape gate exists for those lanes and none is needed" for the
+  pytest lane. I read `cookbook/book/tests/conftest.py` in full and confirmed
+  its `_no_leaked_sessions` fixture already subscribes to
+  `clients/python/jammi/_sessions.py`'s registry for every test, independent
+  of binding shape — a second, less precise mechanism over the same files
+  would be redundant coverage the issue explicitly declines. (Checked for
+  false-positive risk anyway: `cookbook/book/tests/test_unified_client_cache.py:110`
+  binds `embedded = jammi.connect(f"file://{tmp_path}")` against pytest's own
+  `tmp_path` fixture, never a `TemporaryDirectory` with-item, so this gate
+  would not even see it as tainted if the scope were widened — verified by
+  running the gate against that path with the exclusion lifted, zero
+  offenses.)
+- **`jammi.connect` only, not an aliased `from jammi import connect`.** Same
+  limit the excised gate's `_CONNECT` regex had, stated in the issue's own
+  design comment ("taint = the tempdir's bound name appearing in the FIRST
+  argument of any `jammi.connect(...)` call"). Swept by hand:
+  `grep -rn "^from jammi import" cookbook/book/scripts cookbook/book/chapters
+  cookbook/quickstart cookbook/recipes` returns only `Session`/`Capability`
+  imports, never `connect` — zero live occurrences today.
+- **`cookbook/book/jammi_cookbook/**` (the shared support library) is out of
+  scope.** The issue's property names "build scripts, recipes, quickstart,
+  executed chapter cells" — a library imported by those lanes, not itself a
+  lane. Checked: `grep -rln "TemporaryDirectory" cookbook/book/jammi_cookbook`
+  returns nothing, so this is not a live gap today; a reviewer adding a
+  `TemporaryDirectory`+`jammi.connect` site there should not rely on this
+  gate to catch it (documented as a known limit in the module docstring is
+  NOT done for this specific one — flagging it here instead, since it did not
+  come up as a real site to word a limit around).
+
+#### Properties
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| Every `jammi.connect(...)` call under the four non-pytest lane roots, tainted by an enclosing `TemporaryDirectory`'s bound name, is a with-item whose context manager is that connect call directly (same statement or nested `with`) — else the gate reports it by `path:lineno`. | `check_cookbook_session_lifecycle.py --self-test`, checks `assignment-form-flagged`, `wrapper-with-item-flagged`, `exit-stack-flagged`, `finally-body-control-flow-still-flagged`, `two-tempdirs-one-statement-flagged`, `boolop-fallback-assignment-flagged` (6/13); plus the module-level scan `python3 ci/scripts/check_cookbook_session_lifecycle.py` over the real committed tree. | For the self-test fixtures: each fixture IS the mutation of the negative-control shape (e.g. `wrapper-with-item-flagged` is `with-item-shape-silent`'s exact code with the with-item's CM changed from `jammi.connect(...)` to `_Wrap(jammi.connect(...))`) — asserted both ways in the same run, so a change that broke crediting either direction reds one of the two. For the real tree: mutated `cookbook/book/scripts/build_cdc_cache.py`'s with-item connect (`args.target or f"file://{catalog}"`) into a bare assignment closed only in a `try/finally`; ran `python3 ci/scripts/check_cookbook_session_lifecycle.py`; first line of red output: ``::error::an embedded engine outlives the TemporaryDirectory rmtree is about to remove (ENOTEMPTY: Errno 39 on Linux / 66 on macOS):`` followed by ``cookbook/book/scripts/build_cdc_cache.py:274: `jammi.connect(args.target or f'file://{catalog}')` is tainted by TemporaryDirectory `catalog` and is not a with-item...`` (exit 1); reverted the file (`git diff` empty), re-ran, gate green again. |
+| A wrapper with-item (context manager is not the session itself) is flagged — the exact shape the excised regex/indent gate could not distinguish from a genuine with-item. | `--self-test`'s `wrapper-with-item-flagged`. | The fixture's own construction: `_Wrap(jammi.connect(f'file://{d}')) as w` — mutating it back to `jammi.connect(f'file://{d}') as w` (dropping `_Wrap`) makes the check assert `len(...) == 1` against an empty list, i.e. it reds if the credit logic stopped distinguishing wrapper from direct — verified by hand-running that reverted fixture through `offenses_for(...)`, got `[]` as expected for the un-mutated with-item shape. |
+| An `ExitStack.enter_context(jammi.connect(...))` (never a with-item at all) is flagged. | `--self-test`'s `exit-stack-flagged`. | Fixture is the mutation of the with-item shape into an `ExitStack`; `_credited_connect_ids` correctly excludes it since the call is an argument to `enter_context`, not any with-item's `context_expr`. |
+| A close written inside a `finally:` clause — even one reachable only after an early `return` inside a NESTED `try/finally` (the "finally-body control flow" the issue's title names) — is still flagged, because crediting it is unsound in general (indistinguishable from a close on an aliasing name or inside an `if`). | `--self-test`'s `finally-body-control-flow-still-flagged`. | Fixture nests a `try/finally` with a conditional early `return` inside an outer `try/finally: db.close()`, itself inside the tempdir's `with` block — `_credited_connect_ids` never inspects `finally` bodies at all, so this stays red regardless of how deep the control flow nests; verified the fixture actually contains a `return` inside a `finally`-guarded nested `try` (not just a flat `finally`) by re-reading the fixture source in the self-test file. |
+| Two `TemporaryDirectory` items bound in the SAME `with` statement (one of the five shapes the excised regex/indent gate missed) each taint independently; a connect referencing either, not itself a with-item, is flagged. | `--self-test`'s `two-tempdirs-one-statement-flagged`. | Fixture: `with TemporaryDirectory() as a, TemporaryDirectory() as b:` then a bare assignment connect on `f'file://{a}/{b}'` — both names are in `names`, `_tainted_by` matches on either — flags once (deduped by `id(call)`), not twice. |
+| A parenthesized multi-line `with (` header (3.10+ grammar, the excised gate's ">20-line bail-out" shape) parses identically to the unparenthesized form; the with-item shape stays silent regardless of how many lines the header spans. | `--self-test`'s `parenthesized-header-with-item-silent`. | `ast.parse` produces the same `With` node either way — there is no line-count parameter to mutate; instead verified by also running the REAL site `cookbook/book/scripts/check_api_reference.py:215-219` (an actual 5-line parenthesized header with-item) through the real-tree scan, which reports zero offenses for it. |
+| A `.qmd` chapter's `python`-fenced cells are extracted and concatenated (blank-padded so line numbers still index the real file); non-python fences and prose are excluded; a tainted-and-unclosed shape inside a cell is flagged at the cell's own original line number. | `--self-test`'s `qmd-cell-extraction-flags-and-keeps-lineno` (asserts both the offense count AND the exact `lineno` against `qmd_text.splitlines().index(...)`). | Fixture includes a decoy ` ```{r}` cell containing the literal text `1 + 1` and a prose paragraph that MENTIONS `jammi.connect` in backticks — mutating the extractor to not gate cell membership on the `{python}` tag (e.g. treating any fenced block as Python) would either raise `SyntaxError` on the `{r}` cell's content in a real multi-language chapter or shift line numbers; the assertion on the exact lineno catches a padding-offset regression, and the offense count catches a scope-widening regression. |
+| A held, never-`rmtree`'d catalog directory (`tempfile.mkdtemp(...)`, not `TemporaryDirectory`) is out of scope by construction — no removal race exists for it. | `--self-test`'s `held-directory-out-of-scope`; corroborated by the real tree: `cookbook/recipes/image_search/0{2,3,4}-*.py` and the `audio_search` siblings all connect against a persistent `ARTIFACT_DIR`, and the real-tree scan reports zero offenses for them. | Fixture: `db = jammi.connect(f'file://{ARTIFACT_DIR}')` with no enclosing `TemporaryDirectory` at all — `_tempdir_with_statements` finds no `With` node carrying a `TemporaryDirectory` item, so nothing is even attempted; flipping `ARTIFACT_DIR` to a `TemporaryDirectory`-bound name (as done in `assignment-form-flagged`) reproduces a red, confirming the negative here is not merely "the gate never runs." |
+| The real, committed `cookbook/**` tree (80 files: `cookbook/book/scripts`, `cookbook/quickstart`, `cookbook/recipes`, `cookbook/book/chapters/**/*.qmd`) is clean. | `--self-test`'s `real-tree-is-clean` control (asserted first, so a gate that reds everywhere is caught before any positive control is trusted); `python3 ci/scripts/check_cookbook_session_lifecycle.py` exit 0. | Any of the mutations above, applied to the real tree instead of a fixture, reds this control — executed once for real (`build_cdc_cache.py`, see the first row) rather than only argued. |
+
+#### Uncovered
+
+- **Intra-procedural taint only** (a `TemporaryDirectory` passed as a
+  parameter into a helper several calls deep, which then derives the real
+  catalog directory via `tempfile.mkdtemp(dir=parameter)`, is invisible).
+  Real, current instance: `cookbook/book/scripts/build_recompute_cache.py`'s
+  `emit` (lines 388-402, read directly) -> `run_cache`/`_fresh_chain` (lines
+  183-259, read directly) chain — both call sites close correctly via
+  `try/finally` (`_fresh_chain`'s `db.close()` at line 198, `run_cache`'s at
+  line 259), verified by eye, but this gate does not see them at all (no
+  `jammi.connect` call appears anywhere inside `emit`'s own `with
+  tempfile.TemporaryDirectory() as work_root:` block's AST subtree at line
+  392, since the actual connect lives in a DIFFERENT function, reached only
+  through a plain function call `run_cache(work, model, src_path)` at line
+  398). Same limit the excised gate carried (issue #536's fix commit
+  `d63b8ef5`/`caedd168` region); a reviewer introducing a NEW multi-hop chain
+  like this should not rely on this gate.
+- **`jammi.connect` attribute-call only** — an aliased `from jammi import
+  connect` binding a bare `connect(...)` call is invisible (see Scope
+  deviations above; zero live sites today).
+- **`cookbook/book/jammi_cookbook/**` is out of the scanned roots** (see
+  Scope deviations above; zero live `TemporaryDirectory` sites there today,
+  confirmed by grep, so this is a labelled gap rather than a demonstrated
+  miss).
+- **Item ordering within one `with` statement is not enforced.** If a
+  connect item appeared BEFORE its tempdir sibling in the same statement's
+  `items` list, this gate would still treat it as tainted (my `names` set is
+  built from ALL `TemporaryDirectory` items in the statement, not filtered by
+  position) even though the name would not actually be bound yet at that
+  point in real execution (a `NameError` at runtime, not a leak). This is a
+  theoretical false-positive-on-broken-code path only: no cookbook site puts
+  a tempdir item after its dependent connect item (checked: every real
+  with-item site in `cookbook/**` puts the `TemporaryDirectory` item(s)
+  first), and code with this shape would fail at import/run time before this
+  gate's finding would ever matter in practice.
+- **The `merge_path.sh --only guards` run's one unrelated failed LEG** ("pod
+  build substrate", `rc=1`, log `target/merge-path/025.log`) internally runs
+  `ci/scripts/test_pod_substrate.sh`, whose own tally is `195 passed, 19
+  failed, 0 skipped`. Re-read the 19 `FAIL` lines directly (not just the tail
+  I first looked at): every one traces to `cargo`/`cargo metadata`/`cargo
+  package`/a real `cargo build` being unavailable or refusing in this
+  sandbox (`which cargo` -> not found on this worktree's `PATH` at all) —
+  e.g. `cargo package --list failed for a NON-network reason`, `cargo
+  metadata --frozen ... failed (or produced no output)`, `real cargo build
+  of the a2fix fixture workspace failed`, plus several fixture-harness
+  assertions (`(b/adopt)`, `(n)`, `(i)`, `(p1/A5)`, `(p2/A5)`) that
+  themselves shell out to a `cargo`-backed seed pipeline and so fail the same
+  way once the toolchain is absent. Unrelated to this cookbook-only, no-Rust
+  unit (I never touch `ci/scripts/test_pod_substrate.sh`,
+  `pod_build_timings.sh`, or any RunPod/cargo-provisioning script). Not fixed
+  here (out of this unit's scope per the brief: "your worktree ... no Rust
+  crate") — `which cargo` is a property of this shell's `PATH`, not of any
+  git branch content, so this failure is independent of the diff and would
+  reproduce identically checking out any commit in this same shell.
+
+#### Gates
+
+| Command | Exit | Result |
+|---|---|---|
+| `python3 ci/scripts/check_cookbook_session_lifecycle.py --self-test` | 0 | `self-test: all 13/13 checks passed` |
+| `python3 ci/scripts/check_cookbook_session_lifecycle.py` | 0 | `cookbook session-lifecycle gate: clean -- 80 file(s) scanned...` |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1028 file(s) scanned, all PATH:LINE citations resolve...` (2 pre-existing EXEMPT entries, unrelated) |
+| `ruff check jammi_cookbook scripts tests` (run from `cookbook/book/`, the exact invocation `.github/workflows/cookbook-book.yml`'s `Lint` step uses) | 0 | `All checks passed!` (my only edit under that lint scope, `conftest.py`, is a docstring-only change) |
+| `bash ci/scripts/merge_path.sh --only guards --skip-pg --skip-mdbook` | 1 (re-run with output redirected to a file and `$?` read directly afterward, not through a pipe — my first run piped through `tail -100` and mis-showed exit 0, since a pipeline's status is its LAST command's, `tail`'s, not `merge_path.sh`'s; corrected here) | `RAN 89  FAILED 1` (of the 89 guard-matrix LEGS; `exit "$failed"` at the bottom of `merge_path.sh` is exactly the failed-leg count, 1; the failing leg's own internal suite, `test_pod_substrate.sh`, further reports `195 passed, 19 failed`) — both new legs (`cookbook session-lifecycle gate`, `cookbook session-lifecycle gate (self-test)`) `ok`; the failing leg (`pod build substrate`) is the pre-existing, unrelated `cargo`-absent environment gap detailed in Uncovered above |
+| (informational, not in the brief's list) bare `ruff check ci/scripts/check_cookbook_session_lifecycle.py` | 3 findings | `ci/scripts/` carries no `pyproject.toml`/ruff config of its own and is not linted by any CI job (confirmed: running the same bare `ruff check` against the pre-existing, CI-passing `ci/scripts/check_release_manifest.py` also produces findings under ruff's DEFAULT ruleset) — fixed the two real ones anyway (`typing.Iterable` -> `collections.abc.Iterable`; narrowed the defensive `except Exception` to `except (ValueError, TypeError)`) and left the executable-bit finding alone (every sibling `check_*.py` in `ci/scripts/` is non-executable; `chmod +x` would be a gratuitous convention break) |
+
+#### Commits
+
+```
+1124512c fix(cookbook): #500 C1 — AST session-lifecycle gate for the non-pytest lanes (issue #539)
+```
+(branched from `b5a7aab9`, one commit; `git log --oneline main..HEAD` in this
+worktree shows the same single commit — local `main` is already at
+`b5a7aab9`, the wave-3b merge tip, so the base and the branch point coincide.)
+
+
 ## 9. Pressure round (phase 1, executed at `856ec8dd` before the code landed) — REFINE, eight blocks folded
 
 The design of the four wave-A units was attacked read-only against the base tree; the lead

@@ -300,6 +300,15 @@ rebuild unit is "masked scans under Ballista"); the accelerator dimension stays 
   (crates/jammi-ai/tests/distributed) is red on the tip's CI run and on main's (pre-existing,
   timing-sensitive, the leg is `advisory: true`); outside this PR's diff; no issue filed by this
   wave — the nightly watcher's streak rule governs its promotion.
+- **`CatalogClusterState::init` seeds every row's cache timestamp with "now"** (pre-existing on
+  main): a scheduler that starts over rows another scheduler's executors own reads them as
+  freshly heard-from, and its own expiry sweep (Ballista's `expire_dead_executors`, off the
+  per-process cache) can remove them 180 s later if no heartbeat lands on it. The shape-d
+  overlay runs one scheduler, so no fleet today has two sweeps; a second scheduler is the
+  rebuild trigger (seed the cache from the row's own `heartbeat_at`).
+- **The jobs row `already_transferred_gang_is_never_bound` submits** (pre-existing) is not
+  removed by `with_owned_rows` (its verb is `remove_compute_executor`); the row is a queued
+  `fine_tune` no worker claims on the shared database — filed, not fixed in this wave.
 - **Cluster leg (row C9 of the wave-3 remainder).** Two driver defects were found the moment a
   cluster was ever provisioned (§9b: the provisioning read refused at once; the sm_80 literal
   would have refused every non-A100 part on the members) and are fixed with fixtures. Every
@@ -447,7 +456,7 @@ standing is filed in §8d as a residual with its executed refutation, never re-l
 - **F2 BLOCK — "DRAIN stops admission at once" was false at the code.** Fix at the root, three
   parts (ca4f8152): `ExecutorRole::begin_drain` (the Terminating flip + heartbeat) runs at the
   DRAIN instant in both runtime arms, before the worker join; `cluster::executor_is_live`
-  (`Active` + heartbeat within `EXECUTOR_LIVENESS_WINDOW` = Ballista's 180 s executor timeout) is
+  (`Active` + heartbeat within `executor_liveness_window()`, derived from Ballista's 180 s executor timeout) is
   the ONE predicate the binder and the submit edge share, so a Terminating row is never bound;
   `HostAdmission::probe_claim` refuses outside `Running`, so `run_placed_gang` refuses a draining
   host by name before any claim transfer. Oracles: `begin_drain_reports_terminating_to_the_catalog_before_the_executor_stops`
@@ -474,6 +483,49 @@ standing is filed in §8d as a residual with its executed refutation, never re-l
   the scope is the executed boundary, not a guess. The B2 unit test asserts the false arm.
 - **Noted, not a finding (the audit's own note).** `SCHEDULER_CONNECT_WINDOW` is a 60 s constant
   with no knob; a slow scheduler rollout resolves through pod restart. Left; filed in §8d.
+
+### 9c. Closing round 3 (adversarial-audit BLOCK at `a149b334`, 2026-09-16 18:57 UTC — one block, six advisories; the two CI reds on the tip; every item fixed at the root)
+
+Under §9b's stop rule this is the scoped re-audit's diff: the block is a mechanism defect inside
+round 2's own diff, so it is fixed once and re-audited (#6, scoped to `a149b334..<tip>`); the
+advisories are folded here; #6 is terminal.
+
+- **BLOCK — the new `begin_drain` oracle poisoned the shared `it` binary.** `ExecutorRole::begin_drain`
+  stores `ballista_executor::executor_server::TERMINATING`, a crate-wide static nothing resets;
+  every executor hosted afterwards in that process heartbeats `Terminating` and is never bound.
+  The repo had already carved `tests/roles_drain.rs` out of `it` for exactly this; the round put
+  the sibling back in. Fix: the oracle lives in its own `[[test]]` binary
+  `crates/jammi-ballista/tests/roles_begin_drain.rs` (module doc names the reason); `it` hosts
+  no `begin_drain` caller. Executed: `it`, `roles_drain` and `roles_begin_drain` green in one
+  cargo invocation (three processes).
+- **A1 (ownership list carried job/instance ids).** Only executor ids are pushed now; the jobs
+  row of `already_transferred_gang_is_never_bound` is pre-existing and outside the wrapper's
+  verb (filed in §8d).
+- **A2 ("every … nine" was false).** Eleven executor-registering tests in
+  `crates/jammi-ballista/tests/it/cluster.rs` run under `with_owned_rows` now, the stale-cuda
+  submit-edge test included (its catalog is the SQLite tempdir session; wrapped for the
+  invariant, not for a leak).
+- **A3 (`placement_available` read dead executors).** Fixed at the root: it reads
+  `list_compute_executors` and applies `executor_is_live`, the same predicate as the binder and
+  the submit edge — a dead executor's row no longer diverts a claim into a placed path that the
+  submit edge would refuse.
+- **A4 (`EXECUTOR_LIVENESS_WINDOW` was a second literal).** `executor_liveness_window()` derives
+  the window from `SchedulerConfig::default().executor_timeout_seconds` (the default
+  `roles::scheduler_config` keeps); the binder and Ballista's expiry cannot drift.
+- **A5 (the mixed ssh arm burned the whole window).** `_rpc_wait_for_members_ready` settles for
+  F3's proxy fallback after `RP_SSH_MIXED_GRACE_SECS` (45 s) of rank 0 direct + rank 1
+  overlay-only; fixture A4 drives it (grace 1 s → rc 0, proxy_flag 1); the A1/A2 revert-REDs
+  replace the new block verbatim.
+- **A6 (two-step CAS in `submit_placed`).** `begin_awaiting_placement` returns
+  `Err(the holder it saw)` from the same critical section; the call site decides on that value,
+  never on a second read. Unit assertions updated.
+- **CI red (run 35134806942, device-kind test: "Address already in use").** The harness picked
+  listener ports by `bind(:0)`-then-release — the kernel's ephemeral range, where the test
+  process's own outgoing connections draw local ports — so a client socket took the port before
+  the spawned server bound it. `free_port` now picks from 20000..32000 (below every platform's
+  ephemeral floor), verified bindable, never twice per process (e2dd094e). Lane 7/7 locally.
+- **CI red (run 35131688738, killed-executor test).** The placed-claim wait returned on the
+  first claimant (the submitter, pre-transfer); it returns on the transfer now (a149b334).
 
 ## 10. Gate table
 

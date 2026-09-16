@@ -318,18 +318,18 @@ fn contains_code_token_hits_calls_not_comments_strings_or_longer_identifiers() {
         &mask_non_code("// fail_job( in prose\nfn f() {}\n"),
         "fail_job("
     ));
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     assert!(!contains_code_token(
+        // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
         &mask_non_code("fn f() { let s = \"fail_job(\"; }\n"),
         "fail_job("
     ));
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     assert!(!contains_code_token(
+        // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
         &mask_non_code("fn never_fail_job() {}\n"),
         "fail_job("
     ));
-    // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
     assert!(contains_code_token(
+        // kernel-oracles: fn-in-literal reviewed: fixture string, not real code
         &mask_non_code("fn f() { catalog.fail_job(&id).await }\n"),
         "fail_job("
     ));

@@ -7,14 +7,14 @@
 //! no peer-side write into the artifact prefix, no job-row write. The two
 //! types here make that a TYPE fact rather than a discipline:
 //!
-//! - [`LeaseHolder`] is what every job-row-writing site in
+//! - [`LeaseHolder`](crate::fine_tune::role::LeaseHolder) is what every job-row-writing site in
 //!   `crate::fine_tune::worker` takes as a REQUIRED parameter (the lease-hold
 //!   registration and its `Releasing` self-release arm, the holder
 //!   accounting, the acceleration-report write, every `record_failed` site,
 //!   `finish_job_with_model`'s call site, the coordinator's assembly-outcome
 //!   and lease-release writes). It has exactly two values — today's loop
 //!   path and the `Peer` gang's coordinator — and no value for a rank.
-//! - [`RunnerRole`] is what a training body runs AS: a lease holder, or a
+//! - [`RunnerRole`](crate::fine_tune::role::RunnerRole) is what a training body runs AS: a lease holder, or a
 //!   rank `>= 1` of a gang. A `Rank` carries no `LeaseHolder`, so a rank
 //!   body that tried to call a job-row writer would have nothing to pass:
 //!   the write is unreachable by type, not refused at run time. The
@@ -22,7 +22,7 @@
 //!   checkpoints) are gated on the same role
 //!   (`crate::fine_tune::trainer::TrainingLoopBuilder::runner_role`).
 //!
-//! `W == 1` is [`LeaseHolder::LoopClaimer`] on every path (K4): the
+//! `W == 1` is [`LeaseHolder::LoopClaimer`](crate::fine_tune::role::LeaseHolder::LoopClaimer) on every path (K4): the
 //! single-rank run never traverses the coordinator body, and every
 //! pre-gang byte of behaviour is that role's.
 

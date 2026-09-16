@@ -368,12 +368,20 @@ async fn submit_and_await_placed_claim(
     .await;
 
     let (job_id, expected_model) = harness::submit_gang_fine_tune(session, source, size, 2).await;
+    // The PLACED claim, never the first one: the scheduler-role process
+    // (lane-1) claims the row itself and holds it `running` under its own
+    // id until the executor's `run_placed_gang` transfers it. A wait that
+    // returned on any claimant caught that pre-transfer state on a slower
+    // runner (CI run 35131688738: claimant == lane-1, 1.8 s in), so the
+    // predicate is the transfer itself; a placement that never transfers
+    // ends here as a timeout with the fleet's diagnostics.
+    let submitter_id = instance_id_of_label(session, fleet.label(0)).await;
     let record = harness::await_job(
         &mut fleet,
         session,
         &job_id,
-        "the job is claimed and running",
-        |r| r.status == "running" && r.claimed_by.is_some(),
+        "the job is claimed, running, and transferred to a placed executor",
+        |r| r.status == "running" && r.claimed_by.as_deref().is_some_and(|c| c != submitter_id),
     )
     .await;
     let claimant = record.claimed_by.expect("running job has a claimant");

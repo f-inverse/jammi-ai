@@ -782,30 +782,63 @@ pub(crate) async fn shutdown_wait_step() {
 
 /// Close `pool` and wait until it holds **no** live connections.
 ///
-/// `sqlx`'s own `Pool::close` is not that barrier. A `PoolConnection` returns
-/// itself to the pool from a task spawned in its `Drop`, so a connection
-/// dropped shortly before the close can still be mid-return when `close()`
-/// resolves; the driver-level close then lands afterwards. For SQLite that is
-/// the difference between a release point and a race: the final
-/// `sqlite3_close` is what drops the process-exclusive lock and deletes
-/// `catalog.db-wal`, and it was measured landing *after* `Pool::close()`
-/// returned roughly one open/close cycle in seven.
+/// `sqlx`'s own `Pool::close` is not that barrier, for two reasons.
+///
+/// First, a `PoolConnection` returns itself to the pool from a task spawned
+/// in its `Drop`, so a connection dropped shortly before the close can still
+/// be mid-return when `close()` resolves; the driver-level close then lands
+/// afterwards. For SQLite that is the difference between a release point and a
+/// race: the final `sqlite3_close` is what drops the process-exclusive lock and
+/// deletes `catalog.db-wal`, and it was measured landing *after*
+/// `Pool::close()` returned roughly one open/close cycle in seven.
+///
+/// Second — and this is why the wait below re-runs `close` rather than only
+/// polling `size()` — one `Pool::close` pass can END with a connection it will
+/// never close. The pass (sqlx 0.8, `PoolInner::close`) sets the pool's closed
+/// flag, then repeatedly sweeps the idle queue and waits on the pool's permits,
+/// returning once it holds every permit — i.e. once no connection is checked
+/// out. A return task that read the closed flag as *unset* (it began before
+/// the pass and is spending its round trip in the on-release liveness ping)
+/// then pushes its connection onto the idle queue and only THEN gives its
+/// permit back: the pass's last sweep ran before that push, the permit arrives
+/// after it, and the pass returns with the connection idle inside a closed
+/// pool. Nothing sweeps a closed pool's idle queue on its own, so `size()`
+/// stays at one until the pool is dropped. On a server DRAIN the last catalog
+/// write before the session closes is exactly such a drop (the worker join's
+/// `workers` row delete), and its return's ping round trip is the window —
+/// sub-millisecond on a loopback, milliseconds on a container network — so the
+/// barrier waited out its whole ceiling whenever a loaded host lost the race
+/// (the compose smoke's `docker compose restart`: 3 ms on three runs, 30 s on
+/// the fourth).
+///
+/// `Pool::close` may be called again, and every pass sweeps the idle queue
+/// afresh, so the barrier is a LOOP of close passes: each closes everything
+/// idle and waits for everything checked out, and the loop ends when the
+/// pool's accounting reads empty. A connection that lands idle after one
+/// pass's sweep is closed by the next; a return that reads the flag as set
+/// closes its own connection and decrements `size()` itself; a connection
+/// checked out for good blocks the pass, as it always did. Reaching the
+/// ceiling therefore means a driver-level close that does not complete, and
+/// the warning names the consequence per backend.
 ///
 /// `Pool::size()` is decremented by each connection's `DecrementSizeGuard`,
 /// which is dropped only after that connection's driver-level close has
-/// completed, so waiting for `size() == 0` covers the connections the pool's
-/// own accounting knows about. It was measured **not sufficient on its own**
-/// for SQLite — the `-wal` still outlived it by ~3 ms once every few cycles —
-/// so the SQLite backend follows this with a wait on SQLite's own release
-/// evidence. The loop waits through [`shutdown_wait_step`], which leaves the
-/// runtime free to actually run the return tasks it is waiting on.
+/// completed, so `size() == 0` covers every connection the pool's accounting
+/// knows about. It was measured **not sufficient on its own** for SQLite —
+/// the `-wal` still outlived it by ~3 ms once every few cycles — so the SQLite
+/// backend follows this with a wait on SQLite's own release evidence. The loop
+/// waits through [`shutdown_wait_step`], which leaves the runtime free to run
+/// the return tasks it is waiting on.
 pub(crate) async fn close_pool_and_drain<DB: sqlx::Database>(
     pool: &sqlx::Pool<DB>,
     kind: BackendKind,
 ) {
-    pool.close().await;
     let deadline = std::time::Instant::now() + CLOSE_DRAIN_CEILING;
-    while pool.size() > 0 {
+    loop {
+        pool.close().await;
+        if pool.size() == 0 {
+            return;
+        }
         if std::time::Instant::now() >= deadline {
             warn_close_ceiling(pool, kind);
             return;
@@ -825,7 +858,6 @@ fn warn_close_ceiling<DB: sqlx::Database>(pool: &sqlx::Pool<DB>, kind: BackendKi
     };
     tracing::warn!(
         remaining = pool.size(),
-        idle = pool.num_idle(),
         ceiling_secs = CLOSE_DRAIN_CEILING.as_secs(),
         "catalog pool close timed out with connections still open; {consequence}"
     );

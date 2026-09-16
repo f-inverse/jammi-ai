@@ -24,6 +24,21 @@ async fn open_catalog(kind: BackendKind) -> Option<(tempfile::TempDir, Arc<Catal
     Some((dir, Arc::clone(session.catalog())))
 }
 
+/// The require-gate for the Postgres arm: a direct, crate-qualified call to
+/// the registered `shared:` helper, textually in each `#[test]` fn's own body
+/// (the KO-7 scanner is per-fn textual; `open_catalog`'s internal `?` on
+/// `make_test_session` is one function away and does not dominate the skip —
+/// `gang_membership.rs`'s own shape).
+macro_rules! skip_unless_ready {
+    ($kind:expr) => {
+        if matches!($kind, BackendKind::Postgres) && jammi_test_utils::pg_url_for_tests().is_none()
+        {
+            eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+            return;
+        }
+    };
+}
+
 fn executor(id: &str, devices: Vec<DeviceFact>) -> ComputeExecutorRecord {
     ComputeExecutorRecord {
         executor_id: id.to_string(),
@@ -59,10 +74,10 @@ fn job(id: &str, owner: &str) -> ComputeJobRecord {
 )]
 #[tokio::test]
 async fn upsert_list_get_remove_round_trip(kind: BackendKind) {
-    let Some((_dir, catalog)) = open_catalog(kind).await else {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = open_catalog(kind)
+        .await
+        .expect("already skipped above when unconfigured");
     let id = format!("exec-rt-{}", jammi_test_utils::unique_suffix());
     let rec = executor(
         &id,
@@ -106,10 +121,10 @@ async fn upsert_list_get_remove_round_trip(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
-    let Some((_dir, catalog)) = open_catalog(kind).await else {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = open_catalog(kind)
+        .await
+        .expect("already skipped above when unconfigured");
     let target = format!("exec-hb-target-{}", jammi_test_utils::unique_suffix());
     let other = format!("exec-hb-other-{}", jammi_test_utils::unique_suffix());
     catalog
@@ -161,10 +176,10 @@ async fn heartbeat_updates_only_status_and_heartbeat_at(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn adjust_compute_slots_is_atomic_across_the_whole_batch(kind: BackendKind) {
-    let Some((_dir, catalog)) = open_catalog(kind).await else {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = open_catalog(kind)
+        .await
+        .expect("already skipped above when unconfigured");
     let a = format!("exec-adj-a-{}", jammi_test_utils::unique_suffix());
     let b = format!("exec-adj-b-{}", jammi_test_utils::unique_suffix());
     catalog
@@ -262,10 +277,10 @@ async fn adjust_compute_slots_is_atomic_across_the_whole_batch(kind: BackendKind
 )]
 #[tokio::test]
 async fn bind_compute_slots_cas_admits_exactly_capacity_concurrent_binders(kind: BackendKind) {
-    let Some((_dir, catalog)) = open_catalog(kind).await else {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = open_catalog(kind)
+        .await
+        .expect("already skipped above when unconfigured");
     let id = format!("exec-cas-{}", jammi_test_utils::unique_suffix());
     let mut rec = executor(&id, vec![]);
     rec.task_slots = 3;
@@ -313,10 +328,10 @@ async fn bind_compute_slots_cas_admits_exactly_capacity_concurrent_binders(kind:
 )]
 #[tokio::test]
 async fn compute_jobs_put_get_list_delete(kind: BackendKind) {
-    let Some((_dir, catalog)) = open_catalog(kind).await else {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = open_catalog(kind)
+        .await
+        .expect("already skipped above when unconfigured");
     let id = format!("job-{}", jammi_test_utils::unique_suffix());
     let rec = job(&id, "owner-1");
     catalog.put_compute_job(&rec).await.unwrap();
@@ -348,10 +363,10 @@ async fn compute_jobs_put_get_list_delete(kind: BackendKind) {
 )]
 #[tokio::test]
 async fn list_compute_executor_devices_reads_the_executors_own_column(kind: BackendKind) {
-    let Some((_dir, catalog)) = open_catalog(kind).await else {
-        eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-        return;
-    };
+    skip_unless_ready!(kind);
+    let (_dir, catalog) = open_catalog(kind)
+        .await
+        .expect("already skipped above when unconfigured");
     let no_devices = format!("exec-dev-none-{}", jammi_test_utils::unique_suffix());
     let with_devices = format!("exec-dev-some-{}", jammi_test_utils::unique_suffix());
     catalog

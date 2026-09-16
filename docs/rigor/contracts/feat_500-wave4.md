@@ -527,9 +527,57 @@ advisories are folded here; #6 is terminal.
 - **CI red (run 35131688738, killed-executor test).** The placed-claim wait returned on the
   first claimant (the submitter, pre-transfer); it returns on the transfer now (a149b334).
 
+### 9d. Closing round 4 (adversarial-audit BLOCK at `3d936a5a`, 2026-09-16 19:18 UTC — two blocks, seven advisories; the terminal fold under §9b's stop rule: every item fixed at the root, no further audit)
+
+- **BLOCK — the A4 fixture was vacuous.** The pre-fix loop reached the same proxy-fallback line by
+  running to the deadline, and A4 measured no time. Fix: A4 asserts the elapsed wall time
+  (< 20 s of a 40 s window with a 1 s grace), a revert-RED drops the grace on a scratch copy and
+  must take ≥ 35 s, and the symmetric arm (rank 1 direct, rank 0 overlay-only) is refused by name
+  within the grace instead of after the window (audit A5 mirror). The loop's header comment
+  states the mixed-arm behaviour.
+- **BLOCK — `SchedulerPlacedGangSubmitter::cluster_state` written, never read.** The field, its
+  binding and the two comments that asserted the removed read are gone (this is also the
+  `-D warnings` red that failed the CI build at `3d936a5a`, run 35138563225). Executed: clippy
+  with `-D warnings` on the libraries (`jammi-ballista`, `jammi-server`, `jammi-ai`) and on
+  every test target — the lane's feature set included — clean.
+- **A1 (`placement_available` had no oracle).** `placement_available_counts_live_peers_only`
+  (crates/jammi-ballista/tests/it/roles.rs): no row → false; a stale-heartbeat row → false; a
+  fresh row → true. Hosts a scheduler and no executor (nothing touches `TERMINATING`).
+- **A2 (a catalog fault read as "no peer", silently).** The read's error arm logs at warn and
+  answers "unavailable" (the claim runs in-process, still correct, now named).
+- **A3 (`unwrap_or(Holder::Free)` on the CAS's refusal).** `expect` states the invariant
+  (`send_if_modified` runs its closure exactly once); the unsafe default is gone.
+- **A4 (`i64::MAX` fallback panics in chrono; the window rebuilt per row).** The window is
+  computed once (`OnceLock`) with `expect` on the conversion.
+- **A5 (the grace covered one arm).** Both mixed arms are bounded (see the first block).
+- **A6 (stale prose).** The driver's function header, the maintainer guide's "180 s" literal
+  and the folded §11.4 sentence (lead note) state what the code does.
+- **A7 (`free_port`'s properties unasserted).** `free_port_stays_below_the_ephemeral_floor_and_never_repeats`
+  (crates/jammi-ballista/tests/distributed/main.rs): 64 picks, all in 20000..32000, no repeat.
+
 ## 10. Gate table
 
-Written at consolidation: tip, stage, result, log.
+Logs live in the session scratchpad (`scratchpad/logs/`), named per row; CI runs are the GitHub
+Actions run ids. Every row is an executed run at the named tip.
+
+| tip | stage | result | log / run |
+|---|---|---|---|
+| 6e717f1c | full merge path (static, guards, swarm, tests, records) | 119 ran; 2 guard reds (KO-7 lane skips, substrate `DEFMT_LOG`) fixed by 81e0a4df; 2 test-lane reds = the local shared-database collision (§8d); SWARM_GATE_TOUCHED expected | `mp-full-3/` |
+| 81e0a4df | kernel-oracles, citations (1066), names, fmt, ballista clippy ×2, ballista it 27, lane 7/7 (49 s), substrate guard rc 0 | all green | `fix4-gates.log` |
+| 306c9d55 | CI `distributed.yml` run 35127543679 | deterministic green; ballista red (HandedOff snapshot read + unbind on a removed row, §9b); chaos red (pre-existing advisory flake, §8d) | 35127543679 |
+| 306c9d55 | closing audit #4 | BLOCK (3 blocks, 5 advisories) → §9b | ledger row 17:51:41 |
+| aa9b7e32 | ballista it 32, jammi-ai worker unit 2, gang_placed 10, compute_repo 12 (both backends), server ballista_roles + serve_shutdown_modes 16, lane 7/7 (56.9 s), clippy ×2, fmt, KO-7, names, citations, parity, test_gpu_cluster_lane.sh 98 | all green | `fix5-tests-1.log`, `fix5-tests-2.log`, `fix5-lane-1.log`, `lane-test-2.log` |
+| aa9b7e32 | CI `distributed.yml` run 35131688738 | ballista red: killed-executor test's placed-claim wait returned on the first claimant (§9c) | 35131688738 |
+| a149b334 | lane 7/7 (91.9 s) with the transfer wait | green | `fix5-lane-2.log` |
+| a149b334 | closing audit #5 | BLOCK (1 block, 6 advisories) → §9c | ledger row 18:56:58 |
+| a149b334 | CI `distributed.yml` run 35134806942 | ballista red: `Address already in use` from the ephemeral-range port picker (§9c) | 35134806942 |
+| e2dd094e | lane 7/7 (59.1 s) with the reserved-range port picker | green | `fix5-lane-3.log` |
+| e2dd094e | CI `distributed.yml` run 35136370236 | ballista red: killed-executor successor at epoch 734/900 at the 150 s bound (§9c) | 35136370236 |
+| 3d936a5a | test_gpu_cluster_lane.sh 99, clippy ×2, ballista it 31 + roles_drain 1 + roles_begin_drain 1, worker unit 2, gang_placed 10, lane 7/7 (50.3 s then 32.9 s with the 450-epoch job), citations 1067, KO-7, names | all green | `fix7-tests.log`, `fix7-lane-2.log` |
+| a149b334 | merge path guards stage | 96/96 green; swarm stage's R12 mutation sweep in flight (41 min in the 6e717f1c run) | `fix6-guards.log` |
+| 3d936a5a | CI `distributed.yml` run 35138563225 | (recorded when complete) | 35138563225 |
+| 3d936a5a | closing audit #6 (scoped, terminal) | (recorded when complete) | ledger |
+| final tip | full merge path incl. records; PR CI | (recorded at close) | |
 
 ## 11. Units as built — the implementers' contract files, folded by the lead
 
@@ -1287,7 +1335,7 @@ it unconditionally):
   (a real bug this session found and fixed by executing the exact path: red at `addr.port()`,
   green at `local_addr.port()` — see Properties). `host_scheduler` installs
   `SchedulerPlacedGangSubmitter` (submits a `GangExec` via `submit_physical_plan`;
-  `placement_available()` reads the scheduler's own `ClusterState::registered_executor_metadata`
+  `placement_available()` reads the scheduler's own `ClusterState::registered_executor_metadata` [lead, closing round 4: it reads the catalog's `compute_executors` rows through `executor_is_live` now — a dead executor's row is not a peer.]
   synchronously via `block_in_place`); `host_executor` installs `ExecutorPlacedGangRunner`
   (`JobWorker::run_placed_gang`) and reports `devices()` as `jammi_db::catalog::instance::
   DeviceFact` (U8b's real shape), reproducing `jammi_ai::fine_tune::worker`'s PRIVATE

@@ -12,6 +12,8 @@ pub mod lease_keeper;
 pub mod migrations;
 pub mod model_repo;
 pub mod mutable_repo;
+#[cfg(feature = "test-hooks")]
+pub mod pool_test_hooks;
 pub mod result_repo;
 pub mod schema;
 pub mod segment_repo;

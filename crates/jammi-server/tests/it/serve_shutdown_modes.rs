@@ -1077,3 +1077,287 @@ async fn release_subcommand_sends_sigint_and_the_child_exits_zero_within_two_hea
     assert_eq!((row.attempts, row.releases), (1, 1));
     assert!(catalog.list_workers().await.unwrap().is_empty());
 }
+
+/// The DRAIN wall-clock with no job in flight: from the drain signal to
+/// `serve_with_signals` returning. Every DRAIN's tail runs
+/// `InferenceSession::close`, whose catalog pool close waits — up to the
+/// backend's 30 s ceiling — for every pooled connection to be closed; a
+/// connection the close never sweeps is the difference between a sub-second
+/// rolling restart and one that always costs the full ceiling.
+///
+/// How long every return to the session's catalog pool is held open once the
+/// drain is signalled (`jammi_db::catalog::pool_test_hooks`). The last catalog
+/// write on the DRAIN path is the worker join's `workers` row delete; its
+/// connection's return is otherwise one liveness-ping round trip wide, and the
+/// pool closes a few joins later — so whether the return is still in flight
+/// when the pool closes is a race the fixture would only sometimes lose (a
+/// 200 ms park lost it on one of two concurrent runs of this suite). Held open
+/// longer than everything the tail does before the pool closes — on SQLite
+/// that includes the lease keeper's own catalog close waiting out its 2 s
+/// `-wal` settle ceiling (below) — it always is, and the drain's wall clock
+/// reads the barrier's behaviour, not the scheduler's.
+const RETURN_PARK: Duration = Duration::from_secs(3);
+/// The property: a DRAIN with nothing in flight completes in the parked
+/// return's own time plus under a second — the two-mode shutdown's "in the
+/// job's own time" clause applied to the adversary's delay. A barrier that
+/// waits out its ceiling on the parked connection costs 30 s more.
+const DRAIN_SLACK: Duration = Duration::from_secs(1);
+/// The lease keeper's own SQLite backend closes before the session's pool
+/// and, with that pool still holding the file, waits out
+/// `CLOSE_SIDECAR_CEILING` (2 s) for a `-wal` that cannot vanish yet — the
+/// documented cost of closing one of several pools on one file
+/// (`jammi_db::catalog::backend_sqlite`, `CatalogBackend::close`), paid on
+/// every SQLite DRAIN and RELEASE and outside this oracle's subject.
+const SQLITE_KEEPER_SIDECAR_WAIT: Duration = Duration::from_secs(2);
+
+fn assert_drain_within(elapsed: Duration, bound: Duration, backend: &str, what: &str) {
+    assert!(
+        elapsed < bound,
+        "{what} on {backend} took {elapsed:?} (bound {bound:?}): the catalog pool close waited \
+         out its ceiling on a connection it never swept"
+    );
+}
+
+fn park_catalog_returns(served: &Served) {
+    served
+        .session
+        .catalog()
+        .backend_arc()
+        .return_park()
+        .park_for(RETURN_PARK);
+}
+
+async fn idle_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownOutcome) {
+    let served = serve_with_config(cfg).await;
+    park_catalog_returns(&served);
+    let started = std::time::Instant::now();
+    served.drain();
+    let outcome = served
+        .finish(Duration::from_secs(90))
+        .await
+        .expect("an idle DRAIN must return Ok");
+    (started.elapsed(), outcome)
+}
+
+/// An idle DRAIN on a Postgres catalog completes in the parked return's own
+/// time plus under a second: the catalog pool close sweeps the connection
+/// whose return lands during the close instead of waiting out its ceiling
+/// on it. Exactly one return is in flight at the close here (the worker
+/// join's `workers` row delete), so the single-pass barrier leaked it on
+/// every run. Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`)
+/// otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_drain_completes_within_a_second_on_postgres() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!(
+            "skipping idle_drain_completes_within_a_second_on_postgres: JAMMI_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let mut cfg = server_config(dir.path(), DEFAULT_TIMING, true);
+    cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
+        url: jammi_db::config::Secret::from(url),
+        pool_size: 8,
+        max_lifetime_secs: None,
+    };
+    let (elapsed, outcome) = idle_drain_wall_clock(cfg).await;
+    assert_eq!(
+        outcome,
+        ShutdownOutcome::Drained {
+            worker_joined: true
+        }
+    );
+    assert_drain_within(
+        elapsed,
+        RETURN_PARK + DRAIN_SLACK,
+        "Postgres",
+        "an idle DRAIN",
+    );
+}
+
+/// The SQLite twin of the Postgres oracle above: the same drain tail over
+/// the laptop default catalog, plus the lease keeper's documented sidecar
+/// wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_drain_completes_within_a_second_on_sqlite() {
+    let dir = TempDir::new().unwrap();
+    let cfg = server_config(dir.path(), DEFAULT_TIMING, true);
+    let (elapsed, outcome) = idle_drain_wall_clock(cfg).await;
+    assert_eq!(
+        outcome,
+        ShutdownOutcome::Drained {
+            worker_joined: true
+        }
+    );
+    assert_drain_within(
+        elapsed,
+        RETURN_PARK + SQLITE_KEEPER_SIDECAR_WAIT + DRAIN_SLACK,
+        "SQLite",
+        "an idle DRAIN",
+    );
+}
+
+/// One Flight SQL round trip (`execute` = GetFlightInfo, then DoGet on every
+/// endpoint), fully consumed.
+async fn flight_sql(
+    flight_addr: std::net::SocketAddr,
+    query: &str,
+) -> Vec<arrow::record_batch::RecordBatch> {
+    use futures::TryStreamExt;
+    let channel = Channel::from_shared(format!("http://{flight_addr}"))
+        .expect("channel uri")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+    let info = client
+        .execute(query.to_string(), None)
+        .await
+        .expect("flight execute");
+    let mut batches = Vec::new();
+    for endpoint in info.endpoint {
+        let ticket = endpoint.ticket.expect("endpoint ticket");
+        let mut stream = client.do_get(ticket).await.expect("do_get");
+        while let Some(batch) = stream.try_next().await.expect("flight stream") {
+            batches.push(batch);
+        }
+    }
+    batches
+}
+
+/// The compose smoke's pre-restart traffic (`tests/compose/remote_smoke.py`),
+/// verb for verb over the same wire surface: register the patents parquet
+/// source, count it through Flight SQL, embed `abstract` with the local
+/// `tiny_bert` encoder, count and read the result table through Flight SQL,
+/// search it, list its index segments, list the sources, read the server
+/// info. Every stream is consumed to its end and every client is dropped
+/// before this returns, so the server holds no request of ours when the
+/// caller drains.
+async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
+    use jammi_server::grpc::proto::catalog::{ListIndexSegmentsRequest, ListSourcesRequest};
+    use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
+    use jammi_server::grpc::proto::embedding::SearchRequest;
+    let ch = channel(flight_addr).await;
+    let mut catalog = CatalogServiceClient::new(ch.clone());
+    let mut embedding = EmbeddingServiceClient::new(ch.clone());
+    let info = catalog
+        .get_server_info(())
+        .await
+        .expect("get_server_info")
+        .into_inner();
+    assert!(!info.broker.is_empty());
+    // The catalog is shared across lanes on Postgres: every row this replay
+    // creates carries its own id.
+    let source = format!("patents_{}", jammi_test_utils::unique_suffix());
+    add_source(ch.clone(), &source, "patents.parquet", FileFormat::Parquet).await;
+    let n = flight_sql(
+        flight_addr,
+        &format!("SELECT count(*) FROM {source}.public.patents"),
+    )
+    .await;
+    assert!(!n.is_empty());
+    let table = embedding
+        .generate_embeddings(GenerateEmbeddingsRequest {
+            source_id: source.clone(),
+            model_id: tiny_bert_model_id(),
+            columns: vec!["abstract".into()],
+            key_column: "id".into(),
+            modality: Modality::Text as i32,
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+        })
+        .await
+        .expect("generate_embeddings")
+        .into_inner()
+        .table_name;
+    let ident = format!("\"jammi.{table}\"");
+    let count = flight_sql(flight_addr, &format!("SELECT count(*) FROM {ident}")).await;
+    assert!(!count.is_empty());
+    let vec_rows = flight_sql(
+        flight_addr,
+        &format!("SELECT _row_id, vector FROM {ident} LIMIT 1"),
+    )
+    .await;
+    let first_key = {
+        let batch = vec_rows.first().expect("one row");
+        let keys = batch.column_by_name("_row_id").expect("_row_id column");
+        arrow::util::display::array_value_to_string(keys, 0).expect("_row_id renders")
+    };
+    let hits = embedding
+        .search(SearchRequest {
+            source_id: source.clone(),
+            query: Some(SearchQuery::RowKey(first_key)),
+            k: 5,
+            embedding_table: None,
+            filter: None,
+            select: Vec::new(),
+            oversample: None,
+        })
+        .await
+        .expect("search")
+        .into_inner();
+    assert_eq!(hits.hits.len(), 5);
+    let _ = catalog
+        .list_index_segments(ListIndexSegmentsRequest {
+            table_name: table.clone(),
+        })
+        .await
+        .expect("list_index_segments");
+    let _ = catalog
+        .list_sources(ListSourcesRequest {})
+        .await
+        .expect("list_sources");
+}
+
+async fn traffic_then_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownOutcome) {
+    let served = serve_with_config(cfg).await;
+    replay_smoke_traffic(served.flight_addr).await;
+    park_catalog_returns(&served);
+    let started = std::time::Instant::now();
+    served.drain();
+    let outcome = served
+        .finish(Duration::from_secs(90))
+        .await
+        .expect("a DRAIN after served traffic must return Ok");
+    (started.elapsed(), outcome)
+}
+
+/// A DRAIN after the compose smoke's traffic (nothing in flight at the
+/// signal) completes in the parked return's own time plus under a second on
+/// a Postgres catalog — the CI shape. No SQLite twin: after traffic, two
+/// returns park at once there (the `draining` upsert and the `workers`
+/// delete, milliseconds apart) and whether the single-pass barrier's last
+/// sweep runs before or between their landings is the scheduler's call
+/// (measured: two of four base runs passed), so that arm could not be a
+/// RED oracle; the idle SQLite arm above and
+/// `jammi_db::catalog::backend::close_barrier_tests` cover the backend.
+/// Live: requires `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`) otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_after_smoke_traffic_completes_within_a_second_on_postgres() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!(
+            "skipping drain_after_smoke_traffic_completes_within_a_second_on_postgres: JAMMI_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let mut cfg = server_config(dir.path(), DEFAULT_TIMING, true);
+    cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
+        url: jammi_db::config::Secret::from(url),
+        pool_size: 8,
+        max_lifetime_secs: None,
+    };
+    let (elapsed, outcome) = traffic_then_drain_wall_clock(cfg).await;
+    assert_eq!(
+        outcome,
+        ShutdownOutcome::Drained {
+            worker_joined: true
+        }
+    );
+    assert_drain_within(
+        elapsed,
+        RETURN_PARK + DRAIN_SLACK,
+        "Postgres",
+        "a DRAIN after served traffic",
+    );
+}

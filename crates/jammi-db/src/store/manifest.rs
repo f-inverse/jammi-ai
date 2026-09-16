@@ -187,9 +187,9 @@ pub enum ComputeDevice {
 
 /// The device KIND, discarding the ordinal — the determinant `jammi-ballista`'s
 /// `InferenceExec::device_kind` and `JammiExecutionEngine`'s K7 refusal
-/// compare against (a plan built on CUDA ordinal 0 is still refused on an
-/// executor whose only CUDA device is ordinal 1's kind match, never the
-/// ordinal — the codec carries no ordinal at all in v1).
+/// compare against. Ordinals are never compared: a plan built on CUDA
+/// ordinal 0 runs on an executor whose only CUDA device is ordinal 1 (the
+/// ordinal is not output-affecting, and the codec carries none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDeviceKind {

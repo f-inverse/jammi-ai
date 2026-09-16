@@ -117,7 +117,7 @@ PhysicalPlanNode>` with the session's `SessionConfig` upgraded for Ballista and 
 
 ### 2.3 The placed gang (README r41; U8a acceptance (b), (c))
 
-Under Ballista a gang job is ONE task, `GangExec { job_id, attempt, world, submitter }`
+Under Ballista a gang job is ONE task, `GangExec { job_id, attempt, world, submitter, device_kind }` (the kind added by the doc-lens round, §9a)
 (single partition, output schema `{ outcome: Utf8, artifact_digest: Utf8? }`), placed by the
 scheduler on a device-bearing executor. Two seams in `jammi-ai` (the way `MemberDialer` is a
 seam the server installs, `crates/jammi-ai/src/fine_tune/worker.rs::MemberDialer`), so
@@ -289,7 +289,8 @@ above are read WITH these corrections.
   Both roles on one process is therefore a single node that never places, stated in the guide.
 - **B2 — the submitter's host cannot serve a rank while it awaits** (a two-pod overlay could
   not assemble). Disposition: the `Placed` arm moves the host's holder `JobRun → Awaiting`
-  right after submitting: `Awaiting` admits a `RunRank` session (the host runs no compute) and
+  BEFORE submitting (the lane round found an in-process scheduler dials this host's `RunRank`
+  before `submit()` returns; §11.8): `Awaiting` admits a `RunRank` session (the host runs no compute) and
   refuses a second claim exactly as `JobRun` does; the claim loop returns to `Free` when the
   await ends. A placed `Peer` gang of world W therefore needs W hosts able to hold a rank, the
   submitter's included; the overlay's replica count and the guide state that arithmetic.

@@ -14,11 +14,11 @@ duration_secs = 30
 heartbeat_secs = 10
 
 [distributed]
-# The submit edge admits up to the compute pod's two devices (shape D's
-# `jammi-server-compute` runs `task_slots = 1` but assembles a rank-0 +
-# rank-1 pair from `[worker] local_ranks = 2`); a cross-pod `Peer` gang
-# needs this bound raised to the target world size on BOTH this ConfigMap
-# and every compute pod's own `[distributed] max_world_size`.
+# Read at the submit edge only (this query tier is where jobs are
+# enqueued; a compute pod never reads it): admits a `world_size` up to the
+# compute pod's two devices. A cross-pod `Peer` gang needs this bound
+# raised to the target world size here, and at least that many compute
+# pods able to hold a rank.
 max_world_size = 2
 
 [server]

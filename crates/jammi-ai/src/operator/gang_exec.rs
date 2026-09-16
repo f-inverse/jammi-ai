@@ -61,7 +61,7 @@ pub struct GangDescriptor {
     pub submitter: String,
     /// The device kind this gang must run on — the submitter's own
     /// [`crate::session::InferenceSession::compute_device`] kind, stamped at
-    /// [`crate::fine_tune::worker::JobWorker::submit_placed`] (the K7 rule
+    /// `JobWorker::submit_placed` (the K7 rule
     /// this descriptor carries, the same one `InferenceExec::device_kind`
     /// carries: the required kind is the PLAN's own, never re-derived from
     /// "any GPU exists"). `placement::DevicePlacement` binds a `GangExec`

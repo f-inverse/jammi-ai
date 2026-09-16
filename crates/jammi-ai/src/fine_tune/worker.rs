@@ -333,8 +333,8 @@ pub enum Holder {
     ClaimProbe,
     /// A loop-claimed job runs under a registered lease hold.
     JobRun,
-    /// A loop-claimed attempt has SUBMITTED a `GangDescriptor` through an
-    /// installed `PlacedGangSubmitter` and is awaiting its stream (plan 67
+    /// A loop-claimed attempt is submitting a `GangDescriptor` through an
+    /// installed `PlacedGangSubmitter`, or awaiting its stream (plan 67
     /// wave 4, contract `feat_500-wave4` §9 block B2): this host runs no
     /// compute for `(job_id, attempt)` while it waits, so it can still
     /// serve a `RunRank` session for some OTHER attempt —
@@ -535,7 +535,8 @@ impl HostAdmission {
     }
 
     /// `JobRun → Awaiting{job_id, attempt}` — the claim loop's own attempt
-    /// has SUBMITTED a `GangDescriptor` and awaits its stream (contract
+    /// is about to submit a `GangDescriptor` (the move precedes the submit)
+    /// and then awaits its stream (contract
     /// `feat_500-wave4` §9 block B2): this host runs no compute for the
     /// attempt meanwhile, so it can still serve a `RunRank` session
     /// ([`Self::try_hold_rank`]'s `Awaiting` arm admits exactly as `Free`
@@ -2184,9 +2185,10 @@ impl JobWorker {
     ///   owns the attempt; if it died, its own lease expiry requeues it,
     ///   never this instance's).
     ///
-    /// This host's holder moves `JobRun → Awaiting{job_id, attempt}` right
-    /// after a successful submit (`HostAdmission::begin_awaiting_placement`,
-    /// §9 block B2): the host runs no compute while it waits, so it can
+    /// This host's holder moves `JobRun → Awaiting{job_id, attempt}` BEFORE
+    /// the descriptor is submitted (`HostAdmission::begin_awaiting_placement`;
+    /// an in-process scheduler can bind the task and the placed executor can
+    /// dial this host's `RunRank` before `submit()` returns): the host runs no compute while it waits, so it can
     /// still serve a `RunRank` session — a two-host fleet could not
     /// otherwise assemble if its only free-looking host were the one
     /// awaiting its own placement result.

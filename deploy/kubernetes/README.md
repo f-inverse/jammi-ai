@@ -31,8 +31,8 @@ knobs.
   pod also registers as a Ballista executor with `jammi-server-scheduler`.
   This overlay admits single-pod gangs (`W ≤ 2`, `Local` on one pod's two
   devices); a cross-pod `Peer` gang of world `W` needs `W > local_ranks`,
-  `max_world_size ≥ W` on BOTH the submit edge (`base/jammi.toml`) and the
-  compute pods (`jammi-compute.toml`), and at least `W` compute pods able
+  `max_world_size ≥ W` on the submit edge (`base/jammi.toml`; the key is
+  read only where jobs are enqueued), and at least `W` compute pods able
   to hold a rank (the coordinator's included) — whether the job is claimed
   directly by a `jammi-server-compute` pod or PLACED there by the
   scheduler (see "Compute plane" below). This overlay is

@@ -55,11 +55,3 @@ kinds = ["fine_tune", "graph_fine_tune", "context_predictor"]
 # this pod rank 0 of a Peer gang whose other rank is the StatefulSet's other
 # replica.
 local_ranks = 2
-
-[distributed]
-# What THIS pod's coordinator body may assemble once a job lands here
-# (placed or claimed): a `Peer` gang needs `max_world_size >= W` on EVERY
-# compute pod that could hold a rank, not just the coordinator's. The
-# submit edge's own admission is `base/jammi.toml`'s `[distributed]`,
-# a separate bound checked at enqueue, before any pod is chosen.
-max_world_size = 2

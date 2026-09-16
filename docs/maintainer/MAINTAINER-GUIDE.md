@@ -3022,7 +3022,7 @@ this stream keeps, `PerRank(PartitionSpec)` for training or `All { batch }` for 
 prefetch depth (typed); production trains at `PRODUCTION_PREFETCH_DEPTH`
 (`crates/jammi-ai/src/fine_tune/stream.rs:121`, `= 2`) — a named constant, the regression
 pin for a `prefetch = 2` deadlock an earlier design hit, never a literal at the call site:
-`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:5452`). `open`
+`StreamConfig::new` (`crates/jammi-ai/src/fine_tune/worker.rs:5488`). `open`
 (`crates/jammi-ai/src/fine_tune/stream.rs:379`) runs ONE bounded-memory pre-pass over its
 whole window BEFORE the first training step — a schema check plus, for a numeric target, a
 null/NaN aggregate — so a column-level refusal fires before step 0, not after thousands of
@@ -3035,13 +3035,13 @@ against the full corpus) and GradCache (treats the whole dataset as one in-batch
 batch) both need every row resident before an epoch begins, so a config taking either arm
 gets `Resident` (`crates/jammi-ai/src/fine_tune/source.rs:100`); every other text arm at
 `W = 1` gets `TrainingSource::Streamed`. `worker.rs`'s source selection calls this same
-`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:5396`) that the trainer's own
+`whole_set_arm` (`crates/jammi-ai/src/fine_tune/worker.rs:5411`) that the trainer's own
 dispatch refuses a mismatch against, so the two decisions can never come apart. A
 `Streamed` source never collects a `Vec<RecordBatch>` for the training set at all — the
 worker calls only `training_set::materialize_projection_table`
-(`crates/jammi-ai/src/fine_tune/worker.rs:3236`), never `read_back`/
+(`crates/jammi-ai/src/fine_tune/worker.rs:3272`), never `read_back`/
 `read_back_with_reservation` — while a `Resident` loader's construction reads back through
-`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:5404`) — defined at
+`read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/worker.rs:5440`) — defined at
 `read_back_with_reservation` (`crates/jammi-ai/src/fine_tune/training_set.rs:238`) — and
 attaches the live
 `MemoryReservation` to the loader via `with_reservation`
@@ -3060,7 +3060,7 @@ is pinned by `p_r_a_resident_loader_holds_its_eager_reservation_while_training_r
 **A task-local tenant scope does not cross `tokio::spawn` or a `block_on` from the
 blocking pool.** `tenant` (`crates/jammi-ai/src/fine_tune/source.rs:60`) on `StreamedSet`
 captures the job's tenant via `tenant` (`crates/jammi-ai/src/session.rs:764`) on
-`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3193`) is still
+`InferenceSession` while `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs:3229`) is still
 executing inside the caller's `with_tenant_scoped` task-local scope; `open_streamed_source`
 (`crates/jammi-ai/src/fine_tune/trainer.rs:4098`) drives the stream's own `open` through
 `Handle::block_on` from the `spawn_blocking` pool, which starts a FRESH top-level poll on a
@@ -4226,8 +4226,8 @@ with the rest of the workspace, no cargo feature — a process's role is
 - **`JammiExecutionEngine`** (`engine.rs`) wraps Ballista's
   `DefaultExecutionEngine` and adds two duties before delegating: a stage
   containing a `GangExec` must be single-partition (one gang mechanism,
-  never a multi-partition fan-out); an `InferenceExec` whose stamped
-  `device_kind()` differs from this executor's own
+  never a multi-partition fan-out); a stage whose required device kind (an
+  `InferenceExec`'s or a `GangExec`'s stamped `device_kind`) differs from this executor's own
   `InferenceSession::compute_device()` is refused typed (K7 device
   pinning), never silently run on the wrong device.
 - **Roles** (`roles.rs`): `host_scheduler`/`host_executor` build a
@@ -4247,7 +4247,7 @@ with the rest of the workspace, no cargo feature — a process's role is
 - **Client** (`client.rs`) — `submit_physical_plan`: the seam a
   scheduler-role process's `PlacedGangSubmitter` calls to place a plan
   instead of running it in-process; matches the plan's own device KIND
-  (`InferenceExec::device_kind`, "cpu" is a kind too) and refuses it typed
+  (`InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a kind too) and refuses it typed
   BEFORE submitting when no registered executor lists that kind, reading
   the same catalog `DevicePlacement` reads from — `JammiExecutionEngine`'s
   own device-pinning refusal above (K7) is the second line, never a
@@ -4272,7 +4272,7 @@ with the rest of the workspace, no cargo feature — a process's role is
 ### 2.8g The placed gang — `transfer_claim` and the hand-off arms
 
 Under Ballista placement a `Peer` gang runs as ONE task,
-`GangExec { job_id, attempt, world, submitter }`
+`GangExec { job_id, attempt, world, submitter, device_kind }`
 (`crates/jammi-ai/src/operator/gang_exec.rs`), placed by the scheduler on a
 device-bearing executor other than the submitter. Two more `HostAdmission`
 seams beside `MemberDialer` [§2.8a], `crates/jammi-ai/src/fine_tune/

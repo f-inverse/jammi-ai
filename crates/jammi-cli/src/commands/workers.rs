@@ -55,7 +55,7 @@ fn print_row(w: &WorkerSummary) {
     );
 }
 
-/// `kind0, kind1, ...` in ordinal order, `—` for an empty device list —
+/// `kind0, kind1, ...` in rank order (the configured `[gpu] devices` order), `—` for an empty device list —
 /// matching the empty-label convention above.
 fn format_devices(devices: &[jammi_admin::DeviceFact]) -> String {
     if devices.is_empty() {

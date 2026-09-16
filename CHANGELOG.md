@@ -768,8 +768,8 @@ workspace ships every publishable crate at the same
   wire package (a 4-byte magic prefix so a jammi buffer and a Ballista
   buffer can never alias; delegating every other node to Ballista's own
   codec unchanged), an execution-engine wrapper that refuses typed rather
-  than silently mis-running a stage whose `InferenceExec` names a device
-  kind this executor does not run, and a custom task-distribution policy
+  than silently mis-running a stage whose `InferenceExec` or `GangExec` names a
+  device kind this executor does not run, and a custom task-distribution policy
   (`DevicePlacement`) — never a fork, never a vendored copy. A process
   hosts a Ballista scheduler and/or executor role purely by `[ballista]`
   config (`scheduler_bind` / `executor`); unset means today's process,
@@ -789,8 +789,8 @@ workspace ships every publishable crate at the same
   retry loop.
   `CatalogClusterState`/`CatalogJobState` back the scheduler's cluster/job
   state with the shared catalog (migration `038_compute_cluster_state`:
-  `compute_executors` with `devices` — a JSON `[{kind, ordinal}]` claim
-  the placement policy's own authority — and `compute_jobs`; `ALTER TABLE
+  `compute_executors` (whose `devices`, a JSON `[{kind, ordinal}]`, is the
+  placement policy's sole authority) and `compute_jobs`; `ALTER TABLE
   workers ADD COLUMN devices` mirrors it on `ListWorkers` as
   `WorkerSummary.devices` (field 8, `repeated DeviceFact {kind, ordinal}`),
   additive to the frozen surface), so a scheduler restart keeps every executor

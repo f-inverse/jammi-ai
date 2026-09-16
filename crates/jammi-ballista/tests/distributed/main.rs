@@ -960,7 +960,10 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
         rows > 0,
         "the plan submitted through scheduler 4 must produce rows"
     );
-    assert_eq!(scheduler1_port, scheduler1_port); // scheduler 1's port is fixed/used above only implicitly via the fleet.
+    assert_ne!(
+        scheduler4_port, scheduler1_port,
+        "the two schedulers listen on distinct ports"
+    );
 
     drop(fleet);
 }

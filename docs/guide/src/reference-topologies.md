@@ -273,8 +273,8 @@ the claiming process itself when no submitter seam exists or no other
 executor is registered — decides `Single`/`Local`/`Peer` from its OWN
 `local_ranks`: this overlay admits single-pod gangs (`W ≤ 2`, `Local` on
 one pod's two devices); a cross-pod `Peer` gang of world `W` needs `W >
-local_ranks`, `max_world_size ≥ W` on BOTH the submit edge and the compute
-pods, and at least `W` compute pods able to hold a rank (the coordinator's
+local_ranks`, `max_world_size ≥ W` on the submit edge (`base/jammi.toml` — the key is read
+only where jobs are enqueued), and at least `W` compute pods able to hold a rank (the coordinator's
 included) — the submitting host moves to an `Awaiting` holder state for
 the whole placement (it runs no compute meanwhile, but can still serve a
 `RunRank` session). Placement always excludes a task's own submitter: a

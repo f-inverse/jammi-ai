@@ -2292,22 +2292,47 @@ impl BallistaConfig {
         self.executor.is_some()
     }
 
-    /// Validate the `[ballista]` section against `server` (the same class
-    /// as [`ServerConfig::validate`]): every configured bind address
-    /// parses; `executor.scheduler_address` parses as a validated
-    /// `host:port` DIAL target ([`crate::catalog::instance::PeerAddr`] —
-    /// hostnames are the Kubernetes case, so this is never restricted to a
-    /// `SocketAddr`, and a `:0` scheduler address is refused the same way
-    /// `PeerAddr` refuses one for any dial target); a FIXED-port collision
-    /// among `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
+    /// Validate `config`'s `[ballista]` section: a CROSS-SECTION check, the
+    /// same shape as
+    /// [`crate::catalog::instance::MembershipConfig::validate`] — ONE
+    /// `&JammiConfig` in, never `self` plus a separately-threaded
+    /// `&ServerConfig` (a second read into the same config), because the
+    /// six-address collision rule below needs both `config.ballista` and
+    /// `config.server` at once. Every configured bind address parses;
+    /// `executor.scheduler_address` parses as a validated `host:port` DIAL
+    /// target ([`crate::catalog::instance::PeerAddr`] — hostnames are the
+    /// Kubernetes case, so this is never restricted to a `SocketAddr`, and
+    /// a `:0` scheduler address is refused the same way `PeerAddr` refuses
+    /// one for any dial target); a FIXED-port collision among
+    /// `scheduler_bind`, `executor.bind`, `executor.grpc_bind`,
     /// `server.health_listen`, `server.flight_listen`, `server.peer_bind`
     /// is refused naming BOTH keys (an ephemeral `:0` never collides — each
     /// resolves to a distinct kernel-assigned port, the same rule
     /// [`ServerConfig::validate`] applies to its own three listeners);
     /// `executor.task_slots == 0` and `executor.work_dir = Some("")` are
     /// refused.
-    pub fn validate(&self, server: &ServerConfig) -> Result<()> {
+    ///
+    /// Called by [`JammiConfig::load_from`]. [`ServerConfig::validate`]
+    /// stays the owner of its OWN three addresses' domain validity and is
+    /// called from `jammi_server::runtime::OssServer::new`, never from
+    /// `load_from` — so a `JammiConfig` built by struct literal (or by
+    /// `parse_from` alone) and handed straight to `OssServer::new`, the way
+    /// most `jammi-server` integration tests do, never runs THIS function
+    /// either. Hosting the roles this section describes is `OssServer::
+    /// new`'s own job (`docs/rigor/contracts/feat_500-wave4.md` § 2.2), so
+    /// that constructor MUST also call `BallistaConfig::validate(&config)`
+    /// immediately after its existing `config.server.validate()` call —
+    /// the second call site [`crate::catalog::instance::MembershipConfig::
+    /// validate`] has at `InstanceRegistration::from_config` (session
+    /// construction), for the same "struct-literal config skips load_from"
+    /// reason. That edit lands in `crates/jammi-server/src/runtime.rs`,
+    /// outside this crate's ownership; CFGDB names it here for whichever
+    /// unit builds `OssServer`'s role hosting.
+    pub fn validate(config: &JammiConfig) -> Result<()> {
         use std::net::SocketAddr;
+
+        let ballista = &config.ballista;
+        let server = &config.server;
 
         // Every currently-configured FIXED listener this section and
         // `server` own, named, so a collision names both keys. `server`'s
@@ -2320,7 +2345,7 @@ impl BallistaConfig {
         // this function does not own.
         let mut fixed: Vec<(&'static str, SocketAddr)> = Vec::new();
 
-        if let Some(raw) = &self.scheduler_bind {
+        if let Some(raw) = &ballista.scheduler_bind {
             let addr: SocketAddr = raw.parse().map_err(|e| {
                 JammiError::Config(format!(
                     "Invalid ballista.scheduler_bind address '{raw}': {e}"
@@ -2329,7 +2354,7 @@ impl BallistaConfig {
             fixed.push(("ballista.scheduler_bind", addr));
         }
 
-        if let Some(executor) = &self.executor {
+        if let Some(executor) = &ballista.executor {
             let bind: SocketAddr = executor.bind.parse().map_err(|e| {
                 JammiError::Config(format!(
                     "Invalid ballista.executor.bind address '{}': {e}",
@@ -2908,9 +2933,11 @@ impl JammiConfig {
         // Reject an out-of-domain `[ballista]` knob (an unparseable bind, a
         // fixed-port collision with itself or with `[server]`'s three
         // listeners, a zero `task_slots`, an empty `work_dir`) at load
-        // time, naming the offending key — never at the first
-        // `jammi-server` role-hosting call.
-        config.ballista.validate(&config.server)?;
+        // time, naming the offending key. `BallistaConfig::validate` is a
+        // cross-section check (its own doc names the SECOND call site
+        // `OssServer::new` must also make, for a struct-literal config that
+        // skips `load_from` entirely).
+        BallistaConfig::validate(&config)?;
         // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
         // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)
         // `otlp_endpoint`) at load time, naming the offending key, rather

@@ -4607,6 +4607,89 @@ pub(crate) fn assembly_outcome(end: &CoordinatorEnd) -> Option<AssemblyOutcome> 
     })
 }
 
+/// What the coordinator does with THIS attempt's job lease once the
+/// attempt has ended — the released-vs-failed split of DESIGN.md §4
+/// ("Failure and release"; OPS D10), decided by [`lease_settlement`], a
+/// TOTAL match over [`CoordinatorEnd`] (no wildcard: a new end is a
+/// compile error until it has a row here too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseSettlement {
+    /// `Catalog::release_job_lease` now — `releases + 1`, lease NULL: the
+    /// row is reclaimable within one idle poll and the reclaim cap
+    /// (`attempts - releases`) is untouched. Zero net attempts.
+    Release,
+    /// Left to expire: nothing is written; reclaim arm 1a requeues the row
+    /// within the remaining lease window and the successor's `claim_next`
+    /// spends the attempt (`attempts + 1`, `releases` unchanged). An
+    /// attempt spent.
+    Expire,
+    /// Not this function's to settle: the row is not this attempt's
+    /// (`Moved`), or the caller's own exit arm decides — `Published`
+    /// finalizes, `TrainingFailed` records `failed`, `Cancelled` lands on
+    /// the cancel arm (a request → `failed`; a lost lease → left for
+    /// reclaim).
+    Untouched,
+}
+
+/// The released-vs-failed split (DESIGN.md §4, "Failure and release"): how
+/// the coordinator settles its lease for every way an attempt ends.
+///
+/// - **A member's `Aborted{Drain}`** (its host draining, a rolling restart
+///   of the peer tier) → [`LeaseSettlement::Release`]: `release_job_lease`
+///   (`releases + 1`, lease NULL; the CAS admits the holder) so the restart
+///   costs the job zero net attempts (OPS D10).
+/// - **Every other mid-run gang fault** — a member's `Aborted` for any
+///   other reason, a stream that dropped, a rank silent past
+///   `[worker] rank_timeout_secs`, a peer's round fault — is a rank failure
+///   → [`LeaseSettlement::Expire`]: the lease is left to expire, reclaim
+///   requeues the row within the lease window and the successor's claim
+///   spends the attempt (never here; `attempts + 1` is `claim_next`'s).
+///   Bounded by the reclaim cap, a member that keeps failing exhausts the
+///   job's attempts instead of retrying it forever.
+/// - **An assembly end** (no run started: the host cannot coordinate, a
+///   catalog fault, a short listing, a member unreachable or refusing, a
+///   `Peer` that could not be built, the host draining before dispatch)
+///   settles by the recorded outcome's counting class
+///   (`AssemblyOutcome::counts_toward_failures`): an uncounted outcome
+///   hands the lease back at once (nothing was spent assembling nothing —
+///   OPS D10 at the job level), a counted one leaves it to expire.
+/// - **`Moved`, `Published`, `TrainingFailed`, `Cancelled`** →
+///   [`LeaseSettlement::Untouched`] (the caller's arms, see the variant).
+pub(crate) fn lease_settlement(end: &CoordinatorEnd) -> LeaseSettlement {
+    match end {
+        CoordinatorEnd::Moved
+        | CoordinatorEnd::Published
+        | CoordinatorEnd::TrainingFailed(_)
+        | CoordinatorEnd::Cancelled => LeaseSettlement::Untouched,
+        CoordinatorEnd::MemberAborted {
+            reason: AbortReason::Drain,
+            ..
+        } => LeaseSettlement::Release,
+        CoordinatorEnd::MemberAborted {
+            reason:
+                AbortReason::Refuted
+                | AbortReason::Unavailable
+                | AbortReason::StoreUnavailable
+                | AbortReason::NoBody
+                | AbortReason::Cancelled
+                | AbortReason::Unspecified,
+            ..
+        }
+        | CoordinatorEnd::LinkFault(_) => LeaseSettlement::Expire,
+        CoordinatorEnd::HostCannotCoordinate(_)
+        | CoordinatorEnd::CatalogFault(_)
+        | CoordinatorEnd::ShortListed { .. }
+        | CoordinatorEnd::MemberUnreachable { .. }
+        | CoordinatorEnd::MemberRefused { .. }
+        | CoordinatorEnd::PeerRefused(_)
+        | CoordinatorEnd::Drain => match assembly_outcome(end) {
+            Some(outcome) if outcome.counts_toward_failures() => LeaseSettlement::Expire,
+            Some(_) => LeaseSettlement::Release,
+            None => LeaseSettlement::Untouched,
+        },
+    }
+}
+
 /// A listing too short for the gang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShortListing {
@@ -4725,12 +4808,29 @@ impl JobWorker {
     /// 0 over `Peer(coordinator)` through [`Self::train_fine_tune`]; (7)
     /// exactly one [`AssemblyOutcome`] recorded on the row through the
     /// total table ([`assembly_outcome`]) for every end but `Moved`, then
-    /// the lease settled: an uncounted outcome hands the lease back at once
-    /// (`release_job_lease`, zero net attempts — OPS D10), a counted one
-    /// leaves it to expire (an attempt spent); either way the row stays
-    /// `running` for reclaim and the next attempt re-lists once its
+    /// the lease settled by the released-vs-failed split
+    /// ([`lease_settlement`]): a member's `Aborted{Drain}` and every
+    /// uncounted assembly end hand the lease back at once
+    /// (`release_job_lease`, zero net attempts — OPS D10); every other
+    /// mid-run gang fault leaves it to expire (an attempt spent at the
+    /// successor's claim); either way the row stays `running` for reclaim
+    /// with NO terminal write, and the next attempt re-lists once its
     /// cooldown passes. Every member session is ended (`Cancel`) whichever
     /// way the attempt ends.
+    ///
+    /// **The per-attempt watchdog** is the coordinator's own `Peer`: every
+    /// member's stream is read by its rounds, so a member's `Aborted{reason}`
+    /// (recorded typed on that member's link), a stream that dropped, or a
+    /// rank silent past `[worker] rank_timeout_secs` (the round deadline)
+    /// ends rank 0's collective call with the gang faulted — every member
+    /// is faulted in the same round (`RoundFault`) and its session ended
+    /// (`Cancel`, the stream close) — and this body classifies the end
+    /// from the links (`MemberAborted`/`LinkFault`). The `Peer` is built
+    /// for this attempt and dropped with it, so a fault retires exactly
+    /// the attempt it belongs to. OPS D6 holds by the slot discipline: a
+    /// member's slot is `Rank` for the whole session and a peer never
+    /// claims while it holds a rank (`HostAdmission`), so ending a session
+    /// never aborts a claim transaction anywhere.
     #[allow(clippy::too_many_arguments)]
     async fn coordinate(
         &self,
@@ -4768,44 +4868,48 @@ impl JobWorker {
                 ),
             }
         }
+        let settlement = lease_settlement(&end);
         tracing::info!(
             job_id = %job_id,
             attempt,
             world,
             end = %end,
             end_ordinal = end.ordinal(),
+            ?settlement,
             "coordinator attempt ended"
         );
-        match (end, artifact, outcome) {
-            (CoordinatorEnd::Published, Some(artifact), _) => Ok(artifact),
-            (CoordinatorEnd::Published, None, _) => Err(WorkerJobError::Failed(
+        match settlement {
+            LeaseSettlement::Release => {
+                match catalog
+                    .release_job_lease(job_id, &self.worker_id, attempt)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::debug!(
+                        job_id = %job_id, attempt,
+                        "the lease was not this attempt's to release"
+                    ),
+                    Err(e) => tracing::warn!(
+                        job_id = %job_id, attempt, error = %e,
+                        "releasing the lease after the attempt ended failed; left to expiry"
+                    ),
+                }
+            }
+            LeaseSettlement::Expire => tracing::warn!(
+                job_id = %job_id, attempt, end = %end,
+                "gang attempt retired: the lease is left to expire, reclaim requeues the job \
+                 and the successor's claim spends the attempt"
+            ),
+            LeaseSettlement::Untouched => {}
+        }
+        match (end, artifact) {
+            (CoordinatorEnd::Published, Some(artifact)) => Ok(artifact),
+            (CoordinatorEnd::Published, None) => Err(WorkerJobError::Failed(
                 "the coordinator ended Published without an artifact".into(),
             )),
-            (CoordinatorEnd::Cancelled, _, _) => Err(WorkerJobError::Cancelled),
-            (CoordinatorEnd::TrainingFailed(msg), _, _) => Err(WorkerJobError::Failed(msg)),
-            (CoordinatorEnd::Moved, _, _) => {
-                Err(WorkerJobError::Abandoned(CoordinatorEnd::Moved.to_string()))
-            }
-            (end, _, Some(outcome)) => {
-                if !outcome.counts_toward_failures() {
-                    match catalog
-                        .release_job_lease(job_id, &self.worker_id, attempt)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => tracing::debug!(
-                            job_id = %job_id, attempt,
-                            "the lease was not this attempt's to release"
-                        ),
-                        Err(e) => tracing::warn!(
-                            job_id = %job_id, attempt, error = %e,
-                            "releasing the lease after an assembly outcome failed"
-                        ),
-                    }
-                }
-                Err(WorkerJobError::Abandoned(end.to_string()))
-            }
-            (end, _, None) => Err(WorkerJobError::Abandoned(end.to_string())),
+            (CoordinatorEnd::Cancelled, _) => Err(WorkerJobError::Cancelled),
+            (CoordinatorEnd::TrainingFailed(msg), _) => Err(WorkerJobError::Failed(msg)),
+            (end, _) => Err(WorkerJobError::Abandoned(end.to_string())),
         }
     }
 
@@ -5266,11 +5370,12 @@ enum WorkerJobError {
     /// The coordinator body ended this attempt WITHOUT a run reaching a
     /// terminal state (an assembly outcome, or a gang fault mid-run — see
     /// [`CoordinatorEnd`]): no terminal write, the assembly outcome already
-    /// recorded on the row, and the lease either handed back
-    /// (`release_job_lease`, an uncounted outcome) or left to expire (a
-    /// counted one) — either way the row stays `running` for reclaim and
-    /// the next attempt re-assembles once its cooldown passes. The string
-    /// is the reason, for the log.
+    /// recorded on the row, and the lease settled by the released-vs-failed
+    /// split ([`lease_settlement`]) — handed back (`release_job_lease`) or
+    /// left to expire — either way the row stays `running` for reclaim (the
+    /// fleet's only requeue path, DESIGN.md §4) and the next attempt
+    /// re-assembles once its cooldown passes. The string is the reason, for
+    /// the log.
     Abandoned(String),
 }
 
@@ -7728,10 +7833,10 @@ mod tests {
     /// be exactly `0..VARIANTS` (a variant without a sample reds this), and
     /// each sample's outcome must be the documented row. The member-abort
     /// sub-table is one to one over every frozen `AbortReason`, with the
-    /// out-of-set value reading transient. The settle rule the body applies
-    /// after recording — release the lease unless the outcome counts — is
-    /// pinned on `AssemblyOutcome::counts_toward_failures` for every
-    /// variant.
+    /// out-of-set value reading transient. The counting class every
+    /// assembly end settles its lease by
+    /// (`AssemblyOutcome::counts_toward_failures`) is pinned for every
+    /// variant; the settlement itself is the next oracle's.
     #[test]
     fn every_coordinator_end_records_exactly_one_assembly_outcome_and_only_moved_writes_nothing() {
         use std::collections::BTreeSet;
@@ -7827,8 +7932,127 @@ mod tests {
         ] {
             assert!(
                 !outcome.counts_toward_failures(),
-                "{outcome:?} costs the job no attempt: the lease is handed back"
+                "{outcome:?} is not counted toward assembly_failures"
             );
+        }
+    }
+
+    /// UNITS.md § U5b-2, DESIGN.md §4 "Failure and release": the lease
+    /// settlement is a TOTAL function of the end (`lease_settlement` is an
+    /// exhaustive match; one sample per `ordinal` in `0..VARIANTS` here, so
+    /// a new end without a sample reds this). The split: a member's
+    /// `Aborted{Drain}` RELEASES (`releases + 1`, zero net attempts — OPS
+    /// D10); every other mid-run gang fault — a member's `Aborted` for
+    /// every other frozen reason and the out-of-set value, and a
+    /// `LinkFault` (a dropped stream, a rank silent past the deadline, a
+    /// peer's round fault) — leaves the lease to EXPIRE (an attempt spent
+    /// at the successor's claim); an assembly end settles by its recorded
+    /// outcome's counting class (every one is uncounted today → released);
+    /// `Moved`/`Published`/`TrainingFailed`/`Cancelled` are the caller's
+    /// arms (untouched here).
+    #[test]
+    fn every_coordinator_end_settles_its_lease_by_the_released_vs_failed_split() {
+        use std::collections::BTreeSet;
+
+        use LeaseSettlement as S;
+
+        let member_aborted =
+            |reason: AbortReason| CoordinatorEnd::MemberAborted { rank: 1, reason };
+        let samples: Vec<(CoordinatorEnd, S)> = vec![
+            (CoordinatorEnd::Moved, S::Untouched),
+            (
+                CoordinatorEnd::HostCannotCoordinate("no root".into()),
+                S::Release,
+            ),
+            (CoordinatorEnd::CatalogFault("io".into()), S::Release),
+            (
+                CoordinatorEnd::ShortListed {
+                    fresh: 0,
+                    needed: 1,
+                },
+                S::Release,
+            ),
+            (
+                CoordinatorEnd::MemberUnreachable {
+                    rank: 1,
+                    instance_id: "m".into(),
+                },
+                S::Release,
+            ),
+            (
+                CoordinatorEnd::MemberRefused {
+                    rank: 1,
+                    instance_id: "m".into(),
+                    detail: "busy".into(),
+                },
+                S::Release,
+            ),
+            (CoordinatorEnd::PeerRefused("cap".into()), S::Release),
+            (CoordinatorEnd::Cancelled, S::Untouched),
+            (CoordinatorEnd::Drain, S::Release),
+            (member_aborted(AbortReason::Drain), S::Release),
+            (CoordinatorEnd::LinkFault("timed out".into()), S::Expire),
+            (CoordinatorEnd::TrainingFailed("nan".into()), S::Untouched),
+            (CoordinatorEnd::Published, S::Untouched),
+        ];
+        let ordinals: BTreeSet<usize> = samples.iter().map(|(end, _)| end.ordinal()).collect();
+        assert_eq!(
+            ordinals,
+            (0..CoordinatorEnd::VARIANTS).collect::<BTreeSet<_>>(),
+            "one sample per CoordinatorEnd variant"
+        );
+        for (end, expected) in &samples {
+            assert_eq!(
+                lease_settlement(end),
+                *expected,
+                "the settlement of {end} (ordinal {})",
+                end.ordinal()
+            );
+        }
+
+        // The member-abort sub-table: exactly Drain releases; every other
+        // frozen reason, and the out-of-set value, spends the attempt.
+        for reason in [
+            AbortReason::Refuted,
+            AbortReason::Unavailable,
+            AbortReason::StoreUnavailable,
+            AbortReason::NoBody,
+            AbortReason::Cancelled,
+            AbortReason::Unspecified,
+        ] {
+            assert_eq!(
+                lease_settlement(&member_aborted(reason)),
+                S::Expire,
+                "a member's Aborted({reason:?}) mid-run is a rank failure: the attempt is spent"
+            );
+        }
+        assert_eq!(
+            lease_settlement(&member_aborted(AbortReason::Drain)),
+            S::Release
+        );
+
+        // Every assembly end settles by its outcome's counting class — the
+        // one rule, never a second table: an end whose outcome counts
+        // would expire, and today none of them does.
+        for (end, _) in &samples {
+            if matches!(
+                end,
+                CoordinatorEnd::HostCannotCoordinate(_)
+                    | CoordinatorEnd::CatalogFault(_)
+                    | CoordinatorEnd::ShortListed { .. }
+                    | CoordinatorEnd::MemberUnreachable { .. }
+                    | CoordinatorEnd::MemberRefused { .. }
+                    | CoordinatorEnd::PeerRefused(_)
+                    | CoordinatorEnd::Drain
+            ) {
+                let outcome = assembly_outcome(end).expect("an assembly end records an outcome");
+                let expected = if outcome.counts_toward_failures() {
+                    S::Expire
+                } else {
+                    S::Release
+                };
+                assert_eq!(lease_settlement(end), expected, "{end}");
+            }
         }
     }
 

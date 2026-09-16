@@ -701,3 +701,109 @@ async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_pub
         "the fan-out's published adapter must be byte-identical to the LocalGang reference"
     );
 }
+
+/// UNITS.md § U5b-2's `BackOff` row, executed against the tree as the
+/// refutation of its premise: a crashed coordinator's live `building`
+/// training-set row is NEVER met by the successor at this tip. The
+/// training-set producer names every table uniquely (`ResultStore::
+/// create_table`: `{source}__{task}__{model}__{nanos}_{uuid}`), anchors a
+/// registered source `UnpinnedAtInstant` (`training_set::
+/// materialize_projection_table`), so its reuse probe short-circuits
+/// (`exact_match_candidates`) and only `ready` rows are ever candidates;
+/// and the job row's write-once pair is recorded AFTER the table is
+/// `ready` (`run_spec` builds the pair from the finished table, then the
+/// coordinator body's CAS writes it), so a retry binds a `ready` table by
+/// name or materializes anew. Here: a live `building` row over the SAME
+/// source and task, its lease renewed by this process's keeper (the handle
+/// held, never finished — the crashed writer's row) exists while the
+/// successor attempt runs; the attempt materializes ITS OWN table, records
+/// a different name on the row, reaches the coordinator body, and leaves
+/// the orphan exactly as it found it (`building`, the same writer, its
+/// lease live) for the lease to reap after expiry. No `BackOff` disposition
+/// exists on the training path because no attempt can reach the state it
+/// would answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never_met_by_the_successor(
+) {
+    use jammi_db::catalog::result_repo::ResultTableKind;
+    use jammi_db::store::TRAINING_SET_MODEL_ID;
+
+    let (session, _dir) = coordinating_session(|_| {}).await;
+    let worker = JobWorker::new(&session).unwrap();
+
+    // The crashed coordinator's row: `building` over the same source and
+    // task, held under a live, renewing lease.
+    let orphan = session
+        .result_store()
+        .create_table(
+            "pairs",
+            ModelTask::TextEmbedding,
+            ResultTableKind::TrainingSet,
+            None,
+            TRAINING_SET_MODEL_ID,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the orphan's building row");
+    let orphan_name = orphan.table_name().to_string();
+    let before = session
+        .catalog()
+        .get_result_table(&orphan_name)
+        .await
+        .unwrap()
+        .expect("the orphan row exists");
+    assert_eq!(before.status, "building");
+    assert!(
+        before.lease_expires_at.is_some(),
+        "a live lease: {before:?}"
+    );
+    assert_eq!(before.writer_id.as_deref(), Some(orphan.writer_id()));
+
+    let record = submit_and_claim(&session, &worker, two_rank_spec()).await;
+    let job_id = record.job_id.clone();
+    worker.run_claimed_job(&session, record).await;
+
+    // The successor attempt built and recorded its OWN ready table and
+    // reached the coordinator body (short-listed: no member exists here).
+    let ends = training_test_hooks::coordinator_ends_for(&job_id);
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(
+        ends[0].1,
+        "short listing: 0 fresh member(s) where 1 are needed"
+    );
+    let after = row(session.catalog(), &job_id).await;
+    let own_name = after
+        .training_set_location
+        .clone()
+        .expect("the CAS recorded the attempt's own table");
+    assert_ne!(
+        own_name, orphan_name,
+        "the successor never binds the orphan: it materializes its own table"
+    );
+    let own = session
+        .catalog()
+        .get_result_table(&own_name)
+        .await
+        .unwrap()
+        .expect("the attempt's own row");
+    assert_eq!(own.status, "ready");
+
+    // The orphan is exactly as it was: never promoted, failed, deleted or
+    // claimed — the lease's to reap after expiry.
+    let orphan_after = session
+        .catalog()
+        .get_result_table(&orphan_name)
+        .await
+        .unwrap()
+        .expect("the orphan row still exists");
+    assert_eq!(orphan_after.status, "building");
+    assert_eq!(orphan_after.writer_id, before.writer_id);
+    assert!(
+        orphan_after.lease_expires_at.is_some(),
+        "the orphan's lease is still live: {orphan_after:?}"
+    );
+    orphan.abort().await.expect("the fixture's own abort");
+}

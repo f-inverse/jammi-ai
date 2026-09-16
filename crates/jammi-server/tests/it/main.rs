@@ -5,6 +5,7 @@ mod composability_seam;
 mod flight_annotate;
 mod flight_tenant;
 mod gang_admission_catalog_fault_oracle;
+mod gang_chaos;
 mod gang_coordinator;
 mod gang_rank_admission_oracle;
 mod gang_rounds;

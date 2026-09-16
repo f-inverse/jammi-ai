@@ -3937,14 +3937,57 @@ session_abort`, `Peer::member_aborts`); `TrainingFailed`/`Published` →
 `failed` by the caller as at W=1); `Moved` → nothing. `AllRootDivergent` is
 never produced: root identity is a predicate inside the listing verb, so an
 all-divergent fleet reads as a short listing. After recording, the lease is
-settled by the outcome's counting class (`AssemblyOutcome::
-counts_toward_failures`): an uncounted outcome hands the lease back at once
-(`Catalog::release_job_lease` — zero net attempts, OPS D10), a counted one
-leaves it to expire (an attempt spent); either way the attempt returns
-`WorkerJobError::Abandoned`, writes nothing terminal, and the row stays
-`running` for reclaim; the next claim waits out `next_assembly_after`.
-`Cancelled` returns through the existing cancel arm (a request lands
-`failed`, a lost lease is left for reclaim). The oracles:
+settled by the released-vs-failed split (`lease_settlement`, a total match
+over `CoordinatorEnd` — DESIGN.md §4 "Failure and release"): a member's
+`Aborted{Drain}` hands the lease back at once (`Catalog::release_job_lease`
+— `releases + 1`, lease NULL, the row claimable within one idle poll: a
+rolling restart of the peer tier costs zero net attempts, OPS D10); every
+other mid-run gang fault (a member's `Aborted` for any other reason, a
+dropped stream, a rank silent past `[worker] rank_timeout_secs`, a peer's
+round fault) leaves the lease to EXPIRE — reclaim arm 1a requeues the row
+within the lease window and the successor's `claim_next` spends the attempt
+(`attempts + 1`, `releases` unchanged), so a member that keeps failing
+exhausts the job's attempts instead of retrying it forever; an assembly end
+(no run started) settles by its outcome's counting class
+(`AssemblyOutcome::counts_toward_failures`: every one uncounted today, so
+released). Either way the attempt returns `WorkerJobError::Abandoned`,
+writes nothing terminal, and the row stays `running` for reclaim; the next
+claim waits out `next_assembly_after`. `Cancelled` returns through the
+existing cancel arm (a request lands `failed`, a lost lease is left for
+reclaim).
+
+**The per-attempt watchdog is the coordinator's own `Peer`.** Every
+member's stream is read by rank 0's rounds, so a member's `Aborted{reason}`
+(recorded typed on that link, `CoordinatorLink::session_abort`), a stream
+that dropped, or a rank silent past `[worker] rank_timeout_secs` (the round
+deadline) ends rank 0's collective call with the gang faulted — every member
+is faulted in the same round (`RoundFault`, `Peer::fault_all`) and its
+session ended cooperatively (`Peer::end_members` → `Cancel`, the stream
+close) — and the body classifies the end from the links (`MemberAborted` /
+`LinkFault`). The `Peer` is built for the attempt and dropped with it, so a
+fault retires exactly the attempt it belongs to (the actuator rule: the
+engine ships the actuator, never the control loop). OPS D6 holds by the slot
+discipline: a member's slot is `Rank` for its whole session and a peer never
+claims while it holds a rank (`HostAdmission`), so ending a session never
+aborts a claim transaction anywhere. The successor attempt resumes from the
+job-level resume checkpoint (`{job_id}/_resume/`, rank 0's epoch-boundary
+write) and publishes bytes equal to an uninterrupted run. A crashed
+coordinator's live `building` training-set row is never met by the
+successor at this tip — the producer names every table uniquely, anchors a
+registered source `UnpinnedAtInstant` (so the reuse probe never matches),
+and the job row's pair is recorded only after the table is `ready` — so the
+successor materializes its own table and the orphan is the lease's to reap
+after expiry (`ResultStore::recover` → `claim_expired_building_table`); no
+`BackOff` disposition exists on the training path
+(`crates/jammi-ai/tests/it/gang_coordinator.rs`, the planted-row oracle).
+The hermetic chaos rows — a member's stream dropped mid-round, a member
+silent past the deadline, a member's host draining mid-round, split brain
+(an older attempt's stale runner fenced by the successor's `RunRank`) — run
+over a two-host loopback fleet (two engines over one catalog and result
+root, the member's real `GangServer::run_rank` on its own runtime) in
+`crates/jammi-server/tests/it/gang_chaos.rs`; the process-level SIGKILL rows
+(a peer, the coordinator) are `crates/jammi-ai/tests/distributed/gang_chaos.rs`,
+advisory in the distributed lane. The oracles:
 `crates/jammi-ai/tests/it/gang_coordinator.rs` (a two-rank job within the
 serveable world on a one-device host reaches assembly and lands
 `ShortListed`, cooled, released; the `Moved` CAS arm writes nothing; a

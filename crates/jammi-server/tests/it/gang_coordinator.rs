@@ -73,13 +73,13 @@ const LEASE: Duration = Duration::from_secs(30);
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// The U4b gang oracle's fixture: eight `(anchor, positive)` rows.
-fn pairs() -> Vec<(String, String)> {
+pub(crate) fn pairs() -> Vec<(String, String)> {
     (0..8)
         .map(|i| (format!("anchor text {i}"), format!("positive text {i}")))
         .collect()
 }
 
-fn gang_config(epochs: usize) -> FineTuneConfig {
+pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
     FineTuneConfig {
         epochs,
         batch_size: 2,
@@ -96,14 +96,14 @@ fn gang_config(epochs: usize) -> FineTuneConfig {
     }
 }
 
-fn tiny_bert_model() -> String {
+pub(crate) fn tiny_bert_model() -> String {
     "local:".to_string()
         + jammi_test_utils::cookbook_fixture("tiny_bert")
             .to_str()
             .unwrap()
 }
 
-fn write_pairs_csv(dir: &std::path::Path) -> String {
+pub(crate) fn write_pairs_csv(dir: &std::path::Path) -> String {
     let path = dir.join("pairs.csv");
     let mut body = String::from("anchor,positive\n");
     for (anchor, positive) in pairs() {
@@ -144,7 +144,7 @@ async fn coordinating_server() -> crate::common::grpc::PeerEngineServer {
     server
 }
 
-fn two_rank_spec() -> TrainingSpec {
+pub(crate) fn two_rank_spec() -> TrainingSpec {
     TrainingSpec::FineTune {
         source: "pairs".into(),
         columns: vec!["anchor".into(), "positive".into()],
@@ -216,18 +216,18 @@ async fn claim(engine: &Arc<InferenceSession>, worker: &JobWorker, within: Durat
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Row {
-    status: String,
-    attempts: i32,
-    releases: i32,
-    lease_expires_at: Option<String>,
-    assembly_failures: i32,
-    next_assembly_after: Option<String>,
-    training_set_ref: Option<String>,
-    error: Option<String>,
+pub(crate) struct Row {
+    pub(crate) status: String,
+    pub(crate) attempts: i32,
+    pub(crate) releases: i32,
+    pub(crate) lease_expires_at: Option<String>,
+    pub(crate) assembly_failures: i32,
+    pub(crate) next_assembly_after: Option<String>,
+    pub(crate) training_set_ref: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
-async fn row(engine: &Arc<InferenceSession>, job_id: &str) -> Row {
+pub(crate) async fn row(engine: &Arc<InferenceSession>, job_id: &str) -> Row {
     let job_id = job_id.to_string();
     engine
         .catalog()
@@ -267,7 +267,10 @@ async fn row(engine: &Arc<InferenceSession>, job_id: &str) -> Row {
         .expect("the job row exists")
 }
 
-async fn published_adapter_bytes(engine: &Arc<InferenceSession>, job_id: &str) -> Vec<u8> {
+pub(crate) async fn published_adapter_bytes(
+    engine: &Arc<InferenceSession>,
+    job_id: &str,
+) -> Vec<u8> {
     let models = engine.catalog().list_models().await.unwrap();
     let model = models
         .iter()
@@ -332,7 +335,7 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, TempDi
     (catalog, dir)
 }
 
-fn file_store() -> Arc<ArtifactStore> {
+pub(crate) fn file_store() -> Arc<ArtifactStore> {
     let root_dir = TempDir::new().unwrap().keep();
     let cache = TempDir::new().unwrap().keep();
     let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
@@ -341,15 +344,19 @@ fn file_store() -> Arc<ArtifactStore> {
 
 /// Everything a directly-built rank's `TrainingLoop` needs, prepared on
 /// the runtime (async) so the rank's own thread only builds and runs.
-struct RankEnv {
-    base: Arc<jammi_ai::model::LoadedModel>,
-    hidden: usize,
-    catalog: Arc<jammi_db::catalog::Catalog>,
-    dir: TempDir,
-    store: Arc<ArtifactStore>,
+pub(crate) struct RankEnv {
+    pub(crate) base: Arc<jammi_ai::model::LoadedModel>,
+    pub(crate) hidden: usize,
+    pub(crate) catalog: Arc<jammi_db::catalog::Catalog>,
+    pub(crate) dir: TempDir,
+    pub(crate) store: Arc<ArtifactStore>,
 }
 
-async fn rank_env(engine: &Arc<InferenceSession>, tag: &str, store: Arc<ArtifactStore>) -> RankEnv {
+pub(crate) async fn rank_env(
+    engine: &Arc<InferenceSession>,
+    tag: &str,
+    store: Arc<ArtifactStore>,
+) -> RankEnv {
     let guard = engine
         .model_cache()
         .get_or_load(
@@ -375,7 +382,7 @@ async fn rank_env(engine: &Arc<InferenceSession>, tag: &str, store: Arc<Artifact
 /// Build one rank's `TrainingLoop` over `rank_ctx` (the U4b gang oracle's
 /// shape) and run it on the current thread: the saved `adapter.safetensors`
 /// bytes, or the run's own error.
-fn try_run_rank(
+pub(crate) fn try_run_rank(
     call: &BlockingCall,
     env: RankEnv,
     job_id: &str,
@@ -429,7 +436,10 @@ fn run_rank(
 /// The reference: a two-rank `LocalGang` on the CPU, each rank driven
 /// directly through `TrainingLoop::run` on its own `spawn_thread`; rank 0's
 /// adapter bytes.
-async fn reference_rank0_adapter_bytes(engine: &Arc<InferenceSession>, tag: &str) -> Vec<u8> {
+pub(crate) async fn reference_rank0_adapter_bytes(
+    engine: &Arc<InferenceSession>,
+    tag: &str,
+) -> Vec<u8> {
     let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
     let store = file_store();
     let runtime = tokio::runtime::Handle::current();

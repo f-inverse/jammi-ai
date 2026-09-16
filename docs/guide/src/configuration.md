@@ -177,8 +177,10 @@ local_ranks = 1
 # feature.
 collective = "auto"
 # How long a rank waits on its peers at a gang boundary before the wait is a
-# failure. Must be > 0 - a zero deadline expires before any peer can answer,
-# turning every gang into an immediate failure. Default: 120.
+# failure: on the coordinator, a member silent this long retires the attempt
+# (requeued from its checkpoint, one attempt spent). Must be > 0 - a zero
+# deadline expires before any peer can answer, turning every gang into an
+# immediate failure. Default: 120.
 rank_timeout_secs = 120
 
 [distributed]

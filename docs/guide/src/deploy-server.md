@@ -311,7 +311,16 @@ in-flight **unary** (an inline `run_now` such as `GenerateEmbeddings`) is
 bounded only by the grace period. A DRAIN that outlives the grace is
 SIGKILLed: the running job's lease then expires after one `[lease]
 duration_secs`, a successor requeues it (resuming from its last epoch
-bundle) and it consumes one attempt.
+bundle) and it consumes one attempt. A gang RANK this process holds for
+another host's training job (`[server] peer_advertise`) ends at once on
+DRAIN with the `Drain` reason: the coordinator hands that job's lease back
+(`releases + 1`), so a rolling restart of the peer tier costs the job no
+attempt — the next attempt lands within one idle poll over the members
+still listed. Every other way a rank is lost mid-run — the process
+SIGKILLed, its stream dropped, or silent past `[worker] rank_timeout_secs`
+— retires the coordinator's attempt with no terminal write: its lease is
+left to expire, a successor requeues the job and the retry consumes one
+attempt.
 
 **RELEASE** (`kill -INT`, Ctrl+C, `jammi-server release`, or a second
 SIGTERM): connections are severed at once; every job lease this process

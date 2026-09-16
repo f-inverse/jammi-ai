@@ -121,12 +121,6 @@ pub async fn host_scheduler(
         distribution,
     ));
 
-    // Cloned before `cluster` moves into `create_scheduler` — the
-    // `PlacedGangSubmitter`'s `placement_available()` reads it directly
-    // (contract §9 B1: "a registered executor other than this instance
-    // exists"), never re-deriving it from a second cluster handle.
-    let cluster_state = cluster.cluster_state();
-
     let scheduler = create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config)
         .await
         .map_err(Error::Ballista)?;
@@ -142,7 +136,6 @@ pub async fn host_scheduler(
         .install_placed_gang_submitter(Arc::new(SchedulerPlacedGangSubmitter {
             session: Arc::clone(session),
             scheduler_url: format!("http://{local_addr}"),
-            cluster_state,
         }));
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -197,14 +190,14 @@ fn scheduler_config(
 /// The scheduler role's [`jammi_ai::fine_tune::worker::PlacedGangSubmitter`]:
 /// submits a claimant's own gang as one `GangExec` Ballista task instead of
 /// running it in-process (contract §2.3). `placement_available()` answers
-/// "a registered executor other than this instance exists" from the
-/// scheduler's own cluster state — `run_claimed_job_under` treats `false` as
-/// "run in-process" (placement is a property of the claimant's cluster
-/// view, decided BEFORE topology).
+/// "a LIVE registered executor other than this instance exists" from the
+/// catalog with `cluster::executor_is_live`, the binder's and the submit
+/// edge's own predicate — `run_claimed_job_under` treats `false` as "run
+/// in-process" (placement is a property of the claimant's cluster view,
+/// decided BEFORE topology).
 struct SchedulerPlacedGangSubmitter {
     session: Arc<InferenceSession>,
     scheduler_url: String,
-    cluster_state: Arc<dyn ballista_scheduler::cluster::ClusterState>,
 }
 
 impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSubmitter {
@@ -245,11 +238,22 @@ impl jammi_ai::fine_tune::worker::PlacedGangSubmitter for SchedulerPlacedGangSub
         // the submit edge's own predicate): a row a dead executor left
         // behind must not divert a claim into the placed path only to have
         // the submit edge refuse it (an attempt spent for nothing).
-        let rows = tokio::task::block_in_place(|| {
+        let rows = match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async move { catalog.list_compute_executors().await })
-        })
-        .unwrap_or_default();
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                // A catalog fault is not "no peer": say so, then answer
+                // "unavailable" — the claim runs in-process (still correct,
+                // never parked), and the line names why the topology changed.
+                tracing::warn!(
+                    error = %e,
+                    "placement_available: the catalog read failed; treating placement as unavailable"
+                );
+                return false;
+            }
+        };
         let now = chrono::Utc::now();
         rows.iter()
             .any(|r| r.executor_id != own_id && crate::cluster::executor_is_live(r, now))

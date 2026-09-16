@@ -66,8 +66,13 @@ fn ballista_err(e: jammi_db::error::JammiError) -> BallistaError {
 /// so "live to placement" and "live to Ballista" are one definition and
 /// cannot drift apart.
 pub fn executor_liveness_window() -> chrono::Duration {
-    let secs = ballista_scheduler::config::SchedulerConfig::default().executor_timeout_seconds;
-    chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+    static WINDOW: std::sync::OnceLock<chrono::Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let secs = ballista_scheduler::config::SchedulerConfig::default().executor_timeout_seconds;
+        chrono::Duration::seconds(
+            i64::try_from(secs).expect("Ballista's default executor_timeout_seconds fits i64"),
+        )
+    })
 }
 
 /// The ONE liveness predicate every read that decides on executors shares

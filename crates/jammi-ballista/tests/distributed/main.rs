@@ -1175,3 +1175,21 @@ async fn list_workers_and_compute_executor_devices_report_registered_devices() {
 
     drop(fleet);
 }
+
+/// `harness::free_port`'s two stated properties, asserted: every port lies
+/// below every platform's ephemeral floor (so no outgoing `connect()` of
+/// this process can take it before the spawned server binds it), and no
+/// port is handed out twice by one process. Needs no backend. Mutation:
+/// pick from `bind(:0)` again and the range assertion reds.
+#[test]
+fn free_port_stays_below_the_ephemeral_floor_and_never_repeats() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let p = harness::free_port();
+        assert!(
+            (20_000..32_000).contains(&p),
+            "port {p} outside the reserved range"
+        );
+        assert!(seen.insert(p), "port {p} handed out twice");
+    }
+}

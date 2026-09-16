@@ -571,7 +571,9 @@ impl HostAdmission {
         } else {
             // The holder the CAS saw, in the SAME critical section — the
             // caller decides on that value, never on a second read.
-            Err(found.unwrap_or(Holder::Free))
+            Err(found.expect(
+                "send_if_modified runs its closure exactly once; a refusal recorded the holder",
+            ))
         }
     }
 

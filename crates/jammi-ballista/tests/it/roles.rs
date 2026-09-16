@@ -27,7 +27,9 @@ use ballista_scheduler::config::TaskDistributionPolicy;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
+use jammi_ballista::cluster::{CatalogClusterState, CatalogJobState};
 use jammi_ballista::roles::{host_executor, host_scheduler};
+use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::config::BallistaExecutorConfig;
 
 async fn session() -> Arc<InferenceSession> {
@@ -209,5 +211,86 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
         .expect("executor role hosts and registers after the scheduler came up");
     assert_eq!(executor.executor_id(), session.instance_id());
     executor.stop().await;
+    scheduler.stop().await;
+}
+
+/// `placement_available` (the scheduler role's `PlacedGangSubmitter`) answers
+/// from LIVE executors only — the binder's and the submit edge's own
+/// predicate: a row a dead executor left behind (stale `heartbeat_at`) is
+/// not a peer; a fresh row is. Mutation: drop `executor_is_live` from
+/// `placement_available` and the stale row reads as a peer (the first
+/// assertion reds). Hosts a scheduler and NO executor (nothing here touches
+/// the executor's process-wide `TERMINATING` flag).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placement_available_counts_live_peers_only() {
+    let session = session().await;
+    let catalog = Arc::clone(session.catalog_arc());
+    let cluster = BallistaCluster::new(
+        Arc::new(CatalogClusterState::new(Arc::clone(&catalog))),
+        Arc::new(CatalogJobState::new(
+            Arc::clone(&catalog),
+            "jammi-ballista-it-placement",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )),
+    );
+    let scheduler = host_scheduler(
+        &session,
+        "127.0.0.1:0",
+        cluster,
+        TaskDistributionPolicy::RoundRobin,
+    )
+    .await
+    .expect("scheduler role hosts");
+    let submitter = session
+        .host_admission()
+        .placed_gang_submitter()
+        .expect("host_scheduler installs the placed-gang submitter");
+    assert!(
+        !submitter.placement_available(),
+        "no executor registered at all: nothing to place on"
+    );
+
+    let record = |id: &str, heartbeat_at: String| ComputeExecutorRecord {
+        executor_id: id.to_string(),
+        instance_id: id.to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        grpc_port: 0,
+        task_slots: 1,
+        available_slots: 1,
+        status: "Active".to_string(),
+        heartbeat_at,
+        metadata: String::new(),
+        devices: vec![],
+    };
+    let stale_id = format!("stale-peer-{}", jammi_test_utils::unique_suffix());
+    catalog
+        .upsert_compute_executor(&record(
+            &stale_id,
+            "2026-01-01T00:00:00.000000000Z".to_string(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !submitter.placement_available(),
+        "a row a dead executor left behind is not a peer"
+    );
+
+    let live_id = format!("live-peer-{}", jammi_test_utils::unique_suffix());
+    catalog
+        .upsert_compute_executor(&record(
+            &live_id,
+            jammi_db::catalog::backend::now_sortable(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        submitter.placement_available(),
+        "a live registered executor other than this instance is a peer"
+    );
+
+    catalog.remove_compute_executor(&stale_id).await.ok();
+    catalog.remove_compute_executor(&live_id).await.ok();
     scheduler.stop().await;
 }

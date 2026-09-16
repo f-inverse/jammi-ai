@@ -70,7 +70,7 @@ pub(crate) async fn embedding_definition(
 /// `feat_500-wave4` §2.5/§9 B3).
 ///
 /// `embedding_dim` and `model_source` are the caller's own (already resolved
-/// via [`embedding_definition`]) rather than re-derived here, so this
+/// via `embedding_definition`) rather than re-derived here, so this
 /// function never re-loads the model.
 pub async fn build_embedding_plan(
     session: &InferenceSession,

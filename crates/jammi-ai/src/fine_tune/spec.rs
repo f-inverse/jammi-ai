@@ -164,9 +164,10 @@ fn default_world_size() -> u32 {
     DEFAULT_WORLD_SIZE
 }
 
-/// What a submitted [`TrainingSpec`] is admitted against: the deployment's
-/// devices, the collective it reduces over, and whether this build can reach
-/// that collective.
+/// What a submitted [`TrainingSpec`] is admitted against: the widest gang
+/// this deployment serves (`[distributed] max_world_size`, DESIGN.md §7),
+/// the collective it reduces over, and whether this build can reach that
+/// collective.
 ///
 /// The submit edge is where a rank count the deployment cannot serve is
 /// caught, because it is the last point at which refusing costs nothing: past
@@ -175,23 +176,35 @@ fn default_world_size() -> u32 {
 /// deployment can serve — a silently lowered count trains a different model
 /// than the caller asked for and records it under the same identity.
 ///
+/// The bound is the FLEET's, not this host's: a `world_size` within
+/// [`Self::serveable_world`] but beyond this host's own `[gpu] devices` is
+/// admitted here and decided by ASSEMBLY on the claiming coordinator
+/// (`worker.rs`, the coordinator body) — the ranks this host cannot place
+/// itself are members dialed across the fleet, and a short membership is an
+/// assembly outcome (cooled down, retried), never a submit-time refusal.
+/// `[worker] local_ranks` is not read here either: the three knobs load
+/// independently with no cross-check (DESIGN.md §7). Nothing here reads
+/// the catalog — the type holds no handle to one, so a refusal is decided
+/// from configuration alone.
+///
 /// The build flag is DATA rather than a `cfg!` inside the check so the rule
 /// is decidable for either build from either build: a host test can state
 /// what a CUDA build admits, and a CUDA build can state what a host build
 /// refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankAdmission {
-    devices: usize,
+    serveable_world: u32,
     collective: jammi_db::config::CollectiveSelection,
     cuda_build: bool,
 }
 
 impl RankAdmission {
-    /// The admission this deployment implies: one rank per configured
-    /// device, the configured collective, and THIS build's CUDA support.
+    /// The admission this deployment implies: `[distributed] max_world_size`
+    /// as the serveable world, the configured collective, and THIS build's
+    /// CUDA support.
     pub fn from_config(config: &jammi_db::config::JammiConfig) -> Self {
         Self {
-            devices: config.gpu.device_list().len(),
+            serveable_world: config.distributed.max_world_size,
             collective: config.worker.collective,
             cuda_build: cfg!(feature = "cuda"),
         }
@@ -199,19 +212,25 @@ impl RankAdmission {
 
     /// An admission stated outright, rather than read off a live
     /// [`jammi_db::config::JammiConfig`] — for an embedder that has its own
-    /// source of the device count, collective and build flag (a test that
+    /// source of the serveable world, collective and build flag (a test that
     /// needs a deployment this host does not have is one such caller, not
     /// the only one).
     pub fn new(
-        devices: usize,
+        serveable_world: u32,
         collective: jammi_db::config::CollectiveSelection,
         cuda_build: bool,
     ) -> Self {
         Self {
-            devices,
+            serveable_world,
             collective,
             cuda_build,
         }
+    }
+
+    /// The widest `world_size` this admission serves — `[distributed]
+    /// max_world_size` for a config-derived value.
+    pub fn serveable_world(&self) -> u32 {
+        self.serveable_world
     }
 
     /// Admit `spec`, or refuse with a typed [`JammiError::Config`] naming the
@@ -224,8 +243,10 @@ impl RankAdmission {
     ///   request edge (`FineTuneRequest::world_size` is a `NonZeroU32`) but
     ///   reachable through a hand-built or deserialized spec, so the durable
     ///   edge checks it too.
-    /// - `world_size > devices` — there is no device for the last rank, and
-    ///   the alternative to refusing is two ranks silently sharing one.
+    /// - `world_size > serveable_world` — wider than the widest gang any
+    ///   coordinator on this deployment may assemble (`[distributed]
+    ///   max_world_size`); no fleet member could ever be dialed for the
+    ///   ranks past that bound.
     /// - `collective = "nccl"` on a build without CUDA — the requested
     ///   collective cannot be reached. Also refused at session OPEN
     ///   (`refuse_unreachable_collective`), which is the edge a live session
@@ -258,11 +279,12 @@ impl RankAdmission {
                     .into(),
             ));
         }
-        if world_size as usize > self.devices {
+        if world_size > self.serveable_world {
             return Err(JammiError::Config(format!(
-                "world_size = {world_size} exceeds the {} configured device(s): one rank per \
-                 device, so list more in `[gpu] devices` or submit a smaller rank count",
-                self.devices
+                "world_size = {world_size} exceeds the serveable world of {} ([distributed] \
+                 max_world_size): a gang is assembled from fleet members up to that bound, so \
+                 raise it on every coordinator or submit a smaller rank count",
+                self.serveable_world
             )));
         }
         if self.collective.requires_cuda() && !self.cuda_build {

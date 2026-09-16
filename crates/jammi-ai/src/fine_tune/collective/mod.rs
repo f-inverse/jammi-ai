@@ -235,9 +235,11 @@ impl BlockingCall {
         }
     }
 
-    /// Run `f` on tokio's blocking pool with a fresh witness — the
-    /// production minting site: the worker's training thread is spawned
-    /// exactly here.
+    /// Run `f` on tokio's blocking pool with a fresh witness — the first
+    /// of the two production minting sites: the worker spawns rank 0's
+    /// training thread (the single rank, a `Local` gang's rank 0, or a
+    /// `Peer` gang's coordinator) exactly here (`worker.rs`,
+    /// `train_fine_tune`).
     pub fn spawn_blocking<F, T>(f: F) -> tokio::task::JoinHandle<T>
     where
         F: FnOnce(BlockingCall) -> T + Send + 'static,
@@ -246,10 +248,15 @@ impl BlockingCall {
         tokio::task::spawn_blocking(move || f(Self::mint()))
     }
 
-    /// Run `f` on a fresh OS thread with a fresh witness. An OS thread has
-    /// no runtime context of its own, so it can block; [`Peer`] blocks on
-    /// the [`tokio::runtime::Handle`] its links captured, which is allowed
-    /// from any thread that is not one of that runtime's workers.
+    /// Run `f` on a fresh OS thread with a fresh witness — the second
+    /// production minting site: the worker spawns every OTHER rank of an
+    /// in-process `Local` gang here, one thread pinned to one device, each
+    /// rank's `TrainingLoop::run` receiving the witness minted at its own
+    /// boundary (`worker.rs`, `train_fine_tune`). An OS thread has no
+    /// runtime context of its own, so it can block; [`Peer`] blocks on the
+    /// [`tokio::runtime::Handle`] its links captured, which is allowed from
+    /// any thread that is not one of that runtime's workers (the worker's
+    /// rank threads enter the runtime's handle for the same reason).
     pub fn spawn_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
     where
         F: FnOnce(BlockingCall) -> T + Send + 'static,

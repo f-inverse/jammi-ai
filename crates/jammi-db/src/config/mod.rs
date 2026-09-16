@@ -1388,11 +1388,13 @@ pub struct WorkerConfig {
     ///
     /// Renamed from `world_size` (U4b S8): orthogonal to `[distributed]
     /// max_world_size` (the widest `Peer` gang across FLEET members a
-    /// coordinator on this deployment may accept — a later unit's own knob)
-    /// and to the per-job `world_size` in `TrainingCommon` (identity-relevant,
-    /// checked against `[distributed] max_world_size` at submit) — the three
-    /// knobs load independently, with no cross-check between any pair
-    /// (DESIGN.md §7).
+    /// coordinator on this deployment may accept) and to the per-job
+    /// `world_size` in `TrainingCommon` (identity-relevant, checked against
+    /// `[distributed] max_world_size` at submit) — the three knobs load
+    /// independently, with no cross-check between any pair (DESIGN.md §7).
+    /// The claiming worker decides the layout from the job's `world_size`
+    /// and this value alone: within it, every rank runs in-process over a
+    /// `Local` gang; beyond it, this process is rank 0 of a `Peer` gang.
     pub local_ranks: u32,
     /// Which collective a multi-rank worker reduces over. Default: `auto`.
     /// Configuration, not a build feature — see [`CollectiveSelection`].

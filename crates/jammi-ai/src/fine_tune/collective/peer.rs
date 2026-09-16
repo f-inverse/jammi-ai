@@ -107,8 +107,8 @@ use jammi_db::storage::JammiObjectStore;
 use jammi_db::store::manifest::{ArtifactDigest, LeafDigest, LeafKey};
 use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 use jammi_wire::proto::gang::{
-    rank_control, rank_event, AbortReason, Assign, Counts, RankControl, RankEvent, RoundAck,
-    RoundChunk, RoundCommit, RoundDescriptor, RoundFault, RoundPayload, RoundVerb,
+    rank_control, rank_event, AbortReason, Assign, Cancel, Counts, RankControl, RankEvent,
+    RoundAck, RoundChunk, RoundCommit, RoundDescriptor, RoundFault, RoundPayload, RoundVerb,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -150,6 +150,11 @@ struct Link<In, Out> {
     inbound: mpsc::Receiver<std::result::Result<In, LinkFault>>,
     outbound: mpsc::Sender<Out>,
     handle: Handle,
+    /// The `AbortReason` the far side's session ended with, if an
+    /// `Aborted{reason}` frame was ever read on this link — the typed fact
+    /// the coordinator body maps through the assembly reason table after a
+    /// round faulted (`Frame::Session` carries only its description).
+    session_abort: Option<i32>,
 }
 
 impl<In, Out> fmt::Debug for Link<In, Out> {
@@ -207,6 +212,7 @@ impl MemberLink {
             inbound,
             outbound,
             handle: current_handle("MemberLink::from_channels")?,
+            session_abort: None,
         }))
     }
 }
@@ -234,6 +240,7 @@ impl CoordinatorLink {
                 inbound,
                 outbound,
                 handle: current_handle("CoordinatorLink::from_channels")?,
+                session_abort: None,
             },
         })
     }
@@ -304,6 +311,7 @@ impl CoordinatorLink {
                 inbound,
                 outbound: out_tx,
                 handle,
+                session_abort: None,
             },
         })
     }
@@ -311,6 +319,29 @@ impl CoordinatorLink {
     /// The member this link reaches.
     pub fn rank(&self) -> u32 {
         self.rank
+    }
+
+    /// The `AbortReason` (raw wire value) the member's session ended with,
+    /// if an `Aborted{reason}` frame was read on this link — `None` while
+    /// the session is live or if it ended without one (a bare close, a
+    /// transport fault).
+    pub fn session_abort(&self) -> Option<i32> {
+        self.link.session_abort
+    }
+
+    /// End the member's session cooperatively: one `Cancel` frame, which
+    /// the member's hold loop answers with `Aborted{Cancelled}` and the
+    /// release of its slot — the coordinator's "stream close" at the end of
+    /// an attempt, whichever way it ended. `false` when the far side is
+    /// already gone or the outbound channel is full; never blocks (callable
+    /// from a runtime worker).
+    pub fn cancel_session(&self) -> bool {
+        self.link
+            .outbound
+            .try_send(RankControl {
+                control: Some(rank_control::Control::Cancel(Cancel {})),
+            })
+            .is_ok()
     }
 }
 
@@ -343,6 +374,11 @@ enum Frame {
 /// A wire frame a round can read.
 trait Inbound: Send + 'static {
     fn into_frame(self) -> Frame;
+    /// The raw `AbortReason` when this frame is the far side's
+    /// `Aborted{reason}` — only a member's `RankEvent` carries one.
+    fn abort_reason(&self) -> Option<i32> {
+        None
+    }
 }
 
 impl Inbound for RankControl {
@@ -364,6 +400,13 @@ impl Inbound for RankControl {
 }
 
 impl Inbound for RankEvent {
+    fn abort_reason(&self) -> Option<i32> {
+        match &self.event {
+            Some(rank_event::Event::Aborted(aborted)) => Some(aborted.reason),
+            _ => None,
+        }
+    }
+
     fn into_frame(self) -> Frame {
         match self.event {
             Some(rank_event::Event::RoundContribution(payload)) => Frame::Payload(payload),
@@ -453,7 +496,12 @@ impl<In: Inbound, Out: Outbound> Link<In, Out> {
             .handle
             .block_on(async { tokio::time::timeout(remaining, inbound.recv()).await })
         {
-            Ok(Some(Ok(frame))) => Ok(frame.into_frame()),
+            Ok(Some(Ok(frame))) => {
+                if let Some(reason) = frame.abort_reason() {
+                    self.session_abort = Some(reason);
+                }
+                Ok(frame.into_frame())
+            }
             Ok(Some(Err(LinkFault(reason)))) => Err(WaitEnd::Transport(reason)),
             Ok(None) => Err(WaitEnd::Disconnected),
             Err(_elapsed) => Err(WaitEnd::Timeout),
@@ -1088,6 +1136,47 @@ impl Peer {
     /// The device this rank trains on and every result lands on.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The first failure this rank saw, if any — the permanent state every
+    /// later verb refuses with. `None` while the gang is healthy.
+    pub fn fault(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fault
+            .clone()
+    }
+
+    /// Coordinator only: every member whose session ended with an
+    /// `Aborted{reason}` frame this coordinator read, as `(rank, raw
+    /// reason)` in rank order — the typed facts the coordinator body maps
+    /// through the assembly reason table. Empty on a member, and on a
+    /// coordinator none of whose members aborted.
+    pub fn member_aborts(&self) -> Vec<(u32, i32)> {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        match &inner.endpoint {
+            Endpoint::Coordinator(members) => members
+                .iter()
+                .filter_map(|link| link.session_abort().map(|reason| (link.rank(), reason)))
+                .collect(),
+            Endpoint::Member(_) => Vec::new(),
+        }
+    }
+
+    /// Coordinator only: end every member's session cooperatively
+    /// ([`CoordinatorLink::cancel_session`] on each link) — the stream close
+    /// the coordinator body performs at the end of an attempt, so a member's
+    /// slot is freed at once rather than at its park bound. Returns how many
+    /// `Cancel` frames were accepted; a no-op on a member.
+    pub fn end_members(&self) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        match &inner.endpoint {
+            Endpoint::Coordinator(members) => {
+                members.iter().filter(|link| link.cancel_session()).count()
+            }
+            Endpoint::Member(_) => 0,
+        }
     }
 
     fn descriptor(

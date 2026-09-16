@@ -971,7 +971,10 @@ fn results_land_on_the_ranks_device_and_only_the_own_gather_slot_is_attached() {
 }
 
 /// A member whose session ends (`Aborted`) mid-round faults the coordinator
-/// naming the reason.
+/// naming the reason — and the coordinator records the reason TYPED, per
+/// member link (`Peer::member_aborts`, the fact the coordinator body maps
+/// through the assembly reason table), beside its permanent fault
+/// (`Peer::fault`); a member records no aborts of its own.
 #[test]
 fn a_member_that_aborts_its_session_faults_the_coordinator_naming_the_reason() {
     let rt = runtime();
@@ -999,6 +1002,19 @@ fn a_member_that_aborts_its_session_faults_the_coordinator_naming_the_reason() {
         results[0].contains("Aborted(StoreUnavailable)") && results[0].contains("round 0"),
         "unexpected: {}",
         results[0]
+    );
+    assert_eq!(
+        coordinator.member_aborts(),
+        vec![(1, AbortReason::StoreUnavailable as i32)],
+        "the coordinator records the member's abort reason typed, on rank 1's link"
+    );
+    assert!(
+        coordinator.fault().is_some(),
+        "the round's fault is the coordinator's permanent state"
+    );
+    assert!(
+        members.iter().all(|member| member.member_aborts().is_empty()),
+        "a member records no aborts: the record is the coordinator's"
     );
 }
 

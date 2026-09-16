@@ -285,6 +285,16 @@ enum AssemblyEffect {
 }
 
 impl AssemblyOutcome {
+    /// Whether this outcome COUNTS toward `assembly_failures` — the
+    /// terminal-refusal class ([`Self::Refuted`], [`Self::AllRootDivergent`]),
+    /// which the coordinator leaves for reclaim on its lease (an attempt
+    /// spent), as opposed to every other outcome, which costs the job no
+    /// attempt (the coordinator hands its lease back at once, OPS D10).
+    /// Derived from [`Self::effect`] — never a second table.
+    pub fn counts_toward_failures(self) -> bool {
+        self.effect() == AssemblyEffect::CooldownAndCounted
+    }
+
     fn effect(self) -> AssemblyEffect {
         match self {
             Self::Refuted | Self::AllRootDivergent => AssemblyEffect::CooldownAndCounted,

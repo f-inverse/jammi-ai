@@ -127,6 +127,7 @@ test-hooks = ["jammi-ai/test-hooks"]
 # tensor type is candle's (already linked through `jammi-ai`'s default
 # `local` feature — this adds no new crate to the build).
 candle-core.workspace = true
+candle-nn.workspace = true
 tokio.workspace = true
 jammi-test-utils.workspace = true
 # The shutdown oracles park the engine at documented rendezvous points

@@ -21,6 +21,7 @@ mod fine_tune;
 mod fine_tune_materialization;
 mod ft_correctness_sweep;
 mod ft_determinism;
+mod gang_coordinator;
 mod gguf_qlora;
 mod graph_context;
 mod graph_finetune;

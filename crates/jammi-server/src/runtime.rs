@@ -597,6 +597,14 @@ impl OssServer {
                     intervals.lease(),
                     intervals.heartbeat(),
                 );
+                // The process that mounts the gang listener is the process
+                // that can coordinate a `Peer` gang: the coordinator body's
+                // one transport seam (`MemberDialer`) is installed here, over
+                // `gang_rounds::dial_member`. Write-once on the session; a
+                // second `bind` of the same session keeps the first.
+                self.session
+                    .host_admission()
+                    .install_member_dialer(Arc::new(crate::grpc::gang_rounds::GangDialer));
                 #[cfg(feature = "test-hooks")]
                 {
                     gang_refusal_handle = Some(gang_server.refusal_reason_handle());

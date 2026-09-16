@@ -19,7 +19,11 @@
 //!   is built from — with the client's inbound decode capped at the SAME
 //!   `[server.limits] max_message_bytes` every listener applies.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use jammi_ai::fine_tune::collective::{CoordinatorLink, LinkFault, MemberLink};
+use jammi_ai::fine_tune::worker::MemberDialer;
 use jammi_db::catalog::instance::PeerAddr;
 use jammi_db::error::{JammiError, Result};
 use jammi_wire::proto::gang::{rank_control, Assign, RankControl, RankEvent};
@@ -112,4 +116,25 @@ pub async fn dial_member(
         .await
         .map_err(|e| JammiError::FineTune(format!("dial {addr}: {e}")))?;
     CoordinatorLink::over_client(channel, assign, max_message_bytes).await
+}
+
+/// The engine's [`MemberDialer`] seam, implemented over [`dial_member`]:
+/// what the coordinator body (`jammi_ai::fine_tune::worker`, `JobWorker::
+/// coordinate`) dials each assigned member through. Installed ONCE on the
+/// session's `HostAdmission` by `OssServer::bind` beside the gang listener
+/// (`crate::runtime`), so a process that mounts `GangService` is exactly
+/// the process that can coordinate a `Peer` gang; a library process has
+/// none and says so as an assembly outcome.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GangDialer;
+
+impl MemberDialer for GangDialer {
+    fn dial<'a>(
+        &'a self,
+        addr: &'a PeerAddr,
+        assign: Assign,
+        max_message_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<CoordinatorLink>> + Send + 'a>> {
+        Box::pin(dial_member(addr, assign, max_message_bytes))
+    }
 }

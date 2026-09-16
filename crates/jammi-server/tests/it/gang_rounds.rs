@@ -295,7 +295,7 @@ async fn a_round_delivered_through_the_inbox_and_dialed_through_dial_member_equa
 /// receiver. A long lease so no park bound or freshness margin cuts the
 /// session under the round; the re-verification tick stays at `HEARTBEAT`.
 #[cfg(feature = "test-hooks")]
-async fn mount_real_gang_server(
+pub(crate) async fn mount_real_gang_server(
     engine: Arc<jammi_ai::session::InferenceSession>,
     cap: usize,
 ) -> (std::net::SocketAddr, mpsc::UnboundedReceiver<MemberLink>) {

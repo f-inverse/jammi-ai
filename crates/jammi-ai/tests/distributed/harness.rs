@@ -16,12 +16,16 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::config::{CatalogConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig};
+use jammi_db::config::{
+    CatalogConfig, DistributedConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig,
+};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{CloudConfig, S3Config};
+use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
 /// The shared backends the lane needs, discovered from the environment. Absent
@@ -116,6 +120,16 @@ impl Backends {
 const LEASE_SECS: u64 = 3;
 const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
+/// The round deadline every spawned worker runs its gangs under: a rank
+/// silent this long retires the coordinator's attempt. Longer than the
+/// lease, so a member's loss is seen on its dropped stream (a SIGKILL closes
+/// the connection at once), never only at the deadline.
+const RANK_TIMEOUT_SECS: u64 = 10;
+/// The widest gang the fleet admits: every spawned worker is gang-capable
+/// (`peer_bind`/`peer_advertise` rendered per process, `worker_toml`), and
+/// the harness session submits `world_size = 2` jobs against the same bound
+/// (`shared_config`).
+const MAX_WORLD_SIZE: u32 = 2;
 
 /// Build the harness's own session against the shared Postgres + MinIO,
 /// rooted at `result_root`. It runs `[worker] enabled = false` and spawns no
@@ -165,6 +179,9 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             idle_poll_secs: IDLE_POLL_SECS,
             // These processes are the workers under test — claim loop on.
             ..Default::default()
+        },
+        distributed: DistributedConfig {
+            max_world_size: MAX_WORLD_SIZE,
         },
         ..Default::default()
     }
@@ -350,9 +367,13 @@ fn spawn_worker(
     std::fs::create_dir_all(&artifact_dir).expect("worker artifact_dir");
 
     // Distinct ports per worker so N servers coexist on one host. The flight
-    // (gRPC) port is the worker's wire surface; the health port serves /readyz.
-    let flight_port = 50100 + index;
-    let health_port = 50200 + index;
+    // (gRPC) port is the worker's wire surface; the health port serves /readyz;
+    // the peer port is the gang listener other workers dial (`peer_advertise`).
+    let ports = WorkerPorts {
+        flight: 50100 + index,
+        health: 50200 + index,
+        peer: 50300 + index,
+    };
 
     let config_path = scratch.path().join("jammi.toml");
     let config_toml = worker_toml(
@@ -361,8 +382,7 @@ fn spawn_worker(
         &backends.s3_endpoint,
         &backends.region,
         artifact_dir.to_str().expect("utf8 artifact_dir"),
-        flight_port,
-        health_port,
+        ports,
     );
     std::fs::write(&config_path, &config_toml).expect("write worker config");
 
@@ -400,6 +420,16 @@ fn spawn_worker(
     }
 }
 
+/// One spawned worker's three listeners, distinct per process: the flight
+/// (gRPC) port is its wire surface, the health port serves `/readyz`, the
+/// peer port is the gang listener other workers dial (`peer_advertise`).
+#[derive(Clone, Copy)]
+struct WorkerPorts {
+    flight: usize,
+    health: usize,
+    peer: usize,
+}
+
 /// Render a worker's `jammi.toml`. The S3 secrets are deliberately absent — they
 /// arrive as `AWS_*` env on the child — so the rendered file carries no
 /// credential. `allow_http` lets the S3 driver talk plain HTTP to MinIO.
@@ -409,10 +439,14 @@ fn worker_toml(
     s3_endpoint: &str,
     region: &str,
     artifact_dir: &str,
-    flight_port: usize,
-    health_port: usize,
+    ports: WorkerPorts,
 ) -> String {
     let allow_http = s3_endpoint.starts_with("http://");
+    let WorkerPorts {
+        flight: flight_port,
+        health: health_port,
+        peer: peer_port,
+    } = ports;
     format!(
         r#"
 artifact_dir = "{artifact_dir}"
@@ -441,11 +475,21 @@ heartbeat_secs = {HEARTBEAT_SECS}
 # compiled kind. Job submission itself is core, so no optional tier is needed.
 enabled = true
 idle_poll_secs = {IDLE_POLL_SECS}
+rank_timeout_secs = {RANK_TIMEOUT_SECS}
+
+[distributed]
+# Every worker is gang-capable: a two-rank job is coordinated by whichever
+# process claims it and run with one listed member.
+max_world_size = {MAX_WORLD_SIZE}
 
 [server]
 # Distinct per-worker ports so N servers coexist on one host.
 flight_listen = "127.0.0.1:{flight_port}"
 health_listen = "127.0.0.1:{health_port}"
+# The gang listener (`GangService::RunRank`) and the address other workers
+# dial this process at: a fleet member.
+peer_bind = "127.0.0.1:{peer_port}"
+peer_advertise = "127.0.0.1:{peer_port}"
 # Core only — the worker, not a tier, is what makes this process a compute node.
 services = []
 "#
@@ -680,6 +724,39 @@ fn lane_fine_tune_config(size: JobSize) -> FineTuneConfig {
         warmup_steps: 0,
         ..Default::default()
     }
+}
+
+/// Submit one durable two-rank (`world_size = 2`) LoRA fine-tune over
+/// `source` — the SAME columns, method, task and config `submit_fine_tune`
+/// submits, through the spec entrance the `world_size` rides on
+/// (`InferenceSession::run_training_spec`): claimed by one spawned worker
+/// as the coordinator, run with one listed member. Returns
+/// `(job_id, output_model_id)`.
+pub async fn submit_gang_fine_tune(
+    session: &Arc<InferenceSession>,
+    source: &str,
+    size: JobSize,
+) -> (String, String) {
+    let job = session
+        .run_training_spec(TrainingSpec::FineTune {
+            source: source.to_string(),
+            columns: vec![
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            method: FineTuneMethod::Lora,
+            task: ModelTask::TextEmbedding,
+            common: TrainingCommon {
+                base_model: tiny_bert_model(),
+                config: lane_fine_tune_config(size),
+                world_size: MAX_WORLD_SIZE,
+            },
+            cache: CachePolicy::Bypass,
+        })
+        .await
+        .expect("submit a queued two-rank fine-tune job to the shared catalog");
+    (job.job_id.clone(), job.model_id().to_string())
 }
 
 /// Submit one durable LoRA fine-tune job over `source` on `session`, returning

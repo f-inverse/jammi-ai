@@ -23,12 +23,14 @@
 //! - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — MinIO credentials.
 //! - `AWS_REGION`               — optional; defaults to `us-east-1` for MinIO.
 //!
-//! The four properties live in their own modules; `harness` holds the shared
-//! spawn / poll / teardown machinery they all build on.
+//! The properties live in their own modules (`gang_chaos` is the two-rank
+//! gang's SIGKILL pair); `harness` holds the shared spawn / poll / teardown
+//! machinery they all build on.
 
 mod harness;
 
 mod artifact_crash_window;
 mod cross_tenant_isolation;
 mod exactly_one_claim;
+mod gang_chaos;
 mod kill9_reclaim;

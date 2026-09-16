@@ -36,9 +36,15 @@ are pinned identically.)
 
 Two distinct kinds of stamp appear above, and the difference is deliberate:
 
-- **Reject-newer** for formats that carry a *compatibility ordering*. An older
-  or equal version is readable by construction (the layout only grew); only a
-  newer version carries a layout this build does not know. This is the
+- **Reject-newer** for formats that carry a *compatibility ordering*. Only a
+  newer version carries a layout this build does not know, so only a newer
+  version is refused on the stamp. An older or equal version is decoded against
+  the current shape, and what that decode says is what the reader reports: a
+  body that lacks a field the current shape requires — a producer variant that
+  grew a required determinant at the same version, as the fine-tune
+  descriptor's topology fields did — is the typed `ManifestError::Serde`, never
+  a hit; the one older shape the reader names on its own (an object at the
+  current version with no `leaves`) is read as *absent*. This is the
   materialization manifest's idiom (`MaterializationManifest::from_json_bytes`),
   and the `.rowmap` and ANN `.manifest.json` follow it.
 - **Strict** for the USearch `backend_version`, because the USearch serialized

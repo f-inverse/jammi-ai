@@ -763,13 +763,13 @@ pub enum ProducingDescriptor {
         /// determinant like every other field here, not metadata (#500
         /// U4b).
         collective: String,
-        /// How many ranks THIS HOST placed on its own devices for this run
-        /// (`[worker] local_ranks` at claim time) — orthogonal to
-        /// `world_size` above (the per-job identity field): at U4b's
-        /// single-node stage every rank of a job runs on the SAME host, so
-        /// this is the actual gang width the run executed at, recorded
-        /// alongside (never instead of) the job's own declared `world_size`
-        /// (#500 U4b).
+        /// How many ranks THIS HOST ran on its own devices for this run —
+        /// read off the topology the run executed at, never off a
+        /// configured capacity: one for a single rank, the whole gang for
+        /// an in-process (`"local"`) gang, one for the coordinator of a
+        /// multi-host (`"peer"`) gang whose other ranks live elsewhere.
+        /// Orthogonal to `world_size` above (the per-job identity field) and
+        /// recorded alongside it, never instead of it (#500 U4b).
         local_ranks: u32,
     },
     /// A table produced by a verb the engine does not own: a consumer built the

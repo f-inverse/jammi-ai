@@ -85,9 +85,9 @@
 //! DESIGN.md §4: the lease holder is the ONE writer of a job's row, of its
 //! durable checkpoints and of its published artifact; every other rank of a
 //! gang writes nothing durable. [`crate::fine_tune::role`] states it as two
-//! types — a [`LeaseHolder`](crate::fine_tune::role::LeaseHolder) (`LoopClaimer`, today's in-process path incl. a
+//! types — a [`LeaseHolder`] (`LoopClaimer`, today's in-process path incl. a
 //! `Local` gang's rank 0; `Coordinator`, rank 0 of a `Peer` gang) and a
-//! [`RunnerRole`](crate::fine_tune::role::RunnerRole) (`Holder(LeaseHolder)` or `Rank { rank }`) — and EVERY
+//! [`RunnerRole`] (`Holder(LeaseHolder)` or `Rank { rank }`) — and EVERY
 //! job-row-writing site on the run path takes a `LeaseHolder` as a REQUIRED
 //! parameter, so a missed site is a compile error and a `Rank` body, which
 //! holds no `LeaseHolder`, has nothing to pass: the write is unreachable by

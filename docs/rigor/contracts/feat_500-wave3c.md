@@ -1278,9 +1278,302 @@ one `--features live-postgres-tests,test-hooks` set throughout).
 (one commit on `unit/u5b1bii-db`, off tip `856ec8dd`)
 
 
-## 6. U5b-1b-ii — coordinator body
+## 6. U5b-1b-ii — coordinator body (landed as four commits; original tip `a8ab9667`; the U4b-tail commit it carried was dropped as already on this branch)
 
-(built after wave A lands)
+The implementer's contract, folded by the lead after checking: `assembly_outcome` is a total match with only `Moved → None`; the lease is settled by `AssemblyOutcome::counts_toward_failures` (an uncounted outcome hands the lease back at once — OPS D10 at the job level, deviation 2 accepted: leaving it to expire would burn an attempt on every uncounted outcome); `RankAdmission` holds no catalog handle; a retry binds the recorded training set through the tenant-pinned `get_result_table`, never the strict resolver; the dropout-position gather is four `f32` limbs (the F64 row was a dtype the `Peer` wire refuses by design — a defect only a real `Peer` gang reaches, found by this unit's server oracle). The first end-to-end `Peer` gang through the real `run_rank` handler publishes bytes identical to `Local`. Two items surfaced here are scheduled, not accepted: the `jammi-bench` crate does not compile on this branch (U4b's `load_bundle -> Option` and §2b's witness left two call sites behind; no unit's trimmed gates built the bench crate) — fixed in wave C; the agreement digest (U4b's `canonical_vars_digest`) is bound nowhere — bound by U5b-1b-iii at the rank body's post-target-build seam.
+
+Worktree `wt-u5b1bii`, branch `unit/u5b1bii`, base `feat/500-wave3c` @ `9b0dcb57`. Every path
+is repo-relative; every oracle named was executed on the tip (§4); every mutation in §2 was
+applied to the committed tree, run through ONE filtered test, and reverted (`git checkout --
+<file>`, `git status --short` empty afterwards — `u5b1bii-scratch/mutations.py`, logs
+`mut-M*.log`). One `--features` set per crate for the whole session (`jammi-ai`,
+`jammi-server`: `test-hooks`), `RUSTC_WRAPPER=sccache`, `CARGO_TARGET_DIR=…/targets/u5b1bii`.
+
+#### 1. Scope shipped
+
+**`crates/jammi-ai/src/fine_tune/spec.rs`** — `RankAdmission { serveable_world, collective,
+cuda_build }` (was `devices`): `from_config` reads `[distributed] max_world_size`; `new(serveable_world,
+..)`; `serveable_world()`; `admit` refuses `world_size > serveable_world` naming
+`[distributed] max_world_size` — the device count is no longer read, and the type holds no
+catalog handle (no catalog read is expressible from `admit`). Doc rewritten to the fleet-bound
+semantics (a count within the serveable world but beyond this host's devices submits and is
+decided by assembly).
+
+**`crates/jammi-ai/src/fine_tune/worker.rs`**
+- `TopologyDecision::decide(world_size, local_ranks)` → `Single` (`<= 1`) | `Local { world }`
+  (`<= local_ranks`) | `Peer { world }`; called once per `run_spec` FineTune/GraphFineTune arm.
+  A `GraphFineTune` at `Peer` is refused typed at the coordinator's edge (no training-set table
+  for a member to be admitted against) — `WorkerJobError::Failed`, never a smaller gang.
+- `train_fine_tune(.., topology: RankTopology)`: `Single` is byte-unchanged (`rank_ctx: None`,
+  the builder's `single_rank` default; rank 0 on `BlockingCall::spawn_blocking` as before);
+  `Local { world }` builds a `LocalGang::with_timeout([select_device(for_device(devices[r]))..],
+  rank_timeout_secs)`, one `RankContext::new(gang.rank(r), PartitionSpec::for_gang(r, world,
+  batch_size, BlockByGlobalBatch))` per rank, a per-rank model-cache entry
+  (`ModelCache::get_or_load_on(devices[r], ..)`), a per-rank source (`TrainingSource::replicate`),
+  and spawns ranks `1..world` on `BlockingCall::spawn_thread` (each entering the runtime's
+  `Handle`) — the SECOND production minting site (docs: collective/mod.rs, guide §2.8c/§2.8d);
+  the other ranks are joined before rank 0's result is read and any rank's error/panic fails
+  the run (no publish over an incomplete gang); `Peer { world, coordinator }` gives rank 0
+  `RankContext::new(coordinator, for_gang(0, ..))`.
+- `RunFineTuneParams { rank, rank_ctx, .. }`; `run_fine_tune_blocking` sets `.rank_context` when
+  given; `compute_and_persist_acceleration_report(.., persist: bool, ..)` — every rank computes,
+  rank 0 alone persists.
+- `MemberDialer` trait (the engine's one transport seam) + `HostAdmission::{install_member_dialer
+  (write-once), member_dialer}`.
+- `WorkerJobError::Abandoned(String)` + its arm in `run_claimed_job_under` (no terminal write,
+  checkpoint GC, warn).
+- The coordinator body: `TrainingSetIdentityPair` (sidecar digest, table name — built in
+  `run_spec` beside the materialization descriptor), `CoordinatorEnd` (13 variants,
+  `VARIANTS`/`ordinal`, `Display`), `assembly_outcome(&CoordinatorEnd) -> Option<AssemblyOutcome>`
+  (TOTAL match, no wildcard; `Moved => None`; `MemberAborted { reason }` one-to-one over
+  `AbortReason`, `Unspecified → Unavailable`; `TrainingFailed`/`Published → Success`),
+  `ShortListing`, `assign_ranks(&[GangMember], world)` (pure: sorted by `instance_id` bytes, rank
+  `r` = the `r`-th, short → `Err`), `cancel_links`, `JobWorker::coordinate` (record + settle) and
+  `JobWorker::assemble_and_run` (CAS → gates → listing with this process's own `MemberRoot` →
+  assignment → `peer_addr_of` + dial per member → `Peer::coordinator(..).with_timeout(..)` →
+  `train_fine_tune(Peer)` → `end_members` → classify: `member_aborts` → `MemberAborted`,
+  `fault` → `LinkFault`, else `TrainingFailed`). Settle rule: `Published → Ok(artifact)`;
+  `Cancelled → Err(Cancelled)` (the existing arm decides request vs lease loss);
+  `TrainingFailed → Err(Failed)`; `Moved → Err(Abandoned)` with no record and no release; every
+  other end records, then `release_job_lease` iff `!outcome.counts_toward_failures()`, then
+  `Err(Abandoned)`.
+- **The retry binds the recorded training set**: `run_spec(.., recorded_pair)` — the claimed
+  `JobRecord`'s `training_set_ref`/`training_set_location` (written by a prior attempt's CAS,
+  write-once) — and `bind_recorded_training_set` resolves that table by name through the job's
+  tenant-pinned catalog (`get_result_table`, never the strict resolver, whose only caller is
+  the gang handler by an enumerating oracle), requires `ready`, verifies the sidecar's
+  `artifact` against the recorded digest (the same verify a member is admitted against), binds
+  it on the session context (`ResultStore::bind_result_table`, the producer's own reuse arm) and
+  hands the arm a `TrainingSetTable { outcome: Reused }`; a first attempt materialises as
+  before. Without it a registered source (anchored unpinned) mints a fresh table per attempt
+  and the CAS reads every retry as `Moved` — the executed red of M16.
+- `training_test_hooks`: `note_topology`/`topology_for`, `note_assembly_listing`/
+  `assembly_listings_for`, `note_coordinator_end`/`coordinator_ends_for` (`test-hooks` only).
+
+**The seed split, wired (the lead's binding addition after the U4b tail landed at
+`2d46508b`; that commit is cherry-picked onto this branch as its own commit — see §5 — because
+the `_for_rank` builders and `new_with_base_seeded` exist nowhere else, and the demanded
+oracles must execute):**
+- `worker.rs::run_fine_tune_blocking`: `dropout_seed = rank_ctx.map_or(config.seed, |c|
+  c.dropout_seed(config.seed))` (rank 0 / the single rank: the identity); the three head
+  builders are the `_for_rank` siblings at that seed; `BuildEncoderAdaptersParams.dropout_seed`
+  → `LoraBuildConfig { seed: config.seed, dropout_seed }`.
+- `crates/jammi-lora/src/config.rs`: `LoraBuildConfig.dropout_seed: u64` (doc: `seed` keys
+  the init draw, `dropout_seed` the mask draw); `frozen()` sets both `0`.
+- `crates/jammi-encoders/src/{lora_site.rs, bert.rs, distilbert.rs, modernbert.rs}`: the four
+  tower-side `LoraLinear::new_with_base(.., seed, ..)` calls → `new_with_base_seeded(.., seed,
+  dropout_seed, ..)` (the BERT family is not on the `LoraSite` seam, so its own builders are
+  threaded too).
+- Every other `LoraBuildConfig { .. }` construction site (29 across 18 files: jammi-ai's
+  `candle.rs` serving-side load, `trainer.rs` tests, `tower_adapters.rs`, the `gpu_capability`
+  target — gated, by inspection; jammi-lora's `adapter.rs` and `tests/it.rs`; jammi-bench's
+  three; jammi-encoders' `modernbert.rs` test, `test_support.rs` and its it/tests) gains
+  `dropout_seed: <the same expression as seed>` — the `init == dropout` shape every one of
+  them had.
+- `training_test_hooks::{RankTarget, note_rank_target, rank_targets_for}` (`test-hooks`):
+  recorded in `run_fine_tune_blocking` after the target is built and before any step.
+- `crates/jammi-encoders/src/lora_site.rs` `#[cfg(test)] mod tests`: the site-level oracle.
+
+**`crates/jammi-ai/src/fine_tune/trainer.rs`** — `gather_dropout_positions` encodes each
+rank's `u64` positions as four 16-bit limbs in an `f32` `(1, 4n)` tensor
+(`encode_dropout_positions`/`decode_dropout_positions`, free `pub(crate)` fns + a codec
+oracle): the F64 row the base gathered is a dtype the `Peer` wire refuses by design (U5b-1b-i
+P9), so every `Peer` gang with an artifact store faulted at its first epoch boundary — found
+by the server oracle's attempt 2 (`all_gather: round 10: … F64 is refused at the seam`). The
+new encoding is exact for EVERY `u64` (F64 was exact only below `2^53`) and byte-neutral for
+`Local`/`Noop` (the U4b determinism/resume-with-dropout oracles re-executed green).
+
+**`crates/jammi-ai/src/fine_tune/collective/peer.rs`** — `Link.session_abort: Option<i32>`
+recorded in `Link::recv` from `Inbound::abort_reason` (only a member's `RankEvent::Aborted`
+carries one); `CoordinatorLink::{session_abort, cancel_session}` (a `Cancel` frame via
+`try_send`, never blocks); `Peer::{fault, member_aborts, end_members}`.
+**`collective/mod.rs`** — the two minting sites' docs. **`collective/peer_tests.rs`** — the P14
+oracle extended with the typed record.
+**`crates/jammi-ai/src/fine_tune/data.rs`** — `TrainingDataLoader::replicate` (rows/batches
+copied, the pool reservation stays with rank 0's loader). **`source.rs`** — `StreamedSet:
+Clone`, `TrainingSource::replicate`.
+**`crates/jammi-db/src/catalog/jobs_repo.rs`** — `AssemblyOutcome::counts_toward_failures`
+(derived from `effect`, never a second table). **`config/mod.rs`** — `local_ranks` doc current.
+**`crates/jammi-server/src/grpc/gang_rounds.rs`** — `GangDialer: MemberDialer` over
+`dial_member`. **`runtime.rs`** — `OssServer::bind` installs it beside the gang listener.
+**`crates/jammi-server/Cargo.toml`** — dev-dep `candle-nn` (the it oracle's projection head;
+already in the build through `jammi-ai`). **`tests/it/gang_rounds.rs`** —
+`mount_real_gang_server` `pub(crate)`.
+**Tests** — `crates/jammi-ai/tests/it/gang_coordinator.rs` (new), `rank_admission.rs`
+(re-anchored on the serveable world; one new pure oracle), `crates/jammi-server/tests/it/
+gang_coordinator.rs` (new), worker.rs unit tests (three new).
+**Docs** — `docs/maintainer/MAINTAINER-GUIDE.md` (§2.8c minting sites; NEW §2.8d the
+coordinator body; the `[distributed]` and Train-flow sentences), `docs/guide/src/configuration.md`
+(`local_ranks`, `[distributed]`), 11 `PATH:LINE` citations re-anchored under my insertions
+(10 in the guide, 1 in `gguf.rs`).
+
+##### Deviations from UNITS.md / the brief, with the reason and the code
+
+1. **The `Moved` arm records no `AssemblyOutcome`** ("every exit arm records exactly one" vs
+   "a `Moved` claim exits with no write" — the brief's own two sentences): `assembly_outcome`
+   returns `None` for exactly `CoordinatorEnd::Moved` (`worker.rs`, the total match), and the
+   table oracle asserts exactly one `None`. A moved row is another attempt's to describe.
+2. **The lease is settled by the outcome's counting class, not left for reclaim on every end.**
+   DESIGN §4 names leave-`running`-for-reclaim as the only requeue path; the brief says a
+   member's `Unavailable` is "cooled, not counted". Leaving the lease to expire would burn one of
+   `MAX_ATTEMPTS` (`reclaim_expired_jobs` counts `attempts - releases`) on every uncounted
+   outcome — the opposite of "not counted" at the job level. So an uncounted outcome hands the
+   lease back at once (`Catalog::release_job_lease`, `releases + 1`, lease NULL, arm 1a
+   reclaims it within one idle poll, OPS D10) and a counted one leaves it to expire; both keep the
+   row `running` for reclaim — the same arm, reached sooner. `AssemblyOutcome::
+   counts_toward_failures` (jobs_repo.rs) is the one rule, derived from `effect()`.
+3. **`AllRootDivergent` is never produced.** Root identity is a predicate INSIDE
+   `list_gang_members` (U5b-1a-A2), so divergent-root members are invisible to the body and an
+   all-divergent fleet is `ShortListed`. Stated in `assembly_outcome`'s doc and guide §2.8d.
+4. **A coordinator-side catalog fault, an unresolvable address, a refused dial, a `Peer` that
+   cannot be built and a mid-run link fault all map to `Unavailable`** (cooled, not counted):
+   the table has no coordinator-side transient row, and `Unavailable`'s rule is the transient
+   one. A run failure with no gang fault (`TrainingFailed`) maps to `Success` — "assembly
+   proceeded to a run", `AssemblyOutcome::Success`'s own doc — and the caller records `failed`
+   exactly as a W=1 run's failure is recorded.
+5. **A host with no `MemberRoot` or no installed dialer ends `HostCannotCoordinate → ShortListed`**
+   rather than a terminal failure: the job is cooled and released so a member-capable host claims
+   it; the reason is logged and in the end's `Display`.
+6. **The Peer oracle's byte comparison is conditional at this tip** (`crates/jammi-server/tests/
+   it/gang_coordinator.rs`): `run_spec` binds `Streamed` for every column-source `fine_tune`
+   (`source::whole_set_arm` is `None` outside mining/GradCache — both refused at `world > 1`),
+   and the trainer refuses a `Streamed` source at `world > 1` (U4b's contract §2 deviation 3; the
+   U4b tail, §2a, is the concurrent unit building that arm). The oracle admits exactly two ends
+   for attempt 2 — `Published` (then bytes must equal the `LocalGang` reference) or the trainer's
+   pinned streamed refusal (then `failed`, the error names it, the member ends "nothing applied")
+   — and is red on any other. With the U4b tail cherry-picked onto this branch (§5) the
+   `Published` branch EXECUTES (`t-srv-branch.log`, `attempt-2 end: published (ordinal 12)`):
+   rank 0's adapter over `Peer` through the real hold loop is byte-identical to `Local`'s. The
+   refusal branch is what the oracle admits on a tree without that tail, never on this one.
+7. **The local fan-out oracle is a `graph_fine_tune`** (the one `Resident` source `run_spec`
+   binds at this tip, deviation 6): the property — the fan-out through the real `run_spec`
+   publishes bytes equal to a U4b-shaped direct `LocalGang` run over the same rows, config, seed
+   and base model — is the same; the rows come from the same seeded `GraphSampler`.
+8. **No agreement digest is bound** on `Local`/`Peer` ranks (U4b's contract said it binds
+   `canonical_vars_digest`; nothing in the tree does — `grep with_agreement` finds only the
+   constructors and tests). Binding needs a post-target-build seam on the collective; not built
+   here, stated in §3.
+9. **The dialer is injected, not called.** `jammi-ai` cannot depend on `jammi-server`, so the
+   brief's "dial with `gang_rounds::dial_member`" is met by `MemberDialer` (declared in
+   `worker.rs`) implemented by `gang_rounds::GangDialer` over `dial_member` and installed in
+   `OssServer::bind` (`runtime.rs`, one statement — outside `grpc/**`, the only wiring line).
+10. **`peer.rs`, `data.rs`, `source.rs`, `jobs_repo.rs`, `config/mod.rs`, `runtime.rs`,
+    `gguf.rs`, `jammi-server/Cargo.toml`** are touched beyond the brief's files_in_scope, each a
+    small seam the body needs (listed above); `stream.rs`, `lora.rs`, `target.rs` and the
+    trainer's streamed arm are untouched. **`trainer.rs` IS touched at one function**
+    (`gather_dropout_positions`, plus two free codec fns and their oracle) — after the U4b tail
+    landed, so no concurrent edit exists — because the F64 gather is a defect only a `Peer` gang
+    reaches, and this unit is the first to run one.
+
+#### 2. Properties
+
+| Property (quantified) | Executed oracle (path::name; lane) | Executed mutation that reds it (first red line) |
+|---|---|---|
+| (d) For every spec, `world_size > serveable_world` is refused typed naming `[distributed] max_world_size` from configuration alone (no catalog handle exists on the type); every `world_size <= serveable_world` passes this arm regardless of this host's devices, on both embedded entrances, the `jobs` table unchanged on refusal | `it::rank_admission::a_count_past_the_serveable_world_is_refused_from_configuration_alone` (pure); `::every_unservable_rank_count_is_refused_at_both_submit_entrances` (the one-device session admits W=2 within a serveable world of 2 and writes exactly one row) | M1: `if false && world_size > self.serveable_world` (spec.rs) → RED `rank_admission.rs:439: two ranks on a serveable world of one: ()` (the W=2 spec was admitted) |
+| (d) A W=2 job on a one-device host with serveable world 2 REACHES ASSEMBLY: topology `Peer{2}`, the CAS writes the pair, the empty listing ends `ShortListed` recorded on the row (failures 0, `next_assembly_after` set), the lease released (`releases 1`, lease NULL), status `running`, no error — RED at base (the base refuses W=2 at submit on one device) | `it::gang_coordinator::a_two_rank_job_beyond_this_hosts_devices_reaches_assembly_and_lands_short_listed` | M5: `record_assembly_outcome` skipped (`outcome.filter(\|_\| false)`) → RED `gang_coordinator.rs:551: ShortListed is cooled down: Row { .. next_assembly_after: None .. }`; M7: the release skipped (`if false && !counts`) → RED `gang_coordinator.rs:555: assertion left == right failed: an uncounted outcome hands the lease back at once` (`releases 0`) |
+| The CAS `Moved` arm writes nothing: a claim whose attempt moved leaves every assembly/identity/lease/status column byte-identical | `it::gang_coordinator::a_moved_claim_exits_the_coordinator_body_with_no_write` | M4: `Ok(Moved) => {}` (the body proceeds past a moved claim) → RED `gang_coordinator.rs:606: assertion left == right failed` (the row changed: ShortListed recorded and the lease released on a row the attempt did not own) |
+| (e) Rank assignment is a pure function of the sorted listing: every one of the 24 permutations of a 4-member listing yields the same `rank → instance_id`; ranks are `1..world` over the first `world−1` in byte order; a listing shorter than `world−1` is `ShortListing`, never a smaller gang | `lib fine_tune::worker::tests::rank_assignment_is_a_pure_function_of_the_sorted_listing` | M3: the sort in `assign_ranks` removed → RED `worker.rs:7778: assertion left == right failed: rank r is the r-th member in instance_id byte order; the surplus member is unused` |
+| (e) Through the REAL `GangServer::run_rank`: a member whose slot is busy answers `Unavailable` — the attempt ends `MemberRefused` naming rank 1/member, recorded `Unavailable` (failures 0, cooled), lease released, nothing terminal, no slot held; the NEXT attempt (after the cooldown, through the loop's reclaim + claim) RE-LISTS the same sorted listing, is admitted, builds the `Peer`, runs rank 0, records `Success` (cooldown reset), ends the member session (`Cancel` → slot `Free`); the run's end is `Published` with bytes == `LocalGang` reference, or exactly the pinned streamed refusal (deviation 6) — RED at base (W=2 unsubmittable; no body) | `jammi-server it::gang_coordinator::a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_attempt_relists_and_runs_the_gang` (`test-hooks`) | M8: the dialer never installed (`runtime.rs`) → RED `gang_coordinator.rs:495: the real handler's Unavailable ends the attempt naming the member: this host cannot coordinate: no gang listener is mounted in this process (no member dialer installed)`; M11: `end_members` sends no `Cancel` (`filter(\|_link\| false)`) → see the M11 row below |
+| The dropout-position gather carries every `u64` exactly in a dtype every collective accepts: each position round-trips through four `f32` limbs (`0`, `0xFFFF`, `2^16`, `2^24+1`, `2^53+1`, `u64::MAX`), a malformed row (length, a non-integral or over-wide limb) is refused; a `Peer` gang's epoch boundary no longer faults | `lib fine_tune::trainer::dropout_position_codec_tests::every_u64_position_round_trips_through_four_f32_limbs`; the server oracle's attempt 2 past round 10; `gang_determinism_oracle::{w2_twice_is_byte_identical_with_dropout, resume_after_a_kill_matches_an_uninterrupted_run_with_dropout}` (Local, unchanged bytes) | M17: the limb shift dropped on decode (`value \|= raw as u64`) → RED `trainer.rs:15534: assertion left == right failed` (`2^16` decodes as `1`) |
+| A retry of a job whose row names a training set BINDS that table (ready, digest-verified) and its CAS is `Reused`, so the next attempt reaches the run instead of reading its own retry as a moved claim | the server oracle's attempt 2 (`ends[1]` is past dispatch; `training_set_ref` unchanged across attempts) | M16: the bind skipped (`Some(pair) if false`) → RED `gang_coordinator.rs:562: attempt 2 must reach the run (Published or a run failure), got: the claim moved before assembly (no write)` |
+| Every `CoordinatorEnd` maps to exactly one `AssemblyOutcome` and only `Moved` maps to none: `assembly_outcome` is a total match (a new variant is a compile error), one sample per `ordinal` in `0..VARIANTS` (a variant without a sample reds), each sample's row as documented; `MemberAborted{reason}` one-to-one over every frozen `AbortReason` with `Unspecified → Unavailable`; the settle rule: exactly `Refuted`/`AllRootDivergent` count | `lib fine_tune::worker::tests::every_coordinator_end_records_exactly_one_assembly_outcome_and_only_moved_writes_nothing` | M2: `ShortListed => AssemblyOutcome::Unavailable` → RED `worker.rs:7717: assertion left == right failed: short listing: 0 fresh member(s) where 1 are needed`; M13: `counts_toward_failures` keyed on `CooldownOnly` (jobs_repo.rs) → RED `worker.rs:7741: assertion failed: O::Refuted.counts_toward_failures()` |
+| The topology is decided from `(world_size, local_ranks)` alone: `W<=1 → Single`; `1<W<=L → Local{W}`; `W>L → Peer{W}`; no hybrid | `lib fine_tune::worker::tests::topology_is_decided_from_world_size_and_local_ranks_alone` | M6: `world_size < local_ranks` (W=2,L=2 → Peer) → RED `gang_coordinator.rs:643: assertion left == right failed` (topology `Peer{2}`, not `Local{2}`; the graph job is then refused at the coordinator's edge) |
+| The local fan-out: a `local_ranks = 2` host runs a W=2 job through the REAL `run_spec` as `Local{2}` (no coordinator body), completes, and publishes an adapter byte-identical to a U4b-shaped `LocalGang` run (each rank on `spawn_thread`, direct `TrainingLoop::run`) over the same sampled rows, config, seed, base model | `it::gang_coordinator::a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes` | M9: rank 0 given a single-rank context (`None`) while rank 1 joins the 2-rank gang → RED `gang_coordinator.rs:652: assertion left == right failed: Row { status: "failed" .. }` — rank 1 timed out at the 10 s rank deadline, the run failed, nothing published (10.16 s wall vs 0.3 s healthy); M6 (above) |
+| The seed split through the REAL `run_spec` (`local_ranks = 2`, `lora_dropout = 0.3`): the two ranks' dropout seeds differ (rank 0 = `config.seed`), every head layer's `dropout_run_seed` is its rank's own, the ranks' pre-step adapter weight digests are equal — and the published bytes still equal the `LocalGang` reference built per rank at the same seeds | `it::gang_coordinator::a_local_ranks_two_host_fans_…` (the seed assertions in the same oracle) | M14: `build_projection_head_for_rank(.., &FineTuneConfig { seed: dropout_seed, ..config }, .., dropout_seed)` → RED `gang_coordinator.rs:689: assertion left == right failed: both ranks start from byte-identical adapter weights` |
+| At the tower seam (`LoraSite::wrap`, every non-BERT tower's sites): two sites with the same `seed` and different `dropout_seed`s have byte-identical `lora_a` and report each their own `dropout_run_seed`; a different `seed` moves `lora_a` | `jammi-encoders lib lora_site::tests::the_site_keys_init_by_seed_and_the_masks_by_dropout_seed` | M15: `lora_site.rs` passes `self.lora.seed` for both seeds → RED `lora_site.rs:216: assertion left == right failed` (`dropout_run_seed` = `Some(7)`, not `Some(100)`) |
+| A member's `Aborted{reason}` mid-round is recorded TYPED on the coordinator's link for that rank (`Peer::member_aborts == [(1, StoreUnavailable)]`), beside the permanent fault; a member records none | `lib fine_tune::collective::peer_tests::a_member_that_aborts_its_session_faults_the_coordinator_naming_the_reason` (extended) | M10: `session_abort` never recorded in `Link::recv` → RED `peer_tests.rs:1006: assertion left == right failed: the coordinator records the member's abort reason typed, on rank 1's link` (`[]` vs `[(1, 5)]`) |
+| The member's slot is free within seconds of the attempt's end | the server oracle's final poll (`holder() == Free` within 5 s) | M11: `end_members` sends no `Cancel` → stayed GREEN (`mut-M11.log`: `1 passed`). The slot frees either way: dropping the coordinator's `Peer` drops its links, the client stream tears down and the hold loop ends on the transport error. So this row pins the SLOT, not `end_members`'s own effect (a cooperative `Aborted{Cancelled}` at the member instead of a transport error) — that effect is UNCOVERED (§3); `end_members` is kept for the clean end, stated as untested |
+| W=1 is byte-unchanged: the single-rank path passes `rank_ctx: None` and the builder's own default | the pre-existing `fine_tune::` lib suite and `it -- fine_tune` (§4) | regression-only (as U4b's and §2b's contracts state it) |
+
+#### 3. Uncovered
+
+- **`end_members`'s own effect** (a cooperative `Aborted{Cancelled}` at the member rather
+  than a transport error): the slot frees through the transport teardown regardless, so M11
+  stayed green; no server-side observation of a held session's end reason exists to pin it.
+- **A mid-run member abort / link fault through the coordinator body** — the healthy `Peer`
+  run now executes end to end (deviation 6), but no oracle injects a member abort or a link
+  fault into a running gang (U5b-2's chaos row); the classification tail
+  (`MemberAborted`/`LinkFault`) is executed only through the table oracle and the typed record
+  (P14 extended).
+- **A rank of a `Local` gang failing while rank 0 succeeds** ("rank 0's artifact is never
+  published over a gang that did not complete"): built (`rank_failures`), no oracle manufactures
+  a one-sided rank failure through `run_spec`; the symmetric case (rank 0 given a single-rank
+  context, rank 1 times out) is M9's executed red.
+- **`AllRootDivergent`** — unreachable from the body (deviation 3); labelled, not faked.
+- **A deterministic coordinator-side collective refusal** (P9's dtype refusal, a descriptor
+  disagreement) maps to `LinkFault → Unavailable`, uncounted and released: such a job retries
+  under the 2 s… backoff indefinitely (the design's transient class); a typed split of "this
+  rank's own refusal" from "a peer's/transport fault" inside `Peer` is not built.
+- **Agreement binding** (deviation 8).
+- **The BERT family's and the encoder-adapters path's seed split through `run_spec`**: the
+  tower-side threading is by the same mechanical change at four sites and the `LoraSite`
+  unit oracle executes the seam every non-BERT tower goes through; `run_spec`'s fan-out oracle
+  is a projection-head job (`AnyEncoder` exposes no per-site `dropout_run_seed`, only
+  positions), so an encoder-adapters gang's distinct masks are proven at the seam, not
+  end to end. The `gpu_capability` construction sites are gated (`live-gpu-tests`) and
+  compiled by CI's gated-surface clippy, not here.
+- **GPU placement of local ranks** (rank `r` on a real `devices[r]`, one model-cache entry per
+  device): the fan-out oracle runs both ranks on the CPU (declared ordinals `[0, 1]` degrade off
+  the pod); U4b's own (f) covers the cache-map shape; the pod leg is U7b's.
+- **`Handle::enter` on the rank threads**: exercised by the fan-out oracle (rank 1's resume
+  discovery and checkpoint calls `block_on` the entered handle); a rank thread panicking outside
+  `catch_unwind` (`Ok(Err(_))` join arm) is stated, not executed.
+- **The `Abandoned` arm's checkpoint GC** after a mid-run fault: shares `gc_epoch_checkpoints`
+  with the cancelled arm (its own oracles); not separately executed here.
+- **Two real processes**: the server oracle mounts the real handler over the coordinator's own
+  engine (one `HostAdmission`, `run_claimed_job` holds no probe so the slot is the member's);
+  two OS processes over one catalog is the fleet leg.
+
+#### 4. Gates
+
+COMMON.md's trimmed set, plus clippy on the two extra crates this unit touches; every command
+with `RUSTC_WRAPPER=sccache`, `CARGO_TARGET_DIR=…/targets/u5b1bii`, on the final tip (the
+last edits after the mutation round were the three clippy fixes and one `eprintln!`; every
+oracle below was re-executed after them). Logs in `u5b1bii-scratch/` (`gates.log`,
+`gates2.log`, `t-*.log`, `mut-*.log`).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-db --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-lora --all-targets -- -D warnings` | 0 | clean |
+| `cargo clippy -p jammi-encoders --all-targets -- -D warnings` | 0 | clean |
+| `cargo test -p jammi-ai --features test-hooks --lib -- fine_tune::` | 0 | 351 passed, 0 failed (the WHOLE pre-existing suite + this unit's worker/codec/peer rows — the W=1 byte-identity regression oracle) |
+| `cargo test -p jammi-ai --features test-hooks --lib -- dropout_position_codec fine_tune::worker::tests::` | 0 | 38 passed |
+| `cargo test -p jammi-ai --features test-hooks --test it -- gang_coordinator rank_admission` | 0 | 13 passed (3 + 10) |
+| `cargo test -p jammi-server --features test-hooks --test it -- gang_coordinator gang_rounds` | 0 | 5 passed (1 + 4); `--nocapture`: `attempt-2 end: published (ordinal 12)` |
+| `cargo test -p jammi-encoders --lib -- lora_site::tests` | 0 | 1 passed |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1038 file(s) scanned, all PATH:LINE citations resolve (…; 2 exempt as non-ancestor legacy evidence)` — 47 citations re-anchored in total under this unit's insertions (guide, `gguf.rs`, jammi-bench's README/`torch_finetune_step.py`/`grad_oracle.rs`, `ab_merge.py`) |
+| `python3 ci/scripts/check_no_consumer_names.py` | 0 | OK |
+| `cargo check -p jammi-bench` | 101 | PRE-EXISTING at the base (`9b0dcb57`): `finetune_run.rs:2121 builder.resume(restored)` expects `RestoredCheckpoint`, gets `Option` (U4b's `load_bundle` change), and the bin's `#[cfg(test)]` calls `run_impl(&params, true)` with two args (§2b's witness change) — verified by `git show 9b0dcb57:…` carrying the same lines; this unit's bench diff is four `dropout_seed: <seed>` lines, which compile (the errors are elsewhere). Not fixed here (jammi-bench is the `bench` owner's; outside my files); the merge path's workspace clippy is where it surfaces. |
+| Mutations M1–M17 (`mutations.py`, one filtered test each, `git checkout -- <file>` after, `git status --short` clean) | — | 15 red on the first run (§2, first red lines quoted); M11 GREEN (a vacuous row, relabelled: §2/§3); M12 was never assigned |
+| `git status --short` at the tip | — | 0 entries |
+
+Not run, per COMMON.md's trimmed set: `cargo doc`, the live-Postgres lane (no jammi-db test
+added: `counts_toward_failures` is pure and pinned by the worker table oracle), `merge_path.sh`,
+workspace-wide builds. The `gpu_capability` construction sites (`capability_surface.rs`) are
+`live-gpu-tests`-gated: edited by the same mechanical rule, compiled by CI's gated-surface
+clippy, not here.
+
+#### 5. Commits (`git log --oneline 9b0dcb57..HEAD`; base `feat/500-wave3c` @ `9b0dcb57`)
+
+```
+a8ab9667 fix(ai,server,docs): #500 U5b-1b-ii — clippy clean on every target; attempt 2's end on record; citations re-anchored
+aaf10c03 feat(ai,lora,encoders,bench): #500 U5b-1b-ii — the seed split wired per rank; a retry binds the recorded training set; the dropout-position gather carried as f32 limbs
+6cb183c3 feat(ai,lora): #500 U4b tail — streamed arm at world>1, LoRA init/dropout seed split, per-rank dropout position exercised
+acb47662 test(server): #500 U5b-1b-ii — the Peer oracle asserts the attempt's end before joining the member thread, bounded
+5004081c feat(ai,server,db,docs): #500 U5b-1b-ii — the coordinator body: topology fan-out, membership → assignment → dispatch → assembly; serveable_world at submit
+```
+
+`6cb183c3` is the U4b tail's own commit (`2d46508b` on `feat/500-wave3c`), cherry-picked
+onto this branch — not this unit's work: it carries the `_for_rank` builders,
+`new_with_base_seeded` and the streamed arm the lead's binding addition wires and this unit's
+oracles execute against; it touches none of this unit's files and applied without conflict.
+The lead's consolidation takes the four `U5b-1b-ii` commits and drops it (an empty
+cherry-pick on a branch that already has it). Tip: `a8ab966725b4b7d3ede7641e554971681b0807b9`.
+
 
 ## 7. U5b-1b-iii
 

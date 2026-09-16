@@ -3022,8 +3022,13 @@ c752cccd fix(ci): #500 U7b-A2b — F1's own SIGINT oracle was flaky, unrelated t
   refused three intra-doc links in the `worker.rs`/`role.rs` module docs that named `LeaseHolder`,
   `RunnerRole` and `LeaseHolder::LoopClaimer` bare from a scope where they are not imported; they name
   `crate::fine_tune::role::…` now. Both in one commit; the merge path's static, guard and swarm stages were
-  re-run on it (§10) and the tests stage's evidence from `2e43af22` carries: the delta is a gate's scope
-  table, its fixture, and doc comments — no test target's code changed.
+  re-run on it (§10). The tests stage's evidence from `2e43af22` carries for that delta (a gate's scope
+  table, its fixture, doc comments); the topology-determinant fix below changes production code in
+  `worker.rs`, so the hermetic lane was re-run on the final tip for every crate that can observe
+  `jammi-ai` (`jammi-ai`, `jammi-server`, `jammi-bench` — the reverse dependency closure minus
+  `jammi-python`, which the lane excludes; §10). The Postgres lanes' evidence carries: `jammi-db`'s two
+  lanes cannot observe `jammi-ai`, and the `jammi-server` introspection lane runs no fine-tune job
+  (`grpc_introspection.rs` names none).
 - The phase-5 oracle (PASS at `2f27d6a1`, §10) found the manifest's `collective` determinant recording
   the `[worker] collective` SELECTION (`auto|nccl|cpu`) where the field's own contract says the
   collective the run reduced over (`noop|local|peer|nccl`): `auto` resolves differently on different
@@ -3040,6 +3045,26 @@ c752cccd fix(ci): #500 U7b-A2b — F1's own SIGINT oracle was flaky, unrelated t
   `MANIFEST_VERSION` make a pre-existing FineTune sidecar a hard decode error — is the variant's
   designed behaviour for determinant growth (K1 replay for this variant is retrain; no external
   consumers; the release is held), stated here, not changed.
+- The oracle's second run (PASS at `0ae786fc`) returned three doc findings, each fixed where it lives:
+  the field's own definition (`ProducingDescriptor::FineTune::local_ranks`) still sourced the value from
+  `[worker] local_ranks` "at claim time" and called it the gang width — the same class as the fix above,
+  on the consumer side; `docs/guide/src/format-stability.md` claimed an older-or-equal manifest version
+  is "readable by construction (the layout only grew)", which the required topology determinants at an
+  unchanged `MANIFEST_VERSION` falsify for a pre-existing fine-tune sidecar — the reject-newer paragraph
+  now states what the reader does (a body lacking a required field is the typed `ManifestError::Serde`;
+  the one named older shape, no `leaves`, is absent); and the `worker.rs` module-doc links whose bare
+  form resolves (the types are imported there) lost the explicit targets rustdoc refuses as redundant
+  (`role.rs`'s module doc keeps its qualified link: nothing is in scope there). Its third observation —
+  `Cargo.lock`'s `heck 0.4.1 → 0.5.0` re-point on the `prost-build`/`snafu-derive` build-dep edges, a
+  resolver dedupe beside the four added edges — is informational.
+- The oracle's third run (PASS at `c21492b9`) checked the three doc statements against the code and refuted
+  the half of the format-stability paragraph kept from `main`: the materialization manifest's reader refuses
+  ANY version inequality (`MaterializationManifest::from_json_bytes`, `!=`, as its own rustdoc states — an
+  older version names a superseded determinant set), so the guide's table row, bullet and section calling it
+  "reject-newer" (`found > MANIFEST_VERSION`) were wrong on `main` and stayed wrong through the previous
+  rewrite. The three statements now say exact-version, keep reject-newer for the ordered formats
+  (`.rowmap`, ANN `.manifest.json`, whose readers compare with `>`), and state the decode-before-stamp
+  order. Doc-only; the gates and the oracle were re-run on it.
 - The pod leg: run 3 measured the property (§2c) and its artifact is committed; run 4 (workflow 35054325406, on `ddd68928`) is the fully green job after the pod's clone was deepened blobless for the registry's ancestry rule.
 
 ## 9. Pressure round (phase 1, executed at `856ec8dd` before the code landed) — REFINE, eight blocks folded
@@ -3100,3 +3125,15 @@ sole red). The reviewer's attention belongs on those three files.
 local PostgreSQL 16 in the CI lane's shape — run ONCE by the lead, never per implementer; the
 phase-5 oracle dispatched after every other stage is green; only `docs/rigor/**` committed
 after it.
+
+**What ran, on which tip (the lead's runs, logs in the session scratchpad):**
+
+| Tip | Stages | Result |
+|---|---|---|
+| `2e43af22` | static, guards, swarm, tests (all four; the three Postgres lanes included) | 117 ok; red: rustdoc (the three module-doc links, §8d) and `SWARM_GATE_TOUCHED` |
+| `2f27d6a1` | closure row + doc links | `check_flash_attn_closure` PASS, rustdoc links verified; the phase-5 oracle PASS here found the topology-determinant defect (§8d) |
+| `0ae786fc` | static, guards, swarm | rustdoc red again (explicit targets rustdoc refuses as redundant where the bare link resolves, §8d); the phase-5 oracle PASS here returned the three doc findings (§8d) |
+| `c21492b9` | static, guards, swarm; then the hermetic lane for `jammi-ai`, `jammi-server`, `jammi-bench` (`jammi-ai`'s reverse dependency closure, §8d) | 112 ok, the only red `SWARM_GATE_TOUCHED` (expected, above); tests: 17 targets, 2024 passed, 0 failed |
+
+The phase-5 oracle's record of the final tip is `docs/rigor/feat_500-wave3c.oracle.jsonl`; the
+pressure row is `docs/rigor/feat_500-wave3c.jsonl`.

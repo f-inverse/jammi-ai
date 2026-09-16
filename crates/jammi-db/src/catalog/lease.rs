@@ -167,6 +167,35 @@ pub fn lease_expired_clause(
     }
 }
 
+/// The SQL fragment that is true for a LIVE (non-expired, non-absent)
+/// lease — the exact complement of [`lease_expired_clause`], `col IS NOT
+/// NULL AND col > now` rather than that function's `col IS NULL OR col <
+/// now`, on the SAME backend clock. `Catalog::transfer_claim`'s hand-off
+/// predicate needs THIS positive polarity, never
+/// [`lease_expired_clause`]'s: a RELEASE ([`super::jobs_repo::Catalog::
+/// release_job_lease`]) sets `lease_expires_at = NULL`, and a transfer of a
+/// released claim must FAIL — `lease_expired_clause`'s own `col IS NULL OR
+/// …` shape reads a NULL lease as "expired" (true), which is the right
+/// answer for a reclaim sweep deciding whether to requeue a job but the
+/// WRONG answer for a hand-off deciding whether a live claim exists to
+/// transfer; negating `lease_expired_clause` as a whole would still leave
+/// the boundary at exactly `now` ambiguous between the two functions'
+/// independent per-backend expressions, so this is its own, explicitly
+/// authored predicate rather than `format!("NOT {}", lease_expired_clause(..))`.
+pub fn lease_live_clause(
+    col: &str,
+    kind: BackendKind,
+    params: &mut Vec<SqlValue<'static>>,
+) -> String {
+    match kind {
+        BackendKind::Postgres => format!("({col} IS NOT NULL AND {col}::timestamptz > now())"),
+        BackendKind::Sqlite => {
+            params.push(SqlValue::TextOwned(lease_now()));
+            format!("({col} IS NOT NULL AND {col} > ${})", params.len())
+        }
+    }
+}
+
 /// The value-expression for stamping `lease_expires_at` to "`lease` from
 /// now", using the backend's OWN clock on Postgres and the application clock
 /// (through [`lease_deadline`], the one SQLite helper) on SQLite. Appends

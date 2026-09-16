@@ -424,9 +424,9 @@ pub fn decode_devices_json(raw: &str, row_label: &str) -> Vec<DeviceFact> {
     }
 }
 
-/// The claim-loop half of a registration: the `kinds` this worker claims and
-/// its lifecycle [`WorkerState`] — exactly the pair `Catalog::upsert_worker`
-/// writes. Owned exclusively by `JobWorker`
+/// The claim-loop half of a registration: the `kinds` this worker claims,
+/// its lifecycle [`WorkerState`], and its device inventory — exactly the
+/// triple `Catalog::upsert_worker` writes. Owned exclusively by `JobWorker`
 /// (`crates/jammi-ai/src/fine_tune/worker.rs`): `run_until` sets it only
 /// as ONE fact with every row write (`write_worker_facts` in jammi-ai's
 /// `fine_tune::worker`, contract `feat_500-C-U5b-1a` §13): set to the facts
@@ -444,6 +444,13 @@ pub struct WorkerFacts {
     pub kinds: String,
     /// The claim loop's lifecycle state at this instant.
     pub state: WorkerState,
+    /// This `[worker]` process's own device inventory —
+    /// `workers.devices`, a `ListWorkers` MIRROR only (never the placement
+    /// join's authority: `compute_executors.devices`,
+    /// `super::compute_repo::ComputeExecutorRecord::devices`, is that,
+    /// since a compute-executor process and a `[worker]` process may be
+    /// different processes with different device visibility).
+    pub devices: Vec<DeviceFact>,
 }
 
 /// The ONE value every writer of the `instances` (+ `workers`) row builds —
@@ -700,6 +707,7 @@ mod tests {
         reg.set_worker(Some(WorkerFacts {
             kinds: "fine_tune".into(),
             state: WorkerState::Claiming,
+            devices: vec![],
         }));
         let snap = reg.worker_snapshot().unwrap();
         assert_eq!(snap.kinds, "fine_tune");

@@ -1885,3 +1885,403 @@ dde97892 docs(docs-ci): #500 U9a — guide, maintainer guide, README, CHANGELOG 
 81f26d2e docs(docs-ci): #500 U9a — fix CHANGELOG wording, retries are a scheduler-wide pin not a per-role one
 ```
 (`git log --oneline 5772ac53..HEAD`, oldest first above; tip `81f26d2e`.)
+
+### 11.8 LANE — the distributed `ballista` lane; placement as a device-kind match (wire-server) — landed as f681a750, 921739ec, aaf2bbc8 (original tip 7f1a11cc)
+
+**Lead's note.** The kind-match predicate (§9a) landed with the lane. The lane's own execution found and fixed two production defects the hermetic oracles had aliased away: the re-launch guard read the job row by Ballista's own job id rather than the descriptor's, so it refused every real placed gang; and `submit_placed` moved the holder to `Awaiting` only after the submit call returned, so a scheduler-hosting submitter refused its own member dial. Both fixes carry their executed red. The (a3) determinant is a scheduler-process log line naming the bound executor per task (Ballista's client API never returns the job id — read at its source and stated as UNCOVERED). The lead re-ran the seven-test lane on the consolidated tip (§10). A Ballista limitation is stated, never worked around: a scheduler binds only to executors it has itself heard heartbeats from, so (b2) proves two schedulers each serving a job over one catalog, never a task bound across schedulers.
+
+#### Contract — unit `lane` (wire-server): the distributed `ballista` lane
+
+Base: `feat/500-wave4` @ `5772ac53`, merged forward twice to the consolidation
+tip (`e339f995` then `c57bf096`) as the lead's messages directed. Tip:
+`7f1a11cc22fb3e1e601c6a1865bfd6cf3caa6164`.
+
+##### 1. Scope shipped
+
+- `crates/jammi-ballista/tests/distributed/{harness.rs, main.rs}` — the
+  three(+)-process harness (ported from `crates/jammi-ai/tests/distributed/
+  harness.rs` per COMMON.md's own instruction: a private-test-module copy)
+  and the seven test bodies for oracles (a3)-(a5), (b1)-(b4). (b5) is (a4)
+  restated (one test, the K4 byte comparison against a second, non-Ballista
+  fleet); (b6) is covered by (a5)'s "exactly once" assertion plus the
+  hermetic `already_transferred_gang_is_never_bound` (`tests/it/cluster.rs`)
+  — no new test function for either, as the brief allowed.
+- `.github/workflows/distributed.yml` — a new `ballista` matrix leg
+  (`advisory: false`), naming all seven tests, with the "Compile-check"/"Run
+  the tests" steps parameterised by a new `matrix.crate` field so the
+  existing `jammi-ai` legs (`deterministic`, `chaos`) are byte-identical to
+  before.
+
+**Two mid-flight corrections from the lead**, both executed and folded before
+the lane tests landed:
+
+1. **Device placement is KIND MATCH, never GPU-bound.** The shipped
+   `stage_is_gpu_bound` predicate would have refused every `GangExec` on an
+   all-CPU fleet (a gang is unconditionally "GPU-bound" by node type,
+   regardless of what device it actually needs). Replaced with
+   `stage_device_kind(plan) -> Option<ComputeDeviceKind>` (engine.rs);
+   `GangDescriptor` gained `device_kind`, stamped by the submitter
+   (`JobWorker::submit_placed`, the one construction site the lead granted)
+   and carried on the wire (`GangExecNode.device_kind`, encoded/decoded like
+   `InferenceExecNode`'s own field); `DevicePlacement`/`submit_physical_plan`
+   bind/refuse on the exact required kind; `JammiExecutionEngine`'s K7
+   refusal covers `GangExec` the same way it already covered `InferenceExec`.
+   Commit `c17eb8fb`. Updated hermetic oracles: `tests/it/cluster.rs` gained
+   the CPU-only positive/negative pair
+   (`cuda_stamped_stage_never_binds_to_a_cpu_only_executor` /
+   `cpu_stamped_stage_binds_to_a_cpu_only_executor`); `tests/it/engine.rs`
+   gained the `GangExec` K7 mismatch test; `tests/it/codec.rs`'s gang
+   round-trip now asserts `device_kind` survives verbatim.
+2. **The port-collision rule change** (`c57bf096`, lead's own fix, merged
+   forward): two of `BallistaConfig`/`ServerConfig`'s six addresses now
+   collide only when their PORTS match and EITHER host is unspecified. Every
+   harness-rendered listener already uses `127.0.0.1:<port>` with a
+   `free_port()`-allocated port per listener, so this needed no harness
+   change — confirmed by the full suite staying green after the merge.
+
+**Real production bugs this unit's own execution found and fixed** (all in
+files wire-server owns):
+
+- `DevicePlacement::bind_tasks`'s re-launch guard (refinement 3) keyed its
+  per-job claim read by **Ballista's own internally-minted job id**
+  (`for (job_id, job_info) in running_jobs.iter()`), never the fine-tune
+  catalog job id `GangDescriptor::job_id` actually carries — two disjoint id
+  spaces (the ONLY reason the pre-existing hermetic oracle
+  `already_transferred_gang_is_never_bound` never caught this: it
+  deliberately aliases the two ids in its own fixture). The guard's catalog
+  read therefore always faulted "Job 'X' not found" and folded into "claimed
+  by someone unverifiable", refusing every real placed gang. Fixed:
+  `gang_submitter_of` became `gang_descriptor_of` (returns the whole
+  descriptor), and the claim-read cache is now keyed by `descriptor.job_id`,
+  read lazily once per job per `bind_tasks` call (`placement.rs`).
+- `JobWorker::submit_placed` moved the host's holder `JobRun -> Awaiting`
+  **after** `submitter.submit()` returned. When the submitter's own host also
+  hosts the scheduler (the `SchedulerAndExecutor` case every ballista fleet
+  in this lane uses), the scheduler's own background binder can dispatch the
+  task and the placed executor can dial this host's `RunRank` **before** the
+  async `submit()` call itself resolves back to this line — observed as
+  every dial refused with `"this host's job slot is busy"` (`Holder::
+  JobRun`), on every single retry, forever. Fixed by moving the `Awaiting`
+  transition to before the plan crosses the wire (`worker.rs`).
+- A source registered on the harness session **after** the fleet spawns is
+  invisible to a claiming process: `reload_sources` only runs at session
+  construction, never a dynamic re-read of another process's later catalog
+  write (unlike a plan submitted whole via `submit_physical_plan`, whose
+  scan already carries concrete file paths). (b2) registered its own
+  training source before `Fleet::spawn`.
+- A respawned scheduler's TCP port accepting a connect is not sufficient
+  submission readiness (the tonic server can accept the handshake into its
+  backlog moments before its gRPC service is registered); (b1)'s
+  `submit_physical_plan` now retries through a bounded window.
+
+**A genuine, now-documented Ballista limitation** (not a bug, named rather
+than worked around): Ballista's own task binder gates on **its own**
+executor-heartbeat cache (`ballista-scheduler-54.1.0/src/state/
+ballista-scheduler-54.1.0 src/state/executor_manager.rs lines 117–121`'s `get_alive_executors`), never the raw
+`compute_executors` row set. A second scheduler that never itself received a
+heartbeat for an executor registered through a DIFFERENT scheduler can never
+bind a task to it — confirmed empirically ("There are no alive executors to
+bind tasks", every time, for as long as the plan waited). (b2)'s second
+scheduler now hosts its own local executor too, so it independently serves a
+job on its own resources — "two schedulers over one shared catalog, each
+able to serve a job" (contract wording), never a claim that Ballista binds a
+task ACROSS two live schedulers. Same root cause explains why (a5)'s FIRST
+fleet design (a single `fine_tune`-capable host, or a second scheduler-hosted
+reclaimer) deadlocked or never placed at all — see the git log for the two
+reds this surfaced and their fix (a late-joining, executor-less second
+`fine_tune` bidder, spawned only after the first claim+placement already
+resolved).
+
+**Deviation from a literal "same instance id" reading (b1):** `instance_id`
+is minted at session construction, never externally supplied (`instance_id`,
+`crates/jammi-ai/src/session.rs:468`), so a killed-then-respawned process
+cannot literally keep the OLD instance id. (b1)'s own assertions need only
+the OTHER two executors' registrations and a NEW job's completion through
+the replacement, which the shared catalog carries regardless.
+
+##### 2. Properties
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| An embedding job's scan stage (≥2 partitions) runs across two registered executors, byte-identical (Arrow IPC, sorted, `_latency_ms` excluded) to the same plan in-process | `embedding_job_across_two_executors_matches_in_process` | The DevicePlacement job_id fix reverted (keying by Ballista's own job id) reds a4/a5 identically (see below) — a3 itself is unaffected by that fix (no gang), so its own red is the KIND MATCH fix reverted: `stage_is_gpu_bound` restored refuses nothing here (InferenceExec is CPU, never GPU-bound under the old predicate) but the `try_encode_udf`/`try_decode_udf` override removed reds it: "PhysicalExtensionCodec is not provided for scalar function jammi_content_hash" |
+| A `world=2` gang placed through Ballista never binds back to the submitter, transfers claim exactly once (attempts=1, releases=0), completes, and its artifact is byte-identical to the same job run without `[ballista]` at all | `placed_gang_completes_on_a_registered_executor_other_than_the_submitter` | Reverting the `gang_descriptor_of`/job-id-keying fix in `placement.rs` reds it: the row stays `claimed_by` the submitter forever (`claimant == lane1_id` fails), confirmed executed (this exact regression was hit and diagnosed live during this pass) |
+| Killing the executor mid-gang leaves the row `running` (no terminal write) for jammi's own lease to expire, and a survivor completes it (attempts≥2, exactly one model row) | `killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes` | Reverting the `begin_awaiting_placement` ordering fix in `worker.rs` reds it: the row never reaches `completed` within 150s (confirmed executed — this is the exact regression this pass found and fixed) |
+| A scheduler restart keeps the other executors' registrations and job status rows readable, and a NEW job places and completes through the replacement | `scheduler_restart_keeps_executors_and_serves_a_new_job` | Skipping the post-respawn TCP-readiness/retry loop reds it with `ConnectionRefused` (confirmed executed) |
+| Two schedulers over one shared catalog each independently serve a job | `two_schedulers_over_one_catalog_serve_jobs_sequentially` | Reverting scheduler 4 to `SchedulerOnly` (no local executor) reds it with Ballista's own "There are no alive executors to bind tasks" (confirmed executed) |
+| A device-kind mismatched plan (Cuda-stamped `GangExec`) is refused typed before submission on an all-CPU cluster; a matching (Cpu-stamped) plan is accepted and runs | `device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan` | Reverting `client.rs`'s KIND MATCH check to the old `stage_is_gpu_bound` predicate reds it (the dummy Cuda `GangExec` is accepted and hangs trying to actually submit — this exact regression was hit and diagnosed live) |
+| `list_workers` mirrors each `[worker]`-enabled process's own device inventory (`[{cpu,0}]`); `list_compute_executor_devices` matches, for every registered executor regardless of `[worker] enabled` | `list_workers_and_compute_executor_devices_report_registered_devices` | Not independently mutated this pass (pre-existing `ExecutorRole`/`upsert_worker` device-stamping code, unchanged); the oracle itself is new |
+
+##### 3. Uncovered
+
+- **(a3)'s "both executors ran a task" determinant is read from the
+  scheduler's OWN process log**, via a `tracing::info!` line this unit added
+  in `DevicePlacement::bind_tasks` (`placement.rs`), naming the bound
+  executor id per task. The public Ballista client API (`execute_physical_
+  plan`) never exposes the internally-minted job id to a `submit_physical_
+  plan` caller (confirmed by reading `ballista-core-54.1.0/src/
+  execution_plans/distributed_query.rs:332-405` — the job id lives only in a
+  private `Arc<Mutex<Option<JobId>>>` the function never returns), so a
+  `SchedulerGrpcClient::get_job_status`-based determinant (the contract's own
+  suggested shape) is not reachable from outside the scheduler process. The
+  log-line determinant is the honest substitute — same fact, different
+  vantage point — but it is a NEW mechanism this unit introduced, not a
+  pre-existing one; a follow-up could expose the job id through a lower-level
+  client seam instead.
+- **Active/active concurrent job serving through two schedulers** (README
+  r43, contract §3) is NOT exercised — (b2) only proves sequential/
+  independent serving, matching both the contract's own stated scope and the
+  Ballista heartbeat-cache limitation named above.
+- A5's flakiness margin: the observed `claimed_by` sequence is recorded at a
+  300ms poll interval (the honest subset at that rate); two consecutive full
+  runs were green, but the underlying timing (placement + reclaim, now fast
+  since the ordering fix) was not stress-tested beyond that.
+
+##### 4. Gates
+
+| Command | Exit | Notes |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean after `cargo fmt -p jammi-ballista -p jammi-ai` |
+| `cargo clippy -p jammi-ballista --tests --features live-distributed-tests -- -D warnings` | 0 | |
+| `cargo clippy -p jammi-ai --tests --features test-hooks,live-distributed-tests -- -D warnings` | 0 | |
+| `cargo test -p jammi-ballista --features test-hooks --test it -- --test-threads=1` | 0 | 26 passed |
+| `cargo test -p jammi-ai --features test-hooks --test it gang_placed -- --test-threads=1` | 0 | 9 passed |
+| `cargo build -p jammi-server --bin jammi-server --features storage-s3` | 0 | |
+| `JAMMI_REQUIRE_DISTRIBUTED=1 cargo test -p jammi-ballista --features live-distributed-tests --test distributed -- --test-threads=1` (live Postgres+MinIO) | 0 | 7 passed, 0 failed — TWO consecutive full runs, 44.66s and 54.93s |
+| `python3 ci/scripts/perf/check_citations.py` | non-zero overall, but ZERO failures attributable to files this unit touched (the only failures are pre-existing `docs/maintainer/MAINTAINER-GUIDE.md` staleness, docs-ci scope) | |
+| `python3 ci/scripts/check_lint_surface_closure.py` | 0 | `jammi-ballista::distributed` OK |
+| `python3 ci/scripts/check_execution_surface_reachability.py` | 0 | PASS |
+
+##### 5. Commits
+
+```
+7f1a11cc feat(wire-server): #500 LANE — the ballista distributed lane is GREEN
+205d075c Merge commit 'c57bf096' into unit/lane
+c17eb8fb fix(wire-server): #500 LANE — device placement is KIND MATCH, never GPU-bound
+d7eafe27 Merge commit 'e339f995' into unit/lane
+54ce7f10 feat(wire-server): #500 LANE — three-process ballista harness + oracles (a3)-(a5),(b1)-(b4), UDF codec fix
+```
+
+Note: `crates/jammi-ballista/Cargo.toml` gained two dev-dependencies
+(`libc`, `parquet`) in `54ce7f10` — a shared-declaration file per the
+wire-server brief's ownership rule; flagged as a scope amendment.
+
+### 11.9 WIREFIX — `ListWorkers.devices` on the wire; the port-based collision rule (wire-server) — landed as f717d8e9, c57bf096 (original tip be0109b2)
+
+**Lead's note.** Two doc-lens blocks fixed at the root (§9a). `WorkerSummary.devices` is field 8 — additive; the api-freeze oracle (packages and RPC paths) ran unchanged. One `addresses_collide` now serves both `ServerConfig::validate` and `BallistaConfig::validate`. The lead ran the config suite (231), the server suites named (40) and the config-fence oracle on the consolidated tree.
+
+#### WIREFIX — contract
+
+##### 1. Scope shipped
+
+**Item 1 — `ListWorkers` carries `devices`.**
+- `crates/jammi-wire/proto/jammi/v1/job.proto`: new `message DeviceFact { string kind = 1; uint32 ordinal = 2; }` and `repeated DeviceFact devices = 8;` appended to `WorkerSummary` (field 8, no prior field renumbered — the api-freeze baseline covers `jammi.v1.*` packages and `(Service, Method)` rpc paths, not message fields; `api_freeze::wire_surface_equals_the_frozen_baseline` was run unmodified and still passes).
+- `crates/jammi-server/src/grpc/job.rs`: `list_workers`'s mapping closure now maps `WorkerRecord.devices: Vec<jammi_db::catalog::instance::DeviceFact>` into `Vec<pb::DeviceFact>`.
+- `crates/jammi-admin/src/lib.rs`: `CatalogClient::list_workers`'s mapping gains the same; the `WorkerSummary` struct gains `pub devices: Vec<DeviceFact>`, and a new `pub struct DeviceFact { pub kind: String, pub ordinal: u32 }` mirrors the wire message field for field. **Deviation note**: `crates/jammi-admin/src/lib.rs` is a single-file crate — everything (including `WorkerSummary`) lives in what the brief calls the shared-declaration `lib.rs` class. The WIREFIX brief explicitly names this file ("`jammi-admin`/`jammi-client`'s `ListWorkers` mirror types gain `devices: Vec<DeviceFact>`"), so I edited it as directed; flagging per the "coordinate through the lead" rule rather than silently touching a nominally-shared file.
+- `jammi-client` has **no** separate `WorkerSummary` mirror struct — `git grep -n "WorkerSummary" -- crates/jammi-client/src` returns nothing; the crate re-exports the generated `jammi_wire::proto::job::{JobServiceClient, ListWorkersResponse, WorkerSummary}` types directly (`crates/jammi-client/src/lib.rs:64`, `use jammi_wire::proto::job::job_service_client::JobServiceClient;`). The new proto field therefore reaches every `jammi-client` caller with zero code change there — verified by grep, not asserted.
+- `crates/jammi-cli/src/commands/workers.rs`: `print_header`/`print_row` gain a `Devices` column (`format_devices`: `"kind+ordinal"` comma-joined, `"—"` for empty — the same empty-value convention `print_row` already uses for `label`). This file is outside the four crates named at the top of my brief (jammi-wire/admin/client/server); the WIREFIX brief itself grants it explicitly ("the CLI's `workers` listing, if it renders rows, prints the devices column"), so I treated that as in-scope.
+- Rustdoc citation updates (all in `jammi-db`, granted for item 2 but these are item-1 doc sites the brief also named): `crates/jammi-db/src/catalog/schema.rs` (migration 038 comment), `crates/jammi-db/src/catalog/instance.rs` (`WorkerFacts::devices`), `crates/jammi-db/src/catalog/jobs_repo.rs` (`WorkerRecord::devices`, `upsert_worker`'s doc) — each now cites `jammi.v1.job.WorkerSummary.devices` (field 8, `crates/jammi-wire/proto/jammi/v1/job.proto`) as a backtick code span (never an intra-doc link — it names a `.proto` message, not a Rust item), making the pre-existing "additive field on the frozen RPC surface" claim true and traceable.
+
+**Item 2 — the six-address collision rule compares ports.**
+- `crates/jammi-db/src/config/mod.rs`: new `pub(crate) fn addresses_collide(a: SocketAddr, b: SocketAddr) -> bool` — `a.port() != 0 && a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())`. `ServerConfig::validate`'s three-way check (health/flight/peer) and `BallistaConfig::validate`'s six-way pairwise loop both now call this one definition, replacing their separate `addr_a == addr_b && addr_a.port() != 0` / `health == flight && health.port() != 0` comparisons. The six-way loop's refusal message now names both colliding addresses (previously only one) — the existing test only asserts the message contains both KEY names, not the address text, so this is not a breaking change to any assertion.
+- `crates/jammi-db/src/config/tests.rs`: `ballista_ports_fixture` gains a fixed `advertise_host` on the base executor config (decouples the collision-rule tests from the unrelated `advertise_host`-required-when-`bind`-is-unspecified rule, so overriding `ballista.executor.bind` to `0.0.0.0:N` in a collision test never also trips that other refusal). New `ballista_every_fixed_port_collision_pair_is_refused_when_one_host_is_unspecified` (the unspecified-host arm requested for the existing "every pair" test, same six keys, same "names both keys" assertion) and new standalone `addresses_collide_table` (the five cases the brief named, run bidirectionally for symmetry).
+- Searched for a fixture relying on the OLD, narrower rule (a `127.0.0.1:N` beside a `0.0.0.0:N` on the SAME port, which used to load and now is refused): `git grep` over every `jammi.toml`/example config in `jammi-server`/`jammi-db` (`crates/jammi-server/examples/jammi.toml`, `crates/jammi-db/examples/sample-postgres.toml`) and the `jammi-server` it-suite (`server.rs`, `serve_bind_race.rs`, `readiness_preload.rs`, plus `ephemeral_addr()`'s `127.0.0.1 port 0` helper every in-process fixture uses). None found: every health/flight pair in these files uses either distinct ports (8080/8081) or the ephemeral `:0` host/port every in-process test fixture assembles at. `deploy/kubernetes/overlays/shape-d/*.toml` also has no same-port cross-host pair (each is a separate process's config; ports differ within each file) — out of scope (deploy/** is the docs unit's) but checked since the brief said "find and fix any such fixture", not "find and fix any such fixture in your scope".
+- Incidental fix: my `addresses_collide` insertion (17 lines) shifted every subsequent line in `crates/jammi-db/src/config/mod.rs`, staling one citation in `crates/jammi-ai/src/model/backend/gguf.rs:468` (`jammi-db/src/config/mod.rs:2675` -> `:2692`, caught by `check_citations.py`). Re-anchored the one line. `jammi-ai` is outside my four owned crates; this is a single-line citation-number fix caused directly by my edit, not a substantive change to that file.
+
+##### 2. Properties
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| For every worker row a `[worker] enabled` process registers, `ListWorkers`'s wire read of that row's `devices` equals the embedded `catalog().list_workers()` read of the same row | `crates/jammi-server/tests/it/grpc_job.rs::list_workers_carries_the_claiming_workers_devices` (feature `test-hooks`, `--test it`) | Hardcoded `devices: Vec::new()` in `JobServer::list_workers`'s mapping closure (`crates/jammi-server/src/grpc/job.rs`); red first line: `` assertion `left == right` failed: a `[gpu] device = -1` (CPU) worker registers exactly one device fact, ordinal 0 — got [] `` |
+| Adding `WorkerSummary.devices` (field 8) does not change the frozen `jammi.v1.*` package/rpc surface | `crates/jammi-server/tests/it/api_freeze.rs::wire_surface_equals_the_frozen_baseline` (feature `test-hooks`, `--test it`) — run unmodified against `api_freeze_baseline.txt` | Not mutated (a field addition is provably outside this oracle's domain — it decodes only `PACKAGE`/`RPC` tokens, per its own doc; confirmed by reading `live_surface()`, which never inspects message fields) |
+| `ListWorkers` stays on the control-plane allowlist (no per-tenant filter) after the field addition | `crates/jammi-server/tests/it/tenant_isolation_oracle.rs::{every_rpc_is_covered, allowlist_and_cases_partition_the_wire_surface, every_case_isolation_holds}` | Not mutated — these enumerate `(Service, Method)` pairs from the descriptor, unaffected by a field; ran to confirm no regression |
+| `addresses_collide(a, b)` is symmetric and matches the five named cases: equal fixed, equal `:0` never, `127.0.0.1`/`0.0.0.0` same port collides, `127.0.0.1`/`127.0.0.2` same port does not, `[::]`/`0.0.0.0` same port collides | `crates/jammi-db/src/config/tests.rs::addresses_collide_table` (`--lib --features test-hooks`) | Reverted the rule to whole-`SocketAddr` equality (`a == b && a.port() != 0`) as a scratch edit, re-ran: `127.0.0.1 port 9000` vs `0.0.0.0 port 9000` case fails (`addresses_collide(...) must be true`, got `false`); reapplied the real rule, GREEN restored |
+| Every pair among the six fixed-port fields (`ballista.scheduler_bind`, `ballista.executor.bind`, `ballista.executor.grpc_bind`, `server.health_listen`, `server.flight_listen`, `server.peer_bind`) is refused, naming both keys, when one side is a concrete host and the other is unspecified on the same port | `crates/jammi-db/src/config/tests.rs::ballista_every_fixed_port_collision_pair_is_refused_when_one_host_is_unspecified` (`--lib --features test-hooks`) | Same scratch revert as above; this enumeration test failed identically (every pair passed `validate` instead of erroring) before the real rule was restored |
+| `ServerConfig::validate`'s three-way check and `BallistaConfig::validate`'s six-way check apply the identical collision rule (one definition, not two) | Code inspection + both test suites above passing against the same `addresses_collide` call sites (`crates/jammi-db/src/config/mod.rs`'s `ServerConfig::validate` and `BallistaConfig::validate` both call it, verified by `grep -n addresses_collide crates/jammi-db/src/config/mod.rs`) | Not independently mutated beyond the two above — the shared-definition property is structural (one function, two call sites), not a separate runtime behaviour to red |
+| No pre-existing fixture in the touched crates relied on the old (narrower) collision rule | `cargo test -p jammi-server --features test-hooks --test it -- server:: serve_bind_race:: readiness_preload::` — all pass unmodified after the rule change | Not applicable (a search-and-confirm property, not a mutation-testable one); UNCOVERED note below |
+
+##### 3. Uncovered
+
+- **`deploy/**` fixtures under the new collision rule**: `deploy/kubernetes/overlays/shape-d/jammi-scheduler.toml` / `jammi-compute.toml` were read and contain no same-port cross-host pair, but `deploy/**` is out of my scope this unit (a concurrent docs unit owns it) — not run through `BallistaConfig::validate` here, only inspected by eye.
+- **A live two-process Ballista cluster actually refusing to bind at a real OS level under the old rule** (the "loads, then collides at bind time" scenario the brief's motivating example describes) is not exercised — `BallistaConfig::validate` is a pure config-parse-time check; no test in this unit stands up two real Ballista processes on colliding wildcard/concrete addresses. The oracle table above proves the predicate is now correct at the config layer, which is what `validate` owns; the OS-level bind collision this predicate is meant to prevent is Ballista's/the kernel's, out of this crate's reach to test directly.
+- **`jammi-client`'s "no separate mirror" claim** rests on a `git grep` finding zero `WorkerSummary` struct definitions there, not on an exhaustive proof no future re-export shim exists; if the lead knows of a hidden client-side conversion, flag it.
+
+##### 4. Gates
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo build -p jammi-wire -p jammi-server -p jammi-admin -p jammi-cli -p jammi-db --features test-hooks` | 0 | builds clean |
+| `cargo test -p jammi-server --features test-hooks --test it -- grpc_job:: api_freeze:: tenant_isolation_oracle:: server:: serve_bind_race:: readiness_preload::` | 0 | 42 passed, 0 failed |
+| `cargo test -p jammi-db --lib --features test-hooks -- config::` | 0 | 231 passed, 0 failed |
+| `cargo test -p jammi-db --lib --features test-hooks -- ballista collide server_config addresses_collide` | 0 | 11 passed, 0 failed (subset of the above, run first to isolate the new tests) |
+| `cargo fmt --all -- --check` | 0 | clean |
+| `cargo clippy -p jammi-wire -p jammi-admin -p jammi-client -p jammi-server -p jammi-db -p jammi-cli --all-targets --features test-hooks -- -D warnings` | 0 | no warnings |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1066 file(s) scanned, all PATH:LINE citations resolve (... 2 exempt as non-ancestor legacy evidence)` — the 2 exempt lines are pre-existing CUDA-artifact citations unrelated to this change |
+| `RUSTDOCFLAGS="-D warnings" cargo doc -p jammi-db -p jammi-server -p jammi-wire --no-deps` | 0 | generated clean, no warnings |
+| `RUSTDOCFLAGS="-D warnings" cargo doc -p jammi-admin -p jammi-cli --no-deps` (extra, not in the brief's gate list — the two crates I edited outside the brief's rustdoc set) | 0 | generated clean, no warnings |
+
+##### 5. Commits
+
+```
+be0109b2 feat(db): #500 WIREFIX — the fixed-port collision rule compares ports, not whole SocketAddrs
+65675b51 feat(wire): #500 WIREFIX — ListWorkers carries workers.devices
+```
+(`git log --oneline e339f995..HEAD`, base `e339f995`)
+
+### 11.10 DOCFIX — the doc-lens round's prose and overlay corrections (docs-ci) — landed as 1d568491 (original 33f4c314)
+
+**Lead's note.** Every finding of §9a that was prose is closed here; the three that were mechanisms (findings 1, 5, 6) were written for the shape §11.8/§11.9 then shipped, and the lead re-ran the citation resolver and the config-fence oracle on the tip that carries all three. `base/jammi.toml` gains `[distributed] max_world_size = 2` (the submit edge), `task_slots = 1` on the compute pods; the shipped overlay admits single-pod gangs and states the arithmetic a cross-pod gang needs.
+
+#### docfix — the doc-lens audit's ten prose/overlay corrections
+
+Base: `e339f995` (`feat/500-wave4`). Branch `unit/docfix`, tip `33f4c314`.
+
+##### 1. Scope shipped
+
+Prose-only and TOML/YAML-comment-only edits under `docs/guide/src/**`,
+`docs/maintainer/MAINTAINER-GUIDE.md`, `deploy/kubernetes/**`, `CHANGELOG.md`.
+No `crates/**` edit. Every finding below is the audit's own numbering (see
+`DOCFIX.md`).
+
+1. **`CHANGELOG.md` ~798, `MAINTAINER-GUIDE.md` ~688** — "mirrors it on
+   `ListWorkers`" now names the field: `WorkerSummary.devices` (field 8,
+   `repeated DeviceFact {kind, ordinal}`). No deviation: this states the
+   shape the concurrent wire unit is landing (proto field 8 does not exist
+   yet at e339f995 — `crates/jammi-wire/proto/jammi/v1/job.proto`'s
+   `WorkerSummary` message tops out at field 7 `state`); the brief
+   explicitly says finding 1 "becomes TRUE by the concurrent wire unit."
+2. **`reference-topologies.md` ~264** — replaced "`W <= local_ranks` runs
+   Local with no placement" with "placement is decided BEFORE topology…
+   regardless of `W` versus `local_ranks`", verified against
+   `crates/jammi-ai/src/fine_tune/worker.rs:1935-1960` (`placement_world`/
+   `placement` computed independent of `world_size` vs `local_ranks`; only
+   `decide()` at `crates/jammi-ai/src/fine_tune/worker.rs:5011` — called once a process actually runs
+   the body — compares them).
+3. **Cross-pod `Peer` unreachable** — `base/jammi.toml` gains `[distributed]
+   max_world_size = 2` (was absent — default is `1`,
+   `crates/jammi-db/src/config/mod.rs:1658`, confirmed refusing
+   `world_size > 1` at enqueue via `RankAdmission::from_config` in
+   `crates/jammi-ai/src/fine_tune/spec.rs:357`). `jammi-compute.toml`'s
+   `[distributed] max_world_size` comment rewritten (bounds THIS pod's
+   assembly, not "the coordinator's widest gang"). README ~32-35,
+   `jammi-compute.toml` (its own `[distributed]` block), and
+   `reference-topologies.md` ~261-263 rewritten with the exact arithmetic
+   the brief specifies; "spans both replicas" deleted from both guide
+   locations.
+4. **"Both roles claim the training kinds"** — `reference-topologies.md`
+   ~231-234 and README ~186-188 corrected: `jammi-server-scheduler` claims
+   `["fine_tune", "graph_fine_tune"]` only, verified against
+   `deploy/kubernetes/overlays/shape-d/jammi-scheduler.toml:31` (`kinds =
+   ["fine_tune", "graph_fine_tune"]`) — the compute StatefulSet alone
+   claims `context_predictor` too.
+5. **Port-collision rule** — `configuration.md` ~387 states "ports equal
+   and non-zero AND hosts equal or either host is unspecified." Verified:
+   at e339f995 `BallistaConfig::validate` (`crates/jammi-db/src/config/
+   crates/jammi-db/src/config/mod.rs:2420-2427`) actually checks `addr_a == addr_b` (full
+   `SocketAddr` equality — a stricter, currently-FALSE rule versus what
+   the doc will describe); the brief states finding 5 "becomes TRUE by the
+   concurrent wire unit," so this prose describes that unit's landing
+   shape, not e339f995's code as it stands today. Flagged as a deviation
+   from "docs describe current state" ONLY in the sense that it describes
+   the concurrent unit's target, which is the brief's own explicit
+   instruction for this finding.
+6. **"Matching device"** — CHANGELOG ~798-799 and MAINTAINER-GUIDE ~4249,
+   ~4263 restated as a device-KIND match (`InferenceExec::device_kind`,
+   `GangDescriptor.device_kind`, "cpu" is a kind too). Verified:
+   `InferenceExec::device_kind()` exists today
+   (`crates/jammi-ai/src/operator/inference_exec.rs:240`);
+   `GangDescriptor` (`crates/jammi-ai/src/operator/gang_exec.rs:48`) has
+   NO `device_kind` field yet, and `submit_physical_plan`
+   (`crates/jammi-ballista/src/client.rs:42-58`) hard-codes `kind == "cuda"
+   || kind == "metal"` rather than matching the plan's own kind — again
+   the brief's stated "becomes TRUE by the concurrent lane unit," written
+   for that landing shape.
+7. **`task_slots`** — `jammi-compute.toml` `task_slots` dropped from `2` to
+   `1`; comment rewritten with the true reason. Verified:
+   `HostAdmission::probe_claim` (`crates/jammi-ai/src/fine_tune/worker.rs:2302`) gates on ONE job slot
+   per process regardless of `[gpu] devices` count — a placed gang and the
+   pod's own claim contend for that single slot, not for two independent
+   Ballista task slots.
+8. **Journey markers removed**: `deployment-scheduler.yaml:2`,
+   `statefulset-compute.yaml` (its trailing `(design contract
+   feat_500-wave4.md §9 B7)`), `jammi-compute.toml` (top-of-executor-block
+   citation), and `MAINTAINER-GUIDE.md` at the `2.8f`/`2.8g` section opens
+   and the two `(contract §9 B…)` parentheticals. Left untouched (out of
+   this audit's ten findings, not touched): `docs/maintainer/MAINTAINER-GUIDE.md:3970`
+   ("Plan 67 U5b-1b-ii") and `:4129` ("Plan 67 U5b-1b-iii") — the brief's
+   finding 8 names only `~4203, ~4244, ~4260, ~4267`, and
+   `crates/jammi-db/src/config/mod.rs`'s own `docs/rigor/contracts/
+   feat_500-wave4.md § 2.2` citation, which is `crates/**` and out of
+   scope for this unit.
+9. **Rollout knob** — README ~129 restated: "no `maxSurge`; `maxUnavailable`
+   exists only behind the alpha `MaxUnavailableStatefulSet` feature gate —
+   assume strictly serial…", verbatim per the brief.
+10. **Third arm** — added to `reference-topologies.md` (the scheduler
+    bullet) and README ("Compute plane", the scheduler bullet): "when a
+    registered executor exists but none of its own devices lists the
+    plan's device kind, the submission is refused typed before it ever
+    reaches the scheduler — the row is left `running` for reclaim (an
+    attempt spent), never run in-process." Verified against
+    `crates/jammi-ai/src/fine_tune/worker.rs:2181`'s own doc comment: "[`WorkerJobError::Abandoned`]
+    (left `running` for reclaim, an attempt spent)" — exact wording match.
+
+No `crates/**` file touched; no shared-declaration file (`lib.rs`/
+`Cargo.toml`/`error.rs`) touched.
+
+##### 2. Properties
+
+This is a prose/config-comment unit; "properties" here are citation/schema
+resolution properties, not code behavior claims.
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| Every `PATH:LINE` citation this unit's prose relies on resolves against HEAD | `python3 ci/scripts/perf/check_citations.py` (exit 0, "1066 file(s) scanned, all PATH:LINE citations resolve") | No new bare `PATH:LINE` citation was added by this unit's own diff (I verified every code fact by opening the cited source myself rather than adding a new checked citation token); this run is a non-regression check, not a red/green pair I mutated. Left as a gap below rather than fabricated. |
+| The `deploy/kubernetes` TOML files this unit edited (`base/jammi.toml`'s new `[distributed]` section, `overlays/shape-d/jammi-compute.toml`'s edited `[distributed]`/`task_slots`) still LOAD AND VALIDATE under the real `JammiConfig::load_from` (not just parse — full section validation) | A temporary, never-committed probe test added to `crates/jammi-db/tests/it/docs_config_fences.rs` (`scratch_probe_deploy_kubernetes_shape_d_tomls_load_and_validate`; the shipped `docs_toml_fences_parse_under_the_real_loader` only walks `docs/guide/src`, never `deploy/kubernetes`), run as `cargo test -p jammi-db --features test-hooks --test it scratch_probe_deploy_kubernetes_shape_d_tomls_load_and_validate` — GREEN (1 passed) against `base/jammi.toml`, `overlays/shape-d/jammi-compute.toml` (with `JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST` emulating the pod's own downward-API env override), and `overlays/shape-d/jammi-scheduler.toml` | Mutation actually executed: set `base/jammi.toml`'s `max_world_size = 0`, reran the SAME probe test — RED, first line: `load_from(deploy/kubernetes/base/jammi.toml): Configuration error: [distributed] max_world_size must be >= 1 (1 is the single-rank deployment; 0 admits no gang at all)`. Reverted `base/jammi.toml` to the committed `= 2` (confirmed `git diff` empty against `33f4c314`), reran the probe — GREEN again, then reverted the temp test file itself with `git checkout -- crates/jammi-db/tests/it/docs_config_fences.rs` (confirmed `git status --short` clean, no `crates/**` edit ships). |
+| Every kustomize overlay this unit's `base/jammi.toml` edit affects (`base`, `shape-d`, `ci`) still renders manifests that pass `kubeconform --strict` under the pinned schema | `kustomize build deploy/kubernetes/<overlay> \| kubeconform --strict --summary --kubernetes-version 1.34.11 -schema-location <pinned> -cache <dir> -` for `base` (3/3 valid), `overlays/shape-d` (9/9 valid), `overlays/ci` (7/7 valid) — all exit 0 | Not separately mutated: this gate validates Kubernetes manifest SHAPE (ConfigMap/StatefulSet/Deployment schema), not the embedded TOML's own semantics — the TOML-semantics property (and its executed mutation) is the row above. UNCOVERED here in the narrow sense that no kubeconform-specific red-check was run (see §3). |
+| No doc-list enumeration this unit touched drifts from its code enum | `python3 ci/scripts/check_doc_parity.py` (exit 0, "all bindings in parity") | Not applicable: this unit added no new enumerated list bound to a code enum; the gate was run to confirm no regression from the prose edits (unchanged pass/fail set before and after, both zero findings). |
+| No new consumer name or governance-verb stem introduced by this unit | `python3 ci/scripts/check_no_consumer_names.py` (exit 0; one pre-existing ADVISORY on `stage_is_gpu_bound` in `crates/jammi-ballista/src/engine.rs`) | Confirmed pre-existing, not introduced by this unit: `git show e339f995:crates/jammi-ballista/src/engine.rs \| grep stage_is_gpu_bound` finds the same symbol at the base commit, before any edit in this unit's diff. |
+
+##### 3. Uncovered
+
+- **Findings 1, 5, 6** describe the state AFTER a concurrent code unit
+  lands (`ListWorkers`' `devices` field 8, the unspecified-host port
+  collision rule, and `GangDescriptor.device_kind`/kind-matched
+  `submit_physical_plan`). At this unit's own base (`e339f995`) none of
+  these three are true yet in the code the docs cite — UNCOVERED by this
+  unit's own oracles (I cannot execute a test against code that has not
+  landed on my branch). The brief explicitly directs writing the prose for
+  "the shape they are building," so this is a stated, brief-authorized gap,
+  not a silent one. The lead's consolidation must re-run
+  `check_citations.py` and the doc-parity/config-loader tests on the
+  MERGED tip (after the concurrent wire/lane units land) to confirm these
+  three findings' prose actually matches the shipped code, not just the
+  brief's description of it.
+- **`kube-smoke.yml`'s live kind cluster apply** was not run (out of this
+  unit's gate list; `kubeconform --strict` was run standalone per the
+  brief's own gate list, not the full `kube-smoke.yml` job).
+- **Whether `deploy/kubernetes/overlays/ci/jammi.toml`** (a separate
+  ConfigMap layered over `base/jammi.toml` for the kind smoke) needs its
+  own `[distributed]` override was not investigated — it was not named in
+  any of the ten findings, and the `ci` overlay's own kubeconform pass
+  (7/7 valid) confirms the new `[distributed]` section does not break that
+  overlay's schema validity, which is the only property this unit's gate
+  list asks for.
+
+##### 4. Gates
+
+| Command | Exit | Result |
+|---|---|---|
+| `python3 ci/scripts/perf/check_citations.py` | 0 | 1066 files scanned, all PATH:LINE citations resolve (2 pre-existing EXEMPT legacy artifacts, unrelated to this unit) |
+| `python3 ci/scripts/check_doc_parity.py` | 0 | all bindings in parity |
+| `python3 ci/scripts/check_no_consumer_names.py` | 0 | 1 pre-existing ADVISORY (`stage_is_gpu_bound`, untouched by this unit), not a hard fail |
+| `mdbook build docs/guide --dest-dir <scratch>/book` | 0 | clean build, no warnings |
+| `cargo test -p jammi-db --features test-hooks --test it docs_toml_fences_parse_under_the_real_loader` | 0 | 1 passed; 0 failed; 557 filtered out |
+| `cargo fmt --all -- --check` | 0 | no diff |
+| `kustomize build deploy/kubernetes/base \| kubeconform --strict --summary --kubernetes-version 1.34.11 -schema-location <pinned> -cache <dir> -` | 0 | 3 resources, Valid: 3, Invalid: 0, Errors: 0 |
+| `kustomize build deploy/kubernetes/overlays/shape-d \| kubeconform …` | 0 | 9 resources, Valid: 9, Invalid: 0, Errors: 0 |
+| `kustomize build deploy/kubernetes/overlays/ci \| kubeconform …` | 0 | 7 resources, Valid: 7, Invalid: 0, Errors: 0 |
+
+##### 5. Commits
+
+```
+33f4c314 docs(500): wave 4 DOCFIX — doc-lens audit's ten prose/overlay corrections
+```

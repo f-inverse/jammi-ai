@@ -276,6 +276,170 @@ f4d84145 feat(ai): #500 U4b — canonical_reduce: zero-filled, canonical-order a
 ```
 
 
+## 2c. The pod-leg artifact producer (U4b's pod-leg obligation, plan row B8; landed as three commits, originals `6a9ced97`/`b7df5ff0`/`27d52e94`)
+
+The implementer's contract, folded by the lead: ε = 2e-4 registered in its own commit first (its sha re-anchored to this branch's cherry-picked registration commit `e7440afd`, an ancestor of every later tip); the artifact writer is the one function the pod run calls, proven against rule (k) on CPU with a red that came from the pre-registration rule itself; per-EPOCH loss deltas (the only granularity an integration test can observe; the registry requires none). The GPU body is UNCOVERED until the pod runs it — pod-leg run 3 on this branch is that run, and its artifact lands as its own commit.
+
+#### 1. Scope shipped
+
+- **`crates/jammi-ai/tests/gpu_capability/gang_pod_leg.rs`** (NEW). Two-commit
+  shape, per the brief's rule (k) ordering requirement:
+  1. `6a9ced97614890d8c50880b33b3bd70d2e2a67d1` — registers
+     `GANG_POD_LEG_EPSILON` (2e-4) and its derivation alone, before any test
+     reads it and before this leg's own use of it exists.
+  2. `b7df5ff0` — the rest of the module: the `#[test]
+     gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1`, the pure
+     artifact writer (`GangPodArtifact`/`build_gang_pod_artifact`/
+     `write_gang_pod_artifact`), and the hermetic `synthetic_artifact_tests`
+     module — plus `GANG_POD_LEG_EPSILON_REGISTERED_SHA` (commit 1's own
+     sha, learned only once it existed).
+- **`crates/jammi-ai/tests/gpu_capability/main.rs`**: added `mod gang_pod_leg;`.
+- **`docs/maintainer/dev-gpu.md`**: the gang-leg "The artifact" paragraph now
+  names the producer test (it previously described the artifact appearing
+  with no stated writer).
+- No other file touched (`ci/scripts/check_cuda_run_artifacts.py`'s rule (k)
+  registry did not need a new field — every field the pod leg's schema
+  requires already exists in `GANG_POD_FIELD_REGISTRY`).
+
+##### Deviations from the brief, with the code cited (the lead opens the cited
+code before accepting these)
+
+1. **Per-EPOCH, not per-step, `gang.per_step_loss_delta`.** The brief's item
+   2 asks for `per_step_loss_delta[] = |loss_w2[t] − loss_w1[t]| per global
+   step`. The CPU-hermetic oracle this mirrors
+   (`gather_exactness_w2_matches_w1_within_pre_registered_epsilon`,
+   `crates/jammi-ai/src/fine_tune/trainer.rs:14997`) reads per-step loss via
+   `TrainingLoop::compute_loss_gathered`/`encode_chunk`
+   (`crates/jammi-ai/src/fine_tune/trainer.rs:507` — `TrainingLoop`'s
+   `target`/`base_model`/etc. fields are all PRIVATE, and neither
+   `compute_loss_gathered` nor `encode_chunk` is `pub`). This unit's scope is
+   `crates/jammi-ai/tests/gpu_capability/**` only; `trainer.rs` is out of
+   scope (shared-declaration-adjacent for this wave, and the brief itself
+   says "No other file"). The only per-run-progress granularity an external
+   integration test CAN observe is the per-EPOCH `avg_train_loss`
+   `harness::loss_capture` already captures off the trainer's own
+   `tracing::info!("Epoch complete", …)` event — confirmed at
+   `crates/jammi-ai/tests/gpu_capability/harness.rs:434-567` (the exact
+   mechanism `fine_tune_learns.rs`'s P2 already uses,
+   `crates/jammi-ai/tests/gpu_capability/fine_tune_learns.rs:88-90`). Named
+   in the module doc's "Deviations" section. The registry field itself does
+   not encode a granularity requirement — `_gang_check_delta_series`
+   (`ci/scripts/check_cuda_run_artifacts.py:1182`) only requires a non-empty
+   list of finite numbers — so this is a wording deviation, not a schema
+   violation.
+2. **No `Collective` trait import**, unlike `gang_nccl.rs`'s module-level
+   `use jammi_ai::fine_tune::collective::Collective;`
+   (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:100-101`). That import
+   exists there because `assert_gang_checks` calls collective methods
+   (`all_reduce_sum`, `all_gather`, `all_reduce_max_flags`, `barrier`,
+   `is_aborted`) DIRECTLY on a `Nccl` value
+   (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:267-343`), and those
+   methods are trait methods, not inherent ones. `gang_pod_leg.rs` never
+   calls a collective method directly — training runs entirely through
+   `RankContext`/`TrainingLoop::run`
+   (`crates/jammi-ai/src/fine_tune/trainer.rs:322-341` for `RankContext`,
+   `:1084` for `run`), which invoke the collective internally. The one place
+   this module constructs an `Arc<dyn Collective>` is `Arc::new(nccl_rank)`
+   handed to `RankContext::new(collective: Arc<dyn Collective>, ..)`
+   (`crates/jammi-ai/src/fine_tune/trainer.rs:340`), whose parameter type
+   already names the trait — the unsized coercion type-checks without a
+   local `use` (confirmed: `cargo check --features live-gpu-tests` is clean
+   with no `Collective` import anywhere in this file).
+3. **Own copies of small (<20-line) helpers**, never edits to files this
+   unit does not own:
+   - `serial_cuda_device_or_require`/`second_cuda_device_or_require` mirror
+     `gang_nccl.rs`'s same-named functions
+     (`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs:111-149`), which are
+     private to that module (no `pub`) and that file is out of this unit's
+     scope (owned by a concurrent implementer per the brief's file list).
+   - `claimed_job` mirrors `trainer.rs`'s `test_fixtures::claimed_job`
+     (`crates/jammi-ai/src/fine_tune/trainer.rs:7306-7348`), `pub(super)` —
+     not reachable across the crate boundary from an integration test, and
+     `trainer.rs` is out of scope.
+   - `ephemeral_artifact_store`/`ephemeral_hub_source` mirror
+     `gguf_quantized_gpu.rs`'s private helpers of the same shape
+     (`crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs:831-853`).
+   All four are direct structural copies of already-proven, already-tested
+   patterns (not derivations), duplicated only because the originals are
+   private/out-of-file-scope. Each is cited above so the lead can diff it
+   against its original.
+4. **`load_tiny_bert_on` loads directly onto a named CUDA device** via
+   `ModelResolver` + `CandleBackend::load(&resolved, &DeviceConfig{gpu_device,
+   devices: vec![gpu_device], ..})` rather than the async `ModelCache`'s
+   scheduler-budget path (`session.model_cache().get_or_load_on(..)`) —
+   mirrors `gguf_quantized_gpu.rs`'s own precedent for placing a
+   `LoadedModel` on a specific device
+   (`crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs:821-929`).
+   `ModelCache::get_or_load_on` needs a `[gpu] devices` config declaring
+   BOTH cuda:0 and cuda:1 up front and per-device budget bookkeeping this
+   leg's tiny fixture does not need; the resolver+backend path is the
+   simpler, already-proven route to "this exact model, on this exact
+   device".
+
+#### 2. Properties
+
+| Property (quantified) | Executed oracle | Executed mutation that reds it |
+|---|---|---|
+| The full non-`cuda` arm of `gang_pod_leg.rs` (module doc, non-gated helpers, the writer, the hermetic tests) type-checks under `--features live-gpu-tests` (no `cuda`) | `cargo check -p jammi-ai --features live-gpu-tests --test gpu_capability` — exit 0, no warnings | N/A (a compile gate, not a numeric property) — confirmed the two `dead_code` warnings this file first produced (`gang_pod_artifact_filename`/`write_gang_pod_artifact`, only called from the `cuda`-gated real test) by running the check BEFORE wiring `write_gang_pod_artifact` into `synthetic_artifact_tests::run_checker_written`, then confirmed clean after |
+| `build_gang_pod_artifact`'s clean, well-formed `pass` output (written through `write_gang_pod_artifact`, the SAME function the real pod run calls) satisfies EVERY field `ci/scripts/check_cuda_run_artifacts.py`'s rule (k) POD registry requires | `synthetic_artifact_tests::synthetic_pass_artifact_satisfies_rule_k` — `cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability gang_pod_leg -- --test-threads=1`: **ok** | ORGANIC red, captured before commit 2 landed: with `GANG_POD_LEG_EPSILON_REGISTERED_SHA` == the CURRENT `git rev-parse HEAD` (uncommitted commit 2 not yet made, so HEAD was still commit 1 itself), the test failed with `` `gang.epsilon.registered_sha` equals the artifact's own `git_sha` (6a9ced97614890d8c50880b33b3bd70d2e2a67d1) — the ε must be registered BEFORE the tree that was measured, never in the same commit `` — i.e. the pre-registration ordering check genuinely bites when ε and the measured tree coincide. Committing (advancing HEAD past the registration commit) turned it green. |
+| `build_gang_pod_artifact`'s well-formed `fail` output (reason set, status `RED`, an unequal digest pair) ALSO satisfies rule (k) cleanly — a failing run is representable, not refused | `synthetic_artifact_tests::synthetic_fail_artifact_satisfies_rule_k` — **ok** | Same organic red as above (this test hit the identical epsilon-ordering finding before commit 2 landed); green after |
+| Dropping `gang.epsilon` from an otherwise-clean artifact is NAMED by the checker (the non-vacuous half: a checker that never fires would pass the shape test vacuously) | `synthetic_artifact_tests::missing_epsilon_is_named_by_the_checker` — **ok**, asserts a finding containing `gang.epsilon` | The test body itself IS the mutation (`artifact["gang"].remove("epsilon")`) executed every run; its own assertion is the red-proof that the checker bites — confirmed by reading the checker's actual returned finding during a manual run: `` `gang.epsilon` is missing — the pre-registered tolerance, its derivation, and the commit it was registered at… `` |
+| `GANG_POD_LEG_EPSILON_REGISTERED_SHA` is a well-formed 40-lowercase-hex sha | `synthetic_artifact_tests::epsilon_registered_sha_is_well_formed` — **ok** | Standing shape check (a malformed constant would fail this directly); the ancestry/ordering claim itself is exercised by the two tests above via the real checker, not re-derived here |
+| The pod-leg training/artifact-writing property itself (U4b acceptance (a)/(c): reproducible digest pair, per-epoch loss within ε) | **UNCOVERED here** — see §3 | N/A — no CUDA toolchain in this authoring environment; every line touching a CUDA device is `#[cfg(feature = "cuda")]`-gated and did not compile/run in this session |
+
+Gate-command exit codes double as an executed "does the whole non-cuda arm
+still assemble" oracle; see §4.
+
+#### 3. Uncovered
+
+- **The real pod-leg property itself** (byte-identical digest pair across
+  two W=2 runs; the per-epoch loss delta within `GANG_POD_LEG_EPSILON`
+  against a real W=1×2B reference) — no CUDA toolchain in this authoring
+  sandbox (no `nvcc`/`libnccl`). Everything that exercises it is
+  `#[cfg(feature = "cuda")]`-gated and did not run here. The lead runs the
+  leg on the pod (`ci/scripts/runpod_gpu_gang.sh`) and returns the
+  compiler's/driver's output on a failure, per the brief.
+- **Whether `load_tiny_bert_on`'s `DeviceConfig{gpu_device: 1, devices:
+  vec![1], ..}` actually places the model on `cuda:1`** rather than `cuda:0`
+  — this is exactly the kind of off-by-one only a real second device can
+  refute; untestable without CUDA.
+- **`nvidia_smi_field`'s `--id=<ordinal>` flag actually scoping to the named
+  GPU** — untestable without `nvidia-smi`/a real device; a malformed query
+  degrades to `"unknown"` rather than panicking (by design — the module doc
+  states this is descriptive metadata, not a correctness input), but that
+  degrade path itself is unexercised here too.
+- **The dropout-position gather at `lora_dropout > 0`** is out of this
+  leg's scope by the brief's own acceptance (`lora_dropout = 0.0`
+  pinned) — U4b tail's `dropout_seed_split_*` oracles own that property.
+
+#### 4. Gates
+
+| Command | Exit | Notes |
+|---|---|---|
+| `cargo fmt -p jammi-ai -- --check` | 0 | Clean after one `cargo fmt -p jammi-ai` pass (formatting-only diffs: line wraps, arg lists) |
+| `cargo fmt --all -- --check` | 0 | Also clean (no other crate touched) |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` (brief's literal command) | 0 | Does **not** compile `gpu_capability` at all — that target's `required-features = ["live-gpu-tests"]` (`crates/jammi-`ai/Cargo.toml` (line 355 at the unit tip)) is not satisfied by `test-hooks` alone, so this command is a no-op for the file this unit ships. Reported honestly rather than cited as coverage it is not. |
+| `cargo clippy -p jammi-ai --test gpu_capability --features live-gpu-tests,test-hooks --all-targets -- -D warnings` (the gated-surface variant that DOES compile this file, matching CI's own gated-surface clippy step) | 0 | Clean, no warnings |
+| `cargo check -p jammi-ai --features live-gpu-tests --test gpu_capability` | 0 | Clean, no warnings (the two `dead_code` warnings hit during authoring, fixed — see §2) |
+| `cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability gang_pod_leg -- --nocapture --test-threads=1` | 0 | **5 passed; 0 failed.** `gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1` passes VACUOUSLY here (`skip_without_gpu!()` returns immediately — no CUDA feature compiled in this session); the 4 `synthetic_artifact_tests` pass FOR REAL (see §2) |
+| `python3 ci/scripts/check_cuda_run_artifacts.py --self-test` | 0 | `cuda-run-artifacts self-test: OK` — the checker's OWN self-tests (including every rule (k) fixture) still pass; this unit did not touch the checker |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `1042 file(s) scanned, all PATH:LINE citations resolve` (same 2 pre-existing EXEMPT legacy citations as before this unit's changes; nothing new) |
+
+#### 5. Commits
+
+`git log --oneline 109b9c39..HEAD` (this unit's branch base, `feat/500-wave3c @ 109b9c39`
+— `main..HEAD` would additionally list the whole wave-3c stack this branch
+carries, since the local `main` ref in this worktree is behind that base):
+
+```
+27d52e94 docs(maintainer): #500 U4b — name the pod-leg gang artifact's own producer
+b7df5ff0 test(ai): #500 U4b — the pod-leg gang artifact producer over Nccl
+6a9ced97 test(ai): #500 U4b — register the pod-leg gang epsilon ahead of the test and run that measure against it
+```
+
+Tip: `27d52e9425e5720657f5b348ce0a16db5da7dcfc`
+
+
 ## 2a. U4b tail (landed as one commit; original `1261041b`) — streamed arm at `world > 1`; LoRA init/dropout seed split; per-rank dropout positions exercised
 
 The implementer's contract, folded by the lead after checking: the `world > 1` refusal for a streamed source is gone and both epoch loops are `for step in 0..train_batches_per_epoch`; `EpochSource::next_chunk` returns the chunk, never a sentinel; `LoraLinear::{new_seeded, new_with_base_seeded}` split the init seed from the dropout seed with the original constructors as `seed, seed` wrappers; the coordinator's files were not touched. Its two Uncovered items (the worker's construction call sites wired to the `_for_rank` builders with a per-rank dropout seed; the `LoraBuildConfig`/`EncoderAdapters` seed split) belong to the same `run_spec` topology site the coordinator body owns and are folded into §6's scope.
@@ -1580,9 +1744,407 @@ The lead's consolidation takes the four `U5b-1b-ii` commits and drops it (an emp
 cherry-pick on a branch that already has it). Tip: `a8ab966725b4b7d3ede7641e554971681b0807b9`.
 
 
-## 7. U5b-1b-iii
+## 7. U5b-1b-iii (landed as one commit after its rebase onto `a072ad59`; original `2264c28e`)
 
-(built after §6)
+The implementer's contract, folded by the lead after checking: `LeaseHolder` is a separate type so a `Rank` has nothing to pass to a job-row writer (the executed compile error); every writer site takes it; the body runs through the real hold loop and `RankEvent::Outcome` is consumed on receipt with the coordinator publishing only when every member's digest equals its own; the agreement digest is bound at the top of `run`. Two rebase-time decisions accepted on the evidence: the chaos rows drive rank 1 through the REAL body (the tap survives for body-less sessions only), and the resume pin is WITHDRAWN — U5b-2's executed chaos rows have a retired attempt's successor gang resume from the shared root, which the listing's root-identity predicate guarantees every member shares (issue #543 re-scoped to fleets without a shared root). Plan row U5b-1b-iii carries the dated correction.
+
+Worktree `wt-u5b1biii`, branch `unit/u5b1biii`, base `feat/500-wave3c` @ `82f80b84`. Every path
+is repo-relative; every oracle named was executed on the tip (§4); every mutation in §2 was
+applied to the committed tree, run through ONE filtered test (or one `cargo check`), and
+reverted (`git checkout -- <file>`, `git status --short` empty afterwards — `u5b1biii-scratch/
+mutations.py`, logs `mut-M*.log`). One `--features` set per crate for the whole session
+(`jammi-ai`, `jammi-server`, `jammi-db`: `test-hooks`), `RUSTC_WRAPPER=sccache`,
+`CARGO_TARGET_DIR=…/targets/u5b1biii`.
+
+#### 1. Scope shipped
+
+**`crates/jammi-ai/src/fine_tune/role.rs` (new; `fine_tune::role`)** — the single-writer rule
+as types. `LeaseHolder { LoopClaimer, Coordinator }` (the ONE writer of an attempt's row:
+today's in-process path incl. a `Local` gang's rank 0, which never traverses the coordinator
+body; rank 0 of a `Peer` gang) and `RunnerRole { Holder(LeaseHolder), Rank { rank } }` (what a
+body runs AS; `implied_by_rank`, `rank()`, `lease_holder() -> Option<LeaseHolder>` — `None` for a
+`Rank`, which is what makes every durable write unreachable from a rank body). The derived shape
+the brief left open: the brief's `RunnerRole::{LoopClaimer, Coordinator, Rank{rank}}` would let a
+`Rank` be PASSED to a job-row writer and refused at run time; splitting the holder out as its own
+type makes the job-row writers take `LeaseHolder`, so a `Rank` has no value to pass and the write
+is a compile error (§2, the executed M12).
+
+**`crates/jammi-ai/src/fine_tune/worker.rs`**
+- Every job-row-writing site on the run path takes a `LeaseHolder` (REQUIRED, by value): the
+  module doc's new "Runner roles and the job-row writers" section carries the per-site table,
+  derived by `grep -n 'record_failed(\|finish_job_with_model(\|persist_acceleration_report(\|register_job_hold_or_release(' worker.rs`
+  minus doc lines — 17 rows: `register_job_hold_or_release(.., holder)` (the lease-hold
+  registration, the `Releasing` self-release arm, the holder accounting `job_running()` — row 1;
+  the `test-hooks` recorder `note_lease_holder` sits here), the 13 production `record_failed(holder,
+  ..)` sites (rows 2–9, 11–15: `run_claimed_job_under` ×3, `publish_and_finalize` ×5,
+  `run_claimed_compute_job` ×5), the finalize CAS inside `publish_and_finalize(holder, ..)` (row
+  10), `persist_acceleration_report(holder, ..)` and its two markers `mark_acceleration_
+  {not_applicable,undetermined}(holder, ..)` behind `compute_and_persist_acceleration_report(..,
+  role: RunnerRole, ..)` — a `Rank` computes and discards, `role.lease_holder()` is the gate (row
+  16), and `coordinate`'s `record_assembly_outcome`/`release_job_lease` as `LeaseHolder::
+  Coordinator` (row 17). The two test call sites of `record_failed` pass `LoopClaimer`.
+- `lease_holder_for(spec, local_ranks) -> LeaseHolder` (pub): the ONE derivation — `Coordinator`
+  exactly when a column-source `fine_tune` decides `TopologyDecision::Peer` over this host's
+  `[worker] local_ranks` (the SAME `decide` call `run_spec` makes), `LoopClaimer` otherwise (a
+  single rank, a `Local` gang, every `graph_fine_tune`, a context predictor). Derived once in
+  `run_claimed_job_under` right after the spec deserialises and threaded: `run_spec(.., holder)`,
+  `train_fine_tune(.., holder, topology)` (rank 0 gets `RunnerRole::Holder(holder)`, every other
+  local rank `Rank { rank }`), `publish_and_finalize(holder, ..)`, the post-run `record_failed`s.
+  `coordinate`/`assemble_and_run` run as `LeaseHolder::Coordinator` by their own name.
+- `RunFineTuneParams { role: RunnerRole }` replaces `rank: u32` (`rank = role.rank()`);
+  `run_fine_tune_blocking` records `note_runner_role` and sets `.runner_role(role)` on the trainer
+  builder.
+- `bind_training_source(session, table, columns, task, detected, common) -> TrainingSource`:
+  `run_spec`'s FineTune source selection (the `whole_set_arm` predicate, the `Resident` eager
+  read-back with reservation, the `Streamed` set with F5's pre-pass and F3's vocabulary) factored
+  out, called by rank 0 in `run_spec` and by the rank body — the ranks' loaders derive from one
+  definition. `bind_recorded_training_set` returns `(TrainingSetTable, MaterializationManifest)`
+  (the member verifies its leaves against the sidecar it just verified) and documents its error
+  classes: every refusal is `JammiError::FineTune`, every other variant is a read faulting.
+- **The rank body**: `MemberAssignment { job_id, attempt, rank, world, coordinator_instance_id,
+  tenant, training_set_ref, training_set_location, spec_json }`, `RankOutcome { Trained {
+  artifact_digest }, Failed { reason }, Aborted(AbortReason) }`, `pub async fn run_member_rank(
+  session, assignment, link: MemberLink, cancel) -> RankOutcome` (+ `member_rank_body` under the
+  row's tenant scope): decode the spec (a column-source `fine_tune` only; the spec's `world_size`
+  must equal the assignment's), `bind_recorded_training_set` (refusal → `Aborted(Refuted)`;
+  `Storage`/`Io` → `Aborted(StoreUnavailable)`; other → `Aborted(Unavailable)` — the hold loop's
+  re-verification classes), `verify_partition_leaves` over the sidecar's whole inventory BEFORE the
+  first collective (a bad leaf → `Aborted(fault.abort_reason())`), `bind_training_source`, load the
+  base model, `Peer::member(rank, world, link, device, max_message_bytes).with_timeout(
+  rank_timeout_secs)`, `RankContext::new(peer, for_gang(rank, world, batch, BlockByGlobalBatch))`,
+  then `run_fine_tune_blocking` on `BlockingCall::spawn_blocking` — the THIRD production minting
+  site (documented in `collective/mod.rs` on `mint`/`spawn_blocking`) — as `RunnerRole::Rank {
+  rank }` with `worker_id = coordinator_instance_id` (the lease holder's id, which a `Rank` never
+  writes under). Its end: `adapter_files_digest(training.artifact_dir)` → `Trained`; a typed
+  error/panic/join error → `Failed`. `adapter_files_digest(dir)` (pub): SHA-256 over every regular
+  file directly in `dir` in name order as `name`, NUL, `len` (LE u64), bytes — exactly
+  `publish_artifact`'s file set, computed by the ONE function on both sides.
+- **`Outcome` consumed**: `assemble_and_run` step (7) `reconcile_member_ends(&coordinator,
+  &artifact)` after `train_fine_tune` returns `Ok`: `Peer::collect_member_ends` on a blocking
+  thread, then per rank — `Trained` with rank 0's own `adapter_files_digest` → ok; a differing
+  digest or `Failed { reason }` → `CoordinatorEnd::TrainingFailed` (the job's own failure,
+  recorded `failed`, nothing published); `Aborted(raw)` → `MemberAborted { rank, reason }`;
+  `Ended(why)` → `LinkFault`. `end_members` (now step 8) runs whichever way. The `test-hooks`
+  recorder `note_member_end`/`member_ends_for(job_id)` keys on the output model id.
+- **The resume pin — WITHDRAWN at the rebase (§6, deviation 12).** It was built as
+  `CoordinatorEnd::ResumeRefused` + `ArtifactStore::has_resume_checkpoint` + an assembly-time
+  refusal on the pre-rebase tip `74b7e5e0`; on the consolidation tip the successor gang of a
+  retired attempt RESUMES from the shared store (U5b-2's executed chaos rows), and the real
+  member body resumes through `run_fine_tune_blocking`'s `discover_resume` exactly as rank 0
+  and a `Local` rank do. Nothing of the pin remains on the tip.
+- `training_test_hooks`: `note_lease_holder`/`lease_holders_for(job) -> Vec<(attempt,
+  LeaseHolder)>`, `note_runner_role`/`runner_roles_for(job) -> Vec<RunnerRole>`, `note_member_end`/
+  `member_ends_for(job) -> Vec<(rank, Debug)>`, `fail_member_outcome(job, reason)`/`take_member_
+  failure` (the fault injection at the body's natural end).
+- Unit tests: the total-table oracle now asserts exactly `{Moved, ResumeRefused}` record nothing;
+  `the_lease_holder_is_the_coordinator_exactly_when_a_fine_tune_decides_peer` (a 3×4 grid over
+  `fine_tune` and `graph_fine_tune`).
+
+**`crates/jammi-ai/src/fine_tune/trainer.rs`** — `TrainingLoop.role: RunnerRole`;
+`TrainingLoopBuilder::runner_role(role)`; `build()` derives the role from the rank context when
+unset (`RunnerRole::implied_by_rank(rank_ctx.rank())` — rank 0 the loop claimer, the pre-role
+default, so every existing caller changes zero bytes) and REFUSES a role whose `rank()` differs
+from `rank_ctx.rank()` (typed: "the role and the rank must agree"); `save_resume_checkpoint`
+(after the lockstep gather) and `save_epoch_checkpoint` write only when `self.role.
+lease_holder()` is `Some` — the runner-role gate lives HERE, `store/artifact.rs` stays
+role-agnostic. **The agreement binding**: `RankContext::bind_agreement(&self, names)` →
+`Collective::bind_agreement(canonical_vars_digest(names))`, called at the top of
+`TrainingLoop::run` right after `optim_param_names` (the varmap is final, the first collective is
+ahead) over `optimizer::sorted_trainable_var_names(&self.varmap)` (new; the SAME lock and sort
+as `sorted_trainable_vars`). New test module `runner_role_and_agreement_oracle` (3 oracles, §2).
+
+**`crates/jammi-ai/src/fine_tune/collective/{mod,noop,local,nccl,peer}.rs`** —
+`Collective::bind_agreement(&self, digest: String) -> Result<()>` on the trait (object-safe;
+`Noop`/`Nccl` accept and ignore — a gang of one has no peer, NCCL carries no descriptor;
+`Local`/`Peer` bind once through the shared `bind_agreement_once` over a `OnceLock<String>`:
+the same digest again is a no-op, a different one a typed error naming both; `with_agreement`
+builders kept, now over the `OnceLock`). `peer.rs`: `Link.outcome: Option<Outcome>` recorded in
+`recv` beside `session_abort` (`Inbound::outcome`); `MemberEnd { Trained { artifact_digest },
+Failed { reason }, Aborted(i32), Ended(String) }` (exported); `Peer::collect_member_ends(&self,
+&BlockingCall) -> Vec<(u32, MemberEnd)>` — coordinator only, each link read under the gang
+deadline until an `Outcome`/`Aborted`/close, an already-recorded frame honoured without a read.
+`mod.rs`: three production minting sites documented.
+
+**`crates/jammi-db`** — `RankAdmissionRow.spec: String` (the `spec` column verbatim, already
+selected by `get_job_for_rank`'s statement; the rank body reconstructs its job from it — no spec
+travels on the wire); `ArtifactStore::has_resume_checkpoint(tenant, job_id) -> bool` (the resume
+manifest's existence, never a fetch).
+
+**`crates/jammi-server/src/grpc/gang_rounds.rs`** — `RoundInbox { frames, forwarder:
+AbortHandle }`; `RoundInbox::sever(self)` aborts the link's outbound forwarder and closes the
+inbound side, so no frame of the body's rides the response stream after the session's terminal
+event (and the forwarder's clone of the event sender goes with it, which is what closes the
+stream). **`gang.rs`** — `run_rank` spawns `run_member_rank` for every `world_size > 1` session
+(the identity is the world>1 conjunct's product) with the session's link, `row.spec`, the
+row's tenant and pair, BEFORE `Admitted` is queued; a `world_size == 1` session keeps (or, under
+`test-hooks`, offers) its link and parks. `HeldSession { body: Option<JoinHandle<RankOutcome>>,
+body_cancel: Arc<AtomicBool> }`; `SessionEnd { Aborted, Outcome(outcome::Result), Violation }`;
+the hold loop has FIVE arms of which a session takes four — the body's end (`Trained`/`Failed`
+→ `RankEvent::Outcome`; the prologue's `Aborted(reason)` → `Aborted`; a task that ended without
+an outcome → `Outcome{Failed}`) OR the park bound (`if body.is_none()`), beside inbound, drain
+(untouched — U5b-2's) and the tick; a foreign end sets `body_cancel`; every end severs the
+inbox. `outcome_event`. The `test-hooks` tap `take_member_links` now hands out body-less
+(`world_size == 1`) sessions' links only. Module doc and `hold`'s doc restated.
+
+**Tests** — `crates/jammi-server/tests/it/gang_coordinator.rs` rewritten around the real body
+(two oracles over the production `peer_addr` listener; the LocalGang reference kept);
+`gang_service.rs`: `world_two_ready` now materialises a REAL training set (`materialize_
+projection_table` over a registered `pairs` CSV, under the tenant) and claims a REAL `fine_tune`
+spec (`world_two_spec_json`, tiny_bert) so an admitted session's body reconstructs a runnable
+job; `admitted_world_two` opens rank 1 (rank 0 is the coordinator's own); the world-2 park oracle
+became `…_is_admitted_runs_its_body_and_never_parks`; new `run_rank_body_refuses_a_partition_
+whose_leaf_does_not_verify_as_store_unavailable`; module doc restated. `gang_rounds.rs`: the
+world-2 tap oracle (`a_round_through_the_real_run_rank_handler_reaches_the_member_link_and_
+equals_local`) deleted — its seat is the body's; its property (the member's fold over the real
+hold loop equals `Local`) is the coordinator oracle's byte equality; the body-less trailer oracle
+kept. `crates/jammi-ai/tests/it/gang_coordinator.rs`: the K4 pinned row
+`a_single_rank_job_runs_as_the_loop_claimer_and_never_traverses_the_coordinator`, the resume-pin
+row `a_peer_job_with_a_resume_checkpoint_is_refused_at_assembly_and_fails_typed`, role
+assertions on the `Local` fan-out row.
+
+**Docs (same commit set)** — `docs/maintainer/MAINTAINER-GUIDE.md`: §2.8a (the five-arm hold
+loop, the body's end, the sever), §2.8c (three minting sites; the tap's scope), §2.8d (steps
+7–8, the terminal write on receipt, the resume pin, `ResumeRefused → nothing`, the oracles), NEW
+§2.8e (the rank body and the runner roles, the agreement binding), the Train-flow sentence;
+`docs/guide/src/security.md` (admit-and-hold: the body, the single writer); 11 `PATH:LINE`
+citations re-anchored by identifier under my insertions (worker.rs ×5, trainer.rs ×1,
+artifact.rs ×5).
+
+##### Deviations from UNITS.md / the brief, with the reason and the code
+
+1. **`RunnerRole` is two types, not one enum.** The brief's `RunnerRole::{LoopClaimer, Coordinator,
+   Rank{rank}}` on every writer would make "a `Rank` attempts a write" a run-time arm. Splitting
+   `LeaseHolder` out (`role.rs`) makes the writers take a type a `Rank` cannot produce
+   (`RunnerRole::lease_holder() -> Option<_>`): M12 is the executed compile error.
+2. **`TrainedOutcome.artifact_digest` is the MEMBER's own adapter digest, not rank 0's published
+   digest carried by a last round.** The member digests bytes it wrote (its local adapter files),
+   never bytes it did not; every rank holds identical weights after the last step (DESIGN §4), so
+   the coordinator's equality check (`reconcile_member_ends`) is the gang's own attestation that it
+   converged to ONE artifact, and a differing digest fails the attempt rather than publishing over
+   it. Carrying rank 0's digest to members would need a collective after the trainer's last save —
+   a round the trainer does not make.
+3. **The coordinator WAITS for every member's end before publishing** (`assemble_and_run` step 7).
+   §6 published on rank 0's own result alone; "the terminal write on receipt" is now literal:
+   `Published` requires every member's `Trained` with the coordinator's digest; a member's
+   `Failed` is `TrainingFailed` (terminal `failed`, nothing published — the server's second
+   oracle), an `Aborted` after the run is `MemberAborted` through the table.
+4. **A body-bearing session never parks** — the hold loop's park arm is gated `if body.is_none()`
+   (U5a-2's "exactly four arms" pin restated as five-of-which-four). A body's bounds are the gang
+   deadline on every round wait and the re-verification tick. `NoBody` is now exactly what its
+   proto comment says: a body-less session's park.
+5. **The body's `Outcome` is emitted by the hold loop, not sent through the link.** The body
+   RETURNS its `RankOutcome` (the fifth arm's `JoinHandle`), and the hold loop emits the one
+   terminal event — so "every end is ONE stream event" stays a hold-loop property and a foreign
+   end can never be followed by the body's own frame (the inbox is severed).
+6. **The body's prologue classifies its refusals as the tick does** (`Refuted`/`StoreUnavailable`/
+   `Unavailable`), reusing `bind_recorded_training_set`'s error classes — so the two world-2
+   re-verification oracles (a store fault / a stripped sidecar manufactured AFTER admission) read
+   the same wire event whichever of the body's bind or the tick sees the fault first.
+7. **`ResumeRefused` records NO assembly outcome** (a second `None` beside `Moved`; §6's "only
+   `Moved` writes nothing" restated). No assembly happened and the job goes terminal `failed`;
+   recording `Success` would reset a cooldown on a row that is about to be `failed`.
+8. **`RankAdmissionRow.spec`** (jammi-db) and **`ArtifactStore::has_resume_checkpoint`** (jammi-db)
+   are outside the brief's files_in_scope: the body reconstructs its job from the row (no spec on
+   the wire — DESIGN §4), and the pin is a manifest-existence probe (never a bundle fetch).
+9. **The world-2 server fixtures now carry a REAL training set and a REAL spec** — with a body at
+   admission, a synthetic `{"common":{"world_size":2}}` row would end every world-2 session
+   `Outcome{Failed}` at once (an undeserialisable spec) and the re-verification rows could not be
+   held. The fixtures are the coordinator's own producer (`materialize_projection_table`), so they
+   are what a member is admitted against in production.
+10. **The `gang_rounds.rs` world-2 tap oracle is deleted**, not kept behind a flag: the tap's seat
+    is the body's. The tap survives for body-less sessions only (the trailer oracle needs a link
+    the session would otherwise just hold).
+11. **`whole_set_arm` in `run_spec` moved into `bind_training_source`** (the F6 predicate is
+    still the ONE decision, now shared with the member); the guide's citation re-anchored to it.
+
+#### 2. Properties
+
+Lanes: AI-LIB = `cargo test -p jammi-ai --features test-hooks --lib -- <filter>`; AI-IT =
+`cargo test -p jammi-ai --features test-hooks --test it -- <filter>`; SRV = `cargo test -p
+jammi-server --features test-hooks --test it -- <filter>`. Mutation ids are `mutations.py`'s;
+each was applied to the committed tip, run through the ONE named test, reverted.
+
+| Property (quantified) | Executed oracle (path::name; lane) | Executed mutation that reds it (first red line) |
+|---|---|---|
+| (compile-time) For every job-row-writing site on the run path — the lease-hold registration with its `Releasing` self-release arm and holder accounting, every `record_failed` (13 production sites, 2 test sites), the finalize CAS in `publish_and_finalize`, the acceleration-report write and its two markers, the coordinator's assembly-outcome/lease-release writes — the call is unreachable without a `LeaseHolder`; a `Rank` body holds `RunnerRole::Rank`, which has no `LeaseHolder` to pass, so a job-row write from the rank body does not compile | the compiler on the tip: `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` exit 0 (every site compiles WITH the parameter; the base's signatures, without it, would not — a missed site is `E0061`) | M12: a `record_failed(RunnerRole::Rank { rank }, ..)` call added to `member_rank_body` → `cargo check -p jammi-ai --features test-hooks` RED: ``error[E0308]: mismatched types --> `worker.rs` (line 5643 at the unit tip):9 … RunnerRole::Rank { rank } … expected `LeaseHolder`, found `RunnerRole`` (`record_failed`'s first parameter is `holder: LeaseHolder`)` |
+| (derivation) For every `(kind, world_size in 1..=4, local_ranks in 1..=3)`: the attempt's `LeaseHolder` is `Coordinator` exactly when a column-source `fine_tune` decides `TopologyDecision::Peer`, `LoopClaimer` otherwise; a `graph_fine_tune` never coordinates; `W == 1` is the `LoopClaimer` on every kind and host (K4) | AI-LIB `fine_tune::worker::tests::the_lease_holder_is_the_coordinator_exactly_when_a_fine_tune_decides_peer` | M5: `Peer → LoopClaimer` in `lease_holder_for` → RED: ``worker.rs` (line 8568 at the unit tip): assertion left == right failed: fine_tune W=2 L=1` (`left: LoopClaimer`)`; the same mutation against SRV `gang_coordinator::a_member_whose_body_fails…` (the hold registered as the loop claimer on a Peer attempt) → RED: ``gang_coordinator.rs` (line 647 at the unit tip): assertion left == right failed` (`left: [(1, LoopClaimer)]` — the Peer attempt's hold registered as the loop claimer)` |
+| K4, pinned: a `world_size == 1` `fine_tune` through the REAL claim → `run_claimed_job` → `run_spec` is today's loop path — topology `Single`, the hold registered as `LoopClaimer`, exactly one rank ran as `Holder(LoopClaimer)`, no coordinator end, no assembly listing, no identity pair written, the row `completed` with a published adapter | AI-IT `gang_coordinator::a_single_rank_job_runs_as_the_loop_claimer_and_never_traverses_the_coordinator` | M4: `TopologyDecision::decide` answering `Peer` for `world_size <= 1` (the job enters the coordinator body) → RED: ``gang_coordinator.rs` (line 751 at the unit tip): assertion left == right failed` (`left: Some(Peer { world: 1 })` — the single-rank job entered the coordinator body)` |
+| The role and the rank agree by construction on every `TrainingLoop`: unset → derived from the rank context (rank 0 the loop claimer, the pre-role default; rank `r` → `Rank{r}`); an explicit role whose `rank()` contradicts the context is refused at `build`, the matching one builds | AI-LIB `fine_tune::trainer::runner_role_and_agreement_oracle::a_runner_role_that_contradicts_the_rank_context_is_refused_at_build` | M3: the agreement guard made vacuous (`\|\| true`) → RED: ``trainer.rs` (line 8769 at the unit tip): the role contradicts the rank: ()` (a holder role on a rank-1 context built)` |
+| The trainer's durable-write gate, on a REAL two-rank `Local` gang through the full `TrainingLoop::run`, each rank over its OWN artifact store: every rank takes the epoch-boundary dropout gather (both complete), the holder (rank 0) writes the resume checkpoint into its store, the `Rank` (rank 1) writes NOTHING into its own | AI-LIB `…runner_role_and_agreement_oracle::a_rank_of_a_gang_never_writes_the_resume_checkpoint_and_the_holder_does` | M1: the role gate in `save_resume_checkpoint` removed → RED: ``trainer.rs` (line 8677 at the unit tip): assertion left == right failed: the lease holder (rank 0) alone writes the resume checkpoint; the Rank writes nothing` (`left: [true, true]` — rank 1's store holds a bundle)` |
+| The agreement binding: two ranks whose canonical trainable-variable layouts differ (the same `Var`s, shapes and order; different NAMES on rank 1) are refused at the first reduce on BOTH ranks, the refusal naming BOTH digests — never folded | AI-LIB `…runner_role_and_agreement_oracle::two_ranks_whose_canonical_layouts_differ_are_refused_naming_both_digests` | M2: the `bind_agreement` call at the top of `run` removed (bind nothing) → both ranks complete `Ok` (the positions line up, the fold proceeds silently) → RED: ``trainer.rs` (line 8717 at the unit tip): rank 0 must refuse: the ranks' canonical layouts differ, yet the fold proceeded`` |
+| (superseded at the rebase, §6) The total exit table and the resume pin — M6/M7 were executed on `74b7e5e0` (`worker.rs` (line 8488 at the unit tip) … left: Some(Success)`; `gang_coordinator.rs` (line 815 at the unit tip) … short listing: 0 fresh member(s)`) and are WITHDRAWN with the pin; on the tip the total table is the base's 13-variant one (`assembly_outcome`: only `Moved → None`; U5b-2's `lease_settlement` oracle covers every ordinal) and a `Peer` gang's resume is EXECUTED by §8's chaos rows through the real body (every successor attempt resumes from epoch 1's bundle and publishes the reference bytes) | AI-LIB `fine_tune::worker::tests::every_coordinator_end_records_exactly_one_assembly_outcome_and_only_moved_writes_nothing`; SRV `gang_chaos::*` (4 rows, §6) | the chaos rows' own executed mutations are U5b-2's (§8); no new mutation of mine on this row |
+| `RankEvent::Outcome` end to end through the REAL `GangServer::run_rank` on the production `peer_bind` listener and the REAL rank body: attempt 1 (member busy) ends `MemberRefused`, cooled, released, hold as `Coordinator`; attempt 2 re-lists, admits, the body runs rank 1 as `Rank{1}` beside rank 0 as `Holder(Coordinator)` (never `LoopClaimer`), the member's session ends `Outcome{Trained{digest}}` which the coordinator reads (`member_ends_for == [(1, Trained{..})]`), the attempt is `published` (ordinal 12), the row `completed` through the loop's own finalize, the published adapter byte-identical to the U4b-shaped `LocalGang` reference, the slot free | SRV `gang_coordinator::a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_attempt_runs_the_real_rank_body_to_a_published_artifact` | M8: the digest comparison inverted (`!= own` passes) → the equal digest is a mismatch → `TrainingFailed`, nothing published → RED: ``gang_coordinator.rs` (line 513 at the unit tip): assertion left == right failed: attempt 2 publishes over the real rank body: the run failed: rank 1 ended Trained with adapter digest c3432070… where rank 0's is c3432070…: the gang did not converge to one artifact` (ordinal 11, not 12 — the equal digests were read as a mismatch; on record: the member's digest EQUALS rank 0's on the healthy tree)`; M13: the hold loop maps a `Trained` body end to `Aborted{NoBody}` instead of `Outcome` → the coordinator reads `MemberAborted` → RED: ``gang_coordinator.rs` (line 513 at the unit tip): assertion left == right failed: attempt 2 publishes over the real rank body: rank 1 ended its session: Aborted(NoBody)` (ordinal 9, `MemberAborted`)` |
+| The terminal write on receipt, failure arm: a member whose body reports `Outcome{Failed{reason}}` ends the attempt `TrainingFailed("rank 1: …")` (ordinal 11), the row `failed` with that reason (site 4 of the writer table under `Coordinator`), `Success` recorded (assembly proceeded), NO model row registered, nothing published, both roles recorded, the slot free | SRV `gang_coordinator::a_member_whose_body_fails_ends_the_attempt_failed_under_the_coordinator_and_publishes_nothing` | M9: a member's `Failed` ignored by `reconcile_member_ends` → the attempt publishes → RED: ``gang_coordinator.rs` (line 613 at the unit tip): assertion left == right failed: the attempt ends TrainingFailed on the member's Outcome{Failed}: published` (`left: 12` — the attempt published over the failed member)` |
+| A body-bearing (`world_size == 2`) session NEVER parks: through the real handler its body reconstructs the job from the row, binds and verifies the training set, loads the model and sends its round-0 contribution (round frames are the ONLY frames on the stream); past the park bound (`LEASE`) no terminal event has been emitted; `Cancel` ends it `Aborted{Cancelled}` with the stream closing right after (no body frame follows), the row untouched, the slot free | SRV `gang_service::run_rank_world_two_own_tenant_training_set_is_admitted_runs_its_body_and_never_parks` | M10: the park arm's `if body.is_none()` guard removed → `Aborted{NoBody}` inside the bound → RED: ``gang_service.rs` (line 2289 at the unit tip): a body-bearing session emits no terminal event at the park bound: RankEvent { event: Some(Aborted(Aborted { reason: NoBody })) }``; M11: no body spawned for a `world_size > 1` session → parks, no round frame → RED: ``gang_service.rs` (line 2289 at the unit tip): a body-bearing session emits no terminal event at the park bound: RankEvent { event: Some(Aborted(Aborted { reason: NoBody })) }` (no round frame ever sent: nothing ran)` |
+| The body's own pre-collective verify: a training set whose Parquet bytes were corrupted inside a row group AFTER the sidecar attested them (a fault the sidecar-level tick cannot see) ends the session `Aborted{StoreUnavailable}` from the body's leaf verify, member-scoped, within the prologue, the row untouched | SRV `gang_service::run_rank_body_refuses_a_partition_whose_leaf_does_not_verify_as_store_unavailable` | M15: `verify_partition_leaves` handed no leaves → the body binds, loads and waits at its first collective; no terminal event → RED: ``gang_service.rs` (line 709 at the unit tip): assertion left == right failed: expected Aborted{StoreUnavailable}, got RankEvent { event: Some(Outcome(Outcome { result: Some(Failed(FailedOutcome { reason: "rank 1: DataFusion error: Parquet error: … Unexpected PageType -1406" })) })) }` — without the leaf verify the corrupt bytes reach the streamed pre-pass as an untyped decode failure, never the member-scoped abort` |
+| The two world-2 re-verification ends are unchanged with a body alive: a store fault / a stripped sidecar manufactured after admission still end `Aborted{StoreUnavailable}` / `Aborted{Refuted}` whichever of the body's bind or the tick sees it first, the row untouched | SRV `gang_service::run_rank_held_session_ends_store_unavailable_when_this_hosts_store_faults`, `::run_rank_held_session_ends_refuted_when_the_sidecar_stops_verifying` (re-executed over the real training-set fixture) | regression rows (U5a-2's M5 shape); the body's classification arms are by inspection the tick's (`bind_recorded_training_set`'s documented error classes) |
+| Every pre-existing hold-loop end (cancel, second Assign, drain ×2, refuted/unavailable, park for `world_size == 1`, busy slot, probe wait, supersession) and every admission determinant is unchanged; the peer names no `jobs` writer | SRV `-- gang` (the whole gang-prefixed set, §4) incl. `gang_terminal_write_oracle` | unchanged oracles |
+| W=1 and the in-process `Local` gang are byte-unchanged (the roles derive to today's values; the checkpoint gates fire for the same ranks as `rank != 0` did): the whole pre-existing `fine_tune::` lib suite (incl. U4b's determinism/resume-with-dropout oracles over a `Local` gang), the `Local` fan-out row (now also asserting `[(1, LoopClaimer)]` and roles `{Holder(LoopClaimer), Rank{1}}`), and the loop/shutdown/admission suites that drive `register_job_hold_or_release` under `LoopClaimer` | AI-LIB `fine_tune::`; AI-IT `gang_coordinator jobs_shutdown host_admission acceleration_report fine_tune` (§4) | regression-only (as §6 states it) — a perturbation of the W=1 window reports here first |
+
+#### 3. Uncovered
+
+- **A member's `Aborted{reason}` AFTER the run** (its session refuted/drained between its last
+  collective and its `Outcome`): mapped `MemberAborted` through the table (`reconcile_member_
+  ends`), executed only through the table oracle — no hermetic oracle manufactures a refutation
+  in that window.
+- **A `LinkFault` at the outcome read** (`MemberEnd::Ended`: the member's stream closed or fell
+  silent past the gang deadline before its `Outcome`): built, not executed — the healthy oracle
+  and the injected failure both deliver an `Outcome`.
+- **A differing digest from a REAL divergence**: M8 executes the comparison's refusal by
+  inverting it; no oracle manufactures two ranks that complete with different adapter bytes
+  (the collective's agreement and lockstep oracles are what would have to be broken first).
+- **A foreign end while the body is mid-round** (Cancel/Refuted/Drain during training, not at
+  the first collective): the never-parks and re-verification oracles end sessions whose body waits
+  at its FIRST collective; the sever's effect on a body between rounds (its next verb ends
+  `Disconnected`, its `RoundFault` dropped by the aborted forwarder) is executed only there.
+- **`body_cancel` at an epoch boundary**: set on every foreign end; the trainer's check is the
+  existing one, but every executed foreign end reaches the body through the severed inbox first,
+  so the flag's own effect is not separately observed.
+- **The rank body's `Aborted(Unavailable)` arm** (a catalog fault binding the training set) and
+  its "spec's `world_size` differs from the assignment" `Failed` arm: not manufactured.
+- **`Nccl::bind_agreement`** (accept-and-ignore): CUDA-gated, compiled by CI's gated-surface
+  clippy, not here.
+- **A `Resident` source in a `Peer` member** (`bind_training_source`'s eager arm): unreachable for
+  a gang by admission (mining/GradCache refused at `world > 1`), so the member always takes
+  `Streamed`; the eager arm is executed by rank 0's W=1/`Local` rows only.
+- **Two real processes**: the server oracles run the member's body in the SAME process as the
+  coordinator (one engine, one `HostAdmission`; the member dials its own `peer_bind` listener);
+  two OS processes over one catalog is the fleet leg (U7b).
+- **The member body's resume with a bundle written by a DIFFERENT root** (a fleet whose members
+  do not share the coordinator's result root): unreachable by the listing's root-identity
+  predicate; the chaos rows resume over one shared root only.
+
+#### 4. Gates
+
+COMMON.md's trimmed set plus clippy on the third crate this unit touches (`jammi-db`); every
+command with `RUSTC_WRAPPER=sccache`, `CARGO_TARGET_DIR=…/targets/u5b1biii`. Logs in
+`u5b1biii-scratch/`. The tip `74b7e5e0` is `9bbf36a7` (on which every mutation and the clippy
+runs executed) plus ONE `cargo fmt` reflow of two statements in
+`crates/jammi-ai/tests/it/gang_coordinator.rs` (whitespace only; the amended commit); the
+`gang_coordinator` it filter and the citation gate were re-executed on the amended tip.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean (`fmt-final2.log`, on the tip) |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | 0 warnings (`clippy-final-jammi-ai.log`) |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | 0 warnings |
+| `cargo clippy -p jammi-db --all-targets --features test-hooks -- -D warnings` | 0 | 0 warnings |
+| `cargo test -p jammi-ai --features test-hooks --lib -- runner_role_and_agreement_oracle fine_tune::role fine_tune::worker::tests::every_coordinator_end fine_tune::worker::tests::the_lease_holder` | 0 | 6 passed (`t-ai-lib-2.log`) |
+| `cargo test -p jammi-ai --features test-hooks --lib -- fine_tune::` | 0 | 356 passed, 0 failed — the WHOLE pre-existing suite + this unit's rows (the W=1 / `Local` byte-identity regression oracle, incl. U4b's determinism and resume-with-dropout rows) (`t-ai-lib-ft.log`) |
+| `cargo test -p jammi-ai --features test-hooks --test it -- gang_coordinator` | 0 | 5 passed (K4 pinned row, resume pin, Local fan-out with roles, ShortListed, Moved) (`t-ai-it-3.log`, on the tip) |
+| `cargo test -p jammi-ai --features test-hooks --test it -- jobs_shutdown host_admission acceleration_report fine_tune` | 0 | 90 passed, 0 failed (`register_job_hold_or_release`/`record_failed`/the report writers under `LoopClaimer`, unchanged) (`t-ai-it-reg.log`) |
+| `cargo test -p jammi-server --features test-hooks --test it -- gang` | 0 | 54 passed, 0 failed (2 `gang_coordinator` + 1 `gang_rounds` + every `gang_service`/oracle row; `t-srv-4.log`) |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1039 file(s) scanned, all PATH:LINE citations resolve (…; 2 exempt as non-ancestor legacy evidence)` — 11 citations re-anchored by identifier under this unit's insertions (on the tip) |
+| Mutations M1–M13, M15 + M5s (`mutations.py`; one filtered test or one `cargo check` each; `git checkout -- <file>` after; `git status --short` clean after every one) | — | 15 red on the first run whose mutation compiled (§2, first red lines quoted); M7 and M11 were first written as non-exhaustive `match` arms (a compile error, not the property's red) and re-written to compile before the quoted runs (`mutations-summary.log`, `mutations-summary-2.log`) |
+| `git status --short` at the tip | — | 0 entries |
+
+Not run, per COMMON.md's trimmed set: `cargo doc`, the live-Postgres lane (no `jammi-db` test
+added — `RankAdmissionRow.spec` is read by the existing `get_job_for_rank` statement and
+exercised by every world-2 server row; `has_resume_checkpoint` is exercised by the resume-pin
+and every `Peer` assembly row over the file store), `merge_path.sh`, workspace-wide builds,
+`jammi-bench`. `Nccl::bind_agreement` is CUDA-gated (CI's gated-surface clippy).
+
+#### 5. Commits (`git log --oneline 82f80b84..HEAD`; base `feat/500-wave3c` @ `82f80b84`)
+
+```
+74b7e5e0 feat(ai,server,db,docs): #500 U5b-1b-iii — the rank body over the real hold loop; the runner-role writer split; RankEvent::Outcome consumed on receipt; the resume pin; the agreement binding
+```
+
+One commit (19 files + `role.rs`, +2683/−690). Tip: `74b7e5e01a856e35650b4aba29a0cee9ff6fdf8e`.
+
+Seams for the lead (U5b-2, the watchdog): the hold loop's drain arm is untouched (its
+`break SessionEnd::Aborted(AbortReason::Drain)` is the one line U5b-2's `Released` emission
+replaces); a foreign end's body handling (`body_cancel` + `RoundInbox::sever`) is shared by every
+non-body end, so a `Released` end needs no new wiring. `run_claimed_job_under`'s lease-lost arm,
+the `lost` flag and `release_job_lease` were not edited beyond the `LeaseHolder` parameter
+threaded through `record_failed`/`register_job_hold_or_release`.
+
+#### 6. Rebase onto a072ad59 (`feat/500-wave3c` moved from `82f80b84` while this unit was built)
+
+`git rebase a072ad59` in the unit worktree; six files conflicted. Each conflict, its two sides,
+and the resolution — by intent, never by hunk:
+
+| File | Conflict | Resolution |
+|---|---|---|
+| `crates/jammi-ai/src/fine_tune/worker.rs` (1/3) | `coordinate`'s doc: U5b-2's released-vs-failed settlement paragraph vs mine ("every end but `Moved` and `ResumeRefused`", the `Coordinator` role sentence) | U5b-2's paragraph kept whole; my one sentence ("Runs as `LeaseHolder::Coordinator` — writer table row 17") appended; the `ResumeRefused` mention dropped (see the pin below) |
+| `worker.rs` (2/3) | `coordinate`'s settle arms: U5b-2's `lease_settlement(&end)` → `Release`/`Expire`/`Untouched` then a two-tuple `match (end, artifact)` vs my three-tuple match with the `ResumeRefused → Failed` arm and the per-outcome release | U5b-2's shape taken verbatim (the settlement is the ONE lease rule now; my `coordinate` never edited the settlement, only threaded the holder) — `LeaseHolder::Coordinator` is bound above the outcome record as before |
+| `worker.rs` (3/3) | the `tests` module: U5b-2's `every_coordinator_end_settles_its_lease_by_the_released_vs_failed_split` vs my `the_lease_holder_is_the_coordinator_exactly_when_a_fine_tune_decides_peer` (both inserted before `rank_assignment_is_a_pure_function…`) | both kept, U5b-2's first; the shared closing braces re-stitched |
+| `crates/jammi-db/src/catalog/jobs_repo.rs` (2) | `RankAdmissionRow`: #574's `lease: LeaseFact` (replacing `lease_live`/`remaining`) vs my `spec: String` beside the old pair; the constructor likewise | both fields: `spec` (mine) beside `lease` (#574's); `lease_live`/`remaining` gone with #574 |
+| `crates/jammi-ai/tests/it/gang_coordinator.rs` | U5b-2's `a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never_met_by_the_successor` vs my K4 row and resume-pin row (same insertion point) | U5b-2's row + my K4 row kept; my resume-pin row DELETED (the pin is withdrawn, below) |
+| `crates/jammi-server/tests/it/gang_coordinator.rs` (4) | U5b-2 made thirteen helpers `pub(crate)` (incl. `RankEnv`/`rank_env`/`try_run_rank`/`run_rank` for the chaos sibling) vs my rewrite (which deleted the test-thread rank-1 helpers and rewrote the oracle around the real body) | my rewrite, with every helper the chaos sibling still needs `pub(crate)` (`pairs`, `gang_config`, `tiny_bert_model`, `write_pairs_csv`, `two_rank_spec`, `Row` + fields, `row`, `published_adapter_bytes`, `file_store`, `reference_rank0_adapter_bytes`); `RankEnv`/`rank_env`/`try_run_rank`/`run_rank` are gone — their consumer (`gang_chaos.rs`'s test-thread rank 1) is gone too (below) |
+| `docs/guide/src/security.md` | #574's Postgres-only bullet (client-side lease decode) vs my admit-and-hold bullet | both: my admit-and-hold text (the body, the single writer) above #574's bullet |
+| `docs/maintainer/MAINTAINER-GUIDE.md` | §2.8d's post-record paragraph: U5b-2's settlement + watchdog + chaos prose vs my `ResumeRefused → nothing` | U5b-2's prose taken whole; my resume-pin sentences in §2.8d's step list replaced by the resume-through-the-shared-store sentence (below); my §2.8e and the rest untouched |
+
+Landed upstream and folded without conflict: `LeaseSettlement`/`lease_settlement` (a TOTAL
+match — no `ResumeRefused` arm is needed since the variant is withdrawn; `VARIANTS` is 13 again,
+U5b-2's settlement oracle covers every ordinal); the cancel fix's
+`checkpoint_before_spawn_blocking(job_id)` (auto-merged in `train_fine_tune`); #574's
+`LeaseFact` in `gang.rs` (my `run_rank` edits sit below it); the guard fixes.
+
+**The resume pin is WITHDRAWN (deviation 12).** The brief's "`world_size > 1` resume is
+REFUSED at assembly (resume-state broadcast across ranks is #543, never built here)" cannot stand
+on this tree: §8's four chaos rows (`crates/jammi-server/tests/it/gang_chaos.rs`) have the
+successor gang of a retired attempt RESUME from epoch 1's checkpoint and publish bytes equal to
+an uninterrupted run — executed, on the consolidation branch. Their rank 1 did it by hand
+(`run_rank_1` fetched `{job_id}/_resume/` from the shared store); the real body does it through
+`run_fine_tune_blocking`'s `discover_resume` over the member's OWN artifact store — the fleet's
+shared root, the identity every member was admitted on — exactly as an in-process `Local` rank
+does, per-rank dropout positions included (U4b's bundle). The shared store IS the cross-rank
+broadcast; #543 remains the issue for a deployment whose ranks do not share a root, which this
+design's root-identity predicate already refuses at the listing. Removed: `CoordinatorEnd::
+ResumeRefused`, `ArtifactStore::has_resume_checkpoint`, the pin in `assemble_and_run`, the
+resume-pin it oracle, M6/M7 (§2's rows are superseded by the chaos rows' executed resume), the
+docs' pin prose. The lead decides whether the plan row keeps the pin's wording.
+
+**The chaos rows run against the REAL body** (the lead's question, decided): the tap
+(`GangServer::take_member_links`) hands out body-less sessions' links only, so
+`gang_chaos.rs`'s test-thread rank 1 over a tapped link is gone. Instead two `test-hooks` seams
+in the engine — `training_test_hooks::wrap_member_collective(job_id, wrap)` (one-shot: the next
+member body of that job applies `wrap` to its `Peer` right after building it, before the first
+collective — the chaos rows' `ChaosRank`, now over `Arc<dyn Collective>` and forwarding
+`bind_agreement`, is that wrapper) and `note_rank_outcome`/`rank_outcomes_for(job_id)` (every
+`run_member_rank` return recorded, whether or not the session lived to emit it). The rows arm the
+wrapper before the coordinator dials (`arm_rank_1`) and read the body's end
+(`wait_rank_ends`): the retired body ends `Failed{.. chaos ..}` (silent, split brain) or
+`Failed{.. nothing applied ..}` (drain — its round on the severed link), the successor's body
+`Trained{..}`; a body killed WITH its member's runtime (the dropped-stream row) records no end
+at all — asserted. Why the real body rather than a suppression flag: the rows' properties are
+the coordinator's failure path over a member that dies/stalls/drains INSIDE a real round, and a
+rank 1 that is the production body (its own bind, leaf verify, streamed source, resume discovery,
+role) is the stronger oracle for exactly the seam this unit ships; a suppression flag would have
+kept a second, test-only rank body alive beside the real one. `RankEnv`/`rank_env`/
+`try_run_rank`/`run_rank`/`run_rank_1`/`spawn_rank_1`/`joined` and the member's tap are
+deleted, not flagged.
+
+##### 6a. Gates on the rebased tip `2264c28e` (every command re-run on the finished tree; logs `u5b1biii-scratch/f2-*.log`, `f3-*.log`)
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p jammi-server --features test-hooks --test it -- --test-threads=1 gang_chaos gang_coordinator gang_service` | 0 | 43 passed, 0 failed (the 4 chaos rows through the REAL body; the 2 coordinator oracles; every `gang_service` row over the real training-set fixture; `f3-srv.log`, on the tip) |
+| `cargo test -p jammi-ai --features test-hooks --test it -- gang_coordinator jobs_shutdown host_admission` | 0 | 33 passed, 0 failed (`f2-ai-it.log`) |
+| `cargo test -p jammi-ai --features test-hooks --lib -- fine_tune::` | 0 | 358 passed, 0 failed (`f2-ai-lib.log`) |
+| `JAMMI_TEST_PG_URL=… cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- gang_rank_admission --test-threads=1` | 0 | 25 passed, 0 failed — sqlite and postgres arms (`f2-db.log`) |
+| `cargo clippy -p jammi-ai --all-targets --features test-hooks -- -D warnings` | 0 | clean (`f2-clippy-jammi-ai.log`) |
+| `cargo clippy -p jammi-server --all-targets --features test-hooks -- -D warnings` | 0 | clean (`f3-clippy-server.log`, on the tip) |
+| `cargo clippy -p jammi-db --all-targets --features test-hooks -- -D warnings` | 0 | clean |
+| `cargo fmt --all -- --check` | 0 | clean (`f3-fmt.log`) |
+| `python3 ci/scripts/perf/check_citations.py` | 0 | `check-citations: 1042 file(s) scanned, all PATH:LINE citations resolve (…; 2 exempt …)` — 8 more citations re-anchored under the rebase's line moves (guide → worker.rs ×3, artifact.rs ×5) |
+| `git status --short` at the tip | — | 0 entries; `git merge-base --is-ancestor a072ad59 HEAD` true |
+
+The §2 mutations M1–M5s, M8–M13, M15 were executed on the pre-rebase commit `74b7e5e0`; the
+code they mutate is byte-identical on the rebased tip except where §6 states a change (the settle
+arms — U5b-2's shape, whose own settlement oracle is on the tip; the withdrawn pin — M6/M7
+superseded). Not re-executed after the rebase.
+
+##### 6b. Commits (`git log --oneline a072ad59..HEAD`)
+
+```
+2264c28e feat(ai,server,db,docs): #500 U5b-1b-iii — the rank body over the real hold loop; the runner-role writer split; RankEvent::Outcome consumed on receipt; the agreement binding
+```
+
+One commit (20 files incl. `role.rs`, +2874/−911 against `a072ad59`). Tip:
+`2264c28ec15b7c53993330e91c1e47a5307048ac`. The pre-rebase tip `74b7e5e0` (§5) is superseded.
+
 
 ## 8. U5b-2 (landed as two commits; original tip `81dc653a`)
 

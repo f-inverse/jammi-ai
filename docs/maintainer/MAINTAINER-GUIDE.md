@@ -4232,10 +4232,16 @@ with the rest of the workspace, no cargo feature — a process's role is
   `SchedulerRole`/`ExecutorRole` served on jammi's own shutdown — never
   Ballista's own `start_server`/`start_executor_process`, which install
   their own `ctrl_c` handlers and would race the server's two-mode
-  shutdown. The scheduler role installs `jammi_ai::fine_tune::worker::
-  PlacedGangSubmitter`; the executor role installs `PlacedGangRunner` and
-  writes this process's own device claim to its `compute_executors` row
-  right after registering (contract §9 B5).
+  shutdown. `host_scheduler` takes a `BallistaCluster`/
+  `TaskDistributionPolicy` pair as parameters ONLY so an in-memory cluster
+  + a bare policy stay reachable as a test fixture — `jammi-server`'s own
+  hosting always passes `BallistaCluster::new(CatalogClusterState,
+  CatalogJobState)` and `TaskDistributionPolicy::Custom(DevicePlacement)`;
+  there is no knob, the catalog-backed pair is the shipped scheduler,
+  never the in-memory one. The scheduler role installs `jammi_ai::
+  fine_tune::worker::PlacedGangSubmitter`; the executor role installs
+  `PlacedGangRunner` and writes this process's own device claim to its
+  `compute_executors` row right after registering (contract §9 B5).
 - **Client** (`client.rs`) — `submit_physical_plan`: the seam a
   scheduler-role process's `PlacedGangSubmitter` calls to place a plan
   instead of running it in-process; refuses a GPU-bound plan typed BEFORE

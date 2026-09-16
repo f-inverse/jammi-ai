@@ -16,17 +16,19 @@ heartbeat_secs = 10
 # PLACES it on a registered compute-pod executor (configuration.md's
 # semantics: this table's presence makes a process a scheduler). No
 # `[ballista.executor]` here -- this pod never itself registers as an
-# executor, so placement can never bind a gang back to it (contract
-# `feat_500-wave4.md` §9 B1's submitter exclusion is therefore never even
-# exercised on this pod's own claims).
+# executor, so a task it places can never be bound back to it (a task's own
+# submitter is excluded from placement in any case).
 scheduler_bind = "0.0.0.0:50050"
 
-# This pod is also a plain (non-Ballista) fleet member: `[worker] enabled`
-# lets it claim and run a training job in-process (K4) when no compute
-# executor is registered yet, exactly like any other worker-enabled process.
+# This pod claims the training kinds a placed run handles (`fine_tune`,
+# `graph_fine_tune`) and places each claimed job on a compute executor; while
+# no compute executor is registered it runs the job in-process, exactly like
+# any other worker-enabled process (the bytes are identical either way).
+# `context_predictor` has no placed arm, so it is left to the compute pods:
+# listing it here would train it on this CPU pod.
 [worker]
 enabled = true
-kinds = ["fine_tune", "graph_fine_tune", "context_predictor"]
+kinds = ["fine_tune", "graph_fine_tune"]
 
 # This pod's own peer/gang listener -- needed because a training job this
 # pod claims and runs in-process (no placement available) may still assemble
